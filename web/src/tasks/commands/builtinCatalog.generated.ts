@@ -23,6 +23,14 @@ type Seed = readonly [
   },
 ];
 
+function suggestionsFromHint(hint: string | undefined): SlashCommandSuggestion[] {
+  if (!hint?.includes(" | ")) return [];
+  return hint.split(" | ").map((value) => ({
+    label: value.charAt(0).toUpperCase() + value.slice(1),
+    value,
+  }));
+}
+
 function catalog(provider: WebAiKind, seeds: readonly Seed[]): SlashCommand[] {
   return seeds.map(([name, description, options]) => ({
     name,
@@ -31,7 +39,7 @@ function catalog(provider: WebAiKind, seeds: readonly Seed[]): SlashCommand[] {
     source: "builtin",
     category: options?.category ?? "workflow",
     argumentHint: options?.argumentHint ?? null,
-    suggestions: [...(options?.suggestions ?? [])],
+    suggestions: [...(options?.suggestions ?? suggestionsFromHint(options?.argumentHint))],
     aliases: [...(options?.aliases ?? [])],
     interaction: options?.interaction ?? "inline",
   }));

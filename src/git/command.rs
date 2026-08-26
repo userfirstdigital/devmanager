@@ -122,7 +122,10 @@ const HARD_MAX_ALTERNATES: usize = 32;
 const HARD_MAX_PACK_FILES: usize = 4096;
 const HARD_MAX_REF_ENTRIES: usize = 8192;
 const HARD_MAX_LOG_ENTRIES: usize = 8192;
-const HARD_MAX_WORKTREE_ENTRIES: usize = 1024;
+// Worktree metadata is already included in the aggregate repository graph
+// node cap. A busy but healthy multi-worktree repository can exceed 1,024
+// metadata files long before it approaches that overall bound.
+const HARD_MAX_WORKTREE_ENTRIES: usize = HARD_MAX_GRAPH_NODES;
 const HARD_MAX_GRAPH_BYTES: u64 = 256 * 1024 * 1024;
 // Windows repository graph validation deliberately pins and revalidates every
 // relevant handle around each Git child. Under Defender or sustained build
@@ -1528,25 +1531,88 @@ extern "system" {
 }
 
 fn file_identity(path: &Path) -> Result<FileIdentity, String> {
-    stable_file_identity(path, true, None, true)
+    stable_file_identity(path, true, None, true, true, true)
 }
 
 fn data_file_identity(path: &Path) -> Result<FileIdentity, String> {
-    stable_file_identity(path, false, None, true)
+    stable_file_identity(path, false, None, true, true, true)
 }
 
 fn data_file_identity_with_deadline(
     path: &Path,
     deadline: OperationDeadline,
 ) -> Result<FileIdentity, String> {
-    stable_file_identity(path, false, Some(deadline), true)
+    stable_file_identity(path, false, Some(deadline), true, true, true)
+}
+
+fn graph_snapshot_file_identity_after_reparse_check(
+    path: &Path,
+    metadata: &fs::Metadata,
+    deadline: Option<OperationDeadline>,
+    hash_file_content: bool,
+) -> Result<FileIdentity, String> {
+    if hash_file_content {
+        stable_file_identity(path, false, deadline, true, true, false)
+    } else {
+        if deadline.is_some_and(OperationDeadline::is_expired) {
+            return Err("repository graph validation exceeded the operation deadline".to_string());
+        }
+        self_authenticating_file_identity_from_metadata(metadata)
+    }
+}
+
+fn self_authenticating_file_identity_from_metadata(
+    metadata: &fs::Metadata,
+) -> Result<FileIdentity, String> {
+    if !metadata.is_file() {
+        return Err("Git graph entry is not a regular file".to_string());
+    }
+
+    #[cfg(windows)]
+    {
+        // Loose objects and pack files are named/checksummed by Git's own
+        // cryptographic object identity. Admission needs their bounded path,
+        // type, size, and timestamp, but opening every object just to recover
+        // another file id makes ordinary status scale with the entire object
+        // database. Control-plane Git files continue through the strict
+        // handle-and-content identity path.
+        return Ok(FileIdentity {
+            volume_serial_number: 0,
+            file_index: 0,
+            number_of_links: 1,
+            file_size: metadata.file_size(),
+            last_write_time: metadata.last_write_time(),
+            content_digest: [0; 32],
+        });
+    }
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        return Ok(FileIdentity {
+            device: metadata.dev(),
+            inode: metadata.ino(),
+            number_of_links: metadata.nlink(),
+            file_size: metadata.size(),
+            modified_seconds: metadata.mtime(),
+            modified_nanos: metadata.mtime_nsec(),
+            content_digest: [0; 32],
+        });
+    }
+
+    #[cfg(not(any(unix, windows)))]
+    {
+        Ok(FileIdentity {
+            content_digest: [0; 32],
+        })
+    }
 }
 
 fn file_identity_with_deadline(
     path: &Path,
     deadline: OperationDeadline,
 ) -> Result<FileIdentity, String> {
-    stable_file_identity(path, true, Some(deadline), true)
+    stable_file_identity(path, true, Some(deadline), true, true, true)
 }
 
 #[cfg(test)]
@@ -1555,7 +1621,7 @@ fn test_file_identity(path: &Path) -> Result<FileIdentity, String> {
     // image is legitimately hard-linked.  Their identity is still pinned by
     // file id, size, timestamp, and digest; repository graph data files use
     // `data_file_identity` above and continue to reject hard links.
-    stable_file_identity(path, false, None, false)
+    stable_file_identity(path, false, None, false, true, true)
 }
 
 #[cfg(test)]
@@ -1563,7 +1629,7 @@ fn test_file_identity_with_deadline(
     path: &Path,
     deadline: OperationDeadline,
 ) -> Result<FileIdentity, String> {
-    stable_file_identity(path, false, Some(deadline), false)
+    stable_file_identity(path, false, Some(deadline), false, true, true)
 }
 
 fn stable_file_identity(
@@ -1571,11 +1637,15 @@ fn stable_file_identity(
     require_native_image: bool,
     deadline: Option<OperationDeadline>,
     reject_hard_links: bool,
+    digest_content: bool,
+    validate_path_components: bool,
 ) -> Result<FileIdentity, String> {
     if deadline.is_some_and(OperationDeadline::is_expired) {
         return Err("Git executable identity exceeded the operation deadline".to_string());
     }
-    reject_reparse_components(path)?;
+    if validate_path_components {
+        reject_reparse_components(path)?;
+    }
     let metadata = fs::symlink_metadata(path)
         .map_err(|_| "Git executable metadata is unavailable".to_string())?;
     if !metadata.is_file() {
@@ -1589,11 +1659,15 @@ fn stable_file_identity(
     }
     let mut file = fs::File::open(path)
         .map_err(|_| "Git executable cannot be opened for identity".to_string())?;
-    let content_digest = digest_file(
-        &mut file,
-        deadline,
-        (!require_native_image).then_some(HARD_MAX_GRAPH_FILE_BYTES),
-    )?;
+    let content_digest = if digest_content {
+        digest_file(
+            &mut file,
+            deadline,
+            (!require_native_image).then_some(HARD_MAX_GRAPH_FILE_BYTES),
+        )?
+    } else {
+        [0; 32]
+    };
 
     #[cfg(windows)]
     {
@@ -1649,7 +1723,30 @@ fn stable_file_identity(
 }
 
 fn directory_identity(path: &Path) -> Result<FileIdentity, String> {
-    reject_reparse_components(path)?;
+    directory_identity_impl(path, true)
+}
+
+fn directory_identity_after_reparse_check_with_deadline(
+    path: &Path,
+    deadline: Option<OperationDeadline>,
+) -> Result<FileIdentity, String> {
+    if deadline.is_some_and(OperationDeadline::is_expired) {
+        return Err("repository graph validation exceeded the operation deadline".to_string());
+    }
+    let identity = directory_identity_impl(path, false)?;
+    if deadline.is_some_and(OperationDeadline::is_expired) {
+        return Err("repository graph validation exceeded the operation deadline".to_string());
+    }
+    Ok(identity)
+}
+
+fn directory_identity_impl(
+    path: &Path,
+    validate_path_components: bool,
+) -> Result<FileIdentity, String> {
+    if validate_path_components {
+        reject_reparse_components(path)?;
+    }
     let metadata = fs::symlink_metadata(path)
         .map_err(|_| "repository root metadata is unavailable".to_string())?;
     if !metadata.is_dir() {
@@ -1905,13 +2002,18 @@ fn reject_reparse_components(path: &Path) -> Result<(), String> {
         let Ok(metadata) = fs::symlink_metadata(ancestor) else {
             continue;
         };
-        if metadata.file_type().is_symlink() {
-            return Err("Git path contains a symlink or junction".to_string());
-        }
-        #[cfg(windows)]
-        if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
-            return Err("Git path contains a reparse point".to_string());
-        }
+        reject_reparse_metadata(&metadata)?;
+    }
+    Ok(())
+}
+
+fn reject_reparse_metadata(metadata: &fs::Metadata) -> Result<(), String> {
+    if metadata.file_type().is_symlink() {
+        return Err("Git path contains a symlink or junction".to_string());
+    }
+    #[cfg(windows)]
+    if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+        return Err("Git path contains a reparse point".to_string());
     }
     Ok(())
 }
@@ -2736,9 +2838,19 @@ fn valid_git_ref_component(component: &OsStr) -> bool {
 struct GraphNode {
     path: PathBuf,
     identity: FileIdentity,
+    /// The recursive admission snapshot, when this node required one. Keep
+    /// the exact proof that produced `identity` so repository admission does
+    /// not immediately walk the same large Git tree again for its baseline
+    /// and aggregate-limit checks.
+    initial_entries: Option<MutableDirectorySnapshot>,
     is_file: bool,
     mutable: bool,
     mutable_recursive: bool,
+    /// Git loose objects and pack files are named/checksummed by Git's own
+    /// cryptographic content identity. Their filesystem identity remains
+    /// pinned, but re-hashing every object on each status request is both
+    /// redundant and prohibitively slow on large Windows repositories.
+    hash_file_content: bool,
     /// Static alternate roots bind their bounded recursive content as well as
     /// their file identity, so an unenumerated pack/object insertion cannot
     /// appear between admission and the child checks.
@@ -2785,6 +2897,7 @@ impl RepositoryGraph {
         approved_external_roots: &[PathBuf],
         deadline: OperationDeadline,
     ) -> Result<Self, String> {
+        let admission_started = Instant::now();
         check_graph_deadline(deadline)?;
         let approved_external_roots = canonicalize_approved_graph_roots_with_deadline(
             root,
@@ -2930,7 +3043,7 @@ impl RepositoryGraph {
         if !graph_path_allowed(root, &object_store, &approved_external_roots) {
             return Err("repository object store is external to the workspace".to_string());
         }
-        push_mutable_graph_node(
+        push_self_authenticating_mutable_graph_node(
             root,
             &object_store,
             false,
@@ -2940,6 +3053,12 @@ impl RepositoryGraph {
         )?;
         object_stores.push(object_store.clone());
         graph_object_stores.push(object_store.clone());
+        if admission_started.elapsed() >= Duration::from_secs(1) {
+            eprintln!(
+                "devmanager Git graph admission: object store bound after {:?}",
+                admission_started.elapsed()
+            );
+        }
 
         let alternates = object_store.join("info").join("alternates");
         if alternates.is_file() {
@@ -3104,6 +3223,12 @@ impl RepositoryGraph {
         // exists at admission.  Authorized worktree transitions may adopt a
         // newly created root, while reads reject it as a graph substitution.
         metadata_roots.push(worktrees);
+        if admission_started.elapsed() >= Duration::from_secs(1) {
+            eprintln!(
+                "devmanager Git graph admission: worktree metadata bound after {:?}",
+                admission_started.elapsed()
+            );
+        }
 
         // These are the mutable Git inputs that affect preview and mutation
         // semantics.  They are snapshotted as graph nodes so a read-only
@@ -3164,6 +3289,12 @@ impl RepositoryGraph {
                 deadline,
             )?;
         }
+        if admission_started.elapsed() >= Duration::from_secs(1) {
+            eprintln!(
+                "devmanager Git graph admission: mutable inputs bound after {:?}",
+                admission_started.elapsed()
+            );
+        }
 
         // Directory enumeration order is not an authority identity. Sort the
         // admitted graph before computing baselines/identities so a fresh
@@ -3197,7 +3328,10 @@ impl RepositoryGraph {
             check_graph_deadline(deadline)?;
             mutable_entry_baseline.insert(
                 node.path.clone(),
-                mutable_directory_snapshot_for_node(node, Some(deadline))?,
+                match &node.initial_entries {
+                    Some(entries) => entries.clone(),
+                    None => mutable_directory_snapshot_for_node(node, Some(deadline))?,
+                },
             );
         }
         let optional_mutable_entry_baseline = optional_mutable_inputs
@@ -3215,6 +3349,12 @@ impl RepositoryGraph {
             &approved_external_roots,
             deadline,
         )?;
+        if admission_started.elapsed() >= Duration::from_secs(1) {
+            eprintln!(
+                "devmanager Git graph admission: complete after {:?}",
+                admission_started.elapsed()
+            );
+        }
         check_graph_deadline(deadline)?;
         for approved in &approved_external_roots {
             check_graph_deadline(deadline)?;
@@ -3248,7 +3388,18 @@ impl RepositoryGraph {
     }
 
     fn revalidate_with_deadline(&self, deadline: Option<OperationDeadline>) -> Result<(), String> {
-        self.revalidate_nodes(GraphTransition::ReadOnly, deadline, false)
+        self.revalidate_nodes(GraphTransition::ReadOnly, deadline, false, false)
+    }
+
+    fn revalidate_status_read_with_deadline(
+        &self,
+        deadline: Option<OperationDeadline>,
+    ) -> Result<(), String> {
+        // `git status` runs with GIT_OPTIONAL_LOCKS=0 and cannot legitimately
+        // mutate the object store. Git objects and packs are content-addressed
+        // and checksum-verified by Git, so pin their admitted container here
+        // while retaining strict content proofs for every control-plane file.
+        self.revalidate_nodes(GraphTransition::ReadOnly, deadline, false, true)
     }
 
     fn revalidate_after_transition(&self, transition: GraphTransition) -> Result<(), String> {
@@ -3260,7 +3411,7 @@ impl RepositoryGraph {
         transition: GraphTransition,
         deadline: Option<OperationDeadline>,
     ) -> Result<(), String> {
-        self.revalidate_nodes(transition, deadline, true)
+        self.revalidate_nodes(transition, deadline, true, false)
     }
 
     fn revalidate_during_transition_with_deadline(
@@ -3268,7 +3419,7 @@ impl RepositoryGraph {
         transition: GraphTransition,
         deadline: Option<OperationDeadline>,
     ) -> Result<(), String> {
-        self.revalidate_nodes(transition, deadline, false)
+        self.revalidate_nodes(transition, deadline, false, false)
     }
 
     fn revalidate_nodes(
@@ -3276,6 +3427,7 @@ impl RepositoryGraph {
         transition: GraphTransition,
         deadline: Option<OperationDeadline>,
         update_baseline: bool,
+        defer_self_authenticating_content: bool,
     ) -> Result<(), String> {
         // A full content snapshot is mandatory for read admission and for the
         // post-effect proof that adopts a legitimate mutation.  While the
@@ -3310,10 +3462,14 @@ impl RepositoryGraph {
             if node.is_file != metadata.is_file() {
                 return Err("repository graph entry type changed".to_string());
             }
+            let node_content_deferred = defer_self_authenticating_content
+                && node.mutable_recursive
+                && !node.hash_file_content;
             let current_entries = if node.mutable
                 && !node.is_file
                 && is_mutable_directory_snapshot_root(&self.nodes, node)
                 && (full_content || !node.mutable_recursive)
+                && !node_content_deferred
             {
                 Some(mutable_directory_snapshot_for_node(node, deadline)?)
             } else {
@@ -3358,7 +3514,10 @@ impl RepositoryGraph {
                     // container identity is comparable; the complete
                     // post-effect pass below restores the recursive digest
                     // check before adopting any mutable baseline.
-                    let matches = if !node.is_file && node.mutable_recursive && !full_content {
+                    let matches = if !node.is_file
+                        && node.mutable_recursive
+                        && (!full_content || node_content_deferred)
+                    {
                         graph_container_identity_matches(expected, &identity)
                     } else {
                         graph_identity_matches(expected, &identity)
@@ -4011,6 +4170,7 @@ fn push_graph_node_with_mode(
         is_file,
         mutable,
         mutable,
+        true,
         approved_external_roots,
         nodes,
         deadline,
@@ -4031,6 +4191,28 @@ fn push_shallow_mutable_graph_node(
         is_file,
         true,
         false,
+        true,
+        approved_external_roots,
+        nodes,
+        deadline,
+    )
+}
+
+fn push_self_authenticating_mutable_graph_node(
+    root: &Path,
+    path: &Path,
+    is_file: bool,
+    approved_external_roots: &[PathBuf],
+    nodes: &mut Vec<GraphNode>,
+    deadline: OperationDeadline,
+) -> Result<(), String> {
+    push_graph_node_with_content_mode(
+        root,
+        path,
+        is_file,
+        true,
+        true,
+        false,
         approved_external_roots,
         nodes,
         deadline,
@@ -4043,6 +4225,7 @@ fn push_graph_node_with_content_mode(
     is_file: bool,
     mutable: bool,
     mutable_recursive: bool,
+    hash_file_content: bool,
     approved_external_roots: &[PathBuf],
     nodes: &mut Vec<GraphNode>,
     deadline: OperationDeadline,
@@ -4060,12 +4243,25 @@ fn push_graph_node_with_content_mode(
     if (is_file && !metadata.is_file()) || (!is_file && !metadata.is_dir()) {
         return Err("repository graph path type is invalid".to_string());
     }
-    let identity = if is_file {
-        data_file_identity_with_deadline(&canonical, deadline)?
+    let (identity, initial_entries) = if is_file {
+        (
+            data_file_identity_with_deadline(&canonical, deadline)?,
+            None,
+        )
     } else if mutable && mutable_recursive {
-        mutable_directory_identity_with_deadline(&canonical, Some(deadline))?
+        let entries = mutable_directory_snapshot_with_file_mode(
+            &canonical,
+            Some(deadline),
+            hash_file_content,
+        )?;
+        let identity =
+            mutable_directory_identity_from_snapshot(&canonical, Some(deadline), &entries)?;
+        (identity, Some(entries))
     } else {
-        directory_identity_with_deadline(&canonical, Some(deadline))?
+        (
+            directory_identity_with_deadline(&canonical, Some(deadline))?,
+            None,
+        )
     };
     check_graph_deadline(deadline)?;
     if let Some(node) = nodes
@@ -4076,18 +4272,25 @@ fn push_graph_node_with_content_mode(
             return Err("repository graph entry type changed during admission".to_string());
         }
         let was_recursive = node.mutable_recursive;
+        let was_hashing_file_content = node.hash_file_content;
         node.mutable |= mutable;
         node.mutable_recursive |= mutable_recursive;
-        if mutable_recursive && !was_recursive {
+        node.hash_file_content &= hash_file_content;
+        if mutable_recursive
+            && (!was_recursive || (was_hashing_file_content && !node.hash_file_content))
+        {
             node.identity = identity;
+            node.initial_entries = initial_entries;
         }
     } else {
         nodes.push(GraphNode {
             path: canonical,
             identity,
+            initial_entries,
             is_file,
             mutable,
             mutable_recursive,
+            hash_file_content,
             content_bound: false,
         });
     }
@@ -4144,9 +4347,9 @@ fn push_static_graph_descendants(
         let entry =
             entry.map_err(|_| "repository graph directory entry is unavailable".to_string())?;
         let path = entry.path();
-        reject_reparse_components(&path)?;
         let metadata = fs::symlink_metadata(&path)
             .map_err(|_| "repository graph entry metadata is unavailable".to_string())?;
+        reject_reparse_metadata(&metadata)?;
         if metadata.is_file() {
             push_graph_node(root, &path, true, approved_external_roots, nodes, deadline)?;
         } else if metadata.is_dir() {
@@ -4172,7 +4375,7 @@ fn push_worktree_graph(
     common_dir: &Path,
     approved_external_roots: &[PathBuf],
     nodes: &mut Vec<GraphNode>,
-    optional_mutable_inputs: &mut Vec<MutableGraphInput>,
+    _optional_mutable_inputs: &mut Vec<MutableGraphInput>,
     deadline: OperationDeadline,
 ) -> Result<(), String> {
     check_graph_deadline(deadline)?;
@@ -4203,7 +4406,6 @@ fn push_worktree_graph(
         if !metadata.is_dir() {
             return Err("repository worktree metadata entry is not a directory".to_string());
         }
-        push_graph_node(root, &path, false, approved_external_roots, nodes, deadline)?;
         validate_worktree_metadata_descriptors(
             root,
             &path,
@@ -4212,32 +4414,10 @@ fn push_worktree_graph(
             nodes,
             deadline,
         )?;
-        push_worktree_metadata_descendants(
-            root,
-            &path,
-            path.to_path_buf(),
-            approved_external_roots,
-            nodes,
-            deadline,
-            0,
-        )?;
-        for (name, is_file) in [
-            ("HEAD", true),
-            ("index", true),
-            ("ORIG_HEAD", true),
-            ("logs", false),
-            ("refs", false),
-        ] {
-            push_shallow_mutable_graph_input(
-                root,
-                &path.join(name),
-                is_file,
-                approved_external_roots,
-                nodes,
-                optional_mutable_inputs,
-                deadline,
-            )?;
-        }
+        // The recursive snapshot on the enclosing `worktrees` root owns each
+        // per-worktree container and mutable descendant. Adding the same
+        // HEAD/index/log/ref paths as individual nodes duplicated admission
+        // and revalidation work without strengthening that proof.
     }
     Ok(())
 }
@@ -4247,7 +4427,7 @@ fn validate_worktree_metadata_descriptors(
     metadata: &Path,
     common_dir: &Path,
     approved_external_roots: &[PathBuf],
-    nodes: &mut Vec<GraphNode>,
+    _nodes: &mut Vec<GraphNode>,
     deadline: OperationDeadline,
 ) -> Result<(), String> {
     let gitdir_descriptor = metadata.join("gitdir");
@@ -4259,39 +4439,17 @@ fn validate_worktree_metadata_descriptors(
         approved_external_roots,
         deadline,
     )?;
-    let linked_git_contents =
-        read_file_bounded_with_deadline(&linked_git_file, HARD_MAX_STDERR_BYTES, Some(deadline))
-            .map_err(|_| "linked worktree Git descriptor cannot be read safely".to_string())?;
-    let linked_git_contents = String::from_utf8(linked_git_contents)
-        .map_err(|_| "linked worktree Git descriptor is not UTF-8".to_string())?;
-    let linked_git_value = linked_git_contents
-        .trim()
-        .strip_prefix("gitdir:")
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .ok_or_else(|| "linked worktree Git descriptor is invalid".to_string())?;
-    let linked_git_target = resolve_descriptor_value(
-        linked_git_file
-            .parent()
-            .ok_or_else(|| "linked worktree Git descriptor has no parent".to_string())?,
-        linked_git_value,
-        root,
-        approved_external_roots,
-        deadline,
-    )?;
-    if !same_path(&linked_git_target, metadata) {
-        return Err(
-            "linked worktree Git descriptors do not bind to one metadata directory".to_string(),
-        );
+    // The enclosing recursive `worktrees` snapshot already binds this
+    // descriptor's contents. Resolving its target proves it remains a regular
+    // file inside the approved graph. Reading every unrelated worktree's
+    // external `.git` backlink again made status scale with all historical
+    // worktrees even though status cannot consume those links.
+    let linked_git_metadata = fs::symlink_metadata(&linked_git_file)
+        .map_err(|_| "linked worktree descriptor target is unavailable".to_string())?;
+    reject_reparse_metadata(&linked_git_metadata)?;
+    if !linked_git_metadata.is_file() {
+        return Err("linked worktree descriptor target has the wrong type".to_string());
     }
-    push_graph_node(
-        root,
-        &linked_git_file,
-        true,
-        approved_external_roots,
-        nodes,
-        deadline,
-    )?;
 
     let commondir_descriptor = metadata.join("commondir");
     let linked_common_dir = resolve_worktree_descriptor_path(
@@ -4319,16 +4477,18 @@ fn resolve_worktree_descriptor_path(
     deadline: OperationDeadline,
 ) -> Result<PathBuf, String> {
     check_graph_deadline(deadline)?;
-    reject_reparse_components(descriptor)?;
     let metadata = fs::symlink_metadata(descriptor)
         .map_err(|_| "linked worktree descriptor is unavailable".to_string())?;
+    reject_reparse_metadata(&metadata)?;
     if !metadata.is_file() {
         return Err("linked worktree descriptor is not a regular file".to_string());
     }
     check_graph_deadline(deadline)?;
-    let contents =
-        read_file_bounded_with_deadline(descriptor, HARD_MAX_STDERR_BYTES, Some(deadline))
-            .map_err(|_| "linked worktree descriptor cannot be read safely".to_string())?;
+    if metadata.len() > HARD_MAX_STDERR_BYTES as u64 {
+        return Err("linked worktree descriptor cannot be read safely".to_string());
+    }
+    let contents = fs::read(descriptor)
+        .map_err(|_| "linked worktree descriptor cannot be read safely".to_string())?;
     let contents = String::from_utf8(contents)
         .map_err(|_| "linked worktree descriptor is not UTF-8".to_string())?;
     let value = contents.trim();
@@ -4371,94 +4531,6 @@ fn resolve_descriptor_value(
     Ok(canonical)
 }
 
-fn push_worktree_metadata_descendants(
-    root: &Path,
-    worktree: &Path,
-    directory: PathBuf,
-    approved_external_roots: &[PathBuf],
-    nodes: &mut Vec<GraphNode>,
-    deadline: OperationDeadline,
-    depth: usize,
-) -> Result<(), String> {
-    // The enclosing worktrees root owns the recursive content snapshot. Keep
-    // nested mutable directories as shallow containers so revalidation does
-    // not rescan the same subtree once per descendant; the outer snapshot
-    // still binds every descendant identity/content before and after Git.
-    check_graph_deadline(deadline)?;
-    if depth > HARD_MAX_GRAPH_DEPTH {
-        return Err("repository worktree metadata graph is too deep".to_string());
-    }
-    for entry in fs::read_dir(&directory)
-        .map_err(|_| "repository worktree metadata cannot be enumerated safely".to_string())?
-    {
-        check_graph_deadline(deadline)?;
-        if nodes.len() >= HARD_MAX_GRAPH_NODES {
-            return Err(format!(
-                "repository graph exceeds the {HARD_MAX_GRAPH_NODES}-node limit"
-            ));
-        }
-        let entry =
-            entry.map_err(|_| "repository worktree metadata entry is unavailable".to_string())?;
-        let path = entry.path();
-        reject_reparse_components(&path)?;
-        let metadata = fs::symlink_metadata(&path)
-            .map_err(|_| "repository worktree metadata entry is unavailable".to_string())?;
-        let relative = path
-            .strip_prefix(worktree)
-            .map_err(|_| "repository worktree metadata path escaped its root".to_string())?;
-        let mutable = relative.components().any(|component| {
-            matches!(
-                component,
-                std::path::Component::Normal(name)
-                    if name == OsStr::new("HEAD")
-                        || name == OsStr::new("index")
-                        || name == OsStr::new("ORIG_HEAD")
-                        || name == OsStr::new("logs")
-                        || name == OsStr::new("refs")
-            )
-        });
-        if metadata.is_file() {
-            if mutable {
-                push_shallow_mutable_graph_node(
-                    root,
-                    &path,
-                    true,
-                    approved_external_roots,
-                    nodes,
-                    deadline,
-                )?;
-            } else {
-                push_graph_node(root, &path, true, approved_external_roots, nodes, deadline)?;
-            }
-        } else if metadata.is_dir() {
-            if mutable {
-                push_shallow_mutable_graph_node(
-                    root,
-                    &path,
-                    false,
-                    approved_external_roots,
-                    nodes,
-                    deadline,
-                )?;
-            } else {
-                push_graph_node(root, &path, false, approved_external_roots, nodes, deadline)?;
-            }
-            push_worktree_metadata_descendants(
-                root,
-                worktree,
-                path,
-                approved_external_roots,
-                nodes,
-                deadline,
-                depth + 1,
-            )?;
-        } else {
-            return Err("repository worktree metadata contains a non-regular entry".to_string());
-        }
-    }
-    Ok(())
-}
-
 fn enforce_graph_limits(
     root: &Path,
     object_stores: &[PathBuf],
@@ -4482,46 +4554,52 @@ fn enforce_graph_limits(
         }
     }
     for object_store in object_stores {
-        collect_graph_tree_stats(object_store, GraphTreeRole::Object, &mut stats, deadline, 0)?;
+        collect_admitted_graph_tree_stats(
+            object_store,
+            GraphTreeRole::Object,
+            nodes,
+            &mut stats,
+            deadline,
+        )?;
     }
     let state_root = common_dir.unwrap_or(git_dir);
-    collect_graph_tree_stats(
+    collect_admitted_graph_tree_stats(
         &state_root.join("refs"),
         GraphTreeRole::Refs,
+        nodes,
         &mut stats,
         deadline,
-        0,
     )?;
-    collect_graph_tree_stats(
+    collect_admitted_graph_tree_stats(
         &state_root.join("logs"),
         GraphTreeRole::Logs,
+        nodes,
         &mut stats,
         deadline,
-        0,
     )?;
     if common_dir.is_some() {
-        collect_graph_tree_stats(
+        collect_admitted_graph_tree_stats(
             &git_dir.join("refs"),
             GraphTreeRole::Refs,
+            nodes,
             &mut stats,
             deadline,
-            0,
         )?;
-        collect_graph_tree_stats(
+        collect_admitted_graph_tree_stats(
             &git_dir.join("logs"),
             GraphTreeRole::Logs,
+            nodes,
             &mut stats,
             deadline,
-            0,
         )?;
     }
     for metadata_root in metadata_roots {
-        collect_graph_tree_stats(
+        collect_admitted_graph_tree_stats(
             metadata_root,
             GraphTreeRole::Worktrees,
+            nodes,
             &mut stats,
             deadline,
-            0,
         )?;
     }
     if stats.nodes > HARD_MAX_GRAPH_NODES {
@@ -4650,7 +4728,12 @@ fn check_graph_deadline(deadline: OperationDeadline) -> Result<(), String> {
     }
 }
 
-const HARD_MAX_MUTABLE_GRAPH_ENTRIES: usize = 4096;
+// A mutable snapshot is another view of the same repository graph already
+// bounded by `HARD_MAX_GRAPH_NODES`. Keeping a smaller independent ceiling
+// rejects healthy repositories with many loose objects even though the
+// aggregate admission proof accepts them. Reuse the graph-wide envelope so
+// the snapshot remains bounded without contradicting the primary policy.
+const HARD_MAX_MUTABLE_GRAPH_ENTRIES: usize = HARD_MAX_GRAPH_NODES;
 
 fn mutable_directory_identity(path: &Path) -> Result<FileIdentity, String> {
     mutable_directory_identity_with_deadline(path, None)
@@ -4660,12 +4743,80 @@ fn mutable_directory_identity_with_deadline(
     path: &Path,
     deadline: Option<OperationDeadline>,
 ) -> Result<FileIdentity, String> {
+    mutable_directory_identity_with_file_mode(path, deadline, true)
+}
+
+fn collect_admitted_graph_tree_stats(
+    directory: &Path,
+    role: GraphTreeRole,
+    nodes: &[GraphNode],
+    stats: &mut GraphTreeStats,
+    deadline: OperationDeadline,
+) -> Result<(), String> {
+    if let Some(snapshot) = nodes
+        .iter()
+        .find(|node| same_path(&node.path, directory))
+        .and_then(|node| node.initial_entries.as_ref())
+    {
+        collect_graph_tree_stats_from_snapshot(directory, role, snapshot, stats);
+        Ok(())
+    } else {
+        collect_graph_tree_stats(directory, role, stats, deadline, 0)
+    }
+}
+
+fn collect_graph_tree_stats_from_snapshot(
+    root: &Path,
+    role: GraphTreeRole,
+    snapshot: &MutableDirectorySnapshot,
+    stats: &mut GraphTreeStats,
+) {
+    for (relative, is_file, identity) in snapshot {
+        stats.nodes = stats.nodes.saturating_add(1);
+        if !*is_file {
+            continue;
+        }
+        stats.bytes = stats.bytes.saturating_add(identity.file_size);
+        let path = root.join(relative);
+        if matches!(role, GraphTreeRole::Object)
+            && path
+                .parent()
+                .and_then(Path::file_name)
+                .is_some_and(|name| name == OsStr::new("pack"))
+            && path.extension().is_some_and(|extension| {
+                extension == OsStr::new("pack") || extension == OsStr::new("idx")
+            })
+        {
+            stats.packs = stats.packs.saturating_add(1);
+        }
+        match role {
+            GraphTreeRole::Refs => stats.refs = stats.refs.saturating_add(1),
+            GraphTreeRole::Logs => stats.logs = stats.logs.saturating_add(1),
+            GraphTreeRole::Worktrees => stats.worktrees = stats.worktrees.saturating_add(1),
+            GraphTreeRole::Object => {}
+        }
+    }
+}
+
+fn mutable_directory_identity_with_file_mode(
+    path: &Path,
+    deadline: Option<OperationDeadline>,
+    hash_file_content: bool,
+) -> Result<FileIdentity, String> {
+    let entries = mutable_directory_snapshot_with_file_mode(path, deadline, hash_file_content)?;
+    mutable_directory_identity_from_snapshot(path, deadline, &entries)
+}
+
+fn mutable_directory_identity_from_snapshot(
+    path: &Path,
+    deadline: Option<OperationDeadline>,
+    entries: &MutableDirectorySnapshot,
+) -> Result<FileIdentity, String> {
     let mut identity = directory_identity_with_deadline(path, deadline)?;
-    let entries = mutable_directory_snapshot_with_deadline(path, deadline)?;
     let mut hasher = Sha256::new();
     for (relative, is_file, entry_identity) in entries {
         update_os_string_digest(&mut hasher, &relative);
-        hasher.update([is_file as u8]);
+        hasher.update([*is_file as u8]);
         hasher.update(identity_token(&entry_identity).as_bytes());
     }
     let digest = hasher.finalize();
@@ -4680,8 +4831,16 @@ fn mutable_directory_snapshot_with_deadline(
     path: &Path,
     deadline: Option<OperationDeadline>,
 ) -> Result<MutableDirectorySnapshot, String> {
+    mutable_directory_snapshot_with_file_mode(path, deadline, true)
+}
+
+fn mutable_directory_snapshot_with_file_mode(
+    path: &Path,
+    deadline: Option<OperationDeadline>,
+    hash_file_content: bool,
+) -> Result<MutableDirectorySnapshot, String> {
     let mut entries = Vec::new();
-    collect_mutable_directory_entries(path, path, 0, &mut entries, deadline)?;
+    collect_mutable_directory_entries(path, path, 0, &mut entries, deadline, hash_file_content)?;
     entries.sort_by(|left, right| left.0.cmp(&right.0));
     Ok(entries)
 }
@@ -4691,7 +4850,11 @@ fn mutable_directory_snapshot_for_node(
     deadline: Option<OperationDeadline>,
 ) -> Result<MutableDirectorySnapshot, String> {
     if node.mutable_recursive {
-        return mutable_directory_snapshot_with_deadline(&node.path, deadline);
+        return mutable_directory_snapshot_with_file_mode(
+            &node.path,
+            deadline,
+            node.hash_file_content,
+        );
     }
     let children = fs::read_dir(&node.path)
         .map_err(|_| "mutable Git graph directory cannot be read".to_string())?;
@@ -4701,12 +4864,13 @@ fn mutable_directory_snapshot_for_node(
             return Err("repository validation exceeded the operation deadline".to_string());
         }
         if entries.len() >= HARD_MAX_MUTABLE_GRAPH_ENTRIES {
-            return Err("mutable Git graph exceeds the immutable entry limit".to_string());
+            return Err(format!(
+                "mutable Git graph exceeds the {HARD_MAX_MUTABLE_GRAPH_ENTRIES}-entry limit"
+            ));
         }
         let path = entry
             .map_err(|_| "mutable Git graph directory entry cannot be read".to_string())?
             .path();
-        reject_reparse_components(&path)?;
         let metadata = match fs::symlink_metadata(&path) {
             Ok(metadata) => metadata,
             // A Git lock may disappear between directory enumeration and its
@@ -4721,22 +4885,26 @@ fn mutable_directory_snapshot_for_node(
                 ))
             }
         };
+        reject_reparse_metadata(&metadata)?;
         let relative = path
             .strip_prefix(&node.path)
             .unwrap_or(&path)
             .as_os_str()
             .to_os_string();
         if metadata.is_dir() {
-            let identity = match directory_identity_with_deadline(&path, deadline) {
-                Ok(identity) => identity,
-                Err(_) if mutable_graph_entry_disappeared(&path) => continue,
-                Err(reason) => return Err(reason),
-            };
+            let identity =
+                match directory_identity_after_reparse_check_with_deadline(&path, deadline) {
+                    Ok(identity) => identity,
+                    Err(_) if mutable_graph_entry_disappeared(&path) => continue,
+                    Err(reason) => return Err(reason),
+                };
             entries.push((relative, false, identity));
         } else if metadata.is_file() {
-            let identity = match deadline.map_or_else(
-                || data_file_identity(&path),
-                |deadline| data_file_identity_with_deadline(&path, deadline),
+            let identity = match graph_snapshot_file_identity_after_reparse_check(
+                &path,
+                &metadata,
+                deadline,
+                node.hash_file_content,
             ) {
                 Ok(identity) => identity,
                 Err(_) if mutable_graph_entry_disappeared(&path) => continue,
@@ -4816,6 +4984,7 @@ fn collect_mutable_directory_entries(
     depth: usize,
     entries: &mut Vec<(OsString, bool, FileIdentity)>,
     deadline: Option<OperationDeadline>,
+    hash_file_content: bool,
 ) -> Result<(), String> {
     if depth > HARD_MAX_GRAPH_DEPTH {
         return Err("mutable Git graph is too deep".to_string());
@@ -4827,12 +4996,13 @@ fn collect_mutable_directory_entries(
             return Err("repository validation exceeded the operation deadline".to_string());
         }
         if entries.len() >= HARD_MAX_MUTABLE_GRAPH_ENTRIES {
-            return Err("mutable Git graph exceeds the immutable entry limit".to_string());
+            return Err(format!(
+                "mutable Git graph exceeds the {HARD_MAX_MUTABLE_GRAPH_ENTRIES}-entry limit"
+            ));
         }
         let path = entry
             .map_err(|_| "mutable Git graph directory entry cannot be read".to_string())?
             .path();
-        reject_reparse_components(&path)?;
         let metadata = match fs::symlink_metadata(&path) {
             Ok(metadata) => metadata,
             Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
@@ -4843,22 +5013,29 @@ fn collect_mutable_directory_entries(
                 ))
             }
         };
+        reject_reparse_metadata(&metadata)?;
         let relative = path
             .strip_prefix(root)
             .unwrap_or(&path)
             .as_os_str()
             .to_os_string();
         if metadata.is_dir() {
-            let identity = match directory_identity_with_deadline(&path, deadline) {
-                Ok(identity) => identity,
-                Err(_) if mutable_graph_entry_disappeared(&path) => continue,
-                Err(reason) => return Err(reason),
-            };
+            let identity =
+                match directory_identity_after_reparse_check_with_deadline(&path, deadline) {
+                    Ok(identity) => identity,
+                    Err(_) if mutable_graph_entry_disappeared(&path) => continue,
+                    Err(reason) => return Err(reason),
+                };
             let entry_count = entries.len();
             entries.push((relative, false, identity));
-            if let Err(reason) =
-                collect_mutable_directory_entries(root, &path, depth + 1, entries, deadline)
-            {
+            if let Err(reason) = collect_mutable_directory_entries(
+                root,
+                &path,
+                depth + 1,
+                entries,
+                deadline,
+                hash_file_content,
+            ) {
                 if mutable_graph_entry_disappeared(&path) {
                     entries.truncate(entry_count);
                     continue;
@@ -4866,9 +5043,11 @@ fn collect_mutable_directory_entries(
                 return Err(reason);
             }
         } else if metadata.is_file() {
-            let identity = match deadline.map_or_else(
-                || data_file_identity(&path),
-                |deadline| data_file_identity_with_deadline(&path, deadline),
+            let identity = match graph_snapshot_file_identity_after_reparse_check(
+                &path,
+                &metadata,
+                deadline,
+                hash_file_content,
             ) {
                 Ok(identity) => identity,
                 Err(_) if mutable_graph_entry_disappeared(&path) => continue,
@@ -4945,7 +5124,7 @@ fn reject_unsafe_local_config(
             || qualified.starts_with("merge.")
             || qualified.starts_with("mergetool.")
             || qualified.starts_with("gpg.")
-            || qualified.starts_with("submodule.")
+            || unsafe_submodule_config_key(&qualified)
             || qualified == "commit.gpgsign"
             || qualified == "tag.gpgsign"
             || qualified == "sequence.editor"
@@ -4965,6 +5144,17 @@ fn reject_unsafe_local_config(
         return Err("repository Git config validation exceeded the operation deadline".to_string());
     }
     Ok(())
+}
+
+fn unsafe_submodule_config_key(qualified: &str) -> bool {
+    // Ordinary repository metadata such as `submodule.active = .` only
+    // controls which recorded modules are considered active. The dangerous
+    // local overrides are the endpoint and update-command keys: those can
+    // redirect Git outside the admitted repository or execute a command.
+    qualified == "submodule.url"
+        || qualified == "submodule.update"
+        || qualified.starts_with("submodule.")
+            && (qualified.ends_with(".url") || qualified.ends_with(".update"))
 }
 
 fn read_file_bounded_with_deadline(
@@ -5688,6 +5878,7 @@ fn repository_graph_identity_with_filter(root: &RepositoryRoot, include_mutable:
         hasher.update([node.is_file as u8]);
         hasher.update([node.mutable as u8]);
         hasher.update([node.mutable_recursive as u8]);
+        hasher.update([node.hash_file_content as u8]);
         hasher.update([node.content_bound as u8]);
         hasher.update(identity_token(&node.identity).as_bytes());
     }
@@ -8381,9 +8572,14 @@ impl GitRepository {
                 operation: operation.clone(),
                 message: "trusted Git executable identity could not be verified".to_string(),
             })?;
-        self.root
-            .revalidate_with_deadline(deadline)
-            .map_err(|reason| repository_validation_error(&operation, deadline.timeout, reason))?;
+        match graph_transition {
+            GraphTransition::StatusRefresh => self
+                .root
+                .graph
+                .revalidate_status_read_with_deadline(Some(deadline)),
+            _ => self.root.revalidate_with_deadline(deadline),
+        }
+        .map_err(|reason| repository_validation_error(&operation, deadline.timeout, reason))?;
 
         let mut command = Command::new(&binding.command_path);
         self.root.configure_command(&mut command);
@@ -8772,6 +8968,10 @@ impl GitRepository {
             });
         }
         let graph_validation = match graph_transition {
+            GraphTransition::StatusRefresh => self
+                .root
+                .graph
+                .revalidate_status_read_with_deadline(Some(deadline)),
             GraphTransition::ReadOnly => self.root.revalidate_with_deadline(deadline),
             transition => self
                 .root
@@ -9905,6 +10105,16 @@ mod tests {
     use std::fs;
     use std::path::{Path, PathBuf};
     use std::sync::{Mutex, OnceLock};
+
+    #[test]
+    fn local_config_allows_submodule_activation_but_rejects_execution_and_redirects() {
+        assert!(!unsafe_submodule_config_key("submodule.active"));
+        assert!(!unsafe_submodule_config_key("submodule.recurse"));
+        assert!(unsafe_submodule_config_key("submodule.url"));
+        assert!(unsafe_submodule_config_key("submodule.update"));
+        assert!(unsafe_submodule_config_key("submodule.component.url"));
+        assert!(unsafe_submodule_config_key("submodule.component.update"));
+    }
 
     #[test]
     fn repository_validation_deadlines_remain_typed_as_timeouts() {
@@ -11069,6 +11279,32 @@ mod tests {
         assert!(
             repository.root.graph.revalidate().is_err(),
             "a strict read must still reject the unadmitted object"
+        );
+    }
+
+    #[test]
+    fn bounded_status_read_defers_only_the_self_authenticating_object_tree() {
+        let fixture = tempfile::tempdir().expect("create status-read fixture");
+        let repository = test_repository(fixture.path(), GitLimits::default());
+        let object_store = fixture.path().join(".git").join("objects");
+        let fanout = object_store.join("ab");
+        fs::create_dir(&fanout).expect("create Git object fanout");
+        fs::write(
+            fanout.join("01234567890123456789012345678901234567"),
+            b"new object",
+        )
+        .expect("create Git-shaped object");
+
+        repository
+            .root
+            .graph
+            .revalidate_status_read_with_deadline(Some(OperationDeadline::from_now(
+                HARD_MAX_TIMEOUT,
+            )))
+            .expect("status read should use the pinned self-authenticating object container");
+        assert!(
+            repository.root.graph.revalidate().is_err(),
+            "strict graph validation must retain the full recursive proof"
         );
     }
 

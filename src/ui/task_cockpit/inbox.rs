@@ -119,7 +119,12 @@ impl TaskList {
         let ids: Vec<_> = model
             .tasks()
             .iter()
-            .filter(|(_, snapshot)| snapshot.task.lifecycle != TaskLifecycle::Archived)
+            .filter(|(_, snapshot)| {
+                !matches!(
+                    snapshot.task.lifecycle,
+                    TaskLifecycle::Archived | TaskLifecycle::Deleted
+                )
+            })
             .map(|(id, _)| *id)
             .take(MAX_TASK_SOURCE_IDS)
             .collect();
@@ -173,20 +178,24 @@ impl TaskList {
     }
 
     /// Native T3-style rail order: active tasks first, reversible Done tasks
-    /// last. Archived tasks remain outside the interactive rail.
+    /// next, then archived tasks. Archived rows remain bounded and selectable
+    /// only so the shell can offer an explicit one-click restore path.
     pub fn from_client_model_with_settled_virtual(
         model: &ClientModel,
     ) -> Result<Self, TaskListOverflow> {
         let mut active = Vec::new();
         let mut settled = Vec::new();
+        let mut archived = Vec::new();
         for (id, snapshot) in model.tasks() {
             match snapshot.task.lifecycle {
                 TaskLifecycle::Open | TaskLifecycle::Closing => active.push(*id),
                 TaskLifecycle::Settled => settled.push(*id),
-                TaskLifecycle::Archived => {}
+                TaskLifecycle::Archived => archived.push(*id),
+                TaskLifecycle::Deleted => {}
             }
         }
         active.extend(settled);
+        active.extend(archived);
         Self::from_virtual_task_ids(active)
     }
 
@@ -194,7 +203,12 @@ impl TaskList {
         let ids: Vec<_> = preview
             .tasks()
             .iter()
-            .filter(|(_, snapshot)| snapshot.task.lifecycle != TaskLifecycle::Archived)
+            .filter(|(_, snapshot)| {
+                !matches!(
+                    snapshot.task.lifecycle,
+                    TaskLifecycle::Archived | TaskLifecycle::Deleted
+                )
+            })
             .map(|(id, _)| *id)
             .collect();
         Self::from_virtual_task_ids(ids)
@@ -647,6 +661,9 @@ impl InboxFilter {
     }
 
     fn matches(&self, title: &str, lifecycle: TaskLifecycle) -> bool {
+        if lifecycle == TaskLifecycle::Deleted {
+            return false;
+        }
         if lifecycle == TaskLifecycle::Archived && !self.include_archived {
             return false;
         }
@@ -1874,7 +1891,10 @@ impl Inbox {
         let unread = UnreadCursor::default();
         let mut grouped: [Vec<TaskRowModel>; 4] = std::array::from_fn(|_| Vec::new());
         for snapshot in preview.tasks().values() {
-            if snapshot.task.lifecycle == TaskLifecycle::Archived {
+            if matches!(
+                snapshot.task.lifecycle,
+                TaskLifecycle::Archived | TaskLifecycle::Deleted
+            ) {
                 continue;
             }
             if !filter.matches(&snapshot.task.title, snapshot.task.lifecycle) {

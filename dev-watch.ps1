@@ -11,7 +11,28 @@ $RepoRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
 Set-Location $RepoRoot
 
 $BuildProfile = if ($Release) { "release" } else { "debug" }
-$BuildTargetDir = Join-Path $RepoRoot "target-watch"
+# Isolated compiler output outside the checkout (AGENTS.md CARGO_TARGET_DIR rule).
+# Hash the resolved worktree path so concurrent worktrees never share a target.
+$ResolvedRepoRoot = (Resolve-Path -LiteralPath $RepoRoot).Path
+$sha = [System.Security.Cryptography.SHA256]::Create()
+try {
+    $repoBytes = [System.Text.Encoding]::UTF8.GetBytes($ResolvedRepoRoot.ToLowerInvariant())
+    $digest = $sha.ComputeHash($repoBytes)
+    $repoHash = -join ($digest[0..7] | ForEach-Object { $_.ToString("x2") })
+} finally {
+    $sha.Dispose()
+}
+$WatchTargetName = "devmanager-watch-$repoHash"
+$BuildTargetDir = Join-Path "C:\Temp" $WatchTargetName
+$ExactBuildTargetDir = [System.IO.Path]::GetFullPath($BuildTargetDir)
+$TempRoot = [System.IO.Path]::GetFullPath("C:\Temp")
+$TempPrefix = Join-Path $TempRoot "devmanager-"
+if (-not $ExactBuildTargetDir.StartsWith($TempPrefix, [System.StringComparison]::OrdinalIgnoreCase)) {
+    throw ("BuildTargetDir must be beneath an exact C:\Temp\devmanager-* root; refused {0}." -f $ExactBuildTargetDir)
+}
+$BuildTargetDir = $ExactBuildTargetDir
+Write-Host ("[watch {0}] Isolated build target: {1}" -f (Get-Date -Format "HH:mm:ss"), $BuildTargetDir) -ForegroundColor Cyan
+
 $BuildOutputDir = Join-Path $BuildTargetDir $BuildProfile
 $BuildExe = Join-Path $BuildOutputDir "devmanager.exe"
 $BuildPdb = Join-Path $BuildOutputDir "devmanager.pdb"
@@ -256,11 +277,18 @@ function Invoke-BuildAndRelaunch {
     param([string]$Reason)
 
     Write-Status ("Building because {0} changed..." -f $Reason) "build"
+    Write-Status ("BuildTargetDir={0}" -f $BuildTargetDir) "build"
+    $ExactBuildTargetDir = [System.IO.Path]::GetFullPath($BuildTargetDir)
+    $TempRoot = [System.IO.Path]::GetFullPath("C:\Temp")
+    $TempPrefix = Join-Path $TempRoot "devmanager-"
+    if (-not $ExactBuildTargetDir.StartsWith($TempPrefix, [System.StringComparison]::OrdinalIgnoreCase)) {
+        throw ("BuildTargetDir must be beneath an exact C:\Temp\devmanager-* root before Cargo; refused {0}." -f $ExactBuildTargetDir)
+    }
 
     $cargoArgs = @(
         "build",
         "--locked",
-        "--target-dir", $BuildTargetDir,
+        "--target-dir", $ExactBuildTargetDir,
         "--bin", "devmanager",
         "--bin", "devmanager-host"
     )
@@ -379,7 +407,7 @@ $lastReason = "startup"
 $lastChangeAt = Get-Date
 
 Write-Status "Watching src/, assets/, Cargo.toml, and Cargo.lock." "info"
-Write-Status "Builds go to target-watch/ and the running app comes from target-live-dev/ to avoid Windows locking." "info"
+Write-Status "Builds go to C:\Temp\devmanager-watch-<hash>\ and the running app comes from target-live-dev/ to avoid Windows locking." "info"
 Write-Status "The hot-reload app uses its generated workspace-bound profile and never reuses the installed app profile." "info"
 
 try {

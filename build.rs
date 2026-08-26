@@ -76,6 +76,15 @@ fn generate_provider_catalog_typescript_mirror() {
     out.push_str("  },\n");
     out.push_str("];\n\n");
     out.push_str(
+        "function suggestionsFromHint(hint: string | undefined): SlashCommandSuggestion[] {\n",
+    );
+    out.push_str("  if (!hint?.includes(\" | \")) return [];\n");
+    out.push_str("  return hint.split(\" | \").map((value) => ({\n");
+    out.push_str("    label: value.charAt(0).toUpperCase() + value.slice(1),\n");
+    out.push_str("    value,\n");
+    out.push_str("  }));\n");
+    out.push_str("}\n\n");
+    out.push_str(
         "function catalog(provider: WebAiKind, seeds: readonly Seed[]): SlashCommand[] {\n",
     );
     out.push_str("  return seeds.map(([name, description, options]) => ({\n");
@@ -85,7 +94,9 @@ fn generate_provider_catalog_typescript_mirror() {
     out.push_str("    source: \"builtin\",\n");
     out.push_str("    category: options?.category ?? \"workflow\",\n");
     out.push_str("    argumentHint: options?.argumentHint ?? null,\n");
-    out.push_str("    suggestions: [...(options?.suggestions ?? [])],\n");
+    out.push_str(
+        "    suggestions: [...(options?.suggestions ?? suggestionsFromHint(options?.argumentHint))],\n",
+    );
     out.push_str("    aliases: [...(options?.aliases ?? [])],\n");
     out.push_str("    interaction: options?.interaction ?? \"inline\",\n");
     out.push_str("  }));\n");

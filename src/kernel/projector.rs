@@ -208,6 +208,26 @@ pub(crate) fn apply_event(
             )?;
             require_one_change(tx, "task.archived")?;
         }
+        Event::TaskDeleted => {
+            let task_id = require_task_id(event)?;
+            let next_revision = require_next_revision(tx, shadow, task_id, event)?;
+            require_delete(tx, shadow, task_id)?;
+            let table = table_name("tasks", shadow);
+            tx.execute(
+                &format!(
+                    "UPDATE {table}
+                     SET lifecycle = ?1, revision = ?2, updated_at_ms = ?3
+                     WHERE task_id = ?4"
+                ),
+                rusqlite::params![
+                    lifecycle_text(TaskLifecycle::Deleted),
+                    next_revision,
+                    event.occurred_at_ms,
+                    task_id.as_bytes().as_slice(),
+                ],
+            )?;
+            require_one_change(tx, "task.deleted")?;
+        }
         Event::AgentSessionRegistered { agent } => {
             let task_id = require_task_id(event)?;
             if agent.task_id != task_id {
@@ -1719,6 +1739,16 @@ fn require_reopen(tx: &Transaction<'_>, shadow: bool, task_id: TaskId) -> Result
     }
 }
 
+fn require_delete(tx: &Transaction<'_>, shadow: bool, task_id: TaskId) -> Result<(), StoreError> {
+    let (lifecycle, _) = read_task_lifecycle_epoch(tx, shadow, task_id)?;
+    if lifecycle != lifecycle_text(TaskLifecycle::Archived) {
+        return Err(StoreError::Projection(format!(
+            "task.deleted requires archived lifecycle, found {lifecycle}"
+        )));
+    }
+    Ok(())
+}
+
 fn require_archive(tx: &Transaction<'_>, shadow: bool, task_id: TaskId) -> Result<(), StoreError> {
     let (lifecycle, _) = read_task_lifecycle_epoch(tx, shadow, task_id)?;
     if lifecycle != lifecycle_text(TaskLifecycle::Closing) {
@@ -2631,6 +2661,7 @@ fn lifecycle_text(value: TaskLifecycle) -> &'static str {
         TaskLifecycle::Settled => "settled",
         TaskLifecycle::Closing => "closing",
         TaskLifecycle::Archived => "archived",
+        TaskLifecycle::Deleted => "deleted",
     }
 }
 

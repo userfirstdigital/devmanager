@@ -1007,6 +1007,7 @@ pub enum Event {
     TaskSettled,
     TaskReopened,
     TaskArchived,
+    TaskDeleted,
     AgentSessionRegistered {
         agent: AgentSessionFacts,
     },
@@ -1141,6 +1142,7 @@ impl Event {
             Self::TaskSettled => "task.settled",
             Self::TaskReopened => "task.reopened",
             Self::TaskArchived => "task.archived",
+            Self::TaskDeleted => "task.deleted",
             Self::AgentSessionRegistered { .. } => "agent_session.registered",
             Self::AgentProviderSessionBound { .. } => "agent_session.provider_bound",
             Self::PrimaryAgentSet { .. } => "primary_agent.set",
@@ -1200,6 +1202,8 @@ enum EventBody {
     TaskReopened(TaskUnitPayload),
     #[serde(rename = "task.archived")]
     TaskArchived(TaskUnitPayload),
+    #[serde(rename = "task.deleted")]
+    TaskDeleted(TaskUnitPayload),
     #[serde(rename = "agent_session.registered")]
     AgentSessionRegistered(AgentSessionRegisteredPayload),
     #[serde(rename = "agent_session.provider_bound")]
@@ -1289,6 +1293,7 @@ impl From<&Event> for EventDocument {
             Event::TaskSettled => EventBody::TaskSettled(TaskUnitPayload {}),
             Event::TaskReopened => EventBody::TaskReopened(TaskUnitPayload {}),
             Event::TaskArchived => EventBody::TaskArchived(TaskUnitPayload {}),
+            Event::TaskDeleted => EventBody::TaskDeleted(TaskUnitPayload {}),
             Event::AgentSessionRegistered { agent } => {
                 EventBody::AgentSessionRegistered(AgentSessionRegisteredPayload {
                     agent: agent.clone(),
@@ -1556,6 +1561,7 @@ impl TryFrom<EventDocument> for Event {
             EventBody::TaskSettled(_) => Event::TaskSettled,
             EventBody::TaskReopened(_) => Event::TaskReopened,
             EventBody::TaskArchived(_) => Event::TaskArchived,
+            EventBody::TaskDeleted(_) => Event::TaskDeleted,
             EventBody::AgentSessionRegistered(p) => {
                 p.agent
                     .validate_for_registration()
@@ -2194,7 +2200,9 @@ fn apply_into(
         Event::TaskReopened => {
             match snap.task.lifecycle {
                 TaskLifecycle::Settled | TaskLifecycle::Closing | TaskLifecycle::Archived => {}
-                TaskLifecycle::Open => return Err(ApplyError::InvalidTransition),
+                TaskLifecycle::Open | TaskLifecycle::Deleted => {
+                    return Err(ApplyError::InvalidTransition)
+                }
             }
             snap.task.lifecycle = TaskLifecycle::Open;
         }
@@ -2217,6 +2225,12 @@ fn apply_into(
                 return Err(ApplyError::InvalidTransition);
             }
             snap.task.lifecycle = TaskLifecycle::Archived;
+        }
+        Event::TaskDeleted => {
+            if snap.task.lifecycle != TaskLifecycle::Archived {
+                return Err(ApplyError::InvalidTransition);
+            }
+            snap.task.lifecycle = TaskLifecycle::Deleted;
         }
         Event::AgentSessionRegistered { agent } => {
             if agent.task_id != snap.task.id {

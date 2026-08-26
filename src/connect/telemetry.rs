@@ -2130,6 +2130,7 @@ fn content_hash(record: &ObservationRecord) -> [u8; 32] {
         TaskLifecycle::Settled => 2,
         TaskLifecycle::Closing => 3,
         TaskLifecycle::Archived => 4,
+        TaskLifecycle::Deleted => 5,
     }]);
     hasher.update([match record.attention {
         TaskAttention::None => 0,

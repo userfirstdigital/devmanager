@@ -73,6 +73,8 @@ pub const ACTION_TASK_SETTLE: &str = "task.settle";
 pub const ACTION_TASK_REOPEN: &str = "task.reopen";
 /// Stable id for archiving one Task through the host close boundary.
 pub const ACTION_TASK_ARCHIVE: &str = "task.archive";
+/// Permanently hide an already archived Task while retaining its durable tombstone.
+pub const ACTION_TASK_DELETE: &str = "task.delete";
 /// Canonical composer Send Now. Settles through SubmitProviderInput.
 pub const ACTION_TASK_SEND_NOW: &str = "task.send_now";
 /// Canonical composer steer. Settles through SubmitProviderInput.
@@ -358,9 +360,19 @@ const ACTIONS: &[ActionDescriptor] = &[
     },
     ActionDescriptor {
         id: ACTION_TASK_ARCHIVE,
-        title: "Delete task",
+        title: "Archive task",
         description: "Archive one Task after releasing its task-owned resources.",
-        keywords: &["task", "delete", "archive", "close", "remove"],
+        keywords: &["task", "archive", "close", "remove"],
+        scope: ActionScope::Task,
+        required_capability: None,
+        risk: ActionRisk::Mutating,
+        argument_schema: ActionArgumentSchema::TaskId,
+    },
+    ActionDescriptor {
+        id: ACTION_TASK_DELETE,
+        title: "Delete task",
+        description: "Permanently remove one archived Task from the task list.",
+        keywords: &["task", "delete", "permanent", "remove"],
         scope: ActionScope::Task,
         required_capability: None,
         risk: ActionRisk::Mutating,
@@ -526,6 +538,9 @@ pub enum ActionRequest {
     TaskArchive {
         task_id: TaskId,
     },
+    TaskDelete {
+        task_id: TaskId,
+    },
     ProviderInput(ProviderInputActionRequest),
     StartProviderSession(ProviderStartArguments),
     ServiceControl {
@@ -556,6 +571,7 @@ impl ActionRequest {
             Self::TaskSettle { .. } => ACTION_TASK_SETTLE,
             Self::TaskReopen { .. } => ACTION_TASK_REOPEN,
             Self::TaskArchive { .. } => ACTION_TASK_ARCHIVE,
+            Self::TaskDelete { .. } => ACTION_TASK_DELETE,
             Self::ProviderInput(arguments) => arguments.action_id,
             Self::StartProviderSession(_) => ACTION_PROVIDER_START_SESSION,
             Self::ServiceControl { action, .. } => match action {
@@ -1683,11 +1699,11 @@ mod tests {
         ACTION_PROVIDER_TERMINAL_INPUT, ACTION_SERVICE_HEALTH, ACTION_SERVICE_LOGS,
         ACTION_SERVICE_RESTART, ACTION_SERVICE_START, ACTION_SERVICE_STOP, ACTION_SSH_ACTION,
         ACTION_SSH_STATUS, ACTION_TASK_ANSWER_QUESTION, ACTION_TASK_ARCHIVE, ACTION_TASK_CREATE,
-        ACTION_TASK_CREATE_V2, ACTION_TASK_LIST, ACTION_TASK_QUEUE_FOLLOW_UP, ACTION_TASK_RENAME,
-        ACTION_TASK_REOPEN, ACTION_TASK_RESOLVE_APPROVAL, ACTION_TASK_SEND_NOW, ACTION_TASK_SETTLE,
-        ACTION_TASK_SHOW, ACTION_TASK_STEER_CURRENT_TURN, ACTION_TASK_STOP_TURN,
-        ACTION_UPDATER_CHECK, ACTION_UPDATER_DOWNLOAD, ACTION_UPDATER_INSTALL,
-        ACTION_UPDATER_START_BACKGROUND, ACTION_WORKSPACE_STATUS,
+        ACTION_TASK_CREATE_V2, ACTION_TASK_DELETE, ACTION_TASK_LIST, ACTION_TASK_QUEUE_FOLLOW_UP,
+        ACTION_TASK_RENAME, ACTION_TASK_REOPEN, ACTION_TASK_RESOLVE_APPROVAL, ACTION_TASK_SEND_NOW,
+        ACTION_TASK_SETTLE, ACTION_TASK_SHOW, ACTION_TASK_STEER_CURRENT_TURN,
+        ACTION_TASK_STOP_TURN, ACTION_UPDATER_CHECK, ACTION_UPDATER_DOWNLOAD,
+        ACTION_UPDATER_INSTALL, ACTION_UPDATER_START_BACKGROUND, ACTION_WORKSPACE_STATUS,
     };
     use crate::{
         domain::{
@@ -1723,6 +1739,7 @@ mod tests {
         assert!(ids.contains(&ACTION_TASK_SETTLE));
         assert!(ids.contains(&ACTION_TASK_REOPEN));
         assert!(ids.contains(&ACTION_TASK_ARCHIVE));
+        assert!(ids.contains(&ACTION_TASK_DELETE));
         assert!(ids.contains(&ACTION_PROVIDER_SEND_NOW));
         assert!(ids.contains(&ACTION_PROVIDER_STEER_CURRENT_TURN));
         assert!(ids.contains(&ACTION_PROVIDER_QUEUE_FOLLOW_UP));
@@ -1744,7 +1761,7 @@ mod tests {
         assert!(ids.contains(&ACTION_BROWSER_NATIVE));
         assert!(ids.contains(&ACTION_PROVIDER_START_SESSION));
         assert!(ids.contains(&ACTION_CONVERSATION_STATUS));
-        assert_eq!(ids.len(), 49);
+        assert_eq!(ids.len(), 50);
         assert!(ids.contains(&ACTION_SERVICE_START));
         assert!(ids.contains(&ACTION_SERVICE_STOP));
         assert!(ids.contains(&ACTION_SERVICE_RESTART));
@@ -1811,7 +1828,8 @@ mod tests {
                         ActionArgumentSchema::TaskRenameV1,
                         None,
                     ),
-                    ACTION_TASK_SETTLE | ACTION_TASK_REOPEN | ACTION_TASK_ARCHIVE => (
+                    ACTION_TASK_SETTLE | ACTION_TASK_REOPEN | ACTION_TASK_ARCHIVE
+                    | ACTION_TASK_DELETE => (
                         ActionScope::Task,
                         ActionRisk::Mutating,
                         ActionArgumentSchema::TaskId,

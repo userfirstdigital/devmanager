@@ -471,6 +471,20 @@ impl CommandBus {
         }
     }
 
+    /// Build a provider restart intent from current durable snapshot facts when
+    /// provider-input delivery is held for a missing live session/runtime.
+    /// ResumeExact only when a durable providerSessionId is already bound;
+    /// otherwise NewConversation. Never synthesizes a provider identity.
+    pub(crate) fn provider_hold_restart_intent(
+        &self,
+        task_id: TaskId,
+    ) -> Result<Option<StartProviderSessionIntent>, StoreError> {
+        let Some(snapshot) = self.task_snapshot(task_id)? else {
+            return Ok(None);
+        };
+        Ok(provider_hold_restart_intent_from_snapshot(&snapshot))
+    }
+
     /// Load the durable task and reconstruct its host-owned workspace before
     /// any runtime resource can be handed out.
     pub fn load_task_runtime(
@@ -810,6 +824,56 @@ impl CommandBus {
             max_physical_frame_bytes,
         )
     }
+}
+
+/// Pure selection: ResumeExact only with a durable provider session identity.
+/// Otherwise NewConversation. Never invents an id.
+pub(crate) fn provider_hold_restart_mode(
+    durable_provider_session_id: Option<&ProviderSessionId>,
+) -> crate::domain::command::ProviderStartMode {
+    if durable_provider_session_id.is_some() {
+        crate::domain::command::ProviderStartMode::ResumeExact
+    } else {
+        crate::domain::command::ProviderStartMode::NewConversation
+    }
+}
+
+/// Build a restart intent from current snapshot facts. Fail closed when the
+/// primary agent/resource join is missing or ambiguous.
+pub(crate) fn provider_hold_restart_intent_from_snapshot(
+    snapshot: &TaskSnapshot,
+) -> Option<StartProviderSessionIntent> {
+    let agent_session_id = snapshot.primary_agent_id?;
+    let agent = snapshot.agents.get(&agent_session_id)?;
+    if agent.lifecycle != AgentSessionLifecycle::Open {
+        return None;
+    }
+    let resource_id = exact_provider_terminal_resource(snapshot, agent)?;
+    Some(StartProviderSessionIntent {
+        task_id: snapshot.task.id,
+        agent_session_id,
+        resource_id,
+        provider_kind: agent.provider_kind,
+        mode: provider_hold_restart_mode(agent.provider_session_id.as_ref()),
+        expected_task_revision: snapshot.task.revision,
+        expected_action_epoch: snapshot.task.action_epoch,
+    })
+}
+
+fn exact_provider_terminal_resource(
+    snapshot: &TaskSnapshot,
+    agent: &AgentSessionFacts,
+) -> Option<ResourceId> {
+    let mut matches = snapshot.resources.values().filter_map(|resource| {
+        AgentResourceBinding::from_facts(agent, resource)
+            .ok()
+            .map(|binding| binding.resource_id)
+    });
+    let first = matches.next()?;
+    if matches.next().is_some() {
+        return None;
+    }
+    Some(first)
 }
 
 fn map_prompt_store_error(error: PromptStoreError) -> StoreError {
@@ -1469,6 +1533,84 @@ mod provider_restart_identity_tests {
     use crate::domain::command::{CreateTaskIntent, ProviderStartMode};
     use crate::domain::resource::ResourceRecipe;
     use crate::domain::task::{TaskAssignment, TaskAttention, TaskConnectivity, WorkspaceRef};
+    use crate::providers::ProviderKind;
+    use std::collections::BTreeMap;
+
+    #[test]
+    fn hold_restart_mode_requires_durable_provider_session_for_resume() {
+        let durable = ProviderSessionId::new("provider-durable-id").expect("provider session");
+        assert_eq!(
+            provider_hold_restart_mode(Some(&durable)),
+            ProviderStartMode::ResumeExact
+        );
+        assert_eq!(
+            provider_hold_restart_mode(None),
+            ProviderStartMode::NewConversation
+        );
+    }
+
+    #[test]
+    fn hold_restart_intent_from_snapshot_selects_mode_without_synthesizing_ids() {
+        let task = TaskFacts::new(
+            EnvironmentId::new(),
+            "held task",
+            None,
+            ProjectId::new(),
+            WorkspaceRef::Main,
+            TaskAssignment::LocalOwner,
+            1,
+        )
+        .expect("task");
+        let task_id = task.id;
+        let agent = AgentSessionFacts::new(task_id, AgentRole::Primary, ProviderKind::Codex, None)
+            .expect("agent");
+        let resource_id = ResourceId::new();
+        let resource = ResourceFacts {
+            id: resource_id,
+            task_id: Some(task_id),
+            owner_kind: OwnerKind::Task,
+            resource_kind: ResourceKind::Terminal,
+            recipe: ResourceRecipe::Terminal {
+                cols: 120,
+                rows: 40,
+            },
+            lifecycle: ResourceLifecycle::Active,
+            runtime_generation: agent.runtime_generation,
+            updated_at_ms: 1,
+        };
+        let mut snapshot = TaskSnapshot {
+            connectivity: TaskConnectivity::Connected,
+            attention: TaskAttention::None,
+            activity: TaskActivity::Idle,
+            review_readiness: ReviewReadiness::NotReady,
+            task,
+            agents: BTreeMap::from([(agent.id, agent.clone())]),
+            primary_agent_id: Some(agent.id),
+            artifacts: BTreeMap::new(),
+            resources: BTreeMap::from([(resource_id, resource)]),
+            provider_sessions: BTreeMap::new(),
+            browser: crate::domain::browser::BrowserBook::new(),
+        };
+
+        let fresh = provider_hold_restart_intent_from_snapshot(&snapshot).expect("new intent");
+        assert_eq!(fresh.mode, ProviderStartMode::NewConversation);
+        assert_eq!(fresh.resource_id, resource_id);
+        assert!(agent.provider_session_id.is_none());
+
+        let mut resumed_agent = agent.clone();
+        resumed_agent.provider_session_id =
+            Some(ProviderSessionId::new("exact-provider").expect("id"));
+        snapshot
+            .agents
+            .insert(resumed_agent.id, resumed_agent.clone());
+        let resume = provider_hold_restart_intent_from_snapshot(&snapshot).expect("resume intent");
+        assert_eq!(resume.mode, ProviderStartMode::ResumeExact);
+        assert_eq!(resume.resource_id, resource_id);
+        assert_eq!(
+            resume.mode,
+            provider_hold_restart_mode(resumed_agent.provider_session_id.as_ref())
+        );
+    }
 
     fn accepted_revision(receipt: CommandReceipt) -> u64 {
         match receipt {
@@ -6745,6 +6887,7 @@ fn validate_task_history_and_projection_with_agent_sessions(
         TaskLifecycle::Settled => "settled",
         TaskLifecycle::Closing => "closing",
         TaskLifecycle::Archived => "archived",
+        TaskLifecycle::Deleted => "deleted",
     };
     Ok((
         expected_lifecycle.to_string(),
@@ -8578,7 +8721,10 @@ fn load_browser_book(
                 .map_err(|err| StoreError::Projection(err.to_string()))?;
         }
     }
-    if matches!(lifecycle, TaskLifecycle::Closing | TaskLifecycle::Archived) {
+    if matches!(
+        lifecycle,
+        TaskLifecycle::Closing | TaskLifecycle::Archived | TaskLifecycle::Deleted
+    ) {
         book.close_task(task_id)
             .map_err(|err| StoreError::Projection(err.to_string()))?;
     }
@@ -10079,12 +10225,13 @@ pub(crate) fn load_resource(
     let resource = decode_resource_projection(resource_id, task_id, fields)?;
     if let Some(task_id) = task_id {
         let task = load_task_row(conn, task_id)?.ok_or(StoreError::Corruption)?;
-        if task.task.lifecycle == TaskLifecycle::Archived
-            && matches!(
-                resource.lifecycle,
-                ResourceLifecycle::Active | ResourceLifecycle::Releasing
-            )
-        {
+        if matches!(
+            task.task.lifecycle,
+            TaskLifecycle::Archived | TaskLifecycle::Deleted
+        ) && matches!(
+            resource.lifecycle,
+            ResourceLifecycle::Active | ResourceLifecycle::Releasing
+        ) {
             return Err(StoreError::Projection(
                 "archived task cannot own an active or releasing resource".into(),
             ));
@@ -10180,6 +10327,7 @@ fn parse_lifecycle(value: &str) -> Result<TaskLifecycle, StoreError> {
         "settled" => Ok(TaskLifecycle::Settled),
         "closing" => Ok(TaskLifecycle::Closing),
         "archived" => Ok(TaskLifecycle::Archived),
+        "deleted" => Ok(TaskLifecycle::Deleted),
         other => Err(StoreError::CodecMismatch {
             detail: format!("unknown tasks.lifecycle '{other}'"),
         }),

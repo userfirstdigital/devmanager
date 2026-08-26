@@ -57,7 +57,7 @@ watch.bat
 ```
 
 The watcher listens to `src/`, `assets/`, `Cargo.toml`, and `Cargo.lock`.
-Each successful rebuild goes to `target-watch/`, then the script copies both fresh binaries to `target-live-dev/` and relaunches from there.
+Each successful rebuild goes to an isolated `C:\Temp\devmanager-watch-<worktree-hash>\` target directory (not `target-watch/` inside the repo; concurrent worktrees do not share a target), then the script copies both fresh binaries to `target-live-dev/` and relaunches from there.
 That split avoids Windows locking the compiler output while the app is running, and a failed build leaves the last good app window untouched.
 
 If you only want a single rebuild-and-launch cycle, run:

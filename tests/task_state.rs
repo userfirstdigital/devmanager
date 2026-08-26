@@ -322,6 +322,56 @@ fn settling_is_reversible_without_advancing_runtime_ownership() {
 }
 
 #[test]
+fn delete_is_an_irreversible_tombstone_after_archive() {
+    let task = task_id(0xe1);
+    let snap = create_task(None, task, 1, 0xe2);
+    let close = envelope(
+        command_id(0xe3),
+        Some(task),
+        Some(snap.task.revision),
+        Command::BeginCloseTask,
+    );
+    let closing =
+        apply_decided(Some(snap), &close, 2, 0xe4, 1_725_000_000_223).expect("begin close");
+    let archived = apply(
+        Some(closing),
+        &domain_event(
+            event_id(0xe5),
+            Some(task),
+            3,
+            Some(3),
+            1_725_000_000_224,
+            Event::TaskArchived,
+        ),
+    )
+    .expect("archive");
+    let delete = envelope(
+        command_id(0xe6),
+        Some(task),
+        Some(archived.task.revision),
+        Command::DeleteTask,
+    );
+    assert_eq!(
+        decide(Some(&archived), &delete),
+        Ok(vec![Event::TaskDeleted])
+    );
+    let deleted = apply_decided(Some(archived), &delete, 4, 0xe7, 1_725_000_000_225)
+        .expect("delete archived task");
+    assert_eq!(deleted.task.lifecycle, TaskLifecycle::Deleted);
+
+    let reopen = envelope(
+        command_id(0xe8),
+        Some(task),
+        Some(deleted.task.revision),
+        Command::ReopenTask,
+    );
+    assert_eq!(
+        decide(Some(&deleted), &reopen),
+        Err(RejectionCode::InvalidTransition)
+    );
+}
+
+#[test]
 fn apply_rejects_stale_skipped_and_mismatched_task_revision() {
     let task = task_id(0xb5);
     let snap = create_task(None, task, 1, 0xb6);
@@ -1483,6 +1533,7 @@ fn golden_event_serialization_fixtures() {
     );
     assert_golden_event("task_reopened.json", &Event::TaskReopened);
     assert_golden_event("task_archived.json", &Event::TaskArchived);
+    assert_golden_event("task_deleted.json", &Event::TaskDeleted);
     let agent = AgentSessionFacts {
         id: agent_id(0x55),
         task_id: task,

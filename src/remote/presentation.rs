@@ -5,6 +5,9 @@ use alacritty_terminal::vte::{Parser, Perform};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, VecDeque};
 use std::fmt;
+use std::fs;
+use std::io::{self, Write};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 const DEFAULT_CANONICAL_EVENTS: usize = 50_000;
@@ -15,6 +18,11 @@ const DEFAULT_STORE_SESSIONS: usize = 256;
 const DEFAULT_STORE_BYTES: usize = 128 * 1024 * 1024;
 pub(crate) const MAX_SEMANTIC_EVENT_BYTES: usize = 64 * 1024;
 const AI_FALLBACK_MAX_CHARS: usize = 12_288;
+const CONVERSATION_HISTORY_SCHEMA: &str = "devmanager.conversation-history/v1";
+pub const CONVERSATION_HISTORY_FILE_NAME: &str = "conversation-history.json";
+const MAX_PERSISTED_SESSIONS: usize = DEFAULT_STORE_SESSIONS;
+const MAX_PERSISTED_EVENTS_PER_SESSION: usize = DEFAULT_CANONICAL_EVENTS;
+const MAX_CONVERSATION_HISTORY_FILE_BYTES: usize = DEFAULT_STORE_BYTES;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
@@ -351,6 +359,68 @@ impl SemanticJournal {
         self.replay_invocations.get()
     }
 
+    fn canonical_event_count(&self) -> usize {
+        self.canonical.len()
+    }
+
+    fn canonical_events_for_persist(&self) -> Vec<SemanticEvent> {
+        self.canonical
+            .iter()
+            .map(|stored| (*stored.event).clone())
+            .collect()
+    }
+
+    fn restore_canonical_events(
+        limits: JournalLimits,
+        events: &[SemanticEvent],
+        next_sequence: u64,
+        highest_evicted_sequence: u64,
+    ) -> Result<Self, &'static str> {
+        if next_sequence == 0 {
+            return Err("conversation-history next_sequence must be at least 1");
+        }
+        let mut journal = Self::with_limits(limits);
+        journal.highest_evicted_sequence = highest_evicted_sequence;
+        let mut last_sequence = highest_evicted_sequence;
+        for event in events {
+            if event.sequence == 0 || event.sequence <= last_sequence {
+                return Err("conversation-history events must be strictly increasing");
+            }
+            if event.sequence >= next_sequence {
+                return Err("conversation-history event sequence exceeds next_sequence");
+            }
+            if !is_restorable_canonical_kind(&event.kind) {
+                return Err("conversation-history contains a non-canonical event kind");
+            }
+            let encoded_bytes = serde_json::to_vec(event).map_or(0, |encoded| encoded.len());
+            if encoded_bytes > MAX_SEMANTIC_EVENT_BYTES {
+                return Err("conversation-history event exceeds encoded size bound");
+            }
+            let stored = StoredSemanticEvent {
+                encoded_bytes,
+                event: Arc::new(event.clone()),
+                deduplication_key: None,
+            };
+            journal.canonical_bytes = journal.canonical_bytes.saturating_add(encoded_bytes);
+            journal.canonical.push_back(stored);
+            last_sequence = event.sequence;
+        }
+        journal.next_sequence = next_sequence;
+        journal.enforce_canonical_limits();
+        if journal.canonical.len() != events.len() {
+            return Err("conversation-history restore exceeded journal bounds");
+        }
+        let cursor = journal.cursor_metadata();
+        if events.is_empty() {
+            if next_sequence != highest_evicted_sequence.saturating_add(1) {
+                return Err("conversation-history empty session sequence fence mismatch");
+            }
+        } else if cursor.latest_sequence != last_sequence {
+            return Err("conversation-history restore cursor mismatch");
+        }
+        Ok(journal)
+    }
+
     fn allocate_sequence(&mut self) -> u64 {
         let sequence = self.next_sequence;
         self.next_sequence = sequence
@@ -641,6 +711,8 @@ pub struct SemanticJournalStore {
     sessions: HashMap<StableSessionKey, StoredSessionJournal>,
     session_bindings: HashMap<String, SessionBinding>,
     projectors: HashMap<String, PlainTextProjector>,
+    persist_path: Option<PathBuf>,
+    dirty: bool,
 }
 
 impl Default for SemanticJournalStore {
@@ -666,7 +738,88 @@ impl SemanticJournalStore {
             sessions: HashMap::new(),
             session_bindings: HashMap::new(),
             projectors: HashMap::new(),
+            persist_path: None,
+            dirty: false,
         }
+    }
+
+    /// Open (or create) the bounded conversation-history sidecar beside the
+    /// profile. Missing files become an empty store; corrupt or oversized
+    /// payloads fail closed without loading partial truth.
+    pub fn open(path: impl Into<PathBuf>) -> io::Result<Self> {
+        let path = path.into();
+        let mut store = Self::empty_at(path.clone());
+        match fs::metadata(&path) {
+            Ok(metadata) => {
+                let len = metadata.len();
+                if len > MAX_CONVERSATION_HISTORY_FILE_BYTES as u64 {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "conversation-history exceeds file size bound",
+                    ));
+                }
+                let bytes = fs::read(&path)?;
+                if bytes.len() > MAX_CONVERSATION_HISTORY_FILE_BYTES {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "conversation-history exceeds file size bound",
+                    ));
+                }
+                store.load_persisted_bytes(&bytes)?;
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+        Ok(store)
+    }
+
+    /// Empty store that still flushes to `path` when durable facts arrive.
+    pub fn empty_at(path: impl Into<PathBuf>) -> Self {
+        let mut store = Self::with_limits(JournalLimits::default());
+        store.persist_path = Some(path.into());
+        store
+    }
+
+    /// Profile-sibling path used by the production host runtime.
+    pub fn open_at_profile_root(root: impl AsRef<Path>) -> io::Result<Self> {
+        Self::open(root.as_ref().join(CONVERSATION_HISTORY_FILE_NAME))
+    }
+
+    pub fn persist_path(&self) -> Option<&Path> {
+        self.persist_path.as_deref()
+    }
+
+    pub fn is_dirty(&self) -> bool {
+        self.dirty
+    }
+
+    /// Atomically write the durable conversation facts when dirty.
+    /// On failure the store stays dirty so maintenance can retry.
+    pub fn flush(&mut self) -> io::Result<()> {
+        if !self.dirty {
+            return Ok(());
+        }
+        let Some(path) = self.persist_path.clone() else {
+            self.dirty = false;
+            return Ok(());
+        };
+        let file = self.persisted_file()?;
+        let bytes = serde_json::to_vec_pretty(&file)
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+        if bytes.len() > MAX_CONVERSATION_HISTORY_FILE_BYTES {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "conversation-history serialized payload exceeds file size bound",
+            ));
+        }
+        write_conversation_history_atomically(&path, &bytes)?;
+        self.dirty = false;
+        Ok(())
+    }
+
+    /// Flush only when durable conversation facts changed since the last write.
+    pub fn flush_if_dirty(&mut self) -> io::Result<()> {
+        self.flush()
     }
 
     pub fn observe_runtime(
@@ -845,6 +998,7 @@ impl SemanticJournalStore {
         let occurred_at_epoch_ms = draft.occurred_at_epoch_ms;
         let is_question = matches!(&draft.kind, SemanticEventKind::Question { .. });
         let is_user_message = matches!(&draft.kind, SemanticEventKind::UserMessage { .. });
+        let canonical = matches!(draft.retention, SemanticRetention::Canonical);
         let task_title_candidate = match &draft.kind {
             SemanticEventKind::UserMessage { text } => normalize_task_title(text),
             _ => None,
@@ -879,6 +1033,10 @@ impl SemanticJournalStore {
             event
         };
         self.enforce_store_limits();
+        // Ephemeral Output stays verbose and is never marked for the sidecar.
+        if self.persist_path.is_some() && canonical {
+            self.dirty = true;
+        }
         event
     }
 
@@ -1100,6 +1258,7 @@ impl SemanticJournalStore {
         let Some(removed) = self.sessions.remove(key) else {
             return;
         };
+        self.dirty = true;
         if removed.active {
             let latest_sequence = removed.journal.cursor_metadata().latest_sequence;
             for binding in self
@@ -1123,6 +1282,233 @@ impl SemanticJournalStore {
             self.projectors.remove(&session_id);
         }
     }
+
+    fn load_persisted_bytes(&mut self, bytes: &[u8]) -> io::Result<()> {
+        let file: ConversationHistoryFile = serde_json::from_slice(bytes)
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+        if file.schema != CONVERSATION_HISTORY_SCHEMA {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "unsupported conversation-history schema",
+            ));
+        }
+        if file.sessions.len() > MAX_PERSISTED_SESSIONS {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "conversation-history exceeds session bound",
+            ));
+        }
+        let mut sessions = HashMap::new();
+        let mut aggregate_bytes = 0usize;
+        for persisted in file.sessions {
+            if persisted.events.len() > MAX_PERSISTED_EVENTS_PER_SESSION {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "conversation-history session exceeds event bound",
+                ));
+            }
+            if sessions.contains_key(&persisted.key) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "conversation-history has duplicate stable session keys",
+                ));
+            }
+            let mut session_bytes = 0usize;
+            for event in &persisted.events {
+                if matches!(event.kind, SemanticEventKind::Output { .. }) {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "conversation-history must not contain ephemeral Output events",
+                    ));
+                }
+                let encoded = serde_json::to_vec(event)
+                    .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+                if encoded.len() > MAX_SEMANTIC_EVENT_BYTES {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "conversation-history event exceeds encoded size bound",
+                    ));
+                }
+                session_bytes = session_bytes.saturating_add(encoded.len());
+            }
+            if session_bytes > self.limits.canonical_bytes {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "conversation-history session exceeds canonical byte bound",
+                ));
+            }
+            aggregate_bytes = aggregate_bytes.saturating_add(session_bytes);
+            if aggregate_bytes > self.max_total_bytes {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "conversation-history exceeds aggregate store byte bound",
+                ));
+            }
+            let journal = SemanticJournal::restore_canonical_events(
+                self.limits,
+                &persisted.events,
+                persisted.next_sequence,
+                persisted.highest_evicted_sequence,
+            )
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+            let cursor = journal.cursor_metadata();
+            if persisted.metadata.oldest_sequence != cursor.oldest_sequence
+                || persisted.metadata.latest_sequence != cursor.latest_sequence
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "conversation-history metadata sequence mismatch",
+                ));
+            }
+            sessions.insert(
+                persisted.key,
+                StoredSessionJournal {
+                    journal,
+                    metadata: persisted.metadata,
+                    active: false,
+                },
+            );
+        }
+        self.sessions = sessions;
+        self.dirty = false;
+        Ok(())
+    }
+
+    fn persisted_file(&self) -> io::Result<ConversationHistoryFile> {
+        if self.sessions.len() > MAX_PERSISTED_SESSIONS {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "conversation-history exceeds session bound",
+            ));
+        }
+        let mut sessions = Vec::with_capacity(self.sessions.len());
+        let mut aggregate_bytes = 0usize;
+        for (key, session) in &self.sessions {
+            let events = session
+                .journal
+                .canonical_events_for_persist()
+                .into_iter()
+                .filter(|event| !matches!(event.kind, SemanticEventKind::Output { .. }))
+                .take(MAX_PERSISTED_EVENTS_PER_SESSION)
+                .collect::<Vec<_>>();
+            if events.len() == MAX_PERSISTED_EVENTS_PER_SESSION
+                && session
+                    .journal
+                    .canonical_events_for_persist()
+                    .iter()
+                    .filter(|event| !matches!(event.kind, SemanticEventKind::Output { .. }))
+                    .count()
+                    > MAX_PERSISTED_EVENTS_PER_SESSION
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "conversation-history session exceeds event bound",
+                ));
+            }
+            let session_bytes: usize = events
+                .iter()
+                .map(|event| serde_json::to_vec(event).map_or(0, |encoded| encoded.len()))
+                .sum();
+            if session_bytes > self.limits.canonical_bytes {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "conversation-history session exceeds canonical byte bound",
+                ));
+            }
+            aggregate_bytes = aggregate_bytes.saturating_add(session_bytes);
+            if aggregate_bytes > self.max_total_bytes {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "conversation-history exceeds aggregate store byte bound",
+                ));
+            }
+            sessions.push(PersistedConversationSession {
+                key: key.clone(),
+                metadata: session.metadata.clone(),
+                next_sequence: session.journal.next_sequence,
+                highest_evicted_sequence: session.journal.highest_evicted_sequence,
+                events,
+            });
+        }
+        sessions.sort_by(|left, right| left.key.as_str().cmp(right.key.as_str()));
+        Ok(ConversationHistoryFile {
+            schema: CONVERSATION_HISTORY_SCHEMA.to_string(),
+            sessions,
+        })
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ConversationHistoryFile {
+    schema: String,
+    sessions: Vec<PersistedConversationSession>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct PersistedConversationSession {
+    key: StableSessionKey,
+    metadata: SemanticSessionMetadata,
+    next_sequence: u64,
+    highest_evicted_sequence: u64,
+    events: Vec<SemanticEvent>,
+}
+
+fn is_restorable_canonical_kind(kind: &SemanticEventKind) -> bool {
+    !matches!(kind, SemanticEventKind::Output { .. })
+}
+
+fn write_conversation_history_atomically(path: &Path, bytes: &[u8]) -> io::Result<()> {
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    fs::create_dir_all(parent)?;
+    let temporary = parent.join(format!(
+        "{}.tmp",
+        path.file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or(CONVERSATION_HISTORY_FILE_NAME)
+    ));
+    {
+        let mut handle = fs::File::create(&temporary)?;
+        handle.write_all(bytes)?;
+        handle.sync_all()?;
+    }
+    match replace_conversation_history_file(&temporary, path) {
+        Ok(()) => Ok(()),
+        Err(error) => {
+            let _ = fs::remove_file(&temporary);
+            Err(error)
+        }
+    }
+}
+
+#[cfg(windows)]
+fn replace_conversation_history_file(temporary: &Path, destination: &Path) -> io::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows::core::PCWSTR;
+    use windows::Win32::Storage::FileSystem::{
+        MoveFileExW, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH,
+    };
+
+    let temporary: Vec<u16> = temporary.as_os_str().encode_wide().chain(Some(0)).collect();
+    let destination: Vec<u16> = destination
+        .as_os_str()
+        .encode_wide()
+        .chain(Some(0))
+        .collect();
+    unsafe {
+        MoveFileExW(
+            PCWSTR(temporary.as_ptr()),
+            PCWSTR(destination.as_ptr()),
+            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+        )
+        .map_err(io::Error::from)
+    }
+}
+
+#[cfg(not(windows))]
+fn replace_conversation_history_file(temporary: &Path, destination: &Path) -> io::Result<()> {
+    fs::rename(temporary, destination)
 }
 
 fn semantic_source(kind: SessionKind) -> SemanticSource {
@@ -2769,6 +3155,80 @@ mod tests {
         assert_eq!(
             output_texts(&shell, &shell_key),
             vec!["shell line\n".to_string()]
+        );
+    }
+
+    #[test]
+    fn conversation_history_sidecar_reopens_durable_facts_across_restart() {
+        let directory = tempfile::tempdir().expect("temp dir");
+        let path = directory.path().join(CONVERSATION_HISTORY_FILE_NAME);
+        let key = StableSessionKey::from_tab("task-reopen");
+        {
+            let mut store = SemanticJournalStore::open(&path).expect("open empty history");
+            store.record(SemanticEventDraft {
+                stable_session_key: key.clone(),
+                occurred_at_epoch_ms: 10,
+                source: SemanticSource::Claude,
+                kind: SemanticEventKind::UserMessage {
+                    text: "remember this across restart".into(),
+                },
+                retention: SemanticRetention::Canonical,
+                deduplication_key: None,
+            });
+            store.record(SemanticEventDraft {
+                stable_session_key: key.clone(),
+                occurred_at_epoch_ms: 11,
+                source: SemanticSource::Claude,
+                kind: SemanticEventKind::AssistantMessage {
+                    message_id: "m1".into(),
+                    text: "durable final reply".into(),
+                    streaming: false,
+                },
+                retention: SemanticRetention::Canonical,
+                deduplication_key: None,
+            });
+            assert!(store.is_dirty(), "canonical facts stay dirty until flush");
+            store.flush().expect("prompt flush durable facts");
+            assert!(!store.is_dirty(), "successful flush clears dirty");
+            assert!(path.is_file(), "sidecar must exist after durable flush");
+        }
+
+        let reopened = SemanticJournalStore::open(&path).expect("reopen history");
+        let replay = reopened.replay_after(&key, 0).expect("replay after reopen");
+        assert_eq!(replay.events.len(), 2);
+        assert!(matches!(
+            &replay.events[0].kind,
+            SemanticEventKind::UserMessage { text } if text == "remember this across restart"
+        ));
+        assert!(matches!(
+            &replay.events[1].kind,
+            SemanticEventKind::AssistantMessage {
+                text,
+                streaming: false,
+                ..
+            } if text == "durable final reply"
+        ));
+        assert_eq!(
+            reopened.metadata(&key).map(|meta| meta.latest_sequence),
+            Some(2)
+        );
+    }
+
+    #[test]
+    fn conversation_history_corrupt_sidecar_fails_closed() {
+        let directory = tempfile::tempdir().expect("temp dir");
+        let path = directory.path().join(CONVERSATION_HISTORY_FILE_NAME);
+        let corrupt = b"{not-json";
+        fs::write(&path, corrupt).expect("write corrupt");
+        let error = match SemanticJournalStore::open(&path) {
+            Ok(_) => panic!("corrupt must fail closed"),
+            Err(error) => error,
+        };
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(
+            fs::read(&path).expect("corrupt evidence retained"),
+            corrupt,
+            "fail-closed open must leave the corrupt sidecar untouched"
         );
     }
 }

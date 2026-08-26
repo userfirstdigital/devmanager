@@ -781,6 +781,9 @@ pub enum TaskLifecycle {
     Settled,
     Closing,
     Archived,
+    /// Permanent user deletion. The durable task journal remains as an
+    /// auditable tombstone, but the task is never selectable or reopenable.
+    Deleted,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

@@ -8,6 +8,7 @@
 
 use std::time::Duration;
 
+use crate::domain::id::TaskId;
 use crate::domain::operation::OperationState;
 use crate::domain::provider_input::ProviderInputAction;
 use crate::kernel::{AmbiguityDisposition, DestinationClass, Effect, KernelStore, StoreError};
@@ -21,9 +22,18 @@ const DISPATCH_LEASE: Duration = Duration::from_secs(30);
 const HOLD_RETRY: Duration = Duration::from_millis(250);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProviderDispatchHoldReason {
+    SessionNotBound,
+    RuntimeAuthorityAbsent,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProviderDispatchOutcome {
     Idle,
-    Held,
+    Held {
+        task_id: TaskId,
+        reason: ProviderDispatchHoldReason,
+    },
     Settled {
         operation_id: crate::domain::OperationId,
     },
@@ -37,7 +47,8 @@ pub enum ProviderDispatchOutcome {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum WriteFailureDisposition {
-    Hold,
+    Hold(ProviderDispatchHoldReason),
+    HoldOther,
     Uncertain,
 }
 
@@ -67,33 +78,39 @@ impl ProviderDispatchWriteAuthority for ProcessManagerDispatchAuthority {
     ) -> Result<ProviderInputWriteReceipt, ProviderWriteFailure> {
         let plan = sequence_provider_action(action).map_err(|_| ProviderWriteFailure {
             error: ProviderInputDeliveryError::BytesMismatch,
-            disposition: WriteFailureDisposition::Hold,
+            disposition: WriteFailureDisposition::HoldOther,
         })?;
         let handle = self
             .launcher
             .write_handle_for_identity(identity)
             .map_err(|error| ProviderWriteFailure {
                 error,
-                disposition: WriteFailureDisposition::Hold,
+                disposition: hold_disposition(error),
             })?;
         handle
             .write_action(identity, action, &plan)
             .map_err(|error| ProviderWriteFailure {
                 error,
-                disposition: match error {
-                    ProviderInputDeliveryError::SessionNotBound
-                    | ProviderInputDeliveryError::StaleGeneration
-                    | ProviderInputDeliveryError::StaleFence
-                    | ProviderInputDeliveryError::ProviderMismatch
-                    | ProviderInputDeliveryError::RuntimeAuthorityAbsent
-                    | ProviderInputDeliveryError::UnsupportedAction
-                    | ProviderInputDeliveryError::ActionMismatch
-                    | ProviderInputDeliveryError::BytesMismatch => WriteFailureDisposition::Hold,
-                    ProviderInputDeliveryError::PostBoundaryFailure => {
-                        WriteFailureDisposition::Uncertain
-                    }
-                },
+                disposition: hold_disposition(error),
             })
+    }
+}
+
+fn hold_disposition(error: ProviderInputDeliveryError) -> WriteFailureDisposition {
+    match error {
+        ProviderInputDeliveryError::SessionNotBound => {
+            WriteFailureDisposition::Hold(ProviderDispatchHoldReason::SessionNotBound)
+        }
+        ProviderInputDeliveryError::RuntimeAuthorityAbsent => {
+            WriteFailureDisposition::Hold(ProviderDispatchHoldReason::RuntimeAuthorityAbsent)
+        }
+        ProviderInputDeliveryError::StaleGeneration
+        | ProviderInputDeliveryError::StaleFence
+        | ProviderInputDeliveryError::ProviderMismatch
+        | ProviderInputDeliveryError::UnsupportedAction
+        | ProviderInputDeliveryError::ActionMismatch
+        | ProviderInputDeliveryError::BytesMismatch => WriteFailureDisposition::HoldOther,
+        ProviderInputDeliveryError::PostBoundaryFailure => WriteFailureDisposition::Uncertain,
     }
 }
 
@@ -164,6 +181,7 @@ impl ProviderDispatchRuntime {
             question_id: *question_id,
             approval_id: *approval_id,
         };
+        let held_task_id = *task_id;
         match self.authority.write(&identity, action) {
             Ok(receipt) => {
                 let state = match store.settle_provider_input_delivery(&permit, &receipt) {
@@ -189,21 +207,30 @@ impl ProviderDispatchRuntime {
                     operation_id: *operation_id,
                 })
             }
-            Err(failure) if failure.disposition == WriteFailureDisposition::Hold => {
-                let _ = failure.error;
-                store.defer_dispatch_before_boundary(&permit, HOLD_RETRY)?;
-                Ok(ProviderDispatchOutcome::Held)
-            }
-            Err(failure) => {
-                let _ = failure.error;
-                let disposition = store.record_dispatch_ambiguity(&permit, HOLD_RETRY)?;
-                if disposition != AmbiguityDisposition::Uncertain {
-                    return Err(StoreError::Corruption);
+            Err(failure) => match failure.disposition {
+                WriteFailureDisposition::Hold(reason) => {
+                    store.defer_dispatch_before_boundary(&permit, HOLD_RETRY)?;
+                    Ok(ProviderDispatchOutcome::Held {
+                        task_id: held_task_id,
+                        reason,
+                    })
                 }
-                Ok(ProviderDispatchOutcome::Uncertain {
-                    operation_id: *operation_id,
-                })
-            }
+                WriteFailureDisposition::HoldOther => {
+                    store.defer_dispatch_before_boundary(&permit, HOLD_RETRY)?;
+                    // Non-restart holds stay deferred without advertising a
+                    // SessionNotBound/RuntimeAuthorityAbsent restart signal.
+                    Ok(ProviderDispatchOutcome::Idle)
+                }
+                WriteFailureDisposition::Uncertain => {
+                    let disposition = store.record_dispatch_ambiguity(&permit, HOLD_RETRY)?;
+                    if disposition != AmbiguityDisposition::Uncertain {
+                        return Err(StoreError::Corruption);
+                    }
+                    Ok(ProviderDispatchOutcome::Uncertain {
+                        operation_id: *operation_id,
+                    })
+                }
+            },
         }
     }
 }

@@ -490,6 +490,7 @@ impl TaskProjectionIndex {
                 TaskLifecycle::Archived => {
                     index.archived_order.insert(key);
                 }
+                TaskLifecycle::Deleted => continue,
             }
             index.insert_search_scalar_totals(&entry);
             index.insert_search_tokens(task_id, &entry);
@@ -926,6 +927,10 @@ impl TaskProjectionIndex {
             TaskLifecycle::Archived => {
                 self.archived_order.insert(key.clone());
             }
+            TaskLifecycle::Deleted => {
+                self.incremental_updates = self.incremental_updates.saturating_add(1);
+                return;
+            }
         }
         let entry = self
             .entries
@@ -942,7 +947,10 @@ impl TaskProjectionIndex {
             let key = TaskOrderKey::new(task_id, &entry);
             self.active_order.remove(&key);
             self.archived_order.remove(&key);
-            if entry.lifecycle == TaskLifecycle::Settled {
+            if matches!(
+                entry.lifecycle,
+                TaskLifecycle::Settled | TaskLifecycle::Deleted
+            ) {
                 return;
             }
             self.remove_search_scalar_totals(&entry);

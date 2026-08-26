@@ -189,6 +189,7 @@ pub(crate) fn is_pure_slice_decision_fact(event: &Event) -> bool {
         | Event::TaskSettled
         | Event::TaskReopened
         | Event::TaskArchived
+        | Event::TaskDeleted
         | Event::AgentSessionRegistered { .. }
         | Event::AgentProviderSessionBound { .. }
         | Event::PrimaryAgentSet { .. }
@@ -473,6 +474,7 @@ pub(crate) fn plan_effects(
             | Event::TaskSettled
             | Event::TaskReopened
             | Event::TaskArchived
+            | Event::TaskDeleted
             | Event::AgentSessionRegistered { .. }
             | Event::AgentProviderSessionBound { .. }
             | Event::PrimaryAgentSet { .. }

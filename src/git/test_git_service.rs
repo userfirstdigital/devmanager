@@ -1472,7 +1472,10 @@ fn production_host_issuer_confirms_and_executes_stage_unstage_commit_when_fence_
         .plan_stage(&[RepoPath::from("tracked.txt")])
         .expect("stage before commit");
     repo.stage(&stage, &repo.host_confirm(&stage).expect("confirm restage"))
-        .expect("restage");
+        .unwrap_or_else(|error| match error {
+            GitError::InvalidRepositoryRoot { reason, .. } => panic!("restage: {reason}"),
+            error => panic!("restage: {error}"),
+        });
     let repo = issued_production_host_repository(repo_dir.path(), 4, 1);
     let commit = repo.plan_commit("host issuer commit").expect("commit plan");
     let confirmation = repo

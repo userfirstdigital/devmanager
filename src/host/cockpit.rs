@@ -1324,7 +1324,12 @@ fn open_git_repository_targeted(
         }
     }
     .map_err(|error| {
-        eprintln!("devmanager-host: cockpit Git binding failed: {error:?}");
+        match &error {
+            GitError::InvalidRepositoryRoot { reason, .. } => {
+                eprintln!("devmanager-host: cockpit Git binding failed: {reason}");
+            }
+            _ => eprintln!("devmanager-host: cockpit Git binding failed: {error}"),
+        }
         unavailable(
             TaskCockpitSurface::Git,
             TaskCockpitUnavailableReason::GitAuthorityNotIssued,

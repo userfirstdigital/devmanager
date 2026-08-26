@@ -1437,6 +1437,7 @@ pub(crate) fn encode_event_payload(event: &Event) -> Result<Vec<u8>, StoreError>
         Event::TaskSettled => rmp_serde::to_vec(&TaskUnitPayload {}),
         Event::TaskReopened => rmp_serde::to_vec(&TaskUnitPayload {}),
         Event::TaskArchived => rmp_serde::to_vec(&TaskUnitPayload {}),
+        Event::TaskDeleted => rmp_serde::to_vec(&TaskUnitPayload {}),
         Event::AgentSessionRegistered { agent } => {
             rmp_serde::to_vec(&AgentSessionRegisteredPayload {
                 agent: agent.clone(),
@@ -1723,6 +1724,10 @@ pub(crate) fn decode_stored_event(
         "task.archived" => {
             let _: TaskUnitPayload = unpack(payload)?;
             Event::TaskArchived
+        }
+        "task.deleted" => {
+            let _: TaskUnitPayload = unpack(payload)?;
+            Event::TaskDeleted
         }
         "agent_session.registered" => {
             let p: AgentSessionRegisteredPayload = unpack(payload)?;

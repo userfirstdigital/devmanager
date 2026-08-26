@@ -1432,6 +1432,7 @@ fn canonical_command_action(command: &Command) -> Option<ActionId> {
         | Command::SettleTask
         | Command::BeginCloseTask
         | Command::ReopenTask
+        | Command::DeleteTask
         | Command::RegisterAgentSession { .. }
         | Command::SetPrimaryAgent { .. }
         | Command::RegisterArtifact { .. }

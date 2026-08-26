@@ -1207,6 +1207,7 @@ pub enum Command {
     SettleTask,
     BeginCloseTask,
     ReopenTask,
+    DeleteTask,
     RegisterAgentSession {
         agent: AgentSessionFacts,
     },
@@ -1395,7 +1396,9 @@ pub fn decide(
                 TaskLifecycle::Open => Ok(vec![Event::TaskSettled]),
                 TaskLifecycle::Settled => Ok(Vec::new()),
                 TaskLifecycle::Closing => Err(RejectionCode::Closing),
-                TaskLifecycle::Archived => Err(RejectionCode::InvalidTransition),
+                TaskLifecycle::Archived | TaskLifecycle::Deleted => {
+                    Err(RejectionCode::InvalidTransition)
+                }
             }
         }
         Command::BeginCloseTask => decide_begin_close(snapshot, envelope),
@@ -1406,7 +1409,20 @@ pub fn decide(
                 TaskLifecycle::Settled | TaskLifecycle::Closing | TaskLifecycle::Archived => {
                     Ok(vec![Event::TaskReopened])
                 }
-                TaskLifecycle::Open => Err(RejectionCode::InvalidTransition),
+                TaskLifecycle::Open | TaskLifecycle::Deleted => {
+                    Err(RejectionCode::InvalidTransition)
+                }
+            }
+        }
+        Command::DeleteTask => {
+            let snap = require_task(snapshot, envelope)?;
+            require_expected_revision(snap, envelope)?;
+            match snap.task.lifecycle {
+                TaskLifecycle::Archived => Ok(vec![Event::TaskDeleted]),
+                TaskLifecycle::Open
+                | TaskLifecycle::Settled
+                | TaskLifecycle::Closing
+                | TaskLifecycle::Deleted => Err(RejectionCode::InvalidTransition),
             }
         }
         Command::RegisterAgentSession { agent } => {
@@ -1673,7 +1689,7 @@ fn decide_begin_close(
     require_expected_revision(snap, envelope)?;
     match snap.task.lifecycle {
         TaskLifecycle::Closing => Ok(Vec::new()),
-        TaskLifecycle::Archived => Err(RejectionCode::InvalidTransition),
+        TaskLifecycle::Archived | TaskLifecycle::Deleted => Err(RejectionCode::InvalidTransition),
         TaskLifecycle::Open | TaskLifecycle::Settled => {
             let action_epoch = snap
                 .task
@@ -1975,7 +1991,7 @@ fn require_open_or_closing_task<'a>(
     let snap = require_task(snapshot, envelope)?;
     match snap.task.lifecycle {
         TaskLifecycle::Open | TaskLifecycle::Settled | TaskLifecycle::Closing => Ok(snap),
-        TaskLifecycle::Archived => Err(RejectionCode::InvalidTransition),
+        TaskLifecycle::Archived | TaskLifecycle::Deleted => Err(RejectionCode::InvalidTransition),
     }
 }
 
@@ -1987,7 +2003,7 @@ fn require_runtime_capable_task<'a>(
     match snap.task.lifecycle {
         TaskLifecycle::Open | TaskLifecycle::Settled => Ok(snap),
         TaskLifecycle::Closing => Err(RejectionCode::Closing),
-        TaskLifecycle::Archived => Err(RejectionCode::InvalidTransition),
+        TaskLifecycle::Archived | TaskLifecycle::Deleted => Err(RejectionCode::InvalidTransition),
     }
 }
 

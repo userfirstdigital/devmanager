@@ -7,7 +7,7 @@
 //! EventReplaySession, and ArtifactContentSession registries for paged snapshot,
 //! event-replay, and artifact-content queries.
 
-use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::future::Future;
 use std::path::PathBuf;
 use std::pin::{pin, Pin};
@@ -81,6 +81,7 @@ enum ProviderSemanticIngress {
 
 struct ProviderRestoreOutcome {
     task_id: TaskId,
+    action_epoch: u64,
     result: Result<(), String>,
 }
 
@@ -1979,11 +1980,30 @@ impl ConfiguredServiceRuntime {
         semantic_ingress_tx: mpsc::UnboundedSender<ProviderSemanticIngress>,
     ) -> Option<Self> {
         let manager = provider_session_store_path
-            .map(crate::services::ProcessManager::new_with_provider_session_store_path)
+            .as_ref()
+            .map(|path| {
+                crate::services::ProcessManager::new_with_provider_session_store_path(path.clone())
+            })
             .unwrap_or_else(crate::services::ProcessManager::new);
-        let semantic_journal = Arc::new(Mutex::new(
-            crate::remote::presentation::SemanticJournalStore::default(),
-        ));
+        let history_path = provider_session_store_path.as_ref().and_then(|path| {
+            path.parent()
+                .map(|root| root.join(crate::remote::presentation::CONVERSATION_HISTORY_FILE_NAME))
+        });
+        let semantic_journal = match history_path {
+            Some(path) => match crate::remote::presentation::SemanticJournalStore::open(&path) {
+                Ok(store) => Arc::new(Mutex::new(store)),
+                Err(error) => {
+                    eprintln!(
+                        "devmanager-host: conversation history unavailable ({error}); refusing configured service runtime at {}",
+                        path.display()
+                    );
+                    return None;
+                }
+            },
+            None => Arc::new(Mutex::new(
+                crate::remote::presentation::SemanticJournalStore::default(),
+            )),
+        };
         let event_journal = Arc::clone(&semantic_journal);
         manager.set_remote_session_handler(Some(Arc::new(move |event| {
             let Ok(mut journal) = event_journal.lock() else {
@@ -2011,6 +2031,11 @@ impl ConfiguredServiceRuntime {
                 | crate::services::RemoteSessionEvent::CodexSemantic { mut draft, .. } => {
                     let ingress = normalize_provider_question_draft(&mut draft);
                     journal.record(draft);
+                    if let Err(error) = journal.flush_if_dirty() {
+                        eprintln!(
+                            "devmanager-host: conversation history prompt flush failed: {error}"
+                        );
+                    }
                     drop(journal);
                     if let Some(ingress) = ingress {
                         let _ = semantic_ingress_tx.send(ingress);
@@ -2431,6 +2456,12 @@ pub struct HostRequestExecutor {
     provider_restore_pending: bool,
     provider_restore_queue: VecDeque<crate::domain::command::StartProviderSessionIntent>,
     provider_restore_jobs: FuturesUnordered<ProviderRestoreFuture>,
+    /// Tasks that already have a restore/start attempt in flight. Held dispatch
+    /// must not enqueue a duplicate StartProviderSessionIntent for the same task.
+    provider_restore_in_flight: HashSet<TaskId>,
+    /// A failed restore fence suppresses only the same durable action epoch.
+    /// A later user action advances the epoch and may retry intentionally.
+    provider_restore_failed_action_epochs: HashMap<TaskId, u64>,
     /// Host-owned terminal admission. It only writes to terminals explicitly
     /// attached by the task runtime; an unbound/missing terminal fails closed.
     terminal_service: TerminalService,
@@ -2651,6 +2682,8 @@ impl HostRequestExecutor {
             provider_restore_pending,
             provider_restore_queue: VecDeque::new(),
             provider_restore_jobs: FuturesUnordered::new(),
+            provider_restore_in_flight: HashSet::new(),
+            provider_restore_failed_action_epochs: HashMap::new(),
             terminal_service: TerminalService::new(),
             update_gate,
             host_boot_id,
@@ -2727,6 +2760,8 @@ impl HostRequestExecutor {
             provider_restore_pending,
             provider_restore_queue: VecDeque::new(),
             provider_restore_jobs: FuturesUnordered::new(),
+            provider_restore_in_flight: HashSet::new(),
+            provider_restore_failed_action_epochs: HashMap::new(),
             terminal_service: TerminalService::new(),
             update_gate,
             host_boot_id,
@@ -3110,15 +3145,37 @@ impl HostRequestExecutor {
     /// service panel and action path therefore observe reconciled process/port
     /// evidence without doing probes or process work in request dispatch.
     fn reconcile_configured_services(&mut self) {
-        let provider_failures = if let Some(runtime) = self.configured_service_runtime.as_mut() {
-            if let Err(error) = self.bus.run_provider_dispatch(&runtime.provider_dispatch) {
-                eprintln!("devmanager-host: provider dispatch maintenance failed: {error}");
-            }
-            let _ = runtime.manager.configured_service_snapshots();
-            runtime.manager.drain_provider_session_failures()
-        } else {
-            Vec::new()
-        };
+        // Capture dispatch/flush/failure results under the runtime borrow, then
+        // release it before mutating restore queues owned by `self`. Disjoint
+        // field borrows (`bus` + `configured_service_runtime`) keep this compiling.
+        let (held_restart, provider_failures) =
+            if let Some(runtime) = self.configured_service_runtime.as_mut() {
+                let bus = &mut self.bus;
+                let held_restart = match bus.run_provider_dispatch(&runtime.provider_dispatch) {
+                    Ok(crate::providers::dispatch::ProviderDispatchOutcome::Held {
+                        task_id,
+                        reason,
+                    }) => Some((task_id, reason)),
+                    Ok(_) => None,
+                    Err(error) => {
+                        eprintln!("devmanager-host: provider dispatch maintenance failed: {error}");
+                        None
+                    }
+                };
+                if let Ok(mut journal) = runtime.semantic_journal.lock() {
+                    if let Err(error) = journal.flush_if_dirty() {
+                        eprintln!("devmanager-host: conversation history flush failed: {error}");
+                    }
+                }
+                let _ = runtime.manager.configured_service_snapshots();
+                let failures = runtime.manager.drain_provider_session_failures();
+                (held_restart, failures)
+            } else {
+                (None, Vec::new())
+            };
+        if let Some((task_id, reason)) = held_restart {
+            self.queue_held_provider_restart(task_id, reason);
+        }
         for failure in provider_failures {
             eprintln!(
                 "devmanager-host: provider session failed task={} agent={} provider={:?}: {:?}",
@@ -3128,6 +3185,47 @@ impl HostRequestExecutor {
         }
         if let Err(error) = self.sync_provider_session_identities() {
             eprintln!("devmanager-host: provider session identity sync failed: {error}");
+        }
+    }
+
+    fn queue_held_provider_restart(
+        &mut self,
+        task_id: TaskId,
+        reason: crate::providers::dispatch::ProviderDispatchHoldReason,
+    ) {
+        if self.provider_restore_in_flight.contains(&task_id)
+            || self
+                .provider_restore_queue
+                .iter()
+                .any(|intent| intent.task_id == task_id)
+        {
+            return;
+        }
+        match self.bus.provider_hold_restart_intent(task_id) {
+            Ok(Some(intent)) => {
+                if self
+                    .provider_restore_failed_action_epochs
+                    .get(&task_id)
+                    .is_some_and(|failed_epoch| *failed_epoch == intent.expected_action_epoch)
+                {
+                    return;
+                }
+                eprintln!(
+                    "devmanager-host: provider input held task={} reason={reason:?}; scheduling {:?}",
+                    task_id, intent.mode
+                );
+                self.provider_restore_queue.push_back(intent);
+            }
+            Ok(None) => {
+                eprintln!(
+                    "devmanager-host: provider input held task={task_id} reason={reason:?}; no restart facts"
+                );
+            }
+            Err(error) => {
+                eprintln!(
+                    "devmanager-host: provider hold restart selection failed task={task_id}: {error}"
+                );
+            }
         }
     }
 
@@ -3151,6 +3249,7 @@ impl HostRequestExecutor {
         let Some(runtime) = self.configured_service_runtime.as_ref() else {
             self.handle_provider_restore_outcome(ProviderRestoreOutcome {
                 task_id: intent.task_id,
+                action_epoch: intent.expected_action_epoch,
                 result: Err("configured provider runtime is unavailable".to_string()),
             });
             return;
@@ -3188,13 +3287,16 @@ impl HostRequestExecutor {
             Err(error) => {
                 self.handle_provider_restore_outcome(ProviderRestoreOutcome {
                     task_id: intent.task_id,
+                    action_epoch: intent.expected_action_epoch,
                     result: Err(error),
                 });
                 return;
             }
         };
         let task_id = intent.task_id;
+        let action_epoch = intent.expected_action_epoch;
         let provider_kind = intent.provider_kind;
+        self.provider_restore_in_flight.insert(task_id);
         self.provider_restore_jobs.push(Box::pin(async move {
             let result = async {
                 let observation = super::agent_connection::observe_with_trusted_auth(
@@ -3222,17 +3324,27 @@ impl HostRequestExecutor {
                 Ok(())
             }
             .await;
-            ProviderRestoreOutcome { task_id, result }
+            ProviderRestoreOutcome {
+                task_id,
+                action_epoch,
+                result,
+            }
         }));
     }
 
     fn handle_provider_restore_outcome(&mut self, outcome: ProviderRestoreOutcome) {
+        self.provider_restore_in_flight.remove(&outcome.task_id);
         if let Err(error) = outcome.result {
             eprintln!(
                 "devmanager-host: exact provider restore failed task={}: {error}",
                 outcome.task_id
             );
+            self.provider_restore_failed_action_epochs
+                .insert(outcome.task_id, outcome.action_epoch);
             self.mark_provider_restore_failed(outcome.task_id);
+        } else {
+            self.provider_restore_failed_action_epochs
+                .remove(&outcome.task_id);
         }
     }
 
@@ -4102,11 +4214,13 @@ impl HostRequestExecutor {
             }
         };
         let task_id = intent.task_id;
+        let action_epoch = intent.expected_action_epoch;
         let provider_kind = intent.provider_kind;
         let revision = snapshot.task.revision;
         // Sync prepare is complete. Enqueue discovery/launch onto the same
         // cancellation-owned FuturesUnordered lane used by provider restore so
         // the request executor stays free for task-list and cockpit queries.
+        self.provider_restore_in_flight.insert(task_id);
         self.provider_restore_jobs.push(Box::pin(async move {
             let result = async {
                 let observation = super::agent_connection::observe_with_trusted_auth(
@@ -4140,7 +4254,11 @@ impl HostRequestExecutor {
                 Ok(())
             }
             .await;
-            ProviderRestoreOutcome { task_id, result }
+            ProviderRestoreOutcome {
+                task_id,
+                action_epoch,
+                result,
+            }
         }));
         Ok(revision)
     }

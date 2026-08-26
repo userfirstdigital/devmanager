@@ -91,6 +91,7 @@ pub fn action_for_client_request(request: &ClientRequest) -> Option<(ActionId, O
                 | Command::SettleTask
                 | Command::BeginCloseTask
                 | Command::ReopenTask
+                | Command::DeleteTask
                 | Command::RegisterAgentSession { .. }
                 | Command::SetPrimaryAgent { .. }
                 | Command::RegisterArtifact { .. }
