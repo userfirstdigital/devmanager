@@ -61,7 +61,7 @@ use crate::domain::command::{
 use crate::domain::host::{HostQuitInspection, HostQuitWorktreeInspection};
 use crate::domain::id::SubscriptionId;
 use crate::domain::id::{AgentSessionId, CommandId, ProjectId, RequestId, TaskId};
-use crate::domain::snapshot::{SemanticJournalFact, SemanticJournalPage, SnapshotSection};
+use crate::domain::snapshot::SnapshotSection;
 use crate::domain::task::VisibleTaskStatus;
 use crate::domain::ClientId;
 use crate::host::IpcError;
@@ -150,6 +150,10 @@ use crate::ui::project_actions::{
 };
 use crate::ui::project_scope::{ProjectScope, ProjectScopeMenuState};
 use crate::ui::task_search::{TaskSearchCandidate, TaskSearchState};
+use crate::ui::task_workspace::{
+    apply_workspace_selection as apply_task_workspace_selection, TaskSurfaceRegistry,
+    TaskWorkspace, WorkspaceError, WorkspaceSelectionGesture,
+};
 use crate::ui::terminal_adapter::TerminalDockAdapter;
 pub use crate::ui::terminal_adapter::{TerminalDockState, TERMINAL_ADAPTER_DEPENDENCY};
 use crate::ui::theme_system::{
@@ -262,64 +266,6 @@ fn should_schedule_host_bootstrap_retry(
         && !has_pending_bootstrap
         && connection_failed
         && controller_ticks % HOST_BOOTSTRAP_REATTACH_TICKS == 0
-}
-
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-struct TaskConversationCache {
-    facts: Vec<SemanticJournalFact>,
-    high_water: u64,
-    through_sequence: u64,
-    next_sequence: Option<u64>,
-}
-
-impl TaskConversationCache {
-    fn as_page(&self) -> SemanticJournalPage {
-        SemanticJournalPage {
-            after_sequence: 0,
-            through_sequence: self.through_sequence,
-            high_water: self.high_water,
-            encoded_bytes: 0,
-            next_sequence: self.next_sequence,
-            facts: self.facts.clone(),
-        }
-    }
-
-    fn request_after_sequence(&self) -> u64 {
-        self.next_sequence
-            .unwrap_or_else(|| self.high_water.max(self.through_sequence))
-    }
-
-    fn merge_page(&mut self, page: &SemanticJournalPage) {
-        self.high_water = self.high_water.max(page.high_water);
-        self.through_sequence = self.through_sequence.max(page.through_sequence);
-        for fact in &page.facts {
-            if self
-                .facts
-                .iter()
-                .any(|existing| existing.sequence == fact.sequence)
-            {
-                continue;
-            }
-            self.facts.push(fact.clone());
-        }
-        self.facts.sort_by_key(|fact| fact.sequence);
-        self.next_sequence = page.next_sequence;
-        if self.next_sequence.is_none() {
-            self.through_sequence = self
-                .facts
-                .last()
-                .map(|fact| fact.sequence)
-                .unwrap_or(self.through_sequence)
-                .max(page.through_sequence);
-        }
-    }
-}
-
-fn conversation_result_matches_selected_task(
-    selected_task: Option<TaskId>,
-    command_task_id: TaskId,
-) -> bool {
-    selected_task == Some(command_task_id)
 }
 
 fn idle_photo_fetch_matches_current_canvas(
@@ -7739,8 +7685,7 @@ pub struct NativeShell {
     last_projection_kinds: Vec<NativeHostProjectionKind>,
     pending_host_actions: VecDeque<NativeActionRecord>,
     retained_action_overflow: Option<NativeActionRecord>,
-    conversation_query_in_flight: bool,
-    conversation_cache: BTreeMap<TaskId, TaskConversationCache>,
+    task_surfaces: TaskSurfaceRegistry,
     last_action_failure: Option<NativeHostActionFailure>,
     last_action_receipt: Option<crate::domain::command::CommandReceipt>,
     last_query_detail: Option<String>,
@@ -8232,8 +8177,7 @@ impl NativeShell {
             last_projection_kinds: Vec::new(),
             pending_host_actions: VecDeque::new(),
             retained_action_overflow: None,
-            conversation_query_in_flight: false,
-            conversation_cache: BTreeMap::new(),
+            task_surfaces: TaskSurfaceRegistry::default(),
             last_action_failure: None,
             last_action_receipt: None,
             last_query_detail: None,
@@ -9316,47 +9260,79 @@ impl NativeShell {
                 self.agent_connection = Some(snapshot);
             }
             NativeHostQueryBody::TaskCockpit(result) => {
-                if matches!(result, crate::domain::TaskCockpitResult::Conversation(_)) {
-                    self.conversation_query_in_flight = false;
+                let command_task_id = Self::task_cockpit_command_parts(&action.command)
+                    .map(|(_, task_id, _)| task_id);
+                if let crate::domain::TaskCockpitResult::Conversation(page) = &result {
+                    let Some(task_id) = command_task_id else {
+                        return;
+                    };
+                    let Ok(merged) = self.task_surfaces.admit_conversation(
+                        task_id,
+                        action.request_generation,
+                        page,
+                    ) else {
+                        return;
+                    };
+                    if self.interaction.selected_task() == Some(task_id) {
+                        let needs_next_page = merged.next_sequence.is_some();
+                        let after_sequence = self.conversation_after_sequence_for(task_id);
+                        self.cockpit.apply_cockpit_result(
+                            &crate::domain::TaskCockpitResult::Conversation(merged),
+                        );
+                        if needs_next_page && !self.task_surfaces.conversation_in_flight(task_id) {
+                            self.dispatch_related_actions([ActionRequest::TaskCockpit {
+                                task_id,
+                                query: TaskCockpitQuery::Conversation { after_sequence },
+                            }]);
+                        }
+                    }
+                    return;
                 }
+
+                if let crate::domain::TaskCockpitResult::Terminal(projection) = &result {
+                    if command_task_id != Some(projection.task_id)
+                        || self
+                            .task_surfaces
+                            .admit_terminal(projection.task_id, projection)
+                            .is_err()
+                    {
+                        return;
+                    }
+                }
+
+                let global_command = Self::task_cockpit_command_parts(&action.command).is_some_and(
+                    |(_, _, query)| {
+                        matches!(
+                            query,
+                            TaskCockpitQuery::ConfigSnapshot
+                                | TaskCockpitQuery::AgentConnection
+                                | TaskCockpitQuery::ConfigCreateProject { .. }
+                                | TaskCockpitQuery::ConfigUpsertCommand { .. }
+                                | TaskCockpitQuery::ConfigArchiveCommand { .. }
+                                | TaskCockpitQuery::ConfigRunCommand { .. }
+                                | TaskCockpitQuery::ConfigCommandDetail { .. }
+                        )
+                    },
+                );
+                let global_result = global_command
+                    || matches!(
+                        &result,
+                        crate::domain::TaskCockpitResult::Config(_)
+                            | crate::domain::TaskCockpitResult::ConfigCommandDetail(_)
+                            | crate::domain::TaskCockpitResult::AgentConnection(_)
+                    );
+                if !global_result && command_task_id != self.interaction.selected_task() {
+                    return;
+                }
+
+                // Projection always sees an exact-task result only after its
+                // originating command still matches the focused surface.
+                self.cockpit.apply_cockpit_result(&result);
                 if let crate::domain::TaskCockpitResult::Config(snapshot) = &result {
                     self.config_sidebar = ConfigSidebarProjection::from_host_snapshot(snapshot);
                     self.finish_add_project_after_host_accept();
                     self.sync_header_projection();
                     self.refresh_accessibility_tree();
-                }
-                // Projection always sees the result first; commit correlation uses the
-                // originating action command afterward (no query loops from paint).
-                if let crate::domain::TaskCockpitResult::Conversation(page) = &result {
-                    let command_task_id = Self::task_cockpit_command_parts(&action.command)
-                        .map(|(_, task_id, _)| task_id);
-                    if let Some(task_id) = command_task_id {
-                        if conversation_result_matches_selected_task(
-                            self.interaction.selected_task(),
-                            task_id,
-                        ) {
-                            let (merged, needs_next_page, after_sequence) = {
-                                let cache = self.conversation_cache.entry(task_id).or_default();
-                                cache.merge_page(page);
-                                (
-                                    cache.as_page(),
-                                    cache.next_sequence.is_some(),
-                                    cache.request_after_sequence(),
-                                )
-                            };
-                            self.cockpit.apply_cockpit_result(
-                                &crate::domain::TaskCockpitResult::Conversation(merged),
-                            );
-                            if needs_next_page && !self.conversation_query_in_flight {
-                                self.dispatch_related_actions([ActionRequest::TaskCockpit {
-                                    task_id,
-                                    query: TaskCockpitQuery::Conversation { after_sequence },
-                                }]);
-                            }
-                        }
-                    }
-                } else {
-                    self.cockpit.apply_cockpit_result(&result);
                 }
                 if let crate::domain::TaskCockpitResult::Terminal(projection) = &result {
                     if let Some(model) = self.client_model.as_ref() {
@@ -9922,8 +9898,11 @@ impl NativeShell {
     }
 
     fn discard_native_query_action(&mut self, action: &NativeActionRecord) {
-        if is_conversation_query_command(&action.command) {
-            self.conversation_query_in_flight = false;
+        if let Some((_, task_id, TaskCockpitQuery::Conversation { .. })) =
+            Self::task_cockpit_command_parts(&action.command)
+        {
+            self.task_surfaces
+                .cancel_conversation(task_id, action.request_generation);
         }
         let request_id = native_request_id(&action.command);
         self.pending_host_actions
@@ -10198,9 +10177,6 @@ impl NativeShell {
             } => {
                 let action_id = action.id;
                 let request_id = native_request_id(&action.command);
-                if is_conversation_query_command(&action.command) {
-                    self.conversation_query_in_flight = false;
-                }
                 self.last_query_detail = Some(detail);
                 self.apply_query_body(&action, body);
                 if let Some(request_id) = request_id {
@@ -10441,21 +10417,17 @@ impl NativeShell {
         // Keep the primary conversation live without refreshing inactive dock
         // tools. The host page is bounded and replaces the previous retained
         // window, so polling cannot grow client memory.
-        if self.controller_ticks % 30 == 0
-            && !self.conversation_query_in_flight
-            && self.action_lane_len() < MAX_ACTION_LANE_RECORDS / 2
-        {
+        if self.controller_ticks % 30 == 0 && self.action_lane_len() < MAX_ACTION_LANE_RECORDS / 2 {
             if let Some(task_id) = self.interaction.selected_task() {
-                let after_sequence = self.conversation_after_sequence_for(task_id);
-                let request = ActionRequest::TaskCockpit {
-                    task_id,
-                    query: TaskCockpitQuery::Conversation { after_sequence },
-                };
-                if let Some(record) = self.interaction.action_on_current_handler(request) {
-                    self.conversation_query_in_flight = matches!(
-                        self.enqueue_host_action(record),
-                        NativeHostActionResult::Queued
-                    );
+                if !self.task_surfaces.conversation_in_flight(task_id) {
+                    let after_sequence = self.conversation_after_sequence_for(task_id);
+                    let request = ActionRequest::TaskCockpit {
+                        task_id,
+                        query: TaskCockpitQuery::Conversation { after_sequence },
+                    };
+                    if let Some(record) = self.interaction.action_on_current_handler(request) {
+                        let _ = self.enqueue_host_action(record);
+                    }
                 }
                 if self.cockpit.dock().showing_raw_terminal() {
                     if let Some(record) =
@@ -10636,9 +10608,8 @@ impl NativeShell {
                     .accessibility_tree
                     .task_for_platform_node(request.target_node)
                 {
-                    let _ = self
-                        .interaction
-                        .navigation_mouse_down(task_id, &self.task_list);
+                    let _ =
+                        self.apply_workspace_selection(task_id, WorkspaceSelectionGesture::Plain);
                     repaint = true;
                     continue;
                 }
@@ -11143,11 +11114,23 @@ impl NativeShell {
         if pending.is_some() {
             self.pending_select_task = None;
         }
-        let selected_task = pending.or_else(|| {
-            self.interaction
-                .selected_task()
-                .filter(|task_id| task_list.task_ids().contains(task_id))
-        });
+        if let Some(task_id) = pending {
+            self.layout.task_workspace = Some(TaskWorkspace::single(task_id));
+            self.mark_layout_dirty();
+        }
+        let selected_task = pending
+            .or_else(|| {
+                self.layout
+                    .task_workspace
+                    .as_ref()
+                    .and_then(TaskWorkspace::focused_task)
+                    .filter(|task_id| task_list.task_ids().contains(task_id))
+            })
+            .or_else(|| {
+                self.interaction
+                    .selected_task()
+                    .filter(|task_id| task_list.task_ids().contains(task_id))
+            });
         self.interaction.sync_selected_task(selected_task);
         self.task_list = task_list;
         let previous_draft_count = self.composer_drafts.len();
@@ -11183,6 +11166,13 @@ impl NativeShell {
         let previous_selected_task = self.interaction.selected_task();
         let task_list = TaskList::from_client_model_with_settled_virtual(&model)
             .map_err(|error| format!("client model task projection failed: {error:?}"))?;
+        if self.layout.reconcile_task_workspace(task_list.task_ids()) {
+            self.mark_layout_dirty();
+        }
+        self.task_surfaces.retain_tasks(task_list.task_ids());
+        for task_id in self.workspace_task_ids() {
+            self.task_surfaces.ensure_task(task_id);
+        }
         self.apply_task_list(task_list);
         let selected_task_changed = self.interaction.selected_task() != previous_selected_task;
         let selected_task_needs_initial_follow =
@@ -11255,6 +11245,9 @@ impl NativeShell {
     }
 
     pub fn clear_selected_task(&mut self) {
+        if self.layout.task_workspace.take().is_some() {
+            self.mark_layout_dirty();
+        }
         self.interaction.sync_selected_task(None);
         self.sync_cockpit_follow();
     }
@@ -11333,6 +11326,24 @@ impl NativeShell {
     }
 
     pub fn select_projected_task(&mut self, task_id: TaskId) -> NavigationHandlerOutcome {
+        let gesture = if self
+            .layout
+            .task_workspace
+            .as_ref()
+            .is_some_and(|workspace| {
+                workspace.pane_count() > 1 && !workspace.contains_task(task_id)
+            }) {
+            WorkspaceSelectionGesture::Toggle
+        } else {
+            WorkspaceSelectionGesture::Plain
+        };
+        if let Ok(Some(outcome)) = self.apply_workspace_selection(task_id, gesture) {
+            return outcome;
+        }
+
+        // Projected tasks are already validated by TaskList. Preserve the
+        // established single-task navigation contract if local layout repair
+        // ever rejects a persisted tree mutation.
         if let Some(project_id) = self
             .client_model
             .as_ref()
@@ -11346,6 +11357,68 @@ impl NativeShell {
             .navigation_mouse_down(task_id, &self.task_list);
         self.sync_cockpit_follow();
         outcome
+    }
+
+    pub fn apply_workspace_selection(
+        &mut self,
+        task_id: TaskId,
+        gesture: WorkspaceSelectionGesture,
+    ) -> Result<Option<NavigationHandlerOutcome>, WorkspaceError> {
+        if !self.task_list.task_ids().contains(&task_id) {
+            return Err(WorkspaceError::MissingPane);
+        }
+        let before = self.layout.task_workspace.clone();
+        apply_task_workspace_selection(&mut self.layout.task_workspace, task_id, gesture)?;
+        let focused_task = self
+            .layout
+            .task_workspace
+            .as_ref()
+            .and_then(|workspace| workspace.focused_task());
+        if before != self.layout.task_workspace {
+            self.mark_layout_dirty();
+        }
+        for open_task in self
+            .layout
+            .task_workspace
+            .as_ref()
+            .map(|workspace| workspace.task_ids())
+            .unwrap_or_default()
+        {
+            self.task_surfaces.ensure_task(open_task);
+        }
+
+        let outcome = focused_task.map(|focused_task| {
+            if let Some(project_id) = self
+                .client_model
+                .as_ref()
+                .and_then(|model| model.task(focused_task))
+                .map(|snapshot| snapshot.task.project_id)
+            {
+                self.selected_project_id = Some(project_id);
+            }
+            self.interaction
+                .navigation_mouse_down(focused_task, &self.task_list)
+        });
+        if focused_task.is_none() {
+            self.interaction.sync_selected_task(None);
+        }
+        self.sync_cockpit_follow();
+        Ok(outcome)
+    }
+
+    pub fn workspace_task_ids(&self) -> Vec<TaskId> {
+        self.layout
+            .task_workspace
+            .as_ref()
+            .map(|workspace| workspace.task_ids())
+            .unwrap_or_default()
+    }
+
+    pub fn focused_workspace_task(&self) -> Option<TaskId> {
+        self.layout
+            .task_workspace
+            .as_ref()
+            .and_then(|workspace| workspace.focused_task())
     }
 
     fn sync_header_projection(&mut self) {
@@ -11457,6 +11530,19 @@ impl NativeShell {
                 self.splash_fetch_in_flight = false;
                 self.splash_fetch_attempted = false;
             }
+        }
+        let workspace_focus_changed = selected_task.is_some_and(|task_id| {
+            self.layout
+                .task_workspace
+                .as_mut()
+                .is_some_and(|workspace| {
+                    workspace.focused_task() != Some(task_id)
+                        && workspace.contains_task(task_id)
+                        && workspace.focus_task(task_id).is_ok()
+                })
+        });
+        if workspace_focus_changed {
+            self.mark_layout_dirty();
         }
         if self.layout.selected_task != selected_task {
             self.layout.selected_task = selected_task;
@@ -15360,7 +15446,7 @@ impl NativeShell {
     }
 
     fn reopen_task(&mut self, task_id: TaskId) {
-        self.interaction.sync_selected_task(Some(task_id));
+        let _ = self.select_projected_task(task_id);
         let _ = self.dispatch_action(ActionRequest::TaskReopen { task_id });
     }
 
@@ -20697,9 +20783,11 @@ impl NativeShell {
         self.pane_drag = None;
         let window = self.layout.window;
         let selected_task = self.layout.selected_task;
+        let task_workspace = self.layout.task_workspace.clone();
         self.layout = WorkspaceLayout {
             window,
             selected_task,
+            task_workspace,
             ..WorkspaceLayout::default()
         };
         self.mark_layout_dirty();
@@ -20771,22 +20859,18 @@ impl NativeShell {
     }
 
     fn apply_cached_conversation_for_task(&mut self, task_id: TaskId) {
-        let Some(cache) = self.conversation_cache.get(&task_id) else {
+        let Some(page) = self.task_surfaces.conversation_page(task_id) else {
             return;
         };
-        if cache.facts.is_empty() {
+        if page.facts.is_empty() {
             return;
         }
-        let page = cache.as_page();
         self.cockpit
             .apply_cockpit_result(&crate::domain::TaskCockpitResult::Conversation(page));
     }
 
     fn conversation_after_sequence_for(&self, task_id: TaskId) -> u64 {
-        self.conversation_cache
-            .get(&task_id)
-            .map(TaskConversationCache::request_after_sequence)
-            .unwrap_or(0)
+        self.task_surfaces.conversation_after_sequence(task_id)
     }
 
     fn project_label_for_id(&self, project_id: ProjectId) -> String {
@@ -21600,16 +21684,25 @@ impl NativeShell {
                                 let _ = shell_for_mouse.update(app, |shell, cx| {
                                     cx.stop_propagation();
                                     if event.button == MouseButton::Left {
-                                        shell.selected_project_id = Some(project_id);
                                         shell.focus_handle.focus(window);
-                                        let _ = shell.interaction.navigation_mouse_down(
-                                            task_id,
-                                            &shell.task_list,
-                                        );
-                                        if settled || archived {
-                                            shell.reopen_task(task_id);
+                                        let gesture = if event.modifiers.shift {
+                                            WorkspaceSelectionGesture::Toggle
                                         } else {
-                                            shell.sync_cockpit_follow();
+                                            WorkspaceSelectionGesture::Plain
+                                        };
+                                        let was_open = shell
+                                            .layout
+                                            .task_workspace
+                                            .as_ref()
+                                            .is_some_and(|workspace| {
+                                                workspace.contains_task(task_id)
+                                            });
+                                        let _ = shell.apply_workspace_selection(task_id, gesture);
+                                        if (settled || archived)
+                                            && !(gesture == WorkspaceSelectionGesture::Toggle
+                                                && was_open)
+                                        {
+                                            shell.reopen_task(task_id);
                                         }
                                         shell.refresh_accessibility_tree();
                                         cx.notify();
@@ -21640,15 +21733,12 @@ impl NativeShell {
                                 if matches!(event.keystroke.key.as_str(), "enter" | "space") {
                                     let _ = shell_for_key.update(app, |shell, cx| {
                                         cx.stop_propagation();
-                                        shell.selected_project_id = Some(project_id);
-                                        let _ = shell.interaction.navigation_mouse_down(
+                                        let _ = shell.apply_workspace_selection(
                                             task_id,
-                                            &shell.task_list,
+                                            WorkspaceSelectionGesture::Plain,
                                         );
                                         if settled || archived {
                                             shell.reopen_task(task_id);
-                                        } else {
-                                            shell.sync_cockpit_follow();
                                         }
                                         shell.refresh_accessibility_tree();
                                         cx.notify();
@@ -22544,12 +22634,8 @@ impl NativeShell {
                 reuse_handler = true;
                 continue;
             }
-            let is_conversation_query = is_conversation_query_command(&record.command);
             match self.enqueue_host_action(record) {
                 NativeHostActionResult::Queued => {
-                    if is_conversation_query {
-                        self.conversation_query_in_flight = true;
-                    }
                     reuse_handler = true;
                 }
                 NativeHostActionResult::Disconnected
@@ -22633,7 +22719,14 @@ impl NativeShell {
         }
         let result = self.try_enqueue_host_action(record.clone());
         match result {
-            NativeHostActionResult::Queued => {}
+            NativeHostActionResult::Queued => {
+                if let Some((_, task_id, TaskCockpitQuery::Conversation { .. })) =
+                    Self::task_cockpit_command_parts(&record.command)
+                {
+                    self.task_surfaces
+                        .begin_conversation(task_id, record.request_generation);
+                }
+            }
             result @ (NativeHostActionResult::Disconnected
             | NativeHostActionResult::QueueFull
             | NativeHostActionResult::Stale)
@@ -23554,14 +23647,14 @@ mod tests {
         acquire_reaper_permit, admit_idle_conversation_photo_fetch, admits_host_actions,
         agent_connection_snapshot, authorize_full_host_quit, automatic_task_title,
         composer_caret_visible, composer_draft_parts, composer_provider_identity,
-        conversation_result_matches_selected_task, decode_idle_conversation_photo_bytes,
-        detach_native_composer_images_for_key, discard_prepared_native_composer_images,
-        dispatch_pending_action, enqueue_pending_preference, ensure_isolated_host_config_base,
-        idle_conversation_photo_url, idle_photo_dimensions_allowed,
-        idle_photo_fetch_matches_current_canvas, isolated_dev_profile, native_command_id,
-        prepare_native_composer_image, provider_inbox_affordance, publish_projection,
-        reap_retained_children, reap_retained_workers, remove_staged_image, retain_child,
-        retain_worker, retained_children, retry_until_startup_deadline, runtime_connection_visible,
+        decode_idle_conversation_photo_bytes, detach_native_composer_images_for_key,
+        discard_prepared_native_composer_images, dispatch_pending_action,
+        enqueue_pending_preference, ensure_isolated_host_config_base, idle_conversation_photo_url,
+        idle_photo_dimensions_allowed, idle_photo_fetch_matches_current_canvas,
+        isolated_dev_profile, native_command_id, prepare_native_composer_image,
+        provider_inbox_affordance, publish_projection, reap_retained_children,
+        reap_retained_workers, remove_staged_image, retain_child, retain_worker, retained_children,
+        retry_until_startup_deadline, runtime_connection_visible,
         should_schedule_host_bootstrap_retry, take_retained_action_outcomes,
         update_state_from_stage, validate_connected_host_for_shell_launch,
         validate_host_projection_payloads, wait_for_cancellation,
@@ -23577,8 +23670,8 @@ mod tests {
         NativePlatformAccessibilityBridge, NativeShell, NativeShellMode, NativeShutdownDeadline,
         OverlayTextFieldPart, OwnedChild, OwnedWorker, PaletteItem, PendingHostBootstrap,
         ProjectActionMenuMode, ProjectId, ProjectInboxItem, ProviderInboxAffordance, ProviderKind,
-        ReaperKind, ShellStage, TaskComposer, TaskConversationCache, TaskId, UpdateState,
-        UpdaterStage, COMPOSER_CARET_BLINK_TICKS, CONVERSATION_COMPOSER_CONTEXT_INSET,
+        ReaperKind, ShellStage, TaskComposer, TaskId, UpdateState, UpdaterStage,
+        COMPOSER_CARET_BLINK_TICKS, CONVERSATION_COMPOSER_CONTEXT_INSET,
         CONVERSATION_COMPOSER_HEIGHT_RESERVE, CONVERSATION_COMPOSER_INNER_RADIUS,
         CONVERSATION_COMPOSER_INPUT_MIN_HEIGHT, CONVERSATION_COMPOSER_OUTER_RADIUS,
         CONVERSATION_COMPOSER_PLACEHOLDER, CONVERSATION_COMPOSER_SEND_DIAMETER,
@@ -24003,21 +24096,6 @@ mod tests {
     }
 
     #[test]
-    fn conversation_result_correlation_rejects_stale_task_pages() {
-        let selected = TaskId::new();
-        let other = TaskId::new();
-        assert!(conversation_result_matches_selected_task(
-            Some(selected),
-            selected
-        ));
-        assert!(!conversation_result_matches_selected_task(
-            Some(selected),
-            other
-        ));
-        assert!(!conversation_result_matches_selected_task(None, selected));
-    }
-
-    #[test]
     fn conversation_cache_merges_pages_and_advances_the_request_cursor() {
         use crate::domain::{
             EventId, PrivacyClass, SemanticJournalFact, SemanticJournalPage, SemanticJournalPayload,
@@ -24035,7 +24113,7 @@ mod tests {
             redacted: false,
             payload: SemanticJournalPayload::UserMessage { text: text.into() },
         };
-        let mut cache = TaskConversationCache::default();
+        let mut cache = crate::ui::task_workspace::TaskConversationCache::default();
         cache.merge_page(&SemanticJournalPage {
             after_sequence: 0,
             through_sequence: 2,
@@ -24055,6 +24133,7 @@ mod tests {
         });
         assert_eq!(
             cache
+                .as_page()
                 .facts
                 .iter()
                 .map(|fact| fact.sequence)
@@ -24062,7 +24141,7 @@ mod tests {
             vec![1, 2, 3, 4]
         );
         assert_eq!(cache.request_after_sequence(), 4);
-        assert_eq!(cache.next_sequence, None);
+        assert_eq!(cache.as_page().next_sequence, None);
 
         cache.merge_page(&SemanticJournalPage {
             after_sequence: 4,
