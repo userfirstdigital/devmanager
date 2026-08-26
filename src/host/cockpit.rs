@@ -380,23 +380,24 @@ fn serve_conversation(
         .map(|capture| capture.into_replay());
     drop(store);
 
-    let (through_sequence, high_water, events) = match replay {
-        Some(replay) => (
-            replay.through_sequence,
-            replay.through_sequence,
-            replay.events,
-        ),
-        None => (0, 0, Vec::new()),
+    let (high_water, events) = match replay {
+        Some(replay) => (replay.through_sequence, replay.events),
+        None => (0, Vec::new()),
     };
+    // Fixed high-water for this capture. `after_sequence` is a forward exclusive
+    // cursor: return the next retained prefix page in ascending sequence order.
     let replaced = events
         .iter()
         .filter_map(|event| event.replaces_sequence)
         .collect::<std::collections::BTreeSet<_>>();
-    let mut facts = events
+    let retained = events
         .iter()
+        .filter(|event| event.sequence > after_sequence)
         .filter(|event| !replaced.contains(&event.sequence))
         .filter(|event| !conversation_omits_ai_raw_output(event))
-        .rev()
+        .collect::<Vec<_>>();
+    let facts = retained
+        .iter()
         .take(MAX_CONVERSATION_PAGE_ITEMS)
         .map(|event| SemanticJournalFact {
             id: conversation_event_id(task_id, event.sequence),
@@ -411,10 +412,12 @@ fn serve_conversation(
             payload: semantic_payload(event),
         })
         .collect::<Vec<_>>();
-    facts.reverse();
     let mut page = SemanticJournalPage {
         after_sequence,
-        through_sequence,
+        through_sequence: facts
+            .last()
+            .map(|fact| fact.sequence)
+            .unwrap_or(after_sequence),
         high_water,
         encoded_bytes: 0,
         next_sequence: None,
@@ -426,8 +429,21 @@ fn serve_conversation(
             page.encoded_bytes = u32::try_from(encoded.len()).unwrap_or(u32::MAX);
             break;
         }
-        page.facts.remove(0);
+        // Trim from the end so the page remains a contiguous forward prefix.
+        page.facts.pop();
+        page.through_sequence = page
+            .facts
+            .last()
+            .map(|fact| fact.sequence)
+            .unwrap_or(after_sequence);
     }
+    let page_end = page
+        .facts
+        .last()
+        .map(|fact| fact.sequence)
+        .unwrap_or(after_sequence);
+    let more_retained = retained.iter().any(|event| event.sequence > page_end);
+    page.next_sequence = more_retained.then_some(page_end);
     QueryOutcome::Ok(QueryResult::TaskCockpit(TaskCockpitResult::Conversation(
         page,
     )))
@@ -2443,6 +2459,79 @@ mod tests {
                 if text == "Fix the failing test"
         ));
         assert!(page.encoded_bytes > 0);
+    }
+
+    #[test]
+    fn conversation_query_pages_the_complete_local_history_in_sequence_order() {
+        use crate::remote::presentation::{
+            SemanticEventDraft, SemanticEventKind, SemanticRetention, SemanticSource,
+            StableSessionKey,
+        };
+        use std::sync::Mutex;
+
+        let (_repository, bus, client_id, task_id, _roots) = create_bound_task();
+        let journal = Mutex::new(crate::remote::presentation::SemanticJournalStore::default());
+        let key = StableSessionKey::from_tab(task_id.to_string());
+        for index in 1..=130 {
+            journal.lock().expect("journal").record(SemanticEventDraft {
+                stable_session_key: key.clone(),
+                occurred_at_epoch_ms: index,
+                source: SemanticSource::Claude,
+                kind: SemanticEventKind::UserMessage {
+                    text: format!("message {index}"),
+                },
+                retention: SemanticRetention::Canonical,
+                deduplication_key: None,
+            });
+        }
+
+        let query_page = |after_sequence| {
+            let query = TaskCockpitQuery::Conversation { after_sequence };
+            let outcome = serve_task_cockpit(TaskCockpitDispatch {
+                capabilities: CapabilitySet::from_capabilities([
+                    Capability::TaskCockpit,
+                    Capability::SemanticConversation,
+                ]),
+                envelope_task_id: Some(task_id),
+                client_id,
+                connection_id: Uuid::now_v7(),
+                request_id: RequestId::new(),
+                query: &query,
+                bus: &bus,
+                service_runtime: None,
+                semantic_journal: Some(&journal),
+                ssh_endpoints: None,
+                ssh_runtime: None,
+                workspace_projects: None,
+                coordinator: None,
+                action_epoch: None,
+                runtime_generation: None,
+                config: None,
+            });
+            let QueryOutcome::Ok(QueryResult::TaskCockpit(TaskCockpitResult::Conversation(page))) =
+                outcome
+            else {
+                panic!("expected conversation page, got {outcome:?}");
+            };
+            page
+        };
+
+        let first = query_page(0);
+        assert_eq!(first.facts.first().map(|fact| fact.sequence), Some(1));
+        assert_eq!(first.facts.last().map(|fact| fact.sequence), Some(128));
+        assert_eq!(first.next_sequence, Some(128));
+        assert_eq!(first.high_water, 130);
+
+        let second = query_page(first.next_sequence.unwrap());
+        assert_eq!(
+            second
+                .facts
+                .iter()
+                .map(|fact| fact.sequence)
+                .collect::<Vec<_>>(),
+            vec![129, 130]
+        );
+        assert_eq!(second.next_sequence, None);
     }
 
     #[test]

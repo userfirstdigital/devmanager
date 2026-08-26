@@ -59,10 +59,26 @@ pub struct ThemeSelection {
 impl Default for ThemeSelection {
     fn default() -> Self {
         Self {
-            appearance: AppearancePreference::System,
-            light_theme_id: "t3-code".to_string(),
-            dark_theme_id: "t3-code".to_string(),
+            appearance: AppearancePreference::Dark,
+            light_theme_id: "devmanager-classic".to_string(),
+            dark_theme_id: "devmanager-classic".to_string(),
         }
+    }
+}
+
+/// Untouched pre-Classic default: System appearance with T3 Code on both halves.
+fn is_untouched_legacy_theme_selection(selection: &ThemeSelection) -> bool {
+    selection.appearance == AppearancePreference::System
+        && selection.light_theme_id == "t3-code"
+        && selection.dark_theme_id == "t3-code"
+}
+
+/// Migrate only the exact legacy default; never overwrite an explicit user choice.
+pub fn migrate_untouched_legacy_theme_selection(selection: ThemeSelection) -> ThemeSelection {
+    if is_untouched_legacy_theme_selection(&selection) {
+        ThemeSelection::default()
+    } else {
+        selection
     }
 }
 
@@ -1679,8 +1695,136 @@ const IRIS_DARK_ROLES: &[(&str, &str)] = &[
     ("terminalScrollbarHover", "oklch(0.676012 0.015271 305.433)"),
 ];
 
+/// v0.4.1 zinc/indigo dark palette, mapped onto the semantic role set.
+const DEVMANAGER_CLASSIC_DARK_ROLES: &[(&str, &str)] = &[
+    ("canvas", "#18181b"),
+    ("chrome", "#27272a"),
+    ("toolbar", "#27272a"),
+    ("toolbarForeground", "#e4e4e7"),
+    ("toolbarBorder", "#3f3f46"),
+    ("toolbarControl", "#3f3f46"),
+    ("toolbarControlForeground", "#e4e4e7"),
+    ("toolbarControlHover", "#323238"),
+    ("surface", "#18181b"),
+    ("surfaceRaised", "#27272a"),
+    ("surfaceOverlay", "#27272a"),
+    ("text", "#e4e4e7"),
+    ("textMuted", "#a1a1aa"),
+    ("border", "#3f3f46"),
+    ("input", "#3f3f46"),
+    ("focus", "#4f46e5"),
+    ("accent", "#4f46e5"),
+    ("accentForeground", "#f8fafc"),
+    ("secondary", "#27272a"),
+    ("secondaryForeground", "#e4e4e7"),
+    ("muted", "#27272a"),
+    ("mutedForeground", "#a1a1aa"),
+    ("placeholder", "#71717a"),
+    ("secondaryLabel", "#a1a1aa"),
+    ("iconMuted", "#a1a1aa"),
+    ("error", "#fb7185"),
+    ("errorForeground", "#fb7185"),
+    ("errorSurface", "#2a1517"),
+    ("warning", "#facc15"),
+    ("warningForeground", "#facc15"),
+    ("warningSurface", "#1a202a"),
+    ("update", "#4f46e5"),
+    ("updateForeground", "#f8fafc"),
+    ("updateSurface", "#2c266b"),
+    ("accentSurface", "#2c266b"),
+    ("accentSurfaceForeground", "#e4e4e7"),
+    ("messageSurface", "#22364d"),
+    ("messageForeground", "#f8fafc"),
+    ("messageAction", "#4f46e5"),
+    ("messageActionForeground", "#f8fafc"),
+    ("messageActionHover", "#4338ca"),
+    ("codeBackground", "#09090b"),
+    ("codeForeground", "#e4e4e7"),
+    ("sidebar", "#27272a"),
+    ("sidebarForeground", "#e4e4e7"),
+    ("sidebarMutedForeground", "#a1a1aa"),
+    ("sidebarControlSurface", "#3f3f46"),
+    ("sidebarRowHover", "#323238"),
+    ("sidebarRowActive", "#323238"),
+    ("sidebarRowSelected", "#22364d"),
+    ("sidebarBorder", "#3f3f46"),
+    ("terminalBackground", "#09090b"),
+    ("terminalForeground", "#e4e4e7"),
+    ("terminalCursor", "#4f46e5"),
+    ("terminalSelection", "#22364d"),
+    ("terminalScrollbar", "#3f3f46"),
+    ("terminalScrollbarHover", "#52525b"),
+];
+
+/// Light companion for Classic so the built-in library stays paired.
+const DEVMANAGER_CLASSIC_LIGHT_ROLES: &[(&str, &str)] = &[
+    ("canvas", "#fafafa"),
+    ("chrome", "#f4f4f5"),
+    ("toolbar", "#f4f4f5"),
+    ("toolbarForeground", "#18181b"),
+    ("toolbarBorder", "#e4e4e7"),
+    ("toolbarControl", "#e4e4e7"),
+    ("toolbarControlForeground", "#18181b"),
+    ("toolbarControlHover", "#d4d4d8"),
+    ("surface", "#ffffff"),
+    ("surfaceRaised", "#ffffff"),
+    ("surfaceOverlay", "#f4f4f5"),
+    ("text", "#18181b"),
+    ("textMuted", "#71717a"),
+    ("border", "#e4e4e7"),
+    ("input", "#e4e4e7"),
+    ("focus", "#4f46e5"),
+    ("accent", "#4f46e5"),
+    ("accentForeground", "#f8fafc"),
+    ("secondary", "#f4f4f5"),
+    ("secondaryForeground", "#18181b"),
+    ("muted", "#f4f4f5"),
+    ("mutedForeground", "#71717a"),
+    ("placeholder", "#a1a1aa"),
+    ("secondaryLabel", "#71717a"),
+    ("iconMuted", "#71717a"),
+    ("error", "#e11d48"),
+    ("errorForeground", "#e11d48"),
+    ("errorSurface", "#fff1f2"),
+    ("warning", "#ca8a04"),
+    ("warningForeground", "#a16207"),
+    ("warningSurface", "#fefce8"),
+    ("update", "#4f46e5"),
+    ("updateForeground", "#3730a3"),
+    ("updateSurface", "#e0e7ff"),
+    ("accentSurface", "#e0e7ff"),
+    ("accentSurfaceForeground", "#18181b"),
+    ("messageSurface", "#e0e7ff"),
+    ("messageForeground", "#18181b"),
+    ("messageAction", "#4f46e5"),
+    ("messageActionForeground", "#f8fafc"),
+    ("messageActionHover", "#4338ca"),
+    ("codeBackground", "#f4f4f5"),
+    ("codeForeground", "#18181b"),
+    ("sidebar", "#f4f4f5"),
+    ("sidebarForeground", "#18181b"),
+    ("sidebarMutedForeground", "#71717a"),
+    ("sidebarControlSurface", "#e4e4e7"),
+    ("sidebarRowHover", "#e4e4e7"),
+    ("sidebarRowActive", "#e4e4e7"),
+    ("sidebarRowSelected", "#c7d2fe"),
+    ("sidebarBorder", "#e4e4e7"),
+    ("terminalBackground", "#fafafa"),
+    ("terminalForeground", "#18181b"),
+    ("terminalCursor", "#4f46e5"),
+    ("terminalSelection", "#c7d2fe"),
+    ("terminalScrollbar", "#d4d4d8"),
+    ("terminalScrollbarHover", "#a1a1aa"),
+];
+
 fn built_in_themes() -> Vec<ThemeDefinition> {
     vec![
+        ThemeDefinition::paired_semantic(
+            "devmanager-classic",
+            "DevManager Classic",
+            DEVMANAGER_CLASSIC_LIGHT_ROLES,
+            DEVMANAGER_CLASSIC_DARK_ROLES,
+        ),
         ThemeDefinition::paired_managed(
             "t3-code", "T3 Code", "#fbfafc", "#d60057", "#18151d", "#e0005b",
         ),
@@ -1700,7 +1844,7 @@ fn built_in_themes() -> Vec<ThemeDefinition> {
 fn is_built_in_theme_id(id: &str) -> bool {
     matches!(
         id,
-        "t3-code" | "t3-chat" | "grove" | "ocean" | "ember" | "iris"
+        "devmanager-classic" | "t3-code" | "t3-chat" | "grove" | "ocean" | "ember" | "iris"
     )
 }
 
@@ -2002,11 +2146,9 @@ impl ThemeStore {
             })
             .collect::<Result<Vec<_>, _>>()?;
         let library = ThemeLibrary::with_custom(custom).map_err(ThemeStoreError::Library)?;
-        validate_selection(&wire.selection, &library)?;
-        Ok(StoredThemeState {
-            library,
-            selection: wire.selection,
-        })
+        let selection = migrate_untouched_legacy_theme_selection(wire.selection);
+        validate_selection(&selection, &library)?;
+        Ok(StoredThemeState { library, selection })
     }
 
     pub fn save(
@@ -2163,10 +2305,16 @@ impl ThemeController {
             .or_else(|| {
                 self.state
                     .library
+                    .get("devmanager-classic")
+                    .and_then(|theme| theme.palette(resolved.appearance))
+            })
+            .or_else(|| {
+                self.state
+                    .library
                     .get("t3-code")
                     .and_then(|theme| theme.palette(resolved.appearance))
             })
-            .expect("built-in T3 Code theme provides both appearances")
+            .expect("built-in Classic or T3 Code theme provides both appearances")
     }
 
     pub fn set_appearance_preference(
@@ -2671,12 +2819,73 @@ mod tests {
 
         assert_eq!(
             labels,
-            BTreeSet::from(["Ember", "Grove", "Iris", "Ocean", "T3 Chat", "T3 Code"])
+            BTreeSet::from([
+                "DevManager Classic",
+                "Ember",
+                "Grove",
+                "Iris",
+                "Ocean",
+                "T3 Chat",
+                "T3 Code",
+            ])
         );
         assert!(library.themes().iter().all(|theme| {
             theme.palette(ThemeAppearance::Light).is_some()
                 && theme.palette(ThemeAppearance::Dark).is_some()
         }));
+        let classic = library
+            .get("devmanager-classic")
+            .expect("legacy-readable default theme");
+        let dark = classic.palette(ThemeAppearance::Dark).unwrap();
+        assert_eq!(dark.color(ThemeColorRole::Canvas).to_hex(), "#18181b");
+        assert_eq!(dark.color(ThemeColorRole::Sidebar).to_hex(), "#27272a");
+        assert_eq!(dark.color(ThemeColorRole::Text).to_hex(), "#e4e4e7");
+        assert_eq!(
+            dark.color(ThemeColorRole::TerminalBackground).to_hex(),
+            "#09090b"
+        );
+        assert_eq!(
+            ThemeSelection::default().appearance,
+            AppearancePreference::Dark
+        );
+        assert_eq!(
+            ThemeSelection::default().dark_theme_id,
+            "devmanager-classic"
+        );
+    }
+
+    #[test]
+    fn untouched_legacy_system_t3_selection_migrates_to_classic_defaults() {
+        let legacy = ThemeSelection {
+            appearance: AppearancePreference::System,
+            light_theme_id: "t3-code".to_string(),
+            dark_theme_id: "t3-code".to_string(),
+        };
+        assert_eq!(
+            migrate_untouched_legacy_theme_selection(legacy),
+            ThemeSelection::default()
+        );
+
+        let explicit = ThemeSelection {
+            appearance: AppearancePreference::System,
+            light_theme_id: "ocean".to_string(),
+            dark_theme_id: "t3-code".to_string(),
+        };
+        assert_eq!(
+            migrate_untouched_legacy_theme_selection(explicit.clone()),
+            explicit
+        );
+
+        let root = tempfile::tempdir().unwrap();
+        let store = ThemeStore::at(root.path());
+        let legacy = ThemeSelection {
+            appearance: AppearancePreference::System,
+            light_theme_id: "t3-code".to_string(),
+            dark_theme_id: "t3-code".to_string(),
+        };
+        store.save(&ThemeLibrary::built_in(), &legacy).unwrap();
+        let recovered = store.load().unwrap();
+        assert_eq!(recovered.selection, ThemeSelection::default());
     }
 
     #[test]
@@ -2895,7 +3104,7 @@ mod tests {
             .select_theme("iris", ThemeAppearance::Dark)
             .unwrap();
 
-        assert_eq!(controller.selection().light_theme_id, "t3-code");
+        assert_eq!(controller.selection().light_theme_id, "devmanager-classic");
         assert_eq!(controller.selection().dark_theme_id, "iris");
         let recovered = ThemeController::load_at(root.path()).unwrap();
         assert_eq!(recovered.selection(), controller.selection());
@@ -2973,7 +3182,7 @@ mod tests {
 
         controller.remove_custom_theme("aurora").unwrap();
 
-        assert_eq!(controller.selection().light_theme_id, "t3-code");
+        assert_eq!(controller.selection().light_theme_id, "devmanager-classic");
         assert_eq!(controller.selection().dark_theme_id, "t3-code");
         assert!(controller.library().get("aurora").is_none());
     }

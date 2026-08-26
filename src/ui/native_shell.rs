@@ -61,7 +61,7 @@ use crate::domain::command::{
 use crate::domain::host::{HostQuitInspection, HostQuitWorktreeInspection};
 use crate::domain::id::SubscriptionId;
 use crate::domain::id::{AgentSessionId, CommandId, ProjectId, RequestId, TaskId};
-use crate::domain::snapshot::SnapshotSection;
+use crate::domain::snapshot::{SemanticJournalFact, SemanticJournalPage, SnapshotSection};
 use crate::domain::task::VisibleTaskStatus;
 use crate::domain::ClientId;
 use crate::host::IpcError;
@@ -234,6 +234,9 @@ const T3_SIDEBAR_NAV_TOP_INSET: f32 = 12.0;
 const CONVERSATION_COMPOSER_PLACEHOLDER: &str =
     crate::ui::native_composer::NATIVE_COMPOSER_PLACEHOLDER;
 const COMPOSER_DRAFT_PERSIST_INTERVAL: Duration = Duration::from_millis(250);
+const LAYOUT_PERSIST_INTERVAL: Duration = Duration::from_millis(250);
+/// ~512ms blink at the 16ms controller pump.
+const COMPOSER_CARET_BLINK_TICKS: usize = 32;
 const NATIVE_SHUTDOWN_BUDGET: Duration = Duration::from_secs(2);
 const NATIVE_STARTUP_BUDGET: Duration = Duration::from_secs(5);
 /// Isolated debug hosts cold-open sqlite and refresh parent identity before
@@ -257,6 +260,132 @@ fn should_schedule_host_bootstrap_retry(
         && !has_pending_bootstrap
         && connection_failed
         && controller_ticks % HOST_BOOTSTRAP_REATTACH_TICKS == 0
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct TaskConversationCache {
+    facts: Vec<SemanticJournalFact>,
+    high_water: u64,
+    through_sequence: u64,
+    next_sequence: Option<u64>,
+}
+
+impl TaskConversationCache {
+    fn as_page(&self) -> SemanticJournalPage {
+        SemanticJournalPage {
+            after_sequence: 0,
+            through_sequence: self.through_sequence,
+            high_water: self.high_water,
+            encoded_bytes: 0,
+            next_sequence: self.next_sequence,
+            facts: self.facts.clone(),
+        }
+    }
+
+    fn request_after_sequence(&self) -> u64 {
+        self.next_sequence
+            .unwrap_or_else(|| self.high_water.max(self.through_sequence))
+    }
+
+    fn merge_page(&mut self, page: &SemanticJournalPage) {
+        self.high_water = self.high_water.max(page.high_water);
+        self.through_sequence = self.through_sequence.max(page.through_sequence);
+        for fact in &page.facts {
+            if self
+                .facts
+                .iter()
+                .any(|existing| existing.sequence == fact.sequence)
+            {
+                continue;
+            }
+            self.facts.push(fact.clone());
+        }
+        self.facts.sort_by_key(|fact| fact.sequence);
+        self.next_sequence = page.next_sequence;
+        if self.next_sequence.is_none() {
+            self.through_sequence = self
+                .facts
+                .last()
+                .map(|fact| fact.sequence)
+                .unwrap_or(self.through_sequence)
+                .max(page.through_sequence);
+        }
+    }
+}
+
+fn conversation_result_matches_selected_task(
+    selected_task: Option<TaskId>,
+    command_task_id: TaskId,
+) -> bool {
+    selected_task == Some(command_task_id)
+}
+
+fn idle_photo_fetch_matches_current_canvas(
+    fetch_generation: u64,
+    current_generation: u64,
+    selected_task: Option<TaskId>,
+) -> bool {
+    fetch_generation == current_generation && selected_task.is_none()
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum ComposerDraftPart {
+    Text(String),
+    Placeholder,
+    Caret,
+}
+
+fn composer_caret_visible(focused: bool, controller_ticks: usize) -> bool {
+    focused && (controller_ticks / COMPOSER_CARET_BLINK_TICKS) % 2 == 0
+}
+
+fn composer_draft_parts(
+    draft: &str,
+    cursor: usize,
+    focused: bool,
+    caret_visible: bool,
+    _placeholder: &str,
+) -> Vec<ComposerDraftPart> {
+    let mut parts = Vec::new();
+    if draft.is_empty() {
+        if caret_visible {
+            parts.push(ComposerDraftPart::Caret);
+        }
+        parts.push(ComposerDraftPart::Placeholder);
+        let _ = focused;
+        return parts;
+    }
+    let cursor = cursor.min(draft.chars().count());
+    let mut chars = draft.chars();
+    let before: String = chars.by_ref().take(cursor).collect();
+    let after: String = chars.collect();
+    if !before.is_empty() {
+        parts.push(ComposerDraftPart::Text(before));
+    }
+    if caret_visible {
+        parts.push(ComposerDraftPart::Caret);
+    }
+    if !after.is_empty() {
+        parts.push(ComposerDraftPart::Text(after));
+    }
+    parts
+}
+
+fn provider_inbox_affordance(connected: bool, checking: bool) -> ProviderInboxAffordance {
+    if connected {
+        ProviderInboxAffordance::ConnectedAdd
+    } else if checking {
+        ProviderInboxAffordance::Checking
+    } else {
+        ProviderInboxAffordance::DisconnectedAdd
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ProviderInboxAffordance {
+    ConnectedAdd,
+    Checking,
+    DisconnectedAdd,
 }
 
 fn action_lane_total(
@@ -7504,6 +7633,7 @@ pub struct NativeShell {
     pending_host_actions: VecDeque<NativeActionRecord>,
     retained_action_overflow: Option<NativeActionRecord>,
     conversation_query_in_flight: bool,
+    conversation_cache: BTreeMap<TaskId, TaskConversationCache>,
     last_action_failure: Option<NativeHostActionFailure>,
     last_action_receipt: Option<crate::domain::command::CommandReceipt>,
     last_query_detail: Option<String>,
@@ -7546,6 +7676,8 @@ pub struct NativeShell {
     splash_fetch_in_flight: bool,
     /// One network attempt per app session; failures must not refetch every paint.
     splash_fetch_attempted: bool,
+    /// Invalidates a background response whenever the idle canvas is left or re-entered.
+    splash_fetch_generation: u64,
     /// Test/observability counter for idle-photo fetch admission (not a second fetch path).
     idle_photo_fetch_spawns: usize,
     #[cfg(test)]
@@ -7563,6 +7695,8 @@ pub struct NativeShell {
     /// projected from the host, and never shared across profiles.
     layout: WorkspaceLayout,
     layout_store: WorkspaceLayoutStore,
+    layout_dirty: bool,
+    last_layout_persist: Option<Instant>,
     pane_drag: Option<PaneDrag>,
     last_window_persist: Option<Instant>,
     add_project: Option<AddProjectDraft>,
@@ -7640,6 +7774,7 @@ impl Drop for NativeShell {
     fn drop(&mut self) {
         self.cache_current_composer_draft();
         self.flush_composer_drafts_if_due(true);
+        self.flush_layout_if_due(true);
         if self.cockpit.browser_projection().is_some() {
             if let Ok(command) = self.cockpit.detach_browser_native() {
                 let _ = self.browser_host.apply_native_shell_command(&command);
@@ -7966,6 +8101,7 @@ impl NativeShell {
             pending_host_actions: VecDeque::new(),
             retained_action_overflow: None,
             conversation_query_in_flight: false,
+            conversation_cache: BTreeMap::new(),
             last_action_failure: None,
             last_action_receipt: None,
             last_query_detail: None,
@@ -7991,6 +8127,7 @@ impl NativeShell {
             splash_image: None,
             splash_fetch_in_flight: false,
             splash_fetch_attempted: false,
+            splash_fetch_generation: 0,
             idle_photo_fetch_spawns: 0,
             #[cfg(test)]
             interactive_conversation_builds: 0,
@@ -8004,6 +8141,8 @@ impl NativeShell {
             platform_accessibility,
             layout,
             layout_store,
+            layout_dirty: false,
+            last_layout_persist: None,
             pane_drag: None,
             last_window_persist: None,
             add_project: None,
@@ -8934,7 +9073,37 @@ impl NativeShell {
                 }
                 // Projection always sees the result first; commit correlation uses the
                 // originating action command afterward (no query loops from paint).
-                self.cockpit.apply_cockpit_result(&result);
+                if let crate::domain::TaskCockpitResult::Conversation(page) = &result {
+                    let command_task_id = Self::task_cockpit_command_parts(&action.command)
+                        .map(|(_, task_id, _)| task_id);
+                    if let Some(task_id) = command_task_id {
+                        if conversation_result_matches_selected_task(
+                            self.interaction.selected_task(),
+                            task_id,
+                        ) {
+                            let (merged, needs_next_page, after_sequence) = {
+                                let cache = self.conversation_cache.entry(task_id).or_default();
+                                cache.merge_page(page);
+                                (
+                                    cache.as_page(),
+                                    cache.next_sequence.is_some(),
+                                    cache.request_after_sequence(),
+                                )
+                            };
+                            self.cockpit.apply_cockpit_result(
+                                &crate::domain::TaskCockpitResult::Conversation(merged),
+                            );
+                            if needs_next_page && !self.conversation_query_in_flight {
+                                self.dispatch_related_actions([ActionRequest::TaskCockpit {
+                                    task_id,
+                                    query: TaskCockpitQuery::Conversation { after_sequence },
+                                }]);
+                            }
+                        }
+                    }
+                } else {
+                    self.cockpit.apply_cockpit_result(&result);
+                }
                 if let crate::domain::TaskCockpitResult::BrowserProcessSession(projection) = &result
                 {
                     self.apply_browser_process_session(projection);
@@ -9153,11 +9322,12 @@ impl NativeShell {
         if let Some(action_id) = loading_action {
             self.cockpit.begin_cockpit_query(task_id, action_id);
         }
+        let after_sequence = self.conversation_after_sequence_for(task_id);
         requests.insert(
             0,
             ActionRequest::TaskCockpit {
                 task_id,
-                query: TaskCockpitQuery::Conversation { after_sequence: 0 },
+                query: TaskCockpitQuery::Conversation { after_sequence },
             },
         );
         self.dispatch_related_actions(requests);
@@ -9843,7 +10013,9 @@ impl NativeShell {
     fn controller_tick(&mut self, max: usize) -> bool {
         self.controller_ticks = self.controller_ticks.saturating_add(1);
         self.flush_composer_drafts_if_due(false);
-        let mut repaint = false;
+        self.flush_layout_if_due(false);
+        let mut repaint = self.composer_accessibility_focused
+            && self.controller_ticks % COMPOSER_CARET_BLINK_TICKS == 0;
         if let Some(preferences) = self.pending_preferences.pop_back() {
             self.pending_preferences.clear();
             self.preferences = preferences;
@@ -9976,9 +10148,10 @@ impl NativeShell {
             && self.action_lane_len() < MAX_ACTION_LANE_RECORDS / 2
         {
             if let Some(task_id) = self.interaction.selected_task() {
+                let after_sequence = self.conversation_after_sequence_for(task_id);
                 let request = ActionRequest::TaskCockpit {
                     task_id,
-                    query: TaskCockpitQuery::Conversation { after_sequence: 0 },
+                    query: TaskCockpitQuery::Conversation { after_sequence },
                 };
                 if let Some(record) = self.interaction.action_on_current_handler(request) {
                     self.conversation_query_in_flight = matches!(
@@ -10722,10 +10895,11 @@ impl NativeShell {
         self.splash_fetch_attempted = true;
         self.splash_fetch_in_flight = true;
         self.idle_photo_fetch_spawns = self.idle_photo_fetch_spawns.saturating_add(1);
-        Self::spawn_idle_conversation_photo_fetch(cx);
+        self.splash_fetch_generation = self.splash_fetch_generation.saturating_add(1);
+        Self::spawn_idle_conversation_photo_fetch(self.splash_fetch_generation, cx);
     }
 
-    fn spawn_idle_conversation_photo_fetch(cx: &mut Context<Self>) {
+    fn spawn_idle_conversation_photo_fetch(fetch_generation: u64, cx: &mut Context<Self>) {
         let executor = cx.background_executor().clone();
         cx.spawn(
             move |this: gpui::WeakEntity<Self>, cx: &mut gpui::AsyncApp| {
@@ -10735,6 +10909,13 @@ impl NativeShell {
                         .spawn(async move { fetch_idle_conversation_photo() })
                         .await;
                     let _ = this.update(&mut async_cx, |shell, cx| {
+                        if !idle_photo_fetch_matches_current_canvas(
+                            fetch_generation,
+                            shell.splash_fetch_generation,
+                            shell.interaction.selected_task(),
+                        ) {
+                            return;
+                        }
                         shell.splash_fetch_in_flight = false;
                         if let Some(image) = image {
                             shell.splash_image = Some(image);
@@ -10852,9 +11033,26 @@ impl NativeShell {
     fn sync_cockpit_follow_with_refresh(&mut self, refresh_host_surfaces: bool) {
         self.cache_current_composer_draft();
         let selected_task = self.interaction.selected_task();
+        let previous_selected = self.layout.selected_task;
+        if previous_selected != selected_task {
+            if previous_selected.is_none() && selected_task.is_some() {
+                // Leaving idle retires the photo so the next idle visit fetches fresh.
+                self.splash_fetch_generation = self.splash_fetch_generation.saturating_add(1);
+                self.splash_image = None;
+                self.splash_fetch_in_flight = false;
+                self.splash_fetch_attempted = true;
+            }
+            if previous_selected.is_some() && selected_task.is_none() {
+                // Returning to idle re-admits exactly one fresh cache-busted request.
+                self.splash_fetch_generation = self.splash_fetch_generation.saturating_add(1);
+                self.splash_image = None;
+                self.splash_fetch_in_flight = false;
+                self.splash_fetch_attempted = false;
+            }
+        }
         if self.layout.selected_task != selected_task {
             self.layout.selected_task = selected_task;
-            self.persist_layout();
+            self.mark_layout_dirty();
         }
         let Some(task_id) = selected_task else {
             self.selected_repository = None;
@@ -10870,6 +11068,7 @@ impl NativeShell {
             self.selected_repository = None;
         }
         self.cockpit.follow_task(task_id);
+        self.apply_cached_conversation_for_task(task_id);
         let composer_model = if let Some(model) = self.client_model.clone() {
             self.cockpit
                 .follow_projection(model.as_ref(), self.granted_capabilities());
@@ -11210,7 +11409,7 @@ impl NativeShell {
             self.layout
                 .task_center_terminal
                 .insert(task_id.to_string(), visible);
-            self.persist_layout();
+            self.mark_layout_dirty();
         }
         if let Err(error) = result {
             self.composer_error = Some(format!("{error:?}"));
@@ -12243,16 +12442,28 @@ impl NativeShell {
             .as_ref()
             .map(|composer| composer.draft_text().to_string())
             .unwrap_or_default();
+        let draft_cursor = self
+            .composer
+            .as_ref()
+            .map(|composer| composer.draft_cursor())
+            .unwrap_or(0);
         let draft_is_empty = draft.is_empty();
         let draft_has_text = !draft.trim().is_empty();
         let provider_kind = self.active_provider_kind();
-        let draft_label = if draft_is_empty && provider_kind.is_none() {
-            "Enable a provider in Settings".to_string()
-        } else if draft_is_empty {
-            CONVERSATION_COMPOSER_PLACEHOLDER.to_string()
+        let placeholder = if draft_is_empty && provider_kind.is_none() {
+            "Enable a provider in Settings"
         } else {
-            draft
+            CONVERSATION_COMPOSER_PLACEHOLDER
         };
+        let caret_visible =
+            composer_caret_visible(self.composer_accessibility_focused, self.controller_ticks);
+        let draft_parts = composer_draft_parts(
+            &draft,
+            draft_cursor,
+            self.composer_accessibility_focused,
+            caret_visible,
+            placeholder,
+        );
         let provider_label = match provider_kind {
             Some(ProviderKind::ClaudeCode) => "Claude Code",
             Some(ProviderKind::Codex) => "Codex",
@@ -12568,7 +12779,62 @@ impl NativeShell {
                                             } else {
                                                 tokens.text.primary.to_gpui()
                                             })
-                                            .child(draft_label)
+                                            .child(
+                                                div()
+                                                    .id("native-task-composer-draft")
+                                                    .w_full()
+                                                    .flex()
+                                                    .flex_wrap()
+                                                    .items_start()
+                                                    .children(draft_parts.into_iter().enumerate().map(
+                                                        |(index, part)| {
+                                                            match part {
+                                                                ComposerDraftPart::Placeholder => {
+                                                                    div()
+                                                                        .id((
+                                                                            "native-composer-placeholder",
+                                                                            index,
+                                                                        ))
+                                                                        .text_color(
+                                                                            tokens.text.muted.to_gpui(),
+                                                                        )
+                                                                        .child(placeholder)
+                                                                        .into_any_element()
+                                                                }
+                                                                ComposerDraftPart::Caret => div()
+                                                                    .id((
+                                                                        "native-composer-caret",
+                                                                        index,
+                                                                    ))
+                                                                    .flex_none()
+                                                                    .w(px(1.0))
+                                                                    .h(px(18.0))
+                                                                    .bg(tokens
+                                                                        .actions
+                                                                        .primary
+                                                                        .default
+                                                                        .background
+                                                                        .to_gpui())
+                                                                    .into_any_element(),
+                                                                ComposerDraftPart::Text(value) => {
+                                                                    div()
+                                                                        .id((
+                                                                            "native-composer-text",
+                                                                            index,
+                                                                        ))
+                                                                        .text_color(
+                                                                            tokens
+                                                                                .text
+                                                                                .primary
+                                                                                .to_gpui(),
+                                                                        )
+                                                                        .child(value)
+                                                                        .into_any_element()
+                                                                }
+                                                            }
+                                                        },
+                                                    )),
+                                            )
                                             .child(composer_input_registration),
                                     )
                                     .children(self.composer_error.as_ref().map(|error| {
@@ -12976,7 +13242,7 @@ impl NativeShell {
                 if self.layout.dock_collapsed {
                     self.layout.dock_collapsed = false;
                 }
-                self.persist_layout();
+                self.mark_layout_dirty();
                 let _ = self
                     .cockpit
                     .handle_tool_action(Self::cockpit_dock_tool(tool), RequestId::new());
@@ -13985,7 +14251,7 @@ impl NativeShell {
             ProjectScope::All => None,
             ProjectScope::Project(project_id) => Some(project_id.to_string()),
         };
-        self.persist_layout();
+        self.mark_layout_dirty();
     }
 
     fn task_search_candidates(&self) -> Vec<TaskSearchCandidate> {
@@ -13996,7 +14262,7 @@ impl NativeShell {
             .map(|row| TaskSearchCandidate {
                 task_id: row.task_id,
                 title: row.title.clone(),
-                project_label: row.display.project.clone(),
+                project_label: self.project_label_for_id(row.project_id),
             })
             .collect()
     }
@@ -14054,7 +14320,7 @@ impl NativeShell {
             let expanded = !self.collapsed_projects.contains(&project_id);
             items.push(ProjectInboxItem::Project {
                 project_id,
-                label: "Other project".to_string(),
+                label: "Unknown project".to_string(),
                 expanded,
                 task_count: tasks.len(),
             });
@@ -18140,7 +18406,7 @@ impl NativeShell {
         };
         self.layout.active_dock_tab = Some("Files".to_string());
         self.layout.dock_collapsed = false;
-        self.persist_layout();
+        self.mark_layout_dirty();
         self.dispatch_keyboard(KeyboardShortcut::alt(
             crate::ui::actions::ShortcutKey::Digit(2),
         ));
@@ -19266,20 +19532,20 @@ impl NativeShell {
         if self.pane_drag.take().is_none() {
             return false;
         }
-        self.persist_layout();
+        self.mark_layout_dirty();
         true
     }
 
     fn reset_pane(&mut self, edge: PaneEdge) {
         self.pane_drag = None;
         self.layout.reset(edge);
-        self.persist_layout();
+        self.mark_layout_dirty();
     }
 
     fn toggle_pane(&mut self, edge: PaneEdge) {
         self.pane_drag = None;
         self.layout.toggle(edge);
-        self.persist_layout();
+        self.mark_layout_dirty();
     }
 
     /// Restore the shipped geometry without discarding where the window is.
@@ -19293,7 +19559,7 @@ impl NativeShell {
             selected_task,
             ..WorkspaceLayout::default()
         };
-        self.persist_layout();
+        self.mark_layout_dirty();
     }
 
     /// Track where the user left the window. Bounds are observed continuously
@@ -19325,20 +19591,71 @@ impl NativeShell {
             .unwrap_or(true);
         if due {
             self.last_window_persist = Some(now);
-            self.persist_layout();
+            self.mark_layout_dirty();
         }
     }
 
     /// Persist the chosen geometry. A view preference is never worth failing a
     /// session over, so a store that refuses the write leaves the in-memory
     /// layout intact and the window usable.
-    fn persist_layout(&self) {
+    fn mark_layout_dirty(&mut self) {
+        self.layout_dirty = true;
+    }
+
+    fn flush_layout_if_due(&mut self, force: bool) {
+        if !self.layout_dirty {
+            return;
+        }
+        let now = Instant::now();
+        let due = force
+            || self
+                .last_layout_persist
+                .map(|last| now.duration_since(last) >= LAYOUT_PERSIST_INTERVAL)
+                .unwrap_or(true);
+        if !due {
+            return;
+        }
+        self.last_layout_persist = Some(now);
+        self.layout_dirty = false;
         if let Err(error) = self.layout_store.save(self.layout.clone()) {
+            // Keep the dirty bit so a later tick can retry.
+            self.layout_dirty = true;
             eprintln!(
                 "devmanager: workspace layout not persisted ({}): {error}",
                 self.layout_store.path().display()
             );
         }
+    }
+
+    fn apply_cached_conversation_for_task(&mut self, task_id: TaskId) {
+        let Some(cache) = self.conversation_cache.get(&task_id) else {
+            return;
+        };
+        if cache.facts.is_empty() {
+            return;
+        }
+        let page = cache.as_page();
+        self.cockpit
+            .apply_cockpit_result(&crate::domain::TaskCockpitResult::Conversation(page));
+    }
+
+    fn conversation_after_sequence_for(&self, task_id: TaskId) -> u64 {
+        self.conversation_cache
+            .get(&task_id)
+            .map(TaskConversationCache::request_after_sequence)
+            .unwrap_or(0)
+    }
+
+    fn project_label_for_id(&self, project_id: ProjectId) -> String {
+        self.config_sidebar
+            .projects
+            .iter()
+            .find_map(|project| {
+                (ProjectId::parse(&project.workspace_id).ok() == Some(project_id))
+                    .then(|| project.label.clone())
+            })
+            .filter(|label| !label.trim().is_empty())
+            .unwrap_or_else(|| "Unknown project".to_string())
     }
 
     fn main_column(
@@ -19756,9 +20073,8 @@ impl NativeShell {
                 .map(|task_id| {
                     let row = self.inbox.row(*task_id);
                     let project = row
-                        .map(|row| row.display.project.clone())
-                        .filter(|label| !label.trim().is_empty())
-                        .unwrap_or_else(|| "Project".to_string());
+                        .map(|row| self.project_label_for_id(row.project_id))
+                        .unwrap_or_else(|| "Unknown project".to_string());
                     let branch = row
                         .map(|row| row.display.worktree.clone())
                         .filter(|label| !label.trim().is_empty())
@@ -19795,12 +20111,13 @@ impl NativeShell {
         let row_height = Self::inbox_row_height(tokens);
         let inbox_is_empty = inbox_items.is_empty();
         let agents_connected = snapshot_connected(self.agent_connection.as_ref());
-        let agent_loading_glyph = match self.controller_ticks % 4 {
-            0 => "◐",
-            1 => "◓",
-            2 => "◑",
-            _ => "◒",
-        };
+        let agents_checking = self.agent_connection.as_ref().is_some_and(|snapshot| {
+            snapshot
+                .agents
+                .iter()
+                .any(|row| row.presence == AgentPresence::Checking)
+        });
+        let provider_affordance = provider_inbox_affordance(agents_connected, agents_checking);
         let available_agents = self
             .agent_connection
             .as_ref()
@@ -19985,19 +20302,16 @@ impl NativeShell {
                                 };
                                 header.child(claude).child(codex)
                             } else {
-                                header
-                                    .child(
-                                        div()
-                                            .px(px(tokens.density.spacing.sm))
-                                            .text_color(tokens.text.muted.to_gpui())
-                                            .child(format!("{agent_loading_glyph} Claude")),
-                                    )
-                                    .child(
-                                        div()
-                                            .px(px(tokens.density.spacing.sm))
-                                            .text_color(tokens.text.muted.to_gpui())
-                                            .child(format!("{agent_loading_glyph} Codex")),
-                                    )
+                                let checking_label = match provider_affordance {
+                                    ProviderInboxAffordance::Checking => "Checking…",
+                                    _ => "Connect in Settings",
+                                };
+                                header.child(
+                                    div()
+                                        .px(px(tokens.density.spacing.sm))
+                                        .text_color(tokens.text.muted.to_gpui())
+                                        .child(checking_label),
+                                )
                             };
                             header.into_any_element()
                         }
@@ -20037,7 +20351,7 @@ impl NativeShell {
                             row_models.get(&task_id).cloned().unwrap_or_else(|| {
                                 (
                                     format!("Task {task_id}"),
-                                    "Project".to_string(),
+                                    "Unknown project".to_string(),
                                     "main".to_string(),
                                     "Unprojected".to_string(),
                                     tokens.status.inactive,
@@ -20468,8 +20782,8 @@ impl NativeShell {
             .child(self.context_dock_surface(tokens, Some(services_shell_entity)))
             .into_any_element();
 
-        let project_add_control = if agents_connected {
-            Button::new("native-projects-add")
+        let project_add_control = match provider_affordance {
+            ProviderInboxAffordance::ConnectedAdd => Button::new("native-projects-add")
                 .label("+")
                 .tooltip("Add project")
                 .ghost()
@@ -20478,16 +20792,21 @@ impl NativeShell {
                     shell.begin_choose_folder(cx);
                     cx.notify();
                 }))
-                .into_any_element()
-        } else {
-            div()
+                .into_any_element(),
+            ProviderInboxAffordance::Checking => div()
                 .flex()
                 .items_center()
                 .px(px(7.0))
                 .text_size(px(tokens.density.typography.caption))
                 .text_color(tokens.text.muted.to_gpui())
-                .child(agent_loading_glyph)
-                .into_any_element()
+                .child("Checking…")
+                .into_any_element(),
+            ProviderInboxAffordance::DisconnectedAdd => Button::new("native-projects-add-disabled")
+                .label("+")
+                .tooltip("Connect an agent in Settings, then Refresh")
+                .ghost()
+                .disabled(true)
+                .into_any_element(),
         };
         let navigation = div()
             .id("native-shell-sidebar-navigation")
@@ -20598,8 +20917,8 @@ impl NativeShell {
                     .flex()
                     .flex_col()
                     .flex_1()
-                    .min_h(px(row_height * DEFAULT_VISIBLE_ROWS as f32))
-                    .overflow_hidden()
+                    .min_h(px(0.0))
+                    .vertical_scrollbar(&self.task_scroll_handle)
                     .on_scroll_wheel(inbox_scroll)
                     .child(task_list_element)
                     .into_any_element()
@@ -21468,16 +21787,9 @@ fn fetch_idle_conversation_photo() -> Option<Arc<RenderImage>> {
     }
 }
 
-const IDLE_UNSPLASH_PHOTOS: [&str; 5] = [
-    "https://images.unsplash.com/photo-1497366754035-f200968a6e72?auto=format&fit=crop&w=1920&h=1080&q=85",
-    "https://images.unsplash.com/photo-1497366811353-6870744d04b2?auto=format&fit=crop&w=1920&h=1080&q=85",
-    "https://images.unsplash.com/photo-1497215728101-856f4ea42174?auto=format&fit=crop&w=1920&h=1080&q=85",
-    "https://images.unsplash.com/photo-1524758631624-e2822e304c36?auto=format&fit=crop&w=1920&h=1080&q=85",
-    "https://images.unsplash.com/photo-1497366216548-37526070297c?auto=format&fit=crop&w=1920&h=1080&q=85",
-];
-
-fn idle_conversation_photo_url(seed: u64) -> &'static str {
-    IDLE_UNSPLASH_PHOTOS[(seed as usize) % IDLE_UNSPLASH_PHOTOS.len()]
+fn idle_conversation_photo_url(seed: u64) -> String {
+    // Cache-bust each idle admission so returning to the canvas is a fresh image.
+    format!("https://picsum.photos/1920/1080?random={seed}")
 }
 
 fn prepare_native_composer_image(
@@ -21787,29 +22099,33 @@ fn enqueue_pending_preference(
 mod tests {
     use super::{
         acquire_reaper_permit, admit_idle_conversation_photo_fetch, admits_host_actions,
-        agent_connection_snapshot, authorize_full_host_quit, decode_idle_conversation_photo_bytes,
-        detach_native_composer_images_for_key, discard_prepared_native_composer_images,
-        dispatch_pending_action, enqueue_pending_preference, ensure_isolated_host_config_base,
-        idle_conversation_photo_url, idle_photo_dimensions_allowed, isolated_dev_profile,
-        native_command_id, prepare_native_composer_image, publish_projection,
-        reap_retained_children, reap_retained_workers, remove_staged_image, retain_child,
-        retain_worker, retained_children, retry_until_startup_deadline, runtime_connection_visible,
+        agent_connection_snapshot, authorize_full_host_quit, composer_caret_visible,
+        composer_draft_parts, conversation_result_matches_selected_task,
+        decode_idle_conversation_photo_bytes, detach_native_composer_images_for_key,
+        discard_prepared_native_composer_images, dispatch_pending_action,
+        enqueue_pending_preference, ensure_isolated_host_config_base, idle_conversation_photo_url,
+        idle_photo_dimensions_allowed, idle_photo_fetch_matches_current_canvas,
+        isolated_dev_profile, native_command_id, prepare_native_composer_image,
+        provider_inbox_affordance, publish_projection, reap_retained_children,
+        reap_retained_workers, remove_staged_image, retain_child, retain_worker, retained_children,
+        retry_until_startup_deadline, runtime_connection_visible,
         should_schedule_host_bootstrap_retry, take_retained_action_outcomes,
         update_state_from_stage, validate_connected_host_for_shell_launch,
         validate_host_projection_payloads, wait_for_cancellation,
         worker_should_run_deferred_bootstrap, workspace_context_labels, AccessibilityTree,
         AccessibleRole, AgentPresence, AgentSessionId, ClientId, CockpitDockTool, CommandId,
-        ComposerControl, ComposerDraftKey, IsolatedDevProfile, MainConversationCanvas,
-        NativeAccessibilityAction, NativeActionRecord, NativeComposerImage, NativeHeaderAttachment,
-        NativeHostActionFailure, NativeHostActionOutcome, NativeHostActionResult,
-        NativeHostChildOwnership, NativeHostClientRuntime, NativeHostLaunchMode,
-        NativeHostLaunchSpec, NativeHostProjection, NativeHostProjectionKind, NativeHostQueryBody,
-        NativeHostRuntimeAttachment, NativeHostRuntimeEpochs, NativeHostRuntimePort,
-        NativeHostState, NativeHostWorkerCommand, NativeInteraction,
+        ComposerControl, ComposerDraftKey, ComposerDraftPart, IsolatedDevProfile,
+        MainConversationCanvas, NativeAccessibilityAction, NativeActionRecord, NativeComposerImage,
+        NativeHeaderAttachment, NativeHostActionFailure, NativeHostActionOutcome,
+        NativeHostActionResult, NativeHostChildOwnership, NativeHostClientRuntime,
+        NativeHostLaunchMode, NativeHostLaunchSpec, NativeHostProjection, NativeHostProjectionKind,
+        NativeHostQueryBody, NativeHostRuntimeAttachment, NativeHostRuntimeEpochs,
+        NativeHostRuntimePort, NativeHostState, NativeHostWorkerCommand, NativeInteraction,
         NativePlatformAccessibilityBridge, NativeShell, NativeShellMode, NativeShutdownDeadline,
         OverlayTextFieldPart, OwnedChild, OwnedWorker, PaletteItem, PendingHostBootstrap,
-        ProjectActionMenuMode, ProjectId, ProjectInboxItem, ProviderKind, ReaperKind, ShellStage,
-        TaskComposer, TaskId, UpdateState, UpdaterStage, CONVERSATION_COMPOSER_CONTEXT_INSET,
+        ProjectActionMenuMode, ProjectId, ProjectInboxItem, ProviderInboxAffordance, ProviderKind,
+        ReaperKind, ShellStage, TaskComposer, TaskConversationCache, TaskId, UpdateState,
+        UpdaterStage, COMPOSER_CARET_BLINK_TICKS, CONVERSATION_COMPOSER_CONTEXT_INSET,
         CONVERSATION_COMPOSER_HEIGHT_RESERVE, CONVERSATION_COMPOSER_INNER_RADIUS,
         CONVERSATION_COMPOSER_INPUT_MIN_HEIGHT, CONVERSATION_COMPOSER_OUTER_RADIUS,
         CONVERSATION_COMPOSER_PLACEHOLDER, CONVERSATION_COMPOSER_SEND_DIAMETER,
@@ -22196,12 +22512,136 @@ mod tests {
     }
 
     #[test]
-    fn idle_photo_rotation_uses_unsplash_without_a_blocking_api_call() {
+    fn idle_photo_rotation_uses_a_fresh_picsum_request_each_time() {
         let first = idle_conversation_photo_url(0);
         let second = idle_conversation_photo_url(1);
-        assert!(first.starts_with("https://images.unsplash.com/"));
-        assert!(second.starts_with("https://images.unsplash.com/"));
+        assert!(first.starts_with("https://picsum.photos/1920/1080?random="));
+        assert!(second.starts_with("https://picsum.photos/1920/1080?random="));
         assert_ne!(first, second);
+    }
+
+    #[test]
+    fn stale_idle_photo_fetch_cannot_repaint_a_later_canvas() {
+        let task_id = TaskId::new();
+        assert!(idle_photo_fetch_matches_current_canvas(7, 7, None));
+        assert!(!idle_photo_fetch_matches_current_canvas(7, 8, None));
+        assert!(!idle_photo_fetch_matches_current_canvas(
+            7,
+            7,
+            Some(task_id)
+        ));
+    }
+
+    #[test]
+    fn conversation_result_correlation_rejects_stale_task_pages() {
+        let selected = TaskId::new();
+        let other = TaskId::new();
+        assert!(conversation_result_matches_selected_task(
+            Some(selected),
+            selected
+        ));
+        assert!(!conversation_result_matches_selected_task(
+            Some(selected),
+            other
+        ));
+        assert!(!conversation_result_matches_selected_task(None, selected));
+    }
+
+    #[test]
+    fn conversation_cache_merges_pages_and_advances_the_request_cursor() {
+        use crate::domain::{
+            EventId, PrivacyClass, SemanticJournalFact, SemanticJournalPage, SemanticJournalPayload,
+        };
+
+        let fact = |sequence: u64, text: &str| SemanticJournalFact {
+            id: EventId::new(),
+            sequence,
+            occurred_at_ms: Some(sequence as i64),
+            provider: "claude_code".into(),
+            schema_version: 1,
+            kind: "user_message".into(),
+            visibility: "task".into(),
+            privacy_class: PrivacyClass::LocalOnly,
+            redacted: false,
+            payload: SemanticJournalPayload::UserMessage { text: text.into() },
+        };
+        let mut cache = TaskConversationCache::default();
+        cache.merge_page(&SemanticJournalPage {
+            after_sequence: 0,
+            through_sequence: 2,
+            high_water: 4,
+            encoded_bytes: 0,
+            next_sequence: Some(2),
+            facts: vec![fact(1, "one"), fact(2, "two")],
+        });
+        assert_eq!(cache.request_after_sequence(), 2);
+        cache.merge_page(&SemanticJournalPage {
+            after_sequence: 2,
+            through_sequence: 4,
+            high_water: 4,
+            encoded_bytes: 0,
+            next_sequence: None,
+            facts: vec![fact(3, "three"), fact(4, "four")],
+        });
+        assert_eq!(
+            cache
+                .facts
+                .iter()
+                .map(|fact| fact.sequence)
+                .collect::<Vec<_>>(),
+            vec![1, 2, 3, 4]
+        );
+        assert_eq!(cache.request_after_sequence(), 4);
+        assert_eq!(cache.next_sequence, None);
+
+        cache.merge_page(&SemanticJournalPage {
+            after_sequence: 4,
+            through_sequence: 4,
+            high_water: 9,
+            encoded_bytes: 0,
+            next_sequence: None,
+            facts: Vec::new(),
+        });
+        assert_eq!(
+            cache.request_after_sequence(),
+            9,
+            "terminal pages must advance past locally omitted semantic events"
+        );
+    }
+
+    #[test]
+    fn composer_draft_parts_split_around_the_blinking_caret() {
+        assert_eq!(
+            composer_draft_parts("", 0, true, true, "Ask"),
+            vec![ComposerDraftPart::Caret, ComposerDraftPart::Placeholder]
+        );
+        assert_eq!(
+            composer_draft_parts("ab", 1, true, true, "Ask"),
+            vec![
+                ComposerDraftPart::Text("a".into()),
+                ComposerDraftPart::Caret,
+                ComposerDraftPart::Text("b".into()),
+            ]
+        );
+        assert!(composer_caret_visible(true, 0));
+        assert!(!composer_caret_visible(true, COMPOSER_CARET_BLINK_TICKS));
+        assert!(!composer_caret_visible(false, 0));
+    }
+
+    #[test]
+    fn provider_inbox_affordance_is_stable_while_checking() {
+        assert_eq!(
+            provider_inbox_affordance(false, true),
+            ProviderInboxAffordance::Checking
+        );
+        assert_eq!(
+            provider_inbox_affordance(false, false),
+            ProviderInboxAffordance::DisconnectedAdd
+        );
+        assert_eq!(
+            provider_inbox_affordance(true, false),
+            ProviderInboxAffordance::ConnectedAdd
+        );
     }
 
     #[derive(Clone)]
@@ -26306,12 +26746,27 @@ mod tests {
             shell
                 .apply_client_model(Arc::new(model))
                 .expect("apply model");
+            assert_eq!(
+                shell
+                    .task_search_candidates()
+                    .into_iter()
+                    .find(|candidate| candidate.task_id == task_id)
+                    .expect("task search candidate")
+                    .project_label,
+                "DevManager",
+                "task rows must resolve the configured project name"
+            );
+            shell.install_idle_conversation_photo_for_test();
             let list = crate::ui::task_cockpit::TaskList::from_client_model_virtual(
                 shell.client_model_snapshot().as_ref().unwrap(),
             )
             .expect("task list");
             let _ = shell.interaction.navigation_mouse_down(task_id, &list);
             shell.sync_cockpit_follow();
+            assert!(
+                shell.splash_image.is_none(),
+                "leaving the idle canvas must retire its photo so returning fetches a new one"
+            );
 
             assert_eq!(
                 shell.main_conversation_canvas(),
@@ -26388,6 +26843,10 @@ mod tests {
             );
 
             shell.clear_selected_task();
+            assert!(
+                !shell.splash_fetch_attempted,
+                "returning to the idle canvas must admit a fresh random-photo request"
+            );
             assert!(matches!(
                 shell.main_conversation_canvas(),
                 MainConversationCanvas::IdlePhoto { .. }
