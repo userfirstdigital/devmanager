@@ -29,6 +29,7 @@ pub mod renderers;
 pub mod shell;
 pub mod task_cockpit;
 pub mod task_search;
+pub mod task_workspace;
 pub mod terminal_adapter;
 pub mod theme_system;
 pub mod tokens;
