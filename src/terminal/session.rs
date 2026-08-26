@@ -223,7 +223,7 @@ impl TerminalModeSnapshot {
     }
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TerminalScreenSnapshot {
     pub cells: Vec<TerminalIndexedCellSnapshot>,
     pub lines: Vec<Vec<TerminalCellSnapshot>>,

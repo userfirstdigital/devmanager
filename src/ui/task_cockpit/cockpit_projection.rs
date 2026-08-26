@@ -7,7 +7,8 @@
 use crate::client::action::{
     cockpit_surface_descriptors, CockpitSurfaceDescriptor, CockpitSurfaceKind,
     ACTION_BROWSER_NATIVE, ACTION_FILES_LIST, ACTION_FILES_READ, ACTION_GIT_STATUS,
-    ACTION_SERVICE_HEALTH, ACTION_SERVICE_LOGS, ACTION_SSH_STATUS, ACTION_WORKSPACE_STATUS,
+    ACTION_PROVIDER_TERMINAL_INPUT, ACTION_SERVICE_HEALTH, ACTION_SERVICE_LOGS, ACTION_SSH_STATUS,
+    ACTION_WORKSPACE_STATUS,
 };
 use crate::domain::cockpit::{
     TaskCockpitDeniedReason, TaskCockpitResult, TaskCockpitSurface, TaskCockpitUnavailableReason,
@@ -133,6 +134,7 @@ impl TaskCockpitLiveProjection {
             | TaskCockpitResult::AgentConnection(_)
             | TaskCockpitResult::BrowserProcessSession(_)
             | TaskCockpitResult::Conversation(_)
+            | TaskCockpitResult::Terminal(_)
             | TaskCockpitResult::ConfigCommandDetail(_) => {}
             TaskCockpitResult::Denied { reason, .. } => {
                 self.load = CockpitSurfaceLoad::Denied { reason: *reason };
@@ -223,6 +225,7 @@ fn load_for_ready_or_empty(empty: bool) -> CockpitSurfaceLoad {
 pub fn surface_query_action_id(surface: TaskCockpitSurface) -> Option<&'static str> {
     match surface {
         TaskCockpitSurface::Conversation => None,
+        TaskCockpitSurface::Terminal => Some(ACTION_PROVIDER_TERMINAL_INPUT),
         TaskCockpitSurface::Workspace => Some(ACTION_WORKSPACE_STATUS),
         TaskCockpitSurface::Git => Some(ACTION_GIT_STATUS),
         TaskCockpitSurface::Files => Some(ACTION_FILES_LIST),

@@ -40,9 +40,9 @@ pub use cockpit::{
     TaskGitRepositoriesProjection, TaskRepositoryCatalogEntry, TaskRepositoryKind,
     TaskRepositorySelector, TaskRepositorySelectorError, TaskServiceProjection,
     TaskServiceRuntimeState, TaskServiceScope, TaskServiceSnapshot, TaskSshEndpoint,
-    TaskSshProjection, TaskWorkspaceKind, TaskWorkspaceProjection, MAX_COCKPIT_FILE_LIST,
-    MAX_COCKPIT_READ_BYTES, MAX_FOLDER_CONFIG_ID_BYTES, MAX_REPOSITORY_LABEL_BYTES,
-    MAX_TASK_REPOSITORIES,
+    TaskSshProjection, TaskTerminalProjection, TaskWorkspaceKind, TaskWorkspaceProjection,
+    MAX_COCKPIT_FILE_LIST, MAX_COCKPIT_READ_BYTES, MAX_FOLDER_CONFIG_ID_BYTES,
+    MAX_REPOSITORY_LABEL_BYTES, MAX_TASK_REPOSITORIES,
 };
 pub use codec::{
     decode_orchestration_msgpack, encode_orchestration_msgpack, preflight_msgpack,

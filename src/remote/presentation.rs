@@ -1157,7 +1157,7 @@ fn semantic_status(status: SessionStatus) -> &'static str {
 
 const TASK_TITLE_MAX_CHARS: usize = 96;
 
-fn normalize_task_title(text: &str) -> Option<String> {
+pub(crate) fn normalize_task_title(text: &str) -> Option<String> {
     let collapsed: String = text
         .split_whitespace()
         .filter(|part| !part.is_empty())

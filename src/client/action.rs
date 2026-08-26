@@ -641,6 +641,7 @@ pub const fn cockpit_query_action_id(query: &TaskCockpitQuery) -> &'static str {
         TaskCockpitQuery::ConfigCommandDetail { .. } => ACTION_CONFIG_COMMAND_DETAIL,
         TaskCockpitQuery::BrowserProcessSession => ACTION_BROWSER_NATIVE,
         TaskCockpitQuery::Conversation { .. } => ACTION_CONVERSATION_STATUS,
+        TaskCockpitQuery::Terminal => ACTION_PROVIDER_TERMINAL_INPUT,
         TaskCockpitQuery::WorkspaceStatus => ACTION_WORKSPACE_STATUS,
         TaskCockpitQuery::GitRepositories => ACTION_GIT_REPOSITORIES,
         TaskCockpitQuery::GitStatus

@@ -4740,6 +4740,7 @@ impl HostRequestExecutor {
                             .configured_service_runtime
                             .as_ref()
                             .map(|runtime| runtime.semantic_journal.as_ref()),
+                        terminal_service: Some(&self.terminal_service),
                         ssh_endpoints: ssh_endpoints.as_deref(),
                         ssh_runtime: self.config_admission.as_ref().map(|admission| {
                             &admission.ssh_runtime as &dyn crate::ssh::SshRuntimeAdapter
@@ -5927,6 +5928,7 @@ fn dispatch_authenticated_request_inner(
                             bus,
                             service_runtime: None,
                             semantic_journal: None,
+                            terminal_service: None,
                             ssh_endpoints: None,
                             ssh_runtime: None,
                             workspace_projects,

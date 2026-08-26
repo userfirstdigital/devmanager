@@ -988,6 +988,20 @@ pub struct TerminalService {
     terminals: Mutex<HashMap<TerminalId, HostedTerminal>>,
 }
 
+#[derive(Debug, Clone)]
+pub struct TaskTerminalView {
+    pub task_id: TaskId,
+    pub terminal_id: TerminalId,
+    pub session_id: TerminalSessionId,
+    pub agent_session_id: crate::domain::AgentSessionId,
+    pub runtime_generation: u64,
+    pub action_epoch: u64,
+    pub resource_id: crate::domain::ResourceId,
+    pub resource_generation: u64,
+    pub sequence: u64,
+    pub view: TerminalSessionView,
+}
+
 impl Default for TerminalService {
     fn default() -> Self {
         Self::new()
@@ -1420,6 +1434,50 @@ impl TerminalService {
         let mut terminals = self.lock()?;
         let hosted = terminals.get_mut(&id).ok_or(TerminalError::NotFound)?;
         hosted.replace_generation(id)
+    }
+
+    /// Resolve the one live terminal already owned by `task_id` and return a
+    /// complete view with the exact durable/runtime fence. No terminal is
+    /// created, resized, or retargeted by this read path.
+    pub fn task_terminal_view(
+        &self,
+        task_id: TaskId,
+    ) -> Result<Option<TaskTerminalView>, TerminalError> {
+        let mut terminals = self.lock()?;
+        let matching = terminals
+            .iter()
+            .filter_map(|(id, hosted)| (hosted.task_id == task_id && !hosted.closed).then_some(*id))
+            .collect::<Vec<_>>();
+        let [terminal_id] = matching.as_slice() else {
+            return if matching.is_empty() {
+                Ok(None)
+            } else {
+                Err(TerminalError::InvalidFence)
+            };
+        };
+        let hosted = terminals
+            .get_mut(terminal_id)
+            .ok_or(TerminalError::NotFound)?;
+        hosted.ensure_open()?;
+        hosted.drain_attached_output(*terminal_id)?;
+        let agent_session_id = hosted.agent_session_id.ok_or(TerminalError::InvalidFence)?;
+        let runtime_generation = hosted
+            .runtime_generation
+            .ok_or(TerminalError::InvalidFence)?;
+        let action_epoch = hosted.action_epoch.ok_or(TerminalError::InvalidFence)?;
+        let view = hosted.session_view()?;
+        Ok(Some(TaskTerminalView {
+            task_id,
+            terminal_id: *terminal_id,
+            session_id: hosted.session_id,
+            agent_session_id,
+            runtime_generation,
+            action_epoch,
+            resource_id: hosted.resource_id,
+            resource_generation: hosted.generation.get(),
+            sequence: hosted.sequence.get().max(1),
+            view,
+        }))
     }
 
     fn lock(
@@ -1919,5 +1977,35 @@ mod tests {
         let runtime = MockAttachedRuntime::new(TerminalSize::new(40, 8).expect("size"));
         runtime.bound_history(3);
         assert_eq!(runtime.history_bound(), 3);
+    }
+
+    #[test]
+    fn task_terminal_view_resolves_the_one_attached_terminal_for_a_task() {
+        let service = TerminalService::new();
+        let task = TaskId::new();
+        let runtime = MockAttachedRuntime::new(TerminalSize::new(40, 8).expect("size"));
+        let terminal_id = service
+            .attach(
+                task,
+                TerminalSpec::new(
+                    TerminalSessionId::new(),
+                    TerminalSize::new(40, 8).expect("size"),
+                )
+                .expect("spec"),
+                runtime,
+            )
+            .expect("attach");
+        let agent = crate::domain::AgentSessionId::new();
+        service
+            .bind_task_identity(terminal_id, agent, 1, 1)
+            .expect("bind identity");
+
+        let projected = service
+            .task_terminal_view(task)
+            .expect("project")
+            .expect("task terminal");
+        assert_eq!(projected.terminal_id, terminal_id);
+        assert_eq!(projected.task_id, task);
+        assert_eq!(projected.view.screen.cols, 40);
     }
 }

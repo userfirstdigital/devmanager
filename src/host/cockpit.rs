@@ -16,7 +16,8 @@ use crate::domain::cockpit::{
     TaskCockpitResult, TaskCockpitSurface, TaskCockpitUnavailableReason, TaskFileEntry,
     TaskFilesListProjection, TaskFilesReadProjection, TaskGitMutateIntent, TaskGitProjection,
     TaskRepositorySelector, TaskSshEndpoint, TaskSshLifecycle, TaskSshProjection,
-    TaskSshRuntimeError, TaskSshRuntimeProjection, MAX_COCKPIT_FILE_LIST, MAX_COCKPIT_READ_BYTES,
+    TaskSshRuntimeError, TaskSshRuntimeProjection, TaskTerminalProjection, MAX_COCKPIT_FILE_LIST,
+    MAX_COCKPIT_READ_BYTES,
 };
 use crate::domain::id::{ClientId, CommandId, RequestId, TaskId};
 use crate::domain::query::{QueryError, QueryOutcome, QueryResult};
@@ -38,6 +39,7 @@ use crate::ssh::{
     accept_exact_endpoint, SshEndpointDenial, SshLifecycle, SshRuntimeAdapter, SshRuntimeError,
     SshRuntimeSnapshot, SshTaskIdentity,
 };
+use crate::terminal::service::TerminalService;
 use crate::workspace::files::{
     ContentKind, EntryKind, ExpectedRevision, FilePageRequest, FileServiceError, ReadOptions,
     SecretClassification, MAX_CHUNK_BYTES,
@@ -59,6 +61,7 @@ pub(crate) struct TaskCockpitDispatch<'a> {
     pub service_runtime: Option<&'a ProcessManager>,
     pub semantic_journal:
         Option<&'a std::sync::Mutex<crate::remote::presentation::SemanticJournalStore>>,
+    pub terminal_service: Option<&'a TerminalService>,
     pub ssh_endpoints: Option<&'a [TaskSshEndpoint]>,
     pub ssh_runtime: Option<&'a dyn SshRuntimeAdapter>,
     pub workspace_projects: Option<&'a WorkspaceProjectRoots>,
@@ -185,6 +188,81 @@ pub(crate) fn serve_task_cockpit(dispatch: TaskCockpitDispatch<'_>) -> QueryOutc
                 return QueryOutcome::Err(QueryError::UnsupportedCapability);
             }
             serve_conversation(&dispatch, task_id, *after_sequence)
+        }
+        TaskCockpitQuery::Terminal => {
+            let Some(service) = dispatch.terminal_service else {
+                return unavailable(
+                    TaskCockpitSurface::Terminal,
+                    TaskCockpitUnavailableReason::TerminalUnavailable,
+                );
+            };
+            let terminal = match service.task_terminal_view(task_id) {
+                Ok(Some(terminal)) => terminal,
+                Ok(None) => {
+                    return unavailable(
+                        TaskCockpitSurface::Terminal,
+                        TaskCockpitUnavailableReason::TerminalUnavailable,
+                    )
+                }
+                Err(_) => {
+                    return denied(
+                        TaskCockpitSurface::Terminal,
+                        TaskCockpitDeniedReason::StaleFence,
+                    )
+                }
+            };
+            let Some(primary_agent_id) = snapshot.primary_agent_id else {
+                return denied(
+                    TaskCockpitSurface::Terminal,
+                    TaskCockpitDeniedReason::StaleFence,
+                );
+            };
+            let Some(agent) = snapshot.agents.get(&primary_agent_id) else {
+                return denied(
+                    TaskCockpitSurface::Terminal,
+                    TaskCockpitDeniedReason::StaleFence,
+                );
+            };
+            let matching_resources = snapshot
+                .resources
+                .values()
+                .filter(|resource| {
+                    resource.resource_kind == crate::domain::ResourceKind::Terminal
+                        && resource.lifecycle == crate::domain::ResourceLifecycle::Active
+                })
+                .collect::<Vec<_>>();
+            let [resource] = matching_resources.as_slice() else {
+                return denied(
+                    TaskCockpitSurface::Terminal,
+                    TaskCockpitDeniedReason::StaleFence,
+                );
+            };
+            if terminal.agent_session_id != primary_agent_id
+                || terminal.runtime_generation != agent.runtime_generation
+                || terminal.action_epoch != snapshot.task.action_epoch
+                || terminal.resource_id != resource.id
+                || terminal.resource_generation != resource.runtime_generation
+            {
+                return denied(
+                    TaskCockpitSurface::Terminal,
+                    TaskCockpitDeniedReason::StaleFence,
+                );
+            }
+            QueryOutcome::Ok(QueryResult::TaskCockpit(TaskCockpitResult::Terminal(
+                TaskTerminalProjection {
+                    task_id,
+                    terminal_id: terminal.terminal_id,
+                    session_id: terminal.session_id,
+                    agent_session_id: terminal.agent_session_id,
+                    resource_id: terminal.resource_id,
+                    runtime_generation: terminal.runtime_generation,
+                    resource_generation: terminal.resource_generation,
+                    action_epoch: terminal.action_epoch,
+                    sequence: terminal.sequence,
+                    title: terminal.view.runtime.title,
+                    screen: terminal.view.screen,
+                },
+            )))
         }
         TaskCockpitQuery::WorkspaceStatus => QueryOutcome::Ok(QueryResult::TaskCockpit(
             TaskCockpitResult::Workspace(workspace_projection(task_id, &snapshot.task.workspace)),
@@ -2084,6 +2162,7 @@ mod tests {
             bus: &bus,
             service_runtime: None,
             semantic_journal: Some(&journal),
+            terminal_service: None,
             ssh_endpoints: None,
             ssh_runtime: None,
             workspace_projects: None,
@@ -2197,6 +2276,7 @@ mod tests {
             bus: &bus,
             service_runtime: None,
             semantic_journal: None,
+            terminal_service: None,
             ssh_endpoints: Some(&endpoints),
             ssh_runtime: None,
             workspace_projects: Some(&roots),
@@ -2225,6 +2305,7 @@ mod tests {
             bus: &bus,
             service_runtime: None,
             semantic_journal: None,
+            terminal_service: None,
             ssh_endpoints: Some(&endpoints),
             ssh_runtime: None,
             workspace_projects: Some(&roots),
@@ -2252,6 +2333,7 @@ mod tests {
             bus: &bus,
             service_runtime: None,
             semantic_journal: None,
+            terminal_service: None,
             ssh_endpoints: Some(&endpoints),
             ssh_runtime: None,
             workspace_projects: Some(&roots),
@@ -2287,6 +2369,7 @@ mod tests {
             bus: &bus,
             service_runtime: None,
             semantic_journal: None,
+            terminal_service: None,
             ssh_endpoints: None,
             ssh_runtime: None,
             workspace_projects: Some(&roots),
@@ -2314,6 +2397,7 @@ mod tests {
             bus: &bus,
             service_runtime: None,
             semantic_journal: None,
+            terminal_service: None,
             ssh_endpoints: None,
             ssh_runtime: None,
             workspace_projects: Some(&roots),
@@ -2342,6 +2426,7 @@ mod tests {
             bus: &bus,
             service_runtime: None,
             semantic_journal: None,
+            terminal_service: None,
             ssh_endpoints: None,
             ssh_runtime: None,
             workspace_projects: Some(&roots),
@@ -2384,6 +2469,7 @@ mod tests {
             bus: &bus,
             service_runtime: None,
             semantic_journal: None,
+            terminal_service: None,
             ssh_endpoints: None,
             ssh_runtime: None,
             workspace_projects: Some(&roots),
@@ -2439,6 +2525,7 @@ mod tests {
             bus: &bus,
             service_runtime: None,
             semantic_journal: Some(&journal),
+            terminal_service: None,
             ssh_endpoints: None,
             ssh_runtime: None,
             workspace_projects: None,
@@ -2500,6 +2587,7 @@ mod tests {
                 bus: &bus,
                 service_runtime: None,
                 semantic_journal: Some(&journal),
+                terminal_service: None,
                 ssh_endpoints: None,
                 ssh_runtime: None,
                 workspace_projects: None,
@@ -2585,6 +2673,7 @@ mod tests {
             bus: &bus,
             service_runtime: None,
             semantic_journal: Some(&journal),
+            terminal_service: None,
             ssh_endpoints: None,
             ssh_runtime: None,
             workspace_projects: None,
@@ -2630,6 +2719,7 @@ mod tests {
             bus,
             service_runtime: None,
             semantic_journal: None,
+            terminal_service: None,
             ssh_endpoints: None,
             ssh_runtime: None,
             workspace_projects: roots,

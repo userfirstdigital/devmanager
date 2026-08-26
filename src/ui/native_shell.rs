@@ -234,6 +234,7 @@ const T3_SIDEBAR_NAV_TOP_INSET: f32 = 12.0;
 const CONVERSATION_COMPOSER_PLACEHOLDER: &str =
     crate::ui::native_composer::NATIVE_COMPOSER_PLACEHOLDER;
 const COMPOSER_DRAFT_PERSIST_INTERVAL: Duration = Duration::from_millis(250);
+const AUTOMATIC_TASK_TITLE_DELAY: Duration = Duration::from_secs(2);
 const LAYOUT_PERSIST_INTERVAL: Duration = Duration::from_millis(250);
 /// ~512ms blink at the 16ms controller pump.
 const COMPOSER_CARET_BLINK_TICKS: usize = 32;
@@ -337,6 +338,34 @@ enum ComposerDraftPart {
 
 fn composer_caret_visible(focused: bool, controller_ticks: usize) -> bool {
     focused && (controller_ticks / COMPOSER_CARET_BLINK_TICKS) % 2 == 0
+}
+
+fn composer_provider_identity(
+    provider: Option<&crate::domain::ProviderSessionProjection>,
+) -> (
+    Option<crate::domain::TurnId>,
+    Option<crate::domain::QuestionId>,
+    Option<crate::domain::ApprovalId>,
+) {
+    provider
+        .map(|provider| {
+            (
+                provider.current_turn,
+                provider.open_question,
+                provider.open_approval,
+            )
+        })
+        .unwrap_or((None, None, None))
+}
+
+fn automatic_task_title(current_title: &str, first_prompt: &str) -> Option<String> {
+    let is_placeholder = matches!(
+        current_title.trim(),
+        "New task" | "New Claude task" | "New Codex task"
+    );
+    is_placeholder
+        .then(|| crate::remote::presentation::normalize_task_title(first_prompt))
+        .flatten()
 }
 
 fn composer_draft_parts(
@@ -1909,6 +1938,13 @@ struct PendingComposerSubmission {
     draft: ComposerDraftProjection,
     image_ids: Vec<u64>,
     open_provider_terminal: bool,
+    automatic_title_seed: Option<String>,
+}
+
+struct PendingAutomaticTitle {
+    expected_title: String,
+    proposed_title: String,
+    due: Instant,
 }
 
 #[derive(Clone)]
@@ -2196,6 +2232,12 @@ struct AddProjectDraft {
 
 struct NewTaskDraft {
     project_id: ProjectId,
+    title: TextField,
+    error: Option<String>,
+}
+
+struct RenameTaskDraft {
+    task_id: TaskId,
     title: TextField,
     error: Option<String>,
 }
@@ -7657,6 +7699,7 @@ pub struct NativeShell {
     /// composer. Correlate them by the original command identity so only the
     /// exact submitted draft is consumed, regardless of the selected task.
     pending_composer_submissions: BTreeMap<CommandId, PendingComposerSubmission>,
+    pending_automatic_titles: BTreeMap<TaskId, PendingAutomaticTitle>,
     composer_images: BTreeMap<ComposerDraftKey, Vec<NativeComposerImage>>,
     next_composer_image_id: u64,
     slash_command_selection: usize,
@@ -7710,6 +7753,7 @@ pub struct NativeShell {
     /// consumes this one-shot request on the GPUI application thread.
     pending_composer_image_prompt: bool,
     new_task: Option<NewTaskDraft>,
+    rename_task: Option<RenameTaskDraft>,
     selected_project_id: Option<ProjectId>,
     collapsed_projects: HashSet<ProjectId>,
     palette_index: usize,
@@ -8113,6 +8157,7 @@ impl NativeShell {
             pending_terminal_focus: false,
             composer_marked_range: None,
             pending_composer_submissions: BTreeMap::new(),
+            pending_automatic_titles: BTreeMap::new(),
             composer_images: BTreeMap::new(),
             next_composer_image_id: 1,
             slash_command_selection: 0,
@@ -8154,6 +8199,7 @@ impl NativeShell {
             pending_folder_prompt: false,
             pending_composer_image_prompt: false,
             new_task: None,
+            rename_task: None,
             selected_project_id: None,
             collapsed_projects: HashSet::new(),
             task_search: TaskSearchState::default(),
@@ -9104,6 +9150,24 @@ impl NativeShell {
                 } else {
                     self.cockpit.apply_cockpit_result(&result);
                 }
+                if let crate::domain::TaskCockpitResult::Terminal(projection) = &result {
+                    if let Some(model) = self.client_model.as_ref() {
+                        match self
+                            .cockpit
+                            .dock_mut()
+                            .admit_task_terminal_projection(model.as_ref(), projection)
+                        {
+                            Ok(_) => {
+                                self.composer_error = None;
+                                self.sync_terminal_from_cockpit();
+                            }
+                            Err(error) => {
+                                self.composer_error =
+                                    Some(format!("Terminal projection unavailable: {error:?}"));
+                            }
+                        }
+                    }
+                }
                 if let crate::domain::TaskCockpitResult::BrowserProcessSession(projection) = &result
                 {
                     self.apply_browser_process_session(projection);
@@ -9315,9 +9379,14 @@ impl NativeShell {
                     query: TaskCockpitQuery::BrowserProcessSession,
                 }],
             ),
-            CockpitDockTool::Terminal | CockpitDockTool::Artifacts | CockpitDockTool::Review => {
-                (None, Vec::new())
-            }
+            CockpitDockTool::Terminal => (
+                Some(crate::client::action::ACTION_PROVIDER_TERMINAL_INPUT),
+                vec![ActionRequest::TaskCockpit {
+                    task_id,
+                    query: TaskCockpitQuery::Terminal,
+                }],
+            ),
+            CockpitDockTool::Artifacts | CockpitDockTool::Review => (None, Vec::new()),
         };
         if let Some(action_id) = loading_action {
             self.cockpit.begin_cockpit_query(task_id, action_id);
@@ -9855,6 +9924,26 @@ impl NativeShell {
                 if let Some(command_id) = command_id {
                     if let Some(submission) = self.pending_composer_submissions.remove(&command_id)
                     {
+                        if let Some(seed) = submission.automatic_title_seed.as_deref() {
+                            if let Some(snapshot) = self
+                                .client_model
+                                .as_ref()
+                                .and_then(|model| model.task(submission.key.task_id))
+                            {
+                                if let Some(proposed_title) =
+                                    automatic_task_title(&snapshot.task.title, seed)
+                                {
+                                    self.pending_automatic_titles.insert(
+                                        submission.key.task_id,
+                                        PendingAutomaticTitle {
+                                            expected_title: snapshot.task.title.clone(),
+                                            proposed_title,
+                                            due: Instant::now() + AUTOMATIC_TASK_TITLE_DELAY,
+                                        },
+                                    );
+                                }
+                            }
+                        }
                         let open_provider_terminal = submission.open_provider_terminal;
                         let active_matches = self.composer.as_ref().is_some_and(|composer| {
                             let fence = composer.fence();
@@ -10014,6 +10103,7 @@ impl NativeShell {
         self.controller_ticks = self.controller_ticks.saturating_add(1);
         self.flush_composer_drafts_if_due(false);
         self.flush_layout_if_due(false);
+        self.dispatch_due_automatic_title();
         let mut repaint = self.composer_accessibility_focused
             && self.controller_ticks % COMPOSER_CARET_BLINK_TICKS == 0;
         if let Some(preferences) = self.pending_preferences.pop_back() {
@@ -10158,6 +10248,17 @@ impl NativeShell {
                         self.enqueue_host_action(record),
                         NativeHostActionResult::Queued
                     );
+                }
+                if self.cockpit.dock().showing_raw_terminal() {
+                    if let Some(record) =
+                        self.interaction
+                            .action_on_current_handler(ActionRequest::TaskCockpit {
+                                task_id,
+                                query: TaskCockpitQuery::Terminal,
+                            })
+                    {
+                        let _ = self.enqueue_host_action(record);
+                    }
                 }
             }
         }
@@ -10411,6 +10512,34 @@ impl NativeShell {
         self.offer_first_task_if_needed();
         self.refresh_accessibility_tree();
         repaint
+    }
+
+    fn dispatch_due_automatic_title(&mut self) {
+        let Some(task_id) = self.interaction.selected_task() else {
+            return;
+        };
+        let Some(pending) = self.pending_automatic_titles.get(&task_id) else {
+            return;
+        };
+        if Instant::now() < pending.due {
+            return;
+        }
+        let Some(snapshot) = self
+            .client_model
+            .as_ref()
+            .and_then(|model| model.task(task_id))
+        else {
+            return;
+        };
+        if snapshot.task.title != pending.expected_title {
+            self.pending_automatic_titles.remove(&task_id);
+            return;
+        }
+        let title = pending.proposed_title.clone();
+        self.pending_automatic_titles.remove(&task_id);
+        let _ = self.dispatch_action(ActionRequest::TaskRename(
+            crate::client::action::TaskRenameArguments { task_id, title },
+        ));
     }
 
     pub(crate) fn install_window_observers(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -11396,6 +11525,7 @@ impl NativeShell {
         let Some(model) = self.client_model.as_ref().cloned() else {
             return;
         };
+        let selected_task_id = self.interaction.selected_task();
         let result = if visible {
             self.cockpit
                 .dock_mut()
@@ -11405,7 +11535,7 @@ impl NativeShell {
                 .dock_mut()
                 .switch_to_semantic(model.as_ref(), None)
         };
-        if let Some(task_id) = self.interaction.selected_task() {
+        if let Some(task_id) = selected_task_id {
             self.layout
                 .task_center_terminal
                 .insert(task_id.to_string(), visible);
@@ -11415,6 +11545,11 @@ impl NativeShell {
             self.composer_error = Some(format!("{error:?}"));
         } else {
             self.pending_terminal_focus = visible;
+            if visible {
+                if let Some(task_id) = selected_task_id {
+                    let _ = self.dispatch_task_cockpit_query(task_id, TaskCockpitQuery::Terminal);
+                }
+            }
         }
         self.sync_terminal_from_cockpit();
     }
@@ -11944,6 +12079,10 @@ impl NativeShell {
                             provider_command_opens_terminal(provider_kind, composer.draft_text())
                         })
                     }),
+                automatic_title_seed: is_slash_command_send
+                    .then(|| self.composer.as_ref().map(TaskComposer::draft_text))
+                    .flatten()
+                    .map(str::to_string),
             }
         });
         let intent = self.prefix_composer_intent_with_images(intent);
@@ -11962,18 +12101,7 @@ impl NativeShell {
                 self.composer_error = Some("task projection unavailable".into());
                 return;
             };
-            let Some(provider) = snapshot.provider_sessions.get(&fence.agent_session_id) else {
-                if let Some(composer) = self.composer.as_mut() {
-                    let _ = composer.cancel_pending(command_id);
-                }
-                self.composer_error = Some("provider projection unavailable".into());
-                return;
-            };
-            (
-                provider.current_turn,
-                provider.open_question,
-                provider.open_approval,
-            )
+            composer_provider_identity(snapshot.provider_sessions.get(&fence.agent_session_id))
         };
         let request = match intent.to_provider_input_request(
             provider_identity.0,
@@ -13294,6 +13422,7 @@ impl NativeShell {
             KeyboardAction::DismissTransient => {
                 self.add_project = None;
                 self.new_task = None;
+                self.rename_task = None;
                 self.task_search.close();
                 self.pending_task_search_focus = false;
                 self.project_scope_menu.close_menu();
@@ -14733,6 +14862,7 @@ impl NativeShell {
             title,
             error: None,
         });
+        self.rename_task = None;
         self.add_project = None;
         self.interaction.close_palettes();
     }
@@ -14769,6 +14899,48 @@ impl NativeShell {
             return;
         }
         self.new_task = None;
+    }
+
+    fn begin_task_rename(&mut self, task_id: TaskId) {
+        let current = self.task_row_title(task_id);
+        let mut title = TextField::new("Task name").expect("rename task field");
+        let _ = title.set_value(current);
+        title.select_all();
+        title.focus();
+        self.rename_task = Some(RenameTaskDraft {
+            task_id,
+            title,
+            error: None,
+        });
+        self.new_task = None;
+        self.interaction.close_palettes();
+    }
+
+    fn submit_task_rename(&mut self) {
+        let Some(draft) = self.rename_task.as_ref() else {
+            return;
+        };
+        let title = draft.title.value().trim().to_string();
+        if title.is_empty() {
+            if let Some(draft) = self.rename_task.as_mut() {
+                draft.error = Some("Give this task a name.".into());
+            }
+            return;
+        }
+        let task_id = draft.task_id;
+        if self
+            .dispatch_action(ActionRequest::TaskRename(
+                crate::client::action::TaskRenameArguments { task_id, title },
+            ))
+            .is_some()
+        {
+            if let Some(draft) = self.rename_task.as_mut() {
+                draft.error = Some("Couldn't rename the task. Try again.".into());
+            }
+            return;
+        }
+        self.pending_automatic_titles.remove(&task_id);
+        self.rename_task = None;
     }
 
     fn request_composer_accessibility_focus(&mut self) {
@@ -15739,6 +15911,9 @@ impl NativeShell {
         }
         if self.new_task.is_some() {
             return Some(self.render_new_task_overlay(tokens, viewport, cx));
+        }
+        if self.rename_task.is_some() {
+            return Some(self.render_rename_task_overlay(tokens, viewport, cx));
         }
         if self.settings_open {
             return Some(self.render_settings_overlay(tokens, viewport, cx));
@@ -17030,6 +17205,109 @@ impl NativeShell {
         .into_any_element()
     }
 
+    fn render_rename_task_overlay(
+        &self,
+        tokens: crate::ui::tokens::ThemeTokens,
+        viewport: Size<Pixels>,
+        cx: &Context<Self>,
+    ) -> AnyElement {
+        let draft = self.rename_task.as_ref().expect("overlay is open");
+        let error = draft.error.clone();
+        deferred(
+            anchored()
+                .position(point(px(0.0), px(0.0)))
+                .snap_to_window()
+                .child(
+                    div()
+                        .id("native-rename-task-backdrop")
+                        .occlude()
+                        .w(viewport.width)
+                        .h(viewport.height)
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .bg(Self::modal_backdrop())
+                        .on_key_down(cx.listener(|shell, event: &KeyDownEvent, window, cx| {
+                            cx.stop_propagation();
+                            shell.handle_rename_task_key(event, window, cx);
+                            cx.notify();
+                        }))
+                        .child(
+                            div()
+                                .id("native-rename-task-dialog")
+                                .w(px(440.0))
+                                .rounded(px(tokens.density.radii.lg))
+                                .bg(tokens.surfaces.raised.to_gpui())
+                                .border(px(1.0))
+                                .border_color(tokens.borders.subtle.to_gpui())
+                                .shadow_sm()
+                                .p(px(tokens.density.spacing.xl))
+                                .flex()
+                                .flex_col()
+                                .gap(px(tokens.density.spacing.md))
+                                .on_mouse_down(
+                                    MouseButton::Left,
+                                    cx.listener(|shell, _event: &MouseDownEvent, window, cx| {
+                                        cx.stop_propagation();
+                                        shell.focus_handle.focus(window);
+                                    }),
+                                )
+                                .child(
+                                    div()
+                                        .text_size(px(tokens.density.typography.heading))
+                                        .font_weight(FontWeight::SEMIBOLD)
+                                        .text_color(tokens.text.primary.to_gpui())
+                                        .child("Rename task"),
+                                )
+                                .child(Self::overlay_text_field(
+                                    "native-rename-task-name",
+                                    &draft.title,
+                                    "Task name",
+                                    tokens,
+                                ))
+                                .children(error.map(|message| {
+                                    div()
+                                        .text_size(px(tokens.density.typography.caption))
+                                        .text_color(tokens.status.destructive.to_gpui())
+                                        .child(message)
+                                }))
+                                .child(
+                                    div()
+                                        .flex()
+                                        .justify_end()
+                                        .gap(px(tokens.density.spacing.sm))
+                                        .child(
+                                            Button::new("native-rename-task-cancel")
+                                                .label("Cancel")
+                                                .ghost()
+                                                .on_click(cx.listener(
+                                                    |shell, _event: &ClickEvent, _window, cx| {
+                                                        cx.stop_propagation();
+                                                        shell.rename_task = None;
+                                                        cx.notify();
+                                                    },
+                                                )),
+                                        )
+                                        .child(
+                                            Button::new("native-rename-task-submit")
+                                                .label("Rename")
+                                                .primary()
+                                                .on_click(cx.listener(
+                                                    |shell, _event: &ClickEvent, _window, cx| {
+                                                        cx.stop_propagation();
+                                                        shell.submit_task_rename();
+                                                        cx.notify();
+                                                    },
+                                                )),
+                                        ),
+                                ),
+                        ),
+                ),
+        )
+        .with_priority(2)
+        .into_any_element()
+    }
+
     fn render_new_task_overlay(
         &self,
         tokens: crate::ui::tokens::ThemeTokens,
@@ -17038,6 +17316,22 @@ impl NativeShell {
     ) -> AnyElement {
         let draft = self.new_task.as_ref().expect("overlay is open");
         let error = draft.error.clone();
+        let project_choices = self
+            .config_sidebar
+            .projects
+            .iter()
+            .filter_map(|project| {
+                ProjectId::parse(&project.workspace_id)
+                    .ok()
+                    .map(|project_id| {
+                        (
+                            project_id,
+                            project.label.clone(),
+                            project_id == draft.project_id,
+                        )
+                    })
+            })
+            .collect::<Vec<_>>();
         deferred(
             anchored()
                 .position(point(px(0.0), px(0.0)))
@@ -17098,6 +17392,61 @@ impl NativeShell {
                                     .child(
                                         "Chat, files, and the terminal will open with this work.",
                                     ),
+                            )
+                            .child(
+                                div()
+                                    .text_size(px(tokens.density.typography.caption))
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .text_color(tokens.text.muted.to_gpui())
+                                    .child("Project"),
+                            )
+                            .child(
+                                div()
+                                    .id("native-new-task-projects")
+                                    .w_full()
+                                    .flex()
+                                    .flex_col()
+                                    .gap(px(tokens.density.spacing.xs))
+                                    .max_h(px(180.0))
+                                    .overflow_y_scrollbar()
+                                    .children(project_choices.into_iter().map(
+                                        |(project_id, label, selected)| {
+                                            let row = div().id((
+                                                "native-new-task-project",
+                                                stable_project_element_key(project_id, "new-task"),
+                                            ))
+                                                .w_full()
+                                                .px(px(tokens.density.spacing.md))
+                                                .py(px(tokens.density.spacing.sm))
+                                                .rounded(px(tokens.density.radii.md))
+                                                .border(px(1.0))
+                                                .border_color(if selected {
+                                                    tokens.actions.primary.default.background.to_gpui()
+                                                } else {
+                                                    tokens.borders.subtle.to_gpui()
+                                                })
+                                                .bg(if selected {
+                                                    tokens.surfaces.selection.to_gpui()
+                                                } else {
+                                                    tokens.surfaces.overlay.to_gpui()
+                                                })
+                                                .cursor_pointer()
+                                                .hover(|style| style.bg(tokens.surfaces.hover.to_gpui()))
+                                                .child(label);
+                                            row.on_mouse_down(
+                                                MouseButton::Left,
+                                                cx.listener(move |shell, _event: &MouseDownEvent, _window, cx| {
+                                                    cx.stop_propagation();
+                                                    if let Some(draft) = shell.new_task.as_mut() {
+                                                        draft.project_id = project_id;
+                                                        draft.error = None;
+                                                    }
+                                                    shell.selected_project_id = Some(project_id);
+                                                    cx.notify();
+                                                }),
+                                            )
+                                        },
+                                    )),
                             )
                             .child(Self::overlay_text_field(
                                 "native-new-task-name",
@@ -18862,6 +19211,9 @@ impl NativeShell {
         } else if self.new_task.is_some() {
             self.handle_new_task_key(event, window, cx);
             true
+        } else if self.rename_task.is_some() {
+            self.handle_rename_task_key(event, window, cx);
+            true
         } else if matches!(
             self.header_commit.phase,
             HeaderCommitPhase::Preview { .. }
@@ -19092,6 +19444,55 @@ impl NativeShell {
             return;
         }
         let Some(draft) = self.new_task.as_mut() else {
+            return;
+        };
+        let epoch = draft.title.focus_epoch();
+        if let Some(input) = Self::overlay_key_input(event) {
+            if draft.title.handle_key(input, epoch).ok().unwrap_or(false) {
+                window.prevent_default();
+            }
+        }
+    }
+
+    fn handle_rename_task_key(
+        &mut self,
+        event: &KeyDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let key = event.keystroke.key.as_str();
+        if key == "escape" {
+            window.prevent_default();
+            self.rename_task = None;
+            return;
+        }
+        if key == "enter" {
+            window.prevent_default();
+            self.submit_task_rename();
+            return;
+        }
+        if event.keystroke.modifiers.control || event.keystroke.modifiers.platform {
+            match key {
+                "a" => {
+                    window.prevent_default();
+                    if let Some(draft) = self.rename_task.as_mut() {
+                        draft.title.select_all();
+                    }
+                }
+                "v" => {
+                    window.prevent_default();
+                    if let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) {
+                        if let Some(draft) = self.rename_task.as_mut() {
+                            let epoch = draft.title.focus_epoch();
+                            let _ = draft.title.paste(&text, epoch);
+                        }
+                    }
+                }
+                _ => {}
+            }
+            return;
+        }
+        let Some(draft) = self.rename_task.as_mut() else {
             return;
         };
         let epoch = draft.title.focus_epoch();
@@ -20379,6 +20780,11 @@ impl NativeShell {
                                         }
                                         shell.refresh_accessibility_tree();
                                         cx.notify();
+                                    } else if event.button == MouseButton::Right {
+                                        shell.selected_project_id = Some(project_id);
+                                        shell.focus_handle.focus(window);
+                                        shell.begin_task_rename(task_id);
+                                        cx.notify();
                                     }
                                 });
                             };
@@ -20605,12 +21011,7 @@ impl NativeShell {
         let task_rename = cx.listener(|shell, _action: &TaskRename, _window, cx| {
             cx.stop_propagation();
             if let Some(task_id) = shell.interaction.selected_task() {
-                shell.dispatch_action(ActionRequest::TaskRename(
-                    crate::client::action::TaskRenameArguments {
-                        task_id,
-                        title: "Renamed task".to_string(),
-                    },
-                ));
+                shell.begin_task_rename(task_id);
             }
         });
 
@@ -22099,16 +22500,16 @@ fn enqueue_pending_preference(
 mod tests {
     use super::{
         acquire_reaper_permit, admit_idle_conversation_photo_fetch, admits_host_actions,
-        agent_connection_snapshot, authorize_full_host_quit, composer_caret_visible,
-        composer_draft_parts, conversation_result_matches_selected_task,
-        decode_idle_conversation_photo_bytes, detach_native_composer_images_for_key,
-        discard_prepared_native_composer_images, dispatch_pending_action,
-        enqueue_pending_preference, ensure_isolated_host_config_base, idle_conversation_photo_url,
-        idle_photo_dimensions_allowed, idle_photo_fetch_matches_current_canvas,
-        isolated_dev_profile, native_command_id, prepare_native_composer_image,
-        provider_inbox_affordance, publish_projection, reap_retained_children,
-        reap_retained_workers, remove_staged_image, retain_child, retain_worker, retained_children,
-        retry_until_startup_deadline, runtime_connection_visible,
+        agent_connection_snapshot, authorize_full_host_quit, automatic_task_title,
+        composer_caret_visible, composer_draft_parts, composer_provider_identity,
+        conversation_result_matches_selected_task, decode_idle_conversation_photo_bytes,
+        detach_native_composer_images_for_key, discard_prepared_native_composer_images,
+        dispatch_pending_action, enqueue_pending_preference, ensure_isolated_host_config_base,
+        idle_conversation_photo_url, idle_photo_dimensions_allowed,
+        idle_photo_fetch_matches_current_canvas, isolated_dev_profile, native_command_id,
+        prepare_native_composer_image, provider_inbox_affordance, publish_projection,
+        reap_retained_children, reap_retained_workers, remove_staged_image, retain_child,
+        retain_worker, retained_children, retry_until_startup_deadline, runtime_connection_visible,
         should_schedule_host_bootstrap_retry, take_retained_action_outcomes,
         update_state_from_stage, validate_connected_host_for_shell_launch,
         validate_host_projection_payloads, wait_for_cancellation,
@@ -22148,6 +22549,23 @@ mod tests {
     use std::sync::mpsc::SyncSender;
     use std::sync::{Arc, Mutex, OnceLock};
     use std::time::{Duration, Instant};
+
+    #[test]
+    fn missing_provider_projection_is_valid_for_a_first_send() {
+        assert_eq!(composer_provider_identity(None), (None, None, None));
+    }
+
+    #[test]
+    fn automatic_titles_only_replace_known_placeholders() {
+        assert_eq!(
+            automatic_task_title("New Codex task", "  Fix provider projection failures.  "),
+            Some("Fix provider projection failures.".to_string())
+        );
+        assert_eq!(
+            automatic_task_title("My deliberate title", "Ignore this prompt"),
+            None
+        );
+    }
 
     #[test]
     fn target_composer_geometry_and_affordance_copy_are_pinned() {
@@ -27099,6 +27517,7 @@ mod tests {
                     draft: composer.draft_projection(),
                     image_ids: Vec::new(),
                     open_provider_terminal: false,
+                    automatic_title_seed: None,
                 },
             );
             assert!(shell.pending_composer_submissions.contains_key(&command_id));

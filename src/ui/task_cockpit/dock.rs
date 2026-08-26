@@ -13,6 +13,7 @@ use crate::domain::agent::AgentRole;
 use crate::domain::id::{AgentSessionId, RequestId, ResourceId, SubscriptionId, TaskId};
 use crate::domain::resource::{ResourceKind, ResourceLifecycle};
 use crate::domain::snapshot::TaskSnapshot;
+use crate::domain::TaskTerminalProjection;
 use crate::protocol::StreamFrame;
 use crate::services::ProcessManager;
 use crate::terminal::session::TerminalSessionView;
@@ -1046,6 +1047,58 @@ impl ContextDock {
             HostStreamCursor::delta(model, task_id, sequence)?
         };
         self.admit_host_view(cursor, view)
+    }
+
+    /// Admit the host's bounded task-terminal query into the existing replica
+    /// seam. The projection must exactly match the current ClientModel fence;
+    /// repeated polls at the same sequence are harmless no-ops.
+    pub fn admit_task_terminal_projection(
+        &mut self,
+        model: &ClientModel,
+        projection: &TaskTerminalProjection,
+    ) -> Result<bool, DockProjectionError> {
+        let expected =
+            HostTerminalBinding::from_client_model(model, projection.task_id)?.identity();
+        let actual = TerminalRuntimeIdentity::new(
+            projection.task_id,
+            projection.agent_session_id,
+            projection.resource_id,
+            projection.runtime_generation,
+            projection.resource_generation,
+        );
+        if actual != expected || projection.action_epoch == 0 || projection.sequence == 0 {
+            return Err(DockProjectionError::BindingMismatch);
+        }
+        if self.selected_task != Some(projection.task_id) {
+            return Err(DockProjectionError::ForeignIdentity);
+        }
+        if self.current_memory().identity.is_none() {
+            self.bind_from_model(model)?;
+        }
+        if self.current_memory().last_sequence == projection.sequence {
+            return Ok(false);
+        }
+        let mut dimensions = crate::state::SessionDimensions::default();
+        dimensions.cols = projection.screen.cols.clamp(1, u16::MAX as usize) as u16;
+        dimensions.rows = projection.screen.rows.clamp(1, u16::MAX as usize) as u16;
+        let mut runtime = crate::state::SessionRuntimeState::new(
+            projection.session_id.to_string(),
+            std::path::PathBuf::from("."),
+            dimensions,
+            crate::terminal::session::TerminalBackend::default(),
+        );
+        runtime.status = crate::state::SessionStatus::Running;
+        runtime.interactive_shell = true;
+        runtime.title = projection.title.clone();
+        let view = TerminalSessionView {
+            runtime,
+            screen: projection.screen.clone(),
+        };
+        self.admit_host_view(
+            HostStreamCursor::from_identity(actual, projection.sequence, true),
+            view,
+        )?;
+        Ok(true)
     }
 
     pub fn present_host_overlay(

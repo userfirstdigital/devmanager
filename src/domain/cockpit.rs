@@ -7,9 +7,11 @@
 use serde::{Deserialize, Serialize};
 
 use crate::domain::agent_resource::AgentResourceBinding;
-use crate::domain::id::{AgentSessionId, ConfiguredServiceId, ResourceId, TaskId};
+use crate::domain::id::{AgentSessionId, ConfiguredServiceId, ResourceId, TaskId, TerminalId};
 use crate::domain::task::{WorkspaceBindingKind, WorkspaceRef};
 use crate::providers::ProviderKind;
+use crate::terminal::protocol::TerminalSessionId;
+use crate::terminal::session::TerminalScreenSnapshot;
 
 pub const MAX_COCKPIT_FILE_LIST: u16 = 64;
 pub const MAX_COCKPIT_READ_BYTES: u32 = 64 * 1024;
@@ -65,6 +67,7 @@ pub const fn task_agent_resource_projection(
 #[serde(rename_all = "snake_case")]
 pub enum TaskCockpitSurface {
     Conversation,
+    Terminal,
     Workspace,
     Git,
     Files,
@@ -90,6 +93,7 @@ pub enum TaskCockpitDeniedReason {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TaskCockpitUnavailableReason {
+    TerminalUnavailable,
     GitAuthorityNotIssued,
     FileAuthorityNotIssued,
     SshOperationUnsupported,
@@ -273,6 +277,9 @@ pub enum TaskCockpitQuery {
     Conversation {
         after_sequence: u64,
     },
+    /// One bounded, task-owned terminal screen using the host's exact
+    /// task/agent/resource generation fence. This query never launches a PTY.
+    Terminal,
     WorkspaceStatus,
     /// Bounded path-redacted catalog of repositories for the exact Task/project.
     GitRepositories,
@@ -504,6 +511,22 @@ pub struct TaskServiceHealth {
     pub snapshot: TaskServiceSnapshot,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TaskTerminalProjection {
+    pub task_id: TaskId,
+    pub terminal_id: TerminalId,
+    pub session_id: TerminalSessionId,
+    pub agent_session_id: AgentSessionId,
+    pub resource_id: ResourceId,
+    pub runtime_generation: u64,
+    pub resource_generation: u64,
+    pub action_epoch: u64,
+    pub sequence: u64,
+    pub title: Option<String>,
+    pub screen: TerminalScreenSnapshot,
+}
+
 /// Bounded, redacted configuration projection issued by the host's canonical
 /// ConfigStore.  It deliberately contains no absolute paths, command text,
 /// environment values, or credential references.
@@ -613,6 +636,7 @@ pub enum TaskCockpitResult {
     AgentConnection(AgentConnectionSnapshot),
     BrowserProcessSession(BrowserProcessSessionProjection),
     Conversation(crate::domain::snapshot::SemanticJournalPage),
+    Terminal(TaskTerminalProjection),
     Workspace(TaskWorkspaceProjection),
     GitRepositories(TaskGitRepositoriesProjection),
     Git(TaskGitProjection),
@@ -746,6 +770,7 @@ pub fn cockpit_surface(query: &TaskCockpitQuery) -> TaskCockpitSurface {
         | TaskCockpitQuery::ConfigCommandDetail { .. } => TaskCockpitSurface::Workspace,
         TaskCockpitQuery::BrowserProcessSession => TaskCockpitSurface::Browser,
         TaskCockpitQuery::Conversation { .. } => TaskCockpitSurface::Conversation,
+        TaskCockpitQuery::Terminal => TaskCockpitSurface::Terminal,
         TaskCockpitQuery::WorkspaceStatus => TaskCockpitSurface::Workspace,
         TaskCockpitQuery::GitRepositories
         | TaskCockpitQuery::GitStatus
@@ -1130,6 +1155,20 @@ mod tests {
         assert_eq!(
             cockpit_surface(&TaskCockpitQuery::GitRepositories),
             TaskCockpitSurface::Git
+        );
+    }
+
+    #[test]
+    fn terminal_query_routes_to_the_terminal_surface() {
+        assert_eq!(
+            cockpit_surface(&TaskCockpitQuery::Terminal),
+            TaskCockpitSurface::Terminal
+        );
+        let encoded = serde_json::to_value(Query::TaskCockpit(TaskCockpitQuery::Terminal))
+            .expect("encode terminal query");
+        assert_eq!(
+            encoded.get("task_cockpit").and_then(|value| value.as_str()),
+            Some("terminal")
         );
     }
 
