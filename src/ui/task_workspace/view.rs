@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 
 use crate::domain::TaskId;
 
-use super::{Allocation, Axis, PaneId, PanePresentation, TaskWorkspace, WorkspaceNode};
+use super::{Allocation, Axis, PaneId, PanePresentation, SplitId, TaskWorkspace, WorkspaceNode};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum TaskPaneBody {
@@ -46,6 +46,7 @@ pub struct TaskWorkspaceViewChild {
 pub enum TaskWorkspaceViewNode {
     Pane(TaskPaneViewModel),
     Split {
+        split_id: SplitId,
         axis: Axis,
         children: Vec<TaskWorkspaceViewChild>,
     },
@@ -122,7 +123,8 @@ fn build_node(
                 paint_terminal: body == TaskPaneBody::Full && projection.show_terminal,
             }))
         }
-        WorkspaceNode::Split { axis, children, .. } => Ok(TaskWorkspaceViewNode::Split {
+        WorkspaceNode::Split { id, axis, children } => Ok(TaskWorkspaceViewNode::Split {
+            split_id: *id,
             axis: *axis,
             children: children
                 .iter()

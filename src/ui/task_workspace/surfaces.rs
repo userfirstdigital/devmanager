@@ -5,7 +5,19 @@ use crate::domain::{
     TaskTerminalProjection,
 };
 
-use super::{Axis, TaskWorkspace, WorkspaceError};
+use super::{Axis, PanePresentation, TaskWorkspace, WorkspaceError};
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ConversationQueryPriority {
+    Interactive,
+    Background,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ConversationQueryPlan {
+    pub task_id: TaskId,
+    pub priority: ConversationQueryPriority,
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum WorkspaceSelectionGesture {
@@ -265,6 +277,48 @@ impl TaskSurfaceRegistry {
             })
             .collect()
     }
+
+    pub fn conversation_query_schedule(
+        &self,
+        workspace: &TaskWorkspace,
+        max_background: usize,
+    ) -> Vec<ConversationQueryPlan> {
+        let focused = workspace.focused_task();
+        let mut schedule = Vec::with_capacity(max_background.saturating_add(1));
+        if let Some(task_id) = focused {
+            if workspace.presentation(task_id) == Some(PanePresentation::Full)
+                && !self.conversation_in_flight(task_id)
+            {
+                schedule.push(ConversationQueryPlan {
+                    task_id,
+                    priority: ConversationQueryPriority::Interactive,
+                });
+            }
+        }
+
+        let mut background: Vec<_> = workspace
+            .task_ids()
+            .into_iter()
+            .filter(|task_id| Some(*task_id) != focused)
+            .filter_map(|task_id| {
+                let pane = workspace.pane_for_task(task_id)?;
+                (pane.presentation == PanePresentation::Full
+                    && !self.conversation_in_flight(task_id))
+                .then_some((pane.last_focused_at, task_id))
+            })
+            .collect();
+        background.sort_by_key(|(last_focused_at, _)| std::cmp::Reverse(*last_focused_at));
+        schedule.extend(
+            background
+                .into_iter()
+                .take(max_background)
+                .map(|(_, task_id)| ConversationQueryPlan {
+                    task_id,
+                    priority: ConversationQueryPriority::Background,
+                }),
+        );
+        schedule
+    }
 }
 
 #[cfg(test)]
@@ -336,5 +390,36 @@ mod tests {
             registry.admit_conversation(first, 6, &page(2, "stale")),
             Err(SurfaceAdmissionError::StaleGeneration)
         );
+    }
+
+    #[test]
+    fn workspace_query_scheduler_prioritizes_focused_full_and_skips_compact() {
+        let first = TaskId::new();
+        let second = TaskId::new();
+        let third = TaskId::new();
+        let fourth = TaskId::new();
+        let mut workspace = TaskWorkspace::single(first);
+        for task_id in [second, third, fourth] {
+            workspace
+                .insert_after_focused(task_id, Axis::Horizontal)
+                .unwrap();
+        }
+        workspace.focus_task(second).unwrap();
+        workspace.set_manual_compact(third, true).unwrap();
+        let mut registry = TaskSurfaceRegistry::default();
+        registry.begin_conversation(fourth, 4);
+
+        let schedule = registry.conversation_query_schedule(&workspace, 2);
+
+        assert_eq!(
+            schedule.first(),
+            Some(&ConversationQueryPlan {
+                task_id: second,
+                priority: ConversationQueryPriority::Interactive,
+            })
+        );
+        assert!(schedule.iter().any(|plan| plan.task_id == first));
+        assert!(schedule.iter().all(|plan| plan.task_id != third));
+        assert!(schedule.iter().all(|plan| plan.task_id != fourth));
     }
 }

@@ -25,8 +25,8 @@ use std::time::{Duration, Instant};
 use gpui::prelude::FluentBuilder;
 use gpui::{
     anchored, canvas, deferred, div, img, point, px, size, uniform_list, AnyElement, App,
-    AppContext, Application, Bounds, ClickEvent, ClipboardEntry, Context, ElementId,
-    ElementInputHandler, Entity, EntityInputHandler, FocusHandle, FontWeight, ImageFormat,
+    AppContext, Application, Bounds, ClickEvent, ClipboardEntry, Context, DragMoveEvent, ElementId,
+    ElementInputHandler, Entity, EntityInputHandler, FocusHandle, FontWeight, Hsla, ImageFormat,
     ImageSource, InteractiveElement, IntoElement, KeyDownEvent, MouseButton, MouseDownEvent,
     MouseMoveEvent, MouseUpEvent, ObjectFit, ParentElement, PathPromptOptions, Pixels, Point,
     Render, RenderImage, ScrollWheelEvent, Size, StatefulInteractiveElement, Styled, StyledImage,
@@ -152,7 +152,8 @@ use crate::ui::project_scope::{ProjectScope, ProjectScopeMenuState};
 use crate::ui::task_search::{TaskSearchCandidate, TaskSearchState};
 use crate::ui::task_workspace::{
     apply_workspace_selection as apply_task_workspace_selection, Allocation, AllocationMetrics,
-    Axis, TaskPaneBody, TaskPaneProjection, TaskPaneViewModel, TaskSurfaceRegistry, TaskWorkspace,
+    Axis, ConversationQueryPriority, DropTarget, Edge, PaneId, PaneRect, SplitId, TaskPaneBody,
+    TaskPaneProjection, TaskPaneViewModel, TaskSurfaceRegistry, TaskWorkspace,
     TaskWorkspaceViewChild, TaskWorkspaceViewModel, TaskWorkspaceViewNode, Viewport,
     WorkspaceError, WorkspaceSelectionGesture,
 };
@@ -176,6 +177,44 @@ pub struct NativeClientDetach;
 #[derive(Clone, Debug, Default, PartialEq, Eq, gpui::Action)]
 #[action(name = "native.host_full_quit")]
 pub struct NativeHostFullQuit;
+
+#[derive(Clone)]
+struct DraggedTaskPane {
+    pane_id: PaneId,
+    title: String,
+    background: Hsla,
+    foreground: Hsla,
+}
+
+struct TaskPaneDragPreview {
+    title: String,
+    background: Hsla,
+    foreground: Hsla,
+}
+
+impl Render for TaskPaneDragPreview {
+    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .w(px(280.0))
+            .h(px(42.0))
+            .flex()
+            .items_center()
+            .px(px(12.0))
+            .rounded(px(7.0))
+            .bg(self.background)
+            .text_color(self.foreground)
+            .shadow_md()
+            .child(self.title.clone())
+    }
+}
+
+struct DraggedTaskDivider {
+    split_id: SplitId,
+    child_index: usize,
+    axis: Axis,
+    start_size: f32,
+    start_boundary: Rc<RefCell<Option<f32>>>,
+}
 
 const NATIVE_PROFILE_DIR: &str = ".devmanager-next/dev-profile";
 const NATIVE_PROFILE_NAME_PREFIX: &str = "native-next";
@@ -1861,6 +1900,10 @@ pub struct NativeActionRecord {
     /// Task identity captured at activation time, never reconstructed by the
     /// transport worker from mutable selection state.
     pub task_id: Option<TaskId>,
+    /// A bounded, read-only conversation query for an open background pane.
+    /// It is independent of interactive selection but remains fenced to the
+    /// exact task and host runtime generations.
+    pub(crate) background_read: bool,
     /// Durable task revision and task action epoch observed by the immutable
     /// client model when this action was captured.
     pub expected_task_revision: Option<u64>,
@@ -5830,6 +5873,26 @@ impl NativeInteraction {
     }
 
     pub fn accepts_action_record(&self, record: &NativeActionRecord) -> bool {
+        if record.background_read {
+            let exact_background_conversation = matches!(
+                &record.command,
+                NativeHostCommand::TaskCockpitQuery {
+                    task_id,
+                    query: TaskCockpitQuery::Conversation { .. },
+                    ..
+                } if Some(*task_id) == record.task_id
+            );
+            return exact_background_conversation
+                && record.client_epoch <= self.client_epoch
+                && record.connection_epoch == self.connection_epoch
+                && record.resource_generation == self.resource_generation
+                && record.runtime_generation == self.runtime_generation
+                && record.task_id.is_some_and(|task_id| {
+                    self.client_model
+                        .as_ref()
+                        .is_some_and(|model| model.tasks().contains_key(&task_id))
+                });
+        }
         let epochs_match = record.connection_epoch == self.connection_epoch
             && record.client_epoch == self.client_epoch
             && record.navigation_epoch == self.shell.navigation_epoch()
@@ -6264,6 +6327,7 @@ impl NativeInteraction {
                 key: crate::ui::components::KeyboardKey::Enter,
             },
             false,
+            false,
         )
     }
 
@@ -6280,6 +6344,25 @@ impl NativeInteraction {
                 key: crate::ui::components::KeyboardKey::Enter,
             },
             true,
+            false,
+        )
+    }
+
+    pub fn background_conversation_on_current_handler(
+        &mut self,
+        task_id: TaskId,
+        after_sequence: u64,
+    ) -> Option<NativeActionRecord> {
+        self.capture_action(
+            ActionRequest::TaskCockpit {
+                task_id,
+                query: TaskCockpitQuery::Conversation { after_sequence },
+            },
+            ActivationSource::Keyboard {
+                key: crate::ui::components::KeyboardKey::Enter,
+            },
+            true,
+            true,
         )
     }
 
@@ -6288,7 +6371,7 @@ impl NativeInteraction {
         request: ActionRequest,
         source: ActivationSource,
     ) -> Option<NativeActionRecord> {
-        self.capture_action(request, source, false)
+        self.capture_action(request, source, false, false)
     }
 
     fn capture_action(
@@ -6296,6 +6379,7 @@ impl NativeInteraction {
         request: ActionRequest,
         source: ActivationSource,
         reuse_handler: bool,
+        background_read: bool,
     ) -> Option<NativeActionRecord> {
         let descriptor = action::catalog()
             .iter()
@@ -6332,7 +6416,18 @@ impl NativeInteraction {
             ActionRequest::Browser(arguments) => Some(arguments.task_id()),
             _ => None,
         };
-        if request_task.is_some() && request_task != selected_task {
+        if request_task.is_some() && request_task != selected_task && !background_read {
+            return None;
+        }
+        if background_read
+            && !matches!(
+                &request,
+                ActionRequest::TaskCockpit {
+                    query: TaskCockpitQuery::Conversation { .. },
+                    ..
+                }
+            )
+        {
             return None;
         }
         let (expected_task_revision, captured_task_action_epoch) = match &request {
@@ -6525,6 +6620,7 @@ impl NativeInteraction {
             resource_generation: self.resource_generation,
             runtime_generation: self.runtime_generation,
             task_id: request_task,
+            background_read,
             expected_task_revision,
             captured_task_action_epoch,
             capability: descriptor.required_capability,
@@ -10425,17 +10521,33 @@ impl NativeShell {
         // tools. The host page is bounded and replaces the previous retained
         // window, so polling cannot grow client memory.
         if self.controller_ticks % 30 == 0 && self.action_lane_len() < MAX_ACTION_LANE_RECORDS / 2 {
-            if let Some(task_id) = self.interaction.selected_task() {
-                if !self.task_surfaces.conversation_in_flight(task_id) {
-                    let after_sequence = self.conversation_after_sequence_for(task_id);
-                    let request = ActionRequest::TaskCockpit {
-                        task_id,
-                        query: TaskCockpitQuery::Conversation { after_sequence },
-                    };
-                    if let Some(record) = self.interaction.action_on_current_handler(request) {
-                        let _ = self.enqueue_host_action(record);
-                    }
+            let schedule = self
+                .layout
+                .task_workspace
+                .as_ref()
+                .map(|workspace| self.task_surfaces.conversation_query_schedule(workspace, 2))
+                .unwrap_or_default();
+            for plan in schedule {
+                if self.action_lane_len() >= MAX_ACTION_LANE_RECORDS / 2 {
+                    break;
                 }
+                let after_sequence = self.conversation_after_sequence_for(plan.task_id);
+                let record = match plan.priority {
+                    ConversationQueryPriority::Interactive => self
+                        .interaction
+                        .action_on_current_handler(ActionRequest::TaskCockpit {
+                            task_id: plan.task_id,
+                            query: TaskCockpitQuery::Conversation { after_sequence },
+                        }),
+                    ConversationQueryPriority::Background => self
+                        .interaction
+                        .background_conversation_on_current_handler(plan.task_id, after_sequence),
+                };
+                if let Some(record) = record {
+                    let _ = self.enqueue_host_action(record);
+                }
+            }
+            if let Some(task_id) = self.interaction.selected_task() {
                 if self.cockpit.dock().showing_raw_terminal() {
                     if let Some(record) =
                         self.interaction
@@ -13098,7 +13210,17 @@ impl NativeShell {
         let Some(root) = model.root.as_ref() else {
             return self.task_conversation_surface(tokens, workspace_size, cx);
         };
-        self.render_task_workspace_node(root, &allocated, tokens, workspace_size, cx)
+        let workspace =
+            self.render_task_workspace_node(root, &allocated, tokens, workspace_size, cx);
+        let commit_resize = cx.listener(|shell, _dragged: &DraggedTaskDivider, _window, cx| {
+            shell.mark_layout_dirty();
+            cx.notify();
+        });
+        div()
+            .size_full()
+            .on_drop(commit_resize)
+            .child(workspace)
+            .into_any_element()
     }
 
     fn render_task_workspace_node(
@@ -13117,9 +13239,13 @@ impl NativeShell {
                     .unwrap_or(workspace_size);
                 self.render_task_workspace_pane(pane, tokens, pane_size, cx)
             }
-            TaskWorkspaceViewNode::Split { axis, children } => {
-                let mut rendered = Vec::with_capacity(children.len());
-                for child in children {
+            TaskWorkspaceViewNode::Split {
+                split_id,
+                axis,
+                children,
+            } => {
+                let mut rendered = Vec::with_capacity(children.len().saturating_mul(2));
+                for (index, child) in children.iter().enumerate() {
                     let content = self.render_task_workspace_node(
                         &child.node,
                         allocated,
@@ -13128,19 +13254,128 @@ impl NativeShell {
                         cx,
                     );
                     rendered.push(Self::task_workspace_child(*axis, child, content));
+                    if index + 1 < children.len() {
+                        let start_size = Self::task_workspace_node_rect(&child.node, allocated)
+                            .map(|rect| match axis {
+                                Axis::Horizontal => rect.width,
+                                Axis::Vertical => rect.height,
+                            })
+                            .unwrap_or(240.0);
+                        rendered.push(self.task_workspace_divider(
+                            *split_id, *axis, index, start_size, tokens, cx,
+                        ));
+                    }
                 }
-                let split = div()
-                    .w_full()
-                    .h_full()
-                    .min_w(px(0.0))
-                    .min_h(px(0.0))
-                    .flex()
-                    .gap(px(4.0));
+                let split = div().w_full().h_full().min_w(px(0.0)).min_h(px(0.0)).flex();
                 match axis {
                     Axis::Horizontal => split.flex_row().children(rendered).into_any_element(),
                     Axis::Vertical => split.flex_col().children(rendered).into_any_element(),
                 }
             }
+        }
+    }
+
+    fn task_workspace_node_rect(
+        node: &TaskWorkspaceViewNode,
+        allocated: &crate::ui::task_workspace::AllocatedWorkspace,
+    ) -> Option<PaneRect> {
+        match node {
+            TaskWorkspaceViewNode::Pane(pane) => allocated.rect(pane.task_id),
+            TaskWorkspaceViewNode::Split { children, .. } => children
+                .iter()
+                .filter_map(|child| Self::task_workspace_node_rect(&child.node, allocated))
+                .reduce(|left, right| {
+                    let x = left.x.min(right.x);
+                    let y = left.y.min(right.y);
+                    let far_x = (left.x + left.width).max(right.x + right.width);
+                    let far_y = (left.y + left.height).max(right.y + right.height);
+                    PaneRect {
+                        x,
+                        y,
+                        width: far_x - x,
+                        height: far_y - y,
+                    }
+                }),
+        }
+    }
+
+    fn task_workspace_divider(
+        &mut self,
+        split_id: SplitId,
+        axis: Axis,
+        child_index: usize,
+        start_size: f32,
+        tokens: crate::ui::tokens::ThemeTokens,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let split_key = u64::from_be_bytes(
+            split_id.as_bytes()[8..]
+                .try_into()
+                .expect("split identity tail is exactly eight bytes"),
+        );
+        let drag = DraggedTaskDivider {
+            split_id,
+            child_index,
+            axis,
+            start_size,
+            start_boundary: Rc::new(RefCell::new(None)),
+        };
+        let reset = cx.listener(move |shell, event: &MouseDownEvent, _window, cx| {
+            if event.click_count >= 2 {
+                cx.stop_propagation();
+                shell.reset_workspace_split_child(split_id, child_index);
+                cx.notify();
+            }
+        });
+        let divider = div()
+            .id((
+                "native-task-workspace-divider",
+                split_key.rotate_left(11) ^ child_index as u64,
+            ))
+            .flex_none()
+            .bg(tokens.borders.subtle.to_gpui())
+            .hover(|style| style.bg(tokens.borders.focus.to_gpui()))
+            .on_mouse_down(MouseButton::Left, reset)
+            .on_drag(drag, |_, _, _, cx| cx.new(|_| gpui::Empty))
+            .on_drag_move::<DraggedTaskDivider>(cx.listener(
+                |shell, event: &DragMoveEvent<DraggedTaskDivider>, _window, cx| {
+                    let drag = event.drag(cx);
+                    let (split_id, child_index, start_size, cursor, boundary) = match drag.axis {
+                        Axis::Horizontal => (
+                            drag.split_id,
+                            drag.child_index,
+                            drag.start_size,
+                            f32::from(event.event.position.x),
+                            f32::from(event.bounds.origin.x + event.bounds.size.width / 2.0),
+                        ),
+                        Axis::Vertical => (
+                            drag.split_id,
+                            drag.child_index,
+                            drag.start_size,
+                            f32::from(event.event.position.y),
+                            f32::from(event.bounds.origin.y + event.bounds.size.height / 2.0),
+                        ),
+                    };
+                    let start_boundary = {
+                        let mut stored = drag.start_boundary.borrow_mut();
+                        *stored.get_or_insert(boundary)
+                    };
+                    let logical_px = (start_size + cursor - start_boundary).max(116.0);
+                    shell.resize_workspace_split_child(split_id, child_index, logical_px);
+                    cx.notify();
+                },
+            ));
+        match axis {
+            Axis::Horizontal => divider
+                .w(px(4.0))
+                .h_full()
+                .cursor_col_resize()
+                .into_any_element(),
+            Axis::Vertical => divider
+                .h(px(4.0))
+                .w_full()
+                .cursor_row_resize()
+                .into_any_element(),
         }
     }
 
@@ -13186,6 +13421,7 @@ impl NativeShell {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let task_id = pane.task_id;
+        let pane_id = pane.pane_id;
         let focus = cx.listener(move |shell, _event: &MouseDownEvent, _window, cx| {
             cx.stop_propagation();
             let _ = shell.apply_workspace_selection(task_id, WorkspaceSelectionGesture::Plain);
@@ -13212,6 +13448,12 @@ impl NativeShell {
                 .try_into()
                 .expect("task identity tail is exactly eight bytes"),
         );
+        let dragged_pane = DraggedTaskPane {
+            pane_id,
+            title: pane.title.clone(),
+            background: tokens.surfaces.raised.to_gpui().into(),
+            foreground: tokens.text.primary.to_gpui().into(),
+        };
         let header = div()
             .id(("native-task-pane-header", task_element_key))
             .w_full()
@@ -13225,6 +13467,13 @@ impl NativeShell {
             .border_color(tokens.borders.subtle.to_gpui())
             .bg(tokens.surfaces.raised.to_gpui())
             .on_mouse_down(MouseButton::Left, focus)
+            .on_drag(dragged_pane, |dragged, _, _, cx| {
+                cx.new(|_| TaskPaneDragPreview {
+                    title: dragged.title.clone(),
+                    background: dragged.background,
+                    foreground: dragged.foreground,
+                })
+            })
             .child(
                 div()
                     .min_w(px(0.0))
@@ -13348,12 +13597,17 @@ impl NativeShell {
                 .into_any_element()
         };
 
+        let center_drop = cx.listener(move |shell, dragged: &DraggedTaskPane, _window, cx| {
+            shell.move_workspace_pane(dragged.pane_id, DropTarget::Center { pane: pane_id });
+            cx.notify();
+        });
         div()
             .id(("native-task-pane", task_element_key))
             .w_full()
             .h_full()
             .min_w(px(0.0))
             .min_h(px(0.0))
+            .relative()
             .flex()
             .flex_col()
             .overflow_hidden()
@@ -13361,9 +13615,86 @@ impl NativeShell {
             .border_color(focus_border.to_gpui())
             .rounded(px(tokens.density.radii.md))
             .bg(tokens.surfaces.canvas.to_gpui())
+            .can_drop(move |value, _, _| {
+                value
+                    .downcast_ref::<DraggedTaskPane>()
+                    .is_some_and(|dragged| dragged.pane_id != pane_id)
+            })
+            .drag_over::<DraggedTaskPane>(move |style, dragged, _, _| {
+                if dragged.pane_id == pane_id {
+                    style
+                } else {
+                    style.border_color(tokens.borders.focus.to_gpui())
+                }
+            })
+            .on_drop(center_drop)
             .child(header)
             .child(body)
+            .children(
+                [Edge::Left, Edge::Right, Edge::Top, Edge::Bottom]
+                    .into_iter()
+                    .map(|edge| Self::task_workspace_drop_zone(pane_id, edge, tokens, cx)),
+            )
             .into_any_element()
+    }
+
+    fn task_workspace_drop_zone(
+        target_pane: PaneId,
+        edge: Edge,
+        tokens: crate::ui::tokens::ThemeTokens,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let drop = cx.listener(move |shell, dragged: &DraggedTaskPane, _window, cx| {
+            shell.move_workspace_pane(
+                dragged.pane_id,
+                DropTarget::Edge {
+                    pane: target_pane,
+                    edge,
+                },
+            );
+            cx.notify();
+        });
+        let zone = div()
+            .absolute()
+            .can_drop(move |value, _, _| {
+                value
+                    .downcast_ref::<DraggedTaskPane>()
+                    .is_some_and(|dragged| dragged.pane_id != target_pane)
+            })
+            .drag_over::<DraggedTaskPane>(move |style, dragged, _, _| {
+                if dragged.pane_id == target_pane {
+                    style
+                } else {
+                    style.bg(Hsla::from(tokens.borders.focus.to_gpui()).opacity(0.32))
+                }
+            })
+            .on_drop(drop);
+        match edge {
+            Edge::Left => zone
+                .top(px(24.0))
+                .bottom(px(24.0))
+                .left(px(0.0))
+                .w(px(22.0))
+                .into_any_element(),
+            Edge::Right => zone
+                .top(px(24.0))
+                .bottom(px(24.0))
+                .right(px(0.0))
+                .w(px(22.0))
+                .into_any_element(),
+            Edge::Top => zone
+                .top(px(0.0))
+                .left(px(22.0))
+                .right(px(22.0))
+                .h(px(22.0))
+                .into_any_element(),
+            Edge::Bottom => zone
+                .bottom(px(0.0))
+                .left(px(22.0))
+                .right(px(22.0))
+                .h(px(22.0))
+                .into_any_element(),
+        }
     }
 
     fn set_workspace_task_compact(&mut self, task_id: TaskId, compact: bool) {
@@ -13380,6 +13711,50 @@ impl NativeShell {
                     })
                     && workspace.set_manual_compact(task_id, compact).is_ok()
             });
+        if changed {
+            self.mark_layout_dirty();
+        }
+    }
+
+    fn reset_workspace_split_child(&mut self, split_id: SplitId, child_index: usize) {
+        let changed = self
+            .layout
+            .task_workspace
+            .as_mut()
+            .is_some_and(|workspace| {
+                workspace.split_child_allocation(split_id, child_index) != Some(Allocation::auto())
+                    && workspace.reset_split_child(split_id, child_index).is_ok()
+            });
+        if changed {
+            self.mark_layout_dirty();
+        }
+    }
+
+    fn resize_workspace_split_child(
+        &mut self,
+        split_id: SplitId,
+        child_index: usize,
+        logical_px: f32,
+    ) {
+        let _changed = self
+            .layout
+            .task_workspace
+            .as_mut()
+            .is_some_and(|workspace| {
+                workspace.split_child_allocation(split_id, child_index)
+                    != Some(Allocation::Pinned { logical_px })
+                    && workspace
+                        .resize_split_child(split_id, child_index, logical_px)
+                        .is_ok()
+            });
+    }
+
+    fn move_workspace_pane(&mut self, source: PaneId, target: DropTarget) {
+        let changed = self
+            .layout
+            .task_workspace
+            .as_mut()
+            .is_some_and(|workspace| workspace.move_pane(source, target).is_ok());
         if changed {
             self.mark_layout_dirty();
         }
@@ -28092,6 +28467,28 @@ mod tests {
 
     fn terminal_bound_client_model() -> (crate::client::ClientModel, TaskId) {
         terminal_bound_client_model_with_attention(crate::domain::task::TaskAttention::None)
+    }
+
+    #[test]
+    fn background_conversation_read_survives_focus_change_but_stays_runtime_fenced() {
+        let (model, task_id) = terminal_bound_client_model();
+        let mut interaction = NativeInteraction::new(Some(task_id));
+        interaction.sync_host_epochs(NativeHostRuntimeEpochs {
+            connection_epoch: 2,
+            resource_generation: 3,
+            runtime_generation: 4,
+        });
+        interaction.bind_projected_model(Arc::new(model));
+        let record = interaction
+            .background_conversation_on_current_handler(task_id, 0)
+            .expect("capture background conversation");
+        assert!(record.background_read);
+
+        assert!(interaction.sync_selected_task(None));
+        assert!(interaction.accepts_action_record(&record));
+
+        interaction.set_runtime_generation(5);
+        assert!(!interaction.accepts_action_record(&record));
     }
 
     #[test]

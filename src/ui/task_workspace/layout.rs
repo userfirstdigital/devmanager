@@ -27,6 +27,10 @@ impl SplitId {
     pub fn new() -> Self {
         Self(Uuid::now_v7())
     }
+
+    pub fn as_bytes(&self) -> &[u8; 16] {
+        self.0.as_bytes()
+    }
 }
 
 impl Default for SplitId {
@@ -453,6 +457,56 @@ impl TaskWorkspace {
         }
     }
 
+    pub fn split_child_allocation(
+        &self,
+        split_id: SplitId,
+        child_index: usize,
+    ) -> Option<Allocation> {
+        self.root
+            .as_ref()
+            .and_then(|root| find_split(root, split_id))
+            .and_then(|children| children.get(child_index))
+            .map(|child| child.allocation)
+    }
+
+    pub fn resize_split_child(
+        &mut self,
+        split_id: SplitId,
+        child_index: usize,
+        logical_px: f32,
+    ) -> Result<(), WorkspaceError> {
+        if !logical_px.is_finite() || logical_px <= 0.0 {
+            return Err(WorkspaceError::InvalidTree);
+        }
+        let mut candidate = self.clone();
+        let root = candidate.root_mut().ok_or(WorkspaceError::MissingPane)?;
+        let children = find_split_mut(root, split_id).ok_or(WorkspaceError::MissingPane)?;
+        if child_index + 1 >= children.len() {
+            return Err(WorkspaceError::MissingPane);
+        }
+        children[child_index].allocation = Allocation::Pinned { logical_px };
+        candidate.validate()?;
+        *self = candidate;
+        Ok(())
+    }
+
+    pub fn reset_split_child(
+        &mut self,
+        split_id: SplitId,
+        child_index: usize,
+    ) -> Result<(), WorkspaceError> {
+        let mut candidate = self.clone();
+        let root = candidate.root_mut().ok_or(WorkspaceError::MissingPane)?;
+        let children = find_split_mut(root, split_id).ok_or(WorkspaceError::MissingPane)?;
+        if child_index + 1 >= children.len() {
+            return Err(WorkspaceError::MissingPane);
+        }
+        children[child_index].allocation = Allocation::auto();
+        candidate.validate()?;
+        *self = candidate;
+        Ok(())
+    }
+
     pub(crate) fn task_is_unpinned(&self, task_id: TaskId) -> bool {
         self.root
             .as_ref()
@@ -534,6 +588,31 @@ fn find_pane_mut(node: &mut WorkspaceNode, pane_id: PaneId) -> Option<&mut TaskP
         WorkspaceNode::Split { children, .. } => children
             .iter_mut()
             .find_map(|child| find_pane_mut(&mut child.node, pane_id)),
+    }
+}
+
+fn find_split(node: &WorkspaceNode, split_id: SplitId) -> Option<&[SplitChild]> {
+    match node {
+        WorkspaceNode::Pane(_) => None,
+        WorkspaceNode::Split { id, children, .. } if *id == split_id => Some(children),
+        WorkspaceNode::Split { children, .. } => children
+            .iter()
+            .find_map(|child| find_split(&child.node, split_id)),
+    }
+}
+
+fn find_split_mut(node: &mut WorkspaceNode, split_id: SplitId) -> Option<&mut Vec<SplitChild>> {
+    match node {
+        WorkspaceNode::Pane(_) => None,
+        WorkspaceNode::Split { id, children, .. } => {
+            if *id == split_id {
+                Some(children)
+            } else {
+                children
+                    .iter_mut()
+                    .find_map(|child| find_split_mut(&mut child.node, split_id))
+            }
+        }
     }
 }
 
@@ -810,5 +889,73 @@ mod tests {
         assert_eq!(workspace.pane_count(), 1);
         assert_eq!(workspace.focused_pane_id(), Some(first_pane));
         assert!(matches!(workspace.root(), Some(WorkspaceNode::Pane(_))));
+    }
+
+    #[test]
+    fn resizing_a_divider_pins_only_the_manually_adjusted_child() {
+        let first = TaskId::new();
+        let second = TaskId::new();
+        let third = TaskId::new();
+        let mut workspace = TaskWorkspace::single(first);
+        workspace
+            .insert_after_focused(second, Axis::Horizontal)
+            .unwrap();
+        workspace
+            .insert_after_focused(third, Axis::Horizontal)
+            .unwrap();
+        let WorkspaceNode::Split { id, .. } = workspace.root().unwrap() else {
+            panic!("three horizontal tasks must share one split")
+        };
+        let split_id = *id;
+
+        workspace.resize_split_child(split_id, 0, 320.0).unwrap();
+
+        assert_eq!(
+            workspace.split_child_allocation(split_id, 0),
+            Some(Allocation::Pinned { logical_px: 320.0 })
+        );
+        assert_eq!(
+            workspace.split_child_allocation(split_id, 1),
+            Some(Allocation::auto())
+        );
+        assert_eq!(
+            workspace.split_child_allocation(split_id, 2),
+            Some(Allocation::auto())
+        );
+
+        workspace.reset_split_child(split_id, 0).unwrap();
+        assert_eq!(
+            workspace.split_child_allocation(split_id, 0),
+            Some(Allocation::auto())
+        );
+    }
+
+    #[test]
+    fn edge_move_reuses_the_transactional_tree_and_keeps_focus() {
+        let first = TaskId::new();
+        let second = TaskId::new();
+        let third = TaskId::new();
+        let mut workspace = TaskWorkspace::single(first);
+        let first_pane = workspace.focused_pane_id().unwrap();
+        workspace
+            .insert_after_focused(second, Axis::Horizontal)
+            .unwrap();
+        let third_pane = workspace
+            .insert_after_focused(third, Axis::Horizontal)
+            .unwrap();
+
+        workspace
+            .move_pane(
+                third_pane,
+                DropTarget::Edge {
+                    pane: first_pane,
+                    edge: Edge::Top,
+                },
+            )
+            .unwrap();
+
+        assert_eq!(workspace.focused_pane_id(), Some(third_pane));
+        assert_eq!(workspace.task_ids().len(), 3);
+        assert!(workspace.validate().is_ok());
     }
 }
