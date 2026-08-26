@@ -2224,7 +2224,6 @@ struct AddProjectDraft {
 
 struct NewTaskDraft {
     project_id: ProjectId,
-    title: TextField,
     error: Option<String>,
 }
 
@@ -5705,6 +5704,19 @@ fn unix_time_ms() -> i64 {
         .unwrap_or(0)
 }
 
+fn compact_age_label(now_ms: i64, occurred_at_ms: i64) -> String {
+    let age_seconds = now_ms.saturating_sub(occurred_at_ms).max(0) / 1_000;
+    if age_seconds < 60 {
+        "now".to_string()
+    } else if age_seconds < 3_600 {
+        format!("{}m", age_seconds / 60)
+    } else if age_seconds < 86_400 {
+        format!("{}h", age_seconds / 3_600)
+    } else {
+        format!("{}d", age_seconds / 86_400)
+    }
+}
+
 fn update_state_from_stage(stage: UpdaterStage) -> UpdateState {
     match stage {
         UpdaterStage::Disabled => UpdateState::Disabled,
@@ -7871,6 +7883,7 @@ pub struct NativeShell {
     last_window_persist: Option<Instant>,
     add_project: Option<AddProjectDraft>,
     settings_open: bool,
+    show_archived_tasks: bool,
     settings_page: NativeSettingsPage,
     theme_editor: Option<ThemeEditorState>,
     theme_remove_intent: ThemeRemovalIntent,
@@ -8331,6 +8344,7 @@ impl NativeShell {
             last_window_persist: None,
             add_project: None,
             settings_open: false,
+            show_archived_tasks: false,
             settings_page: NativeSettingsPage::Appearance,
             theme_editor: None,
             theme_remove_intent: ThemeRemovalIntent::default(),
@@ -8988,6 +9002,40 @@ impl NativeShell {
             composer.as_ref(),
         );
         let mut overlay_nodes = Vec::new();
+        overlay_nodes.push(
+            AccessibilityNode::new(
+                AccessibleRole::Button,
+                if self.show_archived_tasks {
+                    "Show active tasks"
+                } else {
+                    "Show archived tasks"
+                },
+                "Toggle the sidebar between active tasks and the archived-task browser.",
+            )
+            .gpui("native-sidebar-archived", true, true),
+        );
+        if composer.is_some() {
+            overlay_nodes.extend([
+                AccessibilityNode::new(
+                    AccessibleRole::Button,
+                    "Change model",
+                    "Choose the model used when this provider session starts.",
+                )
+                .gpui("native-composer-model", true, true),
+                AccessibilityNode::new(
+                    AccessibleRole::Button,
+                    "Change thinking budget",
+                    "Choose the reasoning effort used when this provider session starts.",
+                )
+                .gpui("native-composer-reasoning", true, true),
+                AccessibilityNode::new(
+                    AccessibleRole::Button,
+                    "Change access",
+                    "Choose the filesystem and approval access used when this provider session starts.",
+                )
+                .gpui("native-composer-access", true, true),
+            ]);
+        }
         if !matches!(self.project_actions.mode, ProjectActionMenuMode::Closed) {
             overlay_nodes.push(
                 AccessibilityNode::new(
@@ -9066,22 +9114,12 @@ impl NativeShell {
                 .gpui("native-add-project-cancel", true, true),
             );
         }
-        if let Some(draft) = self.new_task.as_ref() {
-            overlay_nodes.push(
-                AccessibilityNode::new(
-                    AccessibleRole::TextField,
-                    "New task name",
-                    "Name the new task before creating it.",
-                )
-                .gpui("native-new-task-name", true, true)
-                .with_value(draft.title.value().to_string())
-                .with_focus(draft.title.is_focused()),
-            );
+        if self.new_task.is_some() {
             overlay_nodes.push(
                 AccessibilityNode::new(
                     AccessibleRole::Button,
-                    "Create task",
-                    "Create the new task with the entered name.",
+                    "Open task",
+                    "Open a new task shell in the selected project.",
                 )
                 .gpui("native-new-task-submit", true, true),
             );
@@ -10743,8 +10781,8 @@ impl NativeShell {
                             self.toggle_project(project_id);
                             self.refresh_accessibility_tree();
                         }
-                        ProjectAccessibilityAction::StartAgent(project_id, provider) => {
-                            self.start_task_with_agent_for_project(project_id, provider);
+                        ProjectAccessibilityAction::StartAgent(project_id, _) => {
+                            self.begin_new_task_for_project(project_id);
                         }
                     }
                     repaint = true;
@@ -10774,13 +10812,6 @@ impl NativeShell {
                 }
                 accesskit::Action::Focus if element_id == "native-task-search-input" => {
                     self.pending_task_search_focus = true;
-                    repaint = true;
-                }
-                accesskit::Action::Focus if element_id == "native-new-task-name" => {
-                    if let Some(draft) = self.new_task.as_mut() {
-                        draft.title.focus();
-                    }
-                    self.pending_root_overlay_focus = true;
                     repaint = true;
                 }
                 accesskit::Action::Focus if element_id == "native-rename-task-name" => {
@@ -10814,16 +10845,6 @@ impl NativeShell {
                     if let Some(accesskit::ActionData::Value(value)) = request.data {
                         self.task_search.set_query(value);
                         self.pending_task_search_focus = true;
-                        self.refresh_accessibility_tree();
-                        repaint = true;
-                    }
-                }
-                accesskit::Action::SetValue if element_id == "native-new-task-name" => {
-                    if let Some(accesskit::ActionData::Value(value)) = request.data {
-                        if let Some(draft) = self.new_task.as_mut() {
-                            let _ = draft.title.focus();
-                            let _ = draft.title.set_value(value.to_string());
-                        }
                         self.refresh_accessibility_tree();
                         repaint = true;
                     }
@@ -11748,6 +11769,90 @@ impl NativeShell {
         self.task_provider_kind(task_id)
     }
 
+    fn composer_launch_options_for(
+        &self,
+        provider: ProviderKind,
+    ) -> crate::providers::ProviderLaunchOptions {
+        use crate::providers::{ProviderLaunchOptions, ProviderModel, ProviderReasoningEffort};
+        let mut options = self
+            .layout
+            .composer_launch_options
+            .unwrap_or(ProviderLaunchOptions {
+                model: ProviderModel::ProviderDefault,
+                reasoning_effort: ProviderReasoningEffort::ProviderDefault,
+                access: crate::providers::ProviderAccessMode::FullAccess,
+            });
+        let compatible = matches!(
+            (provider, options.model),
+            (_, ProviderModel::ProviderDefault)
+                | (
+                    ProviderKind::Codex,
+                    ProviderModel::CodexSol | ProviderModel::CodexTerra | ProviderModel::CodexLuna
+                )
+                | (
+                    ProviderKind::ClaudeCode,
+                    ProviderModel::ClaudeOpus
+                        | ProviderModel::ClaudeSonnet
+                        | ProviderModel::ClaudeHaiku
+                )
+        );
+        if !compatible {
+            options.model = match provider {
+                ProviderKind::Codex => ProviderModel::CodexSol,
+                ProviderKind::ClaudeCode => ProviderModel::ClaudeSonnet,
+                ProviderKind::Cursor => ProviderModel::ProviderDefault,
+            };
+        }
+        options
+    }
+
+    fn cycle_composer_model(&mut self) {
+        use crate::providers::ProviderModel;
+        let provider = self.active_provider_kind().unwrap_or(ProviderKind::Codex);
+        let mut options = self.composer_launch_options_for(provider);
+        options.model = match (provider, options.model) {
+            (ProviderKind::Codex, ProviderModel::CodexSol) => ProviderModel::CodexTerra,
+            (ProviderKind::Codex, ProviderModel::CodexTerra) => ProviderModel::CodexLuna,
+            (ProviderKind::Codex, _) => ProviderModel::CodexSol,
+            (ProviderKind::ClaudeCode, ProviderModel::ClaudeOpus) => ProviderModel::ClaudeSonnet,
+            (ProviderKind::ClaudeCode, ProviderModel::ClaudeSonnet) => ProviderModel::ClaudeHaiku,
+            (ProviderKind::ClaudeCode, _) => ProviderModel::ClaudeOpus,
+            (ProviderKind::Cursor, _) => ProviderModel::ProviderDefault,
+        };
+        self.layout.composer_provider = Some(provider);
+        self.layout.composer_launch_options = Some(options);
+        self.mark_layout_dirty();
+    }
+
+    fn cycle_composer_reasoning(&mut self) {
+        use crate::providers::ProviderReasoningEffort as Effort;
+        let provider = self.active_provider_kind().unwrap_or(ProviderKind::Codex);
+        let mut options = self.composer_launch_options_for(provider);
+        options.reasoning_effort = match options.reasoning_effort {
+            Effort::ProviderDefault => Effort::Medium,
+            Effort::Low => Effort::Medium,
+            Effort::Medium => Effort::High,
+            Effort::High => Effort::ExtraHigh,
+            Effort::ExtraHigh => Effort::Max,
+            Effort::Max => Effort::Low,
+        };
+        self.layout.composer_launch_options = Some(options);
+        self.mark_layout_dirty();
+    }
+
+    fn cycle_composer_access(&mut self) {
+        use crate::providers::ProviderAccessMode as Access;
+        let provider = self.active_provider_kind().unwrap_or(ProviderKind::Codex);
+        let mut options = self.composer_launch_options_for(provider);
+        options.access = match options.access {
+            Access::FullAccess => Access::WorkspaceWrite,
+            Access::WorkspaceWrite => Access::ReadOnly,
+            Access::ReadOnly => Access::FullAccess,
+        };
+        self.layout.composer_launch_options = Some(options);
+        self.mark_layout_dirty();
+    }
+
     fn task_provider_kind(&self, task_id: TaskId) -> Option<ProviderKind> {
         let snapshot = self.client_model.as_ref()?.task(task_id)?;
         let agent_id = snapshot.primary_agent_id?;
@@ -12240,9 +12345,6 @@ impl NativeShell {
 
     /// Root-focused overlay editors that share `focus_handle` (not the composer).
     fn active_root_text_field_mut(&mut self) -> Option<&mut TextField> {
-        if let Some(draft) = self.new_task.as_mut() {
-            return Some(&mut draft.title);
-        }
         if let Some(draft) = self.rename_task.as_mut() {
             return Some(&mut draft.title);
         }
@@ -12258,9 +12360,6 @@ impl NativeShell {
     }
 
     fn root_editor_value(&self) -> Option<String> {
-        if let Some(draft) = self.new_task.as_ref() {
-            return Some(draft.title.value().to_string());
-        }
         if let Some(draft) = self.rename_task.as_ref() {
             return Some(draft.title.value().to_string());
         }
@@ -12283,9 +12382,7 @@ impl NativeShell {
 
     fn root_editor_utf16_selection(&self) -> Option<Range<usize>> {
         let value = self.root_editor_value()?;
-        let cursor = if let Some(draft) = self.new_task.as_ref() {
-            draft.title.cursor()
-        } else if let Some(draft) = self.rename_task.as_ref() {
+        let cursor = if let Some(draft) = self.rename_task.as_ref() {
             draft.title.cursor()
         } else if let Some(draft) = self.add_project.as_ref() {
             draft.name.cursor()
@@ -12315,11 +12412,10 @@ impl NativeShell {
             0
         } else if matches!(
             (
-                self.new_task.as_ref().map(|d| d.title.is_all_selected()),
                 self.rename_task.as_ref().map(|d| d.title.is_all_selected()),
                 self.add_project.as_ref().map(|d| d.name.is_all_selected()),
             ),
-            (Some(true), _, _) | (_, Some(true), _) | (_, _, Some(true))
+            (Some(true), _) | (_, Some(true))
         ) {
             0
         } else {
@@ -12698,6 +12794,13 @@ impl NativeShell {
         );
         let provider_kind = self.active_provider_kind();
         let is_slash_command_send = matches!(&intent.payload, ComposerPayload::SendNow { .. });
+        if is_slash_command_send
+            && provider_kind.is_some()
+            && self.layout.composer_provider != provider_kind
+        {
+            self.layout.composer_provider = provider_kind;
+            self.mark_layout_dirty();
+        }
         let submission = consumes_draft.then(|| {
             let key = ComposerDraftKey::new(fence.task_id, fence.agent_session_id);
             PendingComposerSubmission {
@@ -12729,7 +12832,7 @@ impl NativeShell {
             }
         });
         let intent = self.prefix_composer_intent_with_images(intent);
-        let provider_identity = {
+        let (provider_identity, first_start) = {
             let Some(model) = self.client_model.as_ref() else {
                 if let Some(composer) = self.composer.as_mut() {
                     let _ = composer.cancel_pending(command_id);
@@ -12744,8 +12847,55 @@ impl NativeShell {
                 self.composer_error = Some("task projection unavailable".into());
                 return;
             };
-            composer_provider_identity(snapshot.provider_sessions.get(&fence.agent_session_id))
+            let identity =
+                composer_provider_identity(snapshot.provider_sessions.get(&fence.agent_session_id));
+            let first_start = if is_slash_command_send
+                && identity.0.is_none()
+                && matches!(
+                    snapshot.task.title.as_str(),
+                    "New task" | "New Codex task" | "New Claude task"
+                ) {
+                let agent = snapshot.agents.get(&fence.agent_session_id);
+                let resource = agent.and_then(|agent| {
+                    snapshot.resources.values().find(|resource| {
+                        resource.task_id == Some(fence.task_id)
+                            && resource.resource_kind
+                                == crate::domain::resource::ResourceKind::Terminal
+                            && resource.lifecycle
+                                == crate::domain::resource::ResourceLifecycle::Active
+                            && resource.runtime_generation == agent.runtime_generation
+                    })
+                });
+                agent.zip(resource).map(|(agent, resource)| {
+                    crate::client::action::ProviderStartArguments {
+                        task_id: fence.task_id,
+                        agent_session_id: fence.agent_session_id,
+                        resource_id: resource.id,
+                        provider_kind: agent.provider_kind,
+                        mode: crate::domain::command::ProviderStartMode::NewConversation,
+                        launch_options: self.composer_launch_options_for(agent.provider_kind),
+                        action_epoch: fence.action_epoch,
+                    }
+                })
+            } else {
+                None
+            };
+            (identity, first_start)
         };
+        if let Some(arguments) = first_start {
+            if let Err(failure) =
+                self.dispatch_action_checked(ActionRequest::StartProviderSession(arguments))
+            {
+                if let Some(composer) = self.composer.as_mut() {
+                    let _ = composer.cancel_pending(command_id);
+                }
+                self.composer_error = Some(format!(
+                    "Couldn't start the selected provider: {}",
+                    failure.message
+                ));
+                return;
+            }
+        }
         let request = match intent.to_provider_input_request(
             provider_identity.0,
             provider_identity.1,
@@ -13420,6 +13570,14 @@ impl NativeShell {
             let _ = shell.apply_workspace_selection(task_id, WorkspaceSelectionGesture::Plain);
             cx.notify();
         });
+        let focus_anywhere = cx.listener(move |shell, event: &MouseDownEvent, _window, cx| {
+            if event.button == MouseButton::Left
+                && shell.interaction.selected_task() != Some(task_id)
+            {
+                let _ = shell.apply_workspace_selection(task_id, WorkspaceSelectionGesture::Plain);
+                cx.notify();
+            }
+        });
         let compact = pane.body == TaskPaneBody::Compact;
         let toggle = cx.listener(move |shell, _event: &ClickEvent, _window, cx| {
             cx.stop_propagation();
@@ -13608,6 +13766,7 @@ impl NativeShell {
             .border_color(focus_border.to_gpui())
             .rounded(px(tokens.density.radii.md))
             .bg(tokens.surfaces.canvas.to_gpui())
+            .capture_any_mouse_down(focus_anywhere)
             .can_drop(move |value, _, _| {
                 value
                     .downcast_ref::<DraggedTaskPane>()
@@ -13905,6 +14064,45 @@ impl NativeShell {
             Some(ProviderKind::Cursor) => "Cursor",
             None => "Provider",
         };
+        let launch_options =
+            self.composer_launch_options_for(provider_kind.unwrap_or(ProviderKind::Codex));
+        let model_label = match launch_options.model {
+            crate::providers::ProviderModel::ProviderDefault => "Provider default",
+            crate::providers::ProviderModel::CodexSol => "GPT-5.6 Sol",
+            crate::providers::ProviderModel::CodexTerra => "GPT-5.6 Terra",
+            crate::providers::ProviderModel::CodexLuna => "GPT-5.6 Luna",
+            crate::providers::ProviderModel::ClaudeOpus => "Claude Opus",
+            crate::providers::ProviderModel::ClaudeSonnet => "Claude Sonnet",
+            crate::providers::ProviderModel::ClaudeHaiku => "Claude Haiku",
+        };
+        let reasoning_label = match launch_options.reasoning_effort {
+            crate::providers::ProviderReasoningEffort::ProviderDefault => "Default thinking",
+            crate::providers::ProviderReasoningEffort::Low => "Low",
+            crate::providers::ProviderReasoningEffort::Medium => "Medium",
+            crate::providers::ProviderReasoningEffort::High => "High",
+            crate::providers::ProviderReasoningEffort::ExtraHigh => "Extra high",
+            crate::providers::ProviderReasoningEffort::Max => "Max",
+        };
+        let access_label = match launch_options.access {
+            crate::providers::ProviderAccessMode::FullAccess => "Full access",
+            crate::providers::ProviderAccessMode::WorkspaceWrite => "Workspace write",
+            crate::providers::ProviderAccessMode::ReadOnly => "Read only",
+        };
+        let cycle_model = cx.listener(|shell, _event: &ClickEvent, _window, cx| {
+            cx.stop_propagation();
+            shell.cycle_composer_model();
+            cx.notify();
+        });
+        let cycle_reasoning = cx.listener(|shell, _event: &ClickEvent, _window, cx| {
+            cx.stop_propagation();
+            shell.cycle_composer_reasoning();
+            cx.notify();
+        });
+        let cycle_access = cx.listener(|shell, _event: &ClickEvent, _window, cx| {
+            cx.stop_propagation();
+            shell.cycle_composer_access();
+            cx.notify();
+        });
         let (checkout_label, branch_label) = self
             .interaction
             .selected_task()
@@ -14309,8 +14507,24 @@ impl NativeShell {
                                                     .items_center()
                                                     .gap(px(6.0))
                                                     .child(composer_pill(provider_label))
-                                                    .child(composer_pill("Provider defaults"))
-                                                    .child(composer_pill("Full access")),
+                                                    .child(
+                                                        Button::new("native-composer-model")
+                                                            .label(model_label)
+                                                            .ghost()
+                                                            .on_click(cycle_model),
+                                                    )
+                                                    .child(
+                                                        Button::new("native-composer-reasoning")
+                                                            .label(reasoning_label)
+                                                            .ghost()
+                                                            .on_click(cycle_reasoning),
+                                                    )
+                                                    .child(
+                                                        Button::new("native-composer-access")
+                                                            .label(access_label)
+                                                            .ghost()
+                                                            .on_click(cycle_access),
+                                                    ),
                                             )
                                             .child(
                                                 div()
@@ -15743,6 +15957,29 @@ impl NativeShell {
     fn project_inbox_items(&self) -> Vec<ProjectInboxItem> {
         let scope = self.project_scope();
         let mut items = Vec::new();
+        if self.show_archived_tasks {
+            let archived = self
+                .inbox
+                .history_rows()
+                .iter()
+                .filter(|row| scope.includes(row.project_id))
+                .map(|row| (row.project_id, row.task_id))
+                .collect::<Vec<_>>();
+            if !archived.is_empty() {
+                items.push(ProjectInboxItem::ArchivedHeader {
+                    task_count: archived.len(),
+                });
+                items.extend(archived.into_iter().map(|(project_id, task_id)| {
+                    ProjectInboxItem::Task {
+                        project_id,
+                        task_id,
+                        settled: false,
+                        archived: true,
+                    }
+                }));
+            }
+            return items;
+        }
         let mut represented = HashSet::new();
         for project in &self.config_sidebar.projects {
             let Ok(project_id) = ProjectId::parse(&project.workspace_id) else {
@@ -15756,7 +15993,14 @@ impl NativeShell {
                 .inbox
                 .active_rows()
                 .iter()
-                .filter(|row| row.project_id == project_id)
+                .filter(|row| {
+                    row.project_id == project_id
+                        && matches!(
+                            row.lifecycle,
+                            crate::domain::task::TaskLifecycle::Open
+                                | crate::domain::task::TaskLifecycle::Closing
+                        )
+                })
                 .map(|row| row.task_id)
                 .collect::<Vec<_>>();
             let expanded = !self.collapsed_projects.contains(&project_id);
@@ -15775,7 +16019,13 @@ impl NativeShell {
                 }));
             }
         }
-        for row in self.inbox.active_rows() {
+        for row in self.inbox.active_rows().iter().filter(|row| {
+            matches!(
+                row.lifecycle,
+                crate::domain::task::TaskLifecycle::Open
+                    | crate::domain::task::TaskLifecycle::Closing
+            )
+        }) {
             if represented.contains(&row.project_id) {
                 continue;
             }
@@ -15788,7 +16038,14 @@ impl NativeShell {
                 .inbox
                 .active_rows()
                 .iter()
-                .filter(|candidate| candidate.project_id == project_id)
+                .filter(|candidate| {
+                    candidate.project_id == project_id
+                        && matches!(
+                            candidate.lifecycle,
+                            crate::domain::task::TaskLifecycle::Open
+                                | crate::domain::task::TaskLifecycle::Closing
+                        )
+                })
                 .map(|candidate| candidate.task_id)
                 .collect::<Vec<_>>();
             let expanded = !self.collapsed_projects.contains(&project_id);
@@ -15806,52 +16063,6 @@ impl NativeShell {
                     archived: false,
                 }));
             }
-        }
-        let settled = self
-            .client_model
-            .as_ref()
-            .into_iter()
-            .flat_map(|model| model.tasks().values())
-            .filter(|snapshot| {
-                snapshot.task.lifecycle == crate::domain::task::TaskLifecycle::Settled
-                    && scope.includes(snapshot.task.project_id)
-            })
-            .map(|snapshot| (snapshot.task.project_id, snapshot.task.id))
-            .collect::<Vec<_>>();
-        if !settled.is_empty() {
-            items.push(ProjectInboxItem::DoneHeader {
-                task_count: settled.len(),
-            });
-            items.extend(
-                settled
-                    .into_iter()
-                    .map(|(project_id, task_id)| ProjectInboxItem::Task {
-                        project_id,
-                        task_id,
-                        settled: true,
-                        archived: false,
-                    }),
-            );
-        }
-        let archived = self
-            .inbox
-            .history_rows()
-            .iter()
-            .filter(|row| scope.includes(row.project_id))
-            .map(|row| (row.project_id, row.task_id))
-            .collect::<Vec<_>>();
-        if !archived.is_empty() {
-            items.push(ProjectInboxItem::ArchivedHeader {
-                task_count: archived.len(),
-            });
-            items.extend(archived.into_iter().map(|(project_id, task_id)| {
-                ProjectInboxItem::Task {
-                    project_id,
-                    task_id,
-                    settled: false,
-                    archived: true,
-                }
-            }));
         }
         items
     }
@@ -16187,6 +16398,7 @@ impl NativeShell {
                 project_id,
                 workspace: crate::workspace::WorkspaceRequest::main(),
                 primary_provider: Some(kind),
+                defer_primary_provider_start: false,
             },
         ));
     }
@@ -16263,11 +16475,8 @@ impl NativeShell {
 
     fn begin_new_task_for_project(&mut self, project_id: ProjectId) {
         self.selected_project_id = Some(project_id);
-        let mut title = TextField::new("Task name").expect("task name field");
-        title.focus();
         self.new_task = Some(NewTaskDraft {
             project_id,
-            title,
             error: None,
         });
         self.pending_root_overlay_focus = true;
@@ -16281,24 +16490,22 @@ impl NativeShell {
         let Some(draft) = self.new_task.as_ref() else {
             return;
         };
-        let title = draft.title.value().trim().to_string();
-        if title.is_empty() {
-            if let Some(draft) = self.new_task.as_mut() {
-                draft.error = Some("Give this task a name.".into());
-            }
-            return;
-        }
         let project_id = draft.project_id;
+        let provider_kind = self
+            .layout
+            .composer_provider
+            .unwrap_or(crate::providers::ProviderKind::Codex);
         if self
             .dispatch_action_checked(ActionRequest::TaskCreateV2(
                 crate::client::action::TaskCreateV2Arguments {
                     task_id: TaskId::new(),
                     environment_id: crate::domain::id::EnvironmentId::new(),
-                    title,
+                    title: "New task".to_string(),
                     description: None,
                     project_id,
                     workspace: crate::workspace::WorkspaceRequest::main(),
-                    primary_provider: None,
+                    primary_provider: Some(provider_kind),
+                    defer_primary_provider_start: true,
                 },
             ))
             .is_err()
@@ -16413,6 +16620,13 @@ impl NativeShell {
             "native-delete-task-submit" => self.confirm_task_delete(),
             "native-delete-task-cancel" => self.delete_task = None,
             "native-task-composer-input" => self.request_composer_accessibility_focus(),
+            "native-composer-model" => self.cycle_composer_model(),
+            "native-composer-reasoning" => self.cycle_composer_reasoning(),
+            "native-composer-access" => self.cycle_composer_access(),
+            "native-sidebar-archived" => {
+                self.show_archived_tasks = !self.show_archived_tasks;
+                self.refresh_accessibility_tree();
+            }
             "native-task-composer-attach" => self.pending_composer_image_prompt = true,
             "native-task-composer-send" => self.activate_composer_control(ComposerControl::SendNow),
             "native-shell-tools-affordance" => self.open_project_action_menu(),
@@ -18975,9 +19189,7 @@ impl NativeShell {
                                 div()
                                     .text_size(px(tokens.density.typography.caption))
                                     .text_color(tokens.text.muted.to_gpui())
-                                    .child(
-                                        "Chat, files, and the terminal will open with this work.",
-                                    ),
+                                    .child("Choose the project this task should start in."),
                             )
                             .child(
                                 div()
@@ -19034,12 +19246,6 @@ impl NativeShell {
                                         },
                                     )),
                             )
-                            .child(self.overlay_text_field(
-                                "native-new-task-name",
-                                &draft.title,
-                                "What are you working on?",
-                                tokens,
-                            ))
                             .children(error.map(|message| {
                                 div()
                                     .text_size(px(tokens.density.typography.caption))
@@ -19065,7 +19271,7 @@ impl NativeShell {
                                     )
                                     .child(
                                         Button::new("native-new-task-submit")
-                                            .label("Create task")
+                                            .label("Open task")
                                             .primary()
                                             .on_click(cx.listener(
                                                 |shell, _event: &ClickEvent, _window, cx| {
@@ -20997,7 +21203,7 @@ impl NativeShell {
         &mut self,
         event: &KeyDownEvent,
         window: &mut Window,
-        cx: &mut Context<Self>,
+        _cx: &mut Context<Self>,
     ) {
         let key = event.keystroke.key.as_str();
         if key == "escape" {
@@ -21008,37 +21214,6 @@ impl NativeShell {
         if key == "enter" {
             window.prevent_default();
             self.submit_new_task();
-            return;
-        }
-        if event.keystroke.modifiers.control || event.keystroke.modifiers.platform {
-            match key {
-                "a" => {
-                    window.prevent_default();
-                    if let Some(draft) = self.new_task.as_mut() {
-                        draft.title.select_all();
-                    }
-                }
-                "v" => {
-                    window.prevent_default();
-                    if let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) {
-                        if let Some(draft) = self.new_task.as_mut() {
-                            let epoch = draft.title.focus_epoch();
-                            let _ = draft.title.paste(&text, epoch);
-                        }
-                    }
-                }
-                _ => {}
-            }
-            return;
-        }
-        let Some(draft) = self.new_task.as_mut() else {
-            return;
-        };
-        let epoch = draft.title.focus_epoch();
-        if let Some(input) = Self::overlay_key_input(event) {
-            if draft.title.handle_key(input, epoch).ok().unwrap_or(false) {
-                window.prevent_default();
-            }
         }
     }
 
@@ -22168,6 +22343,29 @@ impl NativeShell {
                 .collect::<std::collections::HashMap<_, _>>(),
         );
         let selected_task = self.interaction.selected_task();
+        let open_task_ids = Arc::new(
+            self.layout
+                .task_workspace
+                .as_ref()
+                .map(|workspace| workspace.task_ids().into_iter().collect::<HashSet<_>>())
+                .unwrap_or_default(),
+        );
+        let settled_rows = self
+            .inbox
+            .active_rows()
+            .iter()
+            .filter(|row| {
+                row.lifecycle == crate::domain::task::TaskLifecycle::Settled
+                    && self.project_scope().includes(row.project_id)
+            })
+            .map(|row| {
+                (
+                    row.task_id,
+                    row.title.clone(),
+                    compact_age_label(unix_time_ms(), row.occurred_at_ms),
+                )
+            })
+            .collect::<Vec<_>>();
         let row_height = Self::inbox_row_height(tokens);
         let inbox_is_empty = inbox_items.is_empty();
         let agents_connected = snapshot_connected(self.agent_connection.as_ref());
@@ -22191,6 +22389,9 @@ impl NativeShell {
             .any(|action| action.provider == ProviderKind::Codex);
         let shell_entity = cx.entity().downgrade();
         let services_shell_entity = shell_entity.clone();
+        let settled_shell_entity = shell_entity.clone();
+        let settled_open_task_ids = Arc::clone(&open_task_ids);
+        let archived_view = self.show_archived_tasks;
         let task_list_generation = selected_task
             .map(|task_id| stable_task_element_key(task_id, "uniform-list"))
             .unwrap_or_default();
@@ -22378,7 +22579,7 @@ impl NativeShell {
                         ProjectInboxItem::DoneHeader { task_count } => div()
                             .id("native-done-section")
                             .w_full()
-                            .h(px(32.0))
+                            .h(px(row_height))
                             .flex()
                             .items_center()
                             .justify_between()
@@ -22395,7 +22596,7 @@ impl NativeShell {
                         ProjectInboxItem::ArchivedHeader { task_count } => div()
                             .id("native-archived-section")
                             .w_full()
-                            .h(px(32.0))
+                            .h(px(row_height))
                             .flex()
                             .items_center()
                             .justify_between()
@@ -22418,6 +22619,7 @@ impl NativeShell {
                         let shell_for_mouse = shell_entity.clone();
                         let shell_for_mouse_up = shell_entity.clone();
                         let shell_for_key = shell_entity.clone();
+                        let shell_for_delete = shell_entity.clone();
                         let (
                             row_title,
                             project_label,
@@ -22437,6 +22639,7 @@ impl NativeShell {
                                 )
                             });
                         let row_selected = selected_task == Some(task_id);
+                        let row_open = open_task_ids.contains(&task_id);
                         let mouse_handler =
                             move |event: &MouseDownEvent,
                                   window: &mut Window,
@@ -22458,7 +22661,7 @@ impl NativeShell {
                                                 workspace.contains_task(task_id)
                                             });
                                         let _ = shell.apply_workspace_selection(task_id, gesture);
-                                        if (settled || archived)
+                                        if settled
                                             && !(gesture == WorkspaceSelectionGesture::Toggle
                                                 && was_open)
                                         {
@@ -22497,7 +22700,7 @@ impl NativeShell {
                                             task_id,
                                             WorkspaceSelectionGesture::Plain,
                                         );
-                                        if settled || archived {
+                                        if settled {
                                             shell.reopen_task(task_id);
                                         }
                                         shell.refresh_accessibility_tree();
@@ -22523,13 +22726,17 @@ impl NativeShell {
                         // explicit text, so the state never depends on color.
                         let row = if row_selected {
                             row.bg(tokens.surfaces.selection.to_gpui())
+                                .border_l(px(2.0))
+                                .border_color(tokens.borders.focus.to_gpui())
+                        } else if row_open {
+                            row.bg(tokens.surfaces.selection.to_gpui())
                         } else if settled || archived {
                             row.opacity(0.72)
                                 .hover(|style| style.bg(tokens.surfaces.hover.to_gpui()))
                         } else {
                             row.hover(|style| style.bg(tokens.surfaces.hover.to_gpui()))
                         };
-                        let title_color = if row_selected {
+                        let title_color = if row_open {
                             tokens.text.on_selection.to_gpui()
                         } else {
                             tokens.text.primary.to_gpui()
@@ -22556,7 +22763,7 @@ impl NativeShell {
                                     .gap(px(5.0))
                                     .text_size(px(tokens.density.typography.caption))
                                     .line_height(px(tokens.density.typography.caption_line_height))
-                                    .text_color(if row_selected {
+                                    .text_color(if row_open {
                                         tokens.text.on_selection.to_gpui()
                                     } else {
                                         tokens.text.secondary.to_gpui()
@@ -22564,7 +22771,7 @@ impl NativeShell {
                                     .child(crate::icons::app_icon(
                                         crate::icons::FOLDER,
                                         13.0,
-                                        if row_selected {
+                                        if row_open {
                                             tokens.text.on_selection.to_u32()
                                         } else {
                                             tokens.text.secondary.to_u32()
@@ -22596,12 +22803,69 @@ impl NativeShell {
                                 div()
                                     .w_full()
                                     .min_w(px(0.0))
-                                    .truncate()
+                                    .flex()
+                                    .items_center()
+                                    .gap(px(4.0))
                                     .text_size(px(tokens.density.typography.body))
                                     .line_height(px(tokens.density.typography.body_line_height))
                                     .font_weight(FontWeight::SEMIBOLD)
                                     .text_color(title_color)
-                                    .child(row_title),
+                                    .child(
+                                        div()
+                                            .flex_1()
+                                            .min_w(px(0.0))
+                                            .truncate()
+                                            .child(row_title),
+                                    )
+                                    .when(archived, |title| {
+                                        title.child(
+                                            div()
+                                                .id((
+                                                    "native-task-delete-icon",
+                                                    stable_task_element_key(task_id, "delete"),
+                                                ))
+                                                .tab_stop(true)
+                                                .size(px(22.0))
+                                                .flex()
+                                                .flex_none()
+                                                .items_center()
+                                                .justify_center()
+                                                .rounded(px(4.0))
+                                                .cursor_pointer()
+                                                .hover(|style| {
+                                                    style.bg(
+                                                        tokens
+                                                            .actions
+                                                            .destructive
+                                                            .hover
+                                                            .background
+                                                            .to_gpui(),
+                                                    )
+                                                })
+                                                .on_click(move |_event: &ClickEvent,
+                                                                _window: &mut Window,
+                                                                app: &mut gpui::App| {
+                                                    let _ = shell_for_delete.update(
+                                                        app,
+                                                        |shell, cx| {
+                                                            cx.stop_propagation();
+                                                            shell.begin_task_delete(task_id);
+                                                            cx.notify();
+                                                        },
+                                                    );
+                                                })
+                                                .child(crate::icons::app_icon(
+                                                    crate::icons::X,
+                                                    12.0,
+                                                    tokens
+                                                        .actions
+                                                        .destructive
+                                                        .default
+                                                        .foreground
+                                                        .to_u32(),
+                                                )),
+                                        )
+                                    }),
                             )
                             .child(
                                 div()
@@ -22610,7 +22874,7 @@ impl NativeShell {
                                     .items_center()
                                     .text_size(px(tokens.density.typography.caption))
                                     .line_height(px(tokens.density.typography.caption_line_height))
-                                    .text_color(if row_selected {
+                                    .text_color(if row_open {
                                         tokens.text.on_selection.to_gpui()
                                     } else {
                                         tokens.text.muted.to_gpui()
@@ -22989,6 +23253,117 @@ impl NativeShell {
                     .child(project_add_control),
             )
             .into_any_element();
+        let settled_panel = (!archived_view && !settled_rows.is_empty()).then(|| {
+            let settled_count = settled_rows.len();
+            let rows = settled_rows.into_iter().map(|(task_id, title, age)| {
+                let shell_for_settled = settled_shell_entity.clone();
+                let is_open = settled_open_task_ids.contains(&task_id);
+                let is_focused = selected_task == Some(task_id);
+                let row = div()
+                    .id((
+                        "native-settled-task-row",
+                        stable_task_element_key(task_id, "settled"),
+                    ))
+                    .tab_stop(true)
+                    .w_full()
+                    .h(px(34.0))
+                    .flex()
+                    .items_center()
+                    .gap(px(8.0))
+                    .px(px(10.0))
+                    .rounded(px(5.0))
+                    .cursor_pointer()
+                    .text_size(px(tokens.density.typography.caption))
+                    .text_color(if is_open {
+                        tokens.text.on_selection.to_gpui()
+                    } else {
+                        tokens.text.secondary.to_gpui()
+                    })
+                    .hover(|style| style.bg(tokens.surfaces.hover.to_gpui()));
+                let row = if is_focused {
+                    row.bg(tokens.surfaces.selection.to_gpui())
+                        .border_l(px(2.0))
+                        .border_color(tokens.borders.focus.to_gpui())
+                } else if is_open {
+                    row.bg(tokens.surfaces.selection.to_gpui())
+                } else {
+                    row
+                };
+                row.on_mouse_down(
+                    MouseButton::Left,
+                    move |_event: &MouseDownEvent, window: &mut Window, app: &mut gpui::App| {
+                        let _ = shell_for_settled.update(app, |shell, cx| {
+                            cx.stop_propagation();
+                            shell.focus_handle.focus(window);
+                            let _ = shell.apply_workspace_selection(
+                                task_id,
+                                WorkspaceSelectionGesture::Plain,
+                            );
+                            shell.reopen_task(task_id);
+                            shell.refresh_accessibility_tree();
+                            cx.notify();
+                        });
+                    },
+                )
+                .child(crate::icons::app_icon(
+                    crate::icons::FILE_TEXT,
+                    13.0,
+                    if is_open {
+                        tokens.text.on_selection.to_u32()
+                    } else {
+                        tokens.text.muted.to_u32()
+                    },
+                ))
+                .child(div().flex_1().min_w(px(0.0)).truncate().child(title))
+                .child(
+                    div()
+                        .flex_none()
+                        .text_color(if is_open {
+                            tokens.text.on_selection.to_gpui()
+                        } else {
+                            tokens.text.muted.to_gpui()
+                        })
+                        .child(age),
+                )
+            });
+            div()
+                .id("native-settled-section")
+                .w_full()
+                .flex()
+                .flex_col()
+                .flex_none()
+                .max_h(px(240.0))
+                .border_t(px(1.0))
+                .border_color(tokens.borders.subtle.to_gpui())
+                .pt(px(5.0))
+                .child(
+                    div()
+                        .w_full()
+                        .h(px(28.0))
+                        .flex()
+                        .items_center()
+                        .gap(px(7.0))
+                        .px(px(10.0))
+                        .text_size(px(tokens.density.typography.caption))
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .text_color(tokens.text.muted.to_gpui())
+                        .child("Settled")
+                        .child(
+                            div()
+                                .flex_1()
+                                .h(px(1.0))
+                                .bg(tokens.borders.subtle.to_gpui()),
+                        )
+                        .child(settled_count.to_string())
+                        .child(crate::icons::app_icon(
+                            crate::icons::CHEVRON_UP,
+                            11.0,
+                            tokens.text.muted.to_u32(),
+                        )),
+                )
+                .child(div().min_h(px(0.0)).overflow_y_scrollbar().children(rows))
+                .into_any_element()
+        });
         let inbox_panel = div()
             .id("native-shell-task-inbox")
             .w_full()
@@ -23012,6 +23387,7 @@ impl NativeShell {
                     .child(task_list_element)
                     .into_any_element()
             })
+            .children(settled_panel)
             .into_any_element();
         let sidebar_footer = div()
             .id("native-shell-sidebar-footer")
@@ -23029,6 +23405,36 @@ impl NativeShell {
                     .flex()
                     .items_center()
                     .gap(px(4.0))
+                    .child(
+                        div()
+                            .id("native-sidebar-archived")
+                            .tab_stop(true)
+                            .size(px(28.0))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .rounded(px(6.0))
+                            .cursor_pointer()
+                            .when(archived_view, |button| {
+                                button.bg(tokens.surfaces.selection.to_gpui())
+                            })
+                            .hover(|style| style.bg(tokens.surfaces.hover.to_gpui()))
+                            .on_click(cx.listener(|shell, _event: &ClickEvent, _window, cx| {
+                                cx.stop_propagation();
+                                shell.show_archived_tasks = !shell.show_archived_tasks;
+                                shell.refresh_accessibility_tree();
+                                cx.notify();
+                            }))
+                            .child(crate::icons::app_icon(
+                                crate::icons::FILE_TEXT,
+                                14.0,
+                                if archived_view {
+                                    tokens.text.primary.to_u32()
+                                } else {
+                                    tokens.text.muted.to_u32()
+                                },
+                            )),
+                    )
                     .child(
                         div()
                             .id("native-header-settings")
@@ -25204,6 +25610,7 @@ mod tests {
                 project_id: crate::domain::id::ProjectId::new(),
                 workspace: crate::workspace::WorkspaceRequest::main(),
                 primary_provider: None,
+                defer_primary_provider_start: false,
             },
         )
     }
@@ -26724,6 +27131,7 @@ mod tests {
                             project_id: crate::domain::id::ProjectId::new(),
                             workspace: crate::workspace::WorkspaceRequest::main(),
                             primary_provider: None,
+                            defer_primary_provider_start: false,
                         },
                     ),
                 );
@@ -28579,6 +28987,7 @@ mod tests {
                 resource_id,
                 provider_kind: crate::providers::ProviderKind::ClaudeCode,
                 mode: ProviderStartMode::Open,
+                launch_options: crate::providers::adapter::ProviderLaunchOptions::default(),
                 action_epoch: 0,
             },
         ));
@@ -29338,60 +29747,22 @@ mod tests {
 
             shell.begin_new_task_for_project(project_id);
             shell.refresh_accessibility_tree();
-            let target_node = shell
-                .platform_accessibility
-                .tree_update()
-                .nodes
-                .iter()
-                .find_map(|(node_id, node)| {
-                    (node.author_id() == Some("native-new-task-name")).then_some(*node_id)
-                })
-                .expect("new-task AccessKit text field");
-            let generation = shell.platform_accessibility.generation();
-            shell
-                .platform_accessibility
-                .pending_actions
-                .lock()
-                .expect("accessibility action queue")
-                .push_back(NativeAccessibilityAction {
-                    request: accesskit::ActionRequest {
-                        action: accesskit::Action::SetValue,
-                        target_tree: accesskit::TreeId::ROOT,
-                        target_node,
-                        data: Some(accesskit::ActionData::Value("a11y new task".into())),
-                    },
-                    tree_generation: generation,
-                });
-            assert!(shell.controller_tick_for_test(MAX_ACCESSIBILITY_ACTIONS));
-            assert_eq!(
-                shell
-                    .new_task
-                    .as_ref()
-                    .expect("new-task draft")
-                    .title
-                    .value(),
-                "a11y new task"
+            let update = shell.platform_accessibility.tree_update();
+            assert!(
+                update
+                    .nodes
+                    .iter()
+                    .all(|(_, node)| node.author_id() != Some("native-new-task-name")),
+                "new task asks only for a project, never a task name"
             );
-            let refreshed_value = shell
-                .platform_accessibility_tree_for_test()
-                .nodes
-                .into_iter()
-                .find_map(|(_, node)| {
-                    (node.author_id() == Some("native-new-task-name"))
-                        .then(|| node.value().map(|value| value.to_string()))
-                        .flatten()
-                });
-            assert_eq!(refreshed_value.as_deref(), Some("a11y new task"));
-
-            let target_node = shell
-                .platform_accessibility
-                .tree_update()
+            let submit_node = update
                 .nodes
                 .iter()
                 .find_map(|(node_id, node)| {
-                    (node.author_id() == Some("native-new-task-name")).then_some(*node_id)
+                    (node.author_id() == Some("native-new-task-submit")).then_some(*node_id)
                 })
-                .expect("new-task AccessKit text field for focus");
+                .expect("new-task open button");
+            let before = shared.lock().expect("runtime").accepted.len();
             let generation = shell.platform_accessibility.generation();
             shell
                 .platform_accessibility
@@ -29400,26 +29771,36 @@ mod tests {
                 .expect("accessibility action queue")
                 .push_back(NativeAccessibilityAction {
                     request: accesskit::ActionRequest {
-                        action: accesskit::Action::Focus,
+                        action: accesskit::Action::Click,
                         target_tree: accesskit::TreeId::ROOT,
-                        target_node,
+                        target_node: submit_node,
                         data: None,
                     },
                     tree_generation: generation,
                 });
             assert!(shell.controller_tick_for_test(MAX_ACCESSIBILITY_ACTIONS));
             assert!(
-                shell
-                    .new_task
-                    .as_ref()
-                    .expect("new-task draft")
-                    .title
-                    .is_focused(),
-                "Focus must target the exact new-task TextField"
+                shell.new_task.is_none(),
+                "Open task must clear the project chooser"
             );
+            let accepted = shared.lock().expect("runtime").accepted.clone();
             assert!(
-                shell.pending_root_overlay_focus,
-                "Focus must rearm root focus_handle for the next render"
+                accepted.len() > before
+                    && accepted.iter().any(|record| {
+                        matches!(
+                            record.command,
+                            super::NativeHostCommand::TaskCreateV2 {
+                                arguments: crate::client::action::TaskCreateV2Arguments {
+                                    project_id: id,
+                                    ref title,
+                                    defer_primary_provider_start: true,
+                                    ..
+                                },
+                                ..
+                            } if id == project_id && title == "New task"
+                        )
+                    }),
+                "project-only creation must dispatch a deferred New task shell"
             );
 
             shell.begin_task_rename(task_id);
@@ -30430,11 +30811,10 @@ mod tests {
             "root editors must own a distinct GPUI input entity and route platform text"
         );
         assert!(
-            source.contains("native-new-task-name")
-                && source.contains("native-rename-task-name")
+            source.contains("native-rename-task-name")
                 && source.contains("native-add-project-name")
                 && source.contains("native-task-terminal-rows"),
-            "new-task, rename, add-project, and task-terminal must expose AccessKit nodes"
+            "rename, add-project, and task-terminal must expose AccessKit nodes"
         );
         assert!(
             source.contains("native-rename-task-submit")
@@ -30446,17 +30826,6 @@ mod tests {
             source.contains("native-empty-conversation") && source.contains("No messages yet"),
             "valid empty timelines must show an honest empty conversation state"
         );
-    }
-
-    #[test]
-    fn root_platform_text_routes_to_new_task_name_field() {
-        let mut draft_title = TextField::new("Task name").expect("field");
-        draft_title.focus();
-        let epoch = draft_title.focus_epoch();
-        assert!(draft_title
-            .replace_range(0..0, "hello", epoch)
-            .expect("replace"));
-        assert_eq!(draft_title.value(), "hello");
     }
 
     #[test]

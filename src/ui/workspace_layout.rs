@@ -18,7 +18,8 @@ use crate::ui::task_workspace::TaskWorkspace;
 const LAYOUT_SCHEMA_V1: &str = "devmanager.workspace-layout/v1";
 const LAYOUT_SCHEMA_V2: &str = "devmanager.workspace-layout/v2";
 const LAYOUT_SCHEMA_V3: &str = "devmanager.workspace-layout/v3";
-const LAYOUT_SCHEMA: &str = "devmanager.workspace-layout/v4";
+const LAYOUT_SCHEMA_V4: &str = "devmanager.workspace-layout/v4";
+const LAYOUT_SCHEMA: &str = "devmanager.workspace-layout/v5";
 const LAYOUT_FILE_NAME: &str = "workspace-layout.json";
 
 pub const SIDEBAR_MIN: f32 = 180.0;
@@ -100,6 +101,12 @@ pub struct WorkspaceLayout {
     /// Per-task center canvas preference: true = provider terminal, false = conversation.
     #[serde(default)]
     pub task_center_terminal: BTreeMap<String, bool>,
+    /// Last composer launch choices. Project-specific overrides can layer on
+    /// these later without changing task creation semantics.
+    #[serde(default)]
+    pub composer_provider: Option<crate::providers::ProviderKind>,
+    #[serde(default)]
+    pub composer_launch_options: Option<crate::providers::ProviderLaunchOptions>,
 }
 
 impl Default for WorkspaceLayout {
@@ -121,6 +128,12 @@ impl Default for WorkspaceLayout {
             active_dock_tab: None,
             project_scope_workspace_id: None,
             task_center_terminal: BTreeMap::new(),
+            composer_provider: Some(crate::providers::ProviderKind::Codex),
+            composer_launch_options: Some(crate::providers::ProviderLaunchOptions {
+                model: crate::providers::ProviderModel::CodexSol,
+                reasoning_effort: crate::providers::ProviderReasoningEffort::ExtraHigh,
+                access: crate::providers::ProviderAccessMode::FullAccess,
+            }),
         }
     }
 }
@@ -174,6 +187,13 @@ impl WorkspaceLayout {
             self.set_value(edge, if value.is_finite() { value } else { fallback });
         }
         self.window = self.window.filter(WindowFrame::is_usable);
+        let defaults = Self::default();
+        if self.composer_provider.is_none() {
+            self.composer_provider = defaults.composer_provider;
+        }
+        if self.composer_launch_options.is_none() {
+            self.composer_launch_options = defaults.composer_launch_options;
+        }
         self.sanitize_task_workspace();
         self
     }
@@ -359,6 +379,7 @@ impl WorkspaceLayoutStore {
         };
         match file.schema.as_str() {
             LAYOUT_SCHEMA => file.layout.sanitized(),
+            LAYOUT_SCHEMA_V4 => file.layout.sanitized(),
             LAYOUT_SCHEMA_V3 => file.layout.sanitized(),
             LAYOUT_SCHEMA_V2 => file.layout.sanitized(),
             LAYOUT_SCHEMA_V1 => {
@@ -577,7 +598,7 @@ mod tests {
     }
 
     #[test]
-    fn v1_layout_migrates_once_to_v4_with_dock_collapsed() {
+    fn v1_layout_migrates_once_to_v5_with_dock_collapsed() {
         let directory = tempfile::tempdir().expect("temp dir");
         let store = WorkspaceLayoutStore::at_profile_root(directory.path());
         let selected = TaskId::new();
@@ -635,14 +656,14 @@ mod tests {
         let bytes = fs::read(store.path()).expect("read saved layout");
         let saved: serde_json::Value = serde_json::from_slice(&bytes).expect("parse saved");
         assert_eq!(
-            saved["schema"], "devmanager.workspace-layout/v4",
+            saved["schema"], "devmanager.workspace-layout/v5",
             "save must write the current workspace-layout schema"
         );
         assert_eq!(store.load(), migrated);
     }
 
     #[test]
-    fn v4_persists_dock_tab_project_scope_and_center_surface() {
+    fn v5_persists_dock_scope_center_surface_and_composer_defaults() {
         let directory = tempfile::tempdir().expect("temp dir");
         let store = WorkspaceLayoutStore::at_profile_root(directory.path());
         let layout = WorkspaceLayout {
@@ -655,7 +676,7 @@ mod tests {
             },
             ..WorkspaceLayout::default()
         };
-        store.save(layout).expect("save v4");
+        store.save(layout).expect("save v5");
         let loaded = store.load();
         assert_eq!(loaded.active_dock_tab.as_deref(), Some("Browser"));
         assert_eq!(
@@ -663,6 +684,10 @@ mod tests {
             Some("project-1")
         );
         assert_eq!(loaded.task_center_terminal.get("task-a"), Some(&true));
+        assert_eq!(
+            loaded.composer_launch_options,
+            WorkspaceLayout::default().composer_launch_options
+        );
         assert!(loaded.dock_collapsed);
     }
 

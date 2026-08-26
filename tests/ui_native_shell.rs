@@ -614,6 +614,7 @@ fn native_mutating_action_captures_model_revision_and_epochs() {
                 project_id: ProjectId::new(),
                 workspace: devmanager::workspace::WorkspaceRequest::main(),
                 primary_provider: None,
+                defer_primary_provider_start: false,
             },
         ))
         .expect("task create should capture a retry identity");
@@ -920,8 +921,10 @@ fn task_preview_projects_inbox_without_becoming_client_model() {
 }
 
 #[test]
-fn idle_conversation_photo_survives_task_selection() {
-    if rerun_headless_integration_test_in_child("idle_conversation_photo_survives_task_selection") {
+fn idle_conversation_photo_rotates_after_task_selection() {
+    if rerun_headless_integration_test_in_child(
+        "idle_conversation_photo_rotates_after_task_selection",
+    ) {
         return;
     }
     let task = task_id(41);
@@ -977,7 +980,7 @@ fn idle_conversation_photo_survives_task_selection() {
     ));
     assert!(matches!(
         idle_again,
-        MainConversationCanvas::IdlePhoto { has_image: true }
+        MainConversationCanvas::IdlePhoto { has_image: false }
     ));
 }
 

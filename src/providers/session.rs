@@ -3201,7 +3201,7 @@ fn validate_same_generation_state_identity(
     if current.generation != next.generation {
         return Ok(());
     }
-    if is_settled_exact_resume_relaunch(current, next) {
+    if is_settled_relaunch(current, next) {
         return Ok(());
     }
     let mut current_launch_spec = current.launch_spec.clone();
@@ -3262,12 +3262,41 @@ fn is_settled_exact_resume_relaunch(
         && next.launch_spec.launch_nonce == next.launch_nonce
 }
 
+fn is_settled_unbound_new_conversation_relaunch(
+    current: &ProviderSessionState,
+    next: &ProviderSessionState,
+) -> bool {
+    current.lifecycle == PersistedRuntimeLifecycle::Replaced
+        && next.lifecycle == PersistedRuntimeLifecycle::Starting
+        && next.action_epoch > current.action_epoch
+        && next.launch_nonce != current.launch_nonce
+        && current.provider_session_id.is_none()
+        && next.provider_session_id.is_none()
+        && next.process_root.is_none()
+        && matches!(
+            current.launch_spec.mode,
+            ProviderLaunchMode::NewConversation
+        )
+        && matches!(next.launch_spec.mode, ProviderLaunchMode::NewConversation)
+        && current.task_id == next.task_id
+        && current.launch_spec.task_id == next.launch_spec.task_id
+        && current.launch_spec.resource_id == next.launch_spec.resource_id
+        && current.launch_spec.provider_kind == next.launch_spec.provider_kind
+        && next.launch_spec.generation == current.generation
+        && next.launch_spec.launch_nonce == next.launch_nonce
+}
+
+fn is_settled_relaunch(current: &ProviderSessionState, next: &ProviderSessionState) -> bool {
+    is_settled_exact_resume_relaunch(current, next)
+        || is_settled_unbound_new_conversation_relaunch(current, next)
+}
+
 fn validate_action_identity_transition(
     current: &ProviderSessionState,
     next: &ProviderSessionState,
 ) -> Result<(), String> {
     let invalid = if current.generation == next.generation {
-        !is_settled_exact_resume_relaunch(current, next)
+        !is_settled_relaunch(current, next)
             && (current.action_epoch != next.action_epoch
                 || current.launch_nonce != next.launch_nonce
                 || current.launch_spec.provider_kind != next.launch_spec.provider_kind)
@@ -10427,6 +10456,47 @@ mod tests {
             error.contains("identity") || error.contains("launch spec"),
             "{error}"
         );
+    }
+
+    #[test]
+    fn sqlite_state_accepts_settled_unbound_new_conversation_relaunch() {
+        let runtime = unit_runtime();
+        let path = tempfile::NamedTempFile::new().unwrap();
+        let mut settled = ProviderSessionState {
+            agent_session_id: runtime.agent_session_id(),
+            task_id: runtime.task_id(),
+            generation: runtime.generation(),
+            action_epoch: runtime.correlation().action_epoch(),
+            revision: 1,
+            lifecycle: PersistedRuntimeLifecycle::Replaced,
+            launch_nonce: runtime.launch_nonce(),
+            launch_spec: runtime.launch_spec(),
+            provider_session_id: None,
+            process_root: Some(PersistedProcessRoot::from_fence(
+                &runtime.fence(),
+                runtime.launch_spec().executable(),
+            )),
+        };
+        settled.launch_spec.mode = ProviderLaunchMode::NewConversation;
+        let mut store = SqliteProviderSessionStateStore::open(path.path()).unwrap();
+        store.persist(settled.clone()).unwrap();
+
+        let next_nonce = LaunchNonce::new();
+        let mut relaunched = settled;
+        relaunched.revision = 2;
+        relaunched.lifecycle = PersistedRuntimeLifecycle::Starting;
+        relaunched.action_epoch += 1;
+        relaunched.launch_nonce = next_nonce;
+        relaunched.launch_spec.launch_nonce = next_nonce;
+        relaunched.process_root = None;
+        relaunched
+            .launch_spec
+            .arguments
+            .push(OsString::from("--new-model"));
+
+        store
+            .persist(relaunched)
+            .expect("a settled launch with no provider identity is safe to replace");
     }
 
     #[test]

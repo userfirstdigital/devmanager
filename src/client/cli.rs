@@ -1551,6 +1551,7 @@ mod tests {
             project_id: ProjectId::new(),
             workspace: WorkspaceRequest::main(),
             primary_provider,
+            defer_primary_provider_start: false,
         }
     }
 

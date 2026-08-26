@@ -479,6 +479,11 @@ pub struct TaskCreateV2Arguments {
     pub workspace: WorkspaceRequest,
     #[serde(default)]
     pub primary_provider: Option<ProviderKind>,
+    /// Create the durable task/agent/resource shell without starting a CLI.
+    /// The native composer starts it with the user's current launch settings
+    /// immediately before accepting the first message.
+    #[serde(default)]
+    pub defer_primary_provider_start: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -624,6 +629,7 @@ pub struct ProviderStartArguments {
     pub resource_id: ResourceId,
     pub provider_kind: ProviderKind,
     pub mode: ProviderStartMode,
+    pub launch_options: crate::providers::adapter::ProviderLaunchOptions,
     pub action_epoch: u64,
 }
 
@@ -1441,6 +1447,7 @@ pub fn task_create_v2_command(
             project_id: args.project_id,
             workspace: args.workspace,
             primary_provider: args.primary_provider,
+            defer_primary_provider_start: args.defer_primary_provider_start,
             assignment: TaskAssignment::LocalOwner,
             created_at_ms: issued_at_ms,
             connectivity: TaskConnectivity::Connected,
@@ -1602,6 +1609,7 @@ pub fn provider_start_command(
             resource_id: args.resource_id,
             provider_kind: args.provider_kind,
             mode: args.mode,
+            launch_options: args.launch_options,
             expected_task_revision,
             expected_action_epoch: args.action_epoch,
         }),
@@ -2280,6 +2288,7 @@ mod tests {
             project_id: ProjectId::new(),
             workspace: crate::workspace::WorkspaceRequest::main(),
             primary_provider: Some(crate::providers::ProviderKind::ClaudeCode),
+            defer_primary_provider_start: false,
         };
         assert_eq!(
             args.primary_provider,
@@ -2348,6 +2357,7 @@ mod tests {
                 resource_id,
                 provider_kind: ProviderKind::ClaudeCode,
                 mode: crate::domain::command::ProviderStartMode::Open,
+                launch_options: crate::providers::adapter::ProviderLaunchOptions::default(),
                 action_epoch: 0,
             },
         )

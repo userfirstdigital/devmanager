@@ -1806,6 +1806,33 @@ impl ProcessManager {
         crate::providers::session::ProviderRuntime,
         crate::providers::controller::StockProviderSessionError,
     > {
+        self.start_production_stock_provider_session_with_options(
+            binding,
+            agent,
+            observation,
+            input,
+            cwd,
+            environment,
+            mode,
+            crate::providers::adapter::ProviderLaunchOptions::default(),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn start_production_stock_provider_session_with_options(
+        &self,
+        binding: crate::domain::AgentResourceBinding,
+        agent: crate::domain::AgentSessionFacts,
+        observation: &crate::providers::registry::ProviderObservation,
+        input: Option<crate::providers::adapter::ProviderInput>,
+        cwd: PathBuf,
+        environment: std::collections::BTreeMap<std::ffi::OsString, std::ffi::OsString>,
+        mode: crate::providers::session::ProviderSessionStartMode,
+        launch_options: crate::providers::adapter::ProviderLaunchOptions,
+    ) -> Result<
+        crate::providers::session::ProviderRuntime,
+        crate::providers::controller::StockProviderSessionError,
+    > {
         let adapter = self
             .inner
             .provider_host
@@ -1845,7 +1872,7 @@ impl ProcessManager {
             .as_mut()
             .expect("production provider manager initialized");
         let start_result = crate::providers::controller::StockProviderSessionController::new()
-            .start_with_resource_binding(
+            .start_with_resource_binding_options(
                 manager,
                 binding,
                 agent,
@@ -1855,6 +1882,7 @@ impl ProcessManager {
                 cwd,
                 environment,
                 mode,
+                launch_options,
             );
         let latched = take_latched_codex_exact_resume_failure(
             &self.inner,

@@ -972,13 +972,49 @@ impl ProviderAdapter for ClaudeCodeAdapter {
         // sessions are intentionally launched with the user's no-prompt policy.
         // `bypassPermissions` suppresses tool approval prompts without disabling
         // explicit AskUserQuestion interactions, which are projected separately.
+        use crate::providers::adapter::{ProviderAccessMode, ProviderModel};
+        let options = request.launch_options();
+        match options.model {
+            ProviderModel::ProviderDefault => {}
+            ProviderModel::ClaudeOpus
+            | ProviderModel::ClaudeSonnet
+            | ProviderModel::ClaudeHaiku => {
+                arguments.extend([
+                    ProviderArgument::new("--model").map_err(|_| {
+                        ProviderError::UnsupportedCapability(ProviderCapability::BuildLaunch)
+                    })?,
+                    ProviderArgument::new(options.model.cli_name().expect("explicit Claude model"))
+                        .map_err(|_| {
+                            ProviderError::UnsupportedCapability(ProviderCapability::BuildLaunch)
+                        })?,
+                ]);
+            }
+            ProviderModel::CodexSol | ProviderModel::CodexTerra | ProviderModel::CodexLuna => {
+                return Err(ProviderError::UnsupportedCapability(
+                    ProviderCapability::BuildLaunch,
+                ));
+            }
+        }
+        if let Some(effort) = options.reasoning_effort.cli_name() {
+            arguments.extend([
+                ProviderArgument::new("--effort").map_err(|_| {
+                    ProviderError::UnsupportedCapability(ProviderCapability::BuildLaunch)
+                })?,
+                ProviderArgument::new(effort).map_err(|_| {
+                    ProviderError::UnsupportedCapability(ProviderCapability::BuildLaunch)
+                })?,
+            ]);
+        }
         arguments.extend([
             ProviderArgument::new("--permission-mode").map_err(|_| {
                 ProviderError::UnsupportedCapability(ProviderCapability::BuildLaunch)
             })?,
-            ProviderArgument::new("bypassPermissions").map_err(|_| {
-                ProviderError::UnsupportedCapability(ProviderCapability::BuildLaunch)
-            })?,
+            ProviderArgument::new(match options.access {
+                ProviderAccessMode::FullAccess => "bypassPermissions",
+                ProviderAccessMode::WorkspaceWrite => "acceptEdits",
+                ProviderAccessMode::ReadOnly => "plan",
+            })
+            .map_err(|_| ProviderError::UnsupportedCapability(ProviderCapability::BuildLaunch))?,
         ]);
         // Bounded launch input is retained on the request for the provider
         // sequencer; stock Claude CLI does not accept a prompt argv here.
@@ -1445,6 +1481,33 @@ mod tests {
                 "durably-bound-session",
                 "--permission-mode",
                 "bypassPermissions"
+            ]
+        );
+    }
+
+    #[test]
+    fn launch_options_apply_model_effort_and_read_only_access() {
+        let observation = attested_observation();
+        let adapter = ClaudeCodeAdapter::from_attested_observation(observation.clone()).unwrap();
+        let spec = adapter
+            .build_launch(
+                LaunchProviderRequest::new(observation.executable_handle().clone(), None, None)
+                    .with_launch_options(crate::providers::ProviderLaunchOptions {
+                        model: crate::providers::ProviderModel::ClaudeOpus,
+                        reasoning_effort: crate::providers::ProviderReasoningEffort::High,
+                        access: crate::providers::ProviderAccessMode::ReadOnly,
+                    }),
+            )
+            .expect("configured Claude launch");
+        assert_eq!(
+            spec.arguments().collect::<Vec<_>>(),
+            vec![
+                "--model",
+                "opus",
+                "--effort",
+                "high",
+                "--permission-mode",
+                "plan",
             ]
         );
     }

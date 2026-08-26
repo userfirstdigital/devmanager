@@ -727,6 +727,8 @@ pub struct CreateTaskRequestIntent {
     pub workspace: WorkspaceRequest,
     #[serde(default)]
     pub primary_provider: Option<ProviderKind>,
+    #[serde(default)]
+    pub defer_primary_provider_start: bool,
     pub assignment: TaskAssignment,
     pub created_at_ms: i64,
     pub connectivity: TaskConnectivity,
@@ -1311,6 +1313,8 @@ pub struct StartProviderSessionIntent {
     pub resource_id: ResourceId,
     pub provider_kind: ProviderKind,
     pub mode: ProviderStartMode,
+    #[serde(default)]
+    pub launch_options: crate::providers::adapter::ProviderLaunchOptions,
     pub expected_task_revision: u64,
     pub expected_action_epoch: u64,
 }

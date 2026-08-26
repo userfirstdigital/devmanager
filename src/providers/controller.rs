@@ -16,6 +16,7 @@ use crate::providers::session::{
     ProviderRuntime, ProviderSessionError, ProviderSessionManager, ProviderSessionStartMode,
     ProviderSessionStateStore,
 };
+use crate::providers::startup::start_request_from_adapter_with_options;
 use crate::providers::startup::{start_request_from_adapter, ProviderBridgeError};
 use std::collections::BTreeMap;
 use std::ffi::OsString;
@@ -79,10 +80,50 @@ impl StockProviderSessionController {
         L: ProviderProcessLauncher,
         S: ProviderSessionStateStore,
     {
+        self.start_with_resource_binding_options(
+            manager,
+            binding,
+            agent,
+            observation,
+            adapter,
+            input,
+            cwd,
+            environment,
+            mode,
+            crate::providers::adapter::ProviderLaunchOptions::default(),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn start_with_resource_binding_options<L, S>(
+        &self,
+        manager: &mut ProviderSessionManager<L, S>,
+        binding: AgentResourceBinding,
+        agent: AgentSessionFacts,
+        observation: &ProviderObservation,
+        adapter: &dyn ProviderAdapter,
+        input: Option<ProviderInput>,
+        cwd: PathBuf,
+        environment: BTreeMap<OsString, OsString>,
+        mode: ProviderSessionStartMode,
+        launch_options: crate::providers::adapter::ProviderLaunchOptions,
+    ) -> Result<ProviderRuntime, StockProviderSessionError>
+    where
+        L: ProviderProcessLauncher,
+        S: ProviderSessionStateStore,
+    {
         reject_cursor_exact_resume(observation.kind(), mode, agent.provider_session_id.as_ref())?;
         reject_unauthenticated_observation(observation, mode, agent.provider_session_id.as_ref())?;
-        let request =
-            start_request_from_adapter(agent, observation, adapter, input, cwd, environment, mode)?;
+        let request = start_request_from_adapter_with_options(
+            agent,
+            observation,
+            adapter,
+            input,
+            cwd,
+            environment,
+            mode,
+            launch_options,
+        )?;
         manager
             .start_with_resource_binding(request, binding)
             .map_err(StockProviderSessionError::from)

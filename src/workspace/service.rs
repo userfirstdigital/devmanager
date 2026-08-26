@@ -2127,7 +2127,9 @@ impl WorkspaceService {
             .durable_ref()
             .host_binding()
             .ok_or(WorkspaceError::RebindRequired)?;
-        if actual.binding_fingerprint() == expected.binding_fingerprint() {
+        if actual.binding_fingerprint() == expected.binding_fingerprint()
+            || actual.same_runtime_identity(expected)
+        {
             Ok(binding)
         } else {
             Err(WorkspaceError::RepositoryFingerprintMismatch {
@@ -3656,6 +3658,41 @@ mod cockpit_authority_tests {
                 1,
             )
             .expect("authorize rehydrated durable workspace");
+    }
+
+    #[test]
+    fn persisted_main_workspace_survives_a_normal_head_change() {
+        let (root, service, task_id) = bound_service();
+        let durable = service.current().expect("binding").durable_ref().clone();
+        let encoded = serde_json::to_vec(&durable).expect("encode durable workspace");
+        let restored: WorkspaceRef =
+            serde_json::from_slice(&encoded).expect("decode durable workspace");
+
+        fs::write(
+            root.path().join(".git").join("HEAD"),
+            "ref: refs/heads/feature/native-shell\n",
+        )
+        .expect("change the current branch normally");
+
+        let project_id = service.project_id;
+        let roots =
+            WorkspaceProjectRoots::try_from_pairs([(project_id, root.path().to_path_buf())])
+                .expect("roots");
+        let loaded = WorkspaceService::from_durable_with_task_coordinator(
+            project_id,
+            task_id,
+            &roots,
+            &restored,
+            super::WorkspaceResourceCoordinator::new(),
+        )
+        .expect("normal Git HEAD changes must not invalidate the workspace");
+
+        assert_eq!(
+            loaded
+                .runtime_working_directory()
+                .expect("runtime working directory"),
+            fs::canonicalize(root.path()).expect("canonical project root")
+        );
     }
 
     #[test]

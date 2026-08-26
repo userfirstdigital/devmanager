@@ -57,6 +57,7 @@ const RESUME_USAGE_TOKENS: &[&str] = &[
 const FORBIDDEN_SUBCOMMANDS: &[&str] = &["app-server", "remote-control", "exec-server", "exec"];
 const FORBIDDEN_FLAGS: &[&str] = &["--remote", "--last", "--listen"];
 const MAX_CLASSIFY_BYTES: usize = 4 * 1024;
+const MAX_RESUME_HELP_CLASSIFY_BYTES: usize = 16 * 1024;
 const MAX_ADMIT_JSON_BYTES: usize = 8 * 1024;
 const MAX_ADMIT_JSON_DEPTH: u32 = 3;
 const MAX_ADMIT_JSON_NODES: u32 = 32;
@@ -397,7 +398,8 @@ impl CodexAdapter {
             }
             let _ = session_id;
         }
-        let mut arguments = stock_arguments(request.provider_session_id())?;
+        let mut arguments =
+            stock_arguments(request.provider_session_id(), request.launch_options())?;
         for token in codex_hook_argument_tokens(relay_executable, endpoint, &issued.nonce)
             .map_err(|_| dependency(ProviderCapability::SemanticEvents))?
         {
@@ -477,7 +479,7 @@ impl ProviderAdapter for CodexAdapter {
             }
             let _ = session_id;
         }
-        let arguments = stock_arguments(request.provider_session_id())?;
+        let arguments = stock_arguments(request.provider_session_id(), request.launch_options())?;
         let _ = request.input();
         let spec = ProviderLaunchSpec::new(request.executable().clone(), arguments)
             .map_err(|_| ProviderError::UnsupportedCapability(ProviderCapability::BuildLaunch))?;
@@ -1028,8 +1030,43 @@ fn require_zero_exit(
 
 fn stock_arguments(
     session_id: Option<&ProviderSessionId>,
+    options: crate::providers::adapter::ProviderLaunchOptions,
 ) -> Result<Vec<ProviderArgument>, ProviderError> {
-    let mut arguments = vec![argument(DANGEROUS_NO_APPROVAL_FLAG)?];
+    use crate::providers::adapter::{ProviderAccessMode, ProviderModel};
+
+    let mut arguments = match options.access {
+        ProviderAccessMode::FullAccess => vec![argument(DANGEROUS_NO_APPROVAL_FLAG)?],
+        ProviderAccessMode::WorkspaceWrite => vec![
+            argument("--sandbox")?,
+            argument("workspace-write")?,
+            argument("--ask-for-approval")?,
+            argument("on-request")?,
+        ],
+        ProviderAccessMode::ReadOnly => vec![
+            argument("--sandbox")?,
+            argument("read-only")?,
+            argument("--ask-for-approval")?,
+            argument("on-request")?,
+        ],
+    };
+    match options.model {
+        ProviderModel::ProviderDefault => {}
+        ProviderModel::CodexSol | ProviderModel::CodexTerra | ProviderModel::CodexLuna => {
+            arguments.push(argument("--model")?);
+            arguments.push(argument(
+                options.model.cli_name().expect("explicit Codex model"),
+            )?);
+        }
+        ProviderModel::ClaudeOpus | ProviderModel::ClaudeSonnet | ProviderModel::ClaudeHaiku => {
+            return Err(ProviderError::UnsupportedCapability(
+                ProviderCapability::BuildLaunch,
+            ));
+        }
+    }
+    if let Some(effort) = options.reasoning_effort.cli_name() {
+        arguments.push(argument("--config")?);
+        arguments.push(argument(&format!("model_reasoning_effort=\"{effort}\""))?);
+    }
     if let Some(session_id) = session_id {
         arguments.push(argument(RESUME_COMMAND)?);
         arguments.push(argument(session_id.as_str())?);
@@ -1120,7 +1157,10 @@ fn help_advertises_flag(help: &str, flag: &str) -> bool {
 }
 
 fn resume_help_supports_exact_id(stdout: &[u8]) -> bool {
-    let Some(text) = classified_text(stdout) else {
+    if stdout.len() > MAX_RESUME_HELP_CLASSIFY_BYTES {
+        return false;
+    }
+    let Ok(text) = std::str::from_utf8(stdout) else {
         return false;
     };
     text.lines().any(|line| {
@@ -1547,6 +1587,35 @@ mod codex_identity_tests;
 #[cfg(test)]
 mod authority_seal_tests {
     use super::*;
+
+    #[test]
+    fn stock_launch_arguments_apply_model_reasoning_and_workspace_access() {
+        let arguments = stock_arguments(
+            None,
+            crate::providers::ProviderLaunchOptions {
+                model: crate::providers::ProviderModel::CodexTerra,
+                reasoning_effort: crate::providers::ProviderReasoningEffort::ExtraHigh,
+                access: crate::providers::ProviderAccessMode::WorkspaceWrite,
+            },
+        )
+        .expect("launch arguments");
+        assert_eq!(
+            arguments
+                .iter()
+                .map(ProviderArgument::as_str)
+                .collect::<Vec<_>>(),
+            vec![
+                "--sandbox",
+                "workspace-write",
+                "--ask-for-approval",
+                "on-request",
+                "--model",
+                "gpt-5.6-terra",
+                "--config",
+                "model_reasoning_effort=\"xhigh\"",
+            ]
+        );
+    }
 
     #[test]
     fn crate_private_correlation_constructor_rejects_zero_generation() {

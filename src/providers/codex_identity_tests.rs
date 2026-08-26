@@ -457,6 +457,20 @@ async fn codex_exact_resume_requires_usage_signature_not_prose() {
 }
 
 #[tokio::test]
+async fn codex_exact_resume_accepts_current_help_larger_than_four_kibibytes() {
+    let identity = fixture_executable();
+    let mut current_help = RESUME_HELP.to_string();
+    current_help.push_str(&"\nOption detail".repeat(350));
+    assert!(current_help.len() > 4 * 1024);
+    let adapter = probed(HELP, &current_help, LOGIN_CHATGPT).await;
+
+    assert_eq!(
+        adapter.last_capabilities(&identity).unwrap().exact_resume,
+        CapabilitySupport::Supported
+    );
+}
+
+#[tokio::test]
 async fn codex_trait_launch_without_correlation_is_terminal_only_dependency() {
     let identity = fixture_executable();
     let adapter = probed(HELP, RESUME_HELP, LOGIN_CHATGPT).await;

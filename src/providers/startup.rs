@@ -149,6 +149,29 @@ pub fn start_request_from_adapter(
     environment: BTreeMap<OsString, OsString>,
     mode: ProviderSessionStartMode,
 ) -> Result<StartProviderSessionRequest, ProviderBridgeError> {
+    start_request_from_adapter_with_options(
+        agent,
+        observation,
+        adapter,
+        input,
+        cwd,
+        environment,
+        mode,
+        crate::providers::adapter::ProviderLaunchOptions::default(),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn start_request_from_adapter_with_options(
+    agent: AgentSessionFacts,
+    observation: &ProviderObservation,
+    adapter: &dyn ProviderAdapter,
+    input: Option<ProviderInput>,
+    cwd: PathBuf,
+    environment: BTreeMap<OsString, OsString>,
+    mode: ProviderSessionStartMode,
+    launch_options: crate::providers::adapter::ProviderLaunchOptions,
+) -> Result<StartProviderSessionRequest, ProviderBridgeError> {
     if agent.provider_kind != observation.kind() || adapter.kind() != observation.kind() {
         return Err(ProviderLaunchSpecError::InvalidCapabilities.into());
     }
@@ -166,7 +189,8 @@ pub fn start_request_from_adapter(
         observation.executable_handle().clone(),
         input,
         provider_session_id.clone(),
-    );
+    )
+    .with_launch_options(launch_options);
     // Exact resume unsupported/mismatch fails here visibly with no fresh fallback.
     let adapter_launch = adapter.build_launch(request)?;
     let (_spec, proof) = prove_adapter_launch(

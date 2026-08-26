@@ -369,6 +369,47 @@ impl WorkspaceBindingFact {
         &self.binding_fingerprint
     }
 
+    /// Compare the immutable filesystem relationship of two host bindings.
+    /// Git legitimately replaces `HEAD` while a task is open (branch changes,
+    /// detach/reattach, and some worktree operations). Its presence is part of
+    /// the repository shape, but its file identity, content, and derived branch
+    /// are mutable runtime state rather than repository identity.
+    pub(crate) fn same_runtime_identity(&self, other: &Self) -> bool {
+        fn same_fact(left: &WorkspacePathFact, right: &WorkspacePathFact) -> bool {
+            left.opaque_id == right.opaque_id
+                && left.content_length == right.content_length
+                && left.content_fingerprint == right.content_fingerprint
+        }
+        fn same_optional(
+            left: Option<&WorkspacePathFact>,
+            right: Option<&WorkspacePathFact>,
+        ) -> bool {
+            match (left, right) {
+                (Some(left), Some(right)) => same_fact(left, right),
+                (None, None) => true,
+                _ => false,
+            }
+        }
+        fn same_head(left: Option<&WorkspacePathFact>, right: Option<&WorkspacePathFact>) -> bool {
+            match (left, right) {
+                (Some(_), Some(_)) => true,
+                (None, None) => true,
+                _ => false,
+            }
+        }
+
+        self.kind == other.kind
+            && same_fact(&self.project_root, &other.project_root)
+            && same_fact(&self.workspace_root, &other.workspace_root)
+            && same_optional(self.repository_root(), other.repository_root())
+            && same_optional(self.common_git_dir(), other.common_git_dir())
+            && same_optional(self.admin_dir(), other.admin_dir())
+            && same_optional(self.marker(), other.marker())
+            && same_optional(self.commondir(), other.commondir())
+            && same_optional(self.gitdir(), other.gitdir())
+            && same_head(self.head(), other.head())
+    }
+
     pub(crate) fn validate(&self) -> Result<(), TaskValidationError> {
         self.project_root.validate()?;
         self.workspace_root.validate()?;

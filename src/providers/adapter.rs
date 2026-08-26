@@ -16,6 +16,7 @@ pub use crate::providers::journal::{
     NormalizedAdapterDelivery,
 };
 use async_trait::async_trait;
+use serde::{Deserialize, Serialize};
 use std::fmt;
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
@@ -43,6 +44,82 @@ unsafe extern "system" {
 }
 
 pub const MAX_PROVIDER_INPUT_BYTES: usize = 64 * 1024;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProviderModel {
+    ProviderDefault,
+    CodexSol,
+    CodexTerra,
+    CodexLuna,
+    ClaudeOpus,
+    ClaudeSonnet,
+    ClaudeHaiku,
+}
+
+impl ProviderModel {
+    pub const fn cli_name(self) -> Option<&'static str> {
+        match self {
+            Self::ProviderDefault => None,
+            Self::CodexSol => Some("gpt-5.6-sol"),
+            Self::CodexTerra => Some("gpt-5.6-terra"),
+            Self::CodexLuna => Some("gpt-5.6-luna"),
+            Self::ClaudeOpus => Some("opus"),
+            Self::ClaudeSonnet => Some("sonnet"),
+            Self::ClaudeHaiku => Some("haiku"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProviderReasoningEffort {
+    ProviderDefault,
+    Low,
+    Medium,
+    High,
+    ExtraHigh,
+    Max,
+}
+
+impl ProviderReasoningEffort {
+    pub const fn cli_name(self) -> Option<&'static str> {
+        match self {
+            Self::ProviderDefault => None,
+            Self::Low => Some("low"),
+            Self::Medium => Some("medium"),
+            Self::High => Some("high"),
+            Self::ExtraHigh => Some("xhigh"),
+            Self::Max => Some("max"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProviderAccessMode {
+    FullAccess,
+    WorkspaceWrite,
+    ReadOnly,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProviderLaunchOptions {
+    pub model: ProviderModel,
+    pub reasoning_effort: ProviderReasoningEffort,
+    pub access: ProviderAccessMode,
+}
+
+impl Default for ProviderLaunchOptions {
+    fn default() -> Self {
+        Self {
+            model: ProviderModel::ProviderDefault,
+            reasoning_effort: ProviderReasoningEffort::ProviderDefault,
+            access: ProviderAccessMode::FullAccess,
+        }
+    }
+}
 pub const MAX_PROVIDER_SIGNAL_BYTES: usize = 64 * 1024;
 pub const MAX_PROVIDER_ARGUMENTS: usize = 32;
 pub const MAX_PROVIDER_ARGUMENT_BYTES: usize = 2048;
@@ -141,6 +218,7 @@ pub struct LaunchProviderRequest {
     executable: ProviderExecutableHandle,
     input: Option<ProviderInput>,
     provider_session_id: Option<ProviderSessionId>,
+    launch_options: ProviderLaunchOptions,
 }
 
 impl fmt::Debug for LaunchProviderRequest {
@@ -154,7 +232,7 @@ impl fmt::Debug for LaunchProviderRequest {
 }
 
 impl LaunchProviderRequest {
-    pub const fn new(
+    pub fn new(
         executable: ProviderExecutableHandle,
         input: Option<ProviderInput>,
         provider_session_id: Option<ProviderSessionId>,
@@ -163,6 +241,7 @@ impl LaunchProviderRequest {
             executable,
             input,
             provider_session_id,
+            launch_options: ProviderLaunchOptions::default(),
         }
     }
 
@@ -176,6 +255,15 @@ impl LaunchProviderRequest {
 
     pub fn provider_session_id(&self) -> Option<&ProviderSessionId> {
         self.provider_session_id.as_ref()
+    }
+
+    pub const fn with_launch_options(mut self, launch_options: ProviderLaunchOptions) -> Self {
+        self.launch_options = launch_options;
+        self
+    }
+
+    pub const fn launch_options(&self) -> ProviderLaunchOptions {
+        self.launch_options
     }
 }
 

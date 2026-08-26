@@ -318,6 +318,7 @@ mod workspace_security_tests {
                 project_id,
                 workspace: WorkspaceRequest::main(),
                 primary_provider: Some(ProviderKind::ClaudeCode),
+                defer_primary_provider_start: false,
                 assignment: TaskAssignment::LocalOwner,
                 created_at_ms: 1_725_000_000_300,
                 connectivity: TaskConnectivity::Connected,
@@ -410,6 +411,7 @@ mod workspace_security_tests {
             resource_id: resource.id,
             provider_kind: ProviderKind::ClaudeCode,
             mode: crate::domain::command::ProviderStartMode::NewConversation,
+            launch_options: crate::providers::adapter::ProviderLaunchOptions::default(),
             expected_task_revision: snapshot.task.revision,
             expected_action_epoch: snapshot.task.action_epoch,
         };
@@ -449,6 +451,7 @@ mod workspace_security_tests {
                 project_id,
                 workspace: WorkspaceRequest::main(),
                 primary_provider: None,
+                defer_primary_provider_start: false,
                 assignment: TaskAssignment::LocalOwner,
                 created_at_ms: 1_725_000_000_101,
                 connectivity: TaskConnectivity::Connected,
@@ -517,6 +520,7 @@ mod workspace_security_tests {
                 project_id: ProjectId::new(),
                 workspace: WorkspaceRequest::main(),
                 primary_provider: None,
+                defer_primary_provider_start: false,
                 assignment: TaskAssignment::LocalOwner,
                 created_at_ms: 1_725_000_000_102,
                 connectivity: TaskConnectivity::Connected,
@@ -571,6 +575,7 @@ mod workspace_security_tests {
                     "codex/missing",
                 ),
                 primary_provider: None,
+                defer_primary_provider_start: false,
                 assignment: TaskAssignment::LocalOwner,
                 created_at_ms: 1_725_000_000_103,
                 connectivity: TaskConnectivity::Connected,
@@ -634,6 +639,7 @@ mod workspace_security_tests {
                 project_id,
                 workspace: WorkspaceRequest::main(),
                 primary_provider: None,
+                defer_primary_provider_start: false,
                 assignment: TaskAssignment::LocalOwner,
                 created_at_ms: 1_725_000_000_104,
                 connectivity: TaskConnectivity::Connected,
@@ -704,6 +710,7 @@ mod workspace_security_tests {
                 project_id,
                 workspace: WorkspaceRequest::main(),
                 primary_provider: None,
+                defer_primary_provider_start: false,
                 assignment: TaskAssignment::LocalOwner,
                 created_at_ms: 1_725_000_000_200,
                 connectivity: TaskConnectivity::Connected,
@@ -3280,9 +3287,10 @@ impl HostRequestExecutor {
                     crate::providers::session::ProviderSessionStartMode::ResumeExact
                 }
             };
-            Ok::<_, String>((binding, agent, cwd, mode))
+            let launch_options = intent.launch_options;
+            Ok::<_, String>((binding, agent, cwd, mode, launch_options))
         })();
-        let (binding, agent, cwd, mode) = match prepared {
+        let (binding, agent, cwd, mode, launch_options) = match prepared {
             Ok(prepared) => prepared,
             Err(error) => {
                 self.handle_provider_restore_outcome(ProviderRestoreOutcome {
@@ -3308,7 +3316,7 @@ impl HostRequestExecutor {
                 .map_err(|error| error.to_string())?;
                 tokio::task::spawn_blocking(move || {
                     manager
-                        .start_production_stock_provider_session(
+                        .start_production_stock_provider_session_with_options(
                             binding,
                             agent,
                             &observation,
@@ -3316,6 +3324,7 @@ impl HostRequestExecutor {
                             cwd,
                             BTreeMap::new(),
                             mode,
+                            launch_options,
                         )
                         .map_err(|error| error.to_string())
                 })
@@ -3956,8 +3965,10 @@ impl HostRequestExecutor {
         if envelope.client_id != negotiated.client_id {
             return Err(IpcError::Unauthorized);
         }
-        let primary_provider = match &envelope.command {
-            Command::CreateTaskV2(intent) => intent.primary_provider,
+        let (primary_provider, defer_primary_provider_start) = match &envelope.command {
+            Command::CreateTaskV2(intent) => {
+                (intent.primary_provider, intent.defer_primary_provider_start)
+            }
             _ => return Err(IpcError::Unavailable),
         };
         if matches!(
@@ -4079,12 +4090,19 @@ impl HostRequestExecutor {
             .map_err(map_store_error)?
             .ok_or(IpcError::Unavailable)?;
 
+        if defer_primary_provider_start {
+            return Ok(DuplexExecuteCompletion::CallerMustWrite(
+                ServerMessage::CommandReceipt(receipt),
+            ));
+        }
+
         let start_intent = crate::domain::command::StartProviderSessionIntent {
             task_id,
             agent_session_id: agent.id,
             resource_id: resource.id,
             provider_kind,
             mode: crate::domain::command::ProviderStartMode::NewConversation,
+            launch_options: crate::providers::adapter::ProviderLaunchOptions::default(),
             expected_task_revision: snapshot.task.revision,
             expected_action_epoch: snapshot.task.action_epoch,
         };
@@ -4216,6 +4234,7 @@ impl HostRequestExecutor {
         let task_id = intent.task_id;
         let action_epoch = intent.expected_action_epoch;
         let provider_kind = intent.provider_kind;
+        let launch_options = intent.launch_options;
         let revision = snapshot.task.revision;
         // Sync prepare is complete. Enqueue discovery/launch onto the same
         // cancellation-owned FuturesUnordered lane used by provider restore so
@@ -4234,7 +4253,7 @@ impl HostRequestExecutor {
                 })?;
                 tokio::task::spawn_blocking(move || {
                     manager
-                        .start_production_stock_provider_session(
+                        .start_production_stock_provider_session_with_options(
                             binding,
                             agent,
                             &observation,
@@ -4242,6 +4261,7 @@ impl HostRequestExecutor {
                             cwd,
                             BTreeMap::new(),
                             mode,
+                            launch_options,
                         )
                         .map_err(|error| {
                             format!("devmanager-host: provider start launch failed: {error}")
@@ -5441,16 +5461,16 @@ fn map_store_error(error: StoreError) -> IpcError {
 }
 
 fn command_starts_new_launch(command: &Command) -> bool {
-    matches!(
-        command,
+    match command {
+        Command::CreateTaskV2(intent) => !intent.defer_primary_provider_start,
         Command::CreateTask(_)
-            | Command::CreateTaskV2(_)
-            | Command::RegisterAgentSession { .. }
-            | Command::RegisterArtifact { .. }
-            | Command::RegisterResource { .. }
-            | Command::SetPrimaryAgent { .. }
-            | Command::StartProviderSession(_)
-    )
+        | Command::RegisterAgentSession { .. }
+        | Command::RegisterArtifact { .. }
+        | Command::RegisterResource { .. }
+        | Command::SetPrimaryAgent { .. }
+        | Command::StartProviderSession(_) => true,
+        _ => false,
+    }
 }
 
 fn is_provider_start_request(request: &ClientRequest) -> bool {
@@ -5729,6 +5749,7 @@ fn normalize_task_create_at_host(
             attention,
             activity,
             review_readiness,
+            defer_primary_provider_start: _,
         }) => {
             if matches!(
                 primary_provider,
@@ -7970,6 +7991,7 @@ mod output_tests {
                 project_id,
                 workspace: WorkspaceRequest::main(),
                 primary_provider: None,
+                defer_primary_provider_start: false,
                 assignment: TaskAssignment::LocalOwner,
                 created_at_ms: 1,
                 connectivity: TaskConnectivity::Connected,
@@ -9172,6 +9194,7 @@ mod output_tests {
                         project_id,
                         workspace: WorkspaceRequest::main(),
                         primary_provider: Some(ProviderKind::ClaudeCode),
+                        defer_primary_provider_start: false,
                         assignment: TaskAssignment::LocalOwner,
                         created_at_ms: 1_725_000_000_800,
                         connectivity: TaskConnectivity::Connected,
@@ -9239,6 +9262,7 @@ mod output_tests {
                         project_id,
                         workspace: WorkspaceRequest::main(),
                         primary_provider: Some(ProviderKind::Cursor),
+                        defer_primary_provider_start: false,
                         assignment: TaskAssignment::LocalOwner,
                         created_at_ms: 1_725_000_000_801,
                         connectivity: TaskConnectivity::Connected,
@@ -9322,6 +9346,7 @@ mod output_tests {
                         project_id,
                         workspace: WorkspaceRequest::main(),
                         primary_provider: Some(ProviderKind::ClaudeCode),
+                        defer_primary_provider_start: false,
                         assignment: TaskAssignment::LocalOwner,
                         created_at_ms: 1_725_000_000_800,
                         connectivity: TaskConnectivity::Connected,
@@ -9543,6 +9568,7 @@ mod output_tests {
                         project_id,
                         workspace: WorkspaceRequest::main(),
                         primary_provider: None,
+                        defer_primary_provider_start: false,
                         assignment: TaskAssignment::LocalOwner,
                         created_at_ms: 1_725_000_000_000,
                         connectivity: TaskConnectivity::Connected,

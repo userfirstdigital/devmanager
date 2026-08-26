@@ -126,6 +126,7 @@ fn seed_task_with_base(paths: &ResolvedAppPaths, base: u8, title: &str) -> TaskI
                         project_id,
                         workspace: WorkspaceRequest::confirmed_external(&paths.root),
                         primary_provider: None,
+                        defer_primary_provider_start: false,
                         assignment: TaskAssignment::LocalOwner,
                         created_at_ms: 1_725_000_000_000,
                         connectivity: TaskConnectivity::Connected,

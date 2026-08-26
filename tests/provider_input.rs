@@ -144,6 +144,7 @@ fn seed_open_task_with_agent_runtime(
                         project_id,
                         workspace: WorkspaceRequest::confirmed_external(&paths.root),
                         primary_provider: None,
+                        defer_primary_provider_start: false,
                         assignment: TaskAssignment::LocalOwner,
                         created_at_ms: 1_725_000_000_000,
                         connectivity: TaskConnectivity::Connected,

@@ -27,10 +27,11 @@ pub(crate) mod test_support;
 
 pub use adapter::{
     AdapterDeliveryPermit, AdapterIngressUnavailable, JournalNormalizeError, LaunchProviderRequest,
-    NormalizedAdapterDelivery, ProviderAdapter, ProviderArgument, ProviderError, ProviderInput,
-    ProviderInputError, ProviderLaunchSpec, ProviderProbeError, ProviderProbeFailureCode,
-    ProviderProbeIoError, ProviderProbeKind, ProviderProbeRequest, ProviderProbeRequestError,
-    ProviderProbeResult, ProviderProbeRunner, ProviderProbeStatus, ProviderQuotaStatus,
+    NormalizedAdapterDelivery, ProviderAccessMode, ProviderAdapter, ProviderArgument,
+    ProviderError, ProviderInput, ProviderInputError, ProviderLaunchOptions, ProviderLaunchSpec,
+    ProviderModel, ProviderProbeError, ProviderProbeFailureCode, ProviderProbeIoError,
+    ProviderProbeKind, ProviderProbeRequest, ProviderProbeRequestError, ProviderProbeResult,
+    ProviderProbeRunner, ProviderProbeStatus, ProviderQuotaStatus, ProviderReasoningEffort,
     ProviderRuntime, ProviderSignal, QuotaObservation, StopStrategy, WindowsProviderProbeRunner,
     MAX_PROVIDER_ARGUMENTS, MAX_PROVIDER_ARGUMENT_BYTES, MAX_PROVIDER_INPUT_BYTES,
     MAX_PROVIDER_PROBE_OUTPUT_BYTES, MAX_PROVIDER_PROBE_TIMEOUT, MAX_PROVIDER_SIGNAL_BYTES,
@@ -96,7 +97,8 @@ pub use session::{
 };
 pub use startup::{
     register_stock_adapters, registered_stock_kinds, start_request_from_adapter,
-    stock_provider_registry, ProviderBridgeError, STOCK_PROVIDER_REGISTRATION_ORDER,
+    start_request_from_adapter_with_options, stock_provider_registry, ProviderBridgeError,
+    STOCK_PROVIDER_REGISTRATION_ORDER,
 };
 
 pub use crate::domain::{ProviderSessionId, ProviderSessionIdError, MAX_PROVIDER_SESSION_ID_BYTES};

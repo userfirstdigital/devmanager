@@ -437,6 +437,7 @@ impl CommandBus {
                 resource_id: id16("agent_sessions.provider_resource_id", &resource_bytes)?,
                 provider_kind,
                 mode: crate::domain::command::ProviderStartMode::ResumeExact,
+                launch_options: crate::providers::adapter::ProviderLaunchOptions::default(),
                 expected_task_revision: revision,
                 expected_action_epoch: action_epoch,
             });
@@ -855,6 +856,7 @@ pub(crate) fn provider_hold_restart_intent_from_snapshot(
         resource_id,
         provider_kind: agent.provider_kind,
         mode: provider_hold_restart_mode(agent.provider_session_id.as_ref()),
+        launch_options: crate::providers::adapter::ProviderLaunchOptions::default(),
         expected_task_revision: snapshot.task.revision,
         expected_action_epoch: snapshot.task.action_epoch,
     })
