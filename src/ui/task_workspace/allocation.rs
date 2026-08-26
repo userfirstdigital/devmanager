@@ -270,30 +270,35 @@ fn allocate_axis_sizes(
     let auto_weight: f32 = children
         .iter()
         .map(|child| match child.allocation {
-            Allocation::Auto { weight } => weight,
+            Allocation::Auto { weight } if contains_full_pane(&child.node) => weight,
             Allocation::Pinned { .. } => 0.0,
+            Allocation::Auto { .. } => 0.0,
         })
         .sum();
-    let fallback_weight = if auto_weight > 0.0 {
-        auto_weight
-    } else {
-        children.len() as f32
-    };
     children
         .iter()
         .zip(bases)
         .map(|(child, base)| {
-            let weight = if auto_weight > 0.0 {
-                match child.allocation {
-                    Allocation::Auto { weight } => weight,
-                    Allocation::Pinned { .. } => 0.0,
-                }
-            } else {
-                1.0
+            let weight = match child.allocation {
+                Allocation::Auto { weight } if contains_full_pane(&child.node) => weight,
+                Allocation::Auto { .. } | Allocation::Pinned { .. } => 0.0,
             };
-            base + extra * weight / fallback_weight
+            if auto_weight > 0.0 {
+                base + extra * weight / auto_weight
+            } else {
+                base
+            }
         })
         .collect()
+}
+
+fn contains_full_pane(node: &WorkspaceNode) -> bool {
+    match node {
+        WorkspaceNode::Pane(pane) => pane.presentation == PanePresentation::Full,
+        WorkspaceNode::Split { children, .. } => {
+            children.iter().any(|child| contains_full_pane(&child.node))
+        }
+    }
 }
 
 fn finite_non_negative(value: f32) -> f32 {
@@ -364,14 +369,17 @@ mod tests {
 
     #[test]
     fn manual_compaction_never_auto_expands() {
-        let (mut workspace, [first, _, _]) = three_horizontal_tasks();
+        let (mut workspace, [first, second, third]) = three_horizontal_tasks();
         workspace.set_manual_compact(first, true).unwrap();
 
-        workspace.allocate(Viewport::new(1_800.0, 900.0), metrics());
+        let allocated = workspace.allocate(Viewport::new(1_000.0, 900.0), metrics());
 
         assert_eq!(
             workspace.presentation(first),
             Some(PanePresentation::CompactManual)
         );
+        assert_eq!(allocated.width(first), Some(80.0));
+        assert_eq!(allocated.width(second), Some(460.0));
+        assert_eq!(allocated.width(third), Some(460.0));
     }
 }

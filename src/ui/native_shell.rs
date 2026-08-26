@@ -13253,7 +13253,7 @@ impl NativeShell {
                         workspace_size,
                         cx,
                     );
-                    rendered.push(Self::task_workspace_child(*axis, child, content));
+                    rendered.push(Self::task_workspace_child(*axis, child, allocated, content));
                     if index + 1 < children.len() {
                         let start_size = Self::task_workspace_node_rect(&child.node, allocated)
                             .map(|rect| match axis {
@@ -13382,34 +13382,27 @@ impl NativeShell {
     fn task_workspace_child(
         axis: Axis,
         child: &TaskWorkspaceViewChild,
+        allocated: &crate::ui::task_workspace::AllocatedWorkspace,
         content: AnyElement,
     ) -> AnyElement {
+        let logical_px = Self::task_workspace_node_rect(&child.node, allocated)
+            .map(|rect| match axis {
+                Axis::Horizontal => rect.width,
+                Axis::Vertical => rect.height,
+            })
+            .unwrap_or_else(|| match child.allocation {
+                Allocation::Pinned { logical_px } => logical_px,
+                Allocation::Auto { .. } => 0.0,
+            });
         let wrapper = div()
             .min_w(px(0.0))
             .min_h(px(0.0))
+            .flex_none()
             .overflow_hidden()
             .child(content);
-        match (axis, child.allocation) {
-            (Axis::Horizontal, Allocation::Pinned { logical_px }) => wrapper
-                .flex_none()
-                .w(px(logical_px))
-                .h_full()
-                .into_any_element(),
-            (Axis::Vertical, Allocation::Pinned { logical_px }) => wrapper
-                .flex_none()
-                .h(px(logical_px))
-                .w_full()
-                .into_any_element(),
-            (Axis::Horizontal, Allocation::Auto { .. }) => wrapper
-                .flex_1()
-                .flex_basis(px(0.0))
-                .h_full()
-                .into_any_element(),
-            (Axis::Vertical, Allocation::Auto { .. }) => wrapper
-                .flex_1()
-                .flex_basis(px(0.0))
-                .w_full()
-                .into_any_element(),
+        match axis {
+            Axis::Horizontal => wrapper.w(px(logical_px)).h_full().into_any_element(),
+            Axis::Vertical => wrapper.h(px(logical_px)).w_full().into_any_element(),
         }
     }
 
