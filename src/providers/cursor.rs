@@ -14,9 +14,9 @@
 use crate::providers::adapter::{
     AdapterDeliveryPermit, AdapterIngressUnavailable, JournalNormalizeError, LaunchProviderRequest,
     NormalizedAdapterDelivery, ProviderAdapter, ProviderError, ProviderLaunchSpec,
-    ProviderProbeError, ProviderProbeFailureCode, ProviderProbeIoError, ProviderProbeRequest,
-    ProviderProbeRequestError, ProviderProbeRunner, ProviderProbeStatus, ProviderRuntime,
-    QuotaObservation, StopStrategy, WindowsProviderProbeRunner,
+    ProviderProbeContext, ProviderProbeError, ProviderProbeFailureCode, ProviderProbeIoError,
+    ProviderProbeRequest, ProviderProbeRequestError, ProviderProbeRunner, ProviderProbeStatus,
+    ProviderRuntime, QuotaObservation, StopStrategy, WindowsProviderProbeRunner,
 };
 use crate::providers::capabilities::{
     CapabilityEvidence, CapabilitySupport, EvidenceSourceId, EvidenceStatus, ProviderAuthState,
@@ -24,6 +24,7 @@ use crate::providers::capabilities::{
     ProviderExecutablePolicy, ProviderKind, ProviderVersion, ProviderVersionError,
 };
 use async_trait::async_trait;
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -48,7 +49,8 @@ pub struct CursorAdapter {
     pinned: Option<PinnedProbes>,
     runner: Option<Arc<dyn ProviderProbeRunner>>,
     observed_at: u64,
-    observed_build_launch: Mutex<Option<CapabilitySupport>>,
+    /// Scope-keyed build_launch support proven by the latest probe for that scope.
+    observed_build_launch: Mutex<HashMap<String, CapabilitySupport>>,
 }
 
 impl CursorAdapter {
@@ -59,7 +61,7 @@ impl CursorAdapter {
             pinned: None,
             runner: Some(Arc::new(WindowsProviderProbeRunner::new(policy))),
             observed_at: now_ms(),
-            observed_build_launch: Mutex::new(None),
+            observed_build_launch: Mutex::new(HashMap::new()),
         }
     }
 
@@ -72,7 +74,7 @@ impl CursorAdapter {
             }),
             runner: None,
             observed_at,
-            observed_build_launch: Mutex::new(None),
+            observed_build_launch: Mutex::new(HashMap::new()),
         }
     }
 
@@ -82,13 +84,14 @@ impl CursorAdapter {
             pinned: None,
             runner: Some(runner),
             observed_at: now_ms(),
-            observed_build_launch: Mutex::new(None),
+            observed_build_launch: Mutex::new(HashMap::new()),
         }
     }
 
     async fn version_and_help(
         &self,
         executable: &ProviderExecutableHandle,
+        context: &ProviderProbeContext,
     ) -> Result<(Vec<u8>, Vec<u8>), ProviderError> {
         if let Some(pinned) = &self.pinned {
             return Ok((pinned.version.clone(), pinned.help.clone()));
@@ -101,21 +104,41 @@ impl CursorAdapter {
                 requested: Some(executable.canonical_path().to_path_buf()),
             })?;
         let version = run_text_probe(runner.as_ref(), executable, |handle| {
-            ProviderProbeRequest::version(handle)
+            Ok(ProviderProbeRequest::version(handle)?
+                .with_scope_fingerprint(context.scope_fingerprint.clone())
+                .with_child_environment(context.child_environment.clone()))
         })
         .await?;
         let help = run_text_probe(runner.as_ref(), executable, |handle| {
-            ProviderProbeRequest::help(handle)
+            Ok(ProviderProbeRequest::help(handle)?
+                .with_scope_fingerprint(context.scope_fingerprint.clone())
+                .with_child_environment(context.child_environment.clone()))
         })
         .await?;
         Ok((version, help))
     }
 
-    fn record_build_launch(&self, support: Option<CapabilitySupport>) {
-        *self
+    fn record_build_launch(&self, scope_key: &str, support: Option<CapabilitySupport>) {
+        let mut map = self
             .observed_build_launch
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()) = support;
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        match support {
+            Some(support) => {
+                map.insert(scope_key.to_string(), support);
+            }
+            None => {
+                map.remove(scope_key);
+            }
+        }
+    }
+
+    fn observed_for_scope(&self, scope_key: &str) -> Option<CapabilitySupport> {
+        self.observed_build_launch
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(scope_key)
+            .copied()
     }
 }
 
@@ -128,28 +151,30 @@ impl ProviderAdapter for CursorAdapter {
     async fn probe(
         &self,
         executable: &ProviderExecutableHandle,
+        context: &crate::providers::adapter::ProviderProbeContext,
     ) -> Result<ProviderCapabilities, ProviderError> {
+        let scope_key = context.scope_key();
         let observed_at = if self.pinned.is_some() {
             self.observed_at
         } else {
             now_ms()
         };
-        let result = match self.version_and_help(executable).await {
+        let result = match self.version_and_help(executable, context).await {
             Ok((version_output, help_output)) => {
                 capabilities_from_cursor_probes(&version_output, &help_output, observed_at)
             }
             Err(error) => {
-                self.record_build_launch(None);
+                self.record_build_launch(&scope_key, None);
                 return Err(error);
             }
         };
         match result {
             Ok(capabilities) => {
-                self.record_build_launch(Some(capabilities.build_launch));
+                self.record_build_launch(&scope_key, Some(capabilities.build_launch));
                 Ok(capabilities)
             }
             Err(error) => {
-                self.record_build_launch(None);
+                self.record_build_launch(&scope_key, None);
                 Err(error)
             }
         }
@@ -164,10 +189,8 @@ impl ProviderAdapter for CursorAdapter {
                 ProviderCapability::ExactResume,
             ));
         }
-        let observed = *self
-            .observed_build_launch
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let scope_key = request.scope_env_key();
+        let observed = self.observed_for_scope(&scope_key);
         if observed != Some(CapabilitySupport::Supported) {
             return Err(ProviderError::UnsupportedCapability(
                 ProviderCapability::BuildLaunch,
@@ -360,7 +383,13 @@ mod tests {
         assert_eq!(adapter.kind(), ProviderKind::Cursor);
 
         let executable = cursor_handle();
-        let capabilities = adapter.probe(&executable).await.unwrap();
+        let capabilities = adapter
+            .probe(
+                &executable,
+                &crate::providers::adapter::ProviderProbeContext::default(),
+            )
+            .await
+            .unwrap();
 
         assert_eq!(capabilities.kind, ProviderKind::Cursor);
         assert_eq!(capabilities.version.as_str(), "2026.08.09-docs-pinned");
@@ -409,7 +438,13 @@ mod tests {
         let adapter = pinned_adapter();
         let executable = cursor_handle();
         let probe_executable = cursor_handle();
-        adapter.probe(&probe_executable).await.unwrap();
+        adapter
+            .probe(
+                &probe_executable,
+                &crate::providers::adapter::ProviderProbeContext::default(),
+            )
+            .await
+            .unwrap();
 
         let fresh = adapter
             .build_launch(LaunchProviderRequest::new(executable.clone(), None, None))
@@ -439,7 +474,13 @@ mod tests {
             OBSERVED_AT,
         );
         let executable = cursor_handle();
-        let capabilities = adapter.probe(&executable).await.unwrap();
+        let capabilities = adapter
+            .probe(
+                &executable,
+                &crate::providers::adapter::ProviderProbeContext::default(),
+            )
+            .await
+            .unwrap();
         assert_eq!(capabilities.build_launch, CapabilitySupport::Unknown);
         assert_eq!(capabilities.exact_resume, CapabilitySupport::Unsupported);
         assert_eq!(capabilities.auth_state, ProviderAuthState::Unknown);
@@ -459,7 +500,13 @@ mod tests {
             OBSERVED_AT,
         );
         let executable = cursor_handle();
-        let capabilities = adapter.probe(&executable).await.unwrap();
+        let capabilities = adapter
+            .probe(
+                &executable,
+                &crate::providers::adapter::ProviderProbeContext::default(),
+            )
+            .await
+            .unwrap();
         assert_eq!(capabilities.build_launch, CapabilitySupport::Unknown);
     }
 
@@ -479,7 +526,12 @@ mod tests {
     async fn cursor_nonzero_probe_status_is_rejected() {
         let adapter = CursorAdapter::from_test_runner(Arc::new(NonZeroProbeRunner));
         let executable = cursor_handle();
-        let result = adapter.probe(&executable).await;
+        let result = adapter
+            .probe(
+                &executable,
+                &crate::providers::adapter::ProviderProbeContext::default(),
+            )
+            .await;
         assert!(matches!(
             result,
             Err(ProviderError::Probe(ProviderProbeError::NonZeroExit(_)))
@@ -502,7 +554,12 @@ mod tests {
     async fn cursor_oversize_probe_is_rejected() {
         let adapter = CursorAdapter::from_test_runner(Arc::new(OversizeProbeRunner));
         let executable = cursor_handle();
-        let result = adapter.probe(&executable).await;
+        let result = adapter
+            .probe(
+                &executable,
+                &crate::providers::adapter::ProviderProbeContext::default(),
+            )
+            .await;
         assert!(matches!(
             result,
             Err(ProviderError::Probe(ProviderProbeError::OutputTooLarge))
@@ -514,7 +571,12 @@ mod tests {
         let adapter =
             CursorAdapter::from_pinned_probes(PINNED_VERSION, b"\xff\xfe not utf-8", OBSERVED_AT);
         let executable = cursor_handle();
-        let result = adapter.probe(&executable).await;
+        let result = adapter
+            .probe(
+                &executable,
+                &crate::providers::adapter::ProviderProbeContext::default(),
+            )
+            .await;
         assert!(matches!(
             result,
             Err(ProviderError::MalformedVersion(

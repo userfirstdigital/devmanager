@@ -6,12 +6,18 @@ use devmanager::providers::capabilities::{ProviderCapability, ProviderExecutable
 use devmanager::providers::cursor::CursorAdapter;
 use devmanager::providers::registry::{ProviderDiscoveryConfig, ProviderRegistry};
 use serde_json::Value;
-use std::path::PathBuf;
 use std::sync::Arc;
 use tempfile::tempdir;
 
 const PHASE4_11_SMOKE_CONTRACT: &str =
     include_str!("fixtures/providers/cursor/phase4_11_smoke_contract.json");
+
+fn test_executable() -> ProviderExecutable {
+    // Capability refusal does not execute the image, but the pinned executable
+    // contract still requires a real, inspectable identity rather than a fake path.
+    ProviderExecutable::from_path(std::env::current_exe().expect("test executable path"))
+        .expect("inspect test executable")
+}
 
 #[test]
 fn cursor_public_constructor_is_live_runner_not_pinned_bytes() {
@@ -36,8 +42,7 @@ async fn cursor_stays_unsupported_until_registry_registration() {
 #[test]
 fn cursor_public_adapter_cannot_launch_without_exact_capability() {
     let adapter = CursorAdapter::new();
-    let executable =
-        ProviderExecutable::new(PathBuf::from("C:/bin/cursor-agent"), [0x44; 32]).unwrap();
+    let executable = test_executable();
     assert!(matches!(
         adapter.build_launch(LaunchProviderRequest::new(
             executable.open_for_launch().unwrap(),
@@ -57,10 +62,7 @@ async fn cursor_signals_stop_and_quota_stay_explicitly_unsupported() {
         adapter.cooperative_stop(&ProviderRuntime),
         StopStrategy::Unsupported
     );
-    let executable = ProviderExecutable::new(PathBuf::from("C:/bin/cursor-agent"), [0x44; 32])
-        .unwrap()
-        .open_for_launch()
-        .unwrap();
+    let executable = test_executable().open_for_launch().unwrap();
     assert!(matches!(
         adapter.observe_quota(&executable).await,
         Err(devmanager::providers::ProviderError::UnsupportedCapability(
@@ -84,6 +86,7 @@ async fn cursor_adapter_does_not_accept_desktop_cursor_exe() {
             &ProviderDiscoveryConfig {
                 executable_override: Some(desktop),
                 path: None,
+                ..Default::default()
             },
         )
         .await;
@@ -146,8 +149,7 @@ fn cursor_phase4_11_smoke_contract_is_fixture_only_and_does_not_claim_auth() {
     );
 
     let adapter = CursorAdapter::new();
-    let executable =
-        ProviderExecutable::new(PathBuf::from("C:/bin/cursor-agent"), [0x44; 32]).unwrap();
+    let executable = test_executable();
     let executable_handle = executable.open_for_launch().unwrap();
     let session = ProviderSessionId::new("chat-id-must-not-be-inferred").unwrap();
     assert!(matches!(

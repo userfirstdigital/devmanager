@@ -181,6 +181,7 @@ impl ProviderAdapter for SampleAdapter {
     async fn probe(
         &self,
         _executable: &ProviderExecutableHandle,
+        _context: &devmanager::providers::adapter::ProviderProbeContext,
     ) -> Result<ProviderCapabilities, ProviderError> {
         Ok(ProviderCapabilities {
             kind: ProviderKind::ClaudeCode,
@@ -247,6 +248,7 @@ impl ProviderAdapter for OutcomeAdapter {
     async fn probe(
         &self,
         _executable: &ProviderExecutableHandle,
+        _context: &devmanager::providers::adapter::ProviderProbeContext,
     ) -> Result<ProviderCapabilities, ProviderError> {
         Ok(ProviderCapabilities {
             kind: ProviderKind::ClaudeCode,

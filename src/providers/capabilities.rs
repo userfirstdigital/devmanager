@@ -2,7 +2,7 @@ use serde::de::{self, Deserializer, SeqAccess, Visitor};
 use serde::ser::SerializeStruct;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::ffi::{OsStr, OsString};
 use std::fmt;
 use std::fs::{self, File, OpenOptions};
@@ -28,8 +28,49 @@ pub const PROVIDER_CAPABILITY_SCHEMA_VERSION: u16 = 1;
 pub const PROVIDER_EVIDENCE_SCHEMA_VERSION: u16 = 1;
 pub const PROVIDER_EXECUTABLE_SCHEMA_VERSION: u16 = 1;
 pub const PROVIDER_FILE_IDENTITY_SCHEMA_VERSION: u16 = 1;
-pub const PROVIDER_OBSERVATION_SCHEMA_VERSION: u16 = 1;
-pub const PROVIDER_CACHE_KEY_SCHEMA_VERSION: u16 = 1;
+pub const PROVIDER_OBSERVATION_SCHEMA_VERSION: u16 = 2;
+pub const PROVIDER_CACHE_KEY_SCHEMA_VERSION: u16 = 2;
+
+/// Length-framed SHA-256 commitment over a scoped child environment map.
+/// Same executable under different env/scopes cannot share this commitment.
+pub(crate) fn commit_child_environment(
+    environment: &std::collections::BTreeMap<OsString, OsString>,
+) -> String {
+    let mut hasher = Sha256::new();
+    for (key, value) in environment {
+        let key_bytes = os_string_commitment_bytes(key);
+        let value_bytes = os_string_commitment_bytes(value);
+        hasher.update((key_bytes.len() as u64).to_le_bytes());
+        hasher.update(&key_bytes);
+        hasher.update((value_bytes.len() as u64).to_le_bytes());
+        hasher.update(&value_bytes);
+    }
+    hasher
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+fn os_string_commitment_bytes(value: &OsStr) -> Vec<u8> {
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStrExt;
+        value
+            .encode_wide()
+            .flat_map(|unit| unit.to_le_bytes())
+            .collect()
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        value.as_bytes().to_vec()
+    }
+    #[cfg(not(any(windows, unix)))]
+    {
+        value.to_string_lossy().as_bytes().to_vec()
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum ProviderKind {
@@ -1047,6 +1088,8 @@ struct ProviderAuthInvocationKey {
     version: ProviderVersion,
     nonce: [u8; PROVIDER_AUTH_NONCE_BYTES],
     generation: u64,
+    scope_fingerprint: Option<String>,
+    env_commitment: String,
 }
 
 #[derive(Clone, PartialEq, Eq, Hash)]
@@ -1056,6 +1099,8 @@ struct ProviderAuthReceiptKey {
     version: ProviderVersion,
     nonce: [u8; PROVIDER_AUTH_NONCE_BYTES],
     generation: u64,
+    scope_fingerprint: Option<String>,
+    env_commitment: String,
 }
 
 /// Private correlation material copied only from an issued invocation into
@@ -1071,6 +1116,8 @@ pub(crate) struct ProviderAuthProbeBinding {
     generation: u64,
     adapter_revision: AdapterRevision,
     semantic_schema_version: SemanticSchemaVersion,
+    scope_fingerprint: Option<String>,
+    env_commitment: String,
 }
 
 #[derive(Clone)]
@@ -1083,6 +1130,8 @@ pub struct ProviderAuthProbeInvocation {
     generation: u64,
     adapter_revision: AdapterRevision,
     semantic_schema_version: SemanticSchemaVersion,
+    scope_fingerprint: Option<String>,
+    env_commitment: String,
     issued_at: Instant,
     deadline: Instant,
     clock: Arc<dyn ProviderAuthClock>,
@@ -1098,13 +1147,32 @@ impl fmt::Debug for ProviderAuthProbeInvocation {
             .field("version", &self.version)
             .field("nonce", &"<redacted>")
             .field("generation", &self.generation)
+            .field("scope_fingerprint", &self.scope_fingerprint)
+            .field("env_commitment", &self.env_commitment)
             .field("issued_at", &self.issued_at)
             .field("deadline", &self.deadline)
             .finish()
     }
 }
 
+#[derive(Clone, PartialEq, Eq, Hash)]
+struct ProviderAuthAuthorityKey {
+    kind: ProviderKind,
+    source: ProviderAuthEvidenceSource,
+    scope_fingerprint: Option<String>,
+    env_commitment: String,
+}
+
 impl ProviderAuthProbeInvocation {
+    fn authority_key(&self) -> ProviderAuthAuthorityKey {
+        ProviderAuthAuthorityKey {
+            kind: self.kind,
+            source: self.source,
+            scope_fingerprint: self.scope_fingerprint.clone(),
+            env_commitment: self.env_commitment.clone(),
+        }
+    }
+
     pub const fn provider_kind(&self) -> ProviderKind {
         self.kind
     }
@@ -1151,7 +1219,17 @@ impl ProviderAuthProbeInvocation {
             generation: self.generation,
             adapter_revision: self.adapter_revision,
             semantic_schema_version: self.semantic_schema_version,
+            scope_fingerprint: self.scope_fingerprint.clone(),
+            env_commitment: self.env_commitment.clone(),
         }
+    }
+
+    pub fn scope_fingerprint(&self) -> Option<&str> {
+        self.scope_fingerprint.as_deref()
+    }
+
+    pub fn env_commitment(&self) -> &str {
+        &self.env_commitment
     }
 
     fn key(&self) -> ProviderAuthInvocationKey {
@@ -1161,6 +1239,8 @@ impl ProviderAuthProbeInvocation {
             version: self.version.clone(),
             nonce: self.nonce,
             generation: self.generation,
+            scope_fingerprint: self.scope_fingerprint.clone(),
+            env_commitment: self.env_commitment.clone(),
         }
     }
 }
@@ -1173,6 +1253,8 @@ pub struct ProviderAuthEvidenceReceipt {
     version: ProviderVersion,
     nonce: [u8; PROVIDER_AUTH_NONCE_BYTES],
     generation: u64,
+    scope_fingerprint: Option<String>,
+    env_commitment: String,
     result: ProviderAuthProbeResult,
     observed_at: Instant,
     deadline: Instant,
@@ -1191,6 +1273,8 @@ impl fmt::Debug for ProviderAuthEvidenceReceipt {
             .field("version", &self.version)
             .field("nonce", &"<redacted>")
             .field("generation", &self.generation)
+            .field("scope_fingerprint", &self.scope_fingerprint)
+            .field("env_commitment", &self.env_commitment)
             .field("result", &self.result)
             .field("observed_at", &self.observed_at)
             .field("deadline", &self.deadline)
@@ -1200,6 +1284,15 @@ impl fmt::Debug for ProviderAuthEvidenceReceipt {
 }
 
 impl ProviderAuthEvidenceReceipt {
+    fn authority_key(&self) -> ProviderAuthAuthorityKey {
+        ProviderAuthAuthorityKey {
+            kind: self.kind,
+            source: self.source,
+            scope_fingerprint: self.scope_fingerprint.clone(),
+            env_commitment: self.env_commitment.clone(),
+        }
+    }
+
     pub const fn provider_kind(&self) -> ProviderKind {
         self.kind
     }
@@ -1264,6 +1357,14 @@ impl ProviderAuthEvidenceReceipt {
         now >= self.observed_at && now < self.deadline
     }
 
+    pub fn scope_fingerprint(&self) -> Option<&str> {
+        self.scope_fingerprint.as_deref()
+    }
+
+    pub fn env_commitment(&self) -> &str {
+        &self.env_commitment
+    }
+
     fn key(&self) -> ProviderAuthReceiptKey {
         ProviderAuthReceiptKey {
             kind: self.kind,
@@ -1271,6 +1372,8 @@ impl ProviderAuthEvidenceReceipt {
             version: self.version.clone(),
             nonce: self.nonce,
             generation: self.generation,
+            scope_fingerprint: self.scope_fingerprint.clone(),
+            env_commitment: self.env_commitment.clone(),
         }
     }
 }
@@ -1335,11 +1438,10 @@ pub struct ProviderAuthEvidenceRegistry {
     accepted_order: VecDeque<ProviderAuthReceiptKey>,
     /// Bounded retirement authority independent from the receipt/body LRU.
     ///
-    /// Generations are allocated globally, so one monotonic high-water mark
-    /// safely retires every older pending invocation even after its accepted
-    /// receipt body has been evicted. Keeping this separate from `accepted`
-    /// prevents an LRU/cache operation from reviving stale work.
-    retirement_high_water: Option<(u64, Instant, u64)>,
+    /// Each account/environment retires only its own earlier observations.
+    /// Entries remain while a bounded pending invocation or receipt owns them,
+    /// so receipt eviction cannot revive stale work or grow this map unbounded.
+    retirement_high_water: HashMap<ProviderAuthAuthorityKey, (u64, Instant, u64)>,
 }
 
 impl ProviderAuthEvidenceRegistry {
@@ -1355,7 +1457,7 @@ impl ProviderAuthEvidenceRegistry {
             pending_order: VecDeque::new(),
             accepted: HashMap::new(),
             accepted_order: VecDeque::new(),
-            retirement_high_water: None,
+            retirement_high_water: HashMap::new(),
         }
     }
 
@@ -1416,7 +1518,15 @@ impl ProviderAuthEvidenceRegistry {
         let executable = executable
             .open_for_launch()
             .map_err(ProviderAuthEvidenceError::ExecutableChanged)?;
-        self.begin_with_source_and_version_handle(kind, source, executable, version, ttl)
+        self.begin_with_source_and_version_handle(
+            kind,
+            source,
+            executable,
+            version,
+            None,
+            commit_child_environment(&BTreeMap::new()),
+            ttl,
+        )
     }
 
     pub(crate) fn begin_with_handle_and_version(
@@ -1427,7 +1537,36 @@ impl ProviderAuthEvidenceRegistry {
         version: ProviderVersion,
         ttl: Duration,
     ) -> Result<ProviderAuthProbeInvocation, ProviderAuthEvidenceError> {
-        self.begin_with_source_and_version_handle(kind, source, executable, version, ttl)
+        self.begin_with_source_and_version_handle(
+            kind,
+            source,
+            executable,
+            version,
+            None,
+            commit_child_environment(&BTreeMap::new()),
+            ttl,
+        )
+    }
+
+    pub(crate) fn begin_with_handle_version_and_scope(
+        &mut self,
+        kind: ProviderKind,
+        source: ProviderAuthEvidenceSource,
+        executable: ProviderExecutableHandle,
+        version: ProviderVersion,
+        scope_fingerprint: Option<String>,
+        env_commitment: String,
+        ttl: Duration,
+    ) -> Result<ProviderAuthProbeInvocation, ProviderAuthEvidenceError> {
+        self.begin_with_source_and_version_handle(
+            kind,
+            source,
+            executable,
+            version,
+            scope_fingerprint,
+            env_commitment,
+            ttl,
+        )
     }
 
     fn begin_with_source_and_version_handle(
@@ -1436,6 +1575,8 @@ impl ProviderAuthEvidenceRegistry {
         source: ProviderAuthEvidenceSource,
         executable: ProviderExecutableHandle,
         version: ProviderVersion,
+        scope_fingerprint: Option<String>,
+        env_commitment: String,
         ttl: Duration,
     ) -> Result<ProviderAuthProbeInvocation, ProviderAuthEvidenceError> {
         let issued_at = self.clock.now();
@@ -1443,7 +1584,14 @@ impl ProviderAuthEvidenceRegistry {
             .checked_add(ttl.min(MAX_PROVIDER_AUTH_TTL))
             .ok_or(ProviderAuthEvidenceError::InvalidDeadline)?;
         self.begin_at_with_source_and_version_handle(
-            kind, source, executable, version, issued_at, deadline,
+            kind,
+            source,
+            executable,
+            version,
+            scope_fingerprint,
+            env_commitment,
+            issued_at,
+            deadline,
         )
     }
 
@@ -1513,7 +1661,14 @@ impl ProviderAuthEvidenceRegistry {
             .open_for_launch()
             .map_err(ProviderAuthEvidenceError::ExecutableChanged)?;
         self.begin_at_with_source_and_version_handle(
-            kind, source, executable, version, issued_at, deadline,
+            kind,
+            source,
+            executable,
+            version,
+            None,
+            commit_child_environment(&BTreeMap::new()),
+            issued_at,
+            deadline,
         )
     }
 
@@ -1523,6 +1678,8 @@ impl ProviderAuthEvidenceRegistry {
         source: ProviderAuthEvidenceSource,
         executable: ProviderExecutableHandle,
         version: ProviderVersion,
+        scope_fingerprint: Option<String>,
+        env_commitment: String,
         issued_at: Instant,
         deadline: Instant,
     ) -> Result<ProviderAuthProbeInvocation, ProviderAuthEvidenceError> {
@@ -1567,6 +1724,8 @@ impl ProviderAuthEvidenceRegistry {
             generation: self.next_generation,
             adapter_revision: PROVIDER_AUTH_ADAPTER_REVISION,
             semantic_schema_version: PROVIDER_AUTH_SEMANTIC_SCHEMA_VERSION,
+            scope_fingerprint,
+            env_commitment,
             issued_at,
             deadline,
             clock: Arc::clone(&self.clock),
@@ -1575,6 +1734,7 @@ impl ProviderAuthEvidenceRegistry {
         self.evict_oldest_pending();
         self.pending.insert(key.clone(), invocation.clone());
         self.pending_order.push_back(key);
+        self.prune_retirements();
         Ok(invocation)
     }
 
@@ -1705,8 +1865,9 @@ impl ProviderAuthEvidenceRegistry {
         }
         self.remove_pending(&key);
 
+        let authority_key = invocation.authority_key();
         if let Some((last_generation, last_observed_at, last_observed_at_ms)) =
-            self.retirement_high_water
+            self.retirement_high_water.get(&authority_key).copied()
         {
             if invocation.generation <= last_generation {
                 return Err(ProviderAuthEvidenceError::Reordered);
@@ -1729,6 +1890,8 @@ impl ProviderAuthEvidenceRegistry {
             version: invocation.version,
             nonce: invocation.nonce,
             generation: invocation.generation,
+            scope_fingerprint: invocation.scope_fingerprint.clone(),
+            env_commitment: invocation.env_commitment.clone(),
             result,
             observed_at,
             deadline: invocation.deadline,
@@ -1736,11 +1899,15 @@ impl ProviderAuthEvidenceRegistry {
             deadline_ms,
             confidence,
         };
-        self.retirement_high_water = Some((invocation.generation, observed_at, observed_at_ms));
+        self.retirement_high_water.insert(
+            authority_key,
+            (invocation.generation, observed_at, observed_at_ms),
+        );
         self.evict_oldest_accepted();
         let receipt_key = receipt.key();
         self.accepted_order.push_back(receipt_key.clone());
         self.accepted.insert(receipt_key, (receipt.clone(), false));
+        self.prune_retirements();
         Ok(receipt)
     }
 
@@ -1794,7 +1961,8 @@ impl ProviderAuthEvidenceRegistry {
         }
         if self
             .retirement_high_water
-            .map_or(true, |(generation, _, _)| generation != receipt.generation)
+            .get(&receipt.authority_key())
+            .map_or(true, |(generation, _, _)| *generation != receipt.generation)
         {
             return Err(ProviderAuthEvidenceError::Reordered);
         }
@@ -1816,6 +1984,8 @@ impl ProviderAuthEvidenceRegistry {
         expected_kind: ProviderKind,
         expected_executable: &ProviderExecutableHandle,
         expected_version: &ProviderVersion,
+        expected_scope_fingerprint: Option<&str>,
+        expected_env_commitment: &str,
         receipt: ProviderAuthEvidenceReceipt,
     ) -> Result<ProviderAuthEvidenceReceipt, ProviderAuthEvidenceError> {
         if receipt.executable != *expected_executable {
@@ -1823,6 +1993,12 @@ impl ProviderAuthEvidenceRegistry {
         }
         if receipt.version != *expected_version {
             return Err(ProviderAuthEvidenceError::WrongVersion);
+        }
+        if receipt.scope_fingerprint.as_deref() != expected_scope_fingerprint {
+            return Err(ProviderAuthEvidenceError::RequestBindingMismatch);
+        }
+        if receipt.env_commitment != expected_env_commitment {
+            return Err(ProviderAuthEvidenceError::RequestBindingMismatch);
         }
         self.consume_at_for(
             expected_kind,
@@ -1904,6 +2080,21 @@ impl ProviderAuthEvidenceRegistry {
             };
             self.pending.remove(&key);
         }
+    }
+
+    fn prune_retirements(&mut self) {
+        let owners: HashSet<_> = self
+            .pending
+            .values()
+            .map(ProviderAuthProbeInvocation::authority_key)
+            .chain(
+                self.accepted
+                    .values()
+                    .map(|(receipt, _)| receipt.authority_key()),
+            )
+            .collect();
+        self.retirement_high_water
+            .retain(|key, _| owners.contains(key));
     }
 
     fn remove_pending(&mut self, key: &ProviderAuthInvocationKey) {
@@ -4702,6 +4893,8 @@ mod auth_timestamp_tests {
             version: ProviderVersion::new("fixture-1").unwrap(),
             nonce: [1; PROVIDER_AUTH_NONCE_BYTES],
             generation: 1,
+            scope_fingerprint: None,
+            env_commitment: super::commit_child_environment(&std::collections::BTreeMap::new()),
             result: ProviderAuthProbeResult::AuthRequired,
             observed_at,
             deadline,
@@ -4715,6 +4908,52 @@ mod auth_timestamp_tests {
     }
 
     #[test]
+    fn independent_account_probes_can_complete_out_of_order() {
+        let now = Instant::now();
+        let clock = Arc::new(FixedClock {
+            now,
+            timestamp_ms: 4_242,
+        });
+        let executable = executable_handle_fixture();
+        let mut registry = ProviderAuthEvidenceRegistry::with_clock(clock);
+        let mut begin = |scope: &str| {
+            registry
+                .begin_with_handle_version_and_scope(
+                    ProviderKind::Codex,
+                    ProviderAuthEvidenceSource::CodexSubscriptionLogin,
+                    executable.clone(),
+                    ProviderVersion::new("fixture-1").unwrap(),
+                    Some(scope.to_owned()),
+                    "same-env".to_owned(),
+                    Duration::from_secs(30),
+                )
+                .unwrap()
+        };
+        let older_a = begin("account-a");
+        let newer_b = begin("account-b");
+        let receipts: Vec<_> = [newer_b, older_a]
+            .into_iter()
+            .map(|invocation| {
+                let observation = ProviderAuthProbeObservation::from_bounded_probe(
+                    &invocation,
+                    ProviderAuthProbeResult::AuthRequired,
+                    EvidenceConfidence::High,
+                )
+                .unwrap();
+                registry
+                    .accept_observation(invocation, observation)
+                    .unwrap()
+            })
+            .collect();
+        for receipt in receipts {
+            registry
+                .consume_at_for(ProviderKind::Codex, executable.executable(), receipt, now)
+                .unwrap();
+        }
+        assert_eq!(registry.retirement_high_water.len(), 2);
+    }
+
+    #[test]
     fn auth_capability_evidence_uses_clock_timestamp_not_generation() {
         let executable = executable_handle_fixture();
         let observed_at = Instant::now();
@@ -4725,6 +4964,8 @@ mod auth_timestamp_tests {
             version: ProviderVersion::new("fixture-1").unwrap(),
             nonce: [1; PROVIDER_AUTH_NONCE_BYTES],
             generation: 99,
+            scope_fingerprint: None,
+            env_commitment: super::commit_child_environment(&std::collections::BTreeMap::new()),
             result: ProviderAuthProbeResult::AuthRequired,
             observed_at,
             deadline: observed_at + Duration::from_secs(30),

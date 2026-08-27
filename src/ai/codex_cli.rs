@@ -471,7 +471,7 @@ pub(crate) fn help_advertises_flag(help: &str, flag: &str) -> bool {
     })
 }
 
-fn strip_ansi_csi(text: &str) -> String {
+pub(crate) fn strip_ansi_csi(text: &str) -> String {
     let mut stripped = String::with_capacity(text.len());
     let mut characters = text.chars().peekable();
     while let Some(character) = characters.next() {

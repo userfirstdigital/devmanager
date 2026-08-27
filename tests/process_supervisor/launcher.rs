@@ -79,6 +79,7 @@ mod windows {
             args,
             cwd: PathBuf::from(env!("CARGO_MANIFEST_DIR")),
             environment: BTreeMap::new(),
+            replace_environment: false,
             display_label: "Phase 3 process helper".to_string(),
         }
     }

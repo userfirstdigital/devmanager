@@ -622,7 +622,7 @@ pub struct ProviderInputActionRequest {
     pub arguments: ProviderInputArguments,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProviderStartArguments {
     pub task_id: TaskId,
     pub agent_session_id: AgentSessionId,
@@ -661,6 +661,7 @@ pub const fn cockpit_query_action_id(query: &TaskCockpitQuery) -> &'static str {
         TaskCockpitQuery::ConfigArchiveCommand { .. } => ACTION_CONFIG_ARCHIVE_COMMAND,
         TaskCockpitQuery::ConfigRunCommand { .. } => ACTION_CONFIG_RUN_COMMAND,
         TaskCockpitQuery::ConfigCommandDetail { .. } => ACTION_CONFIG_COMMAND_DETAIL,
+        TaskCockpitQuery::ProviderSettings(_) => ACTION_HOST_STATUS,
         TaskCockpitQuery::BrowserProcessSession => ACTION_BROWSER_NATIVE,
         TaskCockpitQuery::Conversation { .. } => ACTION_CONVERSATION_STATUS,
         TaskCockpitQuery::Terminal => ACTION_PROVIDER_TERMINAL_INPUT,

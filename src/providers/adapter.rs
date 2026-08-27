@@ -17,6 +17,7 @@ pub use crate::providers::journal::{
 };
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::fmt;
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
@@ -103,12 +104,25 @@ pub enum ProviderAccessMode {
     ReadOnly,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ProviderLaunchOptions {
     pub model: ProviderModel,
     pub reasoning_effort: ProviderReasoningEffort,
     pub access: ProviderAccessMode,
+    /// When set, this slug is passed as `--model` and overrides the enum catalog.
+    /// Used for custom models configured in provider settings. Empty/None keeps
+    /// the Copy-friendly `model` enum behavior for persisted preferences.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub custom_model_slug: Option<String>,
+    /// Extra non-reserved launch arguments from the provider instance config.
+    /// Applied by adapters after identity/protocol wiring; reserved overrides
+    /// are rejected at settings validation time.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub extra_launch_args: Vec<String>,
+    /// Durable provider instance id selected for this launch (task binding).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_instance_id: Option<String>,
 }
 
 impl Default for ProviderLaunchOptions {
@@ -117,7 +131,22 @@ impl Default for ProviderLaunchOptions {
             model: ProviderModel::ProviderDefault,
             reasoning_effort: ProviderReasoningEffort::ProviderDefault,
             access: ProviderAccessMode::FullAccess,
+            custom_model_slug: None,
+            extra_launch_args: Vec::new(),
+            provider_instance_id: None,
         }
+    }
+}
+
+impl ProviderLaunchOptions {
+    pub fn effective_model_slug(&self) -> Option<&str> {
+        if let Some(slug) = self.custom_model_slug.as_deref() {
+            let trimmed = slug.trim();
+            if !trimmed.is_empty() {
+                return Some(trimmed);
+            }
+        }
+        self.model.cli_name()
     }
 }
 pub const MAX_PROVIDER_SIGNAL_BYTES: usize = 64 * 1024;
@@ -219,6 +248,10 @@ pub struct LaunchProviderRequest {
     input: Option<ProviderInput>,
     provider_session_id: Option<ProviderSessionId>,
     launch_options: ProviderLaunchOptions,
+    /// Opaque instance scope fingerprint from the same probe/observe context.
+    scope_fingerprint: Option<String>,
+    /// Commitment over the sealed effective provider environment.
+    env_commitment: String,
 }
 
 impl fmt::Debug for LaunchProviderRequest {
@@ -227,6 +260,8 @@ impl fmt::Debug for LaunchProviderRequest {
             .field("executable", &self.executable)
             .field("has_input", &self.input.is_some())
             .field("provider_session_id", &"<redacted>")
+            .field("scope_fingerprint", &self.scope_fingerprint)
+            .field("env_commitment", &self.env_commitment)
             .finish()
     }
 }
@@ -242,6 +277,10 @@ impl LaunchProviderRequest {
             input,
             provider_session_id,
             launch_options: ProviderLaunchOptions::default(),
+            scope_fingerprint: None,
+            env_commitment: crate::providers::capabilities::commit_child_environment(
+                &BTreeMap::new(),
+            ),
         }
     }
 
@@ -257,13 +296,78 @@ impl LaunchProviderRequest {
         self.provider_session_id.as_ref()
     }
 
-    pub const fn with_launch_options(mut self, launch_options: ProviderLaunchOptions) -> Self {
+    pub fn with_launch_options(mut self, launch_options: ProviderLaunchOptions) -> Self {
         self.launch_options = launch_options;
         self
     }
 
-    pub const fn launch_options(&self) -> ProviderLaunchOptions {
-        self.launch_options
+    pub fn with_scope_fingerprint(mut self, scope_fingerprint: Option<String>) -> Self {
+        self.scope_fingerprint = scope_fingerprint;
+        self
+    }
+
+    pub fn with_env_commitment(mut self, env_commitment: impl Into<String>) -> Self {
+        self.env_commitment = env_commitment.into();
+        self
+    }
+
+    pub fn launch_options(&self) -> &ProviderLaunchOptions {
+        &self.launch_options
+    }
+
+    pub fn scope_fingerprint(&self) -> Option<&str> {
+        self.scope_fingerprint.as_deref()
+    }
+
+    pub fn env_commitment(&self) -> &str {
+        &self.env_commitment
+    }
+
+    /// Adapter-local state key: scope fingerprint + sealed env commitment.
+    pub fn scope_env_key(&self) -> String {
+        provider_scope_env_key(self.scope_fingerprint(), self.env_commitment())
+    }
+}
+
+/// Composite key for adapter-local observed state (never scope-only).
+pub fn provider_scope_env_key(scope_fingerprint: Option<&str>, env_commitment: &str) -> String {
+    format!(
+        "{}|{}",
+        scope_fingerprint.unwrap_or_default(),
+        env_commitment
+    )
+}
+
+/// Immutable per-instance probe context shared by discovery probes and launch.
+#[derive(Clone, Default)]
+pub struct ProviderProbeContext {
+    pub child_environment: BTreeMap<std::ffi::OsString, std::ffi::OsString>,
+    pub scope_fingerprint: Option<String>,
+}
+
+impl fmt::Debug for ProviderProbeContext {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ProviderProbeContext")
+            .field("child_environment_count", &self.child_environment.len())
+            .field("scope_fingerprint", &self.scope_fingerprint)
+            .finish()
+    }
+}
+
+impl ProviderProbeContext {
+    pub fn scope_key(&self) -> String {
+        let env = crate::providers::capabilities::commit_child_environment(&self.child_environment);
+        provider_scope_env_key(self.scope_fingerprint.as_deref(), &env)
+    }
+
+    pub fn from_discovery(config: &crate::providers::registry::ProviderDiscoveryConfig) -> Self {
+        Self {
+            child_environment: config.child_environment.clone(),
+            scope_fingerprint: config
+                .instance_scope
+                .as_ref()
+                .map(|scope| scope.as_cache_key()),
+        }
     }
 }
 
@@ -372,6 +476,10 @@ pub enum ProviderProbeKind {
     AuthStatus,
     LoginStatus,
     ResumeHelp,
+    /// Cursor `agent about --format json` health surface.
+    CursorAboutJson,
+    /// Cursor `about` fallback when `--format` is unsupported.
+    CursorAboutPlain,
 }
 
 impl ProviderProbeKind {
@@ -382,13 +490,16 @@ impl ProviderProbeKind {
             Self::AuthStatus => &["auth", "status"],
             Self::LoginStatus => &["login", "status"],
             Self::ResumeHelp => &["resume", "--help"],
+            Self::CursorAboutJson => &["about", "--format", "json"],
+            Self::CursorAboutPlain => &["about"],
         }
     }
 
     pub const fn for_auth_probe(provider: ProviderKind) -> Self {
         match provider {
             ProviderKind::Codex => Self::LoginStatus,
-            ProviderKind::ClaudeCode | ProviderKind::Cursor => Self::AuthStatus,
+            ProviderKind::ClaudeCode => Self::AuthStatus,
+            ProviderKind::Cursor => Self::CursorAboutJson,
         }
     }
 }
@@ -428,6 +539,10 @@ pub struct ProviderProbeRequest {
     timeout: Duration,
     max_output_bytes: usize,
     auth_binding: Option<ProviderAuthProbeBinding>,
+    /// Scoped overlay applied after the process allowlist (not process-global).
+    child_environment: BTreeMap<std::ffi::OsString, std::ffi::OsString>,
+    /// Opaque instance scope fingerprint for wrong-scope receipt rejection.
+    scope_fingerprint: Option<String>,
 }
 
 impl fmt::Debug for ProviderProbeRequest {
@@ -439,6 +554,8 @@ impl fmt::Debug for ProviderProbeRequest {
             .field("timeout", &self.timeout)
             .field("max_output_bytes", &self.max_output_bytes)
             .field("auth_bound", &self.auth_binding.is_some())
+            .field("child_environment_count", &self.child_environment.len())
+            .field("scope_fingerprint", &self.scope_fingerprint)
             .finish()
     }
 }
@@ -509,7 +626,30 @@ impl ProviderProbeRequest {
             timeout,
             max_output_bytes,
             auth_binding: None,
+            child_environment: BTreeMap::new(),
+            scope_fingerprint: None,
         })
+    }
+
+    pub fn with_child_environment(
+        mut self,
+        environment: BTreeMap<std::ffi::OsString, std::ffi::OsString>,
+    ) -> Self {
+        self.child_environment = environment;
+        self
+    }
+
+    pub fn with_scope_fingerprint(mut self, fingerprint: Option<String>) -> Self {
+        self.scope_fingerprint = fingerprint;
+        self
+    }
+
+    pub fn child_environment(&self) -> &BTreeMap<std::ffi::OsString, std::ffi::OsString> {
+        &self.child_environment
+    }
+
+    pub fn scope_fingerprint(&self) -> Option<&str> {
+        self.scope_fingerprint.as_deref()
     }
 
     /// Binds this request to one exact issued auth invocation.  The nonce and
@@ -522,6 +662,14 @@ impl ProviderProbeRequest {
         if self.kind != ProviderProbeKind::for_auth_probe(invocation.provider_kind())
             || self.executable != *invocation.executable_handle()
         {
+            return Err(ProviderAuthEvidenceError::RequestBindingMismatch);
+        }
+        if self.scope_fingerprint.as_deref() != invocation.scope_fingerprint() {
+            return Err(ProviderAuthEvidenceError::RequestBindingMismatch);
+        }
+        let env_commitment =
+            crate::providers::capabilities::commit_child_environment(&self.child_environment);
+        if env_commitment != invocation.env_commitment() {
             return Err(ProviderAuthEvidenceError::RequestBindingMismatch);
         }
         let binding = invocation.binding();
@@ -583,6 +731,10 @@ impl ProviderProbeRequest {
             timeout: self.timeout,
             max_output_bytes: self.max_output_bytes,
             auth_binding: self.auth_binding.clone(),
+            scope_fingerprint: self.scope_fingerprint.clone(),
+            env_commitment: crate::providers::capabilities::commit_child_environment(
+                &self.child_environment,
+            ),
         }
     }
 }
@@ -705,6 +857,8 @@ struct ProviderProbeRequestBinding {
     timeout: Duration,
     max_output_bytes: usize,
     auth_binding: Option<ProviderAuthProbeBinding>,
+    scope_fingerprint: Option<String>,
+    env_commitment: String,
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -732,7 +886,15 @@ impl ProviderProbeResult {
         // Public metadata may describe a version/help probe.  It cannot claim
         // an auth-status observation: that result is issued only by the
         // crate-owned runner with a private proof token.
-        if request.kind() == ProviderProbeKind::AuthStatus || request.auth_binding.is_some() {
+        if request.auth_binding.is_some()
+            || matches!(
+                request.kind(),
+                ProviderProbeKind::AuthStatus
+                    | ProviderProbeKind::LoginStatus
+                    | ProviderProbeKind::CursorAboutJson
+                    | ProviderProbeKind::CursorAboutPlain
+            )
+        {
             return Err(ProviderProbeError::InvalidRequest(
                 ProviderProbeRequestError::AuthStatusRequiresRunnerProof,
             ));
@@ -943,17 +1105,24 @@ fn classify_auth_output(
                 "chatgpt subscription",
             ],
         ),
-        ProviderKind::Cursor => contains_any(
-            &lower,
-            &[
-                "authenticated with cursor",
-                "logged in with cursor",
-                "cursor subscription",
-            ],
-        ),
+        ProviderKind::Cursor => false,
     };
     if api_key {
         return ProviderAuthProbeResult::ApiKeyDetected;
+    }
+    if kind == ProviderKind::Cursor {
+        let facts = crate::providers::settings::parse_cursor_about_strict_json(stdout);
+        return match facts.auth {
+            crate::providers::settings::CursorAboutAuth::Authenticated => {
+                ProviderAuthProbeResult::AuthenticatedSubscription
+            }
+            crate::providers::settings::CursorAboutAuth::Unauthenticated => {
+                ProviderAuthProbeResult::AuthRequired
+            }
+            crate::providers::settings::CursorAboutAuth::Unknown => {
+                ProviderAuthProbeResult::Unknown
+            }
+        };
     }
     if negative && positive {
         return ProviderAuthProbeResult::Unknown;
@@ -1132,7 +1301,7 @@ impl WindowsProviderProbeRunner {
                 .stdin(Stdio::null())
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped());
-            provider_environment_allowlist(&mut command);
+            apply_provider_environment_exact(&mut command, request.child_environment());
 
             #[cfg(windows)]
             command
@@ -1156,6 +1325,7 @@ impl WindowsProviderProbeRunner {
             deadline,
             request.executable().launch_program().canonical_path(),
             request.executable(),
+            request.child_environment(),
         )?;
         // Windows keeps the no-delete handles open through CreateProcess;
         // Unix uses inherited descriptor paths from `prepare_unix_launch`.
@@ -1510,25 +1680,74 @@ const PROVIDER_ENVIRONMENT_ALLOWLIST: &[&str] = &[
     "ComSpec",
     "TEMP",
     "TMP",
+    "USERPROFILE",
+    "HOME",
+    "APPDATA",
+    "LOCALAPPDATA",
+    "HOMEDRIVE",
+    "HOMEPATH",
 ];
 
-fn provider_environment_allowlist(command: &mut std::process::Command) {
-    command.env_clear();
+/// Fixed provider-runtime transport defaults that are part of the sealed
+/// effective environment (probe, commitment, and provider launch share them).
+const PROVIDER_RUNTIME_TRANSPORT_DEFAULTS: &[(&str, &str)] = &[
+    ("TERM", "xterm-256color"),
+    ("COLORTERM", "truecolor"),
+    ("TERM_PROGRAM", "DevManager"),
+    ("CLICOLOR", "1"),
+    ("CLICOLOR_FORCE", "1"),
+    ("FORCE_COLOR", "1"),
+];
+
+/// Materialize the one effective provider environment: platform allowlist from
+/// ambient at this instant, fixed transport defaults, then configured overrides.
+/// Probe, commitment, and provider launch must all use this exact map.
+pub fn materialize_provider_environment(
+    overrides: BTreeMap<std::ffi::OsString, std::ffi::OsString>,
+) -> BTreeMap<std::ffi::OsString, std::ffi::OsString> {
+    let mut env = BTreeMap::new();
     for key in PROVIDER_ENVIRONMENT_ALLOWLIST {
         if let Some(value) = std::env::var_os(key) {
-            command.env(key, value);
+            env.insert(
+                provider_environment_key(std::ffi::OsString::from(*key)),
+                value,
+            );
         }
+    }
+    for (key, value) in PROVIDER_RUNTIME_TRANSPORT_DEFAULTS {
+        env.entry(std::ffi::OsString::from(*key))
+            .or_insert_with(|| std::ffi::OsString::from(*value));
+    }
+    env.entry(std::ffi::OsString::from("TERM_PROGRAM_VERSION"))
+        .or_insert_with(|| std::ffi::OsString::from(env!("CARGO_PKG_VERSION")));
+    for (key, value) in overrides {
+        env.insert(provider_environment_key(key), value);
+    }
+    env
+}
+
+fn provider_environment_key(key: std::ffi::OsString) -> std::ffi::OsString {
+    #[cfg(windows)]
+    {
+        // Settings keys are ASCII; Windows treats environment names without case.
+        // Seal one key per effective variable, not both PATH and Path.
+        std::ffi::OsString::from(key.to_string_lossy().to_ascii_uppercase())
+    }
+    #[cfg(not(windows))]
+    {
+        key
     }
 }
 
-#[cfg(target_os = "macos")]
-fn provider_environment_values() -> Vec<(std::ffi::OsString, std::ffi::OsString)> {
-    PROVIDER_ENVIRONMENT_ALLOWLIST
-        .iter()
-        .filter_map(|key| {
-            std::env::var_os(key).map(|value| (std::ffi::OsString::from(*key), value))
-        })
-        .collect()
+/// Provider-only: clear inherited ambient, then install the sealed map.
+pub fn apply_provider_environment_exact(
+    command: &mut std::process::Command,
+    environment: &BTreeMap<std::ffi::OsString, std::ffi::OsString>,
+) {
+    command.env_clear();
+    for (key, value) in environment {
+        command.env(key, value);
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1676,6 +1895,7 @@ impl ProbeProcess {
         deadline: std::time::Instant,
         expected: &Path,
         requested: &ProviderExecutableHandle,
+        child_environment: &BTreeMap<std::ffi::OsString, std::ffi::OsString>,
     ) -> Result<Self, ProviderProbeError> {
         use std::ffi::{CString, OsStr};
         use std::os::unix::ffi::OsStrExt;
@@ -1705,7 +1925,8 @@ impl ProbeProcess {
         argv.push(std::ptr::null_mut());
 
         let mut environment = Vec::new();
-        for (key, value) in provider_environment_values() {
+        // child_environment is already the sealed effective map (env_clear semantics).
+        for (key, value) in child_environment {
             let mut entry = key.as_os_str().as_bytes().to_vec();
             entry.push(b'=');
             entry.extend_from_slice(value.as_os_str().as_bytes());
@@ -2932,10 +3153,12 @@ pub trait ProviderAdapter: Send + Sync {
     fn kind(&self) -> ProviderKind;
 
     /// Probe non-authentication capabilities for an already validated
-    /// executable. Authentication is a registry-owned receipt flow.
+    /// executable under one immutable per-instance context. Authentication is
+    /// a registry-owned receipt flow.
     async fn probe(
         &self,
         executable: &ProviderExecutableHandle,
+        context: &ProviderProbeContext,
     ) -> Result<ProviderCapabilities, ProviderError>;
 
     fn build_launch(
@@ -3032,6 +3255,43 @@ mod tests {
                 b""
             ),
             ProviderAuthProbeResult::AuthRequired
+        );
+    }
+
+    #[test]
+    fn cursor_auth_classifier_uses_strict_about_json() {
+        assert_eq!(
+            classify_auth_output(
+                ProviderKind::Cursor,
+                br#"{"cliVersion":"1.2.3","userEmail":"a@example.com","subscriptionTier":"pro"}"#,
+                b""
+            ),
+            ProviderAuthProbeResult::AuthenticatedSubscription
+        );
+        assert_eq!(
+            classify_auth_output(
+                ProviderKind::Cursor,
+                br#"{"cliVersion":"1.2.3","userEmail":"a@example.com","authenticated":false}"#,
+                b""
+            ),
+            ProviderAuthProbeResult::AuthRequired
+        );
+        assert_eq!(
+            classify_auth_output(
+                ProviderKind::Cursor,
+                br#"{"cliVersion":"1.2.3","userEmail":null}"#,
+                b""
+            ),
+            ProviderAuthProbeResult::AuthRequired
+        );
+        // Plain labels are not accepted on the trusted JSON auth path.
+        assert_eq!(
+            classify_auth_output(
+                ProviderKind::Cursor,
+                b"CLI Version  1.2.3\nUser Email  user@example.com",
+                b""
+            ),
+            ProviderAuthProbeResult::Unknown
         );
     }
 

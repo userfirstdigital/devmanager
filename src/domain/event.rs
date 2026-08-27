@@ -2204,6 +2204,9 @@ fn apply_into(
                     return Err(ApplyError::InvalidTransition)
                 }
             }
+            snap.browser
+                .open_task(snap.task.id)
+                .map_err(apply_browser_error)?;
             snap.task.lifecycle = TaskLifecycle::Open;
         }
         Event::TaskArchived => {

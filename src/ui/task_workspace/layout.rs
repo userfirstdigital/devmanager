@@ -287,6 +287,22 @@ impl TaskWorkspace {
         self.focus_pane(pane_id)
     }
 
+    /// Open a different task in the focused slot without discarding other panes
+    /// or their manually sized split allocations.
+    pub fn replace_focused_task(&mut self, task_id: TaskId) -> Result<(), WorkspaceError> {
+        if self.contains_task(task_id) {
+            return self.focus_task(task_id);
+        }
+        let pane_id = self.focused.ok_or(WorkspaceError::MissingPane)?;
+        self.focus_clock = self.focus_clock.saturating_add(1).max(1);
+        let clock = self.focus_clock;
+        let pane = self.pane_mut(pane_id).ok_or(WorkspaceError::MissingPane)?;
+        pane.task_id = task_id;
+        pane.presentation = PanePresentation::Full;
+        pane.last_focused_at = clock;
+        Ok(())
+    }
+
     pub fn set_manual_compact(
         &mut self,
         task_id: TaskId,

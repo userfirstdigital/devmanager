@@ -29,10 +29,11 @@ use crate::providers::capabilities::{
 use crate::providers::hook_bridge;
 use async_trait::async_trait;
 use sha2::{Digest, Sha256};
+use std::collections::HashMap;
 use std::fmt;
 use std::net::SocketAddr;
 use std::path::Path;
-use std::sync::{atomic::AtomicU64, Arc, Mutex};
+use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 const HOOK_TRUST_FLAG: &str = "--dangerously-bypass-hook-trust";
@@ -67,122 +68,156 @@ const UNKNOWN_SESSION_ID: &str = "unknown";
 #[derive(Clone)]
 struct ProbedCodexSurface {
     identity: ProviderExecutable,
+    scope_key: String,
     capabilities: ProviderCapabilities,
     hooks_advertised: bool,
     semantic_state: CodexSemanticLaunchState,
 }
 
+struct CodexScopeSlot {
+    generation: u64,
+    pinned: Option<ProviderExecutable>,
+    probed: Option<ProbedCodexSurface>,
+    registrations: Vec<(std::sync::Weak<CodexHookRegistry>, String)>,
+}
+
 pub struct CodexAdapter {
     runner: Arc<dyn ProviderProbeRunner>,
-    probed: Arc<Mutex<Option<ProbedCodexSurface>>>,
-    pinned: Arc<Mutex<Option<ProviderExecutable>>>,
-    attestation_generation: AtomicU64,
+    scopes: Arc<Mutex<HashMap<String, CodexScopeSlot>>>,
 }
 
 impl CodexAdapter {
     pub fn new(runner: Arc<dyn ProviderProbeRunner>) -> Self {
         Self {
             runner,
-            probed: Arc::new(Mutex::new(None)),
-            pinned: Arc::new(Mutex::new(None)),
-            attestation_generation: AtomicU64::new(0),
+            scopes: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
     pub fn last_capabilities(&self, identity: &ProviderExecutable) -> Option<ProviderCapabilities> {
-        if !pinned_matches(&self.pinned, identity) {
-            return None;
-        }
-        lock_surface(&self.probed)
-            .ok()
-            .flatten()
-            .filter(|surface| surface.identity == *identity)
-            .map(|surface| surface.capabilities.clone())
+        let scopes = self.scopes.lock().ok()?;
+        scopes.values().find_map(|slot| {
+            slot.probed.as_ref().and_then(|surface| {
+                if surface.identity == *identity && slot.pinned.as_ref() == Some(identity) {
+                    Some(surface.capabilities.clone())
+                } else {
+                    None
+                }
+            })
+        })
     }
 
     pub fn semantic_launch_state(&self, identity: &ProviderExecutable) -> CodexSemanticLaunchState {
-        if !pinned_matches(&self.pinned, identity) {
+        let Ok(scopes) = self.scopes.lock() else {
             return CodexSemanticLaunchState::TerminalOnly;
-        }
-        lock_surface(&self.probed)
-            .ok()
-            .flatten()
-            .filter(|surface| surface.identity == *identity)
-            .map(|surface| surface.semantic_state)
+        };
+        scopes
+            .values()
+            .find_map(|slot| {
+                slot.probed.as_ref().and_then(|surface| {
+                    if surface.identity == *identity && slot.pinned.as_ref() == Some(identity) {
+                        Some(surface.semantic_state)
+                    } else {
+                        None
+                    }
+                })
+            })
             .unwrap_or(CodexSemanticLaunchState::TerminalOnly)
     }
 
-    fn quarantine_attestation(&self) -> Result<(), ProviderError> {
-        let mut pinned = self
-            .pinned
+    fn quarantine_attestation(&self, scope_key: &str) -> Result<(), ProviderError> {
+        let mut scopes = self
+            .scopes
             .lock()
             .map_err(|_| dependency(ProviderCapability::BuildLaunch))?;
-        self.bump_attestation_generation()?;
-        let mut probed = self
-            .probed
-            .lock()
-            .map_err(|_| dependency(ProviderCapability::BuildLaunch))?;
-        *probed = None;
-        *pinned = None;
+        let slot = scopes
+            .entry(scope_key.to_string())
+            .or_insert(CodexScopeSlot {
+                generation: 0,
+                pinned: None,
+                probed: None,
+                registrations: Vec::new(),
+            });
+        slot.generation = slot
+            .generation
+            .checked_add(1)
+            .ok_or_else(|| dependency(ProviderCapability::BuildLaunch))?;
+        slot.probed = None;
+        slot.pinned = None;
+        slot.registrations.clear();
         Ok(())
     }
 
-    fn begin_attestation(&self, identity: &ProviderExecutable) -> Result<u64, ProviderError> {
-        let mut pinned = self
-            .pinned
+    fn begin_attestation(
+        &self,
+        scope_key: &str,
+        identity: &ProviderExecutable,
+    ) -> Result<u64, ProviderError> {
+        let mut scopes = self
+            .scopes
             .lock()
             .map_err(|_| dependency(ProviderCapability::BuildLaunch))?;
-        let generation = self.bump_attestation_generation()?;
-        let mut probed = self
-            .probed
-            .lock()
-            .map_err(|_| dependency(ProviderCapability::BuildLaunch))?;
-        // A probe is an attestation epoch, even when path and digest are
-        // unchanged. Clear the prior surface before the first probe command
-        // so a stale concurrent probe cannot publish usable capabilities.
-        *probed = None;
-        *pinned = Some(identity.clone());
-        Ok(generation)
-    }
-
-    fn bump_attestation_generation(&self) -> Result<u64, ProviderError> {
-        let previous = self
-            .attestation_generation
-            .fetch_update(
-                std::sync::atomic::Ordering::AcqRel,
-                std::sync::atomic::Ordering::Acquire,
-                |generation| generation.checked_add(1),
-            )
-            .map_err(|_| dependency(ProviderCapability::BuildLaunch))?;
-        Ok(previous + 1)
+        let slot = scopes
+            .entry(scope_key.to_string())
+            .or_insert(CodexScopeSlot {
+                generation: 0,
+                pinned: None,
+                probed: None,
+                registrations: Vec::new(),
+            });
+        slot.generation = slot
+            .generation
+            .checked_add(1)
+            .ok_or_else(|| dependency(ProviderCapability::BuildLaunch))?;
+        // Clear only this scope's prior surface so concurrent A/B probes do not
+        // share attestation ownership.
+        slot.probed = None;
+        slot.pinned = Some(identity.clone());
+        slot.registrations.clear();
+        Ok(slot.generation)
     }
 
     fn publish_attestation(
         &self,
+        scope_key: &str,
         identity: &ProviderExecutable,
         generation: u64,
         surface: ProbedCodexSurface,
     ) -> Result<(), ProviderError> {
-        let pinned = self
-            .pinned
+        let mut scopes = self
+            .scopes
             .lock()
             .map_err(|_| dependency(ProviderCapability::BuildLaunch))?;
-        if pinned.as_ref() != Some(identity)
-            || self
-                .attestation_generation
-                .load(std::sync::atomic::Ordering::Acquire)
-                != generation
-        {
+        let slot = scopes
+            .get_mut(scope_key)
+            .ok_or_else(|| dependency(ProviderCapability::BuildLaunch))?;
+        if slot.pinned.as_ref() != Some(identity) || slot.generation != generation {
             return Err(dependency(ProviderCapability::BuildLaunch));
         }
-        let mut probed = self
-            .probed
-            .lock()
-            .map_err(|_| dependency(ProviderCapability::BuildLaunch))?;
-        *probed = Some(surface);
+        slot.probed = Some(surface);
         Ok(())
     }
 
+    fn require_attestation(
+        &self,
+        scope_key: &str,
+        identity: &ProviderExecutable,
+        generation: u64,
+    ) -> Result<(), ProviderError> {
+        let scopes = self
+            .scopes
+            .lock()
+            .map_err(|_| dependency(ProviderCapability::BuildLaunch))?;
+        let slot = scopes
+            .get(scope_key)
+            .ok_or_else(|| dependency(ProviderCapability::BuildLaunch))?;
+        if slot.pinned.as_ref() != Some(identity) || slot.generation != generation {
+            return Err(dependency(ProviderCapability::BuildLaunch));
+        }
+        Ok(())
+    }
+
+    #[cfg(test)]
     async fn probe_attested(
         &self,
         identity: &ProviderExecutable,
@@ -190,82 +225,68 @@ impl CodexAdapter {
         let handle = identity
             .open_for_launch()
             .map_err(ProviderError::Executable)?;
-        self.probe_attested_handle(&handle).await
+        self.probe_attested_handle(
+            &handle,
+            &crate::providers::adapter::ProviderProbeContext::default(),
+        )
+        .await
     }
 
     async fn probe_attested_handle(
         &self,
         handle: &ProviderExecutableHandle,
+        context: &crate::providers::adapter::ProviderProbeContext,
     ) -> Result<ProviderCapabilities, ProviderError> {
         let identity = handle.executable();
-        let generation = self.begin_attestation(identity)?;
+        let scope_key = context.scope_key();
+        let generation = self.begin_attestation(&scope_key, identity)?;
 
         let executable = handle.clone();
-        let version_request =
-            attested_probe_request(ProviderProbeRequest::version(executable.clone()), identity)?;
+        let version_request = attested_probe_request(
+            ProviderProbeRequest::version(executable.clone()),
+            identity,
+            context,
+        )?;
         require_request_identity(&version_request, identity)?;
         let version_result = self.runner.run(version_request).await?;
-        require_attestation(
-            &self.pinned,
-            &self.attestation_generation,
-            generation,
-            identity,
-        )?;
+        self.require_attestation(&scope_key, identity, generation)?;
         require_clean_completion(&version_result)?;
         let version = ProviderVersion::from_probe_output(version_result.stdout())?;
 
-        let help_request =
-            attested_probe_request(ProviderProbeRequest::help(executable.clone()), identity)?;
+        let help_request = attested_probe_request(
+            ProviderProbeRequest::help(executable.clone()),
+            identity,
+            context,
+        )?;
         require_request_identity(&help_request, identity)?;
-        require_attestation(
-            &self.pinned,
-            &self.attestation_generation,
-            generation,
-            identity,
-        )?;
+        self.require_attestation(&scope_key, identity, generation)?;
         let help_result = self.runner.run(help_request).await?;
-        require_attestation(
-            &self.pinned,
-            &self.attestation_generation,
-            generation,
-            identity,
-        )?;
+        self.require_attestation(&scope_key, identity, generation)?;
         require_clean_completion(&help_result)?;
         let help = classified_text(help_result.stdout()).unwrap_or("");
 
         let resume_request = attested_probe_request(
             ProviderProbeRequest::resume_help(executable.clone()),
             identity,
+            context,
         )?;
         require_request_identity(&resume_request, identity)?;
-        require_attestation(
-            &self.pinned,
-            &self.attestation_generation,
-            generation,
-            identity,
-        )?;
+        self.require_attestation(&scope_key, identity, generation)?;
         let exact_resume = match self.runner.run(resume_request).await {
             Ok(result) if is_clean_completion(&result) => {
                 support(resume_help_supports_exact_id(result.stdout()))
             }
             _ => CapabilitySupport::Unsupported,
         };
-        require_attestation(
-            &self.pinned,
-            &self.attestation_generation,
-            generation,
-            identity,
-        )?;
+        self.require_attestation(&scope_key, identity, generation)?;
 
-        let login_request =
-            attested_probe_request(ProviderProbeRequest::login_status(executable), identity)?;
-        require_request_identity(&login_request, identity)?;
-        require_attestation(
-            &self.pinned,
-            &self.attestation_generation,
-            generation,
+        let login_request = attested_probe_request(
+            ProviderProbeRequest::login_status(executable),
             identity,
+            context,
         )?;
+        require_request_identity(&login_request, identity)?;
+        self.require_attestation(&scope_key, identity, generation)?;
         if login_request.kind() != crate::providers::adapter::ProviderProbeKind::LoginStatus
             || login_request.arguments() != ["login", "status"]
         {
@@ -274,14 +295,7 @@ impl CodexAdapter {
             )));
         }
         let login_result = self.runner.run(login_request).await?;
-        require_attestation(
-            &self.pinned,
-            &self.attestation_generation,
-            generation,
-            identity,
-        )?;
-        // Stock `codex login status` prints the ChatGPT line on stderr and
-        // leaves stdout empty. Version/help still require a silent stderr.
+        self.require_attestation(&scope_key, identity, generation)?;
         require_zero_exit(&login_result)?;
         let mut login_text = login_result.stdout().to_vec();
         login_text.extend_from_slice(login_result.stderr());
@@ -315,9 +329,6 @@ impl CodexAdapter {
             .map_err(ProviderCapabilitiesError::InvalidEvidence)?,
         ];
 
-        // Registry probes may not mint AuthStatusProbe evidence. Keep the
-        // classified login on the adapter-local surface; trusted auth is a
-        // receipt attached after the extra bound `login status` probe.
         let capabilities = ProviderCapabilities {
             kind: ProviderKind::Codex,
             version,
@@ -335,10 +346,12 @@ impl CodexAdapter {
         let mut local = capabilities.clone();
         local.auth_state = auth_state;
         self.publish_attestation(
+            &scope_key,
             identity,
             generation,
             ProbedCodexSurface {
                 identity: identity.clone(),
+                scope_key: scope_key.clone(),
                 capabilities: local,
                 hooks_advertised,
                 semantic_state,
@@ -354,7 +367,24 @@ impl CodexAdapter {
         endpoint: &str,
         relay_executable: &Path,
     ) -> Result<CodexCorrelatedLaunch, ProviderError> {
-        require_pinned(&self.pinned, request.executable().executable())?;
+        let scope_key = request.scope_env_key();
+        let mut scopes = self
+            .scopes
+            .lock()
+            .map_err(|_| dependency(ProviderCapability::SemanticEvents))?;
+        let slot = scopes
+            .get_mut(&scope_key)
+            .ok_or_else(|| dependency(ProviderCapability::BuildLaunch))?;
+        if slot.pinned.as_ref() != Some(request.executable().executable()) {
+            return Err(match slot.pinned.as_ref() {
+                Some(before) => ProviderError::ExecutableChanged {
+                    before: before.clone(),
+                    after: request.executable().executable().clone(),
+                },
+                None => dependency(ProviderCapability::BuildLaunch),
+            });
+        }
+        let attestation_generation = slot.generation;
         let registry = permit.registry();
         let issued = permit.registration();
         if registry
@@ -374,14 +404,14 @@ impl CodexAdapter {
             issued.generation,
         )
         .map_err(|_| dependency(ProviderCapability::SemanticEvents))?;
-        let mut probed = self
+        let surface = slot
             .probed
-            .lock()
-            .map_err(|_| dependency(ProviderCapability::SemanticEvents))?;
-        let surface = probed
             .as_mut()
             .ok_or_else(|| dependency(ProviderCapability::BuildLaunch))?;
         require_same_executable(surface, request.executable().executable())?;
+        if surface.scope_key != scope_key {
+            return Err(dependency(ProviderCapability::BuildLaunch));
+        }
         if !surface.hooks_advertised {
             return Err(dependency(ProviderCapability::SemanticEvents));
         }
@@ -413,15 +443,25 @@ impl CodexAdapter {
         surface.capabilities.provider_session_id = CapabilitySupport::Supported;
         surface.capabilities.parse_signal = CapabilitySupport::Unsupported;
         let registration = permit.into_registration();
+        slot.registrations.retain(|(owner, nonce)| {
+            owner
+                .upgrade()
+                .is_some_and(|owner| owner.current_registration(nonce).is_some())
+        });
+        slot.registrations
+            .push((Arc::downgrade(&registry), registration.nonce.clone()));
         Ok(CodexCorrelatedLaunch {
             spec,
             identity: request.executable().executable().clone(),
             resume_session: request.provider_session_id().cloned(),
+            resume_surface: surface.clone(),
             authority: CodexIdentityAuthority {
                 correlation,
                 registration,
                 registry,
-                surface: Arc::clone(&self.probed),
+                scopes: Arc::clone(&self.scopes),
+                scope_key,
+                attestation_generation,
                 bound: None,
             },
         })
@@ -448,24 +488,41 @@ impl ProviderAdapter for CodexAdapter {
     async fn probe(
         &self,
         executable: &ProviderExecutableHandle,
+        context: &crate::providers::adapter::ProviderProbeContext,
     ) -> Result<ProviderCapabilities, ProviderError> {
-        self.quarantine_attestation()?;
-        self.probe_attested_handle(executable).await
+        self.quarantine_attestation(&context.scope_key())?;
+        self.probe_attested_handle(executable, context).await
     }
 
     fn build_launch(
         &self,
         request: LaunchProviderRequest,
     ) -> Result<ProviderLaunchSpec, ProviderError> {
-        require_pinned(&self.pinned, request.executable().executable())?;
-        let probed = self
-            .probed
+        let scope_key = request.scope_env_key();
+        let scopes = self
+            .scopes
             .lock()
             .map_err(|_| dependency(ProviderCapability::BuildLaunch))?;
-        let surface = probed
+        let slot = scopes
+            .get(&scope_key)
+            .ok_or_else(|| dependency(ProviderCapability::BuildLaunch))?;
+        if slot.pinned.as_ref() != Some(request.executable().executable()) {
+            return Err(match slot.pinned.as_ref() {
+                Some(before) => ProviderError::ExecutableChanged {
+                    before: before.clone(),
+                    after: request.executable().executable().clone(),
+                },
+                None => dependency(ProviderCapability::BuildLaunch),
+            });
+        }
+        let surface = slot
+            .probed
             .as_ref()
             .ok_or_else(|| dependency(ProviderCapability::BuildLaunch))?;
         require_same_executable(surface, request.executable().executable())?;
+        if surface.scope_key != scope_key {
+            return Err(dependency(ProviderCapability::BuildLaunch));
+        }
         if let Some(session_id) = request.provider_session_id() {
             if !surface.capabilities.exact_resume.is_supported() {
                 return Err(ProviderError::UnsupportedCapability(
@@ -576,6 +633,8 @@ pub struct CodexCorrelatedLaunch {
     spec: ProviderLaunchSpec,
     identity: ProviderExecutable,
     resume_session: Option<ProviderSessionId>,
+    // A later probe cannot rewrite the evidence admitted for this live launch.
+    resume_surface: ProbedCodexSurface,
     authority: CodexIdentityAuthority,
 }
 
@@ -614,11 +673,10 @@ impl CodexCorrelatedLaunch {
         if expected != session_id {
             return Err(CodexResumeFailure::Incompatible);
         }
-        let surface = lock_surface(&self.authority.surface)
-            .ok()
-            .flatten()
-            .filter(|surface| surface.identity == *identity)
-            .ok_or(CodexResumeFailure::Incompatible)?;
+        let surface = &self.resume_surface;
+        if surface.identity != *identity || surface.scope_key != self.authority.scope_key {
+            return Err(CodexResumeFailure::Incompatible);
+        }
         match observed {
             CodexResumeObservation::Failed(failure) => Err(failure),
             CodexResumeObservation::Succeeded => {
@@ -688,8 +746,10 @@ pub struct CodexIdentityAuthority {
     correlation: CodexLaunchCorrelation,
     registration: CodexHookRegistration,
     registry: Arc<CodexHookRegistry>,
-    surface: Arc<Mutex<Option<ProbedCodexSurface>>>,
+    scopes: Arc<Mutex<HashMap<String, CodexScopeSlot>>>,
+    scope_key: String,
     bound: Option<ProviderSessionId>,
+    attestation_generation: u64,
 }
 
 impl fmt::Debug for CodexIdentityAuthority {
@@ -816,17 +876,27 @@ impl CodexIdentityAuthority {
 impl Drop for CodexIdentityAuthority {
     fn drop(&mut self) {
         self.registry.unregister(&self.registration.nonce);
-        if let Ok(mut probed) = self.surface.lock() {
-            if let Some(surface) = probed.as_mut() {
-                if !self.registry.has_live_registrations() {
-                    surface.semantic_state = if surface.hooks_advertised {
-                        CodexSemanticLaunchState::DependencyUnavailable
-                    } else {
-                        CodexSemanticLaunchState::TerminalOnly
-                    };
-                    surface.capabilities.semantic_events = CapabilitySupport::Unsupported;
-                    surface.capabilities.provider_session_id = CapabilitySupport::Unsupported;
-                    surface.capabilities.parse_signal = CapabilitySupport::Unsupported;
+        if let Ok(mut scopes) = self.scopes.lock() {
+            if let Some(slot) = scopes.get_mut(&self.scope_key) {
+                if slot.generation != self.attestation_generation {
+                    return;
+                }
+                slot.registrations.retain(|(owner, nonce)| {
+                    owner
+                        .upgrade()
+                        .is_some_and(|owner| owner.current_registration(nonce).is_some())
+                });
+                if let Some(surface) = slot.probed.as_mut() {
+                    if slot.registrations.is_empty() {
+                        surface.semantic_state = if surface.hooks_advertised {
+                            CodexSemanticLaunchState::DependencyUnavailable
+                        } else {
+                            CodexSemanticLaunchState::TerminalOnly
+                        };
+                        surface.capabilities.semantic_events = CapabilitySupport::Unsupported;
+                        surface.capabilities.provider_session_id = CapabilitySupport::Unsupported;
+                        surface.capabilities.parse_signal = CapabilitySupport::Unsupported;
+                    }
                 }
             }
         }
@@ -886,66 +956,6 @@ pub enum CodexSemanticLaunchState {
     Registered,
 }
 
-fn lock_surface(
-    probed: &Mutex<Option<ProbedCodexSurface>>,
-) -> Result<Option<ProbedCodexSurface>, ProviderError> {
-    probed
-        .lock()
-        .map(|guard| guard.clone())
-        .map_err(|_| dependency(ProviderCapability::BuildLaunch))
-}
-
-fn pinned_matches(
-    pinned: &Mutex<Option<ProviderExecutable>>,
-    identity: &ProviderExecutable,
-) -> bool {
-    pinned
-        .lock()
-        .ok()
-        .and_then(|guard| guard.clone())
-        .is_some_and(|current| current == *identity)
-}
-
-fn require_pinned(
-    pinned: &Mutex<Option<ProviderExecutable>>,
-    identity: &ProviderExecutable,
-) -> Result<(), ProviderError> {
-    let current = pinned
-        .lock()
-        .map_err(|_| dependency(ProviderCapability::BuildLaunch))?
-        .clone();
-    match current {
-        Some(current) if current == *identity => Ok(()),
-        Some(current) => Err(ProviderError::ExecutableChanged {
-            before: current,
-            after: identity.clone(),
-        }),
-        None => Err(dependency(ProviderCapability::BuildLaunch)),
-    }
-}
-
-fn require_attestation(
-    pinned: &Mutex<Option<ProviderExecutable>>,
-    generation: &AtomicU64,
-    expected_generation: u64,
-    identity: &ProviderExecutable,
-) -> Result<(), ProviderError> {
-    let current = pinned
-        .lock()
-        .map_err(|_| dependency(ProviderCapability::BuildLaunch))?
-        .clone();
-    match current {
-        Some(current) if current != *identity => Err(ProviderError::ExecutableChanged {
-            before: current,
-            after: identity.clone(),
-        }),
-        Some(_) if generation.load(std::sync::atomic::Ordering::Acquire) == expected_generation => {
-            Ok(())
-        }
-        _ => Err(dependency(ProviderCapability::BuildLaunch)),
-    }
-}
-
 fn dependency(capability: ProviderCapability) -> ProviderError {
     ProviderError::DependencyUnavailable { capability }
 }
@@ -981,8 +991,11 @@ fn require_request_identity(
 fn attested_probe_request(
     request: Result<ProviderProbeRequest, crate::providers::adapter::ProviderProbeRequestError>,
     identity: &ProviderExecutable,
+    context: &crate::providers::adapter::ProviderProbeContext,
 ) -> Result<ProviderProbeRequest, ProviderError> {
-    let request = probe_request(request)?;
+    let request = probe_request(request)?
+        .with_child_environment(context.child_environment.clone())
+        .with_scope_fingerprint(context.scope_fingerprint.clone());
     require_request_identity(&request, identity)?;
     Ok(request)
 }
@@ -1030,7 +1043,7 @@ fn require_zero_exit(
 
 fn stock_arguments(
     session_id: Option<&ProviderSessionId>,
-    options: crate::providers::adapter::ProviderLaunchOptions,
+    options: &crate::providers::adapter::ProviderLaunchOptions,
 ) -> Result<Vec<ProviderArgument>, ProviderError> {
     use crate::providers::adapter::{ProviderAccessMode, ProviderModel};
 
@@ -1049,23 +1062,38 @@ fn stock_arguments(
             argument("on-request")?,
         ],
     };
-    match options.model {
-        ProviderModel::ProviderDefault => {}
-        ProviderModel::CodexSol | ProviderModel::CodexTerra | ProviderModel::CodexLuna => {
-            arguments.push(argument("--model")?);
-            arguments.push(argument(
-                options.model.cli_name().expect("explicit Codex model"),
-            )?);
-        }
-        ProviderModel::ClaudeOpus | ProviderModel::ClaudeSonnet | ProviderModel::ClaudeHaiku => {
-            return Err(ProviderError::UnsupportedCapability(
-                ProviderCapability::BuildLaunch,
-            ));
+    if let Some(slug) = options
+        .custom_model_slug
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        arguments.push(argument("--model")?);
+        arguments.push(argument(slug)?);
+    } else {
+        match options.model {
+            ProviderModel::ProviderDefault => {}
+            ProviderModel::CodexSol | ProviderModel::CodexTerra | ProviderModel::CodexLuna => {
+                arguments.push(argument("--model")?);
+                arguments.push(argument(
+                    options.model.cli_name().expect("explicit Codex model"),
+                )?);
+            }
+            ProviderModel::ClaudeOpus
+            | ProviderModel::ClaudeSonnet
+            | ProviderModel::ClaudeHaiku => {
+                return Err(ProviderError::UnsupportedCapability(
+                    ProviderCapability::BuildLaunch,
+                ));
+            }
         }
     }
     if let Some(effort) = options.reasoning_effort.cli_name() {
         arguments.push(argument("--config")?);
         arguments.push(argument(&format!("model_reasoning_effort=\"{effort}\""))?);
+    }
+    for arg in &options.extra_launch_args {
+        arguments.push(argument(arg)?);
     }
     if let Some(session_id) = session_id {
         arguments.push(argument(RESUME_COMMAND)?);
@@ -1163,10 +1191,12 @@ fn resume_help_supports_exact_id(stdout: &[u8]) -> bool {
     let Ok(text) = std::str::from_utf8(stdout) else {
         return false;
     };
-    text.lines().any(|line| {
-        line.split_whitespace()
-            .eq(RESUME_USAGE_TOKENS.iter().copied())
-    })
+    crate::ai::codex_cli::strip_ansi_csi(text)
+        .lines()
+        .any(|line| {
+            line.split_whitespace()
+                .eq(RESUME_USAGE_TOKENS.iter().copied())
+        })
 }
 
 fn is_flag_name_character(character: char) -> bool {
@@ -1592,10 +1622,11 @@ mod authority_seal_tests {
     fn stock_launch_arguments_apply_model_reasoning_and_workspace_access() {
         let arguments = stock_arguments(
             None,
-            crate::providers::ProviderLaunchOptions {
+            &crate::providers::ProviderLaunchOptions {
                 model: crate::providers::ProviderModel::CodexTerra,
                 reasoning_effort: crate::providers::ProviderReasoningEffort::ExtraHigh,
                 access: crate::providers::ProviderAccessMode::WorkspaceWrite,
+                ..crate::providers::ProviderLaunchOptions::default()
             },
         )
         .expect("launch arguments");
@@ -1696,5 +1727,18 @@ mod authority_seal_tests {
         assert!(!rendered.contains(&nonce));
         drop(permit);
         assert!(registry.current_registration(&nonce).is_none());
+    }
+
+    #[test]
+    fn colored_resume_help_preserves_exact_signature_validation() {
+        assert!(resume_help_supports_exact_id(
+            b"\x1b[1mUsage:\x1b[0m \x1b[1mcodex resume\x1b[0m [OPTIONS] [SESSION_ID] [PROMPT]\n"
+        ));
+        assert!(!resume_help_supports_exact_id(
+            b"\x1b[1mUsage:\x1b[0m codex resume [OPTIONS] --last [PROMPT]\n"
+        ));
+        assert!(!resume_help_supports_exact_id(
+            b"Usage: codex resume [OPTIONS] [SESSION_ID] [PROMPT] extra"
+        ));
     }
 }

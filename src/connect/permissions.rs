@@ -70,10 +70,11 @@ pub fn action_for_client_request(request: &ClientRequest) -> Option<(ActionId, O
                     | crate::domain::cockpit::TaskCockpitQuery::ConfigUpsertCommand { .. }
                     | crate::domain::cockpit::TaskCockpitQuery::ConfigArchiveCommand { .. }
                     | crate::domain::cockpit::TaskCockpitQuery::ConfigRunCommand { .. }
-                    | crate::domain::cockpit::TaskCockpitQuery::ConfigCommandDetail { .. },
+                    | crate::domain::cockpit::TaskCockpitQuery::ConfigCommandDetail { .. }
+                    | crate::domain::cockpit::TaskCockpitQuery::ProviderSettings(_),
                 ) => {
-                    // Config mutations and command-text detail stay host-local.
-                    // Connect must not map them as READ_TASK or forward them.
+                    // Config mutations, command-text detail, and provider settings
+                    // stay host-local. Connect must not map them as READ_TASK.
                     return None;
                 }
                 // GitRepositories / targeted Git status+mutate remain Task
@@ -371,6 +372,34 @@ mod tests {
             SessionAuthorizer::paired_owner().authorize_request(&request),
             PermissionDecision::Denied(PermissionDenyReason::UnknownAction)
         );
+    }
+
+    #[test]
+    fn provider_settings_is_not_a_connect_read() {
+        use crate::providers::settings::ProviderSettingsHostRequest;
+        for request in [
+            ProviderSettingsHostRequest::Snapshot,
+            ProviderSettingsHostRequest::Refresh { force: true },
+            ProviderSettingsHostRequest::Refresh { force: false },
+            ProviderSettingsHostRequest::Mutate(
+                crate::providers::settings::ProviderSettingsMutation::SetHealthInterval {
+                    expected_revision: 1,
+                    interval_secs: 0,
+                },
+            ),
+        ] {
+            let client_request = ClientRequest::Query(QueryEnvelope {
+                request_id: RequestId::new(),
+                client_id: ClientId::new(),
+                task_id: None,
+                query: Query::TaskCockpit(TaskCockpitQuery::ProviderSettings(request)),
+            });
+            assert_eq!(action_for_client_request(&client_request), None);
+            assert_eq!(
+                SessionAuthorizer::paired_owner().authorize_request(&client_request),
+                PermissionDecision::Denied(PermissionDenyReason::UnknownAction)
+            );
+        }
     }
 
     #[test]

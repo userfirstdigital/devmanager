@@ -43,8 +43,8 @@ pub enum WorkspaceSelectionGesture {
 }
 
 /// Apply the task-list gesture without coupling the recursive model to GPUI.
-/// Plain selection preserves an existing multi-pane membership set; Shift-
-/// selection is the only gesture that adds or removes panes.
+/// Plain selection focuses an open task or replaces the focused slot. Shift-
+/// selection adds or removes panes.
 pub fn apply_workspace_selection(
     workspace: &mut Option<TaskWorkspace>,
     task_id: TaskId,
@@ -63,8 +63,7 @@ pub fn apply_workspace_selection(
                 *workspace = Some(TaskWorkspace::single(task_id));
                 Ok(())
             } else {
-                // A plain click must not silently change multi-pane membership.
-                Ok(())
+                current.replace_focused_task(task_id)
             }
         }
         WorkspaceSelectionGesture::Toggle if current.contains_task(task_id) => {
@@ -235,6 +234,9 @@ pub struct TaskSurfaceState {
     pub conversation: TaskConversationCache,
     pub conversation_generation: u64,
     pub conversation_in_flight: bool,
+    /// Fair-scheduling watermark; lower values are admitted first on the next
+    /// bounded background wave.
+    pub last_conversation_scheduled_at: u64,
     pub latest_snippet: Option<String>,
     pub latest_terminal: Option<TaskTerminalProjection>,
     pub terminal_attachment: TerminalAttachmentState,
@@ -405,6 +407,8 @@ pub enum SurfaceAdmissionError {
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct TaskSurfaceRegistry {
     surfaces: BTreeMap<TaskId, TaskSurfaceState>,
+    /// Monotonic cursor used to fair-rotate background conversation queries.
+    background_schedule_epoch: u64,
 }
 
 impl TaskSurfaceRegistry {
@@ -620,7 +624,7 @@ impl TaskSurfaceRegistry {
     }
 
     pub fn conversation_query_schedule(
-        &self,
+        &mut self,
         workspace: &TaskWorkspace,
         max_background: usize,
     ) -> Vec<ConversationQueryPlan> {
@@ -637,33 +641,62 @@ impl TaskSurfaceRegistry {
             }
         }
 
+        if max_background == 0 {
+            return schedule;
+        }
+
+        // Background cadence covers every open pane that is not already on the
+        // interactive Full path — including a focused Compact summary.
         let mut background: Vec<_> = workspace
             .task_ids()
             .into_iter()
-            .filter(|task_id| Some(*task_id) != focused)
+            .filter(|task_id| {
+                if self.conversation_in_flight(*task_id) {
+                    return false;
+                }
+                match (Some(*task_id) == focused, workspace.presentation(*task_id)) {
+                    (true, Some(PanePresentation::Full)) => false,
+                    (_, Some(_)) => true,
+                    (_, None) => false,
+                }
+            })
             .filter_map(|task_id| {
                 let pane = workspace.pane_for_task(task_id)?;
-                (pane.presentation == PanePresentation::Full
-                    && !self.conversation_in_flight(task_id))
-                .then_some((pane.last_focused_at, task_id))
+                let last_scheduled = self
+                    .state(task_id)
+                    .map(|state| state.last_conversation_scheduled_at)
+                    .unwrap_or(0);
+                Some((last_scheduled, pane.last_focused_at, task_id))
             })
             .collect();
-        background.sort_by_key(|(last_focused_at, _)| std::cmp::Reverse(*last_focused_at));
-        schedule.extend(
-            background
-                .into_iter()
-                .take(max_background)
-                .map(|(_, task_id)| ConversationQueryPlan {
-                    task_id,
-                    priority: ConversationQueryPriority::Background,
-                }),
-        );
+        background.sort_by_key(|(last_scheduled, last_focused_at, task_id)| {
+            (*last_scheduled, *last_focused_at, *task_id)
+        });
+        let selected: Vec<_> = background
+            .into_iter()
+            .take(max_background)
+            .map(|(_, _, task_id)| task_id)
+            .collect();
+        if selected.is_empty() {
+            return schedule;
+        }
+        self.background_schedule_epoch = self.background_schedule_epoch.saturating_add(1);
+        let epoch = self.background_schedule_epoch;
+        for task_id in selected {
+            self.ensure_task(task_id).last_conversation_scheduled_at = epoch;
+            schedule.push(ConversationQueryPlan {
+                task_id,
+                priority: ConversationQueryPriority::Background,
+            });
+        }
         schedule
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeSet;
+
     use crate::domain::{
         CommandId, EventId, PrivacyClass, SemanticJournalFact, SemanticJournalPage,
         SemanticJournalPayload, TaskId,
@@ -1019,6 +1052,24 @@ mod tests {
     }
 
     #[test]
+    fn plain_click_outside_workspace_opens_in_focused_slot() {
+        let first = TaskId::new();
+        let second = TaskId::new();
+        let next = TaskId::new();
+        let mut workspace = Some(TaskWorkspace::single(first));
+        apply_workspace_selection(&mut workspace, second, WorkspaceSelectionGesture::Toggle)
+            .unwrap();
+        let slot = workspace.as_ref().unwrap().focused_pane_id();
+        apply_workspace_selection(&mut workspace, next, WorkspaceSelectionGesture::Plain).unwrap();
+        let workspace = workspace.unwrap();
+        assert_eq!(workspace.pane_count(), 2);
+        assert_eq!(workspace.focused_pane_id(), slot);
+        assert_eq!(workspace.focused_task(), Some(next));
+        assert!(workspace.contains_task(first));
+        assert!(!workspace.contains_task(second));
+    }
+
+    #[test]
     fn late_conversation_result_is_admitted_only_to_its_exact_task_surface() {
         let first = TaskId::new();
         let second = TaskId::new();
@@ -1038,7 +1089,7 @@ mod tests {
     }
 
     #[test]
-    fn workspace_query_scheduler_prioritizes_focused_full_and_skips_compact() {
+    fn workspace_query_scheduler_prioritizes_focused_full_and_includes_compact() {
         let first = TaskId::new();
         let second = TaskId::new();
         let third = TaskId::new();
@@ -1064,7 +1115,157 @@ mod tests {
             })
         );
         assert!(schedule.iter().any(|plan| plan.task_id == first));
-        assert!(schedule.iter().all(|plan| plan.task_id != third));
+        assert!(
+            schedule.iter().any(|plan| plan.task_id == third),
+            "compact panes still receive bounded summary refresh"
+        );
         assert!(schedule.iter().all(|plan| plan.task_id != fourth));
+    }
+
+    #[test]
+    fn workspace_query_scheduler_fairly_rotates_all_open_background_panes() {
+        let focused = TaskId::new();
+        let older = TaskId::new();
+        let mid = TaskId::new();
+        let newer = TaskId::new();
+        let compact = TaskId::new();
+        let mut workspace = TaskWorkspace::single(older);
+        for task_id in [mid, newer, compact, focused] {
+            workspace
+                .insert_after_focused(task_id, Axis::Horizontal)
+                .unwrap();
+        }
+        workspace.focus_task(focused).unwrap();
+        workspace.set_manual_compact(compact, true).unwrap();
+        let mut registry = TaskSurfaceRegistry::default();
+
+        let first_wave = registry.conversation_query_schedule(&workspace, 2);
+        let background: Vec<_> = first_wave
+            .iter()
+            .filter(|plan| plan.priority == ConversationQueryPriority::Background)
+            .map(|plan| plan.task_id)
+            .collect();
+        assert_eq!(background.len(), 2);
+        assert!(!background.contains(&focused));
+
+        let second_wave = registry.conversation_query_schedule(&workspace, 2);
+        let second_background: Vec<_> = second_wave
+            .iter()
+            .filter(|plan| plan.priority == ConversationQueryPriority::Background)
+            .map(|plan| plan.task_id)
+            .collect();
+        assert_eq!(second_background.len(), 2);
+
+        let seen: BTreeSet<_> = background.into_iter().chain(second_background).collect();
+        assert!(
+            seen.contains(&older)
+                && seen.contains(&mid)
+                && seen.contains(&newer)
+                && seen.contains(&compact),
+            "two bounded waves must cover every open background pane including compact: {seen:?}"
+        );
+    }
+
+    #[test]
+    fn interactive_only_schedule_does_not_advance_background_watermarks() {
+        let focused = TaskId::new();
+        let background = TaskId::new();
+        let mut workspace = TaskWorkspace::single(background);
+        workspace
+            .insert_after_focused(focused, Axis::Horizontal)
+            .unwrap();
+        workspace.focus_task(focused).unwrap();
+        let mut registry = TaskSurfaceRegistry::default();
+
+        let before = registry
+            .state(background)
+            .map(|state| state.last_conversation_scheduled_at)
+            .unwrap_or(0);
+        let schedule = registry.conversation_query_schedule(&workspace, 0);
+        assert!(schedule.iter().all(|plan| {
+            plan.priority == ConversationQueryPriority::Interactive && plan.task_id == focused
+        }));
+        assert_eq!(
+            registry
+                .state(background)
+                .map(|state| state.last_conversation_scheduled_at)
+                .unwrap_or(0),
+            before,
+            "interactive-only pump must not rotate background watermarks"
+        );
+    }
+
+    #[test]
+    fn focused_compact_pane_is_scheduled_on_background_cadence() {
+        let task = TaskId::new();
+        let mut workspace = TaskWorkspace::single(task);
+        workspace.set_manual_compact(task, true).unwrap();
+        let mut registry = TaskSurfaceRegistry::default();
+
+        let interactive_only = registry.conversation_query_schedule(&workspace, 0);
+        assert!(
+            interactive_only.is_empty(),
+            "focused compact is not interactive Full"
+        );
+
+        let with_background = registry.conversation_query_schedule(&workspace, 2);
+        assert_eq!(
+            with_background,
+            vec![ConversationQueryPlan {
+                task_id: task,
+                priority: ConversationQueryPriority::Background,
+            }]
+        );
+    }
+
+    #[test]
+    fn pump_cadence_with_five_tasks_covers_all_background_without_interactive_starvation() {
+        let focused = TaskId::new();
+        let mut others = Vec::new();
+        let mut workspace = TaskWorkspace::single(focused);
+        for _ in 0..5 {
+            let task = TaskId::new();
+            workspace
+                .insert_after_focused(task, Axis::Horizontal)
+                .unwrap();
+            others.push(task);
+        }
+        workspace.focus_task(focused).unwrap();
+        workspace.set_manual_compact(others[0], true).unwrap();
+        let mut registry = TaskSurfaceRegistry::default();
+
+        let mut seen = BTreeSet::new();
+        for tick in 1u64..=90 {
+            let due = conversation_poll_priorities_due(tick);
+            let max_background = if due.contains(&ConversationQueryPriority::Background) {
+                2
+            } else {
+                0
+            };
+            let before_epoch = registry.background_schedule_epoch;
+            let schedule = registry.conversation_query_schedule(&workspace, max_background);
+            if max_background == 0 {
+                assert_eq!(registry.background_schedule_epoch, before_epoch);
+                assert!(schedule
+                    .iter()
+                    .all(|plan| { plan.priority == ConversationQueryPriority::Interactive }));
+            }
+            for plan in schedule {
+                if !due.contains(&plan.priority) {
+                    continue;
+                }
+                if plan.priority == ConversationQueryPriority::Background {
+                    seen.insert(plan.task_id);
+                } else {
+                    assert_eq!(plan.task_id, focused);
+                }
+            }
+        }
+        for task in &others {
+            assert!(
+                seen.contains(task),
+                "background cadence across 8/30 ticks must reach every non-interactive pane including compact"
+            );
+        }
     }
 }

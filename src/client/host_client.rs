@@ -625,6 +625,51 @@ impl HostClient {
         }
     }
 
+    pub async fn query_provider_settings(
+        &mut self,
+        request: crate::providers::settings::ProviderSettingsHostRequest,
+    ) -> Result<Result<crate::providers::settings::ProviderSettingsReply, QueryError>, IpcError>
+    {
+        if !self.server_hello.granted.grants_task_cockpit() {
+            return Err(IpcError::UnsupportedCapability);
+        }
+
+        let request_id = RequestId::new();
+        let client_id = self.config.client_id;
+        let outcome = {
+            let connection = self.live_connection()?;
+            connection
+                .query_with_timeout(
+                    task_cockpit_query(
+                        request_id,
+                        client_id,
+                        TaskId::new(),
+                        TaskCockpitQuery::ProviderSettings(request),
+                    ),
+                    task_cockpit_query_timeout(),
+                )
+                .await
+        };
+        let reply = match outcome {
+            Ok(reply) => reply,
+            Err(error) => {
+                self.retire_connection();
+                return Err(error);
+            }
+        };
+
+        match reply.outcome {
+            QueryOutcome::Err(error) => Ok(Err(error)),
+            QueryOutcome::Ok(QueryResult::TaskCockpit(TaskCockpitResult::ProviderSettings(
+                settings,
+            ))) => Ok(Ok(settings)),
+            QueryOutcome::Ok(_) => {
+                self.retire_connection();
+                Err(IpcError::CorrelationMismatch)
+            }
+        }
+    }
+
     /// Query the bounded path-redacted repository catalog for one Task.
     pub async fn query_git_repositories(
         &mut self,

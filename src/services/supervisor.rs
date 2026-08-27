@@ -1772,6 +1772,7 @@ pub fn prepare_managed_service_pty(
         args: spec.args.into_iter().map(OsString::from).collect(),
         cwd: PathBuf::from(spec.cwd),
         environment,
+        replace_environment: false,
         display_label: spec.display_label,
     };
     crate::process::launcher::prepare_suspended_pty(slave, intent).map_err(|_| {

@@ -4,6 +4,7 @@ use gpui::{
     div, AnyElement, Context, InteractiveElement, IntoElement, ParentElement, Render, Styled,
     Window,
 };
+use std::collections::BTreeMap;
 
 use crate::browser::{
     BrowserBounds, BrowserCommand, BrowserGatewayBindingRef, BrowserHostEvent,
@@ -20,7 +21,7 @@ use crate::ui::actions::{
     DockSelectArtifacts, DockSelectBrowser, DockSelectChanges, DockSelectFiles, DockSelectReview,
     DockSelectServices, DockSelectTerminal, DockToggleRawTerminal,
 };
-use crate::ui::renderers::{RendererRegistry, SemanticJournalView};
+use crate::ui::renderers::{live_target, RendererRegistry, SemanticJournalView};
 use crate::ui::task_cockpit::cockpit_projection::TaskCockpitLiveProjection;
 use crate::ui::task_cockpit::composer::{ApprovalProjection, QuestionProjection, TaskComposer};
 use crate::ui::task_cockpit::dock::{
@@ -39,7 +40,13 @@ pub struct TaskCockpitShell {
     projection: Option<TaskCockpitLiveProjection>,
     browser_controller: BrowserNativeShellController,
     browser_projection: Option<BrowserNativeProjection>,
-    timeline: Option<Timeline>,
+    /// Single authoritative timeline per open task. ListState, expansion, and
+    /// follow intent live here only — never duplicated as a focused clone.
+    timelines: BTreeMap<TaskId, Timeline>,
+    /// When set, the focused conversation surface paints this task's map entry.
+    /// Cleared on projection holds so the error/hold footer can show without
+    /// deleting the retained map entry used by background panes.
+    focused_timeline_task: Option<TaskId>,
     timeline_error: Option<String>,
     conversation: Option<SemanticJournalPage>,
     attachment_banner: Option<String>,
@@ -99,7 +106,8 @@ impl TaskCockpitShell {
             projection: None,
             browser_controller: BrowserNativeShellController::for_current_platform(),
             browser_projection: None,
-            timeline: None,
+            timelines: BTreeMap::new(),
+            focused_timeline_task: None,
             timeline_error: None,
             conversation: None,
             attachment_banner: None,
@@ -288,11 +296,13 @@ impl TaskCockpitShell {
             .is_some_and(|projection| projection.task_id != task_id)
         {
             self.projection = None;
-            self.timeline = None;
             self.timeline_error = None;
             self.conversation = None;
             self.attachment_banner = None;
         }
+        // Prefer the authoritative map entry; never clone into a second
+        // current timeline that can drift from retained state.
+        self.focused_timeline_task = self.timelines.contains_key(&task_id).then_some(task_id);
         self.dock.follow_task(task_id);
     }
 
@@ -300,7 +310,8 @@ impl TaskCockpitShell {
     /// (including TerminalPresentation) so returning to a task restores the view.
     pub fn clear_live_surfaces_preserving_dock_memory(&mut self) {
         self.projection = None;
-        self.timeline = None;
+        self.timelines.clear();
+        self.focused_timeline_task = None;
         self.timeline_error = None;
         self.conversation = None;
         self.attachment_banner = None;
@@ -332,8 +343,18 @@ impl TaskCockpitShell {
         self.dock.bind_cockpit_projection(projection.clone());
         self.projection = Some(projection);
         if let TaskCockpitResult::Conversation(page) = result {
+            let high_water = page.high_water.max(page.through_sequence);
+            let unchanged_page = self.conversation.as_ref().is_some_and(|previous| {
+                previous.high_water.max(previous.through_sequence) == high_water
+                    && previous.after_sequence == page.after_sequence
+                    && previous.facts.len() == page.facts.len()
+            });
             self.conversation = Some(page.clone());
             if let Some(model) = self.model.clone() {
+                if unchanged_page {
+                    // Still fence runtime/capability identity; project_timeline
+                    // no-ops when the full projection identity matches.
+                }
                 self.project_timeline(&model, self.capabilities);
             }
         }
@@ -386,12 +407,12 @@ impl TaskCockpitShell {
 
     fn project_timeline(&mut self, model: &ClientModel, capabilities: CapabilitySet) {
         let Some(task_id) = self.dock.selected_task() else {
-            self.timeline = None;
+            self.focused_timeline_task = None;
             self.timeline_error = None;
             return;
         };
         let Some(task) = model.tasks().get(&task_id) else {
-            self.timeline = None;
+            self.focused_timeline_task = None;
             self.timeline_error = Some("This task is no longer available.".to_string());
             return;
         };
@@ -400,7 +421,7 @@ impl TaskCockpitShell {
             // the conversation surface when facts are already installed and
             // surface the diagnostic beside it.
             if self.conversation.is_none() {
-                self.timeline = None;
+                self.focused_timeline_task = None;
                 self.timeline_error = Some(
                     "The agent didn't start. Check Settings, then use +Claude or +Codex again."
                         .to_string(),
@@ -409,7 +430,7 @@ impl TaskCockpitShell {
             }
         }
         if task.primary_agent_id.is_none() {
-            self.timeline = None;
+            self.focused_timeline_task = None;
             self.timeline_error =
                 Some("This task is ready. An agent has not been connected yet.".to_string());
             return;
@@ -418,11 +439,32 @@ impl TaskCockpitShell {
             .primary_agent_id
             .is_some_and(|agent_id| !task.agents.contains_key(&agent_id))
         {
-            self.timeline = None;
+            self.focused_timeline_task = None;
             self.timeline_error = Some(
                 "The agent connection is still starting. Conversation will appear when it is ready."
                     .to_string(),
             );
+            return;
+        }
+        let high_water = self
+            .conversation
+            .as_ref()
+            .map(|page| page.high_water.max(page.through_sequence))
+            .unwrap_or(0);
+        let task_revision = task.task.revision;
+        let Ok(target) = live_target(model, task_id) else {
+            self.focused_timeline_task = None;
+            self.timeline_error = Some(
+                "The agent connection is still starting. Conversation will appear when it is ready."
+                    .to_string(),
+            );
+            return;
+        };
+        if self.timelines.get(&task_id).is_some_and(|timeline| {
+            timeline.matches_projection_identity(high_water, capabilities, target, task_revision)
+        }) {
+            self.focused_timeline_task = Some(task_id);
+            self.timeline_error = None;
             return;
         }
         let result = (|| {
@@ -447,37 +489,202 @@ impl TaskCockpitShell {
         })();
         match result {
             Ok(mut timeline) => {
-                if let Some(previous) = self.timeline.as_ref() {
-                    timeline.preserve_view_state_from(previous);
+                if let Some(previous) = self.timelines.remove(&task_id) {
+                    timeline.preserve_view_state_from(&previous);
                 }
-                self.timeline = Some(timeline);
+                timeline.note_projection_identity(high_water, capabilities, target, task_revision);
+                self.timelines.insert(task_id, timeline);
+                self.focused_timeline_task = Some(task_id);
                 self.timeline_error = None;
             }
             Err(error) => {
-                self.timeline = None;
-                self.timeline_error = Some(
-                    if error.contains("missing field") || error.contains("agent_session_id") {
-                        "The agent didn't start. Check Settings, then use +Claude or +Codex again."
-                            .to_string()
-                    } else {
-                        error
-                    },
-                );
+                if self.dock.selected_task() == Some(task_id) {
+                    self.focused_timeline_task = None;
+                    self.timeline_error = Some(
+                        if error.contains("missing field") || error.contains("agent_session_id") {
+                            "The agent didn't start. Check Settings, then use +Claude or +Codex again."
+                                .to_string()
+                        } else {
+                            error
+                        },
+                    );
+                }
             }
         }
     }
 
     pub fn timeline(&self) -> Option<&Timeline> {
-        self.timeline.as_ref()
+        let task_id = self.focused_timeline_task?;
+        self.timelines.get(&task_id)
+    }
+
+    pub fn timeline_for(&self, task_id: TaskId) -> Option<&Timeline> {
+        self.timelines.get(&task_id)
     }
 
     pub fn timeline_mut(&mut self) -> Option<&mut Timeline> {
-        self.timeline.as_mut()
+        let task_id = self.focused_timeline_task?;
+        self.timelines.get_mut(&task_id)
+    }
+
+    pub fn timeline_mut_for(&mut self, task_id: TaskId) -> Option<&mut Timeline> {
+        self.timelines.get_mut(&task_id)
     }
 
     pub fn clear_timeline(&mut self) {
-        self.timeline = None;
+        self.focused_timeline_task = None;
         self.timeline_error = None;
+    }
+
+    pub fn retain_open_timelines(&mut self, task_ids: &[TaskId]) {
+        let valid: std::collections::BTreeSet<_> = task_ids.iter().copied().collect();
+        self.timelines.retain(|task_id, _| valid.contains(task_id));
+        if self
+            .focused_timeline_task
+            .is_some_and(|task_id| !valid.contains(&task_id))
+        {
+            self.focused_timeline_task = None;
+        }
+    }
+
+    /// Hydrate a missing timeline once from an admitted page. Paint paths must
+    /// call this instead of reprojecting every frame.
+    pub fn hydrate_timeline_if_absent(&mut self, task_id: TaskId, page: &SemanticJournalPage) {
+        if self.timelines.contains_key(&task_id) {
+            return;
+        }
+        self.project_page_into_timeline(task_id, page);
+    }
+
+    /// Project or refresh a retained timeline when admission advances the
+    /// journal high-water. Unchanged high-water is a no-op.
+    pub fn ensure_retained_timeline_from_page(
+        &mut self,
+        task_id: TaskId,
+        page: &SemanticJournalPage,
+    ) {
+        let high_water = page.high_water.max(page.through_sequence);
+        if let Some(model) = self.model.as_ref() {
+            if let (Ok(target), Some(snapshot)) =
+                (live_target(model, task_id), model.tasks().get(&task_id))
+            {
+                if self.timelines.get(&task_id).is_some_and(|timeline| {
+                    timeline.matches_projection_identity(
+                        high_water,
+                        self.capabilities,
+                        target,
+                        snapshot.task.revision,
+                    )
+                }) {
+                    return;
+                }
+            } else if self
+                .timelines
+                .get(&task_id)
+                .is_some_and(|timeline| timeline.projected_high_water() >= high_water)
+            {
+                return;
+            }
+        } else if self
+            .timelines
+            .get(&task_id)
+            .is_some_and(|timeline| timeline.projected_high_water() >= high_water)
+        {
+            return;
+        }
+        self.project_page_into_timeline(task_id, page);
+    }
+
+    fn project_page_into_timeline(&mut self, task_id: TaskId, page: &SemanticJournalPage) {
+        let Some(model) = self.model.clone() else {
+            return;
+        };
+        let Ok(journal) = SemanticJournalView::from_live_page(&model, task_id, page) else {
+            return;
+        };
+        let Ok(registry) = RendererRegistry::standard() else {
+            return;
+        };
+        let Ok(mut timeline) = Timeline::project(
+            &model,
+            task_id,
+            self.capabilities,
+            &journal,
+            &registry,
+            TimelineViewport {
+                height: 280,
+                scroll_offset: 0,
+            },
+        ) else {
+            return;
+        };
+        let high_water = page.high_water.max(page.through_sequence);
+        if let Some(previous) = self.timelines.remove(&task_id) {
+            timeline.preserve_view_state_from(&previous);
+        }
+        let task_revision = model
+            .tasks()
+            .get(&task_id)
+            .map(|snapshot| snapshot.task.revision)
+            .unwrap_or(0);
+        if let Ok(target) = live_target(&model, task_id) {
+            timeline.note_projection_identity(high_water, self.capabilities, target, task_revision);
+        } else {
+            timeline.note_projected_high_water(high_water);
+        }
+        self.timelines.insert(task_id, timeline);
+        if self.dock.selected_task() == Some(task_id) {
+            self.focused_timeline_task = Some(task_id);
+            self.timeline_error = None;
+        }
+    }
+
+    pub fn conversation_timeline_surface_for(
+        &self,
+        task_id: TaskId,
+        tokens: crate::ui::tokens::ThemeTokens,
+        activity_toggle: Option<ActivityToggleHandler>,
+    ) -> AnyElement {
+        self.timeline_for(task_id)
+            .map(|timeline| {
+                div()
+                    .id(("native-semantic-timeline-pane", {
+                        u64::from_be_bytes(
+                            task_id.as_bytes()[8..]
+                                .try_into()
+                                .expect("task identity tail is exactly eight bytes"),
+                        )
+                    }))
+                    .w_full()
+                    .flex_1()
+                    .min_h(gpui::px(0.0))
+                    .overflow_hidden()
+                    .child(timeline.surface_with_activity_handler(tokens, activity_toggle))
+                    .into_any_element()
+            })
+            .unwrap_or_else(|| {
+                div()
+                    .id(("native-semantic-timeline-pane-hold", {
+                        u64::from_be_bytes(
+                            task_id.as_bytes()[8..]
+                                .try_into()
+                                .expect("task identity tail is exactly eight bytes"),
+                        )
+                    }))
+                    .w_full()
+                    .flex_1()
+                    .min_h(gpui::px(0.0))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .p(gpui::px(tokens.density.spacing.xl))
+                    .child(
+                        div()
+                            .text_color(tokens.text.muted.to_gpui())
+                            .child("Conversation is live; waiting for messages."),
+                    )
+                    .into_any_element()
+            })
     }
 
     #[cfg(debug_assertions)]
@@ -486,7 +693,9 @@ impl TaskCockpitShell {
         task_id: TaskId,
         steps: &[PreviewPlanStep],
     ) {
-        self.timeline = Some(Timeline::for_preview_plan_steps(task_id, steps));
+        let timeline = Timeline::for_preview_plan_steps(task_id, steps);
+        self.timelines.insert(task_id, timeline);
+        self.focused_timeline_task = Some(task_id);
         self.timeline_error = None;
     }
 
@@ -587,8 +796,7 @@ impl TaskCockpitShell {
                 "Semantic timeline unavailable until an authenticated journal is admitted".to_string()
             }
         });
-        self.timeline
-            .as_ref()
+        self.timeline()
             .map(|timeline| {
                 div()
                     .id("native-semantic-timeline")
@@ -871,5 +1079,110 @@ mod tests {
 
         assert!(projection.timeline_text.contains("saved answer"));
         assert!(projection.attachment_banner.is_empty());
+    }
+
+    #[test]
+    fn unchanged_high_water_skips_timeline_reproject() {
+        use crate::ui::conversation::fixtures::message_item;
+        use crate::ui::renderers::MessageRole;
+
+        let mut shell = TaskCockpitShell::new(DockEdge::Right);
+        let mut timeline =
+            Timeline::for_test_items(vec![message_item(MessageRole::Assistant, "cached")]);
+        let task_id = timeline.task_id();
+        timeline.note_projected_high_water(4);
+        let rows_ptr = timeline.rows().as_ptr();
+        shell.dock.follow_task(task_id);
+        shell.timelines.insert(task_id, timeline);
+        shell.focused_timeline_task = Some(task_id);
+
+        let page = SemanticJournalPage {
+            after_sequence: 0,
+            through_sequence: 4,
+            high_water: 4,
+            encoded_bytes: 0,
+            next_sequence: None,
+            facts: Vec::new(),
+        };
+        shell.ensure_retained_timeline_from_page(task_id, &page);
+        shell.hydrate_timeline_if_absent(task_id, &page);
+
+        let retained = shell.timelines.get(&task_id).expect("timeline retained");
+        assert_eq!(retained.projected_high_water(), 4);
+        assert_eq!(retained.rows().as_ptr(), rows_ptr);
+    }
+
+    #[test]
+    fn activity_expand_survives_focus_switch_on_single_timeline_map() {
+        use crate::ui::conversation::fixtures::{message_item, tool_item};
+        use crate::ui::renderers::MessageRole;
+
+        let mut shell = TaskCockpitShell::new(DockEdge::Right);
+        let mut timeline = Timeline::for_test_items(vec![
+            tool_item("tool-1", "Read", "completed"),
+            tool_item("tool-2", "Read", "completed"),
+            tool_item("tool-3", "Bash", "completed"),
+            message_item(MessageRole::Assistant, "tail"),
+        ]);
+        let task_id = timeline.task_id();
+        let group = timeline
+            .rows()
+            .iter()
+            .find_map(|row| match row {
+                crate::ui::conversation::rows::ConversationRow::ActivityToggle {
+                    group, ..
+                } => Some(group.clone()),
+                _ => None,
+            })
+            .expect("toggle");
+        assert!(timeline.toggle_activity_group(&group));
+
+        let other = TaskId::new();
+        let other_timeline = Timeline::for_test_task_items(
+            other,
+            vec![message_item(MessageRole::Assistant, "other")],
+        );
+
+        shell.dock.follow_task(task_id);
+        shell.timelines.insert(task_id, timeline);
+        shell.timelines.insert(other, other_timeline);
+        shell.focused_timeline_task = Some(task_id);
+        shell.projection = Some(super::TaskCockpitLiveProjection::empty(task_id));
+
+        shell.follow_task(other);
+        assert_eq!(shell.focused_timeline_task, Some(other));
+        shell.follow_task(task_id);
+        assert_eq!(shell.focused_timeline_task, Some(task_id));
+        let restored = shell
+            .timeline_for(task_id)
+            .expect("authoritative map entry");
+        assert!(restored.rows().iter().any(|row| matches!(
+            row,
+            crate::ui::conversation::rows::ConversationRow::Activity { entries, .. }
+                if entries.len() == 3
+        )));
+    }
+
+    #[test]
+    fn retain_open_timelines_keeps_focused_membership_only() {
+        use crate::ui::conversation::fixtures::message_item;
+        use crate::ui::renderers::MessageRole;
+
+        let mut shell = TaskCockpitShell::new(DockEdge::Right);
+        let first = Timeline::for_test_items(vec![message_item(MessageRole::Assistant, "one")]);
+        let first_id = first.task_id();
+        let second_id = TaskId::new();
+        let second = Timeline::for_test_task_items(
+            second_id,
+            vec![message_item(MessageRole::Assistant, "two")],
+        );
+        shell.timelines.insert(first_id, first);
+        shell.timelines.insert(second_id, second);
+        shell.focused_timeline_task = Some(first_id);
+
+        shell.retain_open_timelines(&[first_id]);
+        assert!(shell.timelines.contains_key(&first_id));
+        assert!(!shell.timelines.contains_key(&second_id));
+        assert_eq!(shell.focused_timeline_task, Some(first_id));
     }
 }

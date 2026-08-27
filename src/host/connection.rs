@@ -2477,6 +2477,10 @@ pub struct HostRequestExecutor {
     /// A failed restore fence suppresses only the same durable action epoch.
     /// A later user action advances the epoch and may retry intentionally.
     provider_restore_failed_action_epochs: HashMap<TaskId, u64>,
+    /// Native profile provider settings + health (exact `--config-base` root).
+    provider_settings:
+        Option<std::sync::Arc<crate::providers::settings::ProviderSettingsAuthority>>,
+    provider_health_jobs: FuturesUnordered<super::provider_health::ProviderHealthFuture>,
     /// Host-owned terminal admission. It only writes to terminals explicitly
     /// attached by the task runtime; an unbound/missing terminal fails closed.
     terminal_service: TerminalService,
@@ -2711,6 +2715,21 @@ impl HostRequestExecutor {
             host_boot_id: Arc::new(OnceLock::new()),
             configured_service_supervisor_ready,
         };
+        let provider_settings = config_admission.as_ref().and_then(|(_, store_path)| {
+            let root = store_path.parent()?;
+            match crate::providers::settings::ProviderProfileOwner::open_dir(root) {
+                Ok(profile) => Some(std::sync::Arc::new(
+                    crate::providers::settings::ProviderSettingsAuthority::from_profile(profile),
+                )),
+                Err(error) => {
+                    eprintln!(
+                        "devmanager-host: provider settings unavailable under {}: {error}",
+                        root.display()
+                    );
+                    None
+                }
+            }
+        });
         let host_boot_id = Arc::clone(&handle.host_boot_id);
         let mut executor = Self {
             bus,
@@ -2722,6 +2741,8 @@ impl HostRequestExecutor {
             provider_restore_jobs: FuturesUnordered::new(),
             provider_restore_in_flight: HashSet::new(),
             provider_restore_failed_action_epochs: HashMap::new(),
+            provider_settings,
+            provider_health_jobs: FuturesUnordered::new(),
             terminal_service: TerminalService::new(),
             update_gate,
             host_boot_id,
@@ -2800,6 +2821,8 @@ impl HostRequestExecutor {
             provider_restore_jobs: FuturesUnordered::new(),
             provider_restore_in_flight: HashSet::new(),
             provider_restore_failed_action_epochs: HashMap::new(),
+            provider_settings: None,
+            provider_health_jobs: FuturesUnordered::new(),
             terminal_service: TerminalService::new(),
             update_gate,
             host_boot_id,
@@ -2865,6 +2888,9 @@ impl HostRequestExecutor {
                 Some(outcome) = self.provider_restore_jobs.next(), if !self.provider_restore_jobs.is_empty() => {
                     self.handle_provider_restore_outcome(outcome);
                 }
+                Some(outcome) = self.provider_health_jobs.next(), if !self.provider_health_jobs.is_empty() => {
+                    self.handle_provider_health_outcome(outcome);
+                }
                 _ = reaper.tick(), if schedule_automatic_maintenance => {
                     let now = Instant::now();
                     self.registry.reap_idle(now);
@@ -2872,6 +2898,7 @@ impl HostRequestExecutor {
                     self.artifact_content_registry.reap(now);
                     self.reconcile_configured_services();
                     self.queue_one_provider_restore();
+                    self.maybe_schedule_provider_health(false);
                     // Missed unregister try_send must not leave completed live
                     // metadata forever once the connection has requested shutdown.
                     self.reap_shutdown_outputs();
@@ -2929,6 +2956,9 @@ impl HostRequestExecutor {
                 Some(outcome) = self.provider_restore_jobs.next(), if !self.provider_restore_jobs.is_empty() => {
                     self.handle_provider_restore_outcome(outcome);
                 }
+                Some(outcome) = self.provider_health_jobs.next(), if !self.provider_health_jobs.is_empty() => {
+                    self.handle_provider_health_outcome(outcome);
+                }
                 _ = reaper.tick(), if schedule_automatic_maintenance => {
                     let now = Instant::now();
                     self.registry.reap_idle(now);
@@ -2936,6 +2966,7 @@ impl HostRequestExecutor {
                     self.artifact_content_registry.reap(now);
                     self.reconcile_configured_services();
                     self.queue_one_provider_restore();
+                    self.maybe_schedule_provider_health(false);
                     self.reap_shutdown_outputs();
                     if let Some(outcome) = self.drive_supervised_maintenance_unit().await? {
                         return Ok(outcome);
@@ -3337,7 +3368,7 @@ impl HostRequestExecutor {
                     crate::providers::session::ProviderSessionStartMode::ResumeExact
                 }
             };
-            let launch_options = intent.launch_options;
+            let launch_options = intent.launch_options.clone();
             Ok::<_, String>((binding, agent, cwd, mode, launch_options))
         })();
         let (binding, agent, cwd, mode, launch_options) = match prepared {
@@ -3354,16 +3385,50 @@ impl HostRequestExecutor {
         let task_id = intent.task_id;
         let action_epoch = intent.expected_action_epoch;
         let provider_kind = intent.provider_kind;
+        let legacy_launch = match manager.peek_persisted_provider_launch_spec(agent.id) {
+            Ok(launch) => launch,
+            Err(error) => {
+                self.handle_provider_restore_outcome(ProviderRestoreOutcome {
+                    task_id,
+                    action_epoch,
+                    result: Err(format!("persisted launch peek failed: {error}")),
+                });
+                return;
+            }
+        };
         self.provider_restore_in_flight.insert(task_id);
+        let Some(owner) = self
+            .provider_settings
+            .as_ref()
+            .map(|authority| std::sync::Arc::clone(authority.profile()))
+        else {
+            self.handle_provider_restore_outcome(ProviderRestoreOutcome {
+                task_id,
+                action_epoch,
+                result: Err("provider settings profile unavailable".into()),
+            });
+            return;
+        };
         self.provider_restore_jobs.push(Box::pin(async move {
             let result = async {
+                let resolved = super::provider_launch::resolve_host_provider_launch(
+                    owner.as_ref(),
+                    task_id,
+                    provider_kind,
+                    launch_options,
+                    true,
+                    legacy_launch.as_ref(),
+                )?;
                 let observation = super::agent_connection::observe_with_trusted_auth(
                     manager.provider_host().registry(),
                     provider_kind,
-                    &crate::providers::registry::ProviderDiscoveryConfig::default(),
+                    &resolved.discovery,
                 )
                 .await
                 .map_err(|error| error.to_string())?;
+                let environment = resolved.environment;
+                let launch_options = resolved.launch_options;
+                let deferred_binding = resolved.deferred_binding;
                 tokio::task::spawn_blocking(move || {
                     manager
                         .start_production_stock_provider_session_with_options(
@@ -3372,11 +3437,18 @@ impl HostRequestExecutor {
                             &observation,
                             None,
                             cwd,
-                            BTreeMap::new(),
+                            environment,
                             mode,
                             launch_options,
                         )
-                        .map_err(|error| error.to_string())
+                        .map_err(|error| error.to_string())?;
+                    if let Some(deferred) = deferred_binding.as_ref() {
+                        super::provider_launch::commit_deferred_provider_binding(
+                            owner.as_ref(),
+                            deferred,
+                        )?;
+                    }
+                    Ok::<(), String>(())
                 })
                 .await
                 .map_err(|error| format!("provider restore launch worker failed: {error}"))??;
@@ -3389,6 +3461,91 @@ impl HostRequestExecutor {
                 result,
             }
         }));
+    }
+
+    fn handle_provider_health_outcome(
+        &mut self,
+        outcome: super::provider_health::ProviderHealthJobOutcome,
+    ) {
+        // Finish ownership lives inside the future DropGuard. Stale completions
+        // are ignored here; only surface unexpected probe-lane failures.
+        if let Some(error) = outcome.error.as_ref() {
+            if let Some(authority) = self.provider_settings.as_ref() {
+                if authority
+                    .health_job()
+                    .is_stale_generation(outcome.generation)
+                    || authority
+                        .health_job()
+                        .is_stale_config(outcome.config_revision)
+                {
+                    return;
+                }
+            }
+            eprintln!("devmanager-host: provider health refresh failed: {error}");
+        }
+    }
+
+    fn maybe_schedule_provider_health(&mut self, force: bool) {
+        let Some(authority) = self.provider_settings.clone() else {
+            return;
+        };
+        let manager = self
+            .configured_service_runtime
+            .as_ref()
+            .map(|runtime| runtime.manager.clone());
+        if let Some((_, future)) =
+            super::provider_health::try_begin_health_job(&authority, manager, force)
+        {
+            self.provider_health_jobs.push(future);
+        }
+    }
+
+    fn dispatch_provider_settings_query(
+        &mut self,
+        request: &crate::providers::settings::ProviderSettingsHostRequest,
+    ) -> QueryOutcome {
+        use crate::providers::settings::{
+            ProviderSettingsHostRequest, ProviderSettingsQuery, ProviderSettingsReply,
+        };
+        let Some(authority) = self.provider_settings.clone() else {
+            return QueryOutcome::Err(QueryError::Unavailable {
+                reason: "provider_settings",
+            });
+        };
+        let reply = match request {
+            ProviderSettingsHostRequest::Snapshot => {
+                match authority.query(ProviderSettingsQuery::Snapshot) {
+                    Ok(reply) => reply,
+                    Err(error) => ProviderSettingsReply::Error {
+                        message: error.to_string(),
+                    },
+                }
+            }
+            ProviderSettingsHostRequest::Refresh { force } => {
+                let manager = self
+                    .configured_service_runtime
+                    .as_ref()
+                    .map(|runtime| runtime.manager.clone());
+                match super::provider_health::try_begin_health_job(&authority, manager, *force) {
+                    Some((generation, future)) => {
+                        self.provider_health_jobs.push(future);
+                        ProviderSettingsReply::RefreshStarted { generation }
+                    }
+                    None => ProviderSettingsReply::RefreshBusy,
+                }
+            }
+            ProviderSettingsHostRequest::Mutate(mutation) => {
+                match authority.mutate(mutation.clone()) {
+                    Ok(reply) => reply,
+                    Err(error) => ProviderSettingsReply::Error {
+                        message: error.to_string(),
+                    },
+                }
+            }
+        };
+        QueryOutcome::Ok(QueryResult::TaskCockpit(
+            TaskCockpitResult::ProviderSettings(reply),
+        ))
     }
 
     fn handle_provider_restore_outcome(&mut self, outcome: ProviderRestoreOutcome) {
@@ -4381,23 +4538,49 @@ impl HostRequestExecutor {
         let task_id = intent.task_id;
         let action_epoch = intent.expected_action_epoch;
         let provider_kind = intent.provider_kind;
-        let launch_options = intent.launch_options;
+        let launch_options = intent.launch_options.clone();
         let revision = snapshot.task.revision;
+        self.provider_restore_in_flight.insert(task_id);
+        let Some(owner) = self
+            .provider_settings
+            .as_ref()
+            .map(|authority| std::sync::Arc::clone(authority.profile()))
+        else {
+            self.handle_provider_restore_outcome(ProviderRestoreOutcome {
+                task_id,
+                action_epoch,
+                result: Err("provider settings profile unavailable".into()),
+            });
+            return Err(IpcError::Unavailable);
+        };
         // Sync prepare is complete. Enqueue discovery/launch onto the same
         // cancellation-owned FuturesUnordered lane used by provider restore so
         // the request executor stays free for task-list and cockpit queries.
-        self.provider_restore_in_flight.insert(task_id);
         self.provider_restore_jobs.push(Box::pin(async move {
             let result = async {
+                let resolved = super::provider_launch::resolve_host_provider_launch(
+                    owner.as_ref(),
+                    task_id,
+                    provider_kind,
+                    launch_options,
+                    false,
+                    None,
+                )
+                .map_err(|error| {
+                    format!("devmanager-host: provider start settings failed: {error}")
+                })?;
                 let observation = super::agent_connection::observe_with_trusted_auth(
                     manager.provider_host().registry(),
                     provider_kind,
-                    &crate::providers::registry::ProviderDiscoveryConfig::default(),
+                    &resolved.discovery,
                 )
                 .await
                 .map_err(|error| {
                     format!("devmanager-host: provider start observe failed: {error}")
                 })?;
+                let environment = resolved.environment;
+                let launch_options = resolved.launch_options;
+                let deferred_binding = resolved.deferred_binding;
                 tokio::task::spawn_blocking(move || {
                     manager
                         .start_production_stock_provider_session_with_options(
@@ -4406,13 +4589,23 @@ impl HostRequestExecutor {
                             &observation,
                             None,
                             cwd,
-                            BTreeMap::new(),
+                            environment,
                             mode,
                             launch_options,
                         )
                         .map_err(|error| {
                             format!("devmanager-host: provider start launch failed: {error}")
-                        })
+                        })?;
+                    if let Some(deferred) = deferred_binding.as_ref() {
+                        super::provider_launch::commit_deferred_provider_binding(
+                            owner.as_ref(),
+                            deferred,
+                        )
+                        .map_err(|error| {
+                            format!("devmanager-host: provider binding commit failed: {error}")
+                        })?;
+                    }
+                    Ok::<(), String>(())
                 })
                 .await
                 .map_err(|error| {
@@ -4476,6 +4669,13 @@ impl HostRequestExecutor {
         if let Some(runtime) = self.configured_service_runtime.as_ref() {
             if let Err(error) = runtime.manager.close_provider_task(task_id) {
                 eprintln!("devmanager-host: task close provider session stop failed: {error}");
+                // A failed cleanup is not permission to archive live resources.
+                return Ok(ServerMessage::CommandReceipt(CommandReceipt::Rejected {
+                    command_id: envelope.command_id,
+                    code: crate::domain::command::RejectionCode::InvalidTransition,
+                    current_revision: Some(snapshot.task.revision),
+                    resolution: None,
+                }));
             }
         }
 
@@ -4606,24 +4806,42 @@ impl HostRequestExecutor {
             return Err(IpcError::Unavailable);
         };
 
-        let agents = if let Some(runtime) = self.configured_service_runtime.as_ref() {
-            super::agent_connection::probe_agents(runtime.manager.provider_host().registry()).await
+        let restore_failed_task_ids = self
+            .provider_restore_failed_action_epochs
+            .keys()
+            .copied()
+            .collect();
+        // Schedule health before borrowing authority for the sync projection.
+        if self.provider_settings.is_some() {
+            self.maybe_schedule_provider_health(false);
+        }
+        let agents = if let Some(authority) = self.provider_settings.as_ref() {
+            // Health work runs on the cancellation-owned future lane; never
+            // await sequential CLI probes on this exclusive executor.
+            super::agent_connection::project_agent_connection_from_authority(
+                authority,
+                restore_failed_task_ids,
+            )
         } else {
-            let manager = crate::services::ProcessManager::new();
-            super::agent_connection::probe_agents(manager.provider_host().registry()).await
+            crate::domain::AgentConnectionSnapshot {
+                agents: vec![
+                    crate::domain::AgentConnectionRow {
+                        provider: crate::domain::ConfigSidebarProviderKind::Claude,
+                        presence: crate::domain::AgentPresence::NotSignedIn,
+                    },
+                    crate::domain::AgentConnectionRow {
+                        provider: crate::domain::ConfigSidebarProviderKind::Codex,
+                        presence: crate::domain::AgentPresence::NotSignedIn,
+                    },
+                ],
+                restore_failed_task_ids,
+            }
         };
         Ok(DuplexExecuteCompletion::CallerMustWrite(
             ServerMessage::QueryReply(QueryReply {
                 request_id: envelope.request_id,
                 outcome: QueryOutcome::Ok(QueryResult::TaskCockpit(
-                    TaskCockpitResult::AgentConnection(crate::domain::AgentConnectionSnapshot {
-                        agents,
-                        restore_failed_task_ids: self
-                            .provider_restore_failed_action_epochs
-                            .keys()
-                            .copied()
-                            .collect(),
-                    }),
+                    TaskCockpitResult::AgentConnection(agents),
                 )),
             }),
         ))
@@ -4948,6 +5166,19 @@ impl HostRequestExecutor {
                     .map_err(map_store_error)
             }
             Query::TaskCockpit(query) => {
+                if let TaskCockpitQuery::ProviderSettings(request) = &query {
+                    if !negotiated.capabilities.grants_task_cockpit() {
+                        return Ok(QueryReply {
+                            request_id: envelope.request_id,
+                            outcome: QueryOutcome::Err(QueryError::UnsupportedCapability),
+                        });
+                    }
+                    let outcome = self.dispatch_provider_settings_query(request);
+                    return Ok(QueryReply {
+                        request_id: envelope.request_id,
+                        outcome,
+                    });
+                }
                 if let TaskCockpitQuery::ConfigCreateProject { name, root_path } = &query {
                     if !negotiated.capabilities.grants_task_cockpit() {
                         return Ok(QueryReply {
@@ -10801,6 +11032,42 @@ mod output_tests {
         assert!(
             blocking_worker_at > observe_at && launch_at > blocking_worker_at,
             "provider process launch must run inside spawn_blocking after async discovery"
+        );
+    }
+
+    #[test]
+    fn agent_connection_dispatch_is_cache_projection_not_probe_await() {
+        let source = include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/src/host/connection.rs"
+        ));
+        let start = source
+            .find("async fn dispatch_agent_connection(")
+            .expect("dispatch_agent_connection");
+        let body = &source[start..];
+        let end = body
+            .find("\n    fn dispatch(")
+            .expect("dispatch follows agent connection");
+        let body = &body[..end];
+        assert!(
+            body.contains("project_agent_connection_from_authority"),
+            "AgentConnection must project from provider-settings cache"
+        );
+        assert!(
+            body.contains("maybe_schedule_provider_health"),
+            "AgentConnection may schedule health futures, not await them"
+        );
+        assert!(
+            !body.contains("probe_agents("),
+            "production AgentConnection must not call probe_agents"
+        );
+        assert!(
+            !body.contains("observe_with_trusted_auth"),
+            "AgentConnection must not await observe_with_trusted_auth on the exclusive executor"
+        );
+        assert!(
+            !body.contains("ProcessManager::new"),
+            "AgentConnection must not construct a ProcessManager fallback"
         );
     }
 }

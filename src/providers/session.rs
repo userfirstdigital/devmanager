@@ -196,6 +196,8 @@ pub struct ProviderAdapterLaunchSpec {
     cwd: PathBuf,
     environment: BTreeMap<OsString, OsString>,
     capabilities: ProviderCapabilities,
+    scope_fingerprint: Option<String>,
+    env_commitment: String,
 }
 
 impl fmt::Debug for ProviderAdapterLaunchSpec {
@@ -211,6 +213,8 @@ impl fmt::Debug for ProviderAdapterLaunchSpec {
             .field("environment_entry_count", &self.environment.len())
             .field("cwd_present", &(!self.cwd.as_os_str().is_empty()))
             .field("provider_kind", &self.capabilities.kind)
+            .field("scope_fingerprint", &self.scope_fingerprint)
+            .field("env_commitment", &self.env_commitment)
             .finish()
     }
 }
@@ -223,6 +227,8 @@ impl ProviderAdapterLaunchSpec {
         cwd: PathBuf,
         environment: BTreeMap<OsString, OsString>,
         capabilities: ProviderCapabilities,
+        scope_fingerprint: Option<String>,
+        env_commitment: String,
     ) -> Result<Self, ProviderLaunchSpecError> {
         if !executable.is_native() {
             return Err(ProviderLaunchSpecError::InvalidCapabilities);
@@ -263,6 +269,10 @@ impl ProviderAdapterLaunchSpec {
         capabilities
             .validate()
             .map_err(|_| ProviderLaunchSpecError::InvalidCapabilities)?;
+        let committed = crate::providers::capabilities::commit_child_environment(&environment);
+        if !env_commitment.is_empty() && committed != env_commitment {
+            return Err(ProviderLaunchSpecError::InvalidCapabilities);
+        }
         Ok(Self {
             executable,
             runtime_dependency,
@@ -270,6 +280,12 @@ impl ProviderAdapterLaunchSpec {
             cwd,
             environment,
             capabilities,
+            scope_fingerprint,
+            env_commitment: if env_commitment.is_empty() {
+                committed
+            } else {
+                env_commitment
+            },
         })
     }
 
@@ -283,6 +299,8 @@ impl ProviderAdapterLaunchSpec {
         cwd: PathBuf,
         environment: BTreeMap<OsString, OsString>,
         capabilities: ProviderCapabilities,
+        scope_fingerprint: Option<String>,
+        env_commitment: String,
     ) -> Result<Self, ProviderLaunchSpecError> {
         handle
             .revalidate()
@@ -296,6 +314,8 @@ impl ProviderAdapterLaunchSpec {
             cwd,
             environment,
             capabilities,
+            scope_fingerprint,
+            env_commitment,
         )
     }
 
@@ -310,7 +330,16 @@ impl ProviderAdapterLaunchSpec {
         let handle = executable
             .open_for_launch()
             .map_err(|_| ProviderLaunchSpecError::InvalidCapabilities)?;
-        Self::from_registry(handle, arguments, cwd, environment, capabilities)
+        let env_commitment = crate::providers::capabilities::commit_child_environment(&environment);
+        Self::from_registry(
+            handle,
+            arguments,
+            cwd,
+            environment,
+            capabilities,
+            None,
+            env_commitment,
+        )
     }
 
     fn unavailable_placeholder(
@@ -324,6 +353,8 @@ impl ProviderAdapterLaunchSpec {
             cwd: PathBuf::new(),
             environment: BTreeMap::new(),
             capabilities,
+            scope_fingerprint: None,
+            env_commitment: String::new(),
         }
     }
 
@@ -349,6 +380,14 @@ impl ProviderAdapterLaunchSpec {
 
     pub fn capabilities(&self) -> &ProviderCapabilities {
         &self.capabilities
+    }
+
+    pub fn scope_fingerprint(&self) -> Option<&str> {
+        self.scope_fingerprint.as_deref()
+    }
+
+    pub fn env_commitment(&self) -> &str {
+        &self.env_commitment
     }
 }
 
@@ -386,7 +425,8 @@ struct AdapterLaunchProofDigestWire<'a> {
     runtime_dependency_sha256: Option<&'a [u8; 32]>,
     arguments: &'a [OsString],
     cwd: &'a Path,
-    environment: &'a BTreeMap<OsString, OsString>,
+    environment_commitment: String,
+    scope_fingerprint: Option<&'a str>,
     capabilities: &'a ProviderCapabilities,
     mode: u8,
     provider_session_id: Option<&'a ProviderSessionId>,
@@ -498,7 +538,12 @@ fn launch_proof_digest(
             .map(ProviderExecutable::sha256),
         arguments: &spec.arguments,
         cwd: &spec.cwd,
-        environment: &spec.environment,
+        // JSON object keys cannot represent OsString. Reuse the lossless,
+        // length-framed commitment and recompute from the actual sealed map.
+        environment_commitment: crate::providers::capabilities::commit_child_environment(
+            &spec.environment,
+        ),
+        scope_fingerprint: spec.scope_fingerprint.as_deref(),
         capabilities: &spec.capabilities,
         mode: match mode {
             ProviderSessionStartMode::Open => 0,
@@ -2065,6 +2110,75 @@ fn stripped_persisted_auth(bytes: &[u8]) -> Result<Vec<u8>, String> {
     serde_json::to_vec(&value).map_err(|error| error.to_string())
 }
 
+// Routing may inspect a bounded durable envelope, but must not open a provider
+// executable belonging to a different task. Launch and exact load stay strict.
+fn persisted_row_belongs_to_task(
+    bytes: &[u8],
+    row_id: &str,
+    row_revision: i64,
+    row_lifecycle: &str,
+    task_id: TaskId,
+) -> Result<bool, String> {
+    validate_bounded_state_json(bytes)?;
+    let wire = match decode_session_wire(bytes) {
+        Ok(wire) => wire,
+        Err(error) if is_untrusted_persisted_auth_error(&error) => {
+            decode_session_wire(&stripped_persisted_auth(bytes)?)?
+        }
+        Err(error) => return Err(error),
+    };
+    let launch = &wire.launch_spec;
+    if wire.generation == 0
+        || wire.action_epoch == 0
+        || wire.revision == 0
+        || wire.task_id != launch.task_id
+        || wire.generation != launch.generation
+        || wire.launch_nonce != launch.launch_nonce
+        || launch.provider_kind != launch.capabilities.kind
+    {
+        return Err("persisted provider launch identity is inconsistent".into());
+    }
+    if row_id
+        .parse::<AgentSessionId>()
+        .map_err(|error| format!("persisted row agent session identity is invalid: {error}"))?
+        != wire.agent_session_id
+    {
+        return Err("persisted agent session identity does not match the row key".into());
+    }
+    let lifecycle = persisted_lifecycle_from_name(&wire.lifecycle)?;
+    if checked_sql_u64(row_revision, "provider session row revision")? != wire.revision
+        || row_lifecycle != persisted_lifecycle_name(lifecycle)
+    {
+        return Err("persisted row metadata does not match its state".into());
+    }
+    if launch.runtime_dependency_path.is_some() != launch.runtime_dependency_sha256.is_some() {
+        return Err("persisted runtime dependency identity is incomplete".into());
+    }
+    if let PersistedLaunchModeWire::ResumeExact(expected) = &launch.mode {
+        if wire.provider_session_id.as_ref() != Some(expected) {
+            return Err("persisted exact-resume identity is inconsistent".into());
+        }
+    }
+    if let Some(root) = &wire.process_root {
+        if root.pid == 0 || root.creation_time_100ns == 0 {
+            return Err("persisted managed process root identity is zero".into());
+        }
+        if root.canonical_executable.as_os_str().is_empty()
+            || root.canonical_executable.as_os_str().len() > MAX_PROVIDER_SESSION_ROOT_PATH_BYTES
+        {
+            return Err("persisted managed process root path is unavailable or too long".into());
+        }
+        if root.canonical_executable != launch.executable_path
+            || root.executable_sha256 != launch.executable_sha256
+        {
+            return Err(
+                "persisted managed process root executable identity is inconsistent".into(),
+            );
+        }
+    }
+    Ok(wire.task_id == task_id)
+}
+
 fn decode_session_wire(bytes: &[u8]) -> Result<ProviderSessionStateWire, String> {
     // Decode the current shape first so strict unknown-field errors stay
     // actionable. The predecessor v1 shape is tried only when the new
@@ -2932,13 +3046,60 @@ struct PersistedLaunchSpecWire {
     mode: PersistedLaunchModeWire,
     arguments: Vec<OsString>,
     cwd: PathBuf,
+    /// Legacy plaintext environment (decode-only). New encodes leave this empty
+    /// and store secrets under `environment_protected`.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     environment: BTreeMap<OsString, OsString>,
+    /// DPAPI-protected JSON map of launch environment. Preferred at-rest form.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    environment_protected: Option<String>,
     capabilities: ProviderCapabilities,
     task_id: TaskId,
     resource_id: ResourceId,
     terminal_id: TerminalId,
     generation: u64,
     launch_nonce: Uuid,
+}
+
+fn launch_env_custody_scope(task_id: &TaskId, generation: u64, launch_nonce: Uuid) -> Vec<u8> {
+    format!(
+        "provider-launch-env/v1/{}/{}/{}",
+        task_id, generation, launch_nonce
+    )
+    .into_bytes()
+}
+
+fn encode_launch_environment_at_rest(
+    environment: &BTreeMap<OsString, OsString>,
+    scope: &[u8],
+) -> Result<Option<String>, String> {
+    if environment.is_empty() {
+        return Ok(None);
+    }
+    let json = crate::providers::settings::secret::encode_os_string_map(environment)
+        .map_err(|error| error.to_string())?;
+    crate::providers::settings::secret::protect_bytes(&json, scope)
+        .map(Some)
+        .map_err(|error| error.to_string())
+}
+
+fn decode_launch_environment_at_rest(
+    protected: Option<&str>,
+    legacy: &BTreeMap<OsString, OsString>,
+    scope: &[u8],
+) -> Result<BTreeMap<OsString, OsString>, String> {
+    if protected.is_some() && !legacy.is_empty() {
+        return Err(
+            "persisted launch environment must not include both legacy and protected fields".into(),
+        );
+    }
+    if let Some(blob) = protected {
+        let bytes = crate::providers::settings::secret::reveal_bytes(blob, scope)
+            .map_err(|error| error.to_string())?;
+        return crate::providers::settings::secret::decode_os_string_map(&bytes)
+            .map_err(|error| error.to_string());
+    }
+    Ok(legacy.clone())
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -3038,7 +3199,24 @@ impl ProviderSessionState {
                 mode,
                 arguments: self.launch_spec.arguments.clone(),
                 cwd: self.launch_spec.cwd.clone(),
+                #[cfg(windows)]
+                environment: BTreeMap::new(),
+                // Preserve the pre-existing ordinary environment encoding on
+                // platforms without OS custody. New sensitive provider fields
+                // are rejected there; never disguise plaintext as protection.
+                #[cfg(not(windows))]
                 environment: self.launch_spec.environment.clone(),
+                #[cfg(windows)]
+                environment_protected: encode_launch_environment_at_rest(
+                    &self.launch_spec.environment,
+                    &launch_env_custody_scope(
+                        &self.launch_spec.task_id,
+                        self.launch_spec.generation,
+                        self.launch_spec.launch_nonce.raw(),
+                    ),
+                )?,
+                #[cfg(not(windows))]
+                environment_protected: None,
                 capabilities: self.launch_spec.capabilities.stable_projection(),
                 task_id: self.launch_spec.task_id,
                 resource_id: self.launch_spec.resource_id,
@@ -3103,13 +3281,26 @@ impl ProviderSessionState {
                 return Err("persisted runtime dependency identity is incomplete".to_string());
             }
         };
+        let decoded_environment = decode_launch_environment_at_rest(
+            persisted_launch.environment_protected.as_deref(),
+            &persisted_launch.environment,
+            &launch_env_custody_scope(
+                &persisted_launch.task_id,
+                persisted_launch.generation,
+                persisted_launch.launch_nonce,
+            ),
+        )?;
+        let env_commitment =
+            crate::providers::capabilities::commit_child_environment(&decoded_environment);
         let bounded_adapter_spec = ProviderAdapterLaunchSpec::bounded(
             executable.clone(),
             runtime_dependency,
             persisted_launch.arguments.clone(),
             persisted_launch.cwd.clone(),
-            persisted_launch.environment.clone(),
+            decoded_environment,
             persisted_launch.capabilities.clone(),
+            None,
+            env_commitment,
         )
         .map_err(|error| format!("persisted launch spec is not bounded: {error:?}"))?;
         let mode = match persisted_launch.mode.clone() {
@@ -3751,6 +3942,15 @@ impl ProviderSessionStateStore for SqliteProviderSessionStateStore {
         for row in rows {
             let (row_id, row_revision, row_lifecycle, bytes) =
                 row.map_err(|error| error.to_string())?;
+            if !persisted_row_belongs_to_task(
+                &bytes,
+                &row_id,
+                row_revision,
+                &row_lifecycle,
+                task_id,
+            )? {
+                continue;
+            }
             let state = ProviderSessionState::decode(&bytes)?;
             if row_id.parse::<AgentSessionId>().map_err(|error| {
                 format!("persisted row agent session identity is invalid: {error}")
@@ -3791,6 +3991,15 @@ impl ProviderSessionStateStore for SqliteProviderSessionStateStore {
         for row in rows {
             let (row_id, row_revision, row_lifecycle, bytes) =
                 row.map_err(|error| error.to_string())?;
+            if !persisted_row_belongs_to_task(
+                &bytes,
+                &row_id,
+                row_revision,
+                &row_lifecycle,
+                task_id,
+            )? {
+                continue;
+            }
             let state = ProviderSessionState::decode(&bytes)?;
             if row_id.parse::<AgentSessionId>().map_err(|error| {
                 format!("persisted row agent session identity is invalid: {error}")
@@ -5385,6 +5594,17 @@ impl<L: ProviderProcessLauncher, S: ProviderSessionStateStore> ProviderSessionMa
 
     pub fn current(&self, agent_session_id: AgentSessionId) -> Option<ProviderRuntime> {
         self.current.get(&agent_session_id).cloned()
+    }
+
+    /// Peek a persisted launch graph for legacy binding migration. Does not
+    /// invent a fresh conversation or synthesize instance scope.
+    pub fn peek_persisted_launch_spec(
+        &mut self,
+        agent_session_id: AgentSessionId,
+    ) -> Result<Option<ProviderLaunchSpec>, ProviderSessionError> {
+        Ok(self
+            .load_state(agent_session_id)?
+            .map(|state| state.launch_spec))
     }
 
     pub fn start(
@@ -7747,6 +7967,79 @@ mod tests {
         assert_eq!(provenance.provider_session_id(), &id);
     }
 
+    #[test]
+    fn sqlite_task_enumeration_ignores_only_unrelated_stale_executables() {
+        let runtime = unit_runtime();
+        for lifecycle in [
+            PersistedRuntimeLifecycle::Starting,
+            PersistedRuntimeLifecycle::Closed,
+        ] {
+            let state = ProviderSessionState {
+                agent_session_id: runtime.agent_session_id(),
+                task_id: runtime.task_id(),
+                generation: runtime.generation(),
+                action_epoch: runtime.correlation().action_epoch(),
+                revision: 1,
+                lifecycle,
+                launch_nonce: runtime.launch_nonce(),
+                launch_spec: runtime.launch_spec(),
+                provider_session_id: None,
+                process_root: None,
+            };
+            let path = tempfile::NamedTempFile::new().unwrap();
+            let mut store = SqliteProviderSessionStateStore::open(path.path()).unwrap();
+            store.persist(state.clone()).unwrap();
+            let mut stale: serde_json::Value =
+                serde_json::from_slice(&state.encode().unwrap()).unwrap();
+            stale["launch_spec"]["executable_sha256"] = serde_json::to_value([0_u8; 32]).unwrap();
+            let bytes = serde_json::to_vec(&stale).unwrap();
+            store
+                .connection
+                .execute(
+                    "UPDATE provider_session_states SET state_json = ?1",
+                    params![&bytes],
+                )
+                .unwrap();
+            let unrelated = TaskId::new();
+            assert!(store.list_open_for_task(unrelated).unwrap().is_empty());
+            assert!(store.list_recovery_for_task(unrelated).unwrap().is_empty());
+            assert!(store
+                .load(state.agent_session_id)
+                .unwrap_err()
+                .contains("hash_mismatch"));
+            if lifecycle == PersistedRuntimeLifecycle::Starting {
+                assert!(store
+                    .list_open_for_task(state.task_id)
+                    .unwrap_err()
+                    .contains("hash_mismatch"));
+            } else {
+                assert!(store
+                    .list_recovery_for_task(state.task_id)
+                    .unwrap_err()
+                    .contains("hash_mismatch"));
+            }
+            // Foreign records must still have a consistent durable envelope.
+            let mut corrupt = stale.clone();
+            corrupt["task_id"] = serde_json::to_value(unrelated).unwrap();
+            store
+                .connection
+                .execute(
+                    "UPDATE provider_session_states SET state_json = ?1",
+                    params![serde_json::to_vec(&corrupt).unwrap()],
+                )
+                .unwrap();
+            assert!(store.list_recovery_for_task(TaskId::new()).is_err());
+            store
+                .connection
+                .execute(
+                    "UPDATE provider_session_states SET state_json = ?1, revision = 2",
+                    params![&bytes],
+                )
+                .unwrap();
+            assert!(store.list_recovery_for_task(unrelated).is_err());
+        }
+    }
+
     fn unit_runtime() -> ProviderRuntime {
         let task_id = TaskId::new();
         let agent =
@@ -9885,6 +10178,44 @@ mod tests {
             Err(ProviderSessionError::AdapterLaunchProofInvalid)
         ));
         assert!(launcher.snapshot().launches().is_empty());
+    }
+
+    #[test]
+    fn launch_proof_accepts_real_environment_and_rejects_tampering() {
+        let mut environment = BTreeMap::from([
+            (OsString::from("HOME"), OsString::from("C:/fixture/home")),
+            (OsString::from("PATH"), OsString::from("C:/fixture/bin")),
+        ]);
+        #[cfg(windows)]
+        {
+            use std::os::windows::ffi::OsStringExt;
+            environment.insert(OsString::from("NATIVE"), OsString::from_wide(&[0xd800]));
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStringExt;
+            environment.insert(OsString::from("NATIVE"), OsString::from_vec(vec![0xff]));
+        }
+        let spec = ProviderAdapterLaunchSpec::from_test(
+            ProviderExecutable::from_path(std::env::current_exe().unwrap()).unwrap(),
+            vec![OsString::from("--fixture")],
+            PathBuf::from("."),
+            environment,
+            test_capabilities(),
+        )
+        .unwrap();
+        let mut proof = ProviderAdapterLaunchProof::from_test(
+            spec,
+            ProviderSessionStartMode::NewConversation,
+            None,
+        )
+        .unwrap();
+        assert!(proof.matches_request(ProviderSessionStartMode::NewConversation, None));
+        proof
+            .spec
+            .environment
+            .insert(OsString::from("HOME"), OsString::from("changed"));
+        assert!(!proof.matches_request(ProviderSessionStartMode::NewConversation, None));
     }
 
     #[test]

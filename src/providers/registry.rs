@@ -41,7 +41,12 @@ pub(crate) fn provider_in_flight_ttl() -> Duration {
 #[derive(Clone, Default)]
 pub struct ProviderDiscoveryConfig {
     pub executable_override: Option<PathBuf>,
+    /// Executable-search PATH override. Never a provider home directory.
     pub path: Option<OsString>,
+    /// Scoped child environment applied to discovery probes and launch (not process-global).
+    pub child_environment: BTreeMap<OsString, OsString>,
+    /// Opaque instance scope bound through probe/launch identity.
+    pub instance_scope: Option<crate::providers::settings::ProviderInstanceScope>,
 }
 
 impl std::fmt::Debug for ProviderDiscoveryConfig {
@@ -53,6 +58,8 @@ impl std::fmt::Debug for ProviderDiscoveryConfig {
                 &self.executable_override.is_some(),
             )
             .field("path_bound", &self.path.is_some())
+            .field("child_environment_count", &self.child_environment.len())
+            .field("instance_scope", &self.instance_scope)
             .finish()
     }
 }
@@ -71,11 +78,13 @@ pub struct CapabilityCacheKey {
     pub version: ProviderVersion,
     pub adapter_revision: AdapterRevision,
     pub semantic_schema_version: SemanticSchemaVersion,
+    pub scope_fingerprint: Option<String>,
+    pub env_commitment: String,
 }
 
 impl Serialize for CapabilityCacheKey {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        let mut state = serializer.serialize_struct("CapabilityCacheKey", 6)?;
+        let mut state = serializer.serialize_struct("CapabilityCacheKey", 8)?;
         state.serialize_field(
             "schema_version",
             &crate::providers::capabilities::PROVIDER_CACHE_KEY_SCHEMA_VERSION,
@@ -85,6 +94,8 @@ impl Serialize for CapabilityCacheKey {
         state.serialize_field("version", &self.version)?;
         state.serialize_field("adapter_revision", &self.adapter_revision)?;
         state.serialize_field("semantic_schema_version", &self.semantic_schema_version)?;
+        state.serialize_field("scope_fingerprint", &self.scope_fingerprint)?;
+        state.serialize_field("env_commitment", &self.env_commitment)?;
         state.end()
     }
 }
@@ -100,6 +111,10 @@ impl<'de> Deserialize<'de> for CapabilityCacheKey {
             version: ProviderVersion,
             adapter_revision: AdapterRevision,
             semantic_schema_version: SemanticSchemaVersion,
+            #[serde(default)]
+            scope_fingerprint: Option<String>,
+            #[serde(default)]
+            env_commitment: String,
         }
 
         let wire = Wire::deserialize(deserializer)?;
@@ -110,13 +125,15 @@ impl<'de> Deserialize<'de> for CapabilityCacheKey {
                 wire.schema_version
             )));
         }
-        Ok(Self::new(
-            wire.kind,
-            wire.executable,
-            wire.version,
-            wire.adapter_revision,
-            wire.semantic_schema_version,
-        ))
+        Ok(Self {
+            kind: wire.kind,
+            executable: wire.executable,
+            version: wire.version,
+            adapter_revision: wire.adapter_revision,
+            semantic_schema_version: wire.semantic_schema_version,
+            scope_fingerprint: wire.scope_fingerprint,
+            env_commitment: wire.env_commitment,
+        })
     }
 }
 
@@ -128,12 +145,34 @@ impl CapabilityCacheKey {
         adapter_revision: AdapterRevision,
         semantic_schema_version: SemanticSchemaVersion,
     ) -> Self {
+        Self::with_scope(
+            kind,
+            executable,
+            version,
+            adapter_revision,
+            semantic_schema_version,
+            None,
+            String::new(),
+        )
+    }
+
+    pub fn with_scope(
+        kind: ProviderKind,
+        executable: ProviderExecutable,
+        version: ProviderVersion,
+        adapter_revision: AdapterRevision,
+        semantic_schema_version: SemanticSchemaVersion,
+        scope_fingerprint: Option<String>,
+        env_commitment: String,
+    ) -> Self {
         Self {
             kind,
             executable,
             version,
             adapter_revision,
             semantic_schema_version,
+            scope_fingerprint,
+            env_commitment,
         }
     }
 }
@@ -148,6 +187,10 @@ pub struct ProviderObservation {
     pub semantic_schema_version: SemanticSchemaVersion,
     pub capabilities: ProviderCapabilities,
     pub cache_status: CacheStatus,
+    /// Opaque instance scope fingerprint from the discovery config used for this observe.
+    pub scope_fingerprint: Option<String>,
+    /// Commitment over the immutable child environment used for this observe.
+    pub env_commitment: String,
 }
 
 impl ProviderObservation {
@@ -171,6 +214,14 @@ impl ProviderObservation {
     }
     pub fn cache_status(&self) -> CacheStatus {
         self.cache_status
+    }
+
+    pub fn scope_fingerprint(&self) -> Option<&str> {
+        self.scope_fingerprint.as_deref()
+    }
+
+    pub fn env_commitment(&self) -> &str {
+        &self.env_commitment
     }
 
     pub fn validate(&self) -> Result<(), ProviderError> {
@@ -220,6 +271,10 @@ impl ProviderObservation {
             semantic_schema_version: TASK_4_1_SEMANTIC_SCHEMA_VERSION,
             capabilities,
             cache_status: CacheStatus::Miss,
+            scope_fingerprint: None,
+            env_commitment: crate::providers::capabilities::commit_child_environment(
+                &std::collections::BTreeMap::new(),
+            ),
         };
         observation.validate()?;
         Ok(observation)
@@ -235,7 +290,7 @@ impl ProviderObservation {
 impl Serialize for ProviderObservation {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         self.validate().map_err(serde::ser::Error::custom)?;
-        let mut state = serializer.serialize_struct("ProviderObservation", 8)?;
+        let mut state = serializer.serialize_struct("ProviderObservation", 10)?;
         state.serialize_field(
             "schema_version",
             &crate::providers::capabilities::PROVIDER_OBSERVATION_SCHEMA_VERSION,
@@ -247,6 +302,8 @@ impl Serialize for ProviderObservation {
         state.serialize_field("semantic_schema_version", &self.semantic_schema_version)?;
         state.serialize_field("capabilities", &self.capabilities)?;
         state.serialize_field("cache_status", &self.cache_status)?;
+        state.serialize_field("scope_fingerprint", &self.scope_fingerprint)?;
+        state.serialize_field("env_commitment", &self.env_commitment)?;
         state.end()
     }
 }
@@ -264,11 +321,16 @@ impl<'de> Deserialize<'de> for ProviderObservation {
             semantic_schema_version: SemanticSchemaVersion,
             capabilities: ProviderCapabilities,
             cache_status: CacheStatus,
+            #[serde(default)]
+            scope_fingerprint: Option<String>,
+            #[serde(default)]
+            env_commitment: String,
         }
 
         let wire = Wire::deserialize(deserializer)?;
-        if wire.schema_version
-            != crate::providers::capabilities::PROVIDER_OBSERVATION_SCHEMA_VERSION
+        if wire.schema_version != 1
+            && wire.schema_version
+                != crate::providers::capabilities::PROVIDER_OBSERVATION_SCHEMA_VERSION
         {
             return Err(de::Error::custom(format!(
                 "unsupported provider observation schema version {}",
@@ -297,6 +359,17 @@ impl<'de> Deserialize<'de> for ProviderObservation {
             semantic_schema_version: wire.semantic_schema_version,
             capabilities: wire.capabilities,
             cache_status: wire.cache_status,
+            // Schema v1 is explicitly unscoped; v2 carries scope/env proof.
+            scope_fingerprint: if wire.schema_version == 1 {
+                None
+            } else {
+                wire.scope_fingerprint
+            },
+            env_commitment: if wire.schema_version == 1 {
+                String::new()
+            } else {
+                wire.env_commitment
+            },
         };
         observation.validate().map_err(de::Error::custom)?;
         Ok(observation)
@@ -337,6 +410,8 @@ struct ProbeReservationKey {
     kind: ProviderKind,
     executable_override: Option<PathBuf>,
     path: Option<OsString>,
+    scope_fingerprint: Option<String>,
+    env_commitment: String,
 }
 
 impl ProbeReservationKey {
@@ -345,6 +420,13 @@ impl ProbeReservationKey {
             kind,
             executable_override: config.executable_override.clone(),
             path: config.path.clone().or_else(|| std::env::var_os("PATH")),
+            scope_fingerprint: config
+                .instance_scope
+                .as_ref()
+                .map(|scope| scope.as_cache_key()),
+            env_commitment: crate::providers::capabilities::commit_child_environment(
+                &config.child_environment,
+            ),
         }
     }
 }
@@ -356,6 +438,8 @@ struct ProbeIdentityKey {
     launch_handle: ProviderExecutableHandle,
     adapter_revision: AdapterRevision,
     semantic_schema_version: SemanticSchemaVersion,
+    scope_fingerprint: Option<String>,
+    env_commitment: String,
 }
 
 #[derive(Clone)]
@@ -652,6 +736,13 @@ async fn run_probe_worker(request: ProbeWorkerRequest) -> ProbeWorkerCompletion 
             launch_handle: before_handle.clone(),
             adapter_revision: TASK_4_1_ADAPTER_REVISION,
             semantic_schema_version: TASK_4_1_SEMANTIC_SCHEMA_VERSION,
+            scope_fingerprint: config
+                .instance_scope
+                .as_ref()
+                .map(|scope| scope.as_cache_key()),
+            env_commitment: crate::providers::capabilities::commit_child_environment(
+                &config.child_environment,
+            ),
         };
         ProviderRegistry::perform_probe(
             &cache,
@@ -661,6 +752,7 @@ async fn run_probe_worker(request: ProbeWorkerRequest) -> ProbeWorkerCompletion 
             &before,
             &before_handle,
             &identity_key,
+            &config.child_environment,
             &flight,
         )
         .await
@@ -950,11 +1042,16 @@ impl ProviderRegistry {
             .auth_evidence
             .lock()
             .unwrap()
-            .begin_with_handle_and_version(
+            .begin_with_handle_version_and_scope(
                 kind,
                 crate::providers::capabilities::ProviderAuthEvidenceSource::for_kind(kind),
                 executable_handle,
                 version,
+                config
+                    .instance_scope
+                    .as_ref()
+                    .map(|scope| scope.as_cache_key()),
+                crate::providers::capabilities::commit_child_environment(&config.child_environment),
                 ttl,
             )
             .map_err(ProviderError::AuthEvidence)?;
@@ -974,6 +1071,8 @@ impl ProviderRegistry {
                 observation.kind(),
                 observation.executable_handle(),
                 observation.version(),
+                observation.scope_fingerprint(),
+                observation.env_commitment(),
                 receipt,
             )
             .map_err(ProviderError::AuthEvidence)?;
@@ -1089,12 +1188,17 @@ impl ProviderRegistry {
             .await?;
 
         let version = probe.capabilities.version.clone();
-        let key = CapabilityCacheKey::new(
+        let key = CapabilityCacheKey::with_scope(
             kind,
             probe.executable.clone(),
             version.clone(),
             TASK_4_1_ADAPTER_REVISION,
             TASK_4_1_SEMANTIC_SCHEMA_VERSION,
+            config
+                .instance_scope
+                .as_ref()
+                .map(|scope| scope.as_cache_key()),
+            crate::providers::capabilities::commit_child_environment(&config.child_environment),
         );
         let stable = if probe.had_matching_cached {
             self.cache
@@ -1125,6 +1229,14 @@ impl ProviderRegistry {
                         kind,
                         &probe.executable_handle,
                         &probe.capabilities.version,
+                        config
+                            .instance_scope
+                            .as_ref()
+                            .map(|scope| scope.as_cache_key())
+                            .as_deref(),
+                        &crate::providers::capabilities::commit_child_environment(
+                            &config.child_environment,
+                        ),
                         receipt,
                     )
                     .map_err(ProviderError::AuthEvidence)?;
@@ -1147,6 +1259,13 @@ impl ProviderRegistry {
             semantic_schema_version: TASK_4_1_SEMANTIC_SCHEMA_VERSION,
             capabilities,
             cache_status,
+            scope_fingerprint: config
+                .instance_scope
+                .as_ref()
+                .map(|scope| scope.as_cache_key()),
+            env_commitment: crate::providers::capabilities::commit_child_environment(
+                &config.child_environment,
+            ),
         };
         observation.validate()?;
         Ok((observation, probe.executable_handle))
@@ -1307,13 +1426,22 @@ impl ProviderRegistry {
         before: &ProviderExecutable,
         before_handle: &ProviderExecutableHandle,
         identity_key: &ProbeIdentityKey,
+        child_environment: &BTreeMap<OsString, OsString>,
         flight: &ProbeFlight,
     ) -> Result<ProbeWorkResult, ProviderError> {
         // Once the retained worker has started, let the adapter finish its
         // bounded probe so its worker/admission ownership settles. The
         // post-probe fence below converts caller cancellation or deadline
         // expiry into a timeout before any identity/cache result is published.
-        let capabilities = adapter.probe(before_handle).await?;
+        let capabilities = adapter
+            .probe(
+                before_handle,
+                &crate::providers::adapter::ProviderProbeContext {
+                    child_environment: child_environment.clone(),
+                    scope_fingerprint: identity_key.scope_fingerprint.clone(),
+                },
+            )
+            .await?;
         if flight.cancelled.load(Ordering::Acquire) || Instant::now() >= flight.deadline {
             return Err(ProviderError::Probe(
                 crate::providers::adapter::ProviderProbeError::TimedOut,
@@ -1377,12 +1505,14 @@ impl ProviderRegistry {
             .revalidate()
             .map_err(ProviderError::Executable)?;
 
-        let cache_key = CapabilityCacheKey::new(
+        let cache_key = CapabilityCacheKey::with_scope(
             identity_key.kind,
             after.clone(),
             capabilities.version.clone(),
             identity_key.adapter_revision,
             identity_key.semantic_schema_version,
+            identity_key.scope_fingerprint.clone(),
+            identity_key.env_commitment.clone(),
         );
         let had_matching_cached = cache
             .lock()

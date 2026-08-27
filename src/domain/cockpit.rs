@@ -271,6 +271,9 @@ pub enum TaskCockpitQuery {
         folder_id: String,
         command_id: String,
     },
+    /// Local-authority provider settings snapshot / refresh / mutate.
+    /// Handled before task-id requirement; Connect maps these to deny.
+    ProviderSettings(crate::providers::settings::ProviderSettingsHostRequest),
     /// Read the bounded provider-neutral semantic conversation retained for
     /// the selected Task. The cursor is exclusive; zero requests the current
     /// retained window from its beginning.
@@ -643,6 +646,7 @@ pub enum TaskCockpitResult {
     Config(ConfigSidebarSnapshot),
     ConfigCommandDetail(ConfigCommandDetailProjection),
     AgentConnection(AgentConnectionSnapshot),
+    ProviderSettings(crate::providers::settings::ProviderSettingsReply),
     BrowserProcessSession(BrowserProcessSessionProjection),
     Conversation(crate::domain::snapshot::SemanticJournalPage),
     Terminal(TaskTerminalProjection),
@@ -776,7 +780,8 @@ pub fn cockpit_surface(query: &TaskCockpitQuery) -> TaskCockpitSurface {
         | TaskCockpitQuery::ConfigUpsertCommand { .. }
         | TaskCockpitQuery::ConfigArchiveCommand { .. }
         | TaskCockpitQuery::ConfigRunCommand { .. }
-        | TaskCockpitQuery::ConfigCommandDetail { .. } => TaskCockpitSurface::Workspace,
+        | TaskCockpitQuery::ConfigCommandDetail { .. }
+        | TaskCockpitQuery::ProviderSettings(_) => TaskCockpitSurface::Workspace,
         TaskCockpitQuery::BrowserProcessSession => TaskCockpitSurface::Browser,
         TaskCockpitQuery::Conversation { .. } => TaskCockpitSurface::Conversation,
         TaskCockpitQuery::Terminal => TaskCockpitSurface::Terminal,

@@ -18,6 +18,7 @@ pub mod quota;
 pub mod quota_runtime;
 pub mod registry;
 pub mod session;
+pub mod settings;
 pub mod startup;
 
 // Test-only provider identities are copied from the real test executable so
@@ -26,15 +27,17 @@ pub mod startup;
 pub(crate) mod test_support;
 
 pub use adapter::{
-    AdapterDeliveryPermit, AdapterIngressUnavailable, JournalNormalizeError, LaunchProviderRequest,
+    materialize_provider_environment, provider_scope_env_key, AdapterDeliveryPermit,
+    AdapterIngressUnavailable, JournalNormalizeError, LaunchProviderRequest,
     NormalizedAdapterDelivery, ProviderAccessMode, ProviderAdapter, ProviderArgument,
     ProviderError, ProviderInput, ProviderInputError, ProviderLaunchOptions, ProviderLaunchSpec,
-    ProviderModel, ProviderProbeError, ProviderProbeFailureCode, ProviderProbeIoError,
-    ProviderProbeKind, ProviderProbeRequest, ProviderProbeRequestError, ProviderProbeResult,
-    ProviderProbeRunner, ProviderProbeStatus, ProviderQuotaStatus, ProviderReasoningEffort,
-    ProviderRuntime, ProviderSignal, QuotaObservation, StopStrategy, WindowsProviderProbeRunner,
-    MAX_PROVIDER_ARGUMENTS, MAX_PROVIDER_ARGUMENT_BYTES, MAX_PROVIDER_INPUT_BYTES,
-    MAX_PROVIDER_PROBE_OUTPUT_BYTES, MAX_PROVIDER_PROBE_TIMEOUT, MAX_PROVIDER_SIGNAL_BYTES,
+    ProviderModel, ProviderProbeContext, ProviderProbeError, ProviderProbeFailureCode,
+    ProviderProbeIoError, ProviderProbeKind, ProviderProbeRequest, ProviderProbeRequestError,
+    ProviderProbeResult, ProviderProbeRunner, ProviderProbeStatus, ProviderQuotaStatus,
+    ProviderReasoningEffort, ProviderRuntime, ProviderSignal, QuotaObservation, StopStrategy,
+    WindowsProviderProbeRunner, MAX_PROVIDER_ARGUMENTS, MAX_PROVIDER_ARGUMENT_BYTES,
+    MAX_PROVIDER_INPUT_BYTES, MAX_PROVIDER_PROBE_OUTPUT_BYTES, MAX_PROVIDER_PROBE_TIMEOUT,
+    MAX_PROVIDER_SIGNAL_BYTES,
 };
 pub use capabilities::{
     AdapterRevision, CapabilityEvidence, CapabilityEvidenceError, CapabilityState,

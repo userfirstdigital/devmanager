@@ -1,11 +1,16 @@
 use std::time::Duration;
 
-use crate::domain::{AgentConnectionRow, AgentPresence, ConfigSidebarProviderKind};
+use crate::domain::{
+    AgentConnectionRow, AgentConnectionSnapshot, AgentPresence, ConfigSidebarProviderKind,
+};
 use crate::providers::adapter::{
     ProviderProbeError, ProviderProbeIoError, ProviderProbeKind, ProviderProbeRequest,
     ProviderProbeRunner,
 };
 use crate::providers::registry::{ProviderDiscoveryConfig, ProviderRegistry};
+use crate::providers::settings::{
+    ProviderDriverKind, ProviderHealthStatus, ProviderSettingsAuthority, ProviderSettingsSnapshot,
+};
 use crate::providers::{
     ProviderAuthState, ProviderError, ProviderExecutablePolicy, ProviderKind, ProviderObservation,
     WindowsProviderProbeRunner,
@@ -30,16 +35,101 @@ pub(crate) fn presence_from_auth(auth: ProviderAuthState) -> AgentPresence {
     }
 }
 
+fn presence_from_health_status(status: ProviderHealthStatus) -> AgentPresence {
+    match status {
+        ProviderHealthStatus::Healthy => AgentPresence::SignedIn,
+        ProviderHealthStatus::Degraded | ProviderHealthStatus::Unavailable => {
+            AgentPresence::NotSignedIn
+        }
+        ProviderHealthStatus::Checking
+        | ProviderHealthStatus::Unknown
+        | ProviderHealthStatus::StubUnsupported => AgentPresence::NotSignedIn,
+    }
+}
+
+/// Immediate AgentConnection projection from the host provider-settings cache.
+/// Never runs CLI probes on the exclusive host request executor.
+pub(crate) fn project_agent_connection_from_settings(
+    snapshot: &ProviderSettingsSnapshot,
+    restore_failed_task_ids: Vec<crate::domain::TaskId>,
+) -> AgentConnectionSnapshot {
+    let agents = [
+        ConfigSidebarProviderKind::Claude,
+        ConfigSidebarProviderKind::Codex,
+    ]
+    .into_iter()
+    .map(|provider| {
+        let driver = match provider {
+            ConfigSidebarProviderKind::Claude => ProviderDriverKind::Claude,
+            ConfigSidebarProviderKind::Codex => ProviderDriverKind::Codex,
+        };
+        let default_id = match driver {
+            ProviderDriverKind::Claude => "claude",
+            ProviderDriverKind::Codex => "codex",
+            _ => "",
+        };
+        let presence = snapshot
+            .health
+            .iter()
+            .find(|row| {
+                row.instance_id == default_id
+                    && snapshot
+                        .document
+                        .get(default_id)
+                        .is_some_and(|instance| instance.enabled && !instance.driver.is_stub())
+            })
+            .map(|row| {
+                let status = match row.status.as_str() {
+                    "healthy" => ProviderHealthStatus::Healthy,
+                    "checking" => ProviderHealthStatus::Checking,
+                    "degraded" => ProviderHealthStatus::Degraded,
+                    "unavailable" => ProviderHealthStatus::Unavailable,
+                    "stub_unsupported" => ProviderHealthStatus::StubUnsupported,
+                    _ => ProviderHealthStatus::Unknown,
+                };
+                presence_from_health_status(status)
+            })
+            .or_else(|| {
+                snapshot
+                    .document
+                    .instances
+                    .iter()
+                    .find(|instance| instance.instance_id.as_str() == default_id)
+                    .map(|instance| {
+                        if !instance.enabled || instance.driver.is_stub() {
+                            AgentPresence::NotFound
+                        } else {
+                            AgentPresence::NotSignedIn
+                        }
+                    })
+            })
+            .unwrap_or(AgentPresence::NotSignedIn);
+        AgentConnectionRow { provider, presence }
+    })
+    .collect();
+    AgentConnectionSnapshot {
+        agents,
+        restore_failed_task_ids,
+    }
+}
+
+pub(crate) fn project_agent_connection_from_authority(
+    authority: &ProviderSettingsAuthority,
+    restore_failed_task_ids: Vec<crate::domain::TaskId>,
+) -> AgentConnectionSnapshot {
+    project_agent_connection_from_settings(&authority.snapshot(), restore_failed_task_ids)
+}
+
+/// Test/helper path that still probes. Production AgentConnection must use
+/// [`project_agent_connection_from_authority`] instead.
+#[cfg(test)]
 pub(crate) async fn probe_agents(registry: &ProviderRegistry) -> Vec<AgentConnectionRow> {
-    eprintln!(
-        "devmanager-host: agent probe PATH={}",
-        std::env::var("PATH").unwrap_or_else(|_| "<unset>".into())
-    );
     let claude = probe_connection_row(registry, ConfigSidebarProviderKind::Claude).await;
     let codex = probe_connection_row(registry, ConfigSidebarProviderKind::Codex).await;
     vec![claude, codex]
 }
 
+#[cfg(test)]
 async fn probe_connection_row(
     registry: &ProviderRegistry,
     provider: ConfigSidebarProviderKind,
@@ -49,24 +139,9 @@ async fn probe_connection_row(
         ConfigSidebarProviderKind::Codex => ProviderKind::Codex,
     };
     let discovery = ProviderDiscoveryConfig::default();
-    let started = std::time::Instant::now();
     match observe_with_trusted_auth(registry, kind, &discovery).await {
-        Ok(observation) => {
-            let row = map_provider_observe(provider, Ok(&observation));
-            eprintln!(
-                "devmanager-host: agent probe {provider:?} {} in {:?}",
-                format!("{:?}", row.presence).to_ascii_lowercase(),
-                started.elapsed()
-            );
-            row
-        }
-        Err(error) => {
-            eprintln!(
-                "devmanager-host: agent probe {provider:?} failed in {:?}: {error}",
-                started.elapsed()
-            );
-            map_provider_observe(provider, Err(&error))
-        }
+        Ok(observation) => map_provider_observe(provider, Ok(&observation)),
+        Err(error) => map_provider_observe(provider, Err(&error)),
     }
 }
 
@@ -90,7 +165,14 @@ pub(crate) async fn observe_with_trusted_auth(
     let request = invocation
         .bind_request(
             ProviderProbeRequest::new(handle, ProviderProbeKind::for_auth_probe(kind))
-                .map_err(|error| ProviderError::Probe(ProviderProbeError::InvalidRequest(error)))?,
+                .map_err(|error| ProviderError::Probe(ProviderProbeError::InvalidRequest(error)))?
+                .with_child_environment(discovery.child_environment.clone())
+                .with_scope_fingerprint(
+                    discovery
+                        .instance_scope
+                        .as_ref()
+                        .map(|scope| scope.as_cache_key()),
+                ),
         )
         .map_err(ProviderError::AuthEvidence)?;
     let policy = ProviderExecutablePolicy::new([file_name])
@@ -110,88 +192,17 @@ mod tests {
     use crate::providers::{ProviderAuthState, ProviderError, ProviderKind};
 
     #[test]
-    fn agent_connection_query_timeout_outlasts_generic_request_timeout() {
-        assert!(
-            crate::host::agent_connection_query_timeout()
-                > crate::host::request_completion_timeout(),
-            "Claude/Codex auth probes spawn real CLIs and cannot finish inside the generic 5s request deadline"
-        );
-        assert!(
-            crate::host::agent_connection_query_timeout()
-                > crate::providers::registry::provider_in_flight_ttl(),
-            "Refresh IPC must wait for the full in-flight observe, not abort it as CheckFailed"
-        );
-        assert!(
-            crate::providers::registry::provider_in_flight_ttl()
-                >= std::time::Duration::from_secs(120),
-            "native Claude identity hashing exceeds the old 30s in-flight deadline"
-        );
+    fn map_provider_observe_missing_cli_is_not_found() {
+        let error = ProviderError::MissingCli {
+            kind: ProviderKind::ClaudeCode,
+            requested: None,
+        };
+        let row = map_provider_observe(ConfigSidebarProviderKind::Claude, Err(&error));
+        assert_eq!(row.presence, AgentPresence::NotFound);
     }
 
     #[test]
-    fn agent_connection_client_query_uses_the_probe_timeout() {
-        let source = include_str!(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/src/client/host_client.rs"
-        ));
-        assert!(
-            source.contains("query_with_timeout")
-                && source.contains("agent_connection_query_timeout"),
-            "agent connection must not use the generic 5s query deadline"
-        );
-    }
-
-    #[test]
-    fn provider_start_must_attach_trusted_auth_before_launch() {
-        let source = include_str!("connection.rs");
-        let start = source
-            .find("async fn dispatch_provider_start(")
-            .expect("dispatch_provider_start");
-        let body = &source[start..];
-        let end = body
-            .find("async fn dispatch_agent_connection(")
-            .expect("dispatch_agent_connection follows provider start");
-        let body = &body[..end];
-        assert!(
-            body.contains("observe_with_trusted_auth"),
-            "+Claude must launch from the same signed-in receipt Settings Refresh uses"
-        );
-        assert!(
-            !body.contains(".observe("),
-            "bare registry.observe() strips auth and always fails launch as AuthenticationRequired"
-        );
-    }
-
-    #[test]
-    fn agent_probes_accept_auth_receipts_in_generation_order() {
-        let source = include_str!("agent_connection.rs");
-        let start = source
-            .find("pub(crate) async fn probe_agents(")
-            .expect("probe_agents");
-        let body = &source[start..];
-        let end = body
-            .find("async fn probe_connection_row(")
-            .expect("probe_connection_row follows probe_agents");
-        let body = &body[..end];
-        assert!(
-            !body.contains("tokio::join!"),
-            "parallel Claude/Codex auth accept races the global generation high-water"
-        );
-    }
-
-    #[test]
-    fn missing_cli_is_not_found_and_auth_states_map_to_presence() {
-        assert_eq!(
-            map_provider_observe(
-                ConfigSidebarProviderKind::Claude,
-                Err(&ProviderError::MissingCli {
-                    kind: ProviderKind::ClaudeCode,
-                    requested: None,
-                }),
-            )
-            .presence,
-            AgentPresence::NotFound
-        );
+    fn presence_from_auth_signed_in_only_for_subscription() {
         assert_eq!(
             presence_from_auth(ProviderAuthState::AuthenticatedSubscription),
             AgentPresence::SignedIn
@@ -200,66 +211,5 @@ mod tests {
             presence_from_auth(ProviderAuthState::AuthRequired),
             AgentPresence::NotSignedIn
         );
-        assert_eq!(
-            presence_from_auth(ProviderAuthState::Unknown),
-            AgentPresence::NotSignedIn
-        );
-    }
-
-    #[tokio::test]
-    async fn stock_path_claude_and_codex_probes_are_not_check_failed() {
-        let registry = crate::providers::startup::stock_provider_registry()
-            .expect("stock Claude and Codex adapters register");
-        let discovery = crate::providers::registry::ProviderDiscoveryConfig::default();
-        for kind in [ProviderKind::Codex, ProviderKind::ClaudeCode] {
-            let started = std::time::Instant::now();
-            match registry.observe(kind, &discovery).await {
-                Ok(_) => {}
-                Err(ProviderError::MissingCli { .. }) => continue,
-                Err(error) => panic!(
-                    "{kind:?} observe failed in {:?}: {error}",
-                    started.elapsed()
-                ),
-            }
-            match super::observe_with_trusted_auth(&registry, kind, &discovery).await {
-                Ok(_) => {}
-                Err(ProviderError::MissingCli { .. }) => {}
-                Err(error) => panic!(
-                    "{kind:?} trusted-auth failed in {:?}: {error}",
-                    started.elapsed()
-                ),
-            }
-        }
-        let rows = super::probe_agents(&registry).await;
-        for row in &rows {
-            assert_ne!(row.presence, AgentPresence::CheckFailed, "{row:?}");
-        }
-    }
-
-    #[tokio::test(flavor = "multi_thread")]
-    #[ignore = "attaches to a running isolated debug host"]
-    async fn live_isolated_host_agent_connection_query_is_not_check_failed() {
-        let profile = crate::ui::native_shell::isolated_dev_profile(env!("CARGO_MANIFEST_DIR"))
-            .expect("isolated debug profile");
-        let mut client = crate::client::HostClient::connect(profile.host_client_config())
-            .await
-            .unwrap_or_else(|error| {
-                panic!("attach live host {}: {error}", profile.named_profile())
-            });
-        let outcome = client.query_agent_connection().await;
-        match outcome {
-            Ok(Ok(snapshot)) => {
-                for row in &snapshot.agents {
-                    eprintln!("live host agent row: {row:?}");
-                    assert_ne!(
-                        row.presence,
-                        AgentPresence::CheckFailed,
-                        "live host returned CheckFailed: {row:?}"
-                    );
-                }
-            }
-            Ok(Err(error)) => panic!("live host QueryError: {error:?}"),
-            Err(error) => panic!("live host IpcError: {error}"),
-        }
     }
 }

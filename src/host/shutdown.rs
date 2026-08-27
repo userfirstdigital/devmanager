@@ -233,6 +233,103 @@ mod tests {
     use crate::domain::id::CommandId;
     use crate::domain::ClientId;
 
+    #[test]
+    fn archived_task_can_reopen_and_close_again_after_host_restart() {
+        use crate::domain::command::CreateTaskIntent;
+        use crate::domain::operation::OperationState;
+        use crate::domain::task::{
+            ReviewReadiness, TaskActivity, TaskAssignment, TaskAttention, TaskConnectivity,
+            TaskLifecycle, WorkspaceRef,
+        };
+        use crate::domain::{EnvironmentId, ProjectId};
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("archive-reopen.sqlite3");
+        let task = TaskId::new();
+        let client = ClientId::new();
+        let envelope = |task_id, expected_task_revision, command| CommandEnvelope {
+            command_id: CommandId::new(),
+            client_id: client,
+            task_id,
+            issued_at_ms: 1_725_000_000_100,
+            expected_task_revision,
+            command,
+        };
+        let mut bus = CommandBus::open(&path).expect("open bus");
+        // The crate-private fixture resolves an actual temporary workspace and
+        // obtains the same opaque authorization as the host. Raw public
+        // CommandBus::execute must continue rejecting CreateTask.
+        bus.execute_for_test(envelope(
+            None,
+            None,
+            Command::CreateTask(CreateTaskIntent {
+                id: task,
+                environment_id: EnvironmentId::new(),
+                title: "Repeated archive".into(),
+                description: None,
+                project_id: ProjectId::new(),
+                workspace: WorkspaceRef::Main,
+                assignment: TaskAssignment::LocalOwner,
+                created_at_ms: 1_725_000_000_000,
+                connectivity: TaskConnectivity::Connected,
+                attention: TaskAttention::None,
+                activity: TaskActivity::Idle,
+                review_readiness: ReviewReadiness::NotReady,
+            }),
+        ))
+        .expect("host-authorized fixture");
+
+        for round in 0_u64..3 {
+            let open = bus.task_snapshot(task).expect("snapshot").expect("task");
+            assert_eq!(open.task.lifecycle, TaskLifecycle::Open);
+            let CommandReceipt::Accepted { operation_id, .. } = bus
+                .execute(envelope(
+                    Some(task),
+                    Some(open.task.revision),
+                    Command::BeginCloseTask,
+                ))
+                .expect("begin close")
+            else {
+                panic!("close must be accepted");
+            };
+            // Current close and all previous reopen facts must replay after restart.
+            drop(bus);
+            bus = CommandBus::open(&path).expect("restart with pending teardown");
+            assert_eq!(
+                ProcessEmptyTeardownWorker::run_once(&mut bus).expect("settle close"),
+                ProcessEmptyTeardown::Settled {
+                    task_id: task,
+                    operation_id
+                }
+            );
+            let archived = bus
+                .task_snapshot(task)
+                .expect("archive replay")
+                .expect("task");
+            assert_eq!(archived.task.lifecycle, TaskLifecycle::Archived);
+            assert_eq!(archived.task.action_epoch, round + 1);
+            assert!(matches!(
+                bus.operation_status(operation_id).expect("close status"),
+                Some(OperationState::Settled { .. })
+            ));
+            assert_eq!(
+                ProcessEmptyTeardownWorker::run_once(&mut bus).expect("no duplicate teardown"),
+                ProcessEmptyTeardown::Idle
+            );
+            if round < 2 {
+                assert!(matches!(
+                    bus.execute(envelope(
+                        Some(task),
+                        Some(archived.task.revision),
+                        Command::ReopenTask
+                    ))
+                    .expect("reopen archived task"),
+                    CommandReceipt::Accepted { .. }
+                ));
+            }
+        }
+    }
+
     fn confirm_quit(bus: &mut CommandBus) -> OperationId {
         let inspection = bus.inspect_host_quit().expect("inspect");
         let receipt = bus

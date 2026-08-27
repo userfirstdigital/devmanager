@@ -1,5 +1,11 @@
 #[cfg(target_os = "windows")]
 fn main() {
+    // The complete GPUI layout stack (including debug-mode builder temporaries)
+    // exceeds the MSVC 1 MiB default for expanded settings. Reserve address space
+    // only for the UI executable; committed pages still grow on demand.
+    if std::env::var("CARGO_CFG_TARGET_ENV").as_deref() == Ok("msvc") {
+        println!("cargo:rustc-link-arg-bin=devmanager=/STACK:8388608");
+    }
     emit_preview_build_identity();
     emit_shipping_build_identity();
     generate_provider_catalog_typescript_mirror();

@@ -112,6 +112,9 @@ pub(crate) struct LaunchIntent {
     pub(crate) args: Vec<OsString>,
     pub(crate) cwd: PathBuf,
     pub(crate) environment: BTreeMap<OsString, OsString>,
+    /// When true, clear inherited ambient env and install `environment` exactly
+    /// (provider CLIs). Normal terminals leave this false.
+    pub(crate) replace_environment: bool,
     pub(crate) display_label: String,
 }
 
@@ -123,6 +126,7 @@ struct ValidatedLaunchIntent {
     args: Vec<OsString>,
     cwd: PathBuf,
     environment: BTreeMap<OsString, OsString>,
+    replace_environment: bool,
     display_label: ProcessDisplayLabel,
 }
 
@@ -187,6 +191,7 @@ impl LaunchIntent {
             args: self.args,
             cwd,
             environment: self.environment,
+            replace_environment: self.replace_environment,
             display_label,
         })
     }
@@ -597,12 +602,23 @@ pub(crate) fn prepare_suspended_pty(
     let mut command = CommandBuilder::new(&intent.executable);
     command.args(&intent.args);
     command.cwd(&intent.cwd);
-    for (key, value) in &intent.environment {
-        command.env(key, value);
+    if intent.replace_environment {
+        command.env_clear();
+        for (key, value) in &intent.environment {
+            command.env(key, value);
+        }
+    } else {
+        for (key, value) in &intent.environment {
+            command.env(key, value);
+        }
     }
+    if !intent.replace_environment {
+        command.env_remove("NO_COLOR");
+        command.env_remove("NODE_DISABLE_COLORS");
+    }
+    // Only host-owned resource metadata is added after the provider environment
+    // is sealed. Never alter provider authentication/configuration variables here.
     for key in [
-        "NO_COLOR",
-        "NODE_DISABLE_COLORS",
         "DEVMANAGER_TASK_ID",
         "DEVMANAGER_RESOURCE_ID",
         "DEVMANAGER_RESOURCE_KIND",

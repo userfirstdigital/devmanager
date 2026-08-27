@@ -108,6 +108,10 @@ pub(crate) fn prove_adapter_launch(
     if adapter_launch.executable() != observation.executable_handle() {
         return Err(ProviderLaunchSpecError::InvalidCapabilities);
     }
+    let env_commitment = crate::providers::capabilities::commit_child_environment(&environment);
+    if env_commitment != observation.env_commitment() {
+        return Err(ProviderLaunchSpecError::InvalidCapabilities);
+    }
     match mode {
         ProviderSessionStartMode::NewConversation if provider_session_id.is_some() => {
             return Err(ProviderLaunchSpecError::ResumeIntentMismatch);
@@ -132,6 +136,8 @@ pub(crate) fn prove_adapter_launch(
         cwd,
         environment,
         observation.capabilities().clone(),
+        observation.scope_fingerprint().map(str::to_string),
+        env_commitment,
     )?;
     let proof = ProviderAdapterLaunchProof::from_registry(spec.clone(), mode, provider_session_id)?;
     Ok((spec, proof))
@@ -190,7 +196,9 @@ pub fn start_request_from_adapter_with_options(
         input,
         provider_session_id.clone(),
     )
-    .with_launch_options(launch_options);
+    .with_launch_options(launch_options)
+    .with_scope_fingerprint(observation.scope_fingerprint().map(str::to_string))
+    .with_env_commitment(observation.env_commitment().to_string());
     // Exact resume unsupported/mismatch fails here visibly with no fresh fallback.
     let adapter_launch = adapter.build_launch(request)?;
     let (_spec, proof) = prove_adapter_launch(

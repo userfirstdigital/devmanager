@@ -1818,6 +1818,35 @@ impl ProcessManager {
         )
     }
 
+    pub fn peek_persisted_provider_launch_spec(
+        &self,
+        agent_session_id: crate::domain::AgentSessionId,
+    ) -> Result<
+        Option<crate::providers::session::ProviderLaunchSpec>,
+        crate::providers::session::ProviderSessionError,
+    > {
+        let mut slot = self.inner.provider_sessions.lock().map_err(|_| {
+            crate::providers::session::ProviderSessionError::StateStore(
+                "provider session manager lock poisoned".to_string(),
+            )
+        })?;
+        if slot.is_none() {
+            let store = crate::providers::session::SqliteProviderSessionStateStore::open(
+                self.production_provider_session_store_path()?,
+            )
+            .map_err(crate::providers::session::ProviderSessionError::StateStore)?;
+            *slot = Some(
+                crate::providers::session::ProviderSessionManager::with_state_store(
+                    self.provider_process_launcher(),
+                    store,
+                ),
+            );
+        }
+        slot.as_mut()
+            .expect("production provider manager initialized")
+            .peek_persisted_launch_spec(agent_session_id)
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn start_production_stock_provider_session_with_options(
         &self,

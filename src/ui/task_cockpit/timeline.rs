@@ -4,9 +4,10 @@
 //! raw `SemanticEvent` arrays are not part of the public API.
 
 use gpui::{
-    div, px, AnyElement, App, InteractiveElement, IntoElement, ParentElement,
-    StatefulInteractiveElement, Styled,
+    div, list, px, AnyElement, App, InteractiveElement, IntoElement, ListAlignment, ListOffset,
+    ListState, ParentElement, StatefulInteractiveElement, Styled, Window,
 };
+use std::cell::Cell;
 use std::collections::BTreeSet;
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::rc::Rc;
@@ -165,17 +166,28 @@ struct TimelineAnchor {
     offset_within: u32,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub struct Timeline {
     task_id: TaskId,
     availability: JournalAvailability,
     items: Vec<TimelineItemModel>,
-    rows: Vec<ConversationRow>,
+    rows: Rc<Vec<ConversationRow>>,
+    /// Cached on admission/reproject; render must not rescan full history.
+    activity_summary: Option<String>,
     expanded_activity: Vec<String>,
     prefix: Vec<u32>,
     content_height: u32,
     viewport: TimelineViewport,
-    following: bool,
+    /// Live-follow intent. Kept in a cell so the GPUI list scroll handler can
+    /// detach without requiring an entity update path. ListState is the
+    /// production authority; this mirrors `!is_scrolled` for Bottom lists.
+    following: Rc<Cell<bool>>,
+    list_state: ListState,
+    /// High-water of the journal page last projected into this timeline.
+    projected_high_water: u64,
+    projected_capabilities: Option<CapabilitySet>,
+    projected_target: Option<CapturedActionTarget>,
+    projected_task_revision: Option<u64>,
     anchor: Option<TimelineAnchor>,
     paint_start: usize,
     paint_end: usize,
@@ -214,27 +226,48 @@ impl Timeline {
         viewport: TimelineViewport,
         captured_target: CapturedActionTarget,
     ) -> Self {
-        let rows = apply_activity_collapse(
+        let rows = Rc::new(apply_activity_collapse(
             derive_conversation_rows(&items, ConversationVerbosity::Calm),
             &[],
-        );
+        ));
+        let status = match availability {
+            JournalAvailability::Unavailable(_) => {
+                "Semantic timeline awaiting authenticated journal"
+            }
+            JournalAvailability::LiveProjection => "Conversation",
+            #[cfg(any(test, feature = "semantic-conformance"))]
+            JournalAvailability::ConformanceFixture => "Semantic timeline",
+        };
+        let activity_summary = conversation_activity_summary(&items, status);
+        let following = Rc::new(Cell::new(true));
+        let list_state = ListState::new(rows.len(), ListAlignment::Bottom, px(2048.0));
+        let following_for_handler = following.clone();
+        list_state.set_scroll_handler(move |event, _window, _cx| {
+            following_for_handler.set(!event.is_scrolled);
+        });
         let mut timeline = Self {
             task_id,
             availability,
             items,
             rows,
+            activity_summary,
             expanded_activity: Vec::new(),
             prefix: Vec::new(),
             content_height: 0,
             viewport,
-            following: true,
+            following,
+            list_state,
+            projected_high_water: 0,
+            projected_capabilities: None,
+            projected_target: Some(captured_target),
+            projected_task_revision: None,
             anchor: None,
             paint_start: 0,
             paint_end: 0,
             captured_target,
         };
         timeline.rebuild_heights();
-        timeline.following = true;
+        timeline.following.set(true);
         timeline.jump_to_latest();
         timeline
     }
@@ -293,7 +326,7 @@ impl Timeline {
     }
 
     #[cfg(test)]
-    fn for_test_task_items(task_id: TaskId, items: Vec<TimelineItemModel>) -> Self {
+    pub(crate) fn for_test_task_items(task_id: TaskId, items: Vec<TimelineItemModel>) -> Self {
         Self::assemble(
             task_id,
             JournalAvailability::LiveProjection,
@@ -336,6 +369,134 @@ impl Timeline {
         tokens: ThemeTokens,
         activity_toggle: Option<ActivityToggleHandler>,
     ) -> AnyElement {
+        let activity = self.activity_summary.clone();
+        let rows = Rc::clone(&self.rows);
+        let list_state = self.list_state.clone();
+        let activity_toggle_for_rows = activity_toggle.clone();
+        let task_key = self.task_element_key();
+        div()
+            .id(("native-semantic-timeline", task_key))
+            .w_full()
+            .h_full()
+            .bg(tokens.surfaces.canvas.to_gpui())
+            .child(
+                div()
+                    .w_full()
+                    .h_full()
+                    .flex()
+                    .justify_center()
+                    .px(px(16.0))
+                    .child(
+                        div()
+                            .id(("native-conversation-column", task_key))
+                            // A definite width is required here. The earlier
+                            // `w_full().max_w(..)` form did not clamp in GPUI.
+                            .w(px(CONVERSATION_CONTENT_MAX_WIDTH))
+                            .max_w_full()
+                            .h_full()
+                            .py(px(tokens.density.spacing.lg))
+                            .flex()
+                            .flex_col()
+                            .gap(px(tokens.density.spacing.md))
+                            .children(activity.map(|summary| {
+                                div()
+                                    .w_full()
+                                    .flex_none()
+                                    .text_size(px(tokens.density.typography.caption))
+                                    .text_color(tokens.text.secondary.to_gpui())
+                                    .child(summary)
+                                    .into_any_element()
+                            }))
+                            .child(
+                                list(
+                                    list_state,
+                                    move |ix, _window: &mut Window, _cx: &mut App| {
+                                        rows.get(ix)
+                                            .map(|row| {
+                                                timeline_row_element(
+                                                    row,
+                                                    tokens,
+                                                    activity_toggle_for_rows.clone(),
+                                                )
+                                            })
+                                            .unwrap_or_else(|| div().into_any_element())
+                                    },
+                                )
+                                .flex_1(),
+                            ),
+                    ),
+            )
+            .into_any_element()
+    }
+
+    fn task_element_key(&self) -> u64 {
+        u64::from_be_bytes(
+            self.task_id.as_bytes()[8..]
+                .try_into()
+                .expect("task identity tail is exactly eight bytes"),
+        )
+    }
+
+    pub fn projected_high_water(&self) -> u64 {
+        self.projected_high_water
+    }
+
+    pub fn note_projected_high_water(&mut self, high_water: u64) {
+        self.projected_high_water = high_water;
+    }
+
+    pub fn note_projection_identity(
+        &mut self,
+        high_water: u64,
+        capabilities: CapabilitySet,
+        target: CapturedActionTarget,
+        task_revision: u64,
+    ) {
+        self.projected_high_water = high_water;
+        self.projected_capabilities = Some(capabilities);
+        self.projected_target = Some(target);
+        self.projected_task_revision = Some(task_revision);
+        self.captured_target = target;
+    }
+
+    pub fn matches_projection_identity(
+        &self,
+        high_water: u64,
+        capabilities: CapabilitySet,
+        target: CapturedActionTarget,
+        task_revision: u64,
+    ) -> bool {
+        self.projected_high_water == high_water
+            && self.projected_capabilities == Some(capabilities)
+            && self.projected_target == Some(target)
+            && self.projected_task_revision == Some(task_revision)
+    }
+
+    /// Replace render rows, invalidate measured heights for overlapping
+    /// indices (including same-count streamed text edits), and restore the
+    /// authoritative ListState scroll offset.
+    fn replace_rows(
+        &mut self,
+        new_rows: Vec<ConversationRow>,
+        following: bool,
+        anchor_key: Option<ConversationRowKey>,
+        offset_in_item: gpui::Pixels,
+    ) {
+        let old_len = self.list_state.item_count();
+        let prefix = self
+            .rows
+            .iter()
+            .zip(&new_rows)
+            .take_while(|(old, new)| old == new)
+            .count();
+        let suffix = self.rows[prefix..]
+            .iter()
+            .rev()
+            .zip(new_rows[prefix..].iter().rev())
+            .take_while(|(old, new)| old == new)
+            .count();
+        self.rows = Rc::new(new_rows);
+        let new_len = self.rows.len();
         let status = match self.availability {
             JournalAvailability::Unavailable(_) => {
                 "Semantic timeline awaiting authenticated journal"
@@ -344,49 +505,35 @@ impl Timeline {
             #[cfg(any(test, feature = "semantic-conformance"))]
             JournalAvailability::ConformanceFixture => "Semantic timeline",
         };
-        let activity = conversation_activity_summary(&self.items, status);
-        let painted_rows = self
-            .painted_rows()
-            .iter()
-            .map(|row| timeline_row_element(row, tokens, activity_toggle.clone()))
-            .collect::<Vec<_>>();
-        div()
-            .id("native-semantic-timeline")
-            .w_full()
-            .h_full()
-            .overflow_y_scroll()
-            .bg(tokens.surfaces.canvas.to_gpui())
-            .child(
-                div()
-                    .w_full()
-                    .min_h(px(self.viewport.height as f32))
-                    .flex()
-                    .items_end()
-                    .justify_center()
-                    .px(px(16.0))
-                    .child(
-                        div()
-                            .id("native-conversation-column")
-                            // A definite width is required here. The earlier
-                            // `w_full().max_w(..)` form did not clamp in GPUI.
-                            .w(px(CONVERSATION_CONTENT_MAX_WIDTH))
-                            .max_w_full()
-                            .py(px(tokens.density.spacing.lg))
-                            .flex()
-                            .flex_col()
-                            .gap(px(tokens.density.spacing.md))
-                            .children(activity.map(|summary| {
-                                div()
-                                    .w_full()
-                                    .text_size(px(tokens.density.typography.caption))
-                                    .text_color(tokens.text.secondary.to_gpui())
-                                    .child(summary)
-                                    .into_any_element()
-                            }))
-                            .children(painted_rows),
-                    ),
-            )
-            .into_any_element()
+        self.activity_summary = conversation_activity_summary(&self.items, status);
+        if prefix + suffix < old_len || prefix + suffix < new_len {
+            self.list_state
+                .splice(prefix..old_len - suffix, new_len - prefix - suffix);
+        }
+        self.rebuild_heights();
+        if following {
+            // Splicing preserves the Bottom list's implicit end anchor. Reset
+            // would discard all measured heights and drop the next scroll input.
+            self.viewport.scroll_offset = self.content_height.saturating_sub(self.viewport.height);
+            self.following.set(true);
+            self.refresh_window();
+            self.capture_anchor_from_list();
+            return;
+        }
+        if let Some(key) = anchor_key {
+            if let Some(index) = self
+                .rows
+                .iter()
+                .position(|row| conversation_row_key(row) == key)
+            {
+                self.list_state.scroll_to(ListOffset {
+                    item_ix: index,
+                    offset_in_item,
+                });
+            }
+        }
+        self.following.set(false);
+        self.capture_anchor_from_list();
     }
 
     pub fn toggle_activity_group(&mut self, group: &str) -> bool {
@@ -404,11 +551,14 @@ impl Timeline {
         } else {
             self.expanded_activity.push(group.to_string());
         }
-        self.rows = apply_activity_collapse(
+        let scroll = self.list_state.logical_scroll_top();
+        let anchor_key = self.rows.get(scroll.item_ix).map(conversation_row_key);
+        let following = self.following.get();
+        let next_rows = apply_activity_collapse(
             derive_conversation_rows(&self.items, ConversationVerbosity::Calm),
             &self.expanded_activity,
         );
-        self.rebuild_heights();
+        self.replace_rows(next_rows, following, anchor_key, scroll.offset_in_item);
         true
     }
 
@@ -417,7 +567,7 @@ impl Timeline {
     }
 
     pub fn rows(&self) -> &[ConversationRow] {
-        &self.rows
+        self.rows.as_ref()
     }
 
     pub fn content_height(&self) -> u32 {
@@ -473,22 +623,31 @@ impl Timeline {
             return;
         }
         self.viewport.scroll_offset = self.prefix[index];
-        self.following = false;
+        self.following.set(false);
+        self.list_state.scroll_to(ListOffset {
+            item_ix: index,
+            offset_in_item: px(0.0),
+        });
         self.refresh_window();
-        self.capture_anchor();
+        self.capture_anchor_from_list();
     }
 
+    /// Legacy keyboard/test helper. Production mouse scrolling is owned by
+    /// GPUI ListState; do not wire transcript wheel events through this.
     pub fn scroll_page(&mut self, down: bool) {
         let step = self.viewport.height.max(1) / 2;
+        let distance = px(step as f32);
         if down {
             self.viewport.scroll_offset = self.viewport.scroll_offset.saturating_add(step);
+            self.list_state.scroll_by(distance);
         } else {
             self.viewport.scroll_offset = self.viewport.scroll_offset.saturating_sub(step);
+            self.list_state.scroll_by(-distance);
         }
         self.clamp_scroll();
-        self.following = self.at_bottom();
+        self.following.set(!self.list_state_is_scrolled_away());
         self.refresh_window();
-        self.capture_anchor();
+        self.capture_anchor_from_list();
     }
 
     pub fn visible_anchor_key(&self) -> Option<ConversationRowKey> {
@@ -496,9 +655,11 @@ impl Timeline {
     }
 
     pub fn follow_latest(&self) -> bool {
-        self.following && self.at_bottom()
+        self.following.get()
     }
 
+    /// Legacy estimated viewport helper for older tests. Production follow
+    /// decisions must use [`Self::follow_latest`] / ListState scroll state.
     pub fn at_bottom(&self) -> bool {
         let visible_end = self
             .viewport
@@ -508,49 +669,47 @@ impl Timeline {
     }
 
     pub fn show_jump_to_latest(&self) -> bool {
-        !self.at_bottom()
+        !self.follow_latest()
     }
 
-    /// Carry reader intent across a fresh journal projection. Projecting a
-    /// streaming delta constructs new item data, but it must not silently
-    /// reset the viewport to the bottom. A following reader moves to the new
-    /// bottom; a detached reader keeps the same durable row anchor and pixel
-    /// offset while the new tail grows below it.
+    fn list_state_is_scrolled_away(&self) -> bool {
+        self.list_state.logical_scroll_top().item_ix < self.rows.len()
+    }
+
+    /// Carry reader intent across a fresh journal projection. ListState
+    /// logical scroll is authoritative for detached readers; estimated
+    /// viewport anchors are never used to override real mouse scroll.
     pub(crate) fn preserve_view_state_from(&mut self, previous: &Self) {
         if self.task_id != previous.task_id {
             return;
         }
 
+        let scroll_top = previous.list_state.logical_scroll_top();
+        let list_following = scroll_top.item_ix >= previous.rows.len();
+        let was_following = previous.following.get() || list_following;
+        let anchor_key = previous
+            .rows
+            .get(scroll_top.item_ix)
+            .map(conversation_row_key);
+        let offset_in_item = scroll_top.offset_in_item;
+
+        self.expanded_activity = previous.expanded_activity.clone();
+        self.activity_summary = previous.activity_summary.clone();
+        self.following = previous.following.clone();
+        self.list_state = previous.list_state.clone();
+        self.projected_high_water = previous.projected_high_water;
+        self.projected_capabilities = previous.projected_capabilities;
+        self.projected_target = previous.projected_target;
+        self.projected_task_revision = previous.projected_task_revision;
+        self.viewport = previous.viewport;
+
         let next_rows = apply_activity_collapse(
             derive_conversation_rows(&self.items, ConversationVerbosity::Calm),
             &previous.expanded_activity,
         );
-        self.rows = stable_conversation_rows(&previous.rows, next_rows);
-        self.expanded_activity = previous.expanded_activity.clone();
-        self.viewport = previous.viewport;
-        self.following = previous.following;
-        self.anchor = previous.anchor.clone();
-        self.rebuild_heights();
-
-        if previous.following {
-            self.jump_to_latest();
-            return;
-        }
-
-        if let Some(anchor) = previous.anchor.as_ref() {
-            if let Some(index) = self
-                .rows
-                .iter()
-                .position(|row| conversation_row_key(row) == anchor.key)
-            {
-                self.viewport.scroll_offset =
-                    self.prefix[index].saturating_add(anchor.offset_within);
-            }
-        }
-        self.clamp_scroll();
-        self.following = false;
-        self.refresh_window();
-        self.capture_anchor();
+        let next_rows = stable_conversation_rows(previous.rows.as_ref(), next_rows);
+        self.rows = previous.rows.clone();
+        self.replace_rows(next_rows, was_following, anchor_key, offset_in_item);
     }
 
     /// Keep the virtual window aligned with the actual conversation canvas.
@@ -561,22 +720,28 @@ impl Timeline {
         if self.viewport.height == height {
             return;
         }
-        let was_following = self.following;
+        let was_following = self.following.get();
         self.viewport.height = height;
         self.clamp_scroll();
         if was_following {
             self.jump_to_latest();
         } else {
             self.refresh_window();
-            self.capture_anchor();
+            self.capture_anchor_from_list();
         }
     }
 
     pub fn jump_to_latest(&mut self) {
         self.viewport.scroll_offset = self.content_height.saturating_sub(self.viewport.height);
-        self.following = true;
+        self.following.set(true);
+        // Bottom-aligned ListState treats reset as "stick to the end".
+        self.list_state.reset(self.rows.len());
         self.refresh_window();
-        self.capture_anchor();
+        self.capture_anchor_from_list();
+    }
+
+    pub fn list_state(&self) -> &ListState {
+        &self.list_state
     }
 
     /// Scroll/virtualization math walks the derived `rows`, not the raw
@@ -590,7 +755,7 @@ impl Timeline {
         let mut total = 0u32;
         self.prefix.reserve(self.rows.len());
         let tokens = height_estimation_tokens();
-        for row in &self.rows {
+        for row in self.rows.iter() {
             self.prefix.push(total);
             total = total.saturating_add(conversation_row_height(row, tokens));
         }
@@ -636,34 +801,51 @@ impl Timeline {
         self.paint_end = end;
     }
 
-    fn capture_anchor(&mut self) {
+    fn capture_anchor_from_list(&mut self) {
         if self.rows.is_empty() {
             self.anchor = None;
             return;
         }
-        let index = match self
-            .prefix
-            .partition_point(|top| *top <= self.viewport.scroll_offset)
-        {
-            0 => 0,
-            n => (n - 1).min(self.rows.len() - 1),
-        };
+        let scroll_top = self.list_state.logical_scroll_top();
+        if scroll_top.item_ix >= self.rows.len() {
+            self.anchor = self.rows.last().map(|row| TimelineAnchor {
+                key: conversation_row_key(row),
+                offset_within: 0,
+            });
+            return;
+        }
         self.anchor = Some(TimelineAnchor {
-            key: conversation_row_key(&self.rows[index]),
-            offset_within: self
-                .viewport
-                .scroll_offset
-                .saturating_sub(self.prefix[index]),
+            key: conversation_row_key(&self.rows[scroll_top.item_ix]),
+            offset_within: scroll_top.offset_in_item.to_f64().max(0.0) as u32,
         });
+        // Keep legacy estimated viewport roughly aligned for older tests.
+        if let Some(prefix) = self.prefix.get(scroll_top.item_ix) {
+            self.viewport.scroll_offset =
+                prefix.saturating_add(scroll_top.offset_in_item.to_f64().max(0.0) as u32);
+        }
     }
 
     #[cfg(test)]
     fn scroll_to_offset_for_test(&mut self, offset: u32) {
         self.viewport.scroll_offset = offset;
         self.clamp_scroll();
-        self.following = self.at_bottom();
+        let at_bottom = self.at_bottom();
+        self.following.set(at_bottom);
+        if !at_bottom {
+            let index = match self.prefix.partition_point(|top| *top <= offset) {
+                0 => 0,
+                n => (n - 1).min(self.rows.len().saturating_sub(1)),
+            };
+            let within = offset.saturating_sub(self.prefix.get(index).copied().unwrap_or(0));
+            self.list_state.scroll_to(ListOffset {
+                item_ix: index,
+                offset_in_item: px(within as f32),
+            });
+        } else {
+            self.list_state.reset(self.rows.len());
+        }
         self.refresh_window();
-        self.capture_anchor();
+        self.capture_anchor_from_list();
     }
 }
 
@@ -959,6 +1141,140 @@ mod tests {
         assert_eq!(
             next.viewport.scroll_offset,
             next.content_height().saturating_sub(next.viewport.height)
+        );
+    }
+
+    #[test]
+    fn same_count_streamed_text_keeps_list_offset_while_invalidating() {
+        use crate::ui::renderers::{MarkdownBlock, TimelineItemContent};
+        use gpui::px;
+
+        let items = (0..40)
+            .map(|index| message_item(MessageRole::Assistant, &format!("row {index}")))
+            .collect::<Vec<_>>();
+        let mut previous = Timeline::for_test_items(items);
+        previous.set_viewport_height(400);
+        previous.scroll_to_offset_for_test(180);
+        let before = previous.list_state().logical_scroll_top();
+        assert!(!previous.follow_latest());
+
+        let mut grown = previous.items.clone();
+        let target = before.item_ix.min(grown.len().saturating_sub(1));
+        if let TimelineItemContent::Message(message) = &mut grown[target].content {
+            message.markdown.blocks = vec![MarkdownBlock::Paragraph {
+                text:
+                    "same-row streamed text that wraps across more measured lines\nand another line"
+                        .into(),
+            }];
+        }
+        let mut next = Timeline::for_test_task_items(previous.task_id, grown);
+        next.preserve_view_state_from(&previous);
+
+        let after = next.list_state().logical_scroll_top();
+        assert_eq!(after.item_ix, before.item_ix);
+        assert!(!next.follow_latest());
+        assert_eq!(next.rows().len(), previous.rows().len());
+    }
+
+    #[test]
+    fn activity_expansion_survives_preserve_across_reproject() {
+        let mut previous = Timeline::for_test_items(vec![
+            tool_item("tool-1", "Read", "completed"),
+            tool_item("tool-2", "Read", "completed"),
+            tool_item("tool-3", "Bash", "completed"),
+            message_item(MessageRole::Assistant, "tail"),
+        ]);
+        let group = previous
+            .rows()
+            .iter()
+            .find_map(|row| match row {
+                crate::ui::conversation::rows::ConversationRow::ActivityToggle {
+                    group, ..
+                } => Some(group.clone()),
+                _ => None,
+            })
+            .expect("toggle");
+        assert!(previous.toggle_activity_group(&group));
+        assert!(previous.rows().iter().any(|row| matches!(
+            row,
+            crate::ui::conversation::rows::ConversationRow::Activity { entries, .. }
+                if entries.len() == 3
+        )));
+
+        let mut next = Timeline::for_test_task_items(previous.task_id, previous.items.clone());
+        next.preserve_view_state_from(&previous);
+        assert!(next.rows().iter().any(|row| matches!(
+            row,
+            crate::ui::conversation::rows::ConversationRow::Activity { entries, .. }
+                if entries.len() == 3
+        )));
+    }
+
+    #[test]
+    fn list_state_offset_is_authoritative_over_estimated_viewport_anchor() {
+        use gpui::px;
+
+        let mut timeline = long_timeline(400);
+        timeline.scroll_to_offset_for_test(220);
+        // Corrupt the legacy estimated viewport; production must still trust ListState.
+        timeline.viewport.scroll_offset = 0;
+        timeline.anchor = None;
+        let list_top = timeline.list_state().logical_scroll_top();
+        assert!(list_top.item_ix > 0 || list_top.offset_in_item > px(0.0));
+
+        let mut next = Timeline::for_test_task_items(timeline.task_id, timeline.items.clone());
+        next.preserve_view_state_from(&timeline);
+        let restored = next.list_state().logical_scroll_top();
+        assert_eq!(restored.item_ix, list_top.item_ix);
+        assert!(!next.follow_latest());
+    }
+
+    #[test]
+    fn replace_rows_append_and_shrink_keep_list_state_item_count_aligned() {
+        let items = (0..8)
+            .map(|index| message_item(MessageRole::Assistant, &format!("row {index}")))
+            .collect::<Vec<_>>();
+        let mut timeline = Timeline::for_test_items(items);
+        assert_eq!(timeline.list_state().item_count(), timeline.rows().len());
+
+        let mut grown = timeline.items.clone();
+        grown.push(message_item(MessageRole::Assistant, "appended"));
+        let mut next = Timeline::for_test_task_items(timeline.task_id, grown);
+        next.preserve_view_state_from(&timeline);
+        assert_eq!(
+            next.list_state().item_count(),
+            next.rows().len(),
+            "append must grow ListState to the new row count"
+        );
+
+        let shrunk_items = next.items[..3].to_vec();
+        let mut shrunk = Timeline::for_test_task_items(next.task_id, shrunk_items);
+        shrunk.preserve_view_state_from(&next);
+        assert_eq!(
+            shrunk.list_state().item_count(),
+            shrunk.rows().len(),
+            "shrink must drop trailing ListState entries"
+        );
+        assert!(shrunk.rows().len() < next.rows().len());
+    }
+
+    #[test]
+    fn distinct_tasks_retain_independent_list_scroll_state() {
+        let first_id = crate::domain::TaskId::new();
+        let second_id = crate::domain::TaskId::new();
+        let items = (0..40)
+            .map(|index| message_item(MessageRole::Assistant, &format!("message {index}")))
+            .collect::<Vec<_>>();
+        let mut first = Timeline::for_test_task_items(first_id, items.clone());
+        let second = Timeline::for_test_task_items(second_id, items);
+        first.set_viewport_height(400);
+        first.scroll_to_offset_for_test(120);
+        assert!(!first.follow_latest());
+        assert!(second.follow_latest());
+        assert!(first.list_state().item_count() > 0);
+        assert_eq!(
+            first.list_state().item_count(),
+            second.list_state().item_count()
         );
     }
 }

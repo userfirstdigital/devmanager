@@ -86,6 +86,7 @@ impl ProviderAdapter for ScriptedAdapter {
     async fn probe(
         &self,
         _executable: &ProviderExecutableHandle,
+        _context: &crate::providers::adapter::ProviderProbeContext,
     ) -> Result<ProviderCapabilities, ProviderError> {
         Err(ProviderError::UnsupportedCapability(
             ProviderCapability::BuildLaunch,

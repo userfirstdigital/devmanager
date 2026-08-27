@@ -131,6 +131,7 @@ impl ProviderAdapter for ScriptedAdapter {
     async fn probe(
         &self,
         _executable: &ProviderExecutableHandle,
+        _context: &crate::providers::adapter::ProviderProbeContext,
     ) -> Result<ProviderCapabilities, ProviderError> {
         Err(ProviderError::UnsupportedCapability(
             ProviderCapability::BuildLaunch,
@@ -269,7 +270,13 @@ async fn cursor_unknown_auth_and_exact_resume_are_rejected() {
     const PINNED_HELP: &[u8] = include_bytes!("../../tests/fixtures/providers/cursor/help.txt");
     let adapter = CursorAdapter::from_pinned_probes(PINNED_VERSION, PINNED_HELP, 1_700_000_000_400);
     let handle = current_executable().open_for_launch().expect("handle");
-    let capabilities = adapter.probe(&handle).await.expect("pinned cursor probe");
+    let capabilities = adapter
+        .probe(
+            &handle,
+            &crate::providers::adapter::ProviderProbeContext::default(),
+        )
+        .await
+        .expect("pinned cursor probe");
     assert_eq!(capabilities.auth_state, ProviderAuthState::Unknown);
     assert_eq!(capabilities.exact_resume, CapabilitySupport::Unsupported);
     let observation = ProviderObservation::from_test_parts(

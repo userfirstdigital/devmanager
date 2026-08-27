@@ -1,6 +1,6 @@
 use super::{
-    require_attestation, CodexAdapter, CodexAdmission, CodexCorrelatedLaunch, CodexIdentityError,
-    CodexResumeFailure, CodexResumeObservation, CodexSemanticLaunchState,
+    CodexAdapter, CodexAdmission, CodexCorrelatedLaunch, CodexIdentityError, CodexResumeFailure,
+    CodexResumeObservation, CodexSemanticLaunchState,
 };
 use crate::ai::codex_hooks::{
     CodexHookRegistry, CodexLaunchPermit, CodexRegistryEvent, CodexRelayIngestStatus,
@@ -141,7 +141,9 @@ impl ProviderProbeRunner for ScriptedProbeRunner {
             ProviderProbeKind::Help => &self.help,
             ProviderProbeKind::ResumeHelp => &self.resume_help,
             ProviderProbeKind::LoginStatus => &self.login_status,
-            ProviderProbeKind::AuthStatus => {
+            ProviderProbeKind::AuthStatus
+            | ProviderProbeKind::CursorAboutJson
+            | ProviderProbeKind::CursorAboutPlain => {
                 return Err(ProviderProbeError::InvalidRequest(
                     crate::providers::adapter::ProviderProbeRequestError::EmptyExecutable,
                 ))
@@ -826,7 +828,22 @@ async fn codex_same_identity_reprobe_failure_quarantines_previous_capabilities()
     let adapter = CodexAdapter::new(runner);
     let identity = fixture_executable();
     adapter.probe_attested(&identity).await.unwrap();
+    let registry = Arc::new(CodexHookRegistry::default());
+    let launch = launch_with(
+        &adapter,
+        identity.clone(),
+        Some(session_id()),
+        &registry,
+        TaskId::new(),
+        AgentSessionId::new(),
+        process_root(51),
+    )
+    .unwrap();
     assert!(adapter.probe_attested(&identity).await.is_err());
+    assert_eq!(
+        launch.settle_exact_resume(&identity, &session_id(), CodexResumeObservation::Succeeded),
+        Ok(())
+    );
     assert!(matches!(
         adapter.build_launch(LaunchProviderRequest::new(
             identity
@@ -856,7 +873,13 @@ async fn codex_public_probe_inspection_failure_quarantines_previous_capabilities
     let handle = identity
         .open_for_launch()
         .expect("fixture executable handle");
-    assert!(ProviderAdapter::probe(&adapter, &handle).await.is_err());
+    assert!(ProviderAdapter::probe(
+        &adapter,
+        &handle,
+        &crate::providers::adapter::ProviderProbeContext::default()
+    )
+    .await
+    .is_err());
     assert!(adapter.last_capabilities(&identity).is_none());
     assert_eq!(
         adapter.semantic_launch_state(&identity),
@@ -885,29 +908,107 @@ fn codex_attestation_generation_fences_stale_probe_publication() {
         LOGIN_CHATGPT,
     ));
     let identity = fixture_executable();
-    let first = adapter.begin_attestation(&identity).expect("first epoch");
+    let first = adapter
+        .begin_attestation("test-scope", &identity)
+        .expect("first epoch");
     let second = adapter
-        .begin_attestation(&identity)
+        .begin_attestation("test-scope", &identity)
         .expect("replacement epoch");
 
     assert!(matches!(
-        require_attestation(
-            &adapter.pinned,
-            &adapter.attestation_generation,
-            first,
-            &identity,
-        ),
+        adapter.require_attestation("test-scope", &identity, first),
         Err(ProviderError::DependencyUnavailable {
             capability: crate::providers::capabilities::ProviderCapability::BuildLaunch
         })
     ));
-    assert!(require_attestation(
-        &adapter.pinned,
-        &adapter.attestation_generation,
-        second,
-        &identity,
+    assert!(adapter
+        .require_attestation("test-scope", &identity, second)
+        .is_ok());
+}
+
+#[tokio::test]
+async fn old_launch_drop_does_not_rewrite_new_attestation() {
+    let adapter = probed(HELP, RESUME_HELP, LOGIN_CHATGPT).await;
+    let identity = fixture_executable();
+    let registry = Arc::new(CodexHookRegistry::default());
+    let launch = launch_with(
+        &adapter,
+        identity.clone(),
+        None,
+        &registry,
+        TaskId::new(),
+        AgentSessionId::new(),
+        process_root(52),
     )
-    .is_ok());
+    .unwrap();
+    adapter.probe_attested(&identity).await.unwrap();
+    let before = adapter.last_capabilities(&identity).unwrap();
+    let state_before = adapter.semantic_launch_state(&identity);
+    drop(launch);
+    assert_eq!(adapter.last_capabilities(&identity).unwrap(), before);
+    assert_eq!(adapter.semantic_launch_state(&identity), state_before);
+}
+
+#[tokio::test]
+async fn dropping_account_a_does_not_retain_its_attestation_because_b_is_live() {
+    use crate::providers::adapter::ProviderProbeContext;
+    let adapter = probed(HELP, RESUME_HELP, LOGIN_CHATGPT).await;
+    let registry = Arc::new(CodexHookRegistry::default());
+    let identity = fixture_executable();
+    let a = launch_with(
+        &adapter,
+        identity.clone(),
+        None,
+        &registry,
+        TaskId::new(),
+        AgentSessionId::new(),
+        process_root(53),
+    )
+    .unwrap();
+    let context_b = ProviderProbeContext {
+        scope_fingerprint: Some("account-b".into()),
+        ..Default::default()
+    };
+    let handle = identity.open_for_launch().unwrap();
+    adapter
+        .probe_attested_handle(&handle, &context_b)
+        .await
+        .unwrap();
+    let b = adapter
+        .prepare_correlated_launch(
+            LaunchProviderRequest::new(handle, None, None)
+                .with_scope_fingerprint(Some("account-b".into())),
+            issue_permit(
+                &registry,
+                TaskId::new(),
+                AgentSessionId::new(),
+                process_root(54),
+            ),
+            "http://127.0.0.1:9/internal/codex-hook",
+            Path::new("C:/fixture/devmanager.exe"),
+        )
+        .unwrap();
+    drop(a);
+    {
+        let scopes = adapter.scopes.lock().unwrap();
+        assert_eq!(
+            scopes[&ProviderProbeContext::default().scope_key()]
+                .probed
+                .as_ref()
+                .unwrap()
+                .semantic_state,
+            CodexSemanticLaunchState::DependencyUnavailable
+        );
+        assert_eq!(
+            scopes[&context_b.scope_key()]
+                .probed
+                .as_ref()
+                .unwrap()
+                .semantic_state,
+            CodexSemanticLaunchState::Registered
+        );
+    }
+    drop(b);
 }
 
 #[tokio::test]
@@ -1339,6 +1440,7 @@ async fn codex_registry_observe_uses_adapter_login_status_seam() {
             &ProviderDiscoveryConfig {
                 executable_override: Some(executable),
                 path: None,
+                ..ProviderDiscoveryConfig::default()
             },
         )
         .await

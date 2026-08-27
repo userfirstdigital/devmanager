@@ -330,6 +330,7 @@ impl ManagedLaunchAuthority for HostManagedLaunchAuthority {
                 args: spec.args.iter().cloned().map(OsString::from).collect(),
                 cwd: PathBuf::from(&spec.cwd),
                 environment,
+                replace_environment: false,
                 display_label: spec.display_label.clone(),
             };
             let pending = prepare_suspended_pty(&*pair.slave, intent).map_err(|_| {

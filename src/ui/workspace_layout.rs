@@ -133,6 +133,7 @@ impl Default for WorkspaceLayout {
                 model: crate::providers::ProviderModel::CodexSol,
                 reasoning_effort: crate::providers::ProviderReasoningEffort::ExtraHigh,
                 access: crate::providers::ProviderAccessMode::FullAccess,
+                ..crate::providers::ProviderLaunchOptions::default()
             }),
         }
     }

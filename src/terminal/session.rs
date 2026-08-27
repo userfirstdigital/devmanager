@@ -1151,6 +1151,7 @@ impl TerminalSession {
             env,
             authority,
             Arc::clone(&io),
+            self.session_id.starts_with("provider-"),
         )?;
         #[cfg(not(windows))]
         let child = {
@@ -2250,6 +2251,7 @@ fn spawn_suspended_managed_terminal(
     env: HashMap<String, String>,
     mut authority: TerminalLaunchAuthority,
     io: Arc<ManagedTerminalIo>,
+    replace_environment: bool,
 ) -> Result<(Box<dyn Child + Send + Sync>, Arc<ManagedTerminalTeardown>), String> {
     // Reject caller-controlled strings and collections before path resolution
     // or duplicate native-string allocations. Reserve the eight fixed
@@ -2270,7 +2272,12 @@ fn spawn_suspended_managed_terminal(
     .map_err(|error| format!("Invalid managed terminal launch: {error}"))?;
     let cwd = managed_terminal_cwd(cwd)?;
     let executable = resolve_terminal_executable(program, &cwd)?;
-    let environment = with_terminal_env_defaults(env);
+    let environment = if replace_environment {
+        // Provider sealed map already includes required transport keys.
+        env
+    } else {
+        with_terminal_env_defaults(env)
+    };
     validate_terminal_launch_source_bounds(
         executable.as_os_str(),
         cwd.as_os_str(),
@@ -2295,6 +2302,7 @@ fn spawn_suspended_managed_terminal(
             args: args.iter().map(OsString::from).collect(),
             cwd,
             environment,
+            replace_environment,
             display_label: program.to_string(),
         },
     )
@@ -2816,6 +2824,7 @@ fn spawn_with_command(
         env,
         authority,
         Arc::clone(&io),
+        session_id.starts_with("provider-"),
     )?;
     #[cfg(not(windows))]
     let child = {

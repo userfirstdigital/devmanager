@@ -9,8 +9,14 @@ mod connection;
 mod ipc;
 mod lock;
 mod organization_runtime;
+mod provider_health;
+mod provider_launch;
 mod shutdown;
 mod update;
+
+#[cfg(test)]
+#[path = "provider_health_tests.rs"]
+mod provider_health_tests;
 
 pub use crate::updater::handoff::{HostUpdateAdmission, HostUpdateHandoff};
 pub use connection::{

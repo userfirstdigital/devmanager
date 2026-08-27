@@ -288,6 +288,7 @@ struct BoundKey {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ClaudeLaunchRegistration {
     inner: crate::ai::claude_hooks::ClaudeCorrelatedRegistration,
+    scope_env_key: String,
 }
 
 impl ClaudeLaunchRegistration {
@@ -313,6 +314,10 @@ impl ClaudeLaunchRegistration {
 
     pub fn journal_key(&self) -> &crate::remote::presentation::StableSessionKey {
         self.inner.journal_key()
+    }
+
+    pub fn scope_env_key(&self) -> &str {
+        &self.scope_env_key
     }
 
     fn bound_key(&self, identity: &AttestedIdentity) -> BoundKey {
@@ -350,8 +355,9 @@ impl BoundKey {
 pub use crate::ai::claude_hooks::{ClaudeAdmittedDelivery, ClaudeCorrelationBinding};
 
 struct ClaudeAdapterState {
-    probed: Option<ProviderCapabilities>,
-    identity: Option<AttestedIdentity>,
+    /// Keyed by opaque instance scope fingerprint (empty string = unbound/default).
+    probed: HashMap<String, ProviderCapabilities>,
+    identity: HashMap<String, AttestedIdentity>,
     bound: HashMap<BoundKey, ProviderSessionId>,
     bound_order: VecDeque<BoundKey>,
 }
@@ -396,11 +402,20 @@ impl ClaudeCodeAdapter {
         let mut state = adapter.state.lock().map_err(|_| {
             ProviderError::Probe(ProviderProbeError::Io(ProviderProbeIoError::WaitFailed))
         })?;
-        state.identity = Some(AttestedIdentity {
-            executable: observation.executable().clone(),
-            version: observation.version().clone(),
-        });
-        state.probed = Some(observation.capabilities().clone());
+        let scope_key = crate::providers::adapter::provider_scope_env_key(
+            observation.scope_fingerprint(),
+            observation.env_commitment(),
+        );
+        state.identity.insert(
+            scope_key.clone(),
+            AttestedIdentity {
+                executable: observation.executable().clone(),
+                version: observation.version().clone(),
+            },
+        );
+        state
+            .probed
+            .insert(scope_key, observation.capabilities().clone());
         drop(state);
         Ok(adapter)
     }
@@ -426,8 +441,8 @@ impl ClaudeCodeAdapter {
             probes,
             now_ms: Arc::new(now_ms),
             state: Mutex::new(ClaudeAdapterState {
-                probed: None,
-                identity: None,
+                probed: HashMap::new(),
+                identity: HashMap::new(),
                 bound: HashMap::new(),
                 bound_order: VecDeque::new(),
             }),
@@ -435,7 +450,19 @@ impl ClaudeCodeAdapter {
     }
 
     pub fn probed_capabilities(&self) -> Option<ProviderCapabilities> {
-        self.state.lock().ok()?.probed.clone()
+        let state = self.state.lock().ok()?;
+        if state.probed.len() == 1 {
+            state.probed.values().next().cloned()
+        } else {
+            None
+        }
+    }
+
+    pub fn probed_capabilities_for_scope(
+        &self,
+        scope_env_key: &str,
+    ) -> Option<ProviderCapabilities> {
+        self.state.lock().ok()?.probed.get(scope_env_key).cloned()
     }
 
     pub fn register_with_relay(
@@ -447,7 +474,7 @@ impl ClaudeCodeAdapter {
         now: Instant,
     ) -> Result<ClaudeLaunchRegistration, ClaudeAdapterError> {
         let identity = self
-            .attested_identity()
+            .attested_identity_for_scope(&launch.scope_env_key())
             .ok_or(ClaudeAdapterError::RelayUnavailable)?;
         if launch.executable().executable() != &identity.executable {
             return Err(ClaudeAdapterError::RelayUnavailable);
@@ -456,7 +483,10 @@ impl ClaudeCodeAdapter {
         let registered = relay
             .register_correlated_at(journal_key, expected.clone(), expected_resume, None, now)
             .map_err(|_| ClaudeAdapterError::RelayUnavailable)?;
-        Ok(ClaudeLaunchRegistration { inner: registered })
+        Ok(ClaudeLaunchRegistration {
+            inner: registered,
+            scope_env_key: launch.scope_env_key(),
+        })
     }
 
     pub fn rotate_relay_nonce(
@@ -466,7 +496,7 @@ impl ClaudeCodeAdapter {
         now: Instant,
     ) -> Result<ClaudeLaunchRegistration, ClaudeAdapterError> {
         let identity = self
-            .attested_identity()
+            .attested_identity_for_scope(current.scope_env_key())
             .ok_or(ClaudeAdapterError::RelayUnavailable)?;
         let carry = relay.bound_provider_session_id(current.nonce().as_str());
         relay.unregister(current.nonce().as_str());
@@ -479,7 +509,10 @@ impl ClaudeCodeAdapter {
                 now,
             )
             .map_err(|_| ClaudeAdapterError::RelayUnavailable)?;
-        let rotated = ClaudeLaunchRegistration { inner: registered };
+        let rotated = ClaudeLaunchRegistration {
+            inner: registered,
+            scope_env_key: current.scope_env_key.clone(),
+        };
         let mut state = self
             .state
             .lock()
@@ -496,7 +529,16 @@ impl ClaudeCodeAdapter {
     }
 
     fn attested_identity(&self) -> Option<AttestedIdentity> {
-        self.state.lock().ok()?.identity.clone()
+        let state = self.state.lock().ok()?;
+        if state.identity.len() == 1 {
+            state.identity.values().next().cloned()
+        } else {
+            None
+        }
+    }
+
+    fn attested_identity_for_scope(&self, scope_env_key: &str) -> Option<AttestedIdentity> {
+        self.state.lock().ok()?.identity.get(scope_env_key).cloned()
     }
 
     pub fn admit_session_start(
@@ -513,7 +555,7 @@ impl ClaudeCodeAdapter {
         }
         physically_bound_json(body)?;
         let identity = self
-            .attested_identity()
+            .attested_identity_for_scope(presented.scope_env_key())
             .ok_or(ClaudeBindError::RelayRejected)?;
         let delivery = relay
             .ingest_correlated_at(peer, &presented.inner, expected, body, now, unix_epoch_ms())
@@ -688,9 +730,12 @@ impl ClaudeCodeAdapter {
         &self,
         executable: &ProviderExecutableHandle,
         kind: ProviderProbeKind,
+        context: &crate::providers::adapter::ProviderProbeContext,
     ) -> Result<crate::providers::adapter::ProviderProbeResult, ProviderError> {
         let request = ProviderProbeRequest::new(executable.clone(), kind)
-            .map_err(ProviderProbeError::InvalidRequest)?;
+            .map_err(ProviderProbeError::InvalidRequest)?
+            .with_child_environment(context.child_environment.clone())
+            .with_scope_fingerprint(context.scope_fingerprint.clone());
         let result = self.probes.run(request).await?;
         match result.status() {
             ProviderProbeStatus::Completed => Ok(result),
@@ -891,13 +936,16 @@ impl ProviderAdapter for ClaudeCodeAdapter {
     async fn probe(
         &self,
         executable: &ProviderExecutableHandle,
+        context: &crate::providers::adapter::ProviderProbeContext,
     ) -> Result<ProviderCapabilities, ProviderError> {
         let version = self
-            .run_probe(executable, ProviderProbeKind::Version)
+            .run_probe(executable, ProviderProbeKind::Version, context)
             .await?;
-        let help = self.run_probe(executable, ProviderProbeKind::Help).await?;
+        let help = self
+            .run_probe(executable, ProviderProbeKind::Help, context)
+            .await?;
         let auth = self
-            .run_probe(executable, ProviderProbeKind::AuthStatus)
+            .run_probe(executable, ProviderProbeKind::AuthStatus, context)
             .await?;
         let capabilities =
             self.interpret_probe_outputs(version.stdout(), help.stdout(), (self.now_ms)())?;
@@ -906,15 +954,19 @@ impl ProviderAdapter for ClaudeCodeAdapter {
                 crate::providers::adapter::ProviderProbeIoError::WaitFailed,
             ))
         })?;
-        state.identity = Some(AttestedIdentity {
-            executable: executable.executable().clone(),
-            version: capabilities.version.clone(),
-        });
+        let scope_key = context.scope_key();
+        state.identity.insert(
+            scope_key.clone(),
+            AttestedIdentity {
+                executable: executable.executable().clone(),
+                version: capabilities.version.clone(),
+            },
+        );
         // Keep parsed auth for adapter-local decisions. The registry only
         // accepts the stable non-auth projection; trusted auth is a receipt.
         let mut probed = capabilities.clone();
         probed.auth_state = parse_subscription_auth(auth.stdout());
-        state.probed = Some(probed);
+        state.probed.insert(scope_key, probed);
         Ok(capabilities)
     }
 
@@ -922,11 +974,11 @@ impl ProviderAdapter for ClaudeCodeAdapter {
         &self,
         request: LaunchProviderRequest,
     ) -> Result<ProviderLaunchSpec, ProviderError> {
-        let capabilities =
-            self.probed_capabilities()
-                .ok_or(ProviderError::UnsupportedCapability(
-                    ProviderCapability::BuildLaunch,
-                ))?;
+        let capabilities = self
+            .probed_capabilities_for_scope(&request.scope_env_key())
+            .ok_or(ProviderError::UnsupportedCapability(
+                ProviderCapability::BuildLaunch,
+            ))?;
         if capabilities.kind != ProviderKind::ClaudeCode {
             return Err(ProviderError::CapabilityKindMismatch {
                 expected: ProviderKind::ClaudeCode,
@@ -934,7 +986,7 @@ impl ProviderAdapter for ClaudeCodeAdapter {
             });
         }
         let identity = self
-            .attested_identity()
+            .attested_identity_for_scope(&request.scope_env_key())
             .ok_or(ProviderError::UnsupportedCapability(
                 ProviderCapability::BuildLaunch,
             ))?;
@@ -974,26 +1026,49 @@ impl ProviderAdapter for ClaudeCodeAdapter {
         // explicit AskUserQuestion interactions, which are projected separately.
         use crate::providers::adapter::{ProviderAccessMode, ProviderModel};
         let options = request.launch_options();
-        match options.model {
-            ProviderModel::ProviderDefault => {}
-            ProviderModel::ClaudeOpus
-            | ProviderModel::ClaudeSonnet
-            | ProviderModel::ClaudeHaiku => {
-                arguments.extend([
-                    ProviderArgument::new("--model").map_err(|_| {
-                        ProviderError::UnsupportedCapability(ProviderCapability::BuildLaunch)
-                    })?,
-                    ProviderArgument::new(options.model.cli_name().expect("explicit Claude model"))
+        if let Some(slug) = options
+            .custom_model_slug
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            arguments.extend([
+                ProviderArgument::new("--model").map_err(|_| {
+                    ProviderError::UnsupportedCapability(ProviderCapability::BuildLaunch)
+                })?,
+                ProviderArgument::new(slug).map_err(|_| {
+                    ProviderError::UnsupportedCapability(ProviderCapability::BuildLaunch)
+                })?,
+            ]);
+        } else {
+            match options.model {
+                ProviderModel::ProviderDefault => {}
+                ProviderModel::ClaudeOpus
+                | ProviderModel::ClaudeSonnet
+                | ProviderModel::ClaudeHaiku => {
+                    arguments.extend([
+                        ProviderArgument::new("--model").map_err(|_| {
+                            ProviderError::UnsupportedCapability(ProviderCapability::BuildLaunch)
+                        })?,
+                        ProviderArgument::new(
+                            options.model.cli_name().expect("explicit Claude model"),
+                        )
                         .map_err(|_| {
                             ProviderError::UnsupportedCapability(ProviderCapability::BuildLaunch)
                         })?,
-                ]);
+                    ]);
+                }
+                ProviderModel::CodexSol | ProviderModel::CodexTerra | ProviderModel::CodexLuna => {
+                    return Err(ProviderError::UnsupportedCapability(
+                        ProviderCapability::BuildLaunch,
+                    ));
+                }
             }
-            ProviderModel::CodexSol | ProviderModel::CodexTerra | ProviderModel::CodexLuna => {
-                return Err(ProviderError::UnsupportedCapability(
-                    ProviderCapability::BuildLaunch,
-                ));
-            }
+        }
+        for arg in &options.extra_launch_args {
+            arguments.push(ProviderArgument::new(arg.as_str()).map_err(|_| {
+                ProviderError::UnsupportedCapability(ProviderCapability::BuildLaunch)
+            })?);
         }
         if let Some(effort) = options.reasoning_effort.cli_name() {
             arguments.extend([
@@ -1137,9 +1212,10 @@ mod tests {
                 // These probe kinds belong to the shared request contract;
                 // Claude's adapter still uses its stock auth-status command
                 // and does not need a separate login/resume probe here.
-                ProviderProbeKind::LoginStatus | ProviderProbeKind::ResumeHelp => {
-                    (0, Vec::new(), Vec::new())
-                }
+                ProviderProbeKind::LoginStatus
+                | ProviderProbeKind::ResumeHelp
+                | ProviderProbeKind::CursorAboutJson
+                | ProviderProbeKind::CursorAboutPlain => (0, Vec::new(), Vec::new()),
             };
             ProviderProbeResult::from_bounded_output(&request, Some(exit), stdout, stderr)
         }
@@ -1151,7 +1227,13 @@ mod tests {
             1_700_000_000_100
         });
         let executable = fixture_handle();
-        let capabilities = adapter.probe(&executable).await.expect("fixture probe");
+        let capabilities = adapter
+            .probe(
+                &executable,
+                &crate::providers::adapter::ProviderProbeContext::default(),
+            )
+            .await
+            .expect("fixture probe");
         assert_eq!(capabilities.kind, ProviderKind::ClaudeCode);
         assert_eq!(capabilities.version.as_str(), "2.0.72 (Claude Code)");
         assert_eq!(capabilities.auth_state, ProviderAuthState::Unknown);
@@ -1198,7 +1280,13 @@ mod tests {
             let adapter =
                 ClaudeCodeAdapter::with_clock(FixtureProbeRunner::auth(body), || 1_700_000_000_100);
             let executable = fixture_handle();
-            let capabilities = adapter.probe(&executable).await.unwrap();
+            let capabilities = adapter
+                .probe(
+                    &executable,
+                    &crate::providers::adapter::ProviderProbeContext::default(),
+                )
+                .await
+                .unwrap();
             assert_eq!(
                 capabilities.auth_state,
                 ProviderAuthState::Unknown,
@@ -1229,7 +1317,10 @@ mod tests {
         });
         let executable = fixture_handle();
         let capabilities = ClaudeCodeAdapter::with_clock(stderr_only, || 1_700_000_000_100)
-            .probe(&executable)
+            .probe(
+                &executable,
+                &crate::providers::adapter::ProviderProbeContext::default(),
+            )
             .await
             .unwrap();
         assert_ne!(
@@ -1248,7 +1339,10 @@ mod tests {
         });
         let executable = fixture_handle();
         let error = ClaudeCodeAdapter::with_clock(nonzero, || 1_700_000_000_100)
-            .probe(&executable)
+            .probe(
+                &executable,
+                &crate::providers::adapter::ProviderProbeContext::default(),
+            )
             .await
             .expect_err("nonzero auth must not mint evidence");
         assert!(matches!(
@@ -1264,7 +1358,10 @@ mod tests {
         });
         let executable = fixture_handle();
         let error = ClaudeCodeAdapter::with_clock(timed_out, || 1_700_000_000_100)
-            .probe(&executable)
+            .probe(
+                &executable,
+                &crate::providers::adapter::ProviderProbeContext::default(),
+            )
             .await
             .expect_err("timeout must not mint evidence");
         assert!(matches!(
@@ -1295,6 +1392,7 @@ mod tests {
                 &ProviderDiscoveryConfig {
                     executable_override: Some(path),
                     path: None,
+                    ..ProviderDiscoveryConfig::default()
                 },
             )
             .await
@@ -1496,6 +1594,7 @@ mod tests {
                         model: crate::providers::ProviderModel::ClaudeOpus,
                         reasoning_effort: crate::providers::ProviderReasoningEffort::High,
                         access: crate::providers::ProviderAccessMode::ReadOnly,
+                        ..crate::providers::ProviderLaunchOptions::default()
                     }),
             )
             .expect("configured Claude launch");

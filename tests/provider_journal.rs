@@ -24,6 +24,7 @@ impl ProviderAdapter for UnavailableAdapter {
     async fn probe(
         &self,
         _executable: &ProviderExecutableHandle,
+        _context: &devmanager::providers::adapter::ProviderProbeContext,
     ) -> Result<ProviderCapabilities, ProviderError> {
         Err(ProviderError::UnsupportedCapability(
             ProviderCapability::ParseSignal,

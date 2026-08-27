@@ -153,6 +153,7 @@ impl ProviderAdapter for FakeAdapter {
     async fn probe(
         &self,
         executable: &ProviderExecutableHandle,
+        _context: &devmanager::providers::adapter::ProviderProbeContext,
     ) -> Result<ProviderCapabilities, ProviderError> {
         self.capability_probes.fetch_add(1, Ordering::Relaxed);
         if self.panic_on_probe.load(Ordering::Acquire) {
@@ -220,6 +221,7 @@ impl ProviderAdapter for ProbeOnlyAdapter {
     async fn probe(
         &self,
         _executable: &ProviderExecutableHandle,
+        _context: &devmanager::providers::adapter::ProviderProbeContext,
     ) -> Result<ProviderCapabilities, ProviderError> {
         self.probes.fetch_add(1, Ordering::Relaxed);
         Ok(self.capabilities.clone())
@@ -320,6 +322,7 @@ fn discovery(override_path: Option<PathBuf>, path_root: Option<&Path>) -> Provid
     ProviderDiscoveryConfig {
         executable_override: override_path,
         path: path_root.map(|root| OsString::from(root.as_os_str())),
+        ..Default::default()
     }
 }
 
@@ -917,6 +920,7 @@ impl ProviderAdapter for PausedNativeAdapter {
     async fn probe(
         &self,
         _executable: &ProviderExecutableHandle,
+        _context: &devmanager::providers::adapter::ProviderProbeContext,
     ) -> Result<ProviderCapabilities, ProviderError> {
         self.started.fetch_add(1, Ordering::SeqCst);
         let release = Arc::clone(&self.release);
@@ -1644,7 +1648,11 @@ async fn provider_observation_wire_is_versioned_and_validates_cross_fields() {
         .unwrap();
     let encoded = serde_json::to_value(&observation).unwrap();
 
-    assert_eq!(encoded["schema_version"], serde_json::json!(1));
+    let observation_schema = devmanager::providers::PROVIDER_OBSERVATION_SCHEMA_VERSION;
+    assert_eq!(
+        encoded["schema_version"],
+        serde_json::json!(observation_schema)
+    );
 
     let mut missing_schema = encoded.clone();
     missing_schema
@@ -1662,10 +1670,15 @@ async fn provider_observation_wire_is_versioned_and_validates_cross_fields() {
     assert!(serde_json::from_value::<ProviderObservation>(unknown).is_err());
 
     let raw = serde_json::to_string(&serde_json::to_value(&observation).unwrap()).unwrap();
+    let version_field = format!("\"schema_version\":{observation_schema}");
     let duplicate = raw.replacen(
-        "\"schema_version\":1,",
-        "\"schema_version\":1,\"schema_version\":1,",
+        &version_field,
+        &format!("{version_field},{version_field}"),
         1,
+    );
+    assert_ne!(
+        raw, duplicate,
+        "fixture must actually duplicate the version field"
     );
     assert!(serde_json::from_str::<ProviderObservation>(&duplicate).is_err());
 
@@ -1677,7 +1690,10 @@ async fn provider_observation_wire_is_versioned_and_validates_cross_fields() {
         observation.semantic_schema_version,
     );
     let cache_value = serde_json::to_value(&cache_key).unwrap();
-    assert_eq!(cache_value["schema_version"], serde_json::json!(1));
+    assert_eq!(
+        cache_value["schema_version"],
+        serde_json::json!(devmanager::providers::capabilities::PROVIDER_CACHE_KEY_SCHEMA_VERSION)
+    );
     let mut cache_missing_schema = cache_value.clone();
     cache_missing_schema
         .as_object_mut()
@@ -1812,6 +1828,7 @@ impl ProviderAdapter for BoundaryAdapter {
     async fn probe(
         &self,
         _executable: &ProviderExecutableHandle,
+        _context: &devmanager::providers::adapter::ProviderProbeContext,
     ) -> Result<ProviderCapabilities, ProviderError> {
         Ok(capabilities(
             ProviderKind::ClaudeCode,
@@ -2029,6 +2046,7 @@ async fn registry_rejects_relative_and_oversized_path_entries_before_fallback() 
             &ProviderDiscoveryConfig {
                 executable_override: None,
                 path: Some(relative_path),
+                ..Default::default()
             },
         )
         .await;
@@ -2045,6 +2063,7 @@ async fn registry_rejects_relative_and_oversized_path_entries_before_fallback() 
             &ProviderDiscoveryConfig {
                 executable_override: None,
                 path: Some(oversized_path),
+                ..Default::default()
             },
         )
         .await;
@@ -2160,6 +2179,7 @@ impl ProviderAdapter for OrderedAdapter {
     async fn probe(
         &self,
         _executable: &ProviderExecutableHandle,
+        _context: &devmanager::providers::adapter::ProviderProbeContext,
     ) -> Result<ProviderCapabilities, ProviderError> {
         self.events.lock().unwrap().push("probe-capabilities");
         Ok(capabilities(
@@ -2417,6 +2437,7 @@ async fn cursor_public_adapter_registers_without_accepting_desktop_cursor_exe() 
             &ProviderDiscoveryConfig {
                 executable_override: Some(desktop),
                 path: None,
+                ..Default::default()
             },
         )
         .await;

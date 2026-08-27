@@ -74,8 +74,10 @@ impl TaskWorkspace {
         metrics: AllocationMetrics,
     ) -> AllocatedWorkspace {
         let metrics = metrics.sanitized();
-        self.restore_automatic_panes_that_fit(viewport, metrics);
-        self.compact_until_fit(viewport, metrics);
+        // CompactAutomatic was a focus/width hide; restore to Full so only
+        // explicit CompactManual remains condensed. Geometry shrinks panes
+        // instead of swapping full content for snippets.
+        self.restore_automatic_to_full();
 
         let mut allocated = AllocatedWorkspace::default();
         if let Some(root) = self.root() {
@@ -94,52 +96,12 @@ impl TaskWorkspace {
         allocated
     }
 
-    fn restore_automatic_panes_that_fit(&mut self, viewport: Viewport, metrics: AllocationMetrics) {
-        let mut candidates: Vec<_> = self
-            .task_ids()
-            .into_iter()
-            .filter_map(|task_id| {
-                let pane = self.pane_for_task(task_id)?;
-                (pane.presentation == PanePresentation::CompactAutomatic)
-                    .then_some((pane.last_focused_at, task_id))
-            })
-            .collect();
-        candidates.sort_by_key(|(last_focused_at, _)| std::cmp::Reverse(*last_focused_at));
-        for (_, task_id) in candidates {
-            let _ = self.set_presentation(task_id, PanePresentation::Full);
-            if !self.minimum_fits(viewport, metrics) {
-                let _ = self.set_presentation(task_id, PanePresentation::CompactAutomatic);
+    fn restore_automatic_to_full(&mut self) {
+        for task_id in self.task_ids() {
+            if self.presentation(task_id) == Some(PanePresentation::CompactAutomatic) {
+                let _ = self.set_presentation(task_id, PanePresentation::Full);
             }
         }
-    }
-
-    fn compact_until_fit(&mut self, viewport: Viewport, metrics: AllocationMetrics) {
-        while !self.minimum_fits(viewport, metrics) {
-            let focused = self.focused_task();
-            let candidate = self
-                .task_ids()
-                .into_iter()
-                .filter(|task_id| Some(*task_id) != focused && self.task_is_unpinned(*task_id))
-                .filter_map(|task_id| {
-                    let pane = self.pane_for_task(task_id)?;
-                    (pane.presentation == PanePresentation::Full)
-                        .then_some((pane.last_focused_at, task_id))
-                })
-                .min_by_key(|(last_focused_at, _)| *last_focused_at)
-                .map(|(_, task_id)| task_id);
-            let Some(task_id) = candidate else {
-                break;
-            };
-            let _ = self.set_presentation(task_id, PanePresentation::CompactAutomatic);
-        }
-    }
-
-    fn minimum_fits(&self, viewport: Viewport, metrics: AllocationMetrics) -> bool {
-        let Some(root) = self.root() else {
-            return true;
-        };
-        let minimum = minimum_size(root, metrics);
-        minimum.width <= viewport.width && minimum.height <= viewport.height
     }
 }
 
@@ -207,14 +169,19 @@ fn allocate_node(
             let minimums: Vec<f32> = children
                 .iter()
                 .map(|child| {
-                    let minimum = minimum_size(&child.node, metrics);
-                    match axis {
-                        Axis::Horizontal => minimum.width,
-                        Axis::Vertical => minimum.height,
+                    let preferred = minimum_size(&child.node, metrics);
+                    let preferred = match axis {
+                        Axis::Horizontal => preferred.width,
+                        Axis::Vertical => preferred.height,
+                    };
+                    match child.allocation {
+                        Allocation::Pinned { logical_px } => preferred.min(logical_px),
+                        Allocation::Auto { .. } => preferred,
                     }
                 })
                 .collect();
-            let sizes = allocate_axis_sizes(children, &minimums, available);
+            let fallback_resize_index = least_recent_focus_child_index(children);
+            let sizes = allocate_axis_sizes(children, &minimums, available, fallback_resize_index);
             let mut cursor = match axis {
                 Axis::Horizontal => rect.x,
                 Axis::Vertical => rect.y,
@@ -248,48 +215,153 @@ fn allocate_axis_sizes(
     children: &[super::layout::SplitChild],
     minimums: &[f32],
     available: f32,
+    fallback_resize_index: Option<usize>,
 ) -> Vec<f32> {
     if children.is_empty() {
         return Vec::new();
     }
-    let bases: Vec<f32> = children
+
+    let mut sizes: Vec<f32> = children
         .iter()
         .zip(minimums)
         .map(|(child, minimum)| match child.allocation {
             Allocation::Auto { .. } => *minimum,
-            Allocation::Pinned { logical_px } => logical_px.max(*minimum),
+            Allocation::Pinned { logical_px } => logical_px,
         })
         .collect();
-    let base_total: f32 = bases.iter().sum();
-    if base_total > available && base_total > 0.0 {
-        let scale = available / base_total;
-        return bases.into_iter().map(|base| base * scale).collect();
-    }
 
-    let extra = (available - base_total).max(0.0);
-    let auto_weight: f32 = children
+    let pinned_total: f32 = children
         .iter()
-        .map(|child| match child.allocation {
-            Allocation::Auto { weight } if contains_full_pane(&child.node) => weight,
-            Allocation::Pinned { .. } => 0.0,
+        .zip(&sizes)
+        .map(|(child, size)| match child.allocation {
+            Allocation::Pinned { .. } => *size,
             Allocation::Auto { .. } => 0.0,
         })
         .sum();
+    let auto_min_total: f32 = children
+        .iter()
+        .zip(minimums)
+        .map(|(child, minimum)| match child.allocation {
+            Allocation::Auto { .. } => *minimum,
+            Allocation::Pinned { .. } => 0.0,
+        })
+        .sum();
+
+    let full_auto_weight: f32 = children
+        .iter()
+        .map(|child| match child.allocation {
+            Allocation::Auto { weight } if contains_full_pane(&child.node) => weight,
+            _ => 0.0,
+        })
+        .sum();
+    let auto_weight: f32 = if full_auto_weight > 0.0 {
+        full_auto_weight
+    } else {
+        children
+            .iter()
+            .map(|child| match child.allocation {
+                Allocation::Auto { weight } => weight,
+                Allocation::Pinned { .. } => 0.0,
+            })
+            .sum()
+    };
+
+    let remaining_for_auto = available - pinned_total;
+    if remaining_for_auto + f32::EPSILON >= auto_min_total && auto_weight > 0.0 {
+        // Keep pinned at requested sizes; Auto siblings absorb surplus (and
+        // any prior oversize shrink by starting from mins then taking remainder).
+        let auto_extra = (remaining_for_auto - auto_min_total).max(0.0);
+        for (index, child) in children.iter().enumerate() {
+            let weight = match child.allocation {
+                Allocation::Auto { weight }
+                    if full_auto_weight > 0.0 && contains_full_pane(&child.node) =>
+                {
+                    weight
+                }
+                Allocation::Auto { weight } if full_auto_weight == 0.0 => weight,
+                _ => 0.0,
+            };
+            if weight > 0.0 {
+                sizes[index] = minimums[index] + auto_extra * weight / auto_weight;
+            }
+        }
+        return sizes;
+    }
+
+    // Deficit: Auto already at mins. Shrink pinned via LRF before proportional
+    // compression, preserving other pinned when an Auto path cannot absorb.
+    for (index, child) in children.iter().enumerate() {
+        if matches!(child.allocation, Allocation::Auto { .. }) {
+            sizes[index] = minimums[index];
+        }
+    }
+    let mut deficit = sizes.iter().sum::<f32>() - available;
+    if deficit > 0.0 {
+        if let Some(index) = fallback_resize_index.filter(|index| *index < sizes.len()) {
+            let reducible = (sizes[index] - minimums[index]).max(0.0);
+            let take = deficit.min(reducible);
+            sizes[index] -= take;
+            deficit -= take;
+        }
+        if deficit > 0.0 {
+            // Remaining deficit: shrink other children toward mins, LRF order.
+            let mut order: Vec<_> = (0..children.len()).collect();
+            order.sort_by_key(|index| most_recent_focus(&children[*index].node).unwrap_or(0));
+            for index in order {
+                if deficit <= 0.0 {
+                    break;
+                }
+                let reducible = (sizes[index] - minimums[index]).max(0.0);
+                let take = deficit.min(reducible);
+                sizes[index] -= take;
+                deficit -= take;
+            }
+        }
+        if deficit > 0.0 {
+            // Physical mins still exceed available: proportional compress.
+            let total: f32 = sizes.iter().sum();
+            if total > 0.0 {
+                let scale = available / total;
+                for size in &mut sizes {
+                    *size *= scale;
+                }
+            }
+        }
+    } else if deficit < 0.0 {
+        // Floating error / all-pinned surplus with no Auto weight.
+        let surplus = -deficit;
+        if let Some(index) = fallback_resize_index.filter(|index| *index < sizes.len()) {
+            sizes[index] += surplus;
+        } else if let Some(last) = sizes.last_mut() {
+            *last += surplus;
+        }
+    }
+
+    sizes
+}
+
+/// Rank each split child by its most-recent focus among descendants, then pick
+/// the least-recently-focused branch so an active nested pane is not resized
+/// when an older wholly-unfocused sibling branch exists.
+fn least_recent_focus_child_index(children: &[super::layout::SplitChild]) -> Option<usize> {
     children
         .iter()
-        .zip(bases)
-        .map(|(child, base)| {
-            let weight = match child.allocation {
-                Allocation::Auto { weight } if contains_full_pane(&child.node) => weight,
-                Allocation::Auto { .. } | Allocation::Pinned { .. } => 0.0,
-            };
-            if auto_weight > 0.0 {
-                base + extra * weight / auto_weight
-            } else {
-                base
-            }
+        .enumerate()
+        .filter_map(|(index, child)| {
+            most_recent_focus(&child.node).map(|last_focused_at| (index, last_focused_at))
         })
-        .collect()
+        .min_by_key(|(_, last_focused_at)| *last_focused_at)
+        .map(|(index, _)| index)
+}
+
+fn most_recent_focus(node: &WorkspaceNode) -> Option<u64> {
+    match node {
+        WorkspaceNode::Pane(pane) => Some(pane.last_focused_at),
+        WorkspaceNode::Split { children, .. } => children
+            .iter()
+            .filter_map(|child| most_recent_focus(&child.node))
+            .max(),
+    }
 }
 
 fn contains_full_pane(node: &WorkspaceNode) -> bool {
@@ -339,6 +411,16 @@ mod tests {
         (workspace, [first, second, third])
     }
 
+    fn production_like_metrics() -> AllocationMetrics {
+        AllocationMetrics {
+            full_min_width: 360.0,
+            full_min_height: 300.0,
+            compact_min_width: 210.0,
+            compact_min_height: 116.0,
+            divider: 4.0,
+        }
+    }
+
     #[test]
     fn pinned_children_keep_requested_pixels_while_auto_children_share_the_remainder() {
         let (mut workspace, [first, second, third]) = three_horizontal_tasks();
@@ -352,19 +434,31 @@ mod tests {
     }
 
     #[test]
-    fn pressure_compacts_the_least_recent_unpinned_pane_and_room_reexpands_it() {
+    fn narrow_pressure_keeps_full_presentation_and_fills_parent() {
         let (mut workspace, [first, second, third]) = three_horizontal_tasks();
         workspace.focus_task(second).unwrap();
 
-        workspace.allocate(Viewport::new(550.0, 700.0), metrics());
-        assert_eq!(
-            workspace.presentation(first),
-            Some(PanePresentation::CompactAutomatic)
-        );
-        assert_eq!(workspace.presentation(third), Some(PanePresentation::Full));
-
-        workspace.allocate(Viewport::new(1_400.0, 700.0), metrics());
+        let allocated = workspace.allocate(Viewport::new(550.0, 700.0), metrics());
         assert_eq!(workspace.presentation(first), Some(PanePresentation::Full));
+        assert_eq!(workspace.presentation(second), Some(PanePresentation::Full));
+        assert_eq!(workspace.presentation(third), Some(PanePresentation::Full));
+        assert_eq!(
+            allocated.width(first).unwrap()
+                + allocated.width(second).unwrap()
+                + allocated.width(third).unwrap(),
+            550.0
+        );
+    }
+
+    #[test]
+    fn automatic_compact_migrates_to_full_on_allocate() {
+        let (mut workspace, [first, second, _third]) = three_horizontal_tasks();
+        workspace
+            .set_presentation(first, PanePresentation::CompactAutomatic)
+            .unwrap();
+        workspace.allocate(Viewport::new(1_000.0, 700.0), metrics());
+        assert_eq!(workspace.presentation(first), Some(PanePresentation::Full));
+        assert_eq!(workspace.presentation(second), Some(PanePresentation::Full));
     }
 
     #[test]
@@ -381,5 +475,197 @@ mod tests {
         assert_eq!(allocated.width(first), Some(80.0));
         assert_eq!(allocated.width(second), Some(460.0));
         assert_eq!(allocated.width(third), Some(460.0));
+    }
+
+    #[test]
+    fn compact_only_vertical_split_fills_parent_without_unowned_gap() {
+        let first = TaskId::new();
+        let second = TaskId::new();
+        let mut workspace = TaskWorkspace::single(first);
+        workspace
+            .insert_after_focused(second, Axis::Vertical)
+            .unwrap();
+        workspace.set_manual_compact(first, true).unwrap();
+        workspace.set_manual_compact(second, true).unwrap();
+
+        let allocated = workspace.allocate(Viewport::new(700.0, 700.0), production_like_metrics());
+
+        assert_eq!(allocated.height(first), Some(348.0));
+        assert_eq!(allocated.height(second), Some(348.0));
+        assert_eq!(
+            allocated.height(first).unwrap() + 4.0 + allocated.height(second).unwrap(),
+            700.0
+        );
+    }
+
+    #[test]
+    fn nested_splits_conserve_parent_extent_on_both_axes() {
+        let first = TaskId::new();
+        let second = TaskId::new();
+        let third = TaskId::new();
+        let mut workspace = TaskWorkspace::single(first);
+        workspace
+            .insert_after_focused(second, Axis::Horizontal)
+            .unwrap();
+        workspace.focus_task(second).unwrap();
+        workspace
+            .insert_after_focused(third, Axis::Vertical)
+            .unwrap();
+        workspace.set_manual_compact(third, true).unwrap();
+
+        let allocated =
+            workspace.allocate(Viewport::new(1_000.0, 700.0), production_like_metrics());
+        let first_rect = allocated.rect(first).expect("first");
+        let second_rect = allocated.rect(second).expect("second");
+        let third_rect = allocated.rect(third).expect("third");
+
+        assert_eq!(first_rect.width + 4.0 + second_rect.width, 1_000.0);
+        assert_eq!(first_rect.height, 700.0);
+        assert_eq!(second_rect.height + 4.0 + third_rect.height, 700.0);
+        assert_eq!(second_rect.width, third_rect.width);
+    }
+
+    #[test]
+    fn all_pinned_children_resize_the_least_recently_focused_to_fill() {
+        let (mut workspace, [first, second, third]) = three_horizontal_tasks();
+        workspace.focus_task(second).unwrap();
+        workspace.focus_task(third).unwrap();
+        workspace.pin_task_axis_size(first, 200.0).unwrap();
+        workspace.pin_task_axis_size(second, 200.0).unwrap();
+        workspace.pin_task_axis_size(third, 200.0).unwrap();
+
+        let allocated = workspace.allocate(Viewport::new(1_000.0, 700.0), metrics());
+        let widths = [
+            allocated.width(first).unwrap(),
+            allocated.width(second).unwrap(),
+            allocated.width(third).unwrap(),
+        ];
+        assert_eq!(widths.iter().sum::<f32>(), 1_000.0);
+        assert!(
+            widths[0] > 200.0,
+            "least-recently-focused pinned child absorbs surplus: {widths:?}"
+        );
+        assert_eq!(widths[1], 200.0);
+        assert_eq!(widths[2], 200.0);
+    }
+
+    #[test]
+    fn pinned_deficit_is_absorbed_by_auto_siblings_before_pinned_shrink() {
+        let (mut workspace, [first, second, third]) = three_horizontal_tasks();
+        workspace.pin_task_axis_size(first, 300.0).unwrap();
+        workspace.pin_task_axis_size(second, 250.0).unwrap();
+
+        let wide = workspace.allocate(Viewport::new(1_000.0, 700.0), metrics());
+        assert_eq!(wide.width(first), Some(300.0));
+        assert_eq!(wide.width(second), Some(250.0));
+        assert_eq!(wide.width(third), Some(450.0));
+
+        let narrow = workspace.allocate(Viewport::new(900.0, 700.0), metrics());
+        assert_eq!(narrow.width(first), Some(300.0));
+        assert_eq!(narrow.width(second), Some(250.0));
+        assert_eq!(
+            narrow.width(third),
+            Some(350.0),
+            "auto sibling absorbs the 100px deficit while pinned sizes stay put"
+        );
+    }
+
+    #[test]
+    fn all_pinned_deficit_shrinks_least_recent_branch_first() {
+        let (mut workspace, [first, second, third]) = three_horizontal_tasks();
+        workspace.focus_task(second).unwrap();
+        workspace.focus_task(third).unwrap();
+        workspace.pin_task_axis_size(first, 400.0).unwrap();
+        workspace.pin_task_axis_size(second, 400.0).unwrap();
+        workspace.pin_task_axis_size(third, 400.0).unwrap();
+
+        let allocated = workspace.allocate(Viewport::new(1_050.0, 700.0), metrics());
+        let widths = [
+            allocated.width(first).unwrap(),
+            allocated.width(second).unwrap(),
+            allocated.width(third).unwrap(),
+        ];
+        assert!((widths.iter().sum::<f32>() - 1_050.0).abs() < 0.01);
+        assert!(
+            widths[0] < 400.0,
+            "LRF pinned branch absorbs deficit first: {widths:?}"
+        );
+        assert_eq!(widths[1], 400.0);
+        assert_eq!(widths[2], 400.0);
+        let smaller = workspace.allocate(Viewport::new(900.0, 700.0), metrics());
+        assert_eq!(smaller.width(first), Some(220.0));
+        assert_eq!(smaller.width(second), Some(280.0));
+        assert_eq!(smaller.width(third), Some(400.0));
+    }
+
+    #[test]
+    fn nested_lrf_uses_most_recent_focus_per_branch() {
+        let left_old = TaskId::new();
+        let left_older = TaskId::new();
+        let focused = TaskId::new();
+        let mut workspace = TaskWorkspace::single(left_old);
+        workspace
+            .insert_after_focused(focused, Axis::Horizontal)
+            .unwrap();
+        workspace.focus_task(left_old).unwrap();
+        workspace
+            .insert_after_focused(left_older, Axis::Vertical)
+            .unwrap();
+        workspace.focus_task(focused).unwrap();
+        let horizontal_id = match workspace.root().expect("root") {
+            crate::ui::task_workspace::WorkspaceNode::Split {
+                id,
+                axis: Axis::Horizontal,
+                ..
+            } => *id,
+            _ => panic!("expected horizontal root after insert"),
+        };
+        workspace
+            .resize_split_child(horizontal_id, 0, 500.0)
+            .unwrap();
+        workspace.pin_task_axis_size(focused, 500.0).unwrap();
+
+        let allocated = workspace.allocate(Viewport::new(800.0, 700.0), metrics());
+        let left_w = allocated.width(left_old).unwrap();
+        let right_w = allocated.width(focused).unwrap();
+        assert!((left_w + right_w - 800.0).abs() < 0.01);
+        assert_eq!(right_w, 500.0, "active right branch keeps preferred size");
+        assert_eq!(
+            left_w, 300.0,
+            "older left branch (lower max focus) absorbs horizontal deficit"
+        );
+    }
+
+    #[test]
+    fn pinned_sizes_stay_put_when_an_auto_sibling_can_absorb_resize() {
+        let (mut workspace, [first, second, third]) = three_horizontal_tasks();
+        workspace.pin_task_axis_size(first, 300.0).unwrap();
+        workspace.pin_task_axis_size(second, 250.0).unwrap();
+
+        let allocated = workspace.allocate(Viewport::new(1_000.0, 700.0), metrics());
+        assert_eq!(allocated.width(first), Some(300.0));
+        assert_eq!(allocated.width(second), Some(250.0));
+        assert_eq!(allocated.width(third), Some(450.0));
+    }
+
+    #[test]
+    fn full_content_survives_narrow_pressure_until_manual_compact() {
+        let (mut workspace, [first, second, third]) = three_horizontal_tasks();
+        workspace.focus_task(third).unwrap();
+        workspace.set_manual_compact(second, true).unwrap();
+
+        let allocated = workspace.allocate(Viewport::new(900.0, 700.0), production_like_metrics());
+        assert_eq!(workspace.presentation(first), Some(PanePresentation::Full));
+        assert_eq!(
+            workspace.presentation(second),
+            Some(PanePresentation::CompactManual)
+        );
+        assert_eq!(workspace.presentation(third), Some(PanePresentation::Full));
+        let total = allocated.width(first).unwrap()
+            + 4.0
+            + allocated.width(second).unwrap()
+            + 4.0
+            + allocated.width(third).unwrap();
+        assert_eq!(total, 900.0);
     }
 }

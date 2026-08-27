@@ -220,4 +220,39 @@ mod task_pane_view_model_tests {
         assert_eq!(interactive.len(), 1);
         assert_eq!(interactive[0].task_id, second);
     }
+
+    #[test]
+    fn background_full_panes_keep_full_body_while_only_focus_owns_composer() {
+        let first = TaskId::new();
+        let second = TaskId::new();
+        let third = TaskId::new();
+        let mut workspace = TaskWorkspace::single(first);
+        workspace
+            .insert_after_focused(second, Axis::Horizontal)
+            .expect("second pane");
+        workspace
+            .insert_after_focused(third, Axis::Horizontal)
+            .expect("third pane");
+        workspace.focus_task(second).expect("focus second");
+        workspace
+            .set_manual_compact(third, true)
+            .expect("compact third");
+        let projections = [first, second, third]
+            .into_iter()
+            .map(|task_id| (task_id, projection(task_id, Some("live"), false)))
+            .collect();
+
+        let model = TaskWorkspaceViewModel::build(&workspace, &projections).expect("workspace");
+        let panes = model.panes();
+        let first_pane = panes.iter().find(|pane| pane.task_id == first).unwrap();
+        let second_pane = panes.iter().find(|pane| pane.task_id == second).unwrap();
+        let third_pane = panes.iter().find(|pane| pane.task_id == third).unwrap();
+
+        assert_eq!(first_pane.body, TaskPaneBody::Full);
+        assert!(!first_pane.build_composer);
+        assert_eq!(second_pane.body, TaskPaneBody::Full);
+        assert!(second_pane.build_composer);
+        assert_eq!(third_pane.body, TaskPaneBody::Compact);
+        assert!(!third_pane.build_composer);
+    }
 }

@@ -29,8 +29,8 @@ use gpui::{
     ElementInputHandler, Entity, EntityInputHandler, FocusHandle, FontWeight, Hsla, ImageFormat,
     ImageSource, InteractiveElement, IntoElement, KeyDownEvent, MouseButton, MouseDownEvent,
     MouseMoveEvent, MouseUpEvent, ObjectFit, ParentElement, PathPromptOptions, Pixels, Point,
-    Render, RenderImage, ScrollWheelEvent, Size, StatefulInteractiveElement, Styled, StyledImage,
-    Subscription, Task, UTF16Selection, UniformListScrollHandle, Window, WindowBounds,
+    Render, RenderImage, ScrollWheelEvent, SharedString, Size, StatefulInteractiveElement, Styled,
+    StyledImage, Subscription, Task, UTF16Selection, UniformListScrollHandle, Window, WindowBounds,
     WindowOptions,
 };
 use gpui_component::button::{Button, ButtonVariants};
@@ -286,12 +286,12 @@ const HOST_BOOTSTRAP_REATTACH_TICKS: usize = 60;
 const IDLE_PHOTO_FETCH_TIMEOUT: Duration = Duration::from_secs(8);
 #[cfg_attr(test, allow(dead_code))]
 const IDLE_PHOTO_MAX_BYTES: u64 = 8 * 1024 * 1024;
-const CONVERSATION_COMPOSER_HEIGHT_RESERVE: f32 = 230.0;
+const CONVERSATION_COMPOSER_HEIGHT_RESERVE: f32 = 200.0;
 const CONVERSATION_COMPOSER_OUTER_RADIUS: f32 = 22.0;
 const CONVERSATION_COMPOSER_INNER_RADIUS: f32 = 20.0;
 const CONVERSATION_COMPOSER_CONTEXT_INSET: f32 = 22.0;
-const CONVERSATION_COMPOSER_SEND_DIAMETER: f32 = 32.0;
-const CONVERSATION_COMPOSER_INPUT_MIN_HEIGHT: f32 = 102.0;
+const CONVERSATION_COMPOSER_SEND_DIAMETER: f32 = 28.0;
+const CONVERSATION_COMPOSER_INPUT_MIN_HEIGHT: f32 = 88.0;
 const T3_SIDEBAR_WIDTH: f32 = 256.0;
 const T3_SIDEBAR_ROW_HEIGHT: f32 = 78.0;
 const T3_WORKSPACE_TOPBAR_HEIGHT: f32 = 32.0;
@@ -806,6 +806,22 @@ fn stable_theme_element_key(seed: &str, suffix: &str) -> u64 {
     digest.update(b"native-theme");
     digest.update([0]);
     digest.update(seed.as_bytes());
+    digest.update([0]);
+    digest.update(suffix.as_bytes());
+    let digest = digest.finalize();
+    u64::from_be_bytes(
+        digest[..8]
+            .try_into()
+            .expect("sha256 digest always contains eight bytes"),
+    )
+}
+
+/// Deterministic numeric suffix for provider-settings ElementIds.
+fn stable_provider_element_key(instance_id: &str, suffix: &str) -> u64 {
+    let mut digest = Sha256::new();
+    digest.update(b"native-provider");
+    digest.update([0]);
+    digest.update(instance_id.as_bytes());
     digest.update([0]);
     digest.update(suffix.as_bytes());
     let digest = digest.finalize();
@@ -2069,6 +2085,11 @@ pub enum NativeHostCommand {
     AgentConnectionQuery {
         request_id: RequestId,
     },
+    /// Local-authority provider settings (no task id). Snapshot/refresh/mutate.
+    ProviderSettingsQuery {
+        request_id: RequestId,
+        request: crate::providers::settings::ProviderSettingsHostRequest,
+    },
     /// Shared action catalog observation through the live host grant seam.
     HostActionsQuery {
         request_id: RequestId,
@@ -2129,6 +2150,7 @@ fn native_command_id(command: &NativeHostCommand) -> Option<CommandId> {
         | NativeHostCommand::TaskListQuery { .. }
         | NativeHostCommand::HostStatusQuery { .. }
         | NativeHostCommand::AgentConnectionQuery { .. }
+        | NativeHostCommand::ProviderSettingsQuery { .. }
         | NativeHostCommand::HostActionsQuery { .. }
         | NativeHostCommand::TaskCockpitQuery { .. }
         | NativeHostCommand::PromptLibraryQuery { .. }
@@ -2148,6 +2170,7 @@ fn native_request_id(command: &NativeHostCommand) -> Option<RequestId> {
         | NativeHostCommand::TaskListQuery { request_id }
         | NativeHostCommand::HostStatusQuery { request_id }
         | NativeHostCommand::AgentConnectionQuery { request_id }
+        | NativeHostCommand::ProviderSettingsQuery { request_id, .. }
         | NativeHostCommand::HostActionsQuery { request_id }
         | NativeHostCommand::TaskCockpitQuery { request_id, .. }
         | NativeHostCommand::PromptLibraryQuery { request_id, .. }
@@ -2177,6 +2200,7 @@ fn is_native_query_command(command: &NativeHostCommand) -> bool {
             | NativeHostCommand::TaskListQuery { .. }
             | NativeHostCommand::HostStatusQuery { .. }
             | NativeHostCommand::AgentConnectionQuery { .. }
+            | NativeHostCommand::ProviderSettingsQuery { .. }
             | NativeHostCommand::HostActionsQuery { .. }
             | NativeHostCommand::TaskCockpitQuery { .. }
             | NativeHostCommand::PromptLibraryQuery { .. }
@@ -2188,6 +2212,7 @@ fn is_global_native_query_command(command: &NativeHostCommand) -> bool {
         command,
         NativeHostCommand::HostStatusQuery { .. }
             | NativeHostCommand::AgentConnectionQuery { .. }
+            | NativeHostCommand::ProviderSettingsQuery { .. }
             | NativeHostCommand::HostActionsQuery { .. }
     )
 }
@@ -2254,8 +2279,39 @@ struct RenameTaskDraft {
 
 struct DeleteTaskDraft {
     task_id: TaskId,
+    /// Title captured when the confirmation opened (selected task, not a later archive label).
     title: String,
     error: Option<String>,
+    stage: DeleteTaskStage,
+}
+
+/// Exact archive→delete intent stages. Deferred deletion is command-correlated and
+/// never recreated after cancel/replace; only a still-live draft may advance.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DeleteTaskStage {
+    Confirming,
+    AwaitingArchive {
+        command_id: CommandId,
+        archive_accepted: bool,
+    },
+    AwaitingDelete {
+        command_id: CommandId,
+    },
+}
+
+impl DeleteTaskStage {
+    fn is_submitting(&self) -> bool {
+        !matches!(self, Self::Confirming)
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum DeleteFlowSettleKind {
+    Accepted,
+    Rejected { message: String },
+    Failed { message: String },
+    Uncertain { message: String },
+    Stale { message: String },
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -2271,6 +2327,41 @@ enum ThemeEditorFocus {
     Canvas,
     Accent,
     Role(ThemeColorRole),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ProviderSettingsFieldFocus {
+    DisplayName,
+    AccentColor,
+    BinaryPath,
+    HomePath,
+    ShadowHomePath,
+    LaunchArgs,
+    ApiEndpoint,
+    EnvName(usize),
+    EnvValue(usize),
+    CustomModelSlug,
+    WizardInstanceId,
+    WizardDisplayName,
+    HealthInterval,
+}
+
+struct ProviderSettingsEditor {
+    instance_id: Option<String>,
+    focused: ProviderSettingsFieldFocus,
+    display_name: TextField,
+    accent: TextField,
+    binary: TextField,
+    home: TextField,
+    shadow: TextField,
+    launch_args: TextField,
+    endpoint: TextField,
+    env_names: Vec<TextField>,
+    env_values: Vec<TextField>,
+    custom_model: TextField,
+    wizard_id: TextField,
+    wizard_name: TextField,
+    health_interval: TextField,
 }
 
 struct ThemeEditorState {
@@ -3047,6 +3138,7 @@ pub enum NativeHostQueryBody {
     Text,
     ConfigSidebar(crate::domain::ConfigSidebarSnapshot),
     AgentConnection(AgentConnectionSnapshot),
+    ProviderSettings(crate::providers::settings::ProviderSettingsReply),
     TaskCockpit(crate::domain::TaskCockpitResult),
     PromptLibrary(PromptProjectionReply),
     Updater(UpdaterSnapshot),
@@ -5512,6 +5604,21 @@ async fn execute_native_command(
                 }),
             }
         }
+        NativeHostCommand::ProviderSettingsQuery {
+            request_id,
+            request,
+        } => {
+            let _ = request_id;
+            match client.query_provider_settings(request).await? {
+                Ok(reply) => Ok(NativeHostExecutionResult::Query {
+                    detail: bounded_host_error("provider.settings"),
+                    body: NativeHostQueryBody::ProviderSettings(reply),
+                }),
+                Err(error) => Ok(NativeHostExecutionResult::QueryFailed(bounded_host_error(
+                    format!("provider settings query failed: {error:?}"),
+                ))),
+            }
+        }
         NativeHostCommand::HostActionsQuery { request_id } => {
             let _ = request_id;
             let granted = client.granted_capabilities();
@@ -6609,7 +6716,7 @@ impl NativeInteraction {
                 issued_at_ms,
             },
             ActionRequest::StartProviderSession(arguments) => NativeHostCommand::ProviderStart {
-                arguments: *arguments,
+                arguments: arguments.clone(),
                 expected_task_revision: expected_task_revision
                     .expect("provider start revision was validated above"),
                 command_id,
@@ -7004,11 +7111,11 @@ impl AccessibilityTree {
                 )
                 .gpui("native-task-restore", true, true)
             });
-        let delete_selected = selected_task.filter(|_| selected_is_archived).map(|_| {
+        let delete_selected = selected_task.map(|_| {
             AccessibilityNode::new(
                 AccessibleRole::Button,
                 "Delete",
-                "Permanently delete the selected archived task after confirmation.",
+                "Permanently delete the selected task after confirmation.",
             )
             .gpui("native-task-delete", true, true)
         });
@@ -7057,12 +7164,6 @@ impl AccessibilityTree {
                 "Open the project action menu for the selected project.",
             )
             .gpui("native-shell-tools-affordance", true, true),
-            AccessibilityNode::new(
-                AccessibleRole::Button,
-                "Open",
-                "Open the selected task Files panel through typed workspace authority.",
-            )
-            .gpui("native-task-open", true, true),
             AccessibilityNode::new(
                 AccessibleRole::Button,
                 "Commit",
@@ -7779,9 +7880,11 @@ enum ComposerSelectorKind {
     Access,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 enum ComposerSelectorChoice {
     Model(crate::providers::ProviderModel),
+    /// Custom slug from provider settings; reaches argv via custom_model_slug.
+    CustomModel(String),
     Reasoning(crate::providers::ProviderReasoningEffort),
     Access(crate::providers::ProviderAccessMode),
 }
@@ -7920,6 +8023,10 @@ pub struct NativeShell {
     show_archived_tasks: bool,
     settings_page: NativeSettingsPage,
     theme_editor: Option<ThemeEditorState>,
+    provider_settings: Option<crate::ui::provider_settings::ProviderSettingsController>,
+    /// Always-available composer/settings cache; survives Settings close.
+    provider_settings_cache: Option<crate::providers::settings::ProviderSettingsSnapshot>,
+    provider_settings_editor: Option<ProviderSettingsEditor>,
     theme_remove_intent: ThemeRemovalIntent,
     theme_feedback: Option<String>,
     pending_folder_prompt: bool,
@@ -7929,6 +8036,9 @@ pub struct NativeShell {
     new_task: Option<NewTaskDraft>,
     rename_task: Option<RenameTaskDraft>,
     delete_task: Option<DeleteTaskDraft>,
+    /// Command identities retired from a cancelled/failed delete flow so late
+    /// outcomes never re-enter the generic retry lane or reopen a modal.
+    retired_delete_flow_commands: Vec<CommandId>,
     selected_project_id: Option<ProjectId>,
     collapsed_projects: HashSet<ProjectId>,
     palette_index: usize,
@@ -8383,6 +8493,9 @@ impl NativeShell {
             show_archived_tasks: false,
             settings_page: NativeSettingsPage::Appearance,
             theme_editor: None,
+            provider_settings: None,
+            provider_settings_cache: None,
+            provider_settings_editor: None,
             theme_remove_intent: ThemeRemovalIntent::default(),
             theme_feedback: None,
             pending_folder_prompt: false,
@@ -8390,6 +8503,7 @@ impl NativeShell {
             new_task: None,
             rename_task: None,
             delete_task: None,
+            retired_delete_flow_commands: Vec::new(),
             selected_project_id: None,
             collapsed_projects: HashSet::new(),
             task_search: TaskSearchState::default(),
@@ -8483,6 +8597,508 @@ impl NativeShell {
         self.cancel_theme_editor();
         self.theme_remove_intent.clear();
         self.theme_feedback = None;
+        if let Some(ctl) = self.provider_settings.as_ref() {
+            self.provider_settings_cache = Some(ctl.snapshot().clone());
+        }
+        // Closing is navigation, not Cancel edits. Preserve drafts, incomplete
+        // fields and in-flight mutation ownership until an explicit discard.
+    }
+
+    fn ensure_provider_settings(&mut self) {
+        if self.provider_settings.is_some() {
+            return;
+        }
+        let controller = if let Some(cache) = self.provider_settings_cache.clone() {
+            crate::ui::provider_settings::ProviderSettingsController::from_snapshot(cache)
+        } else {
+            crate::ui::provider_settings::ProviderSettingsController::loading()
+        };
+        self.provider_settings_cache = Some(controller.snapshot().clone());
+        self.provider_settings = Some(controller);
+        self.request_provider_settings_snapshot();
+    }
+
+    fn ensure_provider_settings_cache_lane(&mut self) {
+        if self.provider_settings_cache.is_none() && self.provider_settings.is_none() {
+            let loading = crate::ui::provider_settings::ProviderSettingsController::loading();
+            self.provider_settings_cache = Some(loading.snapshot().clone());
+        }
+        if self.provider_settings_cache.is_none() || self.provider_settings.is_none() {
+            // Always request host snapshot during attachment even before Settings open.
+            self.request_provider_settings_snapshot_via_cache();
+        }
+    }
+
+    fn request_provider_settings_snapshot_via_cache(&mut self) {
+        let request = crate::providers::settings::ProviderSettingsHostRequest::Snapshot;
+        let _ = self.dispatch_provider_settings_query(request);
+    }
+
+    fn request_provider_settings_snapshot(&mut self) {
+        if let Some(ctl) = self.provider_settings.as_mut() {
+            ctl.queue_snapshot();
+        }
+        self.flush_provider_settings_pending();
+    }
+
+    fn flush_provider_settings_pending(&mut self) {
+        let requests: Vec<_> = self
+            .provider_settings
+            .as_mut()
+            .map(|ctl| {
+                let mut out = Vec::new();
+                while let Some(request) = ctl.take_pending() {
+                    out.push(request);
+                }
+                out
+            })
+            .unwrap_or_default();
+        for request in requests {
+            let result = self.dispatch_provider_settings_query(request);
+            if !matches!(result, NativeHostActionResult::Queued) {
+                if let Some(ctl) = self.provider_settings.as_mut() {
+                    ctl.clear_pending_on_queue_failure();
+                }
+                break;
+            }
+        }
+    }
+
+    fn dispatch_provider_settings_query(
+        &mut self,
+        request: crate::providers::settings::ProviderSettingsHostRequest,
+    ) -> NativeHostActionResult {
+        let Some(mut record) = self.interaction.action(ActionRequest::HostStatus) else {
+            return NativeHostActionResult::Stale;
+        };
+        record.id = "provider.settings";
+        record.command = NativeHostCommand::ProviderSettingsQuery {
+            request_id: RequestId::new(),
+            request,
+        };
+        self.enqueue_host_action(record)
+    }
+
+    fn apply_provider_settings_reply(
+        &mut self,
+        reply: crate::providers::settings::ProviderSettingsReply,
+    ) {
+        use crate::providers::settings::ProviderSettingsReply;
+        let cache_update = match &reply {
+            ProviderSettingsReply::Snapshot(snapshot)
+            | ProviderSettingsReply::MutationApplied { snapshot } => Some(snapshot.clone()),
+            ProviderSettingsReply::RefreshStarted { .. }
+            | ProviderSettingsReply::RefreshBusy
+            | ProviderSettingsReply::Error { .. } => None,
+        };
+        if let Some(snapshot) = cache_update {
+            self.provider_settings_cache = Some(snapshot);
+        }
+        if let Some(ctl) = self.provider_settings.as_mut() {
+            ctl.apply_reply(reply);
+            self.provider_settings_cache = Some(ctl.snapshot().clone());
+            if let Some(id) = ctl.expanded().map(str::to_string) {
+                self.open_provider_settings_editor_for(&id);
+            } else if ctl.add_wizard().is_some() {
+                self.ensure_provider_settings_wizard_editor();
+            } else {
+                self.provider_settings_editor = None;
+            }
+        }
+    }
+
+    fn refresh_provider_settings_health(&mut self) {
+        self.ensure_provider_settings();
+        let Some(controller) = self.provider_settings.as_mut() else {
+            return;
+        };
+        if controller.try_begin_health_refresh().is_none() {
+            return;
+        }
+        self.flush_provider_settings_pending();
+    }
+
+    fn new_provider_text_field(label: &str, value: &str) -> TextField {
+        let mut field = TextField::new(label).expect("provider settings field");
+        field.set_sensitive(label.starts_with("Env value"));
+        let _ = field.set_value(value);
+        field
+    }
+
+    fn open_provider_settings_editor_for(&mut self, instance_id: &str) {
+        let Some(ctl) = self.provider_settings.as_ref() else {
+            return;
+        };
+        let Some(instance) = ctl.working_instance(instance_id) else {
+            return;
+        };
+        let health_secs = ctl.snapshot().document.health_interval_secs;
+        let custom_model_draft = ctl.custom_model_draft().to_string();
+        let previous = self.provider_settings_editor.take();
+        if let Some(mut prev) = previous {
+            if prev.instance_id.as_deref() == Some(instance_id) {
+                let mut env_names = Vec::with_capacity(instance.environment.len());
+                let mut env_values = Vec::with_capacity(instance.environment.len());
+                // The controller already owns every typed value. Rebuild by
+                // that authoritative order, never pair old fields by index
+                // after removing an environment row.
+                for (index, env) in instance.environment.iter().enumerate() {
+                    env_names.push(Self::new_provider_text_field(
+                        &format!("Env name {index}"),
+                        &env.name,
+                    ));
+                    env_values.push(Self::new_provider_text_field(
+                        &format!("Env value {index}"),
+                        env.value.as_deref().unwrap_or(""),
+                    ));
+                }
+                let focused = prev.focused;
+                let mut health_interval = prev.health_interval;
+                let _ = health_interval.set_value(&health_secs.to_string());
+                self.provider_settings_editor = Some(ProviderSettingsEditor {
+                    instance_id: Some(instance_id.to_string()),
+                    focused,
+                    display_name: prev.display_name,
+                    accent: prev.accent,
+                    binary: prev.binary,
+                    home: prev.home,
+                    shadow: prev.shadow,
+                    launch_args: prev.launch_args,
+                    endpoint: prev.endpoint,
+                    env_names,
+                    env_values,
+                    custom_model: prev.custom_model,
+                    wizard_id: prev.wizard_id,
+                    wizard_name: prev.wizard_name,
+                    health_interval,
+                });
+                if let Some(editor) = self.provider_settings_editor.as_mut() {
+                    let field = Self::provider_settings_active_field_mut(editor);
+                    let _ = field.focus();
+                }
+                return;
+            }
+        }
+
+        let mut env_names = Vec::new();
+        let mut env_values = Vec::new();
+        for (index, env) in instance.environment.iter().enumerate() {
+            env_names.push(Self::new_provider_text_field(
+                &format!("Env name {index}"),
+                &env.name,
+            ));
+            env_values.push(Self::new_provider_text_field(
+                &format!("Env value {index}"),
+                env.value.as_deref().unwrap_or(""),
+            ));
+        }
+        let editor = ProviderSettingsEditor {
+            instance_id: Some(instance_id.to_string()),
+            focused: ProviderSettingsFieldFocus::DisplayName,
+            display_name: Self::new_provider_text_field("Display name", &instance.display_name),
+            accent: Self::new_provider_text_field(
+                "Accent color",
+                instance.accent_color.as_deref().unwrap_or(""),
+            ),
+            binary: Self::new_provider_text_field(
+                "Binary path",
+                instance.binary_path.as_deref().unwrap_or(""),
+            ),
+            home: Self::new_provider_text_field(
+                "Home path",
+                instance.home_path.as_deref().unwrap_or(""),
+            ),
+            shadow: Self::new_provider_text_field(
+                "Shadow home path",
+                instance.shadow_home_path.as_deref().unwrap_or(""),
+            ),
+            launch_args: Self::new_provider_text_field(
+                "Launch args (JSON string array)",
+                &crate::ui::provider_settings::encode_launch_args_json(&instance.launch_args),
+            ),
+            endpoint: Self::new_provider_text_field(
+                "API endpoint",
+                instance.api_endpoint.as_deref().unwrap_or(""),
+            ),
+            env_names,
+            env_values,
+            custom_model: Self::new_provider_text_field("Custom model slug", &custom_model_draft),
+            wizard_id: Self::new_provider_text_field("Instance id", ""),
+            wizard_name: Self::new_provider_text_field("Display name", ""),
+            health_interval: Self::new_provider_text_field(
+                "Health interval seconds",
+                &health_secs.to_string(),
+            ),
+        };
+        self.provider_settings_editor = Some(editor);
+        if let Some(editor) = self.provider_settings_editor.as_mut() {
+            let _ = editor.display_name.focus();
+        }
+    }
+
+    fn ensure_provider_settings_wizard_editor(&mut self) {
+        let wizard = self
+            .provider_settings
+            .as_ref()
+            .and_then(|ctl| ctl.add_wizard().cloned());
+        let Some(wizard) = wizard else {
+            return;
+        };
+        let health_secs = self
+            .provider_settings
+            .as_ref()
+            .map(|ctl| ctl.snapshot().document.health_interval_secs)
+            .unwrap_or(300);
+        if wizard.step == crate::ui::provider_settings::AddWizardStep::Config {
+            if let Some(config) = wizard.config_draft.as_ref() {
+                let previous = self.provider_settings_editor.take();
+                let preserve = previous.as_ref().is_some_and(|editor| {
+                    editor.instance_id.as_deref() == Some(config.instance_id.as_str())
+                });
+                let mut env_names = Vec::new();
+                let mut env_values = Vec::new();
+                if preserve {
+                    if let Some(mut prev) = previous {
+                        for (index, env) in config.environment.iter().enumerate() {
+                            env_names.push(Self::new_provider_text_field(
+                                &format!("Env name {index}"),
+                                &env.name,
+                            ));
+                            env_values.push(Self::new_provider_text_field(
+                                &format!("Env value {index}"),
+                                env.value.as_deref().unwrap_or(""),
+                            ));
+                        }
+                        let focused = if matches!(
+                            prev.focused,
+                            ProviderSettingsFieldFocus::WizardInstanceId
+                                | ProviderSettingsFieldFocus::WizardDisplayName
+                        ) {
+                            ProviderSettingsFieldFocus::DisplayName
+                        } else {
+                            prev.focused
+                        };
+                        self.provider_settings_editor = Some(ProviderSettingsEditor {
+                            instance_id: Some(config.instance_id.as_str().to_string()),
+                            focused,
+                            display_name: prev.display_name,
+                            accent: prev.accent,
+                            binary: prev.binary,
+                            home: prev.home,
+                            shadow: prev.shadow,
+                            launch_args: prev.launch_args,
+                            endpoint: prev.endpoint,
+                            env_names,
+                            env_values,
+                            custom_model: prev.custom_model,
+                            wizard_id: prev.wizard_id,
+                            wizard_name: prev.wizard_name,
+                            health_interval: prev.health_interval,
+                        });
+                        if let Some(editor) = self.provider_settings_editor.as_mut() {
+                            let field = Self::provider_settings_active_field_mut(editor);
+                            let _ = field.focus();
+                        }
+                        return;
+                    }
+                }
+                for (index, env) in config.environment.iter().enumerate() {
+                    env_names.push(Self::new_provider_text_field(
+                        &format!("Env name {index}"),
+                        &env.name,
+                    ));
+                    env_values.push(Self::new_provider_text_field(
+                        &format!("Env value {index}"),
+                        env.value.as_deref().unwrap_or(""),
+                    ));
+                }
+                self.provider_settings_editor = Some(ProviderSettingsEditor {
+                    instance_id: Some(config.instance_id.as_str().to_string()),
+                    focused: ProviderSettingsFieldFocus::DisplayName,
+                    display_name: Self::new_provider_text_field(
+                        "Display name",
+                        &config.display_name,
+                    ),
+                    accent: Self::new_provider_text_field(
+                        "Accent color",
+                        config.accent_color.as_deref().unwrap_or(""),
+                    ),
+                    binary: Self::new_provider_text_field(
+                        "Binary path",
+                        config.binary_path.as_deref().unwrap_or(""),
+                    ),
+                    home: Self::new_provider_text_field(
+                        "Home path",
+                        config.home_path.as_deref().unwrap_or(""),
+                    ),
+                    shadow: Self::new_provider_text_field(
+                        "Shadow home path",
+                        config.shadow_home_path.as_deref().unwrap_or(""),
+                    ),
+                    launch_args: Self::new_provider_text_field(
+                        "Launch args (JSON string array)",
+                        &crate::ui::provider_settings::encode_launch_args_json(&config.launch_args),
+                    ),
+                    endpoint: Self::new_provider_text_field(
+                        "API endpoint",
+                        config.api_endpoint.as_deref().unwrap_or(""),
+                    ),
+                    env_names,
+                    env_values,
+                    custom_model: Self::new_provider_text_field("Custom model slug", ""),
+                    wizard_id: Self::new_provider_text_field("Instance id", &wizard.instance_id),
+                    wizard_name: Self::new_provider_text_field(
+                        "Display name",
+                        &wizard.display_name,
+                    ),
+                    health_interval: Self::new_provider_text_field(
+                        "Health interval seconds",
+                        &health_secs.to_string(),
+                    ),
+                });
+                if let Some(editor) = self.provider_settings_editor.as_mut() {
+                    let _ = editor.display_name.focus();
+                }
+                return;
+            }
+        }
+        if self.provider_settings_editor.is_none() {
+            self.provider_settings_editor = Some(ProviderSettingsEditor {
+                instance_id: None,
+                focused: ProviderSettingsFieldFocus::WizardInstanceId,
+                display_name: Self::new_provider_text_field("Display name", ""),
+                accent: Self::new_provider_text_field("Accent color", ""),
+                binary: Self::new_provider_text_field("Binary path", ""),
+                home: Self::new_provider_text_field("Home path", ""),
+                shadow: Self::new_provider_text_field("Shadow home path", ""),
+                launch_args: Self::new_provider_text_field("Launch args (JSON string array)", "[]"),
+                endpoint: Self::new_provider_text_field("API endpoint", ""),
+                env_names: Vec::new(),
+                env_values: Vec::new(),
+                custom_model: Self::new_provider_text_field("Custom model slug", ""),
+                wizard_id: Self::new_provider_text_field("Instance id", &wizard.instance_id),
+                wizard_name: Self::new_provider_text_field("Display name", &wizard.display_name),
+                health_interval: Self::new_provider_text_field(
+                    "Health interval seconds",
+                    &health_secs.to_string(),
+                ),
+            });
+        } else if let Some(editor) = self.provider_settings_editor.as_mut() {
+            let _ = editor.wizard_id.set_value(&wizard.instance_id);
+            let _ = editor.wizard_name.set_value(&wizard.display_name);
+            editor.focused = ProviderSettingsFieldFocus::WizardInstanceId;
+        }
+        if let Some(editor) = self.provider_settings_editor.as_mut() {
+            let _ = editor.wizard_id.focus();
+        }
+    }
+
+    fn provider_settings_active_field_mut(editor: &mut ProviderSettingsEditor) -> &mut TextField {
+        match editor.focused {
+            ProviderSettingsFieldFocus::DisplayName => &mut editor.display_name,
+            ProviderSettingsFieldFocus::AccentColor => &mut editor.accent,
+            ProviderSettingsFieldFocus::BinaryPath => &mut editor.binary,
+            ProviderSettingsFieldFocus::HomePath => &mut editor.home,
+            ProviderSettingsFieldFocus::ShadowHomePath => &mut editor.shadow,
+            ProviderSettingsFieldFocus::LaunchArgs => &mut editor.launch_args,
+            ProviderSettingsFieldFocus::ApiEndpoint => &mut editor.endpoint,
+            ProviderSettingsFieldFocus::EnvName(index) => editor
+                .env_names
+                .get_mut(index)
+                .unwrap_or(&mut editor.display_name),
+            ProviderSettingsFieldFocus::EnvValue(index) => editor
+                .env_values
+                .get_mut(index)
+                .unwrap_or(&mut editor.display_name),
+            ProviderSettingsFieldFocus::CustomModelSlug => &mut editor.custom_model,
+            ProviderSettingsFieldFocus::WizardInstanceId => &mut editor.wizard_id,
+            ProviderSettingsFieldFocus::WizardDisplayName => &mut editor.wizard_name,
+            ProviderSettingsFieldFocus::HealthInterval => &mut editor.health_interval,
+        }
+    }
+
+    fn focus_provider_settings_field(&mut self, focus: ProviderSettingsFieldFocus) {
+        let Some(editor) = self.provider_settings_editor.as_mut() else {
+            return;
+        };
+        editor.focused = focus;
+        let field = Self::provider_settings_active_field_mut(editor);
+        // Fresh overlay gesture: rearm focus so platform IME/selection match the field.
+        let _ = field.focus();
+    }
+
+    fn sync_provider_settings_editor_to_draft(&mut self) {
+        let Some(editor) = self.provider_settings_editor.as_ref() else {
+            return;
+        };
+        let display_name = editor.display_name.value().to_string();
+        let accent = editor.accent.value().to_string();
+        let binary = editor.binary.value().to_string();
+        let home = editor.home.value().to_string();
+        let shadow = editor.shadow.value().to_string();
+        let launch_args = editor.launch_args.value().to_string();
+        let endpoint = editor.endpoint.value().to_string();
+        let custom_model = editor.custom_model.value().to_string();
+        let wizard_id = editor.wizard_id.value().to_string();
+        let wizard_name = editor.wizard_name.value().to_string();
+        let health_focused = matches!(editor.focused, ProviderSettingsFieldFocus::HealthInterval);
+        let env_names: Vec<String> = editor
+            .env_names
+            .iter()
+            .map(|field| field.value().to_string())
+            .collect();
+        let env_values: Vec<String> = editor
+            .env_values
+            .iter()
+            .map(|field| field.value().to_string())
+            .collect();
+        let Some(ctl) = self.provider_settings.as_mut() else {
+            return;
+        };
+        if let Some(wizard) = ctl.add_wizard() {
+            if wizard.step == crate::ui::provider_settings::AddWizardStep::Config {
+                ctl.wizard_apply_editor_fields(
+                    display_name,
+                    accent,
+                    binary,
+                    home,
+                    shadow,
+                    launch_args,
+                    endpoint,
+                    env_names,
+                    env_values,
+                );
+                return;
+            }
+            ctl.wizard_set_instance_id(wizard_id);
+            ctl.wizard_set_display_name(wizard_name);
+            return;
+        }
+        // The interval's Apply button owns persistence, not each keystroke.
+        if health_focused {
+            return;
+        }
+        if ctl.is_dirty() || ctl.expanded().is_some() {
+            if !ctl.is_dirty() {
+                if let Some(id) = ctl.expanded().map(str::to_string) {
+                    ctl.begin_edit(&id);
+                }
+            }
+            ctl.set_draft_display_name(display_name);
+            ctl.set_draft_accent_color(accent);
+            ctl.set_draft_binary_path(binary);
+            ctl.set_draft_home_path(home);
+            ctl.set_draft_shadow_home_path(shadow);
+            ctl.set_draft_launch_args(launch_args);
+            ctl.set_draft_api_endpoint(endpoint);
+            ctl.set_custom_model_draft(custom_model);
+            for (index, name) in env_names.into_iter().enumerate() {
+                ctl.set_env_name(index, name);
+            }
+            for (index, value) in env_values.into_iter().enumerate() {
+                ctl.set_env_value(index, value);
+            }
+        }
     }
 
     fn cancel_theme_editor(&mut self) {
@@ -9023,6 +9639,9 @@ impl NativeShell {
         } else {
             self.cockpit.set_attachment_available();
         }
+        // Provider instance health is owned by ProviderProfileOwner / background
+        // health jobs — never copy sidebar AgentConnection presence onto
+        // per-instance cards.
     }
 
     fn note_selected_task_restore_unavailable(&mut self, task_id: TaskId) {
@@ -9266,20 +9885,24 @@ impl NativeShell {
                 .gpui("native-rename-task-cancel", true, true),
             );
         }
-        if self.delete_task.is_some() {
+        if let Some(draft) = self.delete_task.as_ref() {
             overlay_nodes.push(
                 AccessibilityNode::new(
                     AccessibleRole::Button,
                     "Delete permanently",
-                    "Confirm permanent deletion of the archived task.",
+                    "Confirm permanent deletion of the selected task.",
                 )
                 .gpui("native-delete-task-submit", true, true),
             );
             overlay_nodes.push(
                 AccessibilityNode::new(
                     AccessibleRole::Button,
-                    "Cancel delete",
-                    "Close the delete confirmation without changing the task.",
+                    if matches!(draft.stage, DeleteTaskStage::AwaitingDelete { .. }) { "Close deletion progress" } else { "Cancel delete" },
+                    if matches!(draft.stage, DeleteTaskStage::AwaitingDelete { .. }) {
+                        "Close this dialog. The submitted deletion cannot be cancelled."
+                    } else {
+                        "Cancel permanent deletion. An already submitted archive may still complete."
+                    },
                 )
                 .gpui("native-delete-task-cancel", true, true),
             );
@@ -9506,6 +10129,9 @@ impl NativeShell {
             NativeHostQueryBody::AgentConnection(snapshot) => {
                 self.apply_agent_connection_snapshot(snapshot);
             }
+            NativeHostQueryBody::ProviderSettings(reply) => {
+                self.apply_provider_settings_reply(reply);
+            }
             NativeHostQueryBody::TaskCockpit(result) => {
                 let command_parts = Self::task_cockpit_command_parts(&action.command);
                 let command_task_id = command_parts.map(|(_, task_id, _)| task_id);
@@ -9547,6 +10173,11 @@ impl NativeShell {
                                 task_id,
                                 query: TaskCockpitQuery::Conversation { after_sequence },
                             }]);
+                        }
+                    } else if admission.changed {
+                        if let Some(page) = self.task_surfaces.conversation_page(task_id) {
+                            self.cockpit
+                                .ensure_retained_timeline_from_page(task_id, &page);
                         }
                     }
                     return;
@@ -10093,6 +10724,7 @@ impl NativeShell {
     /// Controller ticks observe outcomes and transport state but never
     /// resubmit a failed or uncertain command on their own.
     pub fn reconcile_pending_host_actions(&mut self, max: usize) {
+        self.flush_provider_settings_pending();
         for _ in 0..max.min(MAX_ACTION_LANE_RECORDS) {
             let from_overflow = self.pending_host_actions.is_empty();
             let Some(action) = self
@@ -10188,6 +10820,14 @@ impl NativeShell {
     fn settle_native_query_failure(&mut self, action: &NativeActionRecord, error: String) {
         if is_agent_connection_query_command(&action.command) {
             self.agent_connection = Some(agent_connection_snapshot(AgentPresence::CheckFailed));
+        }
+        if matches!(
+            &action.command,
+            NativeHostCommand::ProviderSettingsQuery { .. }
+        ) {
+            if let Some(ctl) = self.provider_settings.as_mut() {
+                ctl.clear_pending_on_queue_failure();
+            }
         }
         if let Some((_, task_id, TaskCockpitQuery::Terminal)) =
             Self::task_cockpit_command_parts(&action.command)
@@ -10316,6 +10956,37 @@ impl NativeShell {
 
     fn apply_epoch_fenced_action_outcome(&mut self, outcome: NativeHostActionOutcome) {
         let action = outcome.action().clone();
+        if self.is_retired_delete_flow_command(&action) {
+            if let Some(command_id) = native_command_id(&action.command) {
+                self.discard_host_action_by_command_id(command_id);
+                self.retired_delete_flow_commands
+                    .retain(|id| *id != command_id);
+            }
+            return;
+        }
+        if self.matches_live_delete_flow_command(&action) {
+            // The command's own committed mutation can advance the task revision
+            // (or remove the task) before its receipt arrives. The still-live
+            // confirmation owns this exact command, independently of UI focus.
+            let epochs = self.interaction.action_epochs();
+            if action.connection_epoch == epochs.connection_epoch
+                && action.resource_generation == epochs.resource_generation
+                && action.runtime_generation == epochs.runtime_generation
+                && action.client_epoch <= epochs.client_epoch
+            {
+                self.apply_action_outcome(outcome);
+            } else {
+                self.settle_delete_flow_outcome(
+                    &action,
+                    DeleteFlowSettleKind::Stale {
+                        message:
+                            "The connection changed. Check the task before trying Delete again."
+                                .into(),
+                    },
+                );
+            }
+            return;
+        }
         let accepted = if is_global_native_query_command(&action.command) {
             self.interaction
                 .accepts_global_query_outcome_record(&action)
@@ -10325,6 +10996,14 @@ impl NativeShell {
         if !accepted {
             if is_native_query_command(&action.command) {
                 self.discard_native_query_action(&action);
+                return;
+            }
+            if self.settle_delete_flow_outcome(
+                &action,
+                DeleteFlowSettleKind::Stale {
+                    message: "the task changed before the delete finished".into(),
+                },
+            ) {
                 return;
             }
             if self.retain_pending_host_action(action.clone()) {
@@ -10342,8 +11021,27 @@ impl NativeShell {
             NativeHostActionOutcome::Accepted { action, receipt } => {
                 let action_id = action.id;
                 let command_id = native_command_id(&action.command);
+                if self.matches_live_delete_flow_command(&action)
+                    && command_id != Some(receipt.command_id())
+                {
+                    self.settle_delete_flow_outcome(
+                        &action,
+                        DeleteFlowSettleKind::Failed {
+                            message: "The host returned a receipt for a different command. Deletion stopped.".into(),
+                        },
+                    );
+                    return;
+                }
                 self.last_action_receipt = Some(receipt.clone());
                 if let crate::domain::command::CommandReceipt::Rejected { code, .. } = &receipt {
+                    if self.settle_delete_flow_outcome(
+                        &action,
+                        DeleteFlowSettleKind::Rejected {
+                            message: format!("host rejected command: {code:?}"),
+                        },
+                    ) {
+                        return;
+                    }
                     let retained = self.retain_pending_host_action(action.clone());
                     self.set_execution_failure(
                         &action,
@@ -10354,6 +11052,10 @@ impl NativeShell {
                         self.set_action_capacity_failure(action.id);
                     }
                     return;
+                }
+                if self.settle_delete_flow_outcome(&action, DeleteFlowSettleKind::Accepted) {
+                    // Continue through ordinary receipt bookkeeping below so the
+                    // action leaves pending lanes, but skip generic composer paths.
                 }
                 if let Some(command_id) = command_id {
                     self.pending_host_actions
@@ -10495,6 +11197,14 @@ impl NativeShell {
                     self.settle_native_query_failure(&action, error);
                     return;
                 }
+                if self.settle_delete_flow_outcome(
+                    &action,
+                    DeleteFlowSettleKind::Failed {
+                        message: error.clone(),
+                    },
+                ) {
+                    return;
+                }
                 if action.id == action::ACTION_CONFIG_CREATE_PROJECT {
                     if let Some(draft) = self.add_project.as_mut() {
                         draft.error = Some(error.clone());
@@ -10521,6 +11231,14 @@ impl NativeShell {
             NativeHostActionOutcome::Uncertain { action, error } => {
                 if is_native_query_command(&action.command) {
                     self.settle_native_query_failure(&action, error);
+                    return;
+                }
+                if self.settle_delete_flow_outcome(
+                    &action,
+                    DeleteFlowSettleKind::Uncertain {
+                        message: error.clone(),
+                    },
+                ) {
                     return;
                 }
                 let retained = self.retain_pending_host_action(action.clone());
@@ -10699,12 +11417,18 @@ impl NativeShell {
         // retained window, so polling cannot grow client memory.
         let due_priorities = conversation_poll_priorities_due(self.controller_ticks as u64);
         if !due_priorities.is_empty() && self.action_lane_len() < MAX_ACTION_LANE_RECORDS / 2 {
-            let schedule = self
-                .layout
-                .task_workspace
-                .as_ref()
-                .map(|workspace| self.task_surfaces.conversation_query_schedule(workspace, 2))
-                .unwrap_or_default();
+            let max_background = if due_priorities.contains(&ConversationQueryPriority::Background)
+            {
+                2
+            } else {
+                0
+            };
+            let schedule = match self.layout.task_workspace.as_ref() {
+                Some(workspace) => self
+                    .task_surfaces
+                    .conversation_query_schedule(workspace, max_background),
+                None => Vec::new(),
+            };
             for plan in schedule {
                 if !due_priorities.contains(&plan.priority) {
                     continue;
@@ -11455,6 +12179,7 @@ impl NativeShell {
             self.mark_layout_dirty();
         }
         self.task_surfaces.retain_tasks(task_list.task_ids());
+        self.cockpit.retain_open_timelines(task_list.task_ids());
         for task_id in self.workspace_task_ids() {
             self.task_surfaces.ensure_task(task_id);
         }
@@ -11476,10 +12201,12 @@ impl NativeShell {
         self.sync_cockpit_follow_with_refresh(
             selected_task_changed || selected_task_needs_initial_follow,
         );
+        self.try_advance_pending_delete_after_archive();
         if first_canonical {
             self.restore_active_dock_tool_from_layout();
             let _ = self.dispatch_action(ActionRequest::HostStatus);
             let _ = self.dispatch_agent_connection_query(false);
+            self.ensure_provider_settings_cache_lane();
         }
         Ok(())
     }
@@ -11952,11 +12679,8 @@ impl NativeShell {
         let mut options = self
             .layout
             .composer_launch_options
-            .unwrap_or(ProviderLaunchOptions {
-                model: ProviderModel::ProviderDefault,
-                reasoning_effort: ProviderReasoningEffort::ProviderDefault,
-                access: crate::providers::ProviderAccessMode::FullAccess,
-            });
+            .clone()
+            .unwrap_or_default();
         let compatible = matches!(
             (provider, options.model),
             (_, ProviderModel::ProviderDefault)
@@ -11971,12 +12695,15 @@ impl NativeShell {
                         | ProviderModel::ClaudeHaiku
                 )
         );
-        if !compatible {
+        if options.custom_model_slug.is_some() {
+            // Custom slug is always treated as compatible for the active driver.
+        } else if !compatible {
             options.model = match provider {
                 ProviderKind::Codex => ProviderModel::CodexSol,
                 ProviderKind::ClaudeCode => ProviderModel::ClaudeSonnet,
                 ProviderKind::Cursor => ProviderModel::ProviderDefault,
             };
+            options.custom_model_slug = None;
         }
         options
     }
@@ -12004,7 +12731,13 @@ impl NativeShell {
             let provider = self.active_provider_kind().unwrap_or(ProviderKind::Codex);
             let options = self.composer_launch_options_for(provider);
             match kind {
-                ComposerSelectorKind::Model => ComposerSelectorChoice::Model(options.model),
+                ComposerSelectorKind::Model => {
+                    if let Some(slug) = options.custom_model_slug.clone() {
+                        ComposerSelectorChoice::CustomModel(slug)
+                    } else {
+                        ComposerSelectorChoice::Model(options.model)
+                    }
+                }
                 ComposerSelectorKind::Reasoning => {
                     ComposerSelectorChoice::Reasoning(options.reasoning_effort)
                 }
@@ -12047,6 +12780,18 @@ impl NativeShell {
         let provider = self.active_provider_kind().unwrap_or(ProviderKind::Codex);
         let mut options = self.composer_launch_options_for(provider);
         options.model = model;
+        options.custom_model_slug = None;
+        self.layout.composer_provider = Some(provider);
+        self.layout.composer_launch_options = Some(options);
+        self.composer_selector = None;
+        self.mark_layout_dirty();
+    }
+
+    fn set_composer_custom_model(&mut self, slug: String) {
+        let provider = self.active_provider_kind().unwrap_or(ProviderKind::Codex);
+        let mut options = self.composer_launch_options_for(provider);
+        options.custom_model_slug = Some(slug);
+        options.model = crate::providers::ProviderModel::ProviderDefault;
         self.layout.composer_provider = Some(provider);
         self.layout.composer_launch_options = Some(options);
         self.composer_selector = None;
@@ -12074,42 +12819,54 @@ impl NativeShell {
     fn composer_selector_choices(&self) -> Vec<(String, ComposerSelectorChoice)> {
         let provider = self.active_provider_kind().unwrap_or(ProviderKind::Codex);
         match self.composer_selector {
-            Some(ComposerSelectorKind::Model) => match provider {
-                ProviderKind::Codex => vec![
-                    (
-                        "GPT-5.6 Sol".into(),
-                        ComposerSelectorChoice::Model(crate::providers::ProviderModel::CodexSol),
-                    ),
-                    (
-                        "GPT-5.6 Terra".into(),
-                        ComposerSelectorChoice::Model(crate::providers::ProviderModel::CodexTerra),
-                    ),
-                    (
-                        "GPT-5.6 Luna".into(),
-                        ComposerSelectorChoice::Model(crate::providers::ProviderModel::CodexLuna),
-                    ),
-                ],
-                ProviderKind::ClaudeCode => vec![
-                    (
-                        "Claude Opus".into(),
-                        ComposerSelectorChoice::Model(crate::providers::ProviderModel::ClaudeOpus),
-                    ),
-                    (
-                        "Claude Sonnet".into(),
-                        ComposerSelectorChoice::Model(
-                            crate::providers::ProviderModel::ClaudeSonnet,
-                        ),
-                    ),
-                    (
-                        "Claude Haiku".into(),
-                        ComposerSelectorChoice::Model(crate::providers::ProviderModel::ClaudeHaiku),
-                    ),
-                ],
-                ProviderKind::Cursor => vec![(
+            Some(ComposerSelectorKind::Model) => {
+                let driver =
+                    crate::providers::settings::ProviderDriverKind::from_provider_kind(provider);
+                let builtins = crate::ui::provider_settings::builtin_model_slugs(driver);
+                let instance_id =
+                    crate::providers::settings::default_instance_id_for_kind(provider);
+                let ordered = self
+                    .provider_settings
+                    .as_ref()
+                    .map(|ctl| ctl.document())
+                    .or_else(|| {
+                        self.provider_settings_cache
+                            .as_ref()
+                            .map(|cache| cache.document.clone())
+                    })
+                    .and_then(|doc| doc.ordered_picker_models(instance_id, &builtins).ok())
+                    .unwrap_or_else(|| builtins.clone());
+                let mut choices = Vec::new();
+                choices.push((
                     "Provider default".into(),
                     ComposerSelectorChoice::Model(crate::providers::ProviderModel::ProviderDefault),
-                )],
-            },
+                ));
+                for slug in ordered {
+                    let choice = match (provider, slug.as_str()) {
+                        (ProviderKind::Codex, "gpt-5.6-sol") => {
+                            ComposerSelectorChoice::Model(crate::providers::ProviderModel::CodexSol)
+                        }
+                        (ProviderKind::Codex, "gpt-5.6-terra") => ComposerSelectorChoice::Model(
+                            crate::providers::ProviderModel::CodexTerra,
+                        ),
+                        (ProviderKind::Codex, "gpt-5.6-luna") => ComposerSelectorChoice::Model(
+                            crate::providers::ProviderModel::CodexLuna,
+                        ),
+                        (ProviderKind::ClaudeCode, "opus") => ComposerSelectorChoice::Model(
+                            crate::providers::ProviderModel::ClaudeOpus,
+                        ),
+                        (ProviderKind::ClaudeCode, "sonnet") => ComposerSelectorChoice::Model(
+                            crate::providers::ProviderModel::ClaudeSonnet,
+                        ),
+                        (ProviderKind::ClaudeCode, "haiku") => ComposerSelectorChoice::Model(
+                            crate::providers::ProviderModel::ClaudeHaiku,
+                        ),
+                        _ => ComposerSelectorChoice::CustomModel(slug.clone()),
+                    };
+                    choices.push((slug, choice));
+                }
+                choices
+            }
             Some(ComposerSelectorKind::Reasoning) => vec![
                 (
                     "Default thinking".into(),
@@ -12173,6 +12930,7 @@ impl NativeShell {
     fn apply_composer_selector_choice(&mut self, choice: ComposerSelectorChoice) {
         match choice {
             ComposerSelectorChoice::Model(model) => self.set_composer_model(model),
+            ComposerSelectorChoice::CustomModel(slug) => self.set_composer_custom_model(slug),
             ComposerSelectorChoice::Reasoning(effort) => self.set_composer_reasoning(effort),
             ComposerSelectorChoice::Access(access) => self.set_composer_access(access),
         }
@@ -12191,7 +12949,13 @@ impl NativeShell {
             let provider = self.active_provider_kind().unwrap_or(ProviderKind::Codex);
             let options = self.composer_launch_options_for(provider);
             match self.composer_selector {
-                Some(ComposerSelectorKind::Model) => ComposerSelectorChoice::Model(options.model),
+                Some(ComposerSelectorKind::Model) => {
+                    if let Some(slug) = options.custom_model_slug.clone() {
+                        ComposerSelectorChoice::CustomModel(slug)
+                    } else {
+                        ComposerSelectorChoice::Model(options.model)
+                    }
+                }
                 Some(ComposerSelectorKind::Reasoning) => {
                     ComposerSelectorChoice::Reasoning(options.reasoning_effort)
                 }
@@ -12221,7 +12985,7 @@ impl NativeShell {
                     })
                     .on_click(cx.listener(move |shell, _event: &ClickEvent, _window, cx| {
                         cx.stop_propagation();
-                        shell.apply_composer_selector_choice(choice);
+                        shell.apply_composer_selector_choice(choice.clone());
                         cx.notify();
                     }))
                     .child(format!("{check}{label}"))
@@ -12775,6 +13539,9 @@ impl NativeShell {
         if let Some(draft) = self.add_project.as_mut() {
             return Some(&mut draft.name);
         }
+        if let Some(editor) = self.provider_settings_editor.as_mut() {
+            return Some(Self::provider_settings_active_field_mut(editor));
+        }
         if let Some(editor) = self.theme_editor.as_mut() {
             if matches!(editor.focused, ThemeEditorFocus::Name) {
                 return Some(&mut editor.name);
@@ -12789,6 +13556,57 @@ impl NativeShell {
         }
         if let Some(draft) = self.add_project.as_ref() {
             return Some(draft.name.value().to_string());
+        }
+        if let Some(editor) = self.provider_settings_editor.as_ref() {
+            let value = match editor.focused {
+                ProviderSettingsFieldFocus::DisplayName => editor.display_name.value().to_string(),
+                ProviderSettingsFieldFocus::AccentColor => editor.accent.value().to_string(),
+                ProviderSettingsFieldFocus::BinaryPath => editor.binary.value().to_string(),
+                ProviderSettingsFieldFocus::HomePath => editor.home.value().to_string(),
+                ProviderSettingsFieldFocus::ShadowHomePath => editor.shadow.value().to_string(),
+                ProviderSettingsFieldFocus::LaunchArgs => editor.launch_args.value().to_string(),
+                ProviderSettingsFieldFocus::ApiEndpoint => editor.endpoint.value().to_string(),
+                ProviderSettingsFieldFocus::EnvName(index) => editor
+                    .env_names
+                    .get(index)
+                    .map(|f| f.value().to_string())
+                    .unwrap_or_default(),
+                ProviderSettingsFieldFocus::EnvValue(index) => {
+                    let raw = editor
+                        .env_values
+                        .get(index)
+                        .map(|f| f.value())
+                        .unwrap_or("");
+                    let sensitive = self
+                        .provider_settings
+                        .as_ref()
+                        .and_then(|ctl| {
+                            let id = editor.instance_id.as_deref()?;
+                            ctl.working_instance(id)
+                                .or_else(|| ctl.wizard_working_config().cloned())
+                        })
+                        .and_then(|instance| instance.environment.get(index).cloned())
+                        .is_some_and(|env| env.sensitive);
+                    if sensitive {
+                        crate::ui::provider_settings::mask_secret_preserving_scalars(raw)
+                    } else {
+                        raw.to_string()
+                    }
+                }
+                ProviderSettingsFieldFocus::CustomModelSlug => {
+                    editor.custom_model.value().to_string()
+                }
+                ProviderSettingsFieldFocus::WizardInstanceId => {
+                    editor.wizard_id.value().to_string()
+                }
+                ProviderSettingsFieldFocus::WizardDisplayName => {
+                    editor.wizard_name.value().to_string()
+                }
+                ProviderSettingsFieldFocus::HealthInterval => {
+                    editor.health_interval.value().to_string()
+                }
+            };
+            return Some(value);
         }
         if let Some(editor) = self.theme_editor.as_ref() {
             if matches!(editor.focused, ThemeEditorFocus::Name) {
@@ -12806,23 +13624,44 @@ impl NativeShell {
 
     fn root_editor_utf16_selection(&self) -> Option<Range<usize>> {
         let value = self.root_editor_value()?;
-        let cursor = if let Some(draft) = self.rename_task.as_ref() {
-            draft.title.cursor()
+        let (cursor, all_selected) = if let Some(draft) = self.rename_task.as_ref() {
+            (draft.title.cursor(), draft.title.is_all_selected())
         } else if let Some(draft) = self.add_project.as_ref() {
-            draft.name.cursor()
+            (draft.name.cursor(), draft.name.is_all_selected())
+        } else if let Some(editor) = self.provider_settings_editor.as_ref() {
+            let field = match editor.focused {
+                ProviderSettingsFieldFocus::DisplayName => &editor.display_name,
+                ProviderSettingsFieldFocus::AccentColor => &editor.accent,
+                ProviderSettingsFieldFocus::BinaryPath => &editor.binary,
+                ProviderSettingsFieldFocus::HomePath => &editor.home,
+                ProviderSettingsFieldFocus::ShadowHomePath => &editor.shadow,
+                ProviderSettingsFieldFocus::LaunchArgs => &editor.launch_args,
+                ProviderSettingsFieldFocus::ApiEndpoint => &editor.endpoint,
+                ProviderSettingsFieldFocus::EnvName(index) => {
+                    editor.env_names.get(index).unwrap_or(&editor.display_name)
+                }
+                ProviderSettingsFieldFocus::EnvValue(index) => {
+                    editor.env_values.get(index).unwrap_or(&editor.display_name)
+                }
+                ProviderSettingsFieldFocus::CustomModelSlug => &editor.custom_model,
+                ProviderSettingsFieldFocus::WizardInstanceId => &editor.wizard_id,
+                ProviderSettingsFieldFocus::WizardDisplayName => &editor.wizard_name,
+                ProviderSettingsFieldFocus::HealthInterval => &editor.health_interval,
+            };
+            (field.cursor(), field.is_all_selected())
         } else if let Some(editor) = self.theme_editor.as_ref() {
             if matches!(editor.focused, ThemeEditorFocus::Name) {
-                editor.name.cursor()
+                (editor.name.cursor(), editor.name.is_all_selected())
             } else {
-                value.chars().count()
+                (value.chars().count(), false)
             }
         } else if self.task_search.open() {
-            self.task_search.query().chars().count()
+            (self.task_search.query().chars().count(), false)
         } else if self.browser_address_focused {
             if self.browser_address_select_all {
-                0
+                (self.browser_address_draft.chars().count(), true)
             } else {
-                self.browser_address_draft.chars().count()
+                (self.browser_address_draft.chars().count(), false)
             }
         } else {
             return None;
@@ -12832,19 +13671,7 @@ impl NativeShell {
             .take(cursor)
             .map(|ch| ch.len_utf16())
             .sum::<usize>();
-        let start = if self.browser_address_focused && self.browser_address_select_all {
-            0
-        } else if matches!(
-            (
-                self.rename_task.as_ref().map(|d| d.title.is_all_selected()),
-                self.add_project.as_ref().map(|d| d.name.is_all_selected()),
-            ),
-            (Some(true), _) | (_, Some(true))
-        ) {
-            0
-        } else {
-            end
-        };
+        let start = if all_selected { 0 } else { end };
         Some(start..end)
     }
 
@@ -12901,6 +13728,7 @@ impl NativeShell {
             field
                 .replace_range(scalar_range, text, epoch)
                 .map_err(|error| error.to_string())?;
+            self.sync_provider_settings_editor_to_draft();
         } else {
             return Err("root editor is unavailable".to_string());
         }
@@ -14152,10 +14980,22 @@ impl NativeShell {
                     .py(px(4.0))
                     .rounded(px(5.0))
                     .cursor_pointer()
+                    .flex()
+                    .items_center()
+                    .gap(px(4.0))
                     .text_size(px(tokens.density.typography.caption))
                     .text_color(tokens.text.secondary.to_gpui())
                     .hover(|style| style.bg(tokens.surfaces.hover.to_gpui()))
                     .on_click(toggle)
+                    .child(crate::icons::app_icon(
+                        if compact {
+                            crate::icons::PANEL_RIGHT
+                        } else {
+                            crate::icons::SQUARE
+                        },
+                        11.0,
+                        tokens.text.secondary.to_u32(),
+                    ))
                     .child(if compact { "Full" } else { "Compact" }),
             )
             .child(
@@ -14171,7 +15011,11 @@ impl NativeShell {
                     .text_color(tokens.text.muted.to_gpui())
                     .hover(|style| style.bg(tokens.surfaces.hover.to_gpui()))
                     .on_click(close)
-                    .child("×"),
+                    .child(crate::icons::app_icon(
+                        crate::icons::X,
+                        12.0,
+                        tokens.text.muted.to_u32(),
+                    )),
             );
 
         let body = if pane.body == TaskPaneBody::Compact {
@@ -14198,19 +15042,14 @@ impl NativeShell {
                 )
                 .into_any_element()
         } else if pane.build_composer {
-            self.task_conversation_surface(tokens, pane_size, cx)
-        } else {
-            let lines = if pane.paint_terminal {
-                self.task_surfaces.terminal_tail(task_id, 24)
-            } else {
-                self.task_surfaces.conversation_tail(task_id, 12)
-            };
+            // Focused Full pane owns the interactive composer. Pane chrome
+            // already reserved the 42px header; pass only body height.
+            let body_height = (f32::from(pane_size.height) - 42.0).max(1.0);
+            self.task_conversation_surface(tokens, size(pane_size.width, px(body_height)), cx)
+        } else if pane.paint_terminal {
+            let lines = self.task_surfaces.terminal_tail(task_id, 24);
             let has_lines = !lines.is_empty();
-            let empty = if pane.paint_terminal {
-                self.task_surfaces.terminal_empty_message(task_id)
-            } else {
-                "Conversation is live; waiting for messages."
-            };
+            let empty = self.task_surfaces.terminal_empty_message(task_id);
             div()
                 .w_full()
                 .flex_1()
@@ -14239,6 +15078,49 @@ impl NativeShell {
                         .child(empty)
                         .into_any_element()
                 }))
+                .into_any_element()
+        } else {
+            // Background Full panes render the same semantic conversation as
+            // the focused pane; only composer/input ownership is withheld.
+            if self.cockpit.timeline_for(task_id).is_none() {
+                if let Some(page) = self.task_surfaces.conversation_page(task_id) {
+                    self.cockpit.hydrate_timeline_if_absent(task_id, &page);
+                }
+            }
+            // Multi-pane chrome reserves the 42px header; never inflate beyond
+            // the remaining body with a synthetic floor.
+            let timeline_height = (f32::from(pane_size.height) - 42.0).max(1.0) as u32;
+            if let Some(timeline) = self.cockpit.timeline_mut_for(task_id) {
+                timeline.set_viewport_height(timeline_height);
+            }
+            let shell_entity = cx.entity().downgrade();
+            let activity_toggle: ActivityToggleHandler = Rc::new(move |group, app| {
+                let _ = shell_entity.update(app, |shell, cx| {
+                    let toggled = shell
+                        .cockpit
+                        .timeline_mut_for(task_id)
+                        .is_some_and(|timeline| timeline.toggle_activity_group(&group));
+                    if shell.interaction.selected_task() != Some(task_id) {
+                        let _ = shell
+                            .apply_workspace_selection(task_id, WorkspaceSelectionGesture::Plain);
+                    }
+                    if toggled {
+                        cx.notify();
+                    }
+                });
+            });
+            div()
+                .w_full()
+                .flex_1()
+                .min_h(px(0.0))
+                .flex()
+                .flex_col()
+                .overflow_hidden()
+                .child(self.cockpit.conversation_timeline_surface_for(
+                    task_id,
+                    tokens,
+                    Some(activity_toggle),
+                ))
                 .into_any_element()
         };
 
@@ -14425,7 +15307,7 @@ impl NativeShell {
         }
         let timeline_height = (f32::from(idle_photo_size.height)
             - CONVERSATION_COMPOSER_HEIGHT_RESERVE)
-            .max(120.0) as u32;
+            .max(1.0) as u32;
         if let Some(timeline) = self.cockpit.timeline_mut() {
             timeline.set_viewport_height(timeline_height);
         }
@@ -14475,14 +15357,6 @@ impl NativeShell {
             cx.stop_propagation();
             shell.activate_composer_approval(ApprovalDecision::Reject { reason: None });
             cx.notify();
-        });
-        let scroll = cx.listener(|shell, event: &ScrollWheelEvent, _window, cx| {
-            cx.stop_propagation();
-            let down = event.delta.pixel_delta(px(64.0)).y > px(0.0);
-            if let Some(timeline) = shell.cockpit.timeline_mut() {
-                timeline.scroll_page(down);
-                cx.notify();
-            }
         });
         let composer_input_registration = if self.root_editor_value().is_some() {
             let input_proxy = self
@@ -14560,14 +15434,18 @@ impl NativeShell {
         };
         let launch_options =
             self.composer_launch_options_for(provider_kind.unwrap_or(ProviderKind::Codex));
-        let model_label = match launch_options.model {
-            crate::providers::ProviderModel::ProviderDefault => "Provider default",
-            crate::providers::ProviderModel::CodexSol => "GPT-5.6 Sol",
-            crate::providers::ProviderModel::CodexTerra => "GPT-5.6 Terra",
-            crate::providers::ProviderModel::CodexLuna => "GPT-5.6 Luna",
-            crate::providers::ProviderModel::ClaudeOpus => "Claude Opus",
-            crate::providers::ProviderModel::ClaudeSonnet => "Claude Sonnet",
-            crate::providers::ProviderModel::ClaudeHaiku => "Claude Haiku",
+        let model_label = if let Some(slug) = launch_options.custom_model_slug.as_deref() {
+            slug.to_string()
+        } else {
+            match launch_options.model {
+                crate::providers::ProviderModel::ProviderDefault => "Provider default".into(),
+                crate::providers::ProviderModel::CodexSol => "GPT-5.6 Sol".into(),
+                crate::providers::ProviderModel::CodexTerra => "GPT-5.6 Terra".into(),
+                crate::providers::ProviderModel::CodexLuna => "GPT-5.6 Luna".into(),
+                crate::providers::ProviderModel::ClaudeOpus => "Claude Opus".into(),
+                crate::providers::ProviderModel::ClaudeSonnet => "Claude Sonnet".into(),
+                crate::providers::ProviderModel::ClaudeHaiku => "Claude Haiku".into(),
+            }
         };
         let reasoning_label = match launch_options.reasoning_effort {
             crate::providers::ProviderReasoningEffort::ProviderDefault => "Default thinking",
@@ -14987,12 +15865,12 @@ impl NativeShell {
                                     .child(
                                         div()
                                             .w_full()
-                                            .px(px(12.0))
-                                            .pb(px(12.0))
+                                            .px(px(6.0))
+                                            .pb(px(4.0))
                                             .flex()
                                             .items_center()
                                             .justify_between()
-                                            .gap(px(8.0))
+                                            .gap(px(4.0))
                                             .child(
                                                 div()
                                                     .relative()
@@ -15000,7 +15878,8 @@ impl NativeShell {
                                                     .flex()
                                                     .flex_wrap()
                                                     .items_center()
-                                                    .gap(px(6.0))
+                                                    .gap(px(4.0))
+                                                    .text_size(px(12.0))
                                                     .child(composer_pill(provider_label))
                                                     .child(
                                                         Button::new("native-composer-model")
@@ -15108,11 +15987,16 @@ impl NativeShell {
         };
         let conversation = {
             let shell_entity = cx.entity().downgrade();
+            let focused_task = self.interaction.selected_task();
             let activity_toggle: ActivityToggleHandler = Rc::new(move |group, app| {
                 let _ = shell_entity.update(app, |shell, cx| {
+                    let Some(task_id) = focused_task.or_else(|| shell.interaction.selected_task())
+                    else {
+                        return;
+                    };
                     if shell
                         .cockpit
-                        .timeline_mut()
+                        .timeline_mut_for(task_id)
                         .is_some_and(|timeline| timeline.toggle_activity_group(&group))
                     {
                         cx.notify();
@@ -15158,7 +16042,6 @@ impl NativeShell {
                 .flex_1()
                 .min_h(px(0.0))
                 .flex_col()
-                .on_scroll_wheel(scroll)
                 .child(conversation)
                 .into_any_element()
         };
@@ -16944,6 +17827,117 @@ impl NativeShell {
     }
 
     fn begin_task_delete(&mut self, task_id: TaskId) {
+        if self
+            .client_model
+            .as_ref()
+            .and_then(|model| model.tasks().get(&task_id))
+            .is_none()
+        {
+            return;
+        }
+        // Opening a new confirmation permanently disarms any prior deferred delete.
+        self.cancel_delete_task_flow();
+        self.interaction.sync_selected_task(Some(task_id));
+        self.delete_task = Some(DeleteTaskDraft {
+            task_id,
+            title: self.task_row_title(task_id),
+            error: None,
+            stage: DeleteTaskStage::Confirming,
+        });
+        self.new_task = None;
+        self.rename_task = None;
+        self.interaction.close_palettes();
+    }
+
+    fn confirm_task_delete(&mut self) {
+        let Some(draft) = self.delete_task.as_ref() else {
+            return;
+        };
+        // Duplicate Enter/click while archive or delete is already queued must
+        // not enqueue another host command.
+        if draft.stage.is_submitting() {
+            return;
+        }
+        if self.retired_delete_flow_commands.len() >= MAX_ACTION_LANE_RECORDS {
+            if let Some(draft) = self.delete_task.as_mut() {
+                draft.error = Some("Too many deletion requests are awaiting a result. Reconnect before trying again.".into());
+            }
+            return;
+        }
+        let draft = self.delete_task.as_ref().expect("confirmed draft");
+        let task_id = draft.task_id;
+        let archived = self
+            .client_model
+            .as_ref()
+            .and_then(|model| model.tasks().get(&task_id))
+            .is_some_and(|snapshot| {
+                snapshot.task.lifecycle == crate::domain::task::TaskLifecycle::Archived
+            });
+        if !archived {
+            match self.dispatch_action_recorded(ActionRequest::TaskArchive { task_id }) {
+                Ok(record) => {
+                    let Some(command_id) = native_command_id(&record.command) else {
+                        if let Some(draft) = self.delete_task.as_mut() {
+                            draft.error = Some("Couldn't archive the task before deleting.".into());
+                            draft.stage = DeleteTaskStage::Confirming;
+                        }
+                        return;
+                    };
+                    if let Some(draft) = self.delete_task.as_mut() {
+                        draft.error = None;
+                        draft.stage = DeleteTaskStage::AwaitingArchive {
+                            command_id,
+                            archive_accepted: false,
+                        };
+                    }
+                }
+                Err(failure) => self.settle_delete_admission_failure(failure),
+            }
+            return;
+        }
+        self.queue_confirmed_task_delete(task_id);
+    }
+
+    fn queue_confirmed_task_delete(&mut self, task_id: TaskId) {
+        let Some(draft) = self.delete_task.as_ref() else {
+            return;
+        };
+        if draft.task_id != task_id || draft.stage.is_submitting() {
+            return;
+        }
+        match self.dispatch_action_recorded(ActionRequest::TaskDelete { task_id }) {
+            Ok(record) => {
+                let Some(command_id) = native_command_id(&record.command) else {
+                    if let Some(draft) = self.delete_task.as_mut() {
+                        draft.error = Some("Couldn't delete the task. Try again.".into());
+                        draft.stage = DeleteTaskStage::Confirming;
+                    }
+                    return;
+                };
+                if let Some(draft) = self.delete_task.as_mut() {
+                    draft.error = None;
+                    draft.stage = DeleteTaskStage::AwaitingDelete { command_id };
+                }
+            }
+            Err(failure) => self.settle_delete_admission_failure(failure),
+        }
+    }
+
+    /// Advance only when the still-live confirmation draft matches, the exact
+    /// archive command has been Accepted, and the projected task is Archived.
+    /// Never recreates a cancelled or replaced draft.
+    fn try_advance_pending_delete_after_archive(&mut self) {
+        let Some(draft) = self.delete_task.as_ref() else {
+            return;
+        };
+        let DeleteTaskStage::AwaitingArchive {
+            archive_accepted: true,
+            ..
+        } = draft.stage
+        else {
+            return;
+        };
+        let task_id = draft.task_id;
         let archived = self
             .client_model
             .as_ref()
@@ -16954,32 +17948,208 @@ impl NativeShell {
         if !archived {
             return;
         }
-        self.interaction.sync_selected_task(Some(task_id));
-        self.delete_task = Some(DeleteTaskDraft {
-            task_id,
-            title: self.task_row_title(task_id),
-            error: None,
-        });
-        self.new_task = None;
-        self.rename_task = None;
-        self.interaction.close_palettes();
+        match self.dispatch_action_recorded(ActionRequest::TaskDelete { task_id }) {
+            Ok(record) => {
+                let Some(command_id) = native_command_id(&record.command) else {
+                    if let Some(draft) = self.delete_task.as_mut() {
+                        draft.error = Some("Couldn't delete the task. Try again.".into());
+                        draft.stage = DeleteTaskStage::Confirming;
+                    }
+                    return;
+                };
+                if let Some(draft) = self.delete_task.as_mut() {
+                    if draft.task_id != task_id {
+                        // Draft replaced mid-dispatch; retire the orphaned delete.
+                        self.retire_delete_flow_command(command_id);
+                        return;
+                    }
+                    draft.error = None;
+                    draft.stage = DeleteTaskStage::AwaitingDelete { command_id };
+                } else {
+                    self.retire_delete_flow_command(command_id);
+                }
+            }
+            Err(failure) => self.settle_delete_admission_failure(failure),
+        }
     }
 
-    fn confirm_task_delete(&mut self) {
-        let Some(task_id) = self.delete_task.as_ref().map(|draft| draft.task_id) else {
-            return;
-        };
-        if self
-            .dispatch_action_checked(ActionRequest::TaskDelete { task_id })
-            .is_err()
+    fn settle_delete_admission_failure(&mut self, failure: NativeActionDispatchFailure) {
+        // A captured command can be retained by enqueue_host_action even when
+        // admission fails. It must never survive as an implicit delete retry.
+        if let Some(command_id) = failure
+            .record
+            .as_ref()
+            .and_then(|record| native_command_id(&record.command))
         {
-            if let Some(draft) = self.delete_task.as_mut() {
-                draft.error = Some("Couldn't delete the task. Try again.".into());
-            }
-            return;
+            self.discard_host_action_by_command_id(command_id);
         }
-        self.delete_task = None;
-        self.interaction.sync_selected_task(None);
+        if failure.record.as_ref().is_some_and(|record| {
+            self.last_action_failure
+                .as_ref()
+                .is_some_and(|last| last.command_id().is_none() && last.action_id() == record.id)
+        }) {
+            self.last_action_failure = None;
+            self.restore_connected_host_state();
+        }
+        if let Some(draft) = self.delete_task.as_mut() {
+            draft.error = Some(failure.message);
+            draft.stage = DeleteTaskStage::Confirming;
+        }
+    }
+
+    /// Permanently disarm deferred deletion. An already-sent archive may still
+    /// complete on the host, but no Delete follows after cancellation.
+    fn cancel_delete_task_flow(&mut self) {
+        if let Some(draft) = self.delete_task.take() {
+            match draft.stage {
+                DeleteTaskStage::AwaitingArchive {
+                    command_id,
+                    archive_accepted: true,
+                } => {
+                    self.discard_host_action_by_command_id(command_id);
+                }
+                DeleteTaskStage::AwaitingArchive { command_id, .. }
+                | DeleteTaskStage::AwaitingDelete { command_id } => {
+                    self.retire_delete_flow_command(command_id);
+                }
+                DeleteTaskStage::Confirming => {}
+            }
+        }
+    }
+
+    fn retire_delete_flow_command(&mut self, command_id: CommandId) {
+        self.discard_host_action_by_command_id(command_id);
+        if !self.retired_delete_flow_commands.contains(&command_id) {
+            // Never evict an unresolved cancellation: a late result must not
+            // regain generic retry authority. New confirmations are bounded.
+            self.retired_delete_flow_commands.push(command_id);
+        }
+    }
+
+    fn discard_host_action_by_command_id(&mut self, command_id: CommandId) {
+        self.pending_host_actions
+            .retain(|pending| native_command_id(&pending.command) != Some(command_id));
+        if self
+            .retained_action_overflow
+            .as_ref()
+            .is_some_and(|pending| native_command_id(&pending.command) == Some(command_id))
+        {
+            self.retained_action_overflow = None;
+        }
+        if self
+            .last_action_failure
+            .as_ref()
+            .is_some_and(|failure| failure.command_id() == Some(command_id))
+        {
+            self.last_action_failure = None;
+            self.restore_connected_host_state();
+        }
+    }
+
+    fn delete_flow_command_id(&self) -> Option<CommandId> {
+        match self.delete_task.as_ref()?.stage {
+            DeleteTaskStage::AwaitingArchive { command_id, .. }
+            | DeleteTaskStage::AwaitingDelete { command_id } => Some(command_id),
+            DeleteTaskStage::Confirming => None,
+        }
+    }
+
+    fn matches_live_delete_flow_command(&self, action: &NativeActionRecord) -> bool {
+        let Some(expected) = self.delete_flow_command_id() else {
+            return false;
+        };
+        if native_command_id(&action.command) != Some(expected) {
+            return false;
+        }
+        match (
+            action.task_id,
+            self.delete_task.as_ref().map(|draft| draft.task_id),
+        ) {
+            (Some(action_task), Some(draft_task)) => action_task == draft_task,
+            _ => true,
+        }
+    }
+
+    fn is_retired_delete_flow_command(&self, action: &NativeActionRecord) -> bool {
+        native_command_id(&action.command)
+            .is_some_and(|command_id| self.retired_delete_flow_commands.contains(&command_id))
+    }
+
+    /// Handle archive/delete outcomes for the live confirmation draft. Returns
+    /// true when the outcome belonged to this flow (caller must not retry).
+    fn settle_delete_flow_outcome(
+        &mut self,
+        action: &NativeActionRecord,
+        kind: DeleteFlowSettleKind,
+    ) -> bool {
+        if self.is_retired_delete_flow_command(action) {
+            if let Some(command_id) = native_command_id(&action.command) {
+                self.discard_host_action_by_command_id(command_id);
+                self.retired_delete_flow_commands
+                    .retain(|id| *id != command_id);
+            }
+            // Late outcomes after cancel/failure must not stomp another modal.
+            return true;
+        }
+        if !self.matches_live_delete_flow_command(action) {
+            return false;
+        }
+        let Some(command_id) = native_command_id(&action.command) else {
+            return true;
+        };
+        let uncertain = matches!(
+            &kind,
+            DeleteFlowSettleKind::Uncertain { .. } | DeleteFlowSettleKind::Stale { .. }
+        );
+        match kind {
+            DeleteFlowSettleKind::Accepted => {
+                let mut advance_after_archive = false;
+                let mut clear_after_delete = false;
+                if let Some(draft) = self.delete_task.as_mut() {
+                    match draft.stage {
+                        DeleteTaskStage::AwaitingArchive {
+                            command_id: expected,
+                            ..
+                        } if expected == command_id => {
+                            draft.stage = DeleteTaskStage::AwaitingArchive {
+                                command_id: expected,
+                                archive_accepted: true,
+                            };
+                            draft.error = None;
+                            advance_after_archive = true;
+                        }
+                        DeleteTaskStage::AwaitingDelete {
+                            command_id: expected,
+                        } if expected == command_id => {
+                            clear_after_delete = true;
+                        }
+                        _ => {}
+                    }
+                }
+                self.discard_host_action_by_command_id(command_id);
+                if clear_after_delete {
+                    self.delete_task = None;
+                    self.interaction.sync_selected_task(None);
+                } else if advance_after_archive {
+                    self.try_advance_pending_delete_after_archive();
+                }
+            }
+            DeleteFlowSettleKind::Rejected { message }
+            | DeleteFlowSettleKind::Failed { message }
+            | DeleteFlowSettleKind::Uncertain { message }
+            | DeleteFlowSettleKind::Stale { message } => {
+                if uncertain {
+                    self.retire_delete_flow_command(command_id);
+                } else {
+                    self.discard_host_action_by_command_id(command_id);
+                }
+                if let Some(draft) = self.delete_task.as_mut() {
+                    draft.error = Some(message);
+                    draft.stage = DeleteTaskStage::Confirming;
+                }
+            }
+        }
+        true
     }
 
     fn begin_new_task(&mut self) {
@@ -17002,7 +18172,7 @@ impl NativeShell {
         });
         self.pending_root_overlay_focus = true;
         self.rename_task = None;
-        self.delete_task = None;
+        self.cancel_delete_task_flow();
         self.add_project = None;
         self.interaction.close_palettes();
     }
@@ -17053,7 +18223,7 @@ impl NativeShell {
         });
         self.pending_root_overlay_focus = true;
         self.new_task = None;
-        self.delete_task = None;
+        self.cancel_delete_task_flow();
         self.interaction.close_palettes();
     }
 
@@ -17142,7 +18312,7 @@ impl NativeShell {
                 }
             }
             "native-delete-task-submit" => self.confirm_task_delete(),
-            "native-delete-task-cancel" => self.delete_task = None,
+            "native-delete-task-cancel" => self.cancel_delete_task_flow(),
             "native-task-composer-input" => self.request_composer_accessibility_focus(),
             "native-composer-model" => self.open_composer_model_selector(),
             "native-composer-reasoning" => self.open_composer_reasoning_selector(),
@@ -17571,6 +18741,7 @@ impl NativeShell {
                     .h(px(26.0))
                     .flex()
                     .items_center()
+                    .gap(px(6.0))
                     .px(px(10.0))
                     .rounded(px(6.0))
                     .cursor_pointer()
@@ -17583,6 +18754,11 @@ impl NativeShell {
                         shell.settle_selected_task();
                         cx.notify();
                     }))
+                    .child(crate::icons::app_icon(
+                        crate::icons::CHECK,
+                        12.0,
+                        tokens.text.secondary.to_u32(),
+                    ))
                     .child("Done")
                     .into_any_element()
             });
@@ -17595,6 +18771,7 @@ impl NativeShell {
                     .h(px(26.0))
                     .flex()
                     .items_center()
+                    .gap(px(6.0))
                     .px(px(10.0))
                     .rounded(px(6.0))
                     .cursor_pointer()
@@ -17607,6 +18784,11 @@ impl NativeShell {
                         shell.reopen_task(task_id);
                         cx.notify();
                     }))
+                    .child(crate::icons::app_icon(
+                        crate::icons::REFRESH_CW,
+                        12.0,
+                        tokens.text.secondary.to_u32(),
+                    ))
                     .child("Restore")
                     .into_any_element()
             });
@@ -17617,6 +18799,7 @@ impl NativeShell {
                 .h(px(26.0))
                 .flex()
                 .items_center()
+                .gap(px(6.0))
                 .px(px(10.0))
                 .rounded(px(6.0))
                 .cursor_pointer()
@@ -17629,16 +18812,22 @@ impl NativeShell {
                     shell.archive_selected_task();
                     cx.notify();
                 }))
+                .child(crate::icons::app_icon(
+                    crate::icons::ARCHIVE,
+                    12.0,
+                    tokens.text.muted.to_u32(),
+                ))
                 .child("Archive")
                 .into_any_element()
         });
-        let delete = selected.filter(|_| selected_is_archived).map(|task_id| {
+        let delete = selected.map(|task_id| {
             div()
                 .id("native-task-delete")
                 .tab_stop(true)
                 .h(px(26.0))
                 .flex()
                 .items_center()
+                .gap(px(6.0))
                 .px(px(10.0))
                 .rounded(px(6.0))
                 .cursor_pointer()
@@ -17651,6 +18840,11 @@ impl NativeShell {
                     shell.begin_task_delete(task_id);
                     cx.notify();
                 }))
+                .child(crate::icons::app_icon(
+                    crate::icons::TRASH,
+                    12.0,
+                    tokens.status.destructive.to_u32(),
+                ))
                 .child("Delete")
                 .into_any_element()
         });
@@ -17661,6 +18855,7 @@ impl NativeShell {
                 .h(px(26.0))
                 .flex()
                 .items_center()
+                .gap(px(6.0))
                 .px(px(10.0))
                 .rounded(px(6.0))
                 .cursor_pointer()
@@ -17673,35 +18868,21 @@ impl NativeShell {
                     shell.open_project_action_menu();
                     cx.notify();
                 }))
-                .child("+ Add action")
+                .child(crate::icons::app_icon(
+                    crate::icons::PLUS,
+                    12.0,
+                    tokens.text.secondary.to_u32(),
+                ))
+                .child("Add action")
                 .into_any_element()
         };
-        let open = div()
-            .id("native-task-open")
-            .tab_stop(true)
-            .h(px(26.0))
-            .flex()
-            .items_center()
-            .px(px(10.0))
-            .rounded(px(6.0))
-            .cursor_pointer()
-            .bg(tokens.surfaces.raised.to_gpui())
-            .text_size(px(tokens.density.typography.caption))
-            .text_color(tokens.text.secondary.to_gpui())
-            .hover(|style| style.bg(tokens.surfaces.overlay.to_gpui()))
-            .on_click(cx.listener(|shell, _event: &ClickEvent, _window, cx| {
-                cx.stop_propagation();
-                shell.begin_header_open();
-                cx.notify();
-            }))
-            .child("Open")
-            .into_any_element();
         let commit = div()
             .id("native-task-commit")
             .tab_stop(true)
             .h(px(26.0))
             .flex()
             .items_center()
+            .gap(px(6.0))
             .px(px(10.0))
             .rounded(px(6.0))
             .cursor_pointer()
@@ -17714,6 +18895,11 @@ impl NativeShell {
                 shell.begin_header_commit();
                 cx.notify();
             }))
+            .child(crate::icons::app_icon(
+                crate::icons::GIT_BRANCH,
+                12.0,
+                tokens.text.secondary.to_u32(),
+            ))
             .child("Commit")
             .into_any_element();
         Some(
@@ -17723,7 +18909,6 @@ impl NativeShell {
                 .items_center()
                 .gap(px(self.theme_tokens().density.spacing.xs))
                 .child(add_action)
-                .child(open)
                 .child(commit)
                 .children(done)
                 .children(restore)
@@ -18223,12 +19408,18 @@ impl NativeShell {
     }
 
     fn overlay_text_field_parts(field: &TextField) -> Vec<OverlayTextFieldPart> {
-        let value = field.value();
-        let empty = value.is_empty();
+        Self::overlay_text_field_parts_for_display(field, field.value())
+    }
+
+    fn overlay_text_field_parts_for_display(
+        field: &TextField,
+        display: &str,
+    ) -> Vec<OverlayTextFieldPart> {
+        let empty = display.is_empty();
         let selected = field.is_all_selected();
         let focused = field.is_focused();
         if selected {
-            return vec![OverlayTextFieldPart::Selection(value.to_string())];
+            return vec![OverlayTextFieldPart::Selection(display.to_string())];
         }
         if empty {
             let mut parts = Vec::new();
@@ -18238,8 +19429,8 @@ impl NativeShell {
             parts.push(OverlayTextFieldPart::Placeholder);
             return parts;
         }
-        let cursor = field.cursor().min(value.chars().count());
-        let mut chars = value.chars();
+        let cursor = field.cursor().min(display.chars().count());
+        let mut chars = display.chars();
         let before: String = chars.by_ref().take(cursor).collect();
         let after: String = chars.collect();
         let mut parts = Vec::new();
@@ -18253,6 +19444,45 @@ impl NativeShell {
             parts.push(OverlayTextFieldPart::Text(after));
         }
         parts
+    }
+
+    fn overlay_text_field_with_display(
+        &self,
+        id: impl Into<ElementId>,
+        field: &TextField,
+        display: &str,
+        placeholder: &'static str,
+        tokens: crate::ui::tokens::ThemeTokens,
+    ) -> AnyElement {
+        let chrome = Self::overlay_text_field_chrome(field);
+        let parts = Self::overlay_text_field_parts_for_display(field, display);
+        let mut row = div()
+            .id(id)
+            .relative()
+            .w_full()
+            .px(px(tokens.density.spacing.md))
+            .py(px(tokens.density.spacing.sm))
+            .rounded(px(tokens.density.radii.md))
+            .bg(tokens.surfaces.sunken.to_gpui())
+            .border(px(1.0))
+            .border_color(if chrome.show_focus_ring {
+                tokens.borders.selection.to_gpui()
+            } else {
+                tokens.borders.subtle.to_gpui()
+            })
+            .flex()
+            .items_center()
+            .min_h(px(tokens.density.controls.row_height));
+        for (index, part) in parts.into_iter().enumerate() {
+            row = row.child(Self::overlay_text_field_part(
+                part,
+                placeholder,
+                tokens,
+                index,
+            ));
+        }
+        row.child(self.root_editor_input_registration())
+            .into_any_element()
     }
 
     fn overlay_text_field_part(
@@ -18928,20 +20158,12 @@ impl NativeShell {
             .into_any_element()
     }
 
-    fn render_settings_overlay(
+    #[inline(never)]
+    fn render_appearance_settings_content(
         &self,
         tokens: crate::ui::tokens::ThemeTokens,
-        viewport: Size<Pixels>,
         cx: &Context<Self>,
     ) -> AnyElement {
-        let claude_copy = settings_row_copy(
-            ConfigSidebarProviderKind::Claude,
-            self.agent_presence_for(ConfigSidebarProviderKind::Claude),
-        );
-        let codex_copy = settings_row_copy(
-            ConfigSidebarProviderKind::Codex,
-            self.agent_presence_for(ConfigSidebarProviderKind::Codex),
-        );
         let system_appearance = match self.preferences.mode() {
             crate::ui::tokens::ThemeMode::Light => ThemeAppearance::Light,
             crate::ui::tokens::ThemeMode::Dark | crate::ui::tokens::ThemeMode::HighContrast => {
@@ -19127,7 +20349,7 @@ impl NativeShell {
             .theme_editor
             .as_ref()
             .map(|editor| self.render_theme_editor_panel(editor, tokens, cx));
-        let appearance_content = div()
+        div()
             .flex()
             .flex_row()
             .gap(px(tokens.density.spacing.lg))
@@ -19247,8 +20469,59 @@ impl NativeShell {
                     }),
             )
             .children(theme_editor_panel)
-            .into_any_element();
-        let providers_content = div()
+            .into_any_element()
+    }
+
+    #[inline(never)]
+    fn render_provider_settings_content(
+        &self,
+        tokens: crate::ui::tokens::ThemeTokens,
+        cx: &Context<Self>,
+    ) -> AnyElement {
+        let interval = self
+            .provider_settings
+            .as_ref()
+            .map(|c| c.document().health_interval_secs)
+            .unwrap_or(300);
+        let in_flight = self
+            .provider_settings
+            .as_ref()
+            .is_some_and(|c| c.health_in_flight());
+        let health_rows = self
+            .provider_settings
+            .as_ref()
+            .map(|c| c.health_rows())
+            .unwrap_or_default();
+        let document = self.provider_settings.as_ref().map(|c| c.document());
+        let expanded = self
+            .provider_settings
+            .as_ref()
+            .and_then(|c| c.expanded().map(str::to_string));
+        let feedback = self
+            .provider_settings
+            .as_ref()
+            .and_then(|c| c.feedback().map(str::to_string));
+        let error = self
+            .provider_settings
+            .as_ref()
+            .and_then(|c| c.error().map(str::to_string));
+        let wizard = self
+            .provider_settings
+            .as_ref()
+            .and_then(|c| c.add_wizard().cloned());
+        let mut cards = Vec::new();
+        if let Some(document) = document.as_ref() {
+            for instance in &document.instances {
+                cards.push(self.render_provider_settings_card(
+                    instance,
+                    &health_rows,
+                    expanded.as_deref(),
+                    tokens,
+                    cx,
+                ));
+            }
+        }
+        let mut content = div()
             .flex()
             .flex_col()
             .gap(px(tokens.density.spacing.md))
@@ -19261,38 +20534,1499 @@ impl NativeShell {
             )
             .child(
                 div()
-                    .text_size(px(tokens.density.typography.body))
-                    .line_height(px(tokens.density.typography.body_line_height))
-                    .text_color(tokens.text.secondary.to_gpui())
-                    .child(claude_copy),
+                    .text_size(px(tokens.density.typography.caption))
+                    .text_color(tokens.text.muted.to_gpui())
+                    .child(
+                        "Configure Claude, Codex, and Cursor instances. Grok and OpenCode are listed as unavailable stubs. Health uses cached snapshots; Refresh runs a bounded background probe.",
+                    ),
             )
             .child(
                 div()
-                    .text_size(px(tokens.density.typography.body))
-                    .line_height(px(tokens.density.typography.body_line_height))
+                    .flex()
+                    .items_center()
+                    .gap(px(tokens.density.spacing.sm))
+                    .child(
+                        div()
+                            .text_size(px(tokens.density.typography.caption))
+                            .text_color(tokens.text.secondary.to_gpui())
+                            .child("Health interval (seconds, 0 = manual only)"),
+                    )
+                    .child(
+                        div()
+                            .w(px(88.0))
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(|shell, _event: &MouseDownEvent, _window, cx| {
+                                    cx.stop_propagation();
+                                    shell.ensure_provider_settings();
+                                    if shell.provider_settings_editor.is_none() {
+                                        let secs = shell
+                                            .provider_settings
+                                            .as_ref()
+                                            .map(|ctl| {
+                                                ctl.snapshot().document.health_interval_secs
+                                            })
+                                            .unwrap_or(300);
+                                        shell.provider_settings_editor =
+                                            Some(ProviderSettingsEditor {
+                                                instance_id: None,
+                                                focused:
+                                                    ProviderSettingsFieldFocus::HealthInterval,
+                                                display_name: NativeShell::new_provider_text_field(
+                                                    "Display name",
+                                                    "",
+                                                ),
+                                                accent: NativeShell::new_provider_text_field(
+                                                    "Accent color",
+                                                    "",
+                                                ),
+                                                binary: NativeShell::new_provider_text_field(
+                                                    "Binary path",
+                                                    "",
+                                                ),
+                                                home: NativeShell::new_provider_text_field(
+                                                    "Home path",
+                                                    "",
+                                                ),
+                                                shadow: NativeShell::new_provider_text_field(
+                                                    "Shadow home path",
+                                                    "",
+                                                ),
+                                                launch_args: NativeShell::new_provider_text_field(
+                                                    "Launch args (JSON string array)",
+                                                    "[]",
+                                                ),
+                                                endpoint: NativeShell::new_provider_text_field(
+                                                    "API endpoint",
+                                                    "",
+                                                ),
+                                                env_names: Vec::new(),
+                                                env_values: Vec::new(),
+                                                custom_model: NativeShell::new_provider_text_field(
+                                                    "Custom model slug",
+                                                    "",
+                                                ),
+                                                wizard_id: NativeShell::new_provider_text_field(
+                                                    "Instance id",
+                                                    "",
+                                                ),
+                                                wizard_name: NativeShell::new_provider_text_field(
+                                                    "Display name",
+                                                    "",
+                                                ),
+                                                health_interval:
+                                                    NativeShell::new_provider_text_field(
+                                                        "Health interval seconds",
+                                                        &secs.to_string(),
+                                                    ),
+                                            });
+                                    }
+                                    shell.focus_provider_settings_field(
+                                        ProviderSettingsFieldFocus::HealthInterval,
+                                    );
+                                    cx.notify();
+                                }),
+                            )
+                            .child(if let Some(editor) = self.provider_settings_editor.as_ref()
+                            {
+                                self.overlay_text_field(
+                                    "native-provider-health-interval",
+                                    &editor.health_interval,
+                                    "300",
+                                    tokens,
+                                )
+                            } else {
+                                div()
+                                    .text_size(px(12.0))
+                                    .child(format!("{interval}"))
+                                    .into_any_element()
+                            }),
+                    )
+                    .child(
+                        Button::new("native-provider-interval-apply")
+                            .label("Apply")
+                            .ghost()
+                            .on_click(cx.listener(|shell, _event: &ClickEvent, _window, cx| {
+                                cx.stop_propagation();
+                                shell.ensure_provider_settings();
+                                if let Some(editor) = shell.provider_settings_editor.as_ref() {
+                                    let raw = editor.health_interval.value().to_string();
+                                    if let Some(ctl) = shell.provider_settings.as_mut() {
+                                        ctl.set_health_interval_from_text(&raw);
+                                    }
+                                    shell.flush_provider_settings_pending();
+                                }
+                                cx.notify();
+                            })),
+                    )
+                    .child(
+                        Button::new("native-provider-interval-dec")
+                            .label("−")
+                            .ghost()
+                            .on_click(cx.listener(|shell, _event: &ClickEvent, _window, cx| {
+                                cx.stop_propagation();
+                                shell.ensure_provider_settings();
+                                if let Some(ctl) = shell.provider_settings.as_mut() {
+                                    ctl.nudge_health_interval(-30);
+                                }
+                                shell.flush_provider_settings_pending();
+                                cx.notify();
+                            })),
+                    )
+                    .child(
+                        Button::new("native-provider-interval-inc")
+                            .label("+")
+                            .ghost()
+                            .on_click(cx.listener(|shell, _event: &ClickEvent, _window, cx| {
+                                cx.stop_propagation();
+                                shell.ensure_provider_settings();
+                                if let Some(ctl) = shell.provider_settings.as_mut() {
+                                    ctl.nudge_health_interval(30);
+                                }
+                                shell.flush_provider_settings_pending();
+                                cx.notify();
+                            })),
+                    )
+                    .child(
+                        Button::new("native-provider-interval-300")
+                            .label("300s")
+                            .ghost()
+                            .on_click(cx.listener(|shell, _event: &ClickEvent, _window, cx| {
+                                cx.stop_propagation();
+                                shell.ensure_provider_settings();
+                                if let Some(ctl) = shell.provider_settings.as_mut() {
+                                    ctl.set_health_interval(300);
+                                }
+                                shell.flush_provider_settings_pending();
+                                cx.notify();
+                            })),
+                    )
+                    .child(
+                        Button::new("native-provider-interval-0")
+                            .label("Manual")
+                            .ghost()
+                            .on_click(cx.listener(|shell, _event: &ClickEvent, _window, cx| {
+                                cx.stop_propagation();
+                                shell.ensure_provider_settings();
+                                if let Some(ctl) = shell.provider_settings.as_mut() {
+                                    ctl.set_health_interval(0);
+                                }
+                                shell.flush_provider_settings_pending();
+                                cx.notify();
+                            })),
+                    )
+                    .child(
+                        Button::new("native-provider-interval-reset")
+                            .label("Reset 300")
+                            .ghost()
+                            .on_click(cx.listener(|shell, _event: &ClickEvent, _window, cx| {
+                                cx.stop_propagation();
+                                shell.ensure_provider_settings();
+                                if let Some(ctl) = shell.provider_settings.as_mut() {
+                                    ctl.reset_health_interval_default();
+                                }
+                                shell.flush_provider_settings_pending();
+                                cx.notify();
+                            })),
+                    )
+                    .child(
+                        Button::new("native-settings-refresh")
+                            .label(if in_flight {
+                                "Refreshing…"
+                            } else {
+                                "Refresh providers"
+                            })
+                            .primary()
+                            .disabled(in_flight)
+                            .on_click(cx.listener(|shell, _event: &ClickEvent, _window, cx| {
+                                cx.stop_propagation();
+                                shell.refresh_provider_settings_health();
+                                cx.notify();
+                            })),
+                    )
+                    .child(
+                        Button::new("native-provider-add")
+                            .label("Add instance")
+                            .ghost()
+                            .on_click(cx.listener(|shell, _event: &ClickEvent, _window, cx| {
+                                cx.stop_propagation();
+                                shell.ensure_provider_settings();
+                                if let Some(ctl) = shell.provider_settings.as_mut() {
+                                    ctl.begin_add_wizard();
+                                }
+                                shell.ensure_provider_settings_wizard_editor();
+                                cx.notify();
+                            })),
+                    ),
+            )
+            .children(cards);
+        if let Some(wizard) = wizard {
+            content = content.child(self.render_provider_settings_wizard(wizard, tokens, cx));
+        }
+        let pending_confirm = self
+            .provider_settings
+            .as_ref()
+            .and_then(|ctl| ctl.pending_confirm().cloned());
+        if let Some(confirm) = pending_confirm {
+            let label = match &confirm {
+                crate::ui::provider_settings::PendingConfirm::ResetBuiltin { instance_id } => {
+                    format!("Reset `{instance_id}` to defaults?")
+                }
+                crate::ui::provider_settings::PendingConfirm::DeleteCustom { instance_id } => {
+                    format!("Delete custom instance `{instance_id}`?")
+                }
+            };
+            content = content.child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(tokens.density.spacing.sm))
+                    .child(
+                        div()
+                            .flex_1()
+                            .text_size(px(12.0))
+                            .text_color(tokens.status.warning.to_gpui())
+                            .child(label),
+                    )
+                    .child(
+                        Button::new("native-provider-confirm-yes")
+                            .label("Confirm")
+                            .primary()
+                            .on_click(cx.listener(|shell, _event: &ClickEvent, _window, cx| {
+                                cx.stop_propagation();
+                                if let Some(ctl) = shell.provider_settings.as_mut() {
+                                    ctl.confirm_pending();
+                                }
+                                shell.flush_provider_settings_pending();
+                                cx.notify();
+                            })),
+                    )
+                    .child(
+                        Button::new("native-provider-confirm-no")
+                            .label("Cancel")
+                            .ghost()
+                            .on_click(cx.listener(|shell, _event: &ClickEvent, _window, cx| {
+                                cx.stop_propagation();
+                                if let Some(ctl) = shell.provider_settings.as_mut() {
+                                    ctl.cancel_confirm();
+                                }
+                                cx.notify();
+                            })),
+                    ),
+            );
+        }
+        content = content
+            .when_some(feedback, |content, message| {
+                content.child(
+                    div()
+                        .text_size(px(tokens.density.typography.caption))
+                        .text_color(tokens.text.secondary.to_gpui())
+                        .child(message),
+                )
+            })
+            .when_some(error, |content, message| {
+                content.child(
+                    div()
+                        .text_size(px(tokens.density.typography.caption))
+                        .text_color(tokens.status.destructive.to_gpui())
+                        .child(message),
+                )
+            });
+        content.into_any_element()
+    }
+
+    #[inline(never)]
+    fn render_provider_settings_card(
+        &self,
+        instance: &crate::providers::settings::ProviderInstanceConfig,
+        health_rows: &[crate::providers::settings::ProviderHealthRow],
+        expanded: Option<&str>,
+        tokens: crate::ui::tokens::ThemeTokens,
+        cx: &Context<Self>,
+    ) -> AnyElement {
+        let id = instance.instance_id.as_str().to_string();
+        let health = health_rows
+            .iter()
+            .find(|row| row.instance_id == id)
+            .cloned();
+        let status = health
+            .as_ref()
+            .map(|row| row.status)
+            .unwrap_or(crate::providers::settings::ProviderHealthStatus::Unknown);
+        let version = health
+            .as_ref()
+            .and_then(|row| row.version.clone())
+            .unwrap_or_else(|| "—".into());
+        let account = health.as_ref().and_then(|row| {
+            if row.reveal_email {
+                row.account_email.clone()
+            } else {
+                row.account_email_masked.clone()
+            }
+        });
+        let subscription = health
+            .as_ref()
+            .and_then(|row| row.subscription_tier.clone());
+        let is_stub = instance.driver.is_stub();
+        let is_expanded = expanded.as_deref() == Some(id.as_str());
+        let instance_id_for_enable = id.clone();
+        let instance_id_for_expand = id.clone();
+        let enabled = instance.enabled;
+        let mut card = div()
+            .id((
+                "native-provider-card",
+                stable_provider_element_key(&id, "card"),
+            ))
+            .flex()
+            .flex_col()
+            .gap(px(tokens.density.spacing.sm))
+            .p(px(tokens.density.spacing.md))
+            .rounded(px(tokens.density.radii.md))
+            .border(px(1.0))
+            .border_color(tokens.borders.subtle.to_gpui())
+            .bg(tokens.surfaces.sunken.to_gpui())
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(tokens.density.spacing.sm))
+                    .child(
+                        div()
+                            .size(px(8.0))
+                            .rounded_full()
+                            .bg(crate::ui::tokens::Color::from_u32(
+                                crate::ui::provider_settings::health_dot_color(status, &tokens),
+                            )
+                            .to_gpui()),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .text_size(px(tokens.density.typography.body))
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(tokens.text.primary.to_gpui())
+                            .child(instance.display_name.clone()),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(tokens.density.typography.caption))
+                            .text_color(tokens.text.muted.to_gpui())
+                            .child(version),
+                    )
+                    .child(
+                        Button::new((
+                            "native-provider-expand",
+                            stable_provider_element_key(&id, "expand"),
+                        ))
+                        .label(if is_expanded { "Collapse" } else { "Expand" })
+                        .ghost()
+                        .on_click(cx.listener(
+                            move |shell, _event: &ClickEvent, _window, cx| {
+                                cx.stop_propagation();
+                                shell.ensure_provider_settings();
+                                if let Some(ctl) = shell.provider_settings.as_mut() {
+                                    ctl.toggle_expanded(&instance_id_for_expand);
+                                }
+                                if let Some(id) = shell
+                                    .provider_settings
+                                    .as_ref()
+                                    .and_then(|ctl| ctl.expanded().map(str::to_string))
+                                {
+                                    shell.open_provider_settings_editor_for(&id);
+                                } else {
+                                    shell.provider_settings_editor = None;
+                                }
+                                cx.notify();
+                            },
+                        )),
+                    ),
+            );
+        if !is_stub {
+            card = card.child(
+                Button::new((
+                    "native-provider-enable",
+                    stable_provider_element_key(&id, "enable"),
+                ))
+                .label(if enabled { "Disable" } else { "Enable" })
+                .ghost()
+                .on_click(cx.listener(
+                    move |shell, _event: &ClickEvent, _window, cx| {
+                        cx.stop_propagation();
+                        shell.ensure_provider_settings();
+                        if let Some(ctl) = shell.provider_settings.as_mut() {
+                            ctl.set_enabled(&instance_id_for_enable, !enabled);
+                        }
+                        shell.flush_provider_settings_pending();
+                        cx.notify();
+                    },
+                )),
+            );
+        } else {
+            card = card.child(
+                div()
+                    .text_size(px(tokens.density.typography.caption))
+                    .text_color(tokens.text.muted.to_gpui())
+                    .child("Unavailable"),
+            );
+        }
+        let mut body = div()
+            .flex()
+            .flex_col()
+            .gap(px(tokens.density.spacing.xs))
+            .child(
+                div()
+                    .text_size(px(tokens.density.typography.caption))
                     .text_color(tokens.text.secondary.to_gpui())
-                    .child(codex_copy),
+                    .child(format!(
+                        "{} · {}",
+                        instance.driver.as_str(),
+                        crate::ui::provider_settings::status_label(status)
+                    )),
+            );
+        if let Some(account) = account {
+            let reveal = health.as_ref().is_some_and(|row| row.reveal_email);
+            let id_for_reveal = id.clone();
+            body = body.child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(tokens.density.spacing.sm))
+                    .child(
+                        div()
+                            .text_size(px(tokens.density.typography.caption))
+                            .text_color(tokens.text.secondary.to_gpui())
+                            .child(account),
+                    )
+                    .child(
+                        Button::new((
+                            "native-provider-reveal",
+                            stable_provider_element_key(&id, "reveal"),
+                        ))
+                        .label(if reveal { "Hide email" } else { "Reveal email" })
+                        .ghost()
+                        .on_click(cx.listener(
+                            move |shell, _event: &ClickEvent, _window, cx| {
+                                cx.stop_propagation();
+                                if let Some(ctl) = shell.provider_settings.as_mut() {
+                                    ctl.set_email_reveal(&id_for_reveal, !reveal);
+                                }
+                                cx.notify();
+                            },
+                        )),
+                    ),
+            );
+        }
+        if let Some(subscription) = subscription {
+            body = body.child(
+                div()
+                    .text_size(px(tokens.density.typography.caption))
+                    .text_color(tokens.text.muted.to_gpui())
+                    .child(subscription),
+            );
+        }
+        if is_stub {
+            body = body.child(
+                div()
+                    .text_size(px(tokens.density.typography.caption))
+                    .text_color(tokens.status.warning.to_gpui())
+                    .child("Not supported in native DevManager yet. Cannot enable or launch."),
+            );
+        }
+        if is_expanded && !is_stub {
+            body = self.render_provider_settings_editor(body, instance, tokens, cx);
+        }
+        card.child(body).into_any_element()
+    }
+
+    #[inline(never)]
+    fn render_provider_settings_editor(
+        &self,
+        mut body: gpui::Div,
+        instance: &crate::providers::settings::ProviderInstanceConfig,
+        tokens: crate::ui::tokens::ThemeTokens,
+        cx: &Context<Self>,
+    ) -> gpui::Div {
+        let id = instance.instance_id.as_str().to_string();
+        let instance_id_for_reset = id.clone();
+        let instance_id_for_delete = id.clone();
+        let editor = self.provider_settings_editor.as_ref();
+        let working = self
+            .provider_settings
+            .as_ref()
+            .and_then(|ctl| ctl.working_instance(&id))
+            .unwrap_or_else(|| instance.clone());
+        let field_row = |label: &'static str,
+                         field: Option<&TextField>,
+                         focus: ProviderSettingsFieldFocus,
+                         tokens: crate::ui::tokens::ThemeTokens,
+                         shell_ref: &Self,
+                         cx: &Context<Self>| {
+            let focus_click = focus;
+            div()
+                .flex()
+                .flex_col()
+                .gap(px(2.0))
+                .child(
+                    div()
+                        .text_size(px(12.0))
+                        .text_color(tokens.text.muted.to_gpui())
+                        .child(label),
+                )
+                .child(
+                    div()
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(move |shell, _event: &MouseDownEvent, _window, cx| {
+                                cx.stop_propagation();
+                                shell.focus_provider_settings_field(focus_click);
+                                cx.notify();
+                            }),
+                        )
+                        .child(if let Some(field) = field {
+                            shell_ref.overlay_text_field(
+                                (
+                                    "native-provider-field",
+                                    stable_provider_element_key(&id, &format!("{label:?}")),
+                                ),
+                                field,
+                                label,
+                                tokens,
+                            )
+                        } else {
+                            div()
+                                .text_size(px(12.0))
+                                .child("(open editor)")
+                                .into_any_element()
+                        }),
+                )
+                .into_any_element()
+        };
+        body = body
+            .child(field_row(
+                "Display name",
+                editor.map(|e| &e.display_name),
+                ProviderSettingsFieldFocus::DisplayName,
+                tokens,
+                self,
+                cx,
+            ))
+            .child(field_row(
+                "Accent color",
+                editor.map(|e| &e.accent),
+                ProviderSettingsFieldFocus::AccentColor,
+                tokens,
+                self,
+                cx,
+            ))
+            .child(field_row(
+                "Binary path",
+                editor.map(|e| &e.binary),
+                ProviderSettingsFieldFocus::BinaryPath,
+                tokens,
+                self,
+                cx,
+            ))
+            .child(field_row(
+                "Home / config path",
+                editor.map(|e| &e.home),
+                ProviderSettingsFieldFocus::HomePath,
+                tokens,
+                self,
+                cx,
+            ));
+        if matches!(
+            working.driver,
+            crate::providers::settings::ProviderDriverKind::Codex
+        ) {
+            body = body.child(field_row(
+                "Codex shadow home",
+                editor.map(|e| &e.shadow),
+                ProviderSettingsFieldFocus::ShadowHomePath,
+                tokens,
+                self,
+                cx,
+            ));
+        }
+        if matches!(
+            working.driver,
+            crate::providers::settings::ProviderDriverKind::Cursor
+        ) {
+            body = body.child(field_row(
+                "API endpoint",
+                editor.map(|e| &e.endpoint),
+                ProviderSettingsFieldFocus::ApiEndpoint,
+                tokens,
+                self,
+                cx,
+            ));
+        }
+        body = body.child(field_row(
+            "Launch args (JSON string array)",
+            editor.map(|e| &e.launch_args),
+            ProviderSettingsFieldFocus::LaunchArgs,
+            tokens,
+            self,
+            cx,
+        ));
+        if matches!(
+            working.driver,
+            crate::providers::settings::ProviderDriverKind::Cursor
+        ) {
+            body = body.child(
+                div()
+                    .text_size(px(tokens.density.typography.caption))
+                    .text_color(tokens.text.muted.to_gpui())
+                    .child(
+                        "Cursor adapter limits: settings and health are real, but slash-command discovery and some Claude/Codex-only session surfaces are unsupported.",
+                    ),
+            );
+        }
+        let env_count = editor.map(|e| e.env_names.len()).unwrap_or(0);
+        for index in 0..env_count {
+            let env = working.environment.get(index);
+            let sensitive = env.is_some_and(|e| e.sensitive);
+            let id_env = id.clone();
+            body = body.child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap(px(2.0))
+                    .child(field_row(
+                        "Env name",
+                        editor.and_then(|e| e.env_names.get(index)),
+                        ProviderSettingsFieldFocus::EnvName(index),
+                        tokens,
+                        self,
+                        cx,
+                    ))
+                    .child(
+                        div()
+                            .text_size(px(12.0))
+                            .text_color(tokens.text.muted.to_gpui())
+                            .child(if sensitive {
+                                "Env value (secret)"
+                            } else {
+                                "Env value"
+                            }),
+                    )
+                    .child({
+                        let focus_click = ProviderSettingsFieldFocus::EnvValue(index);
+                        let field = editor.and_then(|e| e.env_values.get(index));
+                        let raw = field.map(|f| f.value()).unwrap_or("");
+                        let display = if sensitive {
+                            crate::ui::provider_settings::mask_secret_preserving_scalars(raw)
+                        } else {
+                            raw.to_string()
+                        };
+                        div()
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(move |shell, _event: &MouseDownEvent, _window, cx| {
+                                    cx.stop_propagation();
+                                    shell.focus_provider_settings_field(focus_click);
+                                    cx.notify();
+                                }),
+                            )
+                            .child(if let Some(field) = field {
+                                self.overlay_text_field_with_display(
+                                    (
+                                        "native-provider-env-value",
+                                        stable_provider_element_key(
+                                            &id,
+                                            &format!("env-value-{index}"),
+                                        ),
+                                    ),
+                                    field,
+                                    &display,
+                                    if sensitive {
+                                        "••••••••"
+                                    } else {
+                                        "value"
+                                    },
+                                    tokens,
+                                )
+                            } else {
+                                div()
+                                    .text_size(px(12.0))
+                                    .child("(open editor)")
+                                    .into_any_element()
+                            })
+                    })
+                    .child(
+                        div()
+                            .flex()
+                            .gap(px(tokens.density.spacing.sm))
+                            .child(
+                                Button::new((
+                                    "native-provider-env-secret",
+                                    stable_provider_element_key(
+                                        &id,
+                                        &format!("env-secret-{index}"),
+                                    ),
+                                ))
+                                .label(if sensitive { "Secret" } else { "Plain" })
+                                .ghost()
+                                .on_click(cx.listener(
+                                    move |shell, _event: &ClickEvent, _window, cx| {
+                                        cx.stop_propagation();
+                                        shell.sync_provider_settings_editor_to_draft();
+                                        if let Some(ctl) = shell.provider_settings.as_mut() {
+                                            ctl.toggle_env_sensitive(&id_env, index);
+                                        }
+                                        if let Some(id) = shell
+                                            .provider_settings
+                                            .as_ref()
+                                            .and_then(|c| c.expanded().map(str::to_string))
+                                        {
+                                            shell.open_provider_settings_editor_for(&id);
+                                        }
+                                        cx.notify();
+                                    },
+                                )),
+                            )
+                            .child(
+                                Button::new((
+                                    "native-provider-env-del",
+                                    stable_provider_element_key(&id, &format!("env-del-{index}")),
+                                ))
+                                .label("Remove")
+                                .ghost()
+                                .on_click({
+                                    let id_env = id.clone();
+                                    cx.listener(move |shell, _event: &ClickEvent, _window, cx| {
+                                        cx.stop_propagation();
+                                        shell.sync_provider_settings_editor_to_draft();
+                                        if let Some(ctl) = shell.provider_settings.as_mut() {
+                                            ctl.remove_env_row(&id_env, index);
+                                        }
+                                        if let Some(id) = shell
+                                            .provider_settings
+                                            .as_ref()
+                                            .and_then(|c| c.expanded().map(str::to_string))
+                                        {
+                                            shell.open_provider_settings_editor_for(&id);
+                                        }
+                                        cx.notify();
+                                    })
+                                }),
+                            ),
+                    ),
+            );
+        }
+        let id_add_env = id.clone();
+        body = body.child(
+            Button::new((
+                "native-provider-env-add",
+                stable_provider_element_key(&id, "env-add"),
+            ))
+            .label("Add environment variable")
+            .ghost()
+            .on_click(cx.listener(move |shell, _event: &ClickEvent, _window, cx| {
+                cx.stop_propagation();
+                shell.sync_provider_settings_editor_to_draft();
+                if let Some(ctl) = shell.provider_settings.as_mut() {
+                    ctl.add_env_row(&id_add_env);
+                }
+                if let Some(id) = shell
+                    .provider_settings
+                    .as_ref()
+                    .and_then(|c| c.expanded().map(str::to_string))
+                {
+                    shell.open_provider_settings_editor_for(&id);
+                }
+                cx.notify();
+            })),
+        );
+        let catalog = self
+            .provider_settings
+            .as_ref()
+            .map(|ctl| ctl.settings_model_catalog(&id))
+            .unwrap_or_default();
+        for slug in catalog {
+            let id_model = id.clone();
+            let slug_fav = slug.clone();
+            let slug_hide = slug.clone();
+            let slug_up = slug.clone();
+            let slug_down = slug.clone();
+            let is_fav = working
+                .model_policy
+                .favorite_order
+                .iter()
+                .any(|s| s == &slug);
+            let is_hidden = working
+                .model_policy
+                .hidden_builtins
+                .iter()
+                .any(|s| s == &slug);
+            let is_custom = working.custom_models.iter().any(|m| m.slug == slug);
+            body = body.child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(tokens.density.spacing.xs))
+                    .child(
+                        div()
+                            .flex_1()
+                            .text_size(px(12.0))
+                            .text_color(tokens.text.secondary.to_gpui())
+                            .child(format!(
+                                "{}{}",
+                                slug,
+                                if is_hidden { " (hidden)" } else { "" }
+                            )),
+                    )
+                    .child(
+                        Button::new((
+                            "native-provider-fav",
+                            stable_provider_element_key(&id, &format!("fav-{slug}")),
+                        ))
+                        .label(if is_fav { "Unfavorite" } else { "Favorite" })
+                        .ghost()
+                        .on_click(cx.listener(
+                            move |shell, _event: &ClickEvent, _window, cx| {
+                                cx.stop_propagation();
+                                if let Some(ctl) = shell.provider_settings.as_mut() {
+                                    ctl.toggle_favorite(&id_model, &slug_fav);
+                                }
+                                shell.flush_provider_settings_pending();
+                                cx.notify();
+                            },
+                        )),
+                    )
+                    .child(
+                        Button::new((
+                            "native-provider-hide",
+                            stable_provider_element_key(&id, &format!("hide-{slug}")),
+                        ))
+                        .label(if is_hidden { "Show" } else { "Hide" })
+                        .ghost()
+                        .on_click({
+                            let id_hide = id.clone();
+                            cx.listener(move |shell, _event: &ClickEvent, _window, cx| {
+                                cx.stop_propagation();
+                                if let Some(ctl) = shell.provider_settings.as_mut() {
+                                    ctl.toggle_hide_builtin(&id_hide, &slug_hide);
+                                }
+                                shell.flush_provider_settings_pending();
+                                cx.notify();
+                            })
+                        }),
+                    )
+                    .child(
+                        Button::new((
+                            "native-provider-up",
+                            stable_provider_element_key(&id, &format!("up-{slug}")),
+                        ))
+                        .label("Up")
+                        .ghost()
+                        .on_click({
+                            let id_up = id.clone();
+                            cx.listener(move |shell, _event: &ClickEvent, _window, cx| {
+                                cx.stop_propagation();
+                                if let Some(ctl) = shell.provider_settings.as_mut() {
+                                    ctl.move_catalog_model(id_up.as_str(), &slug_up, true);
+                                }
+                                shell.flush_provider_settings_pending();
+                                cx.notify();
+                            })
+                        }),
+                    )
+                    .child(
+                        Button::new((
+                            "native-provider-down",
+                            stable_provider_element_key(&id, &format!("down-{slug}")),
+                        ))
+                        .label("Down")
+                        .ghost()
+                        .on_click({
+                            let id_down = id.clone();
+                            cx.listener(move |shell, _event: &ClickEvent, _window, cx| {
+                                cx.stop_propagation();
+                                if let Some(ctl) = shell.provider_settings.as_mut() {
+                                    ctl.move_catalog_model(id_down.as_str(), &slug_down, false);
+                                }
+                                shell.flush_provider_settings_pending();
+                                cx.notify();
+                            })
+                        }),
+                    )
+                    .when(is_custom, |row| {
+                        let id_rm = id.clone();
+                        let slug_rm = slug.clone();
+                        row.child(
+                            Button::new((
+                                "native-provider-rm-model",
+                                stable_provider_element_key(&id, &format!("rm-{slug}")),
+                            ))
+                            .label("Remove")
+                            .ghost()
+                            .on_click(cx.listener(
+                                move |shell, _event: &ClickEvent, _window, cx| {
+                                    cx.stop_propagation();
+                                    if let Some(ctl) = shell.provider_settings.as_mut() {
+                                        ctl.remove_custom_model(&id_rm, &slug_rm);
+                                    }
+                                    shell.flush_provider_settings_pending();
+                                    cx.notify();
+                                },
+                            )),
+                        )
+                    }),
+            );
+        }
+        body = body
+            .child(field_row(
+                "Add custom model slug",
+                editor.map(|e| &e.custom_model),
+                ProviderSettingsFieldFocus::CustomModelSlug,
+                tokens,
+                self,
+                cx,
+            ))
+            .child(
+                Button::new((
+                    "native-provider-add-model",
+                    stable_provider_element_key(&id, "add-model"),
+                ))
+                .label("Add custom model")
+                .ghost()
+                .on_click({
+                    let id_add = id.clone();
+                    cx.listener(move |shell, _event: &ClickEvent, _window, cx| {
+                        cx.stop_propagation();
+                        shell.sync_provider_settings_editor_to_draft();
+                        if let Some(ctl) = shell.provider_settings.as_mut() {
+                            ctl.add_custom_model(&id_add);
+                        }
+                        shell.flush_provider_settings_pending();
+                        cx.notify();
+                    })
+                }),
+            )
+            .child(
+                div()
+                    .flex()
+                    .gap(px(tokens.density.spacing.sm))
+                    .child(
+                        Button::new((
+                            "native-provider-save",
+                            stable_provider_element_key(&id, "save"),
+                        ))
+                        .label("Save")
+                        .primary()
+                        .on_click(cx.listener(
+                            move |shell, _event: &ClickEvent, _window, cx| {
+                                cx.stop_propagation();
+                                shell.sync_provider_settings_editor_to_draft();
+                                if let Some(ctl) = shell.provider_settings.as_mut() {
+                                    ctl.save_draft();
+                                }
+                                shell.flush_provider_settings_pending();
+                                cx.notify();
+                            },
+                        )),
+                    )
+                    .child(
+                        Button::new((
+                            "native-provider-cancel",
+                            stable_provider_element_key(&id, "cancel-edit"),
+                        ))
+                        .label("Cancel")
+                        .ghost()
+                        .on_click({
+                            let id_cancel = id.clone();
+                            cx.listener(move |shell, _event: &ClickEvent, _window, cx| {
+                                cx.stop_propagation();
+                                if let Some(ctl) = shell.provider_settings.as_mut() {
+                                    ctl.cancel_draft();
+                                    ctl.begin_edit(&id_cancel);
+                                }
+                                shell.provider_settings_editor = None;
+                                shell.open_provider_settings_editor_for(&id_cancel);
+                                cx.notify();
+                            })
+                        }),
+                    )
+                    .child(
+                        Button::new((
+                            "native-provider-reset",
+                            stable_provider_element_key(&id, "reset"),
+                        ))
+                        .label("Reset defaults…")
+                        .ghost()
+                        .on_click(cx.listener(
+                            move |shell, _event: &ClickEvent, _window, cx| {
+                                cx.stop_propagation();
+                                if let Some(ctl) = shell.provider_settings.as_mut() {
+                                    ctl.request_reset_builtin(&instance_id_for_reset);
+                                }
+                                cx.notify();
+                            },
+                        )),
+                    )
+                    .when(
+                        !matches!(
+                            id.as_str(),
+                            "claude" | "codex" | "cursor" | "grok" | "opencode"
+                        ),
+                        |row| {
+                            row.child(
+                                Button::new((
+                                    "native-provider-delete",
+                                    stable_provider_element_key(&id, "delete"),
+                                ))
+                                .label("Delete instance…")
+                                .ghost()
+                                .on_click(cx.listener(
+                                    move |shell, _event: &ClickEvent, _window, cx| {
+                                        cx.stop_propagation();
+                                        if let Some(ctl) = shell.provider_settings.as_mut() {
+                                            ctl.request_delete_custom(&instance_id_for_delete);
+                                        }
+                                        cx.notify();
+                                    },
+                                )),
+                            )
+                        },
+                    ),
+            );
+        body
+    }
+
+    #[inline(never)]
+    fn render_provider_settings_wizard(
+        &self,
+        wizard: crate::ui::provider_settings::AddInstanceWizard,
+        tokens: crate::ui::tokens::ThemeTokens,
+        cx: &Context<Self>,
+    ) -> AnyElement {
+        div()
+            .flex()
+            .flex_col()
+            .gap(px(tokens.density.spacing.sm))
+            .p(px(tokens.density.spacing.md))
+            .rounded(px(tokens.density.radii.md))
+            .border(px(1.0))
+            .border_color(tokens.borders.subtle.to_gpui())
+            .child(
+                div()
+                    .text_size(px(tokens.density.typography.body))
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .child("Add provider instance"),
             )
             .child(
                 div()
                     .text_size(px(tokens.density.typography.caption))
                     .text_color(tokens.text.muted.to_gpui())
-                    .child("DevManager does not log you in; sign in with that app, then Refresh"),
+                    .child(format!(
+                        "Step {:?}: driver={}, id={}, name={}",
+                        wizard.step,
+                        wizard.driver.as_str(),
+                        wizard.instance_id,
+                        wizard.display_name
+                    )),
             )
             .child(
-                Button::new("native-settings-refresh")
-                    .label("Refresh providers")
-                    .primary()
-                    .on_click(cx.listener(|shell, _event: &ClickEvent, _window, cx| {
-                        cx.stop_propagation();
-                        let _ = shell.dispatch_agent_connection_query(false);
-                        cx.notify();
-                    })),
+                div()
+                    .flex()
+                    .gap(px(tokens.density.spacing.sm))
+                    .child(
+                        Button::new("native-provider-wizard-claude")
+                            .label("Claude")
+                            .ghost()
+                            .on_click(cx.listener(
+                                |shell, _event: &ClickEvent, _window, cx| {
+                                    cx.stop_propagation();
+                                    if let Some(ctl) = shell.provider_settings.as_mut()
+                                    {
+                                        ctl.wizard_select_driver(
+                                            crate::providers::settings::ProviderDriverKind::Claude,
+                                        );
+                                    }
+                                    cx.notify();
+                                },
+                            )),
+                    )
+                    .child(
+                        Button::new("native-provider-wizard-codex")
+                            .label("Codex")
+                            .ghost()
+                            .on_click(cx.listener(
+                                |shell, _event: &ClickEvent, _window, cx| {
+                                    cx.stop_propagation();
+                                    if let Some(ctl) = shell.provider_settings.as_mut()
+                                    {
+                                        ctl.wizard_select_driver(
+                                            crate::providers::settings::ProviderDriverKind::Codex,
+                                        );
+                                    }
+                                    cx.notify();
+                                },
+                            )),
+                    )
+                    .child(
+                        Button::new("native-provider-wizard-cursor")
+                            .label("Cursor")
+                            .ghost()
+                            .on_click(cx.listener(
+                                |shell, _event: &ClickEvent, _window, cx| {
+                                    cx.stop_propagation();
+                                    if let Some(ctl) = shell.provider_settings.as_mut()
+                                    {
+                                        ctl.wizard_select_driver(
+                                            crate::providers::settings::ProviderDriverKind::Cursor,
+                                        );
+                                    }
+                                    cx.notify();
+                                },
+                            )),
+                    )
+                    .child(
+                        Button::new("native-provider-wizard-grok")
+                            .label("Grok (unavailable)")
+                            .ghost()
+                            .disabled(true),
+                    )
+                    .child(
+                        Button::new("native-provider-wizard-opencode")
+                            .label("OpenCode (unavailable)")
+                            .ghost()
+                            .disabled(true),
+                    ),
             )
-            .into_any_element();
+            .when(
+                matches!(
+                    wizard.step,
+                    crate::ui::provider_settings::AddWizardStep::Identity
+                ),
+                |panel| {
+                    let Some(editor) = self.provider_settings_editor.as_ref() else {
+                        return panel.child(
+                            div()
+                                .text_size(px(12.0))
+                                .child("Open identity fields…"),
+                        );
+                    };
+                    panel
+                        .child(
+                            div()
+                                .text_size(px(12.0))
+                                .text_color(tokens.text.muted.to_gpui())
+                                .child("Instance id"),
+                        )
+                        .child(
+                            div()
+                                .on_mouse_down(
+                                    MouseButton::Left,
+                                    cx.listener(
+                                        |shell, _event: &MouseDownEvent, _window, cx| {
+                                            cx.stop_propagation();
+                                            shell.focus_provider_settings_field(
+                                                ProviderSettingsFieldFocus::WizardInstanceId,
+                                            );
+                                            cx.notify();
+                                        },
+                                    ),
+                                )
+                                .child(self.overlay_text_field(
+                                    "native-provider-wizard-id",
+                                    &editor.wizard_id,
+                                    "unique_instance_id",
+                                    tokens,
+                                )),
+                        )
+                        .child(
+                            div()
+                                .text_size(px(12.0))
+                                .text_color(tokens.text.muted.to_gpui())
+                                .child("Display name"),
+                        )
+                        .child(
+                            div()
+                                .on_mouse_down(
+                                    MouseButton::Left,
+                                    cx.listener(
+                                        |shell, _event: &MouseDownEvent, _window, cx| {
+                                            cx.stop_propagation();
+                                            shell.focus_provider_settings_field(
+                                                ProviderSettingsFieldFocus::WizardDisplayName,
+                                            );
+                                            cx.notify();
+                                        },
+                                    ),
+                                )
+                                .child(self.overlay_text_field(
+                                    "native-provider-wizard-name",
+                                    &editor.wizard_name,
+                                    "Display name",
+                                    tokens,
+                                )),
+                        )
+                        .child(
+                            Button::new("native-provider-wizard-next")
+                                .label("Continue")
+                                .ghost()
+                                .on_click(cx.listener(
+                                    |shell, _event: &ClickEvent, _window, cx| {
+                                        cx.stop_propagation();
+                                        shell.sync_provider_settings_editor_to_draft();
+                                        if let Some(ctl) =
+                                            shell.provider_settings.as_mut()
+                                        {
+                                            ctl.wizard_advance_to_config();
+                                        }
+                                        shell.ensure_provider_settings_wizard_editor();
+                                        cx.notify();
+                                    },
+                                )),
+                        )
+                },
+            )
+            .when(
+                matches!(
+                    wizard.step,
+                    crate::ui::provider_settings::AddWizardStep::Config
+                ),
+                |panel| {
+                    let Some(editor) = self.provider_settings_editor.as_ref() else {
+                        return panel.child(
+                            div()
+                                .text_size(px(12.0))
+                                .child("Open configuration fields…"),
+                        );
+                    };
+                    let wizard_field =
+                        |label: &'static str,
+                         field: &TextField,
+                         focus: ProviderSettingsFieldFocus,
+                         tokens: crate::ui::tokens::ThemeTokens,
+                         shell_ref: &Self,
+                         cx: &Context<Self>| {
+                            let focus_click = focus;
+                            div()
+                                .flex()
+                                .flex_col()
+                                .gap(px(2.0))
+                                .child(
+                                    div()
+                                        .text_size(px(12.0))
+                                        .text_color(tokens.text.muted.to_gpui())
+                                        .child(label),
+                                )
+                                .child(
+                                    div()
+                                        .on_mouse_down(
+                                            MouseButton::Left,
+                                            cx.listener(
+                                                move |shell,
+                                                      _event: &MouseDownEvent,
+                                                      _window,
+                                                      cx| {
+                                                    cx.stop_propagation();
+                                                    shell.focus_provider_settings_field(
+                                                        focus_click,
+                                                    );
+                                                    cx.notify();
+                                                },
+                                            ),
+                                        )
+                                        .child(shell_ref.overlay_text_field(
+                                            (
+                                                "native-provider-wizard-field",
+                                                stable_provider_element_key("wizard", label),
+                                            ),
+                                            field,
+                                            label,
+                                            tokens,
+                                        )),
+                                )
+                                .into_any_element()
+                        };
+                    panel
+                        .child(
+                            div()
+                                .text_size(px(12.0))
+                                .text_color(tokens.text.muted.to_gpui())
+                                .child(
+                                    "Complete provider configuration before Create. Launch args use a JSON string array.",
+                                ),
+                        )
+                        .child(wizard_field(
+                            "Display name",
+                            &editor.display_name,
+                            ProviderSettingsFieldFocus::DisplayName,
+                            tokens,
+                            self,
+                            cx,
+                        ))
+                        .child(wizard_field(
+                            "Binary path",
+                            &editor.binary,
+                            ProviderSettingsFieldFocus::BinaryPath,
+                            tokens,
+                            self,
+                            cx,
+                        ))
+                        .child(wizard_field(
+                            "Home / config path",
+                            &editor.home,
+                            ProviderSettingsFieldFocus::HomePath,
+                            tokens,
+                            self,
+                            cx,
+                        ))
+                        .child(wizard_field(
+                            "Launch args (JSON string array)",
+                            &editor.launch_args,
+                            ProviderSettingsFieldFocus::LaunchArgs,
+                            tokens,
+                            self,
+                            cx,
+                        ))
+                        .children((0..editor.env_names.len()).flat_map(|index| {
+                            let name = editor.env_names.get(index);
+                            let value = editor.env_values.get(index);
+                            let mut rows = Vec::new();
+                            if let Some(field) = name {
+                                rows.push(wizard_field(
+                                    "Env name",
+                                    field,
+                                    ProviderSettingsFieldFocus::EnvName(index),
+                                    tokens,
+                                    self,
+                                    cx,
+                                ));
+                            }
+                            if let Some(field) = value {
+                                let raw = field.value();
+                                let display = crate::ui::provider_settings::mask_secret_preserving_scalars(
+                                    raw,
+                                );
+                                // Prefer masked paint only when the draft marks sensitive.
+                                let sensitive = self
+                                    .provider_settings
+                                    .as_ref()
+                                    .and_then(|ctl| ctl.wizard_working_config())
+                                    .and_then(|cfg| cfg.environment.get(index))
+                                    .is_some_and(|env| env.sensitive);
+                                let shown = if sensitive {
+                                    display
+                                } else {
+                                    raw.to_string()
+                                };
+                                let focus_click =
+                                    ProviderSettingsFieldFocus::EnvValue(index);
+                                rows.push(
+                                    div()
+                                        .flex()
+                                        .flex_col()
+                                        .gap(px(2.0))
+                                        .child(
+                                            div()
+                                                .text_size(px(12.0))
+                                                .text_color(tokens.text.muted.to_gpui())
+                                                .child(if sensitive {
+                                                    "Env value (secret)"
+                                                } else {
+                                                    "Env value"
+                                                }),
+                                        )
+                                        .child(
+                                            div()
+                                                .on_mouse_down(
+                                                    MouseButton::Left,
+                                                    cx.listener(
+                                                        move |shell,
+                                                              _event: &MouseDownEvent,
+                                                              _window,
+                                                              cx| {
+                                                            cx.stop_propagation();
+                                                            shell.focus_provider_settings_field(
+                                                                focus_click,
+                                                            );
+                                                            cx.notify();
+                                                        },
+                                                    ),
+                                                )
+                                                .child(self.overlay_text_field_with_display(
+                                                    (
+                                                        "native-provider-wizard-env-value",
+                                                        index as u64,
+                                                    ),
+                                                    field,
+                                                    &shown,
+                                                    "value",
+                                                    tokens,
+                                                )),
+                                        )
+                                        .into_any_element(),
+                                );
+                            }
+                            rows
+                        }))
+                },
+            )
+            .child(
+                div()
+                    .flex()
+                    .gap(px(tokens.density.spacing.sm))
+                    .child(
+                        Button::new("native-provider-wizard-commit")
+                            .label("Create")
+                            .primary()
+                            .disabled(!matches!(
+                                wizard.step,
+                                crate::ui::provider_settings::AddWizardStep::Config
+                            ))
+                            .on_click(cx.listener(
+                                |shell, _event: &ClickEvent, _window, cx| {
+                                    cx.stop_propagation();
+                                    shell.sync_provider_settings_editor_to_draft();
+                                    if let Some(ctl) = shell.provider_settings.as_mut()
+                                    {
+                                        ctl.wizard_commit();
+                                    }
+                                    shell.flush_provider_settings_pending();
+                                    if let Some(id) = shell
+                                        .provider_settings
+                                        .as_ref()
+                                        .and_then(|ctl| ctl.expanded().map(str::to_string))
+                                    {
+                                        shell.open_provider_settings_editor_for(&id);
+                                    }
+                                    cx.notify();
+                                },
+                            )),
+                    )
+                    .child(
+                        Button::new("native-provider-wizard-cancel")
+                            .label("Cancel")
+                            .ghost()
+                            .on_click(cx.listener(
+                                |shell, _event: &ClickEvent, _window, cx| {
+                                    cx.stop_propagation();
+                                    if let Some(ctl) = shell.provider_settings.as_mut()
+                                    {
+                                        ctl.cancel_add_wizard();
+                                    }
+                                    shell.provider_settings_editor = None;
+                                    cx.notify();
+                                },
+                            )),
+                    ),
+            )
+        .into_any_element()
+    }
+
+    fn render_settings_overlay(
+        &self,
+        tokens: crate::ui::tokens::ThemeTokens,
+        viewport: Size<Pixels>,
+        cx: &Context<Self>,
+    ) -> AnyElement {
         let content = match self.settings_page {
-            NativeSettingsPage::Appearance => appearance_content,
-            NativeSettingsPage::Providers => providers_content,
+            NativeSettingsPage::Appearance => self.render_appearance_settings_content(tokens, cx),
+            NativeSettingsPage::Providers => self.render_provider_settings_content(tokens, cx),
         };
         deferred(
             anchored()
@@ -19413,6 +22147,7 @@ impl NativeShell {
                                                         }
                                                         shell.settings_page =
                                                             NativeSettingsPage::Providers;
+                                                        shell.ensure_provider_settings();
                                                         cx.notify();
                                                     },
                                                 )),
@@ -19544,6 +22279,15 @@ impl NativeShell {
         let draft = self.delete_task.as_ref().expect("overlay is open");
         let title = draft.title.clone();
         let error = draft.error.clone();
+        let submitting = draft.stage.is_submitting();
+        let delete_submitted = matches!(draft.stage, DeleteTaskStage::AwaitingDelete { .. });
+        let status = match &draft.stage {
+            DeleteTaskStage::Confirming => None,
+            DeleteTaskStage::AwaitingArchive { .. } => Some("Archiving task…"),
+            DeleteTaskStage::AwaitingDelete { .. } => {
+                Some("Deleting task… Closing this dialog cannot cancel the submitted deletion.")
+            }
+        };
         deferred(
             anchored()
                 .position(point(px(0.0), px(0.0)))
@@ -19559,11 +22303,11 @@ impl NativeShell {
                         .justify_center()
                         .bg(Self::modal_backdrop())
                         .on_key_down(cx.listener(
-                            |shell, event: &KeyDownEvent, _window, cx| {
+                            move |shell, event: &KeyDownEvent, _window, cx| {
                                 cx.stop_propagation();
                                 match event.keystroke.key.as_str() {
-                                    "escape" => shell.delete_task = None,
-                                    "enter" => shell.confirm_task_delete(),
+                                    "escape" => shell.cancel_delete_task_flow(),
+                                    "enter" if !submitting => shell.confirm_task_delete(),
                                     _ => {}
                                 }
                                 cx.notify();
@@ -19597,6 +22341,12 @@ impl NativeShell {
                                             "“{title}” will disappear from DevManager and cannot be restored."
                                         )),
                                 )
+                                .children(status.map(|message| {
+                                    div()
+                                        .text_size(px(tokens.density.typography.caption))
+                                        .text_color(tokens.text.muted.to_gpui())
+                                        .child(message)
+                                }))
                                 .children(error.map(|message| {
                                     div()
                                         .text_size(px(tokens.density.typography.caption))
@@ -19610,24 +22360,31 @@ impl NativeShell {
                                         .gap(px(tokens.density.spacing.sm))
                                         .child(
                                             Button::new("native-delete-task-cancel")
-                                                .label("Cancel")
+                                                .label(if delete_submitted { "Close" } else { "Cancel" })
                                                 .ghost()
                                                 .on_click(cx.listener(
                                                     |shell, _event: &ClickEvent, _window, cx| {
                                                         cx.stop_propagation();
-                                                        shell.delete_task = None;
+                                                        shell.cancel_delete_task_flow();
                                                         cx.notify();
                                                     },
                                                 )),
                                         )
                                         .child(
                                             Button::new("native-delete-task-submit")
-                                                .label("Delete permanently")
+                                                .label(if submitting {
+                                                    "Working…"
+                                                } else {
+                                                    "Delete permanently"
+                                                })
                                                 .primary()
+                                                .disabled(submitting)
                                                 .on_click(cx.listener(
-                                                    |shell, _event: &ClickEvent, _window, cx| {
+                                                    move |shell, _event: &ClickEvent, _window, cx| {
                                                         cx.stop_propagation();
-                                                        shell.confirm_task_delete();
+                                                        if !submitting {
+                                                            shell.confirm_task_delete();
+                                                        }
                                                         cx.notify();
                                                     },
                                                 )),
@@ -20216,7 +22973,7 @@ impl NativeShell {
                             .py(px(6.0))
                             .rounded(px(6.0))
                             .cursor_pointer()
-                            .child("+ Add action…")
+                            .child("Add action…")
                             .on_mouse_down(
                                 MouseButton::Left,
                                 cx.listener(|shell, _event: &MouseDownEvent, _window, cx| {
@@ -21580,8 +24337,93 @@ impl NativeShell {
             window.prevent_default();
             if self.theme_editor.is_some() {
                 self.cancel_theme_editor();
+            } else if self
+                .provider_settings
+                .as_ref()
+                .is_some_and(|ctl| ctl.is_dirty())
+            {
+                if let Some(ctl) = self.provider_settings.as_mut() {
+                    ctl.cancel_draft();
+                }
+                self.provider_settings_editor = None;
+                if let Some(id) = self
+                    .provider_settings
+                    .as_ref()
+                    .and_then(|ctl| ctl.expanded().map(str::to_string))
+                {
+                    self.open_provider_settings_editor_for(&id);
+                }
+            } else if self
+                .provider_settings
+                .as_ref()
+                .and_then(|c| c.add_wizard())
+                .is_some()
+            {
+                if let Some(ctl) = self.provider_settings.as_mut() {
+                    ctl.cancel_add_wizard();
+                }
+                self.provider_settings_editor = None;
             } else {
                 self.close_settings();
+            }
+            cx.notify();
+            return;
+        }
+        if self.provider_settings_editor.is_some() {
+            if key == "tab" {
+                window.prevent_default();
+                self.cycle_provider_settings_focus(event.keystroke.modifiers.shift);
+                cx.notify();
+                return;
+            }
+            if event.keystroke.modifiers.control || event.keystroke.modifiers.platform {
+                match key {
+                    "a" => {
+                        window.prevent_default();
+                        if let Some(editor) = self.provider_settings_editor.as_mut() {
+                            Self::provider_settings_active_field_mut(editor).select_all();
+                        }
+                    }
+                    "c" => {
+                        window.prevent_default();
+                        if let Some(text) = self.root_editor_value() {
+                            // Sensitive EnvValue is already masked via root_editor_value.
+                            cx.write_to_clipboard(gpui::ClipboardItem::new_string(text));
+                        }
+                    }
+                    "v" => {
+                        window.prevent_default();
+                        if let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) {
+                            if let Some(editor) = self.provider_settings_editor.as_mut() {
+                                let field = Self::provider_settings_active_field_mut(editor);
+                                let epoch = field.focus_epoch();
+                                let _ = field.paste(&text, epoch);
+                            }
+                            self.sync_provider_settings_editor_to_draft();
+                        }
+                    }
+                    "s" => {
+                        window.prevent_default();
+                        self.sync_provider_settings_editor_to_draft();
+                        if let Some(ctl) = self.provider_settings.as_mut() {
+                            ctl.save_draft();
+                        }
+                        self.flush_provider_settings_pending();
+                    }
+                    _ => {}
+                }
+                cx.notify();
+                return;
+            }
+            if let Some(input) = Self::overlay_key_input(event) {
+                if let Some(editor) = self.provider_settings_editor.as_mut() {
+                    let field = Self::provider_settings_active_field_mut(editor);
+                    let epoch = field.focus_epoch();
+                    if field.handle_key(input, epoch).ok().unwrap_or(false) {
+                        window.prevent_default();
+                        self.sync_provider_settings_editor_to_draft();
+                    }
+                }
             }
             cx.notify();
             return;
@@ -21624,6 +24466,85 @@ impl NativeShell {
             }
         }
         cx.notify();
+    }
+
+    fn cycle_provider_settings_focus(&mut self, reverse: bool) {
+        let Some(editor) = self.provider_settings_editor.as_ref() else {
+            return;
+        };
+        let driver = self
+            .provider_settings
+            .as_ref()
+            .and_then(|ctl| {
+                editor
+                    .instance_id
+                    .as_deref()
+                    .and_then(|id| ctl.working_instance(id))
+                    .or_else(|| ctl.wizard_working_config().cloned())
+            })
+            .map(|instance| instance.driver);
+        let wizard_identity_only = editor.instance_id.is_none()
+            && self
+                .provider_settings
+                .as_ref()
+                .and_then(|ctl| ctl.add_wizard())
+                .is_some_and(|wizard| {
+                    !matches!(
+                        wizard.step,
+                        crate::ui::provider_settings::AddWizardStep::Config
+                    )
+                });
+        let mut order = Vec::new();
+        if wizard_identity_only {
+            order.push(ProviderSettingsFieldFocus::WizardInstanceId);
+            order.push(ProviderSettingsFieldFocus::WizardDisplayName);
+        } else {
+            order.push(ProviderSettingsFieldFocus::HealthInterval);
+            order.push(ProviderSettingsFieldFocus::DisplayName);
+            order.push(ProviderSettingsFieldFocus::AccentColor);
+            order.push(ProviderSettingsFieldFocus::BinaryPath);
+            order.push(ProviderSettingsFieldFocus::HomePath);
+            if matches!(
+                driver,
+                Some(crate::providers::settings::ProviderDriverKind::Codex)
+            ) {
+                order.push(ProviderSettingsFieldFocus::ShadowHomePath);
+            }
+            order.push(ProviderSettingsFieldFocus::LaunchArgs);
+            if matches!(
+                driver,
+                Some(crate::providers::settings::ProviderDriverKind::Cursor)
+            ) {
+                order.push(ProviderSettingsFieldFocus::ApiEndpoint);
+            }
+            for index in 0..editor.env_names.len() {
+                order.push(ProviderSettingsFieldFocus::EnvName(index));
+                order.push(ProviderSettingsFieldFocus::EnvValue(index));
+            }
+            if editor.instance_id.is_some()
+                && self
+                    .provider_settings
+                    .as_ref()
+                    .and_then(|ctl| ctl.add_wizard())
+                    .is_none()
+            {
+                order.push(ProviderSettingsFieldFocus::CustomModelSlug);
+            }
+        }
+        let Some(current) = order.iter().position(|focus| *focus == editor.focused) else {
+            self.focus_provider_settings_field(order[0]);
+            return;
+        };
+        let next = if reverse {
+            if current == 0 {
+                order.len() - 1
+            } else {
+                current - 1
+            }
+        } else {
+            (current + 1) % order.len()
+        };
+        self.focus_provider_settings_field(order[next]);
     }
 
     fn handle_browser_address_key(
@@ -23386,7 +26307,7 @@ impl NativeShell {
                                                     );
                                                 })
                                                 .child(crate::icons::app_icon(
-                                                    crate::icons::X,
+                                                    crate::icons::TRASH,
                                                     12.0,
                                                     tokens
                                                         .actions
@@ -25385,6 +28306,7 @@ mod tests {
         PRODUCTION_HOST_PROFILE, T3_SIDEBAR_NAV_TOP_INSET, T3_SIDEBAR_ROW_HEIGHT, T3_SIDEBAR_WIDTH,
         T3_WORKSPACE_TOPBAR_HEIGHT,
     };
+    use super::{NativeSettingsPage, ProviderSettingsFieldFocus};
     use crate::protocol::FrameLimits;
     use crate::remote::RemoteImageAttachment;
     use crate::ui::components::text_field::{TextField, TextFieldKey};
@@ -25420,9 +28342,9 @@ mod tests {
         assert_eq!(CONVERSATION_COMPOSER_OUTER_RADIUS, 22.0);
         assert_eq!(CONVERSATION_COMPOSER_INNER_RADIUS, 20.0);
         assert_eq!(CONVERSATION_COMPOSER_CONTEXT_INSET, 22.0);
-        assert_eq!(CONVERSATION_COMPOSER_SEND_DIAMETER, 32.0);
-        assert_eq!(CONVERSATION_COMPOSER_INPUT_MIN_HEIGHT, 102.0);
-        assert_eq!(CONVERSATION_COMPOSER_HEIGHT_RESERVE, 230.0);
+        assert_eq!(CONVERSATION_COMPOSER_SEND_DIAMETER, 28.0);
+        assert_eq!(CONVERSATION_COMPOSER_INPUT_MIN_HEIGHT, 88.0);
+        assert_eq!(CONVERSATION_COMPOSER_HEIGHT_RESERVE, 200.0);
         assert_eq!(
             CONVERSATION_COMPOSER_PLACEHOLDER,
             crate::ui::native_composer::NATIVE_COMPOSER_PLACEHOLDER
@@ -26626,6 +29548,136 @@ mod tests {
     }
 
     #[test]
+    fn settings_pages_render_on_a_native_sized_stack() {
+        if rerun_headless_shell_test_in_child(
+            "ui::native_shell::tests::settings_pages_render_on_a_native_sized_stack",
+        ) {
+            return;
+        }
+        std::thread::Builder::new()
+            .name("native-settings-stack".into())
+            .stack_size(1024 * 1024)
+            .spawn(|| {
+                gpui::Application::headless().run(|cx| {
+                    crate::ui::init(cx);
+                    let (runtime, _) = TestRuntime::new(true, NativeHostActionResult::Queued);
+                    with_test_shell_in_app_cx(cx, runtime, |shell, cx| {
+                        shell.settings_open = true;
+                        shell.ensure_provider_settings();
+                        let tokens = shell.theme_tokens();
+                        let viewport = gpui::size(gpui::px(1280.0), gpui::px(800.0));
+                        for page in [
+                            NativeSettingsPage::Appearance,
+                            NativeSettingsPage::Providers,
+                        ] {
+                            shell.settings_page = page;
+                            drop(shell.render_settings_overlay(tokens, viewport, cx));
+                        }
+                        if let Some(ctl) = shell.provider_settings.as_mut() {
+                            ctl.toggle_expanded("claude");
+                            ctl.begin_edit("claude");
+                        }
+                        shell.open_provider_settings_editor_for("claude");
+                        drop(shell.render_settings_overlay(tokens, viewport, cx));
+                        if let Some(ctl) = shell.provider_settings.as_mut() {
+                            ctl.cancel_draft();
+                            ctl.begin_add_wizard();
+                            ctl.wizard_select_driver(
+                                crate::providers::settings::ProviderDriverKind::Claude,
+                            );
+                            ctl.wizard_set_instance_id("stack-fixture".into());
+                            ctl.wizard_advance_to_config();
+                        }
+                        shell.ensure_provider_settings_wizard_editor();
+                        drop(shell.render_settings_overlay(tokens, viewport, cx));
+                    });
+                    cx.quit();
+                });
+            })
+            .expect("start native-sized render thread")
+            .join()
+            .expect("settings render without overflowing native stack");
+    }
+
+    #[test]
+    fn provider_settings_editor_typing_and_utf16_selection_share_one_application() {
+        if rerun_headless_shell_test_in_child(
+            "ui::native_shell::tests::provider_settings_editor_typing_and_utf16_selection_share_one_application",
+        ) {
+            return;
+        }
+        let _test_guard = HEADLESS_SHELL_TEST_LOCK
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .expect("headless shell test lock");
+        let completed = std::rc::Rc::new(std::cell::RefCell::new(None));
+        let completed_for_app = std::rc::Rc::clone(&completed);
+        gpui::Application::headless().run(move |cx| {
+            crate::ui::init(cx);
+            let (runtime, _) = TestRuntime::new(true, NativeHostActionResult::Queued);
+            let snapshot = with_test_shell_in_app(cx, runtime, |shell| {
+                shell.settings_open = true;
+                shell.settings_page = NativeSettingsPage::Providers;
+                shell.ensure_provider_settings();
+                if let Some(ctl) = shell.provider_settings.as_mut() {
+                    ctl.begin_edit("claude");
+                }
+                shell.open_provider_settings_editor_for("claude");
+                shell.focus_provider_settings_field(ProviderSettingsFieldFocus::DisplayName);
+                if let Some(editor) = shell.provider_settings_editor.as_mut() {
+                    editor.display_name.select_all();
+                }
+                shell
+                    .replace_root_platform_text(None, "Renamed")
+                    .expect("provider editor IME replace");
+                let after_type = shell.root_editor_value();
+                let selection = shell.root_editor_utf16_selection();
+                shell.close_settings();
+                shell.settings_open = true;
+                shell.ensure_provider_settings();
+                assert_eq!(shell.root_editor_value().as_deref(), Some("Renamed"));
+                if let Some(editor) = shell.provider_settings_editor.as_mut() {
+                    editor.display_name.select_all();
+                }
+                let all_selected = shell.root_editor_utf16_selection();
+                shell.focus_provider_settings_field(ProviderSettingsFieldFocus::EnvValue(0));
+                // Seed a sensitive env row through the controller draft + editor buffer.
+                if let Some(ctl) = shell.provider_settings.as_mut() {
+                    ctl.add_env_row("claude");
+                    ctl.set_env_name(0, "TOKEN".into());
+                    ctl.toggle_env_sensitive("claude", 0);
+                    ctl.set_env_value(0, "secret!".into());
+                }
+                shell.open_provider_settings_editor_for("claude");
+                if let Some(editor) = shell.provider_settings_editor.as_mut() {
+                    if let Some(field) = editor.env_values.get_mut(0) {
+                        let _ = field.set_value("secret!");
+                    }
+                }
+                shell.focus_provider_settings_field(ProviderSettingsFieldFocus::EnvValue(0));
+                let masked = shell.root_editor_value();
+                (
+                    after_type,
+                    selection.map(|range| (range.start, range.end)),
+                    all_selected.map(|range| (range.start, range.end)),
+                    masked,
+                )
+            });
+            *completed_for_app.borrow_mut() = Some(snapshot);
+            cx.quit();
+        });
+        let (after_type, selection, all_selected, masked) = completed
+            .borrow()
+            .clone()
+            .expect("provider editor snapshot");
+        assert_eq!(after_type.as_deref(), Some("Renamed"));
+        assert_eq!(selection, Some((7, 7)));
+        assert_eq!(all_selected, Some((0, 7)));
+        assert_eq!(masked.as_deref(), Some("•••••••"));
+        assert!(!masked.as_deref().unwrap_or("").contains("secret"));
+    }
+
+    #[test]
     fn header_settings_opens_on_welcome_and_cockpit() {
         if rerun_headless_shell_test_in_child(
             "ui::native_shell::tests::header_settings_opens_on_welcome_and_cockpit",
@@ -26878,9 +29930,16 @@ mod tests {
             let (runtime, _) = TestRuntime::new(true, NativeHostActionResult::Queued);
             let snapshot = with_test_shell_in_app(cx, runtime, |shell| {
                 shell.layout.composer_provider = Some(ProviderKind::Codex);
+                shell.set_composer_model(crate::providers::ProviderModel::CodexSol);
                 shell.open_composer_model_selector();
                 let opened = shell.composer_selector;
                 let initial = shell.composer_selector_highlight;
+                let choices = shell.composer_selector_choices();
+                assert!(matches!(
+                    choices[initial].1,
+                    super::ComposerSelectorChoice::Model(crate::providers::ProviderModel::CodexSol)
+                ));
+                let expected_moved = (initial + 1) % choices.len();
                 shell.move_composer_selector_highlight(1);
                 let moved = shell.composer_selector_highlight;
                 shell.dismiss_composer_selector();
@@ -26888,16 +29947,15 @@ mod tests {
                 shell.open_composer_model_selector();
                 shell.confirm_composer_selector_highlight();
                 let after_enter = shell.composer_selector;
-                (opened, initial, moved, dismissed, after_enter)
+                (opened, expected_moved, moved, dismissed, after_enter)
             });
             *completed_for_app.borrow_mut() = Some(snapshot);
             cx.quit();
         });
-        let (opened, initial, moved, dismissed, after_enter) =
+        let (opened, expected_moved, moved, dismissed, after_enter) =
             completed.borrow().clone().expect("composer selector");
         assert_eq!(opened, Some(super::ComposerSelectorKind::Model));
-        assert_eq!(initial, 0);
-        assert_eq!(moved, 1);
+        assert_eq!(moved, expected_moved);
         assert_eq!(dismissed, None);
         assert_eq!(after_enter, None);
     }
@@ -27109,9 +30167,20 @@ mod tests {
         );
         let mapped = tree.task_node_ids_for_test();
         assert_eq!(mapped.len(), 2);
-        assert_eq!(mapped[0], (accesskit::NodeId::from(10), first));
-        assert_eq!(mapped[1], (accesskit::NodeId::from(11), second));
+        assert_eq!(mapped[0].1, first);
+        assert_eq!(mapped[1].1, second);
         let update = tree.platform_update_for_test();
+        let toolbar_end = update
+            .nodes
+            .iter()
+            .position(|(_, node)| node.author_id() == Some("native-header-settings"))
+            .expect("settings toolbar node");
+        let first_row = update
+            .nodes
+            .iter()
+            .position(|(id, _)| *id == mapped[0].0)
+            .expect("first task row");
+        assert!(first_row > toolbar_end);
         for &(node_id, task_id) in mapped {
             let node = update
                 .nodes
@@ -30997,6 +34066,613 @@ mod tests {
         });
     }
 
+    fn terminal_bound_archived_client_model() -> (crate::client::ClientModel, TaskId) {
+        use crate::client::ClientModelBuilder;
+        use crate::domain::{
+            agent::{AgentRole, AgentSessionFacts, AgentSessionLifecycle},
+            id::{AgentSessionId, EnvironmentId, ProjectId, ResourceId, SnapshotId},
+            resource::{OwnerKind, ResourceFacts, ResourceKind, ResourceLifecycle, ResourceRecipe},
+            snapshot::{SnapshotItem, SnapshotPage, SnapshotSection, TaskSnapshotItem},
+            task::{
+                ReviewReadiness, TaskActivity, TaskAssignment, TaskConnectivity, TaskFacts,
+                TaskLifecycle, WorkspaceRef,
+            },
+        };
+
+        let uuid = |tail: u8| {
+            [
+                0x01, 0x8f, 0x60, 0xb0, 0x9c, 0x1a, 0x70, 0x01, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00,
+                0x00, tail,
+            ]
+        };
+        let task_id = TaskId::from_bytes(uuid(0xa1)).expect("task");
+        let agent_id = AgentSessionId::from_bytes(uuid(0xa2)).expect("agent");
+        let resource_id = ResourceId::from_bytes(uuid(0xa3)).expect("resource");
+        let snap = SnapshotId::from_bytes(uuid(0x10)).expect("snapshot");
+        let page = |section, items| SnapshotPage {
+            snapshot_id: snap,
+            through_sequence: 1,
+            section,
+            after_item: None,
+            items,
+            encoded_bytes: 1,
+            next_cursor: None,
+        };
+        let mut builder = ClientModelBuilder::new();
+        builder
+            .ingest_page(page(
+                SnapshotSection::Tasks,
+                vec![SnapshotItem::Task(TaskSnapshotItem {
+                    task: TaskFacts {
+                        id: task_id,
+                        environment_id: EnvironmentId::from_bytes(uuid(0x01)).expect("env"),
+                        title: "bound terminal task".into(),
+                        description: None,
+                        project_id: ProjectId::from_bytes(uuid(0x02)).expect("project"),
+                        workspace: WorkspaceRef::Main,
+                        assignment: TaskAssignment::LocalOwner,
+                        lifecycle: TaskLifecycle::Archived,
+                        action_epoch: 0,
+                        revision: 5,
+                        created_at_ms: 1,
+                    },
+                    connectivity: TaskConnectivity::Connected,
+                    attention: crate::domain::task::TaskAttention::None,
+                    activity: TaskActivity::Idle,
+                    review_readiness: ReviewReadiness::NotReady,
+                    primary_agent_id: Some(agent_id),
+                })],
+            ))
+            .expect("tasks");
+        builder
+            .ingest_page(page(
+                SnapshotSection::AgentSessions,
+                vec![SnapshotItem::AgentSession(AgentSessionFacts {
+                    id: agent_id,
+                    task_id,
+                    role: AgentRole::Primary,
+                    provider_kind: crate::providers::ProviderKind::ClaudeCode,
+                    provider_session_id: Some(
+                        crate::domain::ProviderSessionId::new("provider-conversation-ready")
+                            .expect("provider conversation identity"),
+                    ),
+                    lifecycle: AgentSessionLifecycle::Open,
+                    runtime_generation: 1,
+                    revision: 0,
+                })],
+            ))
+            .expect("agents");
+        builder
+            .ingest_page(page(SnapshotSection::Artifacts, Vec::new()))
+            .expect("artifacts");
+        builder
+            .ingest_page(page(
+                SnapshotSection::Resources,
+                vec![SnapshotItem::Resource(ResourceFacts {
+                    id: resource_id,
+                    task_id: Some(task_id),
+                    owner_kind: OwnerKind::Task,
+                    resource_kind: ResourceKind::Terminal,
+                    recipe: ResourceRecipe::Terminal { cols: 40, rows: 8 },
+                    lifecycle: ResourceLifecycle::Active,
+                    runtime_generation: 1,
+                    updated_at_ms: 1,
+                })],
+            ))
+            .expect("resources");
+        builder
+            .ingest_page(page(SnapshotSection::Operations, Vec::new()))
+            .expect("operations");
+        (builder.finish().expect("client model"), task_id)
+    }
+
+    fn delete_flow_active_to_archive_to_single_delete_scenarios(cx: &mut gpui::App) {
+        let (runtime, shared) = TestRuntime::new(true, NativeHostActionResult::Queued);
+        let (model, task_id) = terminal_bound_client_model();
+        let (archived_model, archived_id) = terminal_bound_archived_client_model();
+        assert_eq!(task_id, archived_id);
+
+        with_test_shell_in_app(cx, runtime, |shell| {
+            shell
+                .apply_client_model(Arc::new(model))
+                .expect("apply model");
+            let list = crate::ui::task_cockpit::TaskList::from_client_model_virtual(
+                shell.client_model_snapshot().as_ref().unwrap(),
+            )
+            .expect("task list");
+            let _ = shell.interaction.navigation_mouse_down(task_id, &list);
+            shell.sync_cockpit_follow();
+
+            shell.begin_task_delete(task_id);
+            assert!(shell.delete_task.is_some());
+            assert_eq!(
+                shell.delete_task.as_ref().map(|draft| draft.stage.clone()),
+                Some(super::DeleteTaskStage::Confirming)
+            );
+            shell.refresh_accessibility_tree();
+            assert!(
+                shell
+                    .accessibility_tree()
+                    .gpui_nodes()
+                    .into_iter()
+                    .any(|node| node.description.contains("selected task")),
+                "delete confirm a11y must name the selected task"
+            );
+
+            shell.confirm_task_delete();
+            let archive_command = {
+                let draft = shell.delete_task.as_ref().expect("draft stays open");
+                match draft.stage {
+                    super::DeleteTaskStage::AwaitingArchive {
+                        command_id,
+                        archive_accepted,
+                    } => {
+                        assert!(!archive_accepted);
+                        command_id
+                    }
+                    other => panic!("expected awaiting archive, got {other:?}"),
+                }
+            };
+            let accepted = shared.lock().expect("runtime").accepted.clone();
+            assert_eq!(
+                accepted
+                    .iter()
+                    .filter(|record| matches!(
+                        record.command,
+                        super::NativeHostCommand::TaskArchive { task_id: id, .. } if id == task_id
+                    ))
+                    .count(),
+                1,
+                "confirm queues exactly one archive"
+            );
+
+            // Double confirm while queued must not enqueue again.
+            shell.confirm_task_delete();
+            assert_eq!(
+                shared
+                    .lock()
+                    .expect("runtime")
+                    .accepted
+                    .iter()
+                    .filter(|record| matches!(
+                        record.command,
+                        super::NativeHostCommand::TaskArchive { task_id: id, .. } if id == task_id
+                    ))
+                    .count(),
+                1
+            );
+
+            // Projection before receipt: still no delete.
+            shell
+                .apply_client_model(Arc::new(archived_model.clone()))
+                .expect("apply archived");
+            assert!(
+                shared
+                    .lock()
+                    .expect("runtime")
+                    .accepted
+                    .iter()
+                    .all(|record| {
+                        !matches!(
+                            record.command,
+                            super::NativeHostCommand::TaskLifecycle {
+                                command: crate::domain::command::Command::DeleteTask,
+                                ..
+                            }
+                        )
+                    }),
+                "no delete without archive receipt"
+            );
+
+            let archive_record = accepted
+                .iter()
+                .find(|record| {
+                    matches!(
+                        record.command,
+                        super::NativeHostCommand::TaskArchive { task_id: id, .. } if id == task_id
+                    )
+                })
+                .cloned()
+                .expect("archive record");
+            shell.apply_epoch_fenced_action_outcome(NativeHostActionOutcome::Accepted {
+                action: archive_record,
+                receipt: crate::domain::command::CommandReceipt::Accepted {
+                    command_id: archive_command,
+                    operation_id: crate::domain::id::OperationId::new(),
+                    task_revision: Some(5),
+                    event_ids: Vec::new(),
+                    prompt_mutation: None,
+                },
+            });
+            let delete_count = shared
+                .lock()
+                .expect("runtime")
+                .accepted
+                .iter()
+                .filter(|record| {
+                    matches!(
+                        record.command,
+                        super::NativeHostCommand::TaskLifecycle {
+                            task_id: id,
+                            command: crate::domain::command::Command::DeleteTask,
+                            ..
+                        } if id == task_id
+                    )
+                })
+                .count();
+            assert_eq!(
+                delete_count, 1,
+                "receipt+archived projection queues one delete"
+            );
+            assert!(matches!(
+                shell.delete_task.as_ref().map(|draft| &draft.stage),
+                Some(super::DeleteTaskStage::AwaitingDelete { .. })
+            ));
+
+            // Closing submitted deletion progress must not restore a retry or
+            // affect a replacement dialog when the exact late result arrives.
+            let delete_record = shared
+                .lock()
+                .expect("runtime")
+                .accepted
+                .last()
+                .unwrap()
+                .clone();
+            let delete_command = native_command_id(&delete_record.command).unwrap();
+            shell.cancel_delete_task_flow();
+            assert!(shell.delete_task.is_none());
+            shell.apply_epoch_fenced_action_outcome(NativeHostActionOutcome::Accepted {
+                action: delete_record,
+                receipt: crate::domain::command::CommandReceipt::Accepted {
+                    command_id: delete_command,
+                    operation_id: crate::domain::id::OperationId::new(),
+                    task_revision: Some(6),
+                    event_ids: Vec::new(),
+                    prompt_mutation: None,
+                },
+            });
+            assert!(shell.delete_task.is_none());
+            assert!(!shell.retired_delete_flow_commands.contains(&delete_command));
+            shell.begin_task_delete(task_id);
+            shell.confirm_task_delete();
+            let failed_delete = shared
+                .lock()
+                .expect("runtime")
+                .accepted
+                .last()
+                .unwrap()
+                .clone();
+            shell.cancel_delete_task_flow();
+            shell.begin_task_delete(task_id);
+            shell.apply_epoch_fenced_action_outcome(NativeHostActionOutcome::Failed {
+                action: failed_delete,
+                error: "late closed deletion failure".into(),
+            });
+            assert_eq!(
+                shell.delete_task.as_ref().unwrap().stage,
+                super::DeleteTaskStage::Confirming
+            );
+            assert!(shell.delete_task.as_ref().unwrap().error.is_none());
+            assert!(shell.pending_host_actions.is_empty());
+        });
+    }
+
+    fn delete_flow_cancel_and_failure_scenarios(cx: &mut gpui::App) {
+        let (runtime, shared) = TestRuntime::new(true, NativeHostActionResult::Queued);
+        let (model, task_id) = terminal_bound_client_model();
+
+        with_test_shell_in_app(cx, runtime, |shell| {
+            shell
+                .apply_client_model(Arc::new(model))
+                .expect("apply model");
+            let list = crate::ui::task_cockpit::TaskList::from_client_model_virtual(
+                shell.client_model_snapshot().as_ref().unwrap(),
+            )
+            .expect("task list");
+            let _ = shell.interaction.navigation_mouse_down(task_id, &list);
+
+            shell.begin_task_delete(task_id);
+            shell.confirm_task_delete();
+            let archive_record = shared
+                .lock()
+                .expect("runtime")
+                .accepted
+                .iter()
+                .find(|record| {
+                    matches!(
+                        record.command,
+                        super::NativeHostCommand::TaskArchive { task_id: id, .. } if id == task_id
+                    )
+                })
+                .cloned()
+                .expect("archive");
+            let archive_command =
+                native_command_id(&archive_record.command).expect("archive command id");
+
+            shell.cancel_delete_task_flow();
+            assert!(shell.delete_task.is_none());
+            shell.apply_epoch_fenced_action_outcome(NativeHostActionOutcome::Accepted {
+                action: archive_record.clone(),
+                receipt: crate::domain::command::CommandReceipt::Accepted {
+                    command_id: archive_command,
+                    operation_id: crate::domain::id::OperationId::new(),
+                    task_revision: Some(5),
+                    event_ids: Vec::new(),
+                    prompt_mutation: None,
+                },
+            });
+            assert!(
+                shared
+                    .lock()
+                    .expect("runtime")
+                    .accepted
+                    .iter()
+                    .all(|record| {
+                        !matches!(
+                            record.command,
+                            super::NativeHostCommand::TaskLifecycle {
+                                command: crate::domain::command::Command::DeleteTask,
+                                ..
+                            }
+                        )
+                    }),
+                "cancelled flow must never queue delete after late archive receipt"
+            );
+            assert!(shell.delete_task.is_none());
+
+            // Escape/new-task/rename/new-delete disarm
+            shell.begin_task_delete(task_id);
+            shell.confirm_task_delete();
+            shell.begin_new_task_for_project(
+                shell
+                    .client_model
+                    .as_ref()
+                    .and_then(|model| model.tasks().get(&task_id))
+                    .map(|snapshot| snapshot.task.project_id)
+                    .expect("project"),
+            );
+            assert!(shell.delete_task.is_none());
+
+            shell.begin_task_delete(task_id);
+            shell.confirm_task_delete();
+            shell.begin_task_rename(task_id);
+            assert!(shell.delete_task.is_none());
+
+            shell.begin_task_delete(task_id);
+            let first_title = shell.delete_task.as_ref().map(|draft| draft.title.clone());
+            shell.begin_task_delete(task_id);
+            assert_eq!(
+                shell.delete_task.as_ref().map(|draft| draft.title.clone()),
+                first_title
+            );
+            assert!(matches!(
+                shell.delete_task.as_ref().map(|draft| &draft.stage),
+                Some(super::DeleteTaskStage::Confirming)
+            ));
+
+            // Archive failure retires deferred intent and keeps modal with error.
+            shell.confirm_task_delete();
+            let failing = shared
+                .lock()
+                .expect("runtime")
+                .accepted
+                .iter()
+                .rev()
+                .find(|record| {
+                    matches!(
+                        record.command,
+                        super::NativeHostCommand::TaskArchive { task_id: id, .. } if id == task_id
+                    )
+                })
+                .cloned()
+                .expect("archive for failure");
+            shell.apply_epoch_fenced_action_outcome(NativeHostActionOutcome::Failed {
+                action: failing,
+                error: "archive exploded".into(),
+            });
+            let draft = shell.delete_task.as_ref().expect("modal stays");
+            assert!(draft
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("archive")));
+            assert_eq!(draft.stage, super::DeleteTaskStage::Confirming);
+            assert!(shell.pending_host_actions.is_empty());
+
+            shared.lock().expect("runtime").admission = NativeHostActionResult::QueueFull;
+            shell.confirm_task_delete();
+            assert!(shell.delete_task.as_ref().unwrap().error.is_some());
+            assert!(
+                shell.pending_host_actions.is_empty(),
+                "failed admission cannot retain a destructive retry"
+            );
+            assert!(shell.retained_action_overflow.is_none());
+            assert!(shell.last_action_failure.is_none());
+            shared.lock().expect("runtime").admission = NativeHostActionResult::Queued;
+
+            let mut first_cancelled = None;
+            for _ in 0..20 {
+                shell.begin_task_delete(task_id);
+                shell.confirm_task_delete();
+                let record = shared
+                    .lock()
+                    .expect("runtime")
+                    .accepted
+                    .last()
+                    .unwrap()
+                    .clone();
+                first_cancelled.get_or_insert(record);
+                shell.cancel_delete_task_flow();
+            }
+            shell.begin_task_delete(task_id);
+            shell.confirm_task_delete();
+            let replacement_command = shell.delete_flow_command_id();
+            shell.apply_epoch_fenced_action_outcome(NativeHostActionOutcome::Failed {
+                action: first_cancelled.unwrap(),
+                error: "late cancelled archive failure".into(),
+            });
+            assert_eq!(shell.delete_flow_command_id(), replacement_command);
+            assert!(shell.delete_task.as_ref().unwrap().error.is_none());
+            assert!(shell.pending_host_actions.is_empty());
+            shell.cancel_delete_task_flow();
+        });
+    }
+
+    fn delete_flow_receipt_before_projection_and_delete_success(cx: &mut gpui::App) {
+        let (runtime, shared) = TestRuntime::new(true, NativeHostActionResult::Queued);
+        let (model, task_id) = terminal_bound_client_model();
+        let (archived_model, _) = terminal_bound_archived_client_model();
+
+        with_test_shell_in_app(cx, runtime, |shell| {
+            shell
+                .apply_client_model(Arc::new(model))
+                .expect("apply model");
+            let list = crate::ui::task_cockpit::TaskList::from_client_model_virtual(
+                shell.client_model_snapshot().as_ref().unwrap(),
+            )
+            .expect("task list");
+            let _ = shell.interaction.navigation_mouse_down(task_id, &list);
+            shell.begin_task_delete(task_id);
+            shell.confirm_task_delete();
+            let archive_record = shared
+                .lock()
+                .expect("runtime")
+                .accepted
+                .last()
+                .cloned()
+                .expect("archive");
+            let archive_command =
+                native_command_id(&archive_record.command).expect("archive command");
+            shell.apply_epoch_fenced_action_outcome(NativeHostActionOutcome::Accepted {
+                action: archive_record,
+                receipt: crate::domain::command::CommandReceipt::Accepted {
+                    command_id: archive_command,
+                    operation_id: crate::domain::id::OperationId::new(),
+                    task_revision: Some(5),
+                    event_ids: Vec::new(),
+                    prompt_mutation: None,
+                },
+            });
+            assert!(
+                matches!(
+                    shell.delete_task.as_ref().map(|draft| &draft.stage),
+                    Some(super::DeleteTaskStage::AwaitingArchive {
+                        archive_accepted: true,
+                        ..
+                    })
+                ),
+                "receipt alone does not delete without Archived projection"
+            );
+            assert!(shared
+                .lock()
+                .expect("runtime")
+                .accepted
+                .iter()
+                .all(|record| {
+                    !matches!(
+                        record.command,
+                        super::NativeHostCommand::TaskLifecycle {
+                            command: crate::domain::command::Command::DeleteTask,
+                            ..
+                        }
+                    )
+                }));
+
+            shell
+                .apply_client_model(Arc::new(archived_model))
+                .expect("archived projection");
+            let delete_record = shared
+                .lock()
+                .expect("runtime")
+                .accepted
+                .iter()
+                .find(|record| {
+                    matches!(
+                        record.command,
+                        super::NativeHostCommand::TaskLifecycle {
+                            command: crate::domain::command::Command::DeleteTask,
+                            ..
+                        }
+                    )
+                })
+                .cloned()
+                .expect("delete queued after projection");
+            let delete_command = native_command_id(&delete_record.command).expect("delete id");
+            shell.apply_epoch_fenced_action_outcome(NativeHostActionOutcome::Accepted {
+                action: delete_record,
+                receipt: crate::domain::command::CommandReceipt::Accepted {
+                    command_id: delete_command,
+                    operation_id: crate::domain::id::OperationId::new(),
+                    task_revision: Some(6),
+                    event_ids: Vec::new(),
+                    prompt_mutation: None,
+                },
+            });
+            assert!(shell.delete_task.is_none());
+            assert_eq!(shell.interaction.selected_task(), None);
+
+            for outcome_kind in 0..4 {
+                shell.begin_task_delete(task_id);
+                shell.confirm_task_delete();
+                let record = shared
+                    .lock()
+                    .expect("runtime")
+                    .accepted
+                    .last()
+                    .unwrap()
+                    .clone();
+                let command_id = native_command_id(&record.command).unwrap();
+                let outcome = match outcome_kind {
+                    0 => NativeHostActionOutcome::Failed {
+                        action: record,
+                        error: "delete failed".into(),
+                    },
+                    1 => NativeHostActionOutcome::Uncertain {
+                        action: record,
+                        error: "delete result is unknown".into(),
+                    },
+                    2 => NativeHostActionOutcome::Accepted {
+                        action: record,
+                        receipt: crate::domain::command::CommandReceipt::Rejected {
+                            command_id,
+                            code: crate::domain::command::RejectionCode::RevisionConflict,
+                            current_revision: Some(5),
+                            resolution: None,
+                        },
+                    },
+                    _ => NativeHostActionOutcome::Accepted {
+                        action: record,
+                        receipt: crate::domain::command::CommandReceipt::Accepted {
+                            command_id: CommandId::new(),
+                            operation_id: crate::domain::id::OperationId::new(),
+                            task_revision: Some(6),
+                            event_ids: Vec::new(),
+                            prompt_mutation: None,
+                        },
+                    },
+                };
+                shell.apply_epoch_fenced_action_outcome(outcome);
+                let draft = shell.delete_task.as_ref().expect("failure stays visible");
+                assert_eq!(draft.stage, super::DeleteTaskStage::Confirming);
+                assert!(draft.error.is_some());
+                assert!(shell.pending_host_actions.is_empty());
+            }
+        });
+    }
+
+    #[test]
+    fn delete_task_stage_submitting_flags_cover_queued_phases() {
+        assert!(!super::DeleteTaskStage::Confirming.is_submitting());
+        assert!(super::DeleteTaskStage::AwaitingArchive {
+            command_id: CommandId::new(),
+            archive_accepted: false,
+        }
+        .is_submitting());
+        assert!(super::DeleteTaskStage::AwaitingDelete {
+            command_id: CommandId::new(),
+        }
+        .is_submitting());
+    }
+
     fn bound_task_with_failed_launch_holds_conversation(cx: &mut gpui::App) {
         let (runtime, shared) = TestRuntime::new(true, NativeHostActionResult::Queued);
         let (model, task_id) =
@@ -31037,6 +34713,10 @@ mod tests {
                 "task.settle must enqueue without a capture failure"
             );
             let accepted = shared.lock().expect("runtime").accepted.clone();
+            let delete_opened = {
+                shell.begin_task_delete(task_id);
+                shell.delete_task.as_ref().map(|draft| draft.task_id)
+            };
             (
                 shell
                     .cockpit()
@@ -31049,6 +34729,7 @@ mod tests {
                 archive_failed,
                 before,
                 accepted,
+                delete_opened,
             )
         });
         assert!(
@@ -31073,6 +34754,16 @@ mod tests {
             report.3
         );
         assert!(
+            report.3.iter().any(|id| id == "native-task-delete"),
+            "a selected task must expose Delete beside Archive: {:?}",
+            report.3
+        );
+        assert!(
+            !report.3.iter().any(|id| id == "native-task-open"),
+            "visible Open must be removed; Files stays on the dock/keyboard path: {:?}",
+            report.3
+        );
+        assert!(
             report.3.iter().any(|id| id == "native-task-settle"),
             "an active selected task must expose Done: {:?}",
             report.3
@@ -31090,6 +34781,11 @@ mod tests {
                     )
                 }),
             "Archive must dispatch TaskArchive for the selected task"
+        );
+        assert_eq!(
+            report.7,
+            Some(task_id),
+            "Delete on an active selected task must open begin_task_delete confirmation"
         );
         assert!(
             report.6.iter().any(|record| {
@@ -31202,6 +34898,9 @@ mod tests {
             cockpit_refresh_only_queries_the_active_host_surface(cx);
             bound_task_with_failed_launch_holds_conversation(cx);
             dock_shortcuts_and_open_task_details_bind_selection(cx);
+            delete_flow_active_to_archive_to_single_delete_scenarios(cx);
+            delete_flow_cancel_and_failure_scenarios(cx);
+            delete_flow_receipt_before_projection_and_delete_success(cx);
             *completed_for_app.borrow_mut() = true;
             cx.quit();
         });

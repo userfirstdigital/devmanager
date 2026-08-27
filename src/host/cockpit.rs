@@ -95,6 +95,7 @@ pub(crate) fn serve_task_cockpit(dispatch: TaskCockpitDispatch<'_>) -> QueryOutc
             | TaskCockpitQuery::ConfigUpsertCommand { .. }
             | TaskCockpitQuery::ConfigArchiveCommand { .. }
             | TaskCockpitQuery::ConfigRunCommand { .. }
+            | TaskCockpitQuery::ProviderSettings(_)
     ) {
         // Mutation is owned by the exclusive host executor, which re-issues
         // workspace authority before returning a snapshot.
@@ -158,7 +159,8 @@ pub(crate) fn serve_task_cockpit(dispatch: TaskCockpitDispatch<'_>) -> QueryOutc
         | TaskCockpitQuery::ConfigUpsertCommand { .. }
         | TaskCockpitQuery::ConfigArchiveCommand { .. }
         | TaskCockpitQuery::ConfigRunCommand { .. }
-        | TaskCockpitQuery::ConfigCommandDetail { .. } => {
+        | TaskCockpitQuery::ConfigCommandDetail { .. }
+        | TaskCockpitQuery::ProviderSettings(_) => {
             unreachable!("config snapshot is handled before task-scoped lookup")
         }
         TaskCockpitQuery::BrowserProcessSession => {

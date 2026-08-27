@@ -131,6 +131,7 @@ pub struct TextField {
     description: String,
     error: Option<String>,
     read_only: bool,
+    sensitive: bool,
     interaction: InteractionStateModel,
     accessibility: AccessibilityMetadata,
 }
@@ -161,6 +162,7 @@ impl TextField {
             description: String::new(),
             error: None,
             read_only: false,
+            sensitive: false,
             interaction: InteractionStateModel::default(),
         })
     }
@@ -214,6 +216,20 @@ impl TextField {
         &self.accessibility
     }
 
+    /// Secret edit buffers must not be copied into accessibility metadata.
+    pub fn set_sensitive(&mut self, sensitive: bool) {
+        self.sensitive = sensitive;
+        self.refresh_accessibility_value();
+    }
+
+    fn refresh_accessibility_value(&mut self) {
+        self.accessibility.set_value(if self.sensitive {
+            None
+        } else {
+            Some(self.value.clone())
+        });
+    }
+
     pub fn set_description(
         &mut self,
         description: impl Into<String>,
@@ -253,7 +269,7 @@ impl TextField {
         self.value = value;
         self.cursor = self.value.chars().count();
         self.all_selected = false;
-        self.accessibility.set_value(Some(self.value.clone()));
+        self.refresh_accessibility_value();
         Ok(())
     }
 
@@ -400,7 +416,7 @@ impl TextField {
         self.value = next;
         self.cursor = range.start + text.chars().count();
         self.all_selected = false;
-        self.accessibility.set_value(Some(self.value.clone()));
+        self.refresh_accessibility_value();
         Ok(changed)
     }
 
@@ -419,7 +435,7 @@ impl TextField {
         self.value.clear();
         self.cursor = 0;
         self.all_selected = false;
-        self.accessibility.set_value(Some(self.value.clone()));
+        self.refresh_accessibility_value();
         true
     }
 
@@ -436,7 +452,7 @@ impl TextField {
         next.insert_str(byte_index, text);
         self.value = next;
         self.cursor += text.chars().count();
-        self.accessibility.set_value(Some(self.value.clone()));
+        self.refresh_accessibility_value();
         Ok(!text.is_empty())
     }
 
@@ -492,7 +508,7 @@ impl TextField {
         let end = byte_index_at_scalar(&self.value, self.cursor);
         self.value.replace_range(start..end, "");
         self.cursor -= 1;
-        self.accessibility.set_value(Some(self.value.clone()));
+        self.refresh_accessibility_value();
         true
     }
 
@@ -503,7 +519,7 @@ impl TextField {
         let start = byte_index_at_scalar(&self.value, self.cursor);
         let end = byte_index_at_scalar(&self.value, self.cursor + 1);
         self.value.replace_range(start..end, "");
-        self.accessibility.set_value(Some(self.value.clone()));
+        self.refresh_accessibility_value();
         true
     }
 }
@@ -550,6 +566,18 @@ mod tests {
             .expect("backspace"));
         assert_eq!(field.value(), "");
         assert!(!field.is_all_selected());
+    }
+
+    #[test]
+    fn sensitive_field_edits_do_not_publish_buffer_to_accessibility() {
+        let mut field = focused_field("secret");
+        field.set_sensitive(true);
+        assert_eq!(field.accessibility().value(), None);
+        field.set_value("replacement").unwrap();
+        let epoch = field.focus_epoch();
+        field.handle_key(TextFieldKey::Backspace, epoch).unwrap();
+        assert_eq!(field.value(), "replacemen");
+        assert_eq!(field.accessibility().value(), None);
     }
 
     #[test]
