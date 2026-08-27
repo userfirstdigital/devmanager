@@ -1051,6 +1051,38 @@ impl TerminalService {
         Ok(terminal_id)
     }
 
+    /// Atomically attach a task-owned runtime and install its durable identity
+    /// before publishing it to readers. A query can therefore never observe an
+    /// attached provider terminal with a missing task/agent fence.
+    pub fn attach_bound_task_runtime(
+        &self,
+        owner: TaskId,
+        spec: TerminalSpec,
+        runtime: Arc<dyn AttachedTerminalRuntime>,
+        agent_session_id: crate::domain::AgentSessionId,
+        runtime_generation: u64,
+        action_epoch: u64,
+    ) -> Result<TerminalId, TerminalError> {
+        if runtime_generation == 0 || action_epoch == 0 {
+            return Err(TerminalError::InvalidFence);
+        }
+        let spec = spec.validated()?;
+        let terminal_id = TerminalId::new();
+        let mut hosted = HostedTerminal::open_attached(owner, spec, terminal_id, runtime)?;
+        hosted.agent_session_id = Some(agent_session_id);
+        hosted.runtime_generation = Some(runtime_generation);
+        hosted.action_epoch = Some(action_epoch);
+        let mut terminals = self.lock()?;
+        if terminals
+            .values()
+            .any(|current| current.task_id == owner && !current.closed)
+        {
+            return Err(TerminalError::InvalidFence);
+        }
+        terminals.insert(terminal_id, hosted);
+        Ok(terminal_id)
+    }
+
     /// Bind durable task/agent admission to an already-attached terminal.
     /// Repeating the exact bind is idempotent; conflicting identity fails.
     pub fn bind_task_identity(
@@ -2007,5 +2039,35 @@ mod tests {
         assert_eq!(projected.terminal_id, terminal_id);
         assert_eq!(projected.task_id, task);
         assert_eq!(projected.view.screen.cols, 40);
+    }
+
+    #[test]
+    fn bound_task_runtime_is_not_visible_without_its_complete_identity() {
+        let service = TerminalService::new();
+        let task = TaskId::new();
+        let agent = crate::domain::AgentSessionId::new();
+        let runtime = MockAttachedRuntime::new(TerminalSize::new(40, 8).expect("size"));
+        service
+            .attach_bound_task_runtime(
+                task,
+                TerminalSpec::new(
+                    TerminalSessionId::new(),
+                    TerminalSize::new(40, 8).expect("size"),
+                )
+                .expect("spec"),
+                runtime,
+                agent,
+                7,
+                9,
+            )
+            .expect("attach bound runtime");
+
+        let projected = service
+            .task_terminal_view(task)
+            .expect("project")
+            .expect("task terminal");
+        assert_eq!(projected.agent_session_id, agent);
+        assert_eq!(projected.runtime_generation, 7);
+        assert_eq!(projected.action_epoch, 9);
     }
 }

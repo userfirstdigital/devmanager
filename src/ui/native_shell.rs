@@ -34,7 +34,7 @@ use gpui::{
     WindowOptions,
 };
 use gpui_component::button::{Button, ButtonVariants};
-use gpui_component::scroll::ScrollableElement;
+use gpui_component::scroll::{ScrollableElement, Scrollbar};
 use gpui_component::Disableable;
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
@@ -151,10 +151,10 @@ use crate::ui::project_actions::{
 use crate::ui::project_scope::{ProjectScope, ProjectScopeMenuState};
 use crate::ui::task_search::{TaskSearchCandidate, TaskSearchState};
 use crate::ui::task_workspace::{
-    apply_workspace_selection as apply_task_workspace_selection, Allocation, AllocationMetrics,
-    Axis, ConversationQueryPriority, DropTarget, Edge, PaneId, PaneRect, SplitId, TaskPaneBody,
-    TaskPaneProjection, TaskPaneViewModel, TaskSurfaceRegistry, TaskWorkspace,
-    TaskWorkspaceViewChild, TaskWorkspaceViewModel, TaskWorkspaceViewNode, Viewport,
+    apply_workspace_selection as apply_task_workspace_selection, conversation_poll_priorities_due,
+    Allocation, AllocationMetrics, Axis, ConversationQueryPriority, DropTarget, Edge, PaneId,
+    PaneRect, SplitId, TaskPaneBody, TaskPaneProjection, TaskPaneViewModel, TaskSurfaceRegistry,
+    TaskWorkspace, TaskWorkspaceViewChild, TaskWorkspaceViewModel, TaskWorkspaceViewNode, Viewport,
     WorkspaceError, WorkspaceSelectionGesture,
 };
 use crate::ui::terminal_adapter::TerminalDockAdapter;
@@ -230,6 +230,25 @@ const CLIENT_BUILD_PREFIX: &str = "devmanager";
 // physical output admitted by one request.
 const NATIVE_SNAPSHOT_PAGE_ITEMS: u32 = 128;
 const NATIVE_POINTER_ID: u64 = 1;
+/// Dedicated inbox scrollbar gutter width (gpui-component Scrollbar WIDTH = 16px).
+const TASK_INBOX_SCROLLBAR_GUTTER_WIDTH_PX: f32 = 16.0;
+/// Row padding matches the left inset; the scrollbar owns its own gutter sibling.
+const TASK_RAIL_ROW_HORIZONTAL_PADDING_PX: f32 = 10.0;
+
+fn task_row_left_click_should_reopen(settled: bool) -> bool {
+    settled
+}
+
+fn task_row_right_click_should_rename(_archived: bool) -> bool {
+    true
+}
+
+fn task_inbox_scroll_geometry() -> (f32, f32) {
+    (
+        TASK_INBOX_SCROLLBAR_GUTTER_WIDTH_PX,
+        TASK_RAIL_ROW_HORIZONTAL_PADDING_PX,
+    )
+}
 /// The dock tools in their canonical Alt+digit order. The tab strip and the
 /// keyboard shortcuts both read this table, so a visible tab can never select a
 /// different tool than its accelerator.
@@ -3046,6 +3065,7 @@ fn agent_connection_snapshot(presence: AgentPresence) -> AgentConnectionSnapshot
                 presence,
             },
         ],
+        restore_failed_task_ids: Vec::new(),
     }
 }
 
@@ -7752,6 +7772,20 @@ struct RootEditorInputProxy {
     focus_handle: FocusHandle,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ComposerSelectorKind {
+    Model,
+    Reasoning,
+    Access,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ComposerSelectorChoice {
+    Model(crate::providers::ProviderModel),
+    Reasoning(crate::providers::ProviderReasoningEffort),
+    Access(crate::providers::ProviderAccessMode),
+}
+
 pub struct NativeShell {
     profile: IsolatedDevProfile,
     host_connection: DevTestHostConnection,
@@ -7918,6 +7952,8 @@ pub struct NativeShell {
     pending_browser_commands: std::collections::VecDeque<(BrowserWorkspaceKey, BrowserCommand)>,
     composer_file_candidates: Vec<TriggerSuggestion>,
     trigger_menu: Option<TriggerMenuState>,
+    composer_selector: Option<ComposerSelectorKind>,
+    composer_selector_highlight: usize,
     /// Explicit HOLD marker kept readable in source for skill trigger honesty.
     #[allow(dead_code)]
     skill_trigger_hold: &'static str,
@@ -8374,6 +8410,8 @@ impl NativeShell {
             pending_browser_commands: std::collections::VecDeque::new(),
             composer_file_candidates: Vec::new(),
             trigger_menu: None,
+            composer_selector: None,
+            composer_selector_highlight: 0,
             skill_trigger_hold: SKILL_TRIGGER_HOLD,
             palette_index: 0,
             pending_select_task: None,
@@ -8969,6 +9007,31 @@ impl NativeShell {
         self.agent_connection.as_ref()
     }
 
+    fn apply_agent_connection_snapshot(&mut self, snapshot: AgentConnectionSnapshot) {
+        let selected = self.interaction.selected_task();
+        let restore_failed = selected.is_some_and(|task_id| {
+            snapshot
+                .restore_failed_task_ids
+                .iter()
+                .any(|failed| *failed == task_id)
+        });
+        self.agent_connection = Some(snapshot);
+        if restore_failed {
+            if let Some(task_id) = selected {
+                self.note_selected_task_restore_unavailable(task_id);
+            }
+        } else {
+            self.cockpit.set_attachment_available();
+        }
+    }
+
+    fn note_selected_task_restore_unavailable(&mut self, task_id: TaskId) {
+        self.task_surfaces.note_terminal_reconnecting(task_id);
+        self.cockpit.set_attachment_unavailable(
+            "The agent didn't start. Check Settings, then use +Claude or +Codex again.",
+        );
+    }
+
     pub fn header_attachment(&self) -> &NativeHeaderAttachment {
         &self.header_attachment
     }
@@ -9014,6 +9077,49 @@ impl NativeShell {
             )
             .gpui("native-sidebar-archived", true, true),
         );
+        overlay_nodes.push(
+            AccessibilityNode::new(
+                AccessibleRole::Button,
+                "New task",
+                "Open a new task in the current project scope.",
+            )
+            .gpui("native-sidebar-new-task", true, true),
+        );
+        overlay_nodes.push(
+            AccessibilityNode::new(
+                AccessibleRole::Button,
+                "New project",
+                "Add a project from the sidebar footer.",
+            )
+            .gpui("native-sidebar-new-project", true, true),
+        );
+        overlay_nodes.push(
+            AccessibilityNode::new(
+                AccessibleRole::Region,
+                "Task inbox scrollbar",
+                "Dedicated scrollbar gutter beside the task list viewport.",
+            )
+            .gpui("native-shell-task-inbox-scrollbar-gutter", false, false),
+        );
+        if let Some(kind) = self.composer_selector {
+            let label = match kind {
+                ComposerSelectorKind::Model => "Model menu",
+                ComposerSelectorKind::Reasoning => "Thinking menu",
+                ComposerSelectorKind::Access => "Access menu",
+            };
+            overlay_nodes.push(
+                AccessibilityNode::new(
+                    AccessibleRole::Menu,
+                    label,
+                    "Expanded composer selector with highlighted choice.",
+                )
+                .gpui("native-composer-selector-menu", true, true)
+                .with_value(format!(
+                    "expanded;selected={}",
+                    self.composer_selector_highlight
+                )),
+            );
+        }
         if composer.is_some() {
             overlay_nodes.extend([
                 AccessibilityNode::new(
@@ -9398,16 +9504,24 @@ impl NativeShell {
                 self.refresh_accessibility_tree();
             }
             NativeHostQueryBody::AgentConnection(snapshot) => {
-                self.agent_connection = Some(snapshot);
+                self.apply_agent_connection_snapshot(snapshot);
             }
             NativeHostQueryBody::TaskCockpit(result) => {
-                let command_task_id = Self::task_cockpit_command_parts(&action.command)
-                    .map(|(_, task_id, _)| task_id);
+                let command_parts = Self::task_cockpit_command_parts(&action.command);
+                let command_task_id = command_parts.map(|(_, task_id, _)| task_id);
+                if let Some((_, task_id, TaskCockpitQuery::Terminal)) = command_parts {
+                    if !matches!(&result, crate::domain::TaskCockpitResult::Terminal(_)) {
+                        self.task_surfaces.note_terminal_reconnecting(task_id);
+                        if self.interaction.selected_task() == Some(task_id) {
+                            self.sync_terminal_from_cockpit();
+                        }
+                    }
+                }
                 if let crate::domain::TaskCockpitResult::Conversation(page) = &result {
                     let Some(task_id) = command_task_id else {
                         return;
                     };
-                    let Ok(merged) = self.task_surfaces.admit_conversation(
+                    let Ok(admission) = self.task_surfaces.admit_conversation(
                         task_id,
                         action.request_generation,
                         page,
@@ -9415,11 +9529,19 @@ impl NativeShell {
                         return;
                     };
                     if self.interaction.selected_task() == Some(task_id) {
-                        let needs_next_page = merged.next_sequence.is_some();
+                        let needs_next_page = self
+                            .task_surfaces
+                            .conversation_page(task_id)
+                            .and_then(|page| page.next_sequence)
+                            .is_some();
                         let after_sequence = self.conversation_after_sequence_for(task_id);
-                        self.cockpit.apply_cockpit_result(
-                            &crate::domain::TaskCockpitResult::Conversation(merged),
-                        );
+                        if admission.changed {
+                            if let Some(page) = admission.page {
+                                self.cockpit.apply_cockpit_result(
+                                    &crate::domain::TaskCockpitResult::Conversation(page),
+                                );
+                            }
+                        }
                         if needs_next_page && !self.task_surfaces.conversation_in_flight(task_id) {
                             self.dispatch_related_actions([ActionRequest::TaskCockpit {
                                 task_id,
@@ -10067,6 +10189,14 @@ impl NativeShell {
         if is_agent_connection_query_command(&action.command) {
             self.agent_connection = Some(agent_connection_snapshot(AgentPresence::CheckFailed));
         }
+        if let Some((_, task_id, TaskCockpitQuery::Terminal)) =
+            Self::task_cockpit_command_parts(&action.command)
+        {
+            self.task_surfaces.note_terminal_reconnecting(task_id);
+            if self.interaction.selected_task() == Some(task_id) {
+                self.sync_terminal_from_cockpit();
+            }
+        }
         self.fail_header_commit_from_action(action, format!("Commit failed: {error}"));
         self.discard_native_query_action(action);
         self.last_query_detail = Some(error);
@@ -10083,6 +10213,14 @@ impl NativeShell {
             NativeHostActionResult::Stale => "host query superseded before it was sent",
             NativeHostActionResult::Queued => return,
         };
+        if let Some((_, task_id, TaskCockpitQuery::Terminal)) =
+            Self::task_cockpit_command_parts(&action.command)
+        {
+            self.task_surfaces.note_terminal_reconnecting(task_id);
+            if self.interaction.selected_task() == Some(task_id) {
+                self.sync_terminal_from_cockpit();
+            }
+        }
         self.fail_header_commit_from_action(action, format!("Commit failed: {detail}"));
         self.discard_native_query_action(action);
         self.last_query_detail = Some(detail.to_string());
@@ -10556,9 +10694,11 @@ impl NativeShell {
         repaint |= self.sync_top_bar_from_updater();
 
         // Keep the primary conversation live without refreshing inactive dock
-        // tools. The host page is bounded and replaces the previous retained
-        // window, so polling cannot grow client memory.
-        if self.controller_ticks % 30 == 0 && self.action_lane_len() < MAX_ACTION_LANE_RECORDS / 2 {
+        // tools. Interactive panes poll faster; background panes stay on the
+        // slower cadence. The host page is bounded and replaces the previous
+        // retained window, so polling cannot grow client memory.
+        let due_priorities = conversation_poll_priorities_due(self.controller_ticks as u64);
+        if !due_priorities.is_empty() && self.action_lane_len() < MAX_ACTION_LANE_RECORDS / 2 {
             let schedule = self
                 .layout
                 .task_workspace
@@ -10566,6 +10706,9 @@ impl NativeShell {
                 .map(|workspace| self.task_surfaces.conversation_query_schedule(workspace, 2))
                 .unwrap_or_default();
             for plan in schedule {
+                if !due_priorities.contains(&plan.priority) {
+                    continue;
+                }
                 if self.action_lane_len() >= MAX_ACTION_LANE_RECORDS / 2 {
                     break;
                 }
@@ -10585,16 +10728,18 @@ impl NativeShell {
                     let _ = self.enqueue_host_action(record);
                 }
             }
-            if let Some(task_id) = self.interaction.selected_task() {
-                if self.cockpit.dock().showing_raw_terminal() {
-                    if let Some(record) =
-                        self.interaction
-                            .action_on_current_handler(ActionRequest::TaskCockpit {
-                                task_id,
-                                query: TaskCockpitQuery::Terminal,
-                            })
-                    {
-                        let _ = self.enqueue_host_action(record);
+            if due_priorities.contains(&ConversationQueryPriority::Background) {
+                if let Some(task_id) = self.interaction.selected_task() {
+                    if self.cockpit.dock().showing_raw_terminal() {
+                        if let Some(record) =
+                            self.interaction
+                                .action_on_current_handler(ActionRequest::TaskCockpit {
+                                    task_id,
+                                    query: TaskCockpitQuery::Terminal,
+                                })
+                        {
+                            let _ = self.enqueue_host_action(record);
+                        }
                     }
                 }
             }
@@ -11706,6 +11851,7 @@ impl NativeShell {
         let composer_model = if let Some(model) = self.client_model.clone() {
             self.cockpit
                 .follow_projection(model.as_ref(), self.granted_capabilities());
+            self.restore_center_canvas_for_task(model.as_ref(), task_id, refresh_host_surfaces);
             Some(model)
         } else {
             self.clear_composer_binding();
@@ -11720,6 +11866,35 @@ impl NativeShell {
         }
         self.sync_terminal_from_cockpit();
         self.sync_header_projection();
+    }
+
+    fn restore_center_canvas_for_task(
+        &mut self,
+        model: &ClientModel,
+        task_id: TaskId,
+        task_follow_changed: bool,
+    ) {
+        let show_terminal = self
+            .layout
+            .task_center_terminal
+            .get(&task_id.to_string())
+            .copied()
+            .unwrap_or(false);
+        let was_showing_terminal = self.cockpit.dock().showing_raw_terminal();
+        let result = if show_terminal {
+            self.cockpit.dock_mut().switch_to_raw_terminal(model, None)
+        } else {
+            self.cockpit.dock_mut().switch_to_semantic(model, None)
+        };
+        if let Err(error) = result {
+            self.composer_error = Some(format!("{error:?}"));
+            return;
+        }
+        self.pending_terminal_focus = show_terminal;
+        if show_terminal && (task_follow_changed || !was_showing_terminal) {
+            self.task_surfaces.note_terminal_query_started(task_id);
+            let _ = self.dispatch_task_cockpit_query(task_id, TaskCockpitQuery::Terminal);
+        }
     }
 
     fn cache_current_composer_draft(&mut self) {
@@ -11806,51 +11981,288 @@ impl NativeShell {
         options
     }
 
-    fn cycle_composer_model(&mut self) {
-        use crate::providers::ProviderModel;
+    fn open_composer_model_selector(&mut self) {
+        self.open_composer_selector(ComposerSelectorKind::Model);
+    }
+
+    fn open_composer_reasoning_selector(&mut self) {
+        self.open_composer_selector(ComposerSelectorKind::Reasoning);
+    }
+
+    fn open_composer_access_selector(&mut self) {
+        self.open_composer_selector(ComposerSelectorKind::Access);
+    }
+
+    fn open_composer_selector(&mut self, kind: ComposerSelectorKind) {
+        if self.composer_selector == Some(kind) {
+            self.dismiss_composer_selector();
+            return;
+        }
+        self.composer_selector = Some(kind);
+        let choices = self.composer_selector_choices();
+        let selected = {
+            let provider = self.active_provider_kind().unwrap_or(ProviderKind::Codex);
+            let options = self.composer_launch_options_for(provider);
+            match kind {
+                ComposerSelectorKind::Model => ComposerSelectorChoice::Model(options.model),
+                ComposerSelectorKind::Reasoning => {
+                    ComposerSelectorChoice::Reasoning(options.reasoning_effort)
+                }
+                ComposerSelectorKind::Access => ComposerSelectorChoice::Access(options.access),
+            }
+        };
+        self.composer_selector_highlight = choices
+            .iter()
+            .position(|(_, choice)| *choice == selected)
+            .unwrap_or(0);
+    }
+
+    fn dismiss_composer_selector(&mut self) {
+        self.composer_selector = None;
+        self.composer_selector_highlight = 0;
+    }
+
+    fn move_composer_selector_highlight(&mut self, delta: isize) {
+        let len = self.composer_selector_choices().len();
+        if len == 0 {
+            return;
+        }
+        let current = self.composer_selector_highlight as isize;
+        let next = (current + delta).rem_euclid(len as isize) as usize;
+        self.composer_selector_highlight = next;
+    }
+
+    fn confirm_composer_selector_highlight(&mut self) {
+        let Some((_, choice)) = self
+            .composer_selector_choices()
+            .into_iter()
+            .nth(self.composer_selector_highlight)
+        else {
+            return;
+        };
+        self.apply_composer_selector_choice(choice);
+    }
+
+    fn set_composer_model(&mut self, model: crate::providers::ProviderModel) {
         let provider = self.active_provider_kind().unwrap_or(ProviderKind::Codex);
         let mut options = self.composer_launch_options_for(provider);
-        options.model = match (provider, options.model) {
-            (ProviderKind::Codex, ProviderModel::CodexSol) => ProviderModel::CodexTerra,
-            (ProviderKind::Codex, ProviderModel::CodexTerra) => ProviderModel::CodexLuna,
-            (ProviderKind::Codex, _) => ProviderModel::CodexSol,
-            (ProviderKind::ClaudeCode, ProviderModel::ClaudeOpus) => ProviderModel::ClaudeSonnet,
-            (ProviderKind::ClaudeCode, ProviderModel::ClaudeSonnet) => ProviderModel::ClaudeHaiku,
-            (ProviderKind::ClaudeCode, _) => ProviderModel::ClaudeOpus,
-            (ProviderKind::Cursor, _) => ProviderModel::ProviderDefault,
-        };
+        options.model = model;
         self.layout.composer_provider = Some(provider);
         self.layout.composer_launch_options = Some(options);
+        self.composer_selector = None;
         self.mark_layout_dirty();
     }
 
-    fn cycle_composer_reasoning(&mut self) {
-        use crate::providers::ProviderReasoningEffort as Effort;
+    fn set_composer_reasoning(&mut self, effort: crate::providers::ProviderReasoningEffort) {
         let provider = self.active_provider_kind().unwrap_or(ProviderKind::Codex);
         let mut options = self.composer_launch_options_for(provider);
-        options.reasoning_effort = match options.reasoning_effort {
-            Effort::ProviderDefault => Effort::Medium,
-            Effort::Low => Effort::Medium,
-            Effort::Medium => Effort::High,
-            Effort::High => Effort::ExtraHigh,
-            Effort::ExtraHigh => Effort::Max,
-            Effort::Max => Effort::Low,
-        };
+        options.reasoning_effort = effort;
         self.layout.composer_launch_options = Some(options);
+        self.composer_selector = None;
         self.mark_layout_dirty();
     }
 
-    fn cycle_composer_access(&mut self) {
-        use crate::providers::ProviderAccessMode as Access;
+    fn set_composer_access(&mut self, access: crate::providers::ProviderAccessMode) {
         let provider = self.active_provider_kind().unwrap_or(ProviderKind::Codex);
         let mut options = self.composer_launch_options_for(provider);
-        options.access = match options.access {
-            Access::FullAccess => Access::WorkspaceWrite,
-            Access::WorkspaceWrite => Access::ReadOnly,
-            Access::ReadOnly => Access::FullAccess,
-        };
+        options.access = access;
         self.layout.composer_launch_options = Some(options);
+        self.composer_selector = None;
         self.mark_layout_dirty();
+    }
+
+    fn composer_selector_choices(&self) -> Vec<(String, ComposerSelectorChoice)> {
+        let provider = self.active_provider_kind().unwrap_or(ProviderKind::Codex);
+        match self.composer_selector {
+            Some(ComposerSelectorKind::Model) => match provider {
+                ProviderKind::Codex => vec![
+                    (
+                        "GPT-5.6 Sol".into(),
+                        ComposerSelectorChoice::Model(crate::providers::ProviderModel::CodexSol),
+                    ),
+                    (
+                        "GPT-5.6 Terra".into(),
+                        ComposerSelectorChoice::Model(crate::providers::ProviderModel::CodexTerra),
+                    ),
+                    (
+                        "GPT-5.6 Luna".into(),
+                        ComposerSelectorChoice::Model(crate::providers::ProviderModel::CodexLuna),
+                    ),
+                ],
+                ProviderKind::ClaudeCode => vec![
+                    (
+                        "Claude Opus".into(),
+                        ComposerSelectorChoice::Model(crate::providers::ProviderModel::ClaudeOpus),
+                    ),
+                    (
+                        "Claude Sonnet".into(),
+                        ComposerSelectorChoice::Model(
+                            crate::providers::ProviderModel::ClaudeSonnet,
+                        ),
+                    ),
+                    (
+                        "Claude Haiku".into(),
+                        ComposerSelectorChoice::Model(crate::providers::ProviderModel::ClaudeHaiku),
+                    ),
+                ],
+                ProviderKind::Cursor => vec![(
+                    "Provider default".into(),
+                    ComposerSelectorChoice::Model(crate::providers::ProviderModel::ProviderDefault),
+                )],
+            },
+            Some(ComposerSelectorKind::Reasoning) => vec![
+                (
+                    "Default thinking".into(),
+                    ComposerSelectorChoice::Reasoning(
+                        crate::providers::ProviderReasoningEffort::ProviderDefault,
+                    ),
+                ),
+                (
+                    "Low".into(),
+                    ComposerSelectorChoice::Reasoning(
+                        crate::providers::ProviderReasoningEffort::Low,
+                    ),
+                ),
+                (
+                    "Medium".into(),
+                    ComposerSelectorChoice::Reasoning(
+                        crate::providers::ProviderReasoningEffort::Medium,
+                    ),
+                ),
+                (
+                    "High".into(),
+                    ComposerSelectorChoice::Reasoning(
+                        crate::providers::ProviderReasoningEffort::High,
+                    ),
+                ),
+                (
+                    "Extra high".into(),
+                    ComposerSelectorChoice::Reasoning(
+                        crate::providers::ProviderReasoningEffort::ExtraHigh,
+                    ),
+                ),
+                (
+                    "Max".into(),
+                    ComposerSelectorChoice::Reasoning(
+                        crate::providers::ProviderReasoningEffort::Max,
+                    ),
+                ),
+            ],
+            Some(ComposerSelectorKind::Access) => vec![
+                (
+                    "Full access".into(),
+                    ComposerSelectorChoice::Access(
+                        crate::providers::ProviderAccessMode::FullAccess,
+                    ),
+                ),
+                (
+                    "Workspace write".into(),
+                    ComposerSelectorChoice::Access(
+                        crate::providers::ProviderAccessMode::WorkspaceWrite,
+                    ),
+                ),
+                (
+                    "Read only".into(),
+                    ComposerSelectorChoice::Access(crate::providers::ProviderAccessMode::ReadOnly),
+                ),
+            ],
+            None => Vec::new(),
+        }
+    }
+
+    fn apply_composer_selector_choice(&mut self, choice: ComposerSelectorChoice) {
+        match choice {
+            ComposerSelectorChoice::Model(model) => self.set_composer_model(model),
+            ComposerSelectorChoice::Reasoning(effort) => self.set_composer_reasoning(effort),
+            ComposerSelectorChoice::Access(access) => self.set_composer_access(access),
+        }
+    }
+
+    fn composer_selector_menu(
+        &self,
+        tokens: crate::ui::tokens::ThemeTokens,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
+        let choices = self.composer_selector_choices();
+        if choices.is_empty() {
+            return None;
+        }
+        let selected = {
+            let provider = self.active_provider_kind().unwrap_or(ProviderKind::Codex);
+            let options = self.composer_launch_options_for(provider);
+            match self.composer_selector {
+                Some(ComposerSelectorKind::Model) => ComposerSelectorChoice::Model(options.model),
+                Some(ComposerSelectorKind::Reasoning) => {
+                    ComposerSelectorChoice::Reasoning(options.reasoning_effort)
+                }
+                Some(ComposerSelectorKind::Access) => {
+                    ComposerSelectorChoice::Access(options.access)
+                }
+                None => return None,
+            }
+        };
+        let rows = choices
+            .into_iter()
+            .enumerate()
+            .map(|(index, (label, choice))| {
+                let is_selected = choice == selected;
+                let is_highlighted = index == self.composer_selector_highlight;
+                let check = if is_selected { "✓ " } else { "  " };
+                div()
+                    .id(("native-composer-selector-row", index))
+                    .w_full()
+                    .px(px(10.0))
+                    .py(px(6.0))
+                    .rounded(px(4.0))
+                    .cursor_pointer()
+                    .hover(|style| style.bg(tokens.surfaces.hover.to_gpui()))
+                    .when(is_highlighted || is_selected, |row| {
+                        row.bg(tokens.surfaces.selection.to_gpui())
+                    })
+                    .on_click(cx.listener(move |shell, _event: &ClickEvent, _window, cx| {
+                        cx.stop_propagation();
+                        shell.apply_composer_selector_choice(choice);
+                        cx.notify();
+                    }))
+                    .child(format!("{check}{label}"))
+                    .into_any_element()
+            });
+        Some(
+            div()
+                .id("native-composer-selector-layer")
+                .absolute()
+                .inset_0()
+                .child(
+                    div()
+                        .id("native-composer-selector-dismiss")
+                        .absolute()
+                        .inset_0()
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(|shell, _event: &MouseDownEvent, _window, cx| {
+                                cx.stop_propagation();
+                                shell.dismiss_composer_selector();
+                                cx.notify();
+                            }),
+                        ),
+                )
+                .child(
+                    div()
+                        .id("native-composer-selector-menu")
+                        .absolute()
+                        .bottom(px(36.0))
+                        .left(px(0.0))
+                        .min_w(px(180.0))
+                        .p(px(6.0))
+                        .rounded(px(8.0))
+                        .bg(tokens.surfaces.overlay.to_gpui())
+                        .border(px(1.0))
+                        .border_color(tokens.borders.subtle.to_gpui())
+                        .shadow_sm()
+                        .children(rows),
+                )
+                .into_any_element(),
+        )
     }
 
     fn task_provider_kind(&self, task_id: TaskId) -> Option<ProviderKind> {
@@ -12136,6 +12548,7 @@ impl NativeShell {
             self.pending_terminal_focus = visible;
             if visible {
                 if let Some(task_id) = selected_task_id {
+                    self.task_surfaces.note_terminal_query_started(task_id);
                     let _ = self.dispatch_task_cockpit_query(task_id, TaskCockpitQuery::Terminal);
                 }
             }
@@ -12155,6 +12568,10 @@ impl NativeShell {
             self.composer_error = Some("select a task before using its terminal".into());
             return false;
         };
+        if !self.task_surfaces.terminal_is_interactive(task_id) {
+            self.composer_error = Some(self.task_surfaces.terminal_label(task_id).to_string());
+            return false;
+        }
         let Some(snapshot) = model.task(task_id) else {
             self.composer_error = Some("task projection unavailable".into());
             return false;
@@ -12212,6 +12629,13 @@ impl NativeShell {
         cx: &mut Context<Self>,
     ) {
         if !self.cockpit.dock().showing_raw_terminal() {
+            return;
+        }
+        if self
+            .interaction
+            .selected_task()
+            .is_some_and(|task_id| !self.task_surfaces.terminal_is_interactive(task_id))
+        {
             return;
         }
         let command = event.keystroke.modifiers.control || event.keystroke.modifiers.platform;
@@ -12509,6 +12933,35 @@ impl NativeShell {
         self.composer_error = None;
         let key = event.keystroke.key.as_str();
         let command = event.keystroke.modifiers.control || event.keystroke.modifiers.platform;
+        if self.composer_selector.is_some() {
+            match key {
+                "escape" => {
+                    self.dismiss_composer_selector();
+                    window.prevent_default();
+                    cx.stop_propagation();
+                    return;
+                }
+                "arrowup" | "up" => {
+                    self.move_composer_selector_highlight(-1);
+                    window.prevent_default();
+                    cx.stop_propagation();
+                    return;
+                }
+                "arrowdown" | "down" => {
+                    self.move_composer_selector_highlight(1);
+                    window.prevent_default();
+                    cx.stop_propagation();
+                    return;
+                }
+                "enter" => {
+                    self.confirm_composer_selector_highlight();
+                    window.prevent_default();
+                    cx.stop_propagation();
+                    return;
+                }
+                _ => {}
+            }
+        }
         if self
             .trigger_menu
             .as_ref()
@@ -12832,6 +13285,18 @@ impl NativeShell {
             }
         });
         let intent = self.prefix_composer_intent_with_images(intent);
+        if let ComposerPayload::SendNow { text, .. } = &intent.payload {
+            let admission =
+                self.task_surfaces
+                    .admit_pending_user_message(fence.task_id, text, command_id);
+            if admission.changed && self.interaction.selected_task() == Some(fence.task_id) {
+                if let Some(page) = admission.page {
+                    self.cockpit.apply_cockpit_result(
+                        &crate::domain::TaskCockpitResult::Conversation(page),
+                    );
+                }
+            }
+        }
         let (provider_identity, first_start) = {
             let Some(model) = self.client_model.as_ref() else {
                 if let Some(composer) = self.composer.as_mut() {
@@ -12903,6 +13368,19 @@ impl NativeShell {
         ) {
             Ok(request) => request,
             Err(error) => {
+                if matches!(intent.payload, ComposerPayload::SendNow { .. }) {
+                    let admission = self
+                        .task_surfaces
+                        .reject_pending_user_message(fence.task_id, command_id);
+                    if admission.changed && self.interaction.selected_task() == Some(fence.task_id)
+                    {
+                        if let Some(page) = admission.page {
+                            self.cockpit.apply_cockpit_result(
+                                &crate::domain::TaskCockpitResult::Conversation(page),
+                            );
+                        }
+                    }
+                }
                 if let Some(composer) = self.composer.as_mut() {
                     let _ = composer.cancel_pending(command_id);
                 }
@@ -12924,8 +13402,24 @@ impl NativeShell {
                         self.pending_composer_submissions
                             .insert(command_id, submission);
                     }
-                } else if let Some(composer) = self.composer.as_mut() {
-                    let _ = composer.cancel_pending(command_id);
+                } else {
+                    if matches!(intent.payload, ComposerPayload::SendNow { .. }) {
+                        let admission = self
+                            .task_surfaces
+                            .reject_pending_user_message(fence.task_id, command_id);
+                        if admission.changed
+                            && self.interaction.selected_task() == Some(fence.task_id)
+                        {
+                            if let Some(page) = admission.page {
+                                self.cockpit.apply_cockpit_result(
+                                    &crate::domain::TaskCockpitResult::Conversation(page),
+                                );
+                            }
+                        }
+                    }
+                    if let Some(composer) = self.composer.as_mut() {
+                        let _ = composer.cancel_pending(command_id);
+                    }
                 }
                 self.composer_error = Some(
                     ComposerError::Unavailable {
@@ -13713,7 +14207,7 @@ impl NativeShell {
             };
             let has_lines = !lines.is_empty();
             let empty = if pane.paint_terminal {
-                "Terminal is live; waiting for output."
+                self.task_surfaces.terminal_empty_message(task_id)
             } else {
                 "Conversation is live; waiting for messages."
             };
@@ -14088,19 +14582,19 @@ impl NativeShell {
             crate::providers::ProviderAccessMode::WorkspaceWrite => "Workspace write",
             crate::providers::ProviderAccessMode::ReadOnly => "Read only",
         };
-        let cycle_model = cx.listener(|shell, _event: &ClickEvent, _window, cx| {
+        let open_model = cx.listener(|shell, _event: &ClickEvent, _window, cx| {
             cx.stop_propagation();
-            shell.cycle_composer_model();
+            shell.open_composer_model_selector();
             cx.notify();
         });
-        let cycle_reasoning = cx.listener(|shell, _event: &ClickEvent, _window, cx| {
+        let open_reasoning = cx.listener(|shell, _event: &ClickEvent, _window, cx| {
             cx.stop_propagation();
-            shell.cycle_composer_reasoning();
+            shell.open_composer_reasoning_selector();
             cx.notify();
         });
-        let cycle_access = cx.listener(|shell, _event: &ClickEvent, _window, cx| {
+        let open_access = cx.listener(|shell, _event: &ClickEvent, _window, cx| {
             cx.stop_propagation();
-            shell.cycle_composer_access();
+            shell.open_composer_access_selector();
             cx.notify();
         });
         let (checkout_label, branch_label) = self
@@ -14501,6 +14995,7 @@ impl NativeShell {
                                             .gap(px(8.0))
                                             .child(
                                                 div()
+                                                    .relative()
                                                     .min_w(px(0.0))
                                                     .flex()
                                                     .flex_wrap()
@@ -14511,20 +15006,21 @@ impl NativeShell {
                                                         Button::new("native-composer-model")
                                                             .label(model_label)
                                                             .ghost()
-                                                            .on_click(cycle_model),
+                                                            .on_click(open_model),
                                                     )
                                                     .child(
                                                         Button::new("native-composer-reasoning")
                                                             .label(reasoning_label)
                                                             .ghost()
-                                                            .on_click(cycle_reasoning),
+                                                            .on_click(open_reasoning),
                                                     )
                                                     .child(
                                                         Button::new("native-composer-access")
                                                             .label(access_label)
                                                             .ghost()
-                                                            .on_click(cycle_access),
-                                                    ),
+                                                            .on_click(open_access),
+                                                    )
+                                                    .children(self.composer_selector_menu(tokens, cx)),
                                             )
                                             .child(
                                                 div()
@@ -14683,11 +15179,17 @@ impl NativeShell {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let shell_entity = cx.weak_entity();
-        let interactive = self.cockpit.dock().terminal_binding().is_some();
+        let interactive = self.interaction.selected_task().is_some_and(|task_id| {
+            self.cockpit.dock().terminal_binding().is_some()
+                && self.task_surfaces.terminal_is_interactive(task_id)
+        });
         let summary = if interactive {
-            "Provider terminal · type, use arrows, Enter, or Escape"
+            "Provider terminal · Live · type, use arrows, Enter, or Escape"
         } else {
-            "Provider terminal · waiting for the bound session"
+            self.interaction
+                .selected_task()
+                .map(|task_id| self.task_surfaces.terminal_label(task_id))
+                .unwrap_or("Terminal unavailable")
         };
         let surface = div()
             .id("native-task-center-terminal-surface")
@@ -14750,6 +15252,25 @@ impl NativeShell {
             self.clear_composer_binding();
             return;
         };
+        let restore_failed = self.agent_connection.as_ref().is_some_and(|connection| {
+            connection
+                .restore_failed_task_ids
+                .iter()
+                .any(|failed| *failed == task_id)
+        });
+        if restore_failed {
+            self.note_selected_task_restore_unavailable(task_id);
+            // Keep composer available when persisted conversation exists so the
+            // user can reconnect or send; only clear when there is no history.
+            if self.task_surfaces.conversation_page(task_id).is_none() {
+                self.clear_composer_binding();
+                self.composer_error = Some(
+                    "The agent didn't start. Check Settings, then use +Claude or +Codex again."
+                        .to_string(),
+                );
+                return;
+            }
+        }
         if snapshot.attention == crate::domain::task::TaskAttention::Failed {
             self.clear_composer_binding();
             self.composer_error = Some(
@@ -16594,7 +17115,7 @@ impl NativeShell {
 
     fn dispatch_named_accessibility_action(&mut self, element_id: &str) {
         match element_id {
-            "native-projects-add" => {
+            "native-projects-add" | "native-sidebar-new-project" => {
                 self.interaction.close_palettes();
                 self.new_task = None;
                 if self.shows_add_project_plus() {
@@ -16602,6 +17123,9 @@ impl NativeShell {
                 } else {
                     self.settings_open = true;
                 }
+            }
+            "native-sidebar-new-task" => {
+                self.begin_new_task();
             }
             "native-inbox-plus-claude" => self.start_task_with_agent(ProviderKind::ClaudeCode),
             "native-inbox-plus-codex" => self.start_task_with_agent(ProviderKind::Codex),
@@ -16620,9 +17144,9 @@ impl NativeShell {
             "native-delete-task-submit" => self.confirm_task_delete(),
             "native-delete-task-cancel" => self.delete_task = None,
             "native-task-composer-input" => self.request_composer_accessibility_focus(),
-            "native-composer-model" => self.cycle_composer_model(),
-            "native-composer-reasoning" => self.cycle_composer_reasoning(),
-            "native-composer-access" => self.cycle_composer_access(),
+            "native-composer-model" => self.open_composer_model_selector(),
+            "native-composer-reasoning" => self.open_composer_reasoning_selector(),
+            "native-composer-access" => self.open_composer_access_selector(),
             "native-sidebar-archived" => {
                 self.show_archived_tasks = !self.show_archived_tasks;
                 self.refresh_accessibility_tree();
@@ -16786,14 +17310,22 @@ impl NativeShell {
     }
 
     fn task_row_status(&self, task_id: TaskId) -> Option<VisibleTaskStatus> {
-        if let Some(row) = self.inbox.row(task_id) {
-            return Some(row.status);
+        let projected = self.inbox.row(task_id).map(|row| row.status).or_else(|| {
+            self.client_model
+                .as_ref()?
+                .tasks()
+                .get(&task_id)
+                .map(|snapshot| snapshot.visible_status())
+        })?;
+        if matches!(
+            projected,
+            VisibleTaskStatus::Working | VisibleTaskStatus::Settling
+        ) && self.task_surfaces.conversation_turn_completed(task_id)
+        {
+            Some(VisibleTaskStatus::Idle)
+        } else {
+            Some(projected)
         }
-        self.client_model
-            .as_ref()?
-            .tasks()
-            .get(&task_id)
-            .map(|snapshot| snapshot.visible_status())
     }
 
     /// Second row line, built only from facts the row projection already
@@ -22661,7 +23193,7 @@ impl NativeShell {
                                                 workspace.contains_task(task_id)
                                             });
                                         let _ = shell.apply_workspace_selection(task_id, gesture);
-                                        if settled
+                                        if task_row_left_click_should_reopen(settled)
                                             && !(gesture == WorkspaceSelectionGesture::Toggle
                                                 && was_open)
                                         {
@@ -22671,9 +23203,7 @@ impl NativeShell {
                                         cx.notify();
                                     } else if event.button == MouseButton::Right {
                                         shell.selected_project_id = Some(project_id);
-                                        if archived {
-                                            shell.begin_task_delete(task_id);
-                                        } else {
+                                        if task_row_right_click_should_rename(archived) {
                                             shell.begin_task_rename(task_id);
                                         }
                                         cx.notify();
@@ -22700,7 +23230,7 @@ impl NativeShell {
                                             task_id,
                                             WorkspaceSelectionGesture::Plain,
                                         );
-                                        if settled {
+                                        if task_row_left_click_should_reopen(settled) {
                                             shell.reopen_task(task_id);
                                         }
                                         shell.refresh_accessibility_tree();
@@ -22717,7 +23247,8 @@ impl NativeShell {
                             .flex_col()
                             .justify_center()
                             .gap(px(3.0))
-                            .px(px(10.0))
+                            .pl(px(TASK_RAIL_ROW_HORIZONTAL_PADDING_PX))
+                            .pr(px(TASK_RAIL_ROW_HORIZONTAL_PADDING_PX))
                             .py(px(7.0))
                             .rounded(px(6.0))
                             .cursor_pointer();
@@ -22905,7 +23436,7 @@ impl NativeShell {
             let offset = scroll_state.base_handle.offset();
             scroll_state
                 .base_handle
-                .set_offset(point(offset.x, offset.y - delta));
+                .set_offset(point(offset.x, offset.y + delta));
             shell.refresh_accessibility_tree();
             cx.notify();
         });
@@ -23135,32 +23666,6 @@ impl NativeShell {
             .child(self.context_dock_surface(tokens, Some(services_shell_entity)))
             .into_any_element();
 
-        let project_add_control = match provider_affordance {
-            ProviderInboxAffordance::ConnectedAdd => Button::new("native-projects-add")
-                .label("+")
-                .tooltip("Add project")
-                .ghost()
-                .on_click(cx.listener(|shell, _event: &ClickEvent, _window, cx| {
-                    cx.stop_propagation();
-                    shell.begin_choose_folder(cx);
-                    cx.notify();
-                }))
-                .into_any_element(),
-            ProviderInboxAffordance::Checking => div()
-                .flex()
-                .items_center()
-                .px(px(7.0))
-                .text_size(px(tokens.density.typography.caption))
-                .text_color(tokens.text.muted.to_gpui())
-                .child("Checking…")
-                .into_any_element(),
-            ProviderInboxAffordance::DisconnectedAdd => Button::new("native-projects-add-disabled")
-                .label("+")
-                .tooltip("Connect an agent in Settings, then Refresh")
-                .ghost()
-                .disabled(true)
-                .into_any_element(),
-        };
         let navigation = div()
             .id("native-shell-sidebar-navigation")
             .w_full()
@@ -23199,18 +23704,7 @@ impl NativeShell {
                         14.0,
                         tokens.text.muted.to_u32(),
                     ))
-                    .child(div().flex_1().child("Search"))
-                    .child(
-                        Button::new("native-sidebar-new-task")
-                            .label("+")
-                            .tooltip("New task")
-                            .ghost()
-                            .on_click(cx.listener(|shell, _event: &ClickEvent, _window, cx| {
-                                cx.stop_propagation();
-                                shell.begin_new_task();
-                                cx.notify();
-                            })),
-                    ),
+                    .child(div().flex_1().child("Search")),
             )
             .child(
                 div()
@@ -23250,7 +23744,17 @@ impl NativeShell {
                         12.0,
                         tokens.text.muted.to_u32(),
                     ))
-                    .child(project_add_control),
+                    .child(
+                        Button::new("native-sidebar-new-task")
+                            .label("+")
+                            .tooltip("New task")
+                            .ghost()
+                            .on_click(cx.listener(|shell, _event: &ClickEvent, _window, cx| {
+                                cx.stop_propagation();
+                                shell.begin_new_task();
+                                cx.notify();
+                            })),
+                    ),
             )
             .into_any_element();
         let settled_panel = (!archived_view && !settled_rows.is_empty()).then(|| {
@@ -23379,12 +23883,27 @@ impl NativeShell {
                     .id("native-shell-task-inbox-rows")
                     .w_full()
                     .flex()
-                    .flex_col()
+                    .flex_row()
                     .flex_1()
                     .min_h(px(0.0))
-                    .vertical_scrollbar(&self.task_scroll_handle)
-                    .on_scroll_wheel(inbox_scroll)
-                    .child(task_list_element)
+                    .child(
+                        div()
+                            .id("native-shell-task-inbox-viewport")
+                            .flex_1()
+                            .min_w(px(0.0))
+                            .min_h(px(0.0))
+                            .overflow_hidden()
+                            .on_scroll_wheel(inbox_scroll)
+                            .child(task_list_element),
+                    )
+                    .child(
+                        div()
+                            .id("native-shell-task-inbox-scrollbar-gutter")
+                            .w(px(TASK_INBOX_SCROLLBAR_GUTTER_WIDTH_PX))
+                            .flex_none()
+                            .h_full()
+                            .child(Scrollbar::vertical(&self.task_scroll_handle)),
+                    )
                     .into_any_element()
             })
             .children(settled_panel)
@@ -23506,29 +24025,47 @@ impl NativeShell {
                             )),
                     ),
             )
-            .child(
-                div()
-                    .id("native-sidebar-new-task-footer")
+            .child({
+                let new_project = div()
+                    .id("native-sidebar-new-project")
                     .tab_stop(true)
-                    .size(px(28.0))
+                    .h(px(28.0))
+                    .px(px(10.0))
                     .flex()
                     .items_center()
                     .justify_center()
-                    .rounded_full()
+                    .gap(px(6.0))
+                    .rounded(px(6.0))
                     .cursor_pointer()
                     .bg(tokens.actions.primary.default.background.to_gpui())
                     .hover(|style| style.bg(tokens.actions.primary.hover.background.to_gpui()))
-                    .on_click(cx.listener(|shell, _event: &ClickEvent, _window, cx| {
-                        cx.stop_propagation();
-                        shell.begin_new_task();
-                        cx.notify();
-                    }))
                     .child(crate::icons::app_icon(
-                        crate::icons::PLUS,
+                        crate::icons::FOLDER,
                         14.0,
                         tokens.actions.primary.default.foreground.to_u32(),
-                    )),
-            )
+                    ))
+                    .child(
+                        div()
+                            .text_size(px(tokens.density.typography.caption))
+                            .text_color(tokens.actions.primary.default.foreground.to_gpui())
+                            .child("New project"),
+                    );
+                match provider_affordance {
+                    ProviderInboxAffordance::ConnectedAdd => new_project
+                        .on_click(cx.listener(|shell, _event: &ClickEvent, _window, cx| {
+                            cx.stop_propagation();
+                            shell.begin_choose_folder(cx);
+                            cx.notify();
+                        }))
+                        .into_any_element(),
+                    ProviderInboxAffordance::Checking => {
+                        new_project.opacity(0.6).into_any_element()
+                    }
+                    ProviderInboxAffordance::DisconnectedAdd => {
+                        new_project.opacity(0.45).into_any_element()
+                    }
+                }
+            })
             .into_any_element();
         let sidebar = Self::reference_sidebar(tokens, navigation, inbox_panel, sidebar_footer);
 
@@ -26240,6 +26777,129 @@ mod tests {
         assert!(!NativeShell::plus_visible_for_state(false, true));
         assert!(NativeShell::plus_visible_for_state(true, false));
         assert!(NativeShell::plus_visible_for_state(true, true));
+    }
+
+    #[test]
+    fn archived_left_click_selects_without_restore_while_settled_reopens() {
+        assert!(
+            !super::task_row_left_click_should_reopen(false),
+            "archived/active rows must not reopen on left click"
+        );
+        assert!(
+            super::task_row_left_click_should_reopen(true),
+            "settled Done rows reopen on left click"
+        );
+    }
+
+    #[test]
+    fn right_click_renames_active_and_archived_tasks() {
+        assert!(super::task_row_right_click_should_rename(false));
+        assert!(super::task_row_right_click_should_rename(true));
+    }
+
+    #[test]
+    fn task_inbox_scroll_geometry_uses_gutter_sibling_not_row_overlay_padding() {
+        let (gutter_width, row_padding) = super::task_inbox_scroll_geometry();
+        assert_eq!(gutter_width, 16.0);
+        assert_eq!(row_padding, 10.0);
+        assert_ne!(
+            row_padding, 18.0,
+            "row padding must not reserve space for an absolute scrollbar overlay"
+        );
+    }
+
+    #[test]
+    fn connected_shell_exposes_new_task_beside_projects_and_footer_new_project_without_search_plus()
+    {
+        if rerun_headless_shell_test_in_child(
+            "ui::native_shell::tests::connected_shell_exposes_new_task_beside_projects_and_footer_new_project_without_search_plus",
+        ) {
+            return;
+        }
+        let _test_guard = HEADLESS_SHELL_TEST_LOCK
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .expect("headless shell test lock");
+        let completed = std::rc::Rc::new(std::cell::RefCell::new(None));
+        let completed_for_app = std::rc::Rc::clone(&completed);
+        gpui::Application::headless().run(move |cx| {
+            crate::ui::init(cx);
+            let (runtime, _) = TestRuntime::new(true, NativeHostActionResult::Queued);
+            let snapshot = with_test_shell_in_app(cx, runtime, |shell| {
+                shell.agent_connection = Some(agent_connection_snapshot(AgentPresence::SignedIn));
+                shell.install_named_folder_for_test("command");
+                let _ = shell.element_without_handlers();
+                shell.refresh_accessibility_tree();
+                shell
+                    .accessibility_tree()
+                    .gpui_nodes()
+                    .into_iter()
+                    .map(|node| node.element_id)
+                    .collect::<Vec<_>>()
+            });
+            *completed_for_app.borrow_mut() = Some(snapshot);
+            cx.quit();
+        });
+        let ids = completed.borrow().clone().expect("rail control ids");
+        assert!(
+            ids.iter().any(|id| id == "native-sidebar-new-task"),
+            "New task must sit beside All projects: {ids:?}"
+        );
+        assert!(
+            ids.iter().any(|id| id == "native-sidebar-new-project"),
+            "footer must expose exactly one New project action: {ids:?}"
+        );
+        assert!(
+            !ids.iter().any(|id| id == "native-search-plus"),
+            "Search must not keep a plus control: {ids:?}"
+        );
+        assert!(
+            ids.iter()
+                .any(|id| id == "native-shell-task-inbox-scrollbar-gutter"),
+            "inbox must project a dedicated scrollbar gutter sibling: {ids:?}"
+        );
+    }
+
+    #[test]
+    fn composer_selector_supports_keyboard_highlight_enter_and_dismiss() {
+        if rerun_headless_shell_test_in_child(
+            "ui::native_shell::tests::composer_selector_supports_keyboard_highlight_enter_and_dismiss",
+        ) {
+            return;
+        }
+        let _test_guard = HEADLESS_SHELL_TEST_LOCK
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .expect("headless shell test lock");
+        let completed = std::rc::Rc::new(std::cell::RefCell::new(None));
+        let completed_for_app = std::rc::Rc::clone(&completed);
+        gpui::Application::headless().run(move |cx| {
+            crate::ui::init(cx);
+            let (runtime, _) = TestRuntime::new(true, NativeHostActionResult::Queued);
+            let snapshot = with_test_shell_in_app(cx, runtime, |shell| {
+                shell.layout.composer_provider = Some(ProviderKind::Codex);
+                shell.open_composer_model_selector();
+                let opened = shell.composer_selector;
+                let initial = shell.composer_selector_highlight;
+                shell.move_composer_selector_highlight(1);
+                let moved = shell.composer_selector_highlight;
+                shell.dismiss_composer_selector();
+                let dismissed = shell.composer_selector;
+                shell.open_composer_model_selector();
+                shell.confirm_composer_selector_highlight();
+                let after_enter = shell.composer_selector;
+                (opened, initial, moved, dismissed, after_enter)
+            });
+            *completed_for_app.borrow_mut() = Some(snapshot);
+            cx.quit();
+        });
+        let (opened, initial, moved, dismissed, after_enter) =
+            completed.borrow().clone().expect("composer selector");
+        assert_eq!(opened, Some(super::ComposerSelectorKind::Model));
+        assert_eq!(initial, 0);
+        assert_eq!(moved, 1);
+        assert_eq!(dismissed, None);
+        assert_eq!(after_enter, None);
     }
 
     #[test]
@@ -29226,10 +29886,14 @@ mod tests {
     }
 
     fn selected_task_follow_title_and_terminal_binding(cx: &mut gpui::App) {
-        let (runtime, _shared) = TestRuntime::new(true, NativeHostActionResult::Queued);
+        let (runtime, shared) = TestRuntime::new(true, NativeHostActionResult::Queued);
         let (model, task_id) = terminal_bound_client_model();
         with_test_shell_in_app(cx, runtime, |shell| {
             assert!(!shell.terminal_state().is_live());
+            shell
+                .layout
+                .task_center_terminal
+                .insert(task_id.to_string(), true);
             shell
                 .apply_client_model(Arc::new(model))
                 .expect("apply model");
@@ -29248,6 +29912,24 @@ mod tests {
             assert!(
                 shell.terminal_state().is_live(),
                 "complete terminal identity must bind the adapter"
+            );
+            assert!(
+                shell.cockpit.dock().showing_raw_terminal(),
+                "a persisted terminal canvas must be restored when the task is followed"
+            );
+            assert!(
+                shared
+                    .lock()
+                    .expect("runtime")
+                    .accepted
+                    .iter()
+                    .any(|record| {
+                        matches!(
+                            NativeShell::task_cockpit_command_parts(&record.command),
+                            Some((_, id, super::TaskCockpitQuery::Terminal)) if id == task_id
+                        )
+                    }),
+                "restoring a terminal canvas must issue its initial bounded terminal query"
             );
         });
     }

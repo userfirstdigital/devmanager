@@ -1,8 +1,8 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::domain::{
-    SemanticJournalFact, SemanticJournalPage, SemanticJournalPayload, TaskId,
-    TaskTerminalProjection,
+    CommandId, EventId, PrivacyClass, SemanticJournalFact, SemanticJournalPage,
+    SemanticJournalPayload, TaskId, TaskTerminalProjection,
 };
 
 use super::{Axis, PanePresentation, TaskWorkspace, WorkspaceError};
@@ -11,6 +11,23 @@ use super::{Axis, PanePresentation, TaskWorkspace, WorkspaceError};
 pub enum ConversationQueryPriority {
     Interactive,
     Background,
+}
+
+/// Focused interactive conversation poll cadence (~128 ms at 16 ms ticks).
+pub const INTERACTIVE_CONVERSATION_POLL_TICKS: u64 = 8;
+/// Background pane / terminal conversation poll cadence (~480 ms at 16 ms ticks).
+pub const BACKGROUND_CONVERSATION_POLL_TICKS: u64 = 30;
+
+/// Which conversation priorities are due on this controller tick.
+pub fn conversation_poll_priorities_due(controller_ticks: u64) -> Vec<ConversationQueryPriority> {
+    let mut due = Vec::new();
+    if controller_ticks % INTERACTIVE_CONVERSATION_POLL_TICKS == 0 {
+        due.push(ConversationQueryPriority::Interactive);
+    }
+    if controller_ticks % BACKGROUND_CONVERSATION_POLL_TICKS == 0 {
+        due.push(ConversationQueryPriority::Background);
+    }
+    due
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -76,6 +93,21 @@ pub struct TaskConversationCache {
     next_sequence: Option<u64>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ConversationAdmission {
+    /// Present only when durable conversation facts changed. Cursor-only polls
+    /// leave this `None` so callers do not clone or reproject the page.
+    pub page: Option<SemanticJournalPage>,
+    pub changed: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct PendingUserMessage {
+    command_id: CommandId,
+    event_id: EventId,
+    text: String,
+}
+
 impl TaskConversationCache {
     pub fn as_page(&self) -> SemanticJournalPage {
         SemanticJournalPage {
@@ -93,20 +125,67 @@ impl TaskConversationCache {
             .unwrap_or_else(|| self.high_water.max(self.through_sequence))
     }
 
-    pub fn merge_page(&mut self, page: &SemanticJournalPage) {
+    pub fn high_water(&self) -> u64 {
+        self.high_water
+    }
+
+    pub fn fact_count(&self) -> usize {
+        self.facts.len()
+    }
+
+    fn latest_message_is_assistant(&self) -> bool {
+        self.facts
+            .iter()
+            .rev()
+            .find_map(|fact| match &fact.payload {
+                SemanticJournalPayload::UserMessage { .. } => Some(false),
+                SemanticJournalPayload::AssistantText { .. } => Some(true),
+                _ => None,
+            })
+            == Some(true)
+    }
+
+    /// Admit a monotonic page. Updates durable cursors always. Reports
+    /// `facts_changed` only when the retained fact list mutates so empty or
+    /// cursor-only polls do not force a visual reprojection.
+    pub fn merge_page(&mut self, page: &SemanticJournalPage) -> bool {
+        let prior_len = self.facts.len();
+
+        if page.facts.is_empty() {
+            self.high_water = self.high_water.max(page.high_water);
+            if page.next_sequence.is_some() {
+                self.next_sequence = page.next_sequence;
+            }
+            if self.next_sequence.is_none() {
+                self.through_sequence = self.through_sequence.max(page.through_sequence);
+            }
+            return false;
+        }
+
+        let append_only = page.facts.iter().enumerate().all(|(index, fact)| {
+            let previous = index
+                .checked_sub(1)
+                .and_then(|prev| page.facts.get(prev).map(|fact| fact.sequence));
+            let ordered = previous.is_none_or(|previous| previous < fact.sequence);
+            ordered && fact.sequence > self.through_sequence
+        });
+        if append_only {
+            self.facts.extend(page.facts.iter().cloned());
+        } else {
+            for fact in &page.facts {
+                if self
+                    .facts
+                    .iter()
+                    .any(|existing| existing.sequence == fact.sequence)
+                {
+                    continue;
+                }
+                self.facts.push(fact.clone());
+            }
+            self.facts.sort_by_key(|fact| fact.sequence);
+        }
         self.high_water = self.high_water.max(page.high_water);
         self.through_sequence = self.through_sequence.max(page.through_sequence);
-        for fact in &page.facts {
-            if self
-                .facts
-                .iter()
-                .any(|existing| existing.sequence == fact.sequence)
-            {
-                continue;
-            }
-            self.facts.push(fact.clone());
-        }
-        self.facts.sort_by_key(|fact| fact.sequence);
         self.next_sequence = page.next_sequence;
         if self.next_sequence.is_none() {
             self.through_sequence = self
@@ -116,6 +195,7 @@ impl TaskConversationCache {
                 .unwrap_or(self.through_sequence)
                 .max(page.through_sequence);
         }
+        self.facts.len() != prior_len
     }
 
     fn latest_snippet(&self) -> Option<&str> {
@@ -157,6 +237,162 @@ pub struct TaskSurfaceState {
     pub conversation_in_flight: bool,
     pub latest_snippet: Option<String>,
     pub latest_terminal: Option<TaskTerminalProjection>,
+    pub terminal_attachment: TerminalAttachmentState,
+    pending_user_messages: Vec<PendingUserMessage>,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum TerminalAttachmentState {
+    #[default]
+    Unavailable,
+    Starting,
+    Live,
+    StaleReconnecting,
+    Exited,
+}
+
+impl TaskSurfaceState {
+    pub fn note_terminal_query_started(&mut self) {
+        if self.latest_terminal.is_none() {
+            self.terminal_attachment = TerminalAttachmentState::Starting;
+        }
+    }
+
+    pub fn note_terminal_reconnecting(&mut self) {
+        if self.latest_terminal.is_some() {
+            self.terminal_attachment = TerminalAttachmentState::StaleReconnecting;
+        } else {
+            self.terminal_attachment = TerminalAttachmentState::Unavailable;
+        }
+    }
+
+    pub fn note_terminal_unavailable(&mut self) {
+        self.terminal_attachment = TerminalAttachmentState::Unavailable;
+    }
+
+    pub fn note_terminal_exited(&mut self) {
+        self.terminal_attachment = TerminalAttachmentState::Exited;
+    }
+
+    pub fn terminal_is_interactive(&self) -> bool {
+        self.terminal_attachment == TerminalAttachmentState::Live && self.latest_terminal.is_some()
+    }
+
+    pub fn terminal_label(&self) -> &'static str {
+        match self.terminal_attachment {
+            TerminalAttachmentState::Live => "Terminal is live",
+            TerminalAttachmentState::StaleReconnecting => "Reconnecting — last terminal screen",
+            TerminalAttachmentState::Starting => "Terminal starting",
+            TerminalAttachmentState::Unavailable => "Terminal unavailable",
+            TerminalAttachmentState::Exited => "Terminal exited",
+        }
+    }
+
+    pub fn terminal_empty_message(&self) -> &'static str {
+        match self.terminal_attachment {
+            TerminalAttachmentState::Live => "Terminal is live; waiting for output.",
+            TerminalAttachmentState::StaleReconnecting => "Reconnecting — last terminal screen",
+            TerminalAttachmentState::Starting => "Terminal starting…",
+            TerminalAttachmentState::Unavailable => "Terminal unavailable",
+            TerminalAttachmentState::Exited => "Terminal exited",
+        }
+    }
+
+    pub fn terminal_tail(&self, max: usize) -> Vec<String> {
+        let Some(terminal) = self.latest_terminal.as_ref() else {
+            return Vec::new();
+        };
+        if terminal.screen.lines.is_empty() {
+            return terminal_tail_from_indexed_cells(&terminal.screen, max);
+        }
+        let start = terminal.screen.lines.len().saturating_sub(max);
+        terminal.screen.lines[start..]
+            .iter()
+            .map(|line| {
+                line.iter()
+                    .filter(|cell| !cell.hidden)
+                    .map(|cell| cell.character)
+                    .collect::<String>()
+                    .trim_end()
+                    .to_string()
+            })
+            .collect()
+    }
+
+    fn presentation_page(&self) -> SemanticJournalPage {
+        let mut page = self.conversation.as_page();
+        let mut next_sequence = page.high_water.max(page.through_sequence).saturating_add(1);
+        for pending in &self.pending_user_messages {
+            page.facts.push(SemanticJournalFact {
+                id: pending.event_id,
+                sequence: next_sequence,
+                occurred_at_ms: None,
+                provider: "local".into(),
+                schema_version: 1,
+                kind: "user_message".into(),
+                visibility: "conversation".into(),
+                privacy_class: PrivacyClass::LocalOnly,
+                redacted: false,
+                payload: SemanticJournalPayload::UserMessage {
+                    text: pending.text.clone(),
+                },
+            });
+            next_sequence = next_sequence.saturating_add(1);
+        }
+        page
+    }
+
+    fn presentation_latest_snippet(&self) -> Option<&str> {
+        self.pending_user_messages
+            .last()
+            .map(|pending| pending.text.as_str())
+            .or_else(|| self.conversation.latest_snippet())
+    }
+
+    fn reconcile_pending_user_messages(&mut self, page: &SemanticJournalPage) {
+        for fact in &page.facts {
+            let SemanticJournalPayload::UserMessage { text } = &fact.payload else {
+                continue;
+            };
+            if let Some(index) = self
+                .pending_user_messages
+                .iter()
+                .position(|pending| pending.text == *text)
+            {
+                self.pending_user_messages.remove(index);
+            }
+        }
+    }
+}
+
+fn terminal_tail_from_indexed_cells(
+    screen: &crate::terminal::session::TerminalScreenSnapshot,
+    max: usize,
+) -> Vec<String> {
+    let start = screen.rows.saturating_sub(max);
+    let row_count = screen.rows.saturating_sub(start);
+    let mut cells = vec![vec![None; screen.cols]; row_count];
+    for indexed in &screen.cells {
+        if indexed.row >= start && indexed.row < screen.rows && indexed.column < screen.cols {
+            cells[indexed.row - start][indexed.column] = Some(&indexed.cell);
+        }
+    }
+    cells
+        .into_iter()
+        .map(|row| {
+            let mut line = String::with_capacity(screen.cols);
+            for cell in row {
+                match cell {
+                    Some(cell) if !cell.hidden => {
+                        line.push(cell.character);
+                        line.extend(cell.zero_width.iter().copied());
+                    }
+                    _ => line.push(' '),
+                }
+            }
+            line.trim_end().to_string()
+        })
+        .collect()
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -211,8 +447,7 @@ impl TaskSurfaceRegistry {
     }
 
     pub fn conversation_page(&self, task_id: TaskId) -> Option<SemanticJournalPage> {
-        self.state(task_id)
-            .map(|state| state.conversation.as_page())
+        self.state(task_id).map(|state| state.presentation_page())
     }
 
     pub fn admit_conversation(
@@ -220,7 +455,7 @@ impl TaskSurfaceRegistry {
         task_id: TaskId,
         generation: u64,
         page: &SemanticJournalPage,
-    ) -> Result<SemanticJournalPage, SurfaceAdmissionError> {
+    ) -> Result<ConversationAdmission, SurfaceAdmissionError> {
         let state = self
             .surfaces
             .get_mut(&task_id)
@@ -228,10 +463,104 @@ impl TaskSurfaceRegistry {
         if state.conversation_generation != generation || !state.conversation_in_flight {
             return Err(SurfaceAdmissionError::StaleGeneration);
         }
-        state.conversation.merge_page(page);
-        state.latest_snippet = state.conversation.latest_snippet().map(ToOwned::to_owned);
+        let pending_before = state.pending_user_messages.len();
+        let facts_changed = state.conversation.merge_page(page);
+        state.reconcile_pending_user_messages(page);
+        let pending_changed = state.pending_user_messages.len() != pending_before;
+        let changed = facts_changed || pending_changed;
+        if changed {
+            state.latest_snippet = state.presentation_latest_snippet().map(ToOwned::to_owned);
+        }
         state.conversation_in_flight = false;
-        Ok(state.conversation.as_page())
+        Ok(ConversationAdmission {
+            page: changed.then(|| state.presentation_page()),
+            changed,
+        })
+    }
+
+    /// Locally admit a pending user message keyed by the real command id.
+    /// Pending rows never advance durable high-water or request cursors.
+    pub fn admit_pending_user_message(
+        &mut self,
+        task_id: TaskId,
+        text: &str,
+        command_id: CommandId,
+    ) -> ConversationAdmission {
+        let state = self.ensure_task(task_id);
+        if let Some(existing) = state
+            .pending_user_messages
+            .iter_mut()
+            .find(|pending| pending.command_id == command_id)
+        {
+            existing.text = text.to_string();
+        } else {
+            state.pending_user_messages.push(PendingUserMessage {
+                command_id,
+                event_id: EventId::new(),
+                text: text.to_string(),
+            });
+        }
+        state.latest_snippet = state.presentation_latest_snippet().map(ToOwned::to_owned);
+        ConversationAdmission {
+            page: Some(state.presentation_page()),
+            changed: true,
+        }
+    }
+
+    pub fn reject_pending_user_message(
+        &mut self,
+        task_id: TaskId,
+        command_id: CommandId,
+    ) -> ConversationAdmission {
+        let Some(state) = self.surfaces.get_mut(&task_id) else {
+            return ConversationAdmission {
+                page: None,
+                changed: false,
+            };
+        };
+        let before = state.pending_user_messages.len();
+        state
+            .pending_user_messages
+            .retain(|pending| pending.command_id != command_id);
+        if state.pending_user_messages.len() != before {
+            state.latest_snippet = state.presentation_latest_snippet().map(ToOwned::to_owned);
+            ConversationAdmission {
+                page: Some(state.presentation_page()),
+                changed: true,
+            }
+        } else {
+            ConversationAdmission {
+                page: None,
+                changed: false,
+            }
+        }
+    }
+
+    pub fn displayed_user_message_count(&self, task_id: TaskId) -> usize {
+        self.state(task_id)
+            .map(|state| {
+                state
+                    .presentation_page()
+                    .facts
+                    .iter()
+                    .filter(|fact| {
+                        matches!(fact.payload, SemanticJournalPayload::UserMessage { .. })
+                    })
+                    .count()
+            })
+            .unwrap_or(0)
+    }
+
+    /// Whether the retained conversation proves that the latest submitted
+    /// user turn has received an assistant response. This supplements stock
+    /// providers whose current CLI advertises conversation hooks but does not
+    /// reliably publish a terminal `Stop` event. Pending optimistic user rows
+    /// keep the task working until the corresponding assistant fact arrives.
+    pub fn conversation_turn_completed(&self, task_id: TaskId) -> bool {
+        self.state(task_id).is_some_and(|state| {
+            state.pending_user_messages.is_empty()
+                && state.conversation.latest_message_is_assistant()
+        })
     }
 
     pub fn admit_terminal(
@@ -242,8 +571,35 @@ impl TaskSurfaceRegistry {
         if projection.task_id != task_id {
             return Err(SurfaceAdmissionError::WrongTask);
         }
-        self.ensure_task(task_id).latest_terminal = Some(projection.clone());
+        let state = self.ensure_task(task_id);
+        state.latest_terminal = Some(projection.clone());
+        state.terminal_attachment = TerminalAttachmentState::Live;
         Ok(())
+    }
+
+    pub fn note_terminal_reconnecting(&mut self, task_id: TaskId) {
+        self.ensure_task(task_id).note_terminal_reconnecting();
+    }
+
+    pub fn note_terminal_query_started(&mut self, task_id: TaskId) {
+        self.ensure_task(task_id).note_terminal_query_started();
+    }
+
+    pub fn terminal_is_interactive(&self, task_id: TaskId) -> bool {
+        self.state(task_id)
+            .is_some_and(TaskSurfaceState::terminal_is_interactive)
+    }
+
+    pub fn terminal_label(&self, task_id: TaskId) -> &'static str {
+        self.state(task_id)
+            .map(TaskSurfaceState::terminal_label)
+            .unwrap_or("Terminal unavailable")
+    }
+
+    pub fn terminal_empty_message(&self, task_id: TaskId) -> &'static str {
+        self.state(task_id)
+            .map(TaskSurfaceState::terminal_empty_message)
+            .unwrap_or("Terminal unavailable")
     }
 
     pub fn latest_snippet(&self, task_id: TaskId) -> Option<&str> {
@@ -258,24 +614,9 @@ impl TaskSurfaceRegistry {
     }
 
     pub fn terminal_tail(&self, task_id: TaskId, max: usize) -> Vec<String> {
-        let Some(terminal) = self
-            .state(task_id)
-            .and_then(|state| state.latest_terminal.as_ref())
-        else {
-            return Vec::new();
-        };
-        let start = terminal.screen.lines.len().saturating_sub(max);
-        terminal.screen.lines[start..]
-            .iter()
-            .map(|line| {
-                line.iter()
-                    .filter(|cell| !cell.hidden)
-                    .map(|cell| cell.character)
-                    .collect::<String>()
-                    .trim_end()
-                    .to_string()
-            })
-            .collect()
+        self.state(task_id)
+            .map(|state| state.terminal_tail(max))
+            .unwrap_or_default()
     }
 
     pub fn conversation_query_schedule(
@@ -324,8 +665,8 @@ impl TaskSurfaceRegistry {
 #[cfg(test)]
 mod tests {
     use crate::domain::{
-        EventId, PrivacyClass, SemanticJournalFact, SemanticJournalPage, SemanticJournalPayload,
-        TaskId,
+        CommandId, EventId, PrivacyClass, SemanticJournalFact, SemanticJournalPage,
+        SemanticJournalPayload, TaskId,
     };
 
     use super::*;
@@ -350,6 +691,310 @@ mod tests {
                 payload: SemanticJournalPayload::AssistantText { text: text.into() },
             }],
         }
+    }
+
+    fn empty_page_after(sequence: u64) -> SemanticJournalPage {
+        SemanticJournalPage {
+            after_sequence: sequence,
+            through_sequence: sequence,
+            high_water: sequence,
+            encoded_bytes: 0,
+            next_sequence: None,
+            facts: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn restore_loss_keeps_last_terminal_screen_but_disables_input() {
+        let mut surface = surface_with_terminal_lines(&["build started", "compiling"]);
+        surface.note_terminal_reconnecting();
+
+        assert_eq!(
+            surface.terminal_tail(8),
+            vec!["build started".to_string(), "compiling".to_string()]
+        );
+        assert!(!surface.terminal_is_interactive());
+        assert_eq!(
+            surface.terminal_label(),
+            "Reconnecting — last terminal screen"
+        );
+    }
+
+    #[test]
+    fn first_terminal_query_projects_starting_without_discarding_a_live_screen() {
+        let mut empty = TaskSurfaceState::default();
+        empty.note_terminal_query_started();
+        assert_eq!(empty.terminal_attachment, TerminalAttachmentState::Starting);
+
+        let mut live = surface_with_terminal_lines(&["ready"]);
+        live.note_terminal_query_started();
+        assert_eq!(live.terminal_attachment, TerminalAttachmentState::Live);
+        assert_eq!(live.terminal_tail(1), vec!["ready".to_string()]);
+    }
+
+    #[test]
+    fn compact_wire_terminal_reconstructs_text_tail_from_indexed_cells() {
+        let mut surface = surface_with_terminal_lines(&["first", "second"]);
+        surface
+            .latest_terminal
+            .as_mut()
+            .expect("terminal")
+            .screen
+            .lines
+            .clear();
+
+        assert_eq!(
+            surface.terminal_tail(2),
+            vec!["first".to_string(), "second".to_string()]
+        );
+    }
+
+    fn surface_with_terminal_lines(lines: &[&str]) -> TaskSurfaceState {
+        use crate::domain::id::{AgentSessionId, ResourceId, TerminalId};
+        use crate::domain::TaskTerminalProjection;
+        use crate::terminal::protocol::TerminalSessionId;
+        use crate::terminal::session::{
+            TerminalCellSnapshot, TerminalIndexedCellSnapshot, TerminalScreenSnapshot,
+        };
+
+        let task_id = TaskId::new();
+        let screen_lines: Vec<Vec<TerminalCellSnapshot>> = lines
+            .iter()
+            .map(|line| {
+                line.chars()
+                    .map(|character| TerminalCellSnapshot {
+                        character,
+                        zero_width: Vec::new(),
+                        foreground: 0,
+                        background: 0,
+                        bold: false,
+                        dim: false,
+                        italic: false,
+                        underline: false,
+                        undercurl: false,
+                        strike: false,
+                        hidden: false,
+                        has_hyperlink: false,
+                        default_background: true,
+                        default_foreground: true,
+                    })
+                    .collect()
+            })
+            .collect();
+        let cols = screen_lines
+            .iter()
+            .map(|line| line.len())
+            .max()
+            .unwrap_or(0);
+        let indexed_cells = screen_lines
+            .iter()
+            .enumerate()
+            .flat_map(|(row, cells)| {
+                cells
+                    .iter()
+                    .cloned()
+                    .enumerate()
+                    .map(move |(column, cell)| TerminalIndexedCellSnapshot { row, column, cell })
+            })
+            .collect();
+        let mut surface = TaskSurfaceState::default();
+        surface.latest_terminal = Some(TaskTerminalProjection {
+            task_id,
+            terminal_id: TerminalId::new(),
+            session_id: TerminalSessionId::new(),
+            agent_session_id: AgentSessionId::new(),
+            resource_id: ResourceId::new(),
+            runtime_generation: 1,
+            resource_generation: 1,
+            action_epoch: 1,
+            sequence: 1,
+            title: None,
+            text_lines: Vec::new(),
+            screen: TerminalScreenSnapshot {
+                cells: indexed_cells,
+                lines: screen_lines,
+                cols,
+                rows: lines.len(),
+                ..Default::default()
+            },
+        });
+        surface.terminal_attachment = TerminalAttachmentState::Live;
+        surface
+    }
+
+    #[test]
+    fn unchanged_conversation_page_reports_no_change_and_keeps_the_same_high_water() {
+        let task = TaskId::new();
+        let mut registry = TaskSurfaceRegistry::default();
+        registry.ensure_task(task);
+        registry.begin_conversation(task, 1);
+        let first = registry
+            .admit_conversation(task, 1, &page(1, "hello"))
+            .unwrap();
+        registry.begin_conversation(task, 2);
+        let repeat = registry
+            .admit_conversation(task, 2, &empty_page_after(1))
+            .unwrap();
+
+        assert!(first.changed);
+        assert!(first.page.is_some());
+        assert!(!repeat.changed);
+        assert!(repeat.page.is_none());
+        assert_eq!(registry.conversation_after_sequence(task), 1);
+        assert_eq!(
+            registry
+                .state(task)
+                .map(|state| state.conversation.high_water()),
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn cursor_only_high_water_advance_does_not_return_a_visual_page() {
+        let mut cache = TaskConversationCache::default();
+        assert!(cache.merge_page(&page(1, "hello")));
+        let prior_facts = cache.fact_count();
+        assert!(!cache.merge_page(&SemanticJournalPage {
+            after_sequence: 1,
+            through_sequence: 1,
+            high_water: 4,
+            encoded_bytes: 0,
+            next_sequence: None,
+            facts: Vec::new(),
+        }));
+        assert_eq!(cache.fact_count(), prior_facts);
+        assert_eq!(cache.high_water(), 4);
+        assert_eq!(cache.request_after_sequence(), 4);
+    }
+
+    #[test]
+    fn pending_user_message_does_not_advance_durable_query_cursor() {
+        let task = TaskId::new();
+        let command_id = CommandId::new();
+        let mut registry = TaskSurfaceRegistry::default();
+        registry.ensure_task(task);
+        registry.begin_conversation(task, 1);
+        registry
+            .admit_conversation(task, 1, &page(1, "prior"))
+            .unwrap();
+
+        let pending = registry.admit_pending_user_message(task, "hello there", command_id);
+        assert!(pending.changed);
+        assert_eq!(registry.conversation_after_sequence(task), 1);
+        assert_eq!(
+            registry
+                .state(task)
+                .map(|state| state.conversation.high_water()),
+            Some(1)
+        );
+        assert_eq!(registry.displayed_user_message_count(task), 1);
+        assert!(
+            registry
+                .conversation_page(task)
+                .is_some_and(|page| page.facts.iter().any(|fact| {
+                    matches!(
+                        &fact.payload,
+                        SemanticJournalPayload::UserMessage { text } if text == "hello there"
+                    )
+                })),
+            "pending overlay must present the local user row"
+        );
+
+        registry.begin_conversation(task, 2);
+        let durable = user_page(2, "hello there");
+        let admitted = registry.admit_conversation(task, 2, &durable).unwrap();
+        assert!(admitted.changed);
+        assert_eq!(registry.displayed_user_message_count(task), 1);
+        assert_eq!(registry.conversation_after_sequence(task), 2);
+    }
+
+    #[test]
+    fn pending_user_message_keeps_stable_presentation_identity() {
+        let task = TaskId::new();
+        let mut registry = TaskSurfaceRegistry::default();
+        registry.admit_pending_user_message(task, "stable row", CommandId::new());
+
+        let first = registry
+            .conversation_page(task)
+            .and_then(|page| page.facts.last().map(|fact| fact.id))
+            .expect("first pending row");
+        let second = registry
+            .conversation_page(task)
+            .and_then(|page| page.facts.last().map(|fact| fact.id))
+            .expect("second pending row");
+
+        assert_eq!(
+            first, second,
+            "reprojection must not replace the pending row"
+        );
+    }
+
+    #[test]
+    fn assistant_fact_completes_the_latest_conversation_turn() {
+        let task = TaskId::new();
+        let mut registry = TaskSurfaceRegistry::default();
+        registry.admit_pending_user_message(task, "hello", CommandId::new());
+        assert!(!registry.conversation_turn_completed(task));
+
+        registry.begin_conversation(task, 1);
+        registry
+            .admit_conversation(task, 1, &user_page(1, "hello"))
+            .expect("admit durable user message");
+        assert!(!registry.conversation_turn_completed(task));
+
+        registry.begin_conversation(task, 2);
+        registry
+            .admit_conversation(task, 2, &page(2, "done"))
+            .expect("admit assistant response");
+        assert!(registry.conversation_turn_completed(task));
+    }
+
+    fn user_page(sequence: u64, text: &str) -> SemanticJournalPage {
+        SemanticJournalPage {
+            after_sequence: sequence.saturating_sub(1),
+            through_sequence: sequence,
+            high_water: sequence,
+            encoded_bytes: 1,
+            next_sequence: None,
+            facts: vec![SemanticJournalFact {
+                id: EventId::new(),
+                sequence,
+                occurred_at_ms: None,
+                provider: "test".into(),
+                schema_version: 1,
+                kind: "user_message".into(),
+                visibility: "conversation".into(),
+                privacy_class: PrivacyClass::LocalOnly,
+                redacted: false,
+                payload: SemanticJournalPayload::UserMessage { text: text.into() },
+            }],
+        }
+    }
+
+    #[test]
+    fn conversation_poll_cadence_is_faster_for_interactive_than_background() {
+        assert_eq!(INTERACTIVE_CONVERSATION_POLL_TICKS, 8);
+        assert_eq!(BACKGROUND_CONVERSATION_POLL_TICKS, 30);
+        assert_eq!(
+            conversation_poll_priorities_due(8),
+            vec![ConversationQueryPriority::Interactive]
+        );
+        assert_eq!(
+            conversation_poll_priorities_due(30),
+            vec![ConversationQueryPriority::Background]
+        );
+        assert_eq!(
+            conversation_poll_priorities_due(120),
+            vec![
+                ConversationQueryPriority::Interactive,
+                ConversationQueryPriority::Background
+            ]
+        );
+        assert!(conversation_poll_priorities_due(7).is_empty());
+        assert_eq!(
+            conversation_poll_priorities_due(16),
+            vec![ConversationQueryPriority::Interactive]
+        );
     }
 
     #[test]

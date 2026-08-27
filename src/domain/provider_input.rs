@@ -767,6 +767,20 @@ impl<'de> Deserialize<'de> for ProviderSessionProjection {
 }
 
 impl ProviderSessionProjection {
+    /// A normal composer submission starts a new provider turn after the
+    /// previous input crossed the runtime boundary. Question, approval, and
+    /// explicit wait records remain hard fences; they must be resolved before
+    /// a different turn can replace the current identity.
+    pub fn can_begin_send_now_turn(&self, turn_id: TurnId) -> bool {
+        self.current_turn.is_none_or(|current| current == turn_id)
+            || (self.open_question.is_none()
+                && self.open_approval.is_none()
+                && self.waits.values().all(|record| !record.pending)
+                && self
+                    .last_settlement
+                    .is_some_and(ProviderInputSettlement::is_delivered))
+    }
+
     pub fn validate_bounds(&self) -> Result<(), ProviderInputIntentError> {
         if self.question_winners.len() > MAX_PROVIDER_QUESTION_WINS {
             return Err(ProviderInputIntentError::QuestionWinnerLimit);

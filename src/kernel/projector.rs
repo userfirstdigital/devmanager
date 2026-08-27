@@ -759,12 +759,20 @@ pub(crate) fn apply_event(
                 ));
             }
             upsert_provider_session_state(tx, shadow, task_id, *agent_session_id, |session| {
+                let context_turn =
+                    if matches!(action, crate::domain::ProviderInputAction::SendNow { .. })
+                        && session.can_begin_send_now_turn(*turn_id)
+                    {
+                        None
+                    } else {
+                        session.current_turn
+                    };
                 let context = read_provider_fence_context(
                     tx,
                     shadow,
                     task_id,
                     *agent_session_id,
-                    session.current_turn,
+                    context_turn,
                     false,
                 )?;
                 let fence = crate::domain::provider_input::ProviderFenceIdentity::new_with_identity(

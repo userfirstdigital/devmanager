@@ -42,6 +42,7 @@ pub struct TaskCockpitShell {
     timeline: Option<Timeline>,
     timeline_error: Option<String>,
     conversation: Option<SemanticJournalPage>,
+    attachment_banner: Option<String>,
 }
 
 /// Authoritative browser surface projection mounted by the active Task
@@ -101,6 +102,7 @@ impl TaskCockpitShell {
             timeline: None,
             timeline_error: None,
             conversation: None,
+            attachment_banner: None,
         }
     }
 
@@ -289,6 +291,7 @@ impl TaskCockpitShell {
             self.timeline = None;
             self.timeline_error = None;
             self.conversation = None;
+            self.attachment_banner = None;
         }
         self.dock.follow_task(task_id);
     }
@@ -300,6 +303,7 @@ impl TaskCockpitShell {
         self.timeline = None;
         self.timeline_error = None;
         self.conversation = None;
+        self.attachment_banner = None;
         self.browser_projection = None;
         self.dock.clear_selection();
     }
@@ -333,6 +337,23 @@ impl TaskCockpitShell {
                 self.project_timeline(&model, self.capabilities);
             }
         }
+    }
+
+    /// Runtime attachment became unavailable. Keep persisted conversation rows
+    /// visible and surface the diagnostic as a banner, never as task failure.
+    pub fn set_attachment_unavailable(&mut self, message: impl Into<String>) {
+        self.attachment_banner = Some(message.into());
+        if let Some(model) = self.model.clone() {
+            self.project_timeline(&model, self.capabilities);
+        }
+    }
+
+    pub fn set_attachment_available(&mut self) {
+        self.attachment_banner = None;
+    }
+
+    pub fn attachment_banner(&self) -> Option<&str> {
+        self.attachment_banner.as_deref()
     }
 
     pub fn live_projection(&self) -> Option<&TaskCockpitLiveProjection> {
@@ -375,12 +396,17 @@ impl TaskCockpitShell {
             return;
         };
         if task.attention == crate::domain::task::TaskAttention::Failed {
-            self.timeline = None;
-            self.timeline_error = Some(
-                "The agent didn't start. Check Settings, then use +Claude or +Codex again."
-                    .to_string(),
-            );
-            return;
+            // Restore/attachment failure must not erase persisted history. Keep
+            // the conversation surface when facts are already installed and
+            // surface the diagnostic beside it.
+            if self.conversation.is_none() {
+                self.timeline = None;
+                self.timeline_error = Some(
+                    "The agent didn't start. Check Settings, then use +Claude or +Codex again."
+                        .to_string(),
+                );
+                return;
+            }
         }
         if task.primary_agent_id.is_none() {
             self.timeline = None;
@@ -465,7 +491,16 @@ impl TaskCockpitShell {
     }
 
     pub fn conversation_hold_message(&self) -> Option<&str> {
-        self.timeline_error.as_deref()
+        self.attachment_banner
+            .as_deref()
+            .or_else(|| {
+                let task_id = self.dock.selected_task()?;
+                let task = self.model.as_ref()?.tasks().get(&task_id)?;
+                (task.attention == crate::domain::task::TaskAttention::Failed).then_some(
+                    "The agent didn't start. Check Settings, then use +Claude or +Codex again.",
+                )
+            })
+            .or(self.timeline_error.as_deref())
     }
 
     pub fn pending_question_projection(
@@ -748,5 +783,93 @@ mod ai_acceptance_tests {
         assert_eq!(projection.request_id.as_bytes(), open_question.as_bytes());
         assert_eq!(projection.state_revision, 17);
         assert_eq!(projection.options, ["Green", "Blue"]);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::domain::{
+        EventId, PrivacyClass, SemanticJournalFact, SemanticJournalPage, SemanticJournalPayload,
+    };
+    use crate::ui::task_cockpit::dock::DockEdge;
+
+    struct ShellProjectionView {
+        timeline_text: String,
+        attachment_banner: String,
+    }
+
+    impl TaskCockpitShell {
+        fn test_projection(&self) -> ShellProjectionView {
+            let timeline_text = self
+                .conversation
+                .as_ref()
+                .map(|page| {
+                    page.facts
+                        .iter()
+                        .filter_map(|fact| match &fact.payload {
+                            SemanticJournalPayload::AssistantText { text }
+                            | SemanticJournalPayload::UserMessage { text } => Some(text.as_str()),
+                            _ => None,
+                        })
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                })
+                .unwrap_or_default();
+            ShellProjectionView {
+                timeline_text,
+                attachment_banner: self.attachment_banner().unwrap_or("").to_string(),
+            }
+        }
+    }
+
+    fn cockpit_with_conversation(text: &str) -> TaskCockpitShell {
+        let mut shell = TaskCockpitShell::new(DockEdge::Right);
+        let task_id = TaskId::new();
+        shell.follow_task(task_id);
+        let page = SemanticJournalPage {
+            after_sequence: 0,
+            through_sequence: 1,
+            high_water: 1,
+            encoded_bytes: 1,
+            next_sequence: None,
+            facts: vec![SemanticJournalFact {
+                id: EventId::new(),
+                sequence: 1,
+                occurred_at_ms: None,
+                provider: "test".into(),
+                schema_version: 1,
+                kind: "assistant_text".into(),
+                visibility: "conversation".into(),
+                privacy_class: PrivacyClass::LocalOnly,
+                redacted: false,
+                payload: SemanticJournalPayload::AssistantText { text: text.into() },
+            }],
+        };
+        shell.apply_cockpit_result(&TaskCockpitResult::Conversation(page));
+        shell
+    }
+
+    #[test]
+    fn attachment_failure_keeps_persisted_conversation_rows_visible() {
+        let mut shell = cockpit_with_conversation("saved answer");
+        shell.set_attachment_unavailable("resume failed");
+
+        let projection = shell.test_projection();
+
+        assert!(projection.timeline_text.contains("saved answer"));
+        assert!(projection.attachment_banner.contains("resume failed"));
+    }
+
+    #[test]
+    fn successful_reattachment_clears_only_the_transient_attachment_banner() {
+        let mut shell = cockpit_with_conversation("saved answer");
+        shell.set_attachment_unavailable("resume failed");
+
+        shell.set_attachment_available();
+        let projection = shell.test_projection();
+
+        assert!(projection.timeline_text.contains("saved answer"));
+        assert!(projection.attachment_banner.is_empty());
     }
 }

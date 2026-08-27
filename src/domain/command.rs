@@ -1746,10 +1746,8 @@ fn decide_submit_provider_input(
         .unwrap_or_default();
     match intent.action() {
         ProviderInputAction::SendNow { .. } => {
-            if let Some(current) = session.current_turn {
-                if current != intent.turn_id() {
-                    return Err(RejectionCode::InvalidTransition);
-                }
+            if !session.can_begin_send_now_turn(intent.turn_id()) {
+                return Err(RejectionCode::InvalidTransition);
             }
         }
         ProviderInputAction::SteerCurrentTurn { .. }

@@ -1090,10 +1090,75 @@ impl ContextDock {
         runtime.status = crate::state::SessionStatus::Running;
         runtime.interactive_shell = true;
         runtime.title = projection.title.clone();
-        let view = TerminalSessionView {
-            runtime,
-            screen: projection.screen.clone(),
-        };
+        let mut screen = projection.screen.clone();
+        if screen.lines.is_empty() && !projection.text_lines.is_empty() {
+            screen.lines = projection
+                .text_lines
+                .iter()
+                .map(|line| {
+                    let mut cells = line
+                        .chars()
+                        .take(screen.cols)
+                        .map(|character| crate::terminal::session::TerminalCellSnapshot {
+                            character,
+                            zero_width: Vec::new(),
+                            foreground: 0,
+                            background: 0,
+                            bold: false,
+                            dim: false,
+                            italic: false,
+                            underline: false,
+                            undercurl: false,
+                            strike: false,
+                            hidden: false,
+                            has_hyperlink: false,
+                            default_background: true,
+                            default_foreground: true,
+                        })
+                        .collect::<Vec<_>>();
+                    cells.resize_with(screen.cols, || {
+                        crate::terminal::session::TerminalCellSnapshot {
+                            character: ' ',
+                            zero_width: Vec::new(),
+                            foreground: 0,
+                            background: 0,
+                            bold: false,
+                            dim: false,
+                            italic: false,
+                            underline: false,
+                            undercurl: false,
+                            strike: false,
+                            hidden: false,
+                            has_hyperlink: false,
+                            default_background: true,
+                            default_foreground: true,
+                        }
+                    });
+                    cells
+                })
+                .collect();
+        }
+        if screen.cells.is_empty() {
+            screen.cells = screen
+                .lines
+                .iter()
+                .enumerate()
+                .flat_map(|(row, cells)| {
+                    cells
+                        .iter()
+                        .cloned()
+                        .enumerate()
+                        .map(move |(column, cell)| {
+                            crate::terminal::session::TerminalIndexedCellSnapshot {
+                                row,
+                                column,
+                                cell,
+                            }
+                        })
+                })
+                .collect();
+        }
+        let view = TerminalSessionView { runtime, screen };
         self.admit_host_view(
             HostStreamCursor::from_identity(actual, projection.sequence, true),
             view,

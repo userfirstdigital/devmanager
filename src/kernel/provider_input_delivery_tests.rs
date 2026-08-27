@@ -300,6 +300,66 @@ fn historical_settled_provider_turn_remains_queryable_after_a_later_turn_settles
 }
 
 #[test]
+fn delivered_send_now_can_begin_a_new_conversation_turn() {
+    let dir = TempDir::new().expect("tempdir");
+    let mut store = KernelStore::open(&dir.path().join("follow-up.sqlite3")).expect("open");
+    let (_, first_permit) = seed_provider_dispatch(&mut store, 0x91);
+    let first_identity = identity_from_effect(first_permit.effect());
+    assert!(matches!(
+        settle_with_accepting_runtime(&mut store, &first_permit),
+        OperationState::Settled { .. }
+    ));
+
+    let (revision, action_epoch): (i64, i64) = store
+        .conn
+        .query_row(
+            "SELECT revision, action_epoch FROM tasks WHERE task_id = ?1",
+            [first_identity.task_id.as_bytes().as_slice()],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .expect("current task fence");
+    let follow_up_turn = TurnId::from_bytes(fixed_uuid_v7(0x9D)).expect("follow-up turn");
+    assert_ne!(follow_up_turn, first_identity.turn_id);
+    let follow_up = store
+        .execute_for_test(CommandEnvelope {
+            command_id: CommandId::from_bytes(fixed_uuid_v7(0x9E)).expect("follow-up command"),
+            client_id: first_identity.client_id,
+            task_id: Some(first_identity.task_id),
+            issued_at_ms: 1_725_003_000_200,
+            expected_task_revision: Some(u64::try_from(revision).expect("revision")),
+            command: Command::SubmitProviderInput(
+                SubmitProviderInputIntent::try_new(
+                    first_identity.agent_session_id,
+                    first_identity.runtime_generation,
+                    follow_up_turn,
+                    u64::try_from(action_epoch).expect("action epoch"),
+                    None,
+                    None,
+                    ProviderInputAction::SendNow {
+                        text: "follow-up turn".into(),
+                        wait: false,
+                    },
+                )
+                .expect("follow-up intent"),
+            ),
+        })
+        .expect("execute follow-up");
+    let CommandReceipt::Accepted {
+        operation_id: follow_up_operation,
+        ..
+    } = follow_up
+    else {
+        panic!("delivered idle turn must admit a fresh SendNow: {follow_up:?}");
+    };
+    assert_eq!(
+        store
+            .operation_status(follow_up_operation)
+            .expect("follow-up operation must preserve replay validation"),
+        Some(OperationState::Accepted)
+    );
+}
+
+#[test]
 fn generic_completion_cannot_settle_provider_input() {
     let dir = TempDir::new().expect("tempdir");
     let mut store = KernelStore::open(&dir.path().join("hold.sqlite3")).expect("open");

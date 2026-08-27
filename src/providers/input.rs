@@ -168,7 +168,7 @@ impl ProviderComposerWriteStep {
 }
 
 /// Proven Claude/Codex composer submit sequence. It mirrors the established
-/// web-composer timing: distinct Enter writes, Codex Escape sequencing, and
+/// terminal-composer timing: distinct text and Enter writes, and
 /// typed slash-command tokens that cannot be collapsed into a ConPTY paste.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ProviderComposerSubmitPlan {
@@ -225,13 +225,6 @@ pub(crate) fn provider_composer_submit_plan(
     }
 
     let mut steps = Vec::new();
-    if matches!(provider_kind, ProviderKind::Codex) {
-        // Exit any full-screen Codex TUI surface before typing the prompt.
-        steps.push(ProviderComposerWriteStep {
-            bytes: "\u{1b}".as_bytes().to_vec(),
-            delay_after: Some(std::time::Duration::from_millis(180)),
-        });
-    }
     let text = std::str::from_utf8(text).map_err(|_| ProviderInputDeliveryError::BytesMismatch)?;
     let trimmed = text.trim_start();
     let slash_command = trimmed.starts_with('/');
@@ -277,9 +270,12 @@ pub(crate) fn provider_composer_submit_plan(
         });
     }
     if matches!(provider_kind, ProviderKind::Codex) && !slash_command {
-        // Leave multiline edit mode before submitting.
+        // A bulk write leaves the Codex TUI composer in multiline mode. Exit
+        // that mode before Enter so the prompt is submitted instead of merely
+        // gaining a newline. Do not send a leading Escape: that can dismiss an
+        // unrelated live Codex surface before the prompt is written.
         steps.push(ProviderComposerWriteStep {
-            bytes: "\u{1b}".as_bytes().to_vec(),
+            bytes: b"\x1b".to_vec(),
             delay_after: Some(std::time::Duration::from_millis(120)),
         });
     }
@@ -715,12 +711,7 @@ mod tests {
                 .iter()
                 .map(ProviderComposerWriteStep::bytes)
                 .collect::<Vec<_>>(),
-            vec![
-                b"\x1b".as_slice(),
-                b"hello".as_slice(),
-                b"\x1b".as_slice(),
-                b"\r".as_slice(),
-            ]
+            vec![b"hello".as_slice(), b"\x1b".as_slice(), b"\r".as_slice()]
         );
     }
 

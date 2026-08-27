@@ -239,7 +239,7 @@ pub(crate) fn serve_task_cockpit(dispatch: TaskCockpitDispatch<'_>) -> QueryOutc
             };
             if terminal.agent_session_id != primary_agent_id
                 || terminal.runtime_generation != agent.runtime_generation
-                || terminal.action_epoch != snapshot.task.action_epoch
+                || terminal.action_epoch == 0
                 || terminal.resource_id != resource.id
                 || terminal.resource_generation != resource.runtime_generation
             {
@@ -248,6 +248,7 @@ pub(crate) fn serve_task_cockpit(dispatch: TaskCockpitDispatch<'_>) -> QueryOutc
                     TaskCockpitDeniedReason::StaleFence,
                 );
             }
+            let (screen, text_lines) = compact_terminal_screen_for_wire(terminal.view.screen);
             QueryOutcome::Ok(QueryResult::TaskCockpit(TaskCockpitResult::Terminal(
                 TaskTerminalProjection {
                     task_id,
@@ -260,7 +261,8 @@ pub(crate) fn serve_task_cockpit(dispatch: TaskCockpitDispatch<'_>) -> QueryOutc
                     action_epoch: terminal.action_epoch,
                     sequence: terminal.sequence,
                     title: terminal.view.runtime.title,
-                    screen: terminal.view.screen,
+                    text_lines,
+                    screen,
                 },
             )))
         }
@@ -428,6 +430,38 @@ pub(crate) fn serve_task_cockpit(dispatch: TaskCockpitDispatch<'_>) -> QueryOutc
             SupervisorAction::Health,
         ),
     }
+}
+
+/// `TerminalScreenSnapshot` keeps both a styled indexed grid and a line grid
+/// for local consumers. Serializing either rich representation crosses the
+/// named MessagePack decoder's collection/value caps at a normal 100x30
+/// provider size. Send bounded strings and let the native client reconstruct
+/// default-themed paint cells locally while retaining cursor and mode metadata.
+fn compact_terminal_screen_for_wire(
+    mut screen: crate::terminal::session::TerminalScreenSnapshot,
+) -> (
+    crate::terminal::session::TerminalScreenSnapshot,
+    Vec<String>,
+) {
+    let text_lines = screen
+        .lines
+        .iter()
+        .map(|cells| {
+            let mut line = String::with_capacity(cells.len());
+            for cell in cells {
+                if cell.hidden {
+                    line.push(' ');
+                } else {
+                    line.push(cell.character);
+                    line.extend(cell.zero_width.iter().copied());
+                }
+            }
+            line
+        })
+        .collect();
+    screen.cells.clear();
+    screen.lines.clear();
+    (screen, text_lines)
 }
 
 const MAX_CONVERSATION_PAGE_ITEMS: usize = 128;

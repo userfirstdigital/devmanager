@@ -18,7 +18,8 @@ use crate::domain::operation::OperationFacts;
 use crate::domain::provider_input::ProviderSessionProjection;
 use crate::domain::resource::ResourceFacts;
 use crate::domain::task::{
-    ReviewReadiness, TaskActivity, TaskAttention, TaskConnectivity, TaskFacts, VisibleTaskStatus,
+    ReviewReadiness, TaskActivity, TaskAttention, TaskConnectivity, TaskFacts, TaskLifecycle,
+    VisibleTaskStatus,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -46,6 +47,33 @@ impl TaskSnapshot {
     }
 
     pub fn visible_status(&self) -> VisibleTaskStatus {
+        if self.connectivity == TaskConnectivity::Disconnected {
+            return VisibleTaskStatus::Disconnected;
+        }
+        match self.attention {
+            TaskAttention::Failed => return VisibleTaskStatus::Failed,
+            TaskAttention::UncertainOutcome => return VisibleTaskStatus::UncertainOutcome,
+            TaskAttention::NeedsApproval => return VisibleTaskStatus::NeedsApproval,
+            TaskAttention::NeedsAnswer => return VisibleTaskStatus::NeedsAnswer,
+            TaskAttention::None => {}
+        }
+        // Settled tasks stay in the Done rail section; never re-litigate live turn state.
+        if self.task.lifecycle == TaskLifecycle::Settled {
+            return VisibleTaskStatus::Idle;
+        }
+        if let Some(agent_id) = self.primary_agent_id {
+            if let Some(session) = self.provider_sessions.get(&agent_id) {
+                if session.open_approval.is_some() {
+                    return VisibleTaskStatus::NeedsApproval;
+                }
+                if session.open_question.is_some() {
+                    return VisibleTaskStatus::NeedsAnswer;
+                }
+                if session.current_turn.is_some() {
+                    return VisibleTaskStatus::Working;
+                }
+            }
+        }
         VisibleTaskStatus::derive(
             self.connectivity,
             self.attention,
@@ -795,6 +823,111 @@ pub struct ProcessAccountingMemberSnapshot {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::domain::browser::BrowserBook;
+    use crate::domain::id::{
+        AgentSessionId, ApprovalId, EnvironmentId, ProjectId, QuestionId, TaskId, TurnId,
+    };
+    use crate::domain::task::{TaskAssignment, TaskFacts, TaskLifecycle, WorkspaceRef};
+
+    fn snapshot_with_primary_projection(
+        projection: ProviderSessionProjection,
+        lifecycle: TaskLifecycle,
+    ) -> TaskSnapshot {
+        let task_id = TaskId::new();
+        let agent_id = AgentSessionId::new();
+        let mut browser = BrowserBook::new();
+        let _ = browser.open_task(task_id);
+        let mut provider_sessions = BTreeMap::new();
+        provider_sessions.insert(agent_id, projection);
+        TaskSnapshot {
+            task: TaskFacts {
+                id: task_id,
+                environment_id: EnvironmentId::new(),
+                title: "Status".into(),
+                description: None,
+                project_id: ProjectId::new(),
+                workspace: WorkspaceRef::Main,
+                assignment: TaskAssignment::LocalOwner,
+                lifecycle,
+                action_epoch: 1,
+                revision: 1,
+                created_at_ms: 1,
+            },
+            connectivity: TaskConnectivity::Connected,
+            attention: TaskAttention::None,
+            activity: TaskActivity::Idle,
+            review_readiness: ReviewReadiness::NotReady,
+            agents: BTreeMap::new(),
+            primary_agent_id: Some(agent_id),
+            artifacts: BTreeMap::new(),
+            resources: BTreeMap::new(),
+            provider_sessions,
+            browser,
+        }
+    }
+
+    #[test]
+    fn visible_status_derives_from_primary_provider_session_projection() {
+        let mut approval = ProviderSessionProjection::default();
+        approval.open_approval = Some(ApprovalId::new());
+        assert_eq!(
+            snapshot_with_primary_projection(approval, TaskLifecycle::Open).visible_status(),
+            VisibleTaskStatus::NeedsApproval
+        );
+
+        let mut question = ProviderSessionProjection::default();
+        question.open_question = Some(QuestionId::new());
+        assert_eq!(
+            snapshot_with_primary_projection(question, TaskLifecycle::Open).visible_status(),
+            VisibleTaskStatus::NeedsAnswer
+        );
+
+        let mut working = ProviderSessionProjection::default();
+        working.current_turn = Some(TurnId::new());
+        assert_eq!(
+            snapshot_with_primary_projection(working, TaskLifecycle::Open).visible_status(),
+            VisibleTaskStatus::Working
+        );
+
+        assert_eq!(
+            snapshot_with_primary_projection(
+                ProviderSessionProjection::default(),
+                TaskLifecycle::Open
+            )
+            .visible_status(),
+            VisibleTaskStatus::Idle
+        );
+    }
+
+    #[test]
+    fn idle_provider_projection_preserves_explicit_attention_and_review_readiness() {
+        let mut needs_answer = snapshot_with_primary_projection(
+            ProviderSessionProjection::default(),
+            TaskLifecycle::Open,
+        );
+        needs_answer.attention = TaskAttention::NeedsAnswer;
+        assert_eq!(
+            needs_answer.visible_status(),
+            VisibleTaskStatus::NeedsAnswer
+        );
+
+        let mut ready = snapshot_with_primary_projection(
+            ProviderSessionProjection::default(),
+            TaskLifecycle::Open,
+        );
+        ready.review_readiness = ReviewReadiness::Ready;
+        assert_eq!(ready.visible_status(), VisibleTaskStatus::ReadyForReview);
+    }
+
+    #[test]
+    fn settled_lifecycle_stays_done_idle_despite_open_turn_projection() {
+        let mut working = ProviderSessionProjection::default();
+        working.current_turn = Some(TurnId::new());
+        assert_eq!(
+            snapshot_with_primary_projection(working, TaskLifecycle::Settled).visible_status(),
+            VisibleTaskStatus::Idle
+        );
+    }
 
     #[test]
     fn provider_plan_lifecycle_is_typed_and_excludes_presentation_only_notifications() {

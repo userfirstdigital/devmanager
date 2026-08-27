@@ -1941,6 +1941,49 @@ impl ProcessManager {
             .collect()
     }
 
+    pub(crate) fn provider_terminal_binding(
+        &self,
+        task_id: TaskId,
+        agent_session_id: crate::domain::AgentSessionId,
+        resource_id: ResourceId,
+        runtime_generation: u64,
+    ) -> Option<ProviderTerminalBinding> {
+        let live = {
+            let book = self.inner.provider_runtime.lock().ok()?;
+            let live = book.live.values().find(|live| {
+                live.task_id == task_id
+                    && live.agent_session_id == agent_session_id
+                    && live.fence.resource().resource_id == resource_id
+                    && live.fence.resource().runtime_generation == runtime_generation
+                    && !live.exit_reported
+            })?;
+            (
+                live.session_id.clone(),
+                live.agent_session_id,
+                live.fence.resource().resource_id,
+                live.fence.resource().runtime_generation,
+                live.correlation.action_epoch(),
+            )
+        };
+        let terminal_session_id =
+            crate::terminal::protocol::TerminalSessionId::parse(live.0.strip_prefix("provider-")?)
+                .ok()?;
+        let runtime = self.inner.sessions.lock().ok()?.get(&live.0)?.clone();
+        let (resource_id, generation) = runtime.current_attachment_fence().ok()?;
+        if resource_id != live.2 || generation != live.3 {
+            return None;
+        }
+        Some(ProviderTerminalBinding {
+            task_id,
+            agent_session_id: live.1,
+            resource_id: live.2,
+            runtime_generation: live.3,
+            action_epoch: live.4,
+            terminal_session_id,
+            runtime,
+        })
+    }
+
     pub(crate) fn drain_provider_session_failures(&self) -> Vec<ProviderSessionFailure> {
         let Ok(mut book) = self.inner.provider_runtime.lock() else {
             return Vec::new();
@@ -2751,6 +2794,15 @@ impl ProcessManager {
         if let Ok(mut notification_sound) = self.inner.notification_sound.write() {
             *notification_sound = sound_id;
         }
+    }
+
+    /// Configured notification sound id retained for idle-transition playback.
+    pub(crate) fn notification_sound(&self) -> Option<String> {
+        self.inner
+            .notification_sound
+            .read()
+            .ok()
+            .and_then(|sound| sound.clone())
     }
 
     pub fn set_settings(&self, settings: Settings) {
@@ -7199,6 +7251,17 @@ pub(crate) struct ProviderSessionBinding {
     pub provider_kind: ProviderKind,
     pub provider_session_id: crate::domain::ProviderSessionId,
     pub runtime_generation: u64,
+}
+
+#[derive(Clone)]
+pub(crate) struct ProviderTerminalBinding {
+    pub task_id: TaskId,
+    pub agent_session_id: crate::domain::AgentSessionId,
+    pub resource_id: ResourceId,
+    pub runtime_generation: u64,
+    pub action_epoch: u64,
+    pub terminal_session_id: crate::terminal::protocol::TerminalSessionId,
+    pub runtime: Arc<TerminalSession>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

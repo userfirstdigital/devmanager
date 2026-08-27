@@ -524,6 +524,11 @@ pub struct TaskTerminalProjection {
     pub action_epoch: u64,
     pub sequence: u64,
     pub title: Option<String>,
+    /// Bounded plain-text rows used by the native IPC projection. The host
+    /// deliberately does not serialize thousands of rich cell structs across
+    /// the one-megabyte transport; the client rebuilds default-themed cells.
+    #[serde(default)]
+    pub text_lines: Vec<String>,
     pub screen: TerminalScreenSnapshot,
 }
 
@@ -618,6 +623,10 @@ pub struct AgentConnectionRow {
 #[serde(deny_unknown_fields)]
 pub struct AgentConnectionSnapshot {
     pub agents: Vec<AgentConnectionRow>,
+    /// Tasks whose exact provider restore failed for the current host generation.
+    /// Distinct from durable [`crate::domain::task::TaskAttention::Failed`].
+    #[serde(default)]
+    pub restore_failed_task_ids: Vec<crate::domain::id::TaskId>,
 }
 
 impl AgentConnectionSnapshot {
@@ -977,9 +986,14 @@ mod tests {
                     presence: AgentPresence::SignedIn,
                 },
             ],
+            restore_failed_task_ids: Vec::new(),
         };
         assert!(snapshot.connected());
-        assert!(!AgentConnectionSnapshot { agents: vec![] }.connected());
+        assert!(!AgentConnectionSnapshot {
+            agents: vec![],
+            restore_failed_task_ids: Vec::new(),
+        }
+        .connected());
     }
 
     #[test]

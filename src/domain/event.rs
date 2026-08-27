@@ -2553,7 +2553,15 @@ fn apply_into(
             let current_turn = snap
                 .provider_sessions
                 .get(agent_session_id)
-                .and_then(|session| session.current_turn);
+                .and_then(|session| {
+                    if matches!(action, ProviderInputAction::SendNow { .. })
+                        && session.can_begin_send_now_turn(*turn_id)
+                    {
+                        None
+                    } else {
+                        session.current_turn
+                    }
+                });
             let fence = ProviderFenceIdentity::new_with_identity(
                 Some(*command_id),
                 Some(snap.task.id),

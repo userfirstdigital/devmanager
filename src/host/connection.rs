@@ -2121,6 +2121,7 @@ impl ConfiguredServiceRuntime {
                 .ok()
         })()
         .is_some();
+        apply_admitted_notification_sound(&manager, config.settings());
         Some(Self {
             provider_dispatch:
                 crate::providers::dispatch::ProviderDispatchRuntime::from_process_manager(
@@ -2132,6 +2133,13 @@ impl ConfiguredServiceRuntime {
             supervisor_ready,
         })
     }
+}
+
+fn apply_admitted_notification_sound(
+    manager: &crate::services::ProcessManager,
+    settings: &crate::config::model::Settings,
+) {
+    manager.set_notification_sound(settings.notification_sound.clone().into_option());
 }
 
 fn unix_time_ms_u64() -> u64 {
@@ -2501,6 +2509,29 @@ fn provider_restore_success_attention(
 ) -> Option<crate::domain::task::TaskAttention> {
     (current == crate::domain::task::TaskAttention::Failed)
         .then_some(crate::domain::task::TaskAttention::None)
+}
+
+/// Exact restore/reattachment failure is a runtime attachment outcome, never a
+/// durable task-operation failure. Returning `None` keeps existing attention.
+/// Legacy restore-poisoned `Failed` is cleared to `None` when an exact provider
+/// session identity is already bound.
+fn next_attention_after_provider_restore_failure(
+    snapshot: &crate::domain::snapshot::TaskSnapshot,
+) -> Option<crate::domain::task::TaskAttention> {
+    let has_exact_session = snapshot
+        .agents
+        .values()
+        .any(|agent| agent.provider_session_id.is_some());
+    if has_exact_session && snapshot.attention == crate::domain::task::TaskAttention::Failed {
+        return Some(crate::domain::task::TaskAttention::None);
+    }
+    provider_restore_failure_attention(snapshot.attention)
+}
+
+fn provider_restore_failure_attention(
+    _current: crate::domain::task::TaskAttention,
+) -> Option<crate::domain::task::TaskAttention> {
+    None
 }
 
 impl HostRequestExecutor {
@@ -3188,6 +3219,13 @@ impl HostRequestExecutor {
                 "devmanager-host: provider session failed task={} agent={} provider={:?}: {:?}",
                 failure.task_id, failure.agent_session_id, failure.provider_kind, failure.failure,
             );
+            if let Ok(Some(snapshot)) = self.bus.task_snapshot(failure.task_id) {
+                self.provider_restore_failed_action_epochs
+                    .insert(failure.task_id, snapshot.task.action_epoch);
+            } else {
+                self.provider_restore_failed_action_epochs
+                    .insert(failure.task_id, 0);
+            }
             self.mark_provider_restore_failed(failure.task_id);
         }
         if let Err(error) = self.sync_provider_session_identities() {
@@ -3221,7 +3259,11 @@ impl HostRequestExecutor {
                     "devmanager-host: provider input held task={} reason={reason:?}; scheduling {:?}",
                     task_id, intent.mode
                 );
-                self.provider_restore_queue.push_back(intent);
+                push_unique_provider_restore_intent(
+                    &mut self.provider_restore_queue,
+                    &self.provider_restore_in_flight,
+                    intent,
+                );
             }
             Ok(None) => {
                 eprintln!(
@@ -3240,7 +3282,15 @@ impl HostRequestExecutor {
         if self.provider_restore_pending {
             self.provider_restore_pending = false;
             match self.bus.restorable_provider_starts(64) {
-                Ok(starts) => self.provider_restore_queue.extend(starts),
+                Ok(starts) => {
+                    for intent in starts {
+                        push_unique_provider_restore_intent(
+                            &mut self.provider_restore_queue,
+                            &self.provider_restore_in_flight,
+                            intent,
+                        );
+                    }
+                }
                 Err(error) => {
                     eprintln!("devmanager-host: provider restore enumeration failed: {error}");
                     return;
@@ -3354,7 +3404,103 @@ impl HostRequestExecutor {
         } else {
             self.provider_restore_failed_action_epochs
                 .remove(&outcome.task_id);
+            if let Err(error) = self.attach_provider_terminal(outcome.task_id) {
+                eprintln!(
+                    "devmanager-host: provider terminal attachment failed task={}: {error}",
+                    outcome.task_id
+                );
+            }
         }
+    }
+
+    fn attach_provider_terminal(&mut self, task_id: TaskId) -> Result<(), String> {
+        let runtime = self
+            .configured_service_runtime
+            .as_ref()
+            .ok_or_else(|| "configured provider runtime is unavailable".to_string())?;
+        let snapshot = self
+            .bus
+            .task_snapshot(task_id)
+            .map_err(|error| error.to_string())?
+            .ok_or_else(|| "provider task projection is unavailable".to_string())?;
+        let primary_agent_id = snapshot
+            .primary_agent_id
+            .ok_or_else(|| "provider task has no primary agent".to_string())?;
+        let agent = snapshot
+            .agents
+            .get(&primary_agent_id)
+            .ok_or_else(|| "provider terminal agent projection is unavailable".to_string())?;
+        let matching_resources = snapshot
+            .resources
+            .values()
+            .filter(|resource| {
+                resource.resource_kind == crate::domain::ResourceKind::Terminal
+                    && resource.lifecycle == crate::domain::ResourceLifecycle::Active
+                    && resource.runtime_generation == agent.runtime_generation
+            })
+            .collect::<Vec<_>>();
+        let [resource] = matching_resources.as_slice() else {
+            return Err(
+                "provider task does not have one exact active terminal resource".to_string(),
+            );
+        };
+        let binding = runtime
+            .manager
+            .provider_terminal_binding(
+                task_id,
+                primary_agent_id,
+                resource.id,
+                agent.runtime_generation,
+            )
+            .ok_or_else(|| "provider runtime did not publish its terminal binding".to_string())?;
+        if binding.task_id != task_id
+            || binding.agent_session_id != primary_agent_id
+            || binding.resource_id != resource.id
+            || agent.runtime_generation != binding.runtime_generation
+            || resource.runtime_generation != binding.runtime_generation
+            || binding.action_epoch == 0
+        {
+            return Err("provider terminal binding conflicts with durable task facts".to_string());
+        }
+        if let Some(existing) = self
+            .terminal_service
+            .task_terminal_view(task_id)
+            .map_err(|error| error.to_string())?
+        {
+            return if existing.agent_session_id == binding.agent_session_id
+                && existing.resource_id == binding.resource_id
+                && existing.runtime_generation == binding.runtime_generation
+                && existing.action_epoch == binding.action_epoch
+            {
+                Ok(())
+            } else {
+                Err("provider terminal already has a conflicting attachment".to_string())
+            };
+        }
+        let view = binding
+            .runtime
+            .session_view()
+            .ok_or_else(|| "provider terminal session view is unavailable".to_string())?;
+        let size = crate::terminal::protocol::TerminalSize::new(
+            view.runtime.dimensions.cols,
+            view.runtime.dimensions.rows,
+        )
+        .map_err(|error| error.to_string())?;
+        let mut spec = TerminalSpec::new(binding.terminal_session_id, size)
+            .map_err(|error| error.to_string())?;
+        spec.title = view.runtime.title;
+        let attached: Arc<dyn AttachedTerminalRuntime> = binding.runtime;
+        self.terminal_service
+            .attach_bound_task_runtime(
+                task_id,
+                spec,
+                attached,
+                binding.agent_session_id,
+                binding.runtime_generation,
+                binding.action_epoch,
+            )
+            .map_err(|error| error.to_string())?;
+        Ok(())
     }
 
     fn mark_provider_restore_succeeded(&mut self, task_id: TaskId) {
@@ -3384,6 +3530,9 @@ impl HostRequestExecutor {
         let Some(snapshot) = self.bus.task_snapshot(task_id).ok().flatten() else {
             return;
         };
+        let Some(attention) = next_attention_after_provider_restore_failure(&snapshot) else {
+            return;
+        };
         let _ = self.bus.execute_host_authorized(
             CommandEnvelope {
                 command_id: crate::domain::CommandId::new(),
@@ -3391,9 +3540,7 @@ impl HostRequestExecutor {
                 task_id: Some(task_id),
                 issued_at_ms: unix_time_ms_u64() as i64,
                 expected_task_revision: Some(snapshot.task.revision),
-                command: Command::SetTaskAttention(SetTaskAttentionIntent {
-                    attention: crate::domain::task::TaskAttention::Failed,
-                }),
+                command: Command::SetTaskAttention(SetTaskAttentionIntent { attention }),
             },
             None,
             RequestId::new(),
@@ -4471,6 +4618,11 @@ impl HostRequestExecutor {
                 outcome: QueryOutcome::Ok(QueryResult::TaskCockpit(
                     TaskCockpitResult::AgentConnection(crate::domain::AgentConnectionSnapshot {
                         agents,
+                        restore_failed_task_ids: self
+                            .provider_restore_failed_action_epochs
+                            .keys()
+                            .copied()
+                            .collect(),
                     }),
                 )),
             }),
@@ -5419,6 +5571,20 @@ impl HostRequestExecutor {
         let _ = output.force_live_resync(subscription_id, stream, newest_sequence);
         self.replay_registry.remove(subscription_id);
     }
+}
+
+fn push_unique_provider_restore_intent(
+    queue: &mut VecDeque<crate::domain::command::StartProviderSessionIntent>,
+    in_flight: &HashSet<TaskId>,
+    intent: crate::domain::command::StartProviderSessionIntent,
+) -> bool {
+    if in_flight.contains(&intent.task_id)
+        || queue.iter().any(|queued| queued.task_id == intent.task_id)
+    {
+        return false;
+    }
+    queue.push_back(intent);
+    true
 }
 
 /// Conservative newest-sequence hint for ResyncRequired after a live replay error.
@@ -10636,5 +10802,422 @@ mod output_tests {
             blocking_worker_at > observe_at && launch_at > blocking_worker_at,
             "provider process launch must run inside spawn_blocking after async discovery"
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        apply_admitted_notification_sound, next_attention_after_provider_restore_failure,
+        provider_restore_failure_attention, provider_restore_success_attention,
+        push_unique_provider_restore_intent,
+    };
+    use crate::domain::agent::{
+        AgentRole, AgentSessionFacts, AgentSessionLifecycle, ProviderSessionId,
+    };
+    use crate::domain::command::{
+        Command, CommandEnvelope, CreateTaskIntent, ProviderStartMode, SetTaskAttentionIntent,
+    };
+    use crate::domain::id::{
+        AgentSessionId, ClientId, CommandId, EnvironmentId, ProjectId, RequestId, ResourceId,
+        TaskId,
+    };
+    use crate::domain::resource::{
+        OwnerKind, ResourceFacts, ResourceKind, ResourceLifecycle, ResourceRecipe,
+    };
+    use crate::domain::task::{
+        ReviewReadiness, TaskActivity, TaskAssignment, TaskAttention, TaskConnectivity,
+        WorkspaceRef,
+    };
+    use crate::kernel::CommandBus;
+    use crate::providers::ProviderKind;
+    use crate::remote::presentation::{
+        SemanticEventDraft, SemanticEventKind, SemanticJournalStore, SemanticRetention,
+        SemanticSource, StableSessionKey,
+    };
+    use std::collections::{HashSet, VecDeque};
+    use uuid::Uuid;
+
+    struct ProviderRestoreHarness {
+        bus: CommandBus,
+        task_id: TaskId,
+        client_id: ClientId,
+        agent_session_id: AgentSessionId,
+        resource_id: ResourceId,
+        provider_session_id: ProviderSessionId,
+        journal: SemanticJournalStore,
+        _directory: tempfile::TempDir,
+    }
+
+    struct RestartRestoreIntentView {
+        provider_session_id: Option<ProviderSessionId>,
+        mode: ProviderStartMode,
+    }
+
+    impl ProviderRestoreHarness {
+        fn with_bound_session(expected: ProviderSessionId) -> Self {
+            Self::seed(expected, true)
+        }
+
+        fn with_history(session: &str) -> Self {
+            let expected = ProviderSessionId::new(session).expect("provider session");
+            let mut harness = Self::seed(expected, true);
+            harness.seed_history_facts(2);
+            harness
+        }
+
+        fn seed(provider_session_id: ProviderSessionId, bind: bool) -> Self {
+            let directory = tempfile::tempdir().expect("provider restore harness directory");
+            let mut bus =
+                CommandBus::open(&directory.path().join("tasks.sqlite")).expect("command bus");
+            let task_id = TaskId::new();
+            let client_id = ClientId::new();
+            let project_id = ProjectId::new();
+            let created = bus
+                .execute_for_test(CommandEnvelope {
+                    command_id: CommandId::new(),
+                    client_id,
+                    task_id: None,
+                    issued_at_ms: 1_725_000_000_000,
+                    expected_task_revision: None,
+                    command: Command::CreateTask(CreateTaskIntent {
+                        id: task_id,
+                        environment_id: EnvironmentId::new(),
+                        title: "Restore harness".into(),
+                        description: None,
+                        project_id,
+                        workspace: WorkspaceRef::Main,
+                        assignment: TaskAssignment::LocalOwner,
+                        created_at_ms: 1_725_000_000_000,
+                        connectivity: TaskConnectivity::Connected,
+                        attention: TaskAttention::None,
+                        activity: TaskActivity::Idle,
+                        review_readiness: ReviewReadiness::NotReady,
+                    }),
+                })
+                .expect("create task");
+            let mut revision = match created {
+                crate::domain::command::CommandReceipt::Accepted {
+                    task_revision: Some(revision),
+                    ..
+                } => revision,
+                other => panic!("expected accepted create, got {other:?}"),
+            };
+            let agent_session_id = AgentSessionId::new();
+            revision = accepted_revision(
+                bus.execute(task_envelope(
+                    client_id,
+                    task_id,
+                    revision,
+                    Command::RegisterAgentSession {
+                        agent: AgentSessionFacts {
+                            id: agent_session_id,
+                            task_id,
+                            role: AgentRole::Primary,
+                            provider_kind: ProviderKind::Codex,
+                            provider_session_id: None,
+                            lifecycle: AgentSessionLifecycle::Open,
+                            runtime_generation: 3,
+                            revision: 0,
+                        },
+                    },
+                ))
+                .expect("register agent"),
+            );
+            revision = accepted_revision(
+                bus.execute(task_envelope(
+                    client_id,
+                    task_id,
+                    revision,
+                    Command::SetPrimaryAgent { agent_session_id },
+                ))
+                .expect("set primary"),
+            );
+            let resource_id = ResourceId::new();
+            revision = accepted_revision(
+                bus.execute(task_envelope(
+                    client_id,
+                    task_id,
+                    revision,
+                    Command::RegisterResource {
+                        resource: ResourceFacts {
+                            id: resource_id,
+                            task_id: Some(task_id),
+                            owner_kind: OwnerKind::Task,
+                            resource_kind: ResourceKind::Terminal,
+                            recipe: ResourceRecipe::Terminal {
+                                cols: 120,
+                                rows: 40,
+                            },
+                            lifecycle: ResourceLifecycle::Active,
+                            runtime_generation: 3,
+                            updated_at_ms: 1_725_000_000_100,
+                        },
+                    },
+                ))
+                .expect("register resource"),
+            );
+            if bind {
+                let _ = accepted_revision(host_execute(
+                    &mut bus,
+                    task_envelope(
+                        client_id,
+                        task_id,
+                        revision,
+                        Command::BindProviderSession {
+                            agent_session_id,
+                            resource_id,
+                            provider_session_id: provider_session_id.clone(),
+                            expected_runtime_generation: 3,
+                        },
+                    ),
+                ));
+            }
+            Self {
+                bus,
+                task_id,
+                client_id,
+                agent_session_id,
+                resource_id,
+                provider_session_id,
+                journal: SemanticJournalStore::default(),
+                _directory: directory,
+            }
+        }
+
+        fn seed_history_facts(&mut self, count: usize) {
+            for index in 0..count {
+                let kind = if index % 2 == 0 {
+                    SemanticEventKind::UserMessage {
+                        text: format!("user-{index}"),
+                    }
+                } else {
+                    SemanticEventKind::AssistantMessage {
+                        message_id: format!("msg-{index}"),
+                        text: format!("assistant-{index}"),
+                        streaming: false,
+                    }
+                };
+                self.journal.record(SemanticEventDraft {
+                    stable_session_key: StableSessionKey::from_tab(self.task_id.to_string()),
+                    occurred_at_epoch_ms: 1_725_000_000_000 + index as u64,
+                    source: SemanticSource::Codex,
+                    kind,
+                    retention: SemanticRetention::Canonical,
+                    deduplication_key: Some(format!("history-{index}")),
+                });
+            }
+        }
+
+        fn restart_restore_intent(&mut self) -> RestartRestoreIntentView {
+            let starts = self
+                .bus
+                .restorable_provider_starts(64)
+                .expect("restorable starts");
+            assert_eq!(starts.len(), 1, "expected one restorable conversation");
+            let intent = &starts[0];
+            assert_eq!(intent.task_id, self.task_id);
+            assert_eq!(intent.agent_session_id, self.agent_session_id);
+            assert_eq!(intent.resource_id, self.resource_id);
+            let (_binding, agent, _) = self
+                .bus
+                .prepare_provider_start(intent)
+                .expect("prepare exact restore");
+            let durable = self
+                .bus
+                .durable_provider_binding(self.agent_session_id)
+                .expect("durable binding")
+                .map(|(provider_session_id, _)| provider_session_id);
+            assert_eq!(
+                durable.as_ref(),
+                Some(&self.provider_session_id),
+                "hand-derived durable value must match the stored provider session"
+            );
+            assert_eq!(
+                agent.provider_session_id.as_ref(),
+                Some(&self.provider_session_id),
+                "prepared agent must carry the exact stored provider session"
+            );
+            RestartRestoreIntentView {
+                provider_session_id: agent.provider_session_id,
+                mode: intent.mode,
+            }
+        }
+
+        fn complete_restore_with_error(&mut self, _reason: &str) {
+            let snapshot = self
+                .bus
+                .task_snapshot(self.task_id)
+                .expect("snapshot")
+                .expect("task present");
+            if let Some(attention) = next_attention_after_provider_restore_failure(&snapshot) {
+                let _ = host_execute(
+                    &mut self.bus,
+                    task_envelope(
+                        self.client_id,
+                        self.task_id,
+                        snapshot.task.revision,
+                        Command::SetTaskAttention(SetTaskAttentionIntent { attention }),
+                    ),
+                );
+            }
+        }
+
+        fn task_attention(&self) -> Option<TaskAttention> {
+            self.bus
+                .task_snapshot(self.task_id)
+                .expect("snapshot")
+                .map(|snapshot| snapshot.attention)
+        }
+
+        fn persisted_history_len(&self) -> usize {
+            let key = StableSessionKey::from_tab(self.task_id.to_string());
+            self.journal
+                .replay_after(&key, 0)
+                .map(|replay| replay.events.len())
+                .unwrap_or(0)
+        }
+    }
+
+    fn accepted_revision(receipt: crate::domain::command::CommandReceipt) -> u64 {
+        match receipt {
+            crate::domain::command::CommandReceipt::Accepted {
+                task_revision: Some(revision),
+                ..
+            } => revision,
+            other => panic!("expected accepted task receipt, got {other:?}"),
+        }
+    }
+
+    fn task_envelope(
+        client_id: ClientId,
+        task_id: TaskId,
+        revision: u64,
+        command: Command,
+    ) -> CommandEnvelope {
+        CommandEnvelope {
+            command_id: CommandId::new(),
+            client_id,
+            task_id: Some(task_id),
+            issued_at_ms: 1_725_000_100_000,
+            expected_task_revision: Some(revision),
+            command,
+        }
+    }
+
+    fn host_execute(
+        bus: &mut CommandBus,
+        envelope: CommandEnvelope,
+    ) -> crate::domain::command::CommandReceipt {
+        bus.execute_host_authorized(envelope, None, RequestId::new(), Uuid::now_v7())
+            .expect("host-authorized command")
+    }
+
+    #[test]
+    fn restart_restore_uses_the_durable_provider_session_id_without_new_conversation_fallback() {
+        let expected = ProviderSessionId::new("conversation-42").unwrap();
+        let mut harness = ProviderRestoreHarness::with_bound_session(expected.clone());
+
+        let intent = harness.restart_restore_intent();
+
+        assert_eq!(intent.provider_session_id.as_ref(), Some(&expected));
+        assert_eq!(intent.mode, ProviderStartMode::ResumeExact);
+    }
+
+    #[test]
+    fn failed_exact_restore_does_not_mark_an_existing_task_failed() {
+        let mut harness = ProviderRestoreHarness::with_history("conversation-42");
+
+        harness.complete_restore_with_error("ExactResumeUnavailable");
+
+        assert_ne!(harness.task_attention(), Some(TaskAttention::Failed));
+        assert_eq!(harness.persisted_history_len(), 2);
+    }
+
+    #[test]
+    fn provider_restore_failure_keeps_existing_attention() {
+        assert_eq!(
+            provider_restore_failure_attention(TaskAttention::None),
+            None
+        );
+        assert_eq!(
+            provider_restore_failure_attention(TaskAttention::NeedsAnswer),
+            None
+        );
+        let _ = provider_restore_success_attention(TaskAttention::Failed);
+    }
+
+    #[test]
+    fn startup_restore_does_not_duplicate_a_held_restart_for_the_same_task() {
+        let task_id = TaskId::new();
+        let intent = crate::domain::command::StartProviderSessionIntent {
+            task_id,
+            agent_session_id: crate::domain::AgentSessionId::new(),
+            resource_id: crate::domain::ResourceId::new(),
+            provider_kind: crate::domain::ProviderKind::Codex,
+            mode: crate::domain::command::ProviderStartMode::ResumeExact,
+            launch_options: crate::providers::adapter::ProviderLaunchOptions::default(),
+            expected_task_revision: 7,
+            expected_action_epoch: 0,
+        };
+        let mut queue = VecDeque::new();
+        let in_flight = HashSet::new();
+
+        assert!(push_unique_provider_restore_intent(
+            &mut queue,
+            &in_flight,
+            intent.clone(),
+        ));
+        assert!(!push_unique_provider_restore_intent(
+            &mut queue, &in_flight, intent,
+        ));
+        assert_eq!(queue.len(), 1);
+    }
+
+    #[test]
+    fn configured_runtime_applies_admitted_notification_sound() {
+        use crate::config::model::{Nullable, Settings};
+
+        // Same boundary as ConfiguredServiceRuntime::initialized_from_admission:
+        // admitted settings.notification_sound → ProcessManager.
+        let mut settings = Settings::default();
+        settings.notification_sound = Nullable::Value("chime".into());
+        let manager = crate::services::ProcessManager::new();
+        apply_admitted_notification_sound(&manager, &settings);
+        assert_eq!(manager.notification_sound().as_deref(), Some("chime"));
+
+        // Replay/stale generations must not invent a second sound source; the
+        // ProcessManager retains exactly one configured id until replaced.
+        manager.set_notification_sound(None);
+        assert_eq!(manager.notification_sound(), None);
+        manager.set_notification_sound(Some("glass".into()));
+        assert_eq!(manager.notification_sound().as_deref(), Some("glass"));
+    }
+
+    #[test]
+    fn legacy_failed_attention_clears_when_exact_session_restore_fails() {
+        let mut harness = ProviderRestoreHarness::with_history("conversation-42");
+        let snapshot = harness
+            .bus
+            .task_snapshot(harness.task_id)
+            .expect("snapshot")
+            .expect("task");
+        let _ = host_execute(
+            &mut harness.bus,
+            task_envelope(
+                harness.client_id,
+                harness.task_id,
+                snapshot.task.revision,
+                Command::SetTaskAttention(SetTaskAttentionIntent {
+                    attention: TaskAttention::Failed,
+                }),
+            ),
+        );
+        assert_eq!(harness.task_attention(), Some(TaskAttention::Failed));
+
+        harness.complete_restore_with_error("ExactResumeUnavailable");
+
+        assert_ne!(harness.task_attention(), Some(TaskAttention::Failed));
+        assert_eq!(harness.persisted_history_len(), 2);
     }
 }

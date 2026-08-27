@@ -130,6 +130,7 @@ mod tests {
                     presence: AgentPresence::NotSignedIn,
                 },
             ],
+            restore_failed_task_ids: Vec::new(),
         };
         assert_eq!(
             inbox_agent_actions(&snapshot),
@@ -153,6 +154,7 @@ mod tests {
                     presence: AgentPresence::Checking,
                 },
             ],
+            restore_failed_task_ids: Vec::new(),
         };
         let (title, detail) = connect_canvas_copy(Some(&snapshot));
         assert_eq!(title, "Checking agents");
@@ -172,6 +174,7 @@ mod tests {
                     presence: AgentPresence::CheckFailed,
                 },
             ],
+            restore_failed_task_ids: Vec::new(),
         };
         let (title, detail) = connect_canvas_copy(Some(&snapshot));
         assert_eq!(title, "Could not check agents");
