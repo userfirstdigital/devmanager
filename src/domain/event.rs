@@ -578,6 +578,13 @@ pub struct PrimaryAgentSetPayload {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+pub struct UnstartedPrimaryProviderReboundPayload {
+    pub agent_session_id: AgentSessionId,
+    pub provider_kind: ProviderKind,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ArtifactRegisteredPayload {
     pub artifact: ArtifactFacts,
 }
@@ -1020,6 +1027,10 @@ pub enum Event {
     PrimaryAgentSet {
         agent_session_id: AgentSessionId,
     },
+    UnstartedPrimaryProviderRebound {
+        agent_session_id: AgentSessionId,
+        provider_kind: ProviderKind,
+    },
     SpecialistRequested {
         specialist_id: AgentSessionId,
         requested_by: AgentSessionId,
@@ -1146,6 +1157,9 @@ impl Event {
             Self::AgentSessionRegistered { .. } => "agent_session.registered",
             Self::AgentProviderSessionBound { .. } => "agent_session.provider_bound",
             Self::PrimaryAgentSet { .. } => "primary_agent.set",
+            Self::UnstartedPrimaryProviderRebound { .. } => {
+                "agent_session.unstarted_provider_rebound"
+            }
             Self::SpecialistRequested { .. } => "specialist.requested",
             Self::PrimaryPromoted { .. } => "primary_agent.promoted",
             Self::SpecialistHandoffRecorded { .. } => "specialist.handoff_recorded",
@@ -1210,6 +1224,8 @@ enum EventBody {
     AgentProviderSessionBound(AgentProviderSessionBoundPayload),
     #[serde(rename = "primary_agent.set")]
     PrimaryAgentSet(PrimaryAgentSetPayload),
+    #[serde(rename = "agent_session.unstarted_provider_rebound")]
+    UnstartedPrimaryProviderRebound(UnstartedPrimaryProviderReboundPayload),
     #[serde(rename = "specialist.requested")]
     SpecialistRequested(SpecialistRequestedPayload),
     #[serde(rename = "primary_agent.promoted")]
@@ -1313,6 +1329,15 @@ impl From<&Event> for EventDocument {
             Event::PrimaryAgentSet { agent_session_id } => {
                 EventBody::PrimaryAgentSet(PrimaryAgentSetPayload {
                     agent_session_id: *agent_session_id,
+                })
+            }
+            Event::UnstartedPrimaryProviderRebound {
+                agent_session_id,
+                provider_kind,
+            } => {
+                EventBody::UnstartedPrimaryProviderRebound(UnstartedPrimaryProviderReboundPayload {
+                    agent_session_id: *agent_session_id,
+                    provider_kind: *provider_kind,
                 })
             }
 
@@ -1577,6 +1602,12 @@ impl TryFrom<EventDocument> for Event {
             EventBody::PrimaryAgentSet(p) => Event::PrimaryAgentSet {
                 agent_session_id: p.agent_session_id,
             },
+            EventBody::UnstartedPrimaryProviderRebound(p) => {
+                Event::UnstartedPrimaryProviderRebound {
+                    agent_session_id: p.agent_session_id,
+                    provider_kind: p.provider_kind,
+                }
+            }
 
             EventBody::SpecialistRequested(p) => {
                 p.validate().map_err(|_| EventSerdeError::Payload)?;
@@ -2288,6 +2319,28 @@ fn apply_into(
                 return Err(ApplyError::InvalidTransition);
             }
             snap.primary_agent_id = Some(*agent_session_id);
+        }
+        Event::UnstartedPrimaryProviderRebound {
+            agent_session_id,
+            provider_kind,
+        } => {
+            if !snap.is_unstarted_draft() {
+                return Err(ApplyError::InvalidTransition);
+            }
+            if snap.primary_agent_id != Some(*agent_session_id) {
+                return Err(ApplyError::OwnershipConflict);
+            }
+            let Some(agent) = snap.agents.get_mut(agent_session_id) else {
+                return Err(ApplyError::NotFound);
+            };
+            if !matches!(agent.role, crate::domain::agent::AgentRole::Primary)
+                || agent.lifecycle != AgentSessionLifecycle::Open
+                || agent.provider_session_id.is_some()
+            {
+                return Err(ApplyError::InvalidTransition);
+            }
+            agent.provider_kind = *provider_kind;
+            agent.revision = agent.revision.saturating_add(1);
         }
         Event::SpecialistRequested {
             specialist_id,

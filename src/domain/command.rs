@@ -1225,6 +1225,13 @@ pub enum Command {
     SetPrimaryAgent {
         agent_session_id: AgentSessionId,
     },
+    /// Host-journal ingress only. Rebinds `provider_kind` on an unstarted
+    /// primary before the first provider SessionStart / input. Preserves
+    /// TaskId, agent session id, resource generation, and folder authority.
+    RebindUnstartedPrimaryProvider {
+        agent_session_id: AgentSessionId,
+        provider_kind: ProviderKind,
+    },
     RegisterArtifact {
         artifact: ArtifactFacts,
     },
@@ -1509,6 +1516,35 @@ pub fn decide(
             }
             Ok(vec![Event::PrimaryAgentSet {
                 agent_session_id: *agent_session_id,
+            }])
+        }
+        Command::RebindUnstartedPrimaryProvider {
+            agent_session_id,
+            provider_kind,
+        } => {
+            let snap = require_runtime_capable_task(snapshot, envelope)?;
+            require_expected_revision(snap, envelope)?;
+            if !snap.is_unstarted_draft() {
+                return Err(RejectionCode::InvalidTransition);
+            }
+            if snap.primary_agent_id != Some(*agent_session_id) {
+                return Err(RejectionCode::OwnershipConflict);
+            }
+            let Some(agent) = snap.agents.get(agent_session_id) else {
+                return Err(RejectionCode::NotFound);
+            };
+            if !matches!(agent.role, crate::domain::agent::AgentRole::Primary)
+                || agent.lifecycle != AgentSessionLifecycle::Open
+                || agent.provider_session_id.is_some()
+            {
+                return Err(RejectionCode::InvalidTransition);
+            }
+            if agent.provider_kind == *provider_kind {
+                return Ok(Vec::new());
+            }
+            Ok(vec![Event::UnstartedPrimaryProviderRebound {
+                agent_session_id: *agent_session_id,
+                provider_kind: *provider_kind,
             }])
         }
         Command::RegisterArtifact { artifact } => {

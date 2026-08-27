@@ -1,9 +1,17 @@
-# Native confirmation ownership
+# Native multi-step action ownership
 
 - A multi-step destructive confirmation owns exact host command IDs, not only
   a task ID or the currently visible dialog. Cancel, replacement, failed queue
   admission, and closure must disarm follow-up commands and remove their retry
   records. Never evict an unresolved cancellation marker to admit new work.
+- The same ownership applies to reopen/start/send: capture the draft and attachment
+  identities once, block duplicate activation, and advance only from the exact
+  owned receipt plus current runtime fences. A queued-start receipt is not live
+  readiness. Providers explicitly lacking conversation identity need a host-attested
+  current-generation readiness result, never an invented ID or a PTY-text heuristic.
+  Likewise, a saved launch preference is not confirmed live configuration: never
+  display a new model or reduced access level as applied to a running provider
+  unless the runtime has acknowledged that change.
 - An accepted command can change the task revision or remove the task before
   its receipt reaches the UI. Admit that exact owned receipt using the host,
   connection, resource, and runtime-generation fences; do not reject it solely

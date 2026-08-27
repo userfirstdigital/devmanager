@@ -525,6 +525,10 @@ pub struct TaskTerminalProjection {
     pub runtime_generation: u64,
     pub resource_generation: u64,
     pub action_epoch: u64,
+    /// Host-attested exception for a live Codex runtime whose launch explicitly
+    /// reports conversation identity unsupported. Never inferred from PTY text.
+    #[serde(default)]
+    pub accepts_input_without_conversation_id: bool,
     pub sequence: u64,
     pub title: Option<String>,
     /// Bounded plain-text rows used by the native IPC projection. The host

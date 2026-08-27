@@ -15,8 +15,9 @@ use crate::providers::registry::ProviderDiscoveryConfig;
 use crate::providers::session::ProviderLaunchSpec;
 use crate::providers::settings::{
     default_instance_id_for_kind, normalize_model_slug, prepare_codex_shadow_home,
-    resolve_launch_config, ProviderInstanceBinding, ProviderInstanceBindingError,
-    ProviderInstanceScope, ProviderProfileOwner, ProviderSettingsDocument,
+    project_all_from_cache, resolve_launch_config_with_known_models, unix_now_ms,
+    ProviderInstanceBinding, ProviderInstanceBindingError, ProviderInstanceScope,
+    ProviderProfileOwner, ProviderSettingsDocument,
 };
 use crate::providers::ProviderKind;
 
@@ -194,8 +195,32 @@ pub fn resolve_host_provider_launch(
         Some(raw) => Some(normalize_model_slug(&raw).map_err(|e| e.to_string())?),
         None => launch_options.model.cli_name().map(str::to_string),
     };
-    let mut resolved =
-        resolve_launch_config(instance, &scope, selected_model).map_err(|e| e.to_string())?;
+    // Dynamic provider aliases (for example Claude's 1m variants) are valid
+    // launch models only when they came from this profile's account-aware
+    // last-good catalog.  The projection filters stale/cross-account cache
+    // rows and still keeps the built-in/custom settings catalog in the launch
+    // policy itself.  Never accept a model merely because it was seen in a
+    // different profile or because it resembles a built-in slug.
+    let known_catalog_slugs =
+        project_all_from_cache(&owner.settings, &owner.metadata, unix_now_ms())
+            .0
+            .into_iter()
+            .find(|catalog| catalog.instance_id == instance_id)
+            .map(|catalog| {
+                catalog
+                    .models
+                    .into_iter()
+                    .map(|model| model.slug)
+                    .collect::<Vec<String>>()
+            })
+            .unwrap_or_default();
+    let mut resolved = resolve_launch_config_with_known_models(
+        instance,
+        &scope,
+        selected_model,
+        &known_catalog_slugs,
+    )
+    .map_err(|e| e.to_string())?;
 
     if let (Some(home), Some(shadow)) = (
         resolved.home_path.as_deref(),

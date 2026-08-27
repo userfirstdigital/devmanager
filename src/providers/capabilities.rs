@@ -4512,16 +4512,77 @@ fn attest_cursor_cmd_wrapper(contents: &str) -> bool {
         "set \"script_dir=%~dp0\"",
         "if \"%script_dir:~-1%\"==\"\\\" set \"script_dir=%script_dir:~0,-1%\"",
     ];
-    let lines = normalized_wrapper_lines(contents);
-    let result = strict_wrapper_lines(&lines, &required, required.len(), |line| {
+    // Cursor's current npm wrapper carries two fixed REM comments between
+    // these statements. They are part of the known template, but comments
+    // must not be treated as arbitrary ignorable input: an injected command
+    // or an unrecognized comment remains a proof failure.
+    let Some(lines) = normalized_cursor_wrapper_lines(contents, CURSOR_CMD_COMMENTS) else {
+        return false;
+    };
+    strict_wrapper_lines(&lines, &required, required.len(), |line| {
         line == "%systemroot%\\system32\\windowspowershell\\v1.0\\powershell.exe -noprofile -executionpolicy bypass -file \"%script_dir%\\cursor-agent.ps1\" %*"
-    });
-    result
+    })
 }
 
 #[cfg(target_os = "windows")]
 fn attest_cursor_powershell_wrapper(contents: &str) -> bool {
-    let lines = normalized_wrapper_lines(contents);
+    let Some(lines) = normalized_cursor_wrapper_lines(contents, CURSOR_POWERSHELL_COMMENTS) else {
+        return false;
+    };
+    // Cursor's current stock wrapper includes an environment bootstrap,
+    // compile-cache setup, a full version parser, and a version-directory
+    // fallback.  Match the complete normalized template before resolving its
+    // node.exe/index.js graph; substring checks would admit injected code.
+    let current_template = normalized_wrapper_lines(
+        r#"
+if (-not $env:cursor_invoked_as) {
+$env:cursor_invoked_as = Split-Path -leaf $MyInvocation.MyCommand.Name
+}
+$scriptPath = Split-Path -parent $MyInvocation.MyCommand.Definition
+function Parse-VersionString {
+param (
+[string]$versionString
+)
+$datePart = $versionString.Split('-')[0]
+$parts = $datePart.Split('.')
+if ($parts.Length -ne 3) {
+throw "Invalid version format. Expected format: YYYY.MM.DD-commit"
+}
+$year = $parts[0]
+$month = $parts[1].PadLeft(2, '0')
+$day = $parts[2].PadLeft(2, '0')
+return [int]($year + $month + $day)
+}
+if (-not $env:NODE_COMPILE_CACHE) {
+$env:NODE_COMPILE_CACHE = "$env:LOCALAPPDATA\cursor-compile-cache"
+}
+if (Test-Path "$scriptPath\node.exe") {
+& "$scriptPath\node.exe" "$scriptPath\index.js" $args
+exit $LASTEXITCODE
+}
+$versionDir = Get-ChildItem -Path "$scriptPath\versions" -Directory |
+Where-Object {
+$name = $_.Name
+$name -match '^\d{4}\.\d{1,2}\.\d{1,2}(-\d{2}-\d{2}-\d{2})?-[a-f0-9]+$'
+} |
+Sort-Object { Parse-VersionString $_.Name } -Descending |
+Select-Object -First 1
+if (-not $versionDir) {
+Write-Error "No version directories found in $scriptPath"
+exit 1
+}
+$versionName = $versionDir.Name
+$nodePath = "$scriptPath\versions\$versionName\node.exe"
+& "$nodePath" "$scriptPath\versions\$versionName\index.js" $args
+exit $LASTEXITCODE
+"#,
+    );
+    if lines == current_template {
+        return true;
+    }
+
+    // Keep accepting the older, already-attested five/six-line Cursor
+    // templates used by existing installations and fixtures.
     let offset = if lines.len() == 6 {
         0
     } else if lines.len() == 7 && lines[3] == "$versionname = $versiondir.name" {
@@ -4557,6 +4618,30 @@ fn attest_cursor_powershell_wrapper(contents: &str) -> bool {
 }
 
 #[cfg(target_os = "windows")]
+const CURSOR_CMD_COMMENTS: &[&str] = &[
+    "rem get the directory of this script",
+    "rem remove trailing backslash",
+];
+
+#[cfg(target_os = "windows")]
+const CURSOR_POWERSHELL_COMMENTS: &[&str] = &[
+    "# split on '-' to remove the commit hash part",
+    "# split on '.' to get year, month, day",
+    "# ensure we have exactly 3 parts (year, month, day)",
+    "# pad month and day to 2 digits if needed, then concatenate",
+    "# return as integer for proper numeric comparison",
+    "## enable node.js compile cache for faster cli startup (requires node.js >= 22.1.0)",
+    "## cache is automatically invalidated when source files change",
+    "## are we somehow in the same dir as the script? just run it. look for node.exe",
+    "## otherwise, we're in a version directory. find the latest version.",
+    "# check if directory name matches version format. supports both the",
+    "# legacy yyyy.mm.dd-commit form and the newer",
+    "# yyyy.mm.dd-hh-mm-ss-commit form that adds a build timestamp between",
+    "# the date and the commit hash.",
+    "## run the version's index.js",
+];
+
+#[cfg(target_os = "windows")]
 fn is_safe_wrapper_version(value: &str) -> bool {
     !value.is_empty()
         && value != "."
@@ -4580,6 +4665,38 @@ fn normalized_wrapper_lines(contents: &str) -> Vec<String> {
                 .join(" ")
         })
         .collect()
+}
+
+#[cfg(target_os = "windows")]
+fn normalized_cursor_wrapper_lines(
+    contents: &str,
+    allowed_comments: &[&str],
+) -> Option<Vec<String>> {
+    let mut lines = Vec::new();
+    for raw_line in contents.replace("\r\n", "\n").lines() {
+        let line = raw_line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let normalized = line
+            .to_ascii_lowercase()
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        let is_comment =
+            normalized == "rem" || normalized.starts_with("rem ") || normalized.starts_with('#');
+        if is_comment {
+            if allowed_comments
+                .iter()
+                .any(|comment| *comment == normalized)
+            {
+                continue;
+            }
+            return None;
+        }
+        lines.push(normalized);
+    }
+    Some(lines)
 }
 
 #[cfg(target_os = "windows")]
@@ -5268,6 +5385,41 @@ exit $LASTEXITCODE
                 "\"$scriptpath\\versions\\$versionname\\index.js\"",
             );
         assert!(attest_cursor_powershell_wrapper(&cursor_ps_variable));
+    }
+
+    #[test]
+    fn current_cursor_wrappers_match_official_fixtures_only() {
+        let cursor_cmd = include_str!("fixtures/cursor-agent.cmd");
+        assert!(attest_cursor_cmd_wrapper(cursor_cmd));
+        assert!(attest_provider_wrapper(
+            ProviderKind::Cursor,
+            Path::new("cursor-agent.cmd"),
+            cursor_cmd
+        ));
+        assert!(!attest_cursor_cmd_wrapper(&format!(
+            "{cursor_cmd}\nwhoami\n"
+        )));
+        let injected_cmd = cursor_cmd.replace(
+            r#"-File "%SCRIPT_DIR%\cursor-agent.ps1" %*"#,
+            r#"-Command whoami -File "%SCRIPT_DIR%\cursor-agent.ps1" %*"#,
+        );
+        assert!(!attest_cursor_cmd_wrapper(&injected_cmd));
+
+        let cursor_powershell = include_str!("fixtures/cursor-agent.ps1");
+        assert!(attest_cursor_powershell_wrapper(cursor_powershell));
+        assert!(attest_provider_wrapper(
+            ProviderKind::Cursor,
+            Path::new("cursor-agent.ps1"),
+            cursor_powershell
+        ));
+        assert!(!attest_cursor_powershell_wrapper(&format!(
+            "{cursor_powershell}\nGet-Process\n"
+        )));
+        let injected_powershell = cursor_powershell.replace(
+            r#"& "$nodePath" "$scriptPath\versions\$versionName\index.js" $args"#,
+            r#"& "$nodePath" "$scriptPath\versions\$versionName\index.js" $args; Get-Process"#,
+        );
+        assert!(!attest_cursor_powershell_wrapper(&injected_powershell));
     }
 
     #[test]

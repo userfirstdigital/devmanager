@@ -288,7 +288,8 @@ impl TaskWorkspace {
     }
 
     /// Open a different task in the focused slot without discarding other panes
-    /// or their manually sized split allocations.
+    /// or their manually sized split allocations. Compact presentation and the
+    /// pane identity stay put so geometry/pins transfer with the slot.
     pub fn replace_focused_task(&mut self, task_id: TaskId) -> Result<(), WorkspaceError> {
         if self.contains_task(task_id) {
             return self.focus_task(task_id);
@@ -298,7 +299,6 @@ impl TaskWorkspace {
         let clock = self.focus_clock;
         let pane = self.pane_mut(pane_id).ok_or(WorkspaceError::MissingPane)?;
         pane.task_id = task_id;
-        pane.presentation = PanePresentation::Full;
         pane.last_focused_at = clock;
         Ok(())
     }
@@ -491,6 +491,18 @@ impl TaskWorkspace {
         child_index: usize,
         logical_px: f32,
     ) -> Result<(), WorkspaceError> {
+        self.resize_split_child_with_parent_extent(split_id, child_index, logical_px, None)
+    }
+
+    /// Persist only explicit user intent; viewport-dependent peer adjustment is
+    /// owned by the allocator and must never overwrite another custom pin.
+    pub fn resize_split_child_with_parent_extent(
+        &mut self,
+        split_id: SplitId,
+        child_index: usize,
+        logical_px: f32,
+        _parent_extent: Option<(f32, f32)>,
+    ) -> Result<(), WorkspaceError> {
         if !logical_px.is_finite() || logical_px <= 0.0 {
             return Err(WorkspaceError::InvalidTree);
         }
@@ -500,6 +512,9 @@ impl TaskWorkspace {
         if child_index + 1 >= children.len() {
             return Err(WorkspaceError::MissingPane);
         }
+        // Only the dragged pin is persisted. The allocator lets Auto peers yield,
+        // then the least-recently-focused custom peers when necessary. Mutating
+        // peer pins here makes saturated forward/back drags drift saved sizes.
         children[child_index].allocation = Allocation::Pinned { logical_px };
         candidate.validate()?;
         *self = candidate;
@@ -577,6 +592,16 @@ fn first_pane_id(node: &WorkspaceNode) -> Option<PaneId> {
         WorkspaceNode::Split { children, .. } => children
             .first()
             .and_then(|child| first_pane_id(&child.node)),
+    }
+}
+
+fn most_recent_focus_in_node(node: &WorkspaceNode) -> Option<u64> {
+    match node {
+        WorkspaceNode::Pane(pane) => Some(pane.last_focused_at),
+        WorkspaceNode::Split { children, .. } => children
+            .iter()
+            .filter_map(|child| most_recent_focus_in_node(&child.node))
+            .max(),
     }
 }
 
@@ -972,6 +997,109 @@ mod tests {
 
         assert_eq!(workspace.focused_pane_id(), Some(third_pane));
         assert_eq!(workspace.task_ids().len(), 3);
+        assert!(workspace.validate().is_ok());
+    }
+
+    #[test]
+    fn plain_replace_preserves_focused_pane_id_compact_and_sibling() {
+        let first = TaskId::new();
+        let second = TaskId::new();
+        let next = TaskId::new();
+        let mut workspace = TaskWorkspace::single(first);
+        workspace
+            .insert_after_focused(second, Axis::Horizontal)
+            .unwrap();
+        let focused_slot = workspace.focused_pane_id().unwrap();
+        workspace.set_manual_compact(second, true).unwrap();
+        let split_id = match workspace.root().unwrap() {
+            WorkspaceNode::Split { id, .. } => *id,
+            _ => panic!("expected split"),
+        };
+        // Pin the first child via resize; pin the focused (last) pane via the
+        // task-axis API because resize_split_child rejects the final index.
+        workspace.resize_split_child(split_id, 0, 420.0).unwrap();
+        workspace.pin_task_axis_size(second, 280.0).unwrap();
+        let before_first_alloc = workspace.split_child_allocation(split_id, 0);
+        let before_second_alloc = workspace.split_child_allocation(split_id, 1);
+
+        workspace.replace_focused_task(next).unwrap();
+
+        assert_eq!(workspace.pane_count(), 2);
+        assert_eq!(workspace.focused_pane_id(), Some(focused_slot));
+        assert_eq!(workspace.focused_task(), Some(next));
+        assert!(workspace.contains_task(first));
+        assert!(!workspace.contains_task(second));
+        assert_eq!(
+            workspace.presentation(next),
+            Some(PanePresentation::CompactManual)
+        );
+        assert_eq!(
+            workspace.split_child_allocation(split_id, 0),
+            before_first_alloc
+        );
+        assert_eq!(
+            workspace.split_child_allocation(split_id, 1),
+            before_second_alloc
+        );
+        assert_eq!(
+            workspace.split_child_allocation(split_id, 1),
+            Some(Allocation::Pinned { logical_px: 280.0 })
+        );
+    }
+
+    #[test]
+    fn resize_split_child_keeps_auto_neighbors_and_falls_back_to_lrf() {
+        let first = TaskId::new();
+        let second = TaskId::new();
+        let third = TaskId::new();
+        let mut workspace = TaskWorkspace::single(first);
+        workspace
+            .insert_after_focused(second, Axis::Horizontal)
+            .unwrap();
+        workspace
+            .insert_after_focused(third, Axis::Horizontal)
+            .unwrap();
+        let split_id = match workspace.root().unwrap() {
+            WorkspaceNode::Split { id, .. } => *id,
+            _ => panic!("expected split"),
+        };
+        workspace.pin_task_axis_size(first, 220.0).unwrap();
+        workspace.pin_task_axis_size(second, 220.0).unwrap();
+        workspace.pin_task_axis_size(third, 220.0).unwrap();
+
+        workspace.resize_split_child(split_id, 0, 360.0).unwrap();
+        assert_eq!(
+            workspace.split_child_allocation(split_id, 0),
+            Some(Allocation::Pinned { logical_px: 360.0 })
+        );
+        assert!(
+            matches!(
+                workspace.split_child_allocation(split_id, 1),
+                Some(Allocation::Pinned { logical_px: 220.0 })
+            ) || matches!(
+                workspace.split_child_allocation(split_id, 2),
+                Some(Allocation::Pinned { logical_px: 220.0 })
+            ),
+            "LRF rendering may yield, but saved custom pins must remain unchanged"
+        );
+        assert!(
+            matches!(
+                workspace.split_child_allocation(split_id, 1),
+                Some(Allocation::Pinned { .. })
+            ) && matches!(
+                workspace.split_child_allocation(split_id, 2),
+                Some(Allocation::Pinned { .. })
+            ),
+            "all-pinned resize must not demote peers to Auto"
+        );
+
+        workspace.resize_split_child(split_id, 0, 300.0).unwrap();
+        workspace.resize_split_child(split_id, 0, 400.0).unwrap();
+        workspace.resize_split_child(split_id, 0, 300.0).unwrap();
+        assert_eq!(
+            workspace.split_child_allocation(split_id, 0),
+            Some(Allocation::Pinned { logical_px: 300.0 })
+        );
         assert!(workspace.validate().is_ok());
     }
 }

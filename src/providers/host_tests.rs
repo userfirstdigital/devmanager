@@ -519,6 +519,7 @@ fn specialist_lifecycle_uses_exact_fenced_process_and_journal() {
     let action = ProviderInputAction::SendNow {
         text: "review".into(),
         wait: false,
+        images: Vec::new(),
     };
     let plan = sequence_provider_action(&action).expect("plan");
     let handle = launcher

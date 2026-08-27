@@ -37,6 +37,15 @@ struct HealthJobDropGuard {
 
 impl HealthJobDropGuard {
     fn finish(mut self, error: Option<String>) {
+        // Metadata normally owns its own completion state. If a future somehow
+        // finishes while that lane is still marked active, close it here; do
+        // not overwrite a completed metadata error with an unrelated health
+        // probe error.
+        if self.authority.health_job().metadata_in_flight() {
+            self.authority
+                .health_job()
+                .finish_metadata_refresh(error.clone());
+        }
         self.authority
             .health_job()
             .finish_refresh(self.generation, error);
@@ -47,6 +56,9 @@ impl HealthJobDropGuard {
 impl Drop for HealthJobDropGuard {
     fn drop(&mut self) {
         if !self.finished {
+            self.authority
+                .health_job()
+                .finish_metadata_refresh(Some("cancelled".into()));
             self.authority
                 .health_job()
                 .finish_refresh(self.generation, Some("cancelled".into()));
@@ -74,9 +86,14 @@ pub(crate) fn try_begin_health_job(
         finished: false,
     };
     let future: ProviderHealthFuture = Box::pin(async move {
-        let error = run_health_probes(&authority, manager.as_ref(), generation, config_revision)
+        let health_error =
+            run_health_probes(&authority, manager.as_ref(), generation, config_revision)
+                .await
+                .err();
+        let metadata_error = run_metadata_refresh(&authority, generation, config_revision)
             .await
             .err();
+        let error = health_error.or(metadata_error);
         if authority.health_job().is_stale_generation(generation)
             || authority.health_job().is_stale_config(config_revision)
         {
@@ -91,6 +108,77 @@ pub(crate) fn try_begin_health_job(
         }
     });
     Some((generation, future))
+}
+
+async fn run_metadata_refresh(
+    authority: &ProviderSettingsAuthority,
+    generation: u64,
+    config_revision: u64,
+) -> Result<(), String> {
+    if authority.health_job().is_stale_generation(generation)
+        || authority.health_job().is_stale_config(config_revision)
+    {
+        return Ok(());
+    }
+    authority.health_job().begin_metadata_refresh();
+    let cancel = authority.health_job().metadata_cancel_flag();
+    let registry = match crate::providers::startup::stock_provider_registry() {
+        Ok(registry) => registry,
+        Err(_) => {
+            let message = "metadata registry unavailable".to_string();
+            authority
+                .health_job()
+                .finish_metadata_refresh(Some(message.clone()));
+            return Err(message);
+        }
+    };
+    let document = authority.profile().settings.snapshot();
+    let mut first_error = None;
+    for instance in &document.instances {
+        if authority.health_job().is_stale_generation(generation)
+            || authority.health_job().is_stale_config(config_revision)
+            || cancel.load(std::sync::atomic::Ordering::Acquire)
+        {
+            break;
+        }
+        if instance.driver.is_stub() || !instance.enabled {
+            continue;
+        }
+        let scope = authority
+            .profile()
+            .settings
+            .custody_scope_for_instance(instance.instance_id.as_str());
+        // Metadata refresh must never invalidate active conversation launch
+        // attestations: it uses a separate registry path and only writes the
+        // profile metadata cache.
+        match crate::providers::settings::refresh_instance_metadata(
+            &registry,
+            &authority.profile().metadata,
+            instance,
+            &scope,
+            cancel.as_ref(),
+        )
+        .await
+        {
+            Ok(()) => {}
+            Err(error) => {
+                if first_error.is_none() {
+                    first_error = Some(error.to_string());
+                }
+            }
+        }
+    }
+    authority
+        .health_job()
+        .finish_metadata_refresh(first_error.clone());
+    crate::providers::settings::prune_metadata_cache_for_settings(
+        &authority.profile().settings,
+        &authority.profile().metadata,
+    );
+    match first_error {
+        Some(message) => Err(message),
+        None => Ok(()),
+    }
 }
 
 async fn run_health_probes(

@@ -193,6 +193,7 @@ pub(crate) fn is_pure_slice_decision_fact(event: &Event) -> bool {
         | Event::AgentSessionRegistered { .. }
         | Event::AgentProviderSessionBound { .. }
         | Event::PrimaryAgentSet { .. }
+        | Event::UnstartedPrimaryProviderRebound { .. }
         | Event::SpecialistRequested { .. }
         | Event::PrimaryPromoted { .. }
         | Event::SpecialistHandoffRecorded { .. }
@@ -478,6 +479,7 @@ pub(crate) fn plan_effects(
             | Event::AgentSessionRegistered { .. }
             | Event::AgentProviderSessionBound { .. }
             | Event::PrimaryAgentSet { .. }
+            | Event::UnstartedPrimaryProviderRebound { .. }
             | Event::SpecialistRequested { .. }
             | Event::PrimaryPromoted { .. }
             | Event::SpecialistHandoffRecorded { .. }
@@ -1191,6 +1193,7 @@ mod tests {
             action: crate::domain::ProviderInputAction::SendNow {
                 text: "sealed adapter seam".into(),
                 wait: false,
+                images: Vec::new(),
             },
             wait: false,
             delivery: crate::domain::ProviderDeliveryVisibility::hold_until_destination_adapter(),

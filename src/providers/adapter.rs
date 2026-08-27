@@ -19,9 +19,9 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::fmt;
-use std::io::{self, Read};
+use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Child, Stdio};
+use std::process::{Child, ChildStdin, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
@@ -42,7 +42,17 @@ unsafe extern "system" {
         total_bytes_available: *mut u32,
         bytes_left_this_message: *mut u32,
     ) -> i32;
+
+    fn SetNamedPipeHandleState(
+        named_pipe: *mut std::ffi::c_void,
+        mode: *const u32,
+        max_collection_count: *const u32,
+        collect_data_timeout: *const u32,
+    ) -> i32;
 }
+
+#[cfg(windows)]
+const PIPE_NOWAIT: u32 = 0x0000_0001;
 
 pub const MAX_PROVIDER_INPUT_BYTES: usize = 64 * 1024;
 
@@ -81,6 +91,11 @@ pub enum ProviderReasoningEffort {
     High,
     ExtraHigh,
     Max,
+    /// Codex exposes an additional highest reasoning tier in its live
+    /// catalog. Keep it distinct from Max; the provider protocol accepts
+    /// the literal ultra value and silently mapping it would change the
+    /// user's requested budget.
+    Ultra,
 }
 
 impl ProviderReasoningEffort {
@@ -92,6 +107,7 @@ impl ProviderReasoningEffort {
             Self::High => Some("high"),
             Self::ExtraHigh => Some("xhigh"),
             Self::Max => Some("max"),
+            Self::Ultra => Some("ultra"),
         }
     }
 }
@@ -2138,6 +2154,11 @@ impl ProbeProcess {
         }
     }
 
+    #[cfg(not(target_os = "macos"))]
+    fn take_stdin(&mut self) -> Option<ChildStdin> {
+        self.child.stdin.take()
+    }
+
     fn take_stderr(&mut self) -> Option<Box<dyn ProbePipe>> {
         #[cfg(target_os = "macos")]
         {
@@ -3182,6 +3203,500 @@ pub trait ProviderAdapter: Send + Sync {
         &self,
         executable: &ProviderExecutableHandle,
     ) -> Result<Option<QuotaObservation>, ProviderError>;
+}
+
+/// Bounded attested interactive probe for metadata-only protocols (Claude
+/// initialize, Codex app-server JSON-RPC, Cursor ACP). Kill-on-drop, fixed
+/// overall deadline, bounded stdout/stderr. Not a conversation launcher.
+pub struct ProviderInteractiveSession {
+    process: ProbeProcess,
+    stdin: Option<ChildStdin>,
+    stdout: Option<Box<dyn ProbePipe>>,
+    stderr: Option<Box<dyn ProbePipe>>,
+    stdout_buf: Vec<u8>,
+    stderr_buf: Vec<u8>,
+    /// Cumulative stdout+stderr bytes observed (including drained lines).
+    total_io_bytes: usize,
+    lines_read: usize,
+    stdin_bytes_written: usize,
+    max_output_bytes: usize,
+    max_lines: usize,
+    max_stdin_bytes: usize,
+    deadline: std::time::Instant,
+    cancel: Option<Arc<AtomicBool>>,
+    executable: ProviderExecutableHandle,
+    finished: bool,
+}
+
+pub const MAX_INTERACTIVE_PROBE_LINES: usize = 4_096;
+pub const MAX_INTERACTIVE_STDIN_BYTES: usize = 64 * 1024;
+pub const MAX_INTERACTIVE_WRITE_CHUNK: usize = 8 * 1024;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProviderInteractiveProbeError {
+    Probe(ProviderProbeError),
+    TooManyArguments,
+    ArgumentTooLong,
+    StdinClosed,
+    StdinTooLarge,
+    OutputTooLarge,
+    TooManyLines,
+    TimedOut,
+    Cancelled,
+    Protocol(String),
+}
+
+impl fmt::Display for ProviderInteractiveProbeError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Probe(error) => write!(f, "{error}"),
+            Self::TooManyArguments => write!(f, "interactive probe has too many arguments"),
+            Self::ArgumentTooLong => write!(f, "interactive probe argument exceeds bound"),
+            Self::StdinClosed => write!(f, "interactive probe stdin closed"),
+            Self::StdinTooLarge => write!(f, "interactive probe stdin exceeded bound"),
+            Self::OutputTooLarge => write!(f, "interactive probe output exceeded bound"),
+            Self::TooManyLines => write!(f, "interactive probe line count exceeded bound"),
+            Self::TimedOut => write!(f, "interactive probe timed out"),
+            Self::Cancelled => write!(f, "interactive probe cancelled"),
+            Self::Protocol(message) => write!(f, "interactive probe protocol: {message}"),
+        }
+    }
+}
+
+impl std::error::Error for ProviderInteractiveProbeError {}
+
+impl From<ProviderProbeError> for ProviderInteractiveProbeError {
+    fn from(value: ProviderProbeError) -> Self {
+        match value {
+            ProviderProbeError::TimedOut => Self::TimedOut,
+            ProviderProbeError::OutputTooLarge => Self::OutputTooLarge,
+            other => Self::Probe(other),
+        }
+    }
+}
+
+impl WindowsProviderProbeRunner {
+    /// Spawn a metadata-only interactive child with piped stdin/stdout/stderr.
+    /// Arguments are fixed argv tokens (never shell-interpolated).
+    pub fn spawn_interactive(
+        &self,
+        executable: ProviderExecutableHandle,
+        arguments: &[String],
+        child_environment: BTreeMap<std::ffi::OsString, std::ffi::OsString>,
+        timeout: Duration,
+        max_output_bytes: usize,
+    ) -> Result<ProviderInteractiveSession, ProviderInteractiveProbeError> {
+        self.spawn_interactive_with_cancel(
+            executable,
+            arguments,
+            child_environment,
+            timeout,
+            max_output_bytes,
+            None,
+        )
+    }
+
+    pub fn spawn_interactive_with_cancel(
+        &self,
+        executable: ProviderExecutableHandle,
+        arguments: &[String],
+        child_environment: BTreeMap<std::ffi::OsString, std::ffi::OsString>,
+        timeout: Duration,
+        max_output_bytes: usize,
+        cancel: Option<Arc<AtomicBool>>,
+    ) -> Result<ProviderInteractiveSession, ProviderInteractiveProbeError> {
+        if arguments.len() > MAX_PROVIDER_ARGUMENTS {
+            return Err(ProviderInteractiveProbeError::TooManyArguments);
+        }
+        for argument in arguments {
+            if argument.len() > MAX_PROVIDER_ARGUMENT_BYTES {
+                return Err(ProviderInteractiveProbeError::ArgumentTooLong);
+            }
+        }
+        if timeout.is_zero() || timeout > MAX_PROVIDER_PROBE_TIMEOUT {
+            return Err(ProviderProbeError::InvalidRequest(if timeout.is_zero() {
+                ProviderProbeRequestError::ZeroTimeout
+            } else {
+                ProviderProbeRequestError::TimeoutTooLong
+            })
+            .into());
+        }
+        if max_output_bytes == 0 || max_output_bytes > MAX_PROVIDER_PROBE_OUTPUT_BYTES {
+            return Err(ProviderProbeError::InvalidRequest(
+                ProviderProbeRequestError::OutputBoundTooLarge,
+            )
+            .into());
+        }
+        if cancel
+            .as_ref()
+            .is_some_and(|flag| flag.load(Ordering::Acquire))
+        {
+            return Err(ProviderInteractiveProbeError::Cancelled);
+        }
+        let deadline = std::time::Instant::now() + timeout;
+        #[cfg(windows)]
+        let resolved = validate_probe_executable(&self.policy, &executable)?;
+        #[cfg(windows)]
+        let mut command = std::process::Command::new(&resolved);
+        #[cfg(windows)]
+        {
+            command
+                .args(executable.launch_fixed_arguments())
+                .args(arguments)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped());
+            apply_provider_environment_exact(&mut command, &child_environment);
+            command
+                .creation_flags(crate::services::platform_service::MANAGED_PROCESS_CREATION_FLAGS);
+        }
+        #[cfg(not(windows))]
+        {
+            let _ = (&executable, arguments, &child_environment, &self.policy);
+            return Err(ProviderInteractiveProbeError::Protocol(
+                "interactive metadata probe is Windows-attested in this slice".into(),
+            ));
+        }
+        #[cfg(windows)]
+        {
+            let mut process = ProbeProcess::spawn(
+                command,
+                deadline,
+                Some(executable.launch_program().canonical_path()),
+                &executable,
+            )?;
+            if executable.revalidate_bound_identity().is_err() {
+                let _ = process.terminate_tree(deadline);
+                return Err(
+                    ProviderProbeError::Io(ProviderProbeIoError::ExecutableNotAllowed).into(),
+                );
+            }
+            if std::time::Instant::now() >= deadline {
+                let _ = process.terminate_tree(deadline);
+                return Err(ProviderInteractiveProbeError::TimedOut);
+            }
+            if let Err(error) = process.release_attestation_barrier_once() {
+                let _ = process.terminate_tree(deadline);
+                return Err(error.into());
+            }
+            // Match the production probe runner: post-barrier image/graph
+            // revalidation before any protocol I/O.
+            let post_revalidate = executable.revalidate_bound_identity();
+            let post_attestation = if post_revalidate.is_ok() {
+                let retry_deadline = std::cmp::min(
+                    deadline,
+                    std::time::Instant::now() + Duration::from_millis(50),
+                );
+                let mut attestation = Err(ProviderProbeError::Io(
+                    ProviderProbeIoError::ExecutableNotAllowed,
+                ));
+                loop {
+                    match process.try_wait() {
+                        Ok(ProbeWait::Exited(_)) => {
+                            attestation = Ok(());
+                            break;
+                        }
+                        Ok(ProbeWait::Running) => {
+                            attestation = attest_launched_image(
+                                &process.child,
+                                executable.launch_program().canonical_path(),
+                            );
+                            if attestation.is_ok() || std::time::Instant::now() >= retry_deadline {
+                                break;
+                            }
+                            std::thread::sleep(Duration::from_millis(1));
+                        }
+                        Err(_) => break,
+                    }
+                }
+                attestation
+            } else {
+                Err(ProviderProbeError::Io(
+                    ProviderProbeIoError::ExecutableNotAllowed,
+                ))
+            };
+            if post_revalidate.is_err() || post_attestation.is_err() {
+                let _ = process.terminate_tree(deadline);
+                return Err(
+                    ProviderProbeError::Io(ProviderProbeIoError::ExecutableNotAllowed).into(),
+                );
+            }
+            let stdin = process.take_stdin();
+            let stdout = process.take_stdout();
+            let stderr = process.take_stderr();
+            #[cfg(windows)]
+            {
+                if let Some(stdin_ref) = stdin.as_ref() {
+                    if let Err(_) = set_stdin_pipe_nowait(stdin_ref) {
+                        let _ = process.terminate_tree(deadline);
+                        return Err(ProviderInteractiveProbeError::Protocol(
+                            "failed to set stdin PIPE_NOWAIT".into(),
+                        ));
+                    }
+                } else {
+                    let _ = process.terminate_tree(deadline);
+                    return Err(ProviderInteractiveProbeError::StdinClosed);
+                }
+            }
+            Ok(ProviderInteractiveSession {
+                process,
+                stdin,
+                stdout,
+                stderr,
+                stdout_buf: Vec::new(),
+                stderr_buf: Vec::new(),
+                total_io_bytes: 0,
+                lines_read: 0,
+                stdin_bytes_written: 0,
+                max_output_bytes,
+                max_lines: MAX_INTERACTIVE_PROBE_LINES,
+                max_stdin_bytes: MAX_INTERACTIVE_STDIN_BYTES,
+                deadline,
+                cancel,
+                executable,
+                finished: false,
+            })
+        }
+    }
+}
+
+#[cfg(windows)]
+fn set_stdin_pipe_nowait(stdin: &ChildStdin) -> io::Result<()> {
+    use std::os::windows::io::AsRawHandle;
+    let mode = PIPE_NOWAIT;
+    let ok = unsafe {
+        SetNamedPipeHandleState(
+            stdin.as_raw_handle() as *mut std::ffi::c_void,
+            &mode,
+            std::ptr::null(),
+            std::ptr::null(),
+        )
+    };
+    if ok == 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
+
+impl ProviderInteractiveSession {
+    pub fn write_stdin(&mut self, bytes: &[u8]) -> Result<(), ProviderInteractiveProbeError> {
+        self.ensure_alive()?;
+        // Metadata protocols only emit small fixed JSON lines; reject larger
+        // writes rather than blocking indefinitely on an unbounded pipe.
+        if bytes.len() > MAX_INTERACTIVE_WRITE_CHUNK {
+            return Err(ProviderInteractiveProbeError::StdinTooLarge);
+        }
+        if self.stdin_bytes_written.saturating_add(bytes.len()) > self.max_stdin_bytes {
+            return Err(ProviderInteractiveProbeError::StdinTooLarge);
+        }
+        let mut offset = 0;
+        let cancel = self.cancel.clone();
+        let deadline = self.deadline;
+        let stdin = self
+            .stdin
+            .as_mut()
+            .ok_or(ProviderInteractiveProbeError::StdinClosed)?;
+        while offset < bytes.len() {
+            if std::time::Instant::now() >= deadline {
+                return Err(ProviderInteractiveProbeError::TimedOut);
+            }
+            if cancel
+                .as_ref()
+                .is_some_and(|flag| flag.load(Ordering::Acquire))
+            {
+                return Err(ProviderInteractiveProbeError::Cancelled);
+            }
+            match stdin.write(&bytes[offset..]) {
+                Ok(0) => {
+                    // PIPE_NOWAIT full buffer can surface as Ok(0); wait for deadline.
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                Ok(written) => {
+                    offset = offset.saturating_add(written);
+                }
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                Err(error)
+                    if error.raw_os_error() == Some(232)
+                        || error.kind() == io::ErrorKind::Interrupted =>
+                {
+                    // Windows ERROR_NO_DATA (232) on PIPE_NOWAIT when the buffer is full.
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                Err(_) => return Err(ProviderInteractiveProbeError::StdinClosed),
+            }
+        }
+        // Best-effort flush; PIPE_NOWAIT may return WouldBlock.
+        match stdin.flush() {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
+            Err(error) if error.raw_os_error() == Some(232) => {}
+            Err(_) => return Err(ProviderInteractiveProbeError::StdinClosed),
+        }
+        self.stdin_bytes_written = self.stdin_bytes_written.saturating_add(bytes.len());
+        Ok(())
+    }
+
+    pub fn write_line(&mut self, line: &str) -> Result<(), ProviderInteractiveProbeError> {
+        let mut bytes = line.as_bytes().to_vec();
+        if !bytes.ends_with(b"\n") {
+            bytes.push(b'\n');
+        }
+        self.write_stdin(&bytes)
+    }
+
+    pub fn close_stdin(&mut self) {
+        self.stdin.take();
+    }
+
+    /// Read until a complete line is available or the deadline hits.
+    pub fn read_line(&mut self) -> Result<String, ProviderInteractiveProbeError> {
+        loop {
+            if let Some(idx) = self.stdout_buf.iter().position(|b| *b == b'\n') {
+                let mut line: Vec<u8> = self.stdout_buf.drain(..=idx).collect();
+                if line.ends_with(b"\n") {
+                    line.pop();
+                }
+                if line.ends_with(b"\r") {
+                    line.pop();
+                }
+                self.lines_read = self.lines_read.saturating_add(1);
+                if self.lines_read > self.max_lines {
+                    let _ = self.process.terminate_tree(self.deadline);
+                    self.finished = true;
+                    return Err(ProviderInteractiveProbeError::TooManyLines);
+                }
+                return String::from_utf8(line)
+                    .map_err(|_| ProviderInteractiveProbeError::Protocol("stdout utf8".into()));
+            }
+            self.ensure_alive()?;
+            if std::time::Instant::now() >= self.deadline {
+                return Err(ProviderInteractiveProbeError::TimedOut);
+            }
+            self.pump_once()?;
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    /// Read lines until `predicate` returns true for a line (that line is included).
+    pub fn read_until<F>(
+        &mut self,
+        mut predicate: F,
+    ) -> Result<Vec<String>, ProviderInteractiveProbeError>
+    where
+        F: FnMut(&str) -> bool,
+    {
+        let mut lines = Vec::new();
+        loop {
+            let line = self.read_line()?;
+            // Bound retained line vector by the same line/IO budget.
+            if lines.len() >= self.max_lines {
+                let _ = self.process.terminate_tree(self.deadline);
+                self.finished = true;
+                return Err(ProviderInteractiveProbeError::TooManyLines);
+            }
+            let done = predicate(&line);
+            lines.push(line);
+            if done {
+                return Ok(lines);
+            }
+        }
+    }
+
+    pub fn total_io_bytes(&self) -> usize {
+        self.total_io_bytes
+    }
+
+    pub fn terminate(mut self) -> Result<(), ProviderInteractiveProbeError> {
+        self.finished = true;
+        self.stdin.take();
+        self.process
+            .terminate_tree(self.deadline)
+            .map_err(ProviderInteractiveProbeError::from)
+    }
+
+    fn ensure_alive(&mut self) -> Result<(), ProviderInteractiveProbeError> {
+        if self.finished {
+            return Err(ProviderInteractiveProbeError::Cancelled);
+        }
+        if self
+            .cancel
+            .as_ref()
+            .is_some_and(|flag| flag.load(Ordering::Acquire))
+        {
+            let _ = self.process.terminate_tree(self.deadline);
+            self.finished = true;
+            return Err(ProviderInteractiveProbeError::Cancelled);
+        }
+        if std::time::Instant::now() >= self.deadline {
+            let _ = self.process.terminate_tree(self.deadline);
+            self.finished = true;
+            return Err(ProviderInteractiveProbeError::TimedOut);
+        }
+        if self.executable.revalidate_bound_identity().is_err() {
+            let _ = self.process.terminate_tree(self.deadline);
+            self.finished = true;
+            return Err(ProviderProbeError::Io(ProviderProbeIoError::ExecutableNotAllowed).into());
+        }
+        match self.process.try_wait() {
+            Ok(ProbeWait::Running) => Ok(()),
+            Ok(ProbeWait::Exited(_)) => Err(ProviderInteractiveProbeError::Protocol(
+                "metadata process exited early".into(),
+            )),
+            Err(_) => Err(ProviderProbeError::Io(ProviderProbeIoError::WaitFailed).into()),
+        }
+    }
+
+    fn pump_once(&mut self) -> Result<(), ProviderInteractiveProbeError> {
+        let mut buffer = [0_u8; 8 * 1024];
+        if let Some(stdout) = self.stdout.as_mut() {
+            match stdout.poll_read(&mut buffer) {
+                Ok(0) => {}
+                Ok(read) => {
+                    if self.total_io_bytes.saturating_add(read) > self.max_output_bytes {
+                        let _ = self.process.terminate_tree(self.deadline);
+                        self.finished = true;
+                        return Err(ProviderInteractiveProbeError::OutputTooLarge);
+                    }
+                    self.total_io_bytes = self.total_io_bytes.saturating_add(read);
+                    self.stdout_buf.extend_from_slice(&buffer[..read]);
+                }
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
+                Err(_) => {
+                    return Err(ProviderProbeError::Io(ProviderProbeIoError::WaitFailed).into());
+                }
+            }
+        }
+        if let Some(stderr) = self.stderr.as_mut() {
+            match stderr.poll_read(&mut buffer) {
+                Ok(0) => {}
+                Ok(read) => {
+                    if self.total_io_bytes.saturating_add(read) > self.max_output_bytes {
+                        let _ = self.process.terminate_tree(self.deadline);
+                        self.finished = true;
+                        return Err(ProviderInteractiveProbeError::OutputTooLarge);
+                    }
+                    self.total_io_bytes = self.total_io_bytes.saturating_add(read);
+                    self.stderr_buf.extend_from_slice(&buffer[..read]);
+                }
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
+                Err(_) => {}
+            }
+        }
+        Ok(())
+    }
+}
+
+impl Drop for ProviderInteractiveSession {
+    fn drop(&mut self) {
+        if !self.finished {
+            self.stdin.take();
+            let _ = self.process.terminate_tree(self.deadline);
+            self.finished = true;
+        }
+    }
 }
 
 #[cfg(test)]

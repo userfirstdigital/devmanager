@@ -256,6 +256,7 @@ fn send_now_intent(
         ProviderInputAction::SendNow {
             text: text.into(),
             wait,
+            images: Vec::new(),
         },
     )
     .expect("valid send-now intent")
@@ -1069,6 +1070,7 @@ fn provider_dispatch_ambiguity_rejects_immutable_attempt_tampering() {
                 *action = ProviderInputAction::SendNow {
                     text: "tampered provider payload".into(),
                     wait: false,
+                    images: Vec::new(),
                 };
             }
             effect
@@ -1757,6 +1759,7 @@ fn extraneous_nested_ids_are_rejected_before_write() {
         ProviderInputAction::SendNow {
             text: "no question on send".into(),
             wait: false,
+            images: Vec::new(),
         },
     )
     .expect_err("extraneous question id");
@@ -1771,6 +1774,7 @@ fn provider_input_debug_redacts_raw_text() {
     let action = ProviderInputAction::SendNow {
         text: "secret prompt".into(),
         wait: false,
+        images: Vec::new(),
     };
     let rendered = format!("{action:?}");
     assert!(!rendered.contains("secret prompt"), "{rendered}");

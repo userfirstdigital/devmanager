@@ -3400,7 +3400,11 @@ fn validate_same_generation_state_identity(
     let mut next_launch_spec = next.launch_spec.clone();
     next_launch_spec.capabilities = next_launch_spec.capabilities.stable_projection();
     if current_launch_spec != next_launch_spec {
-        return Err("provider session state launch spec identity changed".to_string());
+        let fields = launch_spec_mismatch_fields(&current_launch_spec, &next_launch_spec);
+        return Err(format!(
+            "provider session state launch spec identity changed ({})",
+            fields.join(",")
+        ));
     }
     if current.process_root.is_some() && current.process_root != next.process_root {
         return Err("provider session state process root identity changed".to_string());

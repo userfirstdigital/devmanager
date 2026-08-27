@@ -832,6 +832,7 @@ mod tests {
             .collect();
         let mut surface = TaskSurfaceState::default();
         surface.latest_terminal = Some(TaskTerminalProjection {
+            accepts_input_without_conversation_id: false,
             task_id,
             terminal_id: TerminalId::new(),
             session_id: TerminalSessionId::new(),
@@ -1067,6 +1068,53 @@ mod tests {
         assert_eq!(workspace.focused_task(), Some(next));
         assert!(workspace.contains_task(first));
         assert!(!workspace.contains_task(second));
+    }
+
+    #[test]
+    fn plain_click_replaces_focused_slot_while_preserving_compact_geometry() {
+        let first = TaskId::new();
+        let second = TaskId::new();
+        let third = TaskId::new();
+        let mut workspace = Some(TaskWorkspace::single(first));
+        apply_workspace_selection(&mut workspace, second, WorkspaceSelectionGesture::Toggle)
+            .expect("open second");
+        let focused = workspace.as_ref().unwrap().focused_pane_id().unwrap();
+        workspace
+            .as_mut()
+            .unwrap()
+            .set_manual_compact(second, true)
+            .unwrap();
+        let split_id = match workspace.as_ref().unwrap().root().unwrap() {
+            crate::ui::task_workspace::WorkspaceNode::Split { id, .. } => *id,
+            _ => panic!("expected split after toggle"),
+        };
+        workspace
+            .as_mut()
+            .unwrap()
+            .resize_split_child(split_id, 0, 420.0)
+            .unwrap();
+        workspace
+            .as_mut()
+            .unwrap()
+            .pin_task_axis_size(second, 260.0)
+            .unwrap();
+
+        apply_workspace_selection(&mut workspace, third, WorkspaceSelectionGesture::Plain)
+            .expect("replace focused with third");
+        let workspace = workspace.expect("workspace");
+        assert_eq!(workspace.pane_count(), 2);
+        assert_eq!(workspace.focused_pane_id(), Some(focused));
+        assert_eq!(workspace.focused_task(), Some(third));
+        assert!(workspace.contains_task(first));
+        assert!(!workspace.contains_task(second));
+        assert_eq!(
+            workspace.presentation(third),
+            Some(PanePresentation::CompactManual)
+        );
+        assert_eq!(
+            workspace.split_child_allocation(split_id, 1),
+            Some(crate::ui::task_workspace::Allocation::Pinned { logical_px: 260.0 })
+        );
     }
 
     #[test]

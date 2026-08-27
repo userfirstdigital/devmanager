@@ -23,6 +23,9 @@ pub const MAX_PROVIDER_QUESTION_WINS: usize = 256;
 pub const MAX_PROVIDER_APPROVAL_WINS: usize = 256;
 pub const MAX_PROVIDER_WAITS: usize = 64;
 pub const MAX_PROVIDER_SESSION_STATE_BYTES: usize = 64 * 1024;
+pub const MAX_PROVIDER_IMAGE_ATTACHMENTS: usize = 8;
+pub const MAX_PROVIDER_IMAGE_BYTES: usize = 5 * 1024 * 1024;
+pub const MAX_PROVIDER_IMAGE_PATH_BYTES: usize = 4096;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProviderInputIntentError {
@@ -35,6 +38,9 @@ pub enum ProviderInputIntentError {
     WaitLimit,
     MissingOperationId,
     InvalidFence,
+    ImageAttachmentInvalid,
+    ImagesUnsupported,
+    TooManyImages,
 }
 
 impl fmt::Display for ProviderInputIntentError {
@@ -62,11 +68,99 @@ impl fmt::Display for ProviderInputIntentError {
                 f.write_str("provider settlement requires an operation identity")
             }
             Self::InvalidFence => f.write_str("provider wait fence is invalid"),
+            Self::ImageAttachmentInvalid => {
+                f.write_str("provider image attachment identity is invalid")
+            }
+            Self::ImagesUnsupported => {
+                f.write_str("images are only supported on provider send_now")
+            }
+            Self::TooManyImages => write!(
+                f,
+                "provider image attachments exceed {MAX_PROVIDER_IMAGE_ATTACHMENTS}"
+            ),
         }
     }
 }
 
 impl std::error::Error for ProviderInputIntentError {}
+
+/// Bounded staged-image identity for typed native SendNow delivery.
+///
+/// Paths are absolute host paths under the task workspace pasted-images dir.
+/// Physical open/hash/dimension proof happens at fenced write time; this type
+/// only carries fail-closed identity claims for digests and receipts.
+#[derive(Clone, PartialEq, Eq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProviderImageAttachment {
+    path: String,
+    #[serde(serialize_with = "serialize_image_sha256")]
+    sha256: [u8; 32],
+    byte_len: u32,
+}
+
+impl fmt::Debug for ProviderImageAttachment {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ProviderImageAttachment")
+            .field("path_bytes", &self.path.len())
+            .field("sha256_prefix", &hex_prefix(&self.sha256))
+            .field("byte_len", &self.byte_len)
+            .finish()
+    }
+}
+
+impl<'de> Deserialize<'de> for ProviderImageAttachment {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Wire {
+            path: String,
+            #[serde(deserialize_with = "deserialize_image_sha256")]
+            sha256: [u8; 32],
+            byte_len: u32,
+        }
+        let wire = Wire::deserialize(deserializer)?;
+        Self::try_new(wire.path, wire.sha256, wire.byte_len as usize).map_err(de::Error::custom)
+    }
+}
+
+impl ProviderImageAttachment {
+    /// Construct a bounded attachment identity without reading the file.
+    ///
+    /// Callers that stage PNG/JPEG under `.devmanager/pasted-images` should use
+    /// this helper so path/sha256/length claims stay within send-time limits.
+    /// ProcessManager still proves exact bytes under the session cwd before any
+    /// physical write.
+    pub fn try_new(
+        path: impl Into<String>,
+        sha256: [u8; 32],
+        byte_len: usize,
+    ) -> Result<Self, ProviderInputIntentError> {
+        let path = path.into();
+        validate_provider_image_path(&path)?;
+        if byte_len == 0 || byte_len > MAX_PROVIDER_IMAGE_BYTES {
+            return Err(ProviderInputIntentError::ImageAttachmentInvalid);
+        }
+        let byte_len = u32::try_from(byte_len)
+            .map_err(|_| ProviderInputIntentError::ImageAttachmentInvalid)?;
+        Ok(Self {
+            path,
+            sha256,
+            byte_len,
+        })
+    }
+
+    pub fn path(&self) -> &str {
+        &self.path
+    }
+
+    pub fn sha256(&self) -> &[u8; 32] {
+        &self.sha256
+    }
+
+    pub fn byte_len(&self) -> u32 {
+        self.byte_len
+    }
+}
 
 /// Convert a bounded wire provider-kind string into the canonical enum.
 pub fn provider_kind_from_wire(value: &str) -> Result<ProviderKind, ProviderInputIntentError> {
@@ -88,6 +182,8 @@ pub enum ProviderInputAction {
     SendNow {
         text: String,
         wait: bool,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        images: Vec<ProviderImageAttachment>,
     },
     SteerCurrentTurn {
         text: String,
@@ -118,9 +214,11 @@ impl<'de> Deserialize<'de> for ProviderInputAction {
         #[serde(rename_all = "snake_case", deny_unknown_fields)]
         enum Wire {
             SendNow {
-                #[serde(deserialize_with = "deserialize_provider_text")]
+                #[serde(deserialize_with = "deserialize_send_now_text")]
                 text: String,
                 wait: bool,
+                #[serde(default, deserialize_with = "deserialize_provider_images")]
+                images: Vec<ProviderImageAttachment>,
             },
             SteerCurrentTurn {
                 #[serde(deserialize_with = "deserialize_provider_text")]
@@ -146,7 +244,10 @@ impl<'de> Deserialize<'de> for ProviderInputAction {
             StopTurn,
         }
         Ok(match Wire::deserialize(deserializer)? {
-            Wire::SendNow { text, wait } => Self::SendNow { text, wait },
+            Wire::SendNow { text, wait, images } => {
+                validate_send_now_payload(&text, &images).map_err(de::Error::custom)?;
+                Self::SendNow { text, wait, images }
+            }
             Wire::SteerCurrentTurn { text } => Self::SteerCurrentTurn { text },
             Wire::QueueFollowUp { text } => Self::QueueFollowUp { text },
             Wire::AnswerQuestion {
@@ -168,10 +269,11 @@ impl<'de> Deserialize<'de> for ProviderInputAction {
 impl fmt::Debug for ProviderInputAction {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::SendNow { text, wait } => f
+            Self::SendNow { text, wait, images } => f
                 .debug_struct("SendNow")
                 .field("text_bytes", &text.len())
                 .field("wait", wait)
+                .field("image_count", &images.len())
                 .finish(),
             Self::SteerCurrentTurn { text } => f
                 .debug_struct("SteerCurrentTurn")
@@ -875,6 +977,122 @@ pub fn validate_provider_text(text: &str) -> Result<(), ProviderInputIntentError
     Ok(())
 }
 
+pub fn validate_send_now_payload(
+    text: &str,
+    images: &[ProviderImageAttachment],
+) -> Result<(), ProviderInputIntentError> {
+    if images.len() > MAX_PROVIDER_IMAGE_ATTACHMENTS {
+        return Err(ProviderInputIntentError::TooManyImages);
+    }
+    for image in images {
+        validate_provider_image_path(image.path())?;
+        if image.byte_len() == 0 || image.byte_len() as usize > MAX_PROVIDER_IMAGE_BYTES {
+            return Err(ProviderInputIntentError::ImageAttachmentInvalid);
+        }
+    }
+    if text.is_empty() {
+        if images.is_empty() {
+            return Err(ProviderInputIntentError::EmptyText);
+        }
+        return Ok(());
+    }
+    if text.len() > MAX_PROVIDER_INPUT_TEXT_BYTES {
+        return Err(ProviderInputIntentError::TextTooLarge);
+    }
+    Ok(())
+}
+
+pub fn validate_provider_image_path(path: &str) -> Result<(), ProviderInputIntentError> {
+    if path.is_empty() || path.len() > MAX_PROVIDER_IMAGE_PATH_BYTES {
+        return Err(ProviderInputIntentError::ImageAttachmentInvalid);
+    }
+    if path.chars().any(|ch| ch.is_control() || ch == '\0') {
+        return Err(ProviderInputIntentError::ImageAttachmentInvalid);
+    }
+    let path_buf = std::path::Path::new(path);
+    if !path_buf.is_absolute() {
+        return Err(ProviderInputIntentError::ImageAttachmentInvalid);
+    }
+    Ok(())
+}
+
+pub fn validate_provider_images(
+    images: &[ProviderImageAttachment],
+) -> Result<(), ProviderInputIntentError> {
+    if images.len() > MAX_PROVIDER_IMAGE_ATTACHMENTS {
+        return Err(ProviderInputIntentError::TooManyImages);
+    }
+    for image in images {
+        validate_provider_image_path(image.path())?;
+        if image.byte_len() == 0 || image.byte_len() as usize > MAX_PROVIDER_IMAGE_BYTES {
+            return Err(ProviderInputIntentError::ImageAttachmentInvalid);
+        }
+    }
+    Ok(())
+}
+
+fn hex_prefix(digest: &[u8; 32]) -> String {
+    let mut out = String::with_capacity(8);
+    for byte in digest.iter().take(4) {
+        out.push(hex_digit(byte >> 4));
+        out.push(hex_digit(byte & 0x0f));
+    }
+    out
+}
+
+fn hex_digit(value: u8) -> char {
+    match value {
+        0..=9 => char::from(b'0' + value),
+        10..=15 => char::from(b'a' + (value - 10)),
+        _ => '?',
+    }
+}
+
+fn encode_sha256_hex(digest: &[u8; 32]) -> String {
+    let mut out = String::with_capacity(64);
+    for byte in digest {
+        out.push(hex_digit(byte >> 4));
+        out.push(hex_digit(byte & 0x0f));
+    }
+    out
+}
+
+fn decode_sha256_hex(value: &str) -> Result<[u8; 32], ProviderInputIntentError> {
+    if value.len() != 64 || !value.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err(ProviderInputIntentError::ImageAttachmentInvalid);
+    }
+    let mut digest = [0_u8; 32];
+    for (index, chunk) in value.as_bytes().chunks(2).enumerate() {
+        let hi = hex_value(chunk[0])?;
+        let lo = hex_value(chunk[1])?;
+        digest[index] = (hi << 4) | lo;
+    }
+    Ok(digest)
+}
+
+fn hex_value(byte: u8) -> Result<u8, ProviderInputIntentError> {
+    match byte {
+        b'0'..=b'9' => Ok(byte - b'0'),
+        b'a'..=b'f' => Ok(byte - b'a' + 10),
+        b'A'..=b'F' => Ok(byte - b'A' + 10),
+        _ => Err(ProviderInputIntentError::ImageAttachmentInvalid),
+    }
+}
+
+fn serialize_image_sha256<S: ser::Serializer>(
+    value: &[u8; 32],
+    serializer: S,
+) -> Result<S::Ok, S::Error> {
+    serializer.serialize_str(&encode_sha256_hex(value))
+}
+
+fn deserialize_image_sha256<'de, D: Deserializer<'de>>(
+    deserializer: D,
+) -> Result<[u8; 32], D::Error> {
+    let value = String::deserialize(deserializer)?;
+    decode_sha256_hex(&value).map_err(de::Error::custom)
+}
+
 struct ProviderTextVisitor;
 
 impl<'de> Visitor<'de> for ProviderTextVisitor {
@@ -909,6 +1127,62 @@ fn deserialize_provider_text<'de, D: Deserializer<'de>>(
     deserializer.deserialize_str(ProviderTextVisitor)
 }
 
+struct SendNowTextVisitor;
+
+impl<'de> Visitor<'de> for SendNowTextVisitor {
+    type Value = String;
+
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "provider send_now text of at most {MAX_PROVIDER_INPUT_TEXT_BYTES} bytes"
+        )
+    }
+
+    fn visit_borrowed_str<E: de::Error>(self, value: &'de str) -> Result<Self::Value, E> {
+        if value.len() > MAX_PROVIDER_INPUT_TEXT_BYTES {
+            return Err(E::custom(ProviderInputIntentError::TextTooLarge));
+        }
+        Ok(value.to_owned())
+    }
+
+    fn visit_str<E: de::Error>(self, value: &str) -> Result<Self::Value, E> {
+        if value.len() > MAX_PROVIDER_INPUT_TEXT_BYTES {
+            return Err(E::custom(ProviderInputIntentError::TextTooLarge));
+        }
+        Ok(value.to_owned())
+    }
+
+    fn visit_string<E: de::Error>(self, value: String) -> Result<Self::Value, E> {
+        if value.len() > MAX_PROVIDER_INPUT_TEXT_BYTES {
+            return Err(E::custom(ProviderInputIntentError::TextTooLarge));
+        }
+        Ok(value)
+    }
+}
+
+fn deserialize_send_now_text<'de, D: Deserializer<'de>>(
+    deserializer: D,
+) -> Result<String, D::Error> {
+    deserializer.deserialize_str(SendNowTextVisitor)
+}
+
+fn deserialize_provider_images<'de, D: Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Vec<ProviderImageAttachment>, D::Error> {
+    let images = Vec::<ProviderImageAttachment>::deserialize(deserializer)?;
+    validate_provider_images(&images).map_err(de::Error::custom)?;
+    Ok(images)
+}
+
+pub(crate) fn deserialize_optional_provider_images<'de, D: Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Vec<ProviderImageAttachment>, D::Error> {
+    let images = Vec::<ProviderImageAttachment>::deserialize(deserializer)?;
+    validate_provider_images(&images).map_err(de::Error::custom)?;
+    Ok(images)
+}
+
 struct OptionalProviderTextVisitor;
 
 impl<'de> Visitor<'de> for OptionalProviderTextVisitor {
@@ -923,7 +1197,12 @@ impl<'de> Visitor<'de> for OptionalProviderTextVisitor {
     }
 
     fn visit_some<D: Deserializer<'de>>(self, deserializer: D) -> Result<Self::Value, D::Error> {
-        deserializer.deserialize_str(ProviderTextVisitor).map(Some)
+        // The outer action validator still rejects empty text for every action
+        // that requires text.  At this wire boundary an empty string is also
+        // the valid text portion of an image-only SendNow payload, so retain
+        // it here and let `validate_send_now_payload` make the action-specific
+        // decision after images have been decoded.
+        deserializer.deserialize_str(SendNowTextVisitor).map(Some)
     }
 }
 
@@ -939,8 +1218,13 @@ pub fn validate_action_nested_ids(
     approval_id: Option<ApprovalId>,
 ) -> Result<(), ProviderInputIntentError> {
     match action {
-        ProviderInputAction::SendNow { text, .. }
-        | ProviderInputAction::SteerCurrentTurn { text }
+        ProviderInputAction::SendNow { text, images, .. } => {
+            validate_send_now_payload(text, images)?;
+            if question_id.is_some() || approval_id.is_some() {
+                return Err(ProviderInputIntentError::InconsistentNestedIds);
+            }
+        }
+        ProviderInputAction::SteerCurrentTurn { text }
         | ProviderInputAction::QueueFollowUp { text } => {
             validate_provider_text(text)?;
             if question_id.is_some() || approval_id.is_some() {
@@ -1149,5 +1433,70 @@ impl<'de> Deserialize<'de> for SettleProviderWaitIntent {
         }
         let wire = Wire::deserialize(deserializer)?;
         Self::try_new(wire.fence).map_err(de::Error::custom)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sample_sha256(seed: u8) -> [u8; 32] {
+        [seed; 32]
+    }
+
+    #[test]
+    fn send_now_empty_images_serialize_legacy_shape() {
+        let action = ProviderInputAction::SendNow {
+            text: "hello".into(),
+            wait: false,
+            images: Vec::new(),
+        };
+        let encoded = serde_json::to_value(&action).expect("serialize");
+        assert_eq!(
+            encoded,
+            serde_json::json!({
+                "send_now": {
+                    "text": "hello",
+                    "wait": false
+                }
+            })
+        );
+        let decoded: ProviderInputAction =
+            serde_json::from_value(encoded).expect("deserialize legacy");
+        assert_eq!(decoded, action);
+    }
+
+    #[test]
+    fn send_now_image_only_is_legal_with_valid_images() {
+        let absolute = if cfg!(windows) {
+            r"C:\repo\.devmanager\pasted-images\a.png"
+        } else {
+            "/repo/.devmanager/pasted-images/a.png"
+        };
+        let image =
+            ProviderImageAttachment::try_new(absolute, sample_sha256(1), 128).expect("image");
+        let action = ProviderInputAction::SendNow {
+            text: String::new(),
+            wait: false,
+            images: vec![image],
+        };
+        validate_action_nested_ids(&action, None, None).expect("image-only send");
+    }
+
+    #[test]
+    fn send_now_rejects_control_chars_and_relative_image_paths() {
+        assert!(matches!(
+            ProviderImageAttachment::try_new("relative/a.png", sample_sha256(1), 8),
+            Err(ProviderInputIntentError::ImageAttachmentInvalid)
+        ));
+        let absolute = if cfg!(windows) {
+            "C:\\repo\\.devmanager\\pasted-images\\a\u{1b}.png"
+        } else {
+            "/repo/.devmanager/pasted-images/a\u{1b}.png"
+        };
+        assert!(matches!(
+            ProviderImageAttachment::try_new(absolute, sample_sha256(1), 8),
+            Err(ProviderInputIntentError::ImageAttachmentInvalid)
+        ));
     }
 }

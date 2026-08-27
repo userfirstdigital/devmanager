@@ -341,6 +341,50 @@ pub(crate) fn apply_event(
             )?;
             require_one_change(tx, "primary_agent.set")?;
         }
+        Event::UnstartedPrimaryProviderRebound {
+            agent_session_id,
+            provider_kind,
+        } => {
+            let task_id = require_task_id(event)?;
+            validate_primary_agent(tx, shadow, task_id, *agent_session_id)?;
+            // Match TaskSnapshot::is_unstarted_draft: refuse when any provider
+            // projection already carries turn/wait/settlement facts, not only a
+            // null SessionStart id.
+            let mut projection_busy = false;
+            upsert_provider_session_state(tx, shadow, task_id, *agent_session_id, |session| {
+                projection_busy = session.current_turn.is_some()
+                    || session.open_question.is_some()
+                    || session.open_approval.is_some()
+                    || !session.waits.is_empty()
+                    || session.last_settlement.is_some();
+                Ok(())
+            })?;
+            if projection_busy {
+                return Err(StoreError::Projection(
+                    "unstarted primary provider rebound rejected: provider projection busy".into(),
+                ));
+            }
+            let table = table_name("agent_sessions", shadow);
+            let changed = tx.execute(
+                &format!(
+                    "UPDATE {table}
+                     SET provider_kind = ?1, revision = revision + 1
+                     WHERE agent_session_id = ?2 AND task_id = ?3
+                       AND lifecycle = 'open' AND provider_session_id IS NULL"
+                ),
+                rusqlite::params![
+                    provider_kind.wire_name(),
+                    agent_session_id.as_bytes().as_slice(),
+                    task_id.as_bytes().as_slice(),
+                ],
+            )?;
+            if changed != 1 {
+                return Err(StoreError::Projection(
+                    "unstarted primary provider rebound rejected".into(),
+                ));
+            }
+            bump_task_revision(tx, shadow, task_id, event)?;
+        }
         Event::SpecialistRequested {
             specialist_id,
             requested_by,

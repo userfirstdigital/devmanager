@@ -256,9 +256,17 @@ pub fn validate_model_slug(slug: &str) -> Result<(), ProviderSettingsError> {
     if trimmed.is_empty() || trimmed.len() > MAX_MODEL_SLUG_LEN {
         return Err(ProviderSettingsError::InvalidModelSlug(slug.to_string()));
     }
+    // Provider aliases may include bracket suffixes (e.g. `claude-opus-5[1m]`).
+    // Characters stay bounded argv-safe tokens; never shell-interpolated.
     if !trimmed
         .chars()
-        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | '/' | ':'))
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | '/' | ':' | '[' | ']'))
+    {
+        return Err(ProviderSettingsError::InvalidModelSlug(slug.to_string()));
+    }
+    if trimmed.contains("[[")
+        || trimmed.contains("]]")
+        || trimmed.matches('[').count() != trimmed.matches(']').count()
     {
         return Err(ProviderSettingsError::InvalidModelSlug(slug.to_string()));
     }
@@ -825,6 +833,32 @@ impl ProviderSettingsDocument {
                     "duplicate instance id {}",
                     instance.instance_id
                 )));
+            }
+        }
+        // Reserved catalog ids must exist with the exact driver mapping.
+        for (id, driver) in [
+            (CLAUDE_DEFAULT_INSTANCE_ID, ProviderDriverKind::Claude),
+            (CODEX_DEFAULT_INSTANCE_ID, ProviderDriverKind::Codex),
+            (CURSOR_DEFAULT_INSTANCE_ID, ProviderDriverKind::Cursor),
+            ("grok", ProviderDriverKind::Grok),
+            ("opencode", ProviderDriverKind::OpenCode),
+        ] {
+            let Some(instance) = self.get(id) else {
+                return Err(ProviderSettingsError::Corrupt(format!(
+                    "missing reserved catalog instance `{id}`"
+                )));
+            };
+            if instance.driver != driver {
+                return Err(ProviderSettingsError::ImmutableBuiltinDriver);
+            }
+        }
+        // Grok/OpenCode stay disabled stubs across load and ReplaceDocument.
+        for id in ["grok", "opencode"] {
+            let instance = self.get(id).expect("validated present");
+            if !instance.driver.is_stub() || instance.enabled {
+                return Err(ProviderSettingsError::StubCannotEnable(
+                    instance.driver.as_str().to_string(),
+                ));
             }
         }
         Ok(())

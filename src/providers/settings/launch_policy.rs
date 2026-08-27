@@ -232,6 +232,17 @@ pub fn resolve_launch_config(
     custody_scope: &[u8],
     selected_model: Option<String>,
 ) -> Result<ResolvedProviderLaunchConfig, LaunchPolicyError> {
+    resolve_launch_config_with_known_models(instance, custody_scope, selected_model, &[])
+}
+
+/// Like [`resolve_launch_config`], but also accepts discovered catalog slugs
+/// from the last-good metadata cache (aliases such as `claude-opus-5[1m]`).
+pub fn resolve_launch_config_with_known_models(
+    instance: &ProviderInstanceConfig,
+    custody_scope: &[u8],
+    selected_model: Option<String>,
+    known_catalog_slugs: &[String],
+) -> Result<ResolvedProviderLaunchConfig, LaunchPolicyError> {
     instance.validate()?;
     if instance.driver.is_stub() || !instance.enabled {
         return Err(LaunchPolicyError::CannotLaunch(
@@ -251,7 +262,10 @@ pub fn resolve_launch_config(
                 .iter()
                 .map(|m| m.slug.as_str())
                 .collect();
-            if !builtins.iter().any(|b| b == &slug) && !customs.iter().any(|c| *c == slug) {
+            let known = known_catalog_slugs.iter().any(|s| s == &slug)
+                || builtins.iter().any(|b| b == &slug)
+                || customs.iter().any(|c| *c == slug);
+            if !known {
                 return Err(LaunchPolicyError::Settings(
                     ProviderSettingsError::UnknownModel(slug),
                 ));
@@ -348,7 +362,7 @@ pub fn prepare_codex_shadow_home(
             Ok(meta) if meta.file_type().is_symlink() => {
                 return Err(LaunchPolicyError::ShadowHomeConflict(format!(
                     "private `{private}` must not be a link"
-                )))
+                )));
             }
             Ok(_) => {}
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
@@ -409,7 +423,7 @@ pub fn prepare_codex_shadow_home(
                 return Err(LaunchPolicyError::ShadowHomeConflict(format!(
                     "{} already exists and is not a shared link",
                     dest.display()
-                )))
+                )));
             }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
             Err(error) => return Err(LaunchPolicyError::ShadowHomeConflict(error.to_string())),

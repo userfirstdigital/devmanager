@@ -30,14 +30,14 @@ pub use adapter::{
     materialize_provider_environment, provider_scope_env_key, AdapterDeliveryPermit,
     AdapterIngressUnavailable, JournalNormalizeError, LaunchProviderRequest,
     NormalizedAdapterDelivery, ProviderAccessMode, ProviderAdapter, ProviderArgument,
-    ProviderError, ProviderInput, ProviderInputError, ProviderLaunchOptions, ProviderLaunchSpec,
-    ProviderModel, ProviderProbeContext, ProviderProbeError, ProviderProbeFailureCode,
-    ProviderProbeIoError, ProviderProbeKind, ProviderProbeRequest, ProviderProbeRequestError,
-    ProviderProbeResult, ProviderProbeRunner, ProviderProbeStatus, ProviderQuotaStatus,
-    ProviderReasoningEffort, ProviderRuntime, ProviderSignal, QuotaObservation, StopStrategy,
-    WindowsProviderProbeRunner, MAX_PROVIDER_ARGUMENTS, MAX_PROVIDER_ARGUMENT_BYTES,
-    MAX_PROVIDER_INPUT_BYTES, MAX_PROVIDER_PROBE_OUTPUT_BYTES, MAX_PROVIDER_PROBE_TIMEOUT,
-    MAX_PROVIDER_SIGNAL_BYTES,
+    ProviderError, ProviderInput, ProviderInputError, ProviderInteractiveProbeError,
+    ProviderInteractiveSession, ProviderLaunchOptions, ProviderLaunchSpec, ProviderModel,
+    ProviderProbeContext, ProviderProbeError, ProviderProbeFailureCode, ProviderProbeIoError,
+    ProviderProbeKind, ProviderProbeRequest, ProviderProbeRequestError, ProviderProbeResult,
+    ProviderProbeRunner, ProviderProbeStatus, ProviderQuotaStatus, ProviderReasoningEffort,
+    ProviderRuntime, ProviderSignal, QuotaObservation, StopStrategy, WindowsProviderProbeRunner,
+    MAX_PROVIDER_ARGUMENTS, MAX_PROVIDER_ARGUMENT_BYTES, MAX_PROVIDER_INPUT_BYTES,
+    MAX_PROVIDER_PROBE_OUTPUT_BYTES, MAX_PROVIDER_PROBE_TIMEOUT, MAX_PROVIDER_SIGNAL_BYTES,
 };
 pub use capabilities::{
     AdapterRevision, CapabilityEvidence, CapabilityEvidenceError, CapabilityState,
@@ -83,9 +83,10 @@ pub use journal::{
     JournalSemanticKind, JournalVisibility, SemanticJournal, JOURNAL_SCHEMA_VERSION,
 };
 pub use quota::{
-    canonical_top_bar, AdapterQuotaSource, CanonicalQuotaBar, ProductionJitter, ProviderQuotaHost,
-    QuotaCacheKey, QuotaDiagnostic, QuotaJitterError, QuotaObserver, QuotaObserverConfig,
-    QuotaProbeLimiter, QuotaState, QuotaStripEntry, QuotaView,
+    canonical_top_bar, AdapterQuotaSource, CanonicalQuotaBar, MetadataCacheQuotaSource,
+    ProductionJitter, ProviderQuotaHost, QuotaCacheKey, QuotaDiagnostic, QuotaJitterError,
+    QuotaObserver, QuotaObserverConfig, QuotaObserverSource, QuotaProbeLimiter, QuotaState,
+    QuotaStripEntry, QuotaView,
 };
 pub use quota_runtime::{
     NativeQuotaHost, QuotaRuntimeConfig, QuotaRuntimeError, SystemQuotaClock,

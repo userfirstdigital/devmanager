@@ -220,6 +220,7 @@ impl CommandBus {
             Command::CreateTask(_)
                 | Command::CreateTaskV2(_)
                 | Command::BindProviderSession { .. }
+                | Command::RebindUnstartedPrimaryProvider { .. }
                 | Command::ServiceControl(_)
                 | Command::StartProviderSession(_)
         ) {
@@ -7007,6 +7008,7 @@ fn enforce_command_decision_lifecycle_gate(
         }
         Event::AgentSessionRegistered { .. }
         | Event::PrimaryAgentSet { .. }
+        | Event::UnstartedPrimaryProviderRebound { .. }
         | Event::ResourceRegistered { .. }
         | Event::ProviderQuestionPresented { .. }
         | Event::ProviderApprovalPresented { .. } => {

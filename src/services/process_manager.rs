@@ -2020,6 +2020,40 @@ impl ProcessManager {
         book.failures.drain(..).collect()
     }
 
+    pub(crate) fn accepts_input_without_conversation_id(
+        &self,
+        task_id: TaskId,
+        agent_session_id: crate::domain::AgentSessionId,
+        resource_id: ResourceId,
+        runtime_generation: u64,
+        action_epoch: u64,
+    ) -> bool {
+        // A query must not wait behind a provider launch holding this lock.
+        let runtime = self
+            .inner
+            .provider_sessions
+            .try_lock()
+            .ok()
+            .and_then(|manager| manager.as_ref()?.current(agent_session_id));
+        let Some(runtime) = runtime else {
+            return false;
+        };
+        if runtime.task_id() != task_id
+            || runtime.resource_id() != resource_id
+            || runtime.generation() != runtime_generation
+            || runtime.correlation().action_epoch() != action_epoch
+            || runtime.provider_kind() != ProviderKind::Codex
+            || runtime.provider_session_id().is_some()
+            || runtime.lifecycle() != crate::providers::session::RuntimeLifecycle::Running
+            || runtime.capabilities().provider_session_id
+                != crate::providers::CapabilitySupport::Unsupported
+        {
+            return false;
+        }
+        self.provider_terminal_binding(task_id, agent_session_id, resource_id, runtime_generation)
+            .is_some_and(|binding| binding.action_epoch == action_epoch)
+    }
+
     /// Close every provider session bound to one task. Missing manager state is
     /// success: a failed launch never created a live session.
     pub fn close_provider_task(
@@ -3440,6 +3474,7 @@ impl ProcessManager {
         action: &crate::domain::provider_input::ProviderInputAction,
         logical_bytes: &[u8],
     ) -> Result<(), crate::providers::input::ProviderInputDeliveryError> {
+        use crate::domain::provider_input::ProviderInputAction;
         use crate::providers::input::{provider_composer_submit_plan, ProviderInputDeliveryError};
 
         let expected = crate::providers::input::provider_input_action_bytes(action)
@@ -3484,6 +3519,23 @@ impl ProcessManager {
                 return Err(ProviderInputDeliveryError::StaleFence);
             }
         }
+
+        let session_cwd = self
+            .runtime_state()
+            .sessions
+            .get(&live.session_id)
+            .map(|state| state.cwd.clone())
+            .ok_or(ProviderInputDeliveryError::SessionNotBound)?;
+
+        // Prove exact image bytes under cwd/.devmanager/pasted-images and retain
+        // deny-write/delete handles across the whole physical sequence so a
+        // check-then-swap cannot change contents after validation.
+        let _retained_images = match action {
+            ProviderInputAction::SendNow { images, .. } if !images.is_empty() => {
+                retain_validated_provider_images(&session_cwd, images)?
+            }
+            _ => Vec::new(),
+        };
 
         // Delays run only between physical writes and never while holding the
         // ProcessManager provider_runtime lock (released above after clone).
@@ -10823,6 +10875,304 @@ fn shutdown_managed_processes_inner(
     report
 }
 
+/// Open and prove staged SendNow images under the exact session cwd before any
+/// physical provider write. Handles stay open (Windows: share-read only) for the
+/// whole sequencer so bytes cannot be swapped mid-delivery.
+fn retain_validated_provider_images(
+    session_cwd: &Path,
+    images: &[crate::domain::provider_input::ProviderImageAttachment],
+) -> Result<Vec<std::fs::File>, crate::providers::input::ProviderInputDeliveryError> {
+    use crate::domain::provider_input::{MAX_PROVIDER_IMAGE_ATTACHMENTS, MAX_PROVIDER_IMAGE_BYTES};
+    use crate::providers::input::ProviderInputDeliveryError;
+    use crate::remote::web::image_paste::{
+        NATIVE_COMPOSER_IMAGE_MAX_COUNT, WEB_PASTE_IMAGE_MAX_BYTES,
+    };
+    use sha2::{Digest, Sha256};
+    use std::io::Read;
+
+    // Keep limits aligned with remote staging without importing its private
+    // dimension constants through a circular authority path.
+    const PASTE_IMAGE_MAX_DIMENSION: u32 = 4096;
+    const PASTE_IMAGE_MAX_PIXELS: u64 = 16_000_000;
+
+    if images.len() > MAX_PROVIDER_IMAGE_ATTACHMENTS
+        || images.len() > NATIVE_COMPOSER_IMAGE_MAX_COUNT
+    {
+        return Err(ProviderInputDeliveryError::BytesMismatch);
+    }
+    if MAX_PROVIDER_IMAGE_BYTES != WEB_PASTE_IMAGE_MAX_BYTES {
+        return Err(ProviderInputDeliveryError::BytesMismatch);
+    }
+
+    let staging_root = session_cwd.join(".devmanager").join("pasted-images");
+    // Keep the complete staging-directory chain open while the provider is
+    // being written to.  On Windows the handles intentionally omit
+    // FILE_SHARE_DELETE, so a directory/file replacement cannot invalidate
+    // the path after validation.  The same handles also make the no-reparse
+    // checks below independent of a later parent rename.
+    let mut retained = retain_provider_image_directory_handles(&staging_root)
+        .map_err(|_| ProviderInputDeliveryError::BytesMismatch)?;
+    for image in images {
+        let path = Path::new(image.path());
+        if !path.is_absolute() {
+            return Err(ProviderInputDeliveryError::BytesMismatch);
+        }
+        if provider_image_path_escapes_or_reparse(path, &staging_root) {
+            return Err(ProviderInputDeliveryError::BytesMismatch);
+        }
+        let mut file = open_provider_image_retain_handle(path)
+            .map_err(|_| ProviderInputDeliveryError::BytesMismatch)?;
+        let metadata = file
+            .metadata()
+            .map_err(|_| ProviderInputDeliveryError::BytesMismatch)?;
+        if !metadata.is_file() || provider_image_metadata_is_reparse(&metadata) {
+            return Err(ProviderInputDeliveryError::BytesMismatch);
+        }
+        let byte_len = metadata.len();
+        if byte_len == 0
+            || byte_len > MAX_PROVIDER_IMAGE_BYTES as u64
+            || byte_len != u64::from(image.byte_len())
+        {
+            return Err(ProviderInputDeliveryError::BytesMismatch);
+        }
+        // Bound the read independently of the metadata snapshot.  Unix allows
+        // a concurrent writer to grow an open file, and read_to_end would
+        // otherwise turn that race into an unbounded allocation.
+        let mut bytes = Vec::with_capacity((byte_len as usize).saturating_add(1));
+        (&mut file)
+            .take(MAX_PROVIDER_IMAGE_BYTES as u64 + 1)
+            .read_to_end(&mut bytes)
+            .map_err(|_| ProviderInputDeliveryError::BytesMismatch)?;
+        if bytes.len() != image.byte_len() as usize || bytes.len() > MAX_PROVIDER_IMAGE_BYTES {
+            return Err(ProviderInputDeliveryError::BytesMismatch);
+        }
+        let digest: [u8; 32] = Sha256::digest(&bytes).into();
+        if &digest != image.sha256() {
+            return Err(ProviderInputDeliveryError::BytesMismatch);
+        }
+        let format =
+            image::guess_format(&bytes).map_err(|_| ProviderInputDeliveryError::BytesMismatch)?;
+        if !matches!(format, image::ImageFormat::Png | image::ImageFormat::Jpeg) {
+            return Err(ProviderInputDeliveryError::BytesMismatch);
+        }
+        let reader = image::ImageReader::with_format(std::io::Cursor::new(&bytes), format);
+        let (width, height) = reader
+            .into_dimensions()
+            .map_err(|_| ProviderInputDeliveryError::BytesMismatch)?;
+        if width == 0
+            || height == 0
+            || width > PASTE_IMAGE_MAX_DIMENSION
+            || height > PASTE_IMAGE_MAX_DIMENSION
+            || (width as u64).saturating_mul(height as u64) > PASTE_IMAGE_MAX_PIXELS
+        {
+            return Err(ProviderInputDeliveryError::BytesMismatch);
+        }
+        image::load_from_memory_with_format(&bytes, format)
+            .map_err(|_| ProviderInputDeliveryError::BytesMismatch)?;
+        retained.push(file);
+    }
+    Ok(retained)
+}
+
+fn retain_provider_image_directory_handles(path: &Path) -> std::io::Result<Vec<std::fs::File>> {
+    let mut ancestors = path
+        .ancestors()
+        .filter(|ancestor| !ancestor.as_os_str().is_empty())
+        .collect::<Vec<_>>();
+    ancestors.reverse();
+
+    let mut retained = Vec::with_capacity(ancestors.len());
+    for ancestor in ancestors {
+        retained.push(open_provider_directory_retain_handle(ancestor)?);
+    }
+    Ok(retained)
+}
+
+fn open_provider_directory_retain_handle(path: &Path) -> std::io::Result<std::fs::File> {
+    use std::fs::OpenOptions;
+
+    let metadata = std::fs::symlink_metadata(path)?;
+    if !metadata.is_dir() || provider_image_metadata_is_reparse(&metadata) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "provider image staging path is not a plain directory",
+        ));
+    }
+
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        use windows::Win32::Storage::FileSystem::{
+            FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_READ,
+        };
+        options
+            .share_mode(FILE_SHARE_READ.0)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS.0 | FILE_FLAG_OPEN_REPARSE_POINT.0);
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW);
+    }
+    let handle = options.open(path)?;
+    let opened = handle.metadata()?;
+    if !opened.is_dir() || provider_image_metadata_is_reparse(&opened) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "provider image staging handle is not a plain directory",
+        ));
+    }
+    Ok(handle)
+}
+
+fn open_provider_image_retain_handle(path: &Path) -> std::io::Result<std::fs::File> {
+    use std::fs::OpenOptions;
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        use windows::Win32::Storage::FileSystem::{FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_READ};
+        // Share-read only: deny write/delete replacement for the retained
+        // lifetime (matches provider executable attestation discipline).
+        return OpenOptions::new()
+            .read(true)
+            .share_mode(FILE_SHARE_READ.0)
+            .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT.0)
+            .open(path);
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        const NOFOLLOW: i32 = 0x20000;
+        #[cfg(any(
+            target_os = "macos",
+            target_os = "ios",
+            target_os = "freebsd",
+            target_os = "openbsd",
+            target_os = "netbsd"
+        ))]
+        const NOFOLLOW: i32 = 0x100;
+        #[cfg(not(any(
+            target_os = "linux",
+            target_os = "android",
+            target_os = "macos",
+            target_os = "ios",
+            target_os = "freebsd",
+            target_os = "openbsd",
+            target_os = "netbsd"
+        )))]
+        const NOFOLLOW: i32 = 0;
+        return OpenOptions::new()
+            .read(true)
+            .custom_flags(NOFOLLOW)
+            .open(path);
+    }
+    #[cfg(not(any(windows, unix)))]
+    {
+        OpenOptions::new().read(true).open(path)
+    }
+}
+
+fn provider_image_metadata_is_reparse(metadata: &std::fs::Metadata) -> bool {
+    if metadata.file_type().is_symlink() {
+        return true;
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        use windows::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT;
+        return metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT.0 != 0;
+    }
+    #[cfg(not(windows))]
+    {
+        false
+    }
+}
+
+fn provider_image_path_escapes_or_reparse(path: &Path, staging_root: &Path) -> bool {
+    let Some(parent) = path.parent() else {
+        return true;
+    };
+    if provider_image_path_key(parent) != provider_image_path_key(staging_root) {
+        return true;
+    }
+    if !provider_image_file_name_allowed(path) {
+        return true;
+    }
+    let mut current = path.to_path_buf();
+    let staging_key = provider_image_path_key(staging_root);
+    let mut reached_staging_root = false;
+    loop {
+        let Ok(metadata) = std::fs::symlink_metadata(&current) else {
+            return true;
+        };
+        if provider_image_metadata_is_reparse(&metadata) {
+            return true;
+        }
+        if provider_image_path_key(&current) == staging_key {
+            reached_staging_root = true;
+        }
+        let Some(parent) = current.parent() else {
+            break;
+        };
+        if parent == current {
+            break;
+        }
+        current = parent.to_path_buf();
+    }
+    !reached_staging_root
+}
+
+fn provider_image_file_name_allowed(path: &Path) -> bool {
+    let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+        return false;
+    };
+    if name.is_empty() || name == "." || name == ".." {
+        return false;
+    }
+    #[cfg(windows)]
+    {
+        // Alternate data streams and Win32-normalized names are not part of
+        // the staging contract. Reject them instead of allowing a path alias
+        // to resolve to bytes outside the staged regular file.
+        if name.contains(':') || name.ends_with('.') || name.ends_with(' ') {
+            return false;
+        }
+        let stem = name.split('.').next().unwrap_or_default();
+        if matches!(
+            stem.to_ascii_uppercase().as_str(),
+            "CON" | "PRN" | "AUX" | "NUL"
+        ) {
+            return false;
+        }
+        if matches!(
+            stem.strip_prefix("COM")
+                .or_else(|| stem.strip_prefix("LPT"))
+                .and_then(|value| value.parse::<u8>().ok()),
+            Some(1..=9)
+        ) {
+            return false;
+        }
+    }
+    true
+}
+
+fn provider_image_path_key(path: &Path) -> String {
+    let mut key = path.to_string_lossy().replace('\\', "/");
+    #[cfg(windows)]
+    {
+        if let Some(rest) = key.strip_prefix("//?/UNC/") {
+            key = format!("//{rest}");
+        } else if let Some(rest) = key.strip_prefix("//?/") {
+            key = rest.to_string();
+        }
+        key.make_ascii_lowercase();
+    }
+    key
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -17196,5 +17546,70 @@ mod tests {
     #[cfg(not(windows))]
     fn server_test_command() -> (String, Vec<String>) {
         ("sleep".to_string(), vec!["5".to_string()])
+    }
+
+    fn write_tiny_png(path: &Path) {
+        let image = image::RgbImage::from_pixel(1, 1, image::Rgb([0x11, 0x22, 0x33]));
+        image.save(path).expect("write png");
+    }
+
+    #[test]
+    fn retain_validated_provider_images_accepts_cwd_staged_png() {
+        use sha2::{Digest, Sha256};
+        let root = tempfile::tempdir().expect("temp");
+        let staging = root.path().join(".devmanager").join("pasted-images");
+        std::fs::create_dir_all(&staging).expect("staging");
+        let path = staging.join("ok.png");
+        write_tiny_png(&path);
+        let bytes = std::fs::read(&path).expect("read");
+        let digest: [u8; 32] = Sha256::digest(&bytes).into();
+        let attachment = crate::domain::ProviderImageAttachment::try_new(
+            path.to_string_lossy().into_owned(),
+            digest,
+            bytes.len(),
+        )
+        .expect("attachment");
+        let retained = retain_validated_provider_images(root.path(), &[attachment])
+            .expect("validate staged image");
+        assert!(
+            retained.len() >= 1,
+            "the image file and its staging-directory handles must be retained"
+        );
+    }
+
+    #[test]
+    fn retain_validated_provider_images_rejects_foreign_path_and_digest_mismatch() {
+        use sha2::{Digest, Sha256};
+        let root = tempfile::tempdir().expect("temp");
+        let staging = root.path().join(".devmanager").join("pasted-images");
+        std::fs::create_dir_all(&staging).expect("staging");
+        let path = staging.join("ok.png");
+        write_tiny_png(&path);
+        let bytes = std::fs::read(&path).expect("read");
+        let digest: [u8; 32] = Sha256::digest(&bytes).into();
+
+        let foreign = root.path().join("outside.png");
+        write_tiny_png(&foreign);
+        let foreign_attachment = crate::domain::ProviderImageAttachment::try_new(
+            foreign.to_string_lossy().into_owned(),
+            digest,
+            bytes.len(),
+        )
+        .expect("foreign attachment identity");
+        assert!(
+            retain_validated_provider_images(root.path(), &[foreign_attachment]).is_err(),
+            "foreign path must fail before write"
+        );
+
+        let mismatched = crate::domain::ProviderImageAttachment::try_new(
+            path.to_string_lossy().into_owned(),
+            [0xAB; 32],
+            bytes.len(),
+        )
+        .expect("mismatched digest attachment");
+        assert!(
+            retain_validated_provider_images(root.path(), &[mismatched]).is_err(),
+            "digest mismatch must fail before write"
+        );
     }
 }

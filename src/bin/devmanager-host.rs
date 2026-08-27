@@ -1131,14 +1131,23 @@ async fn serve_foreground_host(
     let _bound_updater = bound_updater;
 
     // Quota observation is host-owned and intentionally starts outside the
-    // request/render path. The owner keeps one typed observer per provider
-    // kind, hides observations after the canonical one-hour TTL, and is joined
-    // before the host's remaining runtime is torn down. A stock adapter with
-    // no official quota surface remains unavailable; startup never scrapes
-    // terminal output or fabricates a value.
-    let mut quota_host = match devmanager::providers::NativeQuotaHost::start_stock(
-        devmanager::providers::QuotaRuntimeConfig::production(),
-    ) {
+    // request/render path. Prefer the account-aware metadata cache populated
+    // by the provider settings health lane; the source projects only verified
+    // cached windows and never scrapes terminal output or fabricates values.
+    // If the profile cannot be opened, retain the stock adapter fallback so a
+    // settings-storage failure does not prevent the rest of the host booting.
+    let provider_profile =
+        devmanager::providers::settings::ProviderProfileOwner::open_dir(profile_root).ok();
+    let quota_start = match provider_profile.as_ref() {
+        Some(profile) => devmanager::providers::NativeQuotaHost::start_with_metadata_sources(
+            devmanager::providers::QuotaRuntimeConfig::production(),
+            devmanager::providers::MetadataCacheQuotaSource::for_profile(profile),
+        ),
+        None => devmanager::providers::NativeQuotaHost::start_stock(
+            devmanager::providers::QuotaRuntimeConfig::production(),
+        ),
+    };
+    let mut quota_host = match quota_start {
         Ok(owner) => Some(owner),
         Err(error) => {
             eprintln!("devmanager-host quota refresh unavailable: {error}");

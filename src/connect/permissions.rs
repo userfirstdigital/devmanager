@@ -118,6 +118,7 @@ pub fn action_for_client_request(request: &ClientRequest) -> Option<(ActionId, O
                 // the client action map so an authenticated client cannot
                 // accidentally turn an internal fact into a host action.
                 Command::BindProviderSession { .. }
+                | Command::RebindUnstartedPrimaryProvider { .. }
                 | Command::PresentProviderQuestion(_)
                 | Command::PresentProviderApproval(_)
                 | Command::SettleProviderWait(_) => return None,

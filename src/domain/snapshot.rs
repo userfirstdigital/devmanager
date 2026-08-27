@@ -38,6 +38,37 @@ pub struct TaskSnapshot {
 }
 
 impl TaskSnapshot {
+    /// Unstarted draft: open task with a primary agent that has never bound a
+    /// provider conversation/runtime identity. Placeholder titles are irrelevant.
+    /// A launch already in flight without SessionStart identity must be excluded
+    /// by the live host/UI pending-start fence; durable projection alone cannot
+    /// see that ephemeral lease.
+    pub fn is_unstarted_draft(&self) -> bool {
+        if self.task.lifecycle != TaskLifecycle::Open {
+            return false;
+        }
+        if self
+            .agents
+            .values()
+            .any(|agent| agent.provider_session_id.is_some())
+        {
+            return false;
+        }
+        if self.provider_sessions.values().any(|session| {
+            session.current_turn.is_some()
+                || session.open_question.is_some()
+                || session.open_approval.is_some()
+                || !session.waits.is_empty()
+                || session.last_settlement.is_some()
+        }) {
+            return false;
+        }
+        let Some(primary) = self.primary_agent_id else {
+            return false;
+        };
+        self.agents.get(&primary).is_some()
+    }
+
     pub fn browser_context(&self, context_id: BrowserContextId) -> Option<BrowserContextView> {
         self.browser.context_view(context_id)
     }
@@ -864,6 +895,30 @@ mod tests {
             provider_sessions,
             browser,
         }
+    }
+
+    #[test]
+    fn unstarted_draft_requires_open_primary_without_bound_provider_identity() {
+        use crate::domain::agent::{AgentRole, AgentSessionFacts, AgentSessionLifecycle};
+        use crate::providers::ProviderKind;
+
+        let mut snap = snapshot_with_primary_projection(
+            ProviderSessionProjection::default(),
+            TaskLifecycle::Open,
+        );
+        let primary = snap.primary_agent_id.expect("primary");
+        let mut agent =
+            AgentSessionFacts::new(snap.task.id, AgentRole::Primary, ProviderKind::Codex, None)
+                .expect("agent");
+        agent.id = primary;
+        agent.lifecycle = AgentSessionLifecycle::Open;
+        agent.runtime_generation = 1;
+        snap.agents.insert(primary, agent);
+        assert!(snap.is_unstarted_draft());
+
+        snap.agents.get_mut(&primary).unwrap().provider_session_id =
+            Some(crate::domain::ProviderSessionId::new("sess-1").expect("id"));
+        assert!(!snap.is_unstarted_draft());
     }
 
     #[test]

@@ -118,6 +118,7 @@ fn seed_provider_dispatch(store: &mut KernelStore, tail: u8) -> (OperationId, Di
                     ProviderInputAction::SendNow {
                         text: "typed delivery".into(),
                         wait: false,
+                        images: Vec::new(),
                     },
                 )
                 .expect("intent"),
@@ -338,6 +339,7 @@ fn delivered_send_now_can_begin_a_new_conversation_turn() {
                     ProviderInputAction::SendNow {
                         text: "follow-up turn".into(),
                         wait: false,
+                        images: Vec::new(),
                     },
                 )
                 .expect("follow-up intent"),

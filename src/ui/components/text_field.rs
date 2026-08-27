@@ -125,7 +125,9 @@ pub enum TextFieldKey {
 pub struct TextField {
     value: String,
     cursor: usize,
-    all_selected: bool,
+    /// Exclusive selection start in Unicode scalars when present. The live
+    /// cursor is the other end; equality clears the range.
+    selection_anchor: Option<usize>,
     limits: TextFieldLimits,
     label: String,
     description: String,
@@ -156,7 +158,7 @@ impl TextField {
             accessibility: AccessibilityMetadata::new(AccessibleRole::TextField, label.clone())?,
             value: String::new(),
             cursor: 0,
-            all_selected: false,
+            selection_anchor: None,
             limits,
             label,
             description: String::new(),
@@ -175,17 +177,50 @@ impl TextField {
         self.cursor
     }
 
+    pub fn selection_range(&self) -> Option<Range<usize>> {
+        let len = self.value.chars().count();
+        let cursor = self.cursor.min(len);
+        let anchor = self.selection_anchor?.min(len);
+        if anchor == cursor {
+            None
+        } else if anchor < cursor {
+            Some(anchor..cursor)
+        } else {
+            Some(cursor..anchor)
+        }
+    }
+
     pub fn is_all_selected(&self) -> bool {
-        self.all_selected && !self.value.is_empty()
+        let len = self.value.chars().count();
+        matches!(
+            self.selection_range(),
+            Some(range) if range.start == 0 && range.end == len && len > 0
+        )
     }
 
     pub fn select_all(&mut self) {
         if self.value.is_empty() {
-            self.all_selected = false;
+            self.selection_anchor = None;
             return;
         }
+        self.selection_anchor = Some(0);
         self.cursor = self.value.chars().count();
-        self.all_selected = true;
+    }
+
+    pub fn set_cursor(&mut self, cursor: usize, extend: bool) {
+        let len = self.value.chars().count();
+        let next = cursor.min(len);
+        if extend {
+            if self.selection_anchor.is_none() {
+                self.selection_anchor = Some(self.cursor.min(len));
+            }
+        } else {
+            self.selection_anchor = None;
+        }
+        self.cursor = next;
+        if self.selection_anchor == Some(self.cursor) {
+            self.selection_anchor = None;
+        }
     }
 
     pub fn label(&self) -> &str {
@@ -268,7 +303,7 @@ impl TextField {
         self.validate_value(&value)?;
         self.value = value;
         self.cursor = self.value.chars().count();
-        self.all_selected = false;
+        self.selection_anchor = None;
         self.refresh_accessibility_value();
         Ok(())
     }
@@ -320,8 +355,11 @@ impl TextField {
                 if self.read_only {
                     Ok(false)
                 } else {
-                    self.replace_selection_if_needed();
-                    self.insert_text(&character.to_string())
+                    self.replace_range(
+                        self.selection_range().unwrap_or(self.cursor..self.cursor),
+                        &character.to_string(),
+                        focus_epoch,
+                    )
                 }
             }
             TextFieldKey::Backspace => {
@@ -343,24 +381,31 @@ impl TextField {
                 }
             }
             TextFieldKey::Left => {
-                self.clear_selection_keeping_value();
-                self.cursor = self.cursor.saturating_sub(1);
-                Ok(false)
+                let target = if let Some(range) = self.selection_range() {
+                    range.start
+                } else {
+                    self.cursor.saturating_sub(1)
+                };
+                self.set_cursor(target, false);
+                Ok(true)
             }
             TextFieldKey::Right => {
-                self.clear_selection_keeping_value();
-                self.cursor = (self.cursor + 1).min(self.value.chars().count());
-                Ok(false)
+                let len = self.value.chars().count();
+                let target = if let Some(range) = self.selection_range() {
+                    range.end
+                } else {
+                    (self.cursor + 1).min(len)
+                };
+                self.set_cursor(target, false);
+                Ok(true)
             }
             TextFieldKey::Home => {
-                self.clear_selection_keeping_value();
-                self.cursor = 0;
-                Ok(false)
+                self.set_cursor(0, false);
+                Ok(true)
             }
             TextFieldKey::End => {
-                self.clear_selection_keeping_value();
-                self.cursor = self.value.chars().count();
-                Ok(false)
+                self.set_cursor(self.value.chars().count(), false);
+                Ok(true)
             }
             TextFieldKey::Enter | TextFieldKey::Escape | TextFieldKey::Tab => Ok(false),
         }
@@ -375,8 +420,14 @@ impl TextField {
         {
             return Ok(false);
         }
-        self.replace_selection_if_needed();
-        self.insert_text(text)
+        if text.is_empty() {
+            return Ok(false);
+        }
+        self.replace_range(
+            self.selection_range().unwrap_or(self.cursor..self.cursor),
+            text,
+            focus_epoch,
+        )
     }
 
     /// Replace a scalar-indexed range as one platform text-input operation.
@@ -415,45 +466,26 @@ impl TextField {
         let changed = next != self.value;
         self.value = next;
         self.cursor = range.start + text.chars().count();
-        self.all_selected = false;
+        self.selection_anchor = None;
         self.refresh_accessibility_value();
         Ok(changed)
     }
 
-    fn replace_selection_if_needed(&mut self) {
-        let _ = self.clear_selection_contents();
-    }
-
     fn clear_selection_keeping_value(&mut self) {
-        self.all_selected = false;
+        self.selection_anchor = None;
     }
 
     fn clear_selection_contents(&mut self) -> bool {
-        if !self.all_selected {
+        let Some(range) = self.selection_range() else {
             return false;
-        }
-        self.value.clear();
-        self.cursor = 0;
-        self.all_selected = false;
+        };
+        let start = byte_index_at_scalar(&self.value, range.start);
+        let end = byte_index_at_scalar(&self.value, range.end);
+        self.value.replace_range(start..end, "");
+        self.cursor = range.start;
+        self.selection_anchor = None;
         self.refresh_accessibility_value();
         true
-    }
-
-    fn insert_text(&mut self, text: &str) -> Result<bool, TextFieldError> {
-        if self.interaction.state().is_disabled() || self.read_only {
-            return Ok(false);
-        }
-        if text.is_empty() {
-            return Ok(false);
-        }
-        self.preflight_insert(text)?;
-        let byte_index = byte_index_at_scalar(&self.value, self.cursor);
-        let mut next = self.value.clone();
-        next.insert_str(byte_index, text);
-        self.value = next;
-        self.cursor += text.chars().count();
-        self.refresh_accessibility_value();
-        Ok(!text.is_empty())
     }
 
     fn validate_value(&self, value: &str) -> Result<(), TextFieldError> {
@@ -468,33 +500,6 @@ impl TextField {
             return Err(TextFieldError::ByteLimitExceeded {
                 max: self.limits.max_bytes,
                 actual: value.len(),
-            });
-        }
-        Ok(())
-    }
-
-    fn preflight_insert(&self, text: &str) -> Result<(), TextFieldError> {
-        let scalar_count = self
-            .value
-            .chars()
-            .count()
-            .checked_add(text.chars().count())
-            .unwrap_or(usize::MAX);
-        if scalar_count > self.limits.max_scalars {
-            return Err(TextFieldError::ScalarLimitExceeded {
-                max: self.limits.max_scalars,
-                actual: scalar_count,
-            });
-        }
-        let byte_count = self
-            .value
-            .len()
-            .checked_add(text.len())
-            .unwrap_or(usize::MAX);
-        if byte_count > self.limits.max_bytes {
-            return Err(TextFieldError::ByteLimitExceeded {
-                max: self.limits.max_bytes,
-                actual: byte_count,
             });
         }
         Ok(())
@@ -590,5 +595,42 @@ mod tests {
         assert_eq!(field.value(), "alpha beta");
         assert_eq!(field.cursor(), 10);
         assert!(!field.is_all_selected());
+    }
+
+    #[test]
+    fn partial_selection_is_replaced_by_typing() {
+        let mut field = focused_field("abcdef");
+        field.set_cursor(1, false);
+        field.set_cursor(4, true);
+        assert_eq!(field.selection_range(), Some(1..4));
+        let epoch = field.focus_epoch();
+        assert!(field
+            .handle_key(TextFieldKey::Character('x'), epoch)
+            .expect("replace"));
+        assert_eq!(field.value(), "axef");
+        assert_eq!(field.cursor(), 2);
+        assert!(field.selection_range().is_none());
+    }
+
+    #[test]
+    fn rejected_replacement_preserves_text_cursor_and_selection() {
+        let mut field = focused_field("abcde");
+        field.limits = super::TextFieldLimits::new(5, 5).unwrap();
+        field.set_cursor(1, false);
+        field.set_cursor(3, true);
+        let epoch = field.focus_epoch();
+        assert!(field.paste("12345", epoch).is_err());
+        assert_eq!(field.value(), "abcde");
+        assert_eq!(field.cursor(), 3);
+        assert_eq!(field.selection_range(), Some(1..3));
+        assert!(field
+            .handle_key(TextFieldKey::Character('界'), epoch)
+            .is_err());
+        assert_eq!(field.value(), "abcde");
+        assert_eq!(field.selection_range(), Some(1..3));
+        assert!(field.paste("12", epoch).unwrap());
+        assert_eq!(field.value(), "a12de");
+        assert_eq!(field.cursor(), 3);
+        assert_eq!(field.selection_range(), None);
     }
 }

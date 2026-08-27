@@ -160,12 +160,17 @@ fn allocate_node(
             panes.insert(pane.task_id, rect);
         }
         WorkspaceNode::Split { axis, children, .. } => {
-            let divider_total = metrics.divider * children.len().saturating_sub(1) as f32;
-            let available = match axis {
+            let extent = match axis {
                 Axis::Horizontal => rect.width,
                 Axis::Vertical => rect.height,
             };
-            let available = (available - divider_total).max(0.0);
+            let divider_count = children.len().saturating_sub(1) as f32;
+            let divider = if divider_count > 0.0 {
+                metrics.divider.min(extent / divider_count)
+            } else {
+                0.0
+            };
+            let available = (extent - divider * divider_count).max(0.0);
             let minimums: Vec<f32> = children
                 .iter()
                 .map(|child| {
@@ -181,7 +186,14 @@ fn allocate_node(
                 })
                 .collect();
             let fallback_resize_index = least_recent_focus_child_index(children);
-            let sizes = allocate_axis_sizes(children, &minimums, available, fallback_resize_index);
+            let sizes = allocate_axis_sizes(
+                children,
+                &minimums,
+                available,
+                fallback_resize_index,
+                *axis,
+                metrics,
+            );
             let mut cursor = match axis {
                 Axis::Horizontal => rect.x,
                 Axis::Vertical => rect.y,
@@ -204,8 +216,52 @@ fn allocate_node(
                 allocate_node(&child.node, child_rect, metrics, panes);
                 cursor += size;
                 if index + 1 < children.len() {
-                    cursor += metrics.divider;
+                    cursor += divider;
                 }
+            }
+        }
+    }
+}
+
+/// Visible physical floor for an axis share under user drag pressure. Preferred
+/// content mins (e.g. 360) must not steal a requested pin; Auto peers yield to
+/// this floor first. Nested splits recurse so two Full panes need 64+64+divider.
+const PHYSICAL_AXIS_FLOOR: f32 = 64.0;
+
+fn nested_physical_floor(node: &WorkspaceNode, axis: Axis, metrics: AllocationMetrics) -> f32 {
+    match node {
+        WorkspaceNode::Pane(_) => PHYSICAL_AXIS_FLOOR,
+        WorkspaceNode::Split {
+            axis: split_axis,
+            children,
+            ..
+        } => {
+            let child_floors: Vec<f32> = children
+                .iter()
+                .map(|child| {
+                    let descendant_floor = nested_physical_floor(&child.node, axis, metrics);
+                    if *split_axis == axis {
+                        match child.allocation {
+                            Allocation::Auto { .. } => descendant_floor,
+                            // A user pin below the physical floor is valid and
+                            // must remain the lower bound for that branch. A
+                            // larger pin still yields to its descendants' Auto
+                            // floors if the parent is under pressure.
+                            Allocation::Pinned { logical_px } => logical_px.min(descendant_floor),
+                        }
+                    } else {
+                        // This allocation belongs to the other axis. Do not let
+                        // a vertical pin constrain horizontal width (or vice
+                        // versa) while finding a recursive floor.
+                        descendant_floor
+                    }
+                })
+                .collect();
+            if *split_axis == axis {
+                let dividers = metrics.divider * children.len().saturating_sub(1) as f32;
+                child_floors.iter().sum::<f32>() + dividers
+            } else {
+                child_floors.into_iter().fold(PHYSICAL_AXIS_FLOOR, f32::max)
             }
         }
     }
@@ -216,6 +272,8 @@ fn allocate_axis_sizes(
     minimums: &[f32],
     available: f32,
     fallback_resize_index: Option<usize>,
+    axis: Axis,
+    metrics: AllocationMetrics,
 ) -> Vec<f32> {
     if children.is_empty() {
         return Vec::new();
@@ -246,6 +304,14 @@ fn allocate_axis_sizes(
             Allocation::Pinned { .. } => 0.0,
         })
         .sum();
+    let auto_floors: Vec<f32> = children
+        .iter()
+        .map(|child| match child.allocation {
+            Allocation::Auto { .. } => nested_physical_floor(&child.node, axis, metrics),
+            Allocation::Pinned { .. } => 0.0,
+        })
+        .collect();
+    let auto_floor_total: f32 = auto_floors.iter().sum();
 
     let full_auto_weight: f32 = children
         .iter()
@@ -267,10 +333,8 @@ fn allocate_axis_sizes(
     };
 
     let remaining_for_auto = available - pinned_total;
-    if remaining_for_auto + f32::EPSILON >= auto_min_total && auto_weight > 0.0 {
-        // Keep pinned at requested sizes; Auto siblings absorb surplus (and
-        // any prior oversize shrink by starting from mins then taking remainder).
-        let auto_extra = (remaining_for_auto - auto_min_total).max(0.0);
+    let distribute_auto = |sizes: &mut [f32], auto_base: &[f32], auto_base_total: f32| {
+        let auto_extra = (remaining_for_auto - auto_base_total).max(0.0);
         for (index, child) in children.iter().enumerate() {
             let weight = match child.allocation {
                 Allocation::Auto { weight }
@@ -281,44 +345,59 @@ fn allocate_axis_sizes(
                 Allocation::Auto { weight } if full_auto_weight == 0.0 => weight,
                 _ => 0.0,
             };
-            if weight > 0.0 {
-                sizes[index] = minimums[index] + auto_extra * weight / auto_weight;
+            if matches!(child.allocation, Allocation::Auto { .. }) {
+                sizes[index] = auto_base[index] + auto_extra * weight / auto_weight;
             }
         }
+    };
+    if remaining_for_auto + f32::EPSILON >= auto_min_total && auto_weight > 0.0 {
+        distribute_auto(&mut sizes, minimums, auto_min_total);
+        return sizes;
+    }
+    if remaining_for_auto + f32::EPSILON >= auto_floor_total && auto_weight > 0.0 {
+        distribute_auto(&mut sizes, &auto_floors, auto_floor_total);
         return sizes;
     }
 
-    // Deficit: Auto already at mins. Shrink pinned via LRF before proportional
-    // compression, preserving other pinned when an Auto path cannot absorb.
     for (index, child) in children.iter().enumerate() {
         if matches!(child.allocation, Allocation::Auto { .. }) {
-            sizes[index] = minimums[index];
+            sizes[index] = auto_floors[index];
         }
     }
     let mut deficit = sizes.iter().sum::<f32>() - available;
     if deficit > 0.0 {
+        // Oversized pins may compress so nested Auto floors (e.g.
+        // 64+64+divider) can claim space before residual scale. Preserve a
+        // nested branch's recursive Auto floor while there is room for it, and
+        // never raise a custom pin that is already below 64px.
+        let compression_floor = |index: usize| match children[index].allocation {
+            Allocation::Auto { .. } => auto_floors[index],
+            Allocation::Pinned { logical_px } => {
+                logical_px.min(nested_physical_floor(&children[index].node, axis, metrics))
+            }
+        };
         if let Some(index) = fallback_resize_index.filter(|index| *index < sizes.len()) {
-            let reducible = (sizes[index] - minimums[index]).max(0.0);
+            let floor = compression_floor(index);
+            let reducible = (sizes[index] - floor).max(0.0);
             let take = deficit.min(reducible);
             sizes[index] -= take;
             deficit -= take;
         }
         if deficit > 0.0 {
-            // Remaining deficit: shrink other children toward mins, LRF order.
             let mut order: Vec<_> = (0..children.len()).collect();
             order.sort_by_key(|index| most_recent_focus(&children[*index].node).unwrap_or(0));
             for index in order {
                 if deficit <= 0.0 {
                     break;
                 }
-                let reducible = (sizes[index] - minimums[index]).max(0.0);
+                let floor = compression_floor(index);
+                let reducible = (sizes[index] - floor).max(0.0);
                 let take = deficit.min(reducible);
                 sizes[index] -= take;
                 deficit -= take;
             }
         }
         if deficit > 0.0 {
-            // Physical mins still exceed available: proportional compress.
             let total: f32 = sizes.iter().sum();
             if total > 0.0 {
                 let scale = available / total;
@@ -328,7 +407,6 @@ fn allocate_axis_sizes(
             }
         }
     } else if deficit < 0.0 {
-        // Floating error / all-pinned surplus with no Auto weight.
         let surplus = -deficit;
         if let Some(index) = fallback_resize_index.filter(|index| *index < sizes.len()) {
             sizes[index] += surplus;
@@ -419,6 +497,40 @@ mod tests {
             compact_min_height: 116.0,
             divider: 4.0,
         }
+    }
+
+    // Build an H branch below a V branch below the root H split. This lets the
+    // tests distinguish floors on the requested axis from pins on the other
+    // axis without reaching into production-only tree construction helpers.
+    fn nested_horizontal_branch() -> (TaskWorkspace, TaskId, TaskId, TaskId, TaskId) {
+        let outer = TaskId::new();
+        let inner_left = TaskId::new();
+        let cross_axis = TaskId::new();
+        let inner_right = TaskId::new();
+        let mut workspace = TaskWorkspace::single(outer);
+        workspace
+            .insert_after_focused(inner_left, Axis::Horizontal)
+            .unwrap();
+        workspace.focus_task(inner_left).unwrap();
+        workspace
+            .insert_after_focused(cross_axis, Axis::Vertical)
+            .unwrap();
+        workspace.focus_task(inner_left).unwrap();
+        workspace
+            .insert_after_focused(inner_right, Axis::Horizontal)
+            .unwrap();
+        (workspace, outer, inner_left, inner_right, cross_axis)
+    }
+
+    fn set_root_child_allocation(
+        workspace: &mut TaskWorkspace,
+        child_index: usize,
+        allocation: Allocation,
+    ) {
+        let WorkspaceNode::Split { children, .. } = workspace.root_mut().expect("root") else {
+            panic!("expected split root")
+        };
+        children[child_index].allocation = allocation;
     }
 
     #[test]
@@ -593,8 +705,12 @@ mod tests {
         assert_eq!(widths[1], 400.0);
         assert_eq!(widths[2], 400.0);
         let smaller = workspace.allocate(Viewport::new(900.0, 700.0), metrics());
-        assert_eq!(smaller.width(first), Some(220.0));
-        assert_eq!(smaller.width(second), Some(280.0));
+        assert_eq!(
+            smaller.width(first),
+            Some(100.0),
+            "LRF pins may yield to the visible physical floor before other pins"
+        );
+        assert_eq!(smaller.width(second), Some(400.0));
         assert_eq!(smaller.width(third), Some(400.0));
     }
 
@@ -667,5 +783,357 @@ mod tests {
             + 4.0
             + allocated.width(third).unwrap();
         assert_eq!(total, 900.0);
+    }
+
+    #[test]
+    fn requested_pin_keeps_size_while_auto_yields_below_preferred_min() {
+        let first = TaskId::new();
+        let second = TaskId::new();
+        let mut workspace = TaskWorkspace::single(first);
+        workspace
+            .insert_after_focused(second, Axis::Horizontal)
+            .unwrap();
+        let split_id = match workspace.root().expect("root") {
+            crate::ui::task_workspace::WorkspaceNode::Split { id, .. } => *id,
+            _ => panic!("expected split"),
+        };
+        workspace.resize_split_child(split_id, 0, 500.0).unwrap();
+
+        let allocated = workspace.allocate(Viewport::new(800.0, 700.0), production_like_metrics());
+        assert_eq!(
+            allocated.width(first),
+            Some(500.0),
+            "requested pin must survive preferred Auto min pressure"
+        );
+        assert_eq!(
+            allocated.width(second),
+            Some(296.0),
+            "Auto peer yields residual under physical floor, not preferred 360: {:?}",
+            allocated.width(second)
+        );
+        assert!(matches!(
+            workspace.split_child_allocation(split_id, 1),
+            Some(Allocation::Auto { .. })
+        ));
+    }
+
+    #[test]
+    fn mixed_full_and_compact_auto_peers_conserve_extent_under_pin_pressure() {
+        let (mut workspace, [pinned, full_auto, compact_auto]) = three_horizontal_tasks();
+        workspace.set_manual_compact(compact_auto, true).unwrap();
+        workspace.pin_task_axis_size(pinned, 500.0).unwrap();
+        let metrics = production_like_metrics();
+
+        let at_500 = workspace.allocate(Viewport::new(800.0, 700.0), metrics);
+        assert_eq!(at_500.width(pinned), Some(500.0));
+        assert_eq!(at_500.width(full_auto), Some(228.0));
+        assert_eq!(at_500.width(compact_auto), Some(64.0));
+        assert_eq!(
+            at_500.width(pinned).unwrap()
+                + metrics.divider
+                + at_500.width(full_auto).unwrap()
+                + metrics.divider
+                + at_500.width(compact_auto).unwrap(),
+            800.0
+        );
+
+        workspace.pin_task_axis_size(pinned, 700.0).unwrap();
+        let at_700 = workspace.allocate(Viewport::new(800.0, 700.0), metrics);
+        assert_eq!(at_700.width(pinned), Some(664.0));
+        assert_eq!(at_700.width(full_auto), Some(64.0));
+        assert_eq!(at_700.width(compact_auto), Some(64.0));
+        assert_eq!(
+            at_700.width(pinned).unwrap()
+                + metrics.divider
+                + at_700.width(full_auto).unwrap()
+                + metrics.divider
+                + at_700.width(compact_auto).unwrap(),
+            800.0
+        );
+    }
+
+    #[test]
+    fn all_pinned_resize_keeps_lrf_peer_pinned_with_residual() {
+        let (mut workspace, [first, second, third]) = three_horizontal_tasks();
+        workspace.pin_task_axis_size(first, 220.0).unwrap();
+        workspace.pin_task_axis_size(second, 220.0).unwrap();
+        workspace.pin_task_axis_size(third, 220.0).unwrap();
+        let split_id = match workspace.root().expect("root") {
+            crate::ui::task_workspace::WorkspaceNode::Split { id, .. } => *id,
+            _ => panic!("expected split"),
+        };
+        workspace.focus_task(first).unwrap();
+        workspace.resize_split_child(split_id, 0, 360.0).unwrap();
+        assert_eq!(
+            workspace.split_child_allocation(split_id, 0),
+            Some(Allocation::Pinned { logical_px: 360.0 })
+        );
+        assert_eq!(
+            workspace.split_child_allocation(split_id, 1),
+            Some(Allocation::Pinned { logical_px: 220.0 })
+        );
+        assert_eq!(
+            workspace.split_child_allocation(split_id, 2),
+            Some(Allocation::Pinned { logical_px: 220.0 })
+        );
+    }
+
+    #[test]
+    fn nested_splits_conserve_parent_extent_after_forward_and_back_resize() {
+        let first = TaskId::new();
+        let second = TaskId::new();
+        let third = TaskId::new();
+        let mut workspace = TaskWorkspace::single(first);
+        workspace
+            .insert_after_focused(second, Axis::Horizontal)
+            .unwrap();
+        workspace.focus_task(second).unwrap();
+        workspace
+            .insert_after_focused(third, Axis::Vertical)
+            .unwrap();
+        let horizontal_id = match workspace.root().expect("root") {
+            crate::ui::task_workspace::WorkspaceNode::Split {
+                id,
+                axis: Axis::Horizontal,
+                ..
+            } => *id,
+            _ => panic!("expected horizontal root"),
+        };
+        workspace
+            .resize_split_child(horizontal_id, 0, 420.0)
+            .unwrap();
+        workspace
+            .resize_split_child(horizontal_id, 0, 380.0)
+            .unwrap();
+        workspace
+            .resize_split_child(horizontal_id, 0, 460.0)
+            .unwrap();
+        let allocated =
+            workspace.allocate(Viewport::new(1_000.0, 700.0), production_like_metrics());
+        let first_rect = allocated.rect(first).expect("first");
+        let second_rect = allocated.rect(second).expect("second");
+        let third_rect = allocated.rect(third).expect("third");
+        assert!((first_rect.width + 4.0 + second_rect.width - 1_000.0).abs() < 0.01);
+        assert!((second_rect.height + 4.0 + third_rect.height - 700.0).abs() < 0.01);
+        assert_eq!(second_rect.width, third_rect.width);
+    }
+
+    #[test]
+    fn nested_auto_physical_floor_claims_space_before_oversized_pin() {
+        // outer Pinned(700) + Auto nested H(Full,Full) @ 800 with divider 4:
+        // nested floor = 64+64+4 = 132; pin must yield rather than leave 46/46.
+        let (mut workspace, outer, nested_a, nested_b, cross_axis) = nested_horizontal_branch();
+        workspace.pin_task_axis_size(outer, 700.0).unwrap();
+        // This pin is vertical at the intermediate V split and must not
+        // inflate the horizontal floor of the nested branch.
+        workspace.pin_task_axis_size(cross_axis, 700.0).unwrap();
+        let metrics = production_like_metrics();
+        let allocated = workspace.allocate(Viewport::new(800.0, 700.0), metrics);
+        let nested_w = allocated.width(nested_a).unwrap()
+            + metrics.divider
+            + allocated.width(nested_b).unwrap();
+        assert!(
+            nested_w + 0.01 >= 132.0,
+            "nested Auto branch must receive recursive floor 132, got {nested_w}"
+        );
+        assert_eq!(allocated.width(nested_a), Some(64.0));
+        assert_eq!(allocated.width(nested_b), Some(64.0));
+        assert_eq!(allocated.width(outer), Some(664.0));
+        let total = allocated.width(outer).unwrap() + metrics.divider + nested_w;
+        assert!((total - 800.0).abs() < 0.01, "extent conserved: {total}");
+    }
+
+    #[test]
+    fn pinned_nested_branch_preserves_descendant_auto_floor_when_compressed() {
+        let (mut workspace, outer, nested_a, nested_b, _cross_axis) = nested_horizontal_branch();
+        // The root's second child is the nested V branch. Pin that branch at
+        // the root H axis while keeping its inner H children automatic.
+        workspace.pin_task_axis_size(outer, 700.0).unwrap();
+        set_root_child_allocation(&mut workspace, 1, Allocation::Pinned { logical_px: 500.0 });
+        workspace.focus_task(outer).unwrap();
+
+        let metrics = production_like_metrics();
+        let allocated = workspace.allocate(Viewport::new(800.0, 700.0), metrics);
+        assert_eq!(allocated.width(outer), Some(664.0));
+        assert_eq!(allocated.width(nested_a), Some(64.0));
+        assert_eq!(allocated.width(nested_b), Some(64.0));
+        assert_eq!(
+            allocated.width(nested_a).unwrap()
+                + metrics.divider
+                + allocated.width(nested_b).unwrap(),
+            132.0
+        );
+    }
+
+    #[test]
+    fn nested_physical_floor_honors_custom_pin_below_64_on_matching_axis() {
+        let (mut workspace, outer, nested_a, nested_b, _cross_axis) = nested_horizontal_branch();
+        workspace.pin_task_axis_size(outer, 700.0).unwrap();
+        // nested_a is a child of the inner H split, so this is a horizontal pin.
+        workspace.pin_task_axis_size(nested_a, 32.0).unwrap();
+
+        let metrics = production_like_metrics();
+        let allocated = workspace.allocate(Viewport::new(800.0, 700.0), metrics);
+        assert_eq!(allocated.width(nested_a), Some(32.0));
+        assert_eq!(allocated.width(nested_b), Some(64.0));
+        assert_eq!(allocated.width(outer), Some(696.0));
+        assert_eq!(
+            allocated.width(nested_a).unwrap()
+                + metrics.divider
+                + allocated.width(nested_b).unwrap(),
+            100.0
+        );
+    }
+
+    #[test]
+    fn custom_pin_below_physical_floor_is_not_raised() {
+        let first = TaskId::new();
+        let second = TaskId::new();
+        let mut workspace = TaskWorkspace::single(first);
+        workspace
+            .insert_after_focused(second, Axis::Horizontal)
+            .unwrap();
+        workspace.pin_task_axis_size(first, 32.0).unwrap();
+        workspace.pin_task_axis_size(second, 32.0).unwrap();
+        // In an all-pinned split the LRF peer must absorb spare viewport space.
+        // Focus the pin under test so the assertion checks its floor, not the
+        // deliberate LRF fill behavior.
+        workspace.focus_task(first).unwrap();
+        let pinned_workspace = workspace.clone();
+        let allocated = workspace.allocate(Viewport::new(800.0, 700.0), production_like_metrics());
+        assert_eq!(
+            allocated.width(first),
+            Some(32.0),
+            "valid custom pin 32 must not clamp up to physical floor 64"
+        );
+        assert_eq!(allocated.width(second), Some(764.0));
+        assert_eq!(
+            workspace, pinned_workspace,
+            "fill must not mutate stored pins"
+        );
+    }
+
+    #[test]
+    fn tiny_viewport_conserves_divider_without_overflow() {
+        let first = TaskId::new();
+        let second = TaskId::new();
+        let mut workspace = TaskWorkspace::single(first);
+        workspace
+            .insert_after_focused(second, Axis::Horizontal)
+            .unwrap();
+        let metrics = production_like_metrics();
+        let allocated = workspace.allocate(Viewport::new(2.0, 100.0), metrics);
+        let last = allocated.rect(second).unwrap();
+        let total = last.x + last.width;
+        assert!(
+            total <= 2.0 + 0.01,
+            "parent width 2 with divider 4 must not emit overflow total {total}"
+        );
+
+        let first = TaskId::new();
+        let second = TaskId::new();
+        let mut vertical = TaskWorkspace::single(first);
+        vertical
+            .insert_after_focused(second, Axis::Vertical)
+            .unwrap();
+        let allocated = vertical.allocate(Viewport::new(100.0, 2.0), metrics);
+        let last = allocated.rect(second).unwrap();
+        let total = last.y + last.height;
+        assert!(
+            total <= 2.0 + 0.01,
+            "parent height 2 with divider 4 must not emit overflow total {total}"
+        );
+    }
+
+    #[test]
+    fn gesture_parent_extent_keeps_all_pinned_residual_stable_across_reverse() {
+        let (mut workspace, [first, second, third]) = three_horizontal_tasks();
+        workspace.pin_task_axis_size(first, 220.0).unwrap();
+        workspace.pin_task_axis_size(second, 220.0).unwrap();
+        workspace.pin_task_axis_size(third, 220.0).unwrap();
+        let split_id = match workspace.root().expect("root") {
+            crate::ui::task_workspace::WorkspaceNode::Split { id, .. } => *id,
+            _ => panic!("expected split"),
+        };
+        workspace.focus_task(first).unwrap();
+        let metrics = production_like_metrics();
+        let viewport = Viewport::new(800.0, 700.0);
+        let parent_extent = 800.0;
+        let divider_total = metrics.divider * 2.0;
+        workspace
+            .resize_split_child_with_parent_extent(
+                split_id,
+                0,
+                500.0,
+                Some((parent_extent, divider_total)),
+            )
+            .unwrap();
+        workspace
+            .resize_split_child_with_parent_extent(
+                split_id,
+                0,
+                700.0,
+                Some((parent_extent, divider_total)),
+            )
+            .unwrap();
+        workspace
+            .resize_split_child_with_parent_extent(
+                split_id,
+                0,
+                500.0,
+                Some((parent_extent, divider_total)),
+            )
+            .unwrap();
+        workspace
+            .resize_split_child_with_parent_extent(
+                split_id,
+                0,
+                220.0,
+                Some((parent_extent, divider_total)),
+            )
+            .unwrap();
+        let allocated = workspace.allocate(viewport, metrics);
+        assert_eq!(
+            workspace.split_child_allocation(split_id, 0),
+            Some(Allocation::Pinned { logical_px: 220.0 })
+        );
+        assert_eq!(
+            workspace.split_child_allocation(split_id, 1),
+            Some(Allocation::Pinned { logical_px: 220.0 })
+        );
+        assert_eq!(
+            workspace.split_child_allocation(split_id, 2),
+            Some(Allocation::Pinned { logical_px: 220.0 })
+        );
+        assert_eq!(allocated.width(first), Some(220.0));
+        assert_eq!(allocated.width(second), Some(352.0));
+        assert_eq!(allocated.width(third), Some(220.0));
+        let total = allocated.width(first).unwrap()
+            + metrics.divider
+            + allocated.width(second).unwrap()
+            + metrics.divider
+            + allocated.width(third).unwrap();
+        assert!((total - 800.0).abs() < 0.01);
+
+        // Changing focus changes only the LRF recipient; it must not mutate
+        // any stored custom pin.
+        workspace.focus_task(second).unwrap();
+        workspace.focus_task(third).unwrap();
+        let changed_focus = workspace.allocate(viewport, metrics);
+        assert_eq!(changed_focus.width(first), Some(352.0));
+        assert_eq!(changed_focus.width(second), Some(220.0));
+        assert_eq!(changed_focus.width(third), Some(220.0));
+        assert_eq!(
+            workspace.split_child_allocation(split_id, 0),
+            Some(Allocation::Pinned { logical_px: 220.0 })
+        );
+        assert_eq!(
+            workspace.split_child_allocation(split_id, 1),
+            Some(Allocation::Pinned { logical_px: 220.0 })
+        );
+        assert_eq!(
+            workspace.split_child_allocation(split_id, 2),
+            Some(Allocation::Pinned { logical_px: 220.0 })
+        );
     }
 }

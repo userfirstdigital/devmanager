@@ -16,6 +16,8 @@ pub struct ProviderHealthJobOwner {
     active_generation: Arc<AtomicU64>,
     active_guard: Mutex<Option<ProviderHealthRefreshGuard>>,
     config_revision: AtomicU64,
+    metadata_in_flight: AtomicBool,
+    metadata_error: Mutex<Option<String>>,
 }
 
 impl ProviderHealthJobOwner {
@@ -27,11 +29,40 @@ impl ProviderHealthJobOwner {
             active_generation: Arc::new(AtomicU64::new(0)),
             active_guard: Mutex::new(None),
             config_revision: AtomicU64::new(revision),
+            metadata_in_flight: AtomicBool::new(false),
+            metadata_error: Mutex::new(None),
         }
     }
 
     pub fn health_cache(&self) -> &ProviderHealthCache {
         &self.profile.health
+    }
+
+    pub fn metadata_cancel_flag(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.cancel)
+    }
+
+    pub fn begin_metadata_refresh(&self) {
+        self.metadata_in_flight.store(true, Ordering::Release);
+    }
+
+    pub fn finish_metadata_refresh(&self, error: Option<String>) {
+        self.metadata_in_flight.store(false, Ordering::Release);
+        *self
+            .metadata_error
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = error;
+    }
+
+    pub fn metadata_in_flight(&self) -> bool {
+        self.metadata_in_flight.load(Ordering::Acquire)
+    }
+
+    pub fn metadata_last_error(&self) -> Option<String> {
+        self.metadata_error
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
     }
 
     pub fn document(&self) -> ProviderSettingsDocument {
@@ -85,6 +116,7 @@ impl ProviderHealthJobOwner {
 
     pub fn cancel(&self) {
         self.cancel.store(true, Ordering::Release);
+        self.metadata_in_flight.store(false, Ordering::Release);
         let _ = self
             .active_guard
             .lock()
@@ -123,9 +155,9 @@ mod tests {
             ProviderHealthJobOwner::default_interval(),
             DEFAULT_HEALTH_INTERVAL_SECS
         );
-        let gen = owner.try_begin_manual_refresh().expect("first");
+        let generation = owner.try_begin_manual_refresh().expect("first");
         assert!(owner.try_begin_manual_refresh().is_none());
-        owner.finish_refresh(gen, None);
+        owner.finish_refresh(generation, None);
         assert!(owner.try_begin_manual_refresh().is_some());
     }
 

@@ -9,6 +9,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 
 use crate::providers::settings::binding::ProviderInstanceBindingStore;
 use crate::providers::settings::health::ProviderHealthCache;
+use crate::providers::settings::metadata_cache::ProviderMetadataCache;
 use crate::providers::settings::store::{ProviderSettingsStore, ProviderSettingsStoreError};
 
 static PROFILE_OWNERS: OnceLock<Mutex<BTreeMap<PathBuf, Arc<ProviderProfileOwner>>>> =
@@ -19,6 +20,7 @@ pub struct ProviderProfileOwner {
     pub settings: ProviderSettingsStore,
     pub bindings: ProviderInstanceBindingStore,
     pub health: ProviderHealthCache,
+    pub metadata: ProviderMetadataCache,
     root: PathBuf,
 }
 
@@ -39,12 +41,16 @@ impl ProviderProfileOwner {
         let settings = ProviderSettingsStore::open_dir(&dir)?;
         let bindings = ProviderInstanceBindingStore::open_dir(&dir)
             .map_err(|e| ProviderSettingsStoreError::Path(format!("bindings unavailable: {e}")))?;
+        let metadata = ProviderMetadataCache::open_dir(&dir).map_err(|e| {
+            ProviderSettingsStoreError::Path(format!("metadata cache unavailable: {e}"))
+        })?;
         let health = ProviderHealthCache::new();
         health.seed_from_document(&settings.snapshot());
         let owner = Arc::new(Self {
             settings,
             bindings,
             health,
+            metadata,
             root: dir.clone(),
         });
         guard.insert(dir, Arc::clone(&owner));
@@ -62,12 +68,16 @@ impl ProviderProfileOwner {
         let settings = ProviderSettingsStore::open_dir(dir)?;
         let bindings = ProviderInstanceBindingStore::open_dir(dir)
             .map_err(|e| ProviderSettingsStoreError::Path(format!("bindings unavailable: {e}")))?;
+        let metadata = ProviderMetadataCache::open_dir(dir).map_err(|e| {
+            ProviderSettingsStoreError::Path(format!("metadata cache unavailable: {e}"))
+        })?;
         let health = ProviderHealthCache::new();
         health.seed_from_document(&settings.snapshot());
         Ok(Arc::new(Self {
             settings,
             bindings,
             health,
+            metadata,
             root: dir.to_path_buf(),
         }))
     }

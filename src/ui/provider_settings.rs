@@ -14,6 +14,9 @@ use crate::providers::settings::{
     ProviderSettingsHostRequest, ProviderSettingsMutation, ProviderSettingsReply,
     ProviderSettingsSnapshot, DEFAULT_HEALTH_INTERVAL_SECS,
 };
+use crate::ui::provider_metadata::{
+    catalog_for_instance, format_usage_summary, usage_for_instance, UiModelCatalog, UiUsage,
+};
 use crate::ui::tokens::ThemeTokens;
 
 #[derive(Clone)]
@@ -92,6 +95,10 @@ fn empty_loading_snapshot() -> ProviderSettingsSnapshot {
         health_in_flight: false,
         health_error: None,
         composer_instances: Vec::new(),
+        model_catalogs: Vec::new(),
+        usage: Vec::new(),
+        metadata_in_flight: false,
+        metadata_error: None,
     }
 }
 
@@ -149,6 +156,10 @@ impl ProviderSettingsController {
             self.snapshot.health_in_flight = snapshot.health_in_flight;
             self.snapshot.health_error = snapshot.health_error;
             self.snapshot.composer_instances = snapshot.composer_instances;
+            self.snapshot.model_catalogs = snapshot.model_catalogs;
+            self.snapshot.usage = snapshot.usage;
+            self.snapshot.metadata_in_flight = snapshot.metadata_in_flight;
+            self.snapshot.metadata_error = snapshot.metadata_error;
             if snapshot.revision != self.snapshot.revision {
                 self.error = Some(format!(
                     "settings changed on host (revision {}); save will require refresh",
@@ -158,6 +169,26 @@ impl ProviderSettingsController {
             return;
         }
         self.snapshot = snapshot;
+    }
+
+    pub fn model_catalogs(&self) -> &[UiModelCatalog] {
+        &self.snapshot.model_catalogs
+    }
+
+    pub fn usage_rows(&self) -> &[UiUsage] {
+        &self.snapshot.usage
+    }
+
+    pub fn metadata_in_flight(&self) -> bool {
+        self.snapshot.metadata_in_flight
+    }
+
+    pub fn metadata_error(&self) -> Option<&str> {
+        self.snapshot.metadata_error.as_deref()
+    }
+
+    pub fn usage_summary_for(&self, instance_id: &str) -> Option<String> {
+        usage_for_instance(&self.snapshot.usage, instance_id).map(format_usage_summary)
     }
 
     pub fn apply_reply(&mut self, reply: ProviderSettingsReply) {
@@ -1061,11 +1092,27 @@ impl ProviderSettingsController {
     }
 
     pub fn move_catalog_model(&mut self, instance_id: &str, slug: &str, up: bool) {
-        let builtins = builtin_model_slugs(
-            self.working_instance(instance_id)
-                .map(|i| i.driver)
-                .unwrap_or(ProviderDriverKind::Claude),
-        );
+        let builtins = self
+            .snapshot
+            .model_catalogs
+            .iter()
+            .find(|catalog| catalog.instance_id == instance_id)
+            .filter(|catalog| !catalog.models.is_empty())
+            .map(|catalog| {
+                catalog
+                    .models
+                    .iter()
+                    .filter(|entry| !entry.is_custom)
+                    .map(|entry| entry.slug.clone())
+                    .collect()
+            })
+            .unwrap_or_else(|| {
+                builtin_model_slugs(
+                    self.working_instance(instance_id)
+                        .map(|i| i.driver)
+                        .unwrap_or(ProviderDriverKind::Claude),
+                )
+            });
         let slug = slug.to_string();
         let id = instance_id.to_string();
         self.mutate_draft_models(instance_id, format!("Reordered model {slug}"), move |doc| {
@@ -1078,11 +1125,24 @@ impl ProviderSettingsController {
         let Some(instance) = self.working_instance(instance_id) else {
             return Vec::new();
         };
-        let builtins = builtin_model_slugs(instance.driver);
+        let catalog = catalog_for_instance(&self.snapshot.model_catalogs, instance_id);
+        let builtins = catalog
+            .filter(|catalog| !catalog.models.is_empty())
+            .map(|catalog| {
+                catalog
+                    .models
+                    .iter()
+                    .filter(|entry| !entry.is_custom)
+                    .map(|entry| entry.slug.clone())
+                    .collect()
+            })
+            .unwrap_or_else(|| builtin_model_slugs(instance.driver));
         let mut doc = self.snapshot.document.clone();
         if let Some(slot) = doc.get_mut(instance_id) {
             *slot = instance;
         }
+        // Settings must include hidden models so they can be shown again, and
+        // unsaved custom rows must stay visible in this editor's local draft.
         doc.ordered_settings_catalog(instance_id, &builtins)
             .unwrap_or_default()
     }

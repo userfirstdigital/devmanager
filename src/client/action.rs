@@ -20,7 +20,10 @@ use crate::domain::command::{
 use crate::domain::id::{
     AgentSessionId, ConfiguredServiceId, PromptChainId, PromptVersionId, ResourceId,
 };
-use crate::domain::provider_input::{ProviderInputAction, ProviderInputIntentError};
+use crate::domain::provider_input::{
+    validate_provider_images, validate_send_now_payload, ProviderImageAttachment,
+    ProviderInputAction, ProviderInputIntentError,
+};
 use crate::domain::query::{Query, QueryEnvelope};
 use crate::domain::task::{
     ReviewReadiness, TaskActivity, TaskAssignment, TaskAttention, TaskConnectivity, TaskFacts,
@@ -1515,6 +1518,13 @@ pub struct ProviderInputArguments {
     pub text: Option<String>,
     pub wait: Option<bool>,
     pub allow: Option<bool>,
+    /// Staged image identities for SendNow only. Empty is omitted on the wire.
+    #[serde(
+        default,
+        skip_serializing_if = "Vec::is_empty",
+        deserialize_with = "crate::domain::provider_input::deserialize_optional_provider_images"
+    )]
+    pub images: Vec<ProviderImageAttachment>,
 }
 
 /// Build the shared provider-input mutation after bound and identity checks.
@@ -1526,22 +1536,37 @@ pub fn provider_input_command(
     action_id: &str,
     args: ProviderInputArguments,
 ) -> Result<CommandEnvelope, ProviderInputIntentError> {
+    validate_provider_images(&args.images)?;
     let action = match action_id {
-        ACTION_PROVIDER_SEND_NOW | ACTION_TASK_SEND_NOW => ProviderInputAction::SendNow {
-            text: args.text.ok_or(ProviderInputIntentError::EmptyText)?,
-            wait: args.wait.unwrap_or(false),
-        },
+        ACTION_PROVIDER_SEND_NOW | ACTION_TASK_SEND_NOW => {
+            let text = args.text.unwrap_or_default();
+            validate_send_now_payload(&text, &args.images)?;
+            ProviderInputAction::SendNow {
+                text,
+                wait: args.wait.unwrap_or(false),
+                images: args.images,
+            }
+        }
         ACTION_PROVIDER_STEER_CURRENT_TURN | ACTION_TASK_STEER_CURRENT_TURN => {
+            if !args.images.is_empty() {
+                return Err(ProviderInputIntentError::ImagesUnsupported);
+            }
             ProviderInputAction::SteerCurrentTurn {
                 text: args.text.ok_or(ProviderInputIntentError::EmptyText)?,
             }
         }
         ACTION_PROVIDER_QUEUE_FOLLOW_UP | ACTION_TASK_QUEUE_FOLLOW_UP => {
+            if !args.images.is_empty() {
+                return Err(ProviderInputIntentError::ImagesUnsupported);
+            }
             ProviderInputAction::QueueFollowUp {
                 text: args.text.ok_or(ProviderInputIntentError::EmptyText)?,
             }
         }
         ACTION_PROVIDER_ANSWER_QUESTION | ACTION_TASK_ANSWER_QUESTION => {
+            if !args.images.is_empty() {
+                return Err(ProviderInputIntentError::ImagesUnsupported);
+            }
             ProviderInputAction::AnswerQuestion {
                 question_id: args
                     .question_id
@@ -1550,6 +1575,9 @@ pub fn provider_input_command(
             }
         }
         ACTION_PROVIDER_RESOLVE_APPROVAL | ACTION_TASK_RESOLVE_APPROVAL => {
+            if !args.images.is_empty() {
+                return Err(ProviderInputIntentError::ImagesUnsupported);
+            }
             ProviderInputAction::ResolveApproval {
                 approval_id: args
                     .approval_id
@@ -1559,10 +1587,20 @@ pub fn provider_input_command(
                     .ok_or(ProviderInputIntentError::InconsistentNestedIds)?,
             }
         }
-        ACTION_PROVIDER_STOP_TURN | ACTION_TASK_STOP_TURN => ProviderInputAction::StopTurn,
-        ACTION_PROVIDER_TERMINAL_INPUT => ProviderInputAction::TerminalInput {
-            text: args.text.ok_or(ProviderInputIntentError::EmptyText)?,
-        },
+        ACTION_PROVIDER_STOP_TURN | ACTION_TASK_STOP_TURN => {
+            if !args.images.is_empty() {
+                return Err(ProviderInputIntentError::ImagesUnsupported);
+            }
+            ProviderInputAction::StopTurn
+        }
+        ACTION_PROVIDER_TERMINAL_INPUT => {
+            if !args.images.is_empty() {
+                return Err(ProviderInputIntentError::ImagesUnsupported);
+            }
+            ProviderInputAction::TerminalInput {
+                text: args.text.ok_or(ProviderInputIntentError::EmptyText)?,
+            }
+        }
         _ => return Err(ProviderInputIntentError::InconsistentNestedIds),
     };
     let intent = SubmitProviderInputIntent::try_new(
@@ -2436,9 +2474,42 @@ mod tests {
                 text: Some("ship it".into()),
                 wait: Some(false),
                 allow: None,
+                images: Vec::new(),
             },
         )
         .expect("task.send_now maps to SubmitProviderInput");
         assert!(matches!(envelope.command, Command::SubmitProviderInput(_)));
+
+        let absolute = if cfg!(windows) {
+            r"C:\repo\.devmanager\pasted-images\x.png"
+        } else {
+            "/repo/.devmanager/pasted-images/x.png"
+        };
+        let image =
+            crate::domain::ProviderImageAttachment::try_new(absolute, [7; 32], 32).expect("image");
+        let rejected = provider_input_command(
+            CommandId::new(),
+            ClientId::new(),
+            1_725_000_000_100,
+            2,
+            ACTION_TASK_STEER_CURRENT_TURN,
+            ProviderInputArguments {
+                task_id,
+                agent_session_id: AgentSessionId::new(),
+                runtime_generation: 3,
+                action_epoch: 4,
+                turn_id: TurnId::new(),
+                question_id: None,
+                approval_id: None,
+                text: Some("steer".into()),
+                wait: None,
+                allow: None,
+                images: vec![image],
+            },
+        );
+        assert!(matches!(
+            rejected,
+            Err(crate::domain::ProviderInputIntentError::ImagesUnsupported)
+        ));
     }
 }

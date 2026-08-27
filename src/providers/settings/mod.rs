@@ -4,14 +4,23 @@ mod health;
 mod health_job;
 mod health_probe;
 mod launch_policy;
+mod metadata_cache;
+mod metadata_parse;
+mod metadata_probe;
+mod metadata_types;
 mod model;
 mod profile;
 pub(crate) mod secret;
 mod store;
+pub(crate) mod usage_http;
 
 #[cfg(test)]
 #[path = "core_tests.rs"]
 mod core_tests;
+
+#[cfg(test)]
+#[path = "metadata_tests.rs"]
+mod metadata_tests;
 
 pub use authority::{
     health_probe_plan, publish_instance_health, ComposerProviderChoice, ProviderHealthRowWire,
@@ -35,7 +44,19 @@ pub use health_probe::{
 };
 pub use launch_policy::{
     apply_instance_to_discovery, merge_instance_environment, prepare_codex_shadow_home,
-    resolve_launch_config, LaunchPolicyError, ProviderInstanceScope, ResolvedProviderLaunchConfig,
+    resolve_launch_config, resolve_launch_config_with_known_models, scope_fingerprint_bytes,
+    LaunchPolicyError, ProviderInstanceScope, ResolvedProviderLaunchConfig,
+};
+pub use metadata_cache::{
+    config_scope_fingerprint, effective_scope_fingerprint, ProviderMetadataCache,
+};
+pub use metadata_probe::{
+    project_all_from_cache, project_model_catalog_wire, project_usage_wire,
+    prune_metadata_cache_for_settings, refresh_instance_metadata, METADATA_PROBE_TIMEOUT,
+};
+pub use metadata_types::{
+    DiscoveredModel, ProviderMetadataSource, ProviderModelCatalogWire, ProviderModelEntryWire,
+    ProviderUsageStateWire, ProviderUsageWindowWire, ProviderUsageWire,
 };
 pub use model::{
     builtin_slugs_for_driver, normalize_model_slug, validate_env_name, validate_instance_id,

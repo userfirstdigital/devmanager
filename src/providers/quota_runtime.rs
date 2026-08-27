@@ -188,6 +188,47 @@ impl NativeQuotaHost {
         })
     }
 
+    /// Prefer settings metadata-backed quota sources (canonical truth) over
+    /// stock adapters that still report Unsupported for observe_quota.
+    pub fn start_with_metadata_sources(
+        config: QuotaRuntimeConfig,
+        sources: Vec<Arc<dyn super::quota::QuotaObserverSource>>,
+    ) -> Result<Self, QuotaRuntimeError> {
+        config.validate()?;
+        let runtime =
+            tokio::runtime::Handle::try_current().map_err(|_| QuotaRuntimeError::NoAsyncRuntime)?;
+        let registry = Arc::new(stock_provider_registry()?);
+        let host = Arc::new(
+            ProviderQuotaHost::new(Arc::new(SystemQuotaClock), config.observer)
+                .map_err(QuotaRuntimeError::QuotaHost)?,
+        );
+        for source in sources {
+            host.register(source).map_err(|error| match error {
+                super::quota::QuotaHostError::DuplicateProviderKind(kind) => {
+                    QuotaRuntimeError::DuplicateProviderKind(kind)
+                }
+                super::quota::QuotaHostError::InvalidConfig(error) => {
+                    QuotaRuntimeError::QuotaHost(error)
+                }
+            })?;
+        }
+        let active_keys = Arc::new(RwLock::new(BTreeMap::new()));
+        let (stop, stop_rx) = watch::channel(false);
+        let task = runtime.spawn(refresh_loop(
+            Arc::clone(&host),
+            Arc::clone(&registry),
+            Arc::clone(&active_keys),
+            stop_rx,
+            config.refresh_interval,
+        ));
+        Ok(Self {
+            host,
+            active_keys,
+            stop,
+            task: Some(task),
+        })
+    }
+
     /// Canonical source for the native top bar.  This method only reads the
     /// cache and performs no provider discovery, process launch, or I/O.
     pub fn top_bar(&self) -> CanonicalQuotaBar {

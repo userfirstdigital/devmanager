@@ -9,8 +9,10 @@ use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 
-use crate::providers::settings::health::{ProviderHealthRow, ProviderHealthStatus};
+use crate::providers::settings::health::{unix_now_ms, ProviderHealthRow, ProviderHealthStatus};
 use crate::providers::settings::health_job::ProviderHealthJobOwner;
+use crate::providers::settings::metadata_probe::project_all_from_cache;
+use crate::providers::settings::metadata_types::{ProviderModelCatalogWire, ProviderUsageWire};
 use crate::providers::settings::model::{
     ProviderDriverKind, ProviderInstanceConfig, ProviderSettingsDocument, ProviderSettingsError,
 };
@@ -29,6 +31,17 @@ pub struct ProviderSettingsSnapshot {
     pub health_error: Option<String>,
     /// Composer-facing enabled launchable instances (no secrets).
     pub composer_instances: Vec<ComposerProviderChoice>,
+    /// Cached model catalogs (last-good until refresh). Wire-compatible default empty.
+    #[serde(default)]
+    pub model_catalogs: Vec<ProviderModelCatalogWire>,
+    /// Cached usage projections (truthful nulls; never invented 0/100).
+    #[serde(default)]
+    pub usage: Vec<ProviderUsageWire>,
+    /// Metadata refresh in flight (separate from health attestation registry).
+    #[serde(default)]
+    pub metadata_in_flight: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub metadata_error: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -226,6 +239,11 @@ impl ProviderSettingsAuthority {
                     .map(|kind| kind.wire_name().to_string()),
             })
             .collect();
+        let (model_catalogs, usage) = project_all_from_cache(
+            &self.profile.settings,
+            &self.profile.metadata,
+            unix_now_ms(),
+        );
         ProviderSettingsSnapshot {
             revision: document.revision,
             health_interval_secs: document.health_interval_secs,
@@ -239,6 +257,10 @@ impl ProviderSettingsAuthority {
             health_in_flight: self.profile.health.is_refresh_in_flight(),
             health_error: self.profile.health.last_error(),
             composer_instances,
+            model_catalogs,
+            usage,
+            metadata_in_flight: self.health_job.metadata_in_flight(),
+            metadata_error: self.health_job.metadata_last_error(),
             document,
         }
     }
@@ -384,6 +406,10 @@ impl ProviderSettingsAuthority {
         self.profile
             .health
             .seed_from_document(&self.profile.settings.snapshot());
+        crate::providers::settings::prune_metadata_cache_for_settings(
+            &self.profile.settings,
+            &self.profile.metadata,
+        );
         Ok(ProviderSettingsReply::MutationApplied {
             snapshot: self.snapshot(),
         })

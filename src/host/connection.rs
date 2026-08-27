@@ -4278,7 +4278,8 @@ impl HostRequestExecutor {
         if matches!(
             primary_provider,
             Some(crate::providers::ProviderKind::Cursor)
-        ) {
+        ) && !defer_primary_provider_start
+        {
             return Err(IpcError::Unavailable);
         }
         validate_authenticated_command_capability(negotiated.capabilities, &envelope.command)?;
@@ -4501,8 +4502,122 @@ impl HostRequestExecutor {
             IpcError::Unavailable
         })?;
         let manager = runtime.manager.clone();
+        let mut intent = intent.clone();
+        if self.provider_restore_in_flight.contains(&intent.task_id)
+            || self
+                .provider_restore_queue
+                .iter()
+                .any(|queued| queued.task_id == intent.task_id)
+        {
+            return Err(IpcError::Unavailable);
+        }
+        {
+            let snapshot = self
+                .bus
+                .task_snapshot(intent.task_id)
+                .map_err(|error| {
+                    eprintln!("devmanager-host: provider start snapshot failed: {error}");
+                    map_store_error(error)
+                })?
+                .ok_or_else(|| {
+                    eprintln!("devmanager-host: provider start task missing");
+                    IpcError::Unavailable
+                })?;
+            let agent = snapshot
+                .agents
+                .get(&intent.agent_session_id)
+                .ok_or_else(|| {
+                    eprintln!("devmanager-host: provider start agent missing");
+                    IpcError::Unavailable
+                })?;
+            // Validate the caller's original task/agent/resource fences before
+            // journaling any provider change. The kind is the only draft field
+            // being replaced; all other identity must match the existing claim.
+            let mut original_claim = intent.clone();
+            original_claim.provider_kind = agent.provider_kind;
+            self.bus
+                .prepare_provider_start(&original_claim)
+                .map_err(map_store_error)?;
+            if agent.provider_kind != intent.provider_kind {
+                if intent.mode != crate::domain::command::ProviderStartMode::NewConversation {
+                    eprintln!(
+                        "devmanager-host: provider rebind refused for non-NewConversation start"
+                    );
+                    return Err(IpcError::Unavailable);
+                }
+                if !snapshot.is_unstarted_draft() {
+                    eprintln!("devmanager-host: provider start kind mismatch on non-draft task");
+                    return Err(IpcError::Unavailable);
+                }
+                // Running/launching without SessionStart must not rebind once a
+                // live provider terminal or persisted launch graph exists.
+                if manager
+                    .provider_terminal_binding(
+                        intent.task_id,
+                        intent.agent_session_id,
+                        intent.resource_id,
+                        agent.runtime_generation,
+                    )
+                    .is_some()
+                {
+                    eprintln!(
+                        "devmanager-host: provider rebind refused; live provider terminal present"
+                    );
+                    return Err(IpcError::Unavailable);
+                }
+                match manager.peek_persisted_provider_launch_spec(intent.agent_session_id) {
+                    Ok(Some(_)) => {
+                        eprintln!(
+                            "devmanager-host: provider rebind refused; persisted launch graph present"
+                        );
+                        return Err(IpcError::Unavailable);
+                    }
+                    Ok(None) => {}
+                    Err(error) => {
+                        eprintln!(
+                            "devmanager-host: provider rebind persisted-launch peek failed: {error}"
+                        );
+                        return Err(IpcError::Unavailable);
+                    }
+                }
+                let receipt = self
+                    .bus
+                    .execute_host_authorized(
+                        CommandEnvelope {
+                            command_id: crate::domain::CommandId::new(),
+                            client_id: crate::domain::ClientId::new(),
+                            task_id: Some(intent.task_id),
+                            issued_at_ms: unix_time_ms_u64() as i64,
+                            expected_task_revision: Some(snapshot.task.revision),
+                            command: Command::RebindUnstartedPrimaryProvider {
+                                agent_session_id: intent.agent_session_id,
+                                provider_kind: intent.provider_kind,
+                            },
+                        },
+                        None,
+                        RequestId::new(),
+                        Uuid::nil(),
+                    )
+                    .map_err(|error| {
+                        eprintln!("devmanager-host: draft provider rebind failed: {error}");
+                        map_store_error(error)
+                    })?;
+                if !matches!(receipt, CommandReceipt::Accepted { .. }) {
+                    eprintln!("devmanager-host: draft provider rebind rejected: {receipt:?}");
+                    return Err(IpcError::Unavailable);
+                }
+                self.fan_out_live_durable_events();
+                let rebound = self
+                    .bus
+                    .task_snapshot(intent.task_id)
+                    .map_err(map_store_error)?
+                    .ok_or(IpcError::Unavailable)?;
+                intent.expected_task_revision = rebound.task.revision;
+                intent.expected_action_epoch = rebound.task.action_epoch;
+            }
+        }
         let (binding, agent, snapshot) =
-            self.bus.prepare_provider_start(intent).map_err(|error| {
+            self.bus.prepare_provider_start(&intent).map_err(|error| {
                 eprintln!("devmanager-host: provider start prepare failed: {error}");
                 map_store_error(error)
             })?;
@@ -6517,7 +6632,9 @@ fn validate_authenticated_command_capability(
         }
         Command::PresentProviderQuestion(_)
         | Command::PresentProviderApproval(_)
-        | Command::SettleProviderWait(_) => Err(IpcError::UnsupportedCapability),
+        | Command::SettleProviderWait(_)
+        | Command::BindProviderSession { .. }
+        | Command::RebindUnstartedPrimaryProvider { .. } => Err(IpcError::UnsupportedCapability),
         Command::SubmitProviderInput(_) if !capabilities.contains(Capability::ProviderInput) => {
             Err(IpcError::UnsupportedCapability)
         }
@@ -10958,6 +11075,7 @@ mod output_tests {
                 ProviderInputAction::SendNow {
                     text: "input".into(),
                     wait: false,
+                    images: Vec::new(),
                 },
             )
             .expect("provider intent"),
@@ -11068,6 +11186,106 @@ mod output_tests {
         assert!(
             !body.contains("ProcessManager::new"),
             "AgentConnection must not construct a ProcessManager fallback"
+        );
+    }
+
+    #[test]
+    fn provider_start_rebind_requires_new_conversation_unstarted_and_no_live_launch() {
+        let source = include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/src/host/connection.rs"
+        ));
+        let start = source
+            .find("\n    fn start_provider_session_intent(")
+            .expect("start_provider_session_intent");
+        let body = &source[start..];
+        let end = body
+            .find("\n    fn dispatch_task_close(")
+            .or_else(|| body.find("/// Archive one task after releasing"))
+            .expect("end of start_provider_session_intent");
+        let body = &body[..end];
+        assert!(
+            body.contains("provider_restore_in_flight.contains"),
+            "duplicate queued/inflight restore must guard before starts"
+        );
+        assert!(
+            body.contains("original_claim"),
+            "read-only original_claim must prepare before any rebind"
+        );
+        assert!(
+            body.contains("prepare_provider_start(&original_claim)"),
+            "original fences must validate before journaling provider change"
+        );
+        assert!(
+            body.contains("ProviderStartMode::NewConversation"),
+            "rebind refused unless NewConversation"
+        );
+        assert!(
+            body.contains("is_unstarted_draft()"),
+            "rebind refused unless projection is unstarted draft"
+        );
+        assert!(
+            body.contains("provider_terminal_binding("),
+            "live terminal binding must block rebind even without SessionStart id"
+        );
+        assert!(
+            body.contains("peek_persisted_provider_launch_spec"),
+            "persisted launch graph must block rebind"
+        );
+        assert!(
+            body.contains("execute_host_authorized"),
+            "rebind must use host-authorized execute, not public bus"
+        );
+        assert!(
+            body.contains("Command::RebindUnstartedPrimaryProvider"),
+            "rebind command must be the host-only rebound variant"
+        );
+    }
+
+    #[test]
+    fn public_command_bus_denies_rebind_unstarted_primary_provider() {
+        let bus = include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/src/kernel/command_bus.rs"
+        ));
+        assert!(
+            bus.contains("Command::RebindUnstartedPrimaryProvider")
+                && bus.contains("HostAuthorityRequired"),
+            "public CommandBus.execute must deny RebindUnstartedPrimaryProvider"
+        );
+        let permissions = include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/src/connect/permissions.rs"
+        ));
+        assert!(
+            permissions.contains("Command::RebindUnstartedPrimaryProvider"),
+            "connect permissions must enumerate RebindUnstartedPrimaryProvider"
+        );
+    }
+
+    #[test]
+    fn projector_rebound_validates_busy_projection_not_only_null_session_id() {
+        let source = include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/src/kernel/projector.rs"
+        ));
+        let start = source
+            .find("Event::UnstartedPrimaryProviderRebound")
+            .expect("rebound event arm");
+        let body = &source[start..];
+        let end = body
+            .find("Event::SpecialistRequested")
+            .expect("next event arm");
+        let body = &body[..end];
+        assert!(
+            body.contains("current_turn.is_some()")
+                && body.contains("open_question.is_some()")
+                && body.contains("last_settlement.is_some()"),
+            "projector must refuse rebound when provider projection is busy"
+        );
+        assert!(
+            body.contains("provider_session_id IS NULL"),
+            "SQL still requires null SessionStart id"
         );
     }
 }

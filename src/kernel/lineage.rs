@@ -551,6 +551,7 @@ fn is_pure_decision_fact(event: &Event) -> bool {
             | Event::AgentSessionRegistered { .. }
             | Event::AgentProviderSessionBound { .. }
             | Event::PrimaryAgentSet { .. }
+            | Event::UnstartedPrimaryProviderRebound { .. }
             | Event::SpecialistRequested { .. }
             | Event::PrimaryPromoted { .. }
             | Event::SpecialistHandoffRecorded { .. }

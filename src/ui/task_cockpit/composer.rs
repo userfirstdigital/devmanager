@@ -320,6 +320,23 @@ impl ComposerIntent {
         question_id: Option<QuestionId>,
         approval_id: Option<ApprovalId>,
     ) -> Result<ActionRequest, ComposerError> {
+        self.to_provider_input_request_with_images(turn_id, question_id, approval_id, Vec::new())
+    }
+
+    pub fn to_provider_input_request_with_images(
+        &self,
+        turn_id: Option<DomainTurnId>,
+        question_id: Option<QuestionId>,
+        approval_id: Option<ApprovalId>,
+        images: Vec<crate::domain::ProviderImageAttachment>,
+    ) -> Result<ActionRequest, ComposerError> {
+        if !images.is_empty() && !matches!(self.payload, ComposerPayload::SendNow { .. }) {
+            return Err(ComposerError::Unavailable {
+                control: ComposerControl::SendNow,
+                reason: "Images require Send; wait for this turn to finish before sending them."
+                    .into(),
+            });
+        }
         if self.action_id == crate::client::action::ACTION_PROVIDER_NEW_CONVERSATION {
             return Err(ComposerError::Unavailable {
                 control: ComposerControl::SendNow,
@@ -386,6 +403,7 @@ impl ComposerIntent {
                 question_id,
                 approval_id,
                 text,
+                images,
                 wait: Some(false),
                 allow,
             },
@@ -846,6 +864,10 @@ impl TaskComposer {
         self.field.cursor()
     }
 
+    pub fn draft_selection_range(&self) -> Option<std::ops::Range<usize>> {
+        self.field.selection_range()
+    }
+
     pub fn draft_is_all_selected(&self) -> bool {
         self.field.is_all_selected()
     }
@@ -853,6 +875,17 @@ impl TaskComposer {
     pub fn select_all_draft(&mut self, focus_epoch: FocusEpoch) -> Result<(), ComposerError> {
         self.require_epoch(focus_epoch)?;
         self.field.select_all();
+        Ok(())
+    }
+
+    pub fn set_draft_cursor(
+        &mut self,
+        cursor: usize,
+        extend: bool,
+        focus_epoch: FocusEpoch,
+    ) -> Result<(), ComposerError> {
+        self.require_epoch(focus_epoch)?;
+        self.field.set_cursor(cursor, extend);
         Ok(())
     }
 

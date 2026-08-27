@@ -530,6 +530,157 @@ impl QuotaObserverSource for AdapterQuotaSource {
     }
 }
 
+/// Projects account-aware settings metadata usage into the canonical
+/// [`ProviderQuotaHost`] (no second fake counter; stock adapters stay Unsupported).
+pub struct MetadataCacheQuotaSource {
+    kind: ProviderKind,
+    instance_id: String,
+    cache: crate::providers::settings::ProviderMetadataCache,
+    settings: crate::providers::settings::ProviderSettingsStore,
+}
+
+impl MetadataCacheQuotaSource {
+    pub fn new(
+        kind: ProviderKind,
+        instance_id: impl Into<String>,
+        cache: crate::providers::settings::ProviderMetadataCache,
+        settings: crate::providers::settings::ProviderSettingsStore,
+    ) -> Self {
+        Self {
+            kind,
+            instance_id: instance_id.into(),
+            cache,
+            settings,
+        }
+    }
+
+    pub fn for_profile(
+        profile: &crate::providers::settings::ProviderProfileOwner,
+    ) -> Vec<Arc<dyn QuotaObserverSource>> {
+        use crate::providers::settings::{
+            CLAUDE_DEFAULT_INSTANCE_ID, CODEX_DEFAULT_INSTANCE_ID, CURSOR_DEFAULT_INSTANCE_ID,
+        };
+        vec![
+            Arc::new(Self::new(
+                ProviderKind::ClaudeCode,
+                CLAUDE_DEFAULT_INSTANCE_ID,
+                profile.metadata.clone(),
+                profile.settings.clone(),
+            )) as Arc<dyn QuotaObserverSource>,
+            Arc::new(Self::new(
+                ProviderKind::Codex,
+                CODEX_DEFAULT_INSTANCE_ID,
+                profile.metadata.clone(),
+                profile.settings.clone(),
+            )) as Arc<dyn QuotaObserverSource>,
+            Arc::new(Self::new(
+                ProviderKind::Cursor,
+                CURSOR_DEFAULT_INSTANCE_ID,
+                profile.metadata.clone(),
+                profile.settings.clone(),
+            )) as Arc<dyn QuotaObserverSource>,
+        ]
+    }
+}
+
+#[async_trait]
+impl QuotaObserverSource for MetadataCacheQuotaSource {
+    fn kind(&self) -> ProviderKind {
+        self.kind
+    }
+
+    async fn observe_quota(
+        &self,
+        _executable: &Path,
+        _version: &ProviderVersion,
+    ) -> Result<QuotaSourceOutcome, QuotaSourceError> {
+        use crate::providers::settings::usage_http::{
+            effective_env_has_api_key, resolve_claude_account_fingerprint,
+            resolve_codex_account_fingerprint, resolve_cursor_account_fingerprint, UsageHttpError,
+        };
+        use crate::providers::settings::{
+            effective_scope_fingerprint, resolve_launch_config, ProviderUsageStateWire,
+        };
+
+        let document = self.settings.snapshot();
+        let Some(instance) = document.get(&self.instance_id) else {
+            return Ok(QuotaSourceOutcome::Unavailable);
+        };
+        let custody = self.settings.custody_scope_for_instance(&self.instance_id);
+        let Ok(resolved) = resolve_launch_config(instance, &custody, None) else {
+            return Ok(QuotaSourceOutcome::Unavailable);
+        };
+        if effective_env_has_api_key(&resolved.discovery.child_environment)
+            || effective_env_has_api_key(&resolved.environment)
+        {
+            return Ok(QuotaSourceOutcome::Unsupported);
+        }
+        let fingerprint = effective_scope_fingerprint(instance, &resolved);
+        let verified_account: Result<Option<String>, UsageHttpError> = match self.kind {
+            ProviderKind::ClaudeCode => resolve_claude_account_fingerprint(&resolved),
+            ProviderKind::Cursor => resolve_cursor_account_fingerprint(&resolved),
+            ProviderKind::Codex => resolve_codex_account_fingerprint(&resolved),
+            _ => return Ok(QuotaSourceOutcome::Unsupported),
+        };
+        let verified_account = match verified_account {
+            Ok(Some(fp)) => fp,
+            Ok(None) | Err(UsageHttpError::AuthRequired) => {
+                return Ok(QuotaSourceOutcome::AuthRequired);
+            }
+            Err(UsageHttpError::UnsupportedContext(_)) => {
+                return Ok(QuotaSourceOutcome::Unsupported);
+            }
+            Err(_) => return Ok(QuotaSourceOutcome::Unavailable),
+        };
+        let Some(entry) = self.cache.entry(&self.instance_id, &fingerprint) else {
+            return Ok(QuotaSourceOutcome::Unavailable);
+        };
+        if entry.account_fingerprint.as_deref() != Some(verified_account.as_str()) {
+            return Ok(QuotaSourceOutcome::Unavailable);
+        }
+        match entry.usage.state {
+            ProviderUsageStateWire::Unsupported => {
+                return Ok(QuotaSourceOutcome::Unsupported);
+            }
+            ProviderUsageStateWire::AuthRequired => {
+                return Ok(QuotaSourceOutcome::AuthRequired);
+            }
+            ProviderUsageStateWire::Unavailable
+            | ProviderUsageStateWire::Unknown
+            | ProviderUsageStateWire::Failed
+            | ProviderUsageStateWire::Backoff => {
+                if entry.usage.windows.is_empty() {
+                    return Ok(QuotaSourceOutcome::Unavailable);
+                }
+            }
+            ProviderUsageStateWire::Fresh | ProviderUsageStateWire::Stale => {}
+        }
+        if entry.usage.windows.is_empty() {
+            return Ok(QuotaSourceOutcome::Unavailable);
+        }
+        let mut windows = Vec::new();
+        let mut reset_at = None;
+        for window in &entry.usage.windows {
+            // Prefer remaining when present; never invent from absent used.
+            let remaining = window.remaining_percent;
+            let Ok(quota_window) = QuotaWindow::new(remaining, window.resets_at_unix_ms) else {
+                continue;
+            };
+            if reset_at.is_none() {
+                reset_at = window.resets_at_unix_ms;
+            }
+            windows.push(quota_window);
+            if windows.len() >= MAX_QUOTA_WINDOWS {
+                break;
+            }
+        }
+        if windows.is_empty() {
+            return Ok(QuotaSourceOutcome::Unavailable);
+        }
+        Ok(QuotaSourceOutcome::Supported { reset_at, windows })
+    }
+}
+
 struct RefreshFlight {
     result: Mutex<Option<QuotaView>>,
     completed: Notify,

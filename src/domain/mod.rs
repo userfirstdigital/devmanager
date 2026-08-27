@@ -85,10 +85,11 @@ pub use org::{ManagedScope, TaskScope};
 pub use provider_input::{
     provider_kind_from_wire, validate_provider_fence, PresentProviderApprovalIntent,
     PresentProviderQuestionIntent, ProviderDeliveryHoldReason, ProviderDeliveryVisibility,
-    ProviderFenceContext, ProviderFenceError, ProviderFenceIdentity, ProviderInputAction,
-    ProviderInputIntentError, ProviderInputSettlement, ProviderIntentPhase,
+    ProviderFenceContext, ProviderFenceError, ProviderFenceIdentity, ProviderImageAttachment,
+    ProviderInputAction, ProviderInputIntentError, ProviderInputSettlement, ProviderIntentPhase,
     ProviderResolutionWinner, ProviderSessionProjection, ProviderWaitFence, ProviderWaitRecord,
-    SettleProviderWaitIntent, MAX_PROVIDER_APPROVAL_WINS, MAX_PROVIDER_INPUT_TEXT_BYTES,
+    SettleProviderWaitIntent, MAX_PROVIDER_APPROVAL_WINS, MAX_PROVIDER_IMAGE_ATTACHMENTS,
+    MAX_PROVIDER_IMAGE_BYTES, MAX_PROVIDER_IMAGE_PATH_BYTES, MAX_PROVIDER_INPUT_TEXT_BYTES,
     MAX_PROVIDER_KIND_BYTES, MAX_PROVIDER_QUESTION_WINS, MAX_PROVIDER_SESSION_STATE_BYTES,
     MAX_PROVIDER_WAITS,
 };

@@ -24,18 +24,18 @@ use std::time::{Duration, Instant};
 
 use gpui::prelude::FluentBuilder;
 use gpui::{
-    anchored, canvas, deferred, div, img, point, px, size, uniform_list, AnyElement, App,
-    AppContext, Application, Bounds, ClickEvent, ClipboardEntry, Context, DragMoveEvent, ElementId,
+    anchored, canvas, deferred, div, fill, img, point, px, size, uniform_list, AnyElement, App,
+    AppContext, Application, Bounds, ClickEvent, ClipboardEntry, Context, ElementId,
     ElementInputHandler, Entity, EntityInputHandler, FocusHandle, FontWeight, Hsla, ImageFormat,
     ImageSource, InteractiveElement, IntoElement, KeyDownEvent, MouseButton, MouseDownEvent,
     MouseMoveEvent, MouseUpEvent, ObjectFit, ParentElement, PathPromptOptions, Pixels, Point,
     Render, RenderImage, ScrollWheelEvent, SharedString, Size, StatefulInteractiveElement, Styled,
-    StyledImage, Subscription, Task, UTF16Selection, UniformListScrollHandle, Window, WindowBounds,
-    WindowOptions,
+    StyledImage, Subscription, Task, TextAlign, TextRun, UTF16Selection, UniformListScrollHandle,
+    Window, WindowBounds, WindowOptions, WrappedLine,
 };
 use gpui_component::button::{Button, ButtonVariants};
 use gpui_component::scroll::{ScrollableElement, Scrollbar};
-use gpui_component::Disableable;
+use gpui_component::{Disableable, Sizable};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
@@ -208,12 +208,19 @@ impl Render for TaskPaneDragPreview {
     }
 }
 
-struct DraggedTaskDivider {
+/// Immutable-origin workspace divider drag owned by the shell root so motion
+/// continues while the pointer travels over either adjacent pane body.
+#[derive(Clone, Copy, Debug)]
+struct WorkspaceSplitDrag {
     split_id: SplitId,
     child_index: usize,
     axis: Axis,
+    origin: Point<Pixels>,
     start_size: f32,
-    start_boundary: Rc<RefCell<Option<f32>>>,
+    min_size: f32,
+    parent_extent: f32,
+    divider_total: f32,
+    sibling_floor_total: f32,
 }
 
 const NATIVE_PROFILE_DIR: &str = ".devmanager-next/dev-profile";
@@ -235,8 +242,27 @@ const TASK_INBOX_SCROLLBAR_GUTTER_WIDTH_PX: f32 = 16.0;
 /// Row padding matches the left inset; the scrollbar owns its own gutter sibling.
 const TASK_RAIL_ROW_HORIZONTAL_PADDING_PX: f32 = 10.0;
 
-fn task_row_left_click_should_reopen(settled: bool) -> bool {
-    settled
+const APP_WINDOW_TITLE: &str = "DevManager";
+const WINDOW_TITLE_SEPARATOR: &str = " | ";
+
+fn shell_window_title_segments(project: Option<&str>, task_title: Option<&str>) -> String {
+    let mut segments = Vec::new();
+    if let Some(project) = project.map(str::trim).filter(|value| !value.is_empty()) {
+        segments.push(project.to_string());
+    }
+    if let Some(task) = task_title.map(str::trim).filter(|value| !value.is_empty()) {
+        if segments.last().map(String::as_str) != Some(task) {
+            segments.push(task.to_string());
+        }
+    }
+    segments.push(APP_WINDOW_TITLE.to_string());
+    segments.join(WINDOW_TITLE_SEPARATOR)
+}
+
+fn task_row_left_click_should_reopen(_settled: bool) -> bool {
+    // Viewing Done must not restore. Explicit Restore or an accepted new-message
+    // workflow owns reopen through the ordered host command path.
+    false
 }
 
 fn task_row_right_click_should_rename(_archived: bool) -> bool {
@@ -339,12 +365,41 @@ fn idle_photo_fetch_matches_current_canvas(
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum ComposerDraftPart {
     Text(String),
+    Selected(String),
     Placeholder,
     Caret,
 }
 
 fn composer_caret_visible(focused: bool, controller_ticks: usize) -> bool {
     focused && (controller_ticks / COMPOSER_CARET_BLINK_TICKS) % 2 == 0
+}
+
+fn first_send_terminal_ready(
+    snapshot: &crate::domain::TaskSnapshot,
+    terminal: &crate::domain::TaskTerminalProjection,
+) -> bool {
+    terminal.accepts_input_without_conversation_id
+        && terminal.task_id == snapshot.task.id
+        && snapshot.primary_agent_id == Some(terminal.agent_session_id)
+        && terminal.action_epoch != 0
+        && snapshot
+            .agents
+            .get(&terminal.agent_session_id)
+            .is_some_and(|agent| {
+                agent.provider_kind == ProviderKind::Codex
+                    && agent.provider_session_id.is_none()
+                    && agent.runtime_generation == terminal.runtime_generation
+            })
+        && snapshot
+            .resources
+            .get(&terminal.resource_id)
+            .is_some_and(|resource| {
+                resource.lifecycle == crate::domain::ResourceLifecycle::Active
+                    && resource.resource_kind == crate::domain::ResourceKind::Terminal
+                    && resource.task_id == Some(snapshot.task.id)
+                    && resource.runtime_generation == terminal.resource_generation
+                    && resource.runtime_generation == terminal.runtime_generation
+            })
 }
 
 fn composer_provider_identity(
@@ -378,6 +433,7 @@ fn automatic_task_title(current_title: &str, first_prompt: &str) -> Option<Strin
 fn composer_draft_parts(
     draft: &str,
     cursor: usize,
+    selection: Option<Range<usize>>,
     focused: bool,
     caret_visible: bool,
     _placeholder: &str,
@@ -391,18 +447,50 @@ fn composer_draft_parts(
         let _ = focused;
         return parts;
     }
-    let cursor = cursor.min(draft.chars().count());
-    let mut chars = draft.chars();
-    let before: String = chars.by_ref().take(cursor).collect();
-    let after: String = chars.collect();
-    if !before.is_empty() {
-        parts.push(ComposerDraftPart::Text(before));
-    }
-    if caret_visible {
-        parts.push(ComposerDraftPart::Caret);
-    }
-    if !after.is_empty() {
-        parts.push(ComposerDraftPart::Text(after));
+    let len = draft.chars().count();
+    let cursor = cursor.min(len);
+    let selection = selection
+        .map(|range| range.start.min(len)..range.end.min(len))
+        .filter(|range| range.start < range.end);
+    let chars: Vec<char> = draft.chars().collect();
+    let push_text =
+        |parts: &mut Vec<ComposerDraftPart>, start: usize, end: usize, selected: bool| {
+            if start >= end {
+                return;
+            }
+            let text: String = chars[start..end].iter().collect();
+            if selected {
+                parts.push(ComposerDraftPart::Selected(text));
+            } else {
+                parts.push(ComposerDraftPart::Text(text));
+            }
+        };
+    if let Some(range) = selection {
+        push_text(&mut parts, 0, range.start, false);
+        push_text(&mut parts, range.start, range.end, true);
+        if caret_visible && cursor == range.end {
+            parts.push(ComposerDraftPart::Caret);
+        } else if caret_visible && cursor == range.start {
+            // caret already conceptually at start; keep after selected for simplicity
+        }
+        push_text(&mut parts, range.end, len, false);
+        if caret_visible && cursor != range.start && cursor != range.end {
+            // unusual caret inside selection ignored
+        }
+        if caret_visible && cursor == range.start {
+            let mut with_caret = Vec::new();
+            push_text(&mut with_caret, 0, range.start, false);
+            with_caret.push(ComposerDraftPart::Caret);
+            push_text(&mut with_caret, range.start, range.end, true);
+            push_text(&mut with_caret, range.end, len, false);
+            return with_caret;
+        }
+    } else {
+        push_text(&mut parts, 0, cursor, false);
+        if caret_visible {
+            parts.push(ComposerDraftPart::Caret);
+        }
+        push_text(&mut parts, cursor, len, false);
     }
     parts
 }
@@ -1960,6 +2048,61 @@ struct NativeActionDispatchFailure {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+enum PendingSettledSendStage {
+    AwaitingReopenReceipt,
+    ReopenAcceptedAwaitingActive,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct PendingSettledSend {
+    task_id: TaskId,
+    reopen_command_id: CommandId,
+    control: ComposerControl,
+    attachment_only: bool,
+    stage: PendingSettledSendStage,
+    captured_draft: String,
+    captured_artifact_ids: Vec<crate::domain::id::ArtifactId>,
+    captured_image_ids: Vec<u64>,
+    connection_epoch: u64,
+    resource_generation: u64,
+    runtime_generation: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum PendingDraftFirstSendStage {
+    AwaitingStartReceipt,
+    StartAcceptedAwaitingReady,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct PendingDraftFirstSend {
+    task_id: TaskId,
+    start_command_id: CommandId,
+    control: ComposerControl,
+    attachment_only: bool,
+    stage: PendingDraftFirstSendStage,
+    captured_draft: String,
+    captured_artifact_ids: Vec<crate::domain::id::ArtifactId>,
+    captured_image_ids: Vec<u64>,
+    connection_epoch: u64,
+    resource_generation: u64,
+    runtime_generation: u64,
+    started_at: Instant,
+    readiness_request_id: Option<RequestId>,
+    readiness_requested_at: Option<Instant>,
+    ready_without_conversation_id: bool,
+}
+
+/// Last painted composer layout reused for caret, selection, and pointer hit-testing.
+/// Indices are utf-8 byte offsets within each shaped paragraph; conversion to the
+/// composer scalar cursor happens at the hit-test boundary.
+struct ComposerPaintedLayout {
+    lines: Vec<WrappedLine>,
+    bounds: Bounds<Pixels>,
+    line_height: Pixels,
+    text: String,
+}
+
 struct PendingComposerSubmission {
     key: ComposerDraftKey,
     draft: ComposerDraftProjection,
@@ -1979,12 +2122,14 @@ struct NativeComposerImage {
     id: u64,
     path: PathBuf,
     prompt_reference: String,
+    attachment: crate::domain::ProviderImageAttachment,
     label: String,
     preview: Arc<RenderImage>,
 }
 
 struct PreparedNativeComposerImage {
     staged: StagedImageAttachment,
+    attachment: crate::domain::ProviderImageAttachment,
     label: String,
     preview: Arc<RenderImage>,
 }
@@ -7653,6 +7798,8 @@ impl NativePlatformAccessibilityBridge {
             let RawWindowHandle::Win32(handle) = handle.as_raw() else {
                 return;
             };
+            let hwnd = HWND(handle.hwnd.get() as *mut std::ffi::c_void);
+            apply_embedded_window_icons(hwnd);
             // AccessKit requires the HWND to remain hidden until its subclass is
             // installed. Posting the reveal is also essential: ShowWindow sends
             // WM_SHOWWINDOW synchronously, but this method runs while GPUI owns
@@ -7660,7 +7807,7 @@ impl NativePlatformAccessibilityBridge {
             // re-enter that update, consumes the only first-paint message, and
             // leaves an apparently visible but transparent window.
             unsafe {
-                let _ = ShowWindowAsync(HWND(handle.hwnd.get() as *mut std::ffi::c_void), SW_SHOW);
+                let _ = ShowWindowAsync(hwnd, SW_SHOW);
             }
         }
         #[cfg(not(windows))]
@@ -7684,6 +7831,54 @@ impl NativePlatformAccessibilityBridge {
                 events.raise();
             }
         }
+    }
+}
+
+#[cfg(windows)]
+fn apply_embedded_window_icons(hwnd: windows::Win32::Foundation::HWND) {
+    use std::sync::OnceLock;
+    use windows::core::PCWSTR;
+    use windows::Win32::Foundation::{LPARAM, WPARAM};
+    use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+    use windows::Win32::UI::WindowsAndMessaging::{
+        LoadImageW, SendMessageW, ICON_BIG, ICON_SMALL, IMAGE_ICON, LR_DEFAULTSIZE, LR_SHARED,
+        WM_SETICON,
+    };
+
+    // Resource IDI_ICON1 from build.rs. LR_SHARED module icons must not be destroyed.
+    static ICONS: OnceLock<Option<(isize, isize)>> = OnceLock::new();
+    let Some((big, small)) = *ICONS.get_or_init(|| unsafe {
+        let module = GetModuleHandleW(None).ok()?;
+        let resource = PCWSTR(1usize as *const u16);
+        let big = LoadImageW(
+            Some(module.into()),
+            resource,
+            IMAGE_ICON,
+            0,
+            0,
+            LR_DEFAULTSIZE | LR_SHARED,
+        )
+        .ok()?;
+        let small = LoadImageW(Some(module.into()), resource, IMAGE_ICON, 16, 16, LR_SHARED)
+            .ok()
+            .unwrap_or(big);
+        Some((big.0 as isize, small.0 as isize))
+    }) else {
+        return;
+    };
+    unsafe {
+        let _ = SendMessageW(
+            hwnd,
+            WM_SETICON,
+            Some(WPARAM(ICON_BIG as usize)),
+            Some(LPARAM(big)),
+        );
+        let _ = SendMessageW(
+            hwnd,
+            WM_SETICON,
+            Some(WPARAM(ICON_SMALL as usize)),
+            Some(LPARAM(small)),
+        );
     }
 }
 
@@ -7875,6 +8070,7 @@ struct RootEditorInputProxy {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ComposerSelectorKind {
+    Provider,
     Model,
     Reasoning,
     Access,
@@ -7882,6 +8078,11 @@ enum ComposerSelectorKind {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum ComposerSelectorChoice {
+    Provider(ProviderKind),
+    ProviderInstance {
+        provider: ProviderKind,
+        instance_id: String,
+    },
     Model(crate::providers::ProviderModel),
     /// Custom slug from provider settings; reaches argv via custom_model_slug.
     CustomModel(String),
@@ -7975,6 +8176,13 @@ pub struct NativeShell {
     /// composer. Correlate them by the original command identity so only the
     /// exact submitted draft is consumed, regardless of the selected task.
     pending_composer_submissions: BTreeMap<CommandId, PendingComposerSubmission>,
+    pending_settled_send: Option<PendingSettledSend>,
+    pending_draft_first_send: Option<PendingDraftFirstSend>,
+    first_send_readiness_requests: HashSet<RequestId>,
+    /// Unstarted-draft provider/model/effort choice is task-local so switching
+    /// drafts cannot overwrite another draft's selection. Global layout fields
+    /// still remember last-used defaults for new drafts.
+    draft_launch_prefs: BTreeMap<TaskId, (ProviderKind, crate::providers::ProviderLaunchOptions)>,
     pending_automatic_titles: BTreeMap<TaskId, PendingAutomaticTitle>,
     composer_images: BTreeMap<ComposerDraftKey, Vec<NativeComposerImage>>,
     next_composer_image_id: u64,
@@ -8017,6 +8225,14 @@ pub struct NativeShell {
     layout_dirty: bool,
     last_layout_persist: Option<Instant>,
     pane_drag: Option<PaneDrag>,
+    workspace_split_drag: Option<WorkspaceSplitDrag>,
+    last_window_title: Option<String>,
+    composer_pointer_selecting: bool,
+    composer_input_bounds: Option<Bounds<Pixels>>,
+    composer_painted_layout: Option<ComposerPaintedLayout>,
+    composer_draft_content_height: f32,
+    composer_scroll_handle: gpui::ScrollHandle,
+    composer_reveal_cursor: bool,
     last_window_persist: Option<Instant>,
     add_project: Option<AddProjectDraft>,
     settings_open: bool,
@@ -8455,6 +8671,10 @@ impl NativeShell {
             root_editor_input_proxy: Some(root_editor_input_proxy),
             root_editor_focus_handle,
             pending_composer_submissions: BTreeMap::new(),
+            pending_settled_send: None,
+            pending_draft_first_send: None,
+            first_send_readiness_requests: HashSet::new(),
+            draft_launch_prefs: BTreeMap::new(),
             pending_automatic_titles: BTreeMap::new(),
             composer_images: BTreeMap::new(),
             next_composer_image_id: 1,
@@ -8487,6 +8707,14 @@ impl NativeShell {
             layout_dirty: false,
             last_layout_persist: None,
             pane_drag: None,
+            workspace_split_drag: None,
+            last_window_title: None,
+            composer_pointer_selecting: false,
+            composer_input_bounds: None,
+            composer_painted_layout: None,
+            composer_draft_content_height: CONVERSATION_COMPOSER_INPUT_MIN_HEIGHT - 42.0,
+            composer_scroll_handle: gpui::ScrollHandle::new(),
+            composer_reveal_cursor: false,
             last_window_persist: None,
             add_project: None,
             settings_open: false,
@@ -8619,19 +8847,9 @@ impl NativeShell {
     }
 
     fn ensure_provider_settings_cache_lane(&mut self) {
-        if self.provider_settings_cache.is_none() && self.provider_settings.is_none() {
-            let loading = crate::ui::provider_settings::ProviderSettingsController::loading();
-            self.provider_settings_cache = Some(loading.snapshot().clone());
-        }
-        if self.provider_settings_cache.is_none() || self.provider_settings.is_none() {
-            // Always request host snapshot during attachment even before Settings open.
-            self.request_provider_settings_snapshot_via_cache();
-        }
-    }
-
-    fn request_provider_settings_snapshot_via_cache(&mut self) {
-        let request = crate::providers::settings::ProviderSettingsHostRequest::Snapshot;
-        let _ = self.dispatch_provider_settings_query(request);
+        // Pickers and quota labels consume the same controller even before
+        // Settings has ever been opened. Never create a preview-only cache lane.
+        self.ensure_provider_settings();
     }
 
     fn request_provider_settings_snapshot(&mut self) {
@@ -9722,6 +9940,7 @@ impl NativeShell {
         );
         if let Some(kind) = self.composer_selector {
             let label = match kind {
+                ComposerSelectorKind::Provider => "Provider menu",
                 ComposerSelectorKind::Model => "Model menu",
                 ComposerSelectorKind::Reasoning => "Thinking menu",
                 ComposerSelectorKind::Access => "Access menu",
@@ -9739,7 +9958,7 @@ impl NativeShell {
                 )),
             );
         }
-        if composer.is_some() {
+        if composer.is_some() && self.composer_launch_preferences_editable() {
             overlay_nodes.extend([
                 AccessibilityNode::new(
                     AccessibleRole::Button,
@@ -10116,6 +10335,18 @@ impl NativeShell {
     }
 
     fn apply_query_body(&mut self, action: &NativeActionRecord, body: NativeHostQueryBody) {
+        if let Some(request_id) = native_request_id(&action.command) {
+            if self.first_send_readiness_requests.remove(&request_id)
+                && self
+                    .pending_draft_first_send
+                    .as_ref()
+                    .is_none_or(|pending| pending.readiness_request_id != Some(request_id))
+            {
+                // An exact cancelled/timed-out readiness query cannot clear the
+                // startup error or mutate a replacement task's terminal surface.
+                return;
+            }
+        }
         match body {
             NativeHostQueryBody::Text => {}
             NativeHostQueryBody::ConfigSidebar(snapshot) => {
@@ -10135,6 +10366,31 @@ impl NativeShell {
             NativeHostQueryBody::TaskCockpit(result) => {
                 let command_parts = Self::task_cockpit_command_parts(&action.command);
                 let command_task_id = command_parts.map(|(_, task_id, _)| task_id);
+                if let Some((request_id, task_id, TaskCockpitQuery::Terminal)) = command_parts {
+                    let owns_readiness =
+                        self.pending_draft_first_send
+                            .as_ref()
+                            .is_some_and(|pending| {
+                                pending.task_id == task_id
+                                    && pending.readiness_request_id == Some(request_id)
+                            });
+                    if owns_readiness {
+                        let ready = match &result {
+                            crate::domain::TaskCockpitResult::Terminal(projection) => self
+                                .client_model
+                                .as_ref()
+                                .and_then(|model| model.task(task_id))
+                                .is_some_and(|snapshot| {
+                                    first_send_terminal_ready(snapshot, projection)
+                                }),
+                            _ => false,
+                        };
+                        if let Some(pending) = self.pending_draft_first_send.as_mut() {
+                            pending.readiness_request_id = None;
+                            pending.ready_without_conversation_id = ready;
+                        }
+                    }
+                }
                 if let Some((_, task_id, TaskCockpitQuery::Terminal)) = command_parts {
                     if !matches!(&result, crate::domain::TaskCockpitResult::Terminal(_)) {
                         self.task_surfaces.note_terminal_reconnecting(task_id);
@@ -10793,6 +11049,20 @@ impl NativeShell {
     }
 
     fn discard_native_query_action(&mut self, action: &NativeActionRecord) {
+        if let Some(request_id) = native_request_id(&action.command) {
+            self.first_send_readiness_requests.remove(&request_id);
+        }
+        if let Some((request_id, _, TaskCockpitQuery::Terminal)) =
+            Self::task_cockpit_command_parts(&action.command)
+        {
+            if let Some(pending) = self
+                .pending_draft_first_send
+                .as_mut()
+                .filter(|pending| pending.readiness_request_id == Some(request_id))
+            {
+                pending.readiness_request_id = None;
+            }
+        }
         if let Some((_, task_id, TaskCockpitQuery::Conversation { .. })) =
             Self::task_cockpit_command_parts(&action.command)
         {
@@ -10987,6 +11257,53 @@ impl NativeShell {
             }
             return;
         }
+        if self.matches_pending_settled_send_command(&action) {
+            let epochs = self.interaction.action_epochs();
+            let pending = self.pending_settled_send.as_ref();
+            let fences_ok = pending.is_some_and(|pending| {
+                action.connection_epoch == pending.connection_epoch
+                    && action.resource_generation == pending.resource_generation
+                    && action.runtime_generation == pending.runtime_generation
+                    && pending.connection_epoch == epochs.connection_epoch
+                    && pending.resource_generation == epochs.resource_generation
+                    && pending.runtime_generation == epochs.runtime_generation
+            });
+            if fences_ok {
+                self.apply_action_outcome(outcome);
+            } else {
+                let _ = self.settle_pending_settled_send_outcome(
+                    &action,
+                    false,
+                    Some("The connection changed before reopen finished. Draft kept.".into()),
+                );
+            }
+            return;
+        }
+        if self.matches_pending_draft_first_send_command(&action) {
+            let epochs = self.interaction.action_epochs();
+            let pending = self.pending_draft_first_send.as_ref();
+            let fences_ok = pending.is_some_and(|pending| {
+                action.connection_epoch == pending.connection_epoch
+                    && action.resource_generation == pending.resource_generation
+                    && action.runtime_generation == pending.runtime_generation
+                    && pending.connection_epoch == epochs.connection_epoch
+                    && pending.resource_generation == epochs.resource_generation
+                    && pending.runtime_generation == epochs.runtime_generation
+            });
+            if fences_ok {
+                self.apply_action_outcome(outcome);
+            } else {
+                let _ = self.settle_pending_draft_first_send_outcome(
+                    &action,
+                    false,
+                    Some(
+                        "The connection changed before draft provider start finished. Draft kept."
+                            .into(),
+                    ),
+                );
+            }
+            return;
+        }
         let accepted = if is_global_native_query_command(&action.command) {
             self.interaction
                 .accepts_global_query_outcome_record(&action)
@@ -11032,6 +11349,32 @@ impl NativeShell {
                     );
                     return;
                 }
+                if self.matches_pending_settled_send_command(&action)
+                    && command_id != Some(receipt.command_id())
+                {
+                    let _ = self.settle_pending_settled_send_outcome(
+                        &action,
+                        false,
+                        Some(
+                            "The host returned a receipt for a different command. Send stopped; draft kept."
+                                .into(),
+                        ),
+                    );
+                    return;
+                }
+                if self.matches_pending_draft_first_send_command(&action)
+                    && command_id != Some(receipt.command_id())
+                {
+                    let _ = self.settle_pending_draft_first_send_outcome(
+                        &action,
+                        false,
+                        Some(
+                            "The host returned a receipt for a different command. Send stopped; draft kept."
+                                .into(),
+                        ),
+                    );
+                    return;
+                }
                 self.last_action_receipt = Some(receipt.clone());
                 if let crate::domain::command::CommandReceipt::Rejected { code, .. } = &receipt {
                     if self.settle_delete_flow_outcome(
@@ -11039,6 +11382,24 @@ impl NativeShell {
                         DeleteFlowSettleKind::Rejected {
                             message: format!("host rejected command: {code:?}"),
                         },
+                    ) {
+                        return;
+                    }
+                    if self.settle_pending_settled_send_outcome(
+                        &action,
+                        false,
+                        Some(format!(
+                            "host rejected reopen before send: {code:?}; draft kept"
+                        )),
+                    ) {
+                        return;
+                    }
+                    if self.settle_pending_draft_first_send_outcome(
+                        &action,
+                        false,
+                        Some(format!(
+                            "host rejected provider start before send: {code:?}; draft kept"
+                        )),
                     ) {
                         return;
                     }
@@ -11056,6 +11417,13 @@ impl NativeShell {
                 if self.settle_delete_flow_outcome(&action, DeleteFlowSettleKind::Accepted) {
                     // Continue through ordinary receipt bookkeeping below so the
                     // action leaves pending lanes, but skip generic composer paths.
+                }
+                if self.settle_pending_settled_send_outcome(&action, true, None) {
+                    // Exact reopen receipt owned the deferred send; either the
+                    // fresh intent was dispatched or the draft was preserved.
+                }
+                if self.settle_pending_draft_first_send_outcome(&action, true, None) {
+                    // Exact provider-start receipt owned the deferred first send.
                 }
                 if let Some(command_id) = command_id {
                     self.pending_host_actions
@@ -11205,6 +11573,20 @@ impl NativeShell {
                 ) {
                     return;
                 }
+                if self.settle_pending_settled_send_outcome(
+                    &action,
+                    false,
+                    Some(format!("{error}; draft kept")),
+                ) {
+                    return;
+                }
+                if self.settle_pending_draft_first_send_outcome(
+                    &action,
+                    false,
+                    Some(format!("{error}; draft kept")),
+                ) {
+                    return;
+                }
                 if action.id == action::ACTION_CONFIG_CREATE_PROJECT {
                     if let Some(draft) = self.add_project.as_mut() {
                         draft.error = Some(error.clone());
@@ -11282,9 +11664,37 @@ impl NativeShell {
 
     fn controller_tick(&mut self, max: usize) -> bool {
         self.controller_ticks = self.controller_ticks.saturating_add(1);
+        self.request_pending_first_send_readiness();
+        self.try_advance_pending_draft_first_send();
+        if self
+            .pending_draft_first_send
+            .as_ref()
+            .is_some_and(|pending| pending.started_at.elapsed() > Duration::from_secs(120))
+        {
+            self.cancel_pending_draft_first_send(
+                "Provider startup did not become ready. Your unsent draft was kept.",
+            );
+        }
         self.flush_composer_drafts_if_due(false);
         self.flush_layout_if_due(false);
         self.dispatch_due_automatic_title();
+        if self.client_model.is_some() && self.provider_settings.is_some() {
+            let refreshing = self.settings_open
+                || self
+                    .provider_settings
+                    .as_ref()
+                    .is_some_and(|ctl| ctl.metadata_in_flight() || ctl.health_in_flight());
+            let interval = if refreshing { 125 } else { 1875 };
+            if self.controller_ticks % interval == 0
+                && self.action_lane_len() < MAX_ACTION_LANE_RECORDS / 2
+                && !self
+                    .pending_host_actions
+                    .iter()
+                    .any(|action| action.id == "provider.settings")
+            {
+                self.request_provider_settings_snapshot();
+            }
+        }
         let mut repaint = self.composer_accessibility_focused
             && self.controller_ticks % COMPOSER_CARET_BLINK_TICKS == 0;
         if let Some(preferences) = self.pending_preferences.pop_back() {
@@ -12202,6 +12612,8 @@ impl NativeShell {
             selected_task_changed || selected_task_needs_initial_follow,
         );
         self.try_advance_pending_delete_after_archive();
+        self.try_advance_pending_settled_send();
+        self.try_advance_pending_draft_first_send();
         if first_canonical {
             self.restore_active_dock_tool_from_layout();
             let _ = self.dispatch_action(ActionRequest::HostStatus);
@@ -12338,18 +12750,11 @@ impl NativeShell {
     }
 
     pub fn select_projected_task(&mut self, task_id: TaskId) -> NavigationHandlerOutcome {
-        let gesture = if self
-            .layout
-            .task_workspace
-            .as_ref()
-            .is_some_and(|workspace| {
-                workspace.pane_count() > 1 && !workspace.contains_task(task_id)
-            }) {
-            WorkspaceSelectionGesture::Toggle
-        } else {
-            WorkspaceSelectionGesture::Plain
-        };
-        if let Ok(Some(outcome)) = self.apply_workspace_selection(task_id, gesture) {
+        // Programmatic/palette/search/reopen selection always replaces the
+        // focused pane. Explicit multipane Toggle is only Shift-click/Shift-Enter.
+        if let Ok(Some(outcome)) =
+            self.apply_workspace_selection(task_id, WorkspaceSelectionGesture::Plain)
+        {
             return outcome;
         }
 
@@ -12380,12 +12785,33 @@ impl NativeShell {
             return Err(WorkspaceError::MissingPane);
         }
         let before = self.layout.task_workspace.clone();
+        let previous_selected = self.interaction.selected_task();
         apply_task_workspace_selection(&mut self.layout.task_workspace, task_id, gesture)?;
         let focused_task = self
             .layout
             .task_workspace
             .as_ref()
             .and_then(|workspace| workspace.focused_task());
+        if previous_selected != focused_task
+            && self
+                .pending_settled_send
+                .as_ref()
+                .is_some_and(|pending| Some(pending.task_id) != focused_task)
+        {
+            self.cancel_pending_settled_send(
+                "Selection changed before Done reopen finished. Draft kept.",
+            );
+        }
+        if previous_selected != focused_task
+            && self
+                .pending_draft_first_send
+                .as_ref()
+                .is_some_and(|pending| Some(pending.task_id) != focused_task)
+        {
+            self.cancel_pending_draft_first_send(
+                "Selection changed before draft provider start finished. Draft kept.",
+            );
+        }
         if before != self.layout.task_workspace {
             self.mark_layout_dirty();
         }
@@ -12643,6 +13069,7 @@ impl NativeShell {
             .composer_drafts
             .get(&key)
             .is_none_or(|cached| cached.text != draft.text);
+        self.composer_reveal_cursor |= text_changed;
         if draft.text.starts_with('/') {
             if text_changed {
                 self.slash_command_menu_dismissed = false;
@@ -12671,16 +13098,58 @@ impl NativeShell {
         self.task_provider_kind(task_id)
     }
 
+    fn selected_task_is_unstarted_draft(&self) -> bool {
+        let Some(task_id) = self.interaction.selected_task() else {
+            return false;
+        };
+        self.client_model
+            .as_ref()
+            .and_then(|model| model.task(task_id))
+            .is_some_and(|snapshot| snapshot.is_unstarted_draft())
+            && !self
+                .task_surfaces
+                .state(task_id)
+                .is_some_and(|state| state.terminal_is_interactive())
+    }
+
+    /// Drafts may freely select any enabled provider; started tasks stay on the
+    /// durable primary agent kind. Draft prefs are task-local.
+    fn composer_provider_for_launch(&self) -> Option<ProviderKind> {
+        if self.selected_task_is_unstarted_draft() {
+            if let Some(task_id) = self.interaction.selected_task() {
+                if let Some((provider, _)) = self.draft_launch_prefs.get(&task_id) {
+                    return Some(*provider);
+                }
+            }
+            return self
+                .layout
+                .composer_provider
+                .clone()
+                .or_else(|| self.active_provider_kind());
+        }
+        self.active_provider_kind()
+            .or_else(|| self.layout.composer_provider.clone())
+    }
+
     fn composer_launch_options_for(
         &self,
         provider: ProviderKind,
     ) -> crate::providers::ProviderLaunchOptions {
-        use crate::providers::{ProviderLaunchOptions, ProviderModel, ProviderReasoningEffort};
-        let mut options = self
-            .layout
-            .composer_launch_options
-            .clone()
-            .unwrap_or_default();
+        use crate::providers::{ProviderLaunchOptions, ProviderModel};
+        let mut options = if self.selected_task_is_unstarted_draft() {
+            self.interaction
+                .selected_task()
+                .and_then(|task_id| self.draft_launch_prefs.get(&task_id))
+                .filter(|(stored_provider, _)| *stored_provider == provider)
+                .map(|(_, options)| options.clone())
+                .or_else(|| self.layout.composer_launch_options.clone())
+                .unwrap_or_default()
+        } else {
+            self.layout
+                .composer_launch_options
+                .clone()
+                .unwrap_or_default()
+        };
         let compatible = matches!(
             (provider, options.model),
             (_, ProviderModel::ProviderDefault)
@@ -12708,8 +13177,43 @@ impl NativeShell {
         options
     }
 
+    fn store_draft_launch_prefs(
+        &mut self,
+        provider: ProviderKind,
+        options: crate::providers::ProviderLaunchOptions,
+    ) {
+        if !self.composer_launch_preferences_editable() {
+            return;
+        }
+        self.layout.composer_provider = Some(provider);
+        self.layout.composer_launch_options = Some(options.clone());
+        if self.selected_task_is_unstarted_draft() {
+            if let Some(task_id) = self.interaction.selected_task() {
+                self.draft_launch_prefs.insert(task_id, (provider, options));
+            }
+        }
+        self.mark_layout_dirty();
+    }
+
+    fn composer_launch_preferences_editable(&self) -> bool {
+        // Launch arguments are not a live provider reconfiguration API. In
+        // particular, never present a changed access preference as if it had
+        // restricted an already-running process.
+        self.pending_draft_first_send.is_none()
+            && self.pending_settled_send.is_none()
+            && (self.interaction.selected_task().is_none()
+                || self.selected_task_is_unstarted_draft())
+    }
+
     fn open_composer_model_selector(&mut self) {
         self.open_composer_selector(ComposerSelectorKind::Model);
+    }
+
+    fn open_composer_provider_selector(&mut self) {
+        if !self.selected_task_is_unstarted_draft() {
+            return;
+        }
+        self.open_composer_selector(ComposerSelectorKind::Provider);
     }
 
     fn open_composer_reasoning_selector(&mut self) {
@@ -12721,6 +13225,9 @@ impl NativeShell {
     }
 
     fn open_composer_selector(&mut self, kind: ComposerSelectorKind) {
+        if !self.composer_launch_preferences_editable() {
+            return;
+        }
         if self.composer_selector == Some(kind) {
             self.dismiss_composer_selector();
             return;
@@ -12728,9 +13235,19 @@ impl NativeShell {
         self.composer_selector = Some(kind);
         let choices = self.composer_selector_choices();
         let selected = {
-            let provider = self.active_provider_kind().unwrap_or(ProviderKind::Codex);
+            let provider = self
+                .composer_provider_for_launch()
+                .unwrap_or(ProviderKind::Codex);
             let options = self.composer_launch_options_for(provider);
             match kind {
+                ComposerSelectorKind::Provider => options
+                    .provider_instance_id
+                    .clone()
+                    .map(|instance_id| ComposerSelectorChoice::ProviderInstance {
+                        provider,
+                        instance_id,
+                    })
+                    .unwrap_or(ComposerSelectorChoice::Provider(provider)),
                 ComposerSelectorKind::Model => {
                     if let Some(slug) = options.custom_model_slug.clone() {
                         ComposerSelectorChoice::CustomModel(slug)
@@ -12776,56 +13293,271 @@ impl NativeShell {
         self.apply_composer_selector_choice(choice);
     }
 
+    fn set_composer_provider(&mut self, provider: ProviderKind) {
+        if !self.selected_task_is_unstarted_draft() {
+            return;
+        }
+        let mut options = self.composer_launch_options_for(provider);
+        if self.composer_provider_for_launch() != Some(provider)
+            || options.provider_instance_id.is_some()
+        {
+            options.model = crate::providers::ProviderModel::ProviderDefault;
+            options.custom_model_slug = None;
+            options.provider_instance_id = None;
+            options.extra_launch_args.clear();
+        }
+        self.normalize_composer_effort_for_model(&mut options, provider);
+        self.store_draft_launch_prefs(provider, options);
+        self.composer_selector = None;
+    }
+
     fn set_composer_model(&mut self, model: crate::providers::ProviderModel) {
-        let provider = self.active_provider_kind().unwrap_or(ProviderKind::Codex);
+        let provider = match model {
+            crate::providers::ProviderModel::CodexSol
+            | crate::providers::ProviderModel::CodexTerra
+            | crate::providers::ProviderModel::CodexLuna => ProviderKind::Codex,
+            crate::providers::ProviderModel::ClaudeOpus
+            | crate::providers::ProviderModel::ClaudeSonnet
+            | crate::providers::ProviderModel::ClaudeHaiku => ProviderKind::ClaudeCode,
+            crate::providers::ProviderModel::ProviderDefault => self
+                .composer_provider_for_launch()
+                .unwrap_or(ProviderKind::Codex),
+        };
         let mut options = self.composer_launch_options_for(provider);
         options.model = model;
         options.custom_model_slug = None;
-        self.layout.composer_provider = Some(provider);
-        self.layout.composer_launch_options = Some(options);
+        self.normalize_composer_effort_for_model(&mut options, provider);
+        self.store_draft_launch_prefs(provider, options);
         self.composer_selector = None;
-        self.mark_layout_dirty();
     }
 
     fn set_composer_custom_model(&mut self, slug: String) {
-        let provider = self.active_provider_kind().unwrap_or(ProviderKind::Codex);
+        let provider = self
+            .composer_provider_for_launch()
+            .unwrap_or(ProviderKind::Codex);
         let mut options = self.composer_launch_options_for(provider);
         options.custom_model_slug = Some(slug);
         options.model = crate::providers::ProviderModel::ProviderDefault;
-        self.layout.composer_provider = Some(provider);
-        self.layout.composer_launch_options = Some(options);
+        self.normalize_composer_effort_for_model(&mut options, provider);
+        self.store_draft_launch_prefs(provider, options);
         self.composer_selector = None;
-        self.mark_layout_dirty();
     }
 
     fn set_composer_reasoning(&mut self, effort: crate::providers::ProviderReasoningEffort) {
-        let provider = self.active_provider_kind().unwrap_or(ProviderKind::Codex);
+        let provider = self
+            .composer_provider_for_launch()
+            .unwrap_or(ProviderKind::Codex);
         let mut options = self.composer_launch_options_for(provider);
         options.reasoning_effort = effort;
-        self.layout.composer_launch_options = Some(options);
+        self.store_draft_launch_prefs(provider, options);
         self.composer_selector = None;
-        self.mark_layout_dirty();
     }
 
     fn set_composer_access(&mut self, access: crate::providers::ProviderAccessMode) {
-        let provider = self.active_provider_kind().unwrap_or(ProviderKind::Codex);
+        let provider = self
+            .composer_provider_for_launch()
+            .unwrap_or(ProviderKind::Codex);
         let mut options = self.composer_launch_options_for(provider);
         options.access = access;
-        self.layout.composer_launch_options = Some(options);
+        self.store_draft_launch_prefs(provider, options);
         self.composer_selector = None;
-        self.mark_layout_dirty();
+    }
+
+    fn selected_model_slug_for_effort(
+        &self,
+        provider: ProviderKind,
+        options: &crate::providers::ProviderLaunchOptions,
+    ) -> Option<String> {
+        if let Some(slug) = options.custom_model_slug.clone() {
+            return Some(slug);
+        }
+        match (provider, options.model) {
+            (ProviderKind::Codex, crate::providers::ProviderModel::CodexSol) => {
+                Some("gpt-5.6-sol".into())
+            }
+            (ProviderKind::Codex, crate::providers::ProviderModel::CodexTerra) => {
+                Some("gpt-5.6-terra".into())
+            }
+            (ProviderKind::Codex, crate::providers::ProviderModel::CodexLuna) => {
+                Some("gpt-5.6-luna".into())
+            }
+            (ProviderKind::ClaudeCode, crate::providers::ProviderModel::ClaudeOpus) => {
+                Some("opus".into())
+            }
+            (ProviderKind::ClaudeCode, crate::providers::ProviderModel::ClaudeSonnet) => {
+                Some("sonnet".into())
+            }
+            (ProviderKind::ClaudeCode, crate::providers::ProviderModel::ClaudeHaiku) => {
+                Some("haiku".into())
+            }
+            _ => None,
+        }
+    }
+
+    fn supported_efforts_for_current_model(
+        &self,
+        provider: ProviderKind,
+        options: &crate::providers::ProviderLaunchOptions,
+    ) -> (
+        Vec<crate::providers::ProviderReasoningEffort>,
+        Option<String>,
+    ) {
+        use crate::ui::provider_metadata::{
+            catalog_for_instance, efforts_from_supported, entry_for_slug,
+        };
+        let instance_id = options
+            .provider_instance_id
+            .as_deref()
+            .unwrap_or_else(|| crate::providers::settings::default_instance_id_for_kind(provider));
+        let slug = self.selected_model_slug_for_effort(provider, options);
+        let catalogs = self
+            .provider_settings
+            .as_ref()
+            .map(|ctl| ctl.model_catalogs());
+        let empty: &[crate::ui::provider_metadata::UiModelCatalog] = &[];
+        let catalogs = catalogs.unwrap_or(empty);
+        if let (Some(slug), Some(catalog)) =
+            (slug.as_ref(), catalog_for_instance(catalogs, instance_id))
+        {
+            if let Some(entry) = entry_for_slug(catalog, slug) {
+                return (
+                    efforts_from_supported(&entry.supported_efforts),
+                    entry.default_effort.clone(),
+                );
+            }
+        }
+        // Offline fallback: Haiku reports no efforts; others keep the full set.
+        if matches!(
+            (provider, options.model),
+            (
+                ProviderKind::ClaudeCode,
+                crate::providers::ProviderModel::ClaudeHaiku
+            )
+        ) || slug.as_deref() == Some("haiku")
+        {
+            return (
+                vec![crate::providers::ProviderReasoningEffort::ProviderDefault],
+                None,
+            );
+        }
+        (
+            vec![
+                crate::providers::ProviderReasoningEffort::ProviderDefault,
+                crate::providers::ProviderReasoningEffort::Low,
+                crate::providers::ProviderReasoningEffort::Medium,
+                crate::providers::ProviderReasoningEffort::High,
+                crate::providers::ProviderReasoningEffort::ExtraHigh,
+                crate::providers::ProviderReasoningEffort::Max,
+            ],
+            None,
+        )
+    }
+
+    fn normalize_composer_effort_for_model(
+        &self,
+        options: &mut crate::providers::ProviderLaunchOptions,
+        provider: ProviderKind,
+    ) {
+        use crate::ui::provider_metadata::normalize_effort_to_supported;
+        let (supported, default_token) =
+            self.supported_efforts_for_current_model(provider, options);
+        options.reasoning_effort = normalize_effort_to_supported(
+            options.reasoning_effort,
+            &supported,
+            default_token.as_deref(),
+        );
     }
 
     fn composer_selector_choices(&self) -> Vec<(String, ComposerSelectorChoice)> {
-        let provider = self.active_provider_kind().unwrap_or(ProviderKind::Codex);
+        let provider = self
+            .composer_provider_for_launch()
+            .unwrap_or(ProviderKind::Codex);
         match self.composer_selector {
+            Some(ComposerSelectorKind::Provider) => {
+                let mut choices = Vec::new();
+                let document = self
+                    .provider_settings
+                    .as_ref()
+                    .map(|ctl| ctl.document())
+                    .or_else(|| {
+                        self.provider_settings_cache
+                            .as_ref()
+                            .map(|cache| cache.document.clone())
+                    });
+                for kind in [
+                    ProviderKind::ClaudeCode,
+                    ProviderKind::Codex,
+                    ProviderKind::Cursor,
+                ] {
+                    let instance_id =
+                        crate::providers::settings::default_instance_id_for_kind(kind);
+                    let enabled = document
+                        .as_ref()
+                        .and_then(|doc| doc.get(instance_id))
+                        .map(|instance| instance.enabled)
+                        .unwrap_or(true);
+                    if !enabled {
+                        continue;
+                    }
+                    let label = match kind {
+                        ProviderKind::ClaudeCode => "Claude Code",
+                        ProviderKind::Codex => "Codex",
+                        ProviderKind::Cursor => "Cursor",
+                    };
+                    choices.push((label.into(), ComposerSelectorChoice::Provider(kind)));
+                }
+                if let Some(document) = document {
+                    for instance in document
+                        .instances
+                        .iter()
+                        .filter(|instance| instance.enabled)
+                    {
+                        let Some(provider) = instance.driver.to_provider_kind() else {
+                            continue;
+                        };
+                        if instance.instance_id.as_str()
+                            == crate::providers::settings::default_instance_id_for_kind(provider)
+                        {
+                            continue;
+                        }
+                        choices.push((
+                            instance.display_name.clone(),
+                            ComposerSelectorChoice::ProviderInstance {
+                                provider,
+                                instance_id: instance.instance_id.to_string(),
+                            },
+                        ));
+                    }
+                }
+                choices
+            }
             Some(ComposerSelectorKind::Model) => {
                 let driver =
                     crate::providers::settings::ProviderDriverKind::from_provider_kind(provider);
                 let builtins = crate::ui::provider_settings::builtin_model_slugs(driver);
-                let instance_id =
-                    crate::providers::settings::default_instance_id_for_kind(provider);
-                let ordered = self
+                let options = self.composer_launch_options_for(provider);
+                let instance_id = options.provider_instance_id.as_deref().unwrap_or_else(|| {
+                    crate::providers::settings::default_instance_id_for_kind(provider)
+                });
+                let builtins = self
+                    .provider_settings
+                    .as_ref()
+                    .and_then(|ctl| {
+                        ctl.model_catalogs()
+                            .iter()
+                            .find(|catalog| catalog.instance_id == instance_id)
+                    })
+                    .filter(|catalog| !catalog.models.is_empty())
+                    .map(|catalog| {
+                        catalog
+                            .models
+                            .iter()
+                            .filter(|model| !model.hidden && !model.is_custom)
+                            .map(|model| model.slug.clone())
+                            .collect::<Vec<_>>()
+                    })
+                    .unwrap_or(builtins);
+                let policy_ordered = self
                     .provider_settings
                     .as_ref()
                     .map(|ctl| ctl.document())
@@ -12836,6 +13568,18 @@ impl NativeShell {
                     })
                     .and_then(|doc| doc.ordered_picker_models(instance_id, &builtins).ok())
                     .unwrap_or_else(|| builtins.clone());
+                let catalogs = self
+                    .provider_settings
+                    .as_ref()
+                    .map(|ctl| ctl.model_catalogs());
+                let empty: &[crate::ui::provider_metadata::UiModelCatalog] = &[];
+                let ordered = crate::ui::provider_metadata::merge_picker_slugs(
+                    &policy_ordered,
+                    catalogs
+                        .unwrap_or(empty)
+                        .iter()
+                        .find(|c| c.instance_id == instance_id),
+                );
                 let mut choices = Vec::new();
                 choices.push((
                     "Provider default".into(),
@@ -12863,48 +13607,38 @@ impl NativeShell {
                         ),
                         _ => ComposerSelectorChoice::CustomModel(slug.clone()),
                     };
-                    choices.push((slug, choice));
+                    let label = catalogs
+                        .unwrap_or(empty)
+                        .iter()
+                        .find(|catalog| catalog.instance_id == instance_id)
+                        .and_then(|catalog| catalog.models.iter().find(|model| model.slug == slug))
+                        .map(|model| model.display_name.clone())
+                        .unwrap_or(slug);
+                    choices.push((label, choice));
                 }
                 choices
             }
-            Some(ComposerSelectorKind::Reasoning) => vec![
-                (
-                    "Default thinking".into(),
-                    ComposerSelectorChoice::Reasoning(
-                        crate::providers::ProviderReasoningEffort::ProviderDefault,
-                    ),
-                ),
-                (
-                    "Low".into(),
-                    ComposerSelectorChoice::Reasoning(
-                        crate::providers::ProviderReasoningEffort::Low,
-                    ),
-                ),
-                (
-                    "Medium".into(),
-                    ComposerSelectorChoice::Reasoning(
-                        crate::providers::ProviderReasoningEffort::Medium,
-                    ),
-                ),
-                (
-                    "High".into(),
-                    ComposerSelectorChoice::Reasoning(
-                        crate::providers::ProviderReasoningEffort::High,
-                    ),
-                ),
-                (
-                    "Extra high".into(),
-                    ComposerSelectorChoice::Reasoning(
-                        crate::providers::ProviderReasoningEffort::ExtraHigh,
-                    ),
-                ),
-                (
-                    "Max".into(),
-                    ComposerSelectorChoice::Reasoning(
-                        crate::providers::ProviderReasoningEffort::Max,
-                    ),
-                ),
-            ],
+            Some(ComposerSelectorKind::Reasoning) => {
+                let options = self.composer_launch_options_for(provider);
+                let (supported, _) = self.supported_efforts_for_current_model(provider, &options);
+                supported
+                    .into_iter()
+                    .map(|effort| {
+                        let label = match effort {
+                            crate::providers::ProviderReasoningEffort::ProviderDefault => {
+                                "Default thinking"
+                            }
+                            crate::providers::ProviderReasoningEffort::Low => "Low",
+                            crate::providers::ProviderReasoningEffort::Medium => "Medium",
+                            crate::providers::ProviderReasoningEffort::High => "High",
+                            crate::providers::ProviderReasoningEffort::ExtraHigh => "Extra high",
+                            crate::providers::ProviderReasoningEffort::Max => "Max",
+                            crate::providers::ProviderReasoningEffort::Ultra => "Ultra",
+                        };
+                        (label.into(), ComposerSelectorChoice::Reasoning(effort))
+                    })
+                    .collect()
+            }
             Some(ComposerSelectorKind::Access) => vec![
                 (
                     "Full access".into(),
@@ -12929,6 +13663,22 @@ impl NativeShell {
 
     fn apply_composer_selector_choice(&mut self, choice: ComposerSelectorChoice) {
         match choice {
+            ComposerSelectorChoice::Provider(provider) => self.set_composer_provider(provider),
+            ComposerSelectorChoice::ProviderInstance {
+                provider,
+                instance_id,
+            } => {
+                if !self.selected_task_is_unstarted_draft() {
+                    return;
+                }
+                self.set_composer_provider(provider);
+                let mut options = self.composer_launch_options_for(provider);
+                options.provider_instance_id = Some(instance_id);
+                options.model = crate::providers::ProviderModel::ProviderDefault;
+                options.custom_model_slug = None;
+                self.normalize_composer_effort_for_model(&mut options, provider);
+                self.store_draft_launch_prefs(provider, options);
+            }
             ComposerSelectorChoice::Model(model) => self.set_composer_model(model),
             ComposerSelectorChoice::CustomModel(slug) => self.set_composer_custom_model(slug),
             ComposerSelectorChoice::Reasoning(effort) => self.set_composer_reasoning(effort),
@@ -12946,9 +13696,19 @@ impl NativeShell {
             return None;
         }
         let selected = {
-            let provider = self.active_provider_kind().unwrap_or(ProviderKind::Codex);
+            let provider = self
+                .composer_provider_for_launch()
+                .unwrap_or(ProviderKind::Codex);
             let options = self.composer_launch_options_for(provider);
             match self.composer_selector {
+                Some(ComposerSelectorKind::Provider) => options
+                    .provider_instance_id
+                    .clone()
+                    .map(|instance_id| ComposerSelectorChoice::ProviderInstance {
+                        provider,
+                        instance_id,
+                    })
+                    .unwrap_or(ComposerSelectorChoice::Provider(provider)),
                 Some(ComposerSelectorKind::Model) => {
                     if let Some(slug) = options.custom_model_slug.clone() {
                         ComposerSelectorChoice::CustomModel(slug)
@@ -12975,8 +13735,9 @@ impl NativeShell {
                 div()
                     .id(("native-composer-selector-row", index))
                     .w_full()
-                    .px(px(10.0))
-                    .py(px(6.0))
+                    .h(px(24.0))
+                    .px(px(8.0))
+                    .py(px(2.0))
                     .rounded(px(4.0))
                     .cursor_pointer()
                     .hover(|style| style.bg(tokens.surfaces.hover.to_gpui()))
@@ -13014,15 +13775,19 @@ impl NativeShell {
                     div()
                         .id("native-composer-selector-menu")
                         .absolute()
-                        .bottom(px(36.0))
+                        .bottom(px(28.0))
                         .left(px(0.0))
-                        .min_w(px(180.0))
-                        .p(px(6.0))
-                        .rounded(px(8.0))
+                        .w(px(200.0))
+                        .max_w(px(240.0))
+                        .max_h(px(220.0))
+                        .overflow_y_scroll()
+                        .p(px(4.0))
+                        .rounded(px(6.0))
                         .bg(tokens.surfaces.overlay.to_gpui())
                         .border(px(1.0))
                         .border_color(tokens.borders.subtle.to_gpui())
                         .shadow_sm()
+                        .text_size(px(11.0))
                         .children(rows),
                 )
                 .into_any_element(),
@@ -13370,6 +14135,7 @@ impl NativeShell {
                     question_id: None,
                     approval_id: None,
                     text: Some(text),
+                    images: Vec::new(),
                     wait: None,
                     allow: None,
                 },
@@ -13448,16 +14214,87 @@ impl NativeShell {
     fn composer_utf16_selection(&self) -> Option<Range<usize>> {
         let composer = self.composer.as_ref()?;
         let text = composer.draft_text();
-        let total = text.encode_utf16().count();
-        if composer.draft_is_all_selected() {
-            return Some(0..total);
+        let to_utf16 =
+            |scalar: usize| -> usize { text.chars().take(scalar).map(char::len_utf16).sum() };
+        if let Some(range) = composer.draft_selection_range() {
+            return Some(to_utf16(range.start)..to_utf16(range.end));
         }
-        let cursor = text
-            .chars()
-            .take(composer.draft_cursor())
-            .map(char::len_utf16)
-            .sum();
+        let cursor = to_utf16(composer.draft_cursor());
         Some(cursor..cursor)
+    }
+
+    fn composer_byte_to_scalar(text: &str, byte_index: usize) -> usize {
+        text.char_indices()
+            .take_while(|(index, _)| *index < byte_index)
+            .count()
+            .min(text.chars().count())
+    }
+
+    fn composer_scalar_to_byte(text: &str, scalar: usize) -> usize {
+        text.chars().take(scalar).map(char::len_utf8).sum()
+    }
+
+    fn composer_scalar_index_for_position(&self, position: Point<Pixels>) -> Option<usize> {
+        let composer = self.composer.as_ref()?;
+        let text = composer.draft_text();
+        if text.is_empty() {
+            return Some(0);
+        }
+        let layout = self.composer_painted_layout.as_ref()?;
+        if layout.text != text {
+            return None;
+        }
+        let local = point(
+            position.x - layout.bounds.origin.x,
+            position.y - layout.bounds.origin.y,
+        );
+        let mut y = px(0.0);
+        let mut byte_base = 0usize;
+        for (index, line) in layout.lines.iter().enumerate() {
+            let line_size = line.size(layout.line_height);
+            let last = index + 1 == layout.lines.len();
+            if local.y < y + line_size.height || last {
+                let relative = point(local.x, (local.y - y).max(px(0.0)));
+                let byte_in_line = line
+                    .closest_index_for_position(relative, layout.line_height)
+                    .unwrap_or_else(|fallback| fallback)
+                    .min(line.len());
+                let abs = byte_base.saturating_add(byte_in_line);
+                return Some(Self::composer_byte_to_scalar(text, abs.min(text.len())));
+            }
+            y = y + line_size.height;
+            byte_base = byte_base.saturating_add(line.len());
+            if byte_base < text.len() && text.as_bytes().get(byte_base) == Some(&b'\n') {
+                byte_base = byte_base.saturating_add(1);
+            }
+        }
+        Some(text.chars().count())
+    }
+
+    fn update_composer_pointer_selection(
+        &mut self,
+        position: Point<Pixels>,
+        extend: bool,
+        _window: Option<&Window>,
+    ) -> bool {
+        let cursor = self
+            .composer_scalar_index_for_position(position)
+            .unwrap_or_else(|| {
+                self.composer
+                    .as_ref()
+                    .map(|composer| composer.draft_text().chars().count())
+                    .unwrap_or(0)
+            });
+        let Ok(epoch) = self.focus_current_composer_input() else {
+            return false;
+        };
+        let Some(composer) = self.composer.as_mut() else {
+            return false;
+        };
+        let before = (composer.draft_cursor(), composer.draft_selection_range());
+        let _ = composer.set_draft_cursor(cursor, extend, epoch);
+        let after = (composer.draft_cursor(), composer.draft_selection_range());
+        before != after
     }
 
     fn scalar_boundary_for_utf16(text: &str, requested: usize) -> (usize, usize) {
@@ -13472,6 +14309,53 @@ impl NativeShell {
             scalar = scalar.saturating_add(1);
         }
         (scalar, utf16)
+    }
+
+    fn composition_selection(
+        value: &str,
+        inserted: &Range<usize>,
+        selected: Range<usize>,
+    ) -> Range<usize> {
+        let start = inserted
+            .start
+            .saturating_add(selected.start)
+            .min(inserted.end);
+        let end = inserted
+            .start
+            .saturating_add(selected.end)
+            .min(inserted.end);
+        Self::scalar_boundary_for_utf16(value, start).0
+            ..Self::scalar_boundary_for_utf16(value, end).0
+    }
+
+    fn mark_composer_composition(
+        &mut self,
+        inserted: Range<usize>,
+        selected: Option<Range<usize>>,
+    ) -> Result<(), ComposerError> {
+        if let Some(selected) = selected {
+            let epoch = self.focus_current_composer_input()?;
+            if let Some(composer) = self.composer.as_mut() {
+                let range = Self::composition_selection(composer.draft_text(), &inserted, selected);
+                composer.set_draft_cursor(range.start, false, epoch)?;
+                composer.set_draft_cursor(range.end, true, epoch)?;
+            }
+        }
+        // Mark the complete composition, not the IME's selected subrange.
+        self.composer_marked_range = (!inserted.is_empty()).then_some(inserted);
+        self.cache_current_composer_draft();
+        Ok(())
+    }
+
+    fn mark_root_composition(&mut self, inserted: Range<usize>, selected: Option<Range<usize>>) {
+        if let (Some(selected), Some(value)) = (selected, self.root_editor_value()) {
+            let range = Self::composition_selection(&value, &inserted, selected);
+            if let Some(field) = self.active_root_text_field_mut() {
+                field.set_cursor(range.start, false);
+                field.set_cursor(range.end, true);
+            }
+        }
+        self.root_editor_marked_range = (!inserted.is_empty()).then_some(inserted);
     }
 
     /// Apply one platform text-input transaction to the task-owned composer.
@@ -13878,24 +14762,32 @@ impl NativeShell {
         }
         if command && (key == "c" || key == "x") {
             let selected = self.composer.as_ref().and_then(|composer| {
-                composer
-                    .draft_is_all_selected()
-                    .then(|| composer.draft_text().to_string())
+                let text = composer.draft_text();
+                let range = composer.draft_selection_range()?;
+                let start = text
+                    .char_indices()
+                    .nth(range.start)
+                    .map(|(index, _)| index)
+                    .unwrap_or(0);
+                let end = text
+                    .char_indices()
+                    .nth(range.end)
+                    .map(|(index, _)| index)
+                    .unwrap_or(text.len());
+                Some(text[start..end].to_string())
             });
             if let Some(selected) = selected {
                 cx.write_to_clipboard(gpui::ClipboardItem::new_string(selected));
                 if key == "x" {
-                    let scalar_len = self
+                    let range = self
                         .composer
                         .as_ref()
-                        .map(|composer| composer.draft_text().chars().count())
-                        .unwrap_or(0);
+                        .and_then(|composer| composer.draft_selection_range())
+                        .unwrap_or(0..0);
                     let changed = self
                         .composer
                         .as_mut()
-                        .and_then(|composer| {
-                            composer.replace_draft_range(0..scalar_len, "", epoch).ok()
-                        })
+                        .and_then(|composer| composer.replace_draft_range(range, "", epoch).ok())
                         .unwrap_or(false);
                     if changed {
                         self.cache_current_composer_draft();
@@ -13929,6 +14821,37 @@ impl NativeShell {
             self.activate_composer_control(ComposerControl::SendNow);
             return;
         }
+        let shift = event.keystroke.modifiers.shift;
+        if matches!(key, "left" | "right" | "home" | "end") && shift {
+            let len = self
+                .composer
+                .as_ref()
+                .map(|composer| composer.draft_text().chars().count())
+                .unwrap_or(0);
+            let cursor = self
+                .composer
+                .as_ref()
+                .map(|composer| composer.draft_cursor())
+                .unwrap_or(0);
+            let target = match key {
+                "left" => cursor.saturating_sub(1),
+                "right" => (cursor + 1).min(len),
+                "home" => 0,
+                "end" => len,
+                _ => cursor,
+            };
+            let changed = self
+                .composer
+                .as_mut()
+                .and_then(|composer| composer.set_draft_cursor(target, true, epoch).ok())
+                .is_some();
+            if changed {
+                window.prevent_default();
+                cx.stop_propagation();
+                self.cache_current_composer_draft();
+            }
+            return;
+        }
         let input = match key {
             "backspace" => Some(TextFieldKey::Backspace),
             "delete" => Some(TextFieldKey::Delete),
@@ -13953,6 +14876,11 @@ impl NativeShell {
     }
 
     fn activate_composer_control(&mut self, control: ComposerControl) {
+        // One immutable click owns reopen/start/send. A second click cannot
+        // bypass that transaction while its provider is still starting.
+        if self.pending_settled_send.is_some() || self.pending_draft_first_send.is_some() {
+            return;
+        }
         let epoch = match self.rearm_composer_focus() {
             Ok(epoch) => epoch,
             Err(error) => {
@@ -13966,6 +14894,188 @@ impl NativeShell {
                 .composer
                 .as_ref()
                 .is_some_and(|composer| composer.draft_text().trim().is_empty());
+        let task_id = self.interaction.selected_task();
+        let settled = task_id.is_some_and(|task_id| {
+            self.client_model
+                .as_ref()
+                .and_then(|model| model.task(task_id))
+                .is_some_and(|snapshot| {
+                    snapshot.task.lifecycle == crate::domain::task::TaskLifecycle::Settled
+                })
+        });
+        if settled
+            && matches!(
+                control,
+                ComposerControl::SendNow | ComposerControl::Steer | ComposerControl::QueueFollowUp
+            )
+        {
+            let Some(task_id) = task_id else {
+                return;
+            };
+            // Ordered workflow: reopen first; build a fresh intent only after the
+            // exact reopen receipt and a non-settled snapshot are available.
+            if self.pending_settled_send.is_some() {
+                return;
+            }
+            match self.dispatch_action_recorded(ActionRequest::TaskReopen { task_id }) {
+                Ok(record) => {
+                    let Some(command_id) = native_command_id(&record.command) else {
+                        self.composer_error =
+                            Some("Couldn't reopen the Done task before sending.".into());
+                        return;
+                    };
+                    let captured_draft = self
+                        .composer
+                        .as_ref()
+                        .map(|composer| composer.draft_text().to_string())
+                        .unwrap_or_default();
+                    let captured_artifact_ids = self
+                        .composer
+                        .as_ref()
+                        .map(|composer| {
+                            composer
+                                .attachments()
+                                .iter()
+                                .map(|attachment| attachment.artifact_id)
+                                .collect::<Vec<_>>()
+                        })
+                        .unwrap_or_default();
+                    let captured_image_ids = self
+                        .current_composer_images()
+                        .iter()
+                        .map(|image| image.id)
+                        .collect::<Vec<_>>();
+                    let epochs = self.interaction.action_epochs();
+                    self.pending_settled_send = Some(PendingSettledSend {
+                        task_id,
+                        reopen_command_id: command_id,
+                        control,
+                        attachment_only,
+                        stage: PendingSettledSendStage::AwaitingReopenReceipt,
+                        captured_draft,
+                        captured_artifact_ids,
+                        captured_image_ids,
+                        connection_epoch: epochs.connection_epoch,
+                        resource_generation: epochs.resource_generation,
+                        runtime_generation: epochs.runtime_generation,
+                    });
+                    self.composer_error = None;
+                }
+                Err(failure) => {
+                    self.composer_error = Some(format!(
+                        "Couldn't reopen the Done task before sending: {}",
+                        failure.message
+                    ));
+                }
+            }
+            return;
+        }
+        let draft_first_send = self.selected_task_is_unstarted_draft()
+            && matches!(
+                control,
+                ComposerControl::SendNow | ComposerControl::Steer | ComposerControl::QueueFollowUp
+            )
+            && self.pending_draft_first_send.is_none();
+        if draft_first_send {
+            let Some(task_id) = task_id else {
+                return;
+            };
+            let Some(snapshot) = self
+                .client_model
+                .as_ref()
+                .and_then(|model| model.task(task_id))
+            else {
+                return;
+            };
+            let Some(agent_session_id) = snapshot.primary_agent_id else {
+                return;
+            };
+            let Some(agent) = snapshot.agents.get(&agent_session_id) else {
+                return;
+            };
+            let Some(resource) = snapshot.resources.values().find(|resource| {
+                resource.task_id == Some(task_id)
+                    && resource.resource_kind == crate::domain::resource::ResourceKind::Terminal
+                    && resource.lifecycle == crate::domain::resource::ResourceLifecycle::Active
+                    && resource.runtime_generation == agent.runtime_generation
+            }) else {
+                self.composer_error =
+                    Some("Couldn't find an active terminal resource for first send.".into());
+                return;
+            };
+            let provider_kind = self
+                .composer_provider_for_launch()
+                .unwrap_or(agent.provider_kind.clone());
+            if provider_kind == ProviderKind::Cursor {
+                self.composer_error = Some("Cursor model discovery is available, but its chat transport is not supported yet. Choose Claude or Codex; your draft was kept.".into());
+                return;
+            }
+            let arguments = crate::client::action::ProviderStartArguments {
+                task_id,
+                agent_session_id,
+                resource_id: resource.id,
+                provider_kind: provider_kind.clone(),
+                mode: crate::domain::command::ProviderStartMode::NewConversation,
+                launch_options: self.composer_launch_options_for(provider_kind),
+                action_epoch: snapshot.task.action_epoch,
+            };
+            match self.dispatch_action_recorded(ActionRequest::StartProviderSession(arguments)) {
+                Ok(record) => {
+                    let Some(start_command_id) = native_command_id(&record.command) else {
+                        self.composer_error =
+                            Some("Couldn't start the selected provider before send.".into());
+                        return;
+                    };
+                    let captured_draft = self
+                        .composer
+                        .as_ref()
+                        .map(|composer| composer.draft_text().to_string())
+                        .unwrap_or_default();
+                    let captured_artifact_ids = self
+                        .composer
+                        .as_ref()
+                        .map(|composer| {
+                            composer
+                                .attachments()
+                                .iter()
+                                .map(|attachment| attachment.artifact_id)
+                                .collect::<Vec<_>>()
+                        })
+                        .unwrap_or_default();
+                    let captured_image_ids = self
+                        .current_composer_images()
+                        .iter()
+                        .map(|image| image.id)
+                        .collect::<Vec<_>>();
+                    let epochs = self.interaction.action_epochs();
+                    self.pending_draft_first_send = Some(PendingDraftFirstSend {
+                        task_id,
+                        start_command_id,
+                        control,
+                        attachment_only,
+                        stage: PendingDraftFirstSendStage::AwaitingStartReceipt,
+                        captured_draft,
+                        captured_artifact_ids,
+                        captured_image_ids,
+                        connection_epoch: epochs.connection_epoch,
+                        resource_generation: epochs.resource_generation,
+                        runtime_generation: epochs.runtime_generation,
+                        started_at: Instant::now(),
+                        readiness_request_id: None,
+                        readiness_requested_at: None,
+                        ready_without_conversation_id: false,
+                    });
+                    self.composer_error = None;
+                }
+                Err(failure) => {
+                    self.composer_error = Some(format!(
+                        "Couldn't start the selected provider: {}",
+                        failure.message
+                    ));
+                }
+            }
+            return;
+        }
         let intent = {
             let Some(composer) = self.composer.as_mut() else {
                 return;
@@ -14073,11 +15183,16 @@ impl NativeShell {
                     ..
                 }
         );
-        let provider_kind = self.active_provider_kind();
+        let provider_kind = self.composer_provider_for_launch();
         let is_slash_command_send = matches!(&intent.payload, ComposerPayload::SendNow { .. });
         if is_slash_command_send
             && provider_kind.is_some()
             && self.layout.composer_provider != provider_kind
+            && !self
+                .client_model
+                .as_ref()
+                .and_then(|model| model.task(fence.task_id))
+                .is_some_and(|snapshot| snapshot.is_unstarted_draft())
         {
             self.layout.composer_provider = provider_kind;
             self.mark_layout_dirty();
@@ -14112,7 +15227,26 @@ impl NativeShell {
                     .map(str::to_string),
             }
         });
-        let intent = self.prefix_composer_intent_with_images(intent);
+        let image_key = ComposerDraftKey::new(fence.task_id, fence.agent_session_id);
+        let images = self
+            .composer_images
+            .get(&image_key)
+            .map(|images| {
+                images
+                    .iter()
+                    .map(|image| image.attachment.clone())
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        if !images.is_empty() && !matches!(intent.payload, ComposerPayload::SendNow { .. }) {
+            if let Some(composer) = self.composer.as_mut() {
+                let _ = composer.cancel_pending(command_id);
+            }
+            self.composer_error = Some(
+                "Images require Send; wait for this turn to finish. Your draft was kept.".into(),
+            );
+            return;
+        }
         if let ComposerPayload::SendNow { text, .. } = &intent.payload {
             let admission =
                 self.task_surfaces
@@ -14125,74 +15259,25 @@ impl NativeShell {
                 }
             }
         }
-        let (provider_identity, first_start) = {
-            let Some(model) = self.client_model.as_ref() else {
+        let provider_identity = {
+            let snapshot = self
+                .client_model
+                .as_ref()
+                .and_then(|model| model.task(fence.task_id));
+            let Some(snapshot) = snapshot else {
                 if let Some(composer) = self.composer.as_mut() {
                     let _ = composer.cancel_pending(command_id);
                 }
-                self.composer_error = Some("host model unavailable".into());
+                self.composer_error = Some("Task projection unavailable; draft kept.".into());
                 return;
             };
-            let Some(snapshot) = model.task(fence.task_id) else {
-                if let Some(composer) = self.composer.as_mut() {
-                    let _ = composer.cancel_pending(command_id);
-                }
-                self.composer_error = Some("task projection unavailable".into());
-                return;
-            };
-            let identity =
-                composer_provider_identity(snapshot.provider_sessions.get(&fence.agent_session_id));
-            let first_start = if is_slash_command_send
-                && identity.0.is_none()
-                && matches!(
-                    snapshot.task.title.as_str(),
-                    "New task" | "New Codex task" | "New Claude task"
-                ) {
-                let agent = snapshot.agents.get(&fence.agent_session_id);
-                let resource = agent.and_then(|agent| {
-                    snapshot.resources.values().find(|resource| {
-                        resource.task_id == Some(fence.task_id)
-                            && resource.resource_kind
-                                == crate::domain::resource::ResourceKind::Terminal
-                            && resource.lifecycle
-                                == crate::domain::resource::ResourceLifecycle::Active
-                            && resource.runtime_generation == agent.runtime_generation
-                    })
-                });
-                agent.zip(resource).map(|(agent, resource)| {
-                    crate::client::action::ProviderStartArguments {
-                        task_id: fence.task_id,
-                        agent_session_id: fence.agent_session_id,
-                        resource_id: resource.id,
-                        provider_kind: agent.provider_kind,
-                        mode: crate::domain::command::ProviderStartMode::NewConversation,
-                        launch_options: self.composer_launch_options_for(agent.provider_kind),
-                        action_epoch: fence.action_epoch,
-                    }
-                })
-            } else {
-                None
-            };
-            (identity, first_start)
+            composer_provider_identity(snapshot.provider_sessions.get(&fence.agent_session_id))
         };
-        if let Some(arguments) = first_start {
-            if let Err(failure) =
-                self.dispatch_action_checked(ActionRequest::StartProviderSession(arguments))
-            {
-                if let Some(composer) = self.composer.as_mut() {
-                    let _ = composer.cancel_pending(command_id);
-                }
-                self.composer_error = Some(format!(
-                    "Couldn't start the selected provider: {}",
-                    failure.message
-                ));
-                return;
-            }
-        }
-        let request = match intent.to_provider_input_request(
+        let request = match intent.to_provider_input_request_with_images(
             provider_identity.0,
             provider_identity.1,
             provider_identity.2,
+            images,
         ) {
             Ok(request) => request,
             Err(error) => {
@@ -14258,48 +15343,6 @@ impl NativeShell {
                 );
             }
         }
-    }
-
-    fn prefix_composer_intent_with_images(&self, mut intent: ComposerIntent) -> ComposerIntent {
-        let key = ComposerDraftKey::new(intent.fence.task_id, intent.fence.agent_session_id);
-        let references = self
-            .composer_images
-            .get(&key)
-            .map(|images| {
-                images
-                    .iter()
-                    .map(|image| image.prompt_reference.as_str())
-                    .collect::<Vec<_>>()
-                    .join(" ")
-            })
-            .unwrap_or_default();
-        if references.is_empty() {
-            return intent;
-        }
-        match &mut intent.payload {
-            ComposerPayload::SendNow { text, .. }
-            | ComposerPayload::Steer { text, .. }
-            | ComposerPayload::QueueFollowUp { text, .. }
-            | ComposerPayload::SaveDraft { text, .. } => {
-                if text.trim().is_empty() {
-                    *text = references;
-                } else {
-                    *text = format!("{references} {text}");
-                }
-            }
-            ComposerPayload::Answer {
-                answer: AnswerPayload::Text(text),
-                ..
-            } => {
-                if text.trim().is_empty() {
-                    *text = references;
-                } else {
-                    *text = format!("{references} {text}");
-                }
-            }
-            _ => {}
-        }
-        intent
     }
 
     fn current_composer_draft_key(&self) -> Option<ComposerDraftKey> {
@@ -14380,6 +15423,7 @@ impl NativeShell {
                 id,
                 path: prepared.staged.path,
                 prompt_reference: prepared.staged.prompt_reference,
+                attachment: prepared.attachment,
                 label: prepared.label,
                 preview: prepared.preview,
             });
@@ -14684,15 +15728,7 @@ impl NativeShell {
         };
         let workspace =
             self.render_task_workspace_node(root, &allocated, tokens, workspace_size, cx);
-        let commit_resize = cx.listener(|shell, _dragged: &DraggedTaskDivider, _window, cx| {
-            shell.mark_layout_dirty();
-            cx.notify();
-        });
-        div()
-            .size_full()
-            .on_drop(commit_resize)
-            .child(workspace)
-            .into_any_element()
+        div().size_full().child(workspace).into_any_element()
     }
 
     fn render_task_workspace_node(
@@ -14733,8 +15769,36 @@ impl NativeShell {
                                 Axis::Vertical => rect.height,
                             })
                             .unwrap_or(240.0);
+                        let parent_rect =
+                            Self::task_workspace_node_rect(node, allocated).unwrap_or_default();
+                        let parent_extent = match axis {
+                            Axis::Horizontal => parent_rect.width,
+                            Axis::Vertical => parent_rect.height,
+                        };
+                        let divider_width = 4.0_f32
+                            .min(parent_extent / children.len().saturating_sub(1).max(1) as f32);
+                        let sibling_floor_total = children
+                            .iter()
+                            .enumerate()
+                            .filter(|(sibling, _)| *sibling != index)
+                            .map(|(_, sibling)| Self::task_workspace_child_floor(sibling, *axis))
+                            .sum();
+                        let min_size = Self::task_workspace_child_floor(child, *axis)
+                            .min(start_size)
+                            .max(1.0);
+                        let divider_total = divider_width * children.len().saturating_sub(1) as f32;
                         rendered.push(self.task_workspace_divider(
-                            *split_id, *axis, index, start_size, tokens, cx,
+                            *split_id,
+                            *axis,
+                            index,
+                            start_size,
+                            min_size,
+                            parent_extent,
+                            divider_total,
+                            sibling_floor_total,
+                            divider_width,
+                            tokens,
+                            cx,
                         ));
                     }
                 }
@@ -14771,12 +15835,49 @@ impl NativeShell {
         }
     }
 
+    fn task_workspace_child_floor(child: &TaskWorkspaceViewChild, axis: Axis) -> f32 {
+        let floor = Self::task_workspace_node_floor(&child.node, axis);
+        match child.allocation {
+            Allocation::Pinned { logical_px } => logical_px.min(floor),
+            Allocation::Auto { .. } => floor,
+        }
+    }
+
+    fn task_workspace_node_floor(node: &TaskWorkspaceViewNode, axis: Axis) -> f32 {
+        match node {
+            TaskWorkspaceViewNode::Pane(_) => 64.0,
+            TaskWorkspaceViewNode::Split {
+                axis: nested_axis,
+                children,
+                ..
+            } => {
+                if *nested_axis == axis {
+                    children
+                        .iter()
+                        .map(|child| Self::task_workspace_child_floor(child, axis))
+                        .sum::<f32>()
+                        + 4.0 * children.len().saturating_sub(1) as f32
+                } else {
+                    children
+                        .iter()
+                        .map(|child| Self::task_workspace_node_floor(&child.node, axis))
+                        .fold(64.0, f32::max)
+                }
+            }
+        }
+    }
+
     fn task_workspace_divider(
         &mut self,
         split_id: SplitId,
         axis: Axis,
         child_index: usize,
         start_size: f32,
+        min_size: f32,
+        parent_extent: f32,
+        divider_total: f32,
+        sibling_floor_total: f32,
+        divider_width: f32,
         tokens: crate::ui::tokens::ThemeTokens,
         cx: &mut Context<Self>,
     ) -> AnyElement {
@@ -14785,19 +15886,29 @@ impl NativeShell {
                 .try_into()
                 .expect("split identity tail is exactly eight bytes"),
         );
-        let drag = DraggedTaskDivider {
-            split_id,
-            child_index,
-            axis,
-            start_size,
-            start_boundary: Rc::new(RefCell::new(None)),
-        };
-        let reset = cx.listener(move |shell, event: &MouseDownEvent, _window, cx| {
-            if event.click_count >= 2 {
-                cx.stop_propagation();
-                shell.reset_workspace_split_child(split_id, child_index);
-                cx.notify();
+        let begin = cx.listener(move |shell, event: &MouseDownEvent, _window, cx| {
+            if event.button != MouseButton::Left {
+                return;
             }
+            cx.stop_propagation();
+            if event.click_count >= 2 {
+                shell.reset_workspace_split_child(split_id, child_index);
+                shell.workspace_split_drag = None;
+                cx.notify();
+                return;
+            }
+            shell.workspace_split_drag = Some(WorkspaceSplitDrag {
+                split_id,
+                child_index,
+                axis,
+                origin: event.position,
+                start_size,
+                min_size,
+                parent_extent,
+                divider_total,
+                sibling_floor_total,
+            });
+            cx.notify();
         });
         let divider = div()
             .id((
@@ -14807,44 +15918,15 @@ impl NativeShell {
             .flex_none()
             .bg(tokens.borders.subtle.to_gpui())
             .hover(|style| style.bg(tokens.borders.focus.to_gpui()))
-            .on_mouse_down(MouseButton::Left, reset)
-            .on_drag(drag, |_, _, _, cx| cx.new(|_| gpui::Empty))
-            .on_drag_move::<DraggedTaskDivider>(cx.listener(
-                |shell, event: &DragMoveEvent<DraggedTaskDivider>, _window, cx| {
-                    let drag = event.drag(cx);
-                    let (split_id, child_index, start_size, cursor, boundary) = match drag.axis {
-                        Axis::Horizontal => (
-                            drag.split_id,
-                            drag.child_index,
-                            drag.start_size,
-                            f32::from(event.event.position.x),
-                            f32::from(event.bounds.origin.x + event.bounds.size.width / 2.0),
-                        ),
-                        Axis::Vertical => (
-                            drag.split_id,
-                            drag.child_index,
-                            drag.start_size,
-                            f32::from(event.event.position.y),
-                            f32::from(event.bounds.origin.y + event.bounds.size.height / 2.0),
-                        ),
-                    };
-                    let start_boundary = {
-                        let mut stored = drag.start_boundary.borrow_mut();
-                        *stored.get_or_insert(boundary)
-                    };
-                    let logical_px = (start_size + cursor - start_boundary).max(116.0);
-                    shell.resize_workspace_split_child(split_id, child_index, logical_px);
-                    cx.notify();
-                },
-            ));
+            .on_mouse_down(MouseButton::Left, begin);
         match axis {
             Axis::Horizontal => divider
-                .w(px(4.0))
+                .w(px(divider_width))
                 .h_full()
                 .cursor_col_resize()
                 .into_any_element(),
             Axis::Vertical => divider
-                .h(px(4.0))
+                .h(px(divider_width))
                 .w_full()
                 .cursor_row_resize()
                 .into_any_element(),
@@ -15318,7 +16400,7 @@ impl NativeShell {
             self.interactive_conversation_focus_wires =
                 self.interactive_conversation_focus_wires.saturating_add(1);
         }
-        let focus = cx.listener(|shell, _event: &MouseDownEvent, window, cx| {
+        let focus = cx.listener(|shell, event: &MouseDownEvent, window, cx| {
             cx.stop_propagation();
             shell.composer_focus_handle.focus(window);
             shell.pending_composer_focus = false;
@@ -15327,6 +16409,10 @@ impl NativeShell {
                 shell.composer_error = Some(error.to_string());
             } else {
                 shell.composer_error = None;
+                let extend = event.modifiers.shift;
+                shell.composer_pointer_selecting = event.button == MouseButton::Left;
+                let _ =
+                    shell.update_composer_pointer_selection(event.position, extend, Some(window));
             }
             shell.refresh_accessibility_tree();
             cx.notify();
@@ -15382,10 +16468,14 @@ impl NativeShell {
             .into_any_element()
         } else {
             let shell_entity: Entity<NativeShell> = cx.entity();
+            let bounds_entity = shell_entity.clone();
             let focus_handle = self.composer_focus_handle.clone();
             canvas(
                 |_, _, _| (),
                 move |bounds, _, window, cx| {
+                    let _ = bounds_entity.update(cx, |shell, _| {
+                        shell.composer_input_bounds = Some(bounds);
+                    });
                     window.handle_input(
                         &focus_handle,
                         ElementInputHandler::new(bounds, shell_entity),
@@ -15411,7 +16501,7 @@ impl NativeShell {
             .unwrap_or(0);
         let draft_is_empty = draft.is_empty();
         let draft_has_text = !draft.trim().is_empty();
-        let provider_kind = self.active_provider_kind();
+        let provider_kind = self.composer_provider_for_launch();
         let placeholder = if draft_is_empty && provider_kind.is_none() {
             "Enable a provider in Settings"
         } else {
@@ -15419,13 +16509,10 @@ impl NativeShell {
         };
         let caret_visible =
             composer_caret_visible(self.composer_accessibility_focused, self.controller_ticks);
-        let draft_parts = composer_draft_parts(
-            &draft,
-            draft_cursor,
-            self.composer_accessibility_focused,
-            caret_visible,
-            placeholder,
-        );
+        let draft_selection = self
+            .composer
+            .as_ref()
+            .and_then(|composer| composer.draft_selection_range());
         let provider_label = match provider_kind {
             Some(ProviderKind::ClaudeCode) => "Claude Code",
             Some(ProviderKind::Codex) => "Codex",
@@ -15435,7 +16522,24 @@ impl NativeShell {
         let launch_options =
             self.composer_launch_options_for(provider_kind.unwrap_or(ProviderKind::Codex));
         let model_label = if let Some(slug) = launch_options.custom_model_slug.as_deref() {
-            slug.to_string()
+            let instance_id = launch_options
+                .provider_instance_id
+                .as_deref()
+                .unwrap_or_else(|| {
+                    crate::providers::settings::default_instance_id_for_kind(
+                        provider_kind.unwrap_or(ProviderKind::Codex),
+                    )
+                });
+            self.provider_settings
+                .as_ref()
+                .and_then(|ctl| {
+                    ctl.model_catalogs()
+                        .iter()
+                        .find(|catalog| catalog.instance_id == instance_id)
+                })
+                .and_then(|catalog| catalog.models.iter().find(|model| model.slug == slug))
+                .map(|model| model.display_name.clone())
+                .unwrap_or_else(|| slug.to_string())
         } else {
             match launch_options.model {
                 crate::providers::ProviderModel::ProviderDefault => "Provider default".into(),
@@ -15454,17 +16558,24 @@ impl NativeShell {
             crate::providers::ProviderReasoningEffort::High => "High",
             crate::providers::ProviderReasoningEffort::ExtraHigh => "Extra high",
             crate::providers::ProviderReasoningEffort::Max => "Max",
+            crate::providers::ProviderReasoningEffort::Ultra => "Ultra",
         };
         let access_label = match launch_options.access {
             crate::providers::ProviderAccessMode::FullAccess => "Full access",
             crate::providers::ProviderAccessMode::WorkspaceWrite => "Workspace write",
             crate::providers::ProviderAccessMode::ReadOnly => "Read only",
         };
+        let open_provider = cx.listener(|shell, _event: &ClickEvent, _window, cx| {
+            cx.stop_propagation();
+            shell.open_composer_provider_selector();
+            cx.notify();
+        });
         let open_model = cx.listener(|shell, _event: &ClickEvent, _window, cx| {
             cx.stop_propagation();
             shell.open_composer_model_selector();
             cx.notify();
         });
+        let draft_provider_selectable = self.selected_task_is_unstarted_draft();
         let open_reasoning = cx.listener(|shell, _event: &ClickEvent, _window, cx| {
             cx.stop_propagation();
             shell.open_composer_reasoning_selector();
@@ -15486,6 +16597,7 @@ impl NativeShell {
                     "branch unavailable".to_string(),
                 )
             });
+        // NOTE: provider_control is built after composer_pill below.
         let mut slash_suggestions = self.slash_command_suggestions();
         if !slash_suggestions.is_empty() {
             self.slash_command_selection = self
@@ -15557,7 +16669,9 @@ impl NativeShell {
             .composer
             .as_ref()
             .and_then(TaskComposer::pending_intent)
-            .is_some();
+            .is_some()
+            || self.pending_settled_send.is_some()
+            || self.pending_draft_first_send.is_some();
         let image_chips = self
             .current_composer_images()
             .iter()
@@ -15664,12 +16778,78 @@ impl NativeShell {
             div()
                 .flex()
                 .items_center()
+                .h(px(24.0))
                 .px(px(6.0))
-                .py(px(4.0))
-                .text_size(px(tokens.density.typography.caption))
+                .py(px(2.0))
+                .text_size(px(11.0))
                 .text_color(tokens.text.secondary.to_gpui())
                 .child(label.to_string())
                 .into_any_element()
+        };
+        let provider_control: AnyElement = if draft_provider_selectable {
+            Button::new("native-composer-provider")
+                .label(provider_label)
+                .ghost()
+                .xsmall()
+                .dropdown_caret(true)
+                .compact()
+                .on_click(open_provider)
+                .into_any_element()
+        } else {
+            composer_pill(provider_label)
+        };
+        let launch_option_controls = if self.composer_launch_preferences_editable() {
+            div()
+                .flex()
+                .flex_wrap()
+                .items_center()
+                .gap(px(2.0))
+                .child(
+                    Button::new("native-composer-model")
+                        .label(model_label)
+                        .ghost()
+                        .xsmall()
+                        .dropdown_caret(true)
+                        .max_w(px(160.0))
+                        .overflow_hidden()
+                        .compact()
+                        .on_click(open_model),
+                )
+                .child(
+                    Button::new("native-composer-reasoning")
+                        .label(reasoning_label)
+                        .ghost()
+                        .xsmall()
+                        .dropdown_caret(true)
+                        .compact()
+                        .on_click(open_reasoning),
+                )
+                .child(
+                    Button::new("native-composer-access")
+                        .label(access_label)
+                        .ghost()
+                        .xsmall()
+                        .dropdown_caret(true)
+                        .compact()
+                        .on_click(open_access),
+                )
+                .into_any_element()
+        } else {
+            composer_pill("Options managed by provider")
+        };
+        let usage_pill = {
+            let instance_id = launch_options
+                .provider_instance_id
+                .as_deref()
+                .unwrap_or_else(|| {
+                    provider_kind
+                        .map(crate::providers::settings::default_instance_id_for_kind)
+                        .unwrap_or("codex")
+                });
+            self.provider_settings
+                .as_ref()
+                .and_then(|ctl| ctl.usage_summary_for(instance_id))
+                .map(|summary| composer_pill(&summary))
         };
         let send_base = div()
             .id("native-task-composer-send")
@@ -15771,6 +16951,7 @@ impl NativeShell {
                                             .min_h(px(CONVERSATION_COMPOSER_INPUT_MIN_HEIGHT))
                                             .max_h(px(200.0))
                                             .overflow_y_scroll()
+                                            .track_scroll(&self.composer_scroll_handle)
                                             .track_focus(&self.composer_focus_handle)
                                             .tab_stop(true)
                                             .cursor_text()
@@ -15779,67 +16960,295 @@ impl NativeShell {
                                             .px(px(16.0))
                                             .pt(px(14.0))
                                             .pb(px(28.0))
+                                            .text_size(px(tokens.density.typography.body))
                                             .text_color(if draft_is_empty {
                                                 tokens.text.muted.to_gpui()
                                             } else {
                                                 tokens.text.primary.to_gpui()
                                             })
-                                            .child(
+                                            .child({
+                                                let paint_entity = cx.entity();
+                                                let paint_text = draft.clone();
+                                                let paint_placeholder = placeholder.to_string();
+                                                let paint_empty = draft_is_empty;
+                                                let paint_color =
+                                                    Hsla::from(tokens.text.primary.to_gpui());
+                                                let paint_muted =
+                                                    Hsla::from(tokens.text.muted.to_gpui());
+                                                let paint_selection = draft_selection;
+                                                let paint_cursor = draft_cursor;
+                                                let paint_caret = caret_visible
+                                                    && self.composer_accessibility_focused;
+                                                let caret_color = Hsla::from(
+                                                    tokens
+                                                        .actions
+                                                        .primary
+                                                        .default
+                                                        .background
+                                                        .to_gpui(),
+                                                );
+                                                let selection_bg = Hsla::from(
+                                                    tokens.surfaces.selection.to_gpui(),
+                                                );
+                                                let painted = canvas(
+                                                    |_, _, _| (),
+                                                    move |bounds, _, window, cx| {
+                                                        let style = window.text_style();
+                                                        let font = style.font();
+                                                        let font_size = style
+                                                            .font_size
+                                                            .to_pixels(window.rem_size());
+                                                        let line_height =
+                                                            style.line_height_in_pixels(
+                                                                window.rem_size(),
+                                                            );
+                                                        let display = if paint_empty {
+                                                            paint_placeholder.clone()
+                                                        } else {
+                                                            paint_text.clone()
+                                                        };
+                                                        let color = if paint_empty {
+                                                            paint_muted
+                                                        } else {
+                                                            paint_color
+                                                        };
+                                                        let mut runs = Vec::new();
+                                                        if paint_empty || paint_selection.is_none()
+                                                        {
+                                                            runs.push(TextRun {
+                                                                len: display.len(),
+                                                                font: font.clone(),
+                                                                color,
+                                                                background_color: None,
+                                                                underline: None,
+                                                                strikethrough: None,
+                                                            });
+                                                        } else {
+                                                            let selection =
+                                                                paint_selection.expect("checked");
+                                                            let start = Self::composer_scalar_to_byte(
+                                                                &paint_text,
+                                                                selection.start,
+                                                            )
+                                                            .min(display.len());
+                                                            let end = Self::composer_scalar_to_byte(
+                                                                &paint_text,
+                                                                selection.end,
+                                                            )
+                                                            .min(display.len());
+                                                            let (start, end) = if start <= end {
+                                                                (start, end)
+                                                            } else {
+                                                                (end, start)
+                                                            };
+                                                            if start > 0 {
+                                                                runs.push(TextRun {
+                                                                    len: start,
+                                                                    font: font.clone(),
+                                                                    color,
+                                                                    background_color: None,
+                                                                    underline: None,
+                                                                    strikethrough: None,
+                                                                });
+                                                            }
+                                                            if end > start {
+                                                                runs.push(TextRun {
+                                                                    len: end - start,
+                                                                    font: font.clone(),
+                                                                    color,
+                                                                    background_color: Some(
+                                                                        selection_bg,
+                                                                    ),
+                                                                    underline: None,
+                                                                    strikethrough: None,
+                                                                });
+                                                            }
+                                                            if end < display.len() {
+                                                                runs.push(TextRun {
+                                                                    len: display.len() - end,
+                                                                    font: font.clone(),
+                                                                    color,
+                                                                    background_color: None,
+                                                                    underline: None,
+                                                                    strikethrough: None,
+                                                                });
+                                                            }
+                                                            if runs.is_empty() {
+                                                                runs.push(TextRun {
+                                                                    len: 0,
+                                                                    font: font.clone(),
+                                                                    color,
+                                                                    background_color: None,
+                                                                    underline: None,
+                                                                    strikethrough: None,
+                                                                });
+                                                            }
+                                                        }
+                                                        let shaped = window
+                                                            .text_system()
+                                                            .shape_text(
+                                                                SharedString::from(display),
+                                                                font_size,
+                                                                &runs,
+                                                                Some(bounds.size.width),
+                                                                None,
+                                                            )
+                                                            .unwrap_or_default();
+                                                        let mut origin = bounds.origin;
+                                                        for line in &shaped {
+                                                            let _ = line.paint_background(
+                                                                origin,
+                                                                line_height,
+                                                                TextAlign::Left,
+                                                                Some(bounds),
+                                                                window,
+                                                                cx,
+                                                            );
+                                                            let _ = line.paint(
+                                                                origin,
+                                                                line_height,
+                                                                TextAlign::Left,
+                                                                Some(bounds),
+                                                                window,
+                                                                cx,
+                                                            );
+                                                            origin.y =
+                                                                origin.y + line.size(line_height).height;
+                                                        }
+                                                        let mut caret_bounds = None;
+                                                        if paint_caret || paint_entity.read(cx).composer_reveal_cursor {
+                                                            if paint_empty {
+                                                                let caret = Bounds {
+                                                                    origin: bounds.origin,
+                                                                    size: size(px(1.0), line_height),
+                                                                };
+                                                                window.paint_quad(fill(
+                                                                    caret,
+                                                                    caret_color,
+                                                                ));
+                                                                caret_bounds = Some(caret);
+                                                            } else {
+                                                            let byte = Self::composer_scalar_to_byte(
+                                                                &paint_text,
+                                                                paint_cursor,
+                                                            );
+                                                            let mut y = px(0.0);
+                                                            let mut byte_base = 0usize;
+                                                            for line in &shaped {
+                                                                let line_end =
+                                                                    byte_base + line.len();
+                                                                if byte <= line_end
+                                                                    || byte_base
+                                                                        >= paint_text.len()
+                                                                {
+                                                                    let local = byte
+                                                                        .saturating_sub(byte_base)
+                                                                        .min(line.len());
+                                                                    if let Some(pos) = line
+                                                                        .position_for_index(
+                                                                            local,
+                                                                            line_height,
+                                                                        )
+                                                                    {
+                                                                        let caret = Bounds {
+                                                                            origin: point(
+                                                                                bounds.origin.x
+                                                                                    + pos.x,
+                                                                                bounds.origin.y
+                                                                                    + y
+                                                                                    + pos.y,
+                                                                            ),
+                                                                            size: size(
+                                                                                px(1.0),
+                                                                                line_height,
+                                                                            ),
+                                                                        };
+                                                                        window.paint_quad(fill(
+                                                                            caret,
+                                                                            caret_color,
+                                                                        ));
+                                                                        caret_bounds = Some(caret);
+                                                                    }
+                                                                    break;
+                                                                }
+                                                                y = y
+                                                                    + line
+                                                                        .size(line_height)
+                                                                        .height;
+                                                                byte_base = line_end;
+                                                                if byte_base < paint_text.len()
+                                                                    && paint_text
+                                                                        .as_bytes()
+                                                                        .get(byte_base)
+                                                                        == Some(&b'\n')
+                                                                {
+                                                                    byte_base += 1;
+                                                                    if byte == byte_base - 1 {
+                                                                        break;
+                                                                    }
+                                                                }
+                                                            }
+                                                            }
+                                                        }
+                                                        let content_height = shaped
+                                                            .iter()
+                                                            .map(|line| {
+                                                                f32::from(line.size(line_height).height)
+                                                            })
+                                                            .sum::<f32>()
+                                                            .max(f32::from(line_height));
+                                                        let _ = paint_entity.update(cx, |shell, cx| {
+                                                            let height_changed = (shell
+                                                                .composer_draft_content_height
+                                                                - content_height)
+                                                                .abs()
+                                                                > 0.5;
+                                                            shell.composer_draft_content_height =
+                                                                content_height;
+                                                            if !height_changed && shell.composer_reveal_cursor {
+                                                                if let Some(caret) = caret_bounds {
+                                                                    let viewport = shell.composer_scroll_handle.bounds();
+                                                                    let previous_offset = shell.composer_scroll_handle.offset();
+                                                                    let mut offset = previous_offset;
+                                                                    if caret.top() < viewport.top() {
+                                                                        offset.y += viewport.top() - caret.top();
+                                                                    } else if caret.bottom() > viewport.bottom() {
+                                                                        offset.y -= caret.bottom() - viewport.bottom();
+                                                                    }
+                                                                    shell.composer_scroll_handle.set_offset(offset);
+                                                                    if offset != previous_offset { cx.notify(); }
+                                                                    shell.composer_reveal_cursor = false;
+                                                                }
+                                                            }
+                                                            if paint_empty {
+                                                                shell.composer_painted_layout = None;
+                                                            } else {
+                                                                shell.composer_painted_layout =
+                                                                    Some(ComposerPaintedLayout {
+                                                                        lines: shaped
+                                                                            .into_iter()
+                                                                            .collect(),
+                                                                        bounds,
+                                                                        line_height,
+                                                                        text: paint_text.clone(),
+                                                                    });
+                                                            }
+                                                            if height_changed {
+                                                                cx.notify();
+                                                            }
+                                                        });
+                                                    },
+                                                )
+                                                .w_full()
+                                                .h(px(self
+                                                    .composer_draft_content_height
+                                                    .max(CONVERSATION_COMPOSER_INPUT_MIN_HEIGHT - 42.0)));
                                                 div()
                                                     .id("native-task-composer-draft")
                                                     .w_full()
-                                                    .flex()
-                                                    .flex_wrap()
-                                                    .items_start()
-                                                    .children(draft_parts.into_iter().enumerate().map(
-                                                        |(index, part)| {
-                                                            match part {
-                                                                ComposerDraftPart::Placeholder => {
-                                                                    div()
-                                                                        .id((
-                                                                            "native-composer-placeholder",
-                                                                            index,
-                                                                        ))
-                                                                        .text_color(
-                                                                            tokens.text.muted.to_gpui(),
-                                                                        )
-                                                                        .child(placeholder)
-                                                                        .into_any_element()
-                                                                }
-                                                                ComposerDraftPart::Caret => div()
-                                                                    .id((
-                                                                        "native-composer-caret",
-                                                                        index,
-                                                                    ))
-                                                                    .flex_none()
-                                                                    .w(px(1.0))
-                                                                    .h(px(18.0))
-                                                                    .bg(tokens
-                                                                        .actions
-                                                                        .primary
-                                                                        .default
-                                                                        .background
-                                                                        .to_gpui())
-                                                                    .into_any_element(),
-                                                                ComposerDraftPart::Text(value) => {
-                                                                    div()
-                                                                        .id((
-                                                                            "native-composer-text",
-                                                                            index,
-                                                                        ))
-                                                                        .text_color(
-                                                                            tokens
-                                                                                .text
-                                                                                .primary
-                                                                                .to_gpui(),
-                                                                        )
-                                                                        .child(value)
-                                                                        .into_any_element()
-                                                                }
-                                                            }
-                                                        },
-                                                    )),
-                                            )
+                                                    .child(painted)
+                                                    .into_any_element()
+                                            })
                                             .child(composer_input_registration),
                                     )
                                     .children(self.composer_error.as_ref().map(|error| {
@@ -15879,26 +17288,11 @@ impl NativeShell {
                                                     .flex_wrap()
                                                     .items_center()
                                                     .gap(px(4.0))
-                                                    .text_size(px(12.0))
-                                                    .child(composer_pill(provider_label))
-                                                    .child(
-                                                        Button::new("native-composer-model")
-                                                            .label(model_label)
-                                                            .ghost()
-                                                            .on_click(open_model),
-                                                    )
-                                                    .child(
-                                                        Button::new("native-composer-reasoning")
-                                                            .label(reasoning_label)
-                                                            .ghost()
-                                                            .on_click(open_reasoning),
-                                                    )
-                                                    .child(
-                                                        Button::new("native-composer-access")
-                                                            .label(access_label)
-                                                            .ghost()
-                                                            .on_click(open_access),
-                                                    )
+                                                    .text_size(px(11.0))
+                                                    .gap(px(2.0))
+                                                    .child(provider_control)
+                                                    .child(launch_option_controls)
+                                                    .children(usage_pill)
                                                     .children(self.composer_selector_menu(tokens, cx)),
                                             )
                                             .child(
@@ -18150,6 +19544,300 @@ impl NativeShell {
             }
         }
         true
+    }
+
+    fn matches_pending_settled_send_command(&self, action: &NativeActionRecord) -> bool {
+        let Some(pending) = self.pending_settled_send.as_ref() else {
+            return false;
+        };
+        native_command_id(&action.command) == Some(pending.reopen_command_id)
+    }
+
+    fn settle_pending_settled_send_outcome(
+        &mut self,
+        action: &NativeActionRecord,
+        accepted: bool,
+        message: Option<String>,
+    ) -> bool {
+        if !self.matches_pending_settled_send_command(action) {
+            return false;
+        }
+        if !accepted {
+            self.pending_settled_send = None;
+            self.composer_error = Some(message.unwrap_or_else(|| {
+                "Couldn't reopen the Done task before sending. Your draft was kept.".into()
+            }));
+            return true;
+        }
+        if let Some(pending) = self.pending_settled_send.as_mut() {
+            pending.stage = PendingSettledSendStage::ReopenAcceptedAwaitingActive;
+        }
+        self.try_advance_pending_settled_send();
+        true
+    }
+
+    fn cancel_pending_settled_send(&mut self, message: impl Into<String>) {
+        if self.pending_settled_send.take().is_some() {
+            self.composer_error = Some(message.into());
+        }
+    }
+
+    fn try_advance_pending_settled_send(&mut self) {
+        let Some(pending) = self.pending_settled_send.clone() else {
+            return;
+        };
+        if pending.stage != PendingSettledSendStage::ReopenAcceptedAwaitingActive {
+            return;
+        }
+        let Some(snapshot) = self
+            .client_model
+            .as_ref()
+            .and_then(|model| model.task(pending.task_id))
+        else {
+            // Missing projection is not "active"; wait or cancel on focus loss.
+            return;
+        };
+        if snapshot.task.lifecycle != crate::domain::task::TaskLifecycle::Open {
+            // Exact Open required; Settled or Closing is not ready.
+            return;
+        }
+        if self.interaction.selected_task() != Some(pending.task_id) {
+            self.cancel_pending_settled_send(
+                "Selection changed before Done reopen finished. Draft kept.",
+            );
+            return;
+        }
+        let current_draft = self
+            .composer
+            .as_ref()
+            .map(|composer| composer.draft_text().to_string())
+            .unwrap_or_default();
+        let current_artifacts = self
+            .composer
+            .as_ref()
+            .map(|composer| {
+                composer
+                    .attachments()
+                    .iter()
+                    .map(|attachment| attachment.artifact_id)
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        let current_images = self
+            .current_composer_images()
+            .iter()
+            .map(|image| image.id)
+            .collect::<Vec<_>>();
+        if current_draft != pending.captured_draft
+            || current_artifacts != pending.captured_artifact_ids
+            || current_images != pending.captured_image_ids
+        {
+            self.cancel_pending_settled_send(
+                "Draft changed after Done Send was requested. Draft kept; send cancelled.",
+            );
+            return;
+        }
+        self.pending_settled_send = None;
+        // Re-enter normal send admission: an unopened Done draft still needs
+        // the exact provider-start receipt and ready projection before input.
+        self.activate_composer_control(pending.control);
+    }
+
+    fn matches_pending_draft_first_send_command(&self, action: &NativeActionRecord) -> bool {
+        let Some(pending) = self.pending_draft_first_send.as_ref() else {
+            return false;
+        };
+        native_command_id(&action.command) == Some(pending.start_command_id)
+    }
+
+    fn settle_pending_draft_first_send_outcome(
+        &mut self,
+        action: &NativeActionRecord,
+        accepted: bool,
+        message: Option<String>,
+    ) -> bool {
+        if !self.matches_pending_draft_first_send_command(action) {
+            return false;
+        }
+        if !accepted {
+            self.pending_draft_first_send = None;
+            self.composer_error = Some(message.unwrap_or_else(|| {
+                "Couldn't start the selected provider before send. Your draft was kept.".into()
+            }));
+            return true;
+        }
+        if let Some(pending) = self.pending_draft_first_send.as_mut() {
+            pending.stage = PendingDraftFirstSendStage::StartAcceptedAwaitingReady;
+        }
+        self.try_advance_pending_draft_first_send();
+        true
+    }
+
+    fn cancel_pending_draft_first_send(&mut self, message: impl Into<String>) {
+        if self.pending_draft_first_send.take().is_some() {
+            self.composer_error = Some(message.into());
+        }
+    }
+
+    fn request_pending_first_send_readiness(&mut self) {
+        if self.first_send_readiness_requests.len() >= MAX_ACTION_LANE_RECORDS {
+            return;
+        }
+        let Some(pending) = self.pending_draft_first_send.as_ref() else {
+            return;
+        };
+        if pending.stage != PendingDraftFirstSendStage::StartAcceptedAwaitingReady
+            || pending.ready_without_conversation_id
+            || pending.readiness_request_id.is_some()
+            || pending
+                .readiness_requested_at
+                .is_some_and(|at| at.elapsed() < Duration::from_millis(500))
+        {
+            return;
+        }
+        let task_id = pending.task_id;
+        let Some(snapshot) = self
+            .client_model
+            .as_ref()
+            .and_then(|model| model.task(task_id))
+        else {
+            return;
+        };
+        let codex_without_id = snapshot
+            .primary_agent_id
+            .and_then(|id| snapshot.agents.get(&id))
+            .is_some_and(|agent| {
+                agent.provider_kind == ProviderKind::Codex && agent.provider_session_id.is_none()
+            });
+        if !codex_without_id {
+            return;
+        }
+        if let Some(pending) = self.pending_draft_first_send.as_mut() {
+            pending.readiness_requested_at = Some(Instant::now());
+        }
+        if let Ok(action) = self.dispatch_action_recorded(ActionRequest::TaskCockpit {
+            task_id,
+            query: TaskCockpitQuery::Terminal,
+        }) {
+            if let Some((request_id, _, _)) = Self::task_cockpit_command_parts(&action.command) {
+                self.first_send_readiness_requests.insert(request_id);
+                if let Some(pending) = self.pending_draft_first_send.as_mut() {
+                    pending.readiness_request_id = Some(request_id);
+                }
+            }
+        }
+    }
+
+    fn try_advance_pending_draft_first_send(&mut self) {
+        let Some(pending) = self.pending_draft_first_send.clone() else {
+            return;
+        };
+        if pending.stage != PendingDraftFirstSendStage::StartAcceptedAwaitingReady {
+            return;
+        }
+        let epochs = self.interaction.action_epochs();
+        if pending.connection_epoch != epochs.connection_epoch
+            || pending.resource_generation != epochs.resource_generation
+            || pending.runtime_generation != epochs.runtime_generation
+        {
+            self.cancel_pending_draft_first_send(
+                "The runtime changed before send. Your draft was kept.",
+            );
+            return;
+        }
+        let Some(snapshot) = self
+            .client_model
+            .as_ref()
+            .and_then(|model| model.task(pending.task_id))
+        else {
+            return;
+        };
+        if snapshot.task.lifecycle != crate::domain::task::TaskLifecycle::Open {
+            return;
+        }
+        // Provider-start receipt may precede live SessionStart / runtime
+        // publication. Wait until the draft is no longer "unstarted" (bound or
+        // conversational facts exist) before sending input — never treat a
+        // same-kind unstarted snapshot as proof the runtime is ready.
+        if snapshot.attention == crate::domain::task::TaskAttention::Failed {
+            self.cancel_pending_draft_first_send(
+                "Provider startup failed. Your unsent draft was kept.",
+            );
+            return;
+        }
+        if snapshot.is_unstarted_draft() && !pending.ready_without_conversation_id {
+            return;
+        }
+        if self.interaction.selected_task() != Some(pending.task_id) {
+            self.cancel_pending_draft_first_send(
+                "Selection changed before draft first-send finished. Draft kept.",
+            );
+            return;
+        }
+        let current_draft = self
+            .composer
+            .as_ref()
+            .map(|composer| composer.draft_text().to_string())
+            .unwrap_or_default();
+        let current_artifacts = self
+            .composer
+            .as_ref()
+            .map(|composer| {
+                composer
+                    .attachments()
+                    .iter()
+                    .map(|attachment| attachment.artifact_id)
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        let current_images = self
+            .current_composer_images()
+            .iter()
+            .map(|image| image.id)
+            .collect::<Vec<_>>();
+        if current_draft != pending.captured_draft
+            || current_artifacts != pending.captured_artifact_ids
+            || current_images != pending.captured_image_ids
+        {
+            self.cancel_pending_draft_first_send(
+                "Draft changed after first-send was requested. Draft kept; send cancelled.",
+            );
+            return;
+        }
+        let epoch = match self.rearm_composer_focus() {
+            Ok(epoch) => epoch,
+            Err(error) => {
+                self.pending_draft_first_send = None;
+                self.composer_error = Some(error.to_string());
+                return;
+            }
+        };
+        let intent = {
+            let Some(composer) = self.composer.as_mut() else {
+                self.pending_draft_first_send = None;
+                self.composer_error =
+                    Some("Composer draft unavailable after provider start; draft was kept.".into());
+                return;
+            };
+            match composer
+                .focus_control(pending.control, epoch)
+                .and_then(|_| {
+                    if pending.attachment_only {
+                        composer.activate_attachment_only_send(epoch)
+                    } else {
+                        composer.activate(pending.control, epoch)
+                    }
+                }) {
+                Ok(intent) => intent,
+                Err(error) => {
+                    self.pending_draft_first_send = None;
+                    self.composer_error = Some(error.to_string());
+                    return;
+                }
+            }
+        };
+        self.dispatch_composer_intent(intent);
+        self.pending_draft_first_send = None;
     }
 
     fn begin_new_task(&mut self) {
@@ -21022,6 +22710,40 @@ impl NativeShell {
                     .text_size(px(tokens.density.typography.caption))
                     .text_color(tokens.text.muted.to_gpui())
                     .child(subscription),
+            );
+        }
+        if let Some(usage) = self
+            .provider_settings
+            .as_ref()
+            .and_then(|ctl| ctl.usage_summary_for(&id))
+        {
+            body = body.child(
+                div()
+                    .text_size(px(tokens.density.typography.caption))
+                    .text_color(tokens.text.muted.to_gpui())
+                    .child(usage),
+            );
+        } else if self
+            .provider_settings
+            .as_ref()
+            .is_some_and(|ctl| ctl.metadata_in_flight())
+        {
+            body = body.child(
+                div()
+                    .text_size(px(tokens.density.typography.caption))
+                    .text_color(tokens.text.muted.to_gpui())
+                    .child("Usage refreshing…"),
+            );
+        } else if let Some(error) = self
+            .provider_settings
+            .as_ref()
+            .and_then(|ctl| ctl.metadata_error().map(str::to_string))
+        {
+            body = body.child(
+                div()
+                    .text_size(px(tokens.density.typography.caption))
+                    .text_color(tokens.status.warning.to_gpui())
+                    .child(error),
             );
         }
         if is_stub {
@@ -25153,6 +26875,76 @@ impl NativeShell {
         true
     }
 
+    fn update_workspace_split_drag(&mut self, position: Point<Pixels>) -> bool {
+        let Some(drag) = self.workspace_split_drag else {
+            return false;
+        };
+        let delta = match drag.axis {
+            Axis::Horizontal => f32::from(position.x) - f32::from(drag.origin.x),
+            Axis::Vertical => f32::from(position.y) - f32::from(drag.origin.y),
+        };
+        let max_size =
+            (drag.parent_extent - drag.divider_total - drag.sibling_floor_total).max(drag.min_size);
+        let logical_px = (drag.start_size + delta).clamp(drag.min_size, max_size);
+        let before = self.layout.task_workspace.as_ref().and_then(|workspace| {
+            workspace.split_child_allocation(drag.split_id, drag.child_index)
+        });
+        if let Some(workspace) = self.layout.task_workspace.as_mut() {
+            let _ = workspace.resize_split_child_with_parent_extent(
+                drag.split_id,
+                drag.child_index,
+                logical_px,
+                Some((drag.parent_extent, drag.divider_total)),
+            );
+        }
+        let after = self.layout.task_workspace.as_ref().and_then(|workspace| {
+            workspace.split_child_allocation(drag.split_id, drag.child_index)
+        });
+        if before != after {
+            self.mark_layout_dirty();
+            true
+        } else {
+            false
+        }
+    }
+
+    fn end_workspace_split_drag(&mut self) -> bool {
+        if self.workspace_split_drag.take().is_none() {
+            return false;
+        }
+        self.mark_layout_dirty();
+        true
+    }
+
+    fn current_shell_window_title(&self) -> String {
+        let selected = self.interaction.selected_task();
+        let project = selected
+            .and_then(|task_id| self.inbox.row(task_id))
+            .map(|row| self.project_label_for_id(row.project_id));
+        let task_title = selected.map(|task_id| self.task_row_title(task_id));
+        let dynamic = shell_window_title_segments(project.as_deref(), task_title.as_deref());
+        if self.profile.is_production() {
+            return dynamic;
+        }
+        // Dev keeps the profile badge but still shows project | task | DevManager.
+        let workspace = self
+            .profile
+            .workspace_root()
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("workspace");
+        format!("{dynamic} — dev ({workspace})")
+    }
+
+    fn sync_shell_window_title(&mut self, window: &mut Window) {
+        let next = self.current_shell_window_title();
+        if self.last_window_title.as_deref() == Some(next.as_str()) {
+            return;
+        }
+        window.set_window_title(&next);
+        self.last_window_title = Some(next);
+    }
+
     fn reset_pane(&mut self, edge: PaneEdge) {
         self.pane_drag = None;
         self.layout.reset(edge);
@@ -25390,11 +27182,12 @@ impl NativeShell {
                     .items_center()
                     .justify_center()
                     .rounded(px(6.0))
-                    .bg(tokens.actions.primary.default.background.to_gpui())
-                    .text_size(px(10.0))
-                    .font_weight(FontWeight::BOLD)
-                    .text_color(tokens.actions.primary.default.foreground.to_gpui())
-                    .child("DM"),
+                    .overflow_hidden()
+                    .child(
+                        img("icons/devmanager-32.png")
+                            .size(px(22.0))
+                            .object_fit(ObjectFit::Cover),
+                    ),
             )
             .child(
                 div()
@@ -26147,11 +27940,23 @@ impl NativeShell {
                                 if matches!(event.keystroke.key.as_str(), "enter" | "space") {
                                     let _ = shell_for_key.update(app, |shell, cx| {
                                         cx.stop_propagation();
-                                        let _ = shell.apply_workspace_selection(
-                                            task_id,
-                                            WorkspaceSelectionGesture::Plain,
-                                        );
-                                        if task_row_left_click_should_reopen(settled) {
+                                        let gesture = if event.keystroke.modifiers.shift {
+                                            WorkspaceSelectionGesture::Toggle
+                                        } else {
+                                            WorkspaceSelectionGesture::Plain
+                                        };
+                                        let was_open = shell
+                                            .layout
+                                            .task_workspace
+                                            .as_ref()
+                                            .is_some_and(|workspace| {
+                                                workspace.contains_task(task_id)
+                                            });
+                                        let _ = shell.apply_workspace_selection(task_id, gesture);
+                                        if task_row_left_click_should_reopen(settled)
+                                            && !(gesture == WorkspaceSelectionGesture::Toggle
+                                                && was_open)
+                                        {
                                             shell.reopen_task(task_id);
                                         }
                                         shell.refresh_accessibility_tree();
@@ -26350,15 +28155,17 @@ impl NativeShell {
         .track_scroll(self.task_scroll_handle.clone());
 
         let scroll_handle = self.task_scroll_handle.clone();
-        let inbox_scroll = cx.listener(move |shell, event: &ScrollWheelEvent, _window, cx| {
+        let inbox_scroll = cx.listener(move |_shell, event: &ScrollWheelEvent, _window, cx| {
+            // Own the wheel here so the virtual list does not also apply a
+            // native scroll pass (double processing). Use pixel deltas directly
+            // rather than converting through row_height jumps.
             cx.stop_propagation();
-            let delta = event.delta.pixel_delta(px(row_height)).y;
+            let delta = event.delta.pixel_delta(px(16.0)).y;
             let scroll_state = scroll_handle.0.borrow_mut();
             let offset = scroll_state.base_handle.offset();
             scroll_state
                 .base_handle
                 .set_offset(point(offset.x, offset.y + delta));
-            shell.refresh_accessibility_tree();
             cx.notify();
         });
 
@@ -26667,9 +28474,12 @@ impl NativeShell {
                     ))
                     .child(
                         Button::new("native-sidebar-new-task")
-                            .label("+")
+                            .label("New task")
+                            .icon(gpui_component::IconName::Plus)
                             .tooltip("New task")
-                            .ghost()
+                            .primary()
+                            .small()
+                            .rounded(px(8.0))
                             .on_click(cx.listener(|shell, _event: &ClickEvent, _window, cx| {
                                 cx.stop_propagation();
                                 shell.begin_new_task();
@@ -26724,7 +28534,7 @@ impl NativeShell {
                                 task_id,
                                 WorkspaceSelectionGesture::Plain,
                             );
-                            shell.reopen_task(task_id);
+                            // Done rows select/focus only; Restore or send reopens.
                             shell.refresh_accessibility_tree();
                             cx.notify();
                         });
@@ -26772,7 +28582,7 @@ impl NativeShell {
                         .text_size(px(tokens.density.typography.caption))
                         .font_weight(FontWeight::SEMIBOLD)
                         .text_color(tokens.text.muted.to_gpui())
-                        .child("Settled")
+                        .child("Done")
                         .child(
                             div()
                                 .flex_1()
@@ -27072,18 +28882,30 @@ impl NativeShell {
             // A pane drag has to keep tracking once the pointer leaves the thin
             // rail, so the move and release are owned by the root rather than by
             // the handle that started them.
-            .on_mouse_move(cx.listener(|shell, event: &MouseMoveEvent, _window, cx| {
-                if shell.pane_drag.is_none() {
-                    return;
+            .on_mouse_move(cx.listener(|shell, event: &MouseMoveEvent, window, cx| {
+                let mut changed = false;
+                if shell.pane_drag.is_some() && shell.update_pane_drag(event.position) {
+                    changed = true;
                 }
-                if shell.update_pane_drag(event.position) {
+                if shell.update_workspace_split_drag(event.position) {
+                    changed = true;
+                }
+                if shell.composer_pointer_selecting
+                    && shell.update_composer_pointer_selection(event.position, true, Some(window))
+                {
+                    changed = true;
+                }
+                if changed {
                     cx.notify();
                 }
             }))
             .on_mouse_up(
                 MouseButton::Left,
                 cx.listener(|shell, _event: &MouseUpEvent, _window, cx| {
-                    if shell.end_pane_drag() {
+                    let ended_pane = shell.end_pane_drag();
+                    let ended_split = shell.end_workspace_split_drag();
+                    shell.composer_pointer_selecting = false;
+                    if ended_pane || ended_split {
                         cx.notify();
                     }
                 }),
@@ -27093,7 +28915,10 @@ impl NativeShell {
             .on_mouse_up_out(
                 MouseButton::Left,
                 cx.listener(|shell, _event: &MouseUpEvent, _window, cx| {
-                    if shell.end_pane_drag() {
+                    let ended_pane = shell.end_pane_drag();
+                    let ended_split = shell.end_workspace_split_drag();
+                    shell.composer_pointer_selecting = false;
+                    if ended_pane || ended_split {
                         cx.notify();
                     }
                 }),
@@ -27482,15 +29307,14 @@ impl EntityInputHandler for RootEditorInputProxy {
         &mut self,
         range_utf16: Option<Range<usize>>,
         new_text: &str,
-        _new_selected_range: Option<Range<usize>>,
+        new_selected_range: Option<Range<usize>>,
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         let _ = self.shell.update(cx, |shell, shell_cx| {
-            shell.root_editor_marked_range = shell
-                .replace_root_platform_text(range_utf16, new_text)
-                .ok()
-                .filter(|_| !new_text.is_empty());
+            if let Ok(inserted) = shell.replace_root_platform_text(range_utf16, new_text) {
+                shell.mark_root_composition(inserted, new_selected_range);
+            }
             shell.refresh_accessibility_tree();
             shell_cx.notify();
         });
@@ -27622,22 +29446,24 @@ impl EntityInputHandler for NativeShell {
         &mut self,
         range_utf16: Option<Range<usize>>,
         new_text: &str,
-        _new_selected_range: Option<Range<usize>>,
+        new_selected_range: Option<Range<usize>>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         if self.composer_focus_handle.is_focused(window) {
             match self.replace_composer_platform_text(range_utf16, new_text) {
                 Ok(inserted) => {
-                    self.composer_marked_range = (!new_text.is_empty()).then_some(inserted);
-                    self.composer_error = None;
+                    self.composer_error = self
+                        .mark_composer_composition(inserted, new_selected_range)
+                        .err()
+                        .map(|error| error.to_string());
                 }
                 Err(error) => self.composer_error = Some(error.to_string()),
             }
         } else if self.focus_handle.is_focused(window) {
             match self.replace_root_platform_text(range_utf16, new_text) {
                 Ok(inserted) => {
-                    self.root_editor_marked_range = (!new_text.is_empty()).then_some(inserted);
+                    self.mark_root_composition(inserted, new_selected_range);
                 }
                 Err(_) => self.root_editor_marked_range = None,
             }
@@ -27657,12 +29483,15 @@ impl EntityInputHandler for NativeShell {
 
     fn character_index_for_point(
         &mut self,
-        _point: Point<Pixels>,
+        point: Point<Pixels>,
         window: &mut Window,
         _cx: &mut Context<Self>,
     ) -> Option<usize> {
         if self.composer_focus_handle.is_focused(window) {
-            self.composer_utf16_selection().map(|range| range.end)
+            let _ = window;
+            let scalar = self.composer_scalar_index_for_position(point)?;
+            let text = self.composer.as_ref()?.draft_text();
+            Some(text.chars().take(scalar).map(char::len_utf16).sum())
         } else if self.focus_handle.is_focused(window) {
             self.root_editor_utf16_selection().map(|range| range.end)
         } else {
@@ -27673,6 +29502,7 @@ impl EntityInputHandler for NativeShell {
 
 impl Render for NativeShell {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.sync_shell_window_title(window);
         if self.pending_terminal_focus && self.cockpit.dock().showing_raw_terminal() {
             self.terminal_focus_handle.focus(window);
             self.pending_terminal_focus = false;
@@ -27973,8 +29803,20 @@ fn prepare_native_composer_image(
         .clone()
         .unwrap_or_else(|| "image".to_string());
     let staged = stage_image_for_workspace(workspace, &attachment)?;
+    use sha2::Digest;
+    let image_identity = crate::domain::ProviderImageAttachment::try_new(
+        staged
+            .path
+            .to_str()
+            .ok_or("Image path must be valid Unicode")?
+            .to_string(),
+        sha2::Sha256::digest(&attachment.bytes).into(),
+        attachment.bytes.len(),
+    )
+    .map_err(|error| error.to_string())?;
     Ok(PreparedNativeComposerImage {
         staged,
+        attachment: image_identity,
         label,
         preview,
     })
@@ -28025,7 +29867,13 @@ fn detach_native_composer_images_for_key(
 }
 
 fn load_native_image_attachment(path: &Path) -> Result<RemoteImageAttachment, String> {
-    let bytes = std::fs::read(path).map_err(|error| format!("Failed to read image: {error}"))?;
+    use std::io::Read;
+    let file =
+        std::fs::File::open(path).map_err(|error| format!("Failed to read image: {error}"))?;
+    let mut bytes = Vec::new();
+    file.take(WEB_PASTE_IMAGE_MAX_BYTES as u64 + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|error| format!("Failed to read image: {error}"))?;
     if bytes.len() > WEB_PASTE_IMAGE_MAX_BYTES {
         return Err("Pasted image is too large. Max size is 5 MiB.".to_string());
     }
@@ -28323,6 +30171,46 @@ mod tests {
     #[test]
     fn missing_provider_projection_is_valid_for_a_first_send() {
         assert_eq!(composer_provider_identity(None), (None, None, None));
+    }
+
+    #[test]
+    fn identityless_first_send_requires_host_proof_and_exact_runtime_fences() {
+        let (model, task_id) = terminal_bound_client_model_with_kind_provider_at_epoch(
+            crate::domain::TaskAttention::None,
+            ProviderKind::Codex,
+            None,
+            3,
+        );
+        let snapshot = model.task(task_id).unwrap();
+        let agent_id = snapshot.primary_agent_id.unwrap();
+        let resource = snapshot.resources.values().next().unwrap();
+        let mut terminal = crate::domain::TaskTerminalProjection {
+            task_id,
+            terminal_id: crate::domain::TerminalId::new(),
+            session_id: crate::terminal::protocol::TerminalSessionId::new(),
+            agent_session_id: agent_id,
+            resource_id: resource.id,
+            runtime_generation: snapshot.agents[&agent_id].runtime_generation,
+            resource_generation: resource.runtime_generation,
+            action_epoch: 1,
+            accepts_input_without_conversation_id: true,
+            sequence: 1,
+            title: None,
+            text_lines: Vec::new(),
+            screen: Default::default(),
+        };
+        assert!(super::first_send_terminal_ready(snapshot, &terminal));
+        terminal.accepts_input_without_conversation_id = false;
+        assert!(!super::first_send_terminal_ready(snapshot, &terminal));
+        terminal.accepts_input_without_conversation_id = true;
+        terminal.runtime_generation += 1;
+        assert!(!super::first_send_terminal_ready(snapshot, &terminal));
+        terminal.runtime_generation -= 1;
+        terminal.agent_session_id = AgentSessionId::new();
+        assert!(!super::first_send_terminal_ready(snapshot, &terminal));
+        terminal.agent_session_id = agent_id;
+        terminal.action_epoch = 0;
+        assert!(!super::first_send_terminal_ready(snapshot, &terminal));
     }
 
     #[test]
@@ -28786,20 +30674,41 @@ mod tests {
     #[test]
     fn composer_draft_parts_split_around_the_blinking_caret() {
         assert_eq!(
-            composer_draft_parts("", 0, true, true, "Ask"),
+            composer_draft_parts("", 0, None, true, true, "Ask"),
             vec![ComposerDraftPart::Caret, ComposerDraftPart::Placeholder]
         );
         assert_eq!(
-            composer_draft_parts("ab", 1, true, true, "Ask"),
+            composer_draft_parts("ab", 1, None, true, true, "Ask"),
             vec![
                 ComposerDraftPart::Text("a".into()),
                 ComposerDraftPart::Caret,
                 ComposerDraftPart::Text("b".into()),
             ]
         );
+        assert_eq!(
+            composer_draft_parts("abcd", 4, Some(1..3), true, false, "Ask"),
+            vec![
+                ComposerDraftPart::Text("a".into()),
+                ComposerDraftPart::Selected("bc".into()),
+                ComposerDraftPart::Text("d".into()),
+            ]
+        );
         assert!(composer_caret_visible(true, 0));
         assert!(!composer_caret_visible(true, COMPOSER_CARET_BLINK_TICKS));
         assert!(!composer_caret_visible(false, 0));
+    }
+
+    #[test]
+    fn shell_window_title_segments_match_project_task_app_order() {
+        assert_eq!(super::shell_window_title_segments(None, None), "DevManager");
+        assert_eq!(
+            super::shell_window_title_segments(Some("Househunter"), Some("npm run dev")),
+            "Househunter | npm run dev | DevManager"
+        );
+        assert_eq!(
+            super::shell_window_title_segments(Some("Househunter"), None),
+            "Househunter | DevManager"
+        );
     }
 
     #[test]
@@ -29832,14 +31741,108 @@ mod tests {
     }
 
     #[test]
-    fn archived_left_click_selects_without_restore_while_settled_reopens() {
+    fn composer_scalar_byte_roundtrip_preserves_unicode_and_newlines() {
+        let text = "a😀\n二";
+        assert_eq!(NativeShell::composer_byte_to_scalar(text, 0), 0);
+        assert_eq!(
+            NativeShell::composer_byte_to_scalar(
+                text,
+                NativeShell::composer_scalar_to_byte(text, 1)
+            ),
+            1
+        );
+        assert_eq!(
+            NativeShell::composer_byte_to_scalar(
+                text,
+                NativeShell::composer_scalar_to_byte(text, 2)
+            ),
+            2
+        );
+        assert_eq!(
+            NativeShell::composer_byte_to_scalar(
+                text,
+                NativeShell::composer_scalar_to_byte(text, 3)
+            ),
+            3
+        );
+        assert_eq!(
+            NativeShell::composer_scalar_to_byte(text, text.chars().count()),
+            text.len()
+        );
+    }
+
+    #[test]
+    fn composer_image_request_preserves_text_and_typed_image_identity() {
+        let workspace = tempfile::tempdir().unwrap();
+        let prepared = prepare_native_composer_image(
+            workspace.path(),
+            RemoteImageAttachment {
+                mime_type: "image/png".into(),
+                file_name: Some("image.png".into()),
+                bytes: super::tiny_png_bytes_for_test(),
+            },
+        )
+        .unwrap();
+        let intent = crate::ui::task_cockpit::composer::ComposerIntent {
+            command_id: CommandId::new(),
+            action_id: crate::client::action::ACTION_TASK_SEND_NOW,
+            fence: crate::ui::task_cockpit::composer::ComposerFence {
+                task_id: TaskId::new(),
+                agent_session_id: AgentSessionId::new(),
+                runtime_generation: 1,
+                action_epoch: 0,
+                turn_id: None,
+            },
+            payload: crate::ui::task_cockpit::composer::ComposerPayload::SendNow {
+                text: String::new(),
+                artifact_ids: Vec::new(),
+                prompt: None,
+            },
+        };
+        let request = intent
+            .to_provider_input_request_with_images(
+                None,
+                None,
+                None,
+                vec![prepared.attachment.clone()],
+            )
+            .unwrap();
+        let crate::ui::components::ActionRequest::ProviderInput(request) = request else {
+            panic!("expected typed provider request");
+        };
+        assert_eq!(request.arguments.text.as_deref(), Some(""));
+        assert_eq!(request.arguments.images, vec![prepared.attachment]);
+        assert_eq!(
+            request.arguments.images[0].path(),
+            prepared.staged.path.to_str().unwrap()
+        );
+    }
+
+    #[test]
+    fn composition_selection_keeps_utf16_surrogate_and_selected_subrange() {
+        assert_eq!(
+            NativeShell::composition_selection("a😀bc", &(1..5), 2..3),
+            2..3
+        );
+        assert_eq!(
+            NativeShell::composition_selection("a😀bc", &(1..5), 1..1),
+            1..1
+        );
+        assert_eq!(
+            NativeShell::composition_selection("a😀bc", &(1..5), 3..2),
+            3..2
+        );
+    }
+
+    #[test]
+    fn archived_and_settled_left_click_select_without_restore() {
         assert!(
             !super::task_row_left_click_should_reopen(false),
             "archived/active rows must not reopen on left click"
         );
         assert!(
-            super::task_row_left_click_should_reopen(true),
-            "settled Done rows reopen on left click"
+            !super::task_row_left_click_should_reopen(true),
+            "settled Done rows must not reopen on left click"
         );
     }
 
@@ -30458,6 +32461,7 @@ mod tests {
             id: 1,
             path: prepared.staged.path,
             prompt_reference: prepared.staged.prompt_reference,
+            attachment: prepared.attachment,
             label: prepared.label,
             preview: prepared.preview,
         };
@@ -30475,6 +32479,7 @@ mod tests {
             id: 2,
             path: later.staged.path,
             prompt_reference: later.staged.prompt_reference,
+            attachment: later.attachment,
             label: later.label,
             preview: later.preview,
         };
@@ -32651,6 +34656,7 @@ mod tests {
                     question_id: None,
                     approval_id: None,
                     text: Some("hello".to_string()),
+                    images: Vec::new(),
                     wait: Some(false),
                     allow: None,
                 },
@@ -32700,6 +34706,7 @@ mod tests {
                 question_id: None,
                 approval_id: None,
                 text: Some("first message".to_string()),
+                images: Vec::new(),
                 wait: Some(false),
                 allow: None,
             },
@@ -32951,6 +34958,97 @@ mod tests {
                 .availability(ComposerControl::SendNow)
                 .expect("send availability")
                 .is_available());
+        });
+    }
+
+    fn cancelled_first_send_readiness_preserves_startup_error(cx: &mut gpui::App) {
+        let (runtime, _shared) = TestRuntime::new(true, NativeHostActionResult::Queued);
+        let (model, task_id) = terminal_bound_client_model_with_kind_provider_at_epoch(
+            crate::domain::TaskAttention::None,
+            ProviderKind::Codex,
+            None,
+            3,
+        );
+        let snapshot = model.task(task_id).unwrap();
+        let agent_id = snapshot.primary_agent_id.unwrap();
+        let resource = snapshot.resources.values().next().unwrap();
+        let terminal = crate::domain::TaskTerminalProjection {
+            task_id,
+            terminal_id: crate::domain::TerminalId::new(),
+            session_id: crate::terminal::protocol::TerminalSessionId::new(),
+            agent_session_id: agent_id,
+            resource_id: resource.id,
+            runtime_generation: snapshot.agents[&agent_id].runtime_generation,
+            resource_generation: resource.runtime_generation,
+            action_epoch: 1,
+            accepts_input_without_conversation_id: true,
+            sequence: 1,
+            title: None,
+            text_lines: Vec::new(),
+            screen: Default::default(),
+        };
+        with_test_shell_in_app(cx, runtime, |shell| {
+            shell.interaction.sync_selected_task(Some(task_id));
+            shell.apply_client_model(Arc::new(model)).unwrap();
+            let action = shell
+                .dispatch_action_recorded(crate::ui::components::ActionRequest::TaskCockpit {
+                    task_id,
+                    query: super::TaskCockpitQuery::Terminal,
+                })
+                .unwrap();
+            let request_id = NativeShell::task_cockpit_command_parts(&action.command)
+                .unwrap()
+                .0;
+            let epochs = shell.interaction.action_epochs();
+            shell.first_send_readiness_requests.insert(request_id);
+            shell.pending_draft_first_send = Some(super::PendingDraftFirstSend {
+                task_id,
+                start_command_id: CommandId::new(),
+                control: ComposerControl::SendNow,
+                attachment_only: false,
+                stage: super::PendingDraftFirstSendStage::StartAcceptedAwaitingReady,
+                captured_draft: "keep my first message".into(),
+                captured_artifact_ids: Vec::new(),
+                captured_image_ids: Vec::new(),
+                connection_epoch: epochs.connection_epoch,
+                resource_generation: epochs.resource_generation,
+                runtime_generation: epochs.runtime_generation,
+                started_at: Instant::now(),
+                readiness_request_id: Some(request_id),
+                readiness_requested_at: Some(Instant::now()),
+                ready_without_conversation_id: false,
+            });
+            shell.cancel_pending_draft_first_send("Provider startup timed out. Draft kept.");
+            shell.apply_epoch_fenced_action_outcome(NativeHostActionOutcome::Queried {
+                action,
+                detail: "late readiness".into(),
+                body: NativeHostQueryBody::TaskCockpit(crate::domain::TaskCockpitResult::Terminal(
+                    terminal,
+                )),
+            });
+            assert!(shell.pending_draft_first_send.is_none());
+            assert!(!shell.first_send_readiness_requests.contains(&request_id));
+            assert_eq!(
+                shell.composer_error.as_deref(),
+                Some("Provider startup timed out. Draft kept.")
+            );
+        });
+    }
+
+    fn started_composer_cannot_misrepresent_launch_preferences(cx: &mut gpui::App) {
+        let (runtime, _shared) = TestRuntime::new(true, NativeHostActionResult::Queued);
+        let (model, task_id) = terminal_bound_client_model();
+        with_test_shell_in_app(cx, runtime, |shell| {
+            shell.interaction.sync_selected_task(Some(task_id));
+            shell.apply_client_model(Arc::new(model)).unwrap();
+            let before = shell.layout.composer_launch_options.clone();
+            assert!(!shell.composer_launch_preferences_editable());
+            shell.set_composer_access(crate::providers::ProviderAccessMode::ReadOnly);
+            shell.set_composer_reasoning(crate::providers::ProviderReasoningEffort::Ultra);
+            shell.set_composer_custom_model("different-model".into());
+            shell.open_composer_access_selector();
+            assert!(shell.composer_selector.is_none());
+            assert_eq!(shell.layout.composer_launch_options, before);
         });
     }
 
@@ -34884,6 +36982,8 @@ mod tests {
             selected_task_follow_title_and_terminal_binding(cx);
             selected_task_composer_waits_for_durable_provider_identity(cx);
             selected_codex_task_composer_allows_first_prompt_without_provider_identity(cx);
+            cancelled_first_send_readiness_preserves_startup_error(cx);
+            started_composer_cannot_misrepresent_launch_preferences(cx);
             selected_task_composer_rebinds_after_focus_epoch_advances(cx);
             task_switch_parks_and_restores_unsent_composer_draft(cx);
             task_draft_survives_native_shell_remount(cx);

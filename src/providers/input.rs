@@ -10,7 +10,9 @@
 //! become `ProviderInputDelivered`.
 
 use crate::domain::operation::ResourceFence;
-use crate::domain::provider_input::ProviderInputAction;
+use crate::domain::provider_input::{
+    ProviderImageAttachment, ProviderInputAction, MAX_PROVIDER_IMAGE_ATTACHMENTS,
+};
 use crate::domain::snapshot::TaskSnapshot;
 use crate::domain::{
     AgentSessionId, ApprovalId, ClientId, CommandId, OperationId, ProviderKind, ProviderSessionId,
@@ -184,6 +186,12 @@ impl ProviderComposerSubmitPlan {
 /// Build the physical write sequence for a provider input action. Approval
 /// resolution fails closed because it has no provider-neutral key sequence;
 /// StopTurn uses the standard interrupt byte instead of typing a placeholder.
+///
+/// Codex (and Claude, matching herdr's standalone image-path paste) attach
+/// images when each absolute staged path is delivered as its own bracketed
+/// paste. `@path` + prompt in one text write does not match that contract.
+/// Claude may still treat the path as filesystem context rather than proven
+/// inline vision; this path only mirrors the confirmed paste delivery shape.
 pub(crate) fn provider_composer_submit_plan(
     provider_kind: ProviderKind,
     action: &ProviderInputAction,
@@ -202,11 +210,12 @@ pub(crate) fn provider_composer_submit_plan(
             }],
         });
     }
-    let text = match action {
-        ProviderInputAction::SendNow { text, .. }
-        | ProviderInputAction::SteerCurrentTurn { text }
-        | ProviderInputAction::QueueFollowUp { text } => text.as_bytes(),
-        ProviderInputAction::AnswerQuestion { answer, .. } => answer.as_bytes(),
+
+    let (text, images) = match action {
+        ProviderInputAction::SendNow { text, images, .. } => (text.as_str(), images.as_slice()),
+        ProviderInputAction::SteerCurrentTurn { text }
+        | ProviderInputAction::QueueFollowUp { text } => (text.as_str(), &[][..]),
+        ProviderInputAction::AnswerQuestion { answer, .. } => (answer.as_str(), &[][..]),
         ProviderInputAction::StopTurn => {
             return Ok(ProviderComposerSubmitPlan {
                 steps: vec![ProviderComposerWriteStep {
@@ -220,79 +229,114 @@ pub(crate) fn provider_composer_submit_plan(
         }
         ProviderInputAction::TerminalInput { .. } => unreachable!("handled above"),
     };
-    if text.is_empty() {
+    if images.len() > MAX_PROVIDER_IMAGE_ATTACHMENTS {
+        return Err(ProviderInputDeliveryError::BytesMismatch);
+    }
+    if text.is_empty() && images.is_empty() {
         return Err(ProviderInputDeliveryError::BytesMismatch);
     }
 
     let mut steps = Vec::new();
-    let text = std::str::from_utf8(text).map_err(|_| ProviderInputDeliveryError::BytesMismatch)?;
-    let trimmed = text.trim_start();
-    let slash_command = trimmed.starts_with('/');
-    if slash_command {
-        let leading_len = text.len() - trimmed.len();
-        if leading_len > 0 {
-            steps.push(ProviderComposerWriteStep {
-                bytes: text.as_bytes()[..leading_len].to_vec(),
-                delay_after: None,
-            });
-        }
-        let token_end = trimmed.find(char::is_whitespace).unwrap_or(trimmed.len());
-        let token = &trimmed[..token_end];
-        let token_char_count = token.chars().count();
-        for (index, character) in token.chars().enumerate() {
-            let mut encoded = [0_u8; 4];
-            let is_last = index + 1 == token_char_count;
-            steps.push(ProviderComposerWriteStep {
-                bytes: character.encode_utf8(&mut encoded).as_bytes().to_vec(),
-                delay_after: Some(std::time::Duration::from_millis(
-                    if is_last && token_end == trimmed.len() {
-                        350
-                    } else {
-                        100
-                    },
-                )),
-            });
-        }
-        if token_end < trimmed.len() {
-            steps.push(ProviderComposerWriteStep {
-                bytes: trimmed.as_bytes()[token_end..].to_vec(),
-                delay_after: Some(std::time::Duration::from_millis(250)),
-            });
-        }
+    for image in images {
         steps.push(ProviderComposerWriteStep {
-            bytes: b" ".to_vec(),
-            delay_after: Some(std::time::Duration::from_millis(500)),
-        });
-    } else {
-        steps.push(ProviderComposerWriteStep {
-            bytes: text.as_bytes().to_vec(),
+            bytes: bracketed_image_path_paste(image.path()),
             delay_after: Some(std::time::Duration::from_millis(50)),
         });
     }
-    if matches!(provider_kind, ProviderKind::Codex) && !slash_command {
-        // A bulk write leaves the Codex TUI composer in multiline mode. Exit
-        // that mode before Enter so the prompt is submitted instead of merely
-        // gaining a newline. Do not send a leading Escape: that can dismiss an
-        // unrelated live Codex surface before the prompt is written.
+
+    if !text.is_empty() {
+        let trimmed = text.trim_start();
+        let slash_command = trimmed.starts_with('/');
+        if slash_command {
+            let leading_len = text.len() - trimmed.len();
+            if leading_len > 0 {
+                steps.push(ProviderComposerWriteStep {
+                    bytes: text.as_bytes()[..leading_len].to_vec(),
+                    delay_after: None,
+                });
+            }
+            let token_end = trimmed.find(char::is_whitespace).unwrap_or(trimmed.len());
+            let token = &trimmed[..token_end];
+            let token_char_count = token.chars().count();
+            for (index, character) in token.chars().enumerate() {
+                let mut encoded = [0_u8; 4];
+                let is_last = index + 1 == token_char_count;
+                steps.push(ProviderComposerWriteStep {
+                    bytes: character.encode_utf8(&mut encoded).as_bytes().to_vec(),
+                    delay_after: Some(std::time::Duration::from_millis(
+                        if is_last && token_end == trimmed.len() {
+                            350
+                        } else {
+                            100
+                        },
+                    )),
+                });
+            }
+            if token_end < trimmed.len() {
+                steps.push(ProviderComposerWriteStep {
+                    bytes: trimmed.as_bytes()[token_end..].to_vec(),
+                    delay_after: Some(std::time::Duration::from_millis(250)),
+                });
+            }
+            steps.push(ProviderComposerWriteStep {
+                bytes: b" ".to_vec(),
+                delay_after: Some(std::time::Duration::from_millis(500)),
+            });
+        } else {
+            steps.push(ProviderComposerWriteStep {
+                bytes: text.as_bytes().to_vec(),
+                delay_after: Some(std::time::Duration::from_millis(50)),
+            });
+        }
+
+        let slash_command = text.trim_start().starts_with('/');
+        if matches!(provider_kind, ProviderKind::Codex) && !slash_command {
+            // A bulk write leaves the Codex TUI composer in multiline mode. Exit
+            // that mode before Enter so the prompt is submitted instead of merely
+            // gaining a newline. Do not send a leading Escape: that can dismiss an
+            // unrelated live Codex surface before the prompt is written.
+            steps.push(ProviderComposerWriteStep {
+                bytes: b"\x1b".to_vec(),
+                delay_after: Some(std::time::Duration::from_millis(120)),
+            });
+        }
+        let trimmed = text.trim_start();
+        let claude_exact_slash = slash_command
+            && matches!(provider_kind, ProviderKind::ClaudeCode)
+            && trimmed[token_end(trimmed)..].trim().is_empty();
         steps.push(ProviderComposerWriteStep {
-            bytes: b"\x1b".to_vec(),
-            delay_after: Some(std::time::Duration::from_millis(120)),
+            bytes: b"\r".to_vec(),
+            delay_after: claude_exact_slash.then_some(std::time::Duration::from_millis(180)),
         });
-    }
-    let claude_exact_slash = slash_command
-        && matches!(provider_kind, ProviderKind::ClaudeCode)
-        && trimmed[token_end(trimmed)..].trim().is_empty();
-    steps.push(ProviderComposerWriteStep {
-        bytes: b"\r".to_vec(),
-        delay_after: claude_exact_slash.then_some(std::time::Duration::from_millis(180)),
-    });
-    if claude_exact_slash {
+        if claude_exact_slash {
+            steps.push(ProviderComposerWriteStep {
+                bytes: b"\r".to_vec(),
+                delay_after: None,
+            });
+        }
+    } else {
+        // Image-only SendNow: still submit with Enter. Codex may need Escape to
+        // leave multiline paste mode after standalone image-path pastes.
+        if matches!(provider_kind, ProviderKind::Codex) {
+            steps.push(ProviderComposerWriteStep {
+                bytes: b"\x1b".to_vec(),
+                delay_after: Some(std::time::Duration::from_millis(120)),
+            });
+        }
         steps.push(ProviderComposerWriteStep {
             bytes: b"\r".to_vec(),
             delay_after: None,
         });
     }
     Ok(ProviderComposerSubmitPlan { steps })
+}
+
+fn bracketed_image_path_paste(path: &str) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(path.len().saturating_add(16));
+    bytes.extend_from_slice(b"\x1b[200~");
+    bytes.extend_from_slice(path.as_bytes());
+    bytes.extend_from_slice(b"\x1b[201~");
+    bytes
 }
 
 fn token_end(text: &str) -> usize {
@@ -472,8 +516,10 @@ pub fn provider_input_action_bytes(
     action: &ProviderInputAction,
 ) -> Result<Vec<u8>, ProviderInputError> {
     let bytes = match action {
-        ProviderInputAction::SendNow { text, .. }
-        | ProviderInputAction::SteerCurrentTurn { text }
+        ProviderInputAction::SendNow { text, images, .. } => {
+            encode_send_now_action_bytes(text, images)?
+        }
+        ProviderInputAction::SteerCurrentTurn { text }
         | ProviderInputAction::QueueFollowUp { text } => text.as_bytes().to_vec(),
         ProviderInputAction::AnswerQuestion { answer, .. } => answer.as_bytes().to_vec(),
         ProviderInputAction::ResolveApproval { allow, .. } => {
@@ -487,6 +533,32 @@ pub fn provider_input_action_bytes(
         ProviderInputAction::StopTurn => b"stop_turn".to_vec(),
     };
     Ok(ProviderInput::new(bytes)?.as_bytes().to_vec())
+}
+
+/// Legacy empty-image SendNow digests remain exact text bytes. Nonempty image
+/// identity is mixed into the logical action bytes used by receipts/digests.
+fn encode_send_now_action_bytes(
+    text: &str,
+    images: &[ProviderImageAttachment],
+) -> Result<Vec<u8>, ProviderInputError> {
+    if images.is_empty() {
+        return Ok(text.as_bytes().to_vec());
+    }
+    let mut bytes = Vec::new();
+    let text_len = u32::try_from(text.len()).map_err(|_| ProviderInputError::TooLarge)?;
+    bytes.extend_from_slice(&text_len.to_be_bytes());
+    bytes.extend_from_slice(text.as_bytes());
+    let image_count = u32::try_from(images.len()).map_err(|_| ProviderInputError::TooLarge)?;
+    bytes.extend_from_slice(&image_count.to_be_bytes());
+    for image in images {
+        let path = image.path().as_bytes();
+        let path_len = u32::try_from(path.len()).map_err(|_| ProviderInputError::TooLarge)?;
+        bytes.extend_from_slice(&path_len.to_be_bytes());
+        bytes.extend_from_slice(path);
+        bytes.extend_from_slice(image.sha256());
+        bytes.extend_from_slice(&image.byte_len().to_be_bytes());
+    }
+    Ok(bytes)
 }
 
 pub fn sequence_provider_action(
@@ -691,6 +763,7 @@ mod tests {
         let action = ProviderInputAction::SendNow {
             text: "hello".into(),
             wait: false,
+            images: Vec::new(),
         };
         let claude =
             provider_composer_submit_plan(ProviderKind::ClaudeCode, &action).expect("claude plan");
@@ -713,6 +786,82 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![b"hello".as_slice(), b"\x1b".as_slice(), b"\r".as_slice()]
         );
+    }
+
+    #[test]
+    fn send_now_without_images_keeps_legacy_action_bytes() {
+        let action = ProviderInputAction::SendNow {
+            text: "hello".into(),
+            wait: false,
+            images: Vec::new(),
+        };
+        assert_eq!(
+            provider_input_action_bytes(&action).expect("bytes"),
+            b"hello"
+        );
+    }
+
+    #[test]
+    fn composer_submit_plan_pastes_each_image_path_before_text() {
+        let absolute_a = if cfg!(windows) {
+            r"C:\repo\.devmanager\pasted-images\a.png"
+        } else {
+            "/repo/.devmanager/pasted-images/a.png"
+        };
+        let absolute_b = if cfg!(windows) {
+            r"C:\repo\.devmanager\pasted-images\b.jpg"
+        } else {
+            "/repo/.devmanager/pasted-images/b.jpg"
+        };
+        let images = vec![
+            ProviderImageAttachment::try_new(absolute_a, [1; 32], 32).expect("a"),
+            ProviderImageAttachment::try_new(absolute_b, [2; 32], 64).expect("b"),
+        ];
+        let action = ProviderInputAction::SendNow {
+            text: "caption".into(),
+            wait: false,
+            images,
+        };
+        let plan =
+            provider_composer_submit_plan(ProviderKind::Codex, &action).expect("codex images");
+        let steps: Vec<&[u8]> = plan
+            .steps()
+            .iter()
+            .map(ProviderComposerWriteStep::bytes)
+            .collect();
+        let expected_a = format!("\x1b[200~{absolute_a}\x1b[201~");
+        let expected_b = format!("\x1b[200~{absolute_b}\x1b[201~");
+        assert_eq!(steps[0], expected_a.as_bytes());
+        assert_eq!(steps[1], expected_b.as_bytes());
+        assert_eq!(steps[2], b"caption");
+        assert_eq!(steps[3], b"\x1b");
+        assert_eq!(steps[4], b"\r");
+        let with_images = provider_input_action_bytes(&action).expect("image bytes");
+        assert_ne!(with_images, b"caption");
+        assert!(with_images.len() > "caption".len());
+    }
+
+    #[test]
+    fn composer_submit_plan_supports_image_only_send() {
+        let absolute = if cfg!(windows) {
+            r"C:\repo\.devmanager\pasted-images\only.png"
+        } else {
+            "/repo/.devmanager/pasted-images/only.png"
+        };
+        let action = ProviderInputAction::SendNow {
+            text: String::new(),
+            wait: false,
+            images: vec![ProviderImageAttachment::try_new(absolute, [9; 32], 16).expect("img")],
+        };
+        let plan =
+            provider_composer_submit_plan(ProviderKind::ClaudeCode, &action).expect("image-only");
+        let steps: Vec<&[u8]> = plan
+            .steps()
+            .iter()
+            .map(ProviderComposerWriteStep::bytes)
+            .collect();
+        let expected = format!("\x1b[200~{absolute}\x1b[201~");
+        assert_eq!(steps, vec![expected.as_bytes(), b"\r".as_slice()]);
     }
 
     #[test]
@@ -782,6 +931,7 @@ mod tests {
         let action = crate::domain::provider_input::ProviderInputAction::SendNow {
             text: "hello".into(),
             wait: false,
+            images: Vec::new(),
         };
         let plan = sequence_bounded_input(ACTION_PROVIDER_SEND_NOW, b"hello").expect("plan");
         let mut stale = identity.clone();

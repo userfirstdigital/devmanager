@@ -17,7 +17,7 @@ use crate::domain::event::{
     ResourceReleaseBegunPayload, ResourceReleasedPayload, SpecialistClosedPayload,
     SpecialistHandoffRecordedPayload, SpecialistRequestedPayload, TaskAttentionSetPayload,
     TaskCloseBegunPayload, TaskCreatedPayload, TaskRenamedPayload, TaskUnitPayload,
-    EVENT_SCHEMA_VERSION,
+    UnstartedPrimaryProviderReboundPayload, EVENT_SCHEMA_VERSION,
 };
 use crate::domain::id::{EventId, OperationId, OutboxId, TaskId};
 use crate::domain::operation::{
@@ -1457,6 +1457,13 @@ pub(crate) fn encode_event_payload(event: &Event) -> Result<Vec<u8>, StoreError>
         Event::PrimaryAgentSet { agent_session_id } => rmp_serde::to_vec(&PrimaryAgentSetPayload {
             agent_session_id: *agent_session_id,
         }),
+        Event::UnstartedPrimaryProviderRebound {
+            agent_session_id,
+            provider_kind,
+        } => rmp_serde::to_vec(&UnstartedPrimaryProviderReboundPayload {
+            agent_session_id: *agent_session_id,
+            provider_kind: *provider_kind,
+        }),
         Event::SpecialistRequested {
             specialist_id,
             requested_by,
@@ -1749,6 +1756,13 @@ pub(crate) fn decode_stored_event(
             let p: PrimaryAgentSetPayload = unpack(payload)?;
             Event::PrimaryAgentSet {
                 agent_session_id: p.agent_session_id,
+            }
+        }
+        "agent_session.unstarted_provider_rebound" => {
+            let p: UnstartedPrimaryProviderReboundPayload = unpack(payload)?;
+            Event::UnstartedPrimaryProviderRebound {
+                agent_session_id: p.agent_session_id,
+                provider_kind: p.provider_kind,
             }
         }
         "specialist.requested" => {
@@ -4502,6 +4516,7 @@ mod tests {
                         ProviderInputAction::SendNow {
                             text: "Codex prompt".into(),
                             wait: false,
+                            images: Vec::new(),
                         },
                     )
                     .expect("intent"),
@@ -4575,6 +4590,7 @@ mod tests {
                         ProviderInputAction::SendNow {
                             text: "first attempt".into(),
                             wait: false,
+                            images: Vec::new(),
                         },
                     )
                     .expect("intent"),

@@ -25,6 +25,7 @@ pub mod project_scope;
 pub mod provider_catalog;
 pub mod provider_catalog_contract;
 pub mod provider_catalog_seeds;
+pub mod provider_metadata;
 pub mod provider_settings;
 pub mod renderers;
 pub mod shell;
