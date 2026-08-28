@@ -338,15 +338,61 @@ struct TaskProjectionEntry {
 
 /// Cursor for a bounded continuation search. The cursor is revision-fenced so
 /// a model update cannot make a background result silently skip or duplicate
-/// identities in the newly ordered index.
+/// identities in the newly ordered index. Scope fences prevent an active
+/// continuation from matching settled (or archived) work.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SearchContinuation {
     query: String,
-    archived: bool,
+    scope: SearchScope,
     revision: u64,
     cursor: Option<TaskOrderKey>,
     retained_ids: Vec<TaskId>,
     lower_bound: usize,
+}
+
+/// Which ordered index a bounded search page walks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SearchScope {
+    Active,
+    Settled,
+    Archived,
+}
+
+impl SearchScope {
+    fn from_archived(archived: bool) -> Self {
+        if archived {
+            Self::Archived
+        } else {
+            Self::Active
+        }
+    }
+
+    fn uses_search_postings(self) -> bool {
+        matches!(self, Self::Active | Self::Archived)
+    }
+
+    fn posting_archived(self) -> bool {
+        matches!(self, Self::Archived)
+    }
+}
+
+impl SearchContinuation {
+    #[cfg(test)]
+    pub(crate) fn with_scope(mut self, scope: SearchScope) -> Self {
+        self.scope = scope;
+        self
+    }
+
+    #[cfg(test)]
+    pub(crate) fn bumped_revision(mut self) -> Self {
+        self.revision = self.revision.wrapping_add(1);
+        self
+    }
+
+    #[cfg(test)]
+    pub(crate) fn scope_for_test(&self) -> SearchScope {
+        self.scope
+    }
 }
 
 /// Completion state for one bounded search page.
@@ -414,6 +460,7 @@ pub struct TaskProjectionIndex {
     revision: u64,
     entries: BTreeMap<TaskId, TaskProjectionEntry>,
     active_order: BTreeSet<TaskOrderKey>,
+    settled_order: BTreeSet<TaskOrderKey>,
     archived_order: BTreeSet<TaskOrderKey>,
     /// Compact normalized-title substring postings. Each posting stores only
     /// a bounded TaskId set; title/order strings remain in `entries` and the
@@ -444,6 +491,7 @@ impl TaskProjectionIndex {
             })
             .collect::<BTreeMap<_, _>>();
         let active_order = BTreeSet::new();
+        let settled_order = BTreeSet::new();
         let archived_order = BTreeSet::new();
         let search = HashMap::<String, SearchPosting>::with_capacity(MAX_CLIENT_SEARCH_INDEX_KEYS);
         let search_index_map_bytes = search.capacity().saturating_mul(SEARCH_MAP_SLOT_BYTES);
@@ -461,6 +509,7 @@ impl TaskProjectionIndex {
             revision,
             entries,
             active_order,
+            settled_order,
             archived_order,
             search,
             search_scalar_totals,
@@ -486,7 +535,12 @@ impl TaskProjectionIndex {
                 TaskLifecycle::Open | TaskLifecycle::Closing => {
                     index.active_order.insert(key);
                 }
-                TaskLifecycle::Settled => continue,
+                TaskLifecycle::Settled => {
+                    // Done is a separate bounded order; keep it out of active
+                    // search postings so active/archived counts stay unchanged.
+                    index.settled_order.insert(key);
+                    continue;
+                }
                 TaskLifecycle::Archived => {
                     index.archived_order.insert(key);
                 }
@@ -639,8 +693,20 @@ impl TaskProjectionIndex {
         self.archived_order.len()
     }
 
+    pub fn settled_count(&self) -> usize {
+        self.settled_order.len()
+    }
+
     pub fn top_active_task_ids(&self, limit: usize) -> Vec<TaskId> {
         self.active_order
+            .iter()
+            .take(limit)
+            .map(|key| key.task_id)
+            .collect()
+    }
+
+    pub fn top_settled_task_ids(&self, limit: usize) -> Vec<TaskId> {
+        self.settled_order
             .iter()
             .take(limit)
             .map(|key| key.task_id)
@@ -667,13 +733,38 @@ impl TaskProjectionIndex {
         (ids, total)
     }
 
-    /// Return one bounded search page. The query and index revision fence a
-    /// continuation so stale background work cannot publish another query's
-    /// results. At most [`MAX_CLIENT_SEARCH_WORK`] candidates are inspected.
+    /// Return one bounded active/archived search page. The query, scope, and
+    /// index revision fence a continuation so stale background work cannot
+    /// publish another query's results. At most [`MAX_CLIENT_SEARCH_WORK`]
+    /// candidates are inspected.
     pub fn search_task_ids_page(
         &self,
         query: &str,
         archived: bool,
+        continuation: Option<&SearchContinuation>,
+    ) -> SearchPage {
+        self.search_task_ids_page_scoped(
+            query,
+            SearchScope::from_archived(archived),
+            continuation,
+        )
+    }
+
+    /// Bounded settled (Done) search page with the same work/continuation
+    /// contract as active/archived. Settled is never indexed into search
+    /// postings, so every nonempty query walks only `settled_order`.
+    pub fn search_settled_task_ids_page(
+        &self,
+        query: &str,
+        continuation: Option<&SearchContinuation>,
+    ) -> SearchPage {
+        self.search_task_ids_page_scoped(query, SearchScope::Settled, continuation)
+    }
+
+    fn search_task_ids_page_scoped(
+        &self,
+        query: &str,
+        scope: SearchScope,
         continuation: Option<&SearchContinuation>,
     ) -> SearchPage {
         let (query, query_truncated) =
@@ -681,7 +772,7 @@ impl TaskProjectionIndex {
         let query = query.trim().to_string();
         if let Some(continuation) = continuation {
             if continuation.query != query
-                || continuation.archived != archived
+                || continuation.scope != scope
                 || continuation.revision != self.revision
             {
                 return SearchPage {
@@ -696,11 +787,12 @@ impl TaskProjectionIndex {
             }
         }
 
-        let order = if archived {
-            &self.archived_order
-        } else {
-            &self.active_order
+        let order = match scope {
+            SearchScope::Active => &self.active_order,
+            SearchScope::Settled => &self.settled_order,
+            SearchScope::Archived => &self.archived_order,
         };
+        let posting_archived = scope.posting_archived();
         let mut ids = continuation
             .map(|continuation| continuation.retained_ids.clone())
             .unwrap_or_default();
@@ -715,30 +807,38 @@ impl TaskProjectionIndex {
         // a shorter prefix/gram is never allowed to stand in for the query.
         // Titles beyond the indexed source prefix fence the posting path too;
         // their canonical continuation scan remains the correctness source.
+        // Settled has no postings — it always uses the bounded order scan.
         let query_chars = query.chars().count();
-        let indexed_token = (query_chars >= 4)
+        let indexed_token = scope
+            .uses_search_postings()
             .then(|| {
-                search_tokens(&query)
-                    .into_iter()
-                    .filter_map(|token| self.search.get(&token).map(|posting| (token, posting)))
-                    .max_by_key(|(token, _)| token.chars().count())
+                (query_chars >= 4)
+                    .then(|| {
+                        search_tokens(&query)
+                            .into_iter()
+                            .filter_map(|token| self.search.get(&token).map(|posting| (token, posting)))
+                            .max_by_key(|(token, _)| token.chars().count())
+                    })
+                    .flatten()
+                    .filter(|(_, _)| self.unindexed_suffix_entries == 0)
             })
-            .flatten()
-            .filter(|(_, _)| self.unindexed_suffix_entries == 0);
+            .flatten();
         let first = indexed_token.as_ref().map(|(_, posting)| *posting);
         let exact_indexed_total = if query.is_empty() {
             Some(order.len())
+        } else if !scope.uses_search_postings() {
+            None
         } else if query_chars == 1 {
             query
                 .chars()
                 .next()
                 .and_then(|scalar| self.search_scalar_totals.get(&scalar))
-                .map(|total| total.len(archived))
+                .map(|total| total.len(posting_archived))
         } else {
             indexed_token
                 .as_ref()
                 .filter(|(token, _)| *token == query)
-                .map(|(_, posting)| posting.len(archived))
+                .map(|(_, posting)| posting.len(posting_archived))
         };
 
         // A small complete posting can be materialized and sorted by the
@@ -748,14 +848,14 @@ impl TaskProjectionIndex {
         // instead of sorting or cloning the saturated posting.
         if continuation.is_none()
             && first.is_some_and(|first| {
-                first.len(archived) <= MAX_CLIENT_SEARCH_WORK
-                    && first.ids(archived).len() <= MAX_CLIENT_SEARCH_WORK
-                    && first.ids_complete(archived)
+                first.len(posting_archived) <= MAX_CLIENT_SEARCH_WORK
+                    && first.ids(posting_archived).len() <= MAX_CLIENT_SEARCH_WORK
+                    && first.ids_complete(posting_archived)
             })
         {
             let first = first.expect("small posting candidate");
             let mut candidate_keys = first
-                .ids(archived)
+                .ids(posting_archived)
                 .iter()
                 .filter_map(|task_id| {
                     self.entries
@@ -837,7 +937,7 @@ impl TaskProjectionIndex {
                 query_truncated,
                 continuation: Some(SearchContinuation {
                     query,
-                    archived,
+                    scope,
                     revision: self.revision,
                     cursor: last_cursor,
                     retained_ids: ids,
@@ -921,6 +1021,7 @@ impl TaskProjectionIndex {
                 self.active_order.insert(key.clone());
             }
             TaskLifecycle::Settled => {
+                self.settled_order.insert(key.clone());
                 self.incremental_updates = self.incremental_updates.saturating_add(1);
                 return;
             }
@@ -946,6 +1047,7 @@ impl TaskProjectionIndex {
         if let Some(entry) = self.entries.remove(&task_id) {
             let key = TaskOrderKey::new(task_id, &entry);
             self.active_order.remove(&key);
+            self.settled_order.remove(&key);
             self.archived_order.remove(&key);
             if matches!(
                 entry.lifecycle,
@@ -1264,6 +1366,15 @@ impl ClientModel {
     ) -> SearchPage {
         self.task_projection_index
             .search_task_ids_page(query, archived, continuation)
+    }
+
+    pub fn search_settled_task_ids_page(
+        &self,
+        query: &str,
+        continuation: Option<&SearchContinuation>,
+    ) -> SearchPage {
+        self.task_projection_index
+            .search_settled_task_ids_page(query, continuation)
     }
 
     pub fn search_task_ids_with_work(
@@ -3914,6 +4025,238 @@ mod tests {
                 Err(ClientModelError::DuplicateSection)
             ),
             "started browser sections must fail Tasks-only preview"
+        );
+    }
+
+    #[test]
+    fn settled_order_tracks_open_settled_reopen_without_redefining_active() {
+        let snap = snapshot_id(0xD0);
+        let open_id = task_id(0xD1);
+        let archived_id = task_id(0xD2);
+        let deleted_id = task_id(0xD3);
+        let mut open_item = task_item(open_id, "Active then Done", None);
+        open_item.task.lifecycle = TaskLifecycle::Open;
+        let mut archived_item = task_item(archived_id, "Archived stays history", None);
+        archived_item.task.lifecycle = TaskLifecycle::Archived;
+        let mut deleted_item = task_item(deleted_id, "Deleted stays gone", None);
+        deleted_item.task.lifecycle = TaskLifecycle::Deleted;
+
+        let mut model = assemble_all_sections(
+            snap,
+            1,
+            vec![page(
+                snap,
+                1,
+                SnapshotSection::Tasks,
+                None,
+                vec![
+                    SnapshotItem::Task(open_item),
+                    SnapshotItem::Task(archived_item),
+                    SnapshotItem::Task(deleted_item),
+                ],
+                None,
+            )],
+            Vec::new(),
+        );
+        let index = model.task_projection_index();
+        assert_eq!(index.active_count(), 1);
+        assert_eq!(index.settled_count(), 0);
+        assert_eq!(index.archived_count(), 1);
+        assert_eq!(index.top_active_task_ids(8), vec![open_id]);
+        assert!(index.top_settled_task_ids(8).is_empty());
+
+        model
+            .apply_event(&DomainEvent {
+                id: event_id(0xD4),
+                task_id: Some(open_id),
+                sequence: 2,
+                task_revision: Some(2),
+                occurred_at_ms: 1_725_000_000_500,
+                payload: Event::TaskSettled,
+            })
+            .expect("open -> settled");
+        let index = model.task_projection_index();
+        assert_eq!(index.active_count(), 0);
+        assert_eq!(index.settled_count(), 1);
+        assert_eq!(index.archived_count(), 1);
+        assert_eq!(index.top_settled_task_ids(8), vec![open_id]);
+        assert_eq!(
+            model.task_last_occurred_at_ms(open_id),
+            Some(1_725_000_000_500)
+        );
+
+        model
+            .apply_event(&DomainEvent {
+                id: event_id(0xD5),
+                task_id: Some(open_id),
+                sequence: 3,
+                task_revision: Some(3),
+                occurred_at_ms: 1_725_000_000_900,
+                payload: Event::TaskReopened,
+            })
+            .expect("settled -> open");
+        let index = model.task_projection_index();
+        assert_eq!(index.active_count(), 1);
+        assert_eq!(index.settled_count(), 0);
+        assert_eq!(index.top_active_task_ids(8), vec![open_id]);
+
+        let settled_snap = snapshot_id(0xD6);
+        let settled_id = task_id(0xD7);
+        let mut settled_item = task_item(settled_id, "Fresh Done snapshot", None);
+        settled_item.task.lifecycle = TaskLifecycle::Settled;
+        let fresh = assemble_all_sections(
+            settled_snap,
+            4,
+            vec![page(
+                settled_snap,
+                4,
+                SnapshotSection::Tasks,
+                None,
+                vec![SnapshotItem::Task(settled_item)],
+                None,
+            )],
+            Vec::new(),
+        );
+        let index = fresh.task_projection_index();
+        assert_eq!(index.active_count(), 0);
+        assert_eq!(index.settled_count(), 1);
+        assert_eq!(index.top_settled_task_ids(1), vec![settled_id]);
+    }
+
+    fn settled_search_fixture(non_match_count: usize) -> (ClientModel, TaskId) {
+        let snap = snapshot_id(0xE0);
+        let needle = task_id(0xEF);
+        let mut items = Vec::with_capacity(non_match_count.saturating_add(1));
+        // Newest-first order: high created_at_ms first. Needle is oldest so it
+        // falls beyond the first MAX_CLIENT_SEARCH_WORK settled candidates.
+        // Filler namespace uses variant byte 0x81 so index tails cannot collide
+        // with helper task_id(0xEF) (variant 0x80).
+        for index in 0..non_match_count {
+            let id = TaskId::from_bytes({
+                let mut bytes = fixed_uuid_v7(0xE1);
+                bytes[8] = 0x81;
+                bytes[9..].copy_from_slice(&(index as u64).to_be_bytes()[1..]);
+                bytes
+            })
+            .expect("settled filler");
+            let mut item = task_item(id, &format!("filler-{index}"), None);
+            item.task.lifecycle = TaskLifecycle::Settled;
+            item.task.created_at_ms = (non_match_count as i64).saturating_add(1).saturating_add(index as i64);
+            items.push(SnapshotItem::Task(item));
+        }
+        let mut needle_item = task_item(needle, "settled-needle-match", None);
+        needle_item.task.lifecycle = TaskLifecycle::Settled;
+        needle_item.task.created_at_ms = 1;
+        items.push(SnapshotItem::Task(needle_item));
+        let mut seen = std::collections::BTreeSet::new();
+        for item in &items {
+            let SnapshotItem::Task(task) = item else {
+                panic!("settled search fixture expects only tasks");
+            };
+            assert!(
+                seen.insert(task.task.id),
+                "settled search fixture TaskId collision: {}",
+                task.task.id
+            );
+        }
+        assert_eq!(seen.len(), non_match_count.saturating_add(1));
+        let model = assemble_all_sections(
+            snap,
+            1,
+            vec![page(
+                snap,
+                1,
+                SnapshotSection::Tasks,
+                None,
+                items,
+                None,
+            )],
+            Vec::new(),
+        );
+        (model, needle)
+    }
+
+    #[test]
+    fn settled_search_page_bounds_work_continues_and_rejects_stale_scope() {
+        let (model, needle) = settled_search_fixture(MAX_CLIENT_SEARCH_WORK);
+        let index = model.task_projection_index();
+        assert_eq!(
+            index.settled_count(),
+            MAX_CLIENT_SEARCH_WORK.saturating_add(1)
+        );
+
+        let first = index.search_settled_task_ids_page("needle", None);
+        assert!(first.is_partial(), "first page must stop at work budget");
+        assert_eq!(first.work, MAX_CLIENT_SEARCH_WORK);
+        assert!(
+            !first.ids.contains(&needle),
+            "match beyond first page must remain undiscovered until continued"
+        );
+        assert!(first.exact_total.is_none());
+        let continuation = first
+            .continuation()
+            .cloned()
+            .expect("partial settled page must expose continuation");
+        assert_eq!(continuation.scope_for_test(), SearchScope::Settled);
+
+        let stale_active = index.search_settled_task_ids_page(
+            "needle",
+            Some(&continuation.clone().with_scope(SearchScope::Active)),
+        );
+        assert!(stale_active.is_stale(), "active continuation must not drive settled");
+
+        let stale_query = index.search_settled_task_ids_page("other", Some(&continuation));
+        assert!(stale_query.is_stale());
+
+        let stale_revision = index.search_settled_task_ids_page(
+            "needle",
+            Some(&continuation.clone().bumped_revision()),
+        );
+        assert!(stale_revision.is_stale());
+
+        let active_with_settled_cont =
+            index.search_task_ids_page("needle", false, Some(&continuation));
+        assert!(
+            active_with_settled_cont.is_stale(),
+            "settled continuation must not match active"
+        );
+        let archived_with_settled_cont =
+            index.search_task_ids_page("needle", true, Some(&continuation));
+        assert!(archived_with_settled_cont.is_stale());
+
+        let second = index.search_settled_task_ids_page("needle", Some(&continuation));
+        assert!(second.is_complete());
+        assert!(
+            second.work <= MAX_CLIENT_SEARCH_WORK,
+            "continuation work stays bounded"
+        );
+        assert!(
+            second.ids.contains(&needle),
+            "later settled match must become discoverable"
+        );
+        assert_eq!(second.exact_total, Some(1));
+        assert!(
+            second.ids.iter().all(|id| {
+                model
+                    .tasks()
+                    .get(id)
+                    .is_some_and(|snap| snap.task.lifecycle == TaskLifecycle::Settled)
+            }),
+            "settled search must not contaminate with active/archive rows"
+        );
+        assert!(
+            index
+                .search_task_ids_page("needle", false, None)
+                .ids
+                .is_empty(),
+            "active search must not see settled-only titles"
+        );
+        assert!(
+            index
+                .search_task_ids_page("needle", true, None)
+                .ids
+                .is_empty(),
+            "archived search must not see settled-only titles"
         );
     }
 }

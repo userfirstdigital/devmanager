@@ -23,3 +23,9 @@
   handler. Cover both receipt/projection orders, admission failure, cancellation
   and replacement, late outcomes, and duplicate confirmation. Calling only an
   inner success helper bypasses the ownership checks that these tests must prove.
+- Lifecycle visibility tests must follow canonical model events through the
+  maintained index, Inbox and host-qualified fleet rows; synthetic render rows
+  cannot prove that a task reaches the sidebar. Cover full snapshot, incremental
+  transition and preview for Active, Done, Archive and Delete independently.
+  Filtered lifecycle sections must retain the same bounded search work and
+  continuation contract as the active list, including matches beyond page one.

@@ -23,9 +23,10 @@ use devmanager::client::{
     SubscriptionUpdate, TrackedOperation, UnsolicitedServerMessage,
 };
 use devmanager::config::paths::{resolve_app_paths, AppProfile, BuildKind, ResolvedAppPaths};
+use devmanager::config::{ConfigCommand, ConfigStore, Project};
 use devmanager::domain::command::{
     Command, CommandEnvelope, CommandReceipt, ConfirmHostQuitIntent, CreateTaskIntent,
-    RejectionCode,
+    CreateTaskRequestIntent, RejectionCode,
 };
 use devmanager::domain::event::{DomainEvent, Event};
 use devmanager::domain::id::{
@@ -56,6 +57,7 @@ use devmanager::ui::shell::{InboxActionKind, Shell};
 use devmanager::ui::task_cockpit::{
     InboxFilter, InboxPresentationWidth, InboxRenderItem, NativeNextTaskCockpit,
 };
+use devmanager::workspace::{WorkspaceProjectRoots, WorkspaceRequest};
 use rusqlite::Connection;
 use sha2::{Digest, Sha256};
 
@@ -473,6 +475,38 @@ async fn native_next_bootstrap_drives_visible_inbox_from_fixture_host() {
     let paths = isolated_paths(&config_base, &profile);
     let lock_path = paths.root.join("host.lock");
 
+    // Seed an opaque host project before the real foreground host opens the
+    // same profile. V1 CreateTask is Security-rejected; CreateTaskV2 needs a
+    // WorkspaceProjectRoots-issued ProjectId for paths.root (cli_client precedent).
+    fs::create_dir_all(&paths.root).expect("create isolated profile root");
+    let configured_id = "native-next-fixture-project".to_string();
+    let opaque_project_id = {
+        let mut store = ConfigStore::open_host(&paths).expect("open isolated host config");
+        store
+            .execute(
+                store.snapshot().revision,
+                ConfigCommand::CreateProject {
+                    project: Project {
+                        id: configured_id.clone(),
+                        name: "Native-next fixture project".to_string(),
+                        root_path: paths.root.to_string_lossy().into_owned(),
+                        created_at: "now".to_string(),
+                        updated_at: "now".to_string(),
+                        ..Project::default()
+                    },
+                },
+            )
+            .expect("persist isolated host project");
+        let revision = store.snapshot().revision;
+        let roots = WorkspaceProjectRoots::from_host_config_store(&mut store, revision, 1, 1)
+            .expect("issue isolated host project roots");
+        let project_id = roots
+            .project_id_for_config_id(&configured_id)
+            .expect("opaque isolated host project id");
+        drop(store);
+        project_id
+    };
+
     let mut host = ChildGuard::spawn(host_command(config_base.path(), &profile));
     let _identity = wait_for_identity(&mut host, &lock_path).await;
 
@@ -485,18 +519,40 @@ async fn native_next_bootstrap_drives_visible_inbox_from_fixture_host() {
         limits: FrameLimits::v1_default(),
     };
     let mut command_client = connect_bounded(&command_config, &mut host).await;
-    let (create, _, task_id) = create_task_named(
+    let command_id = CommandId::from_bytes(fixed_uuid_v7(0x77)).expect("command id");
+    let task_id = TaskId::from_bytes(fixed_uuid_v7(0x78)).expect("task id");
+    let create = CommandEnvelope {
+        command_id,
         client_id,
-        0x77,
-        0x78,
-        0x79,
-        0x7a,
-        "Native-next fixture inbox",
-    );
-    command_client
+        task_id: None,
+        issued_at_ms: 1_725_000_000_100,
+        expected_task_revision: None,
+        command: Command::CreateTaskV2(CreateTaskRequestIntent {
+            id: task_id,
+            environment_id: EnvironmentId::from_bytes(fixed_uuid_v7(0x79))
+                .expect("environment id"),
+            title: "Native-next fixture inbox".into(),
+            description: None,
+            project_id: opaque_project_id,
+            workspace: WorkspaceRequest::confirmed_external(&paths.root),
+            primary_provider: None,
+            defer_primary_provider_start: false,
+            assignment: TaskAssignment::LocalOwner,
+            created_at_ms: 1_725_000_000_000,
+            connectivity: TaskConnectivity::Connected,
+            attention: TaskAttention::None,
+            activity: TaskActivity::Idle,
+            review_readiness: ReviewReadiness::NotReady,
+        }),
+    };
+    let receipt = command_client
         .execute_command(create)
         .await
         .expect("fixture task command");
+    assert!(
+        matches!(receipt, CommandReceipt::Accepted { .. }),
+        "CreateTaskV2 fixture must be Accepted, got {receipt:?}"
+    );
     command_client.disconnect();
 
     let subscription_config = HostClientConfig {

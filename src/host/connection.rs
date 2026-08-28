@@ -9239,6 +9239,13 @@ mod output_tests {
         use crate::workspace::{WorkspaceProjectRoots, WorkspaceRequest};
         use uuid::Uuid;
 
+        let repository = tempfile::tempdir().expect("repository");
+        let git_init = std::process::Command::new("git")
+            .args(["init", "--quiet"])
+            .current_dir(repository.path())
+            .output()
+            .expect("git init");
+        assert!(git_init.status.success());
         let dir = tempfile::tempdir().expect("tempdir");
         let bus = CommandBus::open(&dir.path().join("detach.db")).expect("bus");
         let project_id = ProjectId::from_bytes([
@@ -9246,9 +9253,11 @@ mod output_tests {
             0x00, 0xd7,
         ])
         .expect("project");
-        let project_roots =
-            WorkspaceProjectRoots::try_from_pairs([(project_id, test_repository_root())])
-                .expect("project roots");
+        let project_roots = WorkspaceProjectRoots::try_from_pairs([(
+            project_id,
+            repository.path().to_path_buf(),
+        )])
+        .expect("project roots");
         let (requests, executor) =
             HostRequestExecutor::start_with_workspace_projects(bus, project_roots);
 
@@ -9548,6 +9557,8 @@ mod output_tests {
         drop(requests);
         executor.abort();
         let _ = executor.await;
+        // Keep TempDir fixtures alive through executor teardown.
+        let _ = (repository, dir);
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -11081,12 +11092,21 @@ mod output_tests {
         use crate::kernel::CommandBus;
         use crate::workspace::{WorkspaceProjectRoots, WorkspaceRequest};
 
+        let repository = tempfile::tempdir().expect("repository");
+        let git_init = std::process::Command::new("git")
+            .args(["init", "--quiet"])
+            .current_dir(repository.path())
+            .output()
+            .expect("git init");
+        assert!(git_init.status.success());
         let dir = tempfile::tempdir().expect("tempdir");
         let bus = CommandBus::open(&dir.path().join("duplex-caller-owned.db")).expect("bus");
         let project_id = ProjectId::new();
-        let project_roots =
-            WorkspaceProjectRoots::try_from_pairs([(project_id, test_repository_root())])
-                .expect("project roots");
+        let project_roots = WorkspaceProjectRoots::try_from_pairs([(
+            project_id,
+            repository.path().to_path_buf(),
+        )])
+        .expect("project roots");
         let (requests, executor) =
             HostRequestExecutor::start_without_automatic_maintenance_with_workspace_projects(
                 bus,
@@ -11204,6 +11224,8 @@ mod output_tests {
         drop(requests);
         executor.abort();
         let _ = executor.await;
+        // Keep TempDir fixtures alive through executor teardown.
+        let _ = (repository, dir);
     }
 
     #[tokio::test(flavor = "current_thread")]

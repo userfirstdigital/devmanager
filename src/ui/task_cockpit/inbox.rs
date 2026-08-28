@@ -19,7 +19,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::client::model::MAX_INDEXED_TITLE_CHARS;
 use crate::client::{
-    normalize_bounded_search_text, ClientModel, SearchContinuation, SearchPage, TaskInboxPreview,
+    normalize_bounded_search_text, ClientModel, SearchContinuation, SearchPage, SearchScope,
+    TaskInboxPreview,
 };
 use crate::client::{
     ClientSubscription, InboxHostController, SubscriptionError, SubscriptionUpdate,
@@ -930,14 +931,14 @@ pub type LiveClientSubscription = Arc<Mutex<ClientSubscription>>;
 struct BackgroundSearchResult {
     generation: u64,
     model_revision: u64,
-    archived: bool,
+    scope: SearchScope,
     page: SearchPage,
 }
 
 #[derive(Debug)]
 struct BackgroundSearchRequest {
     generation: u64,
-    archived: bool,
+    scope: SearchScope,
     continuation: Option<SearchContinuation>,
 }
 
@@ -1025,18 +1026,24 @@ fn run_background_search_page(
     if cancelled_generation.load(AtomicOrdering::Acquire) != request.generation {
         return;
     }
-    let page = model.search_task_ids_page(
-        filter.query(),
-        request.archived,
-        request.continuation.as_ref(),
-    );
+    let page = match request.scope {
+        SearchScope::Active => {
+            model.search_task_ids_page(filter.query(), false, request.continuation.as_ref())
+        }
+        SearchScope::Archived => {
+            model.search_task_ids_page(filter.query(), true, request.continuation.as_ref())
+        }
+        SearchScope::Settled => {
+            model.search_settled_task_ids_page(filter.query(), request.continuation.as_ref())
+        }
+    };
     if cancelled_generation.load(AtomicOrdering::Acquire) != request.generation {
         return;
     }
     let _ = results.try_send(BackgroundSearchResult {
         generation: request.generation,
         model_revision: model.task_projection_index().revision(),
-        archived: request.archived,
+        scope: request.scope,
         page,
     });
 }
@@ -1066,6 +1073,7 @@ pub struct InboxRuntime {
     background_worker: Option<BackgroundSearchWorker>,
     background_model: Option<Arc<ClientModel>>,
     background_active_page: Option<SearchPage>,
+    background_settled_page: Option<SearchPage>,
     background_archived_page: Option<SearchPage>,
 }
 
@@ -1205,6 +1213,7 @@ impl InboxRuntime {
                             &unread,
                             empty_background_search_page(),
                             None,
+                            None,
                         )
                     }
                 });
@@ -1270,6 +1279,7 @@ impl InboxRuntime {
                 drop(subscription);
                 self.rebuild_projection();
                 self.background_active_page = None;
+                self.background_settled_page = None;
                 self.background_archived_page = None;
                 self.reap_background_worker();
                 return false;
@@ -1285,6 +1295,7 @@ impl InboxRuntime {
         if model.task_projection_index().revision() != result.model_revision {
             self.rebuild_projection();
             self.background_active_page = None;
+            self.background_settled_page = None;
             self.background_archived_page = None;
             self.reap_background_worker();
             return false;
@@ -1316,12 +1327,16 @@ impl InboxRuntime {
             .background_active_page
             .as_ref()
             .is_some_and(|page| page.continuation().is_none());
+        let settled_complete = self
+            .background_settled_page
+            .as_ref()
+            .is_some_and(|page| page.continuation().is_none());
         let archived_complete = !self.filter.includes_archived()
             || self
                 .background_archived_page
                 .as_ref()
                 .is_some_and(|page| page.continuation().is_none());
-        active_complete && archived_complete
+        active_complete && settled_complete && archived_complete
     }
 
     /// Request exactly one page. The caller must invoke this again after the
@@ -1333,30 +1348,43 @@ impl InboxRuntime {
         {
             return false;
         }
-        let (archived, continuation) = if self.background_active_page.is_none() {
-            (false, None)
+        let (scope, continuation) = if self.background_active_page.is_none() {
+            (SearchScope::Active, None)
         } else if self
             .background_active_page
             .as_ref()
             .is_some_and(|page| page.continuation().is_some())
         {
             (
-                false,
+                SearchScope::Active,
                 self.background_active_page
+                    .as_ref()
+                    .and_then(|page| page.continuation().cloned()),
+            )
+        } else if self.background_settled_page.is_none() {
+            (SearchScope::Settled, None)
+        } else if self
+            .background_settled_page
+            .as_ref()
+            .is_some_and(|page| page.continuation().is_some())
+        {
+            (
+                SearchScope::Settled,
+                self.background_settled_page
                     .as_ref()
                     .and_then(|page| page.continuation().cloned()),
             )
         } else if !self.filter.includes_archived() {
             return false;
         } else if self.background_archived_page.is_none() {
-            (true, None)
+            (SearchScope::Archived, None)
         } else if self
             .background_archived_page
             .as_ref()
             .is_some_and(|page| page.continuation().is_some())
         {
             (
-                true,
+                SearchScope::Archived,
                 self.background_archived_page
                     .as_ref()
                     .and_then(|page| page.continuation().cloned()),
@@ -1405,7 +1433,7 @@ impl InboxRuntime {
                     filter,
                     BackgroundSearchRequest {
                         generation,
-                        archived,
+                        scope,
                         continuation,
                     },
                     worker_cancellation,
@@ -1427,20 +1455,22 @@ impl InboxRuntime {
         result: BackgroundSearchResult,
         model: &ClientModel,
     ) -> bool {
-        if result.archived {
-            self.background_archived_page = Some(result.page);
-        } else {
-            self.background_active_page = Some(result.page);
+        match result.scope {
+            SearchScope::Active => self.background_active_page = Some(result.page),
+            SearchScope::Settled => self.background_settled_page = Some(result.page),
+            SearchScope::Archived => self.background_archived_page = Some(result.page),
         }
         let Some(active_page) = self.background_active_page.clone() else {
             return false;
         };
+        let settled_page = self.background_settled_page.clone();
         let archived_page = self.background_archived_page.clone();
         self.projection = Some(Inbox::from_model_with_search_pages(
             model,
             &self.filter,
             &self.unread,
             active_page,
+            settled_page,
             archived_page,
         ));
         self.projection_stale = false;
@@ -1599,6 +1629,7 @@ impl InboxRuntime {
                         &unread,
                         empty_background_search_page(),
                         None,
+                        None,
                     )
                 }
             });
@@ -1611,6 +1642,7 @@ impl InboxRuntime {
                     &filter,
                     &self.unread,
                     empty_background_search_page(),
+                    None,
                     None,
                 )
             });
@@ -1631,6 +1663,7 @@ impl InboxRuntime {
                             &unread,
                             empty_background_search_page(),
                             None,
+                            None,
                         )
                     }
                 })
@@ -1647,6 +1680,7 @@ impl InboxRuntime {
         }
         self.join_background_worker_until(Instant::now() + BACKGROUND_WORKER_JOIN_BUDGET);
         self.background_active_page = None;
+        self.background_settled_page = None;
         self.background_archived_page = None;
     }
 
@@ -1860,6 +1894,24 @@ fn search_projection_page(
     ))
 }
 
+fn settled_projection_page(
+    model: &ClientModel,
+    filter: &InboxFilter,
+    continuation: Option<&SearchContinuation>,
+) -> InboxSearchProjection {
+    if filter.query().trim().is_empty() && continuation.is_none() {
+        return InboxSearchProjection {
+            ids: model
+                .task_projection_index()
+                .top_settled_task_ids(MAX_TASK_LIST_ITEMS),
+            total_count: model.task_projection_index().settled_count(),
+        };
+    }
+    InboxSearchProjection::from_page(
+        model.search_settled_task_ids_page(filter.query(), continuation),
+    )
+}
+
 fn empty_background_search_page() -> SearchPage {
     SearchPage::pending()
 }
@@ -1868,6 +1920,8 @@ fn empty_background_search_page() -> SearchPage {
 pub struct Inbox {
     task_list: InboxList,
     rows: Vec<TaskRowModel>,
+    settled_list: InboxList,
+    settled_rows: Vec<TaskRowModel>,
     archived_list: InboxList,
     history_rows: Vec<TaskRowModel>,
     unread: UnreadCursor,
@@ -1890,6 +1944,7 @@ impl Inbox {
         let filter = InboxFilter::default();
         let unread = UnreadCursor::default();
         let mut grouped: [Vec<TaskRowModel>; 4] = std::array::from_fn(|_| Vec::new());
+        let mut settled_rows = Vec::new();
         for snapshot in preview.tasks().values() {
             if matches!(
                 snapshot.task.lifecycle,
@@ -1906,13 +1961,20 @@ impl Inbox {
                 &unread,
                 true, // preview is read-only
             );
+            if matches!(snapshot.task.lifecycle, TaskLifecycle::Settled) {
+                settled_rows.push(row);
+                continue;
+            }
             grouped[row.section.index()].push(row);
         }
         for rows in &mut grouped {
             rows.sort_by(compare_rows);
         }
+        settled_rows.sort_by(compare_rows);
         // Honest overflow total before the retained window truncates rows.
         let matching_total: usize = grouped.iter().map(Vec::len).sum();
+        let settled_total = settled_rows.len();
+        settled_rows.truncate(MAX_TASK_LIST_ITEMS);
         let mut active_rows = Vec::new();
         let mut section_ranges = [0..0, 0..0, 0..0, 0..0];
         for section in InboxSection::ALL {
@@ -1924,7 +1986,7 @@ impl Inbox {
                 break;
             }
         }
-        let state = if active_rows.is_empty() {
+        let state = if active_rows.is_empty() && settled_rows.is_empty() {
             InboxState::Empty
         } else {
             InboxState::Ready
@@ -1933,6 +1995,11 @@ impl Inbox {
         Self {
             task_list: InboxList::from_ordered_ids(task_ids, matching_total),
             rows: active_rows,
+            settled_list: InboxList::from_ordered_ids(
+                settled_rows.iter().map(|row| row.task_id).collect(),
+                settled_total,
+            ),
+            settled_rows,
             archived_list: InboxList::from_ordered_ids(Vec::new(), 0),
             history_rows: Vec::new(),
             unread,
@@ -1974,6 +2041,15 @@ impl Inbox {
             false,
             active_page.total_count,
         );
+        let settled_page = settled_projection_page(model, filter, None);
+        let (settled_rows, settled_total_count) = project_rows(
+            model,
+            &settled_page.ids,
+            filter,
+            unread,
+            false,
+            settled_page.total_count,
+        );
         let archived_page = if filter.includes_archived() {
             Some(search_projection_page(model, filter, true, None))
         } else {
@@ -2009,7 +2085,8 @@ impl Inbox {
             section_ranges[section.index()] = start..active_rows.len();
         }
 
-        let state = if active_rows.is_empty() && history_rows.is_empty() {
+        let state = if active_rows.is_empty() && settled_rows.is_empty() && history_rows.is_empty()
+        {
             if filter.is_filtered() {
                 InboxState::FilteredEmpty
             } else {
@@ -2023,6 +2100,11 @@ impl Inbox {
         Self {
             task_list: InboxList::from_ordered_ids(task_ids, total_count),
             rows: active_rows,
+            settled_list: InboxList::from_ordered_ids(
+                settled_rows.iter().map(|row| row.task_id).collect(),
+                settled_total_count,
+            ),
+            settled_rows,
             archived_list: InboxList::from_ordered_ids(
                 history_rows.iter().map(|row| row.task_id).collect(),
                 history_total_count,
@@ -2042,9 +2124,24 @@ impl Inbox {
         filter: &InboxFilter,
         unread: &UnreadCursor,
         active_page: SearchPage,
+        settled_page: Option<SearchPage>,
         archived_page: Option<SearchPage>,
     ) -> Self {
         let active_page = InboxSearchProjection::from_page(active_page);
+        let settled_page = match settled_page {
+            Some(page) => InboxSearchProjection::from_page(page),
+            None if filter.query().trim().is_empty() => {
+                settled_projection_page(model, filter, None)
+            }
+            None => {
+                // Filtered settled search is continuation-owned; do not scan
+                // settled_order synchronously while waiting for background pages.
+                InboxSearchProjection {
+                    ids: Vec::new(),
+                    total_count: 0,
+                }
+            }
+        };
         let archived_page = archived_page.map(InboxSearchProjection::from_page);
         let (rows, total_count) = project_rows(
             model,
@@ -2053,6 +2150,14 @@ impl Inbox {
             unread,
             false,
             active_page.total_count,
+        );
+        let (settled_rows, settled_total_count) = project_rows(
+            model,
+            &settled_page.ids,
+            filter,
+            unread,
+            false,
+            settled_page.total_count,
         );
         let (history_rows, history_total_count) = archived_page
             .as_ref()
@@ -2074,7 +2179,8 @@ impl Inbox {
             active_rows.extend(grouped[section.index()].drain(..));
             section_ranges[section.index()] = start..active_rows.len();
         }
-        let state = if active_rows.is_empty() && history_rows.is_empty() {
+        let state = if active_rows.is_empty() && settled_rows.is_empty() && history_rows.is_empty()
+        {
             if filter.is_filtered() {
                 InboxState::FilteredEmpty
             } else {
@@ -2087,6 +2193,11 @@ impl Inbox {
         Self {
             task_list: InboxList::from_ordered_ids(task_ids, total_count),
             rows: active_rows,
+            settled_list: InboxList::from_ordered_ids(
+                settled_rows.iter().map(|row| row.task_id).collect(),
+                settled_total_count,
+            ),
+            settled_rows,
             archived_list: InboxList::from_ordered_ids(
                 history_rows.iter().map(|row| row.task_id).collect(),
                 history_total_count,
@@ -2118,6 +2229,7 @@ impl Inbox {
             return;
         }
         let active_page = search_projection_page(model, &self.filter, false, None);
+        let settled_page = settled_projection_page(model, &self.filter, None);
         let archived_page = if self.filter.includes_archived() {
             Some(search_projection_page(model, &self.filter, true, None))
         } else {
@@ -2128,6 +2240,8 @@ impl Inbox {
         // the complete model or scanning 100k tasks.
         self.rows =
             project_indexed_page(model, &active_page.ids, &self.filter, &self.unread, false);
+        self.settled_rows =
+            project_indexed_page(model, &settled_page.ids, &self.filter, &self.unread, false);
         self.history_rows = archived_page
             .as_ref()
             .map(|page| project_indexed_page(model, &page.ids, &self.filter, &self.unread, true))
@@ -2137,6 +2251,10 @@ impl Inbox {
             self.rows.iter().map(|row| row.task_id).collect(),
             active_page.total_count,
         );
+        self.settled_list = InboxList::from_ordered_ids(
+            self.settled_rows.iter().map(|row| row.task_id).collect(),
+            settled_page.total_count,
+        );
         self.archived_list = InboxList::from_ordered_ids(
             self.history_rows.iter().map(|row| row.task_id).collect(),
             archived_page
@@ -2144,7 +2262,10 @@ impl Inbox {
                 .map(|page| page.total_count)
                 .unwrap_or(0),
         );
-        self.state = if self.rows.is_empty() && self.history_rows.is_empty() {
+        self.state = if self.rows.is_empty()
+            && self.settled_rows.is_empty()
+            && self.history_rows.is_empty()
+        {
             if self.filter.is_filtered() {
                 InboxState::FilteredEmpty
             } else {
@@ -2162,7 +2283,12 @@ impl Inbox {
 
     pub fn set_unread_cursor(&mut self, unread: UnreadCursor) {
         self.unread = unread;
-        for row in self.rows.iter_mut().chain(self.history_rows.iter_mut()) {
+        for row in self
+            .rows
+            .iter_mut()
+            .chain(self.settled_rows.iter_mut())
+            .chain(self.history_rows.iter_mut())
+        {
             row.unread_event_count = self.unread.unread_count(row.task_id);
         }
     }
@@ -2196,6 +2322,8 @@ impl Inbox {
         Self {
             task_list: InboxList::from_ordered_ids(Vec::new(), 0),
             rows: Vec::new(),
+            settled_list: InboxList::from_ordered_ids(Vec::new(), 0),
+            settled_rows: Vec::new(),
             archived_list: InboxList::from_ordered_ids(Vec::new(), 0),
             history_rows: Vec::new(),
             unread: UnreadCursor::default(),
@@ -2252,12 +2380,13 @@ impl Inbox {
     }
 
     pub fn is_empty(&self) -> bool {
-        self.rows.is_empty() && self.history_rows.is_empty()
+        self.rows.is_empty() && self.settled_rows.is_empty() && self.history_rows.is_empty()
     }
 
     pub fn row(&self, task_id: TaskId) -> Option<&TaskRowModel> {
         self.rows
             .iter()
+            .chain(self.settled_rows.iter())
             .chain(self.history_rows.iter())
             .find(|row| row.task_id == task_id)
     }
@@ -2270,10 +2399,13 @@ impl Inbox {
         &self.history_rows
     }
 
-    /// Narrow adapter: active + history rows for host-qualified presentation
-    /// merge without exposing inbox internals to the fleet layer.
+    /// Narrow adapter: active + settled + history rows for host-qualified
+    /// presentation merge without exposing inbox internals to the fleet layer.
     pub fn presentation_rows(&self) -> impl Iterator<Item = &TaskRowModel> {
-        self.rows.iter().chain(self.history_rows.iter())
+        self.rows
+            .iter()
+            .chain(self.settled_rows.iter())
+            .chain(self.history_rows.iter())
     }
 
     pub fn history_row(&self, task_id: TaskId) -> Option<&TaskRowModel> {
@@ -2282,6 +2414,14 @@ impl Inbox {
 
     pub fn active_rows(&self) -> &[TaskRowModel] {
         &self.rows
+    }
+
+    pub fn settled_rows(&self) -> &[TaskRowModel] {
+        &self.settled_rows
+    }
+
+    pub fn settled_overflow(&self) -> Option<InboxOverflow> {
+        self.settled_list.overflow()
     }
 
     pub fn contains_active_task(&self, task_id: TaskId) -> bool {
@@ -2897,7 +3037,7 @@ mod tests {
             .expect("fixture must require a continuation");
         let request = BackgroundSearchRequest {
             generation: 7,
-            archived: false,
+            scope: SearchScope::Active,
             continuation: Some(continuation),
         };
         let cancellation = Arc::new(AtomicU64::new(7));
@@ -2930,7 +3070,7 @@ mod tests {
             InboxFilter::new("task"),
             BackgroundSearchRequest {
                 generation: 7,
-                archived: false,
+                scope: SearchScope::Active,
                 continuation: None,
             },
             cancellation,
@@ -2952,6 +3092,7 @@ mod tests {
             &runtime.filter,
             &runtime.unread,
             SearchPage::pending(),
+            None,
             None,
         ));
 
@@ -2997,6 +3138,7 @@ mod tests {
             &runtime.unread,
             SearchPage::pending(),
             None,
+            None,
         ));
         assert!(runtime.request_background_search_page());
 
@@ -3031,6 +3173,7 @@ mod tests {
             &runtime.filter,
             &runtime.unread,
             SearchPage::pending(),
+            None,
             None,
         ));
 
@@ -3101,6 +3244,7 @@ mod tests {
                 &runtime.unread,
                 SearchPage::pending(),
                 None,
+                None,
             ));
             assert!(runtime.request_background_search_page());
         }
@@ -3159,6 +3303,7 @@ mod tests {
             &runtime.filter,
             &runtime.unread,
             SearchPage::pending(),
+            None,
             None,
         ));
 
@@ -3260,5 +3405,353 @@ mod tests {
         assert_eq!(overflow.total_count, total);
         assert_eq!(overflow.retained_count, MAX_TASK_LIST_ITEMS);
         assert_eq!(overflow.limit, MAX_TASK_LIST_ITEMS);
+    }
+
+    fn lifecycle_model(tasks: Vec<(TaskId, &str, TaskLifecycle, i64)>) -> ClientModel {
+        let snapshot_id = SnapshotId::from_bytes([
+            0x01, 0x8f, 0x60, 0xb0, 0x9c, 0x1a, 0x70, 0x01, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0xe1,
+        ])
+        .expect("snapshot");
+        let items = tasks
+            .into_iter()
+            .map(|(id, title, lifecycle, created_at_ms)| {
+                SnapshotItem::Task(TaskSnapshotItem {
+                    task: TaskFacts {
+                        id,
+                        environment_id: EnvironmentId::from_bytes([
+                            0x01, 0x8f, 0x60, 0xb0, 0x9c, 0x1a, 0x70, 0x01, 0x80, 0x00, 0x00, 0x00,
+                            0x00, 0x00, 0x00, 0x11,
+                        ])
+                        .expect("environment"),
+                        title: title.into(),
+                        description: None,
+                        project_id: ProjectId::from_bytes([
+                            0x01, 0x8f, 0x60, 0xb0, 0x9c, 0x1a, 0x70, 0x01, 0x80, 0x00, 0x00, 0x00,
+                            0x00, 0x00, 0x00, 0x12,
+                        ])
+                        .expect("project"),
+                        workspace: WorkspaceRef::Main,
+                        assignment: TaskAssignment::LocalOwner,
+                        lifecycle,
+                        action_epoch: 0,
+                        revision: 1,
+                        created_at_ms,
+                    },
+                    connectivity: TaskConnectivity::Connected,
+                    attention: TaskAttention::None,
+                    activity: TaskActivity::Idle,
+                    review_readiness: ReviewReadiness::NotReady,
+                    primary_agent_id: None,
+                })
+            })
+            .collect::<Vec<_>>();
+        let mut builder = ClientModelBuilder::new();
+        for (section, section_items) in [
+            (SnapshotSection::Tasks, items),
+            (SnapshotSection::AgentSessions, Vec::new()),
+            (SnapshotSection::Artifacts, Vec::new()),
+            (SnapshotSection::Resources, Vec::new()),
+            (SnapshotSection::Operations, Vec::new()),
+        ] {
+            builder
+                .ingest_page(SnapshotPage {
+                    snapshot_id,
+                    through_sequence: 1,
+                    section,
+                    after_item: None,
+                    items: section_items,
+                    encoded_bytes: 1,
+                    next_cursor: None,
+                })
+                .expect("snapshot page");
+        }
+        builder.finish().expect("client model")
+    }
+
+    fn task_id_tail(tail: u8) -> TaskId {
+        TaskId::from_bytes([
+            0x01, 0x8f, 0x60, 0xb0, 0x9c, 0x1a, 0x70, 0x01, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, tail,
+        ])
+        .expect("task")
+    }
+
+    #[test]
+    fn settled_projection_moves_between_active_and_done_with_distinct_archive_delete() {
+        use crate::domain::event::{DomainEvent, Event};
+        use crate::domain::id::EventId;
+
+        let open_id = task_id_tail(0xA1);
+        let archived_id = task_id_tail(0xA2);
+        let deleted_id = task_id_tail(0xA3);
+        let mut model = lifecycle_model(vec![
+            (open_id, "Will settle", TaskLifecycle::Open, 10),
+            (archived_id, "Already archived", TaskLifecycle::Archived, 20),
+            (deleted_id, "Already deleted", TaskLifecycle::Deleted, 30),
+        ]);
+
+        let mut inbox = Inbox::from_model(&model);
+        assert!(inbox.active_rows().iter().any(|row| row.task_id == open_id));
+        assert!(inbox.settled_rows().is_empty());
+        assert!(inbox.history_rows().is_empty());
+
+        model
+            .apply_event(&DomainEvent {
+                id: EventId::from_bytes([
+                    0x01, 0x8f, 0x60, 0xb0, 0x9c, 0x1a, 0x70, 0x01, 0x80, 0x00, 0x00, 0x00, 0x00,
+                    0x00, 0x00, 0xB1,
+                ])
+                .expect("event"),
+                task_id: Some(open_id),
+                sequence: 2,
+                task_revision: Some(2),
+                occurred_at_ms: 1_000,
+                payload: Event::TaskSettled,
+            })
+            .expect("settle");
+        inbox.apply_model_event(&model, Some(open_id));
+        assert!(!inbox.active_rows().iter().any(|row| row.task_id == open_id));
+        assert_eq!(
+            inbox.settled_rows().iter().map(|row| row.task_id).collect::<Vec<_>>(),
+            vec![open_id]
+        );
+        assert_eq!(
+            inbox.settled_rows()[0].occurred_at_ms,
+            1_000,
+            "Done rows carry real occurrence time"
+        );
+
+        let fresh = Inbox::from_model(&model);
+        assert_eq!(
+            fresh.settled_rows().iter().map(|row| row.task_id).collect::<Vec<_>>(),
+            vec![open_id]
+        );
+        assert!(fresh.active_rows().is_empty());
+
+        model
+            .apply_event(&DomainEvent {
+                id: EventId::from_bytes([
+                    0x01, 0x8f, 0x60, 0xb0, 0x9c, 0x1a, 0x70, 0x01, 0x80, 0x00, 0x00, 0x00, 0x00,
+                    0x00, 0x00, 0xB2,
+                ])
+                .expect("event"),
+                task_id: Some(open_id),
+                sequence: 3,
+                task_revision: Some(3),
+                occurred_at_ms: 2_000,
+                payload: Event::TaskReopened,
+            })
+            .expect("reopen");
+        inbox.apply_model_event(&model, Some(open_id));
+        assert!(inbox.active_rows().iter().any(|row| row.task_id == open_id));
+        assert!(inbox.settled_rows().is_empty());
+
+        let with_history = Inbox::from_model_with_filter(
+            &lifecycle_model(vec![
+                (archived_id, "Already archived", TaskLifecycle::Archived, 20),
+                (deleted_id, "Already deleted", TaskLifecycle::Deleted, 30),
+            ]),
+            &InboxFilter::default().including_archived(),
+            &UnreadCursor::default(),
+        );
+        assert!(with_history
+            .history_rows()
+            .iter()
+            .any(|row| row.task_id == archived_id));
+        assert!(!with_history
+            .settled_rows()
+            .iter()
+            .any(|row| row.task_id == archived_id));
+        assert!(!with_history
+            .history_rows()
+            .iter()
+            .any(|row| row.task_id == deleted_id));
+        assert!(!with_history
+            .settled_rows()
+            .iter()
+            .any(|row| row.task_id == deleted_id));
+    }
+
+    #[test]
+    fn background_settled_continuation_publishes_late_done_without_resetting_active() {
+        use crate::client::model::MAX_CLIENT_SEARCH_WORK;
+        use crate::domain::id::{EnvironmentId, ProjectId, SnapshotId};
+
+        let snapshot_id = SnapshotId::from_bytes([
+            0x01, 0x8f, 0x60, 0xb0, 0x9c, 0x1a, 0x70, 0x01, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0xc0,
+        ])
+        .expect("snapshot");
+        let env = EnvironmentId::from_bytes([
+            0x01, 0x8f, 0x60, 0xb0, 0x9c, 0x1a, 0x70, 0x01, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x11,
+        ])
+        .expect("env");
+        let project = ProjectId::from_bytes([
+            0x01, 0x8f, 0x60, 0xb0, 0x9c, 0x1a, 0x70, 0x01, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x12,
+        ])
+        .expect("project");
+        let active_id = task_id_tail(0xC1);
+        let needle = task_id_tail(0xC2);
+        let mut items = Vec::with_capacity(MAX_CLIENT_SEARCH_WORK.saturating_add(2));
+        items.push(SnapshotItem::Task(TaskSnapshotItem {
+            task: TaskFacts {
+                id: active_id,
+                environment_id: env,
+                title: "active-needle-keep".into(),
+                description: None,
+                project_id: project,
+                workspace: WorkspaceRef::Main,
+                assignment: TaskAssignment::LocalOwner,
+                lifecycle: TaskLifecycle::Open,
+                action_epoch: 0,
+                revision: 1,
+                created_at_ms: 9_000_000,
+            },
+            connectivity: TaskConnectivity::Connected,
+            attention: TaskAttention::None,
+            activity: TaskActivity::Idle,
+            review_readiness: ReviewReadiness::NotReady,
+            primary_agent_id: None,
+        }));
+        for index in 0..MAX_CLIENT_SEARCH_WORK {
+            let id = TaskId::from_bytes({
+                let mut bytes = [
+                    0x01, 0x8f, 0x60, 0xb0, 0x9c, 0x1a, 0x70, 0x01, 0x80, 0x00, 0x00, 0x00, 0x00,
+                    0x00, 0x00, 0x00,
+                ];
+                // Distinct from task_id_tail helpers (variant 0x80) so filler
+                // index 193/194 cannot collide with active 0xC1 / needle 0xC2.
+                bytes[8] = 0x81;
+                bytes[9..].copy_from_slice(&(index as u64).to_be_bytes()[1..]);
+                bytes
+            })
+            .expect("filler");
+            items.push(SnapshotItem::Task(TaskSnapshotItem {
+                task: TaskFacts {
+                    id,
+                    environment_id: env,
+                    title: format!("settled-filler-{index}"),
+                    description: None,
+                    project_id: project,
+                    workspace: WorkspaceRef::Main,
+                    assignment: TaskAssignment::LocalOwner,
+                    lifecycle: TaskLifecycle::Settled,
+                    action_epoch: 0,
+                    revision: 1,
+                    created_at_ms: 1_000_000 + index as i64,
+                },
+                connectivity: TaskConnectivity::Connected,
+                attention: TaskAttention::None,
+                activity: TaskActivity::Idle,
+                review_readiness: ReviewReadiness::NotReady,
+                primary_agent_id: None,
+            }));
+        }
+        items.push(SnapshotItem::Task(TaskSnapshotItem {
+            task: TaskFacts {
+                id: needle,
+                environment_id: env,
+                title: "settled-needle-late".into(),
+                description: None,
+                project_id: project,
+                workspace: WorkspaceRef::Main,
+                assignment: TaskAssignment::LocalOwner,
+                lifecycle: TaskLifecycle::Settled,
+                action_epoch: 0,
+                revision: 1,
+                created_at_ms: 1,
+            },
+            connectivity: TaskConnectivity::Connected,
+            attention: TaskAttention::None,
+            activity: TaskActivity::Idle,
+            review_readiness: ReviewReadiness::NotReady,
+            primary_agent_id: None,
+        }));
+        let mut seen = std::collections::BTreeSet::new();
+        for item in &items {
+            let SnapshotItem::Task(task) = item else {
+                panic!("background settled fixture expects only tasks");
+            };
+            assert!(
+                seen.insert(task.task.id),
+                "background settled fixture TaskId collision: {}",
+                task.task.id
+            );
+        }
+        assert_eq!(
+            seen.len(),
+            MAX_CLIENT_SEARCH_WORK.saturating_add(2),
+            "active + fillers + needle must stay unique"
+        );
+
+        let mut builder = ClientModelBuilder::new();
+        for (section, section_items) in [
+            (SnapshotSection::Tasks, items),
+            (SnapshotSection::AgentSessions, Vec::new()),
+            (SnapshotSection::Artifacts, Vec::new()),
+            (SnapshotSection::Resources, Vec::new()),
+            (SnapshotSection::Operations, Vec::new()),
+        ] {
+            builder
+                .ingest_page(SnapshotPage {
+                    snapshot_id,
+                    through_sequence: 1,
+                    section,
+                    after_item: None,
+                    items: section_items,
+                    encoded_bytes: 1,
+                    next_cursor: None,
+                })
+                .expect("page");
+        }
+        let model = Arc::new(builder.finish().expect("model"));
+
+        let mut runtime = InboxRuntime::new();
+        runtime.background_model = Some(Arc::clone(&model));
+        runtime.filter = InboxFilter::new("needle");
+        runtime.projection_stale = false;
+        runtime.projection = Some(Inbox::from_model_with_search_pages(
+            &model,
+            &runtime.filter,
+            &runtime.unread,
+            SearchPage::pending(),
+            None,
+            None,
+        ));
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while !runtime.tick_background_search().complete {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "active then settled continuations must complete"
+            );
+            thread::yield_now();
+        }
+
+        let projection = runtime.projection().expect("projection");
+        let active_ids: Vec<_> = projection
+            .active_rows()
+            .iter()
+            .map(|row| row.task_id)
+            .collect();
+        assert_eq!(active_ids, vec![active_id], "active rows must stay");
+        assert!(
+            projection
+                .settled_rows()
+                .iter()
+                .any(|row| row.task_id == needle),
+            "late Done match must publish into settled collection"
+        );
+        assert!(
+            !projection
+                .settled_rows()
+                .iter()
+                .any(|row| row.task_id == active_id),
+            "active identity must not contaminate settled"
+        );
+        assert!(projection.history_rows().is_empty());
     }
 }

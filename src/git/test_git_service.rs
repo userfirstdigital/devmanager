@@ -1098,15 +1098,7 @@ fn repository_graph_rejects_creation_of_absent_worktree_config_before_read() {
     );
 }
 
-#[test]
-fn approved_linked_worktree_graph_is_bound_to_external_git_roots() {
-    let primary = init_repo();
-    commit_initial(primary.path(), "tracked.txt", "tracked\n");
-    let linked_parent = test_tempdir("devmanager-phase66-linked-");
-    let linked = linked_parent.path().join("linked");
-    let linked_arg = linked.to_str().expect("linked worktree path");
-    git(primary.path(), &["worktree", "add", "--detach", linked_arg]);
-
+fn resolve_linked_worktree_git_roots(linked: &Path) -> (PathBuf, PathBuf, PathBuf) {
     let descriptor = fs::read_to_string(linked.join(".git")).expect("linked gitdir descriptor");
     let gitdir_value = descriptor
         .trim()
@@ -1130,6 +1122,19 @@ fn approved_linked_worktree_graph_is_bound_to_external_git_roots() {
     })
     .expect("external linked common directory");
     let objects = commondir.join("objects");
+    (gitdir, commondir, objects)
+}
+
+#[test]
+fn approved_linked_worktree_graph_is_bound_to_external_git_roots() {
+    let primary = init_repo();
+    commit_initial(primary.path(), "tracked.txt", "tracked\n");
+    let linked_parent = test_tempdir("devmanager-phase66-linked-");
+    let linked = linked_parent.path().join("linked");
+    let linked_arg = linked.to_str().expect("linked worktree path");
+    git(primary.path(), &["worktree", "add", "--detach", linked_arg]);
+
+    let (gitdir, commondir, objects) = resolve_linked_worktree_git_roots(&linked);
     let binding =
         test_issue_git_host_binding(&linked, vec![gitdir.clone(), commondir.clone(), objects])
             .expect("approved linked worktree authority");
@@ -1141,7 +1146,79 @@ fn approved_linked_worktree_graph_is_bound_to_external_git_roots() {
 }
 
 #[test]
-fn repository_graph_rejects_a_worktree_descriptor_pointing_outside_the_approved_graph() {
+fn current_only_status_admits_external_sibling_worktree_without_authorizing_its_backlink() {
+    let primary = init_repo();
+    commit_initial(primary.path(), "tracked.txt", "tracked\n");
+    let sibling_parent = test_tempdir("devmanager-phase66-sibling-wt-");
+    let sibling = sibling_parent.path().join("sibling");
+    git(
+        primary.path(),
+        &[
+            "worktree",
+            "add",
+            "--detach",
+            sibling.to_str().expect("sibling path"),
+        ],
+    );
+    fs::write(primary.path().join("local-change.txt"), "primary change\n")
+        .expect("write primary change");
+
+    let repository = GitRepository::test_open(primary.path())
+        .expect("current-only open must ignore unrelated sibling backlink targets");
+    let status = repository
+        .status_summary()
+        .expect("current-only status must succeed with an external sibling worktree");
+    assert!(
+        status
+            .entries
+            .iter()
+            .any(|entry| entry.path == RepoPath::from("local-change.txt")),
+        "status must report the current worktree change without authorizing the sibling"
+    );
+    let summary = repository
+        .status()
+        .expect("full status must also succeed under current-only admission");
+    assert!(summary
+        .entries
+        .iter()
+        .any(|entry| entry.path == RepoPath::from("local-change.txt")));
+}
+
+#[test]
+fn current_linked_worktree_backlink_still_requires_approved_external_roots() {
+    let primary = init_repo();
+    commit_initial(primary.path(), "tracked.txt", "tracked\n");
+    let linked_parent = test_tempdir("devmanager-phase66-linked-roots-");
+    let linked = linked_parent.path().join("linked");
+    git(
+        primary.path(),
+        &[
+            "worktree",
+            "add",
+            "--detach",
+            linked.to_str().expect("linked path"),
+        ],
+    );
+
+    let error = GitRepository::test_open(&linked).expect_err(
+        "current linked backlink must still require exact approved external roots",
+    );
+    assert!(matches!(error, GitError::InvalidRepositoryRoot { .. }));
+
+    let (gitdir, commondir, objects) = resolve_linked_worktree_git_roots(&linked);
+    let binding =
+        test_issue_git_host_binding(&linked, vec![gitdir, commondir, objects])
+            .expect("approved linked worktree authority");
+    let repository =
+        GitRepository::from_host_binding(binding, crate::git::command::GitCancellation::new())
+            .expect("open approved linked worktree");
+    repository
+        .status_summary()
+        .expect("approved current linked backlink must admit status");
+}
+
+#[test]
+fn strict_worktree_admission_rejects_sibling_descriptor_outside_approved_graph() {
     let primary = init_repo();
     commit_initial(primary.path(), "tracked.txt", "tracked\n");
     let foreign = test_tempdir("devmanager-phase66-foreign-worktree-");
@@ -1159,10 +1236,90 @@ fn repository_graph_rejects_a_worktree_descriptor_pointing_outside_the_approved_
         format!("{}\n", foreign_gitdir.display()),
     )
     .expect("foreign worktree gitdir descriptor");
+    fs::write(metadata.join("commondir"), "../..\n").expect("foreign worktree commondir");
+
+    let error = GitRepository::test_open_with_strict_worktree_descriptors(primary.path())
+        .expect_err("strict admission must still reject outside sibling backlinks");
+    assert!(matches!(error, GitError::InvalidRepositoryRoot { .. }));
+}
+
+#[test]
+fn current_only_still_rejects_sibling_commondir_that_leaves_admitted_store() {
+    let primary = init_repo();
+    commit_initial(primary.path(), "tracked.txt", "tracked\n");
+    let sibling_parent = test_tempdir("devmanager-phase66-sibling-common-");
+    let sibling = sibling_parent.path().join("sibling");
+    git(
+        primary.path(),
+        &[
+            "worktree",
+            "add",
+            "--detach",
+            sibling.to_str().expect("sibling path"),
+        ],
+    );
+    let worktrees = primary.path().join(".git").join("worktrees");
+    let metadata = fs::read_dir(&worktrees)
+        .expect("enumerate worktrees")
+        .map(|entry| entry.expect("worktree entry").path())
+        .find(|path| path.is_dir())
+        .expect("sibling metadata");
+    let outside = test_tempdir("devmanager-phase66-false-common-");
+    fs::write(
+        metadata.join("commondir"),
+        format!("{}\n", outside.path().display()),
+    )
+    .expect("rewrite sibling commondir away from admitted store");
 
     let error = GitRepository::test_open(primary.path())
-        .expect_err("outside worktree descriptors must not enter the Git graph");
+        .expect_err("current-only must still validate sibling commondir equality");
     assert!(matches!(error, GitError::InvalidRepositoryRoot { .. }));
+}
+
+#[test]
+fn current_only_admission_rejects_descriptor_consuming_git_operations() {
+    let primary = init_repo();
+    commit_initial(primary.path(), "tracked.txt", "tracked\n");
+    let sibling_parent = test_tempdir("devmanager-phase66-policy-sibling-");
+    let sibling = sibling_parent.path().join("sibling");
+    git(
+        primary.path(),
+        &[
+            "worktree",
+            "add",
+            "--detach",
+            sibling.to_str().expect("sibling path"),
+        ],
+    );
+    let repository = GitRepository::test_open(primary.path()).expect("current-only open");
+
+    for arguments in [
+        vec![
+            OsString::from("switch"),
+            OsString::from("-c"),
+            OsString::from("feature-branch"),
+        ],
+        vec![OsString::from("branch"), OsString::from("policy-branch")],
+        vec![
+            OsString::from("worktree"),
+            OsString::from("list"),
+            OsString::from("--porcelain"),
+        ],
+    ] {
+        let permit = GitOperationPermit::test_service_mutation(&arguments, None, None);
+        let error = repository
+            .run_service_mutation_with_permit(arguments.clone(), None, None, permit)
+            .expect_err("descriptor-consuming shapes must not reuse current-only admission");
+        match error {
+            GitError::InvalidRequest { message } => {
+                assert!(
+                    message.contains("strict worktree descriptor admission"),
+                    "unexpected invalid-request message for {arguments:?}: {message}"
+                );
+            }
+            other => panic!("expected InvalidRequest for {arguments:?}, got {other}"),
+        }
+    }
 }
 
 #[test]

@@ -26,6 +26,8 @@ pub struct FleetTaskRow {
     pub done: bool,
     pub archived: bool,
     pub unread_event_count: u64,
+    /// Last durable occurrence time for compact age labels (not synthetic).
+    pub occurred_at_ms: i64,
 }
 
 /// Merged inbox projection across attached hosts.
@@ -138,6 +140,7 @@ mod tests {
                     done: false,
                     archived: false,
                     unread_event_count: 0,
+                    occurred_at_ms: 1,
                 },
                 FleetTaskRow {
                     key: remote.clone(),
@@ -148,6 +151,7 @@ mod tests {
                     done: false,
                     archived: false,
                     unread_event_count: 0,
+                    occurred_at_ms: 2,
                 },
             ],
             done: Vec::new(),

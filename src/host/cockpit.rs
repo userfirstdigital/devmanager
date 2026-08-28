@@ -2351,6 +2351,7 @@ mod tests {
     use crate::protocol::Capability;
     use crate::workspace::{WorkspaceRequest, WorkspaceResourceCoordinator};
     use std::fs;
+    use std::path::Path;
 
     #[test]
     fn provider_lifecycle_projects_canonical_plan_status_and_sequence_identity() {
@@ -3577,6 +3578,83 @@ mod tests {
         assert_eq!(
             targeted_git.selector,
             Some(TaskRepositorySelector::Workspace)
+        );
+    }
+
+    #[test]
+    fn workspace_targeted_git_status_survives_external_sibling_worktree() {
+        let (repository, bus, client_id, task_id, roots) = create_bound_task();
+        // create_bound_task leaves an unborn HEAD; seed one commit so
+        // `git worktree add --detach` has a valid reference (local to this test).
+        std::fs::write(repository.path().join("seed.txt"), "seed\n").expect("seed file");
+        let add = std::process::Command::new("git")
+            .args(["-c", "user.name=Cockpit Test", "-c", "user.email=cockpit@example.invalid"])
+            .args(["add", "seed.txt"])
+            .current_dir(repository.path())
+            .output()
+            .expect("git add seed");
+        assert!(add.status.success(), "{}", String::from_utf8_lossy(&add.stderr));
+        let commit = std::process::Command::new("git")
+            .args(["-c", "user.name=Cockpit Test", "-c", "user.email=cockpit@example.invalid"])
+            .args(["commit", "-m", "seed"])
+            .current_dir(repository.path())
+            .output()
+            .expect("git commit seed");
+        assert!(
+            commit.status.success(),
+            "{}",
+            String::from_utf8_lossy(&commit.stderr)
+        );
+        let sibling_root = Path::new(r"C:\Temp");
+        fs::create_dir_all(sibling_root).expect("sibling temp root");
+        let sibling_parent = tempfile::Builder::new()
+            .prefix("devmanager-cockpit-sibling-wt-")
+            .tempdir_in(sibling_root)
+            .expect("sibling parent");
+        let sibling = sibling_parent.path().join("sibling");
+        let added = std::process::Command::new("git")
+            .args([
+                "worktree",
+                "add",
+                "--detach",
+                sibling.to_str().expect("sibling path"),
+            ])
+            .current_dir(repository.path())
+            .output()
+            .expect("add external sibling worktree");
+        assert!(
+            added.status.success(),
+            "git worktree add failed: {}",
+            String::from_utf8_lossy(&added.stderr)
+        );
+        fs::write(repository.path().join("cockpit-change.txt"), "visible\n")
+            .expect("write current worktree change");
+
+        let coordinator = WorkspaceResourceCoordinator::new();
+        let targeted = serve_task_cockpit(dispatch(
+            &bus,
+            client_id,
+            task_id,
+            &TaskCockpitQuery::GitStatusTargeted {
+                selector: TaskRepositorySelector::Workspace,
+            },
+            Some(&roots),
+            Some(&coordinator),
+            Some(1),
+            Some(1),
+        ));
+        let QueryOutcome::Ok(QueryResult::TaskCockpit(TaskCockpitResult::Git(status))) = targeted
+        else {
+            panic!("Workspace GitStatusTargeted must succeed with an external sibling: {targeted:?}");
+        };
+        assert_eq!(status.selector, Some(TaskRepositorySelector::Workspace));
+        assert!(
+            status.change_count > 0,
+            "current worktree changes must populate without authorizing the sibling backlink"
+        );
+        assert!(
+            !sibling.join("cockpit-change.txt").exists(),
+            "status must not mutate or require the sibling checkout"
         );
     }
 

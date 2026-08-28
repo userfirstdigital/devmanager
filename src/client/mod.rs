@@ -62,7 +62,7 @@ pub(crate) use model::normalize_bounded_search_text;
 pub use model::{
     admit_subscription_stream, one_fresh_quota_per_provider, quota_observation_is_fresh,
     AdmittedStreamFrame, ClientBrowserDockView, ClientModel, ClientModelBuilder, ClientModelError,
-    SearchContinuation, SearchPage, SearchPageStatus, StreamAdmissionReject,
+    SearchContinuation, SearchPage, SearchPageStatus, SearchScope, StreamAdmissionReject,
     TaskCockpitSurfaceProjection, TaskInboxPreview, PROVIDER_QUOTA_MAX_AGE_MS,
 };
 pub use port::{

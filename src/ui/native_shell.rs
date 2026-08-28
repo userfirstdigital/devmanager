@@ -293,6 +293,13 @@ fn task_row_right_click_should_rename(_archived: bool) -> bool {
     true
 }
 
+/// Task-rail row capture must shield right/middle from the terminal behind the
+/// list, but must not consume left so the archived Delete child can receive the
+/// nested mouse sequence (capture runs before child handlers).
+fn task_rail_row_capture_consumes_button(button: MouseButton) -> bool {
+    !matches!(button, MouseButton::Left)
+}
+
 fn task_inbox_scroll_geometry() -> (f32, f32) {
     (
         TASK_INBOX_SCROLLBAR_GUTTER_WIDTH_PX,
@@ -2210,6 +2217,11 @@ pub struct NativeActionRecord {
     /// exact matching admission and never rewrites host/generation/client on
     /// rebind/retry after reconnect.
     pub fleet_admission: Option<FleetAdmission>,
+    /// Immutable delete-confirmation provenance. Set only by the explicit
+    /// Archive/Delete confirmation dispatcher before enqueue — never inferred
+    /// from the current modal or selection. Late outcomes with this flag must
+    /// never enter generic Failed/Uncertain retry after cancel/tombstone reclaim.
+    pub(crate) purpose: NativeActionPurpose,
     /// A bounded, read-only conversation query for an open background pane.
     /// It is independent of interactive selection but remains fenced to the
     /// exact task and host runtime generations.
@@ -2392,11 +2404,26 @@ impl NativeActionRecord {
     fn rebind_transport_epochs(&mut self, epochs: NativeHostRuntimeEpochs, navigation_epoch: u64) {
         // Transport/UI epochs may advance after reconnect. Captured fleet
         // host/generation/client must never be rewritten to authorize stale work.
+        // Delete-flow confirmation purpose is also immutable across rebind.
         self.connection_epoch = epochs.connection_epoch;
         self.navigation_epoch = navigation_epoch;
         self.resource_generation = epochs.resource_generation;
         self.runtime_generation = epochs.runtime_generation;
     }
+
+    fn is_delete_flow_confirmation(&self) -> bool {
+        matches!(self.purpose, NativeActionPurpose::DeleteFlowConfirmation)
+    }
+}
+
+/// Immutable capture-time purpose for host actions. Ordinary is the default;
+/// DeleteFlowConfirmation is set only by the confirmation Archive/Delete
+/// dispatcher before enqueue.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+enum NativeActionPurpose {
+    #[default]
+    Ordinary,
+    DeleteFlowConfirmation,
 }
 
 /// Owner tag for fleet-delivered projections and stream frames.
@@ -2661,6 +2688,9 @@ fn is_native_query_request(request: &ActionRequest) -> bool {
 }
 
 fn same_native_action_identity(left: &NativeActionRecord, right: &NativeActionRecord) -> bool {
+    if left.purpose != right.purpose {
+        return false;
+    }
     match (
         native_command_id(&left.command),
         native_command_id(&right.command),
@@ -2698,18 +2728,21 @@ struct AddProjectDraft {
 }
 
 struct NewTaskDraft {
-    project_id: ProjectId,
+    /// Frozen project owner for this dialog; focus changes must not retarget create.
+    project_key: HostProjectKey,
     error: Option<String>,
 }
 
 struct RenameTaskDraft {
-    task_id: TaskId,
+    /// Frozen task owner for this dialog; focus changes must not retarget rename.
+    owner: HostTaskKey,
     title: TextField,
     error: Option<String>,
 }
 
 struct DeleteTaskDraft {
-    task_id: TaskId,
+    /// Frozen task owner for archive→delete; never retarget by raw TaskId alone.
+    owner: HostTaskKey,
     /// Title captured when the confirmation opened (selected task, not a later archive label).
     title: String,
     error: Option<String>,
@@ -2724,9 +2757,14 @@ enum DeleteTaskStage {
     AwaitingArchive {
         command_id: CommandId,
         archive_accepted: bool,
+        /// Epochs captured with the archive command — not re-read at cancel time.
+        connection_epoch: u64,
+        runtime_generation: u64,
     },
     AwaitingDelete {
         command_id: CommandId,
+        connection_epoch: u64,
+        runtime_generation: u64,
     },
 }
 
@@ -2734,6 +2772,19 @@ impl DeleteTaskStage {
     fn is_submitting(&self) -> bool {
         !matches!(self, Self::Confirming)
     }
+}
+
+/// Cancelled/failed delete-flow ownership with exact owner + generation fences.
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct RetiredDeleteFlowCommand {
+    owner: HostTaskKey,
+    command_id: CommandId,
+    connection_epoch: u64,
+    runtime_generation: u64,
+    /// Set after a matching late outcome is consumed (or the owner generation is
+    /// retired). Terminal markers still block duplicate advance, but may be
+    /// evicted under capacity pressure. Unresolved cancellations never set this.
+    terminal: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -3385,6 +3436,7 @@ enum ProjectInboxItem {
 enum ProjectAccessibilityAction {
     Toggle(HostProjectKey),
     StartAgent(HostProjectKey, ProviderKind),
+    NewTask(HostProjectKey),
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -8016,6 +8068,7 @@ impl NativeInteraction {
             runtime_generation: self.runtime_generation,
             task_id: request_task,
             fleet_admission: None,
+            purpose: NativeActionPurpose::Ordinary,
             background_read,
             expected_task_revision,
             captured_task_action_epoch,
@@ -8255,7 +8308,7 @@ impl AccessibilityTree {
             })
         });
         let remote_selected = selected_key.is_some_and(|key| &key.host != default_host);
-        let remote_authority = "Unavailable on remote hosts — local dock, terminal, files, git, commit, and browser stay on the local machine.";
+        let remote_authority = NativeShell::remote_local_authority_reason();
         let mut task_element_ids = BTreeMap::new();
         let mut project_action_elements = BTreeMap::new();
         let mut rows = Vec::new();
@@ -8346,9 +8399,27 @@ impl AccessibilityTree {
                             project_action_elements.insert(
                                 element_id,
                                 ProjectAccessibilityAction::StartAgent(
-                                    project_key,
+                                    project_key.clone(),
                                     ProviderKind::Codex,
                                 ),
+                            );
+                        }
+                        if !local_project {
+                            let element_id = format!(
+                                "native-project-new-task-{}",
+                                stable_host_project_element_key(&project_key, "new-task")
+                            );
+                            rows.push(
+                                AccessibilityNode::new(
+                                    AccessibleRole::Button,
+                                    format!("New task in {label}"),
+                                    "Open a new-task dialog for this remote owner's project. Provider start stays deferred.",
+                                )
+                                .gpui(element_id.clone(), true, true),
+                            );
+                            project_action_elements.insert(
+                                element_id,
+                                ProjectAccessibilityAction::NewTask(project_key),
                             );
                         }
                     }
@@ -8426,14 +8497,9 @@ impl AccessibilityTree {
             AccessibilityNode::new(
                 AccessibleRole::Button,
                 "Delete",
-                if remote_selected {
-                    remote_authority.to_string()
-                } else {
-                    "Permanently delete the selected task after confirmation.".to_string()
-                },
+                "Permanently delete the selected task after confirmation.",
             )
-            .gpui("native-task-delete", !remote_selected, !remote_selected)
-            .with_disabled(remote_selected)
+            .gpui("native-task-delete", true, true)
         });
         let inbox = AccessibilityNode::new(
             AccessibleRole::Region,
@@ -8523,17 +8589,13 @@ impl AccessibilityTree {
                     AccessibleRole::Button,
                     "Terminal",
                     if remote_selected {
-                        remote_authority.to_string()
+                        "Show the remote provider terminal display in the center canvas (display only)."
+                            .to_string()
                     } else {
                         "Show the bound provider terminal in the center canvas.".to_string()
                     },
                 )
-                .gpui(
-                    "native-task-center-terminal",
-                    !remote_selected,
-                    !remote_selected,
-                )
-                .with_disabled(remote_selected),
+                .gpui("native-task-center-terminal", true, true),
             ])
         });
         let composer_children = selected_key
@@ -8601,7 +8663,8 @@ impl AccessibilityTree {
             AccessibleRole::Region,
             "Task context dock",
             if remote_selected {
-                remote_authority.to_string()
+                "Host-served Changes, Files, Review, and display-only Terminal follow the selected remote task. Browser, Services, and Artifacts stay local."
+                    .to_string()
             } else {
                 "Changes, files, browser, services, artifacts, and review tabs follow the selected task independently of the center canvas.".to_string()
             },
@@ -8611,17 +8674,19 @@ impl AccessibilityTree {
             NATIVE_DOCK_TABS
                 .iter()
                 .map(|(tool, element_id, _)| {
+                    let remote_supported =
+                        !remote_selected || NativeShell::remote_dock_tab_supported(*tool);
                     AccessibilityNode::new(
                         AccessibleRole::Button,
                         tool.label(),
-                        if remote_selected {
+                        if remote_selected && !remote_supported {
                             remote_authority.to_string()
                         } else {
                             format!("Show the {} task context panel.", tool.label())
                         },
                     )
-                    .gpui(*element_id, !remote_selected, !remote_selected)
-                    .with_disabled(remote_selected)
+                    .gpui(*element_id, remote_supported, remote_supported)
+                    .with_disabled(!remote_supported)
                 })
                 .collect(),
         );
@@ -9540,22 +9605,28 @@ pub struct NativeShell {
     new_task: Option<NewTaskDraft>,
     rename_task: Option<RenameTaskDraft>,
     delete_task: Option<DeleteTaskDraft>,
-    /// Command identities retired from a cancelled/failed delete flow so late
-    /// outcomes never re-enter the generic retry lane or reopen a modal.
-    retired_delete_flow_commands: Vec<CommandId>,
+    /// Retired delete-flow identities with owner + generation provenance so a
+    /// same raw CommandId on another host/generation never consumes the marker.
+    retired_delete_flow_commands: Vec<RetiredDeleteFlowCommand>,
+    /// Exact keys whose physical Delete receipt was accepted; exclude only these
+    /// from open-pane reconcile until the owning projection drops them.
+    known_deleted_task_keys: BTreeSet<HostTaskKey>,
     selected_project_id: Option<ProjectId>,
     /// Host that owns [`Self::selected_project_id`] / project-scope filter.
     /// Raw ProjectId alone must not filter another host's same UUID.
     project_scope_host: Option<HostId>,
     collapsed_projects: HashSet<HostProjectKey>,
     palette_index: usize,
-    pending_select_task: Option<TaskId>,
+    /// Owner-qualified create result selection; never admit by raw TaskId alone.
+    pending_select_task: Option<HostTaskKey>,
     task_search: TaskSearchState,
     project_scope_menu: ProjectScopeMenuState,
     project_actions: ProjectActionWorkflow,
     header_commit: HeaderCommitWorkflow,
-    /// Task-scoped Changes/Commit repository selection (not persisted).
-    selected_repository: Option<(TaskId, TaskRepositorySelector)>,
+    /// Owner-scoped Changes/Commit repository selection (not persisted).
+    selected_repository: Option<(HostTaskKey, TaskRepositorySelector)>,
+    /// Owner-scoped Files browse directory retained across refresh (host-relative).
+    files_browse_directory: Option<(HostTaskKey, Option<String>)>,
     browser_page_bounds: Option<crate::browser::BrowserBounds>,
     browser_parent_hwnd: Option<u64>,
     browser_dock_diagnostic: Option<String>,
@@ -10040,6 +10111,7 @@ impl NativeShell {
             rename_task: None,
             delete_task: None,
             retired_delete_flow_commands: Vec::new(),
+            known_deleted_task_keys: BTreeSet::new(),
             selected_project_id: None,
             project_scope_host: None,
             collapsed_projects: HashSet::new(),
@@ -10048,6 +10120,7 @@ impl NativeShell {
             project_actions: ProjectActionWorkflow::default(),
             header_commit: HeaderCommitWorkflow::default(),
             selected_repository: None,
+            files_browse_directory: None,
             browser_page_bounds: None,
             browser_parent_hwnd: None,
             browser_dock_diagnostic: None,
@@ -11378,18 +11451,9 @@ impl NativeShell {
             AccessibilityNode::new(
                 AccessibleRole::Button,
                 "New task",
-                if self.selected_owner_is_remote() {
-                    Self::remote_local_authority_reason().to_string()
-                } else {
-                    "Open a new task in the current project scope.".to_string()
-                },
+                "Open a new task dialog for the selected owner's project (provider start stays deferred).",
             )
-            .gpui(
-                "native-sidebar-new-task",
-                !self.selected_owner_is_remote(),
-                !self.selected_owner_is_remote(),
-            )
-            .with_disabled(self.selected_owner_is_remote()),
+            .gpui("native-sidebar-new-task", true, true),
         );
         overlay_nodes.push(
             AccessibilityNode::new(
@@ -12190,6 +12254,12 @@ impl NativeShell {
     }
 
     fn refresh_selected_cockpit_surfaces(&mut self) {
+        if let Some(key) = self.selected_task_key.clone() {
+            if key.host != self.local_host_id() {
+                self.refresh_cockpit_surfaces_for_owner(&key);
+                return;
+            }
+        }
         let Some(task_id) = self.local_slot_mut().interaction.selected_task() else {
             return;
         };
@@ -12212,7 +12282,8 @@ impl NativeShell {
                 vec![ActionRequest::TaskCockpit {
                     task_id,
                     query: TaskCockpitQuery::FilesList {
-                        relative_directory: None,
+                        relative_directory: self
+                            .files_relative_directory_for_owner(&self.local_task_key(task_id)),
                         limit: 64,
                     },
                 }],
@@ -12253,6 +12324,128 @@ impl NativeShell {
             },
         );
         self.dispatch_related_actions(requests);
+    }
+
+    /// Owner-qualified active-surface refresh. Never falls back to the local
+    /// slot for a remote HostTaskKey; hidden surfaces are not queried.
+    fn refresh_cockpit_surfaces_for_owner(&mut self, key: &HostTaskKey) {
+        if key.host == self.local_host_id() {
+            self.refresh_selected_cockpit_surfaces();
+            return;
+        }
+        let Some(slot) = self.host_slot(&key.host) else {
+            return;
+        };
+        if slot.interaction.selected_task() != Some(key.task_id) {
+            return;
+        }
+        let active_tool = slot.cockpit.active_tool();
+        if !Self::remote_typed_dock_tool_supported(active_tool)
+            && !matches!(active_tool, CockpitDockTool::Artifacts)
+        {
+            return;
+        }
+        let task_id = key.task_id;
+        let files_directory = self.files_relative_directory_for_owner(key);
+        let after_sequence = self.conversation_after_sequence_for(key.clone());
+        let (loading_action, mut requests) = match active_tool {
+            CockpitDockTool::Changes => (
+                Some(crate::client::action::ACTION_GIT_STATUS),
+                vec![
+                    ActionRequest::TaskCockpit {
+                        task_id,
+                        query: TaskCockpitQuery::WorkspaceStatus,
+                    },
+                    ActionRequest::TaskCockpit {
+                        task_id,
+                        query: TaskCockpitQuery::GitRepositories,
+                    },
+                ],
+            ),
+            CockpitDockTool::Files => (
+                Some(crate::client::action::ACTION_FILES_LIST),
+                vec![ActionRequest::TaskCockpit {
+                    task_id,
+                    query: TaskCockpitQuery::FilesList {
+                        relative_directory: files_directory,
+                        limit: 64,
+                    },
+                }],
+            ),
+            CockpitDockTool::Terminal => (
+                Some(crate::client::action::ACTION_PROVIDER_TERMINAL_INPUT),
+                vec![ActionRequest::TaskCockpit {
+                    task_id,
+                    query: TaskCockpitQuery::Terminal,
+                }],
+            ),
+            CockpitDockTool::Review => (
+                None,
+                vec![ActionRequest::TaskShow { task_id }],
+            ),
+            CockpitDockTool::Artifacts => (None, Vec::new()),
+            CockpitDockTool::Browser | CockpitDockTool::Services => {
+                return;
+            }
+        };
+        if let Some(action_id) = loading_action {
+            if let Some(slot) = self.host_slot_mut(&key.host) {
+                slot.cockpit.begin_cockpit_query(task_id, action_id);
+            }
+        }
+        requests.insert(
+            0,
+            ActionRequest::TaskCockpit {
+                task_id,
+                query: TaskCockpitQuery::Conversation { after_sequence },
+            },
+        );
+        self.dispatch_related_actions_for_owner(&key.host, requests);
+    }
+
+    fn files_relative_directory_for_owner(&self, key: &HostTaskKey) -> Option<String> {
+        self.files_browse_directory
+            .as_ref()
+            .filter(|(owned, _)| owned == key)
+            .and_then(|(_, directory)| directory.clone())
+    }
+
+    fn remember_files_browse_directory(&mut self, key: HostTaskKey, directory: Option<String>) {
+        self.files_browse_directory = Some((key, directory));
+    }
+
+    /// Fan out related owner queries on one captured handler so sibling
+    /// Conversation/Workspace/Git/TaskShow outcomes remain admissible.
+    fn dispatch_related_actions_for_owner(
+        &mut self,
+        host_id: &HostId,
+        requests: impl IntoIterator<Item = ActionRequest>,
+    ) {
+        let mut reuse_handler = false;
+        for request in requests {
+            if let ActionRequest::TaskCockpit {
+                task_id,
+                query: TaskCockpitQuery::FilesList {
+                    relative_directory, ..
+                },
+            } = &request
+            {
+                self.remember_files_browse_directory(
+                    HostTaskKey::new(host_id.clone(), *task_id),
+                    relative_directory.clone(),
+                );
+            }
+            match self.dispatch_action_recorded_for_owner_inner(
+                host_id,
+                request,
+                reuse_handler,
+                NativeActionPurpose::Ordinary,
+            ) {
+                Ok(_) => reuse_handler = true,
+                Err(_) if reuse_handler => continue,
+                Err(_) => return,
+            }
+        }
     }
 
     fn hydrate_prompt_library(&mut self) {
@@ -12531,6 +12724,16 @@ impl NativeShell {
             else {
                 break;
             };
+            // Canceled/orphaned delete-confirmation must never replay via Retry.
+            // Live confirmation commands still match and continue below.
+            if action.is_delete_flow_confirmation()
+                && !self.matches_live_delete_flow_command(host_id, &action)
+            {
+                if let Some(command_id) = native_command_id(&action.command) {
+                    self.discard_host_action_by_command_id_for_owner(host_id, command_id);
+                }
+                continue;
+            }
             let accepts = self
                 .host_slot(host_id)
                 .is_some_and(|slot| slot.interaction.accepts_action_record(&action));
@@ -13342,13 +13545,76 @@ impl NativeShell {
         action: &NativeActionRecord,
         receipt: &crate::domain::command::CommandReceipt,
     ) {
+        self.acknowledge_applied_receipt_for_host(&self.local_host_id(), action, receipt.command_id());
+    }
+
+    /// Ack one Fleet retained receipt for the captured owner admission only.
+    fn acknowledge_applied_receipt_for_host(
+        &self,
+        host_id: &HostId,
+        action: &NativeActionRecord,
+        command_id: CommandId,
+    ) {
         let Some(admission) = action.fleet_admission.as_ref() else {
             return;
         };
-        let Some(NativeHostRuntimeAttachment::Client(runtime)) = self.local_slot().host_runtime.as_ref() else {
+        let Some(slot) = self.host_slot(host_id) else {
             return;
         };
-        let _ = runtime.acknowledge_applied_receipt(admission, receipt.command_id());
+        let Some(NativeHostRuntimeAttachment::Client(runtime)) = slot.host_runtime.as_ref() else {
+            return;
+        };
+        let _ = runtime.acknowledge_applied_receipt(admission, command_id);
+    }
+
+    /// Canceled/orphaned delete-confirmation outcomes: never generic retry.
+    /// Only exact command-ID Accepted/Rejected receipts resolve retirement and
+    /// free Fleet capacity; Uncertain/Failed/mismatch stay unresolved and unacked.
+    fn settle_non_live_delete_flow_confirmation_outcome(
+        &mut self,
+        host_id: &HostId,
+        outcome: &NativeHostActionOutcome,
+    ) -> bool {
+        let action = outcome.action();
+        let retired = self.is_retired_delete_flow_command(host_id, action);
+        let orphaned_confirmation = action.is_delete_flow_confirmation()
+            && !retired
+            && !self.matches_live_delete_flow_command(host_id, action);
+        if !retired && !orphaned_confirmation {
+            return false;
+        }
+        // Drop exact pending/overflow on every non-live confirmation outcome so a
+        // pre-retained cancel cannot retry — before receipt matching, and without
+        // acknowledging or terminalizing Uncertain/mismatch ownership.
+        if let Some(command_id) = native_command_id(&action.command) {
+            self.discard_host_action_by_command_id_for_owner(host_id, command_id);
+        }
+        match outcome {
+            NativeHostActionOutcome::Accepted { action, receipt } => {
+                let Some(action_command_id) = native_command_id(&action.command) else {
+                    return true;
+                };
+                if action_command_id != receipt.command_id() {
+                    // Mismatched Accepted/Rejected is not a correlated terminal.
+                    return true;
+                }
+                if retired {
+                    self.mark_retired_delete_flow_terminal(host_id, action);
+                }
+                self.acknowledge_applied_receipt_for_host(
+                    host_id,
+                    action,
+                    receipt.command_id(),
+                );
+                true
+            }
+            NativeHostActionOutcome::Failed { .. }
+            | NativeHostActionOutcome::Uncertain { .. }
+            | NativeHostActionOutcome::Queried { .. } => {
+                // Preserve unresolved retirement ownership; do not ack Fleet.
+                true
+            }
+        }
     }
 
     /// Exact live owner/token gate for outcomes. Stale/foreign tokens are
@@ -13390,8 +13656,8 @@ impl NativeShell {
         if !self.outcome_admission_matches_live_for_host(host_id, &action) {
             return;
         }
-        // Delete-flow remains local-profile. Settled-send / first-send are
-        // owner-routed and use the captured host slot's pending + epochs.
+        // Owner-routed delete / settled-send / first-send use the captured host
+        // slot's pending + epochs. Same raw TaskId on another host never matches.
         if host_id != &self.local_host_id() {
             let Some(epochs) = self
                 .host_slot(host_id)
@@ -13399,6 +13665,29 @@ impl NativeShell {
             else {
                 return;
             };
+            if self.settle_non_live_delete_flow_confirmation_outcome(host_id, &outcome) {
+                return;
+            }
+            if self.matches_live_delete_flow_command(host_id, &action) {
+                if action.connection_epoch == epochs.connection_epoch
+                    && action.resource_generation == epochs.resource_generation
+                    && action.runtime_generation == epochs.runtime_generation
+                    && action.client_epoch <= epochs.client_epoch
+                {
+                    self.apply_action_outcome_for_host(host_id, outcome);
+                } else {
+                    self.settle_delete_flow_outcome(
+                        host_id,
+                        &action,
+                        DeleteFlowSettleKind::Stale {
+                            message:
+                                "The connection changed. Check the task before trying Delete again."
+                                    .into(),
+                        },
+                    );
+                }
+                return;
+            }
             if self.matches_pending_settled_send_command_for_host(host_id, &action) {
                 let fences_ok = self
                     .host_slot(host_id)
@@ -13474,19 +13763,20 @@ impl NativeShell {
             return;
         }
         // Existing local delete/settled/first-send fencing continues below.
-        if self.is_retired_delete_flow_command(&action) {
-            if let Some(command_id) = native_command_id(&action.command) {
-                self.discard_host_action_by_command_id(command_id);
-                self.retired_delete_flow_commands
-                    .retain(|id| *id != command_id);
-            }
+        if self.settle_non_live_delete_flow_confirmation_outcome(host_id, &outcome) {
             return;
         }
-        if self.matches_live_delete_flow_command(&action) {
+        if self.matches_live_delete_flow_command(host_id, &action) {
             // The command's own committed mutation can advance the task revision
             // (or remove the task) before its receipt arrives. The still-live
             // confirmation owns this exact command, independently of UI focus.
-            let epochs = self.local_slot_mut().interaction.action_epochs();
+            let epochs = match self
+                .host_slot(host_id)
+                .map(|slot| slot.interaction.action_epochs())
+            {
+                Some(epochs) => epochs,
+                None => return,
+            };
             if action.connection_epoch == epochs.connection_epoch
                 && action.resource_generation == epochs.resource_generation
                 && action.runtime_generation == epochs.runtime_generation
@@ -13495,6 +13785,7 @@ impl NativeShell {
                 self.apply_action_outcome(outcome);
             } else {
                 self.settle_delete_flow_outcome(
+                    host_id,
                     &action,
                     DeleteFlowSettleKind::Stale {
                         message:
@@ -13564,6 +13855,7 @@ impl NativeShell {
                 return;
             }
             if self.settle_delete_flow_outcome(
+                host_id,
                 &action,
                 DeleteFlowSettleKind::Stale {
                     message: "the task changed before the delete finished".into(),
@@ -13621,15 +13913,75 @@ impl NativeShell {
         let mut admit_conversation: Option<(HostTaskKey, u64, crate::domain::SemanticJournalPage)> =
             None;
         let mut settle_owner: Option<(NativeActionRecord, bool, Option<String>)> = None;
+        let mut pending_terminal: Option<(
+            NativeActionRecord,
+            crate::domain::cockpit::TaskTerminalProjection,
+        )> = None;
+        let mut pending_repo_catalog: Option<TaskGitRepositoriesProjection> = None;
+        if let NativeHostActionOutcome::Accepted { action, receipt } = &outcome {
+            if native_command_id(&action.command) != Some(receipt.command_id()) {
+                let mismatch = "The host returned a receipt for a different command.".to_string();
+                if self.matches_live_delete_flow_command(host_id, action) {
+                    self.settle_delete_flow_outcome(
+                        host_id,
+                        action,
+                        DeleteFlowSettleKind::Failed {
+                            message: format!("{mismatch} Deletion stopped."),
+                        },
+                    );
+                } else if self.is_retired_delete_flow_command(host_id, action)
+                    || action.is_delete_flow_confirmation()
+                {
+                    // Mismatched receipt is not a correlated terminal; keep
+                    // unresolved ownership and never reopen another dialog.
+                } else if self.matches_pending_settled_send_command_for_host(host_id, action) {
+                    let _ = self.settle_pending_settled_send_outcome_for_host(
+                        host_id,
+                        action,
+                        false,
+                        Some(format!("{mismatch} Send stopped; draft kept.")),
+                    );
+                } else if self.matches_pending_draft_first_send_command_for_host(host_id, action) {
+                    let _ = self.settle_pending_draft_first_send_outcome_for_host(
+                        host_id,
+                        action,
+                        false,
+                        Some(format!("{mismatch} Send stopped; draft kept.")),
+                    );
+                } else if let Some(slot) = self.host_slot_mut(host_id) {
+                    slot.composer_error = Some(format!("{mismatch} Draft kept."));
+                }
+                return;
+            }
+        }
         {
             let Some(slot) = self.host_slot_mut(host_id) else {
                 return;
             };
             match &outcome {
                 NativeHostActionOutcome::Accepted { action, receipt } => {
+                    let action_command_id = native_command_id(&action.command);
+                    let rejected_message =
+                        if let crate::domain::command::CommandReceipt::Rejected { code, .. } =
+                            receipt
+                        {
+                            Some(format!("host rejected command: {code:?}"))
+                        } else {
+                            None
+                        };
+                    let success = rejected_message.is_none();
                     slot.last_action_receipt = Some(receipt.clone());
-                    slot.last_action_failure = None;
-                    if let Some(command_id) = native_command_id(&action.command) {
+                    if success {
+                        slot.last_action_failure = None;
+                    } else if let Some(message) = rejected_message.as_ref() {
+                        slot.last_action_failure =
+                            Some(NativeHostActionFailure::ExecutionFailed {
+                                action_id: action.id,
+                                command_id: action_command_id,
+                                message: bounded_host_error(message.clone()),
+                            });
+                    }
+                    if let Some(command_id) = action_command_id {
                         slot.pending_host_actions.retain(|pending| {
                             native_command_id(&pending.command) != Some(command_id)
                         });
@@ -13639,15 +13991,22 @@ impl NativeShell {
                             slot.retained_action_overflow = None;
                         }
                     }
+                    // Accepted and Rejected are both terminal known receipts once the
+                    // exact command-ID guard above has passed. Ack releases Fleet
+                    // retained-outcome capacity (mismatch path returned earlier).
                     if let Some(NativeHostRuntimeAttachment::Client(runtime)) =
                         slot.host_runtime.as_ref()
                     {
                         if let Some(admission) = action.fleet_admission.as_ref() {
-                            let _ =
-                                runtime.acknowledge_applied_receipt(admission, receipt.command_id());
+                            let _ = runtime
+                                .acknowledge_applied_receipt(admission, receipt.command_id());
                         }
                     }
-                    settle_owner = Some((action.clone(), true, None));
+                    settle_owner = Some((
+                        action.clone(),
+                        success,
+                        rejected_message.map(|message| format!("{message}; draft kept")),
+                    ));
                 }
                 NativeHostActionOutcome::Queried { action, detail, body } => {
                     slot.last_query_detail = Some(detail.clone());
@@ -13661,12 +14020,18 @@ impl NativeShell {
                             if !matches!(
                                 result,
                                 crate::domain::TaskCockpitResult::Conversation(_)
+                                    | crate::domain::TaskCockpitResult::Terminal(_)
                             ) {
                                 slot.cockpit.apply_cockpit_result(result);
                             }
                             if let crate::domain::TaskCockpitResult::Config(snapshot) = result {
                                 slot.config_sidebar =
                                     ConfigSidebarProjection::from_host_snapshot(snapshot);
+                            }
+                            if let crate::domain::TaskCockpitResult::GitRepositories(catalog) =
+                                result
+                            {
+                                pending_repo_catalog = Some(catalog.clone());
                             }
                             if let crate::domain::TaskCockpitResult::Conversation(page) = result {
                                 if let Some(task_id) = action.task_id {
@@ -13675,6 +14040,22 @@ impl NativeShell {
                                         action.request_generation,
                                         page.clone(),
                                     ));
+                                }
+                            }
+                            if let crate::domain::TaskCockpitResult::Terminal(projection) = result {
+                                let admits_terminal = Self::task_cockpit_command_parts(
+                                    &action.command,
+                                )
+                                .is_some_and(|( _request_id, task_id, query)| {
+                                    matches!(
+                                        query,
+                                        TaskCockpitQuery::Terminal
+                                            | TaskCockpitQuery::TerminalReadiness
+                                    ) && task_id == projection.task_id
+                                });
+                                if admits_terminal {
+                                    pending_terminal =
+                                        Some((action.clone(), projection.clone()));
                                 }
                             }
                         }
@@ -13713,7 +14094,50 @@ impl NativeShell {
                 }
             }
         }
+        if let Some(catalog) = pending_repo_catalog {
+            let key = HostTaskKey::new(host_id.clone(), catalog.task_id);
+            self.apply_repository_catalog_for_owner(&key, &catalog);
+        }
+        if let Some((action, projection)) = pending_terminal {
+            self.admit_owner_terminal_projection(host_id, &action, &projection);
+        }
         if let Some((action, success, message)) = settle_owner {
+            let settled_delete = match &outcome {
+                NativeHostActionOutcome::Accepted { receipt, .. } => {
+                    if let crate::domain::command::CommandReceipt::Rejected { code, .. } = receipt {
+                        self.settle_delete_flow_outcome(
+                            host_id,
+                            &action,
+                            DeleteFlowSettleKind::Rejected {
+                                message: format!("host rejected command: {code:?}"),
+                            },
+                        )
+                    } else {
+                        self.settle_delete_flow_outcome(
+                            host_id,
+                            &action,
+                            DeleteFlowSettleKind::Accepted,
+                        )
+                    }
+                }
+                NativeHostActionOutcome::Failed { .. } => self.settle_delete_flow_outcome(
+                    host_id,
+                    &action,
+                    DeleteFlowSettleKind::Failed {
+                        message: message.clone().unwrap_or_else(|| "Delete failed.".into()),
+                    },
+                ),
+                NativeHostActionOutcome::Uncertain { .. } => self.settle_delete_flow_outcome(
+                    host_id,
+                    &action,
+                    DeleteFlowSettleKind::Uncertain {
+                        message: message
+                            .clone()
+                            .unwrap_or_else(|| "Delete result is uncertain.".into()),
+                    },
+                ),
+                NativeHostActionOutcome::Queried { .. } => false,
+            };
             let settled_reopen = self.settle_pending_settled_send_outcome_for_host(
                 host_id,
                 &action,
@@ -13726,8 +14150,35 @@ impl NativeShell {
                 success,
                 message.clone(),
             );
-            if !settled_reopen && !settled_first {
-                self.settle_composer_submission_for_owner(host_id, &action, success, message);
+            if !settled_delete && !settled_reopen && !settled_first {
+                self.settle_composer_submission_for_owner(host_id, &action, success, message.clone());
+            }
+            if !success {
+                if matches!(
+                    &action.command,
+                    NativeHostCommand::TaskRename { .. }
+                        | NativeHostCommand::TaskCreateV2 { .. }
+                ) {
+                    if let Some(slot) = self.host_slot_mut(host_id) {
+                        if slot.composer_error.is_none() {
+                            slot.composer_error = message.or_else(|| {
+                                Some("The host rejected the request. Draft kept.".into())
+                            });
+                        }
+                    }
+                }
+            }
+            if success && !settled_delete {
+                if let NativeHostCommand::TaskCreateV2 { arguments, .. } = &action.command {
+                    let created = HostTaskKey::new(host_id.clone(), arguments.task_id);
+                    self.pending_select_task = Some(created.clone());
+                    let already = self
+                        .host_slot(host_id)
+                        .is_some_and(|slot| slot.task_list.task_ids().contains(&arguments.task_id));
+                    if already {
+                        let _ = self.select_fleet_task_key(created, FleetSelectMode::Replace);
+                    }
+                }
             }
         }
         // Owner-scoped Terminal queries: initial runtime probe or readiness attestation.
@@ -13772,6 +14223,72 @@ impl NativeShell {
             if !matches!(outcome, NativeHostActionOutcome::Queried { .. }) {
                 self.task_surfaces.cancel_conversation(key, generation);
             }
+        }
+    }
+
+    /// Admit a host Terminal query into the exact owner surface and dock only
+    /// after command task, selected owner, and generation fences pass.
+    fn admit_owner_terminal_projection(
+        &mut self,
+        host_id: &HostId,
+        action: &NativeActionRecord,
+        projection: &crate::domain::cockpit::TaskTerminalProjection,
+    ) {
+        let Some((_request_id, command_task, query)) =
+            Self::task_cockpit_command_parts(&action.command)
+        else {
+            return;
+        };
+        if !matches!(
+            query,
+            TaskCockpitQuery::Terminal | TaskCockpitQuery::TerminalReadiness
+        ) {
+            return;
+        }
+        if command_task != projection.task_id {
+            return;
+        }
+        let owner = HostTaskKey::new(host_id.clone(), projection.task_id);
+        if self.selected_task_key.as_ref() != Some(&owner) {
+            return;
+        }
+        let selected_ok = self
+            .host_slot(host_id)
+            .is_some_and(|slot| slot.interaction.selected_task() == Some(projection.task_id));
+        if !selected_ok {
+            return;
+        }
+        if self
+            .task_surfaces
+            .admit_terminal(owner.clone(), projection)
+            .is_err()
+        {
+            return;
+        }
+        let model = self
+            .host_slot(host_id)
+            .and_then(|slot| slot.client_model.clone());
+        let Some(model) = model else {
+            return;
+        };
+        if let Some(slot) = self.host_slot_mut(host_id) {
+            match slot
+                .cockpit
+                .dock_mut()
+                .admit_task_terminal_projection(model.as_ref(), projection)
+            {
+                Ok(_) => {
+                    slot.composer_error = None;
+                }
+                Err(error) => {
+                    slot.composer_error =
+                        Some(format!("Terminal projection unavailable: {error:?}"));
+                }
+            }
+        }
+        // Never sync into the local TerminalDockAdapter for a remote owner.
+        if host_id == &self.local_host_id() {
+            self.sync_terminal_from_cockpit();
         }
     }
 
@@ -13925,10 +14442,12 @@ impl NativeShell {
             NativeHostActionOutcome::Accepted { action, receipt } => {
                 let action_id = action.id;
                 let command_id = native_command_id(&action.command);
-                if self.matches_live_delete_flow_command(&action)
+                let local = self.local_host_id();
+                if self.matches_live_delete_flow_command(&local, &action)
                     && command_id != Some(receipt.command_id())
                 {
                     self.settle_delete_flow_outcome(
+                        &local,
                         &action,
                         DeleteFlowSettleKind::Failed {
                             message: "The host returned a receipt for a different command. Deletion stopped.".into(),
@@ -13965,6 +14484,7 @@ impl NativeShell {
                 self.local_slot_mut().last_action_receipt = Some(receipt.clone());
                 if let crate::domain::command::CommandReceipt::Rejected { code, .. } = &receipt {
                     if self.settle_delete_flow_outcome(
+                        &self.local_host_id(),
                         &action,
                         DeleteFlowSettleKind::Rejected {
                             message: format!("host rejected command: {code:?}"),
@@ -14005,7 +14525,11 @@ impl NativeShell {
                     self.acknowledge_settled_command_receipt(&action, &receipt);
                     return;
                 }
-                if self.settle_delete_flow_outcome(&action, DeleteFlowSettleKind::Accepted) {
+                if self.settle_delete_flow_outcome(
+                    &self.local_host_id(),
+                    &action,
+                    DeleteFlowSettleKind::Accepted,
+                ) {
                     // Continue through ordinary receipt bookkeeping below so the
                     // action leaves pending lanes, but skip generic composer paths.
                 }
@@ -14112,9 +14636,10 @@ impl NativeShell {
                 }
                 self.local_slot_mut().composer_error = None;
                 if let NativeHostCommand::TaskCreateV2 { arguments, .. } = &action.command {
-                    self.pending_select_task = Some(arguments.task_id);
+                    let created = HostTaskKey::new(self.local_host_id(), arguments.task_id);
+                    self.pending_select_task = Some(created.clone());
                     if self.local_slot_mut().task_list.task_ids().contains(&arguments.task_id) {
-                        let _ = self.select_projected_task(arguments.task_id);
+                        let _ = self.select_fleet_task_key(created, FleetSelectMode::Replace);
                     }
                 }
                 // Fleet retains receipts until exact UI ownership/correlation/application.
@@ -14168,6 +14693,7 @@ impl NativeShell {
                     return;
                 }
                 if self.settle_delete_flow_outcome(
+                    &self.local_host_id(),
                     &action,
                     DeleteFlowSettleKind::Failed {
                         message: error.clone(),
@@ -14218,6 +14744,7 @@ impl NativeShell {
                     return;
                 }
                 if self.settle_delete_flow_outcome(
+                    &self.local_host_id(),
                     &action,
                     DeleteFlowSettleKind::Uncertain {
                         message: error.clone(),
@@ -14240,14 +14767,22 @@ impl NativeShell {
     }
 
     fn restore_connected_host_state(&mut self) {
-        let Some(runtime_state) = self.local_slot_mut().host_runtime.as_ref().map(|runtime| match runtime {
+        let local = self.local_host_id();
+        self.restore_connected_host_state_for_owner(&local);
+    }
+
+    fn restore_connected_host_state_for_owner(&mut self, host_id: &HostId) {
+        let Some(slot) = self.host_slot_mut(host_id) else {
+            return;
+        };
+        let Some(runtime_state) = slot.host_runtime.as_ref().map(|runtime| match runtime {
             NativeHostRuntimeAttachment::Injected(runtime) => runtime.host_state(),
             NativeHostRuntimeAttachment::Client(runtime) => runtime.host_state(),
         }) else {
-            self.local_slot_mut().host_state = NativeHostState::Disconnected;
+            slot.host_state = NativeHostState::Disconnected;
             return;
         };
-        self.local_slot_mut().host_state = runtime_state;
+        slot.host_state = runtime_state;
     }
 
     fn controller_tick(&mut self, max: usize) -> bool {
@@ -14708,6 +15243,9 @@ impl NativeShell {
                             if project_key.host == self.local_host_id() {
                                 self.begin_new_task_for_project(project_key.project_id);
                             }
+                        }
+                        ProjectAccessibilityAction::NewTask(project_key) => {
+                            self.begin_new_task_for_project_key(project_key);
                         }
                     }
                     repaint = true;
@@ -15188,14 +15726,16 @@ impl NativeShell {
     /// is created by the shell.
     fn apply_task_list(&mut self, task_list: TaskList) {
         self.cache_current_composer_draft();
+        let local = self.local_host_id();
         let pending = self
             .pending_select_task
-            .filter(|task_id| task_list.task_ids().contains(task_id));
+            .as_ref()
+            .filter(|key| key.host == local && task_list.task_ids().contains(&key.task_id))
+            .cloned();
         if pending.is_some() {
             self.pending_select_task = None;
         }
-        if let Some(task_id) = pending {
-            let key = self.local_task_key(task_id);
+        if let Some(key) = pending.clone() {
             self.layout.task_workspace =
                 Some(crate::ui::task_workspace::Workspace::single(key.clone()));
             self.selected_task_key = Some(key.clone());
@@ -15203,6 +15743,8 @@ impl NativeShell {
             self.mark_layout_dirty();
         }
         let selected_task = pending
+            .as_ref()
+            .map(|key| key.task_id)
             .or_else(|| {
                 self.layout
                     .task_workspace
@@ -15245,7 +15787,6 @@ impl NativeShell {
             }
         }
         self.local_slot_mut().task_list = task_list;
-        let local = self.local_host_id();
         let known: std::collections::HashSet<_> = self
             .local_slot()
             .task_list
@@ -15792,16 +16333,25 @@ impl NativeShell {
         }
         let Some(task_id) = selected_task else {
             self.selected_repository = None;
+            self.files_browse_directory = None;
             self.clear_cockpit_projection();
             self.clear_composer_binding();
             return;
         };
+        let local_key = self.local_task_key(task_id);
         if self
             .selected_repository
             .as_ref()
-            .is_some_and(|(owned_task, _)| *owned_task != task_id)
+            .is_some_and(|(owned, _)| owned != &local_key)
         {
             self.selected_repository = None;
+        }
+        if self
+            .files_browse_directory
+            .as_ref()
+            .is_some_and(|(owned, _)| owned != &local_key)
+        {
+            self.files_browse_directory = None;
         }
         self.local_slot_mut().cockpit.follow_task(task_id);
         self.apply_cached_conversation_for_task(task_id);
@@ -15855,6 +16405,20 @@ impl NativeShell {
             self.mark_layout_dirty();
         }
         self.selected_task_key = Some(key.clone());
+        if self
+            .files_browse_directory
+            .as_ref()
+            .is_some_and(|(owned, _)| owned != key)
+        {
+            self.files_browse_directory = None;
+        }
+        if self
+            .selected_repository
+            .as_ref()
+            .is_some_and(|(owned, _)| owned != key)
+        {
+            self.selected_repository = None;
+        }
         if self.composer_owner.as_ref() != Some(key) {
             self.cache_current_composer_draft();
             self.clear_composer_binding();
@@ -17091,13 +17655,44 @@ impl NativeShell {
     }
 
     fn set_provider_terminal_visible(&mut self, visible: bool) {
-        if self.selected_owner_is_remote() {
-            if let Some(key) = self.selected_task_key.clone() {
-                if let Some(slot) = self.host_slot_mut(&key.host) {
-                    slot.composer_error = Some(Self::remote_local_authority_reason().into());
+        if let Some(key) = self.selected_task_key.clone() {
+            if key.host != self.local_host_id() {
+                let model = self
+                    .host_slot(&key.host)
+                    .and_then(|slot| slot.client_model.clone());
+                let Some(model) = model else {
+                    return;
+                };
+                let result = if let Some(slot) = self.host_slot_mut(&key.host) {
+                    if visible {
+                        slot.cockpit
+                            .dock_mut()
+                            .switch_to_raw_terminal(model.as_ref(), None)
+                    } else {
+                        slot.cockpit
+                            .dock_mut()
+                            .switch_to_semantic(model.as_ref(), None)
+                    }
+                } else {
+                    return;
+                };
+                self.set_task_center_terminal_preference(&key, visible);
+                if let Err(error) = result {
+                    if let Some(slot) = self.host_slot_mut(&key.host) {
+                        slot.composer_error = Some(format!("{error:?}"));
+                    }
+                } else if visible {
+                    self.task_surfaces.note_terminal_query_started(key.clone());
+                    let _ = self.dispatch_action_recorded_for_owner(
+                        &key.host,
+                        ActionRequest::TaskCockpit {
+                            task_id: key.task_id,
+                            query: TaskCockpitQuery::Terminal,
+                        },
+                    );
                 }
+                return;
             }
-            return;
         }
         let Some(model) = self.local_slot_mut().client_model.as_ref().cloned() else {
             return;
@@ -17131,7 +17726,17 @@ impl NativeShell {
     }
 
     fn dispatch_provider_terminal_text(&mut self, text: String) -> bool {
-        if text.is_empty() || !self.local_slot().cockpit.dock().showing_raw_terminal() {
+        if text.is_empty() {
+            return false;
+        }
+        let local = self.local_host_id();
+        let Some(owner) = self.selected_task_key.clone() else {
+            return false;
+        };
+        if owner.host != local {
+            return false;
+        }
+        if !self.local_slot().cockpit.dock().showing_raw_terminal() {
             return false;
         }
         let model = self.local_slot().client_model.clone();
@@ -17143,6 +17748,9 @@ impl NativeShell {
             self.local_slot_mut().composer_error = Some("select a task before using its terminal".into());
             return false;
         };
+        if owner.task_id != task_id {
+            return false;
+        }
         let task_key = self.local_task_key(task_id);
         if !self.task_surfaces.terminal_is_interactive(task_key.clone()) {
             self.local_slot_mut().composer_error =
@@ -17206,6 +17814,9 @@ impl NativeShell {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.selected_owner_is_remote() {
+            return;
+        }
         if !self.local_slot_mut().cockpit.dock().showing_raw_terminal() {
             return;
         }
@@ -18577,7 +19188,24 @@ impl NativeShell {
     }
 
     fn remote_local_authority_reason() -> &'static str {
-        "Unavailable on remote hosts — local dock, terminal, files, git, commit, and browser stay on the local machine."
+        "Unavailable on remote hosts — browser, services, commit, raw terminal input, image staging, and project creation stay on the local machine."
+    }
+
+    fn remote_typed_dock_tool_supported(tool: CockpitDockTool) -> bool {
+        matches!(
+            tool,
+            CockpitDockTool::Changes
+                | CockpitDockTool::Files
+                | CockpitDockTool::Review
+                | CockpitDockTool::Terminal
+        )
+    }
+
+    fn remote_dock_tab_supported(tool: CockpitDockTool) -> bool {
+        matches!(
+            tool,
+            CockpitDockTool::Changes | CockpitDockTool::Files | CockpitDockTool::Review
+        )
     }
 
     fn admit_prepared_native_composer_images(
@@ -20042,8 +20670,9 @@ impl NativeShell {
                     .into_any_element()
             })
             .collect::<Vec<_>>();
-        let showing_provider_terminal = owner.host == self.local_host_id()
-            && self.local_slot().cockpit.dock().showing_raw_terminal();
+        let showing_provider_terminal = self
+            .host_slot(&owner.host)
+            .is_some_and(|slot| slot.cockpit.dock().showing_raw_terminal());
         let composer_hairline = mix_color(tokens.surfaces.canvas, tokens.borders.subtle, 0.65);
         let composer_pill = |label: &str| {
             div()
@@ -20796,6 +21425,19 @@ impl NativeShell {
         tokens: crate::ui::tokens::ThemeTokens,
         cx: &mut Context<Self>,
     ) -> AnyElement {
+        let owner = self.selected_task_key.clone().or_else(|| {
+            self.local_slot()
+                .interaction
+                .selected_task()
+                .map(|task_id| self.local_task_key(task_id))
+        });
+        let remote = owner
+            .as_ref()
+            .is_some_and(|key| key.host != self.local_host_id());
+        if remote {
+            let owner = owner.expect("remote owner");
+            return self.remote_terminal_dock_surface(tokens, owner);
+        }
         let shell_entity = cx.weak_entity();
         let interactive = self.local_slot().interaction.selected_task().is_some_and(|task_id| {
             self.local_slot().cockpit.dock().terminal_binding().is_some()
@@ -21066,15 +21708,21 @@ impl NativeShell {
     fn apply_keyboard_shell_effects(&mut self, action: KeyboardAction) {
         if self.selected_owner_is_remote() {
             match action {
-                KeyboardAction::SelectDock(_) | KeyboardAction::OpenTerminal => {
-                    if let Some(key) = self.selected_task_key.clone() {
-                        if let Some(slot) = self.host_slot_mut(&key.host) {
-                            slot.composer_error =
-                                Some(Self::remote_local_authority_reason().into());
+                KeyboardAction::SelectDock(tool) => {
+                    let cockpit_tool = Self::cockpit_dock_tool(tool);
+                    if !Self::remote_dock_tab_supported(cockpit_tool)
+                        && !matches!(tool, DockTool::Terminal)
+                    {
+                        if let Some(key) = self.selected_task_key.clone() {
+                            if let Some(slot) = self.host_slot_mut(&key.host) {
+                                slot.composer_error =
+                                    Some(Self::remote_local_authority_reason().into());
+                            }
                         }
+                        return;
                     }
-                    return;
                 }
+                KeyboardAction::OpenTerminal => {}
                 _ => {}
             }
         }
@@ -21100,22 +21748,36 @@ impl NativeShell {
                     self.layout.dock_collapsed = false;
                 }
                 self.mark_layout_dirty();
-                let _ = self.local_slot_mut()
-                    .cockpit
-                    .handle_tool_action(Self::cockpit_dock_tool(tool), RequestId::new());
-                self.sync_terminal_from_cockpit();
-                self.reconcile_browser_dock_lifecycle(None);
-                if matches!(tool, DockTool::Services) {
-                    // Refresh the shared host/catalog seam when the services
-                    // panel becomes active; the panel itself never mints a
-                    // supervisor command or bypasses ServiceControl fences.
-                    let _ = self.dispatch_action(ActionRequest::HostActions);
-                    self.refresh_selected_cockpit_surfaces();
-                } else if matches!(tool, DockTool::Changes | DockTool::Files) {
-                    self.refresh_selected_cockpit_surfaces();
-                } else {
-                    if let Some(task_id) = self.local_slot_mut().interaction.selected_task() {
-                        let _ = self.dispatch_action(ActionRequest::TaskShow { task_id });
+                let owner = self.selected_task_key.clone().or_else(|| {
+                    self.local_slot()
+                        .interaction
+                        .selected_task()
+                        .map(|task_id| self.local_task_key(task_id))
+                });
+                if let Some(owner) = owner {
+                    if let Some(slot) = self.host_slot_mut(&owner.host) {
+                        let _ = slot
+                            .cockpit
+                            .handle_tool_action(Self::cockpit_dock_tool(tool), RequestId::new());
+                    }
+                    if owner.host == self.local_host_id() {
+                        self.sync_terminal_from_cockpit();
+                        self.reconcile_browser_dock_lifecycle(None);
+                        if matches!(tool, DockTool::Services) {
+                            let _ = self.dispatch_action(ActionRequest::HostActions);
+                            self.refresh_selected_cockpit_surfaces();
+                        } else if matches!(tool, DockTool::Changes | DockTool::Files) {
+                            self.refresh_selected_cockpit_surfaces();
+                        } else if matches!(tool, DockTool::Review) {
+                            let _ = self.dispatch_action_recorded_for_owner(
+                                &owner.host,
+                                ActionRequest::TaskShow {
+                                    task_id: owner.task_id,
+                                },
+                            );
+                        }
+                    } else {
+                        self.refresh_cockpit_surfaces_for_owner(&owner);
                     }
                 }
             }
@@ -21236,6 +21898,17 @@ impl NativeShell {
         tokens: crate::ui::tokens::ThemeTokens,
         shell_entity: Option<gpui::WeakEntity<NativeShell>>,
     ) -> AnyElement {
+        Self::panel_action_element_for_owner(action, target, tokens, shell_entity, None, None)
+    }
+
+    fn panel_action_element_for_owner(
+        action: PanelAction,
+        target: &str,
+        tokens: crate::ui::tokens::ThemeTokens,
+        shell_entity: Option<gpui::WeakEntity<NativeShell>>,
+        owner: Option<HostTaskKey>,
+        captured_focus_epoch: Option<FocusEpoch>,
+    ) -> AnyElement {
         let element = render_panel_action(&action, target, tokens);
         if !action.is_enabled() {
             return element;
@@ -21244,6 +21917,9 @@ impl NativeShell {
             return element;
         };
         let element_key = action.element_key(target);
+        let captured_owner = owner;
+        let captured_revision = action.identity.revision;
+        let captured_focus_epoch = captured_focus_epoch;
 
         div()
             .id(("native-panel-control", element_key))
@@ -21253,21 +21929,77 @@ impl NativeShell {
                     return;
                 }
                 let action = action.clone();
+                let captured_owner = captured_owner.clone();
+                let captured_revision = captured_revision;
+                let captured_focus_epoch = captured_focus_epoch;
                 let _ = shell_entity.update(app, |shell, cx| {
                     cx.stop_propagation();
-                    let revision = shell.local_slot()
+                    let Some(owner) = captured_owner.clone().or_else(|| {
+                        shell
+                            .local_slot()
+                            .interaction
+                            .selected_task()
+                            .map(|task_id| shell.local_task_key(task_id))
+                    }) else {
+                        return;
+                    };
+                    if shell.selected_task_key.as_ref() != Some(&owner) {
+                        return;
+                    }
+                    let Some(slot) = shell.host_slot(&owner.host) else {
+                        return;
+                    };
+                    if let Some(expected) = captured_focus_epoch {
+                        if slot.interaction.current_focus_epoch() != expected {
+                            return;
+                        }
+                    }
+                    let live_revision = slot
                         .client_model
                         .as_ref()
                         .and_then(|model| model.task(action.identity.task_id))
                         .map(|snapshot| snapshot.task.revision);
-                    if !action_is_current(&action, shell.local_slot_mut().interaction.selected_task(), revision) {
-                        shell.local_slot_mut().last_query_detail =
-                            Some("Panel action expired; refresh the selected task.".to_owned());
+                    if captured_revision != live_revision
+                        || !action_is_current(&action, Some(owner.task_id), captured_revision)
+                    {
+                        if let Some(slot) = shell.host_slot_mut(&owner.host) {
+                            slot.last_query_detail =
+                                Some("Panel action expired; refresh the selected task.".to_owned());
+                        }
                         return;
                     }
-                    shell.local_slot_mut().interaction.begin_control_pointer(NATIVE_POINTER_ID);
-                    shell.dispatch_pointer_action(action.request.clone(), NATIVE_POINTER_ID);
-                    shell.local_slot_mut().interaction.release_pointer(NATIVE_POINTER_ID);
+                    if let ActionRequest::TaskCockpit {
+                        task_id,
+                        query: TaskCockpitQuery::FilesList {
+                            relative_directory, ..
+                        },
+                    } = &action.request
+                    {
+                        shell.remember_files_browse_directory(
+                            HostTaskKey::new(owner.host.clone(), *task_id),
+                            relative_directory.clone(),
+                        );
+                    }
+                    if owner.host == shell.local_host_id() {
+                        shell
+                            .local_slot_mut()
+                            .interaction
+                            .begin_control_pointer(NATIVE_POINTER_ID);
+                        shell.dispatch_pointer_action(action.request.clone(), NATIVE_POINTER_ID);
+                        shell
+                            .local_slot_mut()
+                            .interaction
+                            .release_pointer(NATIVE_POINTER_ID);
+                    } else if let Some(slot) = shell.host_slot_mut(&owner.host) {
+                        slot.interaction.begin_control_pointer(NATIVE_POINTER_ID);
+                        let _ = shell.dispatch_action_recorded_for_owner(
+                            &owner.host,
+                            action.request.clone(),
+                        );
+                        if let Some(slot) = shell.host_slot_mut(&owner.host) {
+                            slot.interaction.release_pointer(NATIVE_POINTER_ID);
+                        }
+                    }
                 });
             })
             .child(element)
@@ -21280,18 +22012,40 @@ impl NativeShell {
         tokens: crate::ui::tokens::ThemeTokens,
         shell_entity: Option<gpui::WeakEntity<NativeShell>>,
     ) -> AnyElement {
-        if self.selected_owner_is_remote() {
+        let owner_key = self.selected_task_key.clone().or_else(|| {
+            self.local_slot()
+                .interaction
+                .selected_task()
+                .map(|task_id| self.local_task_key(task_id))
+        });
+        let remote = owner_key
+            .as_ref()
+            .is_some_and(|key| key.host != self.local_host_id());
+        if remote && !Self::remote_typed_dock_tool_supported(tool) {
             return self.remote_dock_unavailable_surface(tool, tokens);
         }
-        let Some(task_id) = self.local_slot().interaction.selected_task() else {
+        if matches!(tool, CockpitDockTool::Artifacts) && remote {
+            return self.remote_dock_unavailable_surface(tool, tokens);
+        }
+        let Some(owner_key) = owner_key else {
             return Self::dock_empty_state(tool, tokens);
         };
-        let snapshot = self.local_slot()
+        let Some(slot) = self.host_slot(&owner_key.host) else {
+            return Self::dock_empty_state(tool, tokens);
+        };
+        let task_id = owner_key.task_id;
+        if slot.interaction.selected_task() != Some(task_id) {
+            return Self::dock_empty_state(tool, tokens);
+        }
+        let snapshot = slot
             .client_model
             .as_ref()
             .and_then(|model| model.task(task_id));
         let revision = snapshot.map(|snapshot| snapshot.task.revision);
-        let live = self.local_slot().cockpit.live_projection();
+        let live = slot.cockpit.live_projection();
+        let owner_for_actions = Some(owner_key.clone());
+        let captured_focus = Some(slot.interaction.current_focus_epoch());
+        let captured_revision = revision;
         let (title, summary, actions, rows): (
             &'static str,
             String,
@@ -21299,7 +22053,7 @@ impl NativeShell {
             Vec<AnyElement>,
         ) = match tool {
             CockpitDockTool::Changes => {
-                let selected = self.selected_repository_for_task(task_id);
+                let selected = self.selected_repository_for_owner(&owner_key);
                 let changes = ChangesPanelProjection::from_host(
                     live.and_then(|projection| projection.git.as_ref()),
                     live.and_then(|projection| projection.repositories.as_ref()),
@@ -21322,6 +22076,9 @@ impl NativeShell {
                         let label =
                             format!("{} · {} · {}", row.label, row.scope_label, row.state_label);
                         let selected_mark = if row.selected { "● " } else { "○ " };
+                        let owner_for_repo = owner_key.clone();
+                        let repo_focus = captured_focus;
+                        let repo_revision = captured_revision;
                         let mut row_div = div()
                             .id(("native-changes-repo", element_key))
                             .flex()
@@ -21345,9 +22102,15 @@ impl NativeShell {
                                         if event.button != MouseButton::Left {
                                             return;
                                         }
+                                        let owner_for_repo = owner_for_repo.clone();
                                         let _ = shell_entity.update(app, |shell, cx| {
                                             cx.stop_propagation();
-                                            shell.select_changes_repository(selector.clone());
+                                            shell.select_changes_repository_for_owner_gated(
+                                                &owner_for_repo,
+                                                selector.clone(),
+                                                repo_focus,
+                                                repo_revision,
+                                            );
                                             cx.notify();
                                         });
                                     },
@@ -21386,31 +22149,67 @@ impl NativeShell {
                 )
             }
             CockpitDockTool::Files => {
+                let relative_directory = self.files_relative_directory_for_owner(&owner_key);
                 let panel = FilesPanelProjection::from_host(
                     live.and_then(|projection| projection.files.as_ref()),
                     live.and_then(|projection| projection.file_read.as_ref()),
                     task_id,
                     revision,
-                    None,
+                    relative_directory,
                 );
-                let mut rows: Vec<AnyElement> = panel
-                    .rows
-                    .iter()
-                    .map(|row| {
+                let mut rows: Vec<AnyElement> = Vec::new();
+                if let Some(parent) = panel.navigate_parent.clone() {
+                    rows.push(
                         div()
                             .flex()
                             .items_center()
                             .gap(px(tokens.density.spacing.sm))
-                            .child(row.label.clone())
-                            .child(Self::panel_action_element(
-                                row.read.clone(),
-                                &row.relative_path,
+                            .child("..")
+                            .child(Self::panel_action_element_for_owner(
+                                parent,
+                                "parent",
                                 tokens,
                                 shell_entity.clone(),
+                                owner_for_actions.clone(),
+                                captured_focus,
                             ))
-                            .into_any_element()
-                    })
-                    .collect();
+                            .into_any_element(),
+                    );
+                }
+                if let Some(root) = panel.navigate_root.clone() {
+                    rows.push(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap(px(tokens.density.spacing.sm))
+                            .child("/")
+                            .child(Self::panel_action_element_for_owner(
+                                root,
+                                "root",
+                                tokens,
+                                shell_entity.clone(),
+                                owner_for_actions.clone(),
+                                captured_focus,
+                            ))
+                            .into_any_element(),
+                    );
+                }
+                rows.extend(panel.rows.iter().map(|row| {
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap(px(tokens.density.spacing.sm))
+                        .child(row.label.clone())
+                        .child(Self::panel_action_element_for_owner(
+                            row.read.clone(),
+                            &row.relative_path,
+                            tokens,
+                            shell_entity.clone(),
+                            owner_for_actions.clone(),
+                            captured_focus,
+                        ))
+                        .into_any_element()
+                }));
                 if let Some(preview) = panel.preview.as_ref() {
                     rows.insert(
                         0,
@@ -21438,7 +22237,7 @@ impl NativeShell {
                 ("Files", panel.summary(), vec![panel.refresh], rows)
             }
             CockpitDockTool::Artifacts => {
-                let summaries = self.local_slot()
+                let summaries = slot
                     .client_model
                     .as_ref()
                     .map(|model| {
@@ -21462,7 +22261,7 @@ impl NativeShell {
                 ("Artifacts", panel.summary(), vec![panel.refresh], rows)
             }
             CockpitDockTool::Review => {
-                let summaries = self.local_slot()
+                let summaries = slot
                     .client_model
                     .as_ref()
                     .map(|model| {
@@ -21492,7 +22291,14 @@ impl NativeShell {
             }
         };
         let controls = actions.into_iter().map(|action| {
-            Self::panel_action_element(action, "refresh", tokens, shell_entity.clone())
+            Self::panel_action_element_for_owner(
+                action,
+                "refresh",
+                tokens,
+                shell_entity.clone(),
+                owner_for_actions.clone(),
+                captured_focus,
+            )
         });
         div()
             .id("native-shell-workspace-dock")
@@ -21746,15 +22552,37 @@ impl NativeShell {
         tokens: crate::ui::tokens::ThemeTokens,
         shell_entity: Option<gpui::WeakEntity<NativeShell>>,
     ) -> AnyElement {
-        if self.selected_owner_is_remote() {
-            return self.remote_dock_unavailable_surface(
-                self.local_slot().cockpit.active_tool(),
-                tokens,
-            );
+        let owner_key = self.selected_task_key.clone().or_else(|| {
+            self.local_slot()
+                .interaction
+                .selected_task()
+                .map(|task_id| self.local_task_key(task_id))
+        });
+        let remote = owner_key
+            .as_ref()
+            .is_some_and(|key| key.host != self.local_host_id());
+        let active_tool = owner_key
+            .as_ref()
+            .and_then(|key| {
+                self.host_slot(&key.host)
+                    .map(|slot| slot.cockpit.active_tool())
+            })
+            .unwrap_or_else(|| self.local_slot().cockpit.active_tool());
+        if remote && !Self::remote_typed_dock_tool_supported(active_tool) {
+            return self.remote_dock_unavailable_surface(active_tool, tokens);
         }
-        match self.local_slot().cockpit.active_tool() {
-            CockpitDockTool::Terminal => self.terminal_dock_surface(tokens, shell_entity),
+        match active_tool {
+            CockpitDockTool::Terminal => {
+                if remote {
+                    self.remote_terminal_dock_surface(tokens, owner_key.expect("remote owner"))
+                } else {
+                    self.terminal_dock_surface(tokens, shell_entity)
+                }
+            }
             CockpitDockTool::Browser => {
+                if remote {
+                    return self.remote_dock_unavailable_surface(CockpitDockTool::Browser, tokens);
+                }
                 let mut model =
                     self.selected_browser_dock_model()
                         .unwrap_or_else(|| TaskBrowserDockModel {
@@ -21955,9 +22783,54 @@ impl NativeShell {
                     )
                     .into_any_element()
             }
-            CockpitDockTool::Services => self.services_dock_surface(tokens, shell_entity),
+            CockpitDockTool::Services => {
+                if remote {
+                    self.remote_dock_unavailable_surface(CockpitDockTool::Services, tokens)
+                } else {
+                    self.services_dock_surface(tokens, shell_entity)
+                }
+            }
             tool => self.workspace_dock_surface(tool, tokens, shell_entity),
         }
+    }
+
+    /// Display-only remote terminal replica. No focus/key handlers, no local PTY adapter.
+    fn remote_terminal_dock_surface(
+        &self,
+        tokens: crate::ui::tokens::ThemeTokens,
+        owner: HostTaskKey,
+    ) -> AnyElement {
+        let label = self.task_surfaces.terminal_label(owner.clone());
+        let pane = self
+            .host_slot(&owner.host)
+            .map(|slot| slot.cockpit.dock().terminal_pane_model());
+        let surface = div()
+            .id("native-shell-remote-context-terminal")
+            .w_full()
+            .flex()
+            .flex_col()
+            .gap(px(tokens.density.spacing.xs))
+            .p(px(tokens.density.physical().control_padding as f32))
+            .bg(tokens.surfaces.sunken.to_gpui())
+            .child(format!("Terminal · display only · {label}"));
+        let surface = if let Some(pane) = pane {
+            surface.child(
+                div()
+                    .flex_1()
+                    .min_h(px(120.0))
+                    .overflow_hidden()
+                    .child(crate::terminal::view::render_terminal_surface_with_tokens(
+                        &pane, None, tokens,
+                    )),
+            )
+        } else {
+            surface.child(
+                div()
+                    .text_color(tokens.text.secondary.to_gpui())
+                    .child("No matching remote terminal replica yet."),
+            )
+        };
+        surface.into_any_element()
     }
 
     fn terminal_dock_surface(
@@ -22379,6 +23252,45 @@ impl NativeShell {
         if host_id == &self.local_host_id() {
             return;
         }
+        // Disarm lifecycle dialogs owned by the forgotten host before slot removal.
+        if self
+            .new_task
+            .as_ref()
+            .is_some_and(|draft| draft.project_key.host == *host_id)
+        {
+            self.new_task = None;
+        }
+        if self
+            .rename_task
+            .as_ref()
+            .is_some_and(|draft| draft.owner.host == *host_id)
+        {
+            self.rename_task = None;
+        }
+        if self
+            .delete_task
+            .as_ref()
+            .is_some_and(|draft| draft.owner.host == *host_id)
+        {
+            // Retires exact pending archive/delete commands; AwaitingDelete cannot
+            // remain stuck after the owner slot is gone.
+            self.cancel_delete_task_flow();
+        }
+        if self
+            .pending_select_task
+            .as_ref()
+            .is_some_and(|key| key.host == *host_id)
+        {
+            self.pending_select_task = None;
+        }
+        self.known_deleted_task_keys
+            .retain(|key| key.host != *host_id);
+        // Drop only this host's UI retirement bookkeeping. Do not mark unresolved
+        // commands terminal or acknowledge Fleet receipts — HostFleet retains
+        // actual receipt/uncertainty ownership. Provenance + missing owner fence
+        // already block late retry; leftover markers must not exhaust Delete capacity.
+        self.retired_delete_flow_commands
+            .retain(|marker| marker.owner.host != *host_id);
         let _ = self.hosts.remove(host_id);
         let open = self
             .layout
@@ -22456,14 +23368,9 @@ impl NativeShell {
         }
         // Conservatively cancel multistep follow-ups whose immutable owner is
         // no longer focused — never silently send to the new focus.
+        // New Task / Rename / Delete drafts freeze their captured owner and
+        // must survive focus changes until explicit cancel/submit.
         let focused = self.selected_task_key.clone();
-        if focused
-            .as_ref()
-            .is_some_and(|key| key.host != self.local_host_id())
-        {
-            // Local-only create dialog must not survive a remote selection.
-            self.new_task = None;
-        }
         let hosts: Vec<HostId> = self.hosts.keys().cloned().collect();
         for host_id in hosts {
             let cancel_settled = self.host_slot(&host_id).is_some_and(|slot| {
@@ -22736,6 +23643,8 @@ impl NativeShell {
                 }
             }
         }
+        // Generation change alone must not resolve unresolved delete-flow
+        // cancellations; provenance + correlated receipts own that fence.
     }
 
     fn accept_fleet_projection_message_for_host(
@@ -22837,6 +23746,11 @@ impl NativeShell {
         if let Some(action) = slot.retained_action_overflow.as_mut() {
             action.client_epoch = client_epoch;
         }
+        // Drop tombstones once the owning projection no longer lists the task.
+        let present: HashSet<TaskId> = keys.iter().map(|key| key.task_id).collect();
+        self.known_deleted_task_keys.retain(|key| {
+            !(key.host == *host_id && !present.contains(&key.task_id))
+        });
         let reconcile_keys = self.union_reconcile_task_keys_with(host_id, &keys);
         if self.layout.reconcile_task_workspace(&reconcile_keys) {
             self.mark_layout_dirty();
@@ -22851,6 +23765,18 @@ impl NativeShell {
         for key in &open_keys {
             self.task_surfaces.ensure_task(key.clone());
         }
+        // Owner-qualified create admission: only the creating host's projection
+        // may select the pending HostTaskKey (never same raw TaskId elsewhere).
+        if let Some(pending) = self
+            .pending_select_task
+            .as_ref()
+            .filter(|key| &key.host == host_id && keys.iter().any(|k| k.task_id == key.task_id))
+            .cloned()
+        {
+            self.pending_select_task = None;
+            let _ = self.select_fleet_task_key(pending, FleetSelectMode::Replace);
+        }
+        self.try_advance_pending_delete_after_archive();
         self.try_advance_pending_settled_send_for_host(host_id);
         self.try_advance_pending_draft_first_send_for_host(host_id);
         Ok(())
@@ -22878,13 +23804,19 @@ impl NativeShell {
         }
         // Preserve open panes for hosts that still have a slot even if their
         // current projection omitted a cached key (offline/reconnect gap).
+        // Exact confirmed-deleted keys are excluded so Delete cannot leave a
+        // dead pane; same raw TaskId on another host stays intact.
         if let Some(workspace) = self.layout.task_workspace.as_ref() {
             for open in workspace.task_ids() {
+                if self.known_deleted_task_keys.contains(&open) {
+                    continue;
+                }
                 if self.hosts.contains_key(&open.host) {
                     keys.insert(open);
                 }
             }
         }
+        keys.retain(|key| !self.known_deleted_task_keys.contains(key));
         keys.into_iter().collect()
     }
 
@@ -22969,6 +23901,69 @@ impl NativeShell {
                     settled: false,
                     archived: false,
                 }));
+            }
+        }
+
+        // Remote owner-configured projects (including empty ones with no tasks yet).
+        let remote_hosts: Vec<HostId> = self
+            .hosts
+            .keys()
+            .filter(|host| *host != &local)
+            .cloned()
+            .collect();
+        for host in remote_hosts {
+            let projects: Vec<(ProjectId, String)> = self
+                .host_slot(&host)
+                .map(|slot| {
+                    slot.config_sidebar
+                        .projects
+                        .iter()
+                        .filter_map(|project| {
+                            ProjectId::parse(&project.workspace_id)
+                                .ok()
+                                .map(|project_id| (project_id, project.label.clone()))
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            for (project_id, label) in projects {
+                if !self.fleet_project_scope_includes(&host, project_id) {
+                    continue;
+                }
+                if !represented.insert((host.clone(), project_id)) {
+                    continue;
+                }
+                let tasks: Vec<_> = projection
+                    .active
+                    .iter()
+                    .filter(|row| {
+                        row.key.host == host && row.project_id == Some(project_id) && !row.done
+                    })
+                    .cloned()
+                    .collect();
+                let expanded = !self
+                    .collapsed_projects
+                    .contains(&HostProjectKey::new(host.clone(), project_id));
+                let label = if label.trim().is_empty() {
+                    format!("{} · project", self.owner_host_label(&host))
+                } else {
+                    format!("{} · {}", self.owner_host_label(&host), label)
+                };
+                items.push(ProjectInboxItem::Project {
+                    project_id,
+                    label,
+                    expanded,
+                    task_count: tasks.len(),
+                    host: host.clone(),
+                });
+                if expanded {
+                    items.extend(tasks.into_iter().map(|row| ProjectInboxItem::Task {
+                        project_id,
+                        task_key: row.key,
+                        settled: false,
+                        archived: false,
+                    }));
+                }
             }
         }
 
@@ -23100,6 +24095,7 @@ impl NativeShell {
                     .as_ref()
                     .is_some_and(|model| !model.tasks().is_empty())
                     || !slot.inbox.active_rows().is_empty()
+                    || !slot.inbox.settled_rows().is_empty()
                     || slot.inbox.history_rows().iter().next().is_some()
                     || !slot.task_list.task_ids().is_empty())
         })
@@ -23329,6 +24325,16 @@ impl NativeShell {
 
     #[cfg(test)]
     fn install_project_for_test(&mut self, label: &str, project_id: ProjectId) {
+        self.install_project_for_host_for_test(&self.local_host_id(), label, project_id);
+    }
+
+    #[cfg(test)]
+    fn install_project_for_host_for_test(
+        &mut self,
+        host_id: &HostId,
+        label: &str,
+        project_id: ProjectId,
+    ) {
         let snapshot = crate::domain::cockpit::ConfigSidebarSnapshot {
             revision: 1,
             projects: vec![crate::domain::cockpit::ConfigSidebarProject {
@@ -23342,7 +24348,9 @@ impl NativeShell {
             ssh_connections: Vec::new(),
             providers: Vec::new(),
         };
-        self.local_slot_mut().config_sidebar = ConfigSidebarProjection::from_host_snapshot(&snapshot);
+        if let Some(slot) = self.host_slot_mut(host_id) {
+            slot.config_sidebar = ConfigSidebarProjection::from_host_snapshot(&snapshot);
+        }
     }
 
     #[cfg(test)]
@@ -23514,11 +24522,10 @@ impl NativeShell {
     }
 
     fn begin_task_delete_key(&mut self, key: HostTaskKey) {
-        if key.host != self.local_host_id() {
-            if let Some(slot) = self.host_slot_mut(&key.host) {
-                slot.composer_error = Some(
-                    "Delete confirmation is not yet available for remote hosts.".into(),
-                );
+        if self.host_slot(&key.host).is_none() {
+            if let Some(slot) = self.host_slot_mut(&self.local_host_id()) {
+                slot.composer_error =
+                    Some("Delete confirmation needs a connected owner host.".into());
             }
             return;
         }
@@ -23532,12 +24539,11 @@ impl NativeShell {
         }
         // Opening a new confirmation permanently disarms any prior deferred delete.
         self.cancel_delete_task_flow();
-        if let Some(slot) = self.host_slot_mut(&key.host) {
-            slot.interaction.sync_selected_task(Some(key.task_id));
-        }
+        // Keep slot/global composer focus coherent with the rendered owner row.
+        let _ = self.select_fleet_task_key(key.clone(), FleetSelectMode::Replace);
         self.delete_task = Some(DeleteTaskDraft {
-            task_id: key.task_id,
-            title: self.task_row_title(key.task_id),
+            owner: key.clone(),
+            title: self.task_row_title_for_owner(&key),
             error: None,
             stage: DeleteTaskStage::Confirming,
         });
@@ -23555,23 +24561,55 @@ impl NativeShell {
         if draft.stage.is_submitting() {
             return;
         }
-        if self.retired_delete_flow_commands.len() >= MAX_ACTION_LANE_RECORDS {
+        // Clone owner before compact mutably borrows retirement bookkeeping (E0502).
+        let owner_for_pressure = draft.owner.clone();
+        // Reclaim terminal (resolved) retired markers before the capacity gate.
+        self.compact_retired_delete_flow_commands();
+        let unresolved_total = self
+            .retired_delete_flow_commands
+            .iter()
+            .filter(|retired| !retired.terminal)
+            .count();
+        let unresolved_host = self
+            .retired_delete_flow_commands
+            .iter()
+            .filter(|retired| {
+                !retired.terminal && retired.owner.host == owner_for_pressure.host
+            })
+            .count();
+        if unresolved_total >= MAX_ACTION_LANE_RECORDS.saturating_mul(MAX_FLEET_HOSTS)
+            || unresolved_host >= MAX_ACTION_LANE_RECORDS
+        {
             if let Some(draft) = self.delete_task.as_mut() {
-                draft.error = Some("Too many deletion requests are awaiting a result. Reconnect before trying again.".into());
+                draft.error = Some(
+                    "Too many deletion requests are still awaiting host outcomes. Forget the host or wait for exact results before trying again."
+                        .into(),
+                );
             }
             return;
         }
         let draft = self.delete_task.as_ref().expect("confirmed draft");
-        let task_id = draft.task_id;
-        let archived = self.local_slot_mut()
-            .client_model
-            .as_ref()
+        let owner = draft.owner.clone();
+        let task_id = owner.task_id;
+        if self.host_slot(&owner.host).is_none() {
+            if let Some(draft) = self.delete_task.as_mut() {
+                draft.error = Some("The owner host is no longer available.".into());
+                draft.stage = DeleteTaskStage::Confirming;
+            }
+            return;
+        }
+        let archived = self
+            .host_slot(&owner.host)
+            .and_then(|slot| slot.client_model.as_ref())
             .and_then(|model| model.tasks().get(&task_id))
             .is_some_and(|snapshot| {
                 snapshot.task.lifecycle == crate::domain::task::TaskLifecycle::Archived
             });
         if !archived {
-            match self.dispatch_action_recorded(ActionRequest::TaskArchive { task_id }) {
+            match self.dispatch_delete_flow_action_recorded_for_owner(
+                &owner.host,
+                ActionRequest::TaskArchive { task_id },
+            ) {
                 Ok(record) => {
                     let Some(command_id) = native_command_id(&record.command) else {
                         if let Some(draft) = self.delete_task.as_mut() {
@@ -23585,6 +24623,8 @@ impl NativeShell {
                         draft.stage = DeleteTaskStage::AwaitingArchive {
                             command_id,
                             archive_accepted: false,
+                            connection_epoch: record.connection_epoch,
+                            runtime_generation: record.runtime_generation,
                         };
                     }
                 }
@@ -23592,17 +24632,22 @@ impl NativeShell {
             }
             return;
         }
-        self.queue_confirmed_task_delete(task_id);
+        self.queue_confirmed_task_delete(owner);
     }
 
-    fn queue_confirmed_task_delete(&mut self, task_id: TaskId) {
+    fn queue_confirmed_task_delete(&mut self, owner: HostTaskKey) {
         let Some(draft) = self.delete_task.as_ref() else {
             return;
         };
-        if draft.task_id != task_id || draft.stage.is_submitting() {
+        if draft.owner != owner || draft.stage.is_submitting() {
             return;
         }
-        match self.dispatch_action_recorded(ActionRequest::TaskDelete { task_id }) {
+        match self.dispatch_delete_flow_action_recorded_for_owner(
+            &owner.host,
+            ActionRequest::TaskDelete {
+                task_id: owner.task_id,
+            },
+        ) {
             Ok(record) => {
                 let Some(command_id) = native_command_id(&record.command) else {
                     if let Some(draft) = self.delete_task.as_mut() {
@@ -23613,7 +24658,11 @@ impl NativeShell {
                 };
                 if let Some(draft) = self.delete_task.as_mut() {
                     draft.error = None;
-                    draft.stage = DeleteTaskStage::AwaitingDelete { command_id };
+                    draft.stage = DeleteTaskStage::AwaitingDelete {
+                        command_id,
+                        connection_epoch: record.connection_epoch,
+                        runtime_generation: record.runtime_generation,
+                    };
                 }
             }
             Err(failure) => self.settle_delete_admission_failure(failure),
@@ -23621,7 +24670,8 @@ impl NativeShell {
     }
 
     /// Advance only when the still-live confirmation draft matches, the exact
-    /// archive command has been Accepted, and the projected task is Archived.
+    /// archive command has been Accepted, the projected task is Archived, and
+    /// the draft's captured connection/runtime generations still match the owner.
     /// Never recreates a cancelled or replaced draft.
     fn try_advance_pending_delete_after_archive(&mut self) {
         let Some(draft) = self.delete_task.as_ref() else {
@@ -23629,23 +24679,44 @@ impl NativeShell {
         };
         let DeleteTaskStage::AwaitingArchive {
             archive_accepted: true,
+            connection_epoch,
+            runtime_generation,
             ..
         } = draft.stage
         else {
             return;
         };
-        let task_id = draft.task_id;
-        let archived = self.local_slot_mut()
-            .client_model
-            .as_ref()
-            .and_then(|model| model.tasks().get(&task_id))
+        let owner = draft.owner.clone();
+        let epochs_ok = self.host_slot(&owner.host).is_some_and(|slot| {
+            let epochs = slot.interaction.action_epochs();
+            epochs.connection_epoch == connection_epoch
+                && epochs.runtime_generation == runtime_generation
+        });
+        if !epochs_ok {
+            if let Some(draft) = self.delete_task.as_mut() {
+                draft.error = Some(
+                    "The connection changed. Check the task before trying Delete again.".into(),
+                );
+                draft.stage = DeleteTaskStage::Confirming;
+            }
+            return;
+        }
+        let archived = self
+            .host_slot(&owner.host)
+            .and_then(|slot| slot.client_model.as_ref())
+            .and_then(|model| model.tasks().get(&owner.task_id))
             .is_some_and(|snapshot| {
                 snapshot.task.lifecycle == crate::domain::task::TaskLifecycle::Archived
             });
         if !archived {
             return;
         }
-        match self.dispatch_action_recorded(ActionRequest::TaskDelete { task_id }) {
+        match self.dispatch_delete_flow_action_recorded_for_owner(
+            &owner.host,
+            ActionRequest::TaskDelete {
+                task_id: owner.task_id,
+            },
+        ) {
             Ok(record) => {
                 let Some(command_id) = native_command_id(&record.command) else {
                     if let Some(draft) = self.delete_task.as_mut() {
@@ -23655,15 +24726,28 @@ impl NativeShell {
                     return;
                 };
                 if let Some(draft) = self.delete_task.as_mut() {
-                    if draft.task_id != task_id {
-                        // Draft replaced mid-dispatch; retire the orphaned delete.
-                        self.retire_delete_flow_command(command_id);
+                    if draft.owner != owner {
+                        self.retire_delete_flow_command_record(
+                            &owner,
+                            command_id,
+                            record.connection_epoch,
+                            record.runtime_generation,
+                        );
                         return;
                     }
                     draft.error = None;
-                    draft.stage = DeleteTaskStage::AwaitingDelete { command_id };
+                    draft.stage = DeleteTaskStage::AwaitingDelete {
+                        command_id,
+                        connection_epoch: record.connection_epoch,
+                        runtime_generation: record.runtime_generation,
+                    };
                 } else {
-                    self.retire_delete_flow_command(command_id);
+                    self.retire_delete_flow_command_record(
+                        &owner,
+                        command_id,
+                        record.connection_epoch,
+                        record.runtime_generation,
+                    );
                 }
             }
             Err(failure) => self.settle_delete_admission_failure(failure),
@@ -23673,20 +24757,25 @@ impl NativeShell {
     fn settle_delete_admission_failure(&mut self, failure: NativeActionDispatchFailure) {
         // A captured command can be retained by enqueue_host_action even when
         // admission fails. It must never survive as an implicit delete retry.
-        if let Some(command_id) = failure
-            .record
+        let owner_host = self
+            .delete_task
             .as_ref()
-            .and_then(|record| native_command_id(&record.command))
-        {
-            self.discard_host_action_by_command_id(command_id);
+            .map(|draft| draft.owner.host.clone())
+            .unwrap_or_else(|| self.local_host_id());
+        if let Some(record) = failure.record.as_ref() {
+            if let Some(command_id) = native_command_id(&record.command) {
+                self.discard_host_action_by_command_id_for_owner(&owner_host, command_id);
+            }
         }
         if failure.record.as_ref().is_some_and(|record| {
-            self.local_slot_mut().last_action_failure
-                .as_ref()
+            self.host_slot(&owner_host)
+                .and_then(|slot| slot.last_action_failure.as_ref())
                 .is_some_and(|last| last.command_id().is_none() && last.action_id() == record.id)
         }) {
-            self.local_slot_mut().last_action_failure = None;
-            self.restore_connected_host_state();
+            if let Some(slot) = self.host_slot_mut(&owner_host) {
+                slot.last_action_failure = None;
+            }
+            self.restore_connected_host_state_for_owner(&owner_host);
         }
         if let Some(draft) = self.delete_task.as_mut() {
             draft.error = Some(failure.message);
@@ -23701,94 +24790,314 @@ impl NativeShell {
             match draft.stage {
                 DeleteTaskStage::AwaitingArchive {
                     command_id,
-                    archive_accepted: true,
-                } => {
-                    self.discard_host_action_by_command_id(command_id);
+                    connection_epoch,
+                    runtime_generation,
+                    ..
                 }
-                DeleteTaskStage::AwaitingArchive { command_id, .. }
-                | DeleteTaskStage::AwaitingDelete { command_id } => {
-                    self.retire_delete_flow_command(command_id);
+                | DeleteTaskStage::AwaitingDelete {
+                    command_id,
+                    connection_epoch,
+                    runtime_generation,
+                } => {
+                    // Always tombstone — including after archive_accepted — so a
+                    // late archive/delete result cannot regain advance authority.
+                    self.retire_delete_flow_command_record(
+                        &draft.owner,
+                        command_id,
+                        connection_epoch,
+                        runtime_generation,
+                    );
                 }
                 DeleteTaskStage::Confirming => {}
             }
         }
     }
 
-    fn retire_delete_flow_command(&mut self, command_id: CommandId) {
-        self.discard_host_action_by_command_id(command_id);
-        if !self.retired_delete_flow_commands.contains(&command_id) {
+    fn retire_delete_flow_command_from_action(
+        &mut self,
+        host_id: &HostId,
+        action: &NativeActionRecord,
+    ) {
+        let Some(command_id) = native_command_id(&action.command) else {
+            return;
+        };
+        let owner = self
+            .delete_task
+            .as_ref()
+            .filter(|draft| draft.owner.host == *host_id)
+            .map(|draft| draft.owner.clone())
+            .or_else(|| {
+                action
+                    .task_id
+                    .map(|task_id| HostTaskKey::new(host_id.clone(), task_id))
+            })
+            .unwrap_or_else(|| HostTaskKey::new(host_id.clone(), TaskId::new()));
+        self.retire_delete_flow_command_record(
+            &owner,
+            command_id,
+            action.connection_epoch,
+            action.runtime_generation,
+        );
+    }
+
+    fn retire_delete_flow_command_record(
+        &mut self,
+        owner: &HostTaskKey,
+        command_id: CommandId,
+        connection_epoch: u64,
+        runtime_generation: u64,
+    ) {
+        self.discard_host_action_by_command_id_for_owner(&owner.host, command_id);
+        let marker = RetiredDeleteFlowCommand {
+            owner: owner.clone(),
+            command_id,
+            connection_epoch,
+            runtime_generation,
+            terminal: false,
+        };
+        if !self.retired_delete_flow_commands.iter().any(|retired| {
+            retired.owner == marker.owner
+                && retired.command_id == marker.command_id
+                && retired.connection_epoch == marker.connection_epoch
+                && retired.runtime_generation == marker.runtime_generation
+        }) {
             // Never evict an unresolved cancellation: a late result must not
-            // regain generic retry authority. New confirmations are bounded.
-            self.retired_delete_flow_commands.push(command_id);
+            // regain generic retry authority. Capacity is recovered by marking
+            // consumed/generation-retired markers terminal, then compacting.
+            self.retired_delete_flow_commands.push(marker);
+        }
+        self.compact_retired_delete_flow_commands();
+    }
+
+    /// Drop oldest terminal retired markers while at/over capacity. Unresolved
+    /// cancellations are never removed here.
+    fn compact_retired_delete_flow_commands(&mut self) {
+        while self.retired_delete_flow_commands.len() >= MAX_ACTION_LANE_RECORDS {
+            let Some(index) = self
+                .retired_delete_flow_commands
+                .iter()
+                .position(|retired| retired.terminal)
+            else {
+                break;
+            };
+            self.retired_delete_flow_commands.remove(index);
         }
     }
 
-    fn discard_host_action_by_command_id(&mut self, command_id: CommandId) {
-        self.local_slot_mut().pending_host_actions
-            .retain(|pending| native_command_id(&pending.command) != Some(command_id));
-        if self.local_slot_mut()
-            .retained_action_overflow
-            .as_ref()
-            .is_some_and(|pending| native_command_id(&pending.command) == Some(command_id))
-        {
-            self.local_slot_mut().retained_action_overflow = None;
+    /// Mark exact retired ownership terminal after a correlated Accepted/Rejected
+    /// receipt only, so duplicates stay blocked while capacity can reclaim.
+    fn mark_retired_delete_flow_terminal(
+        &mut self,
+        host_id: &HostId,
+        action: &NativeActionRecord,
+    ) {
+        let Some(command_id) = native_command_id(&action.command) else {
+            return;
+        };
+        for retired in &mut self.retired_delete_flow_commands {
+            if retired.owner.host == *host_id
+                && retired.command_id == command_id
+                && retired.connection_epoch == action.connection_epoch
+                && retired.runtime_generation == action.runtime_generation
+                && action
+                    .task_id
+                    .is_none_or(|task_id| task_id == retired.owner.task_id)
+            {
+                retired.terminal = true;
+            }
         }
-        if self.local_slot_mut()
-            .last_action_failure
-            .as_ref()
-            .is_some_and(|failure| failure.command_id() == Some(command_id))
-        {
-            self.local_slot_mut().last_action_failure = None;
-            self.restore_connected_host_state();
+        self.compact_retired_delete_flow_commands();
+    }
+
+    fn discard_host_action_by_command_id(&mut self, command_id: CommandId) {
+        let local = self.local_host_id();
+        self.discard_host_action_by_command_id_for_owner(&local, command_id);
+    }
+
+    fn discard_host_action_by_command_id_for_owner(
+        &mut self,
+        host_id: &HostId,
+        command_id: CommandId,
+    ) {
+        let clear_failure = {
+            let Some(slot) = self.host_slot_mut(host_id) else {
+                return;
+            };
+            slot.pending_host_actions
+                .retain(|pending| native_command_id(&pending.command) != Some(command_id));
+            if slot
+                .retained_action_overflow
+                .as_ref()
+                .is_some_and(|pending| native_command_id(&pending.command) == Some(command_id))
+            {
+                slot.retained_action_overflow = None;
+            }
+            if slot
+                .last_action_failure
+                .as_ref()
+                .is_some_and(|failure| failure.command_id() == Some(command_id))
+            {
+                slot.last_action_failure = None;
+                true
+            } else {
+                false
+            }
+        };
+        if clear_failure {
+            self.restore_connected_host_state_for_owner(host_id);
         }
     }
 
     fn delete_flow_command_id(&self) -> Option<CommandId> {
         match self.delete_task.as_ref()?.stage {
             DeleteTaskStage::AwaitingArchive { command_id, .. }
-            | DeleteTaskStage::AwaitingDelete { command_id } => Some(command_id),
+            | DeleteTaskStage::AwaitingDelete { command_id, .. } => Some(command_id),
             DeleteTaskStage::Confirming => None,
         }
     }
 
-    fn matches_live_delete_flow_command(&self, action: &NativeActionRecord) -> bool {
+    fn delete_flow_owner(&self) -> Option<&HostTaskKey> {
+        self.delete_task.as_ref().map(|draft| &draft.owner)
+    }
+
+    fn matches_live_delete_flow_command(
+        &self,
+        host_id: &HostId,
+        action: &NativeActionRecord,
+    ) -> bool {
         let Some(expected) = self.delete_flow_command_id() else {
             return false;
         };
+        let Some(owner) = self.delete_flow_owner() else {
+            return false;
+        };
+        if &owner.host != host_id {
+            return false;
+        }
         if native_command_id(&action.command) != Some(expected) {
             return false;
         }
-        match (
-            action.task_id,
-            self.delete_task.as_ref().map(|draft| draft.task_id),
-        ) {
-            (Some(action_task), Some(draft_task)) => action_task == draft_task,
-            _ => true,
+        let epochs_match = match self.delete_task.as_ref().map(|draft| draft.stage) {
+            Some(DeleteTaskStage::AwaitingArchive {
+                connection_epoch,
+                runtime_generation,
+                ..
+            })
+            | Some(DeleteTaskStage::AwaitingDelete {
+                connection_epoch,
+                runtime_generation,
+                ..
+            }) => {
+                action.connection_epoch == connection_epoch
+                    && action.runtime_generation == runtime_generation
+            }
+            _ => false,
+        };
+        if !epochs_match {
+            return false;
+        }
+        match action.task_id {
+            Some(action_task) => action_task == owner.task_id,
+            None => true,
         }
     }
 
-    fn is_retired_delete_flow_command(&self, action: &NativeActionRecord) -> bool {
-        native_command_id(&action.command)
-            .is_some_and(|command_id| self.retired_delete_flow_commands.contains(&command_id))
+    fn is_retired_delete_flow_command(
+        &self,
+        host_id: &HostId,
+        action: &NativeActionRecord,
+    ) -> bool {
+        let Some(command_id) = native_command_id(&action.command) else {
+            return false;
+        };
+        self.retired_delete_flow_commands.iter().any(|retired| {
+            retired.owner.host == *host_id
+                && retired.command_id == command_id
+                && retired.connection_epoch == action.connection_epoch
+                && retired.runtime_generation == action.runtime_generation
+                && action
+                    .task_id
+                    .is_none_or(|task_id| task_id == retired.owner.task_id)
+        })
+    }
+
+    /// Drop only the exact deleted owner key from layout/surfaces/composer/selection.
+    /// Same raw TaskId on another host and temporary disconnect panes stay intact.
+    fn prune_confirmed_deleted_owner_key(&mut self, key: &HostTaskKey) {
+        self.known_deleted_task_keys.insert(key.clone());
+        let open = self
+            .layout
+            .task_workspace
+            .as_ref()
+            .map(|workspace| {
+                workspace
+                    .task_ids()
+                    .into_iter()
+                    .filter(|open| open != key)
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        let selected = self
+            .selected_task_key
+            .as_ref()
+            .filter(|selected| *selected != key)
+            .cloned()
+            .or_else(|| open.first().cloned());
+        let _ = self.layout.reconcile_task_workspace(&open);
+        self.layout.selected_task = selected.clone();
+        self.selected_task_key = selected.clone();
+        if self.composer_owner.as_ref() == Some(key) {
+            self.cache_current_composer_draft();
+            self.clear_composer_binding();
+            self.composer_owner = selected.clone();
+        }
+        self.task_surfaces.retain_tasks(&open);
+        self.composer_drafts
+            .retain(|draft_key, _| draft_key.task_id != *key);
+        self.draft_launch_prefs.retain(|pref_key, _| pref_key != key);
+        self.pending_automatic_titles.retain(|pending, _| pending != key);
+        self.composer_images
+            .retain(|draft_key, _| draft_key.task_id != *key);
+        if let Some(slot) = self.host_slot_mut(&key.host) {
+            if slot.interaction.selected_task() == Some(key.task_id) {
+                // Never project a cross-host successor's raw TaskId into this
+                // owner's interaction — same UUID on another host is unrelated.
+                let same_host_successor = selected
+                    .as_ref()
+                    .filter(|successor| successor.host == key.host)
+                    .map(|successor| successor.task_id);
+                slot.interaction.sync_selected_task(same_host_successor);
+            }
+        }
+        self.mark_layout_dirty();
     }
 
     /// Handle archive/delete outcomes for the live confirmation draft. Returns
     /// true when the outcome belonged to this flow (caller must not retry).
     fn settle_delete_flow_outcome(
         &mut self,
+        host_id: &HostId,
         action: &NativeActionRecord,
         kind: DeleteFlowSettleKind,
     ) -> bool {
-        if self.is_retired_delete_flow_command(action) {
+        if self.is_retired_delete_flow_command(host_id, action) {
             if let Some(command_id) = native_command_id(&action.command) {
-                self.discard_host_action_by_command_id(command_id);
-                self.retired_delete_flow_commands
-                    .retain(|id| *id != command_id);
+                self.discard_host_action_by_command_id_for_owner(host_id, command_id);
+            }
+            // Only correlated Accepted/Rejected settle kinds resolve retirement.
+            // Failed/Uncertain/Stale keep unresolved ownership (no generic retry).
+            match &kind {
+                DeleteFlowSettleKind::Accepted | DeleteFlowSettleKind::Rejected { .. } => {
+                    self.mark_retired_delete_flow_terminal(host_id, action);
+                }
+                DeleteFlowSettleKind::Failed { .. }
+                | DeleteFlowSettleKind::Uncertain { .. }
+                | DeleteFlowSettleKind::Stale { .. } => {}
             }
             // Late outcomes after cancel/failure must not stomp another modal.
             return true;
         }
-        if !self.matches_live_delete_flow_command(action) {
+        if !self.matches_live_delete_flow_command(host_id, action) {
             return false;
         }
         let Some(command_id) = native_command_id(&action.command) else {
@@ -23802,31 +25111,40 @@ impl NativeShell {
             DeleteFlowSettleKind::Accepted => {
                 let mut advance_after_archive = false;
                 let mut clear_after_delete = false;
+                let mut deleted_owner = None;
                 if let Some(draft) = self.delete_task.as_mut() {
                     match draft.stage {
                         DeleteTaskStage::AwaitingArchive {
                             command_id: expected,
+                            connection_epoch,
+                            runtime_generation,
                             ..
                         } if expected == command_id => {
                             draft.stage = DeleteTaskStage::AwaitingArchive {
                                 command_id: expected,
                                 archive_accepted: true,
+                                connection_epoch,
+                                runtime_generation,
                             };
                             draft.error = None;
                             advance_after_archive = true;
                         }
                         DeleteTaskStage::AwaitingDelete {
                             command_id: expected,
+                            ..
                         } if expected == command_id => {
                             clear_after_delete = true;
+                            deleted_owner = Some(draft.owner.clone());
                         }
                         _ => {}
                     }
                 }
-                self.discard_host_action_by_command_id(command_id);
+                self.discard_host_action_by_command_id_for_owner(host_id, command_id);
                 if clear_after_delete {
                     self.delete_task = None;
-                    self.local_slot_mut().interaction.sync_selected_task(None);
+                    if let Some(owner) = deleted_owner {
+                        self.prune_confirmed_deleted_owner_key(&owner);
+                    }
                 } else if advance_after_archive {
                     self.try_advance_pending_delete_after_archive();
                 }
@@ -23836,9 +25154,9 @@ impl NativeShell {
             | DeleteFlowSettleKind::Uncertain { message }
             | DeleteFlowSettleKind::Stale { message } => {
                 if uncertain {
-                    self.retire_delete_flow_command(command_id);
+                    self.retire_delete_flow_command_from_action(host_id, action);
                 } else {
-                    self.discard_host_action_by_command_id(command_id);
+                    self.discard_host_action_by_command_id_for_owner(host_id, command_id);
                 }
                 if let Some(draft) = self.delete_task.as_mut() {
                     draft.error = Some(message);
@@ -24802,29 +26120,59 @@ impl NativeShell {
     }
 
     fn begin_new_task(&mut self) {
-        if self.selected_owner_is_remote() {
-            self.refuse_remote_local_create("new task");
-            return;
-        }
-        let project_id = match self.project_scope() {
-            ProjectScope::Project(project_id) => Some(project_id),
-            ProjectScope::All => self.current_workspace_project_id(),
+        let project_key = if let Some(selected) = self.selected_task_key.clone() {
+            let project_id = self
+                .host_slot(&selected.host)
+                .and_then(|slot| slot.client_model.as_ref())
+                .and_then(|model| model.task(selected.task_id))
+                .map(|snapshot| snapshot.task.project_id)
+                .or_else(|| {
+                    self.host_slot(&selected.host)
+                        .and_then(|slot| slot.inbox.row(selected.task_id))
+                        .map(|row| row.project_id)
+                });
+            project_id.map(|project_id| HostProjectKey::new(selected.host.clone(), project_id))
+        } else {
+            None
         };
-        let Some(project_id) = project_id else {
+        let project_key = project_key.or_else(|| {
+            match self.project_scope() {
+                ProjectScope::Project(project_id) => {
+                    Some(HostProjectKey::new(self.local_host_id(), project_id))
+                }
+                ProjectScope::All => self
+                    .current_workspace_project_id()
+                    .map(|project_id| HostProjectKey::new(self.local_host_id(), project_id)),
+            }
+        });
+        let Some(project_key) = project_key else {
+            if self.selected_owner_is_remote() {
+                self.refuse_remote_local_create("add project");
+                return;
+            }
             self.open_add_project();
             return;
         };
-        self.begin_new_task_for_project(project_id);
+        self.begin_new_task_for_project_key(project_key);
     }
 
     fn begin_new_task_for_project(&mut self, project_id: ProjectId) {
-        if self.selected_owner_is_remote() {
-            self.refuse_remote_local_create("new task");
+        self.begin_new_task_for_project_key(HostProjectKey::new(self.local_host_id(), project_id));
+    }
+
+    fn begin_new_task_for_project_key(&mut self, project_key: HostProjectKey) {
+        if self.host_slot(&project_key.host).is_none() {
+            if let Some(slot) = self.host_slot_mut(&self.local_host_id()) {
+                slot.composer_error =
+                    Some("New task needs a connected owner host.".into());
+            }
             return;
         }
-        self.selected_project_id = Some(project_id);
+        if project_key.host == self.local_host_id() {
+            self.selected_project_id = Some(project_key.project_id);
+        }
         self.new_task = Some(NewTaskDraft {
-            project_id,
+            project_key,
             error: None,
         });
         self.pending_root_overlay_focus = true;
@@ -24835,33 +26183,32 @@ impl NativeShell {
     }
 
     fn submit_new_task(&mut self) {
-        if self.selected_owner_is_remote() {
-            // Stale dialog opened before a remote selection must not create locally.
-            self.new_task = None;
-            self.refuse_remote_local_create("new task");
-            return;
-        }
         let Some(draft) = self.new_task.as_ref() else {
             return;
         };
-        let project_id = draft.project_id;
-        let provider_kind = self
-            .layout
-            .composer_provider
-            .unwrap_or(crate::providers::ProviderKind::Codex);
+        let project_key = draft.project_key.clone();
+        if self.host_slot(&project_key.host).is_none() {
+            if let Some(draft) = self.new_task.as_mut() {
+                draft.error = Some("The owner host is no longer available.".into());
+            }
+            return;
+        }
+        let provider_kind = self.new_task_provider_for_owner(&project_key.host);
+        let task_id = TaskId::new();
         if self
-            .dispatch_action_checked(ActionRequest::TaskCreateV2(
-                crate::client::action::TaskCreateV2Arguments {
-                    task_id: TaskId::new(),
+            .dispatch_action_recorded_for_owner(
+                &project_key.host,
+                ActionRequest::TaskCreateV2(crate::client::action::TaskCreateV2Arguments {
+                    task_id,
                     environment_id: crate::domain::id::EnvironmentId::new(),
                     title: "New task".to_string(),
                     description: None,
-                    project_id,
+                    project_id: project_key.project_id,
                     workspace: crate::workspace::WorkspaceRequest::main(),
                     primary_provider: Some(provider_kind),
                     defer_primary_provider_start: true,
-                },
-            ))
+                }),
+            )
             .is_err()
         {
             if let Some(draft) = self.new_task.as_mut() {
@@ -24870,6 +26217,24 @@ impl NativeShell {
             return;
         }
         self.new_task = None;
+    }
+
+    fn new_task_provider_for_owner(&self, host_id: &HostId) -> ProviderKind {
+        let preferred = self.layout.composer_provider;
+        let catalog = self
+            .host_slot(host_id)
+            .and_then(|slot| slot.agent_connection.as_ref())
+            .map(inbox_agent_actions)
+            .unwrap_or_default();
+        if let Some(preferred) = preferred {
+            if catalog.is_empty() || catalog.iter().any(|action| action.provider == preferred) {
+                return preferred;
+            }
+        }
+        catalog
+            .first()
+            .map(|action| action.provider)
+            .unwrap_or(ProviderKind::Codex)
     }
 
     fn refuse_remote_local_create(&mut self, surface: &str) {
@@ -24886,14 +26251,27 @@ impl NativeShell {
     }
 
     fn begin_task_rename(&mut self, task_id: TaskId) {
-        self.local_slot_mut().interaction.sync_selected_task(Some(task_id));
-        let current = self.task_row_title(task_id);
+        let key = self
+            .selected_task_key
+            .clone()
+            .filter(|key| key.task_id == task_id)
+            .unwrap_or_else(|| self.local_task_key(task_id));
+        self.begin_task_rename_key(key);
+    }
+
+    fn begin_task_rename_key(&mut self, key: HostTaskKey) {
+        if self.host_slot(&key.host).is_none() {
+            return;
+        }
+        // Keep slot/global composer focus coherent with the rendered owner row.
+        let _ = self.select_fleet_task_key(key.clone(), FleetSelectMode::Replace);
+        let current = self.task_row_title_for_owner(&key);
         let mut title = TextField::new("Task name").expect("rename task field");
         let _ = title.set_value(current);
         title.select_all();
         title.focus();
         self.rename_task = Some(RenameTaskDraft {
-            task_id,
+            owner: key,
             title,
             error: None,
         });
@@ -24914,11 +26292,21 @@ impl NativeShell {
             }
             return;
         }
-        let task_id = draft.task_id;
+        let owner = draft.owner.clone();
+        if self.host_slot(&owner.host).is_none() {
+            if let Some(draft) = self.rename_task.as_mut() {
+                draft.error = Some("The owner host is no longer available.".into());
+            }
+            return;
+        }
         if self
-            .dispatch_action_checked(ActionRequest::TaskRename(
-                crate::client::action::TaskRenameArguments { task_id, title },
-            ))
+            .dispatch_action_recorded_for_owner(
+                &owner.host,
+                ActionRequest::TaskRename(crate::client::action::TaskRenameArguments {
+                    task_id: owner.task_id,
+                    title,
+                }),
+            )
             .is_err()
         {
             if let Some(draft) = self.rename_task.as_mut() {
@@ -24926,8 +26314,7 @@ impl NativeShell {
             }
             return;
         }
-        self.pending_automatic_titles
-            .remove(&self.local_task_key(task_id));
+        self.pending_automatic_titles.remove(&owner);
         self.rename_task = None;
     }
 
@@ -24969,21 +26356,17 @@ impl NativeShell {
             element_id,
             "native-shell-tools-affordance"
                 | "native-task-commit"
-                | "native-task-center-terminal"
                 | "native-task-composer-attach"
                 | "native-browser-back"
                 | "native-browser-forward"
                 | "native-browser-reload"
                 | "native-browser-address"
                 | "native-browser-go"
-                | "native-task-delete"
-                | "native-sidebar-new-task"
-                | "native-new-task-submit"
                 | "native-sidebar-changes"
                 | "native-sidebar-services"
-        ) || NATIVE_DOCK_TABS
-            .iter()
-            .any(|(_, dock_element_id, _)| *dock_element_id == element_id);
+        ) || NATIVE_DOCK_TABS.iter().any(|(tool, dock_element_id, _)| {
+            *dock_element_id == element_id && !Self::remote_dock_tab_supported(*tool)
+        });
         if remote_local_authority && self.selected_owner_is_remote() {
             if let Some(key) = self.selected_task_key.clone() {
                 if let Some(slot) = self.host_slot_mut(&key.host) {
@@ -25194,14 +26577,21 @@ impl NativeShell {
     /// Title without the status suffix. `task_row_label` keeps the suffix
     /// because the accessibility tree reads a row as a single string.
     fn task_row_title(&self, task_id: TaskId) -> String {
-        if let Some(row) = self.local_slot().inbox.row(task_id) {
+        self.task_row_title_for_owner(&self.local_task_key(task_id))
+    }
+
+    fn task_row_title_for_owner(&self, key: &HostTaskKey) -> String {
+        if let Some(row) = self
+            .host_slot(&key.host)
+            .and_then(|slot| slot.inbox.row(key.task_id))
+        {
             return row.title.clone();
         }
-        self.local_slot().client_model
-            .as_ref()
-            .and_then(|model| model.tasks().get(&task_id))
+        self.host_slot(&key.host)
+            .and_then(|slot| slot.client_model.as_ref())
+            .and_then(|model| model.tasks().get(&key.task_id))
             .map(|snapshot| snapshot.task.title.clone())
-            .unwrap_or_else(|| format!("Task {task_id}"))
+            .unwrap_or_else(|| format!("Task {}", key.task_id))
     }
 
     fn task_row_status(&self, task_id: TaskId) -> Option<VisibleTaskStatus> {
@@ -25566,59 +26956,42 @@ impl NativeShell {
                 .child("Archive")
                 .into_any_element()
         });
-        let delete = match selected_key.as_ref() {
-            Some(selected_key) if selected_key.host == self.local_host_id() => {
-                selected.map(|task_id| {
-                    div()
-                        .id("native-task-delete")
-                        .tab_stop(true)
-                        .h(px(26.0))
-                        .flex()
-                        .items_center()
-                        .gap(px(6.0))
-                        .px(px(10.0))
-                        .rounded(px(6.0))
-                        .cursor_pointer()
-                        .bg(tokens.surfaces.raised.to_gpui())
-                        .text_size(px(tokens.density.typography.caption))
-                        .text_color(tokens.status.destructive.to_gpui())
-                        .hover(|style| style.bg(tokens.surfaces.overlay.to_gpui()))
-                        .on_click(cx.listener(move |shell, _event: &ClickEvent, _window, cx| {
-                            cx.stop_propagation();
-                            shell.begin_task_delete(task_id);
-                            cx.notify();
-                        }))
-                        .child(crate::icons::app_icon(
-                            crate::icons::TRASH,
-                            12.0,
-                            tokens.status.destructive.to_u32(),
-                        ))
-                        .child("Delete")
-                        .into_any_element()
-                })
-            }
-            Some(_) => Some(
-                div()
-                    .id("native-task-delete-unavailable")
-                    .h(px(26.0))
-                    .flex()
-                    .items_center()
-                    .gap(px(6.0))
-                    .px(px(10.0))
-                    .rounded(px(6.0))
-                    .bg(tokens.surfaces.raised.to_gpui())
-                    .text_size(px(tokens.density.typography.caption))
-                    .text_color(tokens.text.disabled.to_gpui())
-                    .child(crate::icons::app_icon(
-                        crate::icons::TRASH,
-                        12.0,
-                        tokens.text.disabled.to_u32(),
-                    ))
-                    .child("Delete (local only)")
-                    .into_any_element(),
-            ),
-            None => None,
-        };
+        let delete = selected_key.as_ref().map(|key| {
+            let owner = key.clone();
+            div()
+                .id("native-task-delete")
+                .tab_stop(true)
+                .h(px(26.0))
+                .flex()
+                .items_center()
+                .gap(px(6.0))
+                .px(px(10.0))
+                .rounded(px(6.0))
+                .cursor_pointer()
+                .bg(tokens.surfaces.raised.to_gpui())
+                .text_size(px(tokens.density.typography.caption))
+                .text_color(tokens.status.destructive.to_gpui())
+                .hover(|style| style.bg(tokens.surfaces.overlay.to_gpui()))
+                .on_click(cx.listener(move |shell, _event: &ClickEvent, _window, cx| {
+                    cx.stop_propagation();
+                    // Capture the rendered HostTaskKey; never remint from current focus.
+                    if shell.host_slot(&owner.host).is_some_and(|slot| {
+                        slot.client_model
+                            .as_ref()
+                            .is_some_and(|model| model.tasks().contains_key(&owner.task_id))
+                    }) {
+                        shell.begin_task_delete_key(owner.clone());
+                    }
+                    cx.notify();
+                }))
+                .child(crate::icons::app_icon(
+                    crate::icons::TRASH,
+                    12.0,
+                    tokens.status.destructive.to_u32(),
+                ))
+                .child("Delete")
+                .into_any_element()
+        });
         let add_action = if self.selected_owner_is_remote() {
             div()
                 .id("native-shell-tools-affordance-unavailable")
@@ -29504,22 +30877,52 @@ impl NativeShell {
     ) -> AnyElement {
         let draft = self.new_task.as_ref().expect("overlay is open");
         let error = draft.error.clone();
-        let project_choices = self.local_slot()
-            .config_sidebar
-            .projects
-            .iter()
-            .filter_map(|project| {
-                ProjectId::parse(&project.workspace_id)
-                    .ok()
-                    .map(|project_id| {
+        let owner_host = draft.project_key.host.clone();
+        let draft_project = draft.project_key.project_id;
+        let project_choices = self
+            .host_slot(&owner_host)
+            .map(|slot| {
+                slot.config_sidebar
+                    .projects
+                    .iter()
+                    .filter_map(|project| {
+                        ProjectId::parse(&project.workspace_id)
+                            .ok()
+                            .map(|project_id| {
+                                (
+                                    project_id,
+                                    project.label.clone(),
+                                    project_id == draft_project,
+                                )
+                            })
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        let project_choices = if project_choices.is_empty() {
+            // Fall back to owner residual projects from the frozen host's inbox.
+            self.fleet_inbox_projection()
+                .active
+                .iter()
+                .filter(|row| row.key.host == owner_host)
+                .filter_map(|row| {
+                    row.project_id.map(|project_id| {
                         (
                             project_id,
-                            project.label.clone(),
-                            project_id == draft.project_id,
+                            row.project_label.clone(),
+                            project_id == draft_project,
                         )
                     })
-            })
-            .collect::<Vec<_>>();
+                })
+                .fold(Vec::new(), |mut acc, choice| {
+                    if !acc.iter().any(|(id, _, _)| *id == choice.0) {
+                        acc.push(choice);
+                    }
+                    acc
+                })
+        } else {
+            project_choices
+        };
         deferred(
             anchored()
                 .position(point(px(0.0), px(0.0)))
@@ -29623,11 +31026,15 @@ impl NativeShell {
                                                 MouseButton::Left,
                                                 cx.listener(move |shell, _event: &MouseDownEvent, _window, cx| {
                                                     cx.stop_propagation();
+                                                    let local_host = shell.local_host_id();
                                                     if let Some(draft) = shell.new_task.as_mut() {
-                                                        draft.project_id = project_id;
+                                                        draft.project_key.project_id = project_id;
                                                         draft.error = None;
+                                                        if draft.project_key.host == local_host {
+                                                            shell.selected_project_id =
+                                                                Some(project_id);
+                                                        }
                                                     }
-                                                    shell.selected_project_id = Some(project_id);
                                                     cx.notify();
                                                 }),
                                             )
@@ -30877,7 +32284,7 @@ impl NativeShell {
                 .begin_blocked(PanelDisabledReason::RepositoryReadOnly);
             return;
         }
-        self.selected_repository = Some((task_id, selector.clone()));
+        self.selected_repository = Some((self.local_task_key(task_id), selector.clone()));
         self.header_commit
             .begin(task_id, selector.clone(), entry.label.clone());
         self.dispatch_header_commit_query(
@@ -30886,39 +32293,145 @@ impl NativeShell {
         );
     }
 
-    fn selected_repository_for_task(&self, task_id: TaskId) -> Option<TaskRepositorySelector> {
+    fn selected_repository_for_owner(&self, key: &HostTaskKey) -> Option<TaskRepositorySelector> {
         self.selected_repository
             .as_ref()
-            .filter(|(owned, _)| *owned == task_id)
+            .filter(|(owned, _)| owned == key)
             .map(|(_, selector)| selector.clone())
+    }
+
+    fn selected_repository_for_task(&self, task_id: TaskId) -> Option<TaskRepositorySelector> {
+        self.selected_repository_for_owner(&self.local_task_key(task_id))
+    }
+
+    fn repository_catalog_for_owner(
+        &self,
+        key: &HostTaskKey,
+    ) -> Option<&TaskGitRepositoriesProjection> {
+        self.host_slot(&key.host)
+            .and_then(|slot| slot.cockpit.live_projection())
+            .and_then(|projection| projection.repositories.as_ref())
+            .filter(|catalog| catalog.task_id == key.task_id)
     }
 
     fn repository_catalog_for_task(
         &self,
         task_id: TaskId,
     ) -> Option<&TaskGitRepositoriesProjection> {
-        self.local_slot().cockpit
-            .live_projection()
-            .and_then(|projection| projection.repositories.as_ref())
-            .filter(|catalog| catalog.task_id == task_id)
+        self.repository_catalog_for_owner(&self.local_task_key(task_id))
     }
 
     /// Reconcile Task-scoped selection from a fresh catalog and request targeted
     /// status once. Catalog application is the only loop-free trigger for that
     /// follow-up query (paint paths must not refresh).
-    fn apply_repository_catalog(&mut self, catalog: &TaskGitRepositoriesProjection) {
-        if self.local_slot_mut().interaction.selected_task() != Some(catalog.task_id) {
-            return;
-        }
-        let current = self.selected_repository_for_task(catalog.task_id);
-        let Some(selector) = reconcile_selected_repository(current.as_ref(), catalog) else {
-            self.selected_repository = None;
+    fn apply_repository_catalog_for_owner(
+        &mut self,
+        key: &HostTaskKey,
+        catalog: &TaskGitRepositoriesProjection,
+    ) {
+        let Some(slot) = self.host_slot(&key.host) else {
             return;
         };
-        self.selected_repository = Some((catalog.task_id, selector.clone()));
-        let _ = self.dispatch_task_cockpit_query(
-            catalog.task_id,
-            TaskCockpitQuery::GitStatusTargeted { selector },
+        if slot.interaction.selected_task() != Some(catalog.task_id)
+            || catalog.task_id != key.task_id
+        {
+            return;
+        }
+        let active_tool = slot.cockpit.active_tool();
+        let current = self.selected_repository_for_owner(key);
+        let Some(selector) = reconcile_selected_repository(current.as_ref(), catalog) else {
+            if self
+                .selected_repository
+                .as_ref()
+                .is_some_and(|(owned, _)| owned == key)
+            {
+                self.selected_repository = None;
+            }
+            return;
+        };
+        // Owner-qualified cache may update even when another host is focused;
+        // targeted GitStatus only fires for the globally selected Changes surface.
+        self.selected_repository = Some((key.clone(), selector.clone()));
+        let globally_focused = self.selected_task_key.as_ref() == Some(key);
+        let changes_active = active_tool == CockpitDockTool::Changes;
+        if globally_focused && changes_active {
+            let _ = self.dispatch_action_recorded_for_owner(
+                &key.host,
+                ActionRequest::TaskCockpit {
+                    task_id: catalog.task_id,
+                    query: TaskCockpitQuery::GitStatusTargeted { selector },
+                },
+            );
+        }
+        self.refresh_accessibility_tree();
+    }
+
+    fn apply_repository_catalog(&mut self, catalog: &TaskGitRepositoriesProjection) {
+        let key = self.local_task_key(catalog.task_id);
+        self.apply_repository_catalog_for_owner(&key, catalog);
+    }
+
+    fn select_changes_repository_for_owner(
+        &mut self,
+        key: &HostTaskKey,
+        selector: TaskRepositorySelector,
+    ) {
+        self.select_changes_repository_for_owner_gated(key, selector, None, None);
+    }
+
+    fn select_changes_repository_for_owner_gated(
+        &mut self,
+        key: &HostTaskKey,
+        selector: TaskRepositorySelector,
+        captured_focus_epoch: Option<FocusEpoch>,
+        captured_revision: Option<u64>,
+    ) {
+        if self.selected_task_key.as_ref() != Some(key) {
+            return;
+        }
+        let Some(slot) = self.host_slot(&key.host) else {
+            return;
+        };
+        if slot.interaction.selected_task() != Some(key.task_id) {
+            return;
+        }
+        if let Some(expected) = captured_focus_epoch {
+            if slot.interaction.current_focus_epoch() != expected {
+                return;
+            }
+        }
+        if let Some(expected_revision) = captured_revision {
+            let live_revision = slot
+                .client_model
+                .as_ref()
+                .and_then(|model| model.task(key.task_id))
+                .map(|snapshot| snapshot.task.revision);
+            if live_revision != Some(expected_revision) {
+                return;
+            }
+        }
+        let Some(entry) = self.repository_catalog_for_owner(key).and_then(|catalog| {
+            catalog
+                .repositories
+                .iter()
+                .find(|entry| entry.selector == selector)
+                .cloned()
+        }) else {
+            return;
+        };
+        if !repository_status_readable(&entry) {
+            if let Some(slot) = self.host_slot_mut(&key.host) {
+                slot.last_query_detail = Some("Repository is unavailable.".into());
+            }
+            return;
+        }
+        self.selected_repository = Some((key.clone(), selector.clone()));
+        let _ = self.dispatch_action_recorded_for_owner(
+            &key.host,
+            ActionRequest::TaskCockpit {
+                task_id: key.task_id,
+                query: TaskCockpitQuery::GitStatusTargeted { selector },
+            },
         );
         self.refresh_accessibility_tree();
     }
@@ -30927,25 +32440,7 @@ impl NativeShell {
         let Some(task_id) = self.local_slot_mut().interaction.selected_task() else {
             return;
         };
-        let Some(entry) = self
-            .repository_catalog_for_task(task_id)
-            .and_then(|catalog| {
-                catalog
-                    .repositories
-                    .iter()
-                    .find(|entry| entry.selector == selector)
-            })
-        else {
-            return;
-        };
-        if !repository_status_readable(entry) {
-            self.local_slot_mut().last_query_detail = Some("Repository is unavailable.".into());
-            return;
-        }
-        self.selected_repository = Some((task_id, selector.clone()));
-        let _ = self
-            .dispatch_task_cockpit_query(task_id, TaskCockpitQuery::GitStatusTargeted { selector });
-        self.refresh_accessibility_tree();
+        self.select_changes_repository_for_owner(&self.local_task_key(task_id), selector);
     }
 
     fn begin_header_open(&mut self) {
@@ -31886,8 +33381,17 @@ impl NativeShell {
         }
     }
 
-    /// The application header. `host_status_control` is supplied by the caller
-    /// so the interactive path can attach listeners without duplicating chrome.
+    /// Whether the globally selected owner's dock is showing the raw terminal
+    /// canvas. Remote owners use the same visibility bit for display-only mode.
+    fn owner_showing_raw_terminal(&self) -> bool {
+        let Some(key) = self.selected_task_key.as_ref() else {
+            return self.local_slot().cockpit.dock().showing_raw_terminal();
+        };
+        self.host_slot(&key.host)
+            .map(|slot| slot.cockpit.dock().showing_raw_terminal())
+            .unwrap_or(false)
+    }
+
     /// Compact, independent controls for the center canvas and right context
     /// panel. T3 keeps layout controls in the title bar as quiet icon toggles;
     /// the center mode remains an explicit two-state choice so the active
@@ -31897,8 +33401,7 @@ impl NativeShell {
         tokens: crate::ui::tokens::ThemeTokens,
         cx: &Context<Self>,
     ) -> AnyElement {
-        let terminal_visible = self.local_slot().cockpit.dock().showing_raw_terminal();
-        let remote = self.selected_owner_is_remote();
+        let terminal_visible = self.owner_showing_raw_terminal();
         let conversation_option = div()
             .id("native-task-center-conversation")
             .tab_stop(true)
@@ -31930,69 +33433,49 @@ impl NativeShell {
                 cx.notify();
             }))
             .child("Conversation");
-        let terminal_option = if remote {
-            div()
-                .id("native-task-center-terminal-unavailable")
-                .flex()
-                .flex_none()
-                .items_center()
-                .justify_center()
-                .gap(px(5.0))
-                .h(px(22.0))
-                .px(px(8.0))
-                .rounded(px(tokens.density.radii.sm))
-                .bg(tokens.surfaces.raised.to_gpui())
-                .text_size(px(tokens.density.typography.caption))
-                .text_color(tokens.text.disabled.to_gpui())
-                .child(crate::icons::app_icon(
-                    crate::icons::TERMINAL,
-                    12.0,
-                    tokens.text.disabled.to_u32(),
-                ))
-                .child("Terminal (local only)")
-        } else {
-            div()
-                .id("native-task-center-terminal")
-                .tab_stop(true)
-                .flex()
-                .flex_none()
-                .items_center()
-                .justify_center()
-                .gap(px(5.0))
-                .h(px(22.0))
-                .px(px(8.0))
-                .rounded(px(tokens.density.radii.sm))
-                .cursor_pointer()
-                .bg(if terminal_visible {
-                    tokens.surfaces.overlay.to_gpui()
-                } else {
-                    tokens.surfaces.raised.to_gpui()
-                })
-                .text_size(px(tokens.density.typography.caption))
-                .text_color(if terminal_visible {
-                    tokens.text.primary.to_gpui()
-                } else {
-                    tokens.text.muted.to_gpui()
-                })
-                .hover(|style| style.bg(tokens.surfaces.overlay.to_gpui()))
-                .on_click(cx.listener(|shell, _event: &ClickEvent, window, cx| {
-                    cx.stop_propagation();
-                    shell.set_provider_terminal_visible(true);
+        let terminal_option = div()
+            .id("native-task-center-terminal")
+            .tab_stop(true)
+            .flex()
+            .flex_none()
+            .items_center()
+            .justify_center()
+            .gap(px(5.0))
+            .h(px(22.0))
+            .px(px(8.0))
+            .rounded(px(tokens.density.radii.sm))
+            .cursor_pointer()
+            .bg(if terminal_visible {
+                tokens.surfaces.overlay.to_gpui()
+            } else {
+                tokens.surfaces.raised.to_gpui()
+            })
+            .text_size(px(tokens.density.typography.caption))
+            .text_color(if terminal_visible {
+                tokens.text.primary.to_gpui()
+            } else {
+                tokens.text.muted.to_gpui()
+            })
+            .hover(|style| style.bg(tokens.surfaces.overlay.to_gpui()))
+            .on_click(cx.listener(|shell, _event: &ClickEvent, window, cx| {
+                cx.stop_propagation();
+                shell.set_provider_terminal_visible(true);
+                if !shell.selected_owner_is_remote() {
                     shell.terminal_focus_handle.focus(window);
                     shell.pending_terminal_focus = false;
-                    cx.notify();
-                }))
-                .child(crate::icons::app_icon(
-                    crate::icons::TERMINAL,
-                    12.0,
-                    if terminal_visible {
-                        tokens.text.primary.to_u32()
-                    } else {
-                        tokens.text.muted.to_u32()
-                    },
-                ))
-                .child("Terminal")
-        };
+                }
+                cx.notify();
+            }))
+            .child(crate::icons::app_icon(
+                crate::icons::TERMINAL,
+                12.0,
+                if terminal_visible {
+                    tokens.text.primary.to_u32()
+                } else {
+                    tokens.text.muted.to_u32()
+                },
+            ))
+            .child("Terminal");
         let center_mode_switch = div()
             .id("native-shell-center-mode-switch")
             .flex()
@@ -33108,7 +34591,7 @@ impl NativeShell {
                 (
                     row.key,
                     row.title,
-                    compact_age_label(unix_time_ms(), 0),
+                    compact_age_label(unix_time_ms(), row.occurred_at_ms),
                 )
             })
             .collect::<Vec<_>>();
@@ -33331,11 +34814,60 @@ impl NativeShell {
                                 };
                                 header.child(claude).child(codex)
                             } else if remote_project {
+                                let shell_for_remote_new = shell_entity.clone();
+                                let shell_for_remote_new_key = shell_entity.clone();
+                                let remote_project_key = project_key.clone();
+                                let remote_project_key_for_key = project_key.clone();
                                 header.child(
                                     div()
+                                        .id((
+                                            "native-project-new-task",
+                                            stable_host_project_element_key(
+                                                &project_key,
+                                                "new-task",
+                                            ),
+                                        ))
+                                        .tab_stop(true)
                                         .px(px(tokens.density.spacing.sm))
-                                        .text_color(tokens.text.disabled.to_gpui())
-                                        .child("Remote · no new task"),
+                                        .py(px(tokens.density.spacing.xxs))
+                                        .rounded(px(tokens.density.radii.sm))
+                                        .hover(|style| style.bg(tokens.surfaces.hover.to_gpui()))
+                                        .on_mouse_down(
+                                            MouseButton::Left,
+                                            move |_event: &MouseDownEvent,
+                                                  _window: &mut Window,
+                                                  app: &mut gpui::App| {
+                                                let _ = shell_for_remote_new.update(app, |shell, cx| {
+                                                    cx.stop_propagation();
+                                                    shell.begin_new_task_for_project_key(
+                                                        remote_project_key.clone(),
+                                                    );
+                                                    cx.notify();
+                                                });
+                                            },
+                                        )
+                                        .on_key_down(
+                                            move |event: &KeyDownEvent,
+                                                  _window: &mut Window,
+                                                  app: &mut gpui::App| {
+                                                if matches!(
+                                                    event.keystroke.key.as_str(),
+                                                    "enter" | "space"
+                                                ) {
+                                                    let _ = shell_for_remote_new_key.update(
+                                                        app,
+                                                        |shell, cx| {
+                                                            cx.stop_propagation();
+                                                            shell.begin_new_task_for_project_key(
+                                                                remote_project_key_for_key.clone(),
+                                                            );
+                                                            cx.notify();
+                                                        },
+                                                    );
+                                                }
+                                            },
+                                        )
+                                        .child("+Task"),
                                 )
                             } else {
                                 let checking_label = match provider_affordance {
@@ -33393,12 +34925,18 @@ impl NativeShell {
                         } => {
                         let shell_for_mouse = shell_entity.clone();
                         let shell_for_mouse_up = shell_entity.clone();
+                        let shell_for_left_select = shell_entity.clone();
                         let shell_for_key = shell_entity.clone();
                         let shell_for_delete = shell_entity.clone();
+                        let shell_for_delete_click = shell_entity.clone();
+                        let shell_for_delete_key = shell_entity.clone();
                         let task_id = task_key.task_id;
                         let task_key_mouse = task_key.clone();
+                        let task_key_left = task_key.clone();
                         let task_key_key = task_key.clone();
                         let task_key_delete = task_key.clone();
+                        let task_key_delete_click = task_key.clone();
+                        let task_key_delete_key = task_key.clone();
                         let task_is_local = task_key.host == local_host_for_list;
                         let (
                             row_title,
@@ -33424,39 +34962,60 @@ impl NativeShell {
                             move |event: &MouseDownEvent,
                                   window: &mut Window,
                                   app: &mut gpui::App| {
+                                // Right/middle must be captured so they cannot fall
+                                // through to the terminal dock. Left must reach the
+                                // archived Delete hitbox (child on_click / key).
+                                if !task_rail_row_capture_consumes_button(event.button) {
+                                    return;
+                                }
                                 let _ = shell_for_mouse.update(app, |shell, cx| {
                                     cx.stop_propagation();
-                                    if event.button == MouseButton::Left {
-                                        shell.focus_handle.focus(window);
-                                        let mode = if event.modifiers.shift {
-                                            FleetSelectMode::Toggle
-                                        } else {
-                                            FleetSelectMode::Replace
-                                        };
-                                        // Selection opens Done/Archived; never restores lifecycle.
-                                        let _ = settled;
-                                        let _ = shell.select_fleet_task_key(task_key_mouse.clone(), mode);
-                                        shell.refresh_accessibility_tree();
-                                        cx.notify();
-                                    } else if event.button == MouseButton::Right {
-                                        // Remote rows must never mint local selected_project_id.
+                                    if event.button == MouseButton::Right {
+                                        // Owner-captured rename; never mint local selected_project_id
+                                        // from a remote raw ProjectId.
                                         if task_is_local {
                                             shell.selected_project_id = Some(project_id);
-                                            if task_row_right_click_should_rename(archived) {
-                                                shell.begin_task_rename(task_id);
-                                            }
+                                        }
+                                        if task_row_right_click_should_rename(archived) {
+                                            shell.begin_task_rename_key(task_key_mouse.clone());
                                         }
                                         cx.notify();
                                     }
                                 });
                             };
                         let mouse_up_handler =
-                            move |_event: &MouseUpEvent,
+                            move |event: &MouseUpEvent,
                                   _window: &mut Window,
                                   app: &mut gpui::App| {
+                                if !task_rail_row_capture_consumes_button(event.button) {
+                                    return;
+                                }
                                 let _ = shell_for_mouse_up.update(app, |shell, cx| {
                                     cx.stop_propagation();
                                     shell.local_slot_mut().interaction.release_pointer(NATIVE_POINTER_ID);
+                                });
+                            };
+                        let left_select_handler =
+                            move |event: &MouseDownEvent,
+                                  window: &mut Window,
+                                  app: &mut gpui::App| {
+                                if event.button != MouseButton::Left {
+                                    return;
+                                }
+                                let _ = shell_for_left_select.update(app, |shell, cx| {
+                                    cx.stop_propagation();
+                                    shell.focus_handle.focus(window);
+                                    let mode = if event.modifiers.shift {
+                                        FleetSelectMode::Toggle
+                                    } else {
+                                        FleetSelectMode::Replace
+                                    };
+                                    // Selection opens Done/Archived; never restores lifecycle.
+                                    let _ = settled;
+                                    let _ = shell
+                                        .select_fleet_task_key(task_key_left.clone(), mode);
+                                    shell.refresh_accessibility_tree();
+                                    cx.notify();
                                 });
                             };
                         let key_handler =
@@ -33518,13 +35077,13 @@ impl NativeShell {
                             .px(px(6.0))
                             .py(px(2.0))
                             .child(row
-                            // Capture every button at the row boundary so a
-                            // right/middle click cannot fall through to the
-                            // terminal dock behind the list. The handler
-                            // still navigates only on the explicit primary
-                            // button.
+                            // Capture right/middle at the row boundary so they cannot
+                            // fall through to the terminal dock. Left selection uses
+                            // bubble on_mouse_down so the archived Delete child can
+                            // receive its mouse sequence / click.
                             .capture_any_mouse_down(mouse_handler)
                             .capture_any_mouse_up(mouse_up_handler)
+                            .on_mouse_down(MouseButton::Left, left_select_handler)
                             .on_key_down(key_handler)
                             .child(
                                 div()
@@ -33588,7 +35147,7 @@ impl NativeShell {
                                             .truncate()
                                             .child(row_title),
                                     )
-                                    .when(archived && task_is_local, |title| {
+                                    .when(archived, |title| {
                                         title.child(
                                             div()
                                                 .id((
@@ -33613,18 +35172,59 @@ impl NativeShell {
                                                             .to_gpui(),
                                                     )
                                                 })
+                                                .on_mouse_down(
+                                                    MouseButton::Left,
+                                                    move |_event: &MouseDownEvent,
+                                                          _window: &mut Window,
+                                                          app: &mut gpui::App| {
+                                                        let _ = shell_for_delete.update(
+                                                            app,
+                                                            |shell, cx| {
+                                                                cx.stop_propagation();
+                                                                shell.begin_task_delete_key(
+                                                                    task_key_delete.clone(),
+                                                                );
+                                                                cx.notify();
+                                                            },
+                                                        );
+                                                    },
+                                                )
                                                 .on_click(move |_event: &ClickEvent,
                                                                 _window: &mut Window,
                                                                 app: &mut gpui::App| {
-                                                    let _ = shell_for_delete.update(
+                                                    let _ = shell_for_delete_click.update(
                                                         app,
                                                         |shell, cx| {
                                                             cx.stop_propagation();
-                                                            shell.begin_task_delete(task_id);
+                                                            shell.begin_task_delete_key(
+                                                                task_key_delete_click.clone(),
+                                                            );
                                                             cx.notify();
                                                         },
                                                     );
                                                 })
+                                                .on_key_down(
+                                                    move |event: &KeyDownEvent,
+                                                          _window: &mut Window,
+                                                          app: &mut gpui::App| {
+                                                        if matches!(
+                                                            event.keystroke.key.as_str(),
+                                                            "enter" | "space"
+                                                        ) {
+                                                            let _ = shell_for_delete_key.update(
+                                                                app,
+                                                                |shell, cx| {
+                                                                    cx.stop_propagation();
+                                                                    shell.begin_task_delete_key(
+                                                                        task_key_delete_key
+                                                                            .clone(),
+                                                                    );
+                                                                    cx.notify();
+                                                                },
+                                                            );
+                                                        }
+                                                    },
+                                                )
                                                 .child(crate::icons::app_icon(
                                                     crate::icons::TRASH,
                                                     12.0,
@@ -33735,8 +35335,8 @@ impl NativeShell {
         });
         let task_rename = cx.listener(|shell, _action: &TaskRename, _window, cx| {
             cx.stop_propagation();
-            if let Some(task_id) = shell.local_slot_mut().interaction.selected_task() {
-                shell.begin_task_rename(task_id);
+            if let Some(key) = shell.selected_task_key.clone() {
+                shell.begin_task_rename_key(key);
             }
         });
 
@@ -33824,12 +35424,12 @@ impl NativeShell {
         });
         let toggle_terminal = cx.listener(|shell, _action: &NativeToggleTerminal, window, cx| {
             cx.stop_propagation();
-            let show_terminal = !shell.local_slot_mut().cockpit.dock().showing_raw_terminal();
+            let show_terminal = !shell.owner_showing_raw_terminal();
             shell.set_provider_terminal_visible(show_terminal);
-            if show_terminal {
+            if show_terminal && !shell.selected_owner_is_remote() {
                 shell.terminal_focus_handle.focus(window);
                 shell.pending_terminal_focus = false;
-            } else {
+            } else if !show_terminal {
                 shell.composer_focus_handle.focus(window);
                 shell.pending_composer_focus = false;
             }
@@ -33841,10 +35441,14 @@ impl NativeShell {
             cx.notify();
         });
 
-        // Context tools keep their existing Alt+digit accelerators. Terminal
-        // is intentionally absent here because it is the center-canvas mode,
-        // not a duplicate right-dock surface.
-        let active_tool = self.local_slot_mut().cockpit.active_tool();
+        let active_tool = self
+            .selected_task_key
+            .as_ref()
+            .and_then(|key| {
+                self.host_slot(&key.host)
+                    .map(|slot| slot.cockpit.active_tool())
+            })
+            .unwrap_or_else(|| self.local_slot_mut().cockpit.active_tool());
         let remote_dock = self.selected_owner_is_remote();
         let mut dock_tabs = div()
             .id("native-shell-dock-tabs")
@@ -33859,7 +35463,8 @@ impl NativeShell {
             .border_color(tokens.borders.subtle.to_gpui());
         for (tool, element_id, digit) in NATIVE_DOCK_TABS {
             let selected = tool == active_tool;
-            let tab = if remote_dock {
+            let remote_supported = !remote_dock || Self::remote_dock_tab_supported(tool);
+            let tab = if !remote_supported {
                 div()
                     .id(SharedString::from(format!("{element_id}-unavailable")))
                     .flex()
@@ -34004,34 +35609,27 @@ impl NativeShell {
                         tokens.text.muted.to_u32(),
                     ))
                     .child(
-                        if self.selected_owner_is_remote() {
-                            Button::new("native-sidebar-new-task-unavailable")
-                                .label("New task (local only)")
-                                .icon(gpui_component::IconName::Plus)
-                                .tooltip(Self::remote_local_authority_reason())
-                                .ghost()
-                                .small()
-                                .rounded(px(8.0))
-                                .disabled(true)
-                        } else {
-                            Button::new("native-sidebar-new-task")
-                                .label("New task")
-                                .icon(gpui_component::IconName::Plus)
-                                .tooltip("New task")
-                                .primary()
-                                .small()
-                                .rounded(px(8.0))
-                                .on_click(cx.listener(|shell, _event: &ClickEvent, _window, cx| {
-                                    cx.stop_propagation();
-                                    shell.begin_new_task();
-                                    cx.notify();
-                                }))
-                        },
+                        Button::new("native-sidebar-new-task")
+                            .label("New task")
+                            .icon(gpui_component::IconName::Plus)
+                            .tooltip("New task")
+                            .primary()
+                            .small()
+                            .rounded(px(8.0))
+                            .on_click(cx.listener(|shell, _event: &ClickEvent, _window, cx| {
+                                cx.stop_propagation();
+                                shell.begin_new_task();
+                                cx.notify();
+                            })),
                     ),
             )
             .into_any_element();
         let settled_panel = (!archived_view && !settled_rows.is_empty()).then(|| {
             let settled_count = settled_rows.len();
+            // Keep a real measured height so Done stays visible when the active
+            // list would otherwise consume the full flex column.
+            let settled_body_height =
+                (settled_count.min(5) as f32 * 34.0).clamp(34.0, 212.0);
             let rows = settled_rows.into_iter().map(|(settled_key, title, age)| {
                 let shell_for_settled = settled_shell_entity.clone();
                 let is_open = settled_open_task_ids.contains(&settled_key);
@@ -34109,6 +35707,7 @@ impl NativeShell {
                 .flex()
                 .flex_col()
                 .flex_none()
+                .min_h(px(28.0 + settled_body_height))
                 .max_h(px(240.0))
                 .border_t(px(1.0))
                 .border_color(tokens.borders.subtle.to_gpui())
@@ -34138,7 +35737,13 @@ impl NativeShell {
                             tokens.text.muted.to_u32(),
                         )),
                 )
-                .child(div().min_h(px(0.0)).overflow_y_scrollbar().children(rows))
+                .child(
+                    div()
+                        .h(px(settled_body_height))
+                        .min_h(px(34.0))
+                        .overflow_y_scrollbar()
+                        .children(rows),
+                )
                 .into_any_element()
         });
         let inbox_panel = div()
@@ -34603,6 +36208,37 @@ impl NativeShell {
         host_id: &HostId,
         request: ActionRequest,
     ) -> Result<NativeActionRecord, NativeActionDispatchFailure> {
+        self.dispatch_action_recorded_for_owner_inner(
+            host_id,
+            request,
+            false,
+            NativeActionPurpose::Ordinary,
+        )
+    }
+
+    /// Archive/Delete confirmation dispatch: stamps immutable delete-flow
+    /// provenance before enqueue so late cancel/tombstone outcomes never fall
+    /// into generic Failed/Uncertain retry.
+    fn dispatch_delete_flow_action_recorded_for_owner(
+        &mut self,
+        host_id: &HostId,
+        request: ActionRequest,
+    ) -> Result<NativeActionRecord, NativeActionDispatchFailure> {
+        self.dispatch_action_recorded_for_owner_inner(
+            host_id,
+            request,
+            false,
+            NativeActionPurpose::DeleteFlowConfirmation,
+        )
+    }
+
+    fn dispatch_action_recorded_for_owner_inner(
+        &mut self,
+        host_id: &HostId,
+        request: ActionRequest,
+        reuse_handler: bool,
+        purpose: NativeActionPurpose,
+    ) -> Result<NativeActionRecord, NativeActionDispatchFailure> {
         if self.action_lane_len_for_owner(host_id) >= MAX_ACTION_LANE_RECORDS {
             if is_native_query_request(&request) {
                 self.settle_native_query_request_capacity_failure();
@@ -34613,10 +36249,13 @@ impl NativeShell {
                 "the host action lane is busy",
             ));
         }
-        let Some(record) = self
-            .host_slot_mut(host_id)
-            .and_then(|slot| slot.interaction.action(request))
-        else {
+        let Some(record) = self.host_slot_mut(host_id).and_then(|slot| {
+            if reuse_handler {
+                slot.interaction.action_on_current_handler(request)
+            } else {
+                slot.interaction.action(request)
+            }
+        }) else {
             return Err(NativeActionDispatchFailure::before_capture(
                 "the selected task or runtime fence changed",
             ));
@@ -34663,6 +36302,7 @@ impl NativeShell {
             }
         }
         let mut record = record;
+        record.purpose = purpose;
         match self.enqueue_host_action_for_owner(host_id, &mut record) {
             NativeHostActionResult::Queued => Ok(record),
             result @ (NativeHostActionResult::Disconnected
@@ -34700,8 +36340,21 @@ impl NativeShell {
     }
 
     fn dispatch_related_actions(&mut self, requests: impl IntoIterator<Item = ActionRequest>) {
+        let local = self.local_host_id();
         let mut reuse_handler = false;
         for request in requests {
+            if let ActionRequest::TaskCockpit {
+                task_id,
+                query: TaskCockpitQuery::FilesList {
+                    relative_directory, ..
+                },
+            } = &request
+            {
+                self.remember_files_browse_directory(
+                    HostTaskKey::new(local.clone(), *task_id),
+                    relative_directory.clone(),
+                );
+            }
             if self.action_lane_len() >= MAX_ACTION_LANE_RECORDS {
                 if is_native_query_request(&request) {
                     self.settle_native_query_request_capacity_failure();
@@ -35923,6 +37576,7 @@ mod tests {
     use super::{fleet_projection_message_accepted, NativeProjectionOwner, NativeSettingsPage, ProviderSettingsFieldFocus};
     use crate::client::{ClientConnection, HostClient, HostClientConfig, HostTaskKey, TaskInboxPreview};
     use crate::client::FleetError;
+    use crate::domain::id::RequestId;
     use crate::host::IpcError;
     use crate::protocol::{Capability, CapabilitySet, FrameLimits, ProfileFingerprint};
     use crate::remote::RemoteImageAttachment;
@@ -41008,7 +42662,7 @@ mod tests {
 
                 shell.begin_new_task_for_project(project_id);
                 assert_eq!(
-                    shell.new_task.as_ref().map(|draft| draft.project_id),
+                    shell.new_task.as_ref().map(|draft| draft.project_key.project_id),
                     Some(project_id),
                     "task creation must retain the project whose header launched it"
                 );
@@ -42962,6 +44616,7 @@ mod tests {
                     super::DeleteTaskStage::AwaitingArchive {
                         command_id,
                         archive_accepted,
+                        ..
                     } => {
                         assert!(!archive_accepted);
                         command_id
@@ -43088,7 +44743,12 @@ mod tests {
                 },
             });
             assert!(shell.delete_task.is_none());
-            assert!(!shell.retired_delete_flow_commands.contains(&delete_command));
+            assert!(
+                shell.retired_delete_flow_commands.iter().any(|retired| {
+                    retired.command_id == delete_command && retired.terminal
+                }),
+                "retired delete tombstone must persist as terminal so duplicate late results cannot regain advance"
+            );
             shell.begin_task_delete(task_id);
             shell.confirm_task_delete();
             let failed_delete = shared
@@ -43421,10 +45081,14 @@ mod tests {
         assert!(super::DeleteTaskStage::AwaitingArchive {
             command_id: CommandId::new(),
             archive_accepted: false,
+            connection_epoch: 1,
+            runtime_generation: 1,
         }
         .is_submitting());
         assert!(super::DeleteTaskStage::AwaitingDelete {
             command_id: CommandId::new(),
+            connection_epoch: 1,
+            runtime_generation: 1,
         }
         .is_submitting());
     }
@@ -43471,7 +45135,7 @@ mod tests {
             let accepted = shared.lock().expect("runtime").accepted.clone();
             let delete_opened = {
                 shell.begin_task_delete(task_id);
-                shell.delete_task.as_ref().map(|draft| draft.task_id)
+                shell.delete_task.as_ref().map(|draft| draft.owner.task_id)
             };
             (
                 shell.local_slot()
@@ -48871,9 +50535,9 @@ mod tests {
     }
 
     #[test]
-    fn remote_selection_blocks_local_new_task_and_local_only_controls() {
+    fn remote_selection_blocks_local_only_controls_but_allows_owner_new_task() {
         if rerun_headless_shell_test_in_child(
-            "ui::native_shell::tests::remote_selection_blocks_local_new_task_and_local_only_controls",
+            "ui::native_shell::tests::remote_selection_blocks_local_only_controls_but_allows_owner_new_task",
         ) {
             return;
         }
@@ -48895,14 +50559,14 @@ mod tests {
             });
             let observed = entity.update(cx, |shell, _cx| {
                 shell.install_idle_conversation_photo_for_test();
-                let shared_project = ProjectId::from_bytes([
-                    0x01, 0x8f, 0x60, 0xb0, 0x9c, 0x1a, 0x70, 0x01, 0x80, 0x00, 0x00, 0x00, 0x00,
-                    0x00, 0x00, 0x42,
-                ])
-                .expect("project");
-                shell.install_project_for_test("shared-raw", shared_project);
                 let (model, shared_task) = terminal_bound_client_model();
                 let model = Arc::new(model);
+                let shared_project = model
+                    .tasks()
+                    .get(&shared_task)
+                    .map(|snapshot| snapshot.task.project_id)
+                    .expect("shared project from terminal-bound model");
+                shell.install_project_for_test("shared-raw", shared_project);
                 shell
                     .apply_client_model(Arc::clone(&model))
                     .expect("local model");
@@ -48910,7 +50574,7 @@ mod tests {
                 let local_key = HostTaskKey::new(local.clone(), shared_task);
                 let remote_key = HostTaskKey::new(remote_host.clone(), shared_task);
 
-                let (remote_runtime, _) =
+                let (remote_runtime, remote_shared) =
                     TestRuntime::new(true, NativeHostActionResult::Queued);
                 let mut remote_slot = HostUiState::new_empty(
                     remote_host.clone(),
@@ -48920,14 +50584,16 @@ mod tests {
                 );
                 remote_slot.host_runtime =
                     Some(NativeHostRuntimeAttachment::Injected(Box::new(remote_runtime)));
-                shell
-                    .attach_host_ui_slot(remote_slot)
-                    .expect("attach");
+                shell.attach_host_ui_slot(remote_slot).expect("attach");
                 shell
                     .apply_client_model_for_host(&remote_host, Arc::clone(&model))
                     .expect("remote model");
+                shell.install_project_for_host_for_test(
+                    &remote_host,
+                    "remote-shared",
+                    shared_project,
+                );
 
-                // Local create works when local context is selected.
                 shell
                     .select_fleet_task_key(local_key.clone(), FleetSelectMode::Replace)
                     .expect("select local");
@@ -48943,28 +50609,51 @@ mod tests {
                     })
                     .count();
 
-                // Open dialog then switch to remote with the same raw project/task.
                 shell
                     .select_fleet_task_key(remote_key.clone(), FleetSelectMode::Replace)
                     .expect("select remote");
                 assert!(
-                    shell.new_task.is_none(),
-                    "remote selection must dismiss stale new-task dialog"
+                    shell.new_task.as_ref().is_some_and(|draft| {
+                        draft.project_key == HostProjectKey::new(local.clone(), shared_project)
+                    }),
+                    "focus change must not clear or retarget a frozen new-task draft"
                 );
+                shell.new_task = None;
                 shell.begin_new_task();
-                assert!(shell.new_task.is_none(), "remote begin_new_task must no-op");
+                assert!(
+                    shell.new_task.as_ref().is_some_and(|draft| {
+                        draft.project_key
+                            == HostProjectKey::new(remote_host.clone(), shared_project)
+                    }),
+                    "remote begin_new_task must capture owner HostProjectKey"
+                );
                 shell.begin_new_task_for_project(shared_project);
                 assert!(
-                    shell.new_task.is_none(),
-                    "remote begin_new_task_for_project must not alias raw ProjectId"
+                    shell.new_task.as_ref().is_some_and(|draft| {
+                        draft.project_key.host == local
+                            && draft.project_key.project_id == shared_project
+                    }),
+                    "begin_new_task_for_project remains local HostProjectKey"
                 );
-                // Force a stale dialog and prove submit refuses.
-                shell.new_task = Some(super::NewTaskDraft {
-                    project_id: shared_project,
-                    error: None,
-                });
+                shell.new_task = None;
+                shell
+                    .select_fleet_task_key(remote_key.clone(), FleetSelectMode::Replace)
+                    .expect("reselect remote");
+                shell.begin_new_task_for_project_key(HostProjectKey::new(
+                    remote_host.clone(),
+                    shared_project,
+                ));
                 shell.submit_new_task();
-                assert!(shell.new_task.is_none(), "stale submit clears dialog");
+                let remote_creates = remote_shared
+                    .lock()
+                    .expect("remote")
+                    .accepted
+                    .iter()
+                    .filter(|record| {
+                        matches!(record.command, NativeHostCommand::TaskCreateV2 { .. })
+                    })
+                    .count();
+                assert_eq!(remote_creates, 1, "owner create must dispatch on remote");
                 let creates_after = local_shared
                     .lock()
                     .expect("local")
@@ -48976,18 +50665,9 @@ mod tests {
                     .count();
                 assert_eq!(
                     creates_before, creates_after,
-                    "remote context must not dispatch TaskCreateV2"
+                    "remote create must not mutate local TaskCreateV2 lane"
                 );
 
-                // Remote selection must not retain a local selected_project mint from
-                // the same raw ProjectId used on the remote host.
-                shell.selected_project_id = None;
-                shell.dispatch_named_accessibility_action("native-sidebar-new-task");
-                assert!(shell.new_task.is_none());
-                assert!(
-                    shell.selected_project_id.is_none(),
-                    "remote AT new-task must not mint local selected_project_id"
-                );
                 shell.dispatch_named_accessibility_action("native-task-center-terminal");
                 assert!(
                     !shell.local_slot().cockpit.dock().showing_raw_terminal(),
@@ -48999,7 +50679,6 @@ mod tests {
                     "remote AT Add action must not open the local project menu"
                 );
 
-                // Local controls still work after returning to local context.
                 shell
                     .select_fleet_task_key(local_key.clone(), FleetSelectMode::Replace)
                     .expect("back to local");
@@ -49011,30 +50690,2252 @@ mod tests {
                 shell.set_provider_terminal_visible(false);
 
                 (
-                    creates_before == creates_after,
+                    creates_before == creates_after && remote_creates == 1,
                     local_dialog,
                     local_terminal,
-                    shell
-                        .host_slot(&remote_host)
-                        .and_then(|slot| slot.composer_error.clone()),
                 )
             });
             *report_slot.borrow_mut() = Some(observed);
             drop(entity);
             cx.quit();
         });
-        let (no_remote_create, local_dialog, local_terminal, remote_error) =
+        let (owner_create_ok, local_dialog, local_terminal) =
             report.borrow_mut().take().expect("create-guard report");
-        assert!(no_remote_create);
+        assert!(owner_create_ok);
         assert!(local_dialog, "local new-task must still open");
         assert!(local_terminal, "local terminal toggle must still work");
+    }
+
+    #[test]
+    fn owner_remote_lifecycle_create_rename_delete_routes_and_fences() {
+        if rerun_headless_shell_test_in_child(
+            "ui::native_shell::tests::owner_remote_lifecycle_create_rename_delete_routes_and_fences",
+        ) {
+            return;
+        }
+        let host_a = HostId::Remote([0xb1; 16]);
+        let host_b = HostId::Remote([0xb2; 16]);
+        let (runtime, local_shared) = TestRuntime::new(true, NativeHostActionResult::Queued);
+        gpui::Application::headless().run(move |cx| {
+            crate::ui::init(cx);
+            with_test_shell_in_app(cx, runtime, |shell| {
+                let (model, shared_task) = terminal_bound_client_model();
+                let (archived_model, archived_id) = terminal_bound_archived_client_model();
+                assert_eq!(shared_task, archived_id);
+                let model = Arc::new(model);
+                let archived_model = Arc::new(archived_model);
+                shell
+                    .apply_client_model(Arc::clone(&model))
+                    .expect("local model");
+                let local = shell.local_host_id();
+                let shared_project = model
+                    .tasks()
+                    .get(&shared_task)
+                    .map(|snapshot| snapshot.task.project_id)
+                    .expect("project");
+
+                let remote_a =
+                    attach_remote_test_host_with_shared(shell, &host_a, Arc::clone(&model));
+                let remote_b =
+                    attach_remote_test_host_with_shared(shell, &host_b, Arc::clone(&model));
+                shell.install_project_for_host_for_test(&host_a, "a-project", shared_project);
+                shell.install_project_for_host_for_test(&host_b, "b-project", shared_project);
+
+                let key_a = HostTaskKey::new(host_a.clone(), shared_task);
+                let key_b = HostTaskKey::new(host_b.clone(), shared_task);
+                let local_key = HostTaskKey::new(local.clone(), shared_task);
+
+                shell
+                    .select_fleet_task_key(key_a.clone(), FleetSelectMode::Replace)
+                    .expect("select A");
+                shell.begin_new_task_for_project_key(HostProjectKey::new(
+                    host_a.clone(),
+                    shared_project,
+                ));
+                shell
+                    .select_fleet_task_key(key_b.clone(), FleetSelectMode::Replace)
+                    .expect("focus B while dialog open");
+                assert_eq!(
+                    shell.new_task.as_ref().map(|d| d.project_key.host.clone()),
+                    Some(host_a.clone())
+                );
+                shell.submit_new_task();
+                assert!(
+                    remote_a.lock().expect("a").accepted.iter().any(|record| {
+                        matches!(record.command, NativeHostCommand::TaskCreateV2 { .. })
+                    })
+                );
+                assert!(
+                    remote_b.lock().expect("b").accepted.iter().all(|record| {
+                        !matches!(record.command, NativeHostCommand::TaskCreateV2 { .. })
+                    })
+                );
+                assert!(
+                    local_shared.lock().expect("local").accepted.iter().all(|record| {
+                        !matches!(record.command, NativeHostCommand::TaskCreateV2 { .. })
+                    })
+                );
+
+                shell
+                    .select_fleet_task_key(key_a.clone(), FleetSelectMode::Replace)
+                    .expect("select A for rename");
+                shell.pending_automatic_titles.insert(
+                    key_a.clone(),
+                    super::PendingAutomaticTitle {
+                        expected_title: "bound terminal task".into(),
+                        proposed_title: "auto".into(),
+                        due: Instant::now() + std::time::Duration::from_secs(60),
+                    },
+                );
+                shell.pending_automatic_titles.insert(
+                    key_b.clone(),
+                    super::PendingAutomaticTitle {
+                        expected_title: "bound terminal task".into(),
+                        proposed_title: "auto-b".into(),
+                        due: Instant::now() + std::time::Duration::from_secs(60),
+                    },
+                );
+                shell.begin_task_rename_key(key_a.clone());
+                shell
+                    .select_fleet_task_key(key_b.clone(), FleetSelectMode::Replace)
+                    .expect("focus B during rename");
+                assert_eq!(
+                    shell.rename_task.as_ref().map(|d| d.owner.clone()),
+                    Some(key_a.clone())
+                );
+                if let Some(draft) = shell.rename_task.as_mut() {
+                    let _ = draft.title.set_value("Renamed on A");
+                }
+                shell.submit_task_rename();
+                assert!(!shell.pending_automatic_titles.contains_key(&key_a));
+                assert!(shell.pending_automatic_titles.contains_key(&key_b));
+                assert!(
+                    remote_a.lock().expect("a").accepted.iter().any(|record| {
+                        matches!(record.command, NativeHostCommand::TaskRename { .. })
+                    })
+                );
+
+                shell
+                    .select_fleet_task_key(key_a.clone(), FleetSelectMode::Replace)
+                    .expect("select A delete");
+                shell.begin_task_delete_key(key_a.clone());
+                shell
+                    .select_fleet_task_key(local_key.clone(), FleetSelectMode::Replace)
+                    .expect("focus local during delete dialog");
+                assert_eq!(
+                    shell.delete_task.as_ref().map(|d| d.owner.clone()),
+                    Some(key_a.clone())
+                );
+                shell.confirm_task_delete();
+                shell.confirm_task_delete();
+                let archive_count = remote_a
+                    .lock()
+                    .expect("a")
+                    .accepted
+                    .iter()
+                    .filter(|record| {
+                        matches!(
+                            record.command,
+                            NativeHostCommand::TaskArchive { task_id, .. } if task_id == shared_task
+                        )
+                    })
+                    .count();
+                assert_eq!(archive_count, 1);
+                let archive_record = remote_a
+                    .lock()
+                    .expect("a")
+                    .accepted
+                    .iter()
+                    .rev()
+                    .find(|record| {
+                        matches!(
+                            record.command,
+                            NativeHostCommand::TaskArchive { task_id, .. } if task_id == shared_task
+                        )
+                    })
+                    .cloned()
+                    .expect("archive");
+                let archive_command =
+                    native_command_id(&archive_record.command).expect("archive id");
+                shell.cancel_delete_task_flow();
+                shell.apply_epoch_fenced_action_outcome_for_host(
+                    &host_a,
+                    NativeHostActionOutcome::Accepted {
+                        action: archive_record,
+                        receipt: crate::domain::command::CommandReceipt::Accepted {
+                            command_id: archive_command,
+                            operation_id: crate::domain::id::OperationId::new(),
+                            task_revision: Some(5),
+                            event_ids: Vec::new(),
+                            prompt_mutation: None,
+                        },
+                    },
+                );
+                assert!(
+                    remote_a.lock().expect("a").accepted.iter().all(|record| {
+                        !matches!(
+                            record.command,
+                            NativeHostCommand::TaskLifecycle {
+                                command: crate::domain::command::Command::DeleteTask,
+                                ..
+                            }
+                        )
+                    })
+                );
+
+                shell.begin_task_delete_key(key_a.clone());
+                shell.confirm_task_delete();
+                let archive2 = remote_a
+                    .lock()
+                    .expect("a")
+                    .accepted
+                    .last()
+                    .cloned()
+                    .expect("second archive");
+                let archive2_id = native_command_id(&archive2.command).expect("id");
+                shell.apply_epoch_fenced_action_outcome_for_host(
+                    &host_a,
+                    NativeHostActionOutcome::Accepted {
+                        action: archive2,
+                        receipt: crate::domain::command::CommandReceipt::Accepted {
+                            command_id: archive2_id,
+                            operation_id: crate::domain::id::OperationId::new(),
+                            task_revision: Some(5),
+                            event_ids: Vec::new(),
+                            prompt_mutation: None,
+                        },
+                    },
+                );
+                shell
+                    .apply_client_model_for_host(&host_a, Arc::clone(&archived_model))
+                    .expect("archived on A");
+                assert_eq!(
+                    remote_a
+                        .lock()
+                        .expect("a")
+                        .accepted
+                        .iter()
+                        .filter(|record| {
+                            matches!(
+                                record.command,
+                                NativeHostCommand::TaskLifecycle {
+                                    command: crate::domain::command::Command::DeleteTask,
+                                    ..
+                                }
+                            )
+                        })
+                        .count(),
+                    1
+                );
+
+                shell.begin_task_delete_key(key_b.clone());
+                shell.confirm_task_delete();
+                let archive_b = remote_b
+                    .lock()
+                    .expect("b")
+                    .accepted
+                    .iter()
+                    .rev()
+                    .find(|record| {
+                        matches!(
+                            record.command,
+                            NativeHostCommand::TaskArchive { task_id, .. } if task_id == shared_task
+                        )
+                    })
+                    .cloned()
+                    .expect("archive B");
+                shell
+                    .apply_client_model_for_host(&host_b, Arc::clone(&archived_model))
+                    .expect("archived B before receipt");
+                assert!(
+                    remote_b.lock().expect("b").accepted.iter().all(|record| {
+                        !matches!(
+                            record.command,
+                            NativeHostCommand::TaskLifecycle {
+                                command: crate::domain::command::Command::DeleteTask,
+                                ..
+                            }
+                        )
+                    })
+                );
+                let archive_b_id = native_command_id(&archive_b.command).expect("b archive");
+                shell.apply_epoch_fenced_action_outcome_for_host(
+                    &host_b,
+                    NativeHostActionOutcome::Accepted {
+                        action: archive_b,
+                        receipt: crate::domain::command::CommandReceipt::Accepted {
+                            command_id: archive_b_id,
+                            operation_id: crate::domain::id::OperationId::new(),
+                            task_revision: Some(5),
+                            event_ids: Vec::new(),
+                            prompt_mutation: None,
+                        },
+                    },
+                );
+                assert!(
+                    remote_b.lock().expect("b").accepted.iter().any(|record| {
+                        matches!(
+                            record.command,
+                            NativeHostCommand::TaskLifecycle {
+                                command: crate::domain::command::Command::DeleteTask,
+                                ..
+                            }
+                        )
+                    })
+                );
+
+                // A already has archived_model installed; confirm queues DeleteTask
+                // directly (AwaitingDelete), not another archive.
+                assert!(
+                    shell
+                        .host_slot(&host_a)
+                        .and_then(|slot| slot.client_model.as_ref())
+                        .and_then(|model| model.tasks().get(&shared_task))
+                        .is_some_and(|snapshot| {
+                            snapshot.task.lifecycle
+                                == crate::domain::task::TaskLifecycle::Archived
+                        }),
+                    "precondition: A projection must already be Archived"
+                );
+                shell.begin_task_delete_key(key_a.clone());
+                shell.confirm_task_delete();
+                assert!(
+                    shell.delete_task.as_ref().is_some_and(|draft| {
+                        matches!(draft.stage, super::DeleteTaskStage::AwaitingDelete { .. })
+                            && draft.error.is_none()
+                    }),
+                    "precondition: archived A confirm must enter AwaitingDelete"
+                );
+                let live_command = shell.delete_flow_command_id();
+                let delete_dispatches_before = remote_a
+                    .lock()
+                    .expect("a")
+                    .accepted
+                    .iter()
+                    .filter(|record| {
+                        matches!(
+                            record.command,
+                            NativeHostCommand::TaskLifecycle {
+                                command: crate::domain::command::Command::DeleteTask,
+                                ..
+                            }
+                        )
+                    })
+                    .count();
+                let mut stale_delete = remote_a
+                    .lock()
+                    .expect("a")
+                    .accepted
+                    .last()
+                    .cloned()
+                    .expect("stale candidate");
+                stale_delete.connection_epoch = stale_delete.connection_epoch.wrapping_add(9);
+                shell.apply_epoch_fenced_action_outcome_for_host(
+                    &host_a,
+                    NativeHostActionOutcome::Accepted {
+                        action: stale_delete,
+                        receipt: crate::domain::command::CommandReceipt::Accepted {
+                            command_id: CommandId::new(),
+                            operation_id: crate::domain::id::OperationId::new(),
+                            task_revision: Some(5),
+                            event_ids: Vec::new(),
+                            prompt_mutation: None,
+                        },
+                    },
+                );
+                assert!(
+                    shell.delete_task.as_ref().is_some_and(|draft| {
+                        matches!(draft.stage, super::DeleteTaskStage::AwaitingDelete { .. })
+                            && draft.error.is_none()
+                    }),
+                    "unrelated stale+wrong-receipt delete must leave live AwaitingDelete intact"
+                );
+                assert_eq!(
+                    shell.delete_flow_command_id(),
+                    live_command,
+                    "live delete command ownership must remain unchanged"
+                );
+                assert_eq!(
+                    remote_a
+                        .lock()
+                        .expect("a")
+                        .accepted
+                        .iter()
+                        .filter(|record| {
+                            matches!(
+                                record.command,
+                                NativeHostCommand::TaskLifecycle {
+                                    command: crate::domain::command::Command::DeleteTask,
+                                    ..
+                                }
+                            )
+                        })
+                        .count(),
+                    delete_dispatches_before,
+                    "stale outcome must not enqueue another DeleteTask"
+                );
+
+                // QueueFull needs a fresh confirmation after closing the prior flow;
+                // confirming again while AwaitingArchive/AwaitingDelete is a no-op.
+                shell.cancel_delete_task_flow();
+                shell.begin_task_delete_key(key_a.clone());
+                remote_a.lock().expect("a").admission = NativeHostActionResult::QueueFull;
+                shell.confirm_task_delete();
+                assert!(shell.delete_task.as_ref().unwrap().error.is_some());
+                assert!(shell
+                    .host_slot(&host_a)
+                    .map(|slot| slot.pending_host_actions.is_empty())
+                    .unwrap_or(false));
+                remote_a.lock().expect("a").admission = NativeHostActionResult::Queued;
+
+                shell.begin_task_delete_key(key_b.clone());
+                shell.hosts.remove(&host_b);
+                shell.confirm_task_delete();
+                assert!(shell
+                    .delete_task
+                    .as_ref()
+                    .is_some_and(|d| d.error.as_deref().is_some_and(|e| e.contains("owner"))));
+            });
+            cx.quit();
+        });
+    }
+
+    #[test]
+    fn owner_remote_lifecycle_correction1_receipt_reject_delete_forget_retire_at() {
+        if rerun_headless_shell_test_in_child(
+            "ui::native_shell::tests::owner_remote_lifecycle_correction1_receipt_reject_delete_forget_retire_at",
+        ) {
+            return;
+        }
+        let host_a = HostId::Remote([0xc1; 16]);
+        let host_b = HostId::Remote([0xc2; 16]);
+        let (runtime, local_shared) = TestRuntime::new(true, NativeHostActionResult::Queued);
+        gpui::Application::headless().run(move |cx| {
+            crate::ui::init(cx);
+            with_test_shell_in_app(cx, runtime, |shell| {
+                let (model, shared_task) = terminal_bound_client_model();
+                let (archived_model, archived_id) = terminal_bound_archived_client_model();
+                assert_eq!(shared_task, archived_id);
+                let model = Arc::new(model);
+                let archived_model = Arc::new(archived_model);
+                let empty_model = Arc::new(empty_canonical_client_model());
+                shell
+                    .apply_client_model(Arc::clone(&model))
+                    .expect("local model");
+                let local = shell.local_host_id();
+                let shared_project = model
+                    .tasks()
+                    .get(&shared_task)
+                    .map(|snapshot| snapshot.task.project_id)
+                    .expect("project");
+                let empty_remote_project = ProjectId::new();
+
+                let remote_a =
+                    attach_remote_test_host_with_shared(shell, &host_a, Arc::clone(&model));
+                let remote_b =
+                    attach_remote_test_host_with_shared(shell, &host_b, Arc::clone(&model));
+                shell.install_project_for_host_for_test(&host_a, "a-project", shared_project);
+                shell.install_project_for_host_for_test(&host_b, "b-project", shared_project);
+                // Empty configured remote project (no tasks) must still be creatable.
+                // Helper replaces the whole sidebar — install both A projects together.
+                if let Some(slot) = shell.host_slot_mut(&host_a) {
+                    slot.config_sidebar =
+                        super::ConfigSidebarProjection::from_host_snapshot(
+                        &crate::domain::cockpit::ConfigSidebarSnapshot {
+                            revision: 1,
+                            projects: vec![
+                                crate::domain::cockpit::ConfigSidebarProject {
+                                    config_id: "a-project".into(),
+                                    label: "a-project".into(),
+                                    root_configured: true,
+                                    workspace_id: shared_project.to_string(),
+                                    folders: Vec::new(),
+                                },
+                                crate::domain::cockpit::ConfigSidebarProject {
+                                    config_id: "a-empty".into(),
+                                    label: "a-empty".into(),
+                                    root_configured: true,
+                                    workspace_id: empty_remote_project.to_string(),
+                                    folders: Vec::new(),
+                                },
+                            ],
+                            servers: Vec::new(),
+                            ssh_connections: Vec::new(),
+                            providers: Vec::new(),
+                        },
+                    );
+                }
+
+                let key_a = HostTaskKey::new(host_a.clone(), shared_task);
+                let key_b = HostTaskKey::new(host_b.clone(), shared_task);
+
+                // --- 7: remote empty project AT NewTask; same ProjectId hosts independent ---
+                shell.refresh_accessibility_tree();
+                let at_nodes = shell.accessibility_tree().gpui_nodes();
+                assert!(
+                    at_nodes.iter().any(|node| {
+                        node.element_id.starts_with("native-project-new-task-")
+                            && node.label.contains("a-empty")
+                    }),
+                    "empty remote configured project must expose New task AT: {:?}",
+                    at_nodes
+                        .iter()
+                        .map(|n| (&n.element_id, &n.label))
+                        .collect::<Vec<_>>()
+                );
+                assert!(
+                    shell
+                        .accessibility_tree
+                        .project_node_actions
+                        .iter()
+                        .any(|(_, action)| matches!(
+                            action,
+                            super::ProjectAccessibilityAction::NewTask(key)
+                                if key.host == host_a && key.project_id == empty_remote_project
+                        )),
+                    "AT must bind owner-qualified HostProjectKey for empty remote project"
+                );
+                let empty_project_key = HostProjectKey::new(host_a.clone(), empty_remote_project);
+                shell.begin_new_task_for_project_key(empty_project_key.clone());
+                assert_eq!(
+                    shell.new_task.as_ref().map(|d| d.project_key.clone()),
+                    Some(empty_project_key)
+                );
+                shell.new_task = None;
+                // Same raw ProjectId on B stays independent — opening B's project must not
+                // remint to A.
+                shell.begin_new_task_for_project_key(HostProjectKey::new(
+                    host_b.clone(),
+                    shared_project,
+                ));
+                assert_eq!(
+                    shell.new_task.as_ref().map(|d| d.project_key.host.clone()),
+                    Some(host_b.clone())
+                );
+                shell.new_task = None;
+
+                // --- 1: wrong receipt command_id must not settle/ack/remove ---
+                shell
+                    .select_fleet_task_key(key_a.clone(), FleetSelectMode::Replace)
+                    .expect("select A");
+                shell.begin_task_rename_key(key_a.clone());
+                if let Some(draft) = shell.rename_task.as_mut() {
+                    let _ = draft.title.set_value("Wrong-receipt rename");
+                }
+                shell.submit_task_rename();
+                let rename_action = remote_a
+                    .lock()
+                    .expect("a")
+                    .accepted
+                    .iter()
+                    .rev()
+                    .find(|record| {
+                        matches!(record.command, NativeHostCommand::TaskRename { .. })
+                    })
+                    .cloned()
+                    .expect("rename action");
+                let rename_command_id =
+                    native_command_id(&rename_action.command).expect("rename command");
+                // Queued enqueue does not populate the UI retry queue. Arrange an
+                // explicit retained copy via the production retain helper so wrong
+                // receipt can prove preservation without changing enqueue semantics.
+                assert!(
+                    shell.retain_pending_host_action_for_owner(&host_a, rename_action.clone()),
+                    "explicit retain must place rename on the owner retry queue"
+                );
+                assert!(
+                    shell
+                        .host_slot(&host_a)
+                        .is_some_and(|slot| slot.pending_host_actions.iter().any(|pending| {
+                            native_command_id(&pending.command) == Some(rename_command_id)
+                        })),
+                    "rename must remain pending before wrong receipt"
+                );
+                shell.apply_epoch_fenced_action_outcome_for_host(
+                    &host_a,
+                    NativeHostActionOutcome::Accepted {
+                        action: rename_action.clone(),
+                        receipt: crate::domain::command::CommandReceipt::Accepted {
+                            command_id: CommandId::new(),
+                            operation_id: crate::domain::id::OperationId::new(),
+                            task_revision: Some(5),
+                            event_ids: Vec::new(),
+                            prompt_mutation: None,
+                        },
+                    },
+                );
+                assert!(
+                    shell
+                        .host_slot(&host_a)
+                        .is_some_and(|slot| slot.pending_host_actions.iter().any(|pending| {
+                            native_command_id(&pending.command) == Some(rename_command_id)
+                        })),
+                    "wrong receipt must not remove the original pending rename"
+                );
+                assert!(
+                    shell
+                        .host_slot(&host_a)
+                        .and_then(|slot| slot.composer_error.as_ref())
+                        .is_some_and(|message| message.contains("different command")),
+                    "wrong receipt must surface visible failure"
+                );
+                assert!(shell.pending_select_task.is_none());
+
+                // --- 2: Accepted envelope + Rejected receipt ---
+                // TestRuntime enqueue leaves fleet_admission=None. Production remote
+                // settle_composer_submission_for_owner reports that gap before any
+                // Rejected draft message. Keep that guard; inject a fixture
+                // FleetAdmission only for the rejection-display scenarios below
+                // (real HostFleet ack coverage is owner_non_local_rejected_receipt…).
+                if let Some(slot) = shell.host_slot_mut(&host_a) {
+                    slot.composer_error = None;
+                }
+                shell.begin_new_task_for_project_key(HostProjectKey::new(
+                    host_a.clone(),
+                    shared_project,
+                ));
+                shell.submit_new_task();
+                let create_action = remote_a
+                    .lock()
+                    .expect("a")
+                    .accepted
+                    .iter()
+                    .rev()
+                    .find(|record| {
+                        matches!(record.command, NativeHostCommand::TaskCreateV2 { .. })
+                    })
+                    .cloned()
+                    .expect("create");
+                let create_id = native_command_id(&create_action.command).expect("create id");
+                assert!(
+                    create_action.fleet_admission.is_none(),
+                    "TestRuntime create capture must lack fleet_admission"
+                );
+                shell.apply_epoch_fenced_action_outcome_for_host(
+                    &host_a,
+                    NativeHostActionOutcome::Accepted {
+                        action: create_action.clone(),
+                        receipt: crate::domain::command::CommandReceipt::Rejected {
+                            command_id: create_id,
+                            code: crate::domain::command::RejectionCode::InvalidTransition,
+                            current_revision: None,
+                            resolution: None,
+                        },
+                    },
+                );
+                assert!(
+                    shell
+                        .host_slot(&host_a)
+                        .and_then(|slot| slot.composer_error.as_ref())
+                        .is_some_and(|message| message.contains("missing fleet admission")),
+                    "remote Rejected without admission must surface the missing-admission guard"
+                );
+                if let Some(slot) = shell.host_slot_mut(&host_a) {
+                    slot.composer_error = None;
+                }
+                let fixture_client = ClientId::from_bytes([
+                    0x01, 0x8f, 0x60, 0xb0, 0x9c, 0x1a, 0x70, 0x01, 0x80, 0x00, 0x00, 0x00, 0x00,
+                    0x00, 0x00, 0xc1,
+                ])
+                .expect("fixture client");
+                // Resubmit so production dispatch mints a fresh command id (do not
+                // synthesize commands or swap owner from focus).
+                shell.begin_new_task_for_project_key(HostProjectKey::new(
+                    host_a.clone(),
+                    shared_project,
+                ));
+                shell.submit_new_task();
+                let mut create_action = remote_a
+                    .lock()
+                    .expect("a")
+                    .accepted
+                    .iter()
+                    .rev()
+                    .find(|record| {
+                        matches!(record.command, NativeHostCommand::TaskCreateV2 { .. })
+                    })
+                    .cloned()
+                    .expect("create with fixture admission path");
+                let create_id = native_command_id(&create_action.command).expect("create id");
+                let create_admission = FleetAdmission {
+                    host: host_a.clone(),
+                    task_id: create_action.task_id,
+                    generation: 1,
+                    client_id: fixture_client,
+                };
+                assert_eq!(create_admission.host, host_a);
+                assert_eq!(create_admission.task_id, create_action.task_id);
+                create_action.fleet_admission = Some(create_admission);
+                shell.apply_epoch_fenced_action_outcome_for_host(
+                    &host_a,
+                    NativeHostActionOutcome::Accepted {
+                        action: create_action,
+                        receipt: crate::domain::command::CommandReceipt::Rejected {
+                            command_id: create_id,
+                            code: crate::domain::command::RejectionCode::InvalidTransition,
+                            current_revision: None,
+                            resolution: None,
+                        },
+                    },
+                );
+                assert!(
+                    shell.pending_select_task.is_none(),
+                    "rejectedCreate must not install pending_select_task"
+                );
+                assert!(
+                    shell
+                        .host_slot(&host_a)
+                        .and_then(|slot| slot.composer_error.as_ref())
+                        .is_some_and(|message| message.contains("rejected")),
+                    "rejectedCreate must surface owner failure"
+                );
+
+                if let Some(slot) = shell.host_slot_mut(&host_a) {
+                    slot.composer_error = None;
+                }
+                shell.begin_task_rename_key(key_a.clone());
+                if let Some(draft) = shell.rename_task.as_mut() {
+                    let _ = draft.title.set_value("Rejected rename");
+                }
+                shell.submit_task_rename();
+                let mut rename2 = remote_a
+                    .lock()
+                    .expect("a")
+                    .accepted
+                    .iter()
+                    .rev()
+                    .find(|record| {
+                        matches!(record.command, NativeHostCommand::TaskRename { .. })
+                    })
+                    .cloned()
+                    .expect("rename2");
+                let rename2_id = native_command_id(&rename2.command).expect("rename2 id");
+                assert!(
+                    rename2.fleet_admission.is_none(),
+                    "TestRuntime rename capture must lack fleet_admission"
+                );
+                let rename_admission = FleetAdmission {
+                    host: host_a.clone(),
+                    task_id: rename2.task_id,
+                    generation: 1,
+                    client_id: fixture_client,
+                };
+                assert_eq!(rename_admission.host, host_a);
+                assert_eq!(rename_admission.task_id, rename2.task_id);
+                rename2.fleet_admission = Some(rename_admission);
+                shell.apply_epoch_fenced_action_outcome_for_host(
+                    &host_a,
+                    NativeHostActionOutcome::Accepted {
+                        action: rename2,
+                        receipt: crate::domain::command::CommandReceipt::Rejected {
+                            command_id: rename2_id,
+                            code: crate::domain::command::RejectionCode::NotFound,
+                            current_revision: None,
+                            resolution: None,
+                        },
+                    },
+                );
+                assert!(
+                    shell
+                        .host_slot(&host_a)
+                        .and_then(|slot| slot.composer_error.as_ref())
+                        .is_some_and(|message| message.contains("rejected")),
+                    "rejectedRename must visibly fail"
+                );
+                assert!(shell.pending_select_task.is_none());
+
+                // --- 4: toolbar captures rendered HostTaskKey; focus B cannot open/delete B ---
+                shell
+                    .select_fleet_task_key(key_a.clone(), FleetSelectMode::Replace)
+                    .expect("focus A for toolbar capture");
+                let rendered_delete_owner = key_a.clone();
+                shell
+                    .select_fleet_task_key(key_b.clone(), FleetSelectMode::Replace)
+                    .expect("focus B before queued click");
+                assert_eq!(shell.selected_task_key.as_ref(), Some(&key_b));
+                // Production toolbar path: captured owner only (never remint from focus).
+                if shell.host_slot(&rendered_delete_owner.host).is_some_and(|slot| {
+                    slot.client_model
+                        .as_ref()
+                        .is_some_and(|model| model.tasks().contains_key(&rendered_delete_owner.task_id))
+                }) {
+                    shell.begin_task_delete_key(rendered_delete_owner.clone());
+                }
+                assert_eq!(
+                    shell.delete_task.as_ref().map(|d| d.owner.clone()),
+                    Some(key_a.clone()),
+                    "queued A click after focus B must open delete for A, not B"
+                );
+                assert_eq!(
+                    shell.selected_task_key.as_ref(),
+                    Some(&key_a),
+                    "begin_task_delete_key selects the exact captured owner"
+                );
+                shell.cancel_delete_task_flow();
+
+                // --- 3: successful delete prune — receipt then projection ---
+                shell
+                    .select_fleet_task_key(key_a.clone(), FleetSelectMode::Replace)
+                    .expect("select A delete");
+                shell
+                    .select_fleet_task_key(key_b.clone(), FleetSelectMode::Toggle)
+                    .expect("keep B open beside A");
+                assert!(
+                    shell
+                        .layout
+                        .task_workspace
+                        .as_ref()
+                        .is_some_and(|ws| {
+                            ws.task_ids().contains(&key_a) && ws.task_ids().contains(&key_b)
+                        }),
+                    "both same-TaskId hosts must be open before delete"
+                );
+                shell.begin_task_delete_key(key_a.clone());
+                shell.confirm_task_delete();
+                let archive_a = remote_a
+                    .lock()
+                    .expect("a")
+                    .accepted
+                    .iter()
+                    .rev()
+                    .find(|record| {
+                        matches!(
+                            record.command,
+                            NativeHostCommand::TaskArchive { task_id, .. } if task_id == shared_task
+                        )
+                    })
+                    .cloned()
+                    .expect("archive A");
+                let archive_a_id = native_command_id(&archive_a.command).expect("archive A id");
+                shell.apply_epoch_fenced_action_outcome_for_host(
+                    &host_a,
+                    NativeHostActionOutcome::Accepted {
+                        action: archive_a,
+                        receipt: crate::domain::command::CommandReceipt::Accepted {
+                            command_id: archive_a_id,
+                            operation_id: crate::domain::id::OperationId::new(),
+                            task_revision: Some(5),
+                            event_ids: Vec::new(),
+                            prompt_mutation: None,
+                        },
+                    },
+                );
+                shell
+                    .apply_client_model_for_host(&host_a, Arc::clone(&archived_model))
+                    .expect("archived A");
+                let delete_a = remote_a
+                    .lock()
+                    .expect("a")
+                    .accepted
+                    .iter()
+                    .rev()
+                    .find(|record| {
+                        matches!(
+                            record.command,
+                            NativeHostCommand::TaskLifecycle {
+                                command: crate::domain::command::Command::DeleteTask,
+                                ..
+                            }
+                        )
+                    })
+                    .cloned()
+                    .expect("delete A");
+                let delete_a_id = native_command_id(&delete_a.command).expect("delete A id");
+                shell.apply_epoch_fenced_action_outcome_for_host(
+                    &host_a,
+                    NativeHostActionOutcome::Accepted {
+                        action: delete_a,
+                        receipt: crate::domain::command::CommandReceipt::Accepted {
+                            command_id: delete_a_id,
+                            operation_id: crate::domain::id::OperationId::new(),
+                            task_revision: Some(6),
+                            event_ids: Vec::new(),
+                            prompt_mutation: None,
+                        },
+                    },
+                );
+                assert!(
+                    shell.known_deleted_task_keys.contains(&key_a),
+                    "delete receipt must tombstone exact owner key"
+                );
+                assert!(
+                    shell
+                        .layout
+                        .task_workspace
+                        .as_ref()
+                        .is_none_or(|ws| !ws.task_ids().contains(&key_a)),
+                    "deleted A must leave layout immediately on receipt"
+                );
+                assert!(
+                    shell
+                        .layout
+                        .task_workspace
+                        .as_ref()
+                        .is_some_and(|ws| ws.task_ids().contains(&key_b)),
+                    "same TaskId host B must remain after A delete receipt"
+                );
+                assert_ne!(shell.selected_task_key.as_ref(), Some(&key_a));
+                assert_eq!(
+                    shell.selected_task_key.as_ref(),
+                    Some(&key_b),
+                    "global successor after A delete should be open B"
+                );
+                assert_ne!(
+                    shell
+                        .host_slot(&host_a)
+                        .and_then(|slot| slot.interaction.selected_task()),
+                    Some(key_b.task_id),
+                    "surviving pane on B must not select B's raw TaskId in A's interaction"
+                );
+                shell
+                    .apply_client_model_for_host(&host_a, Arc::clone(&empty_model))
+                    .expect("canonical removal A");
+                assert!(
+                    !shell.known_deleted_task_keys.contains(&key_a),
+                    "tombstone drops once projection no longer lists the task"
+                );
+                assert!(
+                    shell
+                        .layout
+                        .task_workspace
+                        .as_ref()
+                        .is_some_and(|ws| ws.task_ids().contains(&key_b)),
+                    "B must survive post-delete canonical model removal on A"
+                );
+
+                // --- 3b: projection-then-receipt order on B ---
+                shell
+                    .apply_client_model_for_host(&host_a, Arc::clone(&model))
+                    .expect("restore A model for later forget cases");
+                shell
+                    .select_fleet_task_key(key_b.clone(), FleetSelectMode::Replace)
+                    .expect("select B");
+                shell.begin_task_delete_key(key_b.clone());
+                shell.confirm_task_delete();
+                let archive_b = remote_b
+                    .lock()
+                    .expect("b")
+                    .accepted
+                    .iter()
+                    .rev()
+                    .find(|record| {
+                        matches!(
+                            record.command,
+                            NativeHostCommand::TaskArchive { task_id, .. } if task_id == shared_task
+                        )
+                    })
+                    .cloned()
+                    .expect("archive B");
+                let archive_b_id = native_command_id(&archive_b.command).expect("archive B id");
+                shell.apply_epoch_fenced_action_outcome_for_host(
+                    &host_b,
+                    NativeHostActionOutcome::Accepted {
+                        action: archive_b,
+                        receipt: crate::domain::command::CommandReceipt::Accepted {
+                            command_id: archive_b_id,
+                            operation_id: crate::domain::id::OperationId::new(),
+                            task_revision: Some(5),
+                            event_ids: Vec::new(),
+                            prompt_mutation: None,
+                        },
+                    },
+                );
+                shell
+                    .apply_client_model_for_host(&host_b, Arc::clone(&archived_model))
+                    .expect("archived B queues delete");
+                let delete_b = remote_b
+                    .lock()
+                    .expect("b")
+                    .accepted
+                    .iter()
+                    .rev()
+                    .find(|record| {
+                        matches!(
+                            record.command,
+                            NativeHostCommand::TaskLifecycle {
+                                command: crate::domain::command::Command::DeleteTask,
+                                ..
+                            }
+                        )
+                    })
+                    .cloned()
+                    .expect("delete B");
+                assert!(
+                    shell.delete_task.as_ref().is_some_and(|d| {
+                        matches!(d.stage, super::DeleteTaskStage::AwaitingDelete { .. })
+                    })
+                );
+                // Projection removes the task before delete receipt — open pane preserved.
+                shell
+                    .apply_client_model_for_host(&host_b, Arc::clone(&empty_model))
+                    .expect("projection absent while awaiting delete");
+                assert!(
+                    shell
+                        .layout
+                        .task_workspace
+                        .as_ref()
+                        .is_some_and(|ws| ws.task_ids().contains(&key_b)),
+                    "absent projection must not globally prune open B before delete receipt"
+                );
+                let delete_b_id = native_command_id(&delete_b.command).expect("delete B id");
+                shell.apply_epoch_fenced_action_outcome_for_host(
+                    &host_b,
+                    NativeHostActionOutcome::Accepted {
+                        action: delete_b,
+                        receipt: crate::domain::command::CommandReceipt::Accepted {
+                            command_id: delete_b_id,
+                            operation_id: crate::domain::id::OperationId::new(),
+                            task_revision: Some(6),
+                            event_ids: Vec::new(),
+                            prompt_mutation: None,
+                        },
+                    },
+                );
+                assert!(
+                    shell
+                        .layout
+                        .task_workspace
+                        .as_ref()
+                        .is_none_or(|ws| !ws.task_ids().contains(&key_b)),
+                    "delete receipt must prune exact B after projection-first order"
+                );
+                // Clear the receipt tombstone via canonical-absent projection, then restore.
+                shell
+                    .apply_client_model_for_host(&host_b, Arc::clone(&empty_model))
+                    .expect("drop B tombstone after prune");
+                assert!(!shell.known_deleted_task_keys.contains(&key_b));
+                shell
+                    .apply_client_model_for_host(&host_b, Arc::clone(&model))
+                    .expect("restore B");
+                shell
+                    .select_fleet_task_key(key_b.clone(), FleetSelectMode::Replace)
+                    .expect("reselect B");
+
+                // --- 6: retired provenance — archive accepted then cancel; late duplicate ---
+                shell.begin_task_delete_key(key_b.clone());
+                shell.confirm_task_delete();
+                let archive_retire = remote_b
+                    .lock()
+                    .expect("b")
+                    .accepted
+                    .iter()
+                    .rev()
+                    .find(|record| {
+                        matches!(
+                            record.command,
+                            NativeHostCommand::TaskArchive { task_id, .. } if task_id == shared_task
+                        )
+                    })
+                    .cloned()
+                    .expect("archive for retire");
+                let archive_retire_id =
+                    native_command_id(&archive_retire.command).expect("retire archive id");
+                shell.apply_epoch_fenced_action_outcome_for_host(
+                    &host_b,
+                    NativeHostActionOutcome::Accepted {
+                        action: archive_retire.clone(),
+                        receipt: crate::domain::command::CommandReceipt::Accepted {
+                            command_id: archive_retire_id,
+                            operation_id: crate::domain::id::OperationId::new(),
+                            task_revision: Some(5),
+                            event_ids: Vec::new(),
+                            prompt_mutation: None,
+                        },
+                    },
+                );
+                assert!(
+                    shell.delete_task.as_ref().is_some_and(|d| matches!(
+                        d.stage,
+                        super::DeleteTaskStage::AwaitingArchive {
+                            archive_accepted: true,
+                            ..
+                        }
+                    )),
+                    "archive Accepted marks archive_accepted before cancel"
+                );
+                let captured_epochs = match shell.delete_task.as_ref().map(|d| d.stage.clone()) {
+                    Some(super::DeleteTaskStage::AwaitingArchive {
+                        connection_epoch,
+                        runtime_generation,
+                        ..
+                    }) => (connection_epoch, runtime_generation),
+                    other => panic!("expected AwaitingArchive after accept, got {other:?}"),
+                };
+                shell.cancel_delete_task_flow();
+                assert!(shell.delete_task.is_none());
+                assert!(
+                    shell.retired_delete_flow_commands.iter().any(|retired| {
+                        retired.owner == key_b
+                            && retired.command_id == archive_retire_id
+                            && retired.connection_epoch == captured_epochs.0
+                            && retired.runtime_generation == captured_epochs.1
+                    }),
+                    "cancel after archive_accepted must tombstone exact owner+epochs"
+                );
+                let delete_count_after_retire = remote_b
+                    .lock()
+                    .expect("b")
+                    .accepted
+                    .iter()
+                    .filter(|record| {
+                        matches!(
+                            record.command,
+                            NativeHostCommand::TaskLifecycle {
+                                command: crate::domain::command::Command::DeleteTask,
+                                ..
+                            }
+                        )
+                    })
+                    .count();
+                // Late duplicate Accepted archive must not regain advance.
+                shell.apply_epoch_fenced_action_outcome_for_host(
+                    &host_b,
+                    NativeHostActionOutcome::Accepted {
+                        action: archive_retire.clone(),
+                        receipt: crate::domain::command::CommandReceipt::Accepted {
+                            command_id: archive_retire_id,
+                            operation_id: crate::domain::id::OperationId::new(),
+                            task_revision: Some(5),
+                            event_ids: Vec::new(),
+                            prompt_mutation: None,
+                        },
+                    },
+                );
+                assert!(shell.delete_task.is_none());
+                assert_eq!(
+                    remote_b
+                        .lock()
+                        .expect("b")
+                        .accepted
+                        .iter()
+                        .filter(|record| {
+                            matches!(
+                                record.command,
+                                NativeHostCommand::TaskLifecycle {
+                                    command: crate::domain::command::Command::DeleteTask,
+                                    ..
+                                }
+                            )
+                        })
+                        .count(),
+                    delete_count_after_retire,
+                    "retired late archive must not enqueue another DeleteTask"
+                );
+
+                // Same CommandId, different owner must not consume A's retirement.
+                shell
+                    .apply_client_model_for_host(&host_a, Arc::clone(&model))
+                    .expect("A model");
+                shell
+                    .select_fleet_task_key(key_a.clone(), FleetSelectMode::Replace)
+                    .expect("select A");
+                shell.begin_task_delete_key(key_a.clone());
+                shell.confirm_task_delete();
+                let archive_a2 = remote_a
+                    .lock()
+                    .expect("a")
+                    .accepted
+                    .iter()
+                    .rev()
+                    .find(|record| {
+                        matches!(
+                            record.command,
+                            NativeHostCommand::TaskArchive { task_id, .. } if task_id == shared_task
+                        )
+                    })
+                    .cloned()
+                    .expect("archive A2");
+                // Force the live A archive command_id to equal B's retired id in the draft
+                // by applying a mismatched retired marker lookup: inject a foreign retired
+                // entry sharing command_id only, then prove A's live flow still advances.
+                shell.retired_delete_flow_commands.push(super::RetiredDeleteFlowCommand {
+                    owner: key_b.clone(),
+                    command_id: native_command_id(&archive_a2.command).expect("a2 id"),
+                    connection_epoch: archive_a2.connection_epoch,
+                    runtime_generation: archive_a2.runtime_generation,
+                    terminal: false,
+                });
+                let archive_a2_id = native_command_id(&archive_a2.command).expect("a2 id");
+                shell.apply_epoch_fenced_action_outcome_for_host(
+                    &host_a,
+                    NativeHostActionOutcome::Accepted {
+                        action: archive_a2,
+                        receipt: crate::domain::command::CommandReceipt::Accepted {
+                            command_id: archive_a2_id,
+                            operation_id: crate::domain::id::OperationId::new(),
+                            task_revision: Some(5),
+                            event_ids: Vec::new(),
+                            prompt_mutation: None,
+                        },
+                    },
+                );
+                assert!(
+                    shell.delete_task.as_ref().is_some_and(|d| {
+                        d.owner == key_a
+                            && matches!(
+                                d.stage,
+                                super::DeleteTaskStage::AwaitingArchive {
+                                    archive_accepted: true,
+                                    ..
+                                } | super::DeleteTaskStage::AwaitingDelete { .. }
+                            )
+                    }),
+                    "same CommandId retired under B must not steal A's live archive settle"
+                );
+                // Generation mismatch: bump runtime and prove advance refuses.
+                if let Some(draft) = shell.delete_task.as_mut() {
+                    if let super::DeleteTaskStage::AwaitingArchive {
+                        archive_accepted,
+                        connection_epoch,
+                        runtime_generation,
+                        command_id,
+                    } = draft.stage
+                    {
+                        draft.stage = super::DeleteTaskStage::AwaitingArchive {
+                            command_id,
+                            archive_accepted: true,
+                            connection_epoch,
+                            runtime_generation: runtime_generation.wrapping_add(77),
+                        };
+                        let _ = archive_accepted;
+                    }
+                }
+                shell
+                    .apply_client_model_for_host(&host_a, Arc::clone(&archived_model))
+                    .expect("archived for generation fence");
+                shell.try_advance_pending_delete_after_archive();
+                assert!(
+                    shell.delete_task.as_ref().is_some_and(|d| {
+                        matches!(d.stage, super::DeleteTaskStage::Confirming)
+                            && d.error.as_deref().is_some_and(|e| e.contains("connection"))
+                    }),
+                    "generation mismatch must fail closed without silent advance"
+                );
+                shell.cancel_delete_task_flow();
+
+                // --- 5: forget_fleet_host disarms owned dialogs / pending delete ---
+                shell
+                    .apply_client_model_for_host(&host_a, Arc::clone(&model))
+                    .expect("A for forget");
+                shell
+                    .apply_client_model_for_host(&host_b, Arc::clone(&model))
+                    .expect("B for forget");
+                // Unrelated host new-task must survive forgetting A.
+                shell.begin_new_task_for_project_key(HostProjectKey::new(
+                    host_b.clone(),
+                    shared_project,
+                ));
+                assert_eq!(
+                    shell.new_task.as_ref().map(|d| d.project_key.host.clone()),
+                    Some(host_b.clone())
+                );
+                shell.forget_fleet_host(&host_a);
+                assert_eq!(
+                    shell.new_task.as_ref().map(|d| d.project_key.host.clone()),
+                    Some(host_b.clone()),
+                    "forget A must leave B's new-task dialog intact"
+                );
+                shell.new_task = None;
+
+                // Reattach A; prove forget clears A's new-task only.
+                let _ = attach_remote_test_host_with_shared(shell, &host_a, Arc::clone(&model));
+                shell.install_project_for_host_for_test(&host_a, "a-project", shared_project);
+                shell.begin_new_task_for_project_key(HostProjectKey::new(
+                    host_a.clone(),
+                    shared_project,
+                ));
+                shell.forget_fleet_host(&host_a);
+                assert!(shell.new_task.is_none(), "forget A clears A's new-task");
+
+                // Reattach A; prove B rename survives forget A.
+                let _ = attach_remote_test_host_with_shared(shell, &host_a, Arc::clone(&model));
+                shell.install_project_for_host_for_test(&host_a, "a-project", shared_project);
+                shell.begin_task_rename_key(key_b.clone());
+                assert!(shell.rename_task.as_ref().is_some_and(|d| d.owner == key_b));
+                shell.forget_fleet_host(&host_a);
+                assert!(
+                    shell.rename_task.as_ref().is_some_and(|d| d.owner == key_b),
+                    "forget A leaves B rename intact"
+                );
+                shell.rename_task = None;
+
+                // Reattach A; pending delete on A must retire and close on forget.
+                let remote_a = attach_remote_test_host_with_shared(
+                    shell,
+                    &host_a,
+                    Arc::clone(&model),
+                );
+                shell
+                    .select_fleet_task_key(key_a.clone(), FleetSelectMode::Replace)
+                    .expect("A again");
+                shell.begin_task_delete_key(key_a.clone());
+                shell.confirm_task_delete();
+                assert!(
+                    shell.delete_task.as_ref().is_some_and(|d| {
+                        matches!(d.stage, super::DeleteTaskStage::AwaitingArchive { .. })
+                    })
+                );
+                let pending_archive = remote_a
+                    .lock()
+                    .expect("a")
+                    .accepted
+                    .iter()
+                    .rev()
+                    .find(|record| {
+                        matches!(
+                            record.command,
+                            NativeHostCommand::TaskArchive { task_id, .. } if task_id == shared_task
+                        )
+                    })
+                    .cloned();
+                shell.forget_fleet_host(&host_a);
+                assert!(
+                    shell.delete_task.is_none(),
+                    "forget_fleet_host must close AwaitingArchive dialog"
+                );
+                assert!(
+                    shell
+                        .retired_delete_flow_commands
+                        .iter()
+                        .all(|retired| retired.owner.host != host_a),
+                    "forget must drop UI retired markers for the forgotten host only"
+                );
+                if let Some(pending) = pending_archive {
+                    let pending_id = native_command_id(&pending.command).expect("pending id");
+                    assert!(
+                        shell
+                            .retired_delete_flow_commands
+                            .iter()
+                            .all(|retired| retired.command_id != pending_id),
+                        "forgotten host archive command must not remain in UI retirement bookkeeping"
+                    );
+                }
+
+                // Local lane untouched by remote lifecycle outcomes in this correction wave.
+                assert!(
+                    local_shared.lock().expect("local").accepted.iter().all(|record| {
+                        !matches!(
+                            record.command,
+                            NativeHostCommand::TaskCreateV2 { .. }
+                                | NativeHostCommand::TaskRename { .. }
+                                | NativeHostCommand::TaskArchive { .. }
+                                | NativeHostCommand::TaskLifecycle {
+                                    command: crate::domain::command::Command::DeleteTask,
+                                    ..
+                                }
+                        )
+                    }),
+                    "remote correction paths must not enqueue local lifecycle commands"
+                );
+                let _ = local;
+            });
+            cx.quit();
+        });
+    }
+
+    #[test]
+    fn task_rail_row_capture_leaves_left_button_for_archived_delete_child() {
+        // Capture-policy unit check only (not nested GPUI pointer proof).
         assert!(
-            remote_error
-                .as_deref()
-                .is_some_and(|msg| msg.contains("Unavailable on remote") || msg.contains("local")),
-            "{remote_error:?}"
+            !super::task_rail_row_capture_consumes_button(gpui::MouseButton::Left),
+            "left must reach nested archived Delete on_mouse_down/on_click"
+        );
+        assert!(
+            super::task_rail_row_capture_consumes_button(gpui::MouseButton::Right),
+            "right must stay captured against the terminal dock"
+        );
+        assert!(
+            super::task_rail_row_capture_consumes_button(gpui::MouseButton::Middle),
+            "middle must stay captured against the terminal dock"
         );
     }
+
+    #[test]
+    fn retired_delete_flow_terminal_capacity_reclaims_without_evicting_unresolved() {
+        if rerun_headless_shell_test_in_child(
+            "ui::native_shell::tests::retired_delete_flow_terminal_capacity_reclaims_without_evicting_unresolved",
+        ) {
+            return;
+        }
+        let (runtime, shared) = TestRuntime::new(true, NativeHostActionResult::Queued);
+        gpui::Application::headless().run(move |cx| {
+            crate::ui::init(cx);
+            with_test_shell_in_app(cx, runtime, |shell| {
+                let (model, task_id) = terminal_bound_client_model();
+                shell
+                    .apply_client_model(Arc::new(model))
+                    .expect("model");
+                let local = shell.local_host_id();
+                let owner = HostTaskKey::new(local.clone(), task_id);
+
+                // Pre-fill with terminal markers (resolved late results), then one
+                // real cancel→retire unresolved path, then prove confirm reclaims.
+                for index in 0..MAX_ACTION_LANE_RECORDS {
+                    shell.retired_delete_flow_commands.push(super::RetiredDeleteFlowCommand {
+                        owner: owner.clone(),
+                        command_id: CommandId::new(),
+                        connection_epoch: 1,
+                        runtime_generation: 1 + index as u64,
+                        terminal: true,
+                    });
+                }
+                shell.begin_task_delete_key(owner.clone());
+                shell.confirm_task_delete();
+                let archive = shared
+                    .lock()
+                    .expect("rt")
+                    .accepted
+                    .iter()
+                    .rev()
+                    .find(|record| {
+                        matches!(
+                            record.command,
+                            NativeHostCommand::TaskArchive { task_id: id, .. } if id == task_id
+                        )
+                    })
+                    .cloned()
+                    .expect("archive");
+                assert!(
+                    archive.is_delete_flow_confirmation(),
+                    "confirm Archive must stamp immutable delete-flow provenance"
+                );
+                let archive_id = native_command_id(&archive.command).expect("id");
+                // Cancel before a correlated terminal receipt: keep unresolved.
+                shell.cancel_delete_task_flow();
+                assert!(
+                    shell.retired_delete_flow_commands.iter().any(|retired| {
+                        retired.command_id == archive_id && !retired.terminal
+                    }),
+                    "cancel must retire without claiming terminal"
+                );
+                // Uncertain / mismatched Accepted must stay unresolved + unadvanced.
+                shell.apply_epoch_fenced_action_outcome(NativeHostActionOutcome::Uncertain {
+                    action: archive.clone(),
+                    error: "wire uncertain".into(),
+                });
+                assert!(
+                    shell.retired_delete_flow_commands.iter().any(|retired| {
+                        retired.command_id == archive_id && !retired.terminal
+                    }),
+                    "Uncertain must not resolve cancellation ownership"
+                );
+                assert!(shell.delete_task.is_none());
+                shell.apply_epoch_fenced_action_outcome(NativeHostActionOutcome::Accepted {
+                    action: archive.clone(),
+                    receipt: crate::domain::command::CommandReceipt::Accepted {
+                        command_id: CommandId::new(),
+                        operation_id: crate::domain::id::OperationId::new(),
+                        task_revision: Some(5),
+                        event_ids: Vec::new(),
+                        prompt_mutation: None,
+                    },
+                });
+                assert!(
+                    shell.retired_delete_flow_commands.iter().any(|retired| {
+                        retired.command_id == archive_id && !retired.terminal
+                    }),
+                    "mismatched Accepted must stay unresolved"
+                );
+                // Correlated Accepted resolves terminal capacity.
+                shell.apply_epoch_fenced_action_outcome(NativeHostActionOutcome::Accepted {
+                    action: archive.clone(),
+                    receipt: crate::domain::command::CommandReceipt::Accepted {
+                        command_id: archive_id,
+                        operation_id: crate::domain::id::OperationId::new(),
+                        task_revision: Some(5),
+                        event_ids: Vec::new(),
+                        prompt_mutation: None,
+                    },
+                });
+                assert!(shell.delete_task.is_none());
+                assert!(
+                    shell.retired_delete_flow_commands.iter().any(|retired| {
+                        retired.command_id == archive_id && retired.terminal
+                    }),
+                    "correlated late result must mark the exact retired marker terminal"
+                );
+                assert!(
+                    shared.lock().expect("rt").accepted.iter().all(|record| {
+                        !matches!(
+                            record.command,
+                            NativeHostCommand::TaskLifecycle {
+                                command: crate::domain::command::Command::DeleteTask,
+                                ..
+                            }
+                        )
+                    }),
+                    "terminal late archive must never enqueue DeleteTask"
+                );
+
+                // After terminal eviction, duplicate Failed/Uncertain with provenance
+                // must still not enter generic retry/pending action.
+                shell.retired_delete_flow_commands.retain(|retired| retired.command_id != archive_id);
+                let pending_before = shell
+                    .host_slot(&local)
+                    .map(|slot| slot.pending_host_actions.len())
+                    .unwrap_or(0);
+                shell.apply_epoch_fenced_action_outcome(NativeHostActionOutcome::Failed {
+                    action: archive.clone(),
+                    error: "late failed after eviction".into(),
+                });
+                shell.apply_epoch_fenced_action_outcome(NativeHostActionOutcome::Uncertain {
+                    action: archive,
+                    error: "late uncertain after eviction".into(),
+                });
+                assert_eq!(
+                    shell
+                        .host_slot(&local)
+                        .map(|slot| slot.pending_host_actions.len())
+                        .unwrap_or(0),
+                    pending_before,
+                    "orphaned delete-flow Failed/Uncertain must not reopen pending actions"
+                );
+                assert!(shell.delete_task.is_none());
+
+                // Terminal compaction must free confirm capacity while keeping
+                // any still-unresolved markers (none here after terminal mark).
+                shell.begin_task_delete_key(owner.clone());
+                shell.confirm_task_delete();
+                assert!(
+                    shell.delete_task.as_ref().is_some_and(|d| {
+                        matches!(d.stage, super::DeleteTaskStage::AwaitingArchive { .. })
+                            && d.error.is_none()
+                    }),
+                    "confirm must succeed after reclaiming terminal retired capacity"
+                );
+                // Unresolved-only saturation still blocks.
+                shell.cancel_delete_task_flow();
+                shell.retired_delete_flow_commands.clear();
+                for _ in 0..MAX_ACTION_LANE_RECORDS {
+                    shell.retired_delete_flow_commands.push(super::RetiredDeleteFlowCommand {
+                        owner: owner.clone(),
+                        command_id: CommandId::new(),
+                        connection_epoch: 2,
+                        runtime_generation: 2,
+                        terminal: false,
+                    });
+                }
+                shell.begin_task_delete_key(owner.clone());
+                shell.confirm_task_delete();
+                assert!(
+                    shell.delete_task.as_ref().is_some_and(|d| {
+                        d.error.as_deref().is_some_and(|e| {
+                            e.contains("awaiting host outcomes") || e.contains("Forget the host")
+                        }) && matches!(d.stage, super::DeleteTaskStage::Confirming)
+                    }),
+                    "unresolved retired markers must never be silently dropped"
+                );
+            });
+            cx.quit();
+        });
+    }
+
+    #[test]
+    fn owner_delete_flow_correction4_forget_pressure_discard_no_retry() {
+        if rerun_headless_shell_test_in_child(
+            "ui::native_shell::tests::owner_delete_flow_correction4_forget_pressure_discard_no_retry",
+        ) {
+            return;
+        }
+        let host_a = HostId::Remote([0xc4; 16]);
+        let host_b = HostId::Remote([0xc5; 16]);
+        let (runtime, _) = TestRuntime::new(true, NativeHostActionResult::Queued);
+        gpui::Application::headless().run(move |cx| {
+            crate::ui::init(cx);
+            with_test_shell_in_app(cx, runtime, |shell| {
+                let (model, task_id) = terminal_bound_client_model();
+                let model = Arc::new(model);
+                shell.apply_client_model(Arc::clone(&model)).expect("local");
+                let shared_a = attach_remote_test_host_with_shared(shell, &host_a, Arc::clone(&model));
+                let shared_b = attach_remote_test_host_with_shared(shell, &host_b, Arc::clone(&model));
+                let key_a = HostTaskKey::new(host_a.clone(), task_id);
+                let key_b = HostTaskKey::new(host_b.clone(), task_id);
+
+                // Saturate host A unresolved UI markers; B must still confirm.
+                for _ in 0..MAX_ACTION_LANE_RECORDS {
+                    shell.retired_delete_flow_commands.push(super::RetiredDeleteFlowCommand {
+                        owner: key_a.clone(),
+                        command_id: CommandId::new(),
+                        connection_epoch: 1,
+                        runtime_generation: 1,
+                        terminal: false,
+                    });
+                }
+                shell
+                    .select_fleet_task_key(key_b.clone(), FleetSelectMode::Replace)
+                    .expect("focus B");
+                shell.begin_task_delete_key(key_b.clone());
+                shell.confirm_task_delete();
+                assert!(
+                    shell.delete_task.as_ref().is_some_and(|d| {
+                        d.owner == key_b
+                            && d.error.is_none()
+                            && matches!(d.stage, super::DeleteTaskStage::AwaitingArchive { .. })
+                    }),
+                    "saturated host A must not block host B delete confirm"
+                );
+                shell.cancel_delete_task_flow();
+
+                // Repeated forget/cancel over capacity: drop A's UI markers so a
+                // surviving host can still confirm; B markers/flows stay intact.
+                for _ in 0..3 {
+                    shell.begin_task_delete_key(key_a.clone());
+                    shell.confirm_task_delete();
+                    shell.forget_fleet_host(&host_a);
+                    assert!(
+                        shell
+                            .retired_delete_flow_commands
+                            .iter()
+                            .all(|retired| retired.owner.host != host_a),
+                        "forget must clear forgotten-host UI retirement markers"
+                    );
+                    let _ = attach_remote_test_host_with_shared(
+                        shell,
+                        &host_a,
+                        Arc::clone(&model),
+                    );
+                }
+                shell
+                    .select_fleet_task_key(key_b.clone(), FleetSelectMode::Replace)
+                    .expect("B after forget A");
+                shell.begin_task_delete_key(key_b.clone());
+                shell.confirm_task_delete();
+                assert!(
+                    shell.delete_task.as_ref().is_some_and(|d| {
+                        d.owner == key_b && matches!(d.stage, super::DeleteTaskStage::AwaitingArchive { .. })
+                    }),
+                    "surviving host B must confirm after forget/cancel capacity churn"
+                );
+                let b_archive = shared_b
+                    .lock()
+                    .expect("b")
+                    .accepted
+                    .iter()
+                    .rev()
+                    .find(|record| {
+                        matches!(
+                            record.command,
+                            NativeHostCommand::TaskArchive { task_id: id, .. } if id == task_id
+                        )
+                    })
+                    .cloned()
+                    .expect("B archive");
+                assert!(b_archive.is_delete_flow_confirmation());
+                shell.cancel_delete_task_flow();
+
+                // Pre-retained pending AND overflow: late Uncertain/mismatch discard
+                // without retry; reconcile must not replay canceled confirmation.
+                shell.begin_task_delete_key(key_b.clone());
+                shell.confirm_task_delete();
+                let retained = shared_b
+                    .lock()
+                    .expect("b")
+                    .accepted
+                    .iter()
+                    .rev()
+                    .find(|record| {
+                        matches!(
+                            record.command,
+                            NativeHostCommand::TaskArchive { task_id: id, .. } if id == task_id
+                        )
+                    })
+                    .cloned()
+                    .expect("retained archive");
+                let retained_id = native_command_id(&retained.command).expect("id");
+                shell.cancel_delete_task_flow();
+                {
+                    let slot = shell.host_slot_mut(&host_b).expect("B slot");
+                    slot.pending_host_actions.clear();
+                    slot.pending_host_actions.push_back(retained.clone());
+                    slot.retained_action_overflow = Some(retained.clone());
+                }
+                shell.apply_epoch_fenced_action_outcome_for_host(
+                    &host_b,
+                    NativeHostActionOutcome::Uncertain {
+                        action: retained.clone(),
+                        error: "late uncertain".into(),
+                    },
+                );
+                let slot = shell.host_slot(&host_b).expect("B");
+                assert!(
+                    slot.pending_host_actions
+                        .iter()
+                        .all(|pending| native_command_id(&pending.command) != Some(retained_id)),
+                    "late Uncertain must discard exact pending confirmation"
+                );
+                assert!(
+                    slot.retained_action_overflow
+                        .as_ref()
+                        .is_none_or(|pending| native_command_id(&pending.command) != Some(retained_id)),
+                    "late Uncertain must discard exact overflow confirmation"
+                );
+                assert!(
+                    shell.retired_delete_flow_commands.iter().any(|retired| {
+                        retired.command_id == retained_id && !retired.terminal
+                    }),
+                    "Uncertain must keep unresolved retirement ownership"
+                );
+                assert!(shell.delete_task.is_none());
+
+                {
+                    let slot = shell.host_slot_mut(&host_b).expect("B");
+                    slot.pending_host_actions.push_back(retained.clone());
+                    slot.retained_action_overflow = Some(retained.clone());
+                }
+                let accepted_before = shared_b.lock().expect("b").accepted.len();
+                shell.reconcile_pending_host_actions_for_owner(&host_b, 8);
+                assert_eq!(
+                    shared_b.lock().expect("b").accepted.len(),
+                    accepted_before,
+                    "reconcile must not replay canceled/orphaned delete confirmation"
+                );
+                let slot = shell.host_slot(&host_b).expect("B");
+                assert!(
+                    slot.pending_host_actions
+                        .iter()
+                        .all(|pending| native_command_id(&pending.command) != Some(retained_id))
+                        && slot.retained_action_overflow.as_ref().is_none_or(|pending| {
+                            native_command_id(&pending.command) != Some(retained_id)
+                        }),
+                    "reconcile must discard non-live delete-flow confirmation from pending/overflow"
+                );
+
+                // Mismatch Accepted also discards without terminalizing.
+                {
+                    let slot = shell.host_slot_mut(&host_b).expect("B");
+                    slot.pending_host_actions.push_back(retained.clone());
+                }
+                shell.apply_epoch_fenced_action_outcome_for_host(
+                    &host_b,
+                    NativeHostActionOutcome::Accepted {
+                        action: retained,
+                        receipt: crate::domain::command::CommandReceipt::Accepted {
+                            command_id: CommandId::new(),
+                            operation_id: crate::domain::id::OperationId::new(),
+                            task_revision: Some(1),
+                            event_ids: Vec::new(),
+                            prompt_mutation: None,
+                        },
+                    },
+                );
+                assert!(
+                    shell.retired_delete_flow_commands.iter().any(|retired| {
+                        retired.command_id == retained_id && !retired.terminal
+                    }),
+                    "mismatched Accepted must stay unresolved"
+                );
+                assert!(
+                    shell
+                        .host_slot(&host_b)
+                        .is_some_and(|slot| slot
+                            .pending_host_actions
+                            .iter()
+                            .all(|pending| native_command_id(&pending.command) != Some(retained_id))),
+                    "mismatched Accepted must discard exact pending"
+                );
+                let _ = shared_a;
+            });
+            cx.quit();
+        });
+    }
+
+    #[test]
+    fn archived_row_delete_affordance_exact_owner_via_at_and_keyboard() {
+        // Limitation (not nested-pointer proof): this suite's headless
+        // Application / with_test_shell_in_app path does not expose rendered
+        // hitbox bounds for the task-rail trash child, so PlatformInput
+        // MouseDown+MouseUp cannot be aimed at the real parent/child capture
+        // chain. Capture policy is covered by
+        // task_rail_row_capture_leaves_left_button_for_archived_delete_child;
+        // exact HostTaskKey ownership is proven via AT + keyboard here.
+        // Live Computer Use was stopped and cannot substitute.
+        if rerun_headless_shell_test_in_child(
+            "ui::native_shell::tests::archived_row_delete_affordance_exact_owner_via_at_and_keyboard",
+        ) {
+            return;
+        }
+        let host_a = HostId::Remote([0xd1; 16]);
+        let host_b = HostId::Remote([0xd2; 16]);
+        let (runtime, _) = TestRuntime::new(true, NativeHostActionResult::Queued);
+        gpui::Application::headless().run(move |cx| {
+            crate::ui::init(cx);
+            with_test_shell_in_app(cx, runtime, |shell| {
+                let (archived_model, shared_task) = terminal_bound_archived_client_model();
+                let archived_model = Arc::new(archived_model);
+                shell
+                    .apply_client_model(Arc::clone(&archived_model))
+                    .expect("local archived");
+                attach_remote_test_host_with_shared(shell, &host_a, Arc::clone(&archived_model));
+                attach_remote_test_host_with_shared(shell, &host_b, Arc::clone(&archived_model));
+                let key_a = HostTaskKey::new(host_a.clone(), shared_task);
+                let key_b = HostTaskKey::new(host_b.clone(), shared_task);
+                shell
+                    .select_fleet_task_key(key_b.clone(), FleetSelectMode::Replace)
+                    .expect("focus B");
+                shell.refresh_accessibility_tree();
+                assert!(
+                    shell.accessibility_tree().gpui_nodes().iter().any(|node| {
+                        node.element_id.contains("native-task-delete-icon")
+                            || node.element_id.starts_with("native-task-delete")
+                    }),
+                    "archived rows must expose delete affordance in the AT/GPUI tree"
+                );
+                assert!(!super::task_rail_row_capture_consumes_button(gpui::MouseButton::Left));
+                assert!(super::task_rail_row_capture_consumes_button(gpui::MouseButton::Right));
+                assert!(super::task_rail_row_capture_consumes_button(gpui::MouseButton::Middle));
+                shell
+                    .select_fleet_task_key(key_a.clone(), FleetSelectMode::Replace)
+                    .expect("focus A");
+                shell.dispatch_named_accessibility_action("native-task-delete");
+                assert_eq!(
+                    shell.delete_task.as_ref().map(|d| d.owner.clone()),
+                    Some(key_a.clone()),
+                    "AT delete must open confirmation for the exact HostTaskKey"
+                );
+                assert_ne!(
+                    shell.delete_task.as_ref().map(|d| d.owner.clone()),
+                    Some(key_b),
+                    "same TaskId focus peer must not become the delete owner"
+                );
+            });
+            cx.quit();
+        });
+    }
+
+    #[test]
+    fn owner_non_local_rejected_receipt_acks_fleet_retained_capacity() {
+        if rerun_headless_shell_test_in_child(
+            "ui::native_shell::tests::owner_non_local_rejected_receipt_acks_fleet_retained_capacity",
+        ) {
+            return;
+        }
+        use crate::client::{ClientConnection, HostClient, HostClientConfig, HostFleet};
+        use crate::domain::command::{CommandEnvelope, CommandReceipt, RejectionCode};
+        use crate::protocol::{
+            Capability, CapabilitySet, FrameLimits, ProfileFingerprint, ServerHello, PROTOCOL_MAJOR,
+            PROTOCOL_MINOR,
+        };
+
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .expect("runtime");
+
+        let peer_workspace = tempfile::tempdir().expect("peer workspace");
+        let peer_root = peer_workspace.path().join(".devmanager-native");
+        std::fs::create_dir_all(&peer_root).expect("peer root");
+        let peer_profile_name = "task3-reject-ack-peer".to_string();
+        let peer_host = HostId::local_profile(&peer_profile_name).expect("peer host");
+        let peer_profile = IsolatedDevProfile {
+            workspace_root: peer_workspace
+                .path()
+                .canonicalize()
+                .expect("peer workspace canon"),
+            root: std::fs::canonicalize(&peer_root).unwrap_or(peer_root),
+            named_profile: peer_profile_name.clone(),
+            mode: NativeShellMode::IsolatedDebug,
+        };
+
+        let fleet = Arc::new(HostFleet::new());
+        let client_id = ClientId::from_bytes([
+            0x01, 0x8f, 0x60, 0xb0, 0x9c, 0x1a, 0x70, 0x01, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0xe1,
+        ])
+        .expect("client");
+        let hello = ServerHello {
+            protocol_major: PROTOCOL_MAJOR,
+            protocol_minor: PROTOCOL_MINOR,
+            server_build: "devmanager-host/task3-reject-ack".into(),
+            host_boot_id: uuid::Uuid::from_bytes([
+                0x01, 0x8f, 0x60, 0xb0, 0x9c, 0x1a, 0x70, 0x01, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00,
+                0x00, 0xe2,
+            ]),
+            connection_id: uuid::Uuid::from_bytes([
+                0x01, 0x8f, 0x60, 0xb0, 0x9c, 0x1a, 0x70, 0x01, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00,
+                0x00, 0xe3,
+            ]),
+            profile_fingerprint: ProfileFingerprint::hash_normalized(&peer_profile_name),
+            granted: CapabilitySet::from_capabilities([
+                Capability::PagedSnapshots,
+                Capability::EventReplay,
+                Capability::ProviderInput,
+                Capability::OperationSettlement,
+            ]),
+            limits: FrameLimits::v1_default(),
+            reconnect_grant: None,
+        };
+        let (wire, handle) = {
+            // delayed_command_wire_for_test spawns a Tokio IO task; enter the
+            // already-owned runtime only for construction, then drop the guard
+            // before GPUI / block_on.
+            let _enter = runtime.enter();
+            ClientConnection::delayed_command_wire_for_test(client_id, hello.clone())
+        };
+        let client = HostClient::from_parts_for_test(
+            HostClientConfig {
+                named_profile: peer_profile_name.clone(),
+                client_build: "devmanager/task3-reject-ack".into(),
+                client_id,
+                requested: CapabilitySet::from_capabilities([
+                    Capability::PagedSnapshots,
+                    Capability::EventReplay,
+                    Capability::ProviderInput,
+                    Capability::OperationSettlement,
+                ]),
+                limits: FrameLimits::v1_default(),
+            },
+            hello,
+            Some(wire),
+            BTreeMap::new(),
+        );
+        fleet
+            .install(peer_host.clone(), client)
+            .expect("install peer");
+        let (model, task_id) = terminal_bound_client_model();
+        let admission = fleet
+            .admit_action(HostTaskKey::new(peer_host.clone(), task_id))
+            .expect("admit");
+
+        let command_a = CommandId::new();
+        let command_cancel = CommandId::new();
+        for command_id in [command_a, command_cancel] {
+            let fleet_task = Arc::clone(&fleet);
+            let admission_task = admission.clone();
+            let join = runtime.spawn(async move {
+                fleet_task
+                    .execute_command(
+                        &admission_task,
+                        CommandEnvelope {
+                            command_id,
+                            client_id: admission_task.client_id,
+                            task_id: Some(task_id),
+                            issued_at_ms: 1,
+                            expected_task_revision: None,
+                            command: crate::domain::command::Command::SettleTask,
+                        },
+                    )
+                    .await
+            });
+            assert_eq!(
+                runtime.block_on(handle.wait_command_admitted()),
+                command_id
+            );
+            runtime
+                .block_on(handle.dispatch_accepted(CommandReceipt::Rejected {
+                    command_id,
+                    code: RejectionCode::InvalidTransition,
+                    current_revision: None,
+                    resolution: None,
+                }))
+                .expect("dispatch rejected");
+            runtime
+                .block_on(join)
+                .expect("pre-ui command join")
+                .expect("pre-ui command execute");
+        }
+        assert_eq!(
+            fleet.retained_outcomes(&peer_host).expect("retained").len(),
+            2,
+            "ordinary + canceled receipts must occupy fleet retained capacity before UI ack"
+        );
+
+        // cfg(test) seam: finish_construction with runtime_guard=None skips the UI
+        // projection/bootstrap worker while preserving the real HostFleet driver and
+        // exact Client attachment ack_retained_outcome path. This fixture isolates
+        // UI acknowledgement of REAL HostFleet receipts — not snapshot bootstrap.
+        // Public attach_installed still requires a Tokio runtime (unchanged).
+        let client_rt = NativeHostClientRuntime::finish_construction(
+            &peer_profile,
+            Arc::clone(&fleet),
+            peer_host.clone(),
+            "fleet://task3-reject-ack".into(),
+            false,
+            false,
+            None,
+            None,
+            false,
+        )
+        .expect("fixture peer client runtime without UI worker");
+
+        let (shell_runtime, _) = TestRuntime::new(true, NativeHostActionResult::Queued);
+        let model = Arc::new(model);
+        let peer_host_shell = peer_host.clone();
+        let admission_shell = admission.clone();
+        let fleet_shell = Arc::clone(&fleet);
+        gpui::Application::headless().run(move |cx| {
+            crate::ui::init(cx);
+            with_test_shell_in_app(cx, shell_runtime, |shell| {
+                assert_ne!(
+                    shell.local_host_id(),
+                    peer_host_shell,
+                    "peer must use non-local apply_action_outcome_for_host path"
+                );
+                shell
+                    .apply_client_model(Arc::clone(&model))
+                    .expect("local model");
+                let epochs = client_rt.epochs();
+                let mut peer_slot = HostUiState::new_empty(
+                    peer_host_shell.clone(),
+                    NativeHostState::Connected {
+                        endpoint: "fleet://task3-reject-ack".into(),
+                    },
+                );
+                let _ = peer_slot.interaction.sync_host_epochs(epochs);
+                peer_slot.host_runtime = Some(NativeHostRuntimeAttachment::Client(client_rt));
+                shell.attach_host_ui_slot(peer_slot).expect("attach peer");
+                shell
+                    .apply_client_model_for_host(&peer_host_shell, Arc::clone(&model))
+                    .expect("peer model");
+
+                let live = shell
+                    .host_slot(&peer_host_shell)
+                    .expect("peer")
+                    .interaction
+                    .action_epochs();
+                let focus = shell.local_slot().interaction.current_focus_epoch();
+                let action = NativeActionRecord {
+                    id: "reject-ack",
+                    focus_epoch: focus,
+                    request_generation: 1,
+                    action_epoch: 1,
+                    connection_epoch: live.connection_epoch,
+                    client_epoch: live.client_epoch,
+                    navigation_epoch: 0,
+                    resource_generation: live.resource_generation,
+                    runtime_generation: live.runtime_generation,
+                    task_id: Some(task_id),
+                    fleet_admission: Some(admission_shell.clone()),
+                    purpose: super::NativeActionPurpose::Ordinary,
+                    background_read: false,
+                    expected_task_revision: Some(1),
+                    captured_task_action_epoch: Some(0),
+                    capability: None,
+                    disabled_reason: None,
+                    event: crate::ui::components::ActionEvent::new(
+                        crate::ui::components::ActionRequest::TaskSettle { task_id },
+                        crate::ui::components::ActivationSource::Pointer { pointer_id: 1 },
+                        focus,
+                    ),
+                    command: NativeHostCommand::TaskLifecycle {
+                        task_id,
+                        expected_task_revision: 1,
+                        command: crate::domain::command::Command::SettleTask,
+                        command_id: command_a,
+                        issued_at_ms: 1,
+                    },
+                };
+
+                shell.apply_epoch_fenced_action_outcome_for_host(
+                    &peer_host_shell,
+                    NativeHostActionOutcome::Accepted {
+                        action: action.clone(),
+                        receipt: CommandReceipt::Rejected {
+                            command_id: command_a,
+                            code: RejectionCode::InvalidTransition,
+                            current_revision: None,
+                            resolution: None,
+                        },
+                    },
+                );
+                assert!(
+                    shell
+                        .host_slot(&peer_host_shell)
+                        .and_then(|slot| slot.last_action_failure.as_ref())
+                        .is_some(),
+                    "rejected must surface visible failure"
+                );
+                assert_eq!(
+                    fleet_shell
+                        .retained_outcomes(&peer_host_shell)
+                        .expect("after ordinary ack")
+                        .len(),
+                    1,
+                    "ordinary Rejected must ack only its exact retained receipt"
+                );
+
+                // Wrong receipt command-id: no ack of the remaining canceled entry.
+                let mut mismatch = action.clone();
+                if let NativeHostCommand::TaskLifecycle {
+                    command_id: cmd, ..
+                } = &mut mismatch.command
+                {
+                    *cmd = CommandId::new();
+                }
+                shell.apply_epoch_fenced_action_outcome_for_host(
+                    &peer_host_shell,
+                    NativeHostActionOutcome::Accepted {
+                        action: mismatch,
+                        receipt: CommandReceipt::Rejected {
+                            command_id: CommandId::new(),
+                            code: RejectionCode::NotFound,
+                            current_revision: None,
+                            resolution: None,
+                        },
+                    },
+                );
+                assert_eq!(
+                    fleet_shell
+                        .retained_outcomes(&peer_host_shell)
+                        .expect("after mismatch")
+                        .len(),
+                    1,
+                    "mismatched receipt must not ack another retained command"
+                );
+
+                let mut cancel_action = action;
+                cancel_action.purpose = super::NativeActionPurpose::DeleteFlowConfirmation;
+                if let NativeHostCommand::TaskLifecycle {
+                    command_id: cmd, ..
+                } = &mut cancel_action.command
+                {
+                    *cmd = command_cancel;
+                }
+                shell.retired_delete_flow_commands.push(super::RetiredDeleteFlowCommand {
+                    owner: HostTaskKey::new(peer_host_shell.clone(), task_id),
+                    command_id: command_cancel,
+                    connection_epoch: cancel_action.connection_epoch,
+                    runtime_generation: cancel_action.runtime_generation,
+                    terminal: false,
+                });
+                shell.apply_epoch_fenced_action_outcome_for_host(
+                    &peer_host_shell,
+                    NativeHostActionOutcome::Uncertain {
+                        action: cancel_action.clone(),
+                        error: "canceled uncertain".into(),
+                    },
+                );
+                assert!(
+                    shell.retired_delete_flow_commands.iter().any(|retired| {
+                        retired.command_id == command_cancel && !retired.terminal
+                    }),
+                    "canceled Uncertain must stay unresolved"
+                );
+                assert_eq!(
+                    fleet_shell
+                        .retained_outcomes(&peer_host_shell)
+                        .expect("uncertain no-ack")
+                        .len(),
+                    1,
+                    "Uncertain must not acknowledge fleet retained capacity"
+                );
+                assert!(shell.delete_task.is_none());
+
+                shell.apply_epoch_fenced_action_outcome_for_host(
+                    &peer_host_shell,
+                    NativeHostActionOutcome::Accepted {
+                        action: cancel_action,
+                        receipt: CommandReceipt::Rejected {
+                            command_id: command_cancel,
+                            code: RejectionCode::NotFound,
+                            current_revision: None,
+                            resolution: None,
+                        },
+                    },
+                );
+                assert!(
+                    shell.retired_delete_flow_commands.iter().any(|retired| {
+                        retired.command_id == command_cancel && retired.terminal
+                    }),
+                    "correlated canceled Rejected must resolve retirement"
+                );
+                assert!(
+                    fleet_shell
+                        .retained_outcomes(&peer_host_shell)
+                        .expect("after canceled ack")
+                        .is_empty(),
+                    "canceled correlated Rejected must free exact fleet capacity"
+                );
+                assert!(shell.delete_task.is_none());
+            });
+            cx.quit();
+        });
+
+        let command_b = CommandId::new();
+        {
+            let fleet_task = Arc::clone(&fleet);
+            let admission_task = admission.clone();
+            let join = runtime.spawn(async move {
+                fleet_task
+                    .execute_command(
+                        &admission_task,
+                        CommandEnvelope {
+                            command_id: command_b,
+                            client_id: admission_task.client_id,
+                            task_id: Some(task_id),
+                            issued_at_ms: 1,
+                            expected_task_revision: None,
+                            command: crate::domain::command::Command::SettleTask,
+                        },
+                    )
+                    .await
+            });
+            assert_eq!(
+                runtime.block_on(handle.wait_command_admitted()),
+                command_b
+            );
+            runtime
+                .block_on(handle.dispatch_accepted(CommandReceipt::Rejected {
+                    command_id: command_b,
+                    code: RejectionCode::NotFound,
+                    current_revision: None,
+                    resolution: None,
+                }))
+                .expect("dispatch rejected b");
+            runtime
+                .block_on(join)
+                .expect("command_b join")
+                .expect("command_b execute");
+        }
+        assert_eq!(fleet.retained_outcomes(&peer_host).unwrap().len(), 1);
+        assert!(
+            fleet
+                .acknowledge_retained_owned(
+                    &peer_host,
+                    admission.generation,
+                    admission.client_id,
+                    CommandId::new(),
+                )
+                .is_err(),
+            "wrong command must not ack"
+        );
+        assert!(
+            fleet
+                .acknowledge_retained_owned(
+                    &peer_host,
+                    admission.generation.wrapping_add(3),
+                    admission.client_id,
+                    command_b,
+                )
+                .is_err(),
+            "wrong generation must not ack"
+        );
+        // Same CommandId on a different owner must not cross-ack.
+        assert!(
+            fleet
+                .acknowledge_retained_owned(
+                    &HostId::Remote([0xee; 16]),
+                    admission.generation,
+                    admission.client_id,
+                    command_b,
+                )
+                .is_err(),
+            "same CommandId across owners must never cross-ack"
+        );
+        fleet
+            .acknowledge_retained_owned(
+                &peer_host,
+                admission.generation,
+                admission.client_id,
+                command_b,
+            )
+            .expect("exact ack releases capacity for repeated rejects");
+        assert!(fleet.retained_outcomes(&peer_host).unwrap().is_empty());
+        runtime
+            .block_on(fleet.remove(&peer_host))
+            .expect("physical fleet.remove teardown");
+    }
+
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn async_connect_future_drop_cancels_worker_before_admit() {
@@ -50363,6 +54264,996 @@ mod tests {
                     timeline_message_roles_for_test(shell, &remote_host, task_id),
                     before_rows,
                     "stale remote conversation generation must not alter the timeline"
+                );
+            });
+            cx.quit();
+        });
+    }
+
+    fn attach_remote_test_host_with_shared(
+        shell: &mut NativeShell,
+        remote_host: &HostId,
+        model: std::sync::Arc<crate::client::ClientModel>,
+    ) -> Arc<Mutex<TestRuntimeState>> {
+        let (remote_runtime, remote_shared) =
+            TestRuntime::new(true, NativeHostActionResult::Queued);
+        let epochs = remote_runtime.epochs();
+        let mut remote_slot = HostUiState::new_empty(
+            remote_host.clone(),
+            NativeHostState::Connected {
+                endpoint: "fleet://remote-tools".into(),
+            },
+        );
+        remote_slot.host_runtime =
+            Some(NativeHostRuntimeAttachment::Injected(Box::new(remote_runtime)));
+        let _ = remote_slot.interaction.sync_host_epochs(epochs);
+        shell.attach_host_ui_slot(remote_slot).expect("attach remote");
+        shell
+            .apply_client_model_for_host(remote_host, model)
+            .expect("remote model");
+        remote_shared
+    }
+
+    #[test]
+    fn owner_remote_files_changes_review_route_only_to_captured_host() {
+        if rerun_headless_shell_test_in_child(
+            "ui::native_shell::tests::owner_remote_files_changes_review_route_only_to_captured_host",
+        ) {
+            return;
+        }
+        let host_a = HostId::Remote([0xa1; 16]);
+        let host_b = HostId::Remote([0xb2; 16]);
+        let (runtime, local_shared) = TestRuntime::new(true, NativeHostActionResult::Queued);
+        gpui::Application::headless().run(move |cx| {
+            crate::ui::init(cx);
+            with_test_shell_in_app(cx, runtime, |shell| {
+                let (model, shared_task) = terminal_bound_client_model();
+                let model = Arc::new(model);
+                shell
+                    .apply_client_model(Arc::clone(&model))
+                    .expect("local model");
+                let shared_a =
+                    attach_remote_test_host_with_shared(shell, &host_a, Arc::clone(&model));
+                let shared_b =
+                    attach_remote_test_host_with_shared(shell, &host_b, Arc::clone(&model));
+                let key_b = HostTaskKey::new(host_b.clone(), shared_task);
+                shell
+                    .select_fleet_task_key(key_b.clone(), FleetSelectMode::Replace)
+                    .expect("select B");
+                let _ = shell
+                    .host_slot_mut(&host_b)
+                    .expect("B")
+                    .cockpit
+                    .handle_tool_action(
+                        crate::ui::task_cockpit::dock::DockTool::Files,
+                        RequestId::new(),
+                    );
+                shared_b.lock().expect("b").accepted.clear();
+                shared_a.lock().expect("a").accepted.clear();
+                local_shared.lock().expect("local").accepted.clear();
+                shell.refresh_cockpit_surfaces_for_owner(&key_b);
+                let b_queries = shared_b
+                    .lock()
+                    .expect("b")
+                    .accepted
+                    .iter()
+                    .filter_map(|record| match &record.command {
+                        NativeHostCommand::TaskCockpitQuery { query, .. } => Some(query.clone()),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>();
+                assert!(
+                    b_queries.iter().any(|query| matches!(
+                        query,
+                        TaskCockpitQuery::FilesList {
+                            relative_directory: None,
+                            limit: 64
+                        }
+                    )),
+                    "Files refresh must query host B"
+                );
+                assert!(
+                    shared_a.lock().expect("a").accepted.is_empty(),
+                    "duplicate TaskId on host A must not receive Files refresh"
+                );
+                assert!(
+                    local_shared.lock().expect("local").accepted.is_empty(),
+                    "remote Files must not fall back to the local host"
+                );
+
+                let _ = shell
+                    .host_slot_mut(&host_b)
+                    .expect("B")
+                    .cockpit
+                    .handle_tool_action(
+                        crate::ui::task_cockpit::dock::DockTool::Changes,
+                        RequestId::new(),
+                    );
+                shared_b.lock().expect("b").accepted.clear();
+                shell.refresh_cockpit_surfaces_for_owner(&key_b);
+                let changes = shared_b
+                    .lock()
+                    .expect("b")
+                    .accepted
+                    .iter()
+                    .filter_map(|record| match &record.command {
+                        NativeHostCommand::TaskCockpitQuery { query, .. } => Some(query.clone()),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>();
+                assert!(changes.iter().any(|q| matches!(q, TaskCockpitQuery::WorkspaceStatus)));
+                assert!(changes
+                    .iter()
+                    .any(|q| matches!(q, TaskCockpitQuery::GitRepositories)));
+
+                let catalog = crate::domain::cockpit::TaskGitRepositoriesProjection {
+                    task_id: shared_task,
+                    repositories: vec![crate::domain::cockpit::TaskRepositoryCatalogEntry {
+                        selector: crate::domain::cockpit::TaskRepositorySelector::Workspace,
+                        kind: crate::domain::cockpit::TaskRepositoryKind::Workspace,
+                        label: "Workspace".into(),
+                        available: true,
+                        read_only: false,
+                    }],
+                };
+                shell.apply_repository_catalog_for_owner(&key_b, &catalog);
+                assert_eq!(
+                    shell.selected_repository_for_owner(&key_b),
+                    Some(crate::domain::cockpit::TaskRepositorySelector::Workspace)
+                );
+                let key_a = HostTaskKey::new(host_a.clone(), shared_task);
+                assert!(
+                    shell.selected_repository_for_owner(&key_a).is_none(),
+                    "repo selection must stay HostTaskKey-scoped"
+                );
+
+                let review = crate::ui::task_cockpit::ReviewPanelProjection::from_model(
+                    shell
+                        .host_slot(&host_b)
+                        .and_then(|slot| slot.client_model.as_ref())
+                        .and_then(|model| model.task(shared_task)),
+                    Vec::new(),
+                    shared_task,
+                );
+                assert_eq!(review.identity.task_id, shared_task);
+                assert!(
+                    shell.host_slot(&host_a).is_some_and(|slot| {
+                        slot.cockpit.live_projection().is_none_or(|live| live.files.is_none())
+                    }),
+                    "host A Files projection must remain untouched"
+                );
+            });
+            cx.quit();
+        });
+    }
+
+    #[test]
+    fn owner_remote_files_focus_switch_rejects_stale_outcome() {
+        if rerun_headless_shell_test_in_child(
+            "ui::native_shell::tests::owner_remote_files_focus_switch_rejects_stale_outcome",
+        ) {
+            return;
+        }
+        let remote_host = HostId::Remote([0xf1; 16]);
+        let (runtime, _) = TestRuntime::new(true, NativeHostActionResult::Queued);
+        gpui::Application::headless().run(move |cx| {
+            crate::ui::init(cx);
+            with_test_shell_in_app(cx, runtime, |shell| {
+                let (model, first_task, second_task) = two_task_terminal_bound_client_model();
+                let model = Arc::new(model);
+                attach_remote_test_host(shell, &remote_host, Arc::clone(&model));
+                shell
+                    .select_fleet_task_key(
+                        HostTaskKey::new(remote_host.clone(), first_task),
+                        FleetSelectMode::Replace,
+                    )
+                    .expect("select first");
+                let stale = shell
+                    .dispatch_action_recorded_for_owner(
+                        &remote_host,
+                        ActionRequest::TaskCockpit {
+                            task_id: first_task,
+                            query: TaskCockpitQuery::FilesList {
+                                relative_directory: None,
+                                limit: 64,
+                            },
+                        },
+                    )
+                    .expect("files list");
+                shell
+                    .select_fleet_task_key(
+                        HostTaskKey::new(remote_host.clone(), second_task),
+                        FleetSelectMode::Replace,
+                    )
+                    .expect("focus second");
+                shell.apply_epoch_fenced_action_outcome_for_host(
+                    &remote_host,
+                    NativeHostActionOutcome::Queried {
+                        action: stale,
+                        detail: "stale files".into(),
+                        body: NativeHostQueryBody::TaskCockpit(
+                            crate::domain::TaskCockpitResult::FilesList(
+                                crate::domain::cockpit::TaskFilesListProjection {
+                                    task_id: first_task,
+                                    entries: vec![crate::domain::cockpit::TaskFileEntry {
+                                        relative_path: "stale.md".into(),
+                                        is_directory: false,
+                                        secret: false,
+                                    }],
+                                    truncated: false,
+                                },
+                            ),
+                        ),
+                    },
+                );
+                let live = shell
+                    .host_slot(&remote_host)
+                    .and_then(|slot| slot.cockpit.live_projection())
+                    .and_then(|projection| projection.files.clone());
+                assert!(
+                    live.as_ref()
+                        .is_none_or(|files| files.task_id != first_task
+                            || files.entries.iter().all(|e| e.relative_path != "stale.md")),
+                    "stale FilesList after focus switch must not land"
+                );
+            });
+            cx.quit();
+        });
+    }
+
+    #[test]
+    fn owner_remote_terminal_admits_display_only_without_local_input() {
+        if rerun_headless_shell_test_in_child(
+            "ui::native_shell::tests::owner_remote_terminal_admits_display_only_without_local_input",
+        ) {
+            return;
+        }
+        let remote_host = HostId::Remote([0x77; 16]);
+        let (runtime, local_shared) = TestRuntime::new(true, NativeHostActionResult::Queued);
+        gpui::Application::headless().run(move |cx| {
+            crate::ui::init(cx);
+            with_test_shell_in_app(cx, runtime, |shell| {
+                let (model, task_id) = terminal_bound_client_model();
+                let model = Arc::new(model);
+                let snapshot = model.task(task_id).expect("task").clone();
+                let agent_id = snapshot.primary_agent_id.expect("agent");
+                let resource = snapshot
+                    .resources
+                    .values()
+                    .find(|resource| {
+                        resource.resource_kind == crate::domain::resource::ResourceKind::Terminal
+                    })
+                    .expect("terminal resource")
+                    .clone();
+                attach_remote_test_host(shell, &remote_host, Arc::clone(&model));
+                let owner = HostTaskKey::new(remote_host.clone(), task_id);
+                shell
+                    .select_fleet_task_key(owner.clone(), FleetSelectMode::Replace)
+                    .expect("select remote");
+                shell.set_provider_terminal_visible(true);
+                assert!(
+                    !shell.local_slot().cockpit.dock().showing_raw_terminal(),
+                    "remote terminal must not mutate the local dock"
+                );
+                assert!(
+                    shell
+                        .host_slot(&remote_host)
+                        .is_some_and(|slot| slot.cockpit.dock().showing_raw_terminal()),
+                    "remote owner dock should show the display terminal surface"
+                );
+                let action = shell
+                    .dispatch_action_recorded_for_owner(
+                        &remote_host,
+                        ActionRequest::TaskCockpit {
+                            task_id,
+                            query: TaskCockpitQuery::Terminal,
+                        },
+                    )
+                    .expect("terminal query");
+                let terminal = crate::domain::cockpit::TaskTerminalProjection {
+                    task_id,
+                    terminal_id: crate::domain::TerminalId::new(),
+                    session_id: crate::terminal::protocol::TerminalSessionId::new(),
+                    agent_session_id: agent_id,
+                    resource_id: resource.id,
+                    runtime_generation: snapshot.agents[&agent_id].runtime_generation,
+                    resource_generation: resource.runtime_generation,
+                    action_epoch: 1,
+                    accepts_input_without_conversation_id: false,
+                    sequence: 3,
+                    title: Some("remote-display".into()),
+                    text_lines: vec!["remote replica line".into()],
+                    screen: Default::default(),
+                };
+                shell.apply_epoch_fenced_action_outcome_for_host(
+                    &remote_host,
+                    NativeHostActionOutcome::Queried {
+                        action,
+                        detail: "terminal".into(),
+                        body: NativeHostQueryBody::TaskCockpit(
+                            crate::domain::TaskCockpitResult::Terminal(terminal),
+                        ),
+                    },
+                );
+                assert!(
+                    shell.task_surfaces.terminal_is_interactive(owner.clone()),
+                    "owner surface must admit the remote terminal projection"
+                );
+                assert!(
+                    shell
+                        .host_slot(&remote_host)
+                        .is_some_and(|slot| slot.cockpit.dock().terminal_binding().is_some()),
+                    "owner dock must retain the replica binding"
+                );
+                let before_local = local_shared.lock().expect("local").accepted.len();
+                assert!(
+                    !shell.dispatch_provider_terminal_text("should-not-send".into()),
+                    "display-only remote terminal must not dispatch local input"
+                );
+                assert_eq!(
+                    local_shared.lock().expect("local").accepted.len(),
+                    before_local,
+                    "no local terminal input command may be enqueued"
+                );
+            });
+            cx.quit();
+        });
+    }
+
+    #[test]
+    fn owner_remote_files_directory_navigation_preserves_path_on_owner() {
+        if rerun_headless_shell_test_in_child(
+            "ui::native_shell::tests::owner_remote_files_directory_navigation_preserves_path_on_owner",
+        ) {
+            return;
+        }
+        let remote_host = HostId::Remote([0xf2; 16]);
+        let (runtime, _) = TestRuntime::new(true, NativeHostActionResult::Queued);
+        gpui::Application::headless().run(move |cx| {
+            crate::ui::init(cx);
+            with_test_shell_in_app(cx, runtime, |shell| {
+                let (model, task_id) = terminal_bound_client_model();
+                let shared = attach_remote_test_host_with_shared(
+                    shell,
+                    &remote_host,
+                    Arc::new(model),
+                );
+                let owner = HostTaskKey::new(remote_host.clone(), task_id);
+                shell
+                    .select_fleet_task_key(owner.clone(), FleetSelectMode::Replace)
+                    .expect("select");
+                let _ = shell
+                    .host_slot_mut(&remote_host)
+                    .expect("remote")
+                    .cockpit
+                    .handle_tool_action(
+                        crate::ui::task_cockpit::dock::DockTool::Files,
+                        RequestId::new(),
+                    );
+                shell.remember_files_browse_directory(owner.clone(), Some("src".into()));
+                shared.lock().expect("remote").accepted.clear();
+                shell.refresh_cockpit_surfaces_for_owner(&owner);
+                let listed = shared
+                    .lock()
+                    .expect("remote")
+                    .accepted
+                    .iter()
+                    .any(|record| {
+                        matches!(
+                            &record.command,
+                            NativeHostCommand::TaskCockpitQuery {
+                                query: TaskCockpitQuery::FilesList {
+                                    relative_directory: Some(path),
+                                    limit: 64,
+                                },
+                                ..
+                            } if path == "src"
+                        )
+                    });
+                assert!(listed, "refresh must preserve the owner Files directory");
+                assert_eq!(
+                    shell.files_relative_directory_for_owner(&owner).as_deref(),
+                    Some("src")
+                );
+            });
+            cx.quit();
+        });
+    }
+
+    #[test]
+    fn owner_remote_fanout_reuses_handler_so_all_sibling_outcomes_admit() {
+        if rerun_headless_shell_test_in_child(
+            "ui::native_shell::tests::owner_remote_fanout_reuses_handler_so_all_sibling_outcomes_admit",
+        ) {
+            return;
+        }
+        let remote_host = HostId::Remote([0xc3; 16]);
+        let (runtime, _) = TestRuntime::new(true, NativeHostActionResult::Queued);
+        gpui::Application::headless().run(move |cx| {
+            crate::ui::init(cx);
+            with_test_shell_in_app(cx, runtime, |shell| {
+                let (model, task_id) = terminal_bound_client_model();
+                let shared = attach_remote_test_host_with_shared(
+                    shell,
+                    &remote_host,
+                    Arc::new(model),
+                );
+                let owner = HostTaskKey::new(remote_host.clone(), task_id);
+                shell
+                    .select_fleet_task_key(owner.clone(), FleetSelectMode::Replace)
+                    .expect("select");
+                let _ = shell
+                    .host_slot_mut(&remote_host)
+                    .expect("remote")
+                    .cockpit
+                    .handle_tool_action(
+                        crate::ui::task_cockpit::dock::DockTool::Changes,
+                        RequestId::new(),
+                    );
+                shared.lock().expect("remote").accepted.clear();
+                shell.refresh_cockpit_surfaces_for_owner(&owner);
+                let sibling_records = shared
+                    .lock()
+                    .expect("remote")
+                    .accepted
+                    .clone();
+                let generations = sibling_records
+                    .iter()
+                    .map(|record| record.request_generation)
+                    .collect::<Vec<_>>();
+                assert!(
+                    generations.len() >= 3,
+                    "Changes fanout must include Conversation + WorkspaceStatus + GitRepositories"
+                );
+                assert!(
+                    generations.windows(2).all(|pair| pair[0] == pair[1]),
+                    "sibling fanout must reuse one handler generation: {generations:?}"
+                );
+                let interaction = &shell
+                    .host_slot(&remote_host)
+                    .expect("remote")
+                    .interaction;
+                for record in &sibling_records {
+                    assert!(
+                        interaction.accepts_action_outcome_record(record),
+                        "every sibling in the fanout must remain admissible, not only the last"
+                    );
+                }
+
+                let conversation = sibling_records
+                    .iter()
+                    .find(|record| {
+                        matches!(
+                            &record.command,
+                            NativeHostCommand::TaskCockpitQuery {
+                                query: TaskCockpitQuery::Conversation { .. },
+                                ..
+                            }
+                        )
+                    })
+                    .cloned()
+                    .expect("conversation sibling");
+                let workspace = sibling_records
+                    .iter()
+                    .find(|record| {
+                        matches!(
+                            &record.command,
+                            NativeHostCommand::TaskCockpitQuery {
+                                query: TaskCockpitQuery::WorkspaceStatus,
+                                ..
+                            }
+                        )
+                    })
+                    .cloned()
+                    .expect("workspace sibling");
+                let repos = sibling_records
+                    .iter()
+                    .find(|record| {
+                        matches!(
+                            &record.command,
+                            NativeHostCommand::TaskCockpitQuery {
+                                query: TaskCockpitQuery::GitRepositories,
+                                ..
+                            }
+                        )
+                    })
+                    .cloned()
+                    .expect("git repositories sibling");
+
+                apply_conversation_query_outcome_for_test(
+                    shell,
+                    &remote_host,
+                    conversation,
+                    test_conversation_user_page(1, 0, "fanout-conversation"),
+                );
+                shell.apply_epoch_fenced_action_outcome_for_host(
+                    &remote_host,
+                    NativeHostActionOutcome::Queried {
+                        action: workspace,
+                        detail: "workspace".into(),
+                        body: NativeHostQueryBody::TaskCockpit(
+                            crate::domain::TaskCockpitResult::Workspace(
+                                crate::domain::cockpit::TaskWorkspaceProjection {
+                                    task_id,
+                                    kind: crate::domain::cockpit::TaskWorkspaceKind::Main,
+                                    bound: true,
+                                    branch: Some("main".into()),
+                                    has_repository_fingerprint: true,
+                                },
+                            ),
+                        ),
+                    },
+                );
+                shell.apply_epoch_fenced_action_outcome_for_host(
+                    &remote_host,
+                    NativeHostActionOutcome::Queried {
+                        action: repos,
+                        detail: "repos".into(),
+                        body: NativeHostQueryBody::TaskCockpit(
+                            crate::domain::TaskCockpitResult::GitRepositories(
+                                crate::domain::cockpit::TaskGitRepositoriesProjection {
+                                    task_id,
+                                    repositories: vec![
+                                        crate::domain::cockpit::TaskRepositoryCatalogEntry {
+                                            selector: crate::domain::cockpit::TaskRepositorySelector::Workspace,
+                                            kind: crate::domain::cockpit::TaskRepositoryKind::Workspace,
+                                            label: "Workspace".into(),
+                                            available: true,
+                                            read_only: false,
+                                        },
+                                    ],
+                                },
+                            ),
+                        ),
+                    },
+                );
+                let live = shell
+                    .host_slot(&remote_host)
+                    .and_then(|slot| slot.cockpit.live_projection())
+                    .expect("live after sibling outcomes");
+                assert!(
+                    live.workspace
+                        .as_ref()
+                        .is_some_and(|workspace| workspace.task_id == task_id
+                            && workspace.branch.as_deref() == Some("main")),
+                    "WorkspaceStatus sibling outcome must land"
+                );
+                assert!(
+                    live.repositories.as_ref().is_some_and(|catalog| {
+                        catalog.task_id == task_id && !catalog.repositories.is_empty()
+                    }),
+                    "GitRepositories sibling outcome must land"
+                );
+
+                let _ = shell
+                    .host_slot_mut(&remote_host)
+                    .expect("remote")
+                    .cockpit
+                    .handle_tool_action(
+                        crate::ui::task_cockpit::dock::DockTool::Review,
+                        RequestId::new(),
+                    );
+                shared.lock().expect("remote").accepted.clear();
+                shell.refresh_cockpit_surfaces_for_owner(&owner);
+                let review_records = shared.lock().expect("remote").accepted.clone();
+                let review_generations = review_records
+                    .iter()
+                    .map(|record| record.request_generation)
+                    .collect::<Vec<_>>();
+                assert!(
+                    review_records.iter().any(|record| {
+                        matches!(
+                            &record.command,
+                            NativeHostCommand::TaskCockpitQuery {
+                                query: TaskCockpitQuery::Conversation { .. },
+                                ..
+                            }
+                        )
+                    }) && review_records.iter().any(|record| {
+                        matches!(&record.command, NativeHostCommand::TaskShowQuery { .. })
+                    }),
+                    "Review fanout must include Conversation and TaskShow"
+                );
+                assert!(
+                    review_generations.windows(2).all(|pair| pair[0] == pair[1]),
+                    "Review TaskShow must share the Conversation handler: {review_generations:?}"
+                );
+                let interaction = &shell
+                    .host_slot(&remote_host)
+                    .expect("remote")
+                    .interaction;
+                for record in &review_records {
+                    assert!(
+                        interaction.accepts_action_outcome_record(record),
+                        "Review sibling outcomes must all remain admissible"
+                    );
+                }
+            });
+            cx.quit();
+        });
+    }
+
+    #[test]
+    fn owner_remote_same_task_id_stale_callback_after_focus_switch_noops() {
+        if rerun_headless_shell_test_in_child(
+            "ui::native_shell::tests::owner_remote_same_task_id_stale_callback_after_focus_switch_noops",
+        ) {
+            return;
+        }
+        let host_a = HostId::Remote([0xd1; 16]);
+        let host_b = HostId::Remote([0xd2; 16]);
+        let (runtime, _) = TestRuntime::new(true, NativeHostActionResult::Queued);
+        gpui::Application::headless().run(move |cx| {
+            crate::ui::init(cx);
+            with_test_shell_in_app(cx, runtime, |shell| {
+                let (model, shared_task) = terminal_bound_client_model();
+                let model = Arc::new(model);
+                let shared_a =
+                    attach_remote_test_host_with_shared(shell, &host_a, Arc::clone(&model));
+                let shared_b =
+                    attach_remote_test_host_with_shared(shell, &host_b, Arc::clone(&model));
+                let key_a = HostTaskKey::new(host_a.clone(), shared_task);
+                let key_b = HostTaskKey::new(host_b.clone(), shared_task);
+                shell
+                    .select_fleet_task_key(key_a.clone(), FleetSelectMode::Replace)
+                    .expect("focus A");
+                let _ = shell
+                    .host_slot_mut(&host_a)
+                    .expect("A")
+                    .cockpit
+                    .handle_tool_action(
+                        crate::ui::task_cockpit::dock::DockTool::Changes,
+                        RequestId::new(),
+                    );
+                let catalog = crate::domain::cockpit::TaskGitRepositoriesProjection {
+                    task_id: shared_task,
+                    repositories: vec![crate::domain::cockpit::TaskRepositoryCatalogEntry {
+                        selector: crate::domain::cockpit::TaskRepositorySelector::Workspace,
+                        kind: crate::domain::cockpit::TaskRepositoryKind::Workspace,
+                        label: "Workspace".into(),
+                        available: true,
+                        read_only: false,
+                    }],
+                };
+                shell.apply_repository_catalog_for_owner(&key_a, &catalog);
+                let captured_focus = shell
+                    .host_slot(&host_a)
+                    .expect("A")
+                    .interaction
+                    .current_focus_epoch();
+                let captured_revision = model
+                    .task(shared_task)
+                    .map(|snapshot| snapshot.task.revision)
+                    .expect("revision");
+                shared_a.lock().expect("a").accepted.clear();
+                shared_b.lock().expect("b").accepted.clear();
+
+                shell
+                    .select_fleet_task_key(key_b.clone(), FleetSelectMode::Replace)
+                    .expect("focus B");
+                shell.select_changes_repository_for_owner_gated(
+                    &key_a,
+                    crate::domain::cockpit::TaskRepositorySelector::Workspace,
+                    Some(captured_focus),
+                    Some(captured_revision),
+                );
+                assert!(
+                    shared_a.lock().expect("a").accepted.is_empty(),
+                    "stale host A callback after focus B must not dispatch"
+                );
+                assert!(
+                    shared_b.lock().expect("b").accepted.is_empty(),
+                    "stale host A callback must not remint onto host B"
+                );
+            });
+            cx.quit();
+        });
+    }
+
+    #[test]
+    fn owner_remote_forged_terminal_body_on_files_query_is_rejected() {
+        if rerun_headless_shell_test_in_child(
+            "ui::native_shell::tests::owner_remote_forged_terminal_body_on_files_query_is_rejected",
+        ) {
+            return;
+        }
+        let remote_host = HostId::Remote([0xe4; 16]);
+        let (runtime, _) = TestRuntime::new(true, NativeHostActionResult::Queued);
+        gpui::Application::headless().run(move |cx| {
+            crate::ui::init(cx);
+            with_test_shell_in_app(cx, runtime, |shell| {
+                let (model, task_id) = terminal_bound_client_model();
+                let model = Arc::new(model);
+                let snapshot = model.task(task_id).expect("task").clone();
+                let agent_id = snapshot.primary_agent_id.expect("agent");
+                let resource = snapshot
+                    .resources
+                    .values()
+                    .find(|resource| {
+                        resource.resource_kind == crate::domain::resource::ResourceKind::Terminal
+                    })
+                    .expect("terminal resource")
+                    .clone();
+                attach_remote_test_host(shell, &remote_host, Arc::clone(&model));
+                let owner = HostTaskKey::new(remote_host.clone(), task_id);
+                shell
+                    .select_fleet_task_key(owner.clone(), FleetSelectMode::Replace)
+                    .expect("select");
+                let before_binding = shell
+                    .host_slot(&remote_host)
+                    .and_then(|slot| slot.cockpit.dock().terminal_binding());
+                let before_fingerprint = shell
+                    .host_slot(&remote_host)
+                    .map(|slot| slot.cockpit.dock().projection_fingerprint())
+                    .expect("dock fingerprint");
+                let before_replica = shell
+                    .host_slot(&remote_host)
+                    .is_some_and(|slot| slot.cockpit.dock().replica_view().is_some());
+                let before_valid = shell
+                    .host_slot(&remote_host)
+                    .is_some_and(|slot| slot.cockpit.dock().last_valid_view().is_some());
+                assert!(
+                    before_binding.is_some(),
+                    "selection legitimately binds HostTerminalBinding from the task snapshot"
+                );
+                assert!(
+                    !before_replica && !before_valid,
+                    "pre-fixture dock must not already hold a replica/last_valid terminal view"
+                );
+                assert_eq!(
+                    before_fingerprint.last_sequence,
+                    0,
+                    "pre-fixture dock sequence must not already carry a terminal projection"
+                );
+                let before_surface_terminal = shell
+                    .task_surfaces
+                    .state(owner.clone())
+                    .and_then(|state| state.latest_terminal.clone());
+                assert!(
+                    before_surface_terminal.is_none(),
+                    "pre-fixture task surface must not hold a terminal projection"
+                );
+                let files = shell
+                    .dispatch_action_recorded_for_owner(
+                        &remote_host,
+                        ActionRequest::TaskCockpit {
+                            task_id,
+                            query: TaskCockpitQuery::FilesList {
+                                relative_directory: None,
+                                limit: 64,
+                            },
+                        },
+                    )
+                    .expect("files list");
+                let forged = crate::domain::cockpit::TaskTerminalProjection {
+                    task_id,
+                    terminal_id: crate::domain::TerminalId::new(),
+                    session_id: crate::terminal::protocol::TerminalSessionId::new(),
+                    agent_session_id: agent_id,
+                    resource_id: resource.id,
+                    runtime_generation: snapshot.agents[&agent_id].runtime_generation,
+                    resource_generation: resource.runtime_generation,
+                    action_epoch: 1,
+                    accepts_input_without_conversation_id: false,
+                    sequence: 9,
+                    title: Some("forged".into()),
+                    text_lines: vec!["should-not-admit".into()],
+                    screen: Default::default(),
+                };
+                shell.apply_epoch_fenced_action_outcome_for_host(
+                    &remote_host,
+                    NativeHostActionOutcome::Queried {
+                        action: files,
+                        detail: "forged terminal".into(),
+                        body: NativeHostQueryBody::TaskCockpit(
+                            crate::domain::TaskCockpitResult::Terminal(forged),
+                        ),
+                    },
+                );
+                assert!(
+                    !shell.task_surfaces.terminal_is_interactive(owner.clone()),
+                    "forged Terminal body on a FilesList query must not admit the surface"
+                );
+                assert_eq!(
+                    shell
+                        .host_slot(&remote_host)
+                        .and_then(|slot| slot.cockpit.dock().terminal_binding()),
+                    before_binding,
+                    "forged Terminal body must not change the pre-existing owner binding"
+                );
+                let after_fingerprint = shell
+                    .host_slot(&remote_host)
+                    .map(|slot| slot.cockpit.dock().projection_fingerprint())
+                    .expect("fingerprint");
+                assert_eq!(
+                    after_fingerprint, before_fingerprint,
+                    "forged Terminal body must not change the dock projection fingerprint"
+                );
+                assert_eq!(
+                    after_fingerprint.last_sequence,
+                    before_fingerprint.last_sequence,
+                    "forged sequence must not advance the dock fingerprint last_sequence"
+                );
+                assert!(
+                    !shell
+                        .host_slot(&remote_host)
+                        .is_some_and(|slot| slot.cockpit.dock().replica_view().is_some())
+                        && !shell
+                            .host_slot(&remote_host)
+                            .is_some_and(|slot| slot.cockpit.dock().last_valid_view().is_some()),
+                    "forged Terminal body must leave replica_view and last_valid_view absent"
+                );
+                let after_surface = shell
+                    .task_surfaces
+                    .state(owner.clone())
+                    .and_then(|state| state.latest_terminal.as_ref());
+                assert!(
+                    after_surface.is_none(),
+                    "forged Terminal body must not install a task-surface terminal projection"
+                );
+                assert!(
+                    shell
+                        .task_surfaces
+                        .terminal_tail(owner.clone(), 32)
+                        .iter()
+                        .all(|line| !line.contains("should-not-admit")),
+                    "forged text must never enter the task-surface terminal tail"
+                );
+            });
+            cx.quit();
+        });
+    }
+
+    #[test]
+    fn owner_remote_terminal_visual_and_at_toggle_agree_display_only() {
+        if rerun_headless_shell_test_in_child(
+            "ui::native_shell::tests::owner_remote_terminal_visual_and_at_toggle_agree_display_only",
+        ) {
+            return;
+        }
+        let remote_host = HostId::Remote([0xf5; 16]);
+        let (runtime, local_shared) = TestRuntime::new(true, NativeHostActionResult::Queued);
+        gpui::Application::headless().run(move |cx| {
+            crate::ui::init(cx);
+            with_test_shell_in_app(cx, runtime, |shell| {
+                let (model, task_id) = terminal_bound_client_model();
+                attach_remote_test_host(shell, &remote_host, Arc::new(model));
+                let owner = HostTaskKey::new(remote_host.clone(), task_id);
+                shell
+                    .select_fleet_task_key(owner.clone(), FleetSelectMode::Replace)
+                    .expect("select remote");
+                shell.refresh_accessibility_tree();
+                let terminal_node = shell
+                    .accessibility_tree
+                    .nodes()
+                    .into_iter()
+                    .find(|node| node.element_id() == "native-task-center-terminal")
+                    .expect("AT terminal toggle");
+                assert!(
+                    !terminal_node.metadata().disabled(),
+                    "remote Terminal AT route must be enabled for display toggle"
+                );
+                assert!(
+                    terminal_node.focusable() && terminal_node.tab_stop(),
+                    "remote Terminal AT must remain a real toggle control"
+                );
+                assert!(
+                    terminal_node
+                        .description()
+                        .to_ascii_lowercase()
+                        .contains("display"),
+                    "AT copy must describe display-only remote terminal"
+                );
+                assert!(!shell.owner_showing_raw_terminal());
+                shell.dispatch_named_accessibility_action("native-task-center-terminal");
+                assert!(
+                    shell.owner_showing_raw_terminal(),
+                    "AT toggle must flip the selected owner dock visibility"
+                );
+                assert!(
+                    !shell.local_slot().cockpit.dock().showing_raw_terminal(),
+                    "remote AT toggle must not mutate the local dock"
+                );
+                assert!(
+                    shell
+                        .host_slot(&remote_host)
+                        .is_some_and(|slot| slot.cockpit.dock().showing_raw_terminal()),
+                    "visual owner dock must agree with AT"
+                );
+                let before = local_shared.lock().expect("local").accepted.len();
+                assert!(!shell.dispatch_provider_terminal_text("nope".into()));
+                assert_eq!(
+                    local_shared.lock().expect("local").accepted.len(),
+                    before,
+                    "display-only remote must still refuse raw input"
+                );
+                shell.dispatch_named_accessibility_action("native-task-center-conversation");
+                assert!(
+                    !shell.owner_showing_raw_terminal(),
+                    "Conversation AT must restore owner canvas visibility"
+                );
+            });
+            cx.quit();
+        });
+    }
+
+    #[test]
+    fn owner_remote_repo_catalog_defers_git_status_when_not_changes_focused() {
+        if rerun_headless_shell_test_in_child(
+            "ui::native_shell::tests::owner_remote_repo_catalog_defers_git_status_when_not_changes_focused",
+        ) {
+            return;
+        }
+        let remote_host = HostId::Remote([0xa6; 16]);
+        let (runtime, _) = TestRuntime::new(true, NativeHostActionResult::Queued);
+        gpui::Application::headless().run(move |cx| {
+            crate::ui::init(cx);
+            with_test_shell_in_app(cx, runtime, |shell| {
+                let (model, task_id) = terminal_bound_client_model();
+                let model = Arc::new(model);
+                let shared = attach_remote_test_host_with_shared(
+                    shell,
+                    &remote_host,
+                    Arc::clone(&model),
+                );
+                let owner = HostTaskKey::new(remote_host.clone(), task_id);
+                shell
+                    .select_fleet_task_key(owner.clone(), FleetSelectMode::Replace)
+                    .expect("select");
+                let _ = shell
+                    .host_slot_mut(&remote_host)
+                    .expect("remote")
+                    .cockpit
+                    .handle_tool_action(
+                        crate::ui::task_cockpit::dock::DockTool::Files,
+                        RequestId::new(),
+                    );
+                shared.lock().expect("remote").accepted.clear();
+                let catalog = crate::domain::cockpit::TaskGitRepositoriesProjection {
+                    task_id,
+                    repositories: vec![crate::domain::cockpit::TaskRepositoryCatalogEntry {
+                        selector: crate::domain::cockpit::TaskRepositorySelector::Workspace,
+                        kind: crate::domain::cockpit::TaskRepositoryKind::Workspace,
+                        label: "Workspace".into(),
+                        available: true,
+                        read_only: false,
+                    }],
+                };
+                shell.apply_repository_catalog_for_owner(&owner, &catalog);
+                assert_eq!(
+                    shell.selected_repository_for_owner(&owner),
+                    Some(crate::domain::cockpit::TaskRepositorySelector::Workspace),
+                    "catalog may cache while Files is active"
+                );
+                assert!(
+                    !shared.lock().expect("remote").accepted.iter().any(|record| {
+                        matches!(
+                            &record.command,
+                            NativeHostCommand::TaskCockpitQuery {
+                                query: TaskCockpitQuery::GitStatusTargeted { .. },
+                                ..
+                            }
+                        )
+                    }),
+                    "GitStatus follow-up must defer until Changes is the active focused tool"
+                );
+
+                let other = HostId::Remote([0xa7; 16]);
+                attach_remote_test_host(shell, &other, Arc::clone(&model));
+                let other_key = HostTaskKey::new(other.clone(), task_id);
+                shell
+                    .select_fleet_task_key(other_key, FleetSelectMode::Replace)
+                    .expect("focus other");
+                shared.lock().expect("remote").accepted.clear();
+                shell.apply_repository_catalog_for_owner(&owner, &catalog);
+                assert_eq!(
+                    shell.selected_repository_for_owner(&owner),
+                    Some(crate::domain::cockpit::TaskRepositorySelector::Workspace),
+                    "hidden owner may still cache an owner-qualified catalog"
+                );
+                assert!(
+                    shared.lock().expect("remote").accepted.is_empty(),
+                    "hidden owner catalog must not dispatch GitStatus or local fallback"
                 );
             });
             cx.quit();

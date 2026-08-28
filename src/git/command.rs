@@ -2483,6 +2483,22 @@ fn windows_path_units(path: &Path) -> Vec<u16> {
     units
 }
 
+/// How linked-worktree metadata descriptors are admitted into the repository
+/// graph. Current-worktree reads snapshot unrelated sibling descriptor files
+/// without following their checkout backlinks; descriptor-consuming command
+/// shapes require [`WorktreeDescriptorAdmission::Strict`].
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum WorktreeDescriptorAdmission {
+    /// Status and other current-worktree reads. The current linked metadata
+    /// directory (when present) retains full backlink validation; unrelated
+    /// siblings keep shape/commondir checks only.
+    CurrentOnly,
+    /// Resolve and authorize every sibling `gitdir` backlink against approved
+    /// roots. Required before worktree/branch/switch shapes that can consume
+    /// sibling occupancy metadata.
+    Strict,
+}
+
 #[derive(Clone)]
 struct RepositoryGraph {
     nodes: Vec<GraphNode>,
@@ -2491,6 +2507,7 @@ struct RepositoryGraph {
     object_stores: Vec<PathBuf>,
     metadata_roots: Vec<PathBuf>,
     approved_external_roots: Vec<PathBuf>,
+    worktree_descriptor_admission: WorktreeDescriptorAdmission,
     mutable_baseline: Arc<Mutex<std::collections::HashMap<PathBuf, FileIdentity>>>,
     mutable_entry_baseline:
         Arc<Mutex<std::collections::HashMap<PathBuf, MutableDirectorySnapshot>>>,
@@ -2897,6 +2914,20 @@ impl RepositoryGraph {
         approved_external_roots: &[PathBuf],
         deadline: OperationDeadline,
     ) -> Result<Self, String> {
+        Self::open_with_deadline_and_admission(
+            root,
+            approved_external_roots,
+            deadline,
+            WorktreeDescriptorAdmission::CurrentOnly,
+        )
+    }
+
+    fn open_with_deadline_and_admission(
+        root: &Path,
+        approved_external_roots: &[PathBuf],
+        deadline: OperationDeadline,
+        worktree_descriptor_admission: WorktreeDescriptorAdmission,
+    ) -> Result<Self, String> {
         let admission_started = Instant::now();
         check_graph_deadline(deadline)?;
         let approved_external_roots = canonicalize_approved_graph_roots_with_deadline(
@@ -3202,8 +3233,10 @@ impl RepositoryGraph {
             push_worktree_graph(
                 root,
                 &worktrees,
+                &gitdir,
                 commondir.as_deref().unwrap_or(&gitdir),
                 &approved_external_roots,
+                worktree_descriptor_admission,
                 &mut nodes,
                 &mut optional_mutable_inputs,
                 deadline,
@@ -3373,6 +3406,7 @@ impl RepositoryGraph {
             object_stores,
             metadata_roots,
             approved_external_roots,
+            worktree_descriptor_admission,
             mutable_baseline: Arc::new(Mutex::new(mutable_baseline)),
             mutable_entry_baseline: Arc::new(Mutex::new(mutable_entry_baseline)),
             optional_static_inputs,
@@ -3646,11 +3680,46 @@ impl RepositoryGraph {
             if deadline.is_some_and(OperationDeadline::is_expired) {
                 return Err("repository validation exceeded the operation deadline".to_string());
             }
+            let absence_policy = optional_mutable_absence_policy_for_revalidate(
+                transition,
+                input.is_file,
+                &input.path,
+                &self.git_dir,
+                update_baseline,
+                full_content,
+            );
             let actual = if !input.is_file && !full_content {
-                optional_mutable_container_identity_with_deadline(&input.path, deadline)?
+                optional_mutable_container_identity_with_deadline(&input.path, deadline)
+            } else if absence_policy == OptionalMutableAbsencePolicy::AllowApprovedIndexGone {
+                optional_mutable_identity_with_absence_policy(
+                    &input.path,
+                    input.is_file,
+                    deadline,
+                    absence_policy,
+                    |path| fs::canonicalize(path),
+                )
             } else {
-                optional_mutable_identity_with_deadline(&input.path, input.is_file, deadline)?
-            };
+                optional_mutable_identity_with_deadline(&input.path, input.is_file, deadline)
+            }
+            .map_err(|error| {
+                #[cfg(test)]
+                {
+                    eprintln!(
+                        "revalidate_optional_mutable_inputs failed: transition={transition:?} update_baseline={update_baseline} full_content={full_content} path={} helper={} error={error}",
+                        input.path.display(),
+                        if !input.is_file && !full_content {
+                            "optional_mutable_container_identity_with_deadline"
+                        } else if absence_policy
+                            == OptionalMutableAbsencePolicy::AllowApprovedIndexGone
+                        {
+                            "optional_mutable_identity_with_absence_policy(AllowApprovedIndexGone)"
+                        } else {
+                            "optional_mutable_identity_with_deadline"
+                        }
+                    );
+                }
+                error
+            })?;
             let expected = baseline
                 .get(&input.path)
                 .cloned()
@@ -4089,11 +4158,62 @@ fn optional_mutable_identity(path: &Path, is_file: bool) -> Result<Option<FileId
     optional_mutable_identity_with_deadline(path, is_file, None)
 }
 
+/// When [`OptionalMutableAbsencePolicy::AllowApprovedIndexGone`] is selected by
+/// the Stage in-flight index caller, a typed canonicalize `NotFound` may recover
+/// to `None` only after the approved parent/live-metadata window. Default/public
+/// callers remain strict.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum OptionalMutableAbsencePolicy {
+    Strict,
+    AllowApprovedIndexGone,
+}
+
 fn optional_mutable_identity_with_deadline(
     path: &Path,
     is_file: bool,
     deadline: Option<OperationDeadline>,
 ) -> Result<Option<FileIdentity>, String> {
+    optional_mutable_identity_with_absence_policy(
+        path,
+        is_file,
+        deadline,
+        OptionalMutableAbsencePolicy::Strict,
+        |path| fs::canonicalize(path),
+    )
+}
+
+/// Exact Stage in-flight index absence policy for optional mutable revalidation.
+/// All other callers remain [`OptionalMutableAbsencePolicy::Strict`].
+fn optional_mutable_absence_policy_for_revalidate(
+    transition: GraphTransition,
+    is_file: bool,
+    input_path: &Path,
+    git_dir: &Path,
+    update_baseline: bool,
+    full_content: bool,
+) -> OptionalMutableAbsencePolicy {
+    if matches!(transition, GraphTransition::Stage)
+        && is_file
+        && same_path(input_path, &git_dir.join("index"))
+        && !update_baseline
+        && !full_content
+    {
+        OptionalMutableAbsencePolicy::AllowApprovedIndexGone
+    } else {
+        OptionalMutableAbsencePolicy::Strict
+    }
+}
+
+fn optional_mutable_identity_with_absence_policy<C>(
+    path: &Path,
+    is_file: bool,
+    deadline: Option<OperationDeadline>,
+    absence_policy: OptionalMutableAbsencePolicy,
+    canonicalize: C,
+) -> Result<Option<FileIdentity>, String>
+where
+    C: FnOnce(&Path) -> io::Result<PathBuf>,
+{
     reject_reparse_components(path)?;
     if deadline.is_some_and(OperationDeadline::is_expired) {
         return Err("repository validation exceeded the operation deadline".to_string());
@@ -4106,8 +4226,32 @@ fn optional_mutable_identity_with_deadline(
     if (is_file && !metadata.is_file()) || (!is_file && !metadata.is_dir()) {
         return Err("repository graph path type is invalid".to_string());
     }
-    let canonical = fs::canonicalize(path)
-        .map_err(|_| "repository graph path cannot be canonicalized".to_string())?;
+    let canonical = match canonicalize(path) {
+        Ok(canonical) => canonical,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            return recover_optional_mutable_canonicalize_not_found(
+                path,
+                is_file,
+                deadline,
+                absence_policy,
+            );
+        }
+        Err(error) => {
+            #[cfg(test)]
+            {
+                eprintln!(
+                    "optional_mutable_identity_with_deadline canonicalize failed: path={} is_file={} path_is_file={} error_kind={:?} raw_os={:?}",
+                    path.display(),
+                    is_file,
+                    path.is_file(),
+                    error.kind(),
+                    error.raw_os_error()
+                );
+            }
+            let _ = error;
+            return Err("repository graph path cannot be canonicalized".to_string());
+        }
+    };
     if !same_path(&canonical, path) {
         return Err("repository graph path canonical identity changed".to_string());
     }
@@ -4120,6 +4264,72 @@ fn optional_mutable_identity_with_deadline(
         mutable_directory_identity_with_deadline(path, deadline)?
     };
     Ok(Some(identity))
+}
+
+/// Exact approved window for Stage in-flight index: typed canonicalize NotFound
+/// plus live direct parent + fresh index metadata NotFound. Never walks missing
+/// ancestors or ignores non-NotFound canonicalize errors.
+fn recover_optional_mutable_canonicalize_not_found(
+    path: &Path,
+    is_file: bool,
+    deadline: Option<OperationDeadline>,
+    absence_policy: OptionalMutableAbsencePolicy,
+) -> Result<Option<FileIdentity>, String> {
+    if absence_policy != OptionalMutableAbsencePolicy::AllowApprovedIndexGone {
+        #[cfg(test)]
+        {
+            eprintln!(
+                "optional_mutable_identity_with_deadline canonicalize failed: path={} is_file={} path_is_file={} error_kind=NotFound raw_os=strict",
+                path.display(),
+                is_file,
+                path.is_file(),
+            );
+        }
+        return Err("repository graph path cannot be canonicalized".to_string());
+    }
+    if deadline.is_some_and(OperationDeadline::is_expired) {
+        return Err("repository validation exceeded the operation deadline".to_string());
+    }
+    reject_reparse_components(path)?;
+    let Some(parent) = path.parent() else {
+        return Err("repository graph path cannot be canonicalized".to_string());
+    };
+    // Direct parent must still be live and canonical — do not reinterpret a
+    // missing ancestor as an approved absence.
+    let parent_metadata = match fs::symlink_metadata(parent) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            return Err("repository graph path cannot be canonicalized".to_string());
+        }
+        Err(_) => return Err("repository graph path parent cannot be inspected".to_string()),
+    };
+    if !parent_metadata.is_dir() {
+        return Err("repository graph path parent cannot be inspected".to_string());
+    }
+    reject_reparse_metadata(&parent_metadata)?;
+    let canonical_parent = fs::canonicalize(parent)
+        .map_err(|_| "repository graph path parent cannot be canonicalized".to_string())?;
+    if !same_path(&canonical_parent, parent) {
+        return Err("repository graph path parent cannot be canonicalized".to_string());
+    }
+    if deadline.is_some_and(OperationDeadline::is_expired) {
+        return Err("repository validation exceeded the operation deadline".to_string());
+    }
+    match fs::symlink_metadata(path) {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+        Ok(metadata) => {
+            if (is_file && !metadata.is_file()) || (!is_file && !metadata.is_dir()) {
+                return Err("repository graph path type is invalid".to_string());
+            }
+            if let Err(error) = reject_reparse_metadata(&metadata) {
+                return Err(error);
+            }
+            // Still present (or wrong-type/reparse) after typed NotFound is not
+            // an approved absence window.
+            Err("repository graph path cannot be canonicalized".to_string())
+        }
+        Err(_) => Err("repository graph path metadata is unavailable".to_string()),
+    }
 }
 
 fn optional_mutable_container_identity_with_deadline(
@@ -4138,8 +4348,20 @@ fn optional_mutable_container_identity_with_deadline(
     if !metadata.is_dir() {
         return Err("repository graph path type is invalid".to_string());
     }
-    let canonical = fs::canonicalize(path)
-        .map_err(|_| "repository graph path cannot be canonicalized".to_string())?;
+    let canonical = fs::canonicalize(path).map_err(|error| {
+        #[cfg(test)]
+        {
+            eprintln!(
+                "optional_mutable_container_identity_with_deadline canonicalize failed: path={} path_is_file={} path_is_dir={} error_kind={:?} raw_os={:?}",
+                path.display(),
+                path.is_file(),
+                path.is_dir(),
+                error.kind(),
+                error.raw_os_error()
+            );
+        }
+        "repository graph path cannot be canonicalized".to_string()
+    })?;
     if !same_path(&canonical, path) {
         return Err("repository graph path canonical identity changed".to_string());
     }
@@ -4372,8 +4594,10 @@ fn push_static_graph_descendants(
 fn push_worktree_graph(
     root: &Path,
     worktrees: &Path,
+    current_gitdir: &Path,
     common_dir: &Path,
     approved_external_roots: &[PathBuf],
+    admission: WorktreeDescriptorAdmission,
     nodes: &mut Vec<GraphNode>,
     _optional_mutable_inputs: &mut Vec<MutableGraphInput>,
     deadline: OperationDeadline,
@@ -4409,8 +4633,10 @@ fn push_worktree_graph(
         validate_worktree_metadata_descriptors(
             root,
             &path,
+            current_gitdir,
             common_dir,
             approved_external_roots,
+            admission,
             nodes,
             deadline,
         )?;
@@ -4425,30 +4651,38 @@ fn push_worktree_graph(
 fn validate_worktree_metadata_descriptors(
     root: &Path,
     metadata: &Path,
+    current_gitdir: &Path,
     common_dir: &Path,
     approved_external_roots: &[PathBuf],
+    admission: WorktreeDescriptorAdmission,
     _nodes: &mut Vec<GraphNode>,
     deadline: OperationDeadline,
 ) -> Result<(), String> {
     let gitdir_descriptor = metadata.join("gitdir");
-    let linked_git_file = resolve_worktree_descriptor_path(
-        &gitdir_descriptor,
-        metadata,
-        true,
-        root,
-        approved_external_roots,
-        deadline,
-    )?;
-    // The enclosing recursive `worktrees` snapshot already binds this
-    // descriptor's contents. Resolving its target proves it remains a regular
-    // file inside the approved graph. Reading every unrelated worktree's
-    // external `.git` backlink again made status scale with all historical
-    // worktrees even though status cannot consume those links.
-    let linked_git_metadata = fs::symlink_metadata(&linked_git_file)
-        .map_err(|_| "linked worktree descriptor target is unavailable".to_string())?;
-    reject_reparse_metadata(&linked_git_metadata)?;
-    if !linked_git_metadata.is_file() {
-        return Err("linked worktree descriptor target has the wrong type".to_string());
+    let resolve_gitdir_target = admission == WorktreeDescriptorAdmission::Strict
+        || same_path(metadata, current_gitdir);
+    if resolve_gitdir_target {
+        let linked_git_file = resolve_worktree_descriptor_path(
+            &gitdir_descriptor,
+            metadata,
+            true,
+            root,
+            approved_external_roots,
+            deadline,
+        )?;
+        // The enclosing recursive `worktrees` snapshot already binds this
+        // descriptor's contents. Resolving the current (or Strict) target
+        // proves it remains a regular file inside the approved graph.
+        let linked_git_metadata = fs::symlink_metadata(&linked_git_file)
+            .map_err(|_| "linked worktree descriptor target is unavailable".to_string())?;
+        reject_reparse_metadata(&linked_git_metadata)?;
+        if !linked_git_metadata.is_file() {
+            return Err("linked worktree descriptor target has the wrong type".to_string());
+        }
+    } else {
+        // Unrelated sibling on a current-only read: keep the descriptor as
+        // bounded snapshotted input. Do not follow or authorize its checkout.
+        let _ = read_worktree_descriptor_value(&gitdir_descriptor, deadline)?;
     }
 
     let commondir_descriptor = metadata.join("commondir");
@@ -4468,14 +4702,10 @@ fn validate_worktree_metadata_descriptors(
     Ok(())
 }
 
-fn resolve_worktree_descriptor_path(
+fn read_worktree_descriptor_value(
     descriptor: &Path,
-    base: &Path,
-    expect_file: bool,
-    root: &Path,
-    approved_external_roots: &[PathBuf],
     deadline: OperationDeadline,
-) -> Result<PathBuf, String> {
+) -> Result<String, String> {
     check_graph_deadline(deadline)?;
     let metadata = fs::symlink_metadata(descriptor)
         .map_err(|_| "linked worktree descriptor is unavailable".to_string())?;
@@ -4495,7 +4725,19 @@ fn resolve_worktree_descriptor_path(
     if value.is_empty() || value.contains('\n') || value.contains('\r') {
         return Err("linked worktree descriptor is invalid".to_string());
     }
-    let canonical = resolve_descriptor_value(base, value, root, approved_external_roots, deadline)?;
+    Ok(value.to_string())
+}
+
+fn resolve_worktree_descriptor_path(
+    descriptor: &Path,
+    base: &Path,
+    expect_file: bool,
+    root: &Path,
+    approved_external_roots: &[PathBuf],
+    deadline: OperationDeadline,
+) -> Result<PathBuf, String> {
+    let value = read_worktree_descriptor_value(descriptor, deadline)?;
+    let canonical = resolve_descriptor_value(base, &value, root, approved_external_roots, deadline)?;
     let metadata = fs::symlink_metadata(&canonical)
         .map_err(|_| "linked worktree descriptor target is unavailable".to_string())?;
     if (expect_file && !metadata.is_file()) || (!expect_file && !metadata.is_dir()) {
@@ -5574,13 +5816,32 @@ impl RepositoryRoot {
         approved_external_roots: &[PathBuf],
         deadline: OperationDeadline,
     ) -> Result<Self, String> {
+        Self::open_with_approved_external_roots_deadline_and_admission(
+            requested,
+            approved_external_roots,
+            deadline,
+            WorktreeDescriptorAdmission::CurrentOnly,
+        )
+    }
+
+    fn open_with_approved_external_roots_deadline_and_admission(
+        requested: &Path,
+        approved_external_roots: &[PathBuf],
+        deadline: OperationDeadline,
+        worktree_descriptor_admission: WorktreeDescriptorAdmission,
+    ) -> Result<Self, String> {
         check_graph_deadline(deadline)?;
         reject_reparse_components(requested)?;
         let path = fs::canonicalize(requested)
             .map_err(|_| "repository root cannot be canonicalized".to_string())?;
         let identity = directory_identity_with_deadline(&path, Some(deadline))?;
         check_graph_deadline(deadline)?;
-        let graph = RepositoryGraph::open_with_deadline(&path, approved_external_roots, deadline)?;
+        let graph = RepositoryGraph::open_with_deadline_and_admission(
+            &path,
+            approved_external_roots,
+            deadline,
+            worktree_descriptor_admission,
+        )?;
         check_graph_deadline(deadline)?;
         #[cfg(windows)]
         let handle = open_directory_handle(&path)?;
@@ -6367,6 +6628,13 @@ fn argument_contains_nul(argument: &OsString) -> bool {
     {
         argument.to_string_lossy().contains('\0')
     }
+}
+
+fn requires_strict_worktree_descriptor_admission(arguments: &[OsString]) -> bool {
+    matches!(
+        arguments.first().and_then(|argument| argument.to_str()),
+        Some("worktree") | Some("switch") | Some("branch")
+    )
 }
 
 fn service_mutation_allowed(arguments: &[OsString]) -> bool {
@@ -7197,6 +7465,34 @@ impl GitRepository {
     #[cfg(test)]
     pub(crate) fn test_open(root: impl AsRef<Path>) -> Result<Self, GitError> {
         Self::test_open_with_limits(root, GitLimits::default(), GitCancellation::new())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_open_with_strict_worktree_descriptors(
+        root: impl AsRef<Path>,
+    ) -> Result<Self, GitError> {
+        let root = RepositoryRoot::open_with_approved_external_roots_deadline_and_admission(
+            root.as_ref(),
+            &[],
+            OperationDeadline::from_now(HARD_MAX_TIMEOUT),
+            WorktreeDescriptorAdmission::Strict,
+        )
+        .map_err(|reason| GitError::InvalidRepositoryRoot {
+            path: "<test-root>".to_string(),
+            reason,
+        })?;
+        let workspace = WorkspaceIdentity::from_canonical_root(root.path.clone());
+        let limits = GitLimits::default();
+        Ok(Self {
+            root,
+            workspace,
+            limits: limits.clone(),
+            cancellation: GitCancellation::new(),
+            authority: GitRepositoryAuthority::Test,
+            read_permit: Arc::new(Mutex::new(Some(
+                GitOperationPermit::test_read_with_timeout(limits.timeout),
+            ))),
+        })
     }
 
     #[cfg(test)]
@@ -8360,6 +8656,15 @@ impl GitRepository {
         remote_name: Option<String>,
         permit: GitOperationPermit,
     ) -> Result<GitOutput, GitError> {
+        if requires_strict_worktree_descriptor_admission(&arguments)
+            && self.root.graph.worktree_descriptor_admission
+                != WorktreeDescriptorAdmission::Strict
+        {
+            return Err(GitError::InvalidRequest {
+                message: "Git operation requires strict worktree descriptor admission"
+                    .to_string(),
+            });
+        }
         if !service_mutation_allowed(&arguments) {
             return Err(GitError::InvalidRequest {
                 message: "Git service mutation is not authorized for this operation".to_string(),
@@ -8445,6 +8750,15 @@ impl GitRepository {
         let operation = operation_label(arguments);
         let graph_transition = graph_transition_for(arguments, &policy);
         validate_argument_budget(arguments)?;
+        if requires_strict_worktree_descriptor_admission(arguments)
+            && self.root.graph.worktree_descriptor_admission
+                != WorktreeDescriptorAdmission::Strict
+        {
+            return Err(GitError::InvalidRequest {
+                message: "Git operation requires strict worktree descriptor admission"
+                    .to_string(),
+            });
+        }
         self.validate_operation_permit(permit, &policy, arguments)?;
         let deadline = permit.deadline;
         if self.cancellation.is_cancelled() {
@@ -11208,6 +11522,417 @@ mod tests {
             .revalidate_after_transition(GraphTransition::Stage)
             .expect_err("stage must not delete an existing object");
         assert!(error.contains("removed or replaced"));
+    }
+
+    #[test]
+    fn stage_inflight_index_canonicalize_not_found_recovers_when_removed_during_canonicalize() {
+        let fixture = tempfile::tempdir().expect("index race fixture");
+        let git_dir = fixture.path().join(".git");
+        fs::create_dir_all(&git_dir).expect("git dir");
+        let index = git_dir.join("index");
+        fs::write(&index, b"fixture-index").expect("seed index");
+        let observed = Arc::new(AtomicBool::new(false));
+        let observed_flag = Arc::clone(&observed);
+        let result = optional_mutable_identity_with_absence_policy(
+            &index,
+            true,
+            Some(OperationDeadline::from_now(Duration::from_secs(5))),
+            OptionalMutableAbsencePolicy::AllowApprovedIndexGone,
+            {
+                let index = index.clone();
+                move |path| {
+                    assert!(
+                        same_path(path, &index),
+                        "canonicalize must observe the exact index path"
+                    );
+                    assert!(
+                        fs::symlink_metadata(path).is_ok(),
+                        "metadata must have succeeded before injected canonicalize"
+                    );
+                    fs::remove_file(path).expect("remove index after metadata success");
+                    observed_flag.store(true, Ordering::SeqCst);
+                    Err(io::Error::new(io::ErrorKind::NotFound, "index race"))
+                }
+            },
+        );
+        assert!(
+            observed.load(Ordering::SeqCst),
+            "injected canonicalize must run after metadata"
+        );
+        assert!(
+            result
+                .expect("approved Stage in-flight index absence")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn optional_mutable_identity_strict_rejects_canonicalize_not_found() {
+        let fixture = tempfile::tempdir().expect("strict index fixture");
+        let git_dir = fixture.path().join(".git");
+        fs::create_dir_all(&git_dir).expect("git dir");
+        let index = git_dir.join("index");
+        fs::write(&index, b"fixture-index").expect("seed index");
+        let error = optional_mutable_identity_with_absence_policy(
+            &index,
+            true,
+            Some(OperationDeadline::from_now(Duration::from_secs(5))),
+            OptionalMutableAbsencePolicy::Strict,
+            {
+                let index = index.clone();
+                move |path| {
+                    assert!(same_path(path, &index));
+                    fs::remove_file(path).expect("remove during canonicalize");
+                    Err(io::Error::new(io::ErrorKind::NotFound, "gone"))
+                }
+            },
+        )
+        .map(|_| ())
+        .expect_err("default/strict helper must not recover");
+        assert!(error.contains("cannot be canonicalized"));
+    }
+
+    #[test]
+    fn stage_inflight_index_recovery_rejects_still_present_after_canonicalize_not_found() {
+        let fixture = tempfile::tempdir().expect("still-present fixture");
+        let git_dir = fixture.path().join(".git");
+        fs::create_dir_all(&git_dir).expect("git dir");
+        let index = git_dir.join("index");
+        fs::write(&index, b"fixture-index").expect("seed index");
+        let error = optional_mutable_identity_with_absence_policy(
+            &index,
+            true,
+            Some(OperationDeadline::from_now(Duration::from_secs(5))),
+            OptionalMutableAbsencePolicy::AllowApprovedIndexGone,
+            |_path| Err(io::Error::new(io::ErrorKind::NotFound, "fake gone")),
+        )
+        .map(|_| ())
+        .expect_err("still-present index must not recover");
+        assert!(error.contains("cannot be canonicalized"));
+    }
+
+    #[test]
+    fn stage_inflight_index_recovery_rejects_wrong_type_after_canonicalize_not_found() {
+        let fixture = tempfile::tempdir().expect("wrong-type fixture");
+        let git_dir = fixture.path().join(".git");
+        fs::create_dir_all(&git_dir).expect("git dir");
+        let index = git_dir.join("index");
+        fs::write(&index, b"fixture-index").expect("seed index");
+        let error = optional_mutable_identity_with_absence_policy(
+            &index,
+            true,
+            Some(OperationDeadline::from_now(Duration::from_secs(5))),
+            OptionalMutableAbsencePolicy::AllowApprovedIndexGone,
+            {
+                let index = index.clone();
+                move |path| {
+                    assert!(same_path(path, &index));
+                    fs::remove_file(path).expect("remove file");
+                    fs::create_dir(path).expect("replace with directory");
+                    Err(io::Error::new(io::ErrorKind::NotFound, "type race"))
+                }
+            },
+        )
+        .map(|_| ())
+        .expect_err("wrong-type after NotFound must fail closed");
+        assert!(
+            error.contains("type is invalid") || error.contains("cannot be canonicalized"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn stage_inflight_index_recovery_rejects_non_not_found_canonicalize_error() {
+        let fixture = tempfile::tempdir().expect("non-notfound fixture");
+        let git_dir = fixture.path().join(".git");
+        fs::create_dir_all(&git_dir).expect("git dir");
+        let index = git_dir.join("index");
+        fs::write(&index, b"fixture-index").expect("seed index");
+        let error = optional_mutable_identity_with_absence_policy(
+            &index,
+            true,
+            Some(OperationDeadline::from_now(Duration::from_secs(5))),
+            OptionalMutableAbsencePolicy::AllowApprovedIndexGone,
+            {
+                let index = index.clone();
+                move |path| {
+                    assert!(same_path(path, &index));
+                    fs::remove_file(path).expect("remove after metadata");
+                    Err(io::Error::new(
+                        io::ErrorKind::PermissionDenied,
+                        "not a typed NotFound",
+                    ))
+                }
+            },
+        )
+        .map(|_| ())
+        .expect_err("non-NotFound canonicalize must remain an error even if later absent");
+        assert!(error.contains("cannot be canonicalized"));
+        assert!(
+            !index.exists(),
+            "absence after a non-NotFound error must not authorize recovery"
+        );
+    }
+
+    #[test]
+    fn stage_inflight_index_recovery_rejects_expired_deadline_and_missing_parent() {
+        let fixture = tempfile::tempdir().expect("deadline/parent fixture");
+        let git_dir = fixture.path().join(".git");
+        fs::create_dir_all(&git_dir).expect("git dir");
+        let index = git_dir.join("index");
+        fs::write(&index, b"fixture-index").expect("seed index");
+        let expired = optional_mutable_identity_with_absence_policy(
+            &index,
+            true,
+            Some(OperationDeadline::from_now(Duration::ZERO)),
+            OptionalMutableAbsencePolicy::AllowApprovedIndexGone,
+            {
+                let index = index.clone();
+                move |path| {
+                    let _ = fs::remove_file(path);
+                    let _ = same_path(path, &index);
+                    Err(io::Error::new(io::ErrorKind::NotFound, "gone"))
+                }
+            },
+        )
+        .map(|_| ())
+        .expect_err("expired deadline must fail closed");
+        assert!(expired.contains("deadline"));
+
+        fs::write(&index, b"fixture-index").expect("reseed index");
+        let missing_parent = optional_mutable_identity_with_absence_policy(
+            &index,
+            true,
+            Some(OperationDeadline::from_now(Duration::from_secs(5))),
+            OptionalMutableAbsencePolicy::AllowApprovedIndexGone,
+            {
+                let index = index.clone();
+                let git_dir = git_dir.clone();
+                move |path| {
+                    assert!(same_path(path, &index));
+                    fs::remove_file(path).expect("remove index");
+                    // Do not reinterpret a missing ancestor: delete the live parent.
+                    fs::remove_dir_all(&git_dir).expect("remove parent");
+                    Err(io::Error::new(io::ErrorKind::NotFound, "gone with parent"))
+                }
+            },
+        )
+        .map(|_| ())
+        .expect_err("missing parent must not recover");
+        assert!(missing_parent.contains("cannot be canonicalized"));
+    }
+
+    #[test]
+    fn stage_inflight_index_recovery_rejects_reparse_replacement_where_supported() {
+        let fixture = tempfile::tempdir().expect("reparse fixture");
+        let git_dir = fixture.path().join(".git");
+        fs::create_dir_all(&git_dir).expect("git dir");
+        let index = git_dir.join("index");
+        fs::write(&index, b"fixture-index").expect("seed index");
+        let target = fixture.path().join("outside-index");
+        fs::write(&target, b"payload").expect("symlink target");
+        let result = optional_mutable_identity_with_absence_policy(
+            &index,
+            true,
+            Some(OperationDeadline::from_now(Duration::from_secs(5))),
+            OptionalMutableAbsencePolicy::AllowApprovedIndexGone,
+            {
+                let index = index.clone();
+                let target = target.clone();
+                move |path| {
+                    assert!(same_path(path, &index));
+                    fs::remove_file(path).expect("remove index");
+                    #[cfg(windows)]
+                    {
+                        if std::os::windows::fs::symlink_file(&target, path).is_err() {
+                            // Symlink creation may require Developer Mode; skip.
+                            return Err(io::Error::new(
+                                io::ErrorKind::Unsupported,
+                                "symlink unavailable",
+                            ));
+                        }
+                    }
+                    #[cfg(unix)]
+                    {
+                        std::os::unix::fs::symlink(&target, path).expect("create index symlink");
+                    }
+                    #[cfg(not(any(unix, windows)))]
+                    {
+                        let _ = target;
+                        return Err(io::Error::new(
+                            io::ErrorKind::Unsupported,
+                            "symlink unavailable",
+                        ));
+                    }
+                    Err(io::Error::new(io::ErrorKind::NotFound, "reparse race"))
+                }
+            },
+        );
+        match result {
+            Err(error) => {
+                assert!(
+                    error.contains("symlink")
+                        || error.contains("reparse")
+                        || error.contains("cannot be canonicalized")
+                        || error.contains("type is invalid"),
+                    "{error}"
+                );
+            }
+            Ok(_) => panic!("reparse replacement or unsupported symlink creation must fail closed"),
+        }
+    }
+
+    #[test]
+    fn non_index_and_readonly_paths_stay_strict_for_canonicalize_not_found() {
+        let fixture = tempfile::tempdir().expect("non-index strict fixture");
+        let git_dir = fixture.path().join(".git");
+        fs::create_dir_all(&git_dir).expect("git dir");
+        let head = git_dir.join("HEAD");
+        fs::write(&head, b"ref: refs/heads/main\n").expect("seed HEAD");
+        // Public/default helper and Strict policy stay fail-closed for non-index
+        // paths even when the race shape matches the Stage index window.
+        let error = optional_mutable_identity_with_absence_policy(
+            &head,
+            true,
+            Some(OperationDeadline::from_now(Duration::from_secs(5))),
+            OptionalMutableAbsencePolicy::Strict,
+            {
+                let head = head.clone();
+                move |path| {
+                    assert!(same_path(path, &head));
+                    fs::remove_file(path).expect("remove HEAD during canonicalize");
+                    Err(io::Error::new(io::ErrorKind::NotFound, "head race"))
+                }
+            },
+        )
+        .map(|_| ())
+        .expect_err("non-index Strict must reject canonicalize NotFound");
+        assert!(error.contains("cannot be canonicalized"));
+
+        // Post-transition / update_baseline callers use Strict — prove the race
+        // window itself stays rejected under Strict policy on index.
+        let index = git_dir.join("index");
+        fs::write(&index, b"fixture-index").expect("seed index");
+        let post = optional_mutable_identity_with_absence_policy(
+            &index,
+            true,
+            Some(OperationDeadline::from_now(Duration::from_secs(5))),
+            OptionalMutableAbsencePolicy::Strict,
+            {
+                let index = index.clone();
+                move |path| {
+                    assert!(same_path(path, &index));
+                    fs::remove_file(path).expect("remove index");
+                    Err(io::Error::new(io::ErrorKind::NotFound, "post-transition race"))
+                }
+            },
+        )
+        .map(|_| ())
+        .expect_err("post-transition/strict index race must fail closed");
+        assert!(post.contains("cannot be canonicalized"));
+    }
+
+    #[test]
+    fn optional_mutable_absence_policy_selector_permits_only_stage_inflight_index() {
+        let git_dir = PathBuf::from(r"C:\repo\.git");
+        let index = git_dir.join("index");
+        let sibling_index = PathBuf::from(r"C:\repo\.git\worktrees\wt\index");
+        let head = git_dir.join("HEAD");
+        let refs = git_dir.join("refs");
+
+        assert_eq!(
+            optional_mutable_absence_policy_for_revalidate(
+                GraphTransition::Stage,
+                true,
+                &index,
+                &git_dir,
+                false,
+                false,
+            ),
+            OptionalMutableAbsencePolicy::AllowApprovedIndexGone,
+            "Stage + current index file + in-flight must permit recovery"
+        );
+
+        let strict_cases = [
+            (
+                "ReadOnly",
+                GraphTransition::ReadOnly,
+                true,
+                index.as_path(),
+                false,
+                false,
+            ),
+            (
+                "StatusRefresh",
+                GraphTransition::StatusRefresh,
+                true,
+                index.as_path(),
+                false,
+                false,
+            ),
+            (
+                "Commit",
+                GraphTransition::Commit,
+                true,
+                index.as_path(),
+                false,
+                false,
+            ),
+            (
+                "sibling index",
+                GraphTransition::Stage,
+                true,
+                sibling_index.as_path(),
+                false,
+                false,
+            ),
+            (
+                "HEAD",
+                GraphTransition::Stage,
+                true,
+                head.as_path(),
+                false,
+                false,
+            ),
+            (
+                "directory input",
+                GraphTransition::Stage,
+                false,
+                refs.as_path(),
+                false,
+                false,
+            ),
+            (
+                "post-transition update_baseline",
+                GraphTransition::Stage,
+                true,
+                index.as_path(),
+                true,
+                false,
+            ),
+            (
+                "full_content",
+                GraphTransition::Stage,
+                true,
+                index.as_path(),
+                false,
+                true,
+            ),
+        ];
+        for (label, transition, is_file, path, update_baseline, full_content) in strict_cases {
+            assert_eq!(
+                optional_mutable_absence_policy_for_revalidate(
+                    transition,
+                    is_file,
+                    path,
+                    &git_dir,
+                    update_baseline,
+                    full_content,
+                ),
+                OptionalMutableAbsencePolicy::Strict,
+                "{label} must stay Strict"
+            );
+        }
     }
 
     #[test]

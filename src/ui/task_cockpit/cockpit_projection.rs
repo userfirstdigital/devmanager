@@ -14,7 +14,7 @@ use crate::domain::cockpit::{
     TaskCockpitDeniedReason, TaskCockpitResult, TaskCockpitSurface, TaskCockpitUnavailableReason,
     TaskFileEntry, TaskFilesListProjection, TaskFilesReadProjection, TaskGitProjection,
     TaskGitRepositoriesProjection, TaskServiceHealth, TaskServiceLogs, TaskServiceProjection,
-    TaskServiceRuntimeState, TaskSshProjection, TaskWorkspaceProjection,
+    TaskServiceRuntimeState, TaskSshProjection, TaskTerminalProjection, TaskWorkspaceProjection,
 };
 use crate::domain::id::TaskId;
 
@@ -492,6 +492,37 @@ mod tests {
         assert_eq!(
             surface_query_action_id(TaskCockpitSurface::Git),
             Some(ACTION_GIT_STATUS)
+        );
+    }
+
+    #[test]
+    fn terminal_results_remain_out_of_band_from_live_projection() {
+        let task_id = task_id();
+        let mut projection = TaskCockpitLiveProjection::empty(task_id);
+        projection.begin_query(ACTION_FILES_LIST);
+        assert!(projection.load.is_loading());
+        projection.apply_result(&TaskCockpitResult::Terminal(TaskTerminalProjection {
+            task_id,
+            terminal_id: crate::domain::TerminalId::new(),
+            session_id: crate::terminal::protocol::TerminalSessionId::new(),
+            agent_session_id: crate::domain::AgentSessionId::new(),
+            resource_id: crate::domain::ResourceId::new(),
+            runtime_generation: 1,
+            resource_generation: 1,
+            action_epoch: 1,
+            accepts_input_without_conversation_id: false,
+            sequence: 1,
+            title: Some("out-of-band".into()),
+            text_lines: vec!["should not land in live files".into()],
+            screen: Default::default(),
+        }));
+        assert!(
+            projection.files.is_none(),
+            "Terminal stays out-of-band; FilesList projection is untouched"
+        );
+        assert!(
+            projection.load.is_loading(),
+            "Terminal must not settle the in-band cockpit surface load"
         );
     }
 }

@@ -66,16 +66,16 @@ fn discriminating_remote_host_label(bytes: &[u8; 16]) -> String {
 
 /// Build fleet rows for one host's inbox without touching other owners.
 pub fn fleet_rows_from_inbox(host: &HostId, host_label: &str, inbox: &Inbox) -> FleetInboxProjection {
-    let mut active = Vec::new();
-    let mut done = Vec::new();
-    for row in inbox.active_rows() {
-        let fleet_row = fleet_row_from_task_row(host, host_label, row, false);
-        if fleet_row.done {
-            done.push(fleet_row);
-        } else {
-            active.push(fleet_row);
-        }
-    }
+    let active = inbox
+        .active_rows()
+        .iter()
+        .map(|row| fleet_row_from_task_row(host, host_label, row, false))
+        .collect();
+    let done = inbox
+        .settled_rows()
+        .iter()
+        .map(|row| fleet_row_from_task_row(host, host_label, row, false))
+        .collect();
     let archived = inbox
         .history_rows()
         .iter()
@@ -103,6 +103,7 @@ fn fleet_row_from_task_row(
         done: matches!(row.lifecycle, TaskLifecycle::Settled),
         archived,
         unread_event_count: row.unread_event_count,
+        occurred_at_ms: row.occurred_at_ms,
     }
 }
 
@@ -272,6 +273,7 @@ mod tests {
             done,
             archived: false,
             unread_event_count: 0,
+            occurred_at_ms: 0,
         }
     }
 
@@ -343,5 +345,101 @@ mod tests {
             &HostId::local_profile("dev").expect("local")
         ));
         assert!(!remote_raw_terminal_allowed(&HostId::Remote([5; 16])));
+    }
+
+    #[test]
+    fn fleet_done_comes_from_settled_rows_and_keeps_same_uuid_hosts_independent() {
+        use crate::client::ClientModelBuilder;
+        use crate::domain::id::{EnvironmentId, ProjectId, SnapshotId};
+        use crate::domain::snapshot::{SnapshotItem, SnapshotPage, SnapshotSection, TaskSnapshotItem};
+        use crate::domain::task::{
+            ReviewReadiness, TaskActivity, TaskAssignment, TaskAttention, TaskConnectivity,
+            TaskFacts, TaskLifecycle, WorkspaceRef,
+        };
+        use crate::ui::task_cockpit::Inbox;
+
+        let shared = TaskId::from_bytes([
+            0x01, 0x8f, 0x60, 0xb0, 0x9c, 0x1a, 0x70, 0x01, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0xf1,
+        ])
+        .expect("task");
+        let snap = SnapshotId::from_bytes([
+            0x01, 0x8f, 0x60, 0xb0, 0x9c, 0x1a, 0x70, 0x01, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0xf0,
+        ])
+        .expect("snapshot");
+        let page = |lifecycle: TaskLifecycle, title: &str, occurred: i64| {
+            let mut builder = ClientModelBuilder::new();
+            let items = vec![SnapshotItem::Task(TaskSnapshotItem {
+                task: TaskFacts {
+                    id: shared,
+                    environment_id: EnvironmentId::from_bytes([
+                        0x01, 0x8f, 0x60, 0xb0, 0x9c, 0x1a, 0x70, 0x01, 0x80, 0x00, 0x00, 0x00,
+                        0x00, 0x00, 0x00, 0x11,
+                    ])
+                    .expect("env"),
+                    title: title.into(),
+                    description: None,
+                    project_id: ProjectId::from_bytes([
+                        0x01, 0x8f, 0x60, 0xb0, 0x9c, 0x1a, 0x70, 0x01, 0x80, 0x00, 0x00, 0x00,
+                        0x00, 0x00, 0x00, 0x12,
+                    ])
+                    .expect("project"),
+                    workspace: WorkspaceRef::Main,
+                    assignment: TaskAssignment::LocalOwner,
+                    lifecycle,
+                    action_epoch: 0,
+                    revision: 1,
+                    created_at_ms: occurred,
+                },
+                connectivity: TaskConnectivity::Connected,
+                attention: TaskAttention::None,
+                activity: TaskActivity::Idle,
+                review_readiness: ReviewReadiness::NotReady,
+                primary_agent_id: None,
+            })];
+            for (section, section_items) in [
+                (SnapshotSection::Tasks, items),
+                (SnapshotSection::AgentSessions, Vec::new()),
+                (SnapshotSection::Artifacts, Vec::new()),
+                (SnapshotSection::Resources, Vec::new()),
+                (SnapshotSection::Operations, Vec::new()),
+            ] {
+                builder
+                    .ingest_page(SnapshotPage {
+                        snapshot_id: snap,
+                        through_sequence: 1,
+                        section,
+                        after_item: None,
+                        items: section_items,
+                        encoded_bytes: 1,
+                        next_cursor: None,
+                    })
+                    .expect("page");
+            }
+            builder.finish().expect("model")
+        };
+
+        let local = HostId::local_profile("dev").expect("local");
+        let remote = HostId::Remote([0x77; 16]);
+        let local_inbox = Inbox::from_model(&page(TaskLifecycle::Settled, "local-done", 500));
+        let remote_inbox = Inbox::from_model(&page(TaskLifecycle::Open, "remote-open", 600));
+        let local_proj = fleet_rows_from_inbox(&local, "dev", &local_inbox);
+        let remote_proj = fleet_rows_from_inbox(&remote, "phone", &remote_inbox);
+
+        assert!(local_proj.active.is_empty());
+        assert_eq!(local_proj.done.len(), 1);
+        assert_eq!(local_proj.done[0].key.task_id, shared);
+        assert_eq!(local_proj.done[0].occurred_at_ms, 500);
+        assert_eq!(remote_proj.active.len(), 1);
+        assert!(remote_proj.done.is_empty());
+        assert_eq!(remote_proj.active[0].key.task_id, shared);
+        assert_ne!(local_proj.done[0].key, remote_proj.active[0].key);
+
+        let merged = merge_fleet_inbox([local_proj, remote_proj]);
+        assert_eq!(merged.done.len(), 1);
+        assert_eq!(merged.active.len(), 1);
+        assert_eq!(merged.done[0].key.host, local);
+        assert_eq!(merged.active[0].key.host, remote);
     }
 }

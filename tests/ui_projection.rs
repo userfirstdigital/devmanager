@@ -52,6 +52,25 @@ const FIXTURE_JSON: &str = r#"{
 }"#;
 
 static HEADLESS_INIT_TEST_LOCK: Mutex<()> = Mutex::new(());
+const HEADLESS_PROJECTION_CHILD_ENV: &str = "DEVMANAGER_UI_PROJECTION_CHILD";
+
+fn rerun_headless_projection_test_in_child(test_name: &'static str) -> bool {
+    if std::env::var(HEADLESS_PROJECTION_CHILD_ENV).as_deref() == Ok(test_name) {
+        return false;
+    }
+    let status = std::process::Command::new(
+        std::env::current_exe().expect("current ui_projection test harness"),
+    )
+    .args(["--exact", test_name, "--nocapture", "--test-threads=1"])
+    .env(HEADLESS_PROJECTION_CHILD_ENV, test_name)
+    .status()
+    .expect("start isolated ui_projection headless test");
+    assert!(
+        status.success(),
+        "isolated ui_projection headless test failed: {test_name} ({status})"
+    );
+    true
+}
 
 fn fixed_uuid_v7(tail: u8) -> [u8; 16] {
     [
@@ -74,6 +93,20 @@ fn task_cockpit_fixture() -> PathBuf {
 
 fn task_cockpit_reference_fixture() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/ui/task-cockpit-reference.json")
+}
+
+/// Checked-in `tests/fixtures/ui` fixture root with process-owned TempDir output/temp
+/// (reference pattern at task_cockpit_reference_fixture_carries_a_valid_visible_plan).
+/// Avoids writing under repository `.devmanager-next/...` which can fail E_ACCESSDENIED.
+fn checked_in_fixture_owned_output_policy() -> (TempDir, PreviewPathPolicy) {
+    let owned = tempdir().expect("owned preview output/temp roots");
+    let output_root = owned.path().join("output");
+    let temp_root = owned.path().join("temp");
+    fs::create_dir_all(&output_root).expect("output root");
+    fs::create_dir_all(&temp_root).expect("temp root");
+    let fixture_root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/ui");
+    let policy = PreviewPathPolicy::new(fixture_root, output_root, temp_root);
+    (owned, policy)
 }
 
 #[test]
@@ -130,13 +163,18 @@ fn valid_request(policy: &PreviewPathPolicy) -> PreviewRequest {
 
 #[test]
 fn component_init_registers_devmanager_resources_once() {
+    if rerun_headless_projection_test_in_child(
+        "component_init_registers_devmanager_resources_once",
+    ) {
+        return;
+    }
     let _lock = HEADLESS_INIT_TEST_LOCK
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    let policy = repository_policy();
+    let (_owned, policy) = checked_in_fixture_owned_output_policy();
     let request = PreviewRequest::validate(
         repository_fixture(),
-        repository_output("component-init.png"),
+        policy.output_root().join("component-init.png"),
         &policy,
     )
     .expect("checked-in fixture should be accepted");
@@ -162,13 +200,20 @@ fn component_init_registers_devmanager_resources_once() {
 
 #[test]
 fn task_cockpit_headless_preview_instantiates_the_actual_native_shell() {
+    if rerun_headless_projection_test_in_child(
+        "task_cockpit_headless_preview_instantiates_the_actual_native_shell",
+    ) {
+        return;
+    }
     let _lock = HEADLESS_INIT_TEST_LOCK
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    let policy = repository_policy();
+    let (_owned, policy) = checked_in_fixture_owned_output_policy();
     let request = PreviewRequest::validate(
         task_cockpit_fixture(),
-        repository_output("task-cockpit-native-shell-headless.png"),
+        policy
+            .output_root()
+            .join("task-cockpit-native-shell-headless.png"),
         &policy,
     )
     .expect("checked-in task cockpit fixture should be accepted");
@@ -345,10 +390,10 @@ fn canonical_preview_is_large_enough_to_judge_full_shell_visual_parity() {
 
 #[test]
 fn canonical_shell_is_full_bleed_while_component_previews_keep_their_gallery_frame() {
-    let policy = repository_policy();
+    let (_owned, policy) = checked_in_fixture_owned_output_policy();
     let task_request = PreviewRequest::validate(
         task_cockpit_fixture(),
-        repository_output("task-cockpit-frame-layout.png"),
+        policy.output_root().join("task-cockpit-frame-layout.png"),
         &policy,
     )
     .expect("checked-in task cockpit fixture should be accepted");
@@ -506,6 +551,11 @@ fn preview_request_construction_rejects_production_paths_before_load() {
 
 #[test]
 fn task_cockpit_actions_are_registered_and_dispatch_through_gpui() {
+    if rerun_headless_projection_test_in_child(
+        "task_cockpit_actions_are_registered_and_dispatch_through_gpui",
+    ) {
+        return;
+    }
     let dispatched = Rc::new(Cell::new(false));
     let dispatched_in_app = Rc::clone(&dispatched);
     let application = gpui::Application::headless();
@@ -542,10 +592,10 @@ fn task_cockpit_actions_are_registered_and_dispatch_through_gpui() {
 
 #[test]
 fn components_gallery_fixture_is_consumed_and_validated_structurally() {
-    let policy = repository_policy();
+    let (_owned, policy) = checked_in_fixture_owned_output_policy();
     let request = PreviewRequest::validate(
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/ui/component-gallery.json"),
-        repository_output("component-gallery-structural.png"),
+        policy.output_root().join("component-gallery-structural.png"),
         &policy,
     )
     .expect("component gallery path should be accepted");
