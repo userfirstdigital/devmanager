@@ -86,4 +86,30 @@ describe("Connect Rust/WASM loader", () => {
     const runtime = runtimeFixture();
     await expect(resolveConnectCrypto(async () => runtime)).resolves.toBe(runtime);
   });
+
+  it("rejects injected loaders with incompatible protocol or patterns", async () => {
+    await expect(
+      resolveConnectCrypto(async () => ({
+        ...runtimeFixture(),
+        connect_protocol_major: () => 2,
+      })),
+    ).rejects.toMatchObject({ code: CONNECT_BROWSER_E2E_HOLD });
+
+    await expect(
+      resolveConnectCrypto(async () => ({
+        ...runtimeFixture(),
+        connect_noise_pattern: () => "Noise_XX_25519_AESGCM_SHA256",
+      })),
+    ).rejects.toMatchObject({ code: CONNECT_BROWSER_E2E_HOLD });
+  });
+
+  it("rejects injected loaders missing required codec exports", async () => {
+    const incomplete = {
+      ...runtimeFixture(),
+      decode_connect_payload_json: undefined,
+    } as unknown as ConnectCryptoRuntime;
+    await expect(
+      resolveConnectCrypto(async () => incomplete),
+    ).rejects.toMatchObject({ code: CONNECT_BROWSER_E2E_HOLD });
+  });
 });

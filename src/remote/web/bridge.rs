@@ -24,6 +24,7 @@ use axum::extract::ws::{Message as WsMessage, WebSocket, WebSocketUpgrade};
 use axum::extract::{ConnectInfo, Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
+use axum::Extension;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine as _;
 use futures_util::{Sink, SinkExt, StreamExt};
@@ -160,16 +161,56 @@ pub(crate) async fn ws_handler(
 }
 
 const CONNECT_WS_GREETING_MAGIC: &[u8; 5] = b"DMCN1";
-const CONNECT_WS_MAX_FRAME_BYTES: usize = crate::connect::MAX_DIRECT_FRAME_BYTES as usize;
+const CONNECT_WS_MAX_FRAME_BYTES: usize = crate::protocol::MAX_SEALED_FRAME_BYTES as usize;
+pub(crate) const CONNECT_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(15);
+const CONNECT_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Binding captured when a one-use attach ticket is consumed.
+#[derive(Debug, Clone)]
+pub(crate) struct CrossOriginTicketBinding {
+    pub(crate) paired_client_id: String,
+    pub(crate) public_key: super::connect_identity::ConnectPeerPublicKey,
+    pub(crate) host_public_id: [u8; 16],
+}
+
+/// How `/api/connect` or `/api/connect/cross-origin` authenticated the peer
+/// before Noise. Remaining encryption/enrollment/duplex is shared.
+#[derive(Debug, Clone)]
+pub(crate) enum ConnectSessionMode {
+    SameOrigin {
+        paired_client_id: String,
+    },
+    CrossOrigin {
+        origin: String,
+        ticket_binding: Option<CrossOriginTicketBinding>,
+    },
+}
+
+fn connect_greeting(host_id: [u8; 16]) -> (Vec<u8>, [u8; 16], [u8; 16]) {
+    // Prologue bindings are also decoded as UUIDv7 by both envelope clients.
+    let route_id = crate::connect::ConnectionId::new().as_bytes();
+    let session_id = crate::connect::SessionId::new().as_bytes();
+    let mut greeting = Vec::with_capacity(CONNECT_WS_GREETING_MAGIC.len() + 48);
+    greeting.extend_from_slice(CONNECT_WS_GREETING_MAGIC);
+    greeting.extend_from_slice(&host_id);
+    greeting.extend_from_slice(&route_id);
+    greeting.extend_from_slice(&session_id);
+    (greeting, route_id, session_id)
+}
 
 pub(crate) async fn connect_ws_handler(
     State(state): State<Arc<WebState>>,
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    verified: Option<Extension<super::VerifiedDirectTransport>>,
     ws: WebSocketUpgrade,
     headers: HeaderMap,
 ) -> Response {
-    let _ = addr;
-    let authentication = match admit_connect_ws_request(&state, &headers) {
+    let authentication = match admit_connect_ws_request(
+        &state,
+        &headers,
+        addr.ip(),
+        verified.as_ref().map(|value| &value.0),
+    ) {
         Ok(authentication) => authentication,
         Err(response) => return response,
     };
@@ -186,25 +227,33 @@ pub(crate) async fn connect_ws_handler(
         )
             .into_response();
     };
-    match connect_startup
-        .session()
-        .identity_store()
-        .identity_live_state()
-    {
-        Ok(crate::connect::ConnectIdentityLiveState::Live) => {}
-        Ok(crate::connect::ConnectIdentityLiveState::Pending) => {
-            return (
-                StatusCode::SERVICE_UNAVAILABLE,
-                crate::connect::ConnectStartupError::Production(
-                    crate::connect::ConnectProductionError::Identity(
-                        crate::connect::IdentityError::TransitionPending,
-                    ),
-                )
-                .to_string(),
-            )
-                .into_response();
-        }
-        Ok(crate::connect::ConnectIdentityLiveState::Absent) => {
+    let identity_store = connect_startup.session().identity_store().clone();
+    let Ok(mut identity_work) = crate::remote::blocking_work::RemoteBlockingWork::spawn(
+        "connect-identity-read",
+        std::time::Instant::now() + CONNECT_HANDSHAKE_TIMEOUT,
+        move |admission| {
+            if !admission.try_admit() {
+                return Err(crate::connect::IdentityError::TransitionPending);
+            }
+            identity_store.identity_live_state()
+        },
+    ) else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "identity worker unavailable",
+        )
+            .into_response();
+    };
+    let live_state = identity_work.wait().await;
+    match live_state {
+        // Pending permits authentication only. The enrollment owner below
+        // admits only its exact retained peer/command retry and cannot publish
+        // Hello or command authority for any other unfinished transition.
+        Ok(Ok(
+            crate::connect::ConnectIdentityLiveState::Live
+            | crate::connect::ConnectIdentityLiveState::Pending,
+        )) => {}
+        Ok(Ok(crate::connect::ConnectIdentityLiveState::Absent)) => {
             return (
                 StatusCode::SERVICE_UNAVAILABLE,
                 crate::connect::ConnectStartupError::Production(
@@ -216,7 +265,7 @@ pub(crate) async fn connect_ws_handler(
             )
                 .into_response();
         }
-        Err(error) => {
+        Ok(Err(error)) => {
             return (
                 StatusCode::SERVICE_UNAVAILABLE,
                 crate::connect::ConnectStartupError::Production(
@@ -226,10 +275,18 @@ pub(crate) async fn connect_ws_handler(
             )
                 .into_response();
         }
+        Err(_) => {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "identity check unavailable",
+            )
+                .into_response();
+        }
     }
     let inner = Arc::downgrade(&inner);
     let host_requests = state.host_requests.clone();
     let paired_client_id = authentication.client_id;
+    let handshake_deadline = tokio::time::Instant::now() + CONNECT_HANDSHAKE_TIMEOUT;
     ws.max_message_size(CONNECT_WS_MAX_FRAME_BYTES)
         .max_frame_size(CONNECT_WS_MAX_FRAME_BYTES)
         .on_upgrade(move |socket| {
@@ -238,7 +295,8 @@ pub(crate) async fn connect_ws_handler(
                 inner,
                 connect_startup,
                 host_requests,
-                paired_client_id,
+                ConnectSessionMode::SameOrigin { paired_client_id },
+                handshake_deadline,
             )
         })
 }
@@ -246,6 +304,8 @@ pub(crate) async fn connect_ws_handler(
 fn admit_connect_ws_request(
     state: &WebState,
     headers: &HeaderMap,
+    peer_ip: std::net::IpAddr,
+    verified: Option<&super::VerifiedDirectTransport>,
 ) -> Result<ValidatedWebAuthentication, Response> {
     // The Noise handshake authenticates the peer, but it is not a substitute
     // for the host's paired-browser admission.  Keep the cookie check in the
@@ -279,13 +339,16 @@ fn admit_connect_ws_request(
     let referer = headers
         .get(axum::http::header::REFERER)
         .and_then(|value| value.to_str().ok());
-    let scheme = connect_request_scheme(headers);
-    let policy =
-        if crate::connect::is_trustworthy_loopback_host(host.split(':').next().unwrap_or(host)) {
-            crate::connect::DirectBindPolicy::loopback()
-        } else {
-            crate::connect::DirectBindPolicy::lan(host.split(':').next().unwrap_or(host), true)
-        };
+    // Only the actual accept path can mint TLS evidence. Headers alone never
+    // authorize LAN control, including when a client claims forwarded HTTPS.
+    let (scheme, policy) =
+        connect_verified_policy(headers, peer_ip, verified).ok_or_else(|| {
+            (
+                StatusCode::FORBIDDEN,
+                "Connect LAN requires a verified secure listener",
+            )
+                .into_response()
+        })?;
     let view = crate::connect::DirectRequestView {
         method: "GET",
         path: "/api/connect",
@@ -310,64 +373,132 @@ fn admit_connect_ws_request(
     Ok(authentication)
 }
 
-/// Determine the HTTP scheme that was used for the WebSocket upgrade.
-///
-/// Axum's upgrade extractor intentionally exposes the HTTP request but not a
-/// TLS flag.  A reverse proxy therefore has to carry the original scheme in
-/// Forwarded/X-Forwarded-Proto; for direct browser connections the Origin is
-/// the authoritative browser-visible scheme.  Only the two schemes supported
-/// by the direct admission policy are accepted, and malformed forwarding
-/// metadata fails closed to `http` (which is valid only for loopback).
-fn connect_request_scheme(headers: &HeaderMap) -> &'static str {
-    fn normalize(value: &str) -> Option<&'static str> {
-        match value
-            .trim()
-            .split(',')
-            .next()?
-            .trim()
-            .to_ascii_lowercase()
-            .as_str()
-        {
-            "http" => Some("http"),
-            "https" => Some("https"),
-            _ => None,
-        }
-    }
-
-    if let Some(value) = headers
-        .get("forwarded")
-        .and_then(|value| value.to_str().ok())
-        .and_then(|value| {
-            value.split(';').find_map(|part| {
-                let (key, value) = part.trim().split_once('=')?;
-                key.trim().eq_ignore_ascii_case("proto").then_some(value)
-            })
-        })
-        .and_then(normalize)
+/// Trust only actual rustls evidence and exact advertised authority. Never
+/// admits plaintext loopback — cross-origin phone→host requires verified TLS.
+pub(super) fn cross_origin_verified_tls_only(
+    headers: &HeaderMap,
+    peer_ip: std::net::IpAddr,
+    verified: Option<&super::VerifiedDirectTransport>,
+) -> Option<(&'static str, crate::connect::DirectBindPolicy)> {
+    let _ = peer_ip;
+    let transport = verified.filter(|transport| transport.is_tls())?;
+    let actual = headers
+        .get(axum::http::header::HOST)?
+        .to_str()
+        .ok()?
+        .parse::<axum::http::uri::Authority>()
+        .ok()?;
+    let advertised = transport
+        .advertised_authority()
+        .parse::<axum::http::uri::Authority>()
+        .ok()?;
+    if !actual.host().eq_ignore_ascii_case(advertised.host())
+        || actual.port_u16().unwrap_or(443) != advertised.port_u16().unwrap_or(443)
     {
-        return value;
+        return None;
     }
-    if let Some(value) = headers
-        .get("x-forwarded-proto")
-        .and_then(|value| value.to_str().ok())
-        .and_then(normalize)
-    {
-        return value;
-    }
-    headers
-        .get(axum::http::header::ORIGIN)
-        .and_then(|value| value.to_str().ok())
-        .and_then(|value| value.split_once("://").map(|(scheme, _)| scheme))
-        .and_then(normalize)
-        .unwrap_or("http")
+    let hostname = advertised
+        .host()
+        .trim_start_matches('[')
+        .trim_end_matches(']');
+    Some((
+        transport.scheme(),
+        crate::connect::DirectBindPolicy::lan(hostname, true),
+    ))
 }
 
-async fn run_connect_session(
+/// Trust only the actual loopback peer and authority on this plain TCP listener.
+pub(super) fn connect_verified_policy(
+    headers: &HeaderMap,
+    peer_ip: std::net::IpAddr,
+    verified: Option<&super::VerifiedDirectTransport>,
+) -> Option<(&'static str, crate::connect::DirectBindPolicy)> {
+    if let Some(transport) = verified.filter(|transport| transport.is_tls()) {
+        let actual = headers
+            .get(axum::http::header::HOST)?
+            .to_str()
+            .ok()?
+            .parse::<axum::http::uri::Authority>()
+            .ok()?;
+        let advertised = transport
+            .advertised_authority()
+            .parse::<axum::http::uri::Authority>()
+            .ok()?;
+        if !actual.host().eq_ignore_ascii_case(advertised.host())
+            || actual.port_u16().unwrap_or(443) != advertised.port_u16().unwrap_or(443)
+        {
+            return None;
+        }
+        let hostname = advertised
+            .host()
+            .trim_start_matches('[')
+            .trim_end_matches(']');
+        return Some((
+            transport.scheme(),
+            crate::connect::DirectBindPolicy::lan(hostname, true),
+        ));
+    }
+    connect_request_scheme(headers, peer_ip)
+        .map(|scheme| (scheme, crate::connect::DirectBindPolicy::loopback()))
+}
+
+fn connect_request_scheme(headers: &HeaderMap, peer_ip: std::net::IpAddr) -> Option<&'static str> {
+    if !peer_ip.is_loopback() {
+        return None;
+    }
+    let authority = headers
+        .get(axum::http::header::HOST)?
+        .to_str()
+        .ok()?
+        .parse::<axum::http::uri::Authority>()
+        .ok()?;
+    // The shared validator expects an HTTP authority, including IPv6 brackets.
+    crate::connect::is_trustworthy_loopback_host(authority.as_str()).then_some("http")
+}
+
+#[cfg(test)]
+mod verified_transport_tests {
+    use super::*;
+
+    #[test]
+    fn lan_requires_listener_evidence_and_exact_advertised_authority() {
+        let peer = "192.168.1.20".parse().unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert("host", "devbox.example:8443".parse().unwrap());
+        headers.insert("x-forwarded-proto", "https".parse().unwrap());
+        assert!(connect_verified_policy(&headers, peer, None).is_none());
+        let tls = super::super::tls::VerifiedDirectTransport::mint_after_rustls_handshake(
+            "devbox.example:8443".into(),
+        );
+        let (scheme, policy) = connect_verified_policy(&headers, peer, Some(&tls)).unwrap();
+        assert_eq!(scheme, "https");
+        assert_eq!(policy.advertised_hostname, "devbox.example");
+        headers.insert("host", "devbox.example:8444".parse().unwrap());
+        assert!(connect_verified_policy(&headers, peer, Some(&tls)).is_none());
+        headers.insert("host", "attacker.example:8443".parse().unwrap());
+        assert!(connect_verified_policy(&headers, peer, Some(&tls)).is_none());
+    }
+
+    #[test]
+    fn verified_https_normalizes_default_port_and_ipv6_authority() {
+        let peer = "::1".parse().unwrap();
+        let tls = super::super::tls::VerifiedDirectTransport::mint_after_rustls_handshake(
+            "[::1]:443".into(),
+        );
+        let mut headers = HeaderMap::new();
+        headers.insert("host", "[::1]".parse().unwrap());
+        let (_, policy) = connect_verified_policy(&headers, peer, Some(&tls)).unwrap();
+        assert_eq!(policy.advertised_hostname, "::1");
+    }
+}
+
+pub(crate) async fn run_connect_session(
     mut socket: WebSocket,
     inner: Weak<RemoteHostInner>,
     connect_startup: std::sync::Arc<crate::connect::ConnectProductionStartup>,
     host_requests: crate::connect::ConnectHostRequestSlot,
-    paired_client_id: String,
+    mode: ConnectSessionMode,
+    handshake_deadline: tokio::time::Instant,
 ) {
     let Some(inner) = inner.upgrade() else {
         return;
@@ -376,13 +507,8 @@ async fn run_connect_session(
         .connect_encryption_required
         .store(true, Ordering::Release);
     let session = connect_startup.session();
-    if !matches!(
-        session.identity_store().identity_live_state(),
-        Ok(crate::connect::ConnectIdentityLiveState::Live)
-    ) {
-        let _ = socket.close().await;
-        return;
-    }
+    // Enrollment below revalidates live identity off the async executor before
+    // installing any authority, including legacy Host-kind compatibility.
     let pairing = crate::connect::admit_connect_action(
         crate::connect::ConnectIdentityLiveState::Live,
         crate::connect::ConnectAdmission::AnonymousPairing,
@@ -399,107 +525,152 @@ async fn run_connect_session(
         let _ = socket.close().await;
         return;
     }
-    let mut route_id = [0_u8; 16];
-    let mut session_id = [0_u8; 16];
-    if getrandom::fill(&mut route_id).is_err() || getrandom::fill(&mut session_id).is_err() {
-        let _ = socket.close().await;
+    let mut channel = match tokio::time::timeout_at(
+        handshake_deadline,
+        accept_connect_channel(&mut socket, &connect_startup),
+    )
+    .await
+    {
+        Ok(Some(channel)) => channel,
+        _ => return,
+    };
+    let Some(authenticated_peer) = channel.authenticated_peer() else {
+        return;
+    };
+    let peer_static = authenticated_peer.static_public().as_bytes();
+    let Ok(mut peer) = (match &mode {
+        ConnectSessionMode::SameOrigin { paired_client_id } => {
+            crate::remote::validate_or_bind_connect_peer(&inner, paired_client_id, peer_static)
+        }
+        ConnectSessionMode::CrossOrigin {
+            origin,
+            ticket_binding,
+        } => {
+            if let Some(binding) = ticket_binding {
+                if *connect_startup
+                    .session()
+                    .profile_host_public_id()
+                    .as_bytes()
+                    != binding.host_public_id
+                {
+                    return;
+                }
+            }
+            super::connect_identity::validate_cross_origin_connect_peer(
+                &inner,
+                origin,
+                peer_static,
+                ticket_binding
+                    .as_ref()
+                    .map(|binding| binding.paired_client_id.as_str()),
+                ticket_binding.as_ref().map(|binding| binding.public_key),
+            )
+        }
+    }) else {
+        return;
+    };
+    let paired_client_id = peer.paired_client_id().to_string();
+    // Existing pin/cookie membership must remain valid through enrollment.
+    if !peer.is_authorized() {
         return;
     }
-    let Ok(prologue) = crate::connect::connect_prologue(
-        crate::connect::ConnectCredentialPurpose::OwnerPairing,
-        route_id,
-        session_id,
-    ) else {
+    let Some(enrollment) = session.device_enrollment() else {
         let _ = socket.close().await;
         return;
     };
-    let binding = crate::connect::ConnectNoiseIdentityBinding::host(
-        *session.profile_host_public_id().as_bytes(),
-    );
-    let now_unix = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|elapsed| elapsed.as_secs())
-        .unwrap_or(1);
-    let mut handshake = match session.start_handshake(
-        crate::connect::CONNECT_NOISE_FIRST_PAIRING_PATTERN,
-        true,
-        None,
-        prologue,
-        crate::connect::ConnectChannelRole::Responder,
-        binding,
-        now_unix,
-        true,
-        false,
+    let metadata = match super::connect_identity::paired_browser_enrollment_metadata(
+        &inner,
+        &paired_client_id,
     ) {
-        Ok(handshake) => handshake,
+        Ok(metadata) => metadata,
         Err(_) => {
             let _ = socket.close().await;
             return;
         }
     };
-    let mut greeting = Vec::with_capacity(CONNECT_WS_GREETING_MAGIC.len() + 48);
-    greeting.extend_from_slice(CONNECT_WS_GREETING_MAGIC);
-    greeting.extend_from_slice(session.profile_host_public_id().as_bytes());
-    greeting.extend_from_slice(&route_id);
-    greeting.extend_from_slice(&session_id);
-    if socket.send(WsMessage::Binary(greeting)).await.is_err() {
+    // Drop strong host ownership before blocking enrollment so the socket path
+    // cannot keep the listener alive across vault/disk work.
+    drop(inner);
+    let peer_for_enroll = authenticated_peer;
+    let enrollment_handle = enrollment.clone();
+    let Ok(mut enrollment_work) = crate::remote::blocking_work::RemoteBlockingWork::spawn(
+        "connect-device-enrollment",
+        handshake_deadline.into_std(),
+        move |admission| {
+            let mut context = enrollment_handle.lock();
+            // Serial store ownership precedes admission. A queued retry whose
+            // socket disappeared must not consume the vault's one-use slot.
+            if !admission.try_admit() {
+                return Err(crate::connect::DeviceEnrollmentError::Cancelled);
+            }
+            context.enroll_or_rebind_paired_browser(peer_for_enroll, &metadata)
+        },
+    ) else {
+        return;
+    };
+    let enroll_result = tokio::select! {
+        biased;
+        _ = peer.revoked() => None,
+        result = enrollment_work.wait() => match result {
+            Ok(Ok(authority)) => Some(authority),
+            // Timeout, join failure, or enrollment error: do not publish authority.
+            Ok(Err(_)) | Err(_) => None,
+        },
+    };
+    let Some(authority) = enroll_result else {
+        let _ = socket.close().await;
+        return;
+    };
+    peer = peer.with_identity_invalidation(
+        authority.subscribe_authority(),
+        authority.authority_generation(),
+    );
+    // Re-validate pin/cookie membership after enrollment settles.
+    if !peer.is_authorized() {
+        let _ = socket.close().await;
         return;
     }
-    let Some(first) = recv_connect_binary(
-        &mut socket,
-        crate::protocol::MAX_HANDSHAKE_MESSAGE_BYTES as usize,
+    let mut dispatch = crate::connect::ConnectDispatchSession::bind_paired(
+        paired_client_id,
+        crate::connect::ConnectIdentityLiveState::Live,
     )
-    .await
-    else {
-        return;
-    };
-    let Ok(first_message) = crate::connect::ConnectNoiseHandshakeMessage::decode(&first) else {
-        let _ = socket.close().await;
-        return;
-    };
-    if handshake.read_message(&first_message).is_err() {
-        let _ = socket.close().await;
-        return;
-    }
-    let Ok(second) = handshake.write_message() else {
-        let _ = socket.close().await;
-        return;
-    };
-    let Ok(second_bytes) = second.encode() else {
-        let _ = socket.close().await;
-        return;
-    };
-    if socket.send(WsMessage::Binary(second_bytes)).await.is_err() {
-        return;
-    }
-    let Some(third) = recv_connect_binary(
-        &mut socket,
-        crate::protocol::MAX_HANDSHAKE_MESSAGE_BYTES as usize,
-    )
-    .await
-    else {
-        return;
-    };
-    let Ok(third_message) = crate::connect::ConnectNoiseHandshakeMessage::decode(&third) else {
-        let _ = socket.close().await;
-        return;
-    };
-    if handshake.read_message(&third_message).is_err() {
-        let _ = socket.close().await;
-        return;
-    }
-    let mut channel = match crate::connect::ConnectProductionSession::finish_channel(handshake) {
-        Ok(channel) if channel.is_production_grade() => channel,
-        _ => {
+    .with_assigned_client_id(peer.client_id())
+    .with_capability_ceiling(crate::protocol::CapabilitySet::from_bits(
+        u64::MAX
+            & !crate::protocol::Capability::HostShutdown.bit()
+            & !crate::protocol::Capability::UpdateHandoff.bit(),
+    ));
+    dispatch = match authority.device_credential() {
+        Some((proof, session_epoch, _)) if session_epoch != 0 => {
+            dispatch.with_device_credential(proof.clone(), session_epoch)
+        }
+        Some((_, 0, _)) => {
+            let _ = socket.close().await;
+            return;
+        }
+        None if authority.is_legacy_host_compat() => dispatch.with_legacy_host_compat(),
+        None | Some(_) => {
             let _ = socket.close().await;
             return;
         }
     };
-    let mut dispatch = crate::connect::ConnectDispatchSession::bind_paired(
-        paired_client_id,
-        crate::connect::ConnectIdentityLiveState::Live,
-    );
-    while let Some(bytes) = recv_connect_binary(&mut socket, CONNECT_WS_MAX_FRAME_BYTES).await {
+    loop {
+        if !peer.is_authorized() {
+            break;
+        }
+        let bytes = if dispatch.negotiated_limits().is_none() {
+            tokio::select! {
+                biased;
+                _ = peer.revoked() => None,
+                result = tokio::time::timeout_at(handshake_deadline,
+                    recv_connect_binary(&mut socket, CONNECT_WS_MAX_FRAME_BYTES)) => result.ok().flatten(),
+            }
+        } else {
+            recv_connect_binary(&mut socket, CONNECT_WS_MAX_FRAME_BYTES).await
+        };
+        let Some(bytes) = bytes else {
+            break;
+        };
         let Ok(frame) = crate::protocol::SealedFrame::decode(&bytes) else {
             break;
         };
@@ -519,6 +690,17 @@ async fn run_connect_session(
             Ok(envelope) => envelope,
             Err(_) => break,
         };
+        if envelope.sequence != frame.sequence() {
+            break;
+        }
+        let Ok(binding) = envelope.binding() else {
+            break;
+        };
+        if binding.connection_id.as_bytes() != channel.prologue().route_id()
+            || channel.bind_session(binding).is_err()
+        {
+            break;
+        }
         let payload = match envelope.decode_payload() {
             Ok(payload) => payload,
             Err(_) => break,
@@ -528,17 +710,7 @@ async fn run_connect_session(
         let (reply, disposition) = dispatch
             .handle_payload(&envelope, payload, host.as_deref())
             .await;
-        debug_assert!(
-            !matches!(
-                &reply,
-                crate::connect::ConnectPayload::Error(error)
-                    if error.code == 503
-                        || error
-                            .message
-                            .contains(crate::connect::CONNECT_HOLD_CALLBACK_FRAGMENT)
-            ),
-            "Connect production must not emit the former 503 HOLD"
-        );
+        let hello_completed = matches!(&reply, crate::connect::ConnectPayload::Hello(_));
         let mut nonce = [0_u8; crate::protocol::SEALED_NONCE_BYTES];
         if getrandom::fill(&mut nonce).is_err() {
             break;
@@ -569,7 +741,16 @@ async fn run_connect_session(
         let Ok(encoded) = sealed.encode() else {
             break;
         };
-        if socket.send(WsMessage::Binary(encoded)).await.is_err() {
+        if encoded.len() > CONNECT_WS_MAX_FRAME_BYTES
+            || !matches!(
+                tokio::time::timeout(
+                    CONNECT_WRITE_TIMEOUT,
+                    socket.send(WsMessage::Binary(encoded))
+                )
+                .await,
+                Ok(Ok(()))
+            )
+        {
             dispatch.disconnect();
             return;
         }
@@ -579,9 +760,85 @@ async fn run_connect_session(
         ) {
             break;
         }
+        if hello_completed {
+            if let (Some(host), Some(client_id)) = (host, dispatch.bound_client_id()) {
+                match tokio::time::timeout_at(handshake_deadline, host.open_duplex(client_id)).await
+                {
+                    Ok(Ok(Some(duplex))) => {
+                        // Hello was physically flushed by SinkExt::send before
+                        // the single live writer takes ownership of the socket.
+                        let _ = crate::host::serve_host_connect_duplex(
+                            socket, channel, dispatch, duplex, peer,
+                        )
+                        .await;
+                        return;
+                    }
+                    Ok(Ok(None)) => break, // Remote delivery requires the owning host writer.
+                    _ => break,
+                }
+            }
+        }
     }
     dispatch.disconnect();
     let _ = socket.close().await;
+}
+
+/// One cancellation-owned Noise exchange; caller supplies a shared absolute
+/// deadline covering greeting, all handshake flights, and application Hello.
+async fn accept_connect_channel(
+    socket: &mut WebSocket,
+    startup: &crate::connect::ConnectProductionStartup,
+) -> Option<crate::connect::EndToEndChannel> {
+    let session = startup.session();
+    let (greeting, route_id, session_id) =
+        connect_greeting(*session.profile_host_public_id().as_bytes());
+    let prologue = crate::connect::connect_prologue(
+        crate::connect::ConnectCredentialPurpose::OwnerPairing,
+        route_id,
+        session_id,
+    )
+    .ok()?;
+    let binding = crate::connect::ConnectNoiseIdentityBinding::host(
+        *session.profile_host_public_id().as_bytes(),
+    );
+    let now_unix = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()?
+        .as_secs();
+    let mut handshake = session
+        .start_handshake(
+            crate::connect::CONNECT_NOISE_FIRST_PAIRING_PATTERN,
+            true,
+            None,
+            prologue,
+            crate::connect::ConnectChannelRole::Responder,
+            binding,
+            now_unix,
+            true,
+            false,
+        )
+        .ok()?;
+    socket.send(WsMessage::Binary(greeting)).await.ok()?;
+    let first = recv_connect_binary(
+        socket,
+        crate::protocol::MAX_HANDSHAKE_MESSAGE_BYTES as usize,
+    )
+    .await?;
+    handshake
+        .read_message(&crate::connect::ConnectNoiseHandshakeMessage::decode(&first).ok()?)
+        .ok()?;
+    let second = handshake.write_message().ok()?.encode().ok()?;
+    socket.send(WsMessage::Binary(second)).await.ok()?;
+    let third = recv_connect_binary(
+        socket,
+        crate::protocol::MAX_HANDSHAKE_MESSAGE_BYTES as usize,
+    )
+    .await?;
+    handshake
+        .read_message(&crate::connect::ConnectNoiseHandshakeMessage::decode(&third).ok()?)
+        .ok()?;
+    let channel = crate::connect::ConnectProductionSession::finish_channel(handshake).ok()?;
+    channel.is_production_grade().then_some(channel)
 }
 
 async fn recv_connect_binary(socket: &mut WebSocket, max_bytes: usize) -> Option<Vec<u8>> {
@@ -3210,7 +3467,7 @@ fn build_resume_state_locked(
         semantic_after_sequence,
     );
     let (route, desired_session_key) = if hard_reset {
-        ("/sessions".to_string(), None)
+        (super::routes::TASKS_PATH.to_string(), None)
     } else {
         validate_resume_route(&request.route, requested_key.as_ref(), &projection)
     };
@@ -3360,19 +3617,31 @@ fn validate_resume_route(
     let path = route
         .split(['?', '#'])
         .next()
-        .unwrap_or("/sessions")
+        .unwrap_or(super::routes::TASKS_PATH)
         .trim_end_matches('/');
     let path = if path.is_empty() { "/" } else { path };
     match path {
-        "/sessions" | "/projects" | "/settings" => (path.to_string(), None),
+        "/" | "/sessions" | "/tasks" => (super::routes::TASKS_PATH.to_string(), None),
+        "/projects" | "/settings" => (path.to_string(), None),
         _ => {
+            if let Some((canonical, route_key)) = super::routes::parse_task_path(path) {
+                if requested_key == Some(&route_key)
+                    && workspace
+                        .sessions
+                        .iter()
+                        .any(|session| session.stable_session_key.as_ref() == Some(&route_key))
+                {
+                    return (canonical, Some(route_key));
+                }
+            }
             if let Some(project_id) = path.strip_prefix("/projects/") {
+                let decoded_id = super::routes::decode_component(project_id);
                 if !project_id.is_empty()
                     && !project_id.contains('/')
                     && workspace
                         .projects
                         .iter()
-                        .any(|project| project.id == project_id)
+                        .any(|project| Some(project.id.as_str()) == decoded_id.as_deref())
                 {
                     return (path.to_string(), None);
                 }
@@ -3398,12 +3667,12 @@ fn validate_resume_route(
                             .iter()
                             .any(|session| session.stable_session_key.as_ref() == Some(&route_key));
                         if requested_matches && exists {
-                            return (path.to_string(), Some(route_key));
+                            return (super::routes::task_path(&route_key), Some(route_key));
                         }
                     }
                 }
             }
-            ("/sessions".to_string(), None)
+            (super::routes::TASKS_PATH.to_string(), None)
         }
     }
 }
@@ -5524,6 +5793,10 @@ mod tests {
             pairing_attempts: Arc::new(std::sync::Mutex::new(Default::default())),
             connect_startup: None,
             host_requests: crate::connect::ConnectHostRequestSlot::new(),
+            cross_origin: Arc::new(std::sync::Mutex::new(Default::default())),
+            cross_origin_rate: Arc::new(std::sync::Mutex::new(Default::default())),
+            fleet_trust_source: None,
+            fleet_test_publication: None,
         };
         let config = service.config();
         let signed = super::super::sign_cookie(&config.web.cookie_secret_hex, "paired-browser")
@@ -5557,19 +5830,33 @@ mod tests {
     }
 
     #[test]
-    fn connect_request_scheme_prefers_forwarded_tls_and_origin_fallback() {
+    fn connect_request_scheme_never_trusts_forwarded_tls_claims() {
         let mut headers = HeaderMap::new();
+        let local = "127.0.0.1".parse().unwrap();
+        let remote = "192.0.2.7".parse().unwrap();
         headers.insert(
             axum::http::header::ORIGIN,
             "https://devmanager.test".parse().unwrap(),
         );
-        assert_eq!(connect_request_scheme(&headers), "https");
+        headers.insert(
+            axum::http::header::HOST,
+            "devmanager.test:43872".parse().unwrap(),
+        );
+        assert_eq!(connect_request_scheme(&headers, remote), None);
 
         headers.insert("x-forwarded-proto", "http, https".parse().unwrap());
-        assert_eq!(connect_request_scheme(&headers), "http");
+        assert_eq!(connect_request_scheme(&headers, remote), None);
 
         headers.insert("forwarded", "for=192.0.2.7;proto=https".parse().unwrap());
-        assert_eq!(connect_request_scheme(&headers), "https");
+        assert_eq!(connect_request_scheme(&headers, local), None);
+        headers.insert(axum::http::header::HOST, "localhost:43872".parse().unwrap());
+        assert_eq!(connect_request_scheme(&headers, local), Some("http"));
+        assert_eq!(connect_request_scheme(&headers, remote), None);
+        headers.insert(axum::http::header::HOST, "[::1]:43872".parse().unwrap());
+        assert_eq!(
+            connect_request_scheme(&headers, "::1".parse().unwrap()),
+            Some("http")
+        );
     }
 
     #[test]
@@ -5584,6 +5871,10 @@ mod tests {
             pairing_attempts: Arc::new(std::sync::Mutex::new(Default::default())),
             connect_startup: None,
             host_requests: crate::connect::ConnectHostRequestSlot::new(),
+            cross_origin: Arc::new(std::sync::Mutex::new(Default::default())),
+            cross_origin_rate: Arc::new(std::sync::Mutex::new(Default::default())),
+            fleet_trust_source: None,
+            fleet_test_publication: None,
         };
         let mut headers = HeaderMap::new();
         headers.insert(
@@ -5594,8 +5885,9 @@ mod tests {
             axum::http::header::ORIGIN,
             "http://devmanager.test:43872".parse().unwrap(),
         );
-        let response = admit_connect_ws_request(&state, &headers)
-            .expect_err("Connect must not reach Noise without browser admission");
+        let response =
+            admit_connect_ws_request(&state, &headers, "127.0.0.1".parse().unwrap(), None)
+                .expect_err("Connect must not reach Noise without browser admission");
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
     }
 
@@ -7549,6 +7841,7 @@ mod tests {
             browser_version: Some("135".to_string()),
             os_family: Some("Windows".to_string()),
             device_class: Some("desktop".to_string()),
+            permitted_origin: None,
         });
     }
 
@@ -7616,8 +7909,8 @@ mod tests {
             seen_revision: None,
             route: desired_session_key
                 .as_ref()
-                .map(|key| format!("/session/{}", key.as_str().replace(':', "/")))
-                .unwrap_or_else(|| "/sessions".to_string()),
+                .map(super::super::routes::task_path)
+                .unwrap_or_else(|| "/tasks".to_string()),
             desired_session_key,
             raw_session_id: None,
             semantic_after_sequence: Some(0),
@@ -7628,7 +7921,7 @@ mod tests {
     }
 
     #[test]
-    fn resume_runtime_mismatch_is_a_hard_reset_to_sessions() {
+    fn resume_runtime_mismatch_is_a_hard_reset_to_tasks() {
         let service = RemoteHostService::new(RemoteHostConfig::default());
         let state = build_resume_state(
             &service.inner,
@@ -7643,10 +7936,85 @@ mod tests {
         );
 
         assert!(state.hard_reset);
-        assert_eq!(state.route, "/sessions");
+        assert_eq!(state.route, "/tasks");
         assert!(state.desired_session_key.is_none());
         assert!(state.semantic_replay.is_none());
         assert!(state.workspace.is_some());
+    }
+
+    #[test]
+    fn websocket_greeting_prologue_ids_are_accepted_by_the_envelope_decoder() {
+        let host = crate::connect::ConnectHostId::new().as_bytes();
+        for _ in 0..16 {
+            let (greeting, route, session) = connect_greeting(host);
+            assert_eq!(&greeting[..5], b"DMCN1");
+            assert_eq!(&greeting[5..21], &host);
+            let wire_route: [u8; 16] = greeting[21..37].try_into().unwrap();
+            let wire_session: [u8; 16] = greeting[37..53].try_into().unwrap();
+            assert_eq!(wire_route, route);
+            assert_eq!(wire_session, session);
+            assert!(crate::connect::ConnectionId::from_bytes(wire_route).is_ok());
+            assert!(crate::connect::SessionId::from_bytes(wire_session).is_ok());
+        }
+    }
+
+    #[test]
+    fn foreground_resume_keeps_the_task_resource_and_semantic_replay() {
+        let service = RemoteHostService::new(RemoteHostConfig::default());
+        ai_session(&service, "tab-a", "pty-a");
+        let key = StableSessionKey::from_tab("tab-a");
+        let mut request = resume_request(
+            Some(service.inner.runtime_instance_id.clone()),
+            Some(key.clone()),
+            "phone",
+        );
+        request.route = "/tasks/tab%3Atab-a/terminal?source=pwa".to_string();
+        request.wants_writer_lease = false;
+        let state = build_resume_state(&service.inner, 1, "phone", request, 1_000);
+        assert!(!state.hard_reset);
+        assert_eq!(state.route, "/tasks/tab%3Atab-a/terminal");
+        assert_eq!(state.desired_session_key, Some(key.clone()));
+        assert_eq!(state.semantic_replay.unwrap().stable_session_key, key);
+    }
+
+    #[test]
+    fn resume_does_not_attach_a_foreign_missing_or_malformed_task_route() {
+        let service = RemoteHostService::new(RemoteHostConfig::default());
+        ai_session(&service, "tab-a", "pty-a");
+        for route in [
+            "/tasks/tab%3Atab-b",
+            "/tasks/tab%3Atab-a%00",
+            "/tasks/tab%3Atab-a/terminal/extra",
+            "/tasks/%E0%A4%A",
+        ] {
+            let mut request = resume_request(
+                Some(service.inner.runtime_instance_id.clone()),
+                Some(StableSessionKey::from_tab("tab-a")),
+                "phone",
+            );
+            request.route = route.to_string();
+            request.wants_writer_lease = false;
+            let state = build_resume_state(&service.inner, 1, "phone", request, 1_000);
+            assert_eq!(state.route, "/tasks", "{route}");
+            assert!(state.desired_session_key.is_none(), "{route}");
+            assert!(state.semantic_replay.is_none(), "{route}");
+        }
+    }
+
+    #[test]
+    fn old_session_links_resume_to_the_current_task_route() {
+        let service = RemoteHostService::new(RemoteHostConfig::default());
+        ai_session(&service, "tab-a", "pty-a");
+        let mut request = resume_request(
+            Some(service.inner.runtime_instance_id.clone()),
+            Some(StableSessionKey::from_tab("tab-a")),
+            "phone",
+        );
+        request.route = "/session/tab/tab-a".to_string();
+        request.wants_writer_lease = false;
+        let state = build_resume_state(&service.inner, 1, "phone", request, 1_000);
+        assert_eq!(state.route, "/tasks/tab%3Atab-a");
+        assert!(state.semantic_replay.is_some());
     }
 
     #[test]

@@ -1,0 +1,671 @@
+.dm-native-remote-entry {
+  background: #0b0b0d;
+  color: #eeeeef;
+  color-scheme: dark;
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Arial, sans-serif;
+  display: flex;
+  flex-direction: column;
+  height: var(--visual-viewport-height, 100dvh);
+  min-height: 0;
+  overflow: hidden;
+}
+
+.dm-native-remote-entry > .dm-connect-notice {
+  flex: 0 0 auto;
+  margin: 0;
+  padding: 6px 16px;
+  font-size: 12px;
+  overflow-wrap: anywhere;
+}
+
+.dm-native-remote-entry > .dm-native-remote {
+  flex: 1;
+  height: auto;
+  width: 100%;
+}
+
+.dm-native-remote {
+  --native-bg: #0b0b0d;
+  --native-panel: #1b1b1f;
+  --native-panel-strong: #28282e;
+  --native-text: #eeeeef;
+  --native-muted: #98989f;
+  --native-border: #2b2b31;
+  --native-accent: #8978ff;
+  --native-caution: #ffd58a;
+  background: var(--native-bg);
+  box-sizing: border-box;
+  color: var(--native-text);
+  display: flex;
+  flex-direction: column;
+  font: 400 16px/1.55 -apple-system, BlinkMacSystemFont, "Segoe UI", Arial, sans-serif;
+  height: var(--visual-viewport-height, 100dvh);
+  min-height: 0;
+  overflow: hidden;
+  padding: calc(12px + env(safe-area-inset-top, 0px)) 16px
+    calc(14px + env(safe-area-inset-bottom, 0px));
+}
+
+.dm-native-remote__header-actions {
+  align-items: center;
+  display: flex;
+  gap: 8px;
+}
+
+.dm-native-remote__host-panel {
+  background: var(--native-panel);
+  border: 1px solid var(--native-border);
+  border-radius: 12px;
+  margin: 10px 0 4px;
+  padding: 10px 12px;
+}
+
+.dm-native-remote__host-list {
+  display: grid;
+  gap: 8px;
+  list-style: none;
+  margin: 8px 0 0;
+  padding: 0;
+}
+
+.dm-native-remote__host-row {
+  align-items: flex-start;
+  display: flex;
+  gap: 10px;
+  justify-content: space-between;
+}
+
+.dm-native-remote__host-copy {
+  display: grid;
+  gap: 2px;
+  min-width: 0;
+}
+
+.dm-native-remote__host-copy strong {
+  font-size: 14px;
+}
+
+.dm-native-remote__host-copy small {
+  color: var(--native-muted);
+  font-size: 11px;
+  overflow-wrap: anywhere;
+}
+
+.dm-native-remote__host-actions {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.dm-native-remote__host-actions button {
+  background: var(--native-panel-strong);
+  border: 1px solid var(--native-border);
+  border-radius: 8px;
+  color: var(--native-text);
+  cursor: pointer;
+  font-size: 12px;
+  min-height: 32px;
+  padding: 4px 10px;
+}
+
+.dm-native-remote__host-actions button:disabled {
+  cursor: default;
+  opacity: 0.45;
+}
+
+.dm-native-remote__pair-form {
+  display: flex;
+  gap: 6px;
+}
+
+.dm-native-remote__pair-form input {
+  background: var(--native-bg);
+  border: 1px solid var(--native-border);
+  border-radius: 8px;
+  color: var(--native-text);
+  font-size: 12px;
+  max-width: 140px;
+  padding: 6px 8px;
+}
+
+.dm-native-remote__task-copy small:empty {
+  display: none;
+}
+
+.dm-native-remote__brand {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.dm-native-remote__brand img { border-radius: 9px; }
+.dm-native-remote__brand h1 { font-size: 19px; font-weight: 650; }
+
+.dm-native-remote *,
+.dm-native-remote *::before,
+.dm-native-remote *::after {
+  box-sizing: border-box;
+}
+
+.dm-native-remote h1,
+.dm-native-remote p {
+  margin: 0;
+}
+
+.dm-native-remote__inbox-header,
+.dm-native-remote__conversation-header {
+  align-items: center;
+  display: flex;
+  justify-content: space-between;
+  min-height: 44px;
+}
+
+.dm-native-remote__eyebrow,
+.dm-native-remote__conversation-title p {
+  color: var(--native-muted);
+  font-size: 12px;
+  line-height: 1.25;
+}
+
+.dm-native-remote h1 {
+  font-size: 21px;
+  letter-spacing: -0.02em;
+  line-height: 1.15;
+}
+
+.dm-native-remote__icon-button {
+  align-items: center;
+  background: var(--native-panel);
+  border: 1px solid var(--native-border);
+  border-radius: 50%;
+  color: var(--native-text);
+  cursor: pointer;
+  display: inline-flex;
+  height: 44px;
+  justify-content: center;
+  width: 44px;
+  flex-shrink: 0;
+}
+
+.dm-native-remote__icon-button:hover:not(:disabled),
+.dm-native-remote__icon-button:focus-visible {
+  background: var(--native-panel-strong);
+}
+
+.dm-native-remote__icon-button:disabled {
+  cursor: default;
+  opacity: 0.45;
+}
+
+.dm-native-remote__search-wrap {
+  align-items: center;
+  background: var(--native-panel);
+  border: 1px solid var(--native-border);
+  border-radius: 12px;
+  color: var(--native-muted);
+  display: flex;
+  gap: 8px;
+  margin: 12px 0 4px;
+  padding: 0 11px;
+}
+
+.dm-native-remote__search-wrap input {
+  background: transparent;
+  border: 0;
+  color: var(--native-text);
+  font: inherit;
+  min-width: 0;
+  outline: 0;
+  padding: 10px 0;
+  width: 100%;
+}
+
+.dm-native-remote__connection,
+.dm-native-remote__notice {
+  align-items: center;
+  background: var(--native-panel);
+  border: 1px solid var(--native-border);
+  border-radius: 9px;
+  color: var(--native-muted);
+  display: flex;
+  font-size: 12px;
+  gap: 7px;
+  margin: 10px 0;
+  padding: 8px 10px;
+}
+
+.dm-native-remote__notice {
+  color: var(--native-caution);
+}
+
+.dm-native-remote__notice--caution {
+  border-color: #695739;
+}
+
+.dm-native-remote__task-list {
+  min-height: 0;
+  display: flex;
+  flex: 1;
+  flex-direction: column;
+  gap: 5px;
+  overflow: auto;
+  padding: 6px 0 12px;
+}
+
+.dm-native-remote__task-row {
+  align-items: center;
+  background: transparent;
+  border: 1px solid transparent;
+  border-radius: 12px;
+  color: inherit;
+  cursor: pointer;
+  display: flex;
+  gap: 10px;
+  justify-content: space-between;
+  padding: 12px 10px;
+  text-align: left;
+  width: 100%;
+}
+
+.dm-native-remote__task-row:hover:not(:disabled),
+.dm-native-remote__task-row:focus-visible {
+  background: var(--native-panel);
+  border-color: var(--native-border);
+  outline: 0;
+}
+
+.dm-native-remote__task-row:disabled {
+  cursor: default;
+  opacity: 0.55;
+}
+
+.dm-native-remote__task-copy {
+  display: grid;
+  gap: 3px;
+  min-width: 0;
+}
+
+.dm-native-remote__task-copy strong {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.dm-native-remote__task-copy small {
+  color: var(--native-muted);
+  font-size: 12px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.dm-native-remote__done {
+  border-top: 1px solid var(--native-border);
+  color: var(--native-muted);
+  flex: 0 0 auto;
+  font-size: 13px;
+  margin-top: auto;
+  padding-top: 10px;
+}
+
+.dm-native-remote__done summary {
+  cursor: pointer;
+  padding: 4px 2px 7px;
+}
+
+.dm-native-remote__done .dm-native-remote__task-row {
+  color: var(--native-muted);
+  margin-top: 0;
+  padding: 7px 4px;
+  font-size: 14px;
+}
+
+.dm-native-remote__done .dm-native-remote__task-copy small { display: none; }
+.dm-native-remote__done .dm-native-remote__task-copy strong { font-weight: 450; }
+
+.dm-native-remote__lifecycle {
+  color: var(--native-caution);
+  font-size: 11px;
+  margin-top: 2px;
+}
+
+.dm-native-remote__menu {
+  position: relative;
+}
+
+.dm-native-remote__menu-panel {
+  background: var(--native-panel);
+  border: 1px solid var(--native-border);
+  border-radius: 12px;
+  display: grid;
+  gap: 2px;
+  min-width: 168px;
+  padding: 6px;
+  position: absolute;
+  right: 0;
+  top: calc(100% + 6px);
+  z-index: 5;
+}
+
+.dm-native-remote__menu-panel > button {
+  align-items: center;
+  background: transparent;
+  border: 0;
+  border-radius: 8px;
+  color: var(--native-text);
+  cursor: pointer;
+  display: flex;
+  font: inherit;
+  font-size: 14px;
+  gap: 8px;
+  min-height: 40px;
+  padding: 8px 10px;
+  text-align: left;
+  width: 100%;
+}
+
+.dm-native-remote__menu-panel > button:hover,
+.dm-native-remote__menu-panel > button:focus-visible {
+  background: var(--native-panel-strong);
+  outline: 0;
+}
+
+.dm-native-remote__menu-danger {
+  color: #ffb4b4;
+}
+
+.dm-native-remote__rename-form,
+.dm-native-remote__delete-confirm {
+  border-top: 1px solid var(--native-border);
+  display: grid;
+  gap: 6px;
+  margin-top: 4px;
+  padding: 8px 4px 4px;
+}
+
+.dm-native-remote__rename-form input {
+  background: var(--native-bg);
+  border: 1px solid var(--native-border);
+  border-radius: 8px;
+  color: var(--native-text);
+  font: inherit;
+  padding: 8px 10px;
+}
+
+.dm-native-remote__rename-form button,
+.dm-native-remote__delete-confirm button {
+  background: var(--native-panel-strong);
+  border: 1px solid var(--native-border);
+  border-radius: 8px;
+  color: var(--native-text);
+  cursor: pointer;
+  font: inherit;
+  font-size: 13px;
+  min-height: 36px;
+  padding: 6px 10px;
+}
+
+.dm-native-remote__delete-confirm p {
+  color: var(--native-muted);
+  font-size: 12px;
+}
+
+.dm-native-remote__empty {
+  color: var(--native-muted);
+  font-size: 13px;
+  padding: 22px 8px;
+  text-align: center;
+}
+
+.dm-native-remote--conversation {
+  padding-bottom: max(8px, env(safe-area-inset-bottom, 0px));
+}
+
+.dm-native-remote__conversation-header {
+  flex: 0 0 auto;
+  gap: 10px;
+  margin-bottom: 10px;
+}
+
+.dm-native-remote__conversation-header .dm-native-remote__header-actions {
+  margin-left: auto;
+}
+
+.dm-native-remote__conversation-header h1 { font-size: 18px; font-weight: 650; }
+
+.dm-native-remote__conversation-title {
+  flex: 1;
+  min-width: 0;
+}
+
+.dm-native-remote__terminal {
+  flex: 1;
+  min-height: 0;
+  overflow: auto;
+  padding: 12px 0;
+}
+
+.dm-native-remote__terminal pre {
+  font: 13px/1.4 ui-monospace, Consolas, monospace;
+  white-space: pre;
+  user-select: text;
+}
+
+.dm-native-remote__terminal-keys {
+  display: flex;
+  gap: 6px;
+  position: sticky;
+  top: 0;
+  background: var(--native-bg);
+  padding-bottom: 8px;
+}
+
+.dm-native-remote__terminal-keys button {
+  min-width: 42px;
+  min-height: 40px;
+  border: 1px solid var(--native-border);
+  border-radius: 10px;
+  background: var(--native-panel);
+  color: var(--native-text);
+  cursor: pointer;
+}
+
+.dm-native-remote__terminal-keys button:disabled { opacity: 0.45; cursor: default; }
+
+.dm-native-remote__conversation-title h1 {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.dm-native-remote__timeline {
+  display: flex;
+  flex: 1;
+  flex-direction: column;
+  gap: 16px;
+  min-height: 0;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  padding: 8px 0 14px;
+  scroll-behavior: auto;
+}
+
+.dm-native-remote__message,
+.dm-native-remote__question,
+.dm-native-remote__error,
+.dm-native-remote__activity {
+  background: var(--native-panel);
+  border: 1px solid var(--native-border);
+  border-radius: 13px;
+  flex-shrink: 0;
+  overflow-wrap: anywhere;
+  max-width: 100%;
+  padding: 10px 12px;
+}
+
+.dm-native-remote__message:not(.dm-native-remote__message--user) {
+  background: transparent;
+  border: 0;
+  border-radius: 0;
+  padding: 2px 0;
+}
+
+.dm-native-remote__message--user {
+  align-self: flex-end;
+  background: var(--native-panel-strong);
+  border-color: transparent;
+  max-width: 90%;
+  border-radius: 20px;
+  padding: 10px 16px;
+}
+
+.dm-native-remote__message .dm-markdown-message > :first-child {
+  margin-top: 0;
+}
+
+.dm-native-remote__message .dm-markdown-message > :last-child {
+  margin-bottom: 0;
+}
+
+.dm-native-remote__details,
+.dm-native-remote__activity {
+  color: var(--native-muted);
+  font-size: 13px;
+}
+
+.dm-native-remote__details {
+  border-top: 1px solid var(--native-border);
+  margin-top: 8px;
+  padding-top: 7px;
+}
+
+.dm-native-remote__details summary,
+.dm-native-remote__activity summary {
+  color: var(--native-text);
+  cursor: pointer;
+}
+
+.dm-native-remote__details .dm-markdown-message {
+  margin-top: 8px;
+}
+
+.dm-native-remote__activity {
+  background: transparent;
+  border: 0;
+  padding: 2px 0;
+}
+
+.dm-native-remote__activity summary { color: var(--native-muted); }
+
+.dm-native-remote__activity ul,
+.dm-native-remote__question ul {
+  margin: 8px 0 0;
+  padding-left: 19px;
+}
+
+.dm-native-remote__activity li + li,
+.dm-native-remote__question li + li {
+  margin-top: 3px;
+}
+
+.dm-native-remote__question p {
+  font-weight: 600;
+}
+
+.dm-native-remote__error {
+  align-items: center;
+  border-color: #754a4a;
+  color: #ffb0b0;
+  display: flex;
+  gap: 7px;
+}
+
+.dm-native-remote__composer {
+  align-items: flex-end;
+  background: var(--native-panel);
+  border: 1px solid var(--native-border);
+  border-radius: 28px;
+  display: flex;
+  flex: 0 0 auto;
+  gap: 8px;
+  margin-top: 4px;
+  padding: 7px;
+}
+
+.dm-native-remote__composer textarea {
+  background: transparent;
+  border: 0;
+  color: var(--native-text);
+  field-sizing: content;
+  font: inherit;
+  line-height: 1.35;
+  max-height: 140px;
+  min-height: 34px;
+  outline: 0;
+  padding: 6px 10px;
+  resize: none;
+  width: 100%;
+}
+
+.dm-native-remote__composer textarea::placeholder {
+  color: var(--native-muted);
+}
+
+.dm-native-remote__composer button {
+  align-items: center;
+  align-self: flex-end;
+  background: var(--native-accent);
+  border: 0;
+  border-radius: 50%;
+  color: #fff;
+  cursor: pointer;
+  display: inline-flex;
+  height: 40px;
+  justify-content: center;
+  width: 40px;
+  flex: 0 0 40px;
+}
+
+.dm-native-remote__composer button:disabled {
+  cursor: default;
+  opacity: 0.45;
+}
+
+@media (min-width: 760px) {
+  .dm-native-remote {
+    margin: 0 auto;
+    max-width: 940px;
+    padding-left: 28px;
+    padding-right: 28px;
+  }
+
+  .dm-native-remote__task-list {
+    display: grid;
+    align-content: start;
+    gap: 8px;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .dm-native-remote__done {
+    display: block;
+    grid-column: 1 / -1;
+  }
+
+  .dm-native-remote__done[open] {
+    column-count: 2;
+    column-gap: 8px;
+  }
+
+  .dm-native-remote__done summary {
+    column-span: all;
+  }
+
+  .dm-native-remote__message,
+  .dm-native-remote__question,
+  .dm-native-remote__error,
+  .dm-native-remote__activity {
+    max-width: 100%;
+  }
+
+  .dm-native-remote__message--user { max-width: 82%; }
+}

@@ -76,6 +76,7 @@ impl std::error::Error for HostLockError {
 pub struct HostLock {
     _file: File,
     identity: HostIdentity,
+    profile_root: PathBuf,
 }
 
 impl HostLock {
@@ -98,6 +99,10 @@ impl HostLock {
 
     pub fn identity(&self) -> &HostIdentity {
         &self.identity
+    }
+
+    pub fn profile_root(&self) -> &Path {
+        &self.profile_root
     }
 }
 
@@ -494,6 +499,7 @@ fn acquire_windows(profile_root: &Path, profile: String) -> Result<HostLock, Hos
     Ok(HostLock {
         _file: file,
         identity,
+        profile_root: profile_root.canonicalize().map_err(HostLockError::Io)?,
     })
 }
 

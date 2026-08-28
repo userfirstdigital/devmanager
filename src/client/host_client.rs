@@ -4,15 +4,13 @@
 //! observed only through an explicit correlated OperationStatus query.
 
 use std::collections::BTreeMap;
+use std::time::Duration;
 
+use async_trait::async_trait;
 use uuid::Uuid;
 
-use crate::domain::cockpit::{
-    AgentConnectionSnapshot, ConfigSidebarSnapshot, TaskCockpitQuery, TaskCockpitResult,
-};
-use crate::domain::command::{
-    Command, CommandEnvelope, CommandReceipt, ConfirmHostQuitIntent, PrepareUpdateIntent,
-};
+use crate::domain::cockpit::{AgentConnectionSnapshot, ConfigSidebarSnapshot, TaskCockpitQuery};
+use crate::domain::command::{Command, CommandEnvelope, CommandReceipt, PrepareUpdateIntent};
 use crate::domain::host::HostQuitInspection;
 use crate::domain::id::{
     ArtifactId, CommandId, OperationId, RequestId, SnapshotId, SubscriptionId, TaskId,
@@ -26,8 +24,7 @@ use crate::domain::snapshot::{
 };
 use crate::domain::ClientId;
 use crate::host::{
-    agent_connection_query_timeout, pipe_endpoint_for_named_profile,
-    profile_fingerprint_for_named_profile, task_cockpit_query_timeout, IpcError,
+    pipe_endpoint_for_named_profile, profile_fingerprint_for_named_profile, IpcError,
 };
 use crate::prompts::projection::{PromptLibraryQuery, PromptProjectionReply};
 use crate::protocol::{
@@ -37,10 +34,16 @@ use crate::protocol::{
 use crate::terminal::protocol::{InputAck, TerminalInputRequest};
 use crate::updater::UpdateHandoffToken;
 
-use super::action::{task_cockpit_query, task_show_query};
-use super::connection::{connect, ClientConnection, UnsolicitedServerMessage};
+use super::connect_client::{connect_authenticated_halves, ConnectClientConfig};
+use super::connection::{connect, ClientConnection, ConnectionMetadata, UnsolicitedServerMessage};
 use super::inbox_controller::{InboxTransport, InboxTransportFuture};
+use super::port::AsyncHostRequestPort;
 use super::subscription::{ClientSubscription, SubscriptionError, SubscriptionUpdate};
+use super::typed_queries;
+
+use crate::connect::ConnectNoiseCustody;
+use futures_util::{Sink, Stream};
+use tokio_tungstenite::tungstenite::protocol::Message as WsMessage;
 
 /// Caller-owned connection configuration. `client_id` is never rotated here.
 #[derive(Debug, Clone)]
@@ -80,43 +83,149 @@ pub struct ArtifactContentBatch {
 
 /// Profile-derived host client with stable ClientId and operation tracking.
 pub struct HostClient {
-    config: HostClientConfig,
-    endpoint: String,
+    transport: HostClientTransport,
     connection: Option<ClientConnection>,
-    server_hello: ServerHello,
-    reconnect_grant: Option<ReconnectGrant>,
+    metadata: ConnectionMetadata,
     tracked: BTreeMap<OperationId, TrackedOperation>,
+}
+
+enum HostClientTransport {
+    Local {
+        config: HostClientConfig,
+        endpoint: String,
+        reconnect_grant: Option<ReconnectGrant>,
+    },
+    Connect {
+        config: ConnectClientConfig,
+    },
 }
 
 impl HostClient {
     /// Validate the named profile, build ClientHello, and connect.
     pub async fn connect(config: HostClientConfig) -> Result<Self, IpcError> {
         let endpoint = pipe_endpoint_for_named_profile(&config.named_profile)?;
-        let (connection, server_hello) = open_connection(&config, &endpoint, None).await?;
-        let reconnect_grant = server_hello.reconnect_grant.clone();
+        let (connection, metadata) = open_local_connection(&config, &endpoint, None).await?;
+        let reconnect_grant = metadata.reconnect_grant();
         Ok(Self {
-            config,
-            endpoint,
+            transport: HostClientTransport::Local {
+                config,
+                endpoint,
+                reconnect_grant,
+            },
             connection: Some(connection),
-            server_hello,
-            reconnect_grant,
+            metadata,
+            tracked: BTreeMap::new(),
+        })
+    }
+
+    /// Connect over a caller-authenticated Connect transport (Noise + Hello).
+    ///
+    /// The opener supplies already-verified socket halves (TLS/cookie owned by
+    /// the fleet route). Device custody is caller-owned and not retained here.
+    pub async fn connect_connect<Si, St>(
+        config: ConnectClientConfig,
+        custody: &ConnectNoiseCustody,
+        sink: Si,
+        stream: St,
+    ) -> Result<Self, IpcError>
+    where
+        Si: Sink<WsMessage> + Unpin + Send + 'static,
+        Si::Error: std::fmt::Display,
+        St: Stream<Item = Result<WsMessage, tokio_tungstenite::tungstenite::Error>>
+            + Unpin
+            + Send
+            + 'static,
+    {
+        let connection = connect_authenticated_halves(sink, stream, custody, &config).await?;
+        let metadata = connection.metadata();
+        // Assigned Connect client id is authoritative for subsequent queries.
+        let mut config = config;
+        if let Some(session) = metadata.as_connect() {
+            config.requested_client_id = Some(session.assigned_client_id());
+        }
+        Ok(Self {
+            transport: HostClientTransport::Connect { config },
+            connection: Some(connection),
+            metadata,
             tracked: BTreeMap::new(),
         })
     }
 
     /// Drop any prior connection, then rebuild Hello from the same config/client_id.
     /// A failed attempt leaves the client disconnected while preserving tracking.
+    ///
+    /// Local reconnect is self-contained. Connect reconnect requires
+    /// [`Self::reconnect_connect`] with a fresh authenticated socket and the
+    /// same caller-owned pin/custody (never auto-trust).
     pub async fn reconnect(&mut self) -> Result<(), IpcError> {
-        self.connection = None;
-        match open_connection(&self.config, &self.endpoint, self.reconnect_grant.clone()).await {
-            Ok((connection, server_hello)) => {
-                self.connection = Some(connection);
-                self.reconnect_grant = server_hello.reconnect_grant.clone();
-                self.server_hello = server_hello;
-                Ok(())
+        match &self.transport {
+            HostClientTransport::Local {
+                config,
+                endpoint,
+                reconnect_grant,
+            } => {
+                self.connection = None;
+                match open_local_connection(config, endpoint, reconnect_grant.clone()).await {
+                    Ok((connection, metadata)) => {
+                        if let HostClientTransport::Local {
+                            reconnect_grant, ..
+                        } = &mut self.transport
+                        {
+                            *reconnect_grant = metadata.reconnect_grant();
+                        }
+                        self.connection = Some(connection);
+                        self.metadata = metadata;
+                        Ok(())
+                    }
+                    Err(error) => Err(error),
+                }
             }
-            Err(error) => Err(error),
+            HostClientTransport::Connect { .. } => Err(IpcError::Unsupported),
         }
+    }
+
+    /// Reconnect an authenticated Connect session over a fresh socket.
+    ///
+    /// The host key pin in `config` must match the prior session pin exactly;
+    /// this method never rewrites or auto-trusts a new pin.
+    pub async fn reconnect_connect<Si, St>(
+        &mut self,
+        custody: &ConnectNoiseCustody,
+        sink: Si,
+        stream: St,
+    ) -> Result<(), IpcError>
+    where
+        Si: Sink<WsMessage> + Unpin + Send + 'static,
+        Si::Error: std::fmt::Display,
+        St: Stream<Item = Result<WsMessage, tokio_tungstenite::tungstenite::Error>>
+            + Unpin
+            + Send
+            + 'static,
+    {
+        let HostClientTransport::Connect { config } = &self.transport else {
+            return Err(IpcError::Unsupported);
+        };
+        if let Some(prior) = self.metadata.as_connect() {
+            if prior.host_key_pin() != config.host_key_pin
+                || prior.host_public_id() != config.expected_host_public_id
+            {
+                return Err(IpcError::Unauthorized);
+            }
+        }
+        self.connection = None;
+        let connection = connect_authenticated_halves(sink, stream, custody, config).await?;
+        let metadata = connection.metadata();
+        if let Some(session) = metadata.as_connect() {
+            if let HostClientTransport::Connect { config } = &mut self.transport {
+                if config.host_key_pin != session.host_key_pin() {
+                    return Err(IpcError::Unauthorized);
+                }
+                config.requested_client_id = Some(session.assigned_client_id());
+            }
+        }
+        self.connection = Some(connection);
+        self.metadata = metadata;
+        Ok(())
     }
 
     /// Drop the live connection without clearing tracked operations.
@@ -129,10 +238,14 @@ impl HostClient {
     /// Returns the acknowledged wire `connection_id`. Does not clear tracked operations.
     /// Without granted [`Capability::ExplicitDetach`], returns
     /// [`IpcError::UnsupportedCapability`] and leaves the connection live.
+    /// Connect transport does not carry Detach payloads (`IpcError::Unsupported`).
     pub async fn detach(&mut self) -> Result<Uuid, IpcError> {
+        if matches!(self.transport, HostClientTransport::Connect { .. }) {
+            return Err(IpcError::Unsupported);
+        }
         if !self
-            .server_hello
-            .granted
+            .metadata
+            .granted_capabilities()
             .contains(Capability::ExplicitDetach)
         {
             return Err(IpcError::UnsupportedCapability);
@@ -140,10 +253,12 @@ impl HostClient {
         let Some(connection) = self.connection.as_ref() else {
             return Err(IpcError::Unavailable);
         };
+        let client_id = self.client_id();
+        let connection_id = self.metadata.connection_id();
         let request = DetachRequest {
             request_id: RequestId::new(),
-            client_id: self.config.client_id,
-            connection_id: self.server_hello.connection_id,
+            client_id,
+            connection_id,
         };
         let ack = match connection.detach(request).await {
             Ok(ack) => ack,
@@ -152,47 +267,112 @@ impl HostClient {
                 return Err(error);
             }
         };
-        finish_detach_after_matching_ack(&mut self.connection, self.server_hello.connection_id, ack)
+        finish_detach_after_matching_ack(&mut self.connection, connection_id, ack)
     }
 
     pub fn is_connected(&self) -> bool {
-        self.connection.is_some()
+        self.connection
+            .as_ref()
+            .is_some_and(ClientConnection::is_live)
     }
 
     pub fn client_id(&self) -> ClientId {
-        self.config.client_id
+        match &self.transport {
+            HostClientTransport::Local { config, .. } => config.client_id,
+            HostClientTransport::Connect { config } => config
+                .requested_client_id
+                .or_else(|| {
+                    self.metadata
+                        .as_connect()
+                        .map(|session| session.assigned_client_id())
+                })
+                .expect("Connect HostClient always has an assigned client id after Hello"),
+        }
     }
 
     pub fn endpoint(&self) -> &str {
-        &self.endpoint
+        match &self.transport {
+            HostClientTransport::Local { endpoint, .. } => endpoint.as_str(),
+            HostClientTransport::Connect { .. } => "connect",
+        }
+    }
+
+    pub fn metadata(&self) -> &ConnectionMetadata {
+        &self.metadata
     }
 
     pub fn granted_capabilities(&self) -> CapabilitySet {
-        self.server_hello.granted
+        self.metadata.granted_capabilities()
     }
 
     pub fn connection_id(&self) -> Uuid {
-        self.server_hello.connection_id
+        self.metadata.connection_id()
     }
 
-    pub fn host_boot_id(&self) -> Uuid {
-        self.server_hello.host_boot_id
+    /// Local pipe Hello carries a host boot id. Connect sessions have none.
+    pub fn host_boot_id(&self) -> Option<Uuid> {
+        self.metadata.host_boot_id()
     }
 
     pub fn server_build(&self) -> &str {
-        &self.server_hello.server_build
+        self.metadata.server_build()
     }
 
     pub fn protocol_major(&self) -> u16 {
-        self.server_hello.protocol_major
+        self.metadata.protocol_major()
     }
 
     pub fn protocol_minor(&self) -> u16 {
-        self.server_hello.protocol_minor
+        self.metadata.protocol_minor()
     }
 
     pub fn tracked_operation(&self, operation_id: OperationId) -> Option<&TrackedOperation> {
         self.tracked.get(&operation_id)
+    }
+
+    /// Move accepted-operation tracking from `source` into `self` without
+    /// inventing command IDs or touching either transport.
+    ///
+    /// Used by fleet reconnect replacement so prior Pending/Resolved facts stay
+    /// under the surviving owner identity. Collision with a different CommandId
+    /// for the same OperationId fails closed and leaves both maps unchanged.
+    pub fn absorb_tracked_operations(&mut self, source: &mut Self) -> Result<(), IpcError> {
+        for (operation_id, incoming) in &source.tracked {
+            if let Some(existing) = self.tracked.get(operation_id) {
+                let existing_command = match existing {
+                    TrackedOperation::Pending { command_id }
+                    | TrackedOperation::Resolved { command_id, .. } => *command_id,
+                };
+                let incoming_command = match incoming {
+                    TrackedOperation::Pending { command_id }
+                    | TrackedOperation::Resolved { command_id, .. } => *command_id,
+                };
+                if existing_command != incoming_command {
+                    return Err(IpcError::CorrelationMismatch);
+                }
+            }
+        }
+        let stolen = std::mem::take(&mut source.tracked);
+        for (operation_id, incoming) in stolen {
+            match self.tracked.get(&operation_id) {
+                None => {
+                    self.tracked.insert(operation_id, incoming);
+                }
+                Some(TrackedOperation::Resolved { .. }) => {
+                    // Never downgrade Resolved → Pending on same-command collision.
+                    // Destination settlement stays authoritative.
+                }
+                Some(TrackedOperation::Pending { .. }) => match &incoming {
+                    TrackedOperation::Resolved { .. } => {
+                        self.tracked.insert(operation_id, incoming);
+                    }
+                    TrackedOperation::Pending { .. } => {
+                        // Same CommandId Pending collision: keep destination.
+                    }
+                },
+            }
+        }
+        Ok(())
     }
 
     /// Execute a command, tracking Accepted receipts as Pending without settlement.
@@ -200,7 +380,7 @@ impl HostClient {
         &mut self,
         envelope: CommandEnvelope,
     ) -> Result<CommandReceipt, IpcError> {
-        if envelope.client_id != self.config.client_id {
+        if envelope.client_id != self.client_id() {
             return Err(IpcError::Unauthorized);
         }
         let outcome = {
@@ -233,7 +413,7 @@ impl HostClient {
         &self,
         envelope: CommandEnvelope,
     ) -> Result<CommandReceipt, IpcError> {
-        if envelope.client_id != self.config.client_id {
+        if envelope.client_id != self.client_id() {
             return Err(IpcError::Unauthorized);
         }
         self.live_connection()?.execute_command(envelope).await
@@ -246,12 +426,15 @@ impl HostClient {
         &self,
         request: TerminalInputRequest,
     ) -> Result<InputAck, IpcError> {
-        if request.client_id != self.config.client_id {
+        if request.client_id != self.client_id() {
             return Err(IpcError::Unauthorized);
         }
+        if matches!(self.transport, HostClientTransport::Connect { .. }) {
+            return Err(IpcError::Unsupported);
+        }
         if !self
-            .server_hello
-            .granted
+            .metadata
+            .granted_capabilities()
             .contains(Capability::ProviderInput)
         {
             return Err(IpcError::UnsupportedCapability);
@@ -274,10 +457,16 @@ impl HostClient {
         host_build: &str,
         allow_explicit_confirm_with_active: bool,
     ) -> Result<UpdateHandoffToken, IpcError> {
-        if !self.server_hello.granted.contains(Capability::HostShutdown)
+        if matches!(self.transport, HostClientTransport::Connect { .. }) {
+            return Err(IpcError::Unsupported);
+        }
+        if !self
+            .metadata
+            .granted_capabilities()
+            .contains(Capability::HostShutdown)
             || !self
-                .server_hello
-                .granted
+                .metadata
+                .granted_capabilities()
                 .contains(Capability::UpdateHandoff)
         {
             return Err(IpcError::UnsupportedCapability);
@@ -285,7 +474,7 @@ impl HostClient {
 
         let envelope = CommandEnvelope {
             command_id,
-            client_id: self.config.client_id,
+            client_id: self.client_id(),
             task_id: None,
             issued_at_ms: unix_time_ms(),
             expected_task_revision: None,
@@ -312,7 +501,7 @@ impl HostClient {
         };
         let token = reply.token;
         if reply.command_id != command_id
-            || token.host_boot_id != self.server_hello.host_boot_id
+            || self.host_boot_id() != Some(token.host_boot_id)
             || token.host_boot_id == Uuid::nil()
             || token.target_version != target_version
             || token.client_build != client_build
@@ -327,20 +516,17 @@ impl HostClient {
     /// Execute an arbitrary query while preserving the HostClient connection
     /// lifecycle and the exact caller-owned request id.
     pub async fn query(&mut self, envelope: QueryEnvelope) -> Result<QueryReply, IpcError> {
-        if envelope.client_id != self.config.client_id {
-            return Err(IpcError::Unauthorized);
-        }
-        let outcome = {
-            let connection = self.live_connection()?;
-            connection.query(envelope).await
-        };
-        match outcome {
-            Ok(reply) => Ok(reply),
-            Err(error) => {
-                self.retire_connection();
-                Err(error)
-            }
-        }
+        self.query_with_timeout(envelope, None).await
+    }
+
+    /// Query with an optional completion deadline. `None` uses the connection
+    /// default; transport errors retire the exact connection before returning.
+    pub async fn query_with_timeout(
+        &mut self,
+        envelope: QueryEnvelope,
+        timeout: Option<Duration>,
+    ) -> Result<QueryReply, IpcError> {
+        AsyncHostRequestPort::request_query(self, envelope, timeout).await
     }
 
     /// Read one Task snapshot through the shared `task.show` query factory.
@@ -348,34 +534,7 @@ impl HostClient {
         &mut self,
         task_id: TaskId,
     ) -> Result<Result<TaskSnapshotItem, QueryError>, IpcError> {
-        let request_id = RequestId::new();
-        let client_id = self.config.client_id;
-        let outcome = {
-            let connection = self.live_connection()?;
-            connection
-                .query(task_show_query(request_id, client_id, task_id))
-                .await
-        };
-        let reply = match outcome {
-            Ok(reply) => reply,
-            Err(error) => {
-                self.retire_connection();
-                return Err(error);
-            }
-        };
-
-        match reply.outcome {
-            QueryOutcome::Err(error) => Ok(Err(error)),
-            QueryOutcome::Ok(QueryResult::TaskSnapshot { snapshot })
-                if snapshot.task.id == task_id =>
-            {
-                Ok(Ok(snapshot))
-            }
-            QueryOutcome::Ok(_) => {
-                self.retire_connection();
-                Err(IpcError::CorrelationMismatch)
-            }
-        }
+        typed_queries::task_snapshot(self, task_id).await
     }
 
     /// Confirm host quit admission. Requires granted HostShutdown.
@@ -392,28 +551,13 @@ impl HostClient {
         inspection_id: u64,
         allow_uninspected_worktrees: bool,
     ) -> Result<CommandReceipt, IpcError> {
-        if !self.server_hello.granted.contains(Capability::HostShutdown) {
-            return Err(IpcError::UnsupportedCapability);
-        }
-
-        let envelope = CommandEnvelope {
+        typed_queries::confirm_host_quit(
+            self,
             command_id,
-            client_id: self.config.client_id,
-            task_id: None,
-            issued_at_ms: {
-                use std::time::{SystemTime, UNIX_EPOCH};
-                SystemTime::now()
-                    .duration_since(UNIX_EPOCH)
-                    .map(|d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX))
-                    .unwrap_or(0)
-            },
-            expected_task_revision: None,
-            command: Command::ConfirmHostQuit(ConfirmHostQuitIntent {
-                inspection_id,
-                allow_uninspected_worktrees,
-            }),
-        };
-        self.execute_command(envelope).await
+            inspection_id,
+            allow_uninspected_worktrees,
+        )
+        .await
     }
 
     /// Inspect durable host-quit blockers. Requires granted HostShutdown.
@@ -422,39 +566,7 @@ impl HostClient {
     pub async fn inspect_host_quit(
         &mut self,
     ) -> Result<Result<HostQuitInspection, QueryError>, IpcError> {
-        if !self.server_hello.granted.contains(Capability::HostShutdown) {
-            return Err(IpcError::UnsupportedCapability);
-        }
-
-        let request_id = RequestId::new();
-        let client_id = self.config.client_id;
-        let outcome = {
-            let connection = self.live_connection()?;
-            connection
-                .query(QueryEnvelope {
-                    request_id,
-                    client_id,
-                    task_id: None,
-                    query: Query::InspectHostQuit,
-                })
-                .await
-        };
-        let reply = match outcome {
-            Ok(reply) => reply,
-            Err(error) => {
-                self.retire_connection();
-                return Err(error);
-            }
-        };
-
-        match reply.outcome {
-            QueryOutcome::Err(error) => Ok(Err(error)),
-            QueryOutcome::Ok(QueryResult::HostQuitInspection { inspection }) => Ok(Ok(inspection)),
-            QueryOutcome::Ok(_) => {
-                self.retire_connection();
-                Err(IpcError::UnexpectedResponse)
-            }
-        }
+        typed_queries::inspect_host_quit(self).await
     }
 
     /// Page the personal prompt library. Requires the active Hello
@@ -464,39 +576,7 @@ impl HostClient {
         &mut self,
         query: PromptLibraryQuery,
     ) -> Result<Result<PromptProjectionReply, QueryError>, IpcError> {
-        if !self.server_hello.granted.grants_personal_prompt_library() {
-            return Err(IpcError::UnsupportedCapability);
-        }
-
-        let request_id = RequestId::new();
-        let client_id = self.config.client_id;
-        let outcome = {
-            let connection = self.live_connection()?;
-            connection
-                .query(QueryEnvelope {
-                    request_id,
-                    client_id,
-                    task_id: None,
-                    query: Query::PromptLibrary(query),
-                })
-                .await
-        };
-        let reply = match outcome {
-            Ok(reply) => reply,
-            Err(error) => {
-                self.retire_connection();
-                return Err(error);
-            }
-        };
-
-        match reply.outcome {
-            QueryOutcome::Err(error) => Ok(Err(error)),
-            QueryOutcome::Ok(QueryResult::PromptLibrary(page)) => Ok(Ok(page)),
-            QueryOutcome::Ok(_) => {
-                self.retire_connection();
-                Err(IpcError::UnexpectedResponse)
-            }
-        }
+        typed_queries::query_prompt_library(self, query).await
     }
 
     /// Query one Task Cockpit surface. Requires granted TaskCockpit and an
@@ -506,123 +586,28 @@ impl HostClient {
         task_id: TaskId,
         query: TaskCockpitQuery,
     ) -> Result<Result<crate::domain::TaskCockpitResult, QueryError>, IpcError> {
-        if !self.server_hello.granted.grants_task_cockpit() {
-            return Err(IpcError::UnsupportedCapability);
-        }
-
-        let request_id = RequestId::new();
-        let client_id = self.config.client_id;
-        let outcome = {
-            let connection = self.live_connection()?;
-            connection
-                .query_with_timeout(
-                    task_cockpit_query(request_id, client_id, task_id, query),
-                    task_cockpit_query_timeout(),
-                )
-                .await
-        };
-        let reply = match outcome {
-            Ok(reply) => reply,
-            Err(error) => {
-                self.retire_connection();
-                return Err(error);
-            }
-        };
-
-        match reply.outcome {
-            QueryOutcome::Err(error) => Ok(Err(error)),
-            QueryOutcome::Ok(QueryResult::TaskCockpit(result)) => Ok(Ok(result)),
-            QueryOutcome::Ok(_) => {
-                self.retire_connection();
-                Err(IpcError::CorrelationMismatch)
-            }
-        }
+        typed_queries::query_task_cockpit(self, task_id, query).await
     }
 
-    /// Query the host-owned redacted configuration projection. The task id in
-    /// the wire envelope is intentionally synthetic; the host handles this
-    /// global read before task lookup and never uses it for authorization.
+    /// Query the host-owned redacted configuration projection without a task.
     pub async fn query_config_sidebar(
         &mut self,
     ) -> Result<Result<ConfigSidebarSnapshot, QueryError>, IpcError> {
-        if !self.server_hello.granted.grants_task_cockpit() {
-            return Err(IpcError::UnsupportedCapability);
-        }
-
-        let request_id = RequestId::new();
-        let client_id = self.config.client_id;
-        let outcome = {
-            let connection = self.live_connection()?;
-            connection
-                .query(task_cockpit_query(
-                    request_id,
-                    client_id,
-                    TaskId::new(),
-                    TaskCockpitQuery::ConfigSnapshot,
-                ))
-                .await
-        };
-        let reply = match outcome {
-            Ok(reply) => reply,
-            Err(error) => {
-                self.retire_connection();
-                return Err(error);
-            }
-        };
-
-        match reply.outcome {
-            QueryOutcome::Err(error) => Ok(Err(error)),
-            QueryOutcome::Ok(QueryResult::TaskCockpit(TaskCockpitResult::Config(snapshot))) => {
-                Ok(Ok(snapshot))
-            }
-            QueryOutcome::Ok(_) => {
-                self.retire_connection();
-                Err(IpcError::CorrelationMismatch)
-            }
-        }
+        typed_queries::query_config_sidebar(self).await
     }
 
     pub async fn query_agent_connection(
         &mut self,
     ) -> Result<Result<AgentConnectionSnapshot, QueryError>, IpcError> {
-        if !self.server_hello.granted.grants_task_cockpit() {
-            return Err(IpcError::UnsupportedCapability);
-        }
+        typed_queries::query_agent_connection(self).await
+    }
 
-        let request_id = RequestId::new();
-        let client_id = self.config.client_id;
-        let outcome = {
-            let connection = self.live_connection()?;
-            connection
-                .query_with_timeout(
-                    task_cockpit_query(
-                        request_id,
-                        client_id,
-                        TaskId::new(),
-                        TaskCockpitQuery::AgentConnection,
-                    ),
-                    agent_connection_query_timeout(),
-                )
-                .await
-        };
-        let reply = match outcome {
-            Ok(reply) => reply,
-            Err(error) => {
-                self.retire_connection();
-                return Err(error);
-            }
-        };
-
-        match reply.outcome {
-            QueryOutcome::Err(error) => Ok(Err(error)),
-            QueryOutcome::Ok(QueryResult::TaskCockpit(TaskCockpitResult::AgentConnection(
-                snapshot,
-            ))) => Ok(Ok(snapshot)),
-            QueryOutcome::Ok(_) => {
-                self.retire_connection();
-                Err(IpcError::CorrelationMismatch)
-            }
-        }
+    /// Global local-pipe-only setup; no synthetic task identity is attached.
+    pub async fn query_remote_access(
+        &mut self,
+        request: crate::host::remote_setup::RemoteSetupRequest,
+    ) -> Result<Result<crate::host::remote_setup::RemoteSetupReply, QueryError>, IpcError> {
+        typed_queries::query_remote_access(self, request).await
     }
 
     pub async fn query_provider_settings(
@@ -630,44 +615,7 @@ impl HostClient {
         request: crate::providers::settings::ProviderSettingsHostRequest,
     ) -> Result<Result<crate::providers::settings::ProviderSettingsReply, QueryError>, IpcError>
     {
-        if !self.server_hello.granted.grants_task_cockpit() {
-            return Err(IpcError::UnsupportedCapability);
-        }
-
-        let request_id = RequestId::new();
-        let client_id = self.config.client_id;
-        let outcome = {
-            let connection = self.live_connection()?;
-            connection
-                .query_with_timeout(
-                    task_cockpit_query(
-                        request_id,
-                        client_id,
-                        TaskId::new(),
-                        TaskCockpitQuery::ProviderSettings(request),
-                    ),
-                    task_cockpit_query_timeout(),
-                )
-                .await
-        };
-        let reply = match outcome {
-            Ok(reply) => reply,
-            Err(error) => {
-                self.retire_connection();
-                return Err(error);
-            }
-        };
-
-        match reply.outcome {
-            QueryOutcome::Err(error) => Ok(Err(error)),
-            QueryOutcome::Ok(QueryResult::TaskCockpit(TaskCockpitResult::ProviderSettings(
-                settings,
-            ))) => Ok(Ok(settings)),
-            QueryOutcome::Ok(_) => {
-                self.retire_connection();
-                Err(IpcError::CorrelationMismatch)
-            }
-        }
+        typed_queries::query_provider_settings(self, request).await
     }
 
     /// Query the bounded path-redacted repository catalog for one Task.
@@ -675,17 +623,7 @@ impl HostClient {
         &mut self,
         task_id: TaskId,
     ) -> Result<Result<crate::domain::TaskGitRepositoriesProjection, QueryError>, IpcError> {
-        match self
-            .query_task_cockpit(task_id, TaskCockpitQuery::GitRepositories)
-            .await?
-        {
-            Ok(TaskCockpitResult::GitRepositories(catalog)) => Ok(Ok(catalog)),
-            Ok(_) => {
-                self.retire_connection();
-                Err(IpcError::UnexpectedResponse)
-            }
-            Err(error) => Ok(Err(error)),
-        }
+        typed_queries::query_git_repositories(self, task_id).await
     }
 
     /// Open or resume one paged snapshot section. Requires granted PagedSnapshots.
@@ -696,15 +634,15 @@ impl HostClient {
         resume_cursor: Option<Vec<u8>>,
     ) -> Result<Result<SnapshotPage, QueryError>, IpcError> {
         if !self
-            .server_hello
-            .granted
+            .metadata
+            .granted_capabilities()
             .contains(Capability::PagedSnapshots)
         {
             return Err(IpcError::UnsupportedCapability);
         }
 
         let request_id = RequestId::new();
-        let client_id = self.config.client_id;
+        let client_id = self.client_id();
         let expected_snapshot_id = snapshot_id;
         let outcome = {
             let connection = self.live_connection()?;
@@ -757,15 +695,15 @@ impl HostClient {
         snapshot_id: SnapshotId,
     ) -> Result<Result<(), QueryError>, IpcError> {
         if !self
-            .server_hello
-            .granted
+            .metadata
+            .granted_capabilities()
             .contains(Capability::PagedSnapshots)
         {
             return Err(IpcError::UnsupportedCapability);
         }
 
         let request_id = RequestId::new();
-        let client_id = self.config.client_id;
+        let client_id = self.client_id();
         let outcome = {
             let connection = self.live_connection()?;
             connection
@@ -806,12 +744,16 @@ impl HostClient {
         &mut self,
         after_sequence: u64,
     ) -> Result<Result<EventReplayBatch, QueryError>, IpcError> {
-        if !self.server_hello.granted.contains(Capability::EventReplay) {
+        if !self
+            .metadata
+            .granted_capabilities()
+            .contains(Capability::EventReplay)
+        {
             return Err(IpcError::UnsupportedCapability);
         }
 
         let request_id = RequestId::new();
-        let client_id = self.config.client_id;
+        let client_id = self.client_id();
         let outcome = {
             let connection = self.live_connection()?;
             connection
@@ -859,12 +801,16 @@ impl HostClient {
         subscription_id: SubscriptionId,
         resume_cursor: Vec<u8>,
     ) -> Result<Result<EventReplayBatch, QueryError>, IpcError> {
-        if !self.server_hello.granted.contains(Capability::EventReplay) {
+        if !self
+            .metadata
+            .granted_capabilities()
+            .contains(Capability::EventReplay)
+        {
             return Err(IpcError::UnsupportedCapability);
         }
 
         let request_id = RequestId::new();
-        let client_id = self.config.client_id;
+        let client_id = self.client_id();
         let outcome = {
             let connection = self.live_connection()?;
             connection
@@ -914,7 +860,11 @@ impl HostClient {
         &mut self,
         subscription_id: SubscriptionId,
     ) -> Result<Result<(), QueryError>, IpcError> {
-        if !self.server_hello.granted.contains(Capability::EventReplay) {
+        if !self
+            .metadata
+            .granted_capabilities()
+            .contains(Capability::EventReplay)
+        {
             // The capability may have disappeared during reconnect while the
             // caller still owns an older generation. Fence its borrowed queue
             // before surfacing the capability error, so replacement can never
@@ -926,7 +876,7 @@ impl HostClient {
         }
 
         let request_id = RequestId::new();
-        let client_id = self.config.client_id;
+        let client_id = self.client_id();
         let outcome = {
             let connection = self.live_connection()?;
             connection
@@ -985,12 +935,16 @@ impl HostClient {
         task_id: TaskId,
         artifact_id: ArtifactId,
     ) -> Result<Result<ArtifactContentBatch, QueryError>, IpcError> {
-        if !self.server_hello.granted.contains(Capability::ChunkResume) {
+        if !self
+            .metadata
+            .granted_capabilities()
+            .contains(Capability::ChunkResume)
+        {
             return Err(IpcError::UnsupportedCapability);
         }
 
         let request_id = RequestId::new();
-        let client_id = self.config.client_id;
+        let client_id = self.client_id();
         let outcome = {
             let connection = self.live_connection()?;
             connection
@@ -1039,12 +993,16 @@ impl HostClient {
         subscription_id: SubscriptionId,
         resume_cursor: Vec<u8>,
     ) -> Result<Result<ArtifactContentBatch, QueryError>, IpcError> {
-        if !self.server_hello.granted.contains(Capability::ChunkResume) {
+        if !self
+            .metadata
+            .granted_capabilities()
+            .contains(Capability::ChunkResume)
+        {
             return Err(IpcError::UnsupportedCapability);
         }
 
         let request_id = RequestId::new();
-        let client_id = self.config.client_id;
+        let client_id = self.client_id();
         let outcome = {
             let connection = self.live_connection()?;
             connection
@@ -1095,12 +1053,16 @@ impl HostClient {
         task_id: TaskId,
         subscription_id: SubscriptionId,
     ) -> Result<Result<(), QueryError>, IpcError> {
-        if !self.server_hello.granted.contains(Capability::ChunkResume) {
+        if !self
+            .metadata
+            .granted_capabilities()
+            .contains(Capability::ChunkResume)
+        {
             return Err(IpcError::UnsupportedCapability);
         }
 
         let request_id = RequestId::new();
-        let client_id = self.config.client_id;
+        let client_id = self.client_id();
         let outcome = {
             let connection = self.live_connection()?;
             connection
@@ -1142,15 +1104,15 @@ impl HostClient {
         operation_id: OperationId,
     ) -> Result<Result<OperationState, QueryError>, IpcError> {
         if !self
-            .server_hello
-            .granted
+            .metadata
+            .granted_capabilities()
             .contains(Capability::OperationSettlement)
         {
             return Err(IpcError::UnsupportedCapability);
         }
 
         let request_id = RequestId::new();
-        let client_id = self.config.client_id;
+        let client_id = self.client_id();
         let outcome = {
             let connection = self.live_connection()?;
             connection
@@ -1200,7 +1162,10 @@ impl HostClient {
     }
 
     fn live_connection(&self) -> Result<&ClientConnection, IpcError> {
-        self.connection.as_ref().ok_or(IpcError::Unavailable)
+        self.connection
+            .as_ref()
+            .filter(|connection| connection.is_live())
+            .ok_or(IpcError::Unavailable)
     }
 
     fn retire_connection(&mut self) {
@@ -1223,7 +1188,55 @@ impl HostClient {
         }
         result
     }
+}
 
+#[async_trait]
+impl AsyncHostRequestPort for HostClient {
+    fn client_id(&self) -> ClientId {
+        HostClient::client_id(self)
+    }
+
+    fn granted_capabilities(&self) -> CapabilitySet {
+        HostClient::granted_capabilities(self)
+    }
+
+    async fn request_query(
+        &mut self,
+        envelope: QueryEnvelope,
+        timeout: Option<Duration>,
+    ) -> Result<QueryReply, IpcError> {
+        if envelope.client_id != self.client_id() {
+            return Err(IpcError::Unauthorized);
+        }
+        let outcome = {
+            let connection = self.live_connection()?;
+            match timeout {
+                Some(deadline) => connection.query_with_timeout(envelope, deadline).await,
+                None => connection.query(envelope).await,
+            }
+        };
+        match outcome {
+            Ok(reply) => Ok(reply),
+            Err(error) => {
+                self.retire_connection();
+                Err(error)
+            }
+        }
+    }
+
+    async fn request_command(
+        &mut self,
+        envelope: CommandEnvelope,
+    ) -> Result<CommandReceipt, IpcError> {
+        self.execute_command(envelope).await
+    }
+
+    async fn retire_request_transport(&mut self) {
+        self.retire_connection();
+    }
+}
+
+impl HostClient {
     #[cfg(test)]
     pub(crate) fn from_parts_for_test(
         config: HostClientConfig,
@@ -1233,11 +1246,13 @@ impl HostClient {
     ) -> Self {
         let reconnect_grant = server_hello.reconnect_grant.clone();
         Self {
-            config,
-            endpoint: String::new(),
+            transport: HostClientTransport::Local {
+                config,
+                endpoint: String::new(),
+                reconnect_grant,
+            },
             connection,
-            server_hello,
-            reconnect_grant,
+            metadata: ConnectionMetadata::Local(server_hello),
             tracked,
         }
     }
@@ -1365,7 +1380,8 @@ fn correlate_operation_status(
                 Ok(state)
             }
         }
-        QueryResult::TaskSnapshot { .. }
+        QueryResult::CommandReceiptStatus { .. }
+        | QueryResult::TaskSnapshot { .. }
         | QueryResult::SnapshotPage { .. }
         | QueryResult::SnapshotReleased { .. }
         | QueryResult::EventReplayPage { .. }
@@ -1439,11 +1455,11 @@ fn apply_observed_operation_state(
     }
 }
 
-async fn open_connection(
+async fn open_local_connection(
     config: &HostClientConfig,
     endpoint: &str,
     reconnect_grant: Option<ReconnectGrant>,
-) -> Result<(ClientConnection, ServerHello), IpcError> {
+) -> Result<(ClientConnection, ConnectionMetadata), IpcError> {
     let fingerprint = profile_fingerprint_for_named_profile(&config.named_profile)?;
     let hello = ClientHello::new_with_reconnect_grant(
         config.client_build.clone(),
@@ -1455,8 +1471,8 @@ async fn open_connection(
     )
     .map_err(IpcError::ClientHello)?;
     let connection = connect(endpoint, &hello).await?;
-    let server_hello = connection.server_hello();
-    Ok((connection, server_hello))
+    let metadata = connection.metadata();
+    Ok((connection, metadata))
 }
 
 #[cfg(test)]
@@ -1471,6 +1487,55 @@ mod tests {
     use crate::domain::query::QueryResult;
     use crate::host::IpcError;
     use std::collections::BTreeMap;
+
+    #[tokio::test]
+    async fn retained_handle_is_not_connected_after_shared_transport_failure() {
+        use super::{HostClient, HostClientConfig};
+        use crate::client::connection::{ClientConnection, ScriptedDetachBehavior};
+        use crate::domain::{ClientId, Command, CommandEnvelope};
+        use crate::protocol::{CapabilitySet, FrameLimits};
+
+        let client_id = ClientId::new();
+        let hello = test_server_hello(CapabilitySet::empty(), uuid::Uuid::now_v7());
+        let connection = ClientConnection::scripted_for_test(
+            client_id,
+            hello.clone(),
+            ScriptedDetachBehavior::ClosedWriteQueue,
+        );
+        let client = HostClient::from_parts_for_test(
+            HostClientConfig {
+                named_profile: "transport-health-test".into(),
+                client_build: "test".into(),
+                client_id,
+                requested: CapabilitySet::empty(),
+                limits: FrameLimits::v1_default(),
+            },
+            hello,
+            Some(connection),
+            BTreeMap::new(),
+        );
+        assert!(client.is_connected());
+        assert!(client
+            .execute_command_concurrent(CommandEnvelope {
+                command_id: CommandId::new(),
+                client_id,
+                task_id: None,
+                issued_at_ms: 1,
+                expected_task_revision: None,
+                command: Command::SettleTask,
+            })
+            .await
+            .is_err());
+        assert!(
+            client.connection.is_some(),
+            "read-only call retains the handle"
+        );
+        assert!(
+            !client.is_connected(),
+            "poisoned transport cannot grant readiness"
+        );
+        assert!(client.live_connection().is_err());
+    }
 
     fn command_id(tail: u8) -> CommandId {
         let mut bytes = [0_u8; 16];
@@ -1690,6 +1755,193 @@ mod tests {
         let foreign = operation_id(0x1b);
         apply_observed_operation_state(&mut tracked, foreign, &settled()).expect("untracked");
         assert!(!tracked.contains_key(&foreign));
+    }
+
+    #[test]
+    fn absorb_tracked_operations_moves_pending_without_inventing_ids() {
+        use super::{HostClient, HostClientConfig};
+        use crate::client::connection::ClientConnection;
+        use crate::domain::ClientId;
+        use crate::protocol::{Capability, CapabilitySet, FrameLimits};
+
+        let client_id = ClientId::from_bytes([
+            0x01, 0x8f, 0x60, 0xb0, 0x9c, 0x1a, 0x70, 0x01, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0xd0,
+        ])
+        .expect("client");
+        let connection_id = uuid::Uuid::from_bytes([
+            0x01, 0x8f, 0x60, 0xb0, 0x9c, 0x1a, 0x70, 0x01, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0xd1,
+        ]);
+        let hello = test_server_hello(
+            CapabilitySet::from_capabilities([Capability::ChunkResume]),
+            connection_id,
+        );
+        let op = operation_id(0xd2);
+        let cmd = command_id(0xd3);
+        let mut source = HostClient::from_parts_for_test(
+            HostClientConfig {
+                named_profile: "absorb-unit".into(),
+                client_build: "devmanager/test".into(),
+                client_id,
+                requested: CapabilitySet::from_capabilities([Capability::ChunkResume]),
+                limits: FrameLimits::v1_default(),
+            },
+            hello.clone(),
+            Some(ClientConnection::inert_stub_for_test(
+                client_id,
+                hello.clone(),
+            )),
+            BTreeMap::from([(op, TrackedOperation::Pending { command_id: cmd })]),
+        );
+        let mut dest = HostClient::from_parts_for_test(
+            HostClientConfig {
+                named_profile: "absorb-unit".into(),
+                client_build: "devmanager/test".into(),
+                client_id,
+                requested: CapabilitySet::from_capabilities([Capability::ChunkResume]),
+                limits: FrameLimits::v1_default(),
+            },
+            hello.clone(),
+            Some(ClientConnection::inert_stub_for_test(client_id, hello)),
+            BTreeMap::new(),
+        );
+        dest.absorb_tracked_operations(&mut source).expect("absorb");
+        assert!(source.tracked().is_empty());
+        assert_eq!(
+            dest.tracked_operation(op),
+            Some(&TrackedOperation::Pending { command_id: cmd })
+        );
+    }
+
+    #[test]
+    fn absorb_tracked_operations_does_not_downgrade_resolved_to_pending() {
+        use super::{HostClient, HostClientConfig};
+        use crate::client::connection::ClientConnection;
+        use crate::domain::ClientId;
+        use crate::protocol::{Capability, CapabilitySet, FrameLimits};
+
+        let client_id = ClientId::from_bytes([
+            0x01, 0x8f, 0x60, 0xb0, 0x9c, 0x1a, 0x70, 0x01, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0xd4,
+        ])
+        .expect("client");
+        let connection_id = uuid::Uuid::from_bytes([
+            0x01, 0x8f, 0x60, 0xb0, 0x9c, 0x1a, 0x70, 0x01, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0xd5,
+        ]);
+        let hello = test_server_hello(
+            CapabilitySet::from_capabilities([Capability::ChunkResume]),
+            connection_id,
+        );
+        let op = operation_id(0xd6);
+        let cmd = command_id(0xd7);
+        let mut source = HostClient::from_parts_for_test(
+            HostClientConfig {
+                named_profile: "absorb-unit".into(),
+                client_build: "devmanager/test".into(),
+                client_id,
+                requested: CapabilitySet::from_capabilities([Capability::ChunkResume]),
+                limits: FrameLimits::v1_default(),
+            },
+            hello.clone(),
+            Some(ClientConnection::inert_stub_for_test(
+                client_id,
+                hello.clone(),
+            )),
+            BTreeMap::from([(op, TrackedOperation::Pending { command_id: cmd })]),
+        );
+        let mut dest = HostClient::from_parts_for_test(
+            HostClientConfig {
+                named_profile: "absorb-unit".into(),
+                client_build: "devmanager/test".into(),
+                client_id,
+                requested: CapabilitySet::from_capabilities([Capability::ChunkResume]),
+                limits: FrameLimits::v1_default(),
+            },
+            hello.clone(),
+            Some(ClientConnection::inert_stub_for_test(client_id, hello)),
+            BTreeMap::from([(
+                op,
+                TrackedOperation::Resolved {
+                    command_id: cmd,
+                    state: settled(),
+                },
+            )]),
+        );
+        dest.absorb_tracked_operations(&mut source).expect("absorb");
+        assert_eq!(
+            dest.tracked_operation(op),
+            Some(&TrackedOperation::Resolved {
+                command_id: cmd,
+                state: settled(),
+            })
+        );
+    }
+
+    #[test]
+    fn absorb_tracked_operations_upgrades_pending_to_resolved() {
+        use super::{HostClient, HostClientConfig};
+        use crate::client::connection::ClientConnection;
+        use crate::domain::ClientId;
+        use crate::protocol::{Capability, CapabilitySet, FrameLimits};
+
+        let client_id = ClientId::from_bytes([
+            0x01, 0x8f, 0x60, 0xb0, 0x9c, 0x1a, 0x70, 0x01, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0xd8,
+        ])
+        .expect("client");
+        let connection_id = uuid::Uuid::from_bytes([
+            0x01, 0x8f, 0x60, 0xb0, 0x9c, 0x1a, 0x70, 0x01, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0xd9,
+        ]);
+        let hello = test_server_hello(
+            CapabilitySet::from_capabilities([Capability::ChunkResume]),
+            connection_id,
+        );
+        let op = operation_id(0xda);
+        let cmd = command_id(0xdb);
+        let mut source = HostClient::from_parts_for_test(
+            HostClientConfig {
+                named_profile: "absorb-unit".into(),
+                client_build: "devmanager/test".into(),
+                client_id,
+                requested: CapabilitySet::from_capabilities([Capability::ChunkResume]),
+                limits: FrameLimits::v1_default(),
+            },
+            hello.clone(),
+            Some(ClientConnection::inert_stub_for_test(
+                client_id,
+                hello.clone(),
+            )),
+            BTreeMap::from([(
+                op,
+                TrackedOperation::Resolved {
+                    command_id: cmd,
+                    state: settled(),
+                },
+            )]),
+        );
+        let mut dest = HostClient::from_parts_for_test(
+            HostClientConfig {
+                named_profile: "absorb-unit".into(),
+                client_build: "devmanager/test".into(),
+                client_id,
+                requested: CapabilitySet::from_capabilities([Capability::ChunkResume]),
+                limits: FrameLimits::v1_default(),
+            },
+            hello.clone(),
+            Some(ClientConnection::inert_stub_for_test(client_id, hello)),
+            BTreeMap::from([(op, TrackedOperation::Pending { command_id: cmd })]),
+        );
+        dest.absorb_tracked_operations(&mut source).expect("absorb");
+        assert_eq!(
+            dest.tracked_operation(op),
+            Some(&TrackedOperation::Resolved {
+                command_id: cmd,
+                state: settled(),
+            })
+        );
     }
 
     #[test]

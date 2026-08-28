@@ -330,6 +330,47 @@ impl TaskCockpitShell {
         self.projection = Some(projection);
     }
 
+    /// Project the merged admitted conversation page into the exact owner task
+    /// timeline. Admission paths must call this instead of painting raw query
+    /// pages through the selected-task cockpit helper.
+    pub fn install_admitted_conversation_page(
+        &mut self,
+        task_id: TaskId,
+        page: &SemanticJournalPage,
+    ) {
+        if self.dock.selected_task() == Some(task_id) {
+            self.conversation = Some(page.clone());
+        }
+        self.project_admitted_page_into_timeline(task_id, page);
+    }
+
+    fn project_admitted_page_into_timeline(&mut self, task_id: TaskId, page: &SemanticJournalPage) {
+        let high_water = page.high_water.max(page.through_sequence);
+        let presentation_signature = conversation_presentation_signature(page);
+        if let Some(model) = self.model.as_ref() {
+            if let (Ok(target), Some(snapshot)) =
+                (live_target(model, task_id), model.tasks().get(&task_id))
+            {
+                if self.timelines.get(&task_id).is_some_and(|timeline| {
+                    timeline.matches_projection_identity(
+                        high_water,
+                        self.capabilities,
+                        target,
+                        snapshot.task.revision,
+                        presentation_signature,
+                    )
+                }) {
+                    if self.dock.selected_task() == Some(task_id) {
+                        self.focused_timeline_task = Some(task_id);
+                        self.timeline_error = None;
+                    }
+                    return;
+                }
+            }
+        }
+        self.project_page_into_timeline(task_id, page, presentation_signature);
+    }
+
     pub fn apply_cockpit_result(&mut self, result: &TaskCockpitResult) {
         let Some(task_id) = self.dock.selected_task() else {
             return;
@@ -460,8 +501,19 @@ impl TaskCockpitShell {
             );
             return;
         };
+        let presentation_signature = self
+            .conversation
+            .as_ref()
+            .map(conversation_presentation_signature)
+            .unwrap_or(0);
         if self.timelines.get(&task_id).is_some_and(|timeline| {
-            timeline.matches_projection_identity(high_water, capabilities, target, task_revision)
+            timeline.matches_projection_identity(
+                high_water,
+                capabilities,
+                target,
+                task_revision,
+                presentation_signature,
+            )
         }) {
             self.focused_timeline_task = Some(task_id);
             self.timeline_error = None;
@@ -492,7 +544,13 @@ impl TaskCockpitShell {
                 if let Some(previous) = self.timelines.remove(&task_id) {
                     timeline.preserve_view_state_from(&previous);
                 }
-                timeline.note_projection_identity(high_water, capabilities, target, task_revision);
+                timeline.note_projection_identity(
+                    high_water,
+                    capabilities,
+                    target,
+                    task_revision,
+                    presentation_signature,
+                );
                 self.timelines.insert(task_id, timeline);
                 self.focused_timeline_task = Some(task_id);
                 self.timeline_error = None;
@@ -553,7 +611,11 @@ impl TaskCockpitShell {
         if self.timelines.contains_key(&task_id) {
             return;
         }
-        self.project_page_into_timeline(task_id, page);
+        self.project_page_into_timeline(
+            task_id,
+            page,
+            conversation_presentation_signature(page),
+        );
     }
 
     /// Project or refresh a retained timeline when admission advances the
@@ -564,6 +626,7 @@ impl TaskCockpitShell {
         page: &SemanticJournalPage,
     ) {
         let high_water = page.high_water.max(page.through_sequence);
+        let presentation_signature = conversation_presentation_signature(page);
         if let Some(model) = self.model.as_ref() {
             if let (Ok(target), Some(snapshot)) =
                 (live_target(model, task_id), model.tasks().get(&task_id))
@@ -574,28 +637,32 @@ impl TaskCockpitShell {
                         self.capabilities,
                         target,
                         snapshot.task.revision,
+                        presentation_signature,
                     )
                 }) {
                     return;
                 }
-            } else if self
-                .timelines
-                .get(&task_id)
-                .is_some_and(|timeline| timeline.projected_high_water() >= high_water)
-            {
+            } else if self.timelines.get(&task_id).is_some_and(|timeline| {
+                timeline.projected_high_water() >= high_water
+                    && timeline.projected_presentation_signature() == presentation_signature
+            }) {
                 return;
             }
-        } else if self
-            .timelines
-            .get(&task_id)
-            .is_some_and(|timeline| timeline.projected_high_water() >= high_water)
-        {
+        } else if self.timelines.get(&task_id).is_some_and(|timeline| {
+            timeline.projected_high_water() >= high_water
+                && timeline.projected_presentation_signature() == presentation_signature
+        }) {
             return;
         }
-        self.project_page_into_timeline(task_id, page);
+        self.project_page_into_timeline(task_id, page, presentation_signature);
     }
 
-    fn project_page_into_timeline(&mut self, task_id: TaskId, page: &SemanticJournalPage) {
+    fn project_page_into_timeline(
+        &mut self,
+        task_id: TaskId,
+        page: &SemanticJournalPage,
+        presentation_signature: u64,
+    ) {
         let Some(model) = self.model.clone() else {
             return;
         };
@@ -628,7 +695,13 @@ impl TaskCockpitShell {
             .map(|snapshot| snapshot.task.revision)
             .unwrap_or(0);
         if let Ok(target) = live_target(&model, task_id) {
-            timeline.note_projection_identity(high_water, self.capabilities, target, task_revision);
+            timeline.note_projection_identity(
+                high_water,
+                self.capabilities,
+                target,
+                task_revision,
+                presentation_signature,
+            );
         } else {
             timeline.note_projected_high_water(high_water);
         }
@@ -896,6 +969,30 @@ impl TaskCockpitShell {
     }
 }
 
+pub(crate) fn conversation_presentation_signature(page: &SemanticJournalPage) -> u64 {
+    use crate::domain::SemanticJournalPayload;
+    use std::hash::{Hash, Hasher};
+
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    page.facts.len().hash(&mut hasher);
+    for fact in &page.facts {
+        fact.sequence.hash(&mut hasher);
+        fact.id.as_bytes().hash(&mut hasher);
+        match &fact.payload {
+            SemanticJournalPayload::UserMessage { text } => {
+                1u8.hash(&mut hasher);
+                text.hash(&mut hasher);
+            }
+            SemanticJournalPayload::AssistantText { text } => {
+                2u8.hash(&mut hasher);
+                text.hash(&mut hasher);
+            }
+            _ => fact.kind.hash(&mut hasher),
+        }
+    }
+    hasher.finish()
+}
+
 fn question_projection_from_page(
     page: &SemanticJournalPage,
     open_question: QuestionId,
@@ -963,6 +1060,8 @@ mod ai_acceptance_tests {
         let open_question = QuestionId::new();
         let fact_id = EventId::new();
         let page = SemanticJournalPage {
+            oldest_sequence: 0,
+            cursor_rolled_over: false,
             after_sequence: 0,
             through_sequence: 17,
             high_water: 17,
@@ -1036,6 +1135,8 @@ mod tests {
         let task_id = TaskId::new();
         shell.follow_task(task_id);
         let page = SemanticJournalPage {
+            oldest_sequence: 0,
+            cursor_rolled_over: false,
             after_sequence: 0,
             through_sequence: 1,
             high_water: 1,
@@ -1097,6 +1198,8 @@ mod tests {
         shell.focused_timeline_task = Some(task_id);
 
         let page = SemanticJournalPage {
+            oldest_sequence: 0,
+            cursor_rolled_over: false,
             after_sequence: 0,
             through_sequence: 4,
             high_water: 4,
@@ -1110,6 +1213,47 @@ mod tests {
         let retained = shell.timelines.get(&task_id).expect("timeline retained");
         assert_eq!(retained.projected_high_water(), 4);
         assert_eq!(retained.rows().as_ptr(), rows_ptr);
+    }
+
+    #[test]
+    fn conversation_presentation_signature_distinguishes_same_high_water_rows() {
+        let first = SemanticJournalPage {
+            oldest_sequence: 0,
+            cursor_rolled_over: false,
+            after_sequence: 4,
+            through_sequence: 5,
+            high_water: 7,
+            encoded_bytes: 0,
+            next_sequence: None,
+            facts: vec![SemanticJournalFact {
+                id: EventId::new(),
+                sequence: 5,
+                occurred_at_ms: None,
+                provider: "test".into(),
+                schema_version: 1,
+                kind: "user_message".into(),
+                visibility: "conversation".into(),
+                privacy_class: PrivacyClass::LocalOnly,
+                redacted: false,
+                payload: SemanticJournalPayload::UserMessage {
+                    text: "first".into(),
+                },
+            }],
+        };
+        let second = SemanticJournalPage {
+            facts: vec![SemanticJournalFact {
+                payload: SemanticJournalPayload::UserMessage {
+                    text: "second".into(),
+                },
+                ..first.facts[0].clone()
+            }],
+            ..first.clone()
+        };
+        assert_ne!(
+            super::conversation_presentation_signature(&first),
+            super::conversation_presentation_signature(&second),
+            "presentation rows must invalidate cache identity at unchanged durable high-water"
+        );
     }
 
     #[test]

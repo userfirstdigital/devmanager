@@ -128,6 +128,9 @@ fn normalize_provider_question_draft(
 /// Bounded retry ledger for lost authenticated PrepareUpdate replies.
 const MAX_PREPARED_UPDATE_HANDOFFS: usize = 4;
 
+/// Default critical output lane capacity for one duplex connection.
+pub(crate) const HOST_CRITICAL_OUTPUT_QUEUE_CAPACITY: usize = 32;
+
 /// Default durable event output lane capacity for one duplex connection.
 pub(crate) const HOST_DURABLE_OUTPUT_QUEUE_CAPACITY: usize = 32;
 
@@ -1096,6 +1099,16 @@ enum ExecutorControl {
         id: ConnectionOutputId,
         ack: oneshot::Sender<Option<(OperationId, PhysicalWriteAck)>>,
     },
+    #[cfg(test)]
+    InstallTestSemanticJournal {
+        journal: Arc<Mutex<crate::remote::presentation::SemanticJournalStore>>,
+        ack: oneshot::Sender<()>,
+    },
+    #[cfg(test)]
+    RecordTestSemantic {
+        draft: crate::remote::presentation::SemanticEventDraft,
+        ack: oneshot::Sender<u64>,
+    },
 }
 
 #[cfg(test)]
@@ -1495,6 +1508,22 @@ pub(crate) struct ConnectionOutputRegistration {
     control_tx: mpsc::Sender<ExecutorControl>,
 }
 
+/// Host-owned Connect duplex session.
+///
+/// Opaque outside the crate: fields are crate-visible only. Drop keeps
+/// [`ConnectionOutputRegistration`] ownership until the session ends so
+/// shutdown/unregister still runs through the existing guard. This factory
+/// does not spawn reader/writer tasks. `client_id` is host-owned registration
+/// metadata used to bind the encrypted transport entry — never a network
+/// connection id.
+pub struct HostConnectDuplex {
+    pub(crate) client_id: ClientId,
+    pub(crate) requests: HostRequestHandle,
+    pub(crate) output: ConnectionOutputHandle,
+    pub(crate) ports: ConnectionOutputPorts,
+    pub(crate) registration: ConnectionOutputRegistration,
+}
+
 impl ConnectionOutputRegistration {
     pub(crate) fn id(&self) -> ConnectionOutputId {
         self.id
@@ -1518,10 +1547,19 @@ pub struct HostRequestHandle {
     output_id: Option<ConnectionOutputId>,
     update_gate: Arc<crate::host::update::HostUpdateRuntimeGate>,
     host_boot_id: Arc<OnceLock<Uuid>>,
+    remote_setup: Arc<OnceLock<super::remote_setup::RemoteSetupHandle>>,
     configured_service_supervisor_ready: bool,
 }
 
 impl HostRequestHandle {
+    /// Bind the independently owned local setup controller once per host.
+    pub fn bind_remote_setup(
+        &self,
+        handle: super::remote_setup::RemoteSetupHandle,
+    ) -> Result<(), super::remote_setup::RemoteSetupHandle> {
+        self.remote_setup.set(handle)
+    }
+
     /// Attach an already-owned task terminal to the host terminal service.
     /// This never launches a PTY; the runtime is supplied by the task owner.
     pub(crate) async fn attach_terminal(
@@ -1667,6 +1705,7 @@ impl HostRequestHandle {
             output_id: Some(output_id),
             update_gate: Arc::clone(&self.update_gate),
             host_boot_id: Arc::clone(&self.host_boot_id),
+            remote_setup: Arc::clone(&self.remote_setup),
             configured_service_supervisor_ready: self.configured_service_supervisor_ready,
         }
     }
@@ -1765,6 +1804,37 @@ impl HostRequestHandle {
         .await
     }
 
+    /// Open a bounded host Connect duplex session for `client_id`.
+    ///
+    /// Allocates a fresh host UUIDv7 output identity (never a network
+    /// connection id or `reconnect_from`), registers it through the existing
+    /// output queue machinery with cancellation cleanup armed before the first
+    /// transferring await, and returns a request handle bound to that output.
+    /// Durable replay continues to use canonical event cursors. No tasks are
+    /// spawned here.
+    pub async fn open_connect_duplex(
+        &self,
+        client_id: ClientId,
+    ) -> Result<HostConnectDuplex, IpcError> {
+        let (output, ports) = ConnectionOutputHandle::with_connection_id(
+            Uuid::now_v7(),
+            HOST_CRITICAL_OUTPUT_QUEUE_CAPACITY,
+            HOST_DURABLE_OUTPUT_QUEUE_CAPACITY,
+            HOST_EPHEMERAL_OUTPUT_QUEUE_CAPACITY,
+        );
+        let registration = self
+            .register_output_for_connection(output.clone(), client_id, None)
+            .await?;
+        let requests = self.with_output(registration.id());
+        Ok(HostConnectDuplex {
+            client_id,
+            requests,
+            output,
+            ports,
+            registration,
+        })
+    }
+
     async fn register_output_with_reconnect(
         &self,
         output: ConnectionOutputHandle,
@@ -1802,6 +1872,35 @@ impl HostRequestHandle {
         let (ack_tx, ack_rx) = oneshot::channel();
         self.control_tx
             .send(ExecutorControl::InspectOutput { id, ack: ack_tx })
+            .await
+            .map_err(|_| IpcError::Unavailable)?;
+        ack_rx.await.map_err(|_| IpcError::Unavailable)
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn install_test_semantic_journal(
+        &self,
+        journal: Arc<Mutex<crate::remote::presentation::SemanticJournalStore>>,
+    ) -> Result<(), IpcError> {
+        let (ack_tx, ack_rx) = oneshot::channel();
+        self.control_tx
+            .send(ExecutorControl::InstallTestSemanticJournal {
+                journal,
+                ack: ack_tx,
+            })
+            .await
+            .map_err(|_| IpcError::Unavailable)?;
+        ack_rx.await.map_err(|_| IpcError::Unavailable)
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn record_test_semantic(
+        &self,
+        draft: crate::remote::presentation::SemanticEventDraft,
+    ) -> Result<u64, IpcError> {
+        let (ack_tx, ack_rx) = oneshot::channel();
+        self.control_tx
+            .send(ExecutorControl::RecordTestSemantic { draft, ack: ack_tx })
             .await
             .map_err(|_| IpcError::Unavailable)?;
         ack_rx.await.map_err(|_| IpcError::Unavailable)
@@ -1985,6 +2084,7 @@ impl ConfiguredServiceRuntime {
         admission: &HostWorkspaceAdmission,
         provider_session_store_path: Option<std::path::PathBuf>,
         semantic_ingress_tx: mpsc::UnboundedSender<ProviderSemanticIngress>,
+        semantic_dirty: Arc<super::conversation_wake::SemanticDirtyBoard>,
     ) -> Option<Self> {
         let manager = provider_session_store_path
             .as_ref()
@@ -2012,6 +2112,7 @@ impl ConfiguredServiceRuntime {
             )),
         };
         let event_journal = Arc::clone(&semantic_journal);
+        let dirty_board = Arc::clone(&semantic_dirty);
         manager.set_remote_session_handler(Some(Arc::new(move |event| {
             let Ok(mut journal) = event_journal.lock() else {
                 return;
@@ -2037,7 +2138,10 @@ impl ConfiguredServiceRuntime {
                 | crate::services::RemoteSessionEvent::ClaudeSemantic { mut draft, .. }
                 | crate::services::RemoteSessionEvent::CodexSemantic { mut draft, .. } => {
                     let ingress = normalize_provider_question_draft(&mut draft);
-                    journal.record(draft);
+                    // Record once, then signal the bounded dirty board. Do not
+                    // emit per-token DomainEvents or enlarge question ingress.
+                    let recorded = journal.record(draft);
+                    dirty_board.mark(recorded.stable_session_key.clone(), recorded.sequence);
                     if let Err(error) = journal.flush_if_dirty() {
                         eprintln!(
                             "devmanager-host: conversation history prompt flush failed: {error}"
@@ -2486,6 +2590,7 @@ pub struct HostRequestExecutor {
     terminal_service: TerminalService,
     update_gate: Arc<crate::host::update::HostUpdateRuntimeGate>,
     host_boot_id: Arc<OnceLock<Uuid>>,
+    remote_setup: Arc<OnceLock<super::remote_setup::RemoteSetupHandle>>,
     rx: mpsc::Receiver<HostRequestJob>,
     control_rx: mpsc::Receiver<ExecutorControl>,
     semantic_ingress_rx: mpsc::UnboundedReceiver<ProviderSemanticIngress>,
@@ -2495,6 +2600,15 @@ pub struct HostRequestExecutor {
     registry: SnapshotRegistry,
     replay_registry: EventReplayRegistry,
     artifact_content_registry: ArtifactContentRegistry,
+    conversation_registry: super::conversation_wake::ConversationSubscriptionRegistry,
+    semantic_dirty: Arc<super::conversation_wake::SemanticDirtyBoard>,
+    semantic_dirty_rx: watch::Receiver<u64>,
+    /// Shared wake when any output frees an ephemeral slot so conversation
+    /// dirties can retry without waiting for a new token or maintenance tick.
+    ephemeral_capacity_notify: Arc<Notify>,
+    /// Test-only in-memory journal when no configured-service runtime is present.
+    #[cfg(test)]
+    test_semantic_journal: Option<Arc<Mutex<crate::remote::presentation::SemanticJournalStore>>>,
     outputs: HashMap<ConnectionOutputId, ConnectionOutputHandle>,
     /// Latest accepted ConfirmHostQuit receipt ack per output (for terminal drain).
     pending_quit_receipt_acks: HashMap<ConnectionOutputId, PendingQuitReceiptAck>,
@@ -2693,6 +2807,9 @@ impl HostRequestExecutor {
         let (semantic_ingress_tx, semantic_ingress_rx) = mpsc::unbounded_channel();
         let (arm_tx, arm_rx) = mpsc::channel(1);
         let update_gate = crate::host::update::HostUpdateRuntimeGate::new();
+        let (semantic_dirty, semantic_dirty_rx) =
+            super::conversation_wake::SemanticDirtyBoard::new();
+        let ephemeral_capacity_notify = Arc::new(Notify::new());
         let configured_service_runtime =
             config_admission
                 .as_ref()
@@ -2701,6 +2818,7 @@ impl HostRequestExecutor {
                         admission,
                         Some(provider_session_store_path.clone()),
                         semantic_ingress_tx.clone(),
+                        Arc::clone(&semantic_dirty),
                     )
                 });
         let configured_service_supervisor_ready = configured_service_runtime
@@ -2713,6 +2831,7 @@ impl HostRequestExecutor {
             output_id: None,
             update_gate: Arc::clone(&update_gate),
             host_boot_id: Arc::new(OnceLock::new()),
+            remote_setup: Arc::new(OnceLock::new()),
             configured_service_supervisor_ready,
         };
         let provider_settings = config_admission.as_ref().and_then(|(_, store_path)| {
@@ -2731,6 +2850,7 @@ impl HostRequestExecutor {
             }
         });
         let host_boot_id = Arc::clone(&handle.host_boot_id);
+        let remote_setup = Arc::clone(&handle.remote_setup);
         let mut executor = Self {
             bus,
             workspace_projects,
@@ -2746,6 +2866,7 @@ impl HostRequestExecutor {
             terminal_service: TerminalService::new(),
             update_gate,
             host_boot_id,
+            remote_setup,
             rx,
             control_rx,
             semantic_ingress_rx,
@@ -2754,6 +2875,13 @@ impl HostRequestExecutor {
             registry: SnapshotRegistry::new(),
             replay_registry: EventReplayRegistry::new(),
             artifact_content_registry: ArtifactContentRegistry::new(),
+            conversation_registry: super::conversation_wake::ConversationSubscriptionRegistry::new(
+            ),
+            semantic_dirty,
+            semantic_dirty_rx,
+            ephemeral_capacity_notify,
+            #[cfg(test)]
+            test_semantic_journal: None,
             outputs: HashMap::with_capacity(MAX_SNAPSHOT_SESSIONS),
             pending_quit_receipt_acks: HashMap::with_capacity(MAX_SNAPSHOT_SESSIONS),
             prepared_update_replies: HashMap::with_capacity(MAX_PREPARED_UPDATE_HANDOFFS),
@@ -2791,11 +2919,15 @@ impl HostRequestExecutor {
         let (control_tx, control_rx) = mpsc::channel(HOST_REQUEST_QUEUE_CAPACITY);
         let (semantic_ingress_tx, semantic_ingress_rx) = mpsc::unbounded_channel();
         let update_gate = crate::host::update::HostUpdateRuntimeGate::new();
+        let (semantic_dirty, semantic_dirty_rx) =
+            super::conversation_wake::SemanticDirtyBoard::new();
+        let ephemeral_capacity_notify = Arc::new(Notify::new());
         let configured_service_runtime = config_admission.as_ref().and_then(|admission| {
             ConfiguredServiceRuntime::initialized_from_admission(
                 admission,
                 None,
                 semantic_ingress_tx.clone(),
+                Arc::clone(&semantic_dirty),
             )
         });
         let configured_service_supervisor_ready = configured_service_runtime
@@ -2808,9 +2940,11 @@ impl HostRequestExecutor {
             output_id: None,
             update_gate: Arc::clone(&update_gate),
             host_boot_id: Arc::new(OnceLock::new()),
+            remote_setup: Arc::new(OnceLock::new()),
             configured_service_supervisor_ready,
         };
         let host_boot_id = Arc::clone(&handle.host_boot_id);
+        let remote_setup = Arc::clone(&handle.remote_setup);
         let mut executor = Self {
             bus,
             workspace_projects,
@@ -2826,6 +2960,7 @@ impl HostRequestExecutor {
             terminal_service: TerminalService::new(),
             update_gate,
             host_boot_id,
+            remote_setup,
             rx,
             control_rx,
             semantic_ingress_rx,
@@ -2834,6 +2969,13 @@ impl HostRequestExecutor {
             registry: SnapshotRegistry::new(),
             replay_registry: EventReplayRegistry::new(),
             artifact_content_registry: ArtifactContentRegistry::new(),
+            conversation_registry: super::conversation_wake::ConversationSubscriptionRegistry::new(
+            ),
+            semantic_dirty,
+            semantic_dirty_rx,
+            ephemeral_capacity_notify,
+            #[cfg(test)]
+            test_semantic_journal: None,
             outputs: HashMap::with_capacity(MAX_SNAPSHOT_SESSIONS),
             pending_quit_receipt_acks: HashMap::with_capacity(MAX_SNAPSHOT_SESSIONS),
             prepared_update_replies: HashMap::with_capacity(MAX_PREPARED_UPDATE_HANDOFFS),
@@ -2885,6 +3027,12 @@ impl HostRequestExecutor {
                         eprintln!("devmanager-host: provider semantic ingress rejected: {error}");
                     }
                 }
+                Ok(()) = self.semantic_dirty_rx.changed() => {
+                    self.fan_out_conversation_dirty();
+                }
+                () = self.ephemeral_capacity_notify.notified() => {
+                    self.fan_out_conversation_dirty();
+                }
                 Some(outcome) = self.provider_restore_jobs.next(), if !self.provider_restore_jobs.is_empty() => {
                     self.handle_provider_restore_outcome(outcome);
                 }
@@ -2896,6 +3044,7 @@ impl HostRequestExecutor {
                     self.registry.reap_idle(now);
                     self.replay_registry.reap_idle(now);
                     self.artifact_content_registry.reap(now);
+                    self.fan_out_conversation_dirty();
                     self.reconcile_configured_services();
                     self.queue_one_provider_restore();
                     self.maybe_schedule_provider_health(false);
@@ -2953,6 +3102,12 @@ impl HostRequestExecutor {
                         eprintln!("devmanager-host: provider semantic ingress rejected: {error}");
                     }
                 }
+                Ok(()) = self.semantic_dirty_rx.changed() => {
+                    self.fan_out_conversation_dirty();
+                }
+                () = self.ephemeral_capacity_notify.notified() => {
+                    self.fan_out_conversation_dirty();
+                }
                 Some(outcome) = self.provider_restore_jobs.next(), if !self.provider_restore_jobs.is_empty() => {
                     self.handle_provider_restore_outcome(outcome);
                 }
@@ -2964,6 +3119,7 @@ impl HostRequestExecutor {
                     self.registry.reap_idle(now);
                     self.replay_registry.reap_idle(now);
                     self.artifact_content_registry.reap(now);
+                    self.fan_out_conversation_dirty();
                     self.reconcile_configured_services();
                     self.queue_one_provider_restore();
                     self.maybe_schedule_provider_health(false);
@@ -3071,6 +3227,8 @@ impl HostRequestExecutor {
                 if let (Some(client_id), Some(old_id)) = (client_id, reconnect_from) {
                     self.rebind_connection(client_id, old_id, id);
                 }
+                output
+                    .attach_ephemeral_capacity_notify(Arc::clone(&self.ephemeral_capacity_notify));
                 self.outputs.insert(id, output);
                 if ack.send(()).is_err() {
                     self.detach_output(id);
@@ -3207,6 +3365,30 @@ impl HostRequestExecutor {
                     .map(|pending| (pending.operation_id, pending.ack));
                 let _ = ack.send(taken);
             }
+            #[cfg(test)]
+            ExecutorControl::InstallTestSemanticJournal { journal, ack } => {
+                self.test_semantic_journal = Some(journal);
+                let _ = ack.send(());
+            }
+            #[cfg(test)]
+            ExecutorControl::RecordTestSemantic { draft, ack } => {
+                let sequence = if let Some(journal) = self.test_semantic_journal.as_ref() {
+                    let mut store = journal.lock().expect("test semantic journal");
+                    let recorded = store.record(draft);
+                    self.semantic_dirty
+                        .mark(recorded.stable_session_key.clone(), recorded.sequence);
+                    recorded.sequence
+                } else if let Some(runtime) = self.configured_service_runtime.as_ref() {
+                    let mut store = runtime.semantic_journal.lock().expect("semantic journal");
+                    let recorded = store.record(draft);
+                    self.semantic_dirty
+                        .mark(recorded.stable_session_key.clone(), recorded.sequence);
+                    recorded.sequence
+                } else {
+                    0
+                };
+                let _ = ack.send(sequence);
+            }
         }
     }
 
@@ -3311,9 +3493,11 @@ impl HostRequestExecutor {
 
     fn queue_one_provider_restore(&mut self) {
         if self.provider_restore_pending {
-            self.provider_restore_pending = false;
             match self.bus.restorable_provider_starts(64) {
                 Ok(starts) => {
+                    // Only clear pending after successful enumeration. Failed
+                    // or not-yet-run enumeration keeps Unknown on readiness.
+                    self.provider_restore_pending = false;
                     for intent in starts {
                         push_unique_provider_restore_intent(
                             &mut self.provider_restore_queue,
@@ -3788,6 +3972,19 @@ impl HostRequestExecutor {
             .rebind_output(client_id, old_id, new_id);
         self.artifact_content_registry
             .rebind_output(client_id, old_id.as_uuid(), new_id.as_uuid());
+        // Conversation subscriptions are ephemeral and never rebound: drop the
+        // old output's subscriptions so reconnect must open a fresh lease.
+        let old_handle = self.outputs.get(&old_id).cloned();
+        if let Some(ref old_output) = old_handle {
+            self.invalidate_conversation_subscriptions_for_output(old_id, old_output);
+        } else {
+            for (_subscription_id, entry) in self
+                .conversation_registry
+                .remove_for_output(old_id.as_uuid())
+            {
+                self.semantic_dirty.untrack(&entry.session_key);
+            }
+        }
         self.pending_quit_receipt_acks.remove(&old_id);
         if let Some(old_output) = self.outputs.remove(&old_id) {
             old_output.request_shutdown();
@@ -3972,6 +4169,14 @@ impl HostRequestExecutor {
                 ExecutorControl::TakePendingQuitReceiptAck { ack, .. } => {
                     let _ = ack.send(None);
                 }
+                #[cfg(test)]
+                ExecutorControl::InstallTestSemanticJournal { ack, .. } => {
+                    let _ = ack.send(());
+                }
+                #[cfg(test)]
+                ExecutorControl::RecordTestSemantic { ack, .. } => {
+                    let _ = ack.send(0);
+                }
             }
         }
     }
@@ -4151,7 +4356,14 @@ impl HostRequestExecutor {
     fn detach_output(&mut self, id: ConnectionOutputId) {
         self.pending_quit_receipt_acks.remove(&id);
         if let Some(output) = self.outputs.remove(&id) {
+            self.invalidate_conversation_subscriptions_for_output(id, &output);
             output.request_shutdown();
+        } else {
+            for (_subscription_id, entry) in
+                self.conversation_registry.remove_for_output(id.as_uuid())
+            {
+                self.semantic_dirty.untrack(&entry.session_key);
+            }
         }
         self.replay_registry.remove_for_output(id);
     }
@@ -4164,8 +4376,28 @@ impl HostRequestExecutor {
     ) -> Option<ConnectionOutputHandle> {
         self.pending_quit_receipt_acks.remove(&id);
         let output = self.outputs.remove(&id);
+        if let Some(ref handle) = output {
+            self.invalidate_conversation_subscriptions_for_output(id, handle);
+        } else {
+            for (_subscription_id, entry) in
+                self.conversation_registry.remove_for_output(id.as_uuid())
+            {
+                self.semantic_dirty.untrack(&entry.session_key);
+            }
+        }
         self.replay_registry.remove_for_output(id);
         output
+    }
+
+    fn invalidate_conversation_subscriptions_for_output(
+        &mut self,
+        id: ConnectionOutputId,
+        output: &ConnectionOutputHandle,
+    ) {
+        for (subscription_id, entry) in self.conversation_registry.remove_for_output(id.as_uuid()) {
+            self.semantic_dirty.untrack(&entry.session_key);
+            output.release_reserved_ephemeral_key(EphemeralKey::Conversation(subscription_id));
+        }
     }
 
     fn serve_detach(
@@ -4538,6 +4770,45 @@ impl HostRequestExecutor {
             self.bus
                 .prepare_provider_start(&original_claim)
                 .map_err(map_store_error)?;
+            // Same-kind NewConversation must not double-launch when a live or
+            // pending provider already owns the exact agent/resource claim.
+            if intent.mode == crate::domain::command::ProviderStartMode::NewConversation {
+                match manager.try_has_live_provider_runtime(
+                    intent.task_id,
+                    intent.agent_session_id,
+                    intent.resource_id,
+                    agent.runtime_generation,
+                ) {
+                    Some(true) => {
+                        eprintln!(
+                            "devmanager-host: NewConversation refused; live provider generation present"
+                        );
+                        return Err(IpcError::Unavailable);
+                    }
+                    None => {
+                        eprintln!(
+                            "devmanager-host: NewConversation refused; live provider book busy/unknown"
+                        );
+                        return Err(IpcError::Unavailable);
+                    }
+                    Some(false) => {}
+                }
+                match manager.try_classify_persisted_provider_launch(intent.agent_session_id) {
+                    Ok(Some(true)) => {
+                        eprintln!(
+                            "devmanager-host: NewConversation refused; persisted launch graph present"
+                        );
+                        return Err(IpcError::Unavailable);
+                    }
+                    Ok(Some(false)) => {}
+                    Ok(None) | Err(()) => {
+                        eprintln!(
+                            "devmanager-host: NewConversation refused; persisted launch classification unknown"
+                        );
+                        return Err(IpcError::Unavailable);
+                    }
+                }
+            }
             if agent.provider_kind != intent.provider_kind {
                 if intent.mode != crate::domain::command::ProviderStartMode::NewConversation {
                     eprintln!(
@@ -4551,31 +4822,37 @@ impl HostRequestExecutor {
                 }
                 // Running/launching without SessionStart must not rebind once a
                 // live provider terminal or persisted launch graph exists.
-                if manager
-                    .provider_terminal_binding(
-                        intent.task_id,
-                        intent.agent_session_id,
-                        intent.resource_id,
-                        agent.runtime_generation,
-                    )
-                    .is_some()
-                {
-                    eprintln!(
-                        "devmanager-host: provider rebind refused; live provider terminal present"
-                    );
-                    return Err(IpcError::Unavailable);
+                match manager.try_has_live_provider_runtime(
+                    intent.task_id,
+                    intent.agent_session_id,
+                    intent.resource_id,
+                    agent.runtime_generation,
+                ) {
+                    Some(true) => {
+                        eprintln!(
+                            "devmanager-host: provider rebind refused; live provider generation present"
+                        );
+                        return Err(IpcError::Unavailable);
+                    }
+                    None => {
+                        eprintln!(
+                            "devmanager-host: provider rebind refused; live provider book busy/unknown"
+                        );
+                        return Err(IpcError::Unavailable);
+                    }
+                    Some(false) => {}
                 }
-                match manager.peek_persisted_provider_launch_spec(intent.agent_session_id) {
-                    Ok(Some(_)) => {
+                match manager.try_classify_persisted_provider_launch(intent.agent_session_id) {
+                    Ok(Some(true)) => {
                         eprintln!(
                             "devmanager-host: provider rebind refused; persisted launch graph present"
                         );
                         return Err(IpcError::Unavailable);
                     }
-                    Ok(None) => {}
-                    Err(error) => {
+                    Ok(Some(false)) => {}
+                    Ok(None) | Err(()) => {
                         eprintln!(
-                            "devmanager-host: provider rebind persisted-launch peek failed: {error}"
+                            "devmanager-host: provider rebind refused; persisted launch classification unknown"
                         );
                         return Err(IpcError::Unavailable);
                     }
@@ -5012,12 +5289,14 @@ impl HostRequestExecutor {
                     connection_id,
                     Some(&self.workspace_coordinator),
                 )?;
+                let receipt_request_id =
+                    request_id.unwrap_or_else(|| command_receipt_request_id(&envelope));
                 let receipt = self
                     .bus
                     .execute_host_authorized(
                         envelope,
                         authorization,
-                        request_id.unwrap_or_else(RequestId::new),
+                        receipt_request_id,
                         connection_id,
                     )
                     .map_err(map_store_error)?;
@@ -5059,6 +5338,16 @@ impl HostRequestExecutor {
     ) -> Result<QueryReply, IpcError> {
         let task_id = envelope.task_id;
         match envelope.query {
+            Query::CommandReceiptStatus { command } => Ok(QueryReply {
+                request_id: envelope.request_id,
+                outcome: command_receipt_status_outcome(
+                    &self.bus,
+                    negotiated.client_id,
+                    envelope.client_id,
+                    task_id,
+                    &command,
+                ),
+            }),
             Query::SnapshotPage {
                 section,
                 snapshot_id,
@@ -5281,6 +5570,53 @@ impl HostRequestExecutor {
                     .map_err(map_store_error)
             }
             Query::TaskCockpit(query) => {
+                if let TaskCockpitQuery::OpenConversationSubscription { after_sequence } = &query {
+                    let outcome = self.serve_open_conversation_subscription(
+                        negotiated,
+                        envelope.task_id,
+                        envelope.client_id,
+                        envelope.request_id,
+                        *after_sequence,
+                        output_id,
+                    );
+                    return Ok(QueryReply {
+                        request_id: envelope.request_id,
+                        outcome,
+                    });
+                }
+                if let TaskCockpitQuery::ReleaseConversationSubscription { subscription_id } =
+                    &query
+                {
+                    let outcome = self.serve_release_conversation_subscription(
+                        negotiated,
+                        envelope.task_id,
+                        *subscription_id,
+                        output_id,
+                    );
+                    return Ok(QueryReply {
+                        request_id: envelope.request_id,
+                        outcome,
+                    });
+                }
+                if let TaskCockpitQuery::RemoteAccess(request) = &query {
+                    let outcome = if !negotiated.capabilities.grants_task_cockpit() {
+                        QueryOutcome::Err(QueryError::UnsupportedCapability)
+                    } else if envelope.task_id.is_some() {
+                        QueryOutcome::Err(QueryError::InvalidRequest)
+                    } else if let Some(setup) = self.remote_setup.get() {
+                        QueryOutcome::Ok(QueryResult::TaskCockpit(TaskCockpitResult::RemoteAccess(
+                            setup.request(request.clone()),
+                        )))
+                    } else {
+                        QueryOutcome::Err(QueryError::Unavailable {
+                            reason: "remote_setup",
+                        })
+                    };
+                    return Ok(QueryReply {
+                        request_id: envelope.request_id,
+                        outcome,
+                    });
+                }
                 if let TaskCockpitQuery::ProviderSettings(request) = &query {
                     if !negotiated.capabilities.grants_task_cockpit() {
                         return Ok(QueryReply {
@@ -5359,6 +5695,24 @@ impl HostRequestExecutor {
                 let connection_id = output_id
                     .map(ConnectionOutputId::as_uuid)
                     .unwrap_or(Uuid::nil());
+                let provider_launch_hint = match envelope.task_id {
+                    Some(task_id)
+                        if self.provider_restore_in_flight.contains(&task_id)
+                            || self
+                                .provider_restore_queue
+                                .iter()
+                                .any(|queued| queued.task_id == task_id) =>
+                    {
+                        super::cockpit::ProviderLaunchReadinessHint::StartPending
+                    }
+                    Some(_) if self.provider_restore_pending => {
+                        // Startup restore enumeration not yet proved — never
+                        // publish NotPending / NotStarted from this host.
+                        super::cockpit::ProviderLaunchReadinessHint::Unknown
+                    }
+                    Some(_) => super::cockpit::ProviderLaunchReadinessHint::NotPending,
+                    None => super::cockpit::ProviderLaunchReadinessHint::Unknown,
+                };
                 let outcome =
                     super::cockpit::serve_task_cockpit(super::cockpit::TaskCockpitDispatch {
                         capabilities: negotiated.capabilities,
@@ -5372,10 +5726,7 @@ impl HostRequestExecutor {
                             .configured_service_runtime
                             .as_ref()
                             .map(|runtime| &runtime.manager),
-                        semantic_journal: self
-                            .configured_service_runtime
-                            .as_ref()
-                            .map(|runtime| runtime.semantic_journal.as_ref()),
+                        semantic_journal: self.semantic_journal_mutex(),
                         terminal_service: Some(&self.terminal_service),
                         ssh_endpoints: ssh_endpoints.as_deref(),
                         ssh_runtime: self.config_admission.as_ref().map(|admission| {
@@ -5389,6 +5740,7 @@ impl HostRequestExecutor {
                             .config_admission
                             .as_ref()
                             .map(|admission| &admission.store.snapshot().config),
+                        provider_launch_hint,
                     });
                 Ok(QueryReply {
                     request_id: envelope.request_id,
@@ -5715,6 +6067,282 @@ impl HostRequestExecutor {
         }
     }
 
+    fn semantic_journal_mutex(
+        &self,
+    ) -> Option<&std::sync::Mutex<crate::remote::presentation::SemanticJournalStore>> {
+        #[cfg(test)]
+        if let Some(journal) = self.test_semantic_journal.as_ref() {
+            return Some(journal.as_ref());
+        }
+        self.configured_service_runtime
+            .as_ref()
+            .map(|runtime| runtime.semantic_journal.as_ref())
+    }
+
+    fn fan_out_conversation_dirty(&mut self) {
+        let dirties = self.semantic_dirty.snapshot_watched();
+        for (session_key, high_water) in dirties {
+            let targets = self.conversation_registry.subscriptions_for(&session_key);
+            let mut delivered = true;
+            let mut attempted = false;
+            for (
+                subscription_id,
+                task_id,
+                generation,
+                generation_flag,
+                connection_id,
+                last_notified,
+            ) in targets
+            {
+                if high_water <= last_notified {
+                    continue;
+                }
+                attempted = true;
+                let Some(output) = self
+                    .outputs
+                    .get(&ConnectionOutputId::from_uuid(connection_id))
+                    .cloned()
+                else {
+                    delivered = false;
+                    continue;
+                };
+                match output.try_admit_conversation_dirty(
+                    subscription_id,
+                    task_id,
+                    generation,
+                    generation_flag,
+                    high_water,
+                ) {
+                    EphemeralAdmitResult::Queued | EphemeralAdmitResult::Coalesced => {
+                        self.conversation_registry
+                            .note_notified(subscription_id, high_water);
+                    }
+                    EphemeralAdmitResult::CapacityDrop
+                    | EphemeralAdmitResult::StaleGeneration
+                    | EphemeralAdmitResult::ShutdownRequested => {
+                        delivered = false;
+                    }
+                }
+            }
+            if !attempted || delivered {
+                self.semantic_dirty
+                    .clear_if_at_most(&session_key, high_water);
+            }
+        }
+    }
+
+    fn serve_open_conversation_subscription(
+        &mut self,
+        negotiated: NegotiatedParameters,
+        task_id: Option<TaskId>,
+        client_id: ClientId,
+        request_id: RequestId,
+        after_sequence: u64,
+        output_id: Option<ConnectionOutputId>,
+    ) -> QueryOutcome {
+        if !negotiated.capabilities.grants_task_cockpit()
+            || !negotiated
+                .capabilities
+                .contains(Capability::SemanticConversation)
+        {
+            return QueryOutcome::Err(QueryError::UnsupportedCapability);
+        }
+        let Some(task_id) = task_id else {
+            return QueryOutcome::Ok(QueryResult::TaskCockpit(TaskCockpitResult::Denied {
+                surface: crate::domain::cockpit::TaskCockpitSurface::Conversation,
+                reason: crate::domain::cockpit::TaskCockpitDeniedReason::MissingTask,
+            }));
+        };
+        let Some(output_id) = output_id else {
+            return QueryOutcome::Err(QueryError::InvalidRequest);
+        };
+        if !self.outputs.contains_key(&output_id) {
+            return QueryOutcome::Err(QueryError::Unavailable {
+                reason: "conversation_output",
+            });
+        }
+        if client_id != negotiated.client_id {
+            return QueryOutcome::Err(QueryError::Unauthorized);
+        }
+
+        let connection_id = output_id.as_uuid();
+        let session_key =
+            super::conversation_wake::ConversationSubscriptionRegistry::session_key_for_task(
+                task_id,
+            );
+        if !self.conversation_registry.prepare_insert(connection_id) {
+            return QueryOutcome::Err(QueryError::Unavailable {
+                reason: "conversation_subscription_capacity",
+            });
+        }
+
+        // Track before capture so producer marks during the open window are
+        // retained; journal metadata catch-up closes any remaining race.
+        self.semantic_dirty.track(session_key.clone());
+
+        let dispatch = super::cockpit::TaskCockpitDispatch {
+            capabilities: negotiated.capabilities,
+            envelope_task_id: Some(task_id),
+            client_id: negotiated.client_id,
+            connection_id,
+            request_id,
+            query: &TaskCockpitQuery::Conversation { after_sequence },
+            bus: &self.bus,
+            service_runtime: self
+                .configured_service_runtime
+                .as_ref()
+                .map(|runtime| &runtime.manager),
+            semantic_journal: self.semantic_journal_mutex(),
+            terminal_service: Some(&self.terminal_service),
+            ssh_endpoints: None,
+            ssh_runtime: None,
+            workspace_projects: Some(&self.workspace_projects),
+            coordinator: Some(&self.workspace_coordinator),
+            action_epoch: None,
+            runtime_generation: None,
+            config: None,
+            provider_launch_hint: super::cockpit::ProviderLaunchReadinessHint::Unknown,
+        };
+        let page = match super::cockpit::serve_conversation(&dispatch, task_id, after_sequence) {
+            QueryOutcome::Ok(QueryResult::TaskCockpit(TaskCockpitResult::Conversation(page))) => {
+                page
+            }
+            other => {
+                self.semantic_dirty.untrack(&session_key);
+                return other;
+            }
+        };
+
+        let scope = session_scope(negotiated, Some(task_id), Some(output_id));
+        let subscription_id = match self.conversation_registry.insert(
+            negotiated.client_id,
+            task_id,
+            session_key.clone(),
+            connection_id,
+            scope,
+            page.high_water,
+        ) {
+            Ok(id) => id,
+            Err(()) => {
+                self.semantic_dirty.untrack(&session_key);
+                return QueryOutcome::Err(QueryError::Unavailable {
+                    reason: "conversation_subscription_capacity",
+                });
+            }
+        };
+
+        if let Some(output) = self.outputs.get(&output_id) {
+            output.reserve_ephemeral_key(EphemeralKey::Conversation(subscription_id));
+        } else {
+            let _ = self.conversation_registry.remove(subscription_id);
+            self.semantic_dirty.untrack(&session_key);
+            return QueryOutcome::Err(QueryError::Unavailable {
+                reason: "conversation_output",
+            });
+        }
+
+        let journal_high_water = self.semantic_journal_mutex().and_then(|journal| {
+            let Ok(store) = journal.lock() else {
+                return None;
+            };
+            store
+                .metadata(&session_key)
+                .map(|meta| meta.latest_sequence)
+        });
+        let catch_up = super::conversation_wake::race_catch_up_high_water(
+            page.high_water,
+            self.semantic_dirty.peek(&session_key),
+            journal_high_water,
+        );
+        if catch_up > page.high_water {
+            let output = self.outputs.get(&output_id).cloned();
+            let admit = self
+                .conversation_registry
+                .get(subscription_id)
+                .map(|entry| {
+                    (
+                        entry.task_id,
+                        entry.current_generation(),
+                        Arc::clone(&entry.generation),
+                    )
+                });
+            if let (Some(output), Some((task_id, generation, flag))) = (output, admit) {
+                match output.try_admit_conversation_dirty(
+                    subscription_id,
+                    task_id,
+                    generation,
+                    flag,
+                    catch_up,
+                ) {
+                    EphemeralAdmitResult::Queued | EphemeralAdmitResult::Coalesced => {
+                        self.conversation_registry
+                            .note_notified(subscription_id, catch_up);
+                    }
+                    EphemeralAdmitResult::CapacityDrop
+                    | EphemeralAdmitResult::StaleGeneration
+                    | EphemeralAdmitResult::ShutdownRequested => {
+                        // Retain dirty / journal high-water for later fan-out.
+                    }
+                }
+            }
+        }
+        self.fan_out_conversation_dirty();
+
+        QueryOutcome::Ok(QueryResult::TaskCockpit(
+            TaskCockpitResult::ConversationSubscription {
+                subscription_id,
+                page,
+            },
+        ))
+    }
+
+    fn serve_release_conversation_subscription(
+        &mut self,
+        negotiated: NegotiatedParameters,
+        task_id: Option<TaskId>,
+        subscription_id: SubscriptionId,
+        output_id: Option<ConnectionOutputId>,
+    ) -> QueryOutcome {
+        if !negotiated.capabilities.grants_task_cockpit()
+            || !negotiated
+                .capabilities
+                .contains(Capability::SemanticConversation)
+        {
+            return QueryOutcome::Err(QueryError::UnsupportedCapability);
+        }
+        let Some(task_id) = task_id else {
+            return QueryOutcome::Err(QueryError::InvalidRequest);
+        };
+        let scope = session_scope(negotiated, Some(task_id), output_id);
+        match self
+            .conversation_registry
+            .release(subscription_id, negotiated.client_id, scope)
+        {
+            Ok(entry) => {
+                self.semantic_dirty.untrack(&entry.session_key);
+                if let Some(output) = self
+                    .outputs
+                    .get(&ConnectionOutputId::from_uuid(entry.connection_id))
+                {
+                    output.release_reserved_ephemeral_key(EphemeralKey::Conversation(
+                        subscription_id,
+                    ));
+                }
+                QueryOutcome::Ok(QueryResult::TaskCockpit(
+                    TaskCockpitResult::ConversationSubscriptionReleased { subscription_id },
+                ))
+            }
+            Err(super::conversation_wake::ReleaseError::NotFound) => {
+                QueryOutcome::Ok(QueryResult::TaskCockpit(
+                    TaskCockpitResult::ConversationSubscriptionReleased { subscription_id },
+                ))
+            }
+            Err(super::conversation_wake::ReleaseError::Unauthorized) => {
+                QueryOutcome::Err(QueryError::Unauthorized)
+            }
+        }
+    }
+
     fn serve_open_artifact_content(
         &mut self,
         negotiated: NegotiatedParameters,
@@ -5969,6 +6597,36 @@ fn map_store_error(error: StoreError) -> IpcError {
     match error {
         StoreError::Busy => IpcError::Busy,
         _ => IpcError::Unavailable,
+    }
+}
+
+/// CommandEnvelope has no transport request ID. Its logical receipt request
+/// therefore uses the already validated command UUID, not a fresh UUID on each
+/// retry. Workspace-authorized commands retain their explicit grant request ID.
+/// Physical connection scope remains independent and is never bypassed here.
+fn command_receipt_request_id(envelope: &CommandEnvelope) -> RequestId {
+    RequestId::from_bytes(*envelope.command_id.as_bytes()).expect("validated command UUIDv7")
+}
+
+fn command_receipt_status_outcome(
+    bus: &CommandBus,
+    authenticated_client: ClientId,
+    query_client: ClientId,
+    task_id: Option<TaskId>,
+    command: &CommandEnvelope,
+) -> QueryOutcome {
+    if query_client != authenticated_client || command.client_id != authenticated_client {
+        return QueryOutcome::Err(QueryError::Unauthorized);
+    }
+    if task_id != command.task_id {
+        return QueryOutcome::Err(QueryError::Conflict);
+    }
+    match bus.command_receipt_status(authenticated_client, command) {
+        Ok(receipt) => QueryOutcome::Ok(QueryResult::CommandReceiptStatus { receipt }),
+        Err(StoreError::CommandIdConflict) => QueryOutcome::Err(QueryError::Conflict),
+        Err(_) => QueryOutcome::Err(QueryError::Unavailable {
+            reason: "receipt_recovery",
+        }),
     }
 }
 
@@ -6509,13 +7167,10 @@ fn dispatch_authenticated_request_inner(
                 connection_id,
                 None,
             )?;
+            let receipt_request_id =
+                request_id.unwrap_or_else(|| command_receipt_request_id(&envelope));
             let receipt = bus
-                .execute_host_authorized(
-                    envelope,
-                    authorization,
-                    request_id.unwrap_or_else(RequestId::new),
-                    connection_id,
-                )
+                .execute_host_authorized(envelope, authorization, receipt_request_id, connection_id)
                 .map_err(map_store_error)?;
             Ok(ServerMessage::CommandReceipt(receipt))
         }
@@ -6524,6 +7179,18 @@ fn dispatch_authenticated_request_inner(
                 return Err(IpcError::Unauthorized);
             }
             match &envelope.query {
+                Query::CommandReceiptStatus { command } => {
+                    return Ok(ServerMessage::QueryReply(QueryReply {
+                        request_id: envelope.request_id,
+                        outcome: command_receipt_status_outcome(
+                            bus,
+                            authenticated_client_id,
+                            envelope.client_id,
+                            envelope.task_id,
+                            command,
+                        ),
+                    }));
+                }
                 Query::SnapshotPage { .. }
                 | Query::ReleaseSnapshot { .. }
                 | Query::OpenEventReplay { .. }
@@ -6587,6 +7254,7 @@ fn dispatch_authenticated_request_inner(
                             action_epoch: None,
                             runtime_generation: None,
                             config: None,
+                            provider_launch_hint: super::cockpit::ProviderLaunchReadinessHint::Unknown,
                         });
                     return Ok(ServerMessage::QueryReply(QueryReply {
                         request_id: envelope.request_id,
@@ -6844,7 +7512,20 @@ impl PrioritizedOutbound {
 }
 
 /// Cloneable materializer invoked only when the writer drains an ephemeral token.
+pub(crate) type EphemeralMaterializer =
+    Arc<dyn Fn() -> Option<ServerMessage> + Send + Sync + 'static>;
+
+/// Stream-frame materializer preserved for existing callers; wrapped into
+/// [`EphemeralMaterializer`] at admission.
 pub(crate) type StreamMaterializer = Arc<dyn Fn() -> Option<StreamFrame> + Send + Sync + 'static>;
+
+/// Typed ephemeral coalescer key. Stream frames and conversation dirties share
+/// one bounded lane with identical generation/dirty-revision semantics.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) enum EphemeralKey {
+    ResourceStream(StreamKey),
+    Conversation(SubscriptionId),
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum EphemeralAdmitResult {
@@ -6867,19 +7548,24 @@ enum EphemeralPhase {
 struct EphemeralSlot {
     generation: u64,
     dirty_revision: u64,
-    materializer: StreamMaterializer,
+    materializer: EphemeralMaterializer,
     phase: EphemeralPhase,
 }
 
 struct EphemeralLaneInner {
     capacity: usize,
-    slots: HashMap<StreamKey, EphemeralSlot>,
-    pending: VecDeque<StreamKey>,
+    /// Conversation subscription keys with a reserved coalescer slot so stream
+    /// traffic cannot starve the final dirty notice.
+    reserved: HashSet<EphemeralKey>,
+    slots: HashMap<EphemeralKey, EphemeralSlot>,
+    pending: VecDeque<EphemeralKey>,
 }
 
 struct EphemeralControl {
     shutdown: bool,
     lane: EphemeralLaneInner,
+    /// Executor-shared wake when a slot frees (capacity return without new token).
+    capacity_notify: Option<Arc<Notify>>,
 }
 
 impl EphemeralLaneInner {
@@ -6890,15 +7576,46 @@ impl EphemeralLaneInner {
     fn clear(&mut self) {
         self.slots.clear();
         self.pending.clear();
+        self.reserved.clear();
+    }
+
+    fn reserve_key(&mut self, key: EphemeralKey) {
+        self.reserved.insert(key);
+    }
+
+    fn release_reserved_key(&mut self, key: EphemeralKey) -> bool {
+        self.reserved.remove(&key);
+        let removed = self.slots.remove(&key).is_some();
+        self.pending.retain(|pending| *pending != key);
+        removed
+    }
+
+    fn invalidate_key(&mut self, key: EphemeralKey) -> bool {
+        let removed = self.slots.remove(&key).is_some();
+        self.pending.retain(|pending| *pending != key);
+        removed
+    }
+
+    fn can_admit_new(&self, key: &EphemeralKey) -> bool {
+        if self.reserved.contains(key) {
+            // Reserved conversation slot: never blocked by stream fill.
+            return true;
+        }
+        let non_reserved = self
+            .slots
+            .keys()
+            .filter(|occupied| !self.reserved.contains(occupied))
+            .count();
+        non_reserved < self.capacity
     }
 
     fn admit(
         &mut self,
-        stream: StreamKey,
+        key: EphemeralKey,
         generation: u64,
-        materializer: StreamMaterializer,
+        materializer: EphemeralMaterializer,
     ) -> (EphemeralAdmitResult, bool) {
-        if let Some(slot) = self.slots.get_mut(&stream) {
+        if let Some(slot) = self.slots.get_mut(&key) {
             if generation < slot.generation {
                 return (EphemeralAdmitResult::StaleGeneration, false);
             }
@@ -6906,17 +7623,17 @@ impl EphemeralLaneInner {
             slot.dirty_revision = slot.dirty_revision.saturating_add(1);
             slot.materializer = materializer;
             let wake = matches!(slot.phase, EphemeralPhase::Queued)
-                && !self.pending.iter().any(|key| *key == stream);
+                && !self.pending.iter().any(|pending| *pending == key);
             if wake {
-                self.pending.push_back(stream);
+                self.pending.push_back(key);
             }
             return (EphemeralAdmitResult::Coalesced, wake);
         }
-        if self.slots.len() >= self.capacity {
+        if !self.can_admit_new(&key) {
             return (EphemeralAdmitResult::CapacityDrop, false);
         }
         self.slots.insert(
-            stream,
+            key,
             EphemeralSlot {
                 generation,
                 dirty_revision: 1,
@@ -6924,13 +7641,13 @@ impl EphemeralLaneInner {
                 phase: EphemeralPhase::Queued,
             },
         );
-        self.pending.push_back(stream);
+        self.pending.push_back(key);
         (EphemeralAdmitResult::Queued, true)
     }
 
-    fn take_pending(&mut self) -> Option<(StreamKey, u64, u64, StreamMaterializer)> {
-        while let Some(stream) = self.pending.pop_front() {
-            let Some(slot) = self.slots.get_mut(&stream) else {
+    fn take_pending(&mut self) -> Option<(EphemeralKey, u64, u64, EphemeralMaterializer)> {
+        while let Some(key) = self.pending.pop_front() {
+            let Some(slot) = self.slots.get_mut(&key) else {
                 continue;
             };
             if !matches!(slot.phase, EphemeralPhase::Queued) {
@@ -6943,7 +7660,7 @@ impl EphemeralLaneInner {
                 taken_dirty_revision,
             };
             return Some((
-                stream,
+                key,
                 taken_generation,
                 taken_dirty_revision,
                 Arc::clone(&slot.materializer),
@@ -6952,34 +7669,35 @@ impl EphemeralLaneInner {
         None
     }
 
+    /// Returns `(requeue, freed_capacity)`.
     fn finish(
         &mut self,
-        stream: StreamKey,
+        key: EphemeralKey,
         taken_generation: u64,
         taken_dirty_revision: u64,
-    ) -> bool {
-        let Some(slot) = self.slots.get_mut(&stream) else {
-            return false;
+    ) -> (bool, bool) {
+        let Some(slot) = self.slots.get_mut(&key) else {
+            return (false, false);
         };
         let EphemeralPhase::InFlight {
             taken_generation: phase_generation,
             taken_dirty_revision: phase_dirty,
         } = slot.phase
         else {
-            return false;
+            return (false, false);
         };
         if phase_generation != taken_generation || phase_dirty != taken_dirty_revision {
-            return false;
+            return (false, false);
         }
         if slot.dirty_revision > taken_dirty_revision {
             slot.phase = EphemeralPhase::Queued;
-            if !self.pending.iter().any(|key| *key == stream) {
-                self.pending.push_back(stream);
+            if !self.pending.iter().any(|pending| *pending == key) {
+                self.pending.push_back(key);
             }
-            true
+            (true, false)
         } else {
-            self.slots.remove(&stream);
-            false
+            self.slots.remove(&key);
+            (false, true)
         }
     }
 }
@@ -6992,10 +7710,44 @@ fn wake_ephemeral(tx: &mpsc::Sender<()>) -> Result<(), ()> {
     }
 }
 
+fn notify_ephemeral_capacity(control: &EphemeralControl) {
+    if let Some(notify) = control.capacity_notify.as_ref() {
+        // Store a permit so a capacity return between select polls is not lost.
+        notify.notify_one();
+    }
+}
+
+fn materialize_ephemeral_message(
+    key: EphemeralKey,
+    taken_generation: u64,
+    materializer: &EphemeralMaterializer,
+) -> Option<ServerMessage> {
+    match (key, materializer()) {
+        (EphemeralKey::ResourceStream(stream), Some(ServerMessage::Stream(frame)))
+            if frame.stream == stream && frame.generation == taken_generation =>
+        {
+            Some(ServerMessage::Stream(frame))
+        }
+        (
+            EphemeralKey::Conversation(subscription_id),
+            Some(ServerMessage::ConversationDirty {
+                subscription_id: dirty_id,
+                task_id,
+                high_water,
+            }),
+        ) if dirty_id == subscription_id => Some(ServerMessage::ConversationDirty {
+            subscription_id,
+            task_id,
+            high_water,
+        }),
+        _ => None,
+    }
+}
+
 /// Ephemeral outbound token: materializes at drain time, frees/requeues on completion.
 pub(crate) struct EphemeralOutbound {
     message: Option<ServerMessage>,
-    stream: StreamKey,
+    key: EphemeralKey,
     taken_generation: u64,
     taken_dirty_revision: u64,
     control: Arc<Mutex<EphemeralControl>>,
@@ -7021,19 +7773,21 @@ impl EphemeralOutbound {
     }
 
     fn release_or_requeue(&self) {
-        let requeue = {
+        let (requeue, freed) = {
             let mut control = self.control.lock().expect("ephemeral control");
             if control.shutdown {
                 control.lane.clear();
-                false
+                (false, false)
             } else {
-                control.lane.finish(
-                    self.stream,
-                    self.taken_generation,
-                    self.taken_dirty_revision,
-                )
+                control
+                    .lane
+                    .finish(self.key, self.taken_generation, self.taken_dirty_revision)
             }
         };
+        if freed {
+            let control = self.control.lock().expect("ephemeral control");
+            notify_ephemeral_capacity(&control);
+        }
         if requeue && wake_ephemeral(&self.wake_tx).is_err() {
             let mut control = self.control.lock().expect("ephemeral control");
             control.shutdown = true;
@@ -7108,9 +7862,11 @@ impl ConnectionOutputHandle {
             shutdown: false,
             lane: EphemeralLaneInner {
                 capacity: ephemeral_capacity,
+                reserved: HashSet::new(),
                 slots: HashMap::new(),
                 pending: VecDeque::new(),
             },
+            capacity_notify: None,
         }));
         let handle = Self {
             id: ConnectionOutputId::from_uuid(connection_id),
@@ -7332,11 +8088,24 @@ impl ConnectionOutputHandle {
         generation: u64,
         materializer: StreamMaterializer,
     ) -> EphemeralAdmitResult {
+        self.try_admit_ephemeral(
+            EphemeralKey::ResourceStream(stream),
+            generation,
+            Arc::new(move || materializer().map(ServerMessage::Stream)),
+        )
+    }
+
+    pub(crate) fn try_admit_ephemeral(
+        &self,
+        key: EphemeralKey,
+        generation: u64,
+        materializer: EphemeralMaterializer,
+    ) -> EphemeralAdmitResult {
         let mut control = self.ephemeral.lock().expect("ephemeral control");
         if control.shutdown {
             return EphemeralAdmitResult::ShutdownRequested;
         }
-        let (result, wake) = control.lane.admit(stream, generation, materializer);
+        let (result, wake) = control.lane.admit(key, generation, materializer);
         if wake {
             if wake_ephemeral(&self.ephemeral_wake_tx).is_err() {
                 control.shutdown = true;
@@ -7348,6 +8117,55 @@ impl ConnectionOutputHandle {
         }
         result
     }
+
+    pub(crate) fn invalidate_ephemeral_key(&self, key: EphemeralKey) {
+        let mut control = self.ephemeral.lock().expect("ephemeral control");
+        if control.lane.invalidate_key(key) {
+            notify_ephemeral_capacity(&control);
+        }
+    }
+
+    pub(crate) fn attach_ephemeral_capacity_notify(&self, notify: Arc<Notify>) {
+        let mut control = self.ephemeral.lock().expect("ephemeral control");
+        control.capacity_notify = Some(notify);
+    }
+
+    pub(crate) fn reserve_ephemeral_key(&self, key: EphemeralKey) {
+        let mut control = self.ephemeral.lock().expect("ephemeral control");
+        control.lane.reserve_key(key);
+    }
+
+    pub(crate) fn release_reserved_ephemeral_key(&self, key: EphemeralKey) {
+        let mut control = self.ephemeral.lock().expect("ephemeral control");
+        if control.lane.release_reserved_key(key) {
+            notify_ephemeral_capacity(&control);
+        }
+    }
+
+    pub(crate) fn try_admit_conversation_dirty(
+        &self,
+        subscription_id: SubscriptionId,
+        task_id: TaskId,
+        generation: u64,
+        generation_flag: Arc<AtomicU64>,
+        high_water: u64,
+    ) -> EphemeralAdmitResult {
+        let materializer: EphemeralMaterializer = Arc::new(move || {
+            if generation_flag.load(Ordering::SeqCst) != generation {
+                return None;
+            }
+            Some(ServerMessage::ConversationDirty {
+                subscription_id,
+                task_id,
+                high_water,
+            })
+        });
+        self.try_admit_ephemeral(
+            EphemeralKey::Conversation(subscription_id),
+            generation,
+            materializer,
+        )
+    }
 }
 
 impl ConnectionOutputPorts {
@@ -7357,23 +8175,17 @@ impl ConnectionOutputPorts {
     }
 
     fn take_ephemeral_outbound(&mut self) -> Option<EphemeralOutbound> {
-        let (stream, taken_generation, taken_dirty_revision, materializer) = {
+        let (key, taken_generation, taken_dirty_revision, materializer) = {
             let mut control = self.ephemeral.lock().expect("ephemeral control");
             if control.shutdown {
                 return None;
             }
             control.lane.take_pending()?
         };
-        let frame = materializer();
-        let message = match frame {
-            Some(frame) if frame.stream == stream && frame.generation == taken_generation => {
-                Some(ServerMessage::Stream(frame))
-            }
-            _ => None,
-        };
+        let message = materialize_ephemeral_message(key, taken_generation, &materializer);
         Some(EphemeralOutbound {
             message,
-            stream,
+            key,
             taken_generation,
             taken_dirty_revision,
             control: Arc::clone(&self.ephemeral),
@@ -7477,10 +8289,11 @@ mod output_tests {
 
     use super::{
         provider_restore_success_attention, ConnectionOutputHandle, ConnectionOutputId,
-        DuplexExecuteCompletion, DurableAdmitResult, EphemeralAdmitResult, EventReplayRegistry,
-        HostRequestExecutor, HostRequestHandle, LiveStreamState, LiveTail, PhysicalWriteAckStatus,
-        PrioritizedOutbound, StreamMaterializer,
+        DuplexExecuteCompletion, DurableAdmitResult, EphemeralAdmitResult, EphemeralKey,
+        EventReplayRegistry, HostRequestExecutor, HostRequestHandle, LiveStreamState, LiveTail,
+        PhysicalWriteAckStatus, PrioritizedOutbound, StreamMaterializer,
     };
+    use crate::domain::cockpit::{TaskCockpitQuery, TaskCockpitResult};
     use crate::domain::command::{Command, CommandEnvelope, CreateTaskIntent};
     use crate::domain::event::{DomainEvent, Event};
     use crate::domain::id::{
@@ -7495,10 +8308,12 @@ mod output_tests {
     use crate::domain::ClientId;
     use crate::kernel::SessionScope;
     use crate::protocol::{
-        ClientRequest, NegotiatedParameters, ServerMessage, StreamFrame, StreamKey,
-        StreamPayloadKind,
+        Capability, CapabilitySet, ClientRequest, NegotiatedParameters, ServerMessage, StreamFrame,
+        StreamKey, StreamPayloadKind,
     };
-    use std::sync::Arc;
+    use std::sync::atomic::AtomicU64;
+    use std::sync::{Arc, Mutex};
+    use tokio::sync::Notify;
     use uuid::Uuid;
 
     #[test]
@@ -8767,6 +9582,264 @@ mod output_tests {
             "cancel before ack observation must still request output shutdown"
         );
 
+        drop(requests);
+        executor.abort();
+        let _ = executor.await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn open_connect_duplex_allocates_unique_host_uuidv7_outputs() {
+        use super::HostRequestExecutor;
+        use crate::kernel::CommandBus;
+        use uuid::Version;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let bus = CommandBus::open(&dir.path().join("duplex-uuid.db")).expect("bus");
+        let (requests, executor) = HostRequestExecutor::start_without_automatic_maintenance(bus);
+        let client_a = ClientId::new();
+        let client_b = ClientId::new();
+
+        let duplex_a1 = requests
+            .open_connect_duplex(client_a)
+            .await
+            .expect("duplex a1");
+        let duplex_a2 = requests
+            .open_connect_duplex(client_a)
+            .await
+            .expect("duplex a2");
+        let duplex_b = requests
+            .open_connect_duplex(client_b)
+            .await
+            .expect("duplex b");
+
+        let id_a1 = duplex_a1.registration.id().as_uuid();
+        let id_a2 = duplex_a2.registration.id().as_uuid();
+        let id_b = duplex_b.registration.id().as_uuid();
+        assert_ne!(id_a1, id_a2);
+        assert_ne!(id_a1, id_b);
+        assert_ne!(id_a2, id_b);
+        for id in [id_a1, id_a2, id_b] {
+            assert_eq!(
+                id.get_version(),
+                Some(Version::SortRand),
+                "host must mint UUIDv7 outputs, got {id}"
+            );
+        }
+
+        drop(duplex_a1);
+        drop(duplex_a2);
+        drop(duplex_b);
+        drop(requests);
+        executor.abort();
+        let _ = executor.await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn open_connect_duplex_bound_requests_open_event_replay_live_bound() {
+        use super::{HostRequestExecutor, OutputInspection};
+        use crate::domain::id::RequestId;
+        use crate::domain::query::{Query, QueryEnvelope};
+        use crate::kernel::CommandBus;
+        use crate::protocol::{ClientRequest, ServerMessage};
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let bus = CommandBus::open(&dir.path().join("duplex-replay.db")).expect("bus");
+        let (requests, executor) = HostRequestExecutor::start_without_automatic_maintenance(bus);
+        let client = ClientId::new();
+        let negotiated = event_replay_negotiated(client);
+
+        let duplex = requests
+            .open_connect_duplex(client)
+            .await
+            .expect("open duplex");
+        let output_id = duplex.registration.id();
+        let opened = duplex
+            .requests
+            .execute(
+                negotiated,
+                ClientRequest::Query(QueryEnvelope {
+                    request_id: RequestId::new(),
+                    client_id: client,
+                    task_id: None,
+                    query: Query::OpenEventReplay { after_sequence: 0 },
+                }),
+            )
+            .await
+            .expect("open replay");
+        assert!(matches!(opened, ServerMessage::QueryReply(_)));
+        assert_eq!(
+            requests.inspect_output(output_id).await.expect("inspect"),
+            OutputInspection {
+                registered: true,
+                live_bound: true,
+            }
+        );
+
+        drop(duplex);
+        drop(requests);
+        executor.abort();
+        let _ = executor.await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn open_connect_duplex_drop_unregisters_only_its_output() {
+        use super::{HostRequestExecutor, OutputInspection};
+        use crate::kernel::CommandBus;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let bus = CommandBus::open(&dir.path().join("duplex-drop.db")).expect("bus");
+        let (requests, executor) = HostRequestExecutor::start_without_automatic_maintenance(bus);
+        let client_a = ClientId::new();
+        let client_b = ClientId::new();
+
+        let duplex_a = requests
+            .open_connect_duplex(client_a)
+            .await
+            .expect("duplex a");
+        let duplex_b = requests
+            .open_connect_duplex(client_b)
+            .await
+            .expect("duplex b");
+        let id_a = duplex_a.registration.id();
+        let id_b = duplex_b.registration.id();
+
+        drop(duplex_a);
+        assert_eq!(
+            requests.inspect_output(id_a).await.expect("inspect a"),
+            OutputInspection {
+                registered: false,
+                live_bound: false,
+            }
+        );
+        assert_eq!(
+            requests.inspect_output(id_b).await.expect("inspect b"),
+            OutputInspection {
+                registered: true,
+                live_bound: false,
+            },
+            "dropping one session must not unregister another client's output"
+        );
+
+        drop(duplex_b);
+        assert_eq!(
+            requests
+                .inspect_output(id_b)
+                .await
+                .expect("inspect b after"),
+            OutputInspection {
+                registered: false,
+                live_bound: false,
+            }
+        );
+
+        drop(requests);
+        executor.abort();
+        let _ = executor.await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn open_connect_duplex_cancel_while_awaiting_ack_still_requests_shutdown() {
+        use super::HostRequestExecutor;
+        use crate::kernel::CommandBus;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let bus = CommandBus::open(&dir.path().join("duplex-cancel.db")).expect("bus");
+        let (requests, executor) = HostRequestExecutor::start(bus);
+        let client = ClientId::new();
+
+        {
+            let open = requests.open_connect_duplex(client);
+            tokio::pin!(open);
+            // Poll open first (biased) so register_output_with_reconnect arms the
+            // RAII guard, then cancel by dropping the future while send/ack may
+            // still be pending — same contract as register_output_cancel_while_awaiting_ack.
+            tokio::select! {
+                biased;
+                result = &mut open => {
+                    let duplex = result.expect("open duplex");
+                    let shutdown_rx = duplex.output.subscribe_shutdown();
+                    let id = duplex.registration.id();
+                    drop(duplex);
+                    assert!(
+                        *shutdown_rx.borrow(),
+                        "completed session drop must request output shutdown"
+                    );
+                    assert!(
+                        !requests
+                            .inspect_output(id)
+                            .await
+                            .expect("inspect after drop")
+                            .registered,
+                        "drop must unregister the exact output"
+                    );
+                }
+                _ = tokio::task::yield_now() => {
+                    drop(open);
+                }
+            }
+        }
+
+        // Cancel or drop must leave no wedged retained owner: a fresh session opens.
+        let duplex = requests
+            .open_connect_duplex(client)
+            .await
+            .expect("reopen after cancel");
+        let id = duplex.registration.id();
+        assert!(
+            requests
+                .inspect_output(id)
+                .await
+                .expect("inspect reopen")
+                .registered
+        );
+        let shutdown_rx = duplex.output.subscribe_shutdown();
+        drop(duplex);
+        assert!(*shutdown_rx.borrow());
+        assert!(
+            !requests
+                .inspect_output(id)
+                .await
+                .expect("cleared")
+                .registered
+        );
+
+        drop(requests);
+        executor.abort();
+        let _ = executor.await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn open_connect_duplex_dequeue_never_auto_acks_physical_write() {
+        use super::{HostRequestExecutor, PhysicalWriteAckStatus};
+        use crate::kernel::CommandBus;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let bus = CommandBus::open(&dir.path().join("duplex-ack.db")).expect("bus");
+        let (requests, executor) = HostRequestExecutor::start_without_automatic_maintenance(bus);
+        let client = ClientId::new();
+        let mut duplex = requests
+            .open_connect_duplex(client)
+            .await
+            .expect("open duplex");
+
+        let mut ack = duplex
+            .output
+            .try_enqueue_critical_tracked(sample_reply())
+            .expect("tracked critical admit");
+        assert_eq!(ack.status(), PhysicalWriteAckStatus::Pending);
+        let outbound = duplex
+            .ports
+            .try_recv_prioritized()
+            .expect("dequeue tracked critical");
+        assert_eq!(
+            ack.status(),
+            PhysicalWriteAckStatus::Pending,
+            "dequeuing must not call after_successful_write automatically"
+        );
+        outbound.after_successful_write();
+        assert!(ack.wait().await.is_ok());
+
+        drop(duplex);
         drop(requests);
         executor.abort();
         let _ = executor.await;
@@ -10258,6 +11331,677 @@ mod output_tests {
         let _ = executor.await;
     }
 
+    fn conversation_wake_negotiated(client: ClientId) -> NegotiatedParameters {
+        use crate::protocol::{Capability, CapabilitySet, FrameLimits, ProtocolVersion};
+        NegotiatedParameters {
+            version: ProtocolVersion::current(),
+            client_id: client,
+            capabilities: CapabilitySet::from_capabilities([
+                Capability::TaskCockpit,
+                Capability::SemanticConversation,
+            ]),
+            limits: FrameLimits::v1_default(),
+        }
+    }
+
+    fn create_task_for_conversation_wake(
+        bus: &mut crate::kernel::CommandBus,
+        client: ClientId,
+    ) -> TaskId {
+        use crate::domain::command::{Command, CommandEnvelope, CommandReceipt, CreateTaskIntent};
+        use crate::domain::id::{EnvironmentId, ProjectId};
+        use crate::domain::task::{
+            ReviewReadiness, TaskActivity, TaskAssignment, TaskAttention, TaskConnectivity,
+            WorkspaceRef,
+        };
+
+        let task_id = TaskId::new();
+        // These tests exercise subscription/dirty delivery, not workspace
+        // admission. Seed their durable task through the test-only kernel
+        // authority before the authenticated host executor starts; raw V1
+        // CreateTask must remain rejected at that production boundary.
+        let receipt = bus
+            .execute_for_test(CommandEnvelope {
+                command_id: crate::domain::id::CommandId::new(),
+                client_id: client,
+                task_id: None,
+                issued_at_ms: 1_725_000_000_000,
+                expected_task_revision: None,
+                command: Command::CreateTask(CreateTaskIntent {
+                    id: task_id,
+                    environment_id: EnvironmentId::new(),
+                    title: "conversation wake".into(),
+                    description: None,
+                    project_id: ProjectId::new(),
+                    workspace: WorkspaceRef::Main,
+                    assignment: TaskAssignment::LocalOwner,
+                    created_at_ms: 1_725_000_000_000,
+                    connectivity: TaskConnectivity::Connected,
+                    attention: TaskAttention::None,
+                    activity: TaskActivity::Idle,
+                    review_readiness: ReviewReadiness::NotReady,
+                }),
+            })
+            .expect("seed task");
+        assert!(matches!(receipt, CommandReceipt::Accepted { .. }));
+        task_id
+    }
+
+    fn sample_semantic_draft(
+        task_id: TaskId,
+        index: u64,
+    ) -> crate::remote::presentation::SemanticEventDraft {
+        use crate::remote::presentation::{
+            SemanticEventDraft, SemanticEventKind, SemanticRetention, SemanticSource,
+            StableSessionKey,
+        };
+        SemanticEventDraft {
+            stable_session_key: StableSessionKey::from_tab(task_id.to_string()),
+            occurred_at_epoch_ms: 1_725_000_000_000 + index,
+            source: SemanticSource::Codex,
+            kind: SemanticEventKind::AssistantMessage {
+                message_id: format!("msg-{index}"),
+                text: format!("token-{index}"),
+                streaming: false,
+            },
+            retention: SemanticRetention::Canonical,
+            deduplication_key: Some(format!("dedupe-{index}")),
+        }
+    }
+
+    async fn open_conversation_subscription(
+        duplex: &super::HostConnectDuplex,
+        negotiated: NegotiatedParameters,
+        client: ClientId,
+        task_id: TaskId,
+        after_sequence: u64,
+    ) -> (SubscriptionId, crate::domain::snapshot::SemanticJournalPage) {
+        use crate::domain::query::{Query, QueryEnvelope, QueryOutcome, QueryResult};
+
+        let reply = duplex
+            .requests
+            .execute(
+                negotiated,
+                ClientRequest::Query(QueryEnvelope {
+                    request_id: RequestId::new(),
+                    client_id: client,
+                    task_id: Some(task_id),
+                    query: Query::TaskCockpit(TaskCockpitQuery::OpenConversationSubscription {
+                        after_sequence,
+                    }),
+                }),
+            )
+            .await
+            .expect("open conversation subscription");
+        match reply {
+            ServerMessage::QueryReply(crate::domain::query::QueryReply {
+                outcome:
+                    QueryOutcome::Ok(QueryResult::TaskCockpit(
+                        TaskCockpitResult::ConversationSubscription {
+                            subscription_id,
+                            page,
+                        },
+                    )),
+                ..
+            }) => (subscription_id, page),
+            other => panic!("expected ConversationSubscription, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn ephemeral_conversation_dirty_materializer_coalesces_newest_high_water() {
+        let subscription_id = SubscriptionId::new();
+        let task_id = TaskId::new();
+        let (handle, mut ports) = ConnectionOutputHandle::new(1, 1, 1);
+        handle.reserve_ephemeral_key(EphemeralKey::Conversation(subscription_id));
+        let generation = Arc::new(AtomicU64::new(1));
+        for high_water in [1u64, 50, 200] {
+            let flag = Arc::clone(&generation);
+            let result =
+                handle.try_admit_conversation_dirty(subscription_id, task_id, 1, flag, high_water);
+            if high_water == 1 {
+                assert!(matches!(result, EphemeralAdmitResult::Queued));
+            } else {
+                assert!(matches!(result, EphemeralAdmitResult::Coalesced));
+            }
+        }
+        assert_eq!(handle.ephemeral_slots_occupied(), 1);
+        let outbound = ports.try_recv_prioritized().expect("one dirty token");
+        let PrioritizedOutbound::Ephemeral(ephemeral) = outbound else {
+            panic!("expected ephemeral");
+        };
+        assert!(matches!(
+            ephemeral.message(),
+            ServerMessage::ConversationDirty {
+                subscription_id: id,
+                task_id: dirty_task,
+                high_water: 200,
+            } if *id == subscription_id && *dirty_task == task_id
+        ));
+        PrioritizedOutbound::Ephemeral(ephemeral).after_successful_write();
+        assert_eq!(handle.ephemeral_slots_occupied(), 0);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn ephemeral_capacity_return_notifies_so_conversation_dirty_recovers() {
+        use std::pin::pin;
+
+        let subscription_id = SubscriptionId::new();
+        let task_id = TaskId::new();
+        let notify = Arc::new(Notify::new());
+        let (handle, mut ports) = ConnectionOutputHandle::new(1, 1, 1);
+        handle.attach_ephemeral_capacity_notify(Arc::clone(&notify));
+        let stream = sample_stream_key(0x55);
+        assert!(matches!(
+            handle.try_admit_ephemeral_stream(
+                stream,
+                1,
+                Arc::new(move || Some(sample_stream_frame(stream, 1, 1, 9))),
+            ),
+            EphemeralAdmitResult::Queued
+        ));
+        // Unreserved conversation competes for the single stream budget → drop.
+        let generation = Arc::new(AtomicU64::new(1));
+        assert!(matches!(
+            handle.try_admit_conversation_dirty(
+                subscription_id,
+                task_id,
+                1,
+                Arc::clone(&generation),
+                42,
+            ),
+            EphemeralAdmitResult::CapacityDrop
+        ));
+
+        let stream_out = ports.try_recv_prioritized().expect("stream token");
+        let mut notified = pin!(notify.notified());
+        notified.as_mut().enable();
+        stream_out.after_successful_write();
+        notified.await;
+
+        handle.reserve_ephemeral_key(EphemeralKey::Conversation(subscription_id));
+        assert!(matches!(
+            handle.try_admit_conversation_dirty(
+                subscription_id,
+                task_id,
+                1,
+                Arc::clone(&generation),
+                42,
+            ),
+            EphemeralAdmitResult::Queued
+        ));
+        let dirty = ports
+            .try_recv_prioritized()
+            .expect("dirty after capacity return");
+        let PrioritizedOutbound::Ephemeral(ephemeral) = dirty else {
+            panic!("expected ephemeral dirty");
+        };
+        assert!(matches!(
+            ephemeral.message(),
+            ServerMessage::ConversationDirty {
+                subscription_id: id,
+                task_id: dirty_task,
+                high_water: 42,
+            } if *id == subscription_id && *dirty_task == task_id
+        ));
+        PrioritizedOutbound::Ephemeral(ephemeral).after_successful_write();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn remote_setup_queries_require_global_scope_and_bound_local_controller() {
+        use crate::domain::query::{Query, QueryEnvelope, QueryError};
+        let directory = tempfile::tempdir().expect("tempdir");
+        let bus = crate::kernel::CommandBus::open(&directory.path().join("remote-setup-query.db"))
+            .expect("bus");
+        let (requests, executor) = HostRequestExecutor::start_without_automatic_maintenance(bus);
+        let client = ClientId::new();
+        let negotiated = conversation_wake_negotiated(client);
+        for (task_id, expected) in [
+            (
+                None,
+                QueryError::Unavailable {
+                    reason: "remote_setup",
+                },
+            ),
+            (Some(TaskId::new()), QueryError::InvalidRequest),
+        ] {
+            let reply = requests
+                .execute(
+                    negotiated,
+                    ClientRequest::Query(QueryEnvelope {
+                        request_id: RequestId::new(),
+                        client_id: client,
+                        task_id,
+                        query: Query::TaskCockpit(TaskCockpitQuery::RemoteAccess(
+                            super::super::remote_setup::RemoteSetupRequest::Snapshot,
+                        )),
+                    }),
+                )
+                .await
+                .expect("bounded host reply");
+            assert!(matches!(reply, ServerMessage::QueryReply(QueryReply {
+                outcome: QueryOutcome::Err(error), ..
+            }) if error == expected));
+        }
+        drop(requests);
+        executor.abort();
+        let _ = executor.await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn conversation_subscription_executor_race_record_before_and_after_register() {
+        use crate::domain::query::{Query, QueryEnvelope, QueryOutcome, QueryResult};
+        use crate::kernel::CommandBus;
+        use crate::remote::presentation::SemanticJournalStore;
+        use std::sync::Arc;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut bus = CommandBus::open(&dir.path().join("conv-race.db")).expect("bus");
+        let client = ClientId::new();
+        let task_id = create_task_for_conversation_wake(&mut bus, client);
+        let (requests, executor) = HostRequestExecutor::start_without_automatic_maintenance(bus);
+        let negotiated = conversation_wake_negotiated(client);
+        let journal = Arc::new(Mutex::new(SemanticJournalStore::default()));
+        requests
+            .install_test_semantic_journal(Arc::clone(&journal))
+            .await
+            .expect("install journal");
+
+        let mut duplex = requests
+            .open_connect_duplex(client)
+            .await
+            .expect("open duplex");
+
+        // Order A: producer marks before open/register — catch-up must surface.
+        let before = requests
+            .record_test_semantic(sample_semantic_draft(task_id, 1))
+            .await
+            .expect("record before");
+        assert_eq!(before, 1);
+        let (subscription_a, page_a) =
+            open_conversation_subscription(&duplex, negotiated, client, task_id, 0).await;
+        assert!(page_a.high_water >= 1);
+        // Drain any catch-up dirty from open.
+        while let Some(outbound) = duplex.ports.try_recv_prioritized() {
+            if matches!(outbound.message(), ServerMessage::ConversationDirty { .. }) {
+                outbound.after_successful_write();
+            } else {
+                break;
+            }
+        }
+
+        // Order B: register first, then hundreds of records coalesce to newest.
+        let release = duplex
+            .requests
+            .execute(
+                negotiated,
+                ClientRequest::Query(QueryEnvelope {
+                    request_id: RequestId::new(),
+                    client_id: client,
+                    task_id: Some(task_id),
+                    query: Query::TaskCockpit(TaskCockpitQuery::ReleaseConversationSubscription {
+                        subscription_id: subscription_a,
+                    }),
+                }),
+            )
+            .await
+            .expect("release");
+        assert!(matches!(
+            release,
+            ServerMessage::QueryReply(crate::domain::query::QueryReply {
+                outcome: QueryOutcome::Ok(QueryResult::TaskCockpit(
+                    TaskCockpitResult::ConversationSubscriptionReleased { .. }
+                )),
+                ..
+            })
+        ));
+
+        let (subscription_b, page_b) =
+            open_conversation_subscription(&duplex, negotiated, client, task_id, page_a.high_water)
+                .await;
+        assert_eq!(page_b.high_water, page_a.high_water);
+        let mut highest = page_b.high_water;
+        for index in 2..=201u64 {
+            highest = requests
+                .record_test_semantic(sample_semantic_draft(task_id, index))
+                .await
+                .expect("record burst");
+        }
+        // Allow executor dirty fan-out.
+        tokio::task::yield_now().await;
+        tokio::task::yield_now().await;
+
+        let mut saw_dirty = None;
+        for _ in 0..32 {
+            if let Some(outbound) = duplex.ports.try_recv_prioritized() {
+                match outbound.message() {
+                    ServerMessage::ConversationDirty {
+                        subscription_id,
+                        task_id: dirty_task,
+                        high_water,
+                    } if *subscription_id == subscription_b && *dirty_task == task_id => {
+                        saw_dirty = Some(*high_water);
+                        outbound.after_successful_write();
+                        break;
+                    }
+                    _ => outbound.after_successful_write(),
+                }
+            } else {
+                tokio::task::yield_now().await;
+            }
+        }
+        let dirty_hw = saw_dirty.expect("coalesced ConversationDirty after burst");
+        assert_eq!(dirty_hw, highest);
+
+        let page_reply = duplex
+            .requests
+            .execute(
+                negotiated,
+                ClientRequest::Query(QueryEnvelope {
+                    request_id: RequestId::new(),
+                    client_id: client,
+                    task_id: Some(task_id),
+                    query: Query::TaskCockpit(TaskCockpitQuery::Conversation {
+                        after_sequence: page_b.high_water,
+                    }),
+                }),
+            )
+            .await
+            .expect("page after dirty");
+        match page_reply {
+            ServerMessage::QueryReply(crate::domain::query::QueryReply {
+                outcome:
+                    QueryOutcome::Ok(QueryResult::TaskCockpit(TaskCockpitResult::Conversation(page))),
+                ..
+            }) => {
+                assert_eq!(page.high_water, highest);
+                assert!(
+                    !page.facts.is_empty(),
+                    "page after coalesced wake must recover recorded facts"
+                );
+            }
+            other => panic!("expected Conversation page, got {other:?}"),
+        }
+
+        drop(duplex);
+        drop(requests);
+        executor.abort();
+        let _ = executor.await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn conversation_subscription_release_detach_and_foreign_scope_fail() {
+        use crate::domain::query::{Query, QueryEnvelope, QueryOutcome, QueryResult};
+        use crate::kernel::CommandBus;
+        use crate::remote::presentation::SemanticJournalStore;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut bus = CommandBus::open(&dir.path().join("conv-release.db")).expect("bus");
+        let client = ClientId::new();
+        let task_id = create_task_for_conversation_wake(&mut bus, client);
+        let (requests, executor) = HostRequestExecutor::start_without_automatic_maintenance(bus);
+        let negotiated = conversation_wake_negotiated(client);
+        requests
+            .install_test_semantic_journal(Arc::new(Mutex::new(SemanticJournalStore::default())))
+            .await
+            .expect("install journal");
+        let mut duplex = requests
+            .open_connect_duplex(client)
+            .await
+            .expect("open duplex");
+        let output_id = duplex.registration.id();
+        let (subscription_id, _) =
+            open_conversation_subscription(&duplex, negotiated, client, task_id, 0).await;
+
+        // Stall stream lane: fill non-reserved capacity. Reserved conversation
+        // coalescer must still admit the final dirty without waiting for the
+        // stream write to complete.
+        let stream = sample_stream_key(0x44);
+        assert!(matches!(
+            duplex.output.try_admit_ephemeral_stream(
+                stream,
+                1,
+                Arc::new(move || Some(sample_stream_frame(stream, 1, 1, 1))),
+            ),
+            EphemeralAdmitResult::Queued
+        ));
+        let highest = requests
+            .record_test_semantic(sample_semantic_draft(task_id, 1))
+            .await
+            .expect("dirty while stream stalled");
+        let (saw_dirty, stalled_stream) = tokio::time::timeout(Duration::from_secs(3), async {
+            let mut stalled_stream = None;
+            loop {
+                let outbound = duplex
+                    .ports
+                    .recv_prioritized()
+                    .await
+                    .expect("live output while subscription is attached");
+                match outbound.message() {
+                    ServerMessage::ConversationDirty {
+                        subscription_id: id,
+                        task_id: dirty_task,
+                        high_water,
+                    } if *id == subscription_id && *dirty_task == task_id => {
+                        let delivered_high_water = *high_water;
+                        outbound.after_successful_write();
+                        return (delivered_high_water, stalled_stream);
+                    }
+                    ServerMessage::Stream(_) => {
+                        // Hold the preexisting stream in-flight, but keep
+                        // polling until the executor consumes the dirty watch
+                        // edge. Its record ack precedes that select turn.
+                        assert!(stalled_stream.is_none(), "one stalled stream");
+                        stalled_stream = Some(outbound);
+                    }
+                    _ => outbound.after_successful_write(),
+                }
+            }
+        })
+        .await
+        .expect("reserved conversation dirty before stream capacity returns");
+        assert_eq!(
+            saw_dirty, highest,
+            "reserved conversation slot must deliver final notice while stream lane is stalled"
+        );
+        assert!(stalled_stream.is_some(), "stream stayed in-flight");
+        drop(stalled_stream);
+
+        // Release must invalidate queued conversation generation even if a notice
+        // was coalesced onto the lane.
+        let released = duplex
+            .requests
+            .execute(
+                negotiated,
+                ClientRequest::Query(QueryEnvelope {
+                    request_id: RequestId::new(),
+                    client_id: client,
+                    task_id: Some(task_id),
+                    query: Query::TaskCockpit(TaskCockpitQuery::ReleaseConversationSubscription {
+                        subscription_id,
+                    }),
+                }),
+            )
+            .await
+            .expect("release");
+        assert!(matches!(
+            released,
+            ServerMessage::QueryReply(crate::domain::query::QueryReply {
+                outcome: QueryOutcome::Ok(QueryResult::TaskCockpit(
+                    TaskCockpitResult::ConversationSubscriptionReleased { .. }
+                )),
+                ..
+            })
+        ));
+
+        // Foreign owner / wrong task scope fails closed.
+        let foreign = ClientId::new();
+        let foreign_neg = conversation_wake_negotiated(foreign);
+        let (subscription_id, _) =
+            open_conversation_subscription(&duplex, negotiated, client, task_id, 0).await;
+        let unauthorized = duplex
+            .requests
+            .execute(
+                foreign_neg,
+                ClientRequest::Query(QueryEnvelope {
+                    request_id: RequestId::new(),
+                    client_id: foreign,
+                    task_id: Some(task_id),
+                    query: Query::TaskCockpit(TaskCockpitQuery::ReleaseConversationSubscription {
+                        subscription_id,
+                    }),
+                }),
+            )
+            .await
+            .expect("foreign release");
+        assert!(matches!(
+            unauthorized,
+            ServerMessage::QueryReply(crate::domain::query::QueryReply {
+                outcome: QueryOutcome::Err(crate::domain::query::QueryError::Unauthorized),
+                ..
+            })
+        ));
+
+        // Detach removes subscriptions for the exact output.
+        let detach = duplex
+            .requests
+            .execute(
+                NegotiatedParameters {
+                    version: crate::protocol::ProtocolVersion::current(),
+                    client_id: client,
+                    capabilities: CapabilitySet::from_capabilities([
+                        Capability::TaskCockpit,
+                        Capability::SemanticConversation,
+                        Capability::ExplicitDetach,
+                    ]),
+                    limits: crate::protocol::FrameLimits::v1_default(),
+                },
+                ClientRequest::Detach(crate::protocol::DetachRequest {
+                    request_id: RequestId::new(),
+                    client_id: client,
+                    connection_id: output_id.as_uuid(),
+                }),
+            )
+            .await
+            .expect("detach");
+        assert!(matches!(detach, ServerMessage::Detached(_)));
+
+        drop(duplex);
+        drop(requests);
+        executor.abort();
+        let _ = executor.await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn conversation_subscription_stalled_writer_recovers_on_capacity_return() {
+        use crate::kernel::CommandBus;
+        use crate::remote::presentation::SemanticJournalStore;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut bus = CommandBus::open(&dir.path().join("conv-capacity.db")).expect("bus");
+        let client = ClientId::new();
+        let task_id = create_task_for_conversation_wake(&mut bus, client);
+        let (requests, executor) = HostRequestExecutor::start_without_automatic_maintenance(bus);
+        let negotiated = conversation_wake_negotiated(client);
+        requests
+            .install_test_semantic_journal(Arc::new(Mutex::new(SemanticJournalStore::default())))
+            .await
+            .expect("install journal");
+        let mut duplex = requests
+            .open_connect_duplex(client)
+            .await
+            .expect("open duplex");
+        let (subscription_id, _) =
+            open_conversation_subscription(&duplex, negotiated, client, task_id, 0).await;
+
+        let stream = sample_stream_key(0x66);
+        assert!(matches!(
+            duplex.output.try_admit_ephemeral_stream(
+                stream,
+                1,
+                Arc::new(move || Some(sample_stream_frame(stream, 1, 1, 3))),
+            ),
+            EphemeralAdmitResult::Queued
+        ));
+        let first = requests
+            .record_test_semantic(sample_semantic_draft(task_id, 1))
+            .await
+            .expect("first dirty");
+        // Hold the stream in-flight and await the dirty watch edge, rather
+        // than assuming the record-control ack also completed fanout.
+        let stream_out = tokio::time::timeout(Duration::from_secs(3), async {
+            let mut stream_out = None;
+            loop {
+                let outbound = duplex
+                    .ports
+                    .recv_prioritized()
+                    .await
+                    .expect("live output while subscription is attached");
+                match outbound.message() {
+                    ServerMessage::ConversationDirty {
+                        subscription_id: id,
+                        task_id: dirty_task,
+                        high_water,
+                    } if *id == subscription_id
+                        && *dirty_task == task_id
+                        && *high_water == first =>
+                    {
+                        outbound.after_successful_write();
+                        return stream_out;
+                    }
+                    ServerMessage::Stream(_) => {
+                        assert!(stream_out.is_none(), "one stalled stream");
+                        stream_out = Some(outbound);
+                    }
+                    _ => outbound.after_successful_write(),
+                }
+            }
+        })
+        .await
+        .expect("reserved conversation dirty before stream capacity returns")
+        .expect("stream stays in-flight until reserved dirty delivery");
+
+        // Completing the stalled stream frees capacity and notifies the executor.
+        stream_out.after_successful_write();
+
+        let second = requests
+            .record_test_semantic(sample_semantic_draft(task_id, 2))
+            .await
+            .expect("second dirty after capacity return");
+        let saw_second = tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                let outbound = duplex
+                    .ports
+                    .recv_prioritized()
+                    .await
+                    .expect("live output while subscription is attached");
+                match outbound.message() {
+                    ServerMessage::ConversationDirty {
+                        subscription_id: id,
+                        task_id: dirty_task,
+                        high_water,
+                    } if *id == subscription_id && *dirty_task == task_id => {
+                        let delivered_high_water = *high_water;
+                        outbound.after_successful_write();
+                        return delivered_high_water;
+                    }
+                    _ => outbound.after_successful_write(),
+                }
+            }
+        })
+        .await
+        .expect("capacity-return dirty delivery");
+        assert_eq!(
+            saw_second, second,
+            "capacity-return notify must let the next token deliver promptly"
+        );
+
+        drop(duplex);
+        drop(requests);
+        executor.abort();
+        let _ = executor.await;
+    }
+
     fn event_replay_negotiated(client: ClientId) -> NegotiatedParameters {
         use crate::protocol::{Capability, CapabilitySet, FrameLimits, ProtocolVersion};
         NegotiatedParameters {
@@ -11225,12 +12969,12 @@ mod output_tests {
             "rebind refused unless projection is unstarted draft"
         );
         assert!(
-            body.contains("provider_terminal_binding("),
-            "live terminal binding must block rebind even without SessionStart id"
+            body.contains("try_has_live_provider_runtime("),
+            "live provider book must block rebind even without SessionStart id"
         );
         assert!(
-            body.contains("peek_persisted_provider_launch_spec"),
-            "persisted launch graph must block rebind"
+            body.contains("try_classify_persisted_provider_launch"),
+            "persisted launch graph must use bounded classification"
         );
         assert!(
             body.contains("execute_host_authorized"),
@@ -11239,6 +12983,86 @@ mod output_tests {
         assert!(
             body.contains("Command::RebindUnstartedPrimaryProvider"),
             "rebind command must be the host-only rebound variant"
+        );
+    }
+
+    #[test]
+    fn provider_restore_pending_keeps_readiness_unknown_until_enumeration() {
+        let source = include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/src/host/connection.rs"
+        ));
+        let queue = source
+            .find("fn queue_one_provider_restore(")
+            .expect("queue_one_provider_restore");
+        let body = &source[queue..];
+        let end = body
+            .find("\n    fn handle_provider_restore_outcome(")
+            .or_else(|| body.find("\n    async fn "))
+            .unwrap_or(body.len().min(2500));
+        let body = &body[..end];
+        assert!(
+            body.contains("self.provider_restore_pending = false"),
+            "pending must clear only after successful enumeration"
+        );
+        let clear_at = body
+            .find("self.provider_restore_pending = false")
+            .expect("clear");
+        let enum_at = body
+            .find("restorable_provider_starts")
+            .expect("enumeration");
+        assert!(
+            enum_at < clear_at,
+            "must not publish NotPending before enumeration succeeds"
+        );
+        assert!(
+            source.contains("Some(_) if self.provider_restore_pending =>"),
+            "readiness hint must stay Unknown while restore enumeration is pending/failed"
+        );
+    }
+
+    #[test]
+    fn same_kind_new_conversation_refuses_live_or_persisted_provider() {
+        let source = include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/src/host/connection.rs"
+        ));
+        let start = source
+            .find("\n    fn start_provider_session_intent(")
+            .expect("start_provider_session_intent");
+        let body = &source[start..];
+        let end = body
+            .find("\n    fn dispatch_task_close(")
+            .or_else(|| body.find("/// Archive one task after releasing"))
+            .expect("end of start_provider_session_intent");
+        let body = &body[..end];
+        let same_kind = body
+            .find("Same-kind NewConversation must not double-launch")
+            .expect("same-kind NewConversation guard");
+        let kind_mismatch = body
+            .find("if agent.provider_kind != intent.provider_kind")
+            .expect("kind-mismatch rebind branch");
+        assert!(
+            same_kind < kind_mismatch,
+            "same-kind live/persisted refusal must run before kind-mismatch rebind"
+        );
+        let guard = &body[same_kind..kind_mismatch];
+        assert!(
+            guard.contains("try_has_live_provider_runtime"),
+            "same-kind guard must refuse live provider runtime"
+        );
+        assert!(
+            guard.contains("try_classify_persisted_provider_launch"),
+            "same-kind guard must use bounded persisted classification"
+        );
+        assert!(
+            !guard.contains("peek_persisted_provider_launch_spec"),
+            "same-kind guard must not call blocking persisted peek"
+        );
+        assert!(
+            guard.contains("NewConversation refused; live provider generation present")
+                || guard.contains("live provider generation present"),
+            "refusal must stay Unavailable — never fake success"
         );
     }
 

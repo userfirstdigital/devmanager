@@ -335,6 +335,90 @@ impl CommandBus {
         Ok(snapshot)
     }
 
+    /// Recover an exact durable command receipt for an authenticated client.
+    ///
+    /// This is deliberately separate from [`lookup_receipt_for_scope`]: status
+    /// recovery spans physical reconnects and must never claim or rewrite the
+    /// execution receipt's connection/request scope. The caller supplies the
+    /// authenticated client identity out-of-band; all other identity fields
+    /// are recomputed from the complete original envelope and checked against
+    /// the immutable receipt metadata before its event/operation lineage is
+    /// validated.
+    pub fn command_receipt_status(
+        &self,
+        authenticated_client_id: ClientId,
+        envelope: &CommandEnvelope,
+    ) -> Result<Option<CommandReceipt>, StoreError> {
+        if envelope.client_id != authenticated_client_id {
+            return Err(StoreError::CommandIdConflict);
+        }
+
+        let conn = self.store.open_query_connection()?;
+        let tx = conn.unchecked_transaction()?;
+        let row: Option<(
+            Vec<u8>,
+            Option<Vec<u8>>,
+            Option<Vec<u8>>,
+            Option<Vec<u8>>,
+        )> = tx
+            .query_row(
+                "SELECT client_id, task_id, command_fingerprint, payload_digest
+                 FROM command_receipts WHERE command_id = ?1",
+                [envelope.command_id.as_bytes().as_slice()],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .optional()?;
+        let Some((client_bytes, task_bytes, fingerprint_bytes, payload_digest_bytes)) = row else {
+            tx.commit()?;
+            return Ok(None);
+        };
+
+        let stored_client_id = parse_client_receipt_id("command_receipts.client_id", &client_bytes)?;
+        if stored_client_id != authenticated_client_id {
+            return Err(StoreError::CommandIdConflict);
+        }
+
+        let stored_task_id = parse_optional_task_scope("command_receipts.task_id", task_bytes)?;
+        if stored_task_id != effective_task_scope(envelope) {
+            return Err(StoreError::CommandIdConflict);
+        }
+
+        // A status response is only safe when both immutable identity hashes
+        // exist. Legacy rows without either hash cannot prove that this full
+        // envelope is the command that produced the receipt.
+        let stored_fingerprint: [u8; 32] = fingerprint_bytes
+            .ok_or(StoreError::CommandIdConflict)?
+            .try_into()
+            .map_err(|_| StoreError::CommandIdConflict)?;
+        let expected_fingerprint = command_fingerprint(envelope)?;
+        if stored_fingerprint != expected_fingerprint {
+            return Err(StoreError::CommandIdConflict);
+        }
+
+        let stored_payload_digest: [u8; 32] = payload_digest_bytes
+            .ok_or(StoreError::CommandIdConflict)?
+            .try_into()
+            .map_err(|_| StoreError::CommandIdConflict)?;
+        let expected_payload_digest = crate::domain::command::command_payload_digest(envelope)
+            .map_err(|detail| StoreError::CodecMismatch { detail })?;
+        if stored_payload_digest != expected_payload_digest {
+            return Err(StoreError::CommandIdConflict);
+        }
+
+        let Some((receipt, receipt_payload_digest)) =
+            lookup_receipt_with_digest(&tx, envelope.command_id)?
+        else {
+            // The identity row and receipt payload are written atomically; a
+            // missing payload in the same read snapshot is storage corruption.
+            return Err(StoreError::Corruption);
+        };
+        if receipt_payload_digest != Some(expected_payload_digest) {
+            return Err(StoreError::CommandIdConflict);
+        }
+        tx.commit()?;
+        Ok(Some(receipt))
+    }
+
     /// Claim the exact durable provider resource identity for a later stock
     /// provider launch. The store performs the join; callers cannot replace
     /// the provider session identity or substitute a PTY-derived resource.
@@ -638,6 +722,9 @@ impl CommandBus {
                 }),
                 None => QueryOutcome::Err(QueryError::NotFound),
             },
+            // Receipt status requires the authenticated client identity from
+            // the host transport, so an unscoped facade query cannot serve it.
+            Query::CommandReceiptStatus { .. } => QueryOutcome::Err(QueryError::Unauthorized),
             Query::TaskSnapshot => {
                 let Some(task_id) = envelope.task_id else {
                     return Ok(QueryReply {
@@ -2095,6 +2182,55 @@ mod receipt_scope_tests {
             execute_with_scope(&mut store, altered, scope),
             Err(StoreError::CommandIdConflict)
         );
+    }
+
+    #[test]
+    fn receipt_status_is_authenticated_exact_and_read_only() {
+        let directory = tempfile::tempdir().expect("receipt status directory");
+        let mut bus = CommandBus::open(&directory.path().join("tasks.sqlite")).expect("bus");
+        let client_id = ClientId::new();
+        let command = missing_task_envelope(CommandId::new(), client_id, TaskId::new());
+        let original = bus
+            .execute_host_authorized(command.clone(), None, RequestId::new(), Uuid::nil())
+            .expect("persist rejected receipt");
+
+        assert_eq!(
+            bus.command_receipt_status(client_id, &command)
+                .expect("read receipt status"),
+            Some(original)
+        );
+
+        let mut wrong_client = command.clone();
+        wrong_client.client_id = ClientId::new();
+        assert_eq!(
+            bus.command_receipt_status(client_id, &wrong_client),
+            Err(StoreError::CommandIdConflict)
+        );
+
+        let mut wrong_envelope = command.clone();
+        wrong_envelope.issued_at_ms += 1;
+        assert_eq!(
+            bus.command_receipt_status(client_id, &wrong_envelope),
+            Err(StoreError::CommandIdConflict)
+        );
+
+        let missing = missing_task_envelope(CommandId::new(), client_id, command.task_id.unwrap());
+        assert_eq!(
+            bus.command_receipt_status(client_id, &missing)
+                .expect("missing receipt status"),
+            None
+        );
+
+        let conn = bus.store.open_query_connection().expect("query connection");
+        let (connection_id, request_id): (Option<Vec<u8>>, Option<Vec<u8>>) = conn
+            .query_row(
+                "SELECT connection_id, request_id FROM command_receipts WHERE command_id = ?1",
+                [command.command_id.as_bytes().as_slice()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("receipt scope");
+        assert!(connection_id.is_none());
+        assert!(request_id.is_none());
     }
 }
 

@@ -1788,9 +1788,19 @@ fn decide_submit_provider_input(
         }
         ProviderInputAction::SteerCurrentTurn { .. }
         | ProviderInputAction::QueueFollowUp { .. }
-        | ProviderInputAction::TerminalInput { .. }
         | ProviderInputAction::StopTurn => {
             if session.current_turn != Some(intent.turn_id()) {
+                return Err(RejectionCode::InvalidTransition);
+            }
+        }
+        ProviderInputAction::TerminalInput { .. } => {
+            // An interactive CLI can ask an onboarding question before its
+            // first chat turn. The exact task/agent/runtime/epoch checks above
+            // still apply; once a turn exists it must match, never retarget.
+            if session
+                .current_turn
+                .is_some_and(|current| current != intent.turn_id())
+            {
                 return Err(RejectionCode::InvalidTransition);
             }
         }

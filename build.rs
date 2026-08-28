@@ -1,4 +1,4 @@
-#[cfg(target_os = "windows")]
+#[cfg(all(target_os = "windows", not(test)))]
 fn main() {
     // The complete GPUI layout stack (including debug-mode builder temporaries)
     // exceeds the MSVC 1 MiB default for expanded settings. Reserve address space
@@ -233,7 +233,7 @@ fn rust_str_list(body: &str) -> Vec<String> {
     values
 }
 
-#[cfg(target_os = "windows")]
+#[cfg(all(target_os = "windows", not(test)))]
 fn stamp_windows_binaries() {
     let version = std::env::var("CARGO_PKG_VERSION").unwrap_or_else(|_| "0.0.0".to_string());
     let (major, minor, patch, build) = windows_file_version_parts(&version);
@@ -270,7 +270,7 @@ fn stamp_windows_binaries() {
     );
 }
 
-#[cfg(target_os = "windows")]
+#[cfg(all(target_os = "windows", not(test)))]
 #[allow(clippy::too_many_arguments)]
 fn stamp_windows_binary(
     bin_name: &str,
@@ -332,7 +332,7 @@ IDI_ICON1 ICON "{icon_rc}"
         });
 }
 
-#[cfg(target_os = "windows")]
+#[cfg(all(target_os = "windows", not(test)))]
 fn windows_file_version_parts(version: &str) -> (u16, u16, u16, u16) {
     let mut parts = [0u16; 4];
     let normalized = version
@@ -693,7 +693,13 @@ fn validate_asset_graph(
         if !referenced.insert(asset.clone()) {
             continue;
         }
-        if !safe_bundle_reference(&asset) || !is_hashed_asset(&asset) {
+        // The reviewed wasm-bindgen module has a fixed runtime import path.
+        // Its exact files and manifest are validated separately; do not turn
+        // this exception into a general allowance for unhashed assets.
+        let connect_artifact = asset
+            .strip_prefix("assets/wasm/")
+            .is_some_and(|name| CONNECT_CRYPTO_ARTIFACT_FILES.contains(&name));
+        if !safe_bundle_reference(&asset) || !(is_hashed_asset(&asset) || connect_artifact) {
             errors.push(format!(
                 "generated asset reference is not a safe hashed path: {asset}"
             ));
@@ -703,6 +709,13 @@ fn validate_asset_graph(
         let path = bundle.join(&asset);
         if !path.is_file() {
             errors.push(format!("generated asset graph references missing {asset}"));
+            continue;
+        }
+        // wasm-bindgen's JS includes type annotations and an import-object key
+        // ending in _bg.js; those strings are not fetches. Its reviewed fixed
+        // artifact set is a leaf validated by validate_connect_crypto_artifacts,
+        // not a Vite chunk to scan with the relative-import heuristic.
+        if connect_artifact {
             continue;
         }
         if !asset.ends_with(".js") && !asset.ends_with(".css") {
@@ -891,4 +904,63 @@ fn is_hashed_asset(path: &str) -> bool {
         && bytes[bytes.len() - 8..]
             .iter()
             .all(|byte| byte.is_ascii_alphanumeric() || *byte == b'_' || *byte == b'-')
+}
+
+#[cfg(test)]
+mod bundle_graph_tests {
+    use super::*;
+
+    #[test]
+    fn fixed_connect_import_is_validated_without_allowing_arbitrary_unhashed_assets() {
+        let bundle =
+            std::env::temp_dir().join(format!("devmanager-bundle-graph-{}", std::process::id()));
+        std::fs::create_dir(&bundle).expect("unique test directory");
+        struct Cleanup(std::path::PathBuf);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let _cleanup = Cleanup(bundle.clone());
+        std::fs::create_dir_all(bundle.join("assets/wasm")).unwrap();
+        std::fs::write(
+            bundle.join("assets/index-12345678.js"),
+            "import('./wasm/connect_crypto.js')",
+        )
+        .unwrap();
+        std::fs::write(
+            bundle.join("assets/wasm/connect_crypto.js"),
+            "new URL('./connect_crypto_bg.wasm', import.meta.url)",
+        )
+        .unwrap();
+        std::fs::write(bundle.join("assets/wasm/connect_crypto_bg.wasm"), b"\0asm").unwrap();
+        let roots = vec!["assets/index-12345678.js".to_owned()];
+        let mut errors = Vec::new();
+        let reached = validate_asset_graph(&bundle, &roots, &mut errors);
+        assert!(errors.is_empty(), "{errors:?}");
+        assert!(reached.contains("assets/wasm/connect_crypto.js"));
+
+        // Referenced allowlisted files still must exist.
+        std::fs::remove_file(bundle.join("assets/wasm/connect_crypto.js")).unwrap();
+        errors.clear();
+        validate_asset_graph(&bundle, &roots, &mut errors);
+        assert!(errors
+            .iter()
+            .any(|error| error.contains("references missing")));
+
+        for invalid in [
+            "assets/plain.js",
+            "assets/wasm/other.js",
+            "assets/wasm/../connect_crypto.js",
+        ] {
+            errors.clear();
+            validate_asset_graph(&bundle, &[invalid.to_owned()], &mut errors);
+            assert!(
+                errors
+                    .iter()
+                    .any(|error| error.contains("not a safe hashed path")),
+                "{invalid}: {errors:?}"
+            );
+        }
+    }
 }

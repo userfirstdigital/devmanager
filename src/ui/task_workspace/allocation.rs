@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 
 use crate::domain::TaskId;
 
-use super::layout::{Allocation, Axis, PanePresentation, TaskWorkspace, WorkspaceNode};
+use super::layout::{Allocation, Axis, PanePresentation, Workspace, WorkspaceNode};
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Viewport {
@@ -48,31 +48,39 @@ pub struct PaneRect {
     pub height: f32,
 }
 
-#[derive(Clone, Debug, Default, PartialEq)]
-pub struct AllocatedWorkspace {
-    panes: BTreeMap<TaskId, PaneRect>,
+#[derive(Clone, Debug, PartialEq)]
+pub struct AllocatedWorkspace<K = TaskId> {
+    panes: BTreeMap<K, PaneRect>,
 }
 
-impl AllocatedWorkspace {
-    pub fn rect(&self, task_id: TaskId) -> Option<PaneRect> {
+impl<K> Default for AllocatedWorkspace<K> {
+    fn default() -> Self {
+        Self {
+            panes: BTreeMap::new(),
+        }
+    }
+}
+
+impl<K: Clone + Ord + Eq> AllocatedWorkspace<K> {
+    pub fn rect(&self, task_id: K) -> Option<PaneRect> {
         self.panes.get(&task_id).copied()
     }
 
-    pub fn width(&self, task_id: TaskId) -> Option<f32> {
+    pub fn width(&self, task_id: K) -> Option<f32> {
         self.rect(task_id).map(|rect| rect.width)
     }
 
-    pub fn height(&self, task_id: TaskId) -> Option<f32> {
+    pub fn height(&self, task_id: K) -> Option<f32> {
         self.rect(task_id).map(|rect| rect.height)
     }
 }
 
-impl TaskWorkspace {
+impl<K: Clone + Ord + Eq> Workspace<K> {
     pub fn allocate(
         &mut self,
         viewport: Viewport,
         metrics: AllocationMetrics,
-    ) -> AllocatedWorkspace {
+    ) -> AllocatedWorkspace<K> {
         let metrics = metrics.sanitized();
         // CompactAutomatic was a focus/width hide; restore to Full so only
         // explicit CompactManual remains condensed. Geometry shrinks panes
@@ -98,7 +106,7 @@ impl TaskWorkspace {
 
     fn restore_automatic_to_full(&mut self) {
         for task_id in self.task_ids() {
-            if self.presentation(task_id) == Some(PanePresentation::CompactAutomatic) {
+            if self.presentation(task_id.clone()) == Some(PanePresentation::CompactAutomatic) {
                 let _ = self.set_presentation(task_id, PanePresentation::Full);
             }
         }
@@ -111,7 +119,7 @@ struct MinimumSize {
     height: f32,
 }
 
-fn minimum_size(node: &WorkspaceNode, metrics: AllocationMetrics) -> MinimumSize {
+fn minimum_size<K>(node: &WorkspaceNode<K>, metrics: AllocationMetrics) -> MinimumSize {
     match node {
         WorkspaceNode::Pane(pane) => match pane.presentation {
             PanePresentation::Full => MinimumSize {
@@ -149,15 +157,15 @@ fn minimum_size(node: &WorkspaceNode, metrics: AllocationMetrics) -> MinimumSize
     }
 }
 
-fn allocate_node(
-    node: &WorkspaceNode,
+fn allocate_node<K: Clone + Ord + Eq>(
+    node: &WorkspaceNode<K>,
     rect: PaneRect,
     metrics: AllocationMetrics,
-    panes: &mut BTreeMap<TaskId, PaneRect>,
+    panes: &mut BTreeMap<K, PaneRect>,
 ) {
     match node {
         WorkspaceNode::Pane(pane) => {
-            panes.insert(pane.task_id, rect);
+            panes.insert(pane.task_id.clone(), rect);
         }
         WorkspaceNode::Split { axis, children, .. } => {
             let extent = match axis {
@@ -228,7 +236,11 @@ fn allocate_node(
 /// this floor first. Nested splits recurse so two Full panes need 64+64+divider.
 const PHYSICAL_AXIS_FLOOR: f32 = 64.0;
 
-fn nested_physical_floor(node: &WorkspaceNode, axis: Axis, metrics: AllocationMetrics) -> f32 {
+fn nested_physical_floor<K>(
+    node: &WorkspaceNode<K>,
+    axis: Axis,
+    metrics: AllocationMetrics,
+) -> f32 {
     match node {
         WorkspaceNode::Pane(_) => PHYSICAL_AXIS_FLOOR,
         WorkspaceNode::Split {
@@ -267,8 +279,8 @@ fn nested_physical_floor(node: &WorkspaceNode, axis: Axis, metrics: AllocationMe
     }
 }
 
-fn allocate_axis_sizes(
-    children: &[super::layout::SplitChild],
+fn allocate_axis_sizes<K>(
+    children: &[super::layout::SplitChild<K>],
     minimums: &[f32],
     available: f32,
     fallback_resize_index: Option<usize>,
@@ -421,7 +433,7 @@ fn allocate_axis_sizes(
 /// Rank each split child by its most-recent focus among descendants, then pick
 /// the least-recently-focused branch so an active nested pane is not resized
 /// when an older wholly-unfocused sibling branch exists.
-fn least_recent_focus_child_index(children: &[super::layout::SplitChild]) -> Option<usize> {
+fn least_recent_focus_child_index<K>(children: &[super::layout::SplitChild<K>]) -> Option<usize> {
     children
         .iter()
         .enumerate()
@@ -432,7 +444,7 @@ fn least_recent_focus_child_index(children: &[super::layout::SplitChild]) -> Opt
         .map(|(index, _)| index)
 }
 
-fn most_recent_focus(node: &WorkspaceNode) -> Option<u64> {
+fn most_recent_focus<K>(node: &WorkspaceNode<K>) -> Option<u64> {
     match node {
         WorkspaceNode::Pane(pane) => Some(pane.last_focused_at),
         WorkspaceNode::Split { children, .. } => children
@@ -442,7 +454,7 @@ fn most_recent_focus(node: &WorkspaceNode) -> Option<u64> {
     }
 }
 
-fn contains_full_pane(node: &WorkspaceNode) -> bool {
+fn contains_full_pane<K>(node: &WorkspaceNode<K>) -> bool {
     match node {
         WorkspaceNode::Pane(pane) => pane.presentation == PanePresentation::Full,
         WorkspaceNode::Split { children, .. } => {
@@ -1135,5 +1147,22 @@ mod tests {
             workspace.split_child_allocation(split_id, 2),
             Some(Allocation::Pinned { logical_px: 220.0 })
         );
+    }
+
+    #[test]
+    fn host_qualified_keys_allocate_distinct_rects_for_shared_raw_task_id() {
+        let shared = TaskId::new();
+        let local = ("local".to_string(), shared);
+        let remote = ("remote".to_string(), shared);
+        let mut workspace = crate::ui::task_workspace::Workspace::single(local.clone());
+        workspace
+            .insert_after_focused(remote.clone(), Axis::Horizontal)
+            .unwrap();
+        workspace.pin_task_axis_size(local.clone(), 300.0).unwrap();
+
+        let allocated = workspace.allocate(Viewport::new(1_000.0, 700.0), metrics());
+
+        assert_eq!(allocated.width(local), Some(300.0));
+        assert_eq!(allocated.width(remote), Some(700.0));
     }
 }

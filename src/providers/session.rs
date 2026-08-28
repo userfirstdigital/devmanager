@@ -21,7 +21,7 @@ use crate::providers::capabilities::{
     ProviderKind,
 };
 use rusqlite::types::ValueRef;
-use rusqlite::{params, Connection, OptionalExtension, Row, Transaction, TransactionBehavior};
+use rusqlite::{params, Connection, OpenFlags, OptionalExtension, Row, Transaction, TransactionBehavior};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -3592,6 +3592,42 @@ impl SqliteProviderSessionStateStore {
             .map_err(|error| error.to_string())?;
         Self::migrate_legacy_schema(&mut connection)?;
         Ok(Self { connection })
+    }
+
+    /// Bounded read-only presence probe for latency-sensitive readiness.
+    ///
+    /// - Missing store file → `Ok(false)` (absence) — caller must own the path.
+    /// - Row present / absent → `Ok(true)` / `Ok(false)`.
+    /// - Busy, permissions, schema, or corruption → `Err` (unknown).
+    ///
+    /// Never creates schema, never mutates WAL/journal mode, and uses a zero
+    /// busy timeout so a held writer cannot stall the host request lane.
+    pub fn probe_agent_persisted_bounded(
+        path: impl AsRef<Path>,
+        agent_session_id: AgentSessionId,
+    ) -> Result<bool, String> {
+        let path = path.as_ref();
+        if !path.try_exists().map_err(|error| error.to_string())? {
+            return Ok(false);
+        }
+        let connection = Connection::open_with_flags(
+            path,
+            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )
+        .map_err(|error| error.to_string())?;
+        connection
+            .busy_timeout(std::time::Duration::from_millis(0))
+            .map_err(|error| error.to_string())?;
+        let present: bool = connection
+            .query_row(
+                "SELECT 1 FROM provider_session_states WHERE agent_session_id = ?1 LIMIT 1",
+                params![agent_session_id.to_string()],
+                |_| Ok(true),
+            )
+            .optional()
+            .map_err(|error| error.to_string())?
+            .unwrap_or(false);
+        Ok(present)
     }
 
     fn table_columns(connection: &Connection, table: &str) -> Result<Vec<(String, i64)>, String> {
@@ -7952,6 +7988,78 @@ mod tests {
             correlation
                 .set_launch_nonce_for_test(LaunchNonce::new())
                 .launch_nonce()
+        );
+    }
+
+    #[test]
+    fn sqlite_bounded_presence_probe_is_absence_busy_safe_and_read_only() {
+        let path = tempfile::tempdir().expect("probe dir");
+        let db = path.path().join("provider-sessions.sqlite");
+        let agent = AgentSessionId::new();
+        assert!(
+            SqliteProviderSessionStateStore::probe_agent_persisted_bounded(
+                path.path().join("invalid\0store.sqlite"),
+                agent,
+            )
+            .is_err(),
+            "filesystem errors must not become absence"
+        );
+        assert_eq!(
+            SqliteProviderSessionStateStore::probe_agent_persisted_bounded(&db, agent).unwrap(),
+            false,
+            "missing store is absence"
+        );
+        let mut store = SqliteProviderSessionStateStore::open(&db).unwrap();
+        let runtime = unit_runtime();
+        let state = ProviderSessionState {
+            agent_session_id: runtime.agent_session_id(),
+            task_id: runtime.task_id(),
+            generation: runtime.generation(),
+            action_epoch: runtime.correlation().action_epoch(),
+            revision: 1,
+            lifecycle: PersistedRuntimeLifecycle::Running,
+            launch_nonce: runtime.launch_nonce(),
+            launch_spec: runtime.launch_spec(),
+            provider_session_id: None,
+            process_root: None,
+        };
+        store.persist(state).unwrap();
+        drop(store);
+        assert!(
+            SqliteProviderSessionStateStore::probe_agent_persisted_bounded(
+                &db,
+                runtime.agent_session_id()
+            )
+            .unwrap()
+        );
+        assert!(
+            !SqliteProviderSessionStateStore::probe_agent_persisted_bounded(&db, agent).unwrap()
+        );
+        std::fs::write(&db, b"corrupt-not-sqlite").unwrap();
+        assert!(
+            SqliteProviderSessionStateStore::probe_agent_persisted_bounded(&db, agent).is_err(),
+            "corrupt store must be unknown"
+        );
+
+        let locked_db = path.path().join("locked.sqlite");
+        let writer = Connection::open(&locked_db).unwrap();
+        writer
+            .execute_batch(
+                "CREATE TABLE provider_session_states (agent_session_id TEXT PRIMARY KEY);
+                 BEGIN EXCLUSIVE;",
+            )
+            .unwrap();
+        let started = std::time::Instant::now();
+        assert!(
+            SqliteProviderSessionStateStore::probe_agent_persisted_bounded(&locked_db, agent)
+                .is_err(),
+            "a locked store must hold readiness rather than invent absence"
+        );
+        assert!(started.elapsed() < std::time::Duration::from_millis(500));
+        writer.execute_batch("ROLLBACK;").unwrap();
+        assert!(
+            !SqliteProviderSessionStateStore::probe_agent_persisted_bounded(&locked_db, agent)
+                .unwrap()
         );
     }
 

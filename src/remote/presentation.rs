@@ -1069,6 +1069,23 @@ impl SemanticJournalStore {
             .map(|session| session.journal.capture_replay_after(cursor))
     }
 
+    /// Pointer-only retained window for canonical conversation projection.
+    /// Replacement ancestry can precede the caller's cursor. Retaining those
+    /// links is necessary to keep message identity stable across incremental
+    /// pages; the caller still emits only facts newer than its cursor.
+    pub(crate) fn capture_conversation_after(
+        &self,
+        key: &StableSessionKey,
+        cursor: u64,
+    ) -> Option<SemanticReplayCapture> {
+        self.sessions.get(key).map(|session| {
+            let mut capture = session.journal.capture_replay_after(0);
+            capture.cursor_rolled_over = cursor != 0
+                && cursor <= session.journal.highest_evicted_sequence;
+            capture
+        })
+    }
+
     pub fn stable_key_for_session(&self, session_id: &str) -> Option<StableSessionKey> {
         self.session_bindings
             .get(session_id)

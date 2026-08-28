@@ -71,6 +71,21 @@ pub(crate) struct TaskCockpitDispatch<'a> {
     /// Host-only canonical config snapshot. It is used only for the redacted
     /// ConfigSnapshot query and is never exposed as a path-bearing AppConfig.
     pub config: Option<&'a AppConfig>,
+    /// Exact restore queue / in-flight hint for TerminalReadiness. Defaults to
+    /// Unknown so compatibility callers never invent absence.
+    pub provider_launch_hint: ProviderLaunchReadinessHint,
+}
+
+/// Host-owned launch/restore hint passed into TaskCockpitDispatch. Never
+/// synthesized from terminal text or PID observations.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) enum ProviderLaunchReadinessHint {
+    #[default]
+    Unknown,
+    /// Exact task is queued or in-flight for provider restore/start.
+    StartPending,
+    /// Host proved the task is not in the restore queue or in-flight set.
+    NotPending,
 }
 
 /// Host-side adapter for the exact kernel provider-resource claim.  The
@@ -96,6 +111,7 @@ pub(crate) fn serve_task_cockpit(dispatch: TaskCockpitDispatch<'_>) -> QueryOutc
             | TaskCockpitQuery::ConfigArchiveCommand { .. }
             | TaskCockpitQuery::ConfigRunCommand { .. }
             | TaskCockpitQuery::ProviderSettings(_)
+            | TaskCockpitQuery::RemoteAccess(_)
     ) {
         // Mutation is owned by the exclusive host executor, which re-issues
         // workspace authority before returning a snapshot.
@@ -153,6 +169,16 @@ pub(crate) fn serve_task_cockpit(dispatch: TaskCockpitDispatch<'_>) -> QueryOutc
     }
 
     match dispatch.query {
+        TaskCockpitQuery::ProviderInputState => {
+            if !dispatch.capabilities.contains(Capability::ProviderInput) {
+                return QueryOutcome::Err(QueryError::UnsupportedCapability);
+            }
+            let state = crate::domain::cockpit::ProviderInputStateProjection::from_snapshot(&snapshot);
+            if state.pending_wait_command_ids.len() > crate::domain::cockpit::MAX_PROVIDER_INPUT_STATE_WAITS {
+                return QueryOutcome::Err(QueryError::Unavailable { reason: "provider_wait_limit" });
+            }
+            QueryOutcome::Ok(QueryResult::TaskCockpit(TaskCockpitResult::ProviderInputState(state)))
+        }
         TaskCockpitQuery::ConfigSnapshot
         | TaskCockpitQuery::AgentConnection
         | TaskCockpitQuery::ConfigCreateProject { .. }
@@ -160,7 +186,8 @@ pub(crate) fn serve_task_cockpit(dispatch: TaskCockpitDispatch<'_>) -> QueryOutc
         | TaskCockpitQuery::ConfigArchiveCommand { .. }
         | TaskCockpitQuery::ConfigRunCommand { .. }
         | TaskCockpitQuery::ConfigCommandDetail { .. }
-        | TaskCockpitQuery::ProviderSettings(_) => {
+        | TaskCockpitQuery::ProviderSettings(_)
+        | TaskCockpitQuery::RemoteAccess(_) => {
             unreachable!("config snapshot is handled before task-scoped lookup")
         }
         TaskCockpitQuery::BrowserProcessSession => {
@@ -191,93 +218,17 @@ pub(crate) fn serve_task_cockpit(dispatch: TaskCockpitDispatch<'_>) -> QueryOutc
             }
             serve_conversation(&dispatch, task_id, *after_sequence)
         }
-        TaskCockpitQuery::Terminal => {
-            let Some(service) = dispatch.terminal_service else {
-                return unavailable(
-                    TaskCockpitSurface::Terminal,
-                    TaskCockpitUnavailableReason::TerminalUnavailable,
-                );
-            };
-            let terminal = match service.task_terminal_view(task_id) {
-                Ok(Some(terminal)) => terminal,
-                Ok(None) => {
-                    return unavailable(
-                        TaskCockpitSurface::Terminal,
-                        TaskCockpitUnavailableReason::TerminalUnavailable,
-                    )
-                }
-                Err(_) => {
-                    return denied(
-                        TaskCockpitSurface::Terminal,
-                        TaskCockpitDeniedReason::StaleFence,
-                    )
-                }
-            };
-            let Some(primary_agent_id) = snapshot.primary_agent_id else {
-                return denied(
-                    TaskCockpitSurface::Terminal,
-                    TaskCockpitDeniedReason::StaleFence,
-                );
-            };
-            let Some(agent) = snapshot.agents.get(&primary_agent_id) else {
-                return denied(
-                    TaskCockpitSurface::Terminal,
-                    TaskCockpitDeniedReason::StaleFence,
-                );
-            };
-            let matching_resources = snapshot
-                .resources
-                .values()
-                .filter(|resource| {
-                    resource.resource_kind == crate::domain::ResourceKind::Terminal
-                        && resource.lifecycle == crate::domain::ResourceLifecycle::Active
-                })
-                .collect::<Vec<_>>();
-            let [resource] = matching_resources.as_slice() else {
-                return denied(
-                    TaskCockpitSurface::Terminal,
-                    TaskCockpitDeniedReason::StaleFence,
-                );
-            };
-            if terminal.agent_session_id != primary_agent_id
-                || terminal.runtime_generation != agent.runtime_generation
-                || terminal.action_epoch == 0
-                || terminal.resource_id != resource.id
-                || terminal.resource_generation != resource.runtime_generation
-            {
-                return denied(
-                    TaskCockpitSurface::Terminal,
-                    TaskCockpitDeniedReason::StaleFence,
-                );
-            }
-            let (screen, text_lines) = compact_terminal_screen_for_wire(terminal.view.screen);
-            QueryOutcome::Ok(QueryResult::TaskCockpit(TaskCockpitResult::Terminal(
-                TaskTerminalProjection {
-                    task_id,
-                    terminal_id: terminal.terminal_id,
-                    session_id: terminal.session_id,
-                    agent_session_id: terminal.agent_session_id,
-                    resource_id: terminal.resource_id,
-                    runtime_generation: terminal.runtime_generation,
-                    resource_generation: terminal.resource_generation,
-                    action_epoch: terminal.action_epoch,
-                    accepts_input_without_conversation_id: dispatch.service_runtime.is_some_and(
-                        |manager| {
-                            manager.accepts_input_without_conversation_id(
-                                task_id,
-                                terminal.agent_session_id,
-                                terminal.resource_id,
-                                terminal.runtime_generation,
-                                terminal.action_epoch,
-                            )
-                        },
-                    ),
-                    sequence: terminal.sequence,
-                    title: terminal.view.runtime.title,
-                    text_lines,
-                    screen,
-                },
-            )))
+        TaskCockpitQuery::OpenConversationSubscription { .. }
+        | TaskCockpitQuery::ReleaseConversationSubscription { .. } => {
+            // Owned by HostRequestExecutor so the subscription registry stays
+            // serialized with output lifecycle. Reaching this arm is a routing bug.
+            QueryOutcome::Err(QueryError::Unavailable {
+                reason: "conversation_subscription_executor",
+            })
+        }
+        TaskCockpitQuery::Terminal | TaskCockpitQuery::TerminalReadiness => {
+            let readiness_query = matches!(dispatch.query, TaskCockpitQuery::TerminalReadiness);
+            serve_task_terminal(&dispatch, task_id, &snapshot, readiness_query)
         }
         TaskCockpitQuery::WorkspaceStatus => QueryOutcome::Ok(QueryResult::TaskCockpit(
             TaskCockpitResult::Workspace(workspace_projection(task_id, &snapshot.task.workspace)),
@@ -480,7 +431,229 @@ fn compact_terminal_screen_for_wire(
 const MAX_CONVERSATION_PAGE_ITEMS: usize = 128;
 const MAX_CONVERSATION_PAGE_BYTES: usize = 256 * 1024;
 
-fn serve_conversation(
+/// Project one bounded semantic conversation page for a Task. Shared by the
+/// one-shot Conversation query and OpenConversationSubscription initial capture.
+fn serve_task_terminal(
+    dispatch: &TaskCockpitDispatch<'_>,
+    task_id: TaskId,
+    snapshot: &crate::domain::TaskSnapshot,
+    readiness_query: bool,
+) -> QueryOutcome {
+    let Some(service) = dispatch.terminal_service else {
+        return unavailable(
+            TaskCockpitSurface::Terminal,
+            TaskCockpitUnavailableReason::TerminalUnavailable,
+        );
+    };
+    match service.task_terminal_view(task_id) {
+        Ok(Some(terminal)) => {
+            let Some(primary_agent_id) = snapshot.primary_agent_id else {
+                return denied(
+                    TaskCockpitSurface::Terminal,
+                    TaskCockpitDeniedReason::StaleFence,
+                );
+            };
+            let Some(agent) = snapshot.agents.get(&primary_agent_id) else {
+                return denied(
+                    TaskCockpitSurface::Terminal,
+                    TaskCockpitDeniedReason::StaleFence,
+                );
+            };
+            let matching_resources = snapshot
+                .resources
+                .values()
+                .filter(|resource| {
+                    resource.resource_kind == crate::domain::ResourceKind::Terminal
+                        && resource.lifecycle == crate::domain::ResourceLifecycle::Active
+                })
+                .collect::<Vec<_>>();
+            let [resource] = matching_resources.as_slice() else {
+                return denied(
+                    TaskCockpitSurface::Terminal,
+                    TaskCockpitDeniedReason::StaleFence,
+                );
+            };
+            if terminal.agent_session_id != primary_agent_id
+                || terminal.runtime_generation != agent.runtime_generation
+                || terminal.action_epoch == 0
+                || terminal.resource_id != resource.id
+                || terminal.resource_generation != resource.runtime_generation
+            {
+                return denied(
+                    TaskCockpitSurface::Terminal,
+                    TaskCockpitDeniedReason::StaleFence,
+                );
+            }
+            let (screen, text_lines) = compact_terminal_screen_for_wire(terminal.view.screen);
+            if readiness_query
+                && agent.provider_kind == crate::providers::ProviderKind::Codex
+                && agent.provider_session_id.is_none()
+            {
+                use crate::providers::input::{
+                    classify_codex_identityless_startup_readiness,
+                    CodexIdentitylessStartupReadiness,
+                };
+                match classify_codex_identityless_startup_readiness(&text_lines) {
+                    CodexIdentitylessStartupReadiness::ProviderSetupRequired => {
+                        return unavailable(
+                            TaskCockpitSurface::Terminal,
+                            TaskCockpitUnavailableReason::TerminalProviderSetupRequired,
+                        );
+                    }
+                    CodexIdentitylessStartupReadiness::StartupPending => {
+                        return unavailable(
+                            TaskCockpitSurface::Terminal,
+                            TaskCockpitUnavailableReason::TerminalStartPending,
+                        );
+                    }
+                    CodexIdentitylessStartupReadiness::ChatComposerReady => {}
+                }
+            }
+            QueryOutcome::Ok(QueryResult::TaskCockpit(TaskCockpitResult::Terminal(
+                TaskTerminalProjection {
+                    task_id,
+                    terminal_id: terminal.terminal_id,
+                    session_id: terminal.session_id,
+                    agent_session_id: terminal.agent_session_id,
+                    resource_id: terminal.resource_id,
+                    runtime_generation: terminal.runtime_generation,
+                    resource_generation: terminal.resource_generation,
+                    action_epoch: terminal.action_epoch,
+                    accepts_input_without_conversation_id: dispatch.service_runtime.is_some_and(
+                        |manager| {
+                            manager.accepts_input_without_conversation_id(
+                                task_id,
+                                terminal.agent_session_id,
+                                terminal.resource_id,
+                                terminal.runtime_generation,
+                                terminal.action_epoch,
+                            )
+                        },
+                    ),
+                    sequence: terminal.sequence,
+                    title: terminal.view.runtime.title,
+                    text_lines,
+                    screen,
+                },
+            )))
+        }
+        Ok(None) => {
+            if !readiness_query {
+                // Legacy Terminal callers keep the closed Unavailable reason.
+                return unavailable(
+                    TaskCockpitSurface::Terminal,
+                    TaskCockpitUnavailableReason::TerminalUnavailable,
+                );
+            }
+            classify_terminal_readiness_absence(dispatch, task_id, snapshot)
+        }
+        Err(_) => denied(
+            TaskCockpitSurface::Terminal,
+            TaskCockpitDeniedReason::StaleFence,
+        ),
+    }
+}
+
+/// Opt-in TerminalReadiness classification when no terminal attachment exists.
+/// Presence, busy locks, and unknown service never become NotStarted.
+fn classify_terminal_readiness_absence(
+    dispatch: &TaskCockpitDispatch<'_>,
+    task_id: TaskId,
+    snapshot: &crate::domain::TaskSnapshot,
+) -> QueryOutcome {
+    if matches!(
+        dispatch.provider_launch_hint,
+        ProviderLaunchReadinessHint::StartPending
+    ) {
+        return unavailable(
+            TaskCockpitSurface::Terminal,
+            TaskCockpitUnavailableReason::TerminalStartPending,
+        );
+    }
+    let Some(primary_agent_id) = snapshot.primary_agent_id else {
+        return unavailable(
+            TaskCockpitSurface::Terminal,
+            TaskCockpitUnavailableReason::TerminalUnavailable,
+        );
+    };
+    let Some(agent) = snapshot.agents.get(&primary_agent_id) else {
+        return unavailable(
+            TaskCockpitSurface::Terminal,
+            TaskCockpitUnavailableReason::TerminalUnavailable,
+        );
+    };
+    let matching_resources = snapshot
+        .resources
+        .values()
+        .filter(|resource| {
+            resource.resource_kind == crate::domain::ResourceKind::Terminal
+                && resource.lifecycle == crate::domain::ResourceLifecycle::Active
+                && resource.runtime_generation == agent.runtime_generation
+        })
+        .collect::<Vec<_>>();
+    let [resource] = matching_resources.as_slice() else {
+        return unavailable(
+            TaskCockpitSurface::Terminal,
+            TaskCockpitUnavailableReason::TerminalUnavailable,
+        );
+    };
+    let Some(manager) = dispatch.service_runtime else {
+        return unavailable(
+            TaskCockpitSurface::Terminal,
+            TaskCockpitUnavailableReason::TerminalUnavailable,
+        );
+    };
+    // Live provider without terminal attachment is not absence. A busy or
+    // poisoned runtime book is unknown — never treat None as verified absence.
+    match manager.try_has_live_provider_runtime(
+        task_id,
+        primary_agent_id,
+        resource.id,
+        agent.runtime_generation,
+    ) {
+        Some(true) => {
+            return unavailable(
+                TaskCockpitSurface::Terminal,
+                TaskCockpitUnavailableReason::TerminalStartPending,
+            );
+        }
+        None => {
+            return unavailable(
+                TaskCockpitSurface::Terminal,
+                TaskCockpitUnavailableReason::TerminalUnavailable,
+            );
+        }
+        Some(false) => {}
+    }
+    match manager.try_classify_persisted_provider_launch(primary_agent_id) {
+        Ok(Some(true)) => unavailable(
+            TaskCockpitSurface::Terminal,
+            TaskCockpitUnavailableReason::TerminalStartPending,
+        ),
+        Ok(Some(false)) => {
+            if !matches!(
+                dispatch.provider_launch_hint,
+                ProviderLaunchReadinessHint::NotPending
+            ) || !snapshot.is_unstarted_draft()
+            {
+                return unavailable(
+                    TaskCockpitSurface::Terminal,
+                    TaskCockpitUnavailableReason::TerminalUnavailable,
+                );
+            }
+            unavailable(
+                TaskCockpitSurface::Terminal,
+                TaskCockpitUnavailableReason::TerminalNotStarted,
+            )
+        }
+        Ok(None) | Err(_) => unavailable(
+            TaskCockpitSurface::Terminal,
+            TaskCockpitUnavailableReason::TerminalUnavailable,
+        ),
+    }
+}
+
+pub(crate) fn serve_conversation(
     dispatch: &TaskCockpitDispatch<'_>,
     task_id: TaskId,
     after_sequence: u64,
@@ -500,21 +673,42 @@ fn serve_conversation(
         });
     };
     let key = StableSessionKey::from_tab(&task_id.to_string());
-    let replay = store
-        .capture_replay_after(&key, after_sequence)
-        .map(|capture| capture.into_replay());
+    let capture = store.capture_conversation_after(&key, after_sequence);
     drop(store);
+    // Sort retained pointers and resolve replacement links outside the journal
+    // mutex; provider token recording must not wait on page projection.
+    let replay = capture.map(|capture| capture.into_replay());
+    let cursor_rolled_over = replay.as_ref().is_some_and(|r| r.cursor_rolled_over || after_sequence > r.through_sequence)
+        || (replay.is_none() && after_sequence > 0);
 
-    let (high_water, events) = match replay {
-        Some(replay) => (replay.through_sequence, replay.events),
-        None => (0, Vec::new()),
+    let (oldest_sequence, high_water, events) = match replay {
+        Some(replay) => (replay.oldest_sequence, replay.through_sequence, replay.events),
+        None => (0, 0, Vec::new()),
     };
+    let after_sequence = if cursor_rolled_over { 0 } else { after_sequence };
     // Fixed high-water for this capture. `after_sequence` is a forward exclusive
     // cursor: return the next retained prefix page in ascending sequence order.
     let replaced = events
         .iter()
         .filter_map(|event| event.replaces_sequence)
         .collect::<std::collections::BTreeSet<_>>();
+    // An upsert receives a new replay sequence, but remains the same visible
+    // message. Keep its original identity through retained replacement links;
+    // clients can then replace cached partial text instead of appending copies.
+    let links = events.iter().filter_map(|event| event.replaces_sequence
+        .map(|previous| (event.sequence, previous)))
+        .collect::<std::collections::BTreeMap<_, _>>();
+    let mut identities = std::collections::BTreeMap::new();
+    for event in &events {
+        let mut original = event.sequence;
+        while let Some(previous) = links.get(&original).copied() {
+            if previous == 0 || previous >= original {
+                return QueryOutcome::Err(QueryError::Unavailable { reason: "semantic_replacement_lineage" });
+            }
+            original = identities.get(&previous).copied().unwrap_or(previous);
+        }
+        identities.insert(event.sequence, original);
+    }
     let retained = events
         .iter()
         .filter(|event| event.sequence > after_sequence)
@@ -525,7 +719,7 @@ fn serve_conversation(
         .iter()
         .take(MAX_CONVERSATION_PAGE_ITEMS)
         .map(|event| SemanticJournalFact {
-            id: conversation_event_id(task_id, event.sequence),
+            id: conversation_event_id(task_id, identities[&event.sequence]),
             sequence: event.sequence,
             occurred_at_ms: i64::try_from(event.occurred_at_epoch_ms).ok(),
             provider: semantic_provider_name(event.source).to_string(),
@@ -538,6 +732,8 @@ fn serve_conversation(
         })
         .collect::<Vec<_>>();
     let mut page = SemanticJournalPage {
+        oldest_sequence,
+        cursor_rolled_over,
         after_sequence,
         through_sequence: facts
             .last()
@@ -549,26 +745,29 @@ fn serve_conversation(
         facts,
     };
     loop {
-        let encoded = rmp_serde::to_vec_named(&page).unwrap_or_default();
-        if encoded.len() <= MAX_CONVERSATION_PAGE_BYTES || page.facts.is_empty() {
-            page.encoded_bytes = u32::try_from(encoded.len()).unwrap_or(u32::MAX);
-            break;
-        }
-        // Trim from the end so the page remains a contiguous forward prefix.
-        page.facts.pop();
-        page.through_sequence = page
+        let page_end = page
             .facts
             .last()
             .map(|fact| fact.sequence)
             .unwrap_or(after_sequence);
+        let more_retained = retained.iter().any(|event| event.sequence > page_end);
+        page.next_sequence = more_retained.then_some(page_end);
+        // The final page consumes filtered facts too; otherwise every wake
+        // would fetch the same omitted terminal output again.
+        page.through_sequence = if more_retained { page_end } else { high_water };
+        let Ok(encoded_bytes) = crate::domain::snapshot::canonical_semantic_page_size(&page) else {
+            return QueryOutcome::Err(QueryError::Unavailable { reason: "semantic_page_encode" });
+        };
+        if encoded_bytes as usize <= MAX_CONVERSATION_PAGE_BYTES {
+            page.encoded_bytes = encoded_bytes;
+            break;
+        }
+        // Never emit an empty continuation that cannot advance.
+        if page.facts.len() <= 1 {
+            return QueryOutcome::Err(QueryError::Unavailable { reason: "semantic_fact_too_large" });
+        }
+        page.facts.pop();
     }
-    let page_end = page
-        .facts
-        .last()
-        .map(|fact| fact.sequence)
-        .unwrap_or(after_sequence);
-    let more_retained = retained.iter().any(|event| event.sequence > page_end);
-    page.next_sequence = more_retained.then_some(page_end);
     QueryOutcome::Ok(QueryResult::TaskCockpit(TaskCockpitResult::Conversation(
         page,
     )))
@@ -2144,7 +2343,7 @@ fn unavailable(surface: TaskCockpitSurface, reason: TaskCockpitUnavailableReason
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::domain::command::{Command, CommandEnvelope, CreateTaskRequestIntent};
+    use crate::domain::command::{Command, CommandEnvelope, CommandReceipt, CreateTaskRequestIntent};
     use crate::domain::task::{
         ReviewReadiness, TaskActivity, TaskAssignment, TaskAttention, TaskConnectivity,
     };
@@ -2222,6 +2421,7 @@ mod tests {
             action_epoch: None,
             runtime_generation: None,
             config: None,
+            provider_launch_hint: ProviderLaunchReadinessHint::Unknown,
         });
         let QueryOutcome::Ok(QueryResult::TaskCockpit(TaskCockpitResult::Conversation(page))) =
             outcome
@@ -2337,6 +2537,7 @@ mod tests {
             action_epoch: None,
             runtime_generation: None,
             config: None,
+            provider_launch_hint: ProviderLaunchReadinessHint::Unknown,
         });
         assert!(matches!(
             accepted,
@@ -2366,6 +2567,7 @@ mod tests {
             action_epoch: Some(1),
             runtime_generation: Some(1),
             config: None,
+            provider_launch_hint: ProviderLaunchReadinessHint::Unknown,
         });
         assert!(matches!(
             named,
@@ -2394,6 +2596,7 @@ mod tests {
             action_epoch: None,
             runtime_generation: None,
             config: None,
+            provider_launch_hint: ProviderLaunchReadinessHint::Unknown,
         });
         assert!(matches!(
             foreign,
@@ -2430,6 +2633,7 @@ mod tests {
             action_epoch: Some(1),
             runtime_generation: Some(1),
             config: None,
+            provider_launch_hint: ProviderLaunchReadinessHint::Unknown,
         });
         let QueryOutcome::Ok(QueryResult::TaskCockpit(TaskCockpitResult::FilesRead(text))) = text
         else {
@@ -2458,6 +2662,7 @@ mod tests {
             action_epoch: Some(1),
             runtime_generation: Some(1),
             config: None,
+            provider_launch_hint: ProviderLaunchReadinessHint::Unknown,
         });
         let QueryOutcome::Ok(QueryResult::TaskCockpit(TaskCockpitResult::FilesRead(binary))) =
             binary
@@ -2487,6 +2692,7 @@ mod tests {
             action_epoch: Some(1),
             runtime_generation: Some(1),
             config: None,
+            provider_launch_hint: ProviderLaunchReadinessHint::Unknown,
         });
         assert!(matches!(
             secret,
@@ -2530,6 +2736,7 @@ mod tests {
             action_epoch: Some(1),
             runtime_generation: Some(1),
             config: None,
+            provider_launch_hint: ProviderLaunchReadinessHint::Unknown,
         });
         let QueryOutcome::Ok(QueryResult::TaskCockpit(TaskCockpitResult::FilesList(listed))) =
             listed
@@ -2586,6 +2793,7 @@ mod tests {
             action_epoch: None,
             runtime_generation: None,
             config: None,
+            provider_launch_hint: ProviderLaunchReadinessHint::Unknown,
         });
         let QueryOutcome::Ok(QueryResult::TaskCockpit(TaskCockpitResult::Conversation(page))) =
             outcome
@@ -2648,6 +2856,7 @@ mod tests {
                 action_epoch: None,
                 runtime_generation: None,
                 config: None,
+            provider_launch_hint: ProviderLaunchReadinessHint::Unknown,
             });
             let QueryOutcome::Ok(QueryResult::TaskCockpit(TaskCockpitResult::Conversation(page))) =
                 outcome
@@ -2673,6 +2882,108 @@ mod tests {
             vec![129, 130]
         );
         assert_eq!(second.next_sequence, None);
+        assert_eq!(second.encoded_bytes as usize, rmp_serde::to_vec_named(&second).unwrap().len());
+
+        let reset = query_page(900);
+        assert!(reset.cursor_rolled_over);
+        assert_eq!(reset.after_sequence, 0);
+        assert_eq!(reset.oldest_sequence, 1);
+        assert_eq!(reset.facts.first().unwrap().sequence, 1);
+        assert_eq!(reset.next_sequence, Some(128));
+        assert_eq!(reset.encoded_bytes as usize, rmp_serde::to_vec_named(&reset).unwrap().len());
+    }
+
+    #[test]
+    fn conversation_incremental_upserts_preserve_original_message_identity() {
+        use crate::remote::presentation::{SemanticEventDraft, SemanticEventKind,
+            SemanticRetention, SemanticSource, StableSessionKey, SemanticJournalStore};
+        let (_repository, bus, client_id, task_id, _) = create_bound_task();
+        let journal = std::sync::Mutex::new(SemanticJournalStore::default());
+        let query_page = |after_sequence| {
+            let query = TaskCockpitQuery::Conversation { after_sequence };
+            let outcome = serve_task_cockpit(TaskCockpitDispatch {
+                capabilities: CapabilitySet::from_capabilities([Capability::TaskCockpit,
+                    Capability::SemanticConversation]),
+                envelope_task_id: Some(task_id), client_id,
+                connection_id: Uuid::now_v7(), request_id: RequestId::new(), query: &query,
+                bus: &bus, service_runtime: None, semantic_journal: Some(&journal),
+                terminal_service: None, ssh_endpoints: None, ssh_runtime: None,
+                workspace_projects: None, coordinator: None, action_epoch: None,
+                runtime_generation: None, config: None,
+            provider_launch_hint: ProviderLaunchReadinessHint::Unknown,
+            });
+            let QueryOutcome::Ok(QueryResult::TaskCockpit(TaskCockpitResult::Conversation(page))) = outcome
+                else { panic!("conversation page expected") };
+            page
+        };
+        let mut first_id = None;
+        for (index, text) in ["Hel", "Hello", "Hello world"].into_iter().enumerate() {
+            journal.lock().unwrap().record(SemanticEventDraft {
+                stable_session_key: StableSessionKey::from_tab(task_id.to_string()),
+                occurred_at_epoch_ms: index as u64 + 1, source: SemanticSource::Claude,
+                kind: SemanticEventKind::UserMessage { text: text.into() },
+                retention: SemanticRetention::Canonical,
+                deduplication_key: Some("stable-message".into()),
+            });
+            let page = query_page(index as u64);
+            assert_eq!(page.facts.len(), 1);
+            let id = page.facts[0].id;
+            assert_eq!(id, *first_id.get_or_insert(id));
+            assert_eq!(page.facts[0].sequence, index as u64 + 1);
+        }
+        let page = query_page(0);
+        assert_eq!(page.facts.len(), 1);
+        assert_eq!(Some(page.facts[0].id), first_id);
+    }
+
+    #[test]
+    fn provider_input_state_is_exact_primary_agent_and_capability_gated() {
+        use crate::domain::cockpit::ProviderInputStateProjection;
+        use crate::domain::agent::{AgentRole, AgentSessionFacts, ProviderSessionId};
+        use crate::domain::provider_input::ProviderSessionProjection;
+        use crate::providers::ProviderKind;
+
+        let (_repository, bus, client_id, task_id, _roots) = create_bound_task();
+        let mut snapshot = bus.task_snapshot(task_id).unwrap().unwrap();
+        let empty = ProviderInputStateProjection::from_snapshot(&snapshot);
+        assert_eq!(empty.task_id, task_id);
+        assert!(empty.agent_session_id.is_none());
+        let mut agent = AgentSessionFacts::new(task_id, AgentRole::Primary, ProviderKind::ClaudeCode,
+            Some(ProviderSessionId::new("exact-provider-conversation").unwrap())).unwrap();
+        agent.runtime_generation = 7;
+        snapshot.primary_agent_id = Some(agent.id);
+        snapshot.agents.insert(agent.id, agent.clone());
+        let question = crate::domain::QuestionId::new();
+        snapshot.provider_sessions.insert(agent.id, ProviderSessionProjection {
+            open_question: Some(question), ..Default::default()
+        });
+        let state = ProviderInputStateProjection::from_snapshot(&snapshot);
+        assert_eq!(state.runtime_generation, Some(7));
+        assert_eq!(state.agent_session_id, Some(agent.id));
+        assert_eq!(state.provider_session_id, agent.provider_session_id);
+        assert_eq!(state.open_question, Some(question));
+        // Even a malformed foreign primary reference cannot grant input authority.
+        snapshot.agents.get_mut(&agent.id).unwrap().task_id = TaskId::new();
+        assert!(ProviderInputStateProjection::from_snapshot(&snapshot).agent_session_id.is_none());
+
+        for allowed in [false, true] {
+            let caps = if allowed { CapabilitySet::from_capabilities([Capability::TaskCockpit, Capability::ProviderInput]) }
+                else { CapabilitySet::from_capabilities([Capability::TaskCockpit]) };
+            let outcome = serve_task_cockpit(TaskCockpitDispatch {
+                capabilities: caps, envelope_task_id: Some(task_id), client_id,
+                connection_id: Uuid::now_v7(), request_id: RequestId::new(),
+                query: &TaskCockpitQuery::ProviderInputState, bus: &bus,
+                service_runtime: None, semantic_journal: None, terminal_service: None,
+                ssh_endpoints: None, ssh_runtime: None, workspace_projects: None,
+                coordinator: None, action_epoch: None, runtime_generation: None, config: None,
+                provider_launch_hint: ProviderLaunchReadinessHint::Unknown,
+            });
+            if allowed {
+                assert!(matches!(outcome, QueryOutcome::Ok(QueryResult::TaskCockpit(TaskCockpitResult::ProviderInputState(_)))));
+            } else {
+                assert!(matches!(outcome, QueryOutcome::Err(QueryError::UnsupportedCapability)));
+            }
+        }
     }
 
     #[test]
@@ -2734,6 +3045,7 @@ mod tests {
             action_epoch: None,
             runtime_generation: None,
             config: None,
+            provider_launch_hint: ProviderLaunchReadinessHint::Unknown,
         });
         let QueryOutcome::Ok(QueryResult::TaskCockpit(TaskCockpitResult::Conversation(page))) =
             outcome
@@ -2780,6 +3092,7 @@ mod tests {
             action_epoch,
             runtime_generation,
             config: None,
+            provider_launch_hint: ProviderLaunchReadinessHint::Unknown,
         }
     }
 
@@ -3215,8 +3528,8 @@ mod tests {
             .expect("config query follows Task Cockpit query");
         let body = &body[..end];
         assert!(
-            body.contains("query_with_timeout") && body.contains("task_cockpit_query_timeout"),
-            "Task Cockpit must not use the generic 5s request deadline"
+            body.contains("typed_queries::query_task_cockpit(self, task_id, query)"),
+            "Task Cockpit must use the typed request path whose timeout is verified by cockpit_and_agent_keep_custom_timeouts"
         );
     }
 
@@ -3335,5 +3648,357 @@ mod tests {
             path_like,
             QueryOutcome::Err(QueryError::InvalidRequest)
         ));
+    }
+
+    fn create_unstarted_draft_with_terminal_claim() -> (
+        tempfile::TempDir,
+        CommandBus,
+        ClientId,
+        TaskId,
+        WorkspaceProjectRoots,
+        crate::domain::AgentSessionId,
+        crate::domain::ResourceId,
+    ) {
+        use crate::domain::agent::{AgentRole, AgentSessionFacts};
+        use crate::domain::resource::{OwnerKind, ResourceFacts, ResourceKind, ResourceRecipe};
+        use crate::providers::ProviderKind;
+
+        let (repository, mut bus, client_id, task_id, roots) = create_bound_task();
+        let mut revision = bus
+            .task_snapshot(task_id)
+            .expect("lookup")
+            .expect("task")
+            .task
+            .revision;
+        let mut agent = AgentSessionFacts::new(task_id, AgentRole::Primary, ProviderKind::Codex, None)
+            .expect("agent");
+        agent.runtime_generation = 1;
+        let agent_id = agent.id;
+        let receipt = bus
+            .execute(CommandEnvelope {
+                command_id: CommandId::new(),
+                client_id,
+                task_id: Some(task_id),
+                issued_at_ms: 2,
+                expected_task_revision: Some(revision),
+                command: Command::RegisterAgentSession { agent },
+            })
+            .expect("register agent");
+        let CommandReceipt::Accepted {
+            task_revision: Some(next),
+            ..
+        } = receipt
+        else {
+            panic!("register agent: {receipt:?}");
+        };
+        revision = next;
+        let mut resource = ResourceFacts::new(
+            Some(task_id),
+            OwnerKind::Task,
+            ResourceKind::Terminal,
+            ResourceRecipe::Terminal {
+                cols: 120,
+                rows: 40,
+            },
+            2,
+        )
+        .expect("resource");
+        resource.runtime_generation = 1;
+        let resource_id = resource.id;
+        let receipt = bus
+            .execute(CommandEnvelope {
+                command_id: CommandId::new(),
+                client_id,
+                task_id: Some(task_id),
+                issued_at_ms: 3,
+                expected_task_revision: Some(revision),
+                command: Command::RegisterResource { resource },
+            })
+            .expect("register resource");
+        let CommandReceipt::Accepted {
+            task_revision: Some(next),
+            ..
+        } = receipt
+        else {
+            panic!("register resource: {receipt:?}");
+        };
+        revision = next;
+        let receipt = bus
+            .execute(CommandEnvelope {
+                command_id: CommandId::new(),
+                client_id,
+                task_id: Some(task_id),
+                issued_at_ms: 4,
+                expected_task_revision: Some(revision),
+                command: Command::SetPrimaryAgent {
+                    agent_session_id: agent_id,
+                },
+            })
+            .expect("set primary");
+        assert!(matches!(receipt, CommandReceipt::Accepted { .. }), "{receipt:?}");
+        (
+            repository,
+            bus,
+            client_id,
+            task_id,
+            roots,
+            agent_id,
+            resource_id,
+        )
+    }
+
+    #[test]
+    fn terminal_readiness_classifies_pending_unknown_and_not_started() {
+        use crate::services::ProcessManager;
+        use crate::terminal::service::TerminalService;
+
+        let (_repository, bus, client_id, task_id, roots, agent_id, _resource) =
+            create_unstarted_draft_with_terminal_claim();
+        let granted = CapabilitySet::from_capabilities([Capability::TaskCockpit]);
+        let terminals = TerminalService::new();
+        let store_dir = tempfile::tempdir().expect("provider store");
+        // Genuinely cold manager: provider_sessions stays None; missing store
+        // file is proved absence without peek/init.
+        let manager = ProcessManager::new_with_provider_session_store_path(
+            store_dir.path().join("provider-sessions.sqlite"),
+        );
+        assert!(
+            matches!(
+                manager.try_classify_persisted_provider_launch(agent_id),
+                Ok(Some(false))
+            ),
+            "cold missing store must classify absence without initializing the manager"
+        );
+
+        let no_service = serve_task_cockpit(TaskCockpitDispatch {
+            capabilities: granted,
+            envelope_task_id: Some(task_id),
+            client_id,
+            connection_id: Uuid::now_v7(),
+            request_id: RequestId::new(),
+            query: &TaskCockpitQuery::TerminalReadiness,
+            bus: &bus,
+            service_runtime: None,
+            semantic_journal: None,
+            terminal_service: None,
+            ssh_endpoints: None,
+            ssh_runtime: None,
+            workspace_projects: Some(&roots),
+            coordinator: None,
+            action_epoch: None,
+            runtime_generation: None,
+            config: None,
+            provider_launch_hint: ProviderLaunchReadinessHint::NotPending,
+        });
+        assert!(matches!(
+            no_service,
+            QueryOutcome::Ok(QueryResult::TaskCockpit(TaskCockpitResult::Unavailable {
+                surface: TaskCockpitSurface::Terminal,
+                reason: TaskCockpitUnavailableReason::TerminalUnavailable,
+            }))
+        ));
+
+        let pending = serve_task_cockpit(TaskCockpitDispatch {
+            capabilities: granted,
+            envelope_task_id: Some(task_id),
+            client_id,
+            connection_id: Uuid::now_v7(),
+            request_id: RequestId::new(),
+            query: &TaskCockpitQuery::TerminalReadiness,
+            bus: &bus,
+            service_runtime: Some(&manager),
+            semantic_journal: None,
+            terminal_service: Some(&terminals),
+            ssh_endpoints: None,
+            ssh_runtime: None,
+            workspace_projects: Some(&roots),
+            coordinator: None,
+            action_epoch: None,
+            runtime_generation: None,
+            config: None,
+            provider_launch_hint: ProviderLaunchReadinessHint::StartPending,
+        });
+        assert!(matches!(
+            pending,
+            QueryOutcome::Ok(QueryResult::TaskCockpit(TaskCockpitResult::Unavailable {
+                surface: TaskCockpitSurface::Terminal,
+                reason: TaskCockpitUnavailableReason::TerminalStartPending,
+            }))
+        ));
+
+        let unknown = serve_task_cockpit(TaskCockpitDispatch {
+            capabilities: granted,
+            envelope_task_id: Some(task_id),
+            client_id,
+            connection_id: Uuid::now_v7(),
+            request_id: RequestId::new(),
+            query: &TaskCockpitQuery::TerminalReadiness,
+            bus: &bus,
+            service_runtime: Some(&manager),
+            semantic_journal: None,
+            terminal_service: Some(&terminals),
+            ssh_endpoints: None,
+            ssh_runtime: None,
+            workspace_projects: Some(&roots),
+            coordinator: None,
+            action_epoch: None,
+            runtime_generation: None,
+            config: None,
+            provider_launch_hint: ProviderLaunchReadinessHint::Unknown,
+        });
+        assert!(matches!(
+            unknown,
+            QueryOutcome::Ok(QueryResult::TaskCockpit(TaskCockpitResult::Unavailable {
+                surface: TaskCockpitSurface::Terminal,
+                reason: TaskCockpitUnavailableReason::TerminalUnavailable,
+            }))
+        ));
+
+        let legacy = serve_task_cockpit(TaskCockpitDispatch {
+            capabilities: granted,
+            envelope_task_id: Some(task_id),
+            client_id,
+            connection_id: Uuid::now_v7(),
+            request_id: RequestId::new(),
+            query: &TaskCockpitQuery::Terminal,
+            bus: &bus,
+            service_runtime: Some(&manager),
+            semantic_journal: None,
+            terminal_service: Some(&terminals),
+            ssh_endpoints: None,
+            ssh_runtime: None,
+            workspace_projects: Some(&roots),
+            coordinator: None,
+            action_epoch: None,
+            runtime_generation: None,
+            config: None,
+            provider_launch_hint: ProviderLaunchReadinessHint::StartPending,
+        });
+        assert!(
+            matches!(
+                legacy,
+                QueryOutcome::Ok(QueryResult::TaskCockpit(TaskCockpitResult::Unavailable {
+                    surface: TaskCockpitSurface::Terminal,
+                    reason: TaskCockpitUnavailableReason::TerminalUnavailable,
+                }))
+            ),
+            "legacy Terminal must keep the closed Unavailable reason"
+        );
+
+        let not_started = serve_task_cockpit(TaskCockpitDispatch {
+            capabilities: granted,
+            envelope_task_id: Some(task_id),
+            client_id,
+            connection_id: Uuid::now_v7(),
+            request_id: RequestId::new(),
+            query: &TaskCockpitQuery::TerminalReadiness,
+            bus: &bus,
+            service_runtime: Some(&manager),
+            semantic_journal: None,
+            terminal_service: Some(&terminals),
+            ssh_endpoints: None,
+            ssh_runtime: None,
+            workspace_projects: Some(&roots),
+            coordinator: None,
+            action_epoch: None,
+            runtime_generation: None,
+            config: None,
+            provider_launch_hint: ProviderLaunchReadinessHint::NotPending,
+        });
+        assert!(matches!(
+            not_started,
+            QueryOutcome::Ok(QueryResult::TaskCockpit(TaskCockpitResult::Unavailable {
+                surface: TaskCockpitSurface::Terminal,
+                reason: TaskCockpitUnavailableReason::TerminalNotStarted,
+            }))
+        ));
+    }
+
+    #[test]
+    fn terminal_readiness_corrupt_store_stays_unknown_within_bound() {
+        use crate::services::ProcessManager;
+        use crate::terminal::service::TerminalService;
+        use std::time::Instant;
+
+        let (_repository, bus, client_id, task_id, roots, agent_id, _resource) =
+            create_unstarted_draft_with_terminal_claim();
+        let store_dir = tempfile::tempdir().expect("provider store");
+        let store_path = store_dir.path().join("provider-sessions.sqlite");
+        std::fs::write(&store_path, b"not-a-sqlite-database").expect("corrupt");
+        let manager = ProcessManager::new_with_provider_session_store_path(store_path);
+        let started = Instant::now();
+        let classified = manager.try_classify_persisted_provider_launch(agent_id);
+        assert!(
+            started.elapsed() < std::time::Duration::from_millis(500),
+            "corrupt probe must stay bounded"
+        );
+        assert!(
+            matches!(classified, Ok(None)),
+            "corrupt store must be unknown, got {classified:?}"
+        );
+        let terminals = TerminalService::new();
+        let outcome = serve_task_cockpit(TaskCockpitDispatch {
+            capabilities: CapabilitySet::from_capabilities([Capability::TaskCockpit]),
+            envelope_task_id: Some(task_id),
+            client_id,
+            connection_id: Uuid::now_v7(),
+            request_id: RequestId::new(),
+            query: &TaskCockpitQuery::TerminalReadiness,
+            bus: &bus,
+            service_runtime: Some(&manager),
+            semantic_journal: None,
+            terminal_service: Some(&terminals),
+            ssh_endpoints: None,
+            ssh_runtime: None,
+            workspace_projects: Some(&roots),
+            coordinator: None,
+            action_epoch: None,
+            runtime_generation: None,
+            config: None,
+            provider_launch_hint: ProviderLaunchReadinessHint::NotPending,
+        });
+        assert!(matches!(
+            outcome,
+            QueryOutcome::Ok(QueryResult::TaskCockpit(TaskCockpitResult::Unavailable {
+                surface: TaskCockpitSurface::Terminal,
+                reason: TaskCockpitUnavailableReason::TerminalUnavailable,
+            }))
+        ));
+    }
+
+    #[test]
+    fn terminal_readiness_live_binding_without_attachment_is_pending_not_absence() {
+        let source = include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/src/host/cockpit.rs"
+        ));
+        let start = source
+            .find("fn classify_terminal_readiness_absence(")
+            .expect("classify_terminal_readiness_absence");
+        let body = &source[start..];
+        let end = body
+            .find("\npub(crate) fn serve_conversation(")
+            .expect("serve_conversation follows classify");
+        let body = &body[..end];
+        assert!(
+            !body.contains("provider_terminal_binding("),
+            "no-attachment classification must not call blocking provider_terminal_binding"
+        );
+        assert!(
+            body.contains("try_has_live_provider_runtime("),
+            "live runtime book must be tri-state checked"
+        );
+        assert!(
+            body.contains("Some(false)"),
+            "NotStarted requires proved Some(false) live absence"
+        );
+        assert!(
+            body.contains("try_classify_persisted_provider_launch("),
+            "persisted launch classification must stay non-blocking"
+        );
+        assert!(
+            !body.contains("peek_persisted_provider_launch_spec("),
+            "readiness must not call the blocking persisted peek"
+        );
     }
 }

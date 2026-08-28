@@ -3,6 +3,7 @@ use serde::ser::SerializeMap;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::fmt;
 
+use crate::domain::command::{CommandEnvelope, CommandReceipt};
 use crate::domain::cockpit::{TaskCockpitQuery, TaskCockpitResult};
 use crate::domain::host::HostQuitInspection;
 use crate::domain::id::{
@@ -189,6 +190,10 @@ pub enum Query {
     OperationStatus {
         operation_id: OperationId,
     },
+    /// Read-only lookup of a durable command receipt for reconnect recovery.
+    /// The authenticated host client identity is supplied out-of-band by the
+    /// host transport; it is never inferred from this nested command.
+    CommandReceiptStatus { command: CommandEnvelope },
     /// Task scope is taken from [`QueryEnvelope::task_id`].
     TaskSnapshot,
     /// Open (`snapshot_id` and `resume_cursor` both absent) or resume (both present).
@@ -226,6 +231,21 @@ pub enum Query {
     PromptLibrary(PromptLibraryQuery),
     /// Task-scoped cockpit workspace/git/files/ssh/service projection.
     TaskCockpit(TaskCockpitQuery),
+}
+
+struct CommandReceiptStatusQueryRef<'a> {
+    command: &'a CommandEnvelope,
+}
+
+impl Serialize for CommandReceiptStatusQueryRef<'_> {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let mut map = serializer.serialize_map(Some(1))?;
+        map.serialize_entry("command", self.command)?;
+        map.end()
+    }
 }
 
 struct OperationStatusQueryRef<'a> {
@@ -393,6 +413,10 @@ impl Serialize for Query {
                 "operation_status",
                 &OperationStatusQueryRef { operation_id },
             )?,
+            Self::CommandReceiptStatus { command } => map.serialize_entry(
+                "command_receipt_status",
+                &CommandReceiptStatusQueryRef { command },
+            )?,
             Self::TaskSnapshot => map.serialize_entry("task_snapshot", &EmptyNamedMap)?,
             Self::SnapshotPage {
                 section,
@@ -457,6 +481,7 @@ impl Serialize for Query {
 
 enum QueryVariant {
     OperationStatus,
+    CommandReceiptStatus,
     TaskSnapshot,
     SnapshotPage,
     ReleaseSnapshot,
@@ -483,7 +508,7 @@ impl<'de> Deserialize<'de> for QueryVariant {
 
             fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
                 formatter.write_str(
-                    "operation_status, task_snapshot, snapshot_page, release_snapshot, open_event_replay, continue_event_replay, release_event_replay, open_artifact_content, continue_artifact_content, release_artifact_content, inspect_host_quit, prompt_library, or task_cockpit",
+                    "operation_status, command_receipt_status, task_snapshot, snapshot_page, release_snapshot, open_event_replay, continue_event_replay, release_event_replay, open_artifact_content, continue_artifact_content, release_artifact_content, inspect_host_quit, prompt_library, or task_cockpit",
                 )
             }
 
@@ -493,6 +518,7 @@ impl<'de> Deserialize<'de> for QueryVariant {
             {
                 match value {
                     "operation_status" => Ok(QueryVariant::OperationStatus),
+                    "command_receipt_status" => Ok(QueryVariant::CommandReceiptStatus),
                     "task_snapshot" => Ok(QueryVariant::TaskSnapshot),
                     "snapshot_page" => Ok(QueryVariant::SnapshotPage),
                     "release_snapshot" => Ok(QueryVariant::ReleaseSnapshot),
@@ -509,6 +535,7 @@ impl<'de> Deserialize<'de> for QueryVariant {
                         value,
                         &[
                             "operation_status",
+                            "command_receipt_status",
                             "task_snapshot",
                             "snapshot_page",
                             "release_snapshot",
@@ -528,6 +555,82 @@ impl<'de> Deserialize<'de> for QueryVariant {
         }
 
         deserializer.deserialize_identifier(VariantVisitor)
+    }
+}
+
+struct CommandReceiptStatusQueryPayload {
+    command: CommandEnvelope,
+}
+
+enum CommandReceiptStatusQueryField {
+    Command,
+}
+
+impl<'de> Deserialize<'de> for CommandReceiptStatusQueryField {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        struct FieldVisitor;
+
+        impl Visitor<'_> for FieldVisitor {
+            type Value = CommandReceiptStatusQueryField;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("command")
+            }
+
+            fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
+            where
+                E: de::Error,
+            {
+                match value {
+                    "command" => Ok(CommandReceiptStatusQueryField::Command),
+                    _ => Err(de::Error::unknown_field(value, &["command"])),
+                }
+            }
+        }
+
+        deserializer.deserialize_identifier(FieldVisitor)
+    }
+}
+
+impl<'de> Deserialize<'de> for CommandReceiptStatusQueryPayload {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        struct PayloadVisitor;
+
+        impl<'de> Visitor<'de> for PayloadVisitor {
+            type Value = CommandReceiptStatusQueryPayload;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("a named command_receipt_status query payload map")
+            }
+
+            fn visit_map<M>(self, mut map: M) -> Result<Self::Value, M::Error>
+            where
+                M: MapAccess<'de>,
+            {
+                let mut command = None;
+                while let Some(field) = map.next_key()? {
+                    match field {
+                        CommandReceiptStatusQueryField::Command => {
+                            if command.is_some() {
+                                return Err(de::Error::duplicate_field("command"));
+                            }
+                            command = Some(map.next_value()?);
+                        }
+                    }
+                }
+                Ok(CommandReceiptStatusQueryPayload {
+                    command: command.ok_or_else(|| de::Error::missing_field("command"))?,
+                })
+            }
+        }
+
+        deserializer.deserialize_map(PayloadVisitor)
     }
 }
 
@@ -1340,6 +1443,12 @@ impl<'de> Deserialize<'de> for Query {
                             operation_id: payload.operation_id,
                         }
                     }
+                    QueryVariant::CommandReceiptStatus => {
+                        let payload: CommandReceiptStatusQueryPayload = map.next_value()?;
+                        Query::CommandReceiptStatus {
+                            command: payload.command,
+                        }
+                    }
                     QueryVariant::TaskSnapshot => {
                         let _: EmptyNamedMap = map.next_value()?;
                         Query::TaskSnapshot
@@ -1429,6 +1538,10 @@ pub enum QueryResult {
         operation_id: OperationId,
         state: OperationState,
     },
+    /// Durable receipt recovered without touching command execution scope.
+    CommandReceiptStatus {
+        receipt: Option<CommandReceipt>,
+    },
     TaskSnapshot {
         snapshot: TaskSnapshotItem,
     },
@@ -1457,6 +1570,21 @@ pub enum QueryResult {
     },
     PromptLibrary(PromptProjectionReply),
     TaskCockpit(TaskCockpitResult),
+}
+
+struct CommandReceiptStatusResultRef<'a> {
+    receipt: &'a Option<CommandReceipt>,
+}
+
+impl Serialize for CommandReceiptStatusResultRef<'_> {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let mut map = serializer.serialize_map(Some(1))?;
+        map.serialize_entry("receipt", self.receipt)?;
+        map.end()
+    }
 }
 
 struct OperationStatusResultRef<'a> {
@@ -1617,6 +1745,10 @@ impl Serialize for QueryResult {
                     state,
                 },
             )?,
+            Self::CommandReceiptStatus { receipt } => map.serialize_entry(
+                "command_receipt_status",
+                &CommandReceiptStatusResultRef { receipt },
+            )?,
             Self::TaskSnapshot { snapshot } => {
                 map.serialize_entry("task_snapshot", &TaskSnapshotResultRef { snapshot })?
             }
@@ -1675,6 +1807,7 @@ impl Serialize for QueryResult {
 
 enum QueryResultVariant {
     OperationStatus,
+    CommandReceiptStatus,
     TaskSnapshot,
     SnapshotPage,
     SnapshotReleased,
@@ -1699,7 +1832,7 @@ impl<'de> Deserialize<'de> for QueryResultVariant {
 
             fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
                 formatter.write_str(
-                    "operation_status, task_snapshot, snapshot_page, snapshot_released, event_replay_page, event_replay_released, artifact_content_page, artifact_content_released, host_quit_inspection, prompt_library, or task_cockpit",
+                    "operation_status, command_receipt_status, task_snapshot, snapshot_page, snapshot_released, event_replay_page, event_replay_released, artifact_content_page, artifact_content_released, host_quit_inspection, prompt_library, or task_cockpit",
                 )
             }
 
@@ -1709,6 +1842,7 @@ impl<'de> Deserialize<'de> for QueryResultVariant {
             {
                 match value {
                     "operation_status" => Ok(QueryResultVariant::OperationStatus),
+                    "command_receipt_status" => Ok(QueryResultVariant::CommandReceiptStatus),
                     "task_snapshot" => Ok(QueryResultVariant::TaskSnapshot),
                     "snapshot_page" => Ok(QueryResultVariant::SnapshotPage),
                     "snapshot_released" => Ok(QueryResultVariant::SnapshotReleased),
@@ -1723,6 +1857,7 @@ impl<'de> Deserialize<'de> for QueryResultVariant {
                         value,
                         &[
                             "operation_status",
+                            "command_receipt_status",
                             "task_snapshot",
                             "snapshot_page",
                             "snapshot_released",
@@ -1740,6 +1875,82 @@ impl<'de> Deserialize<'de> for QueryResultVariant {
         }
 
         deserializer.deserialize_identifier(VariantVisitor)
+    }
+}
+
+struct CommandReceiptStatusResultPayload {
+    receipt: Option<CommandReceipt>,
+}
+
+enum CommandReceiptStatusResultField {
+    Receipt,
+}
+
+impl<'de> Deserialize<'de> for CommandReceiptStatusResultField {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        struct FieldVisitor;
+
+        impl Visitor<'_> for FieldVisitor {
+            type Value = CommandReceiptStatusResultField;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("receipt")
+            }
+
+            fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
+            where
+                E: de::Error,
+            {
+                match value {
+                    "receipt" => Ok(CommandReceiptStatusResultField::Receipt),
+                    _ => Err(de::Error::unknown_field(value, &["receipt"])),
+                }
+            }
+        }
+
+        deserializer.deserialize_identifier(FieldVisitor)
+    }
+}
+
+impl<'de> Deserialize<'de> for CommandReceiptStatusResultPayload {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        struct PayloadVisitor;
+
+        impl<'de> Visitor<'de> for PayloadVisitor {
+            type Value = CommandReceiptStatusResultPayload;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("a named command_receipt_status result payload map")
+            }
+
+            fn visit_map<M>(self, mut map: M) -> Result<Self::Value, M::Error>
+            where
+                M: MapAccess<'de>,
+            {
+                let mut receipt: Option<Option<CommandReceipt>> = None;
+                while let Some(field) = map.next_key()? {
+                    match field {
+                        CommandReceiptStatusResultField::Receipt => {
+                            if receipt.is_some() {
+                                return Err(de::Error::duplicate_field("receipt"));
+                            }
+                            receipt = Some(map.next_value()?);
+                        }
+                    }
+                }
+                Ok(CommandReceiptStatusResultPayload {
+                    receipt: receipt.ok_or_else(|| de::Error::missing_field("receipt"))?,
+                })
+            }
+        }
+
+        deserializer.deserialize_map(PayloadVisitor)
     }
 }
 
@@ -2503,6 +2714,12 @@ impl<'de> Deserialize<'de> for QueryResult {
                             state: payload.state,
                         }
                     }
+                    QueryResultVariant::CommandReceiptStatus => {
+                        let payload: CommandReceiptStatusResultPayload = map.next_value()?;
+                        QueryResult::CommandReceiptStatus {
+                            receipt: payload.receipt,
+                        }
+                    }
                     QueryResultVariant::TaskSnapshot => {
                         let payload: TaskSnapshotResultPayload = map.next_value()?;
                         QueryResult::TaskSnapshot {
@@ -2582,6 +2799,9 @@ pub enum QueryError {
     NotFound,
     Unauthorized,
     InvalidRequest,
+    /// The requested durable command identity does not match the authenticated
+    /// caller or the stored receipt identity.
+    Conflict,
     UnsupportedCapability,
     ReplayUnavailable {
         oldest_sequence: u64,
@@ -2633,6 +2853,7 @@ impl Serialize for QueryError {
             Self::NotFound => serializer.serialize_str("not_found"),
             Self::Unauthorized => serializer.serialize_str("unauthorized"),
             Self::InvalidRequest => serializer.serialize_str("invalid_request"),
+            Self::Conflict => serializer.serialize_str("conflict"),
             Self::UnsupportedCapability => serializer.serialize_str("unsupported_capability"),
             Self::ReplayUnavailable {
                 oldest_sequence,
@@ -2689,6 +2910,7 @@ impl<'de> Deserialize<'de> for QueryErrorMapVariant {
                             "not_found",
                             "unauthorized",
                             "invalid_request",
+                            "conflict",
                             "unsupported_capability",
                             "replay_unavailable",
                             "unavailable",
@@ -2907,6 +3129,7 @@ impl<'de> Deserialize<'de> for QueryError {
                     "not_found" => Ok(QueryError::NotFound),
                     "unauthorized" => Ok(QueryError::Unauthorized),
                     "invalid_request" => Ok(QueryError::InvalidRequest),
+                    "conflict" => Ok(QueryError::Conflict),
                     "unsupported_capability" => Ok(QueryError::UnsupportedCapability),
                     _ => Err(de::Error::unknown_variant(
                         value,
@@ -2914,6 +3137,7 @@ impl<'de> Deserialize<'de> for QueryError {
                             "not_found",
                             "unauthorized",
                             "invalid_request",
+                            "conflict",
                             "unsupported_capability",
                             "replay_unavailable",
                         ],
@@ -3153,7 +3377,24 @@ impl<'de> Deserialize<'de> for QueryOutcome {
 
 #[cfg(test)]
 mod tests {
-    use super::QueryError;
+    use super::{Query, QueryError, QueryResult};
+    use crate::domain::command::{
+        Command, CommandEnvelope, CommandReceipt, RejectionCode, RenameTaskIntent,
+    };
+    use crate::domain::id::{ClientId, CommandId, TaskId};
+
+    fn receipt_status_command() -> CommandEnvelope {
+        CommandEnvelope {
+            command_id: CommandId::new(),
+            client_id: ClientId::new(),
+            task_id: Some(TaskId::new()),
+            issued_at_ms: 1_725_000_000_777,
+            expected_task_revision: Some(3),
+            command: Command::RenameTask(RenameTaskIntent {
+                title: "receipt status codec".into(),
+            }),
+        }
+    }
 
     #[test]
     fn unavailable_query_error_roundtrips_negotiated_transport_limit() {
@@ -3168,5 +3409,33 @@ mod tests {
                 reason: "negotiated_transport_limit"
             }
         ));
+    }
+
+    #[test]
+    fn command_receipt_status_query_result_and_conflict_codecs_roundtrip() {
+        let command = receipt_status_command();
+        let query = Query::CommandReceiptStatus {
+            command: command.clone(),
+        };
+        let encoded = serde_json::to_vec(&query).expect("encode receipt status query");
+        let decoded: Query = serde_json::from_slice(&encoded).expect("decode receipt status query");
+        assert_eq!(decoded, query);
+
+        let result = QueryResult::CommandReceiptStatus {
+            receipt: Some(CommandReceipt::Rejected {
+                command_id: command.command_id,
+                code: RejectionCode::NotFound,
+                current_revision: None,
+                resolution: None,
+            }),
+        };
+        let encoded = serde_json::to_vec(&result).expect("encode receipt status result");
+        let decoded: QueryResult =
+            serde_json::from_slice(&encoded).expect("decode receipt status result");
+        assert_eq!(decoded, result);
+
+        let encoded = serde_json::to_vec(&QueryError::Conflict).expect("encode query conflict");
+        let decoded: QueryError = serde_json::from_slice(&encoded).expect("decode query conflict");
+        assert_eq!(decoded, QueryError::Conflict);
     }
 }

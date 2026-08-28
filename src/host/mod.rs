@@ -5,12 +5,16 @@
 
 mod agent_connection;
 mod cockpit;
+mod connect;
 mod connection;
+mod conversation_wake;
 mod ipc;
 mod lock;
 mod organization_runtime;
 mod provider_health;
 mod provider_launch;
+mod remote_access;
+pub mod remote_setup;
 mod shutdown;
 mod update;
 
@@ -19,9 +23,10 @@ mod update;
 mod provider_health_tests;
 
 pub use crate::updater::handoff::{HostUpdateAdmission, HostUpdateHandoff};
+pub(crate) use connect::serve_host_connect_duplex;
 pub use connection::{
-    dispatch_host_request, HostExecutorOutcome, HostRequestExecutor, HostRequestHandle,
-    PhysicalExitArmRequest, SupervisedHostExecutor, HOST_REQUEST_QUEUE_CAPACITY,
+    dispatch_host_request, HostConnectDuplex, HostExecutorOutcome, HostRequestExecutor,
+    HostRequestHandle, PhysicalExitArmRequest, SupervisedHostExecutor, HOST_REQUEST_QUEUE_CAPACITY,
 };
 #[cfg(test)]
 pub(crate) use connection::{ConnectionOutputHandle, ConnectionOutputId, OutputInspection};
@@ -42,6 +47,9 @@ pub use organization_runtime::{
     OrganizationRuntimeConfig, OrganizationRuntimeError, OrganizationRuntimeHandle,
     OrganizationSnapshot, ORGANIZATION_RUNTIME_DEFAULT_REFRESH_INTERVAL_MS,
     ORGANIZATION_RUNTIME_MAX_REFRESH_INTERVAL_MS,
+};
+pub use remote_access::{
+    shutdown_remote_access_before_fullquit_arm, HostRemoteAccessController, HostRemoteAccessError,
 };
 pub use shutdown::{
     HostCleanupProgress, HostCleanupSuccessSettlement, HostCleanupWorker, HostRestartDisposition,

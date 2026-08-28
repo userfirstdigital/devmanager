@@ -17,6 +17,7 @@
 [CmdletBinding()]
 param(
     [string] $OutDir = (Join-Path $PSScriptRoot "../../web/src/connect/wasm"),
+    [string] $TargetDir = $env:CARGO_TARGET_DIR,
     [switch] $PlanOnly
 )
 
@@ -153,11 +154,27 @@ function Write-Utf8NoBom {
 $repoRoot = [System.IO.Path]::GetFullPath((Join-Path $PSScriptRoot "../.."))
 $crateManifestPath = Join-Path $repoRoot "crates/connect-crypto/Cargo.toml"
 $resolvedOutDir = Resolve-RepositoryPath $OutDir
-$targetRoot = Join-Path $repoRoot "target"
+$targetRoot = if ([string]::IsNullOrWhiteSpace($TargetDir)) {
+    Join-Path $repoRoot "target"
+} else {
+    Resolve-RepositoryPath $TargetDir
+}
 $stageDir = Join-Path $targetRoot ("connect-crypto-wasm-bindgen-{0}" -f $PID)
 $wasmPath = Join-Path $targetRoot ("{0}/release/connect_crypto.wasm" -f $WasmTarget)
+$ownsStage = $false
 
 try {
+    # Honor the caller's isolated Cargo lane; never silently reuse the daily
+    # checkout's target when a worker has supplied CARGO_TARGET_DIR/-TargetDir.
+    $targetInsideRepository = (Test-PathInsideRepository $targetRoot) -and $targetRoot -ne $repoRoot
+    $targetIsIsolatedTemp = $targetRoot -match '^C:\\Temp\\devmanager-[^\\/]+$'
+    if (-not ($targetInsideRepository -or $targetIsIsolatedTemp)) {
+        Hold-ConnectCrypto `
+            -Reason "unsafe-target-directory" `
+            -Message "Cargo target must be a checkout subdirectory or an exact C:\Temp\devmanager-* root." `
+            -Checks @{ targetDirectory = $targetRoot }
+    }
+
     if (-not (Test-PathInsideRepository $resolvedOutDir) -or $resolvedOutDir -eq $repoRoot) {
         Hold-ConnectCrypto `
             -Reason "unsafe-output-directory" `
@@ -245,6 +262,7 @@ try {
         installedTargets    = $installedTargets.output
         wasmBindgen          = $wasmBindgenVersionResult.output
         outputDirectory     = $resolvedOutDir
+        targetDirectory     = $targetRoot
         package              = $PackageName
         cargoLocked         = $true
         automaticInstall    = $false
@@ -262,6 +280,7 @@ try {
         Remove-Item -LiteralPath $stageDir -Recurse -Force
     }
     New-Item -ItemType Directory -Force -Path $stageDir | Out-Null
+    $ownsStage = $true
 
     Push-Location $repoRoot
     try {
@@ -413,7 +432,7 @@ catch {
         -ExitCode 1
 }
 finally {
-    if (Test-Path -LiteralPath $stageDir) {
+    if ($ownsStage -and (Test-Path -LiteralPath $stageDir)) {
         Remove-Item -LiteralPath $stageDir -Recurse -Force -ErrorAction SilentlyContinue
     }
 }

@@ -89,4 +89,29 @@ Assert-Contract `
     ) `
     -Message "Plan-only or missing-prerequisite invocation must emit typed HOLD JSON; exit=$exitCode output=$($capture.Stdout)"
 
+foreach ($unsafeTarget in @('C:\', 'C:\Temp', $script:WorktreeRoot)) {
+    $rejected = Invoke-NativeNextScriptCapture -ScriptPath $scriptPath -Arguments @(
+        '-PlanOnly', '-TargetDir', $unsafeTarget
+    )
+    $rejection = $rejected.Stdout | ConvertFrom-Json
+    Assert-Contract `
+        -Name "connect-crypto-rejects-broad-target-$unsafeTarget" `
+        -Condition ($rejected.ExitCode -eq 2 -and $rejection.reason -eq 'unsafe-target-directory') `
+        -Message 'A broad Cargo target must fail before creating a stage or invoking tools.'
+}
+
+$isolatedTarget = 'C:\Temp\devmanager-connect-packaging-contract'
+$isolated = Invoke-NativeNextScriptCapture -ScriptPath $scriptPath -Arguments @(
+    '-PlanOnly', '-TargetDir', $isolatedTarget
+)
+$isolatedResult = $isolated.Stdout | ConvertFrom-Json
+Assert-Contract `
+    -Name 'connect-crypto-honors-explicit-isolated-target' `
+    -Condition (
+        $isolated.ExitCode -eq 2 -and
+        $isolatedResult.reason -ne 'unsafe-target-directory' -and
+        ($isolatedResult.reason -ne 'plan-only' -or $isolatedResult.checks.targetDirectory -eq $isolatedTarget)
+    ) `
+    -Message 'An explicit isolated target must survive preflight unchanged when tools are present.'
+
 Complete-ContractTests -Suite 'ConnectCryptoBuild'

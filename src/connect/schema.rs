@@ -13,18 +13,21 @@ use crate::domain::id::{
 use crate::domain::operation::OperationState;
 use crate::domain::query::{Query, QueryEnvelope, QueryError, QueryOutcome, QueryReply};
 use crate::domain::snapshot::{EventPage, SnapshotPage, SnapshotSection};
-use crate::protocol::{CapabilitySet, MessagePackCodec, MessagePackError, ServerMessage};
+use crate::protocol::{
+    Capability, CapabilitySet, MessagePackCodec, MessagePackError, ServerMessage, StreamFrame,
+    StreamPayloadKind,
+};
 
 use super::envelope::{
-    binary_payload, ChannelKind, ConnectLimitError, ConnectLimits, ConnectPrivacyClass,
-    KnownPayloadKind, PayloadKind, MAX_CONNECT_DIAGNOSTIC_BYTES, MAX_CONNECT_PAGE_ENCODED_BYTES,
-    MAX_CONNECT_REASSEMBLED_MESSAGE_BYTES,
+    ChannelKind, ConnectLimitError, ConnectLimits, ConnectPrivacyClass, KnownPayloadKind,
+    MAX_CONNECT_DIAGNOSTIC_BYTES, MAX_CONNECT_PAGE_ENCODED_BYTES,
+    MAX_CONNECT_REASSEMBLED_MESSAGE_BYTES, PayloadKind, binary_payload,
 };
 use super::epoch::{FocusEpoch, TurnEpoch};
 use super::permission::HostCapabilityGrant;
 use super::presence::LastSenderHint;
 use super::transport::{
-    validate_advertised_relay_url, BrowserExtensionDescriptor, PromptExtensionDescriptor,
+    BrowserExtensionDescriptor, PromptExtensionDescriptor, validate_advertised_relay_url,
 };
 
 pub const CONNECT_PAYLOAD_SCHEMA_VERSION: u16 = 1;
@@ -186,6 +189,38 @@ static PAYLOAD_CATALOG: &[PayloadDescriptor] = &[
         false,
         MAX_CONNECT_REASSEMBLED_MESSAGE_BYTES,
     ),
+    descriptor(
+        PayloadKind::HOST_DURABLE_OUTPUT,
+        "host_durable_output",
+        ChannelKind::Durable,
+        false,
+        false,
+        MAX_CONNECT_REASSEMBLED_MESSAGE_BYTES,
+    ),
+    descriptor(
+        PayloadKind::HOST_CRITICAL_OUTPUT,
+        "host_critical_output",
+        ChannelKind::Critical,
+        false,
+        false,
+        MAX_CONNECT_REASSEMBLED_MESSAGE_BYTES,
+    ),
+    descriptor(
+        PayloadKind::HOST_STREAM_OUTPUT,
+        "host_stream_output",
+        ChannelKind::Ephemeral,
+        false,
+        true,
+        MAX_CONNECT_REASSEMBLED_MESSAGE_BYTES,
+    ),
+    descriptor(
+        PayloadKind::HOST_CONVERSATION_OUTPUT,
+        "host_conversation_output",
+        ChannelKind::Ephemeral,
+        false,
+        false,
+        MAX_CONNECT_DIAGNOSTIC_BYTES,
+    ),
 ];
 
 pub const fn payload_catalog() -> &'static [PayloadDescriptor] {
@@ -304,6 +339,166 @@ pub struct GenericExtensionPayload {
     pub payload: Vec<u8>,
 }
 
+/// Lane discriminant for lossless unsolicited host [`ServerMessage`] wrappers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HostOutputLane {
+    Durable,
+    Critical,
+    Ephemeral,
+}
+
+/// Lossless Connect wrapper for an existing host [`ServerMessage`].
+///
+/// The wrapper does not authorize a resource: the future host writer must
+/// supply an already-authorized subscription and compare
+/// [`Self::required_capabilities`] against negotiated capabilities via
+/// [`Self::validate_negotiated_capabilities`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HostOutputPayload {
+    pub required_capabilities: CapabilitySet,
+    pub message: ServerMessage,
+}
+
+impl HostOutputPayload {
+    /// Construct a host-output carrier. Rejects request/reply/receipt/detach
+    /// variants; lane-specific validation runs through
+    /// [`Self::validate_for_lane`] or [`ConnectPayload::from_host_output`].
+    pub fn new(
+        required_capabilities: CapabilitySet,
+        message: ServerMessage,
+    ) -> Result<Self, PayloadDecodeError> {
+        match &message {
+            ServerMessage::DurableEvent { .. }
+            | ServerMessage::ResyncRequired { .. }
+            | ServerMessage::Stream(_)
+            | ServerMessage::ConversationDirty { .. } => {}
+            ServerMessage::QueryReply(_)
+            | ServerMessage::CommandReceipt(_)
+            | ServerMessage::TerminalInputAck(_)
+            | ServerMessage::UpdateHandoff(_)
+            | ServerMessage::Detached(_) => {
+                return Err(PayloadDecodeError::Ambiguous {
+                    reason: "request, reply, receipt, and detach variants are not host-output payloads",
+                });
+            }
+        }
+        Ok(Self {
+            required_capabilities,
+            message,
+        })
+    }
+
+    /// Writer-facing intersection check against negotiated session capabilities.
+    pub fn validate_negotiated_capabilities(
+        &self,
+        negotiated: CapabilitySet,
+    ) -> Result<(), PayloadDecodeError> {
+        if self.required_capabilities.intersection(negotiated) != self.required_capabilities {
+            return Err(PayloadDecodeError::Ambiguous {
+                reason: "host output required_capabilities are not covered by negotiated capabilities",
+            });
+        }
+        Ok(())
+    }
+
+    pub fn validate_for_lane(
+        &self,
+        lane: HostOutputLane,
+        limits: ConnectLimits,
+    ) -> Result<(), PayloadDecodeError> {
+        limits.validate()?;
+        match (lane, &self.message) {
+            (HostOutputLane::Durable, ServerMessage::DurableEvent { event, .. }) => {
+                if !self.required_capabilities.contains(Capability::EventReplay) {
+                    return Err(PayloadDecodeError::Ambiguous {
+                        reason: "host durable output requires EventReplay in required_capabilities",
+                    });
+                }
+                // Event identity/sequence bytes are preserved; MessagePack length
+                // bounds are enforced when the wrapper is encoded.
+                let _ = event;
+            }
+            (
+                HostOutputLane::Critical,
+                ServerMessage::ResyncRequired {
+                    last_delivered_sequence,
+                    newest_sequence,
+                    ..
+                },
+            ) => {
+                if !self.required_capabilities.contains(Capability::EventReplay) {
+                    return Err(PayloadDecodeError::Ambiguous {
+                        reason: "host critical output requires EventReplay in required_capabilities",
+                    });
+                }
+                if *newest_sequence < *last_delivered_sequence {
+                    return Err(PayloadDecodeError::Ambiguous {
+                        reason: "host critical ResyncRequired newest_sequence is before last_delivered_sequence",
+                    });
+                }
+            }
+            (HostOutputLane::Ephemeral, ServerMessage::Stream(frame)) => {
+                validate_host_stream_output(self.required_capabilities, frame, limits)?;
+            }
+            (HostOutputLane::Ephemeral, ServerMessage::ConversationDirty { high_water, .. }) => {
+                let required = CapabilitySet::from_capabilities([
+                    Capability::TaskCockpit,
+                    Capability::SemanticConversation,
+                ]);
+                if *high_water == 0 || self.required_capabilities != required {
+                    return Err(PayloadDecodeError::Ambiguous {
+                        reason: "host conversation output requires nonzero high_water and exactly TaskCockpit plus SemanticConversation",
+                    });
+                }
+            }
+            (HostOutputLane::Durable, _) => {
+                return Err(PayloadDecodeError::Ambiguous {
+                    reason: "host durable output accepts only ServerMessage::DurableEvent",
+                });
+            }
+            (HostOutputLane::Critical, _) => {
+                return Err(PayloadDecodeError::Ambiguous {
+                    reason: "host critical output accepts only ServerMessage::ResyncRequired",
+                });
+            }
+            (HostOutputLane::Ephemeral, _) => {
+                return Err(PayloadDecodeError::Ambiguous {
+                    reason: "host ephemeral output accepts only ServerMessage::Stream or ConversationDirty",
+                });
+            }
+        }
+        Ok(())
+    }
+}
+
+fn validate_host_stream_output(
+    required_capabilities: CapabilitySet,
+    frame: &StreamFrame,
+    limits: ConnectLimits,
+) -> Result<(), PayloadDecodeError> {
+    if required_capabilities.bits() == 0 {
+        return Err(PayloadDecodeError::Ambiguous {
+            reason: "host stream output requires a nonempty explicit capability set",
+        });
+    }
+    // Deliberate boundary: only production-defined StreamPayloadKind values are
+    // admitted. Test fixtures that invent terminal kind IDs (for example 1 or 3)
+    // are rejected until a production kind is defined.
+    if frame.payload_kind != StreamPayloadKind::BROWSER_FRAME {
+        return Err(PayloadDecodeError::Ambiguous {
+            reason: "host stream output rejects unknown StreamPayloadKind values; only production-defined BROWSER_FRAME (8) is admitted",
+        });
+    }
+    if !required_capabilities.contains(Capability::BrowserProjection) {
+        return Err(PayloadDecodeError::Ambiguous {
+            reason: "host stream BROWSER_FRAME requires BrowserProjection in required_capabilities",
+        });
+    }
+    limits.validate_payload_len(frame.payload.len())?;
+    Ok(())
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ConnectPayload {
     Hello(HelloPayload),
@@ -324,6 +519,10 @@ pub enum ConnectPayload {
     Resync(ResyncPayload),
     Error(ErrorPayload),
     Extension(GenericExtensionPayload),
+    HostDurableOutput(HostOutputPayload),
+    HostCriticalOutput(HostOutputPayload),
+    HostStreamOutput(HostOutputPayload),
+    HostConversationOutput(HostOutputPayload),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -399,6 +598,10 @@ impl ConnectPayload {
             Self::Chunk(_) => PayloadKind::CHUNK,
             Self::Resync(_) => PayloadKind::RESYNC,
             Self::Error(_) => PayloadKind::ERROR,
+            Self::HostDurableOutput(_) => PayloadKind::HOST_DURABLE_OUTPUT,
+            Self::HostCriticalOutput(_) => PayloadKind::HOST_CRITICAL_OUTPUT,
+            Self::HostStreamOutput(_) => PayloadKind::HOST_STREAM_OUTPUT,
+            Self::HostConversationOutput(_) => PayloadKind::HOST_CONVERSATION_OUTPUT,
             Self::Extension(extension) => PayloadKind::new(extension.type_id)
                 .filter(|kind| kind.known().is_none() || *kind == PayloadKind::EXTENSION)
                 .unwrap_or(PayloadKind::EXTENSION),
@@ -422,16 +625,20 @@ impl ConnectPayload {
             | Self::CommandReceipt(_)
             | Self::OperationSettlement(_)
             | Self::Resync(_)
-            | Self::Error(_) => ChannelKind::Critical,
+            | Self::Error(_)
+            | Self::HostCriticalOutput(_) => ChannelKind::Critical,
             Self::SnapshotPage(_)
             | Self::EventPage(_)
             | Self::PromptExtension(_)
             | Self::BrowserExtension(_)
             | Self::Chunk(_)
-            | Self::Extension(_) => ChannelKind::Durable,
-            Self::Presence(_) | Self::TerminalDelta(_) | Self::BrowserFrame(_) => {
-                ChannelKind::Ephemeral
-            }
+            | Self::Extension(_)
+            | Self::HostDurableOutput(_) => ChannelKind::Durable,
+            Self::Presence(_)
+            | Self::TerminalDelta(_)
+            | Self::BrowserFrame(_)
+            | Self::HostStreamOutput(_)
+            | Self::HostConversationOutput(_) => ChannelKind::Ephemeral,
         }
     }
 
@@ -439,10 +646,23 @@ impl ConnectPayload {
         matches!(self, Self::Command(_))
     }
 
+    pub const fn is_host_output(&self) -> bool {
+        matches!(
+            self,
+            Self::HostDurableOutput(_)
+                | Self::HostCriticalOutput(_)
+                | Self::HostStreamOutput(_)
+                | Self::HostConversationOutput(_)
+        )
+    }
+
     pub const fn allows_raw_content(&self) -> bool {
         matches!(
             self,
-            Self::TerminalDelta(_) | Self::BrowserFrame(_) | Self::Chunk(_)
+            Self::TerminalDelta(_)
+                | Self::BrowserFrame(_)
+                | Self::Chunk(_)
+                | Self::HostStreamOutput(_)
         )
     }
 
@@ -478,10 +698,48 @@ impl ConnectPayload {
             })),
             ServerMessage::DurableEvent { .. }
             | ServerMessage::Stream(_)
+            | ServerMessage::ConversationDirty { .. }
             | ServerMessage::Detached(_) => Err(PayloadDecodeError::Ambiguous {
                 reason: "host output is not a Connect request-lane payload",
             }),
         }
+    }
+
+    /// Lossless unsolicited host-output conversion. Distinct from the lossy
+    /// request-lane [`Self::from_host_server_message`] path.
+    pub fn from_host_output(
+        message: ServerMessage,
+        required_capabilities: CapabilitySet,
+    ) -> Result<Self, PayloadDecodeError> {
+        let host = HostOutputPayload::new(required_capabilities, message)?;
+        let payload = match &host.message {
+            ServerMessage::DurableEvent { .. } => {
+                host.validate_for_lane(HostOutputLane::Durable, ConnectLimits::v1_default())?;
+                Self::HostDurableOutput(host)
+            }
+            ServerMessage::ResyncRequired { .. } => {
+                host.validate_for_lane(HostOutputLane::Critical, ConnectLimits::v1_default())?;
+                Self::HostCriticalOutput(host)
+            }
+            ServerMessage::Stream(_) => {
+                host.validate_for_lane(HostOutputLane::Ephemeral, ConnectLimits::v1_default())?;
+                Self::HostStreamOutput(host)
+            }
+            ServerMessage::ConversationDirty { .. } => {
+                host.validate_for_lane(HostOutputLane::Ephemeral, ConnectLimits::v1_default())?;
+                Self::HostConversationOutput(host)
+            }
+            ServerMessage::QueryReply(_)
+            | ServerMessage::CommandReceipt(_)
+            | ServerMessage::TerminalInputAck(_)
+            | ServerMessage::UpdateHandoff(_)
+            | ServerMessage::Detached(_) => {
+                return Err(PayloadDecodeError::Ambiguous {
+                    reason: "request, reply, receipt, and detach variants are not host-output payloads",
+                });
+            }
+        };
+        Ok(payload)
     }
 
     pub fn encode(&self, limits: ConnectLimits) -> Result<Vec<u8>, PayloadDecodeError> {
@@ -510,6 +768,10 @@ impl ConnectPayload {
             Self::Resync(value) => encode_named(value, limits)?,
             Self::Error(value) => encode_named(value, limits)?,
             Self::Extension(value) => encode_named(value, limits)?,
+            Self::HostDurableOutput(value)
+            | Self::HostCriticalOutput(value)
+            | Self::HostStreamOutput(value)
+            | Self::HostConversationOutput(value) => encode_named(value, limits)?,
         };
         limits.validate_payload_len(bytes.len())?;
         if let Some(descriptor) = catalog_entry(self.kind()) {
@@ -582,6 +844,12 @@ impl ConnectPayload {
             KnownPayloadKind::Resync => Self::Resync(codec.decode(bytes)?),
             KnownPayloadKind::Error => Self::Error(codec.decode(bytes)?),
             KnownPayloadKind::Extension => Self::Extension(codec.decode(bytes)?),
+            KnownPayloadKind::HostDurableOutput => Self::HostDurableOutput(codec.decode(bytes)?),
+            KnownPayloadKind::HostCriticalOutput => Self::HostCriticalOutput(codec.decode(bytes)?),
+            KnownPayloadKind::HostStreamOutput => Self::HostStreamOutput(codec.decode(bytes)?),
+            KnownPayloadKind::HostConversationOutput => {
+                Self::HostConversationOutput(codec.decode(bytes)?)
+            }
         };
         payload.validate(limits)?;
         Ok(payload)
@@ -671,6 +939,18 @@ impl ConnectPayload {
             | Self::Presence(_)
             | Self::PromptExtension(_)
             | Self::BrowserExtension(_) => {}
+            Self::HostDurableOutput(host) => {
+                host.validate_for_lane(HostOutputLane::Durable, limits)?;
+            }
+            Self::HostCriticalOutput(host) => {
+                host.validate_for_lane(HostOutputLane::Critical, limits)?;
+            }
+            Self::HostStreamOutput(host) => {
+                host.validate_for_lane(HostOutputLane::Ephemeral, limits)?;
+            }
+            Self::HostConversationOutput(host) => {
+                host.validate_for_lane(HostOutputLane::Ephemeral, limits)?;
+            }
         }
         Ok(())
     }
@@ -731,7 +1011,113 @@ fn fixture_transfer(tail: u8) -> TransferId {
     TransferId::from_bytes(fixture_uuid(tail)).expect("canonical transfer id")
 }
 
+fn fixture_subscription(tail: u8) -> crate::domain::id::SubscriptionId {
+    crate::domain::id::SubscriptionId::from_bytes(fixture_uuid(tail))
+        .expect("canonical subscription id")
+}
+
+fn fixture_resource(tail: u8) -> crate::domain::id::ResourceId {
+    crate::domain::id::ResourceId::from_bytes(fixture_uuid(tail)).expect("canonical resource id")
+}
+
+fn fixture_host_durable() -> HostOutputPayload {
+    HostOutputPayload::new(
+        CapabilitySet::from_capabilities([Capability::EventReplay]),
+        ServerMessage::DurableEvent {
+            subscription_id: fixture_subscription(0x71),
+            event: crate::domain::DomainEvent {
+                id: fixture_event(0x55),
+                task_id: Some(fixture_task(0x43)),
+                sequence: 3,
+                task_revision: Some(1),
+                occurred_at_ms: 1,
+                payload: crate::domain::Event::TaskReopened,
+            },
+        },
+    )
+    .expect("canonical durable host output")
+}
+
+fn fixture_host_critical() -> HostOutputPayload {
+    HostOutputPayload::new(
+        CapabilitySet::from_capabilities([Capability::EventReplay]),
+        ServerMessage::ResyncRequired {
+            subscription_id: fixture_subscription(0x72),
+            last_delivered_sequence: 2,
+            newest_sequence: 5,
+        },
+    )
+    .expect("canonical critical host output")
+}
+
+fn fixture_host_stream() -> HostOutputPayload {
+    HostOutputPayload::new(
+        CapabilitySet::from_capabilities([Capability::BrowserProjection]),
+        ServerMessage::Stream(crate::protocol::StreamFrame {
+            subscription_id: fixture_subscription(0x73),
+            stream: crate::protocol::StreamKey::from_resource_id(fixture_resource(0x74)),
+            generation: 1,
+            sequence: 2,
+            payload_kind: StreamPayloadKind::BROWSER_FRAME,
+            schema_version: 1,
+            payload: vec![0x62, 0x72],
+        }),
+    )
+    .expect("canonical stream host output")
+}
+
+fn fixture_host_conversation() -> HostOutputPayload {
+    HostOutputPayload::new(
+        CapabilitySet::from_capabilities([
+            Capability::TaskCockpit,
+            Capability::SemanticConversation,
+        ]),
+        ServerMessage::ConversationDirty {
+            subscription_id: fixture_subscription(0x75),
+            task_id: fixture_task(0x43),
+            high_water: 4,
+        },
+    )
+    .expect("canonical conversation host output")
+}
+
 /// Deterministic named payloads used as the Rust schema source of truth.
+pub fn native_browser_contract_fixtures() -> Vec<CanonicalSchemaFixture> {
+    use crate::domain::cockpit::{ProviderInputStateProjection, TaskCockpitResult};
+    use crate::domain::query::QueryResult;
+    use crate::domain::snapshot::{SemanticJournalFact, SemanticJournalPage, SemanticJournalPayload};
+    let mut fixtures = canonical_schema_fixtures().into_iter()
+        .filter(|f| matches!(f.payload.kind().get(), 1 | 18 | 19 | 20 | 21 | 22)).collect::<Vec<_>>();
+    let state = ProviderInputStateProjection {
+        task_id: fixture_task(0x43), task_revision: 3, action_epoch: 4,
+        agent_session_id: Some(crate::domain::AgentSessionId::from_bytes(fixture_uuid(0x44)).unwrap()),
+        runtime_generation: Some(7), agent_lifecycle: Some(crate::domain::agent::AgentSessionLifecycle::Open),
+        provider_kind: Some(crate::providers::ProviderKind::ClaudeCode),
+        provider_session_id: Some(crate::domain::agent::ProviderSessionId::new("native-exact-conversation").unwrap()),
+        current_turn: None, open_question: None, open_approval: None, pending_wait_command_ids: Vec::new(),
+    };
+    fixtures.push(CanonicalSchemaFixture { name: "provider_input_state", payload: ConnectPayload::QueryReply(QueryReply {
+        request_id: fixture_request(0x41), outcome: QueryOutcome::Ok(QueryResult::TaskCockpit(TaskCockpitResult::ProviderInputState(state))),
+    }) });
+    for (name, reset, more) in [("conversation_final", false, false), ("conversation_page", false, true), ("conversation_rollover", true, false)] {
+        let mut page = SemanticJournalPage {
+            oldest_sequence: 1, cursor_rolled_over: reset, after_sequence: 0,
+            through_sequence: if more { 1 } else { 2 }, high_water: 2,
+            encoded_bytes: 0, next_sequence: more.then_some(1),
+            facts: vec![SemanticJournalFact { id: fixture_event(0x55), sequence: 1, occurred_at_ms: Some(1),
+                provider: "claude_code".into(), schema_version: 1, kind: "assistant_text".into(), visibility: "task".into(),
+                privacy_class: crate::domain::PrivacyClass::LocalOnly, redacted: false,
+                payload: SemanticJournalPayload::AssistantText { text: "Native conversation text".into() },
+            }],
+        };
+        page.encoded_bytes = crate::domain::snapshot::canonical_semantic_page_size(&page).unwrap();
+        fixtures.push(CanonicalSchemaFixture { name, payload: ConnectPayload::QueryReply(QueryReply {
+            request_id: fixture_request(0x41), outcome: QueryOutcome::Ok(QueryResult::TaskCockpit(TaskCockpitResult::Conversation(page))),
+        }) });
+    }
+    fixtures
+}
+
 pub fn canonical_schema_fixtures() -> Vec<CanonicalSchemaFixture> {
     let empty_caps = CapabilitySet::empty();
     vec![
@@ -894,6 +1280,22 @@ pub fn canonical_schema_fixtures() -> Vec<CanonicalSchemaFixture> {
                 payload: vec![0x91, 0x01],
             }),
         },
+        CanonicalSchemaFixture {
+            name: "host_durable_output",
+            payload: ConnectPayload::HostDurableOutput(fixture_host_durable()),
+        },
+        CanonicalSchemaFixture {
+            name: "host_critical_output",
+            payload: ConnectPayload::HostCriticalOutput(fixture_host_critical()),
+        },
+        CanonicalSchemaFixture {
+            name: "host_stream_output",
+            payload: ConnectPayload::HostStreamOutput(fixture_host_stream()),
+        },
+        CanonicalSchemaFixture {
+            name: "host_conversation_output",
+            payload: ConnectPayload::HostConversationOutput(fixture_host_conversation()),
+        },
     ]
 }
 
@@ -1035,5 +1437,240 @@ mod tests {
             None,
         ));
         assert!(payload.validate(ConnectLimits::v1_default()).is_err());
+    }
+
+    #[test]
+    fn host_output_preserves_exact_server_message_fields() {
+        let limits = ConnectLimits::v1_default();
+        let durable = ConnectPayload::from_host_output(
+            ServerMessage::DurableEvent {
+                subscription_id: fixture_subscription(0x71),
+                event: crate::domain::DomainEvent {
+                    id: fixture_event(0x55),
+                    task_id: Some(fixture_task(0x43)),
+                    sequence: 3,
+                    task_revision: Some(1),
+                    occurred_at_ms: 1,
+                    payload: crate::domain::Event::TaskReopened,
+                },
+            },
+            CapabilitySet::from_capabilities([Capability::EventReplay]),
+        )
+        .expect("durable");
+        let critical = ConnectPayload::from_host_output(
+            ServerMessage::ResyncRequired {
+                subscription_id: fixture_subscription(0x72),
+                last_delivered_sequence: 2,
+                newest_sequence: 5,
+            },
+            CapabilitySet::from_capabilities([Capability::EventReplay]),
+        )
+        .expect("critical");
+        let stream = ConnectPayload::from_host_output(
+            ServerMessage::Stream(crate::protocol::StreamFrame {
+                subscription_id: fixture_subscription(0x73),
+                stream: crate::protocol::StreamKey::from_resource_id(fixture_resource(0x74)),
+                generation: 1,
+                sequence: 2,
+                payload_kind: StreamPayloadKind::BROWSER_FRAME,
+                schema_version: 1,
+                payload: vec![0x62, 0x72],
+            }),
+            CapabilitySet::from_capabilities([Capability::BrowserProjection]),
+        )
+        .expect("stream");
+
+        for payload in [&durable, &critical, &stream] {
+            let bytes = payload.encode(limits).expect("encode");
+            let decoded = ConnectPayload::decode(payload.kind(), payload.version(), &bytes, limits)
+                .expect("decode");
+            assert_eq!(&decoded, payload);
+        }
+
+        let ConnectPayload::HostDurableOutput(host) = &durable else {
+            panic!("durable wrapper");
+        };
+        match &host.message {
+            ServerMessage::DurableEvent {
+                subscription_id,
+                event,
+            } => {
+                assert_eq!(*subscription_id, fixture_subscription(0x71));
+                assert_eq!(event.id, fixture_event(0x55));
+                assert_eq!(event.sequence, 3);
+                assert_eq!(event.task_id, Some(fixture_task(0x43)));
+            }
+            other => panic!("expected DurableEvent, got {other:?}"),
+        }
+
+        let ConnectPayload::HostStreamOutput(host) = &stream else {
+            panic!("stream wrapper");
+        };
+        match &host.message {
+            ServerMessage::Stream(frame) => {
+                assert_eq!(frame.subscription_id, fixture_subscription(0x73));
+                assert_eq!(
+                    frame.stream,
+                    crate::protocol::StreamKey::from_resource_id(fixture_resource(0x74))
+                );
+                assert_eq!(frame.generation, 1);
+                assert_eq!(frame.sequence, 2);
+                assert_eq!(frame.payload_kind, StreamPayloadKind::BROWSER_FRAME);
+                assert_eq!(frame.schema_version, 1);
+                assert_eq!(frame.payload, vec![0x62, 0x72]);
+            }
+            other => panic!("expected Stream, got {other:?}"),
+        }
+
+        assert!(matches!(
+            ConnectPayload::from_host_server_message(ServerMessage::DurableEvent {
+                subscription_id: fixture_subscription(0x71),
+                event: crate::domain::DomainEvent {
+                    id: fixture_event(0x55),
+                    task_id: None,
+                    sequence: 1,
+                    task_revision: None,
+                    occurred_at_ms: 1,
+                    payload: crate::domain::Event::TaskReopened,
+                },
+            }),
+            Err(PayloadDecodeError::Ambiguous { .. })
+        ));
+    }
+
+    #[test]
+    fn host_output_rejects_wrong_lane_variant_and_request_messages() {
+        let durable_message = ServerMessage::DurableEvent {
+            subscription_id: fixture_subscription(0x71),
+            event: crate::domain::DomainEvent {
+                id: fixture_event(0x55),
+                task_id: None,
+                sequence: 1,
+                task_revision: None,
+                occurred_at_ms: 1,
+                payload: crate::domain::Event::TaskReopened,
+            },
+        };
+        let caps = CapabilitySet::from_capabilities([Capability::EventReplay]);
+        let host = HostOutputPayload::new(caps, durable_message.clone()).expect("construct");
+        assert!(
+            host.validate_for_lane(HostOutputLane::Critical, ConnectLimits::v1_default())
+                .is_err()
+        );
+        assert!(
+            host.validate_for_lane(HostOutputLane::Ephemeral, ConnectLimits::v1_default())
+                .is_err()
+        );
+
+        let mismatched = ConnectPayload::HostCriticalOutput(host);
+        assert!(mismatched.validate(ConnectLimits::v1_default()).is_err());
+
+        assert!(
+            HostOutputPayload::new(
+                caps,
+                ServerMessage::QueryReply(QueryReply {
+                    request_id: fixture_request(0x41),
+                    outcome: QueryOutcome::Err(QueryError::NotFound),
+                }),
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn host_output_rejects_missing_capability_and_negotiated_gap() {
+        let message = ServerMessage::DurableEvent {
+            subscription_id: fixture_subscription(0x71),
+            event: crate::domain::DomainEvent {
+                id: fixture_event(0x55),
+                task_id: None,
+                sequence: 1,
+                task_revision: None,
+                occurred_at_ms: 1,
+                payload: crate::domain::Event::TaskReopened,
+            },
+        };
+        assert!(ConnectPayload::from_host_output(message, CapabilitySet::empty()).is_err());
+
+        let host = fixture_host_durable();
+        assert!(
+            host.validate_negotiated_capabilities(CapabilitySet::empty())
+                .is_err()
+        );
+        assert!(
+            host.validate_negotiated_capabilities(CapabilitySet::from_capabilities([
+                Capability::EventReplay
+            ]))
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn host_critical_output_rejects_reversed_resync_sequences() {
+        let host = HostOutputPayload::new(
+            CapabilitySet::from_capabilities([Capability::EventReplay]),
+            ServerMessage::ResyncRequired {
+                subscription_id: fixture_subscription(0x72),
+                last_delivered_sequence: 9,
+                newest_sequence: 3,
+            },
+        )
+        .expect("construct");
+        assert!(
+            host.validate_for_lane(HostOutputLane::Critical, ConnectLimits::v1_default())
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn host_stream_output_rejects_unknown_stream_kind() {
+        let invented = StreamPayloadKind::new(3).expect("nonzero invented kind");
+        let host = HostOutputPayload::new(
+            CapabilitySet::from_capabilities([Capability::BrowserProjection]),
+            ServerMessage::Stream(crate::protocol::StreamFrame {
+                subscription_id: fixture_subscription(0x73),
+                stream: crate::protocol::StreamKey::from_resource_id(fixture_resource(0x74)),
+                generation: 1,
+                sequence: 1,
+                payload_kind: invented,
+                schema_version: 1,
+                payload: vec![0x01],
+            }),
+        )
+        .expect("construct");
+        let error = host
+            .validate_for_lane(HostOutputLane::Ephemeral, ConnectLimits::v1_default())
+            .expect_err("unknown stream kinds stay rejected");
+        assert!(matches!(
+            error,
+            PayloadDecodeError::Ambiguous { reason }
+            if reason.contains("BROWSER_FRAME (8)")
+        ));
+    }
+
+    #[test]
+    fn host_stream_output_rejects_oversize_payload() {
+        let mut tight = ConnectLimits::v1_default();
+        tight.max_reassembled_message_bytes = 64;
+        tight.max_physical_frame_bytes = 64;
+        tight.max_chunk_bytes = 32;
+        tight.max_cumulative_bytes = 64;
+        let host = HostOutputPayload::new(
+            CapabilitySet::from_capabilities([Capability::BrowserProjection]),
+            ServerMessage::Stream(crate::protocol::StreamFrame {
+                subscription_id: fixture_subscription(0x73),
+                stream: crate::protocol::StreamKey::from_resource_id(fixture_resource(0x74)),
+                generation: 1,
+                sequence: 1,
+                payload_kind: StreamPayloadKind::BROWSER_FRAME,
+                schema_version: 1,
+                payload: vec![0xab; 128],
+            }),
+        )
+        .expect("construct");
+        assert!(
+            host.validate_for_lane(HostOutputLane::Ephemeral, tight)
+                .is_err()
+        );
     }
 }

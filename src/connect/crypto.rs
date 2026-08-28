@@ -183,6 +183,15 @@ impl EndToEndChannel {
         matches!(&self.cipher, ChannelCipher::Production(_))
     }
 
+    /// Authenticated remote peer from a finished production Noise transport.
+    /// Source-level channels have no peer identity and return `None`.
+    pub fn authenticated_peer(&self) -> Option<ConnectAuthenticatedPeer> {
+        match &self.cipher {
+            ChannelCipher::Production(transport) => Some(transport.remote_peer()),
+            ChannelCipher::SourceLevel(_) => None,
+        }
+    }
+
     pub const fn next_send_sequence(&self) -> u64 {
         self.send_sequence.saturating_add(1)
     }
@@ -406,6 +415,7 @@ mod tests {
         )
         .expect("source-level test channel");
         assert!(!source.is_production_grade());
+        assert!(source.authenticated_peer().is_none());
         assert_eq!(source.preferred_route(), ConnectRoute::Direct);
     }
 
@@ -443,6 +453,8 @@ mod tests {
         let (mut xx_a, mut xx_b) = complete_production_pair(true, false);
         assert!(xx_a.is_production_grade());
         assert!(xx_b.is_production_grade());
+        assert!(xx_a.authenticated_peer().is_some());
+        assert!(xx_b.authenticated_peer().is_some());
         let frame = xx_a.seal_bytes(b"xx-payload", [1; 16], 6).expect("xx seal");
         assert_eq!(xx_b.open_bytes(&frame, 6).expect("xx open"), b"xx-payload");
         assert!(matches!(

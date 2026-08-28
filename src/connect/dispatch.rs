@@ -16,12 +16,13 @@ use crate::connect::permission::{
 use crate::connect::permissions::{action_for_client_request, organization_permission};
 use crate::connect::{
     ChannelBinding, ConnectEnvelope, ConnectIdentityLiveState, ConnectLimits, ConnectPayload,
-    ConnectPrivacyClass, ConnectRole, ErrorPayload, HelloPayload, MAX_CONNECT_DIAGNOSTIC_BYTES,
+    ConnectPrivacyClass, ConnectRole, DeviceCredentialProof, ErrorPayload, HelloPayload,
+    MAX_CONNECT_DIAGNOSTIC_BYTES,
 };
 use crate::domain::id::{ClientId, RequestId};
 use crate::domain::query::{Query, QueryEnvelope};
 use crate::domain::snapshot::SnapshotSection;
-use crate::host::{HostRequestHandle, IpcError, OrganizationRuntime};
+use crate::host::{HostConnectDuplex, HostRequestHandle, IpcError, OrganizationRuntime};
 use crate::protocol::{
     Capability, CapabilitySet, ClientRequest, FrameLimits, NegotiatedParameters, ProtocolVersion,
     ServerMessage,
@@ -69,8 +70,12 @@ fn advertised_connect_capabilities_for_host(host_attached: bool) -> CapabilitySe
         Capability::ManagementMetadata,
     ]);
     if host_attached {
-        capabilities =
-            CapabilitySet::from_bits(capabilities.bits() | Capability::EventReplay.bit());
+        capabilities = CapabilitySet::from_bits(
+            capabilities.bits()
+                | Capability::EventReplay.bit()
+                | Capability::SemanticConversation.bit()
+                | Capability::BrowserProjection.bit(),
+        );
     }
     // Organization is advertised only while the host-owned runtime is
     // enrolled and enabled. A standalone process must not imply a second
@@ -119,6 +124,13 @@ impl ConnectHostCommandPort for HostRequestHandle {
         request: ClientRequest,
     ) -> Result<ServerMessage, IpcError> {
         HostRequestHandle::execute(self, negotiated, request).await
+    }
+
+    async fn open_duplex(
+        &self,
+        client_id: ClientId,
+    ) -> Result<Option<HostConnectDuplex>, IpcError> {
+        Ok(Some(self.open_connect_duplex(client_id).await?))
     }
 }
 
@@ -213,6 +225,12 @@ pub struct ConnectDispatchSession {
     last_recv_sequence: u64,
     negotiated: Option<NegotiatedConnect>,
     active: bool,
+    capability_ceiling: CapabilitySet,
+    /// Opaque session-bound device proof for canonical Device-kind peers.
+    device_credential: Option<DeviceCredentialProof>,
+    session_epoch: Option<u64>,
+    /// Host-kind Noise on the paired-cookie route during browser migration.
+    legacy_host_compat: bool,
 }
 
 impl ConnectDispatchSession {
@@ -228,7 +246,63 @@ impl ConnectDispatchSession {
             last_recv_sequence: 0,
             negotiated: None,
             active: true,
+            capability_ceiling: CapabilitySet::from_bits(u64::MAX),
+            device_credential: None,
+            session_epoch: None,
+            // Legacy Host compatibility is explicit via with_legacy_host_compat
+            // after an authenticated Host claim; never the default.
+            legacy_host_compat: false,
         }
+    }
+
+    /// Canonical Device path: require the opaque enrollment proof on requests.
+    /// `session_epoch == 0` fails closed and does **not** enable legacy compat.
+    pub fn with_device_credential(
+        mut self,
+        proof: DeviceCredentialProof,
+        session_epoch: u64,
+    ) -> Self {
+        if self.negotiated.is_some() {
+            return self;
+        }
+        if session_epoch == 0 {
+            self.device_credential = None;
+            self.session_epoch = None;
+            self.legacy_host_compat = false;
+            return self;
+        }
+        self.device_credential = Some(proof);
+        self.session_epoch = Some(session_epoch);
+        self.legacy_host_compat = false;
+        self
+    }
+
+    /// Explicit Host-kind cookie-pinned compatibility (no device registration).
+    pub fn with_legacy_host_compat(mut self) -> Self {
+        if self.negotiated.is_none() {
+            self.device_credential = None;
+            self.session_epoch = None;
+            self.legacy_host_compat = true;
+        }
+        self
+    }
+
+    /// Restrict advertised authority to operations supported by this carrier.
+    /// Set before Hello; changing an active negotiation is never permitted.
+    pub fn with_capability_ceiling(mut self, ceiling: CapabilitySet) -> Self {
+        if self.negotiated.is_none() {
+            self.capability_ceiling = self.capability_ceiling.intersection(ceiling);
+        }
+        self
+    }
+
+    /// The pairing registry, not the browser, owns the durable command identity.
+    /// An omitted Hello ID receives this ID; a conflicting supplied ID is rejected.
+    pub(crate) fn with_assigned_client_id(mut self, client_id: ClientId) -> Self {
+        if self.negotiated.is_none() {
+            self.bound_client_id = Some(client_id);
+        }
+        self
     }
 
     pub fn bound_client_id(&self) -> Option<ClientId> {
@@ -245,6 +319,16 @@ impl ConnectDispatchSession {
 
     pub fn is_active(&self) -> bool {
         self.active
+    }
+
+    #[cfg(test)]
+    pub(crate) fn legacy_host_compat_for_test(&self) -> bool {
+        self.legacy_host_compat
+    }
+
+    #[cfg(test)]
+    pub(crate) fn has_device_credential_for_test(&self) -> bool {
+        self.device_credential.is_some()
     }
 
     pub fn negotiated_capabilities(&self) -> Option<CapabilitySet> {
@@ -266,6 +350,9 @@ impl ConnectDispatchSession {
         self.bound_client_id = None;
         self.last_recv_sequence = 0;
         self.paired_web_client_id.clear();
+        self.device_credential = None;
+        self.session_epoch = None;
+        self.legacy_host_compat = false;
     }
 
     pub async fn handle_payload(
@@ -422,6 +509,10 @@ impl ConnectDispatchSession {
             | ConnectPayload::BrowserExtension(_)
             | ConnectPayload::Chunk(_)
             | ConnectPayload::Error(_)
+            | ConnectPayload::HostDurableOutput(_)
+            | ConnectPayload::HostCriticalOutput(_)
+            | ConnectPayload::HostStreamOutput(_)
+            | ConnectPayload::HostConversationOutput(_)
             | ConnectPayload::Extension(_) => {
                 self.admit_post_hello_frame(envelope)?;
                 Err(DispatchFailure::soft(
@@ -482,8 +573,12 @@ impl ConnectDispatchSession {
                 DispatchFailure::fatal(CONNECT_ERROR_PROTOCOL, "Hello limits cannot be negotiated")
             })?;
         let capabilities = advertised_connect_capabilities_for_host(host_attached)
-            .intersection(hello.capabilities);
-        let client_id = hello.client_id.unwrap_or_else(ClientId::new);
+            .intersection(hello.capabilities)
+            .intersection(self.capability_ceiling);
+        let client_id = self
+            .bound_client_id
+            .or(hello.client_id)
+            .unwrap_or_else(ClientId::new);
         self.binding = Some(binding);
         self.last_recv_sequence = envelope.sequence;
         self.bound_client_id = Some(client_id);
@@ -561,7 +656,7 @@ impl ConnectDispatchSession {
         })?;
         bind_request_identity(&request, bound)?;
         deny_if_capability_missing(&request, negotiated.capabilities)?;
-        authorize_established_request(&request)?;
+        authorize_established_request(self, &request)?;
 
         let Some(host) = host else {
             return Err(DispatchFailure::soft(
@@ -630,8 +725,25 @@ impl ConnectDispatchSession {
                 )
             })?;
         let mutating = organization_request_is_mutating(&extension.payload)?;
-        let decision = PermissionEvaluator::default()
-            .evaluate_transport_authenticated_owner(organization_permission(mutating));
+        let mut org_request = organization_permission(mutating);
+        org_request.credential = match (self.device_credential.as_ref(), self.legacy_host_compat) {
+            (Some(proof), false)
+                if self
+                    .session_epoch
+                    .is_some_and(|epoch| proof.session_epoch() == epoch) =>
+            {
+                Some(proof.clone())
+            }
+            (None, true) => None,
+            _ => {
+                return Err(DispatchFailure::soft(
+                    CONNECT_ERROR_FORBIDDEN,
+                    deny_message(PermissionDenyReason::DeviceCredentialRequired),
+                ));
+            }
+        };
+        let decision =
+            PermissionEvaluator::default().evaluate_transport_authenticated_owner(org_request);
         if let PermissionDecision::Denied(reason) = decision {
             return Err(DispatchFailure::soft(
                 CONNECT_ERROR_FORBIDDEN,
@@ -801,6 +913,7 @@ fn deny_if_capability_missing(
             crate::domain::query::Query::PromptLibrary(_) => Some(Capability::PromptProjection),
             crate::domain::query::Query::TaskCockpit(_) => Some(Capability::TaskCockpit),
             crate::domain::query::Query::OperationStatus { .. }
+            | crate::domain::query::Query::CommandReceiptStatus { .. }
             | crate::domain::query::Query::TaskSnapshot => None,
         },
         ClientRequest::Command(envelope) => match &envelope.command {
@@ -829,10 +942,30 @@ fn deny_if_capability_missing(
             ));
         }
     }
+    if matches!(
+        request,
+        ClientRequest::Query(envelope)
+            if matches!(
+                &envelope.query,
+                crate::domain::query::Query::TaskCockpit(
+                    crate::domain::cockpit::TaskCockpitQuery::OpenConversationSubscription { .. }
+                        | crate::domain::cockpit::TaskCockpitQuery::ReleaseConversationSubscription { .. }
+                )
+            )
+    ) && !granted.contains(Capability::SemanticConversation)
+    {
+        return Err(DispatchFailure::soft(
+            CONNECT_ERROR_FORBIDDEN,
+            "request requires a capability that was not negotiated",
+        ));
+    }
     Ok(())
 }
 
-fn authorize_established_request(request: &ClientRequest) -> Result<(), DispatchFailure> {
+fn authorize_established_request(
+    session: &ConnectDispatchSession,
+    request: &ClientRequest,
+) -> Result<(), DispatchFailure> {
     if matches!(request, ClientRequest::Detach(_)) {
         return Ok(());
     }
@@ -842,12 +975,37 @@ fn authorize_established_request(request: &ClientRequest) -> Result<(), Dispatch
             "unauthorized Connect command",
         ));
     };
+    let credential = match (
+        session.device_credential.as_ref(),
+        session.legacy_host_compat,
+    ) {
+        (Some(proof), false) => {
+            if session
+                .session_epoch
+                .is_some_and(|epoch| proof.session_epoch() == epoch)
+            {
+                Some(proof.clone())
+            } else {
+                return Err(DispatchFailure::soft(
+                    CONNECT_ERROR_FORBIDDEN,
+                    deny_message(PermissionDenyReason::DeviceCredentialRequired),
+                ));
+            }
+        }
+        (None, true) => None,
+        _ => {
+            return Err(DispatchFailure::soft(
+                CONNECT_ERROR_FORBIDDEN,
+                deny_message(PermissionDenyReason::DeviceCredentialRequired),
+            ));
+        }
+    };
     let decision =
         PermissionEvaluator::default().evaluate_transport_authenticated_owner(PermissionRequest {
             role: ConnectRole::PairedOwner,
             task_id,
             action,
-            credential: None,
+            credential,
         });
     match decision {
         PermissionDecision::Allow => Ok(()),
@@ -931,6 +1089,10 @@ fn map_ipc_error(error: IpcError) -> DispatchFailure {
         IpcError::Unauthorized => DispatchFailure::soft(
             CONNECT_ERROR_UNAUTHORIZED,
             "request client_id is not the authenticated paired identity",
+        ),
+        IpcError::Unsupported => DispatchFailure::soft(
+            CONNECT_ERROR_FORBIDDEN,
+            "request is unsupported on this Connect transport",
         ),
         IpcError::UnsupportedCapability => DispatchFailure::soft(
             CONNECT_ERROR_FORBIDDEN,
@@ -1076,7 +1238,8 @@ mod tests {
         let mut session = ConnectDispatchSession::bind_paired(
             "web-paired-owner".to_owned(),
             ConnectIdentityLiveState::Live,
-        );
+        )
+        .with_legacy_host_compat();
         let (limits, client_id) = complete_hello(&mut session, binding).await;
         let request_id = RequestId::new();
         let query = QueryEnvelope {
@@ -1114,7 +1277,8 @@ mod tests {
         let mut session = ConnectDispatchSession::bind_paired(
             "web-paired-owner".to_owned(),
             ConnectIdentityLiveState::Live,
-        );
+        )
+        .with_legacy_host_compat();
         let (limits, client_id) = complete_hello(&mut session, binding).await;
         let command_id = CommandId::new();
         let request_id = RequestId::new();
@@ -1152,7 +1316,8 @@ mod tests {
         let mut session = ConnectDispatchSession::bind_paired(
             "web-paired-owner".to_owned(),
             ConnectIdentityLiveState::Live,
-        );
+        )
+        .with_legacy_host_compat();
         assert!(session.bound_client_id().is_none());
         let request_id = RequestId::new();
         let payload = ConnectPayload::Query(QueryEnvelope {
@@ -1190,7 +1355,8 @@ mod tests {
         let mut session = ConnectDispatchSession::bind_paired(
             "web-paired-owner".to_owned(),
             ConnectIdentityLiveState::Live,
-        );
+        )
+        .with_legacy_host_compat();
         let mut hello = hello_payload(
             advertised_connect_capabilities(),
             ConnectLimits::v1_default(),
@@ -1220,7 +1386,8 @@ mod tests {
         let mut session = ConnectDispatchSession::bind_paired(
             "web-paired-owner".to_owned(),
             ConnectIdentityLiveState::Live,
-        );
+        )
+        .with_legacy_host_compat();
         let (limits, _) = complete_hello(&mut session, binding).await;
         let payload = ConnectPayload::Capabilities(CapabilitySet::from_capabilities([
             Capability::OrganizationProjection,
@@ -1243,7 +1410,8 @@ mod tests {
         let mut session = ConnectDispatchSession::bind_paired(
             "web-paired-owner".to_owned(),
             ConnectIdentityLiveState::Live,
-        );
+        )
+        .with_legacy_host_compat();
         let (limits, client_id) = complete_hello(&mut session, channel_binding).await;
         let other_limits = ConnectLimits::try_new(
             limits.max_physical_frame_bytes,
@@ -1279,7 +1447,8 @@ mod tests {
         let mut session = ConnectDispatchSession::bind_paired(
             "web-paired-owner".to_owned(),
             ConnectIdentityLiveState::Live,
-        );
+        )
+        .with_legacy_host_compat();
         let (limits, client_id) = complete_hello(&mut session, channel_binding).await;
         let query = ConnectPayload::Query(QueryEnvelope {
             request_id,
@@ -1298,7 +1467,8 @@ mod tests {
         let mut session = ConnectDispatchSession::bind_paired(
             "web-paired-owner".to_owned(),
             ConnectIdentityLiveState::Live,
-        );
+        )
+        .with_legacy_host_compat();
         let (limits, _) = complete_hello(&mut session, channel_binding).await;
         let hello = ConnectPayload::Hello(hello_payload(advertised_connect_capabilities(), limits));
         let env = envelope(channel_binding, 1, None, None, limits, hello.clone());
@@ -1316,7 +1486,8 @@ mod tests {
         let mut session = ConnectDispatchSession::bind_paired(
             "web-paired-owner".to_owned(),
             ConnectIdentityLiveState::Live,
-        );
+        )
+        .with_legacy_host_compat();
         let (limits, bound) = complete_hello(&mut session, binding).await;
         let request_id = RequestId::new();
         let payload = ConnectPayload::Command(CommandEnvelope {
@@ -1357,11 +1528,54 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn paired_pin_owns_hello_identity_and_capability_ceiling() {
+        let assigned = ClientId::new();
+        for supplied in [None, Some(assigned), Some(ClientId::new())] {
+            let mut session = ConnectDispatchSession::bind_paired(
+                "paired".into(),
+                ConnectIdentityLiveState::Live,
+            )
+            .with_legacy_host_compat()
+            .with_assigned_client_id(assigned)
+            .with_capability_ceiling(CapabilitySet::from_capabilities([
+                Capability::PagedSnapshots,
+            ]));
+            let limits = ConnectLimits::v1_default();
+            let mut hello = hello_payload(advertised_connect_capabilities(), limits);
+            hello.client_id = supplied;
+            let payload = ConnectPayload::Hello(hello);
+            let env = envelope(binding(), 1, None, None, limits, payload.clone());
+            let (reply, disposition) = session.handle_payload(&env, payload, None).await;
+            if supplied.is_some_and(|id| id != assigned) {
+                assert_eq!(disposition, ConnectSessionDisposition::Disconnect);
+                assert!(
+                    matches!(reply, ConnectPayload::Error(error) if error.code == CONNECT_ERROR_UNAUTHORIZED)
+                );
+            } else {
+                assert_eq!(disposition, ConnectSessionDisposition::Continue);
+                let ConnectPayload::Hello(hello) = reply else {
+                    panic!("expected hello")
+                };
+                assert_eq!(hello.client_id, Some(assigned));
+                assert!(!hello.capabilities.contains(Capability::HostShutdown));
+                assert!(!hello.capabilities.contains(Capability::UpdateHandoff));
+                assert_eq!(
+                    hello.capabilities,
+                    advertised_connect_capabilities().intersection(
+                        CapabilitySet::from_capabilities([Capability::PagedSnapshots])
+                    )
+                );
+            }
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn production_path_never_returns_callback_hold_and_keeps_paired_identity() {
         let mut session = ConnectDispatchSession::bind_paired(
             "web-paired-owner".to_owned(),
             ConnectIdentityLiveState::Live,
-        );
+        )
+        .with_legacy_host_compat();
         assert!(session.bound_client_id().is_none());
         assert!(session.paired_identity_bound());
         let binding = binding();
@@ -1382,7 +1596,8 @@ mod tests {
         let mut session = ConnectDispatchSession::bind_paired(
             "web-paired-owner".to_owned(),
             ConnectIdentityLiveState::Live,
-        );
+        )
+        .with_legacy_host_compat();
         let supplied = ClientId::new();
         let mut hello = hello_payload(
             advertised_connect_capabilities(),
@@ -1431,7 +1646,8 @@ mod tests {
         let mut session = ConnectDispatchSession::bind_paired(
             "web-paired-owner".to_owned(),
             ConnectIdentityLiveState::Live,
-        );
+        )
+        .with_legacy_host_compat();
         let (limits, _) = complete_hello(&mut session, binding).await;
         let duplicate =
             ConnectPayload::Hello(hello_payload(advertised_connect_capabilities(), limits));
@@ -1449,7 +1665,8 @@ mod tests {
         let mut session = ConnectDispatchSession::bind_paired(
             "web-paired-owner".to_owned(),
             ConnectIdentityLiveState::Live,
-        );
+        )
+        .with_legacy_host_compat();
         let (limits, client_id) = complete_hello(&mut session, binding).await;
         let negotiated = session.negotiated_capabilities().expect("negotiated");
         let confirm = ConnectPayload::Capabilities(negotiated);
@@ -1562,7 +1779,8 @@ mod tests {
         let mut session = ConnectDispatchSession::bind_paired(
             "web-paired-owner".to_owned(),
             ConnectIdentityLiveState::Live,
-        );
+        )
+        .with_legacy_host_compat();
         let request_id = RequestId::new();
         let operation_id = OperationId::new();
         let payload = ConnectPayload::Command(CommandEnvelope {
@@ -1598,5 +1816,25 @@ mod tests {
         assert!(!advertised.contains(Capability::EventReplay));
         assert!(!advertised.contains(Capability::TerminalDeltas));
         assert!(!advertised.contains(Capability::OrganizationProjection));
+    }
+
+    #[test]
+    fn bind_paired_defaults_without_legacy_and_epoch_zero_stays_fail_closed() {
+        let session = ConnectDispatchSession::bind_paired(
+            "web-paired-owner".to_owned(),
+            ConnectIdentityLiveState::Live,
+        );
+        assert!(!session.legacy_host_compat_for_test());
+        assert!(!session.has_device_credential_for_test());
+        let legacy = ConnectDispatchSession::bind_paired(
+            "web-paired-owner".to_owned(),
+            ConnectIdentityLiveState::Live,
+        )
+        .with_legacy_host_compat();
+        assert!(legacy.legacy_host_compat_for_test());
+        assert!(!legacy.has_device_credential_for_test());
+        // with_device_credential(proof, 0) clears credential and leaves
+        // legacy_host_compat=false (see impl); bridge also closes on epoch 0.
+        // Opaque DeviceCredentialProof has no public test constructor here.
     }
 }

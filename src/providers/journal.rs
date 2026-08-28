@@ -2238,6 +2238,8 @@ impl SemanticJournal {
                     let candidate = event.to_snapshot_fact();
                     state.candidates.push(candidate);
                     let mut page = SemanticJournalPage {
+                        oldest_sequence: 0,
+                        cursor_rolled_over: false,
                         after_sequence,
                         through_sequence: event.sequence,
                         high_water,
@@ -2276,6 +2278,8 @@ impl SemanticJournal {
         let next_sequence = overflow_sequence
             .or_else(|| (scanned_through < high_water).then_some(scanned_through + 1));
         let mut page = SemanticJournalPage {
+            oldest_sequence: 0,
+            cursor_rolled_over: false,
             after_sequence,
             through_sequence,
             high_water,
@@ -3499,7 +3503,11 @@ impl<P: Serialize> Serialize for JournalPageProjection<'_, '_, P> {
     where
         S: Serializer,
     {
-        let mut page = serializer.serialize_struct("SemanticJournalPage", 6)?;
+        // Match the complete wire envelope, including retention metadata, before
+        // admitting an owned fact. These defaults match page_from_store.
+        let mut page = serializer.serialize_struct("SemanticJournalPage", 8)?;
+        page.serialize_field("oldest_sequence", &0_u64)?;
+        page.serialize_field("cursor_rolled_over", &false)?;
         page.serialize_field("after_sequence", &self.after_sequence)?;
         page.serialize_field("through_sequence", &self.through_sequence)?;
         page.serialize_field("high_water", &self.high_water)?;

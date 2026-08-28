@@ -7,7 +7,7 @@ use std::fmt;
 
 use crate::domain::command::{CommandEnvelope, CommandReceipt};
 use crate::domain::event::DomainEvent;
-use crate::domain::id::{CommandId, SubscriptionId};
+use crate::domain::id::{CommandId, SubscriptionId, TaskId};
 use crate::domain::query::{QueryEnvelope, QueryReply};
 use crate::protocol::control::{DetachAck, DetachRequest};
 use crate::protocol::stream::StreamFrame;
@@ -162,7 +162,41 @@ pub enum ServerMessage {
         newest_sequence: u64,
     },
     Stream(StreamFrame),
+    /// Ephemeral-only coalesced wake: subscription high-water advanced. No
+    /// semantic content and no raw payload; clients page via cockpit queries.
+    ConversationDirty {
+        subscription_id: SubscriptionId,
+        task_id: TaskId,
+        high_water: u64,
+    },
     Detached(DetachAck),
+}
+
+struct ConversationDirtyPayloadRef<'a> {
+    subscription_id: &'a SubscriptionId,
+    task_id: &'a TaskId,
+    high_water: u64,
+}
+
+impl Serialize for ConversationDirtyPayloadRef<'_> {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let mut map = serializer.serialize_map(Some(3))?;
+        map.serialize_entry("subscription_id", self.subscription_id)?;
+        map.serialize_entry("task_id", self.task_id)?;
+        map.serialize_entry("high_water", &self.high_water)?;
+        map.end()
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ConversationDirtyPayload {
+    subscription_id: SubscriptionId,
+    task_id: TaskId,
+    high_water: u64,
 }
 
 struct DurableEventPayloadRef<'a> {
@@ -235,6 +269,18 @@ impl Serialize for ServerMessage {
                 },
             )?,
             Self::Stream(frame) => map.serialize_entry("stream", frame)?,
+            Self::ConversationDirty {
+                subscription_id,
+                task_id,
+                high_water,
+            } => map.serialize_entry(
+                "conversation_dirty",
+                &ConversationDirtyPayloadRef {
+                    subscription_id,
+                    task_id,
+                    high_water: *high_water,
+                },
+            )?,
             Self::Detached(ack) => map.serialize_entry("detached", ack)?,
         }
         map.end()
@@ -249,6 +295,7 @@ enum ServerMessageVariant {
     DurableEvent,
     ResyncRequired,
     Stream,
+    ConversationDirty,
     Detached,
 }
 
@@ -263,7 +310,7 @@ impl<'de> Deserialize<'de> for ServerMessageVariant {
             type Value = ServerMessageVariant;
 
             fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-                formatter.write_str("command_receipt, terminal_input_ack, update_handoff, query_reply, durable_event, resync_required, stream, or detached")
+                formatter.write_str("command_receipt, terminal_input_ack, update_handoff, query_reply, durable_event, resync_required, stream, conversation_dirty, or detached")
             }
 
             fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
@@ -278,6 +325,7 @@ impl<'de> Deserialize<'de> for ServerMessageVariant {
                     "durable_event" => Ok(ServerMessageVariant::DurableEvent),
                     "resync_required" => Ok(ServerMessageVariant::ResyncRequired),
                     "stream" => Ok(ServerMessageVariant::Stream),
+                    "conversation_dirty" => Ok(ServerMessageVariant::ConversationDirty),
                     "detached" => Ok(ServerMessageVariant::Detached),
                     _ => Err(de::Error::unknown_variant(
                         value,
@@ -289,6 +337,7 @@ impl<'de> Deserialize<'de> for ServerMessageVariant {
                             "durable_event",
                             "resync_required",
                             "stream",
+                            "conversation_dirty",
                             "detached",
                         ],
                     )),
@@ -549,6 +598,14 @@ impl<'de> Deserialize<'de> for ServerMessage {
                         }
                     }
                     ServerMessageVariant::Stream => ServerMessage::Stream(map.next_value()?),
+                    ServerMessageVariant::ConversationDirty => {
+                        let payload: ConversationDirtyPayload = map.next_value()?;
+                        ServerMessage::ConversationDirty {
+                            subscription_id: payload.subscription_id,
+                            task_id: payload.task_id,
+                            high_water: payload.high_water,
+                        }
+                    }
                     ServerMessageVariant::Detached => ServerMessage::Detached(map.next_value()?),
                 };
                 if map.next_key::<de::IgnoredAny>()?.is_some() {

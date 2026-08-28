@@ -25,6 +25,10 @@ pub struct ConnectWebTransportMarker {
     pub generation: u64,
     pub protocol_major: u16,
     pub protocol_minor: u16,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub host_public_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub host_public_key: Option<String>,
 }
 
 #[derive(Clone)]
@@ -36,6 +40,7 @@ struct ConnectWebPublicationInner {
     generation: AtomicU64,
     marker: RwLock<Option<ConnectWebTransportMarker>>,
     endpoint: String,
+    identity: Option<(String, String)>,
 }
 
 impl fmt::Debug for ConnectWebPublication {
@@ -50,7 +55,19 @@ impl fmt::Debug for ConnectWebPublication {
 
 impl ConnectWebPublication {
     pub fn new(endpoint: impl Into<String>) -> Self {
-        let endpoint = endpoint.into();
+        Self::with_identity(endpoint.into(), None)
+    }
+
+    pub(crate) fn for_host(
+        endpoint: impl Into<String>,
+        host: super::identity::HostPublicId,
+        public: crate::protocol::NoiseStaticPublicKey,
+    ) -> Self {
+        let key = public.as_bytes().iter().map(|byte| format!("{byte:02x}")).collect();
+        Self::with_identity(endpoint.into(), Some((uuid::Uuid::from_bytes(*host.as_bytes()).to_string(), key)))
+    }
+
+    fn with_identity(endpoint: String, identity: Option<(String, String)>) -> Self {
         assert!(
             endpoint.len() <= CONNECT_WEB_MARKER_MAX_ENDPOINT_BYTES,
             "Connect endpoint exceeds marker bound"
@@ -60,6 +77,7 @@ impl ConnectWebPublication {
                 generation: AtomicU64::new(1),
                 marker: RwLock::new(None),
                 endpoint,
+                identity,
             }),
         }
     }
@@ -136,6 +154,8 @@ impl ConnectWebPublication {
                 generation,
                 protocol_major: CONNECT_PROTOCOL_MAJOR,
                 protocol_minor: CONNECT_PROTOCOL_MINOR,
+                host_public_id: self.inner.identity.as_ref().map(|(host, _)| host.clone()),
+                host_public_key: self.inner.identity.as_ref().map(|(_, key)| key.clone()),
             });
         }
     }
@@ -176,5 +196,21 @@ mod tests {
 
         assert!(!publication.is_published());
         assert!(!publication.publish_if_generation(generation));
+    }
+
+    #[test]
+    fn production_marker_carries_public_identity_not_listener_generation_as_host() {
+        let host = super::super::identity::HostPublicId::new();
+        let custody = crate::protocol::NoiseCustody::generate().expect("custody");
+        let publication = ConnectWebPublication::for_host("/api/connect", host, custody.public());
+        publication.publish();
+        let first = publication.marker().unwrap();
+        publication.revoke();
+        publication.publish();
+        let second = publication.marker().unwrap();
+        assert_eq!(first.host_public_id, second.host_public_id);
+        assert_eq!(first.host_public_key, second.host_public_key);
+        assert_eq!(first.host_public_key.unwrap().len(), 64);
+        assert!(second.generation > first.generation);
     }
 }

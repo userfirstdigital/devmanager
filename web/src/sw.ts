@@ -10,6 +10,11 @@ import { NavigationRoute, registerRoute } from "workbox-routing";
 import { NetworkOnly } from "workbox-strategies";
 import { isNetworkOnlyPath } from "./pwa/cachePolicy";
 import {
+  isSameOriginHtmlNavigation,
+  networkFirstHtmlNavigation,
+  shouldBypassHtmlNavigationCache,
+} from "./pwa/htmlNavigation";
+import {
   applyAppBadge,
   describePushNotification,
   notificationClickDestination,
@@ -39,10 +44,37 @@ for (const method of ["GET", "POST", "PUT", "PATCH", "DELETE"] as const) {
   registerRoute(networkOnlyMatch, networkOnly, method);
 }
 
+const precacheIndexHandler = createHandlerBoundToURL("/index.html");
+
 registerRoute(
-  new NavigationRoute(createHandlerBoundToURL("/index.html"), {
-    denylist: [/^\/api(?:\/|$)/, /^\/pair(?:[/?]|$)/],
-  }),
+  new NavigationRoute(
+    async ({ request, event }) => {
+      if (
+        !isSameOriginHtmlNavigation({
+          request,
+          origin: self.location.origin,
+        }) ||
+        shouldBypassHtmlNavigationCache(new URL(request.url).pathname)
+      ) {
+        return precacheIndexHandler({ event, request } as never);
+      }
+      const networkFirst = await networkFirstHtmlNavigation({
+        request,
+        origin: self.location.origin,
+        caches: self.caches,
+        fetch: self.fetch.bind(self),
+        precacheUrl: "/index.html",
+        waitUntil: (promise) => {
+          event.waitUntil(promise);
+        },
+      });
+      if (networkFirst) return networkFirst;
+      return precacheIndexHandler({ event, request } as never);
+    },
+    {
+      denylist: [/^\/api(?:\/|$)/, /^\/pair(?:[/?]|$)/],
+    },
+  ),
 );
 
 const updateGate = createWorkerUpdateGate({

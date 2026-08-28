@@ -705,14 +705,14 @@ fn clean_label(value: &str, fallback: &str) -> String {
 fn route_for_stable_key(key: &StableSessionKey) -> String {
     if let Some(id) = key.as_str().strip_prefix("tab:") {
         safe_route_id(id)
-            .map(|id| format!("/session/tab/{id}"))
-            .unwrap_or_else(|| "/sessions".to_string())
+            .map(|_| super::routes::task_path(key))
+            .unwrap_or_else(|| super::routes::TASKS_PATH.to_string())
     } else if let Some(id) = key.as_str().strip_prefix("server:") {
         safe_route_id(id)
-            .map(|id| format!("/session/server/{id}"))
-            .unwrap_or_else(|| "/sessions".to_string())
+            .map(|_| super::routes::task_path(key))
+            .unwrap_or_else(|| super::routes::TASKS_PATH.to_string())
     } else {
-        "/sessions".to_string()
+        super::routes::TASKS_PATH.to_string()
     }
 }
 
@@ -1333,7 +1333,7 @@ mod tests {
         );
         let json = serde_json::to_string(&payload).unwrap();
 
-        assert_eq!(payload.route, "/session/tab/tab-1");
+        assert_eq!(payload.route, "/tasks/tab%3Atab-1");
         assert_eq!(payload.badge, 2);
         assert!(!json.contains("PROMPT_SENTINEL"));
         assert!(!json.contains("OUTPUT_SENTINEL"));
@@ -1349,7 +1349,7 @@ mod tests {
             "event-unsafe",
             1,
         );
-        assert_eq!(unsafe_route.route, "/sessions");
+        assert_eq!(unsafe_route.route, "/tasks");
     }
 
     #[test]

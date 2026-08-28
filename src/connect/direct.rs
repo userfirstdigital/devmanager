@@ -163,8 +163,18 @@ pub fn referer_contains_pairing_secret(referer: Option<&str>) -> bool {
 }
 
 pub fn is_trustworthy_loopback_host(host: &str) -> bool {
-    let hostname = host.split(':').next().unwrap_or(host);
-    matches!(hostname, "localhost" | "127.0.0.1" | "[::1]" | "::1")
+    // Parse the HTTP authority rather than splitting IPv6 at its first colon.
+    // Paths, user-info and malformed ports are never loopback authority.
+    let Ok(authority) = host.parse::<axum::http::uri::Authority>() else {
+        return false;
+    };
+    if authority.as_str().contains('@') {
+        return false;
+    }
+    matches!(
+        authority.host().to_ascii_lowercase().as_str(),
+        "localhost" | "127.0.0.1" | "[::1]" | "::1"
+    )
 }
 
 pub fn origin_matches_host(origin: &str, scheme: &str, host: &str) -> bool {

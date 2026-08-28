@@ -1,19 +1,25 @@
 //! Cloneable duplex multiplexed client connection after Hello.
 //!
-//! One shared I/O supervisor owns the named-pipe writer and continuously
+//! One shared I/O supervisor owns the transport writer and continuously
 //! running reader futures. Concurrent command/query calls register correlation
 //! waiters before enqueueing writes. Unsolicited durable messages land in a
-//! bounded inbox for later subscription consumers.
+//! bounded inbox for later subscription consumers. Named-pipe and Connect
+//! transports share the same waiter/inbox/poison machinery after Hello.
 
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::fmt;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use tokio::sync::{mpsc, oneshot};
 
+use crate::connect::{
+    ChannelBinding, ConnectLimits, ConnectNoiseStaticPublicKey, CONNECT_PROTOCOL_MAJOR,
+    CONNECT_PROTOCOL_MINOR,
+};
 use crate::domain::command::{CommandEnvelope, CommandReceipt};
 use crate::domain::event::DomainEvent;
-use crate::domain::id::{CommandId, RequestId, SubscriptionId};
+use crate::domain::id::{CommandId, RequestId, SubscriptionId, TaskId};
 #[cfg(test)]
 use crate::domain::query::{Query, QueryError, QueryOutcome, QueryResult};
 use crate::domain::query::{QueryEnvelope, QueryReply};
@@ -24,13 +30,13 @@ use crate::host::{
     write_physical_frame, write_physical_frame_with_deadline, IpcError,
 };
 use crate::protocol::{
-    ClientHello, ClientRequest, DetachAck, DetachRequest, FrameLimits, MessagePackCodec,
-    PhysicalFrameCodec, ServerHello, ServerMessage, StreamFrame, UpdateHandoffReply,
-    MAX_PHYSICAL_FRAME_BYTES, MAX_REASSEMBLED_MESSAGE_BYTES,
+    CapabilitySet, ClientHello, ClientRequest, DetachAck, DetachRequest, FrameLimits,
+    MessagePackCodec, PhysicalFrameCodec, ServerHello, ServerMessage, StreamFrame,
+    UpdateHandoffReply, MAX_PHYSICAL_FRAME_BYTES, MAX_REASSEMBLED_MESSAGE_BYTES,
 };
 use crate::terminal::protocol::{InputAck, InputId, TerminalInputRequest};
 
-const WRITE_QUEUE_CAPACITY: usize = 32;
+pub(crate) const WRITE_QUEUE_CAPACITY: usize = 32;
 const UNSOLICITED_QUEUE_CAPACITY: usize = 64;
 const UNSOLICITED_STREAM_CAPACITY: usize = 16;
 const MAX_RETIRED_SUBSCRIPTION_IDS: usize = 64;
@@ -53,6 +59,214 @@ pub(crate) enum ScriptedDetachBehavior {
     ReleaseWrongSubscriptionAck,
 }
 
+/// Test handle for [`ClientConnection::delayed_command_wire_for_test`].
+#[cfg(test)]
+pub(crate) struct DelayedCommandWireHandle {
+    state: Arc<Mutex<SharedState>>,
+    unsolicited: Arc<UnsolicitedInbox>,
+    admitted_rx: Mutex<mpsc::UnboundedReceiver<CommandId>>,
+    query_rx: Mutex<mpsc::UnboundedReceiver<RequestId>>,
+}
+
+#[cfg(test)]
+impl DelayedCommandWireHandle {
+    pub(crate) async fn wait_command_admitted(&self) -> CommandId {
+        let mut rx = self
+            .admitted_rx
+            .lock()
+            .expect("delayed command admit receiver");
+        rx.recv()
+            .await
+            .expect("command write must admit before wait returns")
+    }
+
+    pub(crate) async fn wait_query_admitted(&self) -> RequestId {
+        let mut rx = self.query_rx.lock().expect("delayed query admit receiver");
+        rx.recv()
+            .await
+            .expect("query write must admit before wait returns")
+    }
+
+    pub(crate) async fn dispatch_accepted(&self, receipt: CommandReceipt) -> Result<(), IpcError> {
+        dispatch_server_message(
+            &self.state,
+            &self.unsolicited,
+            ServerMessage::CommandReceipt(receipt),
+        )
+        .await
+    }
+
+    pub(crate) async fn dispatch_query_reply(&self, reply: QueryReply) -> Result<(), IpcError> {
+        dispatch_server_message(
+            &self.state,
+            &self.unsolicited,
+            ServerMessage::QueryReply(reply),
+        )
+        .await
+    }
+
+    pub(crate) fn has_command_waiter(&self, command_id: CommandId) -> bool {
+        self.state
+            .lock()
+            .expect("client connection state")
+            .command_waiters
+            .contains_key(&command_id)
+    }
+
+    pub(crate) fn is_poisoned(&self) -> bool {
+        self.state.lock().expect("client connection state").poisoned
+    }
+}
+
+/// Authenticated Connect session metadata after Noise + Hello (no local boot id).
+#[derive(Clone, PartialEq, Eq)]
+pub struct ConnectAuthenticatedSession {
+    host_public_id: [u8; 16],
+    host_key_pin: ConnectNoiseStaticPublicKey,
+    assigned_client_id: ClientId,
+    binding: ChannelBinding,
+    negotiated_capabilities: CapabilitySet,
+    negotiated_limits: ConnectLimits,
+    server_build: Option<String>,
+}
+
+impl ConnectAuthenticatedSession {
+    pub fn new(
+        host_public_id: [u8; 16],
+        host_key_pin: ConnectNoiseStaticPublicKey,
+        assigned_client_id: ClientId,
+        binding: ChannelBinding,
+        negotiated_capabilities: CapabilitySet,
+        negotiated_limits: ConnectLimits,
+        server_build: Option<String>,
+    ) -> Self {
+        Self {
+            host_public_id,
+            host_key_pin,
+            assigned_client_id,
+            binding,
+            negotiated_capabilities,
+            negotiated_limits,
+            server_build,
+        }
+    }
+
+    pub fn host_public_id(&self) -> [u8; 16] {
+        self.host_public_id
+    }
+
+    pub fn host_key_pin(&self) -> ConnectNoiseStaticPublicKey {
+        self.host_key_pin
+    }
+
+    pub fn assigned_client_id(&self) -> ClientId {
+        self.assigned_client_id
+    }
+
+    pub fn binding(&self) -> ChannelBinding {
+        self.binding
+    }
+
+    pub fn negotiated_capabilities(&self) -> CapabilitySet {
+        self.negotiated_capabilities
+    }
+
+    pub fn negotiated_limits(&self) -> ConnectLimits {
+        self.negotiated_limits
+    }
+
+    pub fn server_build(&self) -> Option<&str> {
+        self.server_build.as_deref()
+    }
+}
+
+impl fmt::Debug for ConnectAuthenticatedSession {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ConnectAuthenticatedSession")
+            .field("host_public_id", &"redacted")
+            .field("host_key_pin", &self.host_key_pin)
+            .field("assigned_client_id", &self.assigned_client_id)
+            .field("binding", &self.binding)
+            .field("negotiated_capabilities", &self.negotiated_capabilities)
+            .field("negotiated_limits", &self.negotiated_limits)
+            .field("server_build", &self.server_build)
+            .finish()
+    }
+}
+
+/// Post-Hello connection identity. Local pipe Hello stays distinct from Connect.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ConnectionMetadata {
+    Local(ServerHello),
+    Connect(ConnectAuthenticatedSession),
+}
+
+impl ConnectionMetadata {
+    pub fn as_local(&self) -> Option<&ServerHello> {
+        match self {
+            Self::Local(hello) => Some(hello),
+            Self::Connect(_) => None,
+        }
+    }
+
+    pub fn as_connect(&self) -> Option<&ConnectAuthenticatedSession> {
+        match self {
+            Self::Connect(session) => Some(session),
+            Self::Local(_) => None,
+        }
+    }
+
+    pub fn granted_capabilities(&self) -> CapabilitySet {
+        match self {
+            Self::Local(hello) => hello.granted,
+            Self::Connect(session) => session.negotiated_capabilities,
+        }
+    }
+
+    pub fn connection_id(&self) -> uuid::Uuid {
+        match self {
+            Self::Local(hello) => hello.connection_id,
+            Self::Connect(session) => session.binding.connection_id.as_uuid(),
+        }
+    }
+
+    pub fn host_boot_id(&self) -> Option<uuid::Uuid> {
+        match self {
+            Self::Local(hello) => Some(hello.host_boot_id),
+            Self::Connect(_) => None,
+        }
+    }
+
+    pub fn server_build(&self) -> &str {
+        match self {
+            Self::Local(hello) => hello.server_build.as_str(),
+            Self::Connect(session) => session.server_build.as_deref().unwrap_or(""),
+        }
+    }
+
+    pub fn protocol_major(&self) -> u16 {
+        match self {
+            Self::Local(hello) => hello.protocol_major,
+            Self::Connect(_) => CONNECT_PROTOCOL_MAJOR,
+        }
+    }
+
+    pub fn protocol_minor(&self) -> u16 {
+        match self {
+            Self::Local(hello) => hello.protocol_minor,
+            Self::Connect(_) => CONNECT_PROTOCOL_MINOR,
+        }
+    }
+
+    pub fn reconnect_grant(&self) -> Option<crate::protocol::ReconnectGrant> {
+        match self {
+            Self::Local(hello) => hello.reconnect_grant.clone(),
+            Self::Connect(_) => None,
+        }
+    }
+}
+
 /// Unsolicited server→client messages (not correlated replies).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum UnsolicitedServerMessage {
@@ -66,6 +280,12 @@ pub enum UnsolicitedServerMessage {
         newest_sequence: u64,
     },
     Stream(StreamFrame),
+    /// Coalesced ephemeral conversation wake; not durable and not a correlation failure.
+    ConversationDirty {
+        subscription_id: SubscriptionId,
+        task_id: TaskId,
+        high_water: u64,
+    },
 }
 
 #[derive(Clone, Copy)]
@@ -73,6 +293,7 @@ enum UnsolicitedLane {
     Durable,
     Retained,
     Stream,
+    Conversation,
 }
 
 fn durable_message_subscription_id(message: &UnsolicitedServerMessage) -> Option<SubscriptionId> {
@@ -83,7 +304,8 @@ fn durable_message_subscription_id(message: &UnsolicitedServerMessage) -> Option
         | UnsolicitedServerMessage::ResyncRequired {
             subscription_id, ..
         } => Some(*subscription_id),
-        UnsolicitedServerMessage::Stream(_) => None,
+        UnsolicitedServerMessage::Stream(_)
+        | UnsolicitedServerMessage::ConversationDirty { .. } => None,
     }
 }
 
@@ -100,13 +322,14 @@ impl UnsolicitedLane {
         match self {
             Self::Durable => Self::Retained,
             Self::Retained => Self::Stream,
-            Self::Stream => Self::Durable,
+            Self::Stream => Self::Conversation,
+            Self::Conversation => Self::Durable,
         }
     }
 }
 
-/// Bounded fair unsolicited inbox with separate retained, durable, and
-/// coalescing current-stream lanes.
+/// Bounded fair unsolicited inbox with separate retained, durable,
+/// coalescing current-stream, and coalescing conversation-dirty lanes.
 struct DurableInboxState {
     durable_tx: mpsc::Sender<UnsolicitedServerMessage>,
     durable_rx: mpsc::Receiver<UnsolicitedServerMessage>,
@@ -119,7 +342,7 @@ struct DurableInboxState {
     retired_subscription_ids: HashSet<SubscriptionId>,
 }
 
-struct UnsolicitedInbox {
+pub(crate) struct UnsolicitedInbox {
     /// Admission, retirement, and dequeue share one short synchronous fence.
     /// This makes the retired check plus nonblocking send atomic with the
     /// retirement mark plus queue drain: an old frame is either linearized
@@ -128,6 +351,7 @@ struct UnsolicitedInbox {
     next_lane: Mutex<UnsolicitedLane>,
     stream_capacity: usize,
     streams: Mutex<std::collections::HashMap<crate::protocol::StreamKey, StreamFrame>>,
+    conversations: Mutex<std::collections::HashMap<SubscriptionId, (TaskId, u64)>>,
     notify: tokio::sync::Notify,
     closed: std::sync::atomic::AtomicBool,
     #[cfg(test)]
@@ -152,10 +376,12 @@ impl UnsolicitedInbox {
                 retired_subscription_ids: HashSet::new(),
             }),
             // Preserve the durable-first admission behavior, then rotate
-            // retained and current-stream work before another durable turn.
+            // retained, current-stream, and conversation work before another
+            // durable turn.
             next_lane: Mutex::new(UnsolicitedLane::Durable),
             stream_capacity: stream_capacity.max(1),
             streams: Mutex::new(std::collections::HashMap::new()),
+            conversations: Mutex::new(std::collections::HashMap::new()),
             notify: tokio::sync::Notify::new(),
             closed: std::sync::atomic::AtomicBool::new(false),
             #[cfg(test)]
@@ -184,7 +410,7 @@ impl UnsolicitedInbox {
         *self.admission_barrier.lock().expect("admission barrier") = Some((entered, release));
     }
 
-    fn close(&self) {
+    pub(crate) fn close(&self) {
         self.closed.store(true, std::sync::atomic::Ordering::SeqCst);
         // Wake existing waiters and leave a permit for a waiter that races in
         // after the closed store but before registration.
@@ -199,7 +425,10 @@ impl UnsolicitedInbox {
         match message {
             UnsolicitedServerMessage::DurableEvent { .. }
             | UnsolicitedServerMessage::ResyncRequired { .. } => {}
-            UnsolicitedServerMessage::Stream(_) => return Err(IpcError::Unavailable),
+            UnsolicitedServerMessage::Stream(_)
+            | UnsolicitedServerMessage::ConversationDirty { .. } => {
+                return Err(IpcError::Unavailable)
+            }
         }
         let subscription_id = match &message {
             UnsolicitedServerMessage::DurableEvent {
@@ -208,7 +437,10 @@ impl UnsolicitedInbox {
             | UnsolicitedServerMessage::ResyncRequired {
                 subscription_id, ..
             } => *subscription_id,
-            UnsolicitedServerMessage::Stream(_) => return Err(IpcError::Unavailable),
+            UnsolicitedServerMessage::Stream(_)
+            | UnsolicitedServerMessage::ConversationDirty { .. } => {
+                return Err(IpcError::Unavailable)
+            }
         };
         let durable = self.durable.lock().expect("durable inbox");
         #[cfg(test)]
@@ -258,6 +490,11 @@ impl UnsolicitedInbox {
             .retained_durable
             .retain(|message| durable_message_subscription_id(message) != Some(subscription_id));
 
+        {
+            let mut conversations = self.conversations.lock().expect("conversation inbox");
+            conversations.remove(&subscription_id);
+        }
+
         if durable
             .retained_durable
             .len()
@@ -306,17 +543,55 @@ impl UnsolicitedInbox {
         Ok(())
     }
 
+    fn push_conversation_dirty(
+        &self,
+        subscription_id: SubscriptionId,
+        task_id: TaskId,
+        high_water: u64,
+    ) -> Result<(), IpcError> {
+        if self.closed.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err(IpcError::Unavailable);
+        }
+        if high_water == 0 {
+            return Err(IpcError::Unauthorized);
+        }
+        {
+            let durable = self.durable.lock().expect("durable inbox");
+            if durable.retired_subscription_ids.contains(&subscription_id) {
+                return Ok(());
+            }
+        }
+        let mut conversations = self.conversations.lock().expect("conversation inbox");
+        if let Some(existing) = conversations.get_mut(&subscription_id) {
+            if high_water > existing.1 {
+                *existing = (task_id, high_water);
+            }
+            drop(conversations);
+            self.notify.notify_one();
+            return Ok(());
+        }
+        if conversations.len() < self.stream_capacity {
+            conversations.insert(subscription_id, (task_id, high_water));
+            drop(conversations);
+            self.notify.notify_one();
+        }
+        // Saturated for a new key: drop without failing I/O (stream policy).
+        Ok(())
+    }
+
     fn try_dequeue_from_state(
         durable: &mut DurableInboxState,
         streams: &Mutex<std::collections::HashMap<crate::protocol::StreamKey, StreamFrame>>,
+        conversations: &Mutex<std::collections::HashMap<SubscriptionId, (TaskId, u64)>>,
         next_lane: &mut UnsolicitedLane,
     ) -> Option<UnsolicitedServerMessage> {
         let first_lane = *next_lane;
-        for offset in 0..3 {
+        for offset in 0..4 {
             let lane = match offset {
                 0 => first_lane,
                 1 => first_lane.next(),
-                _ => first_lane.next().next(),
+                2 => first_lane.next().next(),
+                _ => first_lane.next().next().next(),
             };
             loop {
                 let message = match lane {
@@ -334,6 +609,19 @@ impl UnsolicitedInbox {
                         let key = streams.keys().next().copied();
                         key.and_then(|key| streams.remove(&key))
                             .map(UnsolicitedServerMessage::Stream)
+                    }
+                    UnsolicitedLane::Conversation => {
+                        let mut conversations = conversations.lock().expect("conversation inbox");
+                        let key = conversations.keys().next().copied();
+                        key.and_then(|key| {
+                            conversations.remove(&key).map(|(task_id, high_water)| {
+                                UnsolicitedServerMessage::ConversationDirty {
+                                    subscription_id: key,
+                                    task_id,
+                                    high_water,
+                                }
+                            })
+                        })
                     }
                 };
                 let Some(message) = message else {
@@ -386,7 +674,12 @@ impl UnsolicitedInbox {
     fn try_dequeue(&self) -> Option<UnsolicitedServerMessage> {
         let mut next_lane = self.next_lane.lock().expect("unsolicited lane");
         let mut durable = self.durable.lock().expect("durable inbox");
-        Self::try_dequeue_from_state(&mut durable, &self.streams, &mut next_lane)
+        Self::try_dequeue_from_state(
+            &mut durable,
+            &self.streams,
+            &self.conversations,
+            &mut next_lane,
+        )
     }
 }
 
@@ -574,12 +867,12 @@ impl Drop for PendingRegistration {
     }
 }
 
-struct WriteJob {
-    request: ClientRequest,
+pub(crate) struct WriteJob {
+    pub(crate) request: ClientRequest,
 }
 
 #[derive(Default)]
-struct SharedState {
+pub(crate) struct SharedState {
     next_registration_id: u64,
     command_waiters: HashMap<CommandId, PendingReply<CommandReceipt>>,
     update_handoff_waiters: HashMap<CommandId, PendingReply<UpdateHandoffReply>>,
@@ -592,7 +885,7 @@ struct SharedState {
 
 struct SharedConnection {
     client_id: ClientId,
-    server_hello: ServerHello,
+    metadata: ConnectionMetadata,
     state: Arc<Mutex<SharedState>>,
     write_tx: mpsc::Sender<WriteJob>,
     unsolicited: Arc<UnsolicitedInbox>,
@@ -610,8 +903,16 @@ impl ClientConnection {
         self.shared.client_id
     }
 
+    pub fn metadata(&self) -> ConnectionMetadata {
+        self.shared.metadata.clone()
+    }
+
     pub fn server_hello(&self) -> ServerHello {
-        self.shared.server_hello.clone()
+        self.shared
+            .metadata
+            .as_local()
+            .cloned()
+            .expect("local ServerHello metadata")
     }
 
     /// Inert connected stub for HostClient unit tests (never performs I/O).
@@ -620,7 +921,7 @@ impl ClientConnection {
         Self {
             shared: Arc::new(SharedConnection {
                 client_id,
-                server_hello,
+                metadata: ConnectionMetadata::Local(server_hello),
                 state: Arc::new(Mutex::new(SharedState::default())),
                 write_tx: {
                     let (tx, _rx) = mpsc::channel(1);
@@ -747,13 +1048,64 @@ impl ClientConnection {
         Self {
             shared: Arc::new(SharedConnection {
                 client_id,
-                server_hello,
+                metadata: ConnectionMetadata::Local(server_hello),
                 state,
                 write_tx,
                 unsolicited,
                 io_task: Mutex::new(io_task),
             }),
         }
+    }
+
+    /// Delayed CommandReceipt fixture: real `register_waiter` + outbound admission +
+    /// [`dispatch_server_message`]. The I/O task observes command/query writes but
+    /// does not auto-complete them; tests dispatch receipts/replies explicitly.
+    #[cfg(test)]
+    pub(crate) fn delayed_command_wire_for_test(
+        client_id: ClientId,
+        server_hello: ServerHello,
+    ) -> (Self, DelayedCommandWireHandle) {
+        let (write_tx, mut write_rx) = mpsc::channel::<WriteJob>(WRITE_QUEUE_CAPACITY);
+        let state = Arc::new(Mutex::new(SharedState::default()));
+        let unsolicited = Arc::new(UnsolicitedInbox::new_for_test(8, 1));
+        let (admitted_tx, admitted_rx) = mpsc::unbounded_channel();
+        let (query_tx, query_rx) = mpsc::unbounded_channel();
+        let reader_state = Arc::clone(&state);
+        let terminal_state = Arc::clone(&state);
+        let reader_unsolicited = Arc::clone(&unsolicited);
+        let io_task = tokio::spawn(async move {
+            while let Some(job) = write_rx.recv().await {
+                match job.request {
+                    ClientRequest::Command(envelope) => {
+                        let _ = admitted_tx.send(envelope.command_id);
+                    }
+                    ClientRequest::Query(envelope) => {
+                        let _ = query_tx.send(envelope.request_id);
+                    }
+                    _ => {}
+                }
+            }
+            reader_unsolicited.close();
+            poison_mutex(&terminal_state);
+            let _ = reader_state;
+        });
+        let connection = Self {
+            shared: Arc::new(SharedConnection {
+                client_id,
+                metadata: ConnectionMetadata::Local(server_hello),
+                state: Arc::clone(&state),
+                write_tx,
+                unsolicited: Arc::clone(&unsolicited),
+                io_task: Mutex::new(Some(io_task)),
+            }),
+        };
+        let handle = DelayedCommandWireHandle {
+            state,
+            unsolicited,
+            admitted_rx: Mutex::new(admitted_rx),
+            query_rx: Mutex::new(query_rx),
+        };
+        (connection, handle)
     }
 
     #[cfg(test)]
@@ -796,6 +1148,15 @@ impl ClientConnection {
             .lock()
             .expect("client connection state")
             .poisoned
+    }
+
+    /// The retained handle alone does not prove the duplex transport is live.
+    pub(crate) fn is_live(&self) -> bool {
+        self.shared
+            .state
+            .lock()
+            .map(|state| !state.closed && !state.poisoned)
+            .unwrap_or(false)
     }
 
     pub async fn execute_command(
@@ -1159,7 +1520,7 @@ async fn windows_connect(
     let (physical, message) = codecs_for_limits(server_hello.limits)?;
     Ok(spawn_duplex_supervisor(
         hello.client_id,
-        server_hello,
+        ConnectionMetadata::Local(server_hello),
         physical,
         message,
         pipe,
@@ -1169,19 +1530,19 @@ async fn windows_connect(
 #[cfg(windows)]
 fn spawn_duplex_supervisor(
     client_id: ClientId,
-    server_hello: ServerHello,
+    metadata: ConnectionMetadata,
     physical: PhysicalFrameCodec,
     message: MessagePackCodec,
     pipe: tokio::net::windows::named_pipe::NamedPipeClient,
 ) -> ClientConnection {
     let (mut reader, mut writer) = tokio::io::split(pipe);
-    let (write_tx, mut write_rx) = mpsc::channel::<WriteJob>(WRITE_QUEUE_CAPACITY);
-    let unsolicited = Arc::new(UnsolicitedInbox::new(
-        UNSOLICITED_QUEUE_CAPACITY,
-        UNSOLICITED_STREAM_CAPACITY,
-    ));
-
-    let state = Arc::new(Mutex::new(SharedState::default()));
+    let handles = new_supervisor_handles();
+    let SupervisorHandles {
+        state,
+        unsolicited,
+        write_tx,
+        write_rx: mut write_rx,
+    } = handles;
     let reader_state = Arc::clone(&state);
     let terminal_state = Arc::clone(&state);
     let reader_unsolicited = Arc::clone(&unsolicited);
@@ -1223,10 +1584,42 @@ fn spawn_duplex_supervisor(
         poison_mutex(&terminal_state);
     });
 
+    finish_shared_connection(client_id, metadata, state, unsolicited, write_tx, io_task)
+}
+
+pub(crate) struct SupervisorHandles {
+    pub(crate) state: Arc<Mutex<SharedState>>,
+    pub(crate) unsolicited: Arc<UnsolicitedInbox>,
+    pub(crate) write_tx: mpsc::Sender<WriteJob>,
+    pub(crate) write_rx: mpsc::Receiver<WriteJob>,
+}
+
+pub(crate) fn new_supervisor_handles() -> SupervisorHandles {
+    let (write_tx, write_rx) = mpsc::channel::<WriteJob>(WRITE_QUEUE_CAPACITY);
+    let unsolicited = Arc::new(UnsolicitedInbox::new(
+        UNSOLICITED_QUEUE_CAPACITY,
+        UNSOLICITED_STREAM_CAPACITY,
+    ));
+    SupervisorHandles {
+        state: Arc::new(Mutex::new(SharedState::default())),
+        unsolicited,
+        write_tx,
+        write_rx,
+    }
+}
+
+pub(crate) fn finish_shared_connection(
+    client_id: ClientId,
+    metadata: ConnectionMetadata,
+    state: Arc<Mutex<SharedState>>,
+    unsolicited: Arc<UnsolicitedInbox>,
+    write_tx: mpsc::Sender<WriteJob>,
+    io_task: tokio::task::JoinHandle<()>,
+) -> ClientConnection {
     ClientConnection {
         shared: Arc::new(SharedConnection {
             client_id,
-            server_hello,
+            metadata,
             state,
             write_tx,
             unsolicited,
@@ -1235,7 +1628,7 @@ fn spawn_duplex_supervisor(
     }
 }
 
-async fn dispatch_server_message(
+pub(crate) async fn dispatch_server_message(
     state: &Arc<Mutex<SharedState>>,
     unsolicited: &UnsolicitedInbox,
     message: ServerMessage,
@@ -1316,6 +1709,11 @@ async fn dispatch_server_message(
             newest_sequence,
         }),
         ServerMessage::Stream(frame) => unsolicited.push_stream(frame),
+        ServerMessage::ConversationDirty {
+            subscription_id,
+            task_id,
+            high_water,
+        } => unsolicited.push_conversation_dirty(subscription_id, task_id, high_water),
         ServerMessage::Detached(ack) => {
             let request_id = ack.request_id;
             let waiter = {
@@ -1401,7 +1799,7 @@ fn remove_pending_exact(
     }
 }
 
-fn poison_mutex(state: &Arc<Mutex<SharedState>>) {
+pub(crate) fn poison_mutex(state: &Arc<Mutex<SharedState>>) {
     let mut guard = state
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -1430,6 +1828,24 @@ fn poison_mutex(state: &Arc<Mutex<SharedState>>) {
     }
     for (_, pending) in detaches {
         pending.complete(Err(IpcError::Unavailable));
+    }
+}
+
+pub(crate) fn complete_query_waiter_error(
+    state: &Arc<Mutex<SharedState>>,
+    request_id: RequestId,
+    error: IpcError,
+) -> Result<(), IpcError> {
+    let pending = {
+        let mut guard = state.lock().expect("client connection state");
+        guard.query_waiters.remove(&request_id)
+    };
+    match pending {
+        Some(pending) => {
+            pending.complete(Err(error));
+            Ok(())
+        }
+        None => Err(IpcError::CorrelationMismatch),
     }
 }
 

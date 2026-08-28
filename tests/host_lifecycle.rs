@@ -363,7 +363,7 @@ async fn foreground_host_retains_lock_and_bus_across_client_reconnect() {
     let mut client = connect_bounded(&config, &mut host).await;
     let first_connection_id = client.connection_id();
     assert_eq!(client.client_id(), client_id);
-    assert_eq!(client.host_boot_id(), original_identity.boot_id);
+    assert_eq!(client.host_boot_id(), Some(original_identity.boot_id));
     assert_eq!(client.granted_capabilities(), requested);
 
     let (create, command_id, _task_id) = create_task(client_id);
@@ -428,7 +428,7 @@ async fn foreground_host_retains_lock_and_bus_across_client_reconnect() {
     reconnect_bounded(&mut client, &mut host).await;
     assert_ne!(client.connection_id(), first_connection_id);
     assert_eq!(client.client_id(), client_id);
-    assert_eq!(client.host_boot_id(), original_identity.boot_id);
+    assert_eq!(client.host_boot_id(), Some(original_identity.boot_id));
     assert_eq!(client.granted_capabilities(), requested);
     assert!(matches!(
         client.tracked_operation(operation_id),
@@ -699,8 +699,8 @@ async fn two_clients_attach_concurrently_and_share_one_command_bus() {
     .expect("second client attach must not wait for client A to disconnect")
     .expect("second client attach");
 
-    assert_eq!(client_a.host_boot_id(), original_identity.boot_id);
-    assert_eq!(client_b.host_boot_id(), original_identity.boot_id);
+    assert_eq!(client_a.host_boot_id(), Some(original_identity.boot_id));
+    assert_eq!(client_b.host_boot_id(), Some(original_identity.boot_id));
     assert_ne!(client_a.connection_id(), client_b.connection_id());
 
     let (create, _command_id, task_id) = create_task(client_a_id);
@@ -2046,7 +2046,7 @@ async fn artifact_content_retry_same_cursor_after_connection_replacement_is_byte
         "lifecycle detach proof requires negotiated ExplicitDetach"
     );
     let first_connection_id = client.connection_id();
-    assert_eq!(client.host_boot_id(), original_identity.boot_id);
+    assert_eq!(client.host_boot_id(), Some(original_identity.boot_id));
 
     let (create, _, task_id) = create_task_named(
         client_id,
@@ -2154,7 +2154,7 @@ async fn artifact_content_retry_same_cursor_after_connection_replacement_is_byte
         first_connection_id,
         "replacement connection must be distinct from the interrupted one"
     );
-    assert_eq!(replacement.host_boot_id(), original_identity.boot_id);
+    assert_eq!(replacement.host_boot_id(), Some(original_identity.boot_id));
     let mid_identity = read_identity(&lock_path).expect("host identity after replacement");
     assert_eq!(mid_identity.pid, original_identity.pid);
     assert_eq!(mid_identity.boot_id, original_identity.boot_id);
@@ -2500,8 +2500,8 @@ async fn begin_close_rejects_new_runtime_registration_with_closing_before_drain(
     };
     let mut client_b = connect_bounded(&client_b_config, &mut host).await;
 
-    assert_eq!(client_a.host_boot_id(), original_identity.boot_id);
-    assert_eq!(client_b.host_boot_id(), original_identity.boot_id);
+    assert_eq!(client_a.host_boot_id(), Some(original_identity.boot_id));
+    assert_eq!(client_b.host_boot_id(), Some(original_identity.boot_id));
 
     let (create, _, task_id) = create_task_named(
         client_a_id,
@@ -2716,7 +2716,7 @@ async fn empty_begin_close_settles_and_archives_via_host_maintenance() {
         limits: FrameLimits::v1_default(),
     };
     let mut client = connect_bounded(&config, &mut host).await;
-    assert_eq!(client.host_boot_id(), original_identity.boot_id);
+    assert_eq!(client.host_boot_id(), Some(original_identity.boot_id));
 
     let (create, _, task_id) = create_task_named(
         client_id,
@@ -2855,7 +2855,7 @@ async fn inspect_host_quit_reports_durable_blockers_without_mutation_or_exit() {
             .contains(Capability::HostShutdown),
         "debug foreground host must advertise HostShutdown"
     );
-    assert_eq!(client.host_boot_id(), original_identity.boot_id);
+    assert_eq!(client.host_boot_id(), Some(original_identity.boot_id));
 
     let (create, _, task_id) = create_task_named(client_id, 0x21, 0x22, 0x23, 0x24, TASK_TITLE);
     assert!(matches!(
@@ -3177,7 +3177,7 @@ async fn confirmed_quit_settles_live_and_exits_foreground_host_successfully() {
         limits: FrameLimits::v1_default(),
     };
     let mut client = connect_bounded(&config, &mut host).await;
-    assert_eq!(client.host_boot_id(), original_identity.boot_id);
+    assert_eq!(client.host_boot_id(), Some(original_identity.boot_id));
 
     let mut sub = ClientSubscription::new();
     sub.synchronize(&mut client)
@@ -3367,7 +3367,7 @@ async fn confirmed_quit_with_residue_terminalizes_cleanup_failed_live_and_keeps_
         limits: FrameLimits::v1_default(),
     };
     let mut client = connect_bounded(&config, &mut host).await;
-    assert_eq!(client.host_boot_id(), original_identity.boot_id);
+    assert_eq!(client.host_boot_id(), Some(original_identity.boot_id));
 
     let (create, _, task_id) =
         create_task_named(client_id, 0x51, 0x52, 0x53, 0x54, "cleanup-failed residue");
@@ -3634,7 +3634,7 @@ async fn confirmed_quit_with_residue_terminalizes_cleanup_failed_live_and_keeps_
     .await;
     assert_eq!(
         fresh.host_boot_id(),
-        original_identity.boot_id,
+        Some(original_identity.boot_id),
         "fresh client must attach to the same host boot"
     );
 

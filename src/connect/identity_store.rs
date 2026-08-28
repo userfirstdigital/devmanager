@@ -5,14 +5,16 @@
 //! seam. This module never follows caller-supplied filesystem paths or claims
 //! OS/WebCrypto vault authority.
 
+use std::collections::HashMap;
 use std::fmt;
 use std::fs;
 use std::io::{Read, Write};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use sha2::{Digest, Sha256};
+use tokio::sync::watch;
 use zeroize::{Zeroize, Zeroizing};
 
 use super::crypto::{
@@ -77,13 +79,58 @@ pub trait IdentityPersistence {
         expected_revision: u64,
         bytes: &[u8],
     ) -> Result<u64, IdentityError>;
+    /// Stable key for the durable storage identity this persistence names.
+    /// Authority invalidation is shared only across stores with the same key.
+    fn authority_storage_key(&self) -> AuthorityStorageKey;
+}
+
+/// Identifies one durable Connect identity storage location for authority wake.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct AuthorityStorageKey(AuthorityStorageKeyInner);
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+enum AuthorityStorageKeyInner {
+    KernelSqlite(PathBuf),
+    #[cfg(test)]
+    InMemory(u64),
+}
+
+fn authority_notifier_for(key: AuthorityStorageKey) -> watch::Sender<u64> {
+    static REGISTRY: OnceLock<Mutex<HashMap<AuthorityStorageKey, watch::Sender<u64>>>> =
+        OnceLock::new();
+    let registry = REGISTRY.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut guard = registry
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    guard
+        .entry(key)
+        .or_insert_with(|| {
+            let (tx, _) = watch::channel(0_u64);
+            tx
+        })
+        .clone()
 }
 
 #[cfg(test)]
-#[derive(Clone, Default)]
+static NEXT_IN_MEMORY_AUTHORITY_ID: AtomicU64 = AtomicU64::new(1);
+
+#[cfg(test)]
+#[derive(Clone)]
 pub struct InMemoryIdentityPersistence {
+    authority_id: u64,
     bytes: Option<Vec<u8>>,
     revision: u64,
+}
+
+#[cfg(test)]
+impl Default for InMemoryIdentityPersistence {
+    fn default() -> Self {
+        Self {
+            authority_id: NEXT_IN_MEMORY_AUTHORITY_ID.fetch_add(1, Ordering::Relaxed),
+            bytes: None,
+            revision: 0,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -115,6 +162,7 @@ impl InMemoryIdentityPersistence {
             })
             .unwrap_or(0);
         Ok(Self {
+            authority_id: NEXT_IN_MEMORY_AUTHORITY_ID.fetch_add(1, Ordering::Relaxed),
             bytes: Some(bytes.to_vec()),
             revision,
         })
@@ -124,6 +172,7 @@ impl InMemoryIdentityPersistence {
     #[doc(hidden)]
     pub fn from_unchecked_oversize(bytes: Vec<u8>) -> Self {
         Self {
+            authority_id: NEXT_IN_MEMORY_AUTHORITY_ID.fetch_add(1, Ordering::Relaxed),
             bytes: Some(bytes),
             revision: 0,
         }
@@ -219,6 +268,10 @@ impl IdentityPersistence for InMemoryIdentityPersistence {
         self.revision = next_revision;
         Ok(self.revision)
     }
+
+    fn authority_storage_key(&self) -> AuthorityStorageKey {
+        AuthorityStorageKey(AuthorityStorageKeyInner::InMemory(self.authority_id))
+    }
 }
 
 #[cfg(test)]
@@ -237,6 +290,7 @@ impl InMemoryIdentityPersistence {
 #[derive(Clone)]
 pub struct KernelIdentityPersistence {
     store: Arc<Mutex<KernelStore>>,
+    sqlite_path: PathBuf,
 }
 
 impl fmt::Debug for KernelIdentityPersistence {
@@ -254,6 +308,7 @@ impl KernelIdentityPersistence {
         let store = KernelStore::open(&path).map_err(map_store_error)?;
         Ok(Self {
             store: Arc::new(Mutex::new(store)),
+            sqlite_path: path,
         })
     }
 
@@ -262,6 +317,7 @@ impl KernelIdentityPersistence {
         let store = KernelStore::open(path).map_err(map_store_error)?;
         Ok(Self {
             store: Arc::new(Mutex::new(store)),
+            sqlite_path: path.to_path_buf(),
         })
     }
 
@@ -327,6 +383,12 @@ impl IdentityPersistence for KernelIdentityPersistence {
         bytes: &[u8],
     ) -> Result<u64, IdentityError> {
         self.compare_and_swap(expected_revision, bytes)
+    }
+
+    fn authority_storage_key(&self) -> AuthorityStorageKey {
+        AuthorityStorageKey(AuthorityStorageKeyInner::KernelSqlite(
+            self.sqlite_path.clone(),
+        ))
     }
 }
 
@@ -542,11 +604,16 @@ impl ConnectProductionStartup {
             .validate_transport(scheme)
             .map_err(ConnectStartupError::Direct)?;
         let session = ConnectProductionSession::open().map_err(ConnectStartupError::Production)?;
+        let web_publication = ConnectWebPublication::for_host(
+            "/api/connect",
+            session.profile_host_public_id(),
+            session.custody_public(),
+        );
         Ok(Self {
             session,
             bind_policy: policy,
             listener_bound: AtomicBool::new(false),
-            web_publication: ConnectWebPublication::new("/api/connect"),
+            web_publication,
         })
     }
 
@@ -745,12 +812,15 @@ fn load_os_noise_custody(
 }
 
 #[cfg(windows)]
-fn protect_noise_private(plaintext: &[u8], entropy: &[u8]) -> Result<Vec<u8>, OsNoiseCustodyError> {
+pub(crate) fn protect_noise_private(
+    plaintext: &[u8],
+    entropy: &[u8],
+) -> Result<Vec<u8>, OsNoiseCustodyError> {
     dpapi_protect(plaintext, entropy)
 }
 
 #[cfg(windows)]
-fn unprotect_noise_private(
+pub(crate) fn unprotect_noise_private(
     blob: &[u8],
     entropy: &[u8],
 ) -> Result<Zeroizing<Vec<u8>>, OsNoiseCustodyError> {
@@ -758,13 +828,16 @@ fn unprotect_noise_private(
 }
 
 #[cfg(not(windows))]
-fn protect_noise_private(plaintext: &[u8], entropy: &[u8]) -> Result<Vec<u8>, OsNoiseCustodyError> {
+pub(crate) fn protect_noise_private(
+    plaintext: &[u8],
+    entropy: &[u8],
+) -> Result<Vec<u8>, OsNoiseCustodyError> {
     let _ = (plaintext, entropy);
     Err(OsNoiseCustodyError::UnsupportedPlatform)
 }
 
 #[cfg(not(windows))]
-fn unprotect_noise_private(
+pub(crate) fn unprotect_noise_private(
     blob: &[u8],
     entropy: &[u8],
 ) -> Result<Zeroizing<Vec<u8>>, OsNoiseCustodyError> {
@@ -860,6 +933,11 @@ fn dpapi_unprotect(blob: &[u8], entropy: &[u8]) -> Result<Zeroizing<Vec<u8>>, Os
 }
 
 pub struct ConnectProductionSession {
+    /// Claim-owning enrollment context (store + vault + binding). Mutex is never
+    /// held across await; blocking enrollment runs on a worker pool.
+    enrollment: Option<std::sync::Arc<super::device_enrollment::SharedDeviceEnrollment>>,
+    /// Always available for coherent `identity_store()` reads. Production clones
+    /// share KernelStore + authority notifier with the enrollment writer store.
     store: IsolatedRemoteStore<KernelIdentityPersistence>,
     custody: ConnectNoiseCustody,
     profile_host_public_id: HostPublicId,
@@ -872,19 +950,33 @@ impl fmt::Debug for ConnectProductionSession {
 }
 
 impl ConnectProductionSession {
-    /// Open the active profile identity store and OS-backed Noise custody.
-    /// Never derives a production static key from profile metadata.
+    /// Open the active profile identity store and load-only OS host vault custody.
+    /// Never mints a Noise static key and never derives one from profile metadata.
+    ///
+    /// Binding uses [`super::host_vault::resolve_host_profile_for_binding`]: the
+    /// active instance profile when set, otherwise the packaged production host
+    /// profile `"production"`. Retains one claim-owning enrollment context for
+    /// the production startup lifetime.
     pub fn open() -> Result<Self, ConnectProductionError> {
-        let store = IsolatedRemoteStore::<KernelIdentityPersistence>::open_active_profile()
+        let enrollment = super::device_enrollment::SharedDeviceEnrollment::open_production()
             .map_err(ConnectProductionError::Identity)?;
-        let identity = store
-            .require_active_profile_identity()
-            .map_err(ConnectProductionError::Identity)?;
-        let custody =
-            OsNoiseCustody::load_or_create(&identity).map_err(ConnectProductionError::Custody)?;
+        let store = enrollment.read_store_clone();
+        let (profile_host_public_id, custody) = {
+            let guard = enrollment.lock();
+            let identity = guard
+                .store()
+                .require_active_profile_identity()
+                .map_err(ConnectProductionError::Identity)?;
+            let custody = guard
+                .vault()
+                .load_host_noise(&identity)
+                .map_err(ConnectProductionError::Identity)?;
+            (identity.host_public_id(), custody)
+        };
         Ok(Self {
-            profile_host_public_id: identity.host_public_id(),
+            enrollment: Some(std::sync::Arc::new(enrollment)),
             store,
+            profile_host_public_id,
             custody,
         })
     }
@@ -893,6 +985,7 @@ impl ConnectProductionSession {
     ///
     /// Requires a durable Connect identity on the active profile store. Does
     /// not fall back to in-memory identity storage or derive keys from metadata.
+    /// Custody-only sessions have no enrollment vault bridge.
     pub fn open_with_custody(custody: ConnectNoiseCustody) -> Result<Self, ConnectProductionError> {
         let store = IsolatedRemoteStore::<KernelIdentityPersistence>::open_active_profile()
             .map_err(ConnectProductionError::Identity)?;
@@ -900,6 +993,7 @@ impl ConnectProductionSession {
             .require_active_profile_host()
             .map_err(ConnectProductionError::Identity)?;
         Ok(Self {
+            enrollment: None,
             store,
             custody,
             profile_host_public_id,
@@ -908,6 +1002,17 @@ impl ConnectProductionSession {
 
     pub fn profile_host_public_id(&self) -> HostPublicId {
         self.profile_host_public_id
+    }
+
+    /// Shared enrollment bridge for the paired-browser Connect route.
+    pub fn device_enrollment(
+        &self,
+    ) -> Option<std::sync::Arc<super::device_enrollment::SharedDeviceEnrollment>> {
+        self.enrollment.clone()
+    }
+
+    pub fn identity_live_state(&self) -> Result<ConnectIdentityLiveState, IdentityError> {
+        self.store.identity_live_state()
     }
 
     pub fn start_handshake(
@@ -951,11 +1056,13 @@ impl ConnectProductionSession {
             .map_err(ConnectProductionError::Channel)
     }
 
+    /// Coherent identity store access for production and custody-only sessions.
+    /// Production opens share durable KernelStore + authority notifier with the
+    /// enrollment writer; claimed_owner stays on the enrollment mutex path.
     pub fn identity_store(&self) -> &IsolatedRemoteStore<KernelIdentityPersistence> {
         &self.store
     }
 
-    #[cfg(test)]
     pub(crate) fn custody_public(&self) -> ConnectNoiseStaticPublicKey {
         self.custody.public()
     }
@@ -1037,6 +1144,9 @@ pub struct IsolatedRemoteStore<P> {
     /// retry after a transient vault/persistence error reuse its own exact
     /// marker while another reader remains excluded.
     claimed_owner: Option<[u8; 16]>,
+    /// Narrow wake seam for device revocation / repair / host rotation. Shared
+    /// across clones; never polled on a timer. Active duplexes subscribe once.
+    authority_generation: watch::Sender<u64>,
 }
 
 impl<P> fmt::Debug for IsolatedRemoteStore<P> {
@@ -1066,9 +1176,11 @@ enum VaultTransition {
 
 impl<P: IdentityPersistence + 'static> IsolatedRemoteStore<P> {
     fn from_persistence(persistence: P) -> Self {
+        let authority_generation = authority_notifier_for(persistence.authority_storage_key());
         Self {
             persistence,
             claimed_owner: None,
+            authority_generation,
         }
     }
 
@@ -1081,11 +1193,29 @@ impl<P: IdentityPersistence + 'static> IsolatedRemoteStore<P> {
         &self.persistence
     }
 
+    /// Current authority generation for this durable storage identity.
+    pub fn authority_generation(&self) -> u64 {
+        *self.authority_generation.borrow()
+    }
+
+    /// Subscribe to identity authority invalidation (revoke / repair / host rotate).
+    pub fn subscribe_authority_invalidation(&self) -> watch::Receiver<u64> {
+        self.authority_generation.subscribe()
+    }
+
+    fn bump_authority_generation(&self) {
+        // One write lock covers read + increment. Independent store instances
+        // must not overwrite each other's invalidations with the same value.
+        // MAX is a permanently denied authority generation, never a new lease.
+        self.authority_generation
+            .send_modify(|generation| *generation = generation.saturating_add(1));
+    }
+
     fn require_active_profile_host(&self) -> Result<HostPublicId, IdentityError> {
         Ok(self.require_active_profile_identity()?.host_public_id())
     }
 
-    fn require_active_profile_identity(&self) -> Result<ConnectIdentity, IdentityError> {
+    pub(crate) fn require_active_profile_identity(&self) -> Result<ConnectIdentity, IdentityError> {
         let document = self.read_document()?;
         if document.pending_revocation.is_some() || document.pending_transition.is_some() {
             return Err(IdentityError::TransitionPending);
@@ -1312,6 +1442,40 @@ impl<P: IdentityPersistence + 'static> IsolatedRemoteStore<P> {
             }
             Err(error) => Err(error),
         }
+    }
+
+    /// RegisterDevice-only orphan recovery after process death lost the
+    /// in-memory retained RegisterDevice command.
+    ///
+    /// Owner invariant: the singular durable-host `RemoteSetupRuntime` startup
+    /// seam (before any listener admission) owns this call. Never invoke from
+    /// `DeviceEnrollmentContext::open_production`, `ConnectProductionSession::open`,
+    /// `ConnectProductionStartup::prepare_direct`, ordinary status/snapshot,
+    /// disabled remote startup, or client connection paths — those can steal a
+    /// live enrollment claim or mutate without exclusive lifecycle ownership.
+    ///
+    /// Reuses [`Self::abandon_pending_transition`] (no synthetic command /
+    /// journal / timestamp). Pending revocation and Enable/Repair/Rotate
+    /// markers fail closed. Returns `Ok(true)` when a RegisterDevice marker
+    /// was abandoned; `Ok(false)` when no pending transition existed (read
+    /// only — durable bytes untouched).
+    pub fn recover_orphaned_register_device_pending<V: CredentialVault>(
+        &mut self,
+        binding: &MachineBinding,
+        vault: &mut V,
+    ) -> Result<bool, IdentityError> {
+        let document = self.read_document()?;
+        if document.pending_revocation.is_some() {
+            return Err(IdentityError::UnsupportedOperation);
+        }
+        let Some(pending) = document.pending_transition.as_ref() else {
+            return Ok(false);
+        };
+        if pending.kind != PendingIdentityTransitionKind::RegisterDevice {
+            return Err(IdentityError::UnsupportedOperation);
+        }
+        self.abandon_pending_transition(binding, vault)?;
+        Ok(true)
     }
 
     /// Explicitly abandon an interrupted vault transition. Register preserves
@@ -1795,6 +1959,13 @@ impl<P: IdentityPersistence + 'static> IsolatedRemoteStore<P> {
                 {
                     stored.revision = logical_revision;
                 }
+                let authority_changed = matches!(
+                    &command.op,
+                    IdentityOp::RevokeDevice { .. }
+                        | IdentityOp::RevokeAllDevices { .. }
+                        | IdentityOp::RepairDevice(_)
+                        | IdentityOp::RotateHostIdentity { .. }
+                );
                 if keep_pending_until_vault_commit
                     && self
                         .clear_pending_transition(
@@ -1803,9 +1974,17 @@ impl<P: IdentityPersistence + 'static> IsolatedRemoteStore<P> {
                         )
                         .is_err()
                 {
+                    // Durable authority already changed; wake listeners even when
+                    // marker cleanup fails so idle duplexes fail closed.
+                    if authority_changed {
+                        self.bump_authority_generation();
+                    }
                     // The identity/vault transition committed. Retain the
                     // durable marker so a retry can clear it idempotently.
                     return Err(IdentityError::PersistFailed);
+                }
+                if authority_changed {
+                    self.bump_authority_generation();
                 }
                 Ok(receipt)
             }
@@ -1850,7 +2029,7 @@ impl<P: IdentityPersistence + 'static> IsolatedRemoteStore<P> {
                 .is_some_and(|expires| expires > now);
             return if lease_live
                 && self.claimed_owner == Some(owner)
-                && pending.claim_logical_revision == Some(document.revision)
+                && pending_claim_owns_revision(&pending, &document)
             {
                 Ok(pending)
             } else if lease_live {
@@ -1905,6 +2084,12 @@ impl<P: IdentityPersistence + 'static> IsolatedRemoteStore<P> {
         )?;
         self.claimed_owner = claimed.claim_owner;
         Ok(claimed)
+    }
+
+    #[cfg(test)]
+    #[doc(hidden)]
+    pub(crate) fn clear_claimed_owner_for_test(&mut self) {
+        self.claimed_owner = None;
     }
 
     fn reclaim_pending_transition_after_vault_recovery(
@@ -2056,11 +2241,13 @@ impl<P: IdentityPersistence + 'static> IsolatedRemoteStore<P> {
                 Err(_) => uncertain.push((*device_id, *epoch)),
             }
         }
+        let mut notify_authority = false;
         if invalidated.is_empty() && uncertain.is_empty() {
             // The journal may remain after a final-CAS failure whose vault
             // rollback already completed. Do not restore an active slot a
             // second time; clear only the durable intent.
             document.pending_revocation = None;
+            notify_authority = true;
         } else if invalidated.len() == journal.entries.len() {
             let next_revision = document
                 .revision
@@ -2081,6 +2268,7 @@ impl<P: IdentityPersistence + 'static> IsolatedRemoteStore<P> {
             push_receipt(&mut document, receipt)?;
             document.revision = next_revision;
             document.pending_revocation = None;
+            notify_authority = true;
         } else {
             let mut restore_error = None;
             for (device_id, epoch) in invalidated.into_iter().chain(uncertain).rev() {
@@ -2103,6 +2291,9 @@ impl<P: IdentityPersistence + 'static> IsolatedRemoteStore<P> {
             expected_bytes.as_deref(),
             &encoded,
         )?;
+        if notify_authority {
+            self.bump_authority_generation();
+        }
         Ok(())
     }
 
@@ -2343,6 +2534,18 @@ impl LoadedRemoteDocument {
 
     pub fn has_pending_transition(&self) -> bool {
         self.document.pending_transition.is_some()
+    }
+
+    #[cfg(test)]
+    #[doc(hidden)]
+    pub(crate) fn receipt_for_command(
+        &self,
+        command_id: crate::domain::CommandId,
+    ) -> Option<&IdentityReceipt> {
+        self.document
+            .receipts
+            .iter()
+            .find(|receipt| receipt.command_id() == command_id)
     }
 
     pub fn host_public_id_if_any(&self) -> Option<HostPublicId> {
@@ -3056,6 +3259,25 @@ fn push_receipt(
     Ok(())
 }
 
+/// A vault commit can fail after this exact owner's identity CAS advanced the
+/// logical revision. Only its correlated durable receipt permits that one-step
+/// advance; an arbitrary/newer document must not extend the claim's authority.
+fn pending_claim_owns_revision(
+    pending: &PendingIdentityTransition,
+    document: &IdentityDocument,
+) -> bool {
+    pending.claim_logical_revision == Some(document.revision)
+        || (pending
+            .claim_logical_revision
+            .and_then(|revision| revision.checked_add(1))
+            == Some(document.revision)
+            && document.receipts.iter().any(|receipt| {
+                receipt.command_id() == pending.command_id
+                    && receipt.command_digest == Some(pending.command_digest)
+                    && receipt.revision == document.revision
+            }))
+}
+
 fn decode_legacy_pairing_only(bytes: &[u8]) -> Result<IdentityDocument, IdentityError> {
     scan_bounded_json(bytes)?;
     let value: serde_json::Value =
@@ -3106,6 +3328,82 @@ fn decode_legacy_pairing_only(bytes: &[u8]) -> Result<IdentityDocument, Identity
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    #[test]
+    fn concurrent_authority_invalidations_are_not_lost() {
+        let store = IsolatedRemoteStore::from_persistence(InMemoryIdentityPersistence::default());
+        std::thread::scope(|scope| {
+            for _ in 0..8 {
+                let store = store.clone();
+                scope.spawn(move || {
+                    for _ in 0..100 {
+                        store.bump_authority_generation();
+                    }
+                });
+            }
+        });
+        assert_eq!(store.authority_generation(), 800);
+        store.authority_generation.send_replace(u64::MAX - 1);
+        store.bump_authority_generation();
+        store.bump_authority_generation();
+        assert_eq!(store.authority_generation(), u64::MAX);
+    }
+
+    #[test]
+    fn independent_kernel_connections_share_only_their_durable_authority_wake() {
+        let dir = TempDir::new().expect("isolated store");
+        let path = dir.path().join("kernel.sqlite3");
+        let first = IsolatedRemoteStore::from_persistence(
+            KernelIdentityPersistence::open_path_for_test(&path).unwrap(),
+        );
+        let second = IsolatedRemoteStore::from_persistence(
+            KernelIdentityPersistence::open_path_for_test(&path).unwrap(),
+        );
+        let other = IsolatedRemoteStore::from_persistence(
+            KernelIdentityPersistence::open_path_for_test(&dir.path().join("other.sqlite3"))
+                .unwrap(),
+        );
+        first.bump_authority_generation();
+        assert_eq!(second.authority_generation(), 1);
+        assert_eq!(other.authority_generation(), 0);
+        second.bump_authority_generation();
+        assert_eq!(first.authority_generation(), 2);
+    }
+
+    #[test]
+    fn pending_claim_revision_advance_requires_its_exact_committed_receipt() {
+        let command_id = crate::domain::CommandId::new();
+        let pending = PendingIdentityTransition {
+            command_id,
+            command_digest: [7; 32],
+            kind: PendingIdentityTransitionKind::Enable,
+            transition_nonce: [1; 16],
+            claim_owner: Some([2; 16]),
+            claim_expires_at_epoch_ms: Some(u64::MAX),
+            claim_logical_revision: Some(0),
+            host_public_id: Some(HostPublicId::new()),
+            device_id: None,
+            previous_identity: None,
+        };
+        let mut document = IdentityDocument::default();
+        assert!(pending_claim_owns_revision(&pending, &document));
+        document.revision = 1;
+        assert!(!pending_claim_owns_revision(&pending, &document));
+        let mut receipt = empty_receipt(command_id, 1);
+        receipt.command_digest = Some(pending.command_digest);
+        document.receipts.push(receipt);
+        assert!(pending_claim_owns_revision(&pending, &document));
+        document.receipts[0].command_digest = Some([8; 32]);
+        assert!(!pending_claim_owns_revision(&pending, &document));
+        document.receipts[0].command_digest = Some(pending.command_digest);
+        document.receipts[0].revision = 0;
+        assert!(!pending_claim_owns_revision(&pending, &document));
+        document.receipts[0] = empty_receipt(crate::domain::CommandId::new(), 1);
+        document.receipts[0].command_digest = Some(pending.command_digest);
+        assert!(!pending_claim_owns_revision(&pending, &document));
+        document.revision = 2;
+        assert!(!pending_claim_owns_revision(&pending, &document));
+    }
 
     #[test]
     fn kernel_identity_persistence_cas_round_trip_and_stale_conflict() {
@@ -3366,34 +3664,34 @@ mod tests {
     }
 
     #[test]
-    fn production_open_uses_os_custody_or_fails_closed_on_unsupported_platform() {
+    fn production_open_load_only_rejects_unbound_identity_without_minting() {
         let _profile = crate::remote::test_support::TestProfileEnvGuard::new(
             "connect-identity-production-open",
         );
         let _root = crate::persistence::app_config_dir().expect("isolated test config");
         persist_active_profile_identity();
         match ConnectProductionSession::open() {
-            Ok(session) => {
-                let first = session.custody_public();
-                drop(session);
-                let again = ConnectProductionSession::open().expect("reload os custody");
-                assert_eq!(again.custody_public(), first);
-                let blob = _root.join("connect").join("noise-static-v1.dpapi");
-                assert!(
-                    blob.exists(),
-                    "DPAPI envelope must live under app_config_dir"
-                );
-                let bytes = std::fs::read(&blob).expect("read envelope");
-                assert!(
-                    !bytes
-                        .windows(NOISE_STATIC_KEY_BYTES)
-                        .any(|window| window == again.custody.private().as_bytes()),
-                    "DPAPI envelope must not contain the private custody key"
-                );
-            }
-            Err(ConnectProductionError::Custody(OsNoiseCustodyError::UnsupportedPlatform)) => {}
+            // Fixture identity uses a non-host binding hash → explicit repair.
+            Err(ConnectProductionError::Identity(IdentityError::UnsupportedOperation))
+            // Matching binding but absent vault slot → fail closed, no mint.
+            | Err(ConnectProductionError::Identity(IdentityError::MissingCredentialProof))
+            | Err(ConnectProductionError::Identity(IdentityError::CopiedProfile)) => {}
+            Ok(_) => panic!("load-only open must not mint custody for unbound fixture identity"),
             Err(err) => panic!("unexpected production open error: {err:?}"),
         }
+        let legacy_blob = _root.join("connect").join("noise-static-v1.dpapi");
+        assert!(
+            !legacy_blob.exists(),
+            "load-only open must not create legacy OsNoiseCustody blobs"
+        );
+        let vault_dir = _root.join("connect-host-vault");
+        assert!(
+            !vault_dir.exists()
+                || fs::read_dir(&vault_dir)
+                    .map(|entries| entries.count() == 0)
+                    .unwrap_or(true),
+            "load-only open must not mint host vault slots"
+        );
     }
 
     #[test]
@@ -3402,7 +3700,12 @@ mod tests {
             crate::remote::test_support::TestProfileEnvGuard::new("connect-identity-wrong-profile");
         let _root = crate::persistence::app_config_dir().expect("isolated test config");
         persist_active_profile_identity();
-        match ConnectProductionSession::open() {
+        match OsNoiseCustody::load_or_create(
+            &IsolatedRemoteStore::<KernelIdentityPersistence>::open_active_profile()
+                .expect("open")
+                .require_active_profile_identity()
+                .expect("identity"),
+        ) {
             Ok(_) => {
                 let other = ConnectIdentity {
                     schema_version: CONNECT_IDENTITY_SCHEMA_VERSION,
@@ -3426,8 +3729,8 @@ mod tests {
                         | Err(OsNoiseCustodyError::UnprotectFailed)
                 ));
             }
-            Err(ConnectProductionError::Custody(OsNoiseCustodyError::UnsupportedPlatform)) => {}
-            Err(err) => panic!("unexpected production open error: {err:?}"),
+            Err(OsNoiseCustodyError::UnsupportedPlatform) => {}
+            Err(err) => panic!("unexpected os custody error: {err:?}"),
         }
     }
 
@@ -3445,17 +3748,15 @@ mod tests {
         let _root = crate::persistence::app_config_dir().expect("isolated test config");
         persist_active_profile_identity();
         match ConnectProductionStartup::prepare_direct(DirectBindPolicy::loopback()) {
-            Ok(startup) => {
-                assert_eq!(
-                    startup.session().identity_store().identity_live_state(),
-                    Ok(ConnectIdentityLiveState::Live)
-                );
-                assert!(!startup.listener_is_bound());
-                assert!(startup.require_bound_listener().is_err());
-                startup.mark_listener_bound();
-                assert!(startup.listener_is_bound());
-                assert!(startup.require_bound_listener().is_ok());
+            Ok(_startup) => {
+                panic!("fixture identity without host vault must not prepare production startup")
             }
+            Err(ConnectStartupError::Production(ConnectProductionError::Identity(
+                IdentityError::UnsupportedOperation
+                | IdentityError::MissingCredentialProof
+                | IdentityError::CopiedProfile
+                | IdentityError::NotEnabled,
+            ))) => {}
             Err(ConnectStartupError::Production(ConnectProductionError::Custody(
                 OsNoiseCustodyError::UnsupportedPlatform,
             ))) => {}

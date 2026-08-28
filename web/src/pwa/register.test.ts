@@ -2,7 +2,9 @@ import { describe, expect, it, vi } from "vitest";
 import {
   canActivateUpdate,
   claimCompatibleBuildReloadAttempt,
+  claimFleetDocumentReloadAttempt,
   createCompatibleBuildRecoveryCoordinator,
+  createFleetDocumentReloadCoordinator,
   createPwaUpdateCoordinator,
   createViteServiceWorkerRegistrar,
   defaultUpdateSafetyState,
@@ -51,6 +53,102 @@ describe("canActivateUpdate", () => {
       attachmentLoads: 0,
     });
     expect(canActivateUpdate(defaultUpdateSafetyState())).toBe(false);
+  });
+});
+
+describe("createFleetDocumentReloadCoordinator", () => {
+  it("reloads when safe for a new document+roster fingerprint", () => {
+    const storage = new Map<string, string>();
+    const reloadPage = vi.fn();
+    const coordinator = createFleetDocumentReloadCoordinator({
+      isVisible: () => true,
+      readSafetyState: () => ({ hasDraft: false, pendingMutations: 0 }),
+      reloadPage,
+      claimAttempt: (fingerprint) =>
+        claimFleetDocumentReloadAttempt(
+          {
+            getItem: (key) => storage.get(key) ?? null,
+            setItem: (key, value) => storage.set(key, value),
+          },
+          fingerprint,
+        ),
+    });
+    expect(coordinator.requestReload("|fp-cached-b")).toBe(true);
+    expect(reloadPage).toHaveBeenCalledTimes(1);
+  });
+
+  it("blocks the same fingerprint on the next mount after a claimed reload", () => {
+    const storage = new Map<string, string>();
+    const claim = (fingerprint: string) =>
+      claimFleetDocumentReloadAttempt(
+        {
+          getItem: (key) => storage.get(key) ?? null,
+          setItem: (key, value) => storage.set(key, value),
+        },
+        fingerprint,
+      );
+    expect(claim("|fp-cached-b")).toBe(true);
+    const reloadPage = vi.fn();
+    const coordinator = createFleetDocumentReloadCoordinator({
+      isVisible: () => true,
+      readSafetyState: () => ({ hasDraft: false, pendingMutations: 0 }),
+      reloadPage,
+      claimAttempt: claim,
+    });
+    expect(coordinator.requestReload("|fp-cached-b")).toBe(false);
+    // Claim refuses — no second reload.
+    expect(reloadPage).not.toHaveBeenCalled();
+  });
+
+  it("keeps an unsafe document reload pending until drafts/outbox/attachments clear", () => {
+    let safety = {
+      hasDraft: true,
+      pendingMutations: 0,
+      selectedAttachments: 0,
+      attachmentLoads: 0,
+    };
+    const reloadPage = vi.fn();
+    const coordinator = createFleetDocumentReloadCoordinator({
+      isVisible: () => true,
+      readSafetyState: () => safety,
+      reloadPage,
+      claimAttempt: () => true,
+    });
+    expect(coordinator.requestReload("|fp-b")).toBe(false);
+    expect(coordinator.hasPendingReload()).toBe(true);
+    expect(reloadPage).not.toHaveBeenCalled();
+
+    safety = { ...safety, hasDraft: false, pendingMutations: 1 };
+    expect(coordinator.notifySafePoint()).toBe(false);
+
+    safety = {
+      hasDraft: false,
+      pendingMutations: 0,
+      selectedAttachments: 1,
+      attachmentLoads: 0,
+    };
+    expect(coordinator.notifySafePoint()).toBe(false);
+
+    safety = {
+      hasDraft: false,
+      pendingMutations: 0,
+      selectedAttachments: 0,
+      attachmentLoads: 0,
+    };
+    expect(coordinator.notifySafePoint()).toBe(true);
+    expect(reloadPage).toHaveBeenCalledTimes(1);
+  });
+
+  it("fail-closes when session storage is unavailable", () => {
+    const reloadPage = vi.fn();
+    const coordinator = createFleetDocumentReloadCoordinator({
+      isVisible: () => true,
+      readSafetyState: () => ({ hasDraft: false, pendingMutations: 0 }),
+      reloadPage,
+      claimAttempt: () => false,
+    });
+    expect(coordinator.requestReload("|fp")).toBe(false);
+    expect(reloadPage).not.toHaveBeenCalled();
   });
 });
 

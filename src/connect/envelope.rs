@@ -12,8 +12,9 @@ use crate::domain::id::{OperationId, RequestId, TransferId};
 use crate::domain::snapshot::{MAX_SNAPSHOT_PAGE_ENCODED_BYTES, MAX_SNAPSHOT_PAGE_ITEMS};
 use crate::protocol::{
     ChunkContext as ProtocolChunkContext, ChunkError, ChunkLimitField as ProtocolChunkLimitField,
-    ChunkLimits, ChunkLimitsError, FrameLimits, MessagePackCodec, MessagePackError,
-    MAX_PHYSICAL_FRAME_BYTES, MAX_REASSEMBLED_MESSAGE_BYTES, PROTOCOL_MAJOR, PROTOCOL_MINOR,
+    ChunkLimits, ChunkLimitsError, FrameLimits, MAX_PHYSICAL_FRAME_BYTES,
+    MAX_REASSEMBLED_MESSAGE_BYTES, MessagePackCodec, MessagePackError, PROTOCOL_MAJOR,
+    PROTOCOL_MINOR,
 };
 
 use super::schema::{ConnectPayload, PayloadDecodeError};
@@ -762,6 +763,10 @@ impl PayloadKind {
     pub const RESYNC: Self = Self(NonZeroU16::new(15).unwrap());
     pub const ERROR: Self = Self(NonZeroU16::new(16).unwrap());
     pub const EXTENSION: Self = Self(NonZeroU16::new(17).unwrap());
+    pub const HOST_DURABLE_OUTPUT: Self = Self(NonZeroU16::new(19).unwrap());
+    pub const HOST_CRITICAL_OUTPUT: Self = Self(NonZeroU16::new(20).unwrap());
+    pub const HOST_STREAM_OUTPUT: Self = Self(NonZeroU16::new(21).unwrap());
+    pub const HOST_CONVERSATION_OUTPUT: Self = Self(NonZeroU16::new(22).unwrap());
 
     pub const fn new(value: u16) -> Option<Self> {
         match NonZeroU16::new(value) {
@@ -794,6 +799,10 @@ impl PayloadKind {
             15 => KnownPayloadKind::Resync,
             16 => KnownPayloadKind::Error,
             17 => KnownPayloadKind::Extension,
+            19 => KnownPayloadKind::HostDurableOutput,
+            20 => KnownPayloadKind::HostCriticalOutput,
+            21 => KnownPayloadKind::HostStreamOutput,
+            22 => KnownPayloadKind::HostConversationOutput,
             _ => return None,
         })
     }
@@ -838,6 +847,10 @@ pub enum KnownPayloadKind {
     Resync,
     Error,
     Extension,
+    HostDurableOutput,
+    HostCriticalOutput,
+    HostStreamOutput,
+    HostConversationOutput,
 }
 
 impl KnownPayloadKind {
@@ -885,7 +898,7 @@ impl fmt::Display for EnvelopeError {
                 formatter.write_str("Connect envelope channel does not match payload kind")
             }
             Self::PrivacyViolation => formatter.write_str(
-                "Connect RawContent is not the default and is limited to explicit stream or chunk payloads",
+                "Connect RawContent is limited to explicit stream, chunk, or host-stream payloads; host outputs reject ManagedMetadata",
             ),
             Self::Limits(error) => error.fmt(formatter),
             Self::Schema(error) => error.fmt(formatter),
@@ -973,10 +986,7 @@ impl ConnectEnvelope {
         if channel != payload.channel() {
             return Err(EnvelopeError::ChannelMismatch);
         }
-        if matches!(privacy_class, ConnectPrivacyClass::RawContent) && !payload.allows_raw_content()
-        {
-            return Err(EnvelopeError::PrivacyViolation);
-        }
+        validate_payload_privacy(privacy_class, &payload)?;
         let payload_kind = payload.kind();
         let payload_version = payload.version();
         let payload_bytes = payload.encode(limits)?;
@@ -1031,7 +1041,15 @@ impl ConnectEnvelope {
         }
         // Unknown/future kinds stay inert extension data and may never be
         // labeled RawContent at the wire boundary. Known Terminal/Browser/Chunk
-        // grants remain the only RawContent-capable payloads.
+        // and HostStreamOutput grants remain the only RawContent-capable payloads.
+        // Host output wrappers also reject ManagedMetadata (local-session data).
+        if let Some(kind) = self.payload_kind.known() {
+            if kind.is_host_output()
+                && matches!(self.privacy_class, ConnectPrivacyClass::ManagedMetadata)
+            {
+                return Err(EnvelopeError::PrivacyViolation);
+            }
+        }
         if matches!(self.privacy_class, ConnectPrivacyClass::RawContent) {
             match self.payload_kind.known() {
                 Some(kind) if kind.allows_raw_content() => {}
@@ -1087,11 +1105,7 @@ impl ConnectEnvelope {
         if payload.channel() != self.channel || payload.kind() != self.payload_kind {
             return Err(EnvelopeError::ChannelMismatch);
         }
-        if matches!(self.privacy_class, ConnectPrivacyClass::RawContent)
-            && !payload.allows_raw_content()
-        {
-            return Err(EnvelopeError::PrivacyViolation);
-        }
+        validate_payload_privacy(self.privacy_class, &payload)?;
         Ok(payload)
     }
 
@@ -1256,20 +1270,60 @@ impl KnownPayloadKind {
             | Self::CommandReceipt
             | Self::OperationSettlement
             | Self::Resync
-            | Self::Error => ChannelKind::Critical,
+            | Self::Error
+            | Self::HostCriticalOutput => ChannelKind::Critical,
             Self::SnapshotPage
             | Self::EventPage
             | Self::PromptExtension
             | Self::BrowserExtension
             | Self::Chunk
-            | Self::Extension => ChannelKind::Durable,
-            Self::Presence | Self::TerminalDelta | Self::BrowserFrame => ChannelKind::Ephemeral,
+            | Self::Extension
+            | Self::HostDurableOutput => ChannelKind::Durable,
+            Self::Presence
+            | Self::TerminalDelta
+            | Self::BrowserFrame
+            | Self::HostStreamOutput
+            | Self::HostConversationOutput => {
+                ChannelKind::Ephemeral
+            }
         }
     }
 
     pub const fn allows_raw_content(self) -> bool {
-        matches!(self, Self::TerminalDelta | Self::BrowserFrame | Self::Chunk)
+        matches!(
+            self,
+            Self::TerminalDelta | Self::BrowserFrame | Self::Chunk | Self::HostStreamOutput
+        )
     }
+
+    pub const fn is_host_output(self) -> bool {
+        matches!(
+            self,
+            Self::HostDurableOutput
+                | Self::HostCriticalOutput
+                | Self::HostStreamOutput
+                | Self::HostConversationOutput
+        )
+    }
+}
+
+fn validate_payload_privacy(
+    privacy_class: ConnectPrivacyClass,
+    payload: &ConnectPayload,
+) -> Result<(), EnvelopeError> {
+    if payload.is_host_output() {
+        return match privacy_class {
+            ConnectPrivacyClass::LocalOnly => Ok(()),
+            ConnectPrivacyClass::RawContent if payload.allows_raw_content() => Ok(()),
+            ConnectPrivacyClass::ManagedMetadata | ConnectPrivacyClass::RawContent => {
+                Err(EnvelopeError::PrivacyViolation)
+            }
+        };
+    }
+    if matches!(privacy_class, ConnectPrivacyClass::RawContent) && !payload.allows_raw_content() {
+        return Err(EnvelopeError::PrivacyViolation);
+    }
+    Ok(())
 }
 
 pub type NegotiatedLimits = ConnectLimits;

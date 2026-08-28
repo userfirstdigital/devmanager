@@ -659,7 +659,7 @@ fn write_atomically_encoded(
     write_bytes_atomically(path, &encode_profile(content, encoding))
 }
 
-fn write_bytes_atomically(path: &Path, bytes: &[u8]) -> io::Result<()> {
+pub(crate) fn write_bytes_atomically(path: &Path, bytes: &[u8]) -> io::Result<()> {
     write_bytes_atomically_with(path, bytes, promote_temp_file)
 }
 

@@ -763,6 +763,9 @@ async fn assemble_task_list(
             Ok(Err(QueryError::InvalidRequest)) => {
                 return Err(CliError::new("task.list query was invalid"))
             }
+            Ok(Err(QueryError::Conflict)) => {
+                return Err(CliError::new("task.list query conflicted with durable state"))
+            }
             Ok(Err(QueryError::UnsupportedCapability)) => {
                 return Err(CliError::new("task.list query capability is unsupported"))
             }
@@ -875,6 +878,9 @@ async fn task_show_json_document_async(profile: &str, task_id: TaskId) -> Result
         }
         Ok(Err(QueryError::InvalidRequest)) => {
             return Err(CliError::new("task.show query was invalid"))
+        }
+        Ok(Err(QueryError::Conflict)) => {
+            return Err(CliError::new("task.show query conflicted with durable state"))
         }
         Ok(Err(QueryError::UnsupportedCapability)) => {
             return Err(CliError::new("task.show query capability is unsupported"))

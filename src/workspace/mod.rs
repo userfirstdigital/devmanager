@@ -4544,6 +4544,7 @@ fn connected_remote_draft() -> SettingsDraft {
         browser_version: Some("17.4".to_string()),
         os_family: Some("iOS".to_string()),
         device_class: Some("tablet".to_string()),
+        permitted_origin: None,
     }];
     draft.remote_access_activity_log = sample_remote_access_log();
     draft
@@ -4591,6 +4592,7 @@ fn browser_access_enabled_remote_draft() -> SettingsDraft {
         browser_version: Some("17.4".to_string()),
         os_family: Some("iOS".to_string()),
         device_class: Some("tablet".to_string()),
+        permitted_origin: None,
     }];
     draft.remote_access_activity_log = sample_remote_access_log();
     draft.remote_host_error = None;

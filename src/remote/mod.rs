@@ -1,4 +1,6 @@
 mod access_log;
+pub(crate) mod blocking_work;
+pub(crate) use blocking_work::{BackgroundWorkStop, RemoteBackgroundWork};
 mod client_pool;
 pub mod presentation;
 mod transport;
@@ -6,7 +8,12 @@ pub mod web;
 
 pub use access_log::{RemoteAccessActivityEvent, RemoteAccessActivityKind, RemoteAccessSource};
 pub use client_pool::RemoteClientPool;
-pub use web::{PairedWebClient, WebConfig, WebListenerHandle};
+pub(crate) use web::{validate_or_bind_connect_peer, ConnectPeerLease};
+pub use web::{
+    ConnectPeerPin, ConnectPeerPublicKey, ConnectPeerTrustError, PairedWebClient, WebConfig,
+    WebListenerHandle, CONNECT_PEER_PUBLIC_KEY_BYTES, CONNECT_PEER_PUBLIC_KEY_HEX_CHARS,
+    MAX_CONNECT_PEER_PINS, MAX_PAIRED_COOKIE_CLIENT_ID_BYTES,
+};
 
 use presentation::{
     SemanticAdapterHealth, SemanticAttention, SemanticEvent, SemanticEventDraft, SemanticEventKind,
@@ -51,6 +58,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc, Condvar, Mutex, OnceLock, RwLock, Weak};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use tokio::sync::watch;
 
 pub const PROTOCOL_VERSION: u32 = 5;
 const REMOTE_FILE_NAME: &str = "remote.json";
@@ -1796,17 +1804,17 @@ fn lock_remote_state_file_permissions(path: &Path) -> std::io::Result<()> {
 }
 
 #[cfg(unix)]
-fn lock_new_remote_state_file_permissions(path: &Path) -> std::io::Result<()> {
+pub(crate) fn lock_new_remote_state_file_permissions(path: &Path) -> std::io::Result<()> {
     lock_remote_state_file_permissions(path)
 }
 
 #[cfg(windows)]
-fn lock_new_remote_state_file_permissions(path: &Path) -> std::io::Result<()> {
+pub(crate) fn lock_new_remote_state_file_permissions(path: &Path) -> std::io::Result<()> {
     lock_remote_state_file_permissions(path)
 }
 
 #[cfg(not(any(unix, windows)))]
-fn lock_new_remote_state_file_permissions(path: &Path) -> std::io::Result<()> {
+pub(crate) fn lock_new_remote_state_file_permissions(path: &Path) -> std::io::Result<()> {
     lock_remote_state_file_permissions(path)
 }
 
@@ -1822,7 +1830,7 @@ fn lock_remote_state_file_permissions(path: &Path) -> std::io::Result<()> {
 }
 
 #[cfg(unix)]
-fn verify_remote_state_file_permissions(path: &Path) -> std::io::Result<()> {
+pub(crate) fn verify_remote_state_file_permissions(path: &Path) -> std::io::Result<()> {
     use std::os::unix::fs::PermissionsExt;
 
     let mode = fs::metadata(path)?.permissions().mode() & 0o777;
@@ -1837,7 +1845,7 @@ fn verify_remote_state_file_permissions(path: &Path) -> std::io::Result<()> {
 }
 
 #[cfg(windows)]
-fn verify_remote_state_file_permissions(path: &Path) -> std::io::Result<()> {
+pub(crate) fn verify_remote_state_file_permissions(path: &Path) -> std::io::Result<()> {
     let current_sid = current_windows_process_sid()?;
     let entries = windows_dacl_entries(&windows_acl_sddl(path)?)?;
     if entries.len() == 1
@@ -1855,7 +1863,7 @@ fn verify_remote_state_file_permissions(path: &Path) -> std::io::Result<()> {
 }
 
 #[cfg(not(any(unix, windows)))]
-fn verify_remote_state_file_permissions(path: &Path) -> std::io::Result<()> {
+pub(crate) fn verify_remote_state_file_permissions(path: &Path) -> std::io::Result<()> {
     Err(std::io::Error::new(
         ErrorKind::Unsupported,
         format!(
@@ -1909,6 +1917,80 @@ pub fn save_remote_machine_state(state: &RemoteMachineState) -> Result<(), Persi
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     save_remote_machine_state_locked(state)
+}
+
+/// Publish bounded native trust custody with the same private-file transaction
+/// as remote state. The caller owns its store lock for the entire operation.
+pub(crate) fn atomic_write_remote_state_bytes(path: &Path, contents: &[u8]) -> std::io::Result<()> {
+    const MAX_TRUST_BYTES: usize = 256 * 1024;
+    if contents.len() > MAX_TRUST_BYTES {
+        return Err(std::io::Error::new(
+            ErrorKind::InvalidData,
+            "trust file exceeds bound",
+        ));
+    }
+    let mut options = fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        use windows::Win32::Storage::FileSystem::{FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_READ};
+        options
+            .share_mode(FILE_SHARE_READ.0)
+            .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT.0);
+    }
+    let previous_bytes = match options.open(path) {
+        Ok(file) => {
+            let metadata = file.metadata()?;
+            #[cfg(windows)]
+            {
+                use std::os::windows::fs::MetadataExt;
+                if metadata.file_attributes() & 0x400 != 0 {
+                    return Err(std::io::Error::new(
+                        ErrorKind::InvalidData,
+                        "trust file is a reparse point",
+                    ));
+                }
+            }
+            if !metadata.is_file() || metadata.len() > MAX_TRUST_BYTES as u64 {
+                return Err(std::io::Error::new(
+                    ErrorKind::InvalidData,
+                    "invalid trust file",
+                ));
+            }
+            let mut bytes = Vec::new();
+            std::io::Read::take(file, MAX_TRUST_BYTES as u64 + 1).read_to_end(&mut bytes)?;
+            if bytes.len() > MAX_TRUST_BYTES {
+                return Err(std::io::Error::new(
+                    ErrorKind::InvalidData,
+                    "trust file exceeds bound",
+                ));
+            }
+            Some(bytes)
+        }
+        Err(error) if error.kind() == ErrorKind::NotFound => None,
+        Err(error) => return Err(error),
+    };
+    let temp_path = path.with_extension(format!(
+        "tmp-{}-{}",
+        std::process::id(),
+        REMOTE_STATE_SAVE_COUNTER.fetch_add(1, Ordering::Relaxed)
+    ));
+    if let Err(error) = write_private_remote_state_temp(&temp_path, contents) {
+        let _ = fs::remove_file(&temp_path);
+        return Err(error);
+    }
+    if let Err(error) = rename_remote_state_file(&temp_path, path) {
+        let _ = fs::remove_file(&temp_path);
+        return Err(error);
+    }
+    if let Err(error) =
+        sync_remote_state_parent(path).and_then(|()| verify_saved_remote_state_permissions(path))
+    {
+        let _ = restore_remote_state_bytes(path, previous_bytes.as_deref());
+        return Err(error);
+    }
+    Ok(())
 }
 
 fn save_remote_machine_state_locked(state: &RemoteMachineState) -> Result<(), PersistenceError> {
@@ -1980,6 +2062,21 @@ fn save_remote_machine_state_locked(state: &RemoteMachineState) -> Result<(), Pe
         });
     }
     Ok(())
+}
+
+/// Patch only web-listener settings while holding the shared persistence lock.
+/// Setup must not replace paired clients or unrelated remote settings from a
+/// stale UI/controller snapshot.
+pub(crate) fn update_web_listener_config(
+    mutate: impl FnOnce(&mut web::WebConfig),
+) -> Result<RemoteHostConfig, PersistenceError> {
+    let _guard = REMOTE_STATE_SAVE_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let mut state = load_remote_machine_state_locked()?;
+    mutate(&mut state.host.web);
+    save_remote_machine_state_locked(&state)?;
+    Ok(state.host)
 }
 
 pub(crate) fn persist_host_config_snapshot(
@@ -2175,7 +2272,10 @@ pub(crate) fn mutate_host_config_if<T>(
     persist_host_config_snapshot(&staged.candidate)
         .map_err(|error| HostConfigAdmissionError::Persistence(error.to_string()))?;
     if let Err(error) = commit_staged_host_config_mutation(inner, &staged) {
-        compensate_rejected_host_config_admission(&staged, attempt_id)?;
+        let compensate = compensate_rejected_host_config_admission(&staged, attempt_id);
+        // Wake leases after rollback so they re-check committed truth.
+        bump_host_config_revision(inner);
+        compensate?;
         return Err(HostConfigAdmissionError::Persistence(error));
     }
     Ok(Some(staged.result))
@@ -2196,7 +2296,9 @@ pub(crate) fn mutate_host_config<T>(
     persist_host_config_snapshot(&staged.candidate)
         .map_err(|error| HostConfigAdmissionError::Persistence(error.to_string()))?;
     if let Err(error) = commit_staged_host_config_mutation(inner, &staged) {
-        compensate_rejected_host_config_admission(&staged, attempt_id)?;
+        let compensate = compensate_rejected_host_config_admission(&staged, attempt_id);
+        bump_host_config_revision(inner);
+        compensate?;
         return Err(HostConfigAdmissionError::Persistence(error));
     }
     Ok(staged.result)
@@ -3248,6 +3350,9 @@ impl Drop for RemoteHostServiceOwner {
                 .fetch_add(1, Ordering::SeqCst)
                 .wrapping_add(1);
             self.inner.stop_flag.store(true, Ordering::SeqCst);
+            // Wake Connect peer leases immediately on stop, even while other
+            // strong Arcs still retain the inner runtime during teardown.
+            bump_host_config_revision(&self.inner);
             self.inner.listener_running.store(false, Ordering::Release);
             wake_native_listener(&self.inner);
             notify_broadcaster(&self.inner);
@@ -3554,6 +3659,20 @@ fn acquire_listener_lease(
     })
 }
 
+/// Host web-only path: require persisted pairing/cookie secrets. Do not mint
+/// ephemeral values for an already-loaded active config without persistence.
+fn require_durable_web_secrets(web: &WebConfig) -> Result<(), String> {
+    if web.pairing_token.trim().is_empty() {
+        return Err("durable web pairing token is missing".to_string());
+    }
+    let cookie_secret_is_valid = web.cookie_secret_hex.len() == 64
+        && web::auth::hex_decode(&web.cookie_secret_hex).is_some_and(|secret| secret.len() == 32);
+    if !cookie_secret_is_valid {
+        return Err("durable web cookie signing secret is missing or invalid".to_string());
+    }
+    Ok(())
+}
+
 fn acquire_config_listener_leases(
     inner: &Arc<RemoteHostInner>,
     generation: u64,
@@ -3622,6 +3741,10 @@ pub(crate) struct RemoteHostInner {
     /// completing their disconnect cleanup.
     lifecycle_lock: Mutex<()>,
     config_revision: AtomicU64,
+    /// Process-local epoch for Connect peer leases. Advanced only after a
+    /// durable host-config commit (or equivalent in-memory apply) so watches
+    /// observe revoke/disable without polling.
+    pub(crate) host_config_watch: watch::Sender<u64>,
     /// Coordinates publication of workspace state with browser snapshot
     /// capture so a revision always describes the state sent with it.
     snapshot_state_lock: Mutex<()>,
@@ -3718,6 +3841,9 @@ pub(crate) struct RemoteHostInner {
     connect_encryption_required: AtomicBool,
     connect_startup_error: RwLock<Option<String>>,
     connect_listener_bound: AtomicBool,
+    /// Host-owned auth/config shell: never execute legacy native TCP listener or
+    /// snapshot broadcaster. Persisted `config.enabled` is left unchanged.
+    web_only_execution: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -3968,14 +4094,39 @@ impl LocalPortForwardWorkerRegistry {
 
 impl RemoteHostService {
     pub fn new(config: RemoteHostConfig) -> Self {
+        let service = Self::construct(config, false);
+        service.apply_config(service.config());
+        service
+    }
+
+    /// Auth/config shell for durable `devmanager-host` Connect ownership.
+    ///
+    /// Stores the supplied host config without minting pairing/cookie secrets or
+    /// TLS material. Missing durable web secrets fail closed. Never starts the
+    /// legacy native TCP listener or snapshot broadcaster, even when persisted
+    /// `config.enabled` is true. The caller owns web-listener start via
+    /// [`Self::start_web_listener_for_host`]; this constructor does not bind
+    /// ports, write `remote.json`, auto-enable, or auto-enroll.
+    pub fn new_web_only(config: RemoteHostConfig) -> Result<Self, String> {
+        require_durable_web_secrets(&config.web)?;
+        Ok(Self::construct_stored(config, true))
+    }
+
+    fn construct(config: RemoteHostConfig, web_only_execution: bool) -> Self {
         let mut config = config;
         config.web.ensure_secrets();
         let _ = transport::ensure_host_tls_material(&mut config);
+        Self::construct_stored(config, web_only_execution)
+    }
+
+    fn construct_stored(config: RemoteHostConfig, web_only_execution: bool) -> Self {
+        let (host_config_watch, _) = watch::channel(1_u64);
         let inner = Arc::new(RemoteHostInner {
-            config: RwLock::new(config.clone()),
+            config: RwLock::new(config),
             host_config_tx: Mutex::new(()),
             lifecycle_lock: Mutex::new(()),
             config_revision: AtomicU64::new(1),
+            host_config_watch,
             snapshot_state_lock: Mutex::new(()),
             snapshot_revision: AtomicU64::new(1),
             runtime_instance_id: generate_secret("runtime"),
@@ -4045,6 +4196,7 @@ impl RemoteHostService {
             connect_encryption_required: AtomicBool::new(true),
             connect_startup_error: RwLock::new(None),
             connect_listener_bound: AtomicBool::new(false),
+            web_only_execution,
         });
         let service = Self {
             _lifetime_owner: Some(RemoteHostServiceOwner {
@@ -4053,8 +4205,137 @@ impl RemoteHostService {
             inner,
         };
         service.install_connect_production_gate();
-        service.apply_config(config);
         service
+    }
+
+    /// Bind the Connect web listener for host-owned lifetime.
+    ///
+    /// No-op when `config.web.enabled` is false. Never starts legacy native
+    /// listener/broadcaster workers. Does not persist config. Connect bind
+    /// status is taken from the started handle's own production startup, not a
+    /// second factory call.
+    pub(crate) fn start_web_listener_for_host(&self) -> Result<(), String> {
+        if !self.inner.web_only_execution {
+            return Err("start_web_listener_for_host requires web-only mode".to_string());
+        }
+        let config = self.config();
+        if !config.web.enabled {
+            return Ok(());
+        }
+        let generation = self.inner.native_runtime_generation.load(Ordering::Acquire);
+        let lease = acquire_listener_lease(&self.inner, config.web.port, generation)?;
+        match WebListenerHandle::start(self.inner.clone(), config.web.clone(), lease) {
+            Ok(handle) => {
+                handle.publish_push_sender();
+                let connect_startup_present = handle.connect_startup_present();
+                let connect_bound = handle.require_connect_startup_bound();
+                {
+                    let _lifecycle_guard = self
+                        .inner
+                        .lifecycle_lock
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    if self.inner.stop_flag.load(Ordering::Acquire) {
+                        drop(_lifecycle_guard);
+                        // Direct shutdown on the host OS worker path — do not defer
+                        // to the legacy residue registry for host-owned lifetime.
+                        handle.shutdown();
+                        return Err("web listener generation stopped before install".to_string());
+                    }
+                    self.inner
+                        .connect_encryption_required
+                        .store(true, Ordering::Release);
+                    match &connect_bound {
+                        Ok(()) => {
+                            self.inner
+                                .connect_listener_bound
+                                .store(true, Ordering::Release);
+                            surface_connect_startup(&self.inner, None, false);
+                        }
+                        Err(error) => {
+                            self.inner
+                                .connect_listener_bound
+                                .store(false, Ordering::Release);
+                            // Missing startup is the held-closed prepare path (e.g.
+                            // unenrolled). Present-but-unbound is unexpected.
+                            surface_connect_startup(
+                                &self.inner,
+                                Some(error.clone()),
+                                connect_startup_present,
+                            );
+                        }
+                    }
+                    *self
+                        .inner
+                        .web_listener
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(handle);
+                }
+                Ok(())
+            }
+            Err(error) => {
+                if let Ok(mut error_slot) = self.inner.web_listener_error.write() {
+                    *error_slot = Some(error.to_string());
+                }
+                self.inner
+                    .connect_listener_bound
+                    .store(false, Ordering::Release);
+                surface_connect_startup(
+                    &self.inner,
+                    Some(format!("web listener bind failed: {error}")),
+                    true,
+                );
+                Err(error.to_string())
+            }
+        }
+    }
+
+    /// Host-owned web-only shutdown: take the listener and call
+    /// [`WebListenerHandle::shutdown`] directly on this OS thread, then drop the
+    /// service. Does not claim success via residue-deferred Owner drop.
+    pub(crate) fn shutdown_web_listener_for_host(self) -> Result<(), String> {
+        if !self.inner.web_only_execution {
+            return Err("shutdown_web_listener_for_host requires web-only mode".to_string());
+        }
+        let handle = {
+            let _lifecycle_guard = self
+                .inner
+                .lifecycle_lock
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            self.inner
+                .native_runtime_generation
+                .fetch_add(1, Ordering::SeqCst);
+            self.inner.stop_flag.store(true, Ordering::SeqCst);
+            bump_host_config_revision(&self.inner);
+            self.inner
+                .web_listener
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .take()
+        };
+        if let Some(handle) = handle {
+            handle.shutdown();
+        }
+        self.inner
+            .connect_listener_bound
+            .store(false, Ordering::Release);
+        // Dropping self runs Owner cleanup with web_listener already taken, so
+        // legacy residue settle is not used for this host-owned listener.
+        drop(self);
+        Ok(())
+    }
+
+    pub(crate) fn web_only_execution(&self) -> bool {
+        self.inner.web_only_execution
+    }
+
+    pub(crate) fn web_listener_is_installed(&self) -> bool {
+        self.inner
+            .web_listener
+            .lock()
+            .map(|slot| slot.is_some())
+            .unwrap_or(false)
     }
 
     /// Fail-closed production gate. Legacy `/api/ws` is never Connect and
@@ -4169,8 +4450,9 @@ impl RemoteHostService {
             };
             if let Ok(mut slot) = self.inner.config.write() {
                 *slot = config;
+                // Notify after the in-memory mutation is visible to readers.
+                self.bump_config_revision();
             }
-            self.bump_config_revision();
         }
         self.restart_threads();
     }
@@ -5667,6 +5949,7 @@ impl RemoteHostService {
                     .web
                     .paired_clients
                     .retain(|client| client.client_id != client_id);
+                config.web.connect_peer_keys.remove(client_id);
                 config.web.activity_log.retain(|event| {
                     !(event.source == RemoteAccessSource::Browser && event.client_id == client_id)
                 });
@@ -5693,6 +5976,7 @@ impl RemoteHostService {
                 Ok(()) => HostConfigAdmissionError::Persistence(error),
                 Err(error) => error,
             };
+            bump_host_config_revision(&self.inner);
             set_last_connection_note(
                 &self.inner,
                 format!("Browser revoke durability failed: {error}"),
@@ -5761,6 +6045,7 @@ impl RemoteHostService {
                     .map(|client| client.client_id.clone())
                     .collect::<Vec<_>>();
                 config.web.paired_clients.clear();
+                config.web.connect_peer_keys.clear();
                 config.web.push.enabled_client_ids.clear();
                 config.web.push.subscriptions.clear();
                 config
@@ -5791,6 +6076,7 @@ impl RemoteHostService {
                 Ok(()) => HostConfigAdmissionError::Persistence(error),
                 Err(error) => error,
             };
+            bump_host_config_revision(&self.inner);
             set_last_connection_note(
                 &self.inner,
                 format!("Browser reset durability failed: {error}"),
@@ -5849,7 +6135,7 @@ impl RemoteHostService {
     }
 
     fn bump_config_revision(&self) {
-        self.inner.config_revision.fetch_add(1, Ordering::Relaxed);
+        bump_host_config_revision(&self.inner);
     }
 
     fn restart_threads(&self) {
@@ -5943,7 +6229,23 @@ impl RemoteHostService {
             .map(|slot| slot.clone())
             .unwrap_or_default();
 
-        let (native_lease, web_lease) =
+        let web_only = self.inner.web_only_execution;
+        let (native_lease, web_lease) = if web_only {
+            let web = if config.web.enabled {
+                match acquire_listener_lease(&self.inner, config.web.port, generation) {
+                    Ok(lease) => Some(lease),
+                    Err(error) => {
+                        if let Ok(mut slot) = self.inner.web_listener_error.write() {
+                            *slot = Some(format!("Web listener reservation failed: {error}"));
+                        }
+                        return;
+                    }
+                }
+            } else {
+                None
+            };
+            (None, web)
+        } else {
             match acquire_config_listener_leases(&self.inner, generation, &config) {
                 Ok(leases) => leases,
                 Err(error) => {
@@ -5959,9 +6261,10 @@ impl RemoteHostService {
                     }
                     return;
                 }
-            };
+            }
+        };
 
-        let mut new_listener_worker = if config.enabled {
+        let mut new_listener_worker = if config.enabled && !web_only {
             let listener_inner = Arc::downgrade(&self.inner);
             match RemoteWorker::try_spawn("remote-native-listener", None, move || {
                 run_listener(listener_inner, generation, native_lease);
@@ -5975,9 +6278,10 @@ impl RemoteHostService {
                 }
             }
         } else {
+            drop(native_lease);
             None
         };
-        let mut new_broadcaster_worker = if config.enabled || config.web.enabled {
+        let mut new_broadcaster_worker = if !web_only && (config.enabled || config.web.enabled) {
             let broadcaster_inner = Arc::downgrade(&self.inner);
             let broadcaster_signal = self.inner.broadcaster_signal.clone();
             match RemoteWorker::try_spawn("remote-broadcaster", None, move || {
@@ -6009,8 +6313,10 @@ impl RemoteHostService {
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             if self.inner.stop_flag.load(Ordering::Acquire)
                 || self.inner.native_runtime_generation.load(Ordering::Acquire) != generation
-                || (config.enabled && new_listener_worker.is_none())
-                || ((config.enabled || config.web.enabled) && new_broadcaster_worker.is_none())
+                || (config.enabled && !web_only && new_listener_worker.is_none())
+                || (!web_only
+                    && (config.enabled || config.web.enabled)
+                    && new_broadcaster_worker.is_none())
             {
                 false
             } else {
@@ -9769,7 +10075,10 @@ fn remote_authority_allows_forward_with_live_at(
 }
 
 fn bump_host_config_revision(inner: &Arc<RemoteHostInner>) {
-    inner.config_revision.fetch_add(1, Ordering::Relaxed);
+    let previous = inner.config_revision.fetch_add(1, Ordering::Relaxed);
+    let revision = previous.wrapping_add(1);
+    // send_replace keeps the watch current even when no receivers are attached.
+    inner.host_config_watch.send_replace(revision);
 }
 
 pub(crate) fn browser_admission_now_epoch_ms(inner: &Arc<RemoteHostInner>) -> u64 {
@@ -11784,6 +12093,26 @@ mod tests {
     }
 
     #[test]
+    fn web_listener_patch_preserves_other_host_settings_and_pairing() {
+        let _profile = TestProfileGuard::new("web-listener-narrow-patch");
+        let mut before = RemoteMachineState::default();
+        before.host.web.cookie_secret_hex = "ab".repeat(32);
+        before.host.web.pairing_token = "retained-test-invite".into();
+        save_remote_machine_state(&before).expect("seed remote state");
+        let before = load_remote_machine_state().expect("normalized seed");
+        super::update_web_listener_config(|web| {
+            web.port = 18443;
+            web.enabled = false;
+        })
+        .expect("narrow listener patch");
+        let mut after = load_remote_machine_state().expect("read patch");
+        assert_eq!(after.host.web.port, 18443);
+        after.host.web.port = before.host.web.port;
+        after.host.web.enabled = before.host.web.enabled;
+        assert_eq!(after, before, "only requested web fields may change");
+    }
+
+    #[test]
     fn missing_remote_state_remains_first_run_without_persisting() {
         let _profile = TestProfileGuard::new("remote-state-missing");
         let path = super::remote_state_path().expect("remote state path");
@@ -11848,6 +12177,7 @@ mod tests {
             browser_version: Some("17.4".to_string()),
             os_family: Some("iOS".to_string()),
             device_class: Some("phone".to_string()),
+            permitted_origin: None,
         });
 
         save_remote_machine_state(&state).expect("save remote machine state");
@@ -12307,6 +12637,7 @@ mod tests {
                     browser_version: Some("17.4".to_string()),
                     os_family: Some("iOS".to_string()),
                     device_class: Some("phone".to_string()),
+                    permitted_origin: None,
                 });
             })
             .expect("persist paired browser");
@@ -12559,6 +12890,7 @@ mod tests {
             browser_version: Some("135".to_string()),
             os_family: Some("Windows".to_string()),
             device_class: Some("desktop".to_string()),
+            permitted_origin: None,
         });
         let subscription = validate_registration(PushRegistrationRequest {
             mode: PushRegistrationMode::Reconcile,
@@ -12688,6 +13020,7 @@ mod tests {
             browser_version: Some("135".to_string()),
             os_family: Some("Windows".to_string()),
             device_class: Some("desktop".to_string()),
+            permitted_origin: None,
         });
         let subscription = validate_registration(PushRegistrationRequest {
             mode: PushRegistrationMode::Reconcile,
@@ -13418,7 +13751,7 @@ mod tests {
             .recv_timeout(Duration::from_millis(250))
             .expect("server crash push");
         assert_eq!(delivery.payload.action, PushAttentionKind::ServerCrashed);
-        assert_eq!(delivery.payload.route, "/session/server/server-a");
+        assert_eq!(delivery.payload.route, "/tasks/server%3Aserver-a");
         assert!(!delivery.payload.body.contains("log"));
 
         service.push_session_runtime("server-a", crashed);
@@ -15778,9 +16111,13 @@ mod tests {
             .expect("native callback deadlocked while replacing its own handler");
 
         result.client.disconnect();
+        // Join/retain the exact reader owner; sending Disconnect alone does not
+        // close its socket. ClientRemoved follows durable last_seen persistence,
+        // not the callback whose short deadlock budget was checked above.
+        drop(result);
         assert_eq!(
             lifecycle_rx
-                .recv_timeout(Duration::from_secs(3))
+                .recv_timeout(Duration::from_secs(10))
                 .expect("host never observed client disconnect"),
             super::NativeLifecycleTestEvent::ClientRemoved
         );

@@ -231,10 +231,39 @@ impl fmt::Debug for NoiseCustody {
     }
 }
 
+/// Authenticated Noise identity claim kind preserved from a completed handshake.
+///
+/// Wire encoding remains the existing claim byte values; this type is only the
+/// typed peer-side view of that already-decoded kind.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum IdentityClaimKind {
+    Host,
+    Device,
+}
+
+impl IdentityClaimKind {
+    const fn from_wire(kind: u8) -> Option<Self> {
+        match kind {
+            IDENTITY_CLAIM_KIND_HOST => Some(Self::Host),
+            IDENTITY_CLAIM_KIND_DEVICE => Some(Self::Device),
+            _ => None,
+        }
+    }
+
+    pub(crate) const fn is_device(self) -> bool {
+        matches!(self, Self::Device)
+    }
+
+    pub(crate) const fn is_host(self) -> bool {
+        matches!(self, Self::Host)
+    }
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub struct AuthenticatedPeer {
     static_public: NoiseStaticPublicKey,
     public_id: [u8; 16],
+    kind: IdentityClaimKind,
 }
 
 impl AuthenticatedPeer {
@@ -245,6 +274,18 @@ impl AuthenticatedPeer {
     pub const fn public_id(self) -> [u8; 16] {
         self.public_id
     }
+
+    pub(crate) const fn identity_kind(self) -> IdentityClaimKind {
+        self.kind
+    }
+
+    pub const fn is_device(self) -> bool {
+        self.kind.is_device()
+    }
+
+    pub const fn is_host(self) -> bool {
+        self.kind.is_host()
+    }
 }
 
 impl fmt::Debug for AuthenticatedPeer {
@@ -252,6 +293,7 @@ impl fmt::Debug for AuthenticatedPeer {
         formatter
             .debug_struct("AuthenticatedPeer")
             .field("public_id_len", &16_usize)
+            .field("kind", &self.kind)
             .finish()
     }
 }
@@ -683,7 +725,9 @@ pub fn validate_noise_pattern(pattern: &str, first_pairing: bool) -> Result<(), 
 /// Validate the locked pattern and construct a real snow handshake.
 ///
 /// `local_static` must be vault-supplied key material. IK requires
-/// `expected_remote`. Empty prologues and unlocked patterns fail closed.
+/// `expected_remote`. XX may also verify an out-of-band host pin, but does not
+/// feed that pin into Snow's pre-message state. Empty prologues and unlocked
+/// patterns fail closed.
 pub fn instantiate_noise_channel(
     pattern: &str,
     first_pairing: bool,
@@ -702,11 +746,6 @@ pub fn instantiate_noise_channel(
     if !first_pairing && expected_remote.is_none() {
         return Err(CryptoHold {
             reason: CryptoHoldReason::MissingStaticKey,
-        });
-    }
-    if first_pairing && expected_remote.is_some() {
-        return Err(CryptoHold {
-            reason: CryptoHoldReason::AlgorithmRejected,
         });
     }
     NoiseHandshake::open(
@@ -806,7 +845,11 @@ impl NoiseHandshake {
             .map_err(|_| CryptoError::HandshakeFailed)?
             .prologue(&prologue_bytes)
             .map_err(|_| CryptoError::HandshakeFailed)?;
-        let remote_bytes = expected_remote.map(NoiseStaticPublicKey::as_bytes);
+        // Only IK has a remote-static pre-message. An optional XX pin is
+        // checked against the authenticated claim in read_message and finish.
+        let remote_bytes = expected_remote
+            .filter(|_| !first_pairing)
+            .map(NoiseStaticPublicKey::as_bytes);
         let builder = if let Some(remote_bytes) = remote_bytes.as_ref() {
             builder
                 .remote_public_key(remote_bytes)
@@ -921,6 +964,8 @@ impl NoiseHandshake {
                 self.remote_peer = Some(AuthenticatedPeer {
                     static_public: remote_key,
                     public_id: claim.public_id,
+                    kind: IdentityClaimKind::from_wire(claim.kind)
+                        .ok_or(CryptoError::IdentityBinding)?,
                 });
             }
         }
@@ -1627,6 +1672,10 @@ mod tests {
         let (mut initiator, mut responder, initiator_peer, responder_peer) = complete_xx();
         assert_eq!(initiator_peer.public_id(), [2; 16]);
         assert_eq!(responder_peer.public_id(), [1; 16]);
+        assert!(initiator_peer.is_host());
+        assert!(responder_peer.is_host());
+        assert!(!initiator_peer.is_device());
+        assert_eq!(initiator_peer.identity_kind(), IdentityClaimKind::Host);
         assert_ne!(
             initiator_peer.static_public(),
             responder_peer.static_public()
@@ -1645,6 +1694,86 @@ mod tests {
         assert_eq!(opened, b"hello-xx");
         let reply = responder.seal(1, [4; 16], b"ack-xx").expect("reply");
         assert_eq!(initiator.open(&reply).expect("open reply"), b"ack-xx");
+    }
+
+    #[test]
+    fn xx_device_claim_preserves_authenticated_peer_kind() {
+        let initiator_keys = NoiseCustody::generate().expect("initiator keys");
+        let responder_keys = NoiseCustody::generate().expect("responder keys");
+        let prologue = test_prologue();
+        let mut initiator = instantiate_noise_channel(
+            NOISE_FIRST_PAIRING_PATTERN,
+            true,
+            initiator_keys.private(),
+            initiator_keys.public(),
+            None,
+            prologue,
+            ChannelRole::Initiator,
+            NoiseIdentityBinding::host_device([1; 16], [7; 16]),
+            10,
+            true,
+        )
+        .expect("device initiator");
+        let mut responder = instantiate_noise_channel(
+            NOISE_FIRST_PAIRING_PATTERN,
+            true,
+            responder_keys.private(),
+            responder_keys.public(),
+            None,
+            prologue,
+            ChannelRole::Responder,
+            NoiseIdentityBinding::host([2; 16]),
+            10,
+            true,
+        )
+        .expect("host responder");
+        let msg1 = initiator.write_message().expect("xx msg1");
+        responder.read_message(&msg1).expect("read msg1");
+        let msg2 = responder.write_message().expect("xx msg2");
+        initiator.read_message(&msg2).expect("read msg2");
+        let msg3 = initiator.write_message().expect("xx msg3");
+        responder.read_message(&msg3).expect("read msg3");
+        let host_view = responder.finish().expect("host finish").remote_peer();
+        let device_view = initiator.finish().expect("device finish").remote_peer();
+        assert!(host_view.is_device());
+        assert_eq!(host_view.identity_kind(), IdentityClaimKind::Device);
+        assert_eq!(host_view.public_id(), [7; 16]);
+        assert_eq!(host_view.static_public(), initiator_keys.public());
+        assert!(device_view.is_host());
+        assert_eq!(device_view.public_id(), [2; 16]);
+    }
+
+    #[test]
+    fn xx_verifies_an_out_of_band_host_pin_before_completing() {
+        for wrong_pin in [false, true] {
+            let device = NoiseCustody::generate().expect("device");
+            let host = NoiseCustody::generate().expect("host");
+            let other = NoiseCustody::generate().expect("other");
+            let mut initiator = instantiate_noise_channel(
+                NOISE_FIRST_PAIRING_PATTERN, true, device.private(), device.public(),
+                Some(if wrong_pin { other.public() } else { host.public() }),
+                test_prologue(), ChannelRole::Initiator,
+                NoiseIdentityBinding::host_device([2; 16], [7; 16]), 10, true,
+            ).expect("pinned XX initiator");
+            let mut responder = instantiate_noise_channel(
+                NOISE_FIRST_PAIRING_PATTERN, true, host.private(), host.public(), None,
+                test_prologue(), ChannelRole::Responder,
+                NoiseIdentityBinding::host([2; 16]), 10, true,
+            ).expect("XX responder");
+            responder.read_message(&initiator.write_message().expect("first")).expect("first read");
+            let second = responder.write_message().expect("second");
+            if wrong_pin {
+                assert_eq!(initiator.read_message(&second), Err(CryptoError::UnexpectedPeer));
+                assert!(!initiator.is_finished());
+            } else {
+                initiator.read_message(&second).expect("pinned host");
+                responder.read_message(&initiator.write_message().expect("third")).expect("third read");
+                let remote = initiator.finish().expect("verified transport").remote_peer();
+                assert_eq!(remote.static_public(), host.public());
+                assert!(remote.is_host());
+                responder.finish().expect("host transport");
+            }
+        }
     }
 
     #[test]

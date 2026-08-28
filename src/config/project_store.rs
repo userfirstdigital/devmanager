@@ -2413,6 +2413,81 @@ fn windows_remove_relative_file(parent: &RelativeParent, name: &std::ffi::OsStr)
     }
 }
 
+/// Reuse the store's handle-relative primitives for an already locked OS vault.
+/// The caller retains a writable plain-directory handle (without delete sharing)
+/// and validates its record. No pathname is reopened and no parent is created.
+#[cfg(windows)]
+pub(crate) fn write_bytes_in_retained_directory(
+    directory: &fs::File,
+    leaf: &std::ffi::OsStr,
+    bytes: &[u8],
+) -> io::Result<()> {
+    use std::os::windows::io::AsRawHandle;
+    use windows::Win32::Storage::FileSystem::{FILE_GENERIC_READ, FILE_GENERIC_WRITE};
+    validate_retained_leaf(leaf)?;
+    let parent = RelativeParent {
+        handle: windows::Win32::Foundation::HANDLE(directory.as_raw_handle().cast()),
+        owned: false,
+    };
+    let temporary = std::ffi::OsString::from(format!(".dm-vault-temp-{}", uuid::Uuid::now_v7()));
+    let mut file = windows_open_relative_file(
+        &parent,
+        &temporary,
+        FILE_GENERIC_READ.0 | FILE_GENERIC_WRITE.0 | 0x0001_0000,
+        0x0000_0007,
+        2,
+        0x0020_0060,
+        0x0000_0100,
+    )?;
+    let result = (|| {
+        sync_relative_parent(&parent)?;
+        file.write_all(bytes)?;
+        file.sync_all()?;
+        windows_rename_relative_file(&file, &parent, leaf, true)?;
+        sync_relative_parent(&parent)
+    })();
+    drop(file);
+    if result.is_err() {
+        // If rename succeeded but final sync failed, preserve the destination.
+        // The caller reports failure and the existing identity journal retries.
+        let _ = windows_remove_relative_file(&parent, &temporary);
+    }
+    result
+}
+
+#[cfg(windows)]
+pub(crate) fn remove_file_in_retained_directory(
+    directory: &fs::File,
+    leaf: &std::ffi::OsStr,
+) -> io::Result<()> {
+    use std::os::windows::io::AsRawHandle;
+    validate_retained_leaf(leaf)?;
+    let parent = RelativeParent {
+        handle: windows::Win32::Foundation::HANDLE(directory.as_raw_handle().cast()),
+        owned: false,
+    };
+    windows_remove_relative_file(&parent, leaf)?;
+    sync_relative_parent(&parent)
+}
+
+#[cfg(windows)]
+fn validate_retained_leaf(leaf: &std::ffi::OsStr) -> io::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+    let mut components = Path::new(leaf).components();
+    if !matches!(components.next(), Some(std::path::Component::Normal(_)))
+        || components.next().is_some()
+        || leaf
+            .encode_wide()
+            .any(|unit| matches!(unit, 0 | 47 | 58 | 92))
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "expected a single vault filename",
+        ));
+    }
+    Ok(())
+}
+
 #[cfg(unix)]
 fn unix_open_relative_parent(
     root: &RootHandle,

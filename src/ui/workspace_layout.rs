@@ -7,20 +7,28 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
-use std::io::{self, Write};
+use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 
+use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
 use crate::domain::TaskId;
+#[cfg(test)]
 use crate::ui::task_workspace::TaskWorkspace;
+use crate::ui::task_workspace::Workspace;
 
 const LAYOUT_SCHEMA_V1: &str = "devmanager.workspace-layout/v1";
 const LAYOUT_SCHEMA_V2: &str = "devmanager.workspace-layout/v2";
 const LAYOUT_SCHEMA_V3: &str = "devmanager.workspace-layout/v3";
 const LAYOUT_SCHEMA_V4: &str = "devmanager.workspace-layout/v4";
-const LAYOUT_SCHEMA: &str = "devmanager.workspace-layout/v5";
+const LAYOUT_SCHEMA_V5: &str = "devmanager.workspace-layout/v5";
+/// Legacy raw-`TaskId` layout schema written by [`WorkspaceLayoutStore::save`].
+const LAYOUT_SCHEMA: &str = LAYOUT_SCHEMA_V5;
+/// Host-qualified layout schema written by [`WorkspaceLayoutStore::save_keyed`].
+const LAYOUT_SCHEMA_V6: &str = "devmanager.workspace-layout/v6";
 const LAYOUT_FILE_NAME: &str = "workspace-layout.json";
+const MAX_LAYOUT_FILE_BYTES: u64 = 2 * 1024 * 1024;
 
 pub const SIDEBAR_MIN: f32 = 180.0;
 pub const SIDEBAR_MAX: f32 = 460.0;
@@ -70,7 +78,8 @@ impl WindowFrame {
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-pub struct WorkspaceLayout {
+#[serde(bound(serialize = "K: Serialize", deserialize = "K: Deserialize<'de>"))]
+pub struct KeyedWorkspaceLayout<K = TaskId> {
     pub sidebar_width: f32,
     pub inbox_width: f32,
     pub dock_width: f32,
@@ -87,11 +96,11 @@ pub struct WorkspaceLayout {
     /// Task state, and is validated against the next host projection before it
     /// can become active.
     #[serde(default)]
-    pub selected_task: Option<TaskId>,
+    pub selected_task: Option<K>,
     /// Recursive multi-task pane tree. The selected task remains as a compact
     /// compatibility cursor and is always synchronized to this tree's focus.
     #[serde(default)]
-    pub task_workspace: Option<TaskWorkspace>,
+    pub task_workspace: Option<Workspace<K>>,
     /// Active right-dock tab label (`Changes`, `Files`, …). Validated on restore.
     #[serde(default)]
     pub active_dock_tab: Option<String>,
@@ -99,6 +108,7 @@ pub struct WorkspaceLayout {
     #[serde(default)]
     pub project_scope_workspace_id: Option<String>,
     /// Per-task center canvas preference: true = provider terminal, false = conversation.
+    /// Map keys are [`TerminalCenterKey::center_preference_key`] encodings.
     #[serde(default)]
     pub task_center_terminal: BTreeMap<String, bool>,
     /// Last composer launch choices. Project-specific overrides can layer on
@@ -109,7 +119,50 @@ pub struct WorkspaceLayout {
     pub composer_launch_options: Option<crate::providers::ProviderLaunchOptions>,
 }
 
-impl Default for WorkspaceLayout {
+/// Local raw-`TaskId` layout (existing public API).
+pub type WorkspaceLayout = KeyedWorkspaceLayout<TaskId>;
+
+/// Fallible migration / mapping failures for host-qualified layout keys.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum WorkspaceLayoutMapError {
+    DuplicateMappedKey,
+    InvalidWorkspace,
+}
+
+/// Stable full-key preference string for `task_center_terminal` map entries.
+///
+/// Serializes the **complete** owner key as compact JSON. Host-qualified keys
+/// must use this (or an equivalent full-key encoding via [`TerminalCenterKey`])
+/// — never a raw `TaskId` UUID alone, which would collide across hosts.
+pub fn task_center_terminal_preference_key<K: Serialize>(
+    key: &K,
+) -> Result<String, serde_json::Error> {
+    serde_json::to_string(key)
+}
+
+/// Encoding used when reconciling / retaining center-surface preference entries.
+///
+/// Legacy [`TaskId`] layouts keep bare UUID strings for on-disk compatibility.
+/// Host-qualified keys should delegate to [`task_center_terminal_preference_key`].
+pub trait TerminalCenterKey {
+    fn center_preference_key(&self) -> String;
+}
+
+impl TerminalCenterKey for TaskId {
+    fn center_preference_key(&self) -> String {
+        self.to_string()
+    }
+}
+
+impl TerminalCenterKey for crate::client::HostTaskKey {
+    fn center_preference_key(&self) -> String {
+        // This concrete key contains only strings, bytes and a UUID, so JSON
+        // serialization is infallible. Preserve the complete owner identity.
+        task_center_terminal_preference_key(self).expect("serialize host task key")
+    }
+}
+
+impl<K> Default for KeyedWorkspaceLayout<K> {
     fn default() -> Self {
         Self {
             sidebar_width: 260.0,
@@ -139,7 +192,7 @@ impl Default for WorkspaceLayout {
     }
 }
 
-impl WorkspaceLayout {
+impl<K: Clone + Ord + Eq> KeyedWorkspaceLayout<K> {
     pub fn value(&self, edge: PaneEdge) -> f32 {
         match edge {
             PaneEdge::Sidebar => self.sidebar_width,
@@ -202,11 +255,14 @@ impl WorkspaceLayout {
     /// Reconcile local pane membership against the canonical task projection.
     /// Unknown panes and per-task surface preferences are discarded locally;
     /// no host or durable task state is mutated.
-    pub fn reconcile_task_workspace(&mut self, valid_task_ids: &[TaskId]) -> bool {
+    pub fn reconcile_task_workspace(&mut self, valid_task_ids: &[K]) -> bool
+    where
+        K: TerminalCenterKey,
+    {
         let before = self.clone();
         self.sanitize_task_workspace();
 
-        let valid: BTreeSet<TaskId> = valid_task_ids.iter().copied().collect();
+        let valid: BTreeSet<K> = valid_task_ids.iter().cloned().collect();
         let mut prune_failed = false;
         if let Some(workspace) = self.task_workspace.as_mut() {
             let unknown: Vec<_> = workspace
@@ -239,15 +295,19 @@ impl WorkspaceLayout {
         if self.task_workspace.is_none() {
             self.task_workspace = self
                 .selected_task
+                .clone()
                 .filter(|task_id| valid.contains(task_id))
-                .map(TaskWorkspace::single);
+                .map(Workspace::single);
         }
         self.selected_task = self
             .task_workspace
             .as_ref()
-            .and_then(TaskWorkspace::focused_task);
+            .and_then(Workspace::focused_task);
 
-        let valid_keys: BTreeSet<String> = valid.iter().map(ToString::to_string).collect();
+        let valid_keys: BTreeSet<String> = valid
+            .iter()
+            .map(TerminalCenterKey::center_preference_key)
+            .collect();
         self.task_center_terminal
             .retain(|task_id, _| valid_keys.contains(task_id));
         *self != before
@@ -262,12 +322,12 @@ impl WorkspaceLayout {
             self.task_workspace = None;
         }
         if self.task_workspace.is_none() {
-            self.task_workspace = self.selected_task.map(TaskWorkspace::single);
+            self.task_workspace = self.selected_task.clone().map(Workspace::single);
         }
         self.selected_task = self
             .task_workspace
             .as_ref()
-            .and_then(TaskWorkspace::focused_task);
+            .and_then(Workspace::focused_task);
     }
 
     /// The window frame to restore, if one was stored and is still usable.
@@ -327,6 +387,68 @@ impl WorkspaceLayout {
     }
 }
 
+impl KeyedWorkspaceLayout<TaskId> {
+    /// Map a legacy raw-`TaskId` layout onto host-qualified owner keys.
+    ///
+    /// Selected task, recursive workspace panes, and terminal-preference entries
+    /// that parse as `TaskId` are rewritten through `map_legacy_task`. Mapping
+    /// collisions fail closed without merging panes or preference rows.
+    pub fn map_legacy_task_keys<K, F>(
+        self,
+        mut map_legacy_task: F,
+    ) -> Result<KeyedWorkspaceLayout<K>, WorkspaceLayoutMapError>
+    where
+        K: Clone + Ord + Eq + TerminalCenterKey,
+        F: FnMut(TaskId) -> K,
+    {
+        let task_workspace = match self.task_workspace {
+            Some(workspace) => Some(
+                workspace
+                    .map_task_keys(|task_id| map_legacy_task(*task_id))
+                    .map_err(|error| match error {
+                        crate::ui::task_workspace::WorkspaceError::DuplicateTask => {
+                            WorkspaceLayoutMapError::DuplicateMappedKey
+                        }
+                        _ => WorkspaceLayoutMapError::InvalidWorkspace,
+                    })?,
+            ),
+            None => None,
+        };
+        let selected_task = match self.selected_task {
+            Some(task_id) => Some(map_legacy_task(task_id)),
+            None => None,
+        };
+        let mut task_center_terminal = BTreeMap::new();
+        for (raw_key, value) in self.task_center_terminal {
+            let Ok(task_id) = TaskId::parse(&raw_key) else {
+                continue;
+            };
+            let mapped = map_legacy_task(task_id);
+            let preference_key = mapped.center_preference_key();
+            if task_center_terminal.insert(preference_key, value).is_some() {
+                return Err(WorkspaceLayoutMapError::DuplicateMappedKey);
+            }
+        }
+        Ok(KeyedWorkspaceLayout {
+            sidebar_width: self.sidebar_width,
+            inbox_width: self.inbox_width,
+            dock_width: self.dock_width,
+            terminal_height: self.terminal_height,
+            sidebar_collapsed: self.sidebar_collapsed,
+            dock_collapsed: self.dock_collapsed,
+            terminal_collapsed: self.terminal_collapsed,
+            window: self.window,
+            selected_task,
+            task_workspace,
+            active_dock_tab: self.active_dock_tab,
+            project_scope_workspace_id: self.project_scope_workspace_id,
+            task_center_terminal,
+            composer_provider: self.composer_provider,
+            composer_launch_options: self.composer_launch_options,
+        })
+    }
+}
+
 pub fn clamp_edge(edge: PaneEdge, value: f32) -> f32 {
     let (min, max) = match edge {
         PaneEdge::Sidebar => (SIDEBAR_MIN, SIDEBAR_MAX),
@@ -342,9 +464,10 @@ pub fn clamp_edge(edge: PaneEdge, value: f32) -> f32 {
 }
 
 #[derive(Serialize, Deserialize)]
-struct LayoutFile {
+#[serde(bound(serialize = "K: Serialize", deserialize = "K: Deserialize<'de>"))]
+struct LayoutFile<K = TaskId> {
     schema: String,
-    layout: WorkspaceLayout,
+    layout: KeyedWorkspaceLayout<K>,
 }
 
 /// Profile-scoped store for the pane geometry.
@@ -371,15 +494,18 @@ impl WorkspaceLayoutStore {
     /// storage degrades to the default geometry. Legacy layouts migrate their
     /// selected task into a one-pane workspace; version 1 also collapses the
     /// context dock once for the conversation-first shell.
+    ///
+    /// Remains the raw-`TaskId` path (`v1`–`v5`). Host-qualified loads use
+    /// [`Self::load_keyed`].
     pub fn load(&self) -> WorkspaceLayout {
-        let Ok(bytes) = fs::read(&self.path) else {
+        let Some(bytes) = read_bounded(&self.path) else {
             return WorkspaceLayout::default();
         };
-        let Ok(file) = serde_json::from_slice::<LayoutFile>(&bytes) else {
+        let Ok(file) = serde_json::from_slice::<LayoutFile<TaskId>>(&bytes) else {
             return WorkspaceLayout::default();
         };
         match file.schema.as_str() {
-            LAYOUT_SCHEMA => file.layout.sanitized(),
+            LAYOUT_SCHEMA_V5 => file.layout.sanitized(),
             LAYOUT_SCHEMA_V4 => file.layout.sanitized(),
             LAYOUT_SCHEMA_V3 => file.layout.sanitized(),
             LAYOUT_SCHEMA_V2 => file.layout.sanitized(),
@@ -392,6 +518,63 @@ impl WorkspaceLayoutStore {
         }
     }
 
+    /// Load a host-qualified layout.
+    ///
+    /// - `v1`–`v5` parse through the legacy raw-`TaskId` path, then each task is
+    ///   rewritten with the caller-supplied local-profile owner mapper.
+    /// - `v6` deserializes `K` directly and never reinterprets a foreign/corrupt
+    ///   owner as local.
+    ///
+    /// Read-only: never writes. Mapping collisions and corrupt keyed payloads
+    /// fail closed to defaults without touching disk.
+    pub fn load_keyed<K, F>(&self, map_legacy_task: F) -> KeyedWorkspaceLayout<K>
+    where
+        K: Clone + Ord + Eq + Serialize + DeserializeOwned + TerminalCenterKey,
+        F: FnMut(TaskId) -> K,
+    {
+        let Some(bytes) = read_bounded(&self.path) else {
+            return KeyedWorkspaceLayout::default();
+        };
+        let Ok(value) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
+            return KeyedWorkspaceLayout::default();
+        };
+        let Some(schema) = value
+            .get("schema")
+            .and_then(|schema| schema.as_str())
+            .map(str::to_owned)
+        else {
+            return KeyedWorkspaceLayout::default();
+        };
+        match schema.as_str() {
+            LAYOUT_SCHEMA_V6 => {
+                let Ok(file) = serde_json::from_value::<LayoutFile<K>>(value) else {
+                    return KeyedWorkspaceLayout::default();
+                };
+                file.layout.sanitized()
+            }
+            LAYOUT_SCHEMA_V1 | LAYOUT_SCHEMA_V2 | LAYOUT_SCHEMA_V3 | LAYOUT_SCHEMA_V4
+            | LAYOUT_SCHEMA_V5 => {
+                let Ok(file) = serde_json::from_value::<LayoutFile<TaskId>>(value) else {
+                    return KeyedWorkspaceLayout::default();
+                };
+                let mut layout = match schema.as_str() {
+                    LAYOUT_SCHEMA_V1 => {
+                        let mut layout = file.layout.sanitized();
+                        layout.dock_collapsed = true;
+                        layout
+                    }
+                    _ => file.layout.sanitized(),
+                };
+                layout.sanitize_task_workspace();
+                match layout.map_legacy_task_keys(map_legacy_task) {
+                    Ok(mapped) => mapped.sanitized(),
+                    Err(_) => KeyedWorkspaceLayout::default(),
+                }
+            }
+            _ => KeyedWorkspaceLayout::default(),
+        }
+    }
+
     pub fn save(&self, layout: WorkspaceLayout) -> io::Result<()> {
         let file = LayoutFile {
             schema: LAYOUT_SCHEMA.to_string(),
@@ -399,8 +582,42 @@ impl WorkspaceLayoutStore {
         };
         let bytes = serde_json::to_vec_pretty(&file)
             .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
-        write_atomically(&self.path, &bytes)
+        self.write_bounded(&bytes)
     }
+
+    /// Persist a host-qualified layout as schema `v6`.
+    pub fn save_keyed<K>(&self, layout: KeyedWorkspaceLayout<K>) -> io::Result<()>
+    where
+        K: Clone + Ord + Eq + Serialize + DeserializeOwned,
+    {
+        let file = LayoutFile {
+            schema: LAYOUT_SCHEMA_V6.to_string(),
+            layout: layout.sanitized(),
+        };
+        let bytes = serde_json::to_vec_pretty(&file)
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+        self.write_bounded(&bytes)
+    }
+
+    fn write_bounded(&self, bytes: &[u8]) -> io::Result<()> {
+        if bytes.len() as u64 > MAX_LAYOUT_FILE_BYTES {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "workspace layout exceeds its storage limit",
+            ));
+        }
+        write_atomically(&self.path, bytes)
+    }
+}
+
+fn read_bounded(path: &Path) -> Option<Vec<u8>> {
+    let mut bytes = Vec::new();
+    fs::File::open(path)
+        .ok()?
+        .take(MAX_LAYOUT_FILE_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .ok()?;
+    (bytes.len() as u64 <= MAX_LAYOUT_FILE_BYTES).then_some(bytes)
 }
 
 pub(crate) fn write_atomically(path: &Path, bytes: &[u8]) -> io::Result<()> {
@@ -794,5 +1011,273 @@ mod tests {
             layout.task_center_terminal,
             BTreeMap::from([(first.to_string(), true)])
         );
+    }
+
+    #[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Serialize, Deserialize)]
+    struct TestOwnerKey {
+        host: String,
+        task: TaskId,
+    }
+
+    impl TerminalCenterKey for TestOwnerKey {
+        fn center_preference_key(&self) -> String {
+            task_center_terminal_preference_key(self).expect("serialize owner key")
+        }
+    }
+
+    fn local_owner(task: TaskId) -> TestOwnerKey {
+        TestOwnerKey {
+            host: "local-profile".into(),
+            task,
+        }
+    }
+
+    #[test]
+    fn fleet_center_preferences_preserve_host_for_the_same_task() {
+        use crate::client::{HostId, HostTaskKey};
+        let task = TaskId::new();
+        let local = HostTaskKey::new(HostId::LocalProfile("dev".into()), task);
+        let remote = HostTaskKey::new(HostId::Remote([1; 16]), task);
+        assert_ne!(
+            local.center_preference_key(),
+            remote.center_preference_key()
+        );
+        assert_eq!(
+            serde_json::from_str::<HostTaskKey>(&local.center_preference_key()).unwrap(),
+            local
+        );
+        let mut layout = KeyedWorkspaceLayout::<HostTaskKey>::default();
+        layout
+            .task_center_terminal
+            .insert(local.center_preference_key(), true);
+        layout
+            .task_center_terminal
+            .insert(remote.center_preference_key(), false);
+        layout.reconcile_task_workspace(&[remote.clone()]);
+        assert_eq!(
+            layout.task_center_terminal,
+            BTreeMap::from([(remote.center_preference_key(), false)])
+        );
+    }
+
+    #[test]
+    fn keyed_layout_round_trips_two_owners_sharing_raw_task_id() {
+        use crate::ui::task_workspace::{Axis, WorkspaceNode};
+
+        let shared = TaskId::new();
+        let local = local_owner(shared);
+        let remote = TestOwnerKey {
+            host: "remote-host".into(),
+            task: shared,
+        };
+        let mut workspace = Workspace::single(local.clone());
+        workspace
+            .insert_after_focused(remote.clone(), Axis::Horizontal)
+            .unwrap();
+        let split_id = match workspace.root().unwrap() {
+            WorkspaceNode::Split { id, .. } => *id,
+            _ => panic!("expected split"),
+        };
+        workspace.pin_task_axis_size(local.clone(), 260.0).unwrap();
+        let mut layout = KeyedWorkspaceLayout {
+            selected_task: Some(remote.clone()),
+            task_workspace: Some(workspace),
+            task_center_terminal: BTreeMap::from([
+                (local.center_preference_key(), true),
+                (remote.center_preference_key(), false),
+            ]),
+            ..KeyedWorkspaceLayout::default()
+        };
+        layout.sanitize_task_workspace();
+
+        let directory = tempfile::tempdir().expect("temp dir");
+        let store = WorkspaceLayoutStore::at_profile_root(directory.path());
+        store.save_keyed(layout.clone()).expect("save keyed");
+        let loaded = store.load_keyed(local_owner);
+        assert_eq!(loaded.selected_task, Some(remote.clone()));
+        let workspace = loaded.task_workspace.as_ref().expect("workspace");
+        assert_eq!(workspace.pane_count(), 2);
+        assert!(workspace.contains_task(local.clone()));
+        assert!(workspace.contains_task(remote.clone()));
+        assert_eq!(
+            workspace.split_child_allocation(split_id, 0),
+            Some(crate::ui::task_workspace::Allocation::Pinned { logical_px: 260.0 })
+        );
+        assert_eq!(
+            loaded
+                .task_center_terminal
+                .get(&local.center_preference_key()),
+            Some(&true)
+        );
+        assert_eq!(
+            loaded
+                .task_center_terminal
+                .get(&remote.center_preference_key()),
+            Some(&false)
+        );
+        let bytes = fs::read(store.path()).expect("read");
+        let saved: serde_json::Value = serde_json::from_slice(&bytes).expect("parse");
+        assert_eq!(saved["schema"], LAYOUT_SCHEMA_V6);
+        // load_keyed is read-only: disk unchanged by a second load.
+        let _ = store.load_keyed(local_owner);
+        assert_eq!(fs::read(store.path()).expect("reread"), bytes);
+    }
+
+    #[test]
+    fn v5_split_tree_migrates_through_load_keyed_preserving_geometry() {
+        use crate::ui::task_workspace::{Allocation, Axis, PanePresentation, WorkspaceNode};
+
+        let first = TaskId::new();
+        let second = TaskId::new();
+        let mut workspace = TaskWorkspace::single(first);
+        workspace
+            .insert_after_focused(second, Axis::Horizontal)
+            .unwrap();
+        let focused = workspace.focused_pane_id();
+        let previous = workspace.previous_focus();
+        let split_id = match workspace.root().unwrap() {
+            WorkspaceNode::Split { id, .. } => *id,
+            _ => panic!("expected split"),
+        };
+        workspace.pin_task_axis_size(first, 300.0).unwrap();
+        workspace.set_manual_compact(second, true).unwrap();
+        let layout = WorkspaceLayout {
+            selected_task: Some(second),
+            task_workspace: Some(workspace),
+            task_center_terminal: BTreeMap::from([(first.to_string(), true)]),
+            sidebar_width: 275.0,
+            ..WorkspaceLayout::default()
+        };
+        let directory = tempfile::tempdir().expect("temp dir");
+        let store = WorkspaceLayoutStore::at_profile_root(directory.path());
+        store.save(layout).expect("save v5");
+
+        let migrated = store.load_keyed(local_owner);
+        assert_eq!(migrated.sidebar_width, 275.0);
+        assert_eq!(migrated.selected_task, Some(local_owner(second)));
+        let workspace = migrated.task_workspace.as_ref().expect("workspace");
+        assert_eq!(workspace.focused_pane_id(), focused);
+        assert_eq!(workspace.previous_focus(), previous);
+        assert_eq!(
+            workspace.presentation(local_owner(second)),
+            Some(PanePresentation::CompactManual)
+        );
+        assert_eq!(
+            workspace.split_child_allocation(split_id, 0),
+            Some(Allocation::Pinned { logical_px: 300.0 })
+        );
+        assert_eq!(
+            migrated
+                .task_center_terminal
+                .get(&local_owner(first).center_preference_key()),
+            Some(&true)
+        );
+        let bytes = fs::read(store.path()).expect("read");
+        let saved: serde_json::Value = serde_json::from_slice(&bytes).expect("parse");
+        assert_eq!(
+            saved["schema"], LAYOUT_SCHEMA_V5,
+            "load_keyed must not rewrite legacy disk"
+        );
+    }
+
+    #[test]
+    fn v1_layout_load_keyed_uses_explicit_local_owner_and_collapses_dock() {
+        let directory = tempfile::tempdir().expect("temp dir");
+        let store = WorkspaceLayoutStore::at_profile_root(directory.path());
+        let selected = TaskId::new();
+        let v1 = serde_json::json!({
+            "schema": "devmanager.workspace-layout/v1",
+            "layout": {
+                "sidebar_width": 275.0,
+                "inbox_width": 410.0,
+                "dock_width": 520.0,
+                "terminal_height": 240.0,
+                "dock_collapsed": false,
+                "selected_task": selected
+            }
+        });
+        fs::write(store.path(), serde_json::to_vec_pretty(&v1).unwrap()).unwrap();
+
+        let migrated = store.load_keyed(local_owner);
+        assert!(migrated.dock_collapsed);
+        assert_eq!(migrated.selected_task, Some(local_owner(selected)));
+        assert_eq!(
+            migrated
+                .task_workspace
+                .as_ref()
+                .and_then(|workspace| workspace.focused_task()),
+            Some(local_owner(selected))
+        );
+    }
+
+    #[test]
+    fn mapping_collision_fails_closed_without_modifying_disk() {
+        let directory = tempfile::tempdir().expect("temp dir");
+        let store = WorkspaceLayoutStore::at_profile_root(directory.path());
+        let first = TaskId::new();
+        let second = TaskId::new();
+        let mut workspace = TaskWorkspace::single(first);
+        workspace
+            .insert_after_focused(second, crate::ui::task_workspace::Axis::Horizontal)
+            .unwrap();
+        let layout = WorkspaceLayout {
+            selected_task: Some(second),
+            task_workspace: Some(workspace),
+            ..WorkspaceLayout::default()
+        };
+        store.save(layout).expect("save");
+        let before = fs::read(store.path()).expect("read before");
+
+        let collided = local_owner(TaskId::new());
+        let loaded = store.load_keyed(|_| collided.clone());
+        assert_eq!(loaded, KeyedWorkspaceLayout::default());
+        assert_eq!(fs::read(store.path()).expect("read after"), before);
+    }
+
+    #[test]
+    fn corrupt_or_foreign_v6_fails_closed() {
+        let directory = tempfile::tempdir().expect("temp dir");
+        let store = WorkspaceLayoutStore::at_profile_root(directory.path());
+        fs::write(store.path(), b"{not json").unwrap();
+        assert_eq!(
+            store.load_keyed(local_owner),
+            KeyedWorkspaceLayout::default()
+        );
+
+        let foreign = serde_json::json!({
+            "schema": "devmanager.workspace-layout/v6",
+            "layout": {
+                "sidebar_width": 260.0,
+                "inbox_width": 320.0,
+                "dock_width": 360.0,
+                "terminal_height": 200.0,
+                "selected_task": { "host": 1, "task": "not-a-uuid" }
+            }
+        });
+        fs::write(store.path(), serde_json::to_vec_pretty(&foreign).unwrap()).unwrap();
+        assert_eq!(
+            store.load_keyed(local_owner),
+            KeyedWorkspaceLayout::default()
+        );
+    }
+
+    #[test]
+    fn oversized_keyed_layout_does_not_replace_saved_preferences() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = WorkspaceLayoutStore::at_profile_root(directory.path());
+        store.save(WorkspaceLayout::default()).unwrap();
+        let before = fs::read(store.path()).unwrap();
+        let layout: KeyedWorkspaceLayout<TestOwnerKey> = KeyedWorkspaceLayout {
+            task_center_terminal: BTreeMap::from([(
+                "x".repeat(MAX_LAYOUT_FILE_BYTES as usize),
+                true,
+            )]),
+            ..KeyedWorkspaceLayout::default()
+        };
+        assert_eq!(
+            store.save_keyed(layout).unwrap_err().kind(),
+            io::ErrorKind::InvalidData
+        );
+        assert_eq!(fs::read(store.path()).unwrap(), before);
     }
 }

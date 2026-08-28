@@ -301,6 +301,7 @@ export class WsClient {
   private lastWriterLeaseRequestAt = Number.NEGATIVE_INFINITY;
   private lastForegroundWakeAt = Number.NEGATIVE_INFINITY;
   private lastFrameAt = 0;
+  private hiddenAt: number | null = null;
   private nextRequestId = 1;
   private connectionEpoch = 0;
   private visible = currentVisibility();
@@ -780,12 +781,27 @@ export class WsClient {
   wake(): void {
     if (this.stopped) return;
     if (this.options.transport === "connect") {
-      const state = this.options.connectTransport?.state().kind;
-      if (state === "ready" || state === "resyncing") {
-        this.resume();
-      } else {
-        void this.start();
+      const transport = this.options.connectTransport;
+      if (!transport) {
+        this.cb.onHelloFailure?.({
+          kind: "connectTransportHeld",
+          code: CONNECT_BROWSER_E2E_HOLD,
+        });
+        return;
       }
+      // Capture elapsed hidden duration before clearing timestamps.
+      const hiddenDurationMs =
+        this.hiddenAt !== null ? Date.now() - this.hiddenAt : 0;
+      const action = transport.wake({ hiddenDurationMs });
+      if (this.visible) {
+        this.hiddenAt = null;
+        transport.setBackgrounded(false);
+      }
+      if (action === "held") return;
+      if (action === "resume") {
+        this.resume();
+      }
+      // reconnect/start: observeConnectState resumes once on authenticated ready
       return;
     }
     if (this.reconnectTimer !== null) {
@@ -832,15 +848,26 @@ export class WsClient {
   setVisibility(visible: boolean): void {
     this.visible = visible;
     if (visible) {
+      // Preserve hiddenAt through foreground/wake so the 10s phone-return path
+      // observes the real elapsed duration; clear only after wake consumes it.
       this.foreground();
       return;
     }
+    this.hiddenAt ??= Date.now();
+    this.options.connectTransport?.setBackgrounded(true);
     this.lastForegroundWakeAt = Number.NEGATIVE_INFINITY;
     this.send({
       type: "setVisibility",
       clientInstanceId: this.clientInstanceId,
       visible: false,
     });
+  }
+
+  /** Reversible Connect suspension for pagehide/bfcache; no-op for legacy. */
+  suspendConnection(): void {
+    if (this.options.transport === "connect") {
+      this.options.connectTransport?.suspend();
+    }
   }
 
   resetRuntime(reason = "host runtime changed"): void {
@@ -954,6 +981,7 @@ export class WsClient {
   }
 
   private observeConnectEnvelope(envelope: DecodedConnectEnvelope): void {
+    this.lastFrameAt = Date.now();
     const mapped = this.options.connectMessage?.(envelope);
     if (mapped) {
       this.cb.onMessage(mapped);

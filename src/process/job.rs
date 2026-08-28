@@ -1218,6 +1218,32 @@ impl ManagedChildGuard {
     pub fn child_mut(&mut self) -> &mut std::process::Child {
         &mut self.child
     }
+
+    /// Stop a fixture's exact Job and prove all members exited before reusing
+    /// its profile endpoint. Keep ownership on failure; Drop remains the backstop.
+    #[doc(hidden)]
+    pub fn terminate_and_join_until(&mut self, deadline: Instant) -> Result<(), String> {
+        let job = self.job.as_ref().ok_or("fixture Job ownership absent")?;
+        job.terminate_tree_until(deadline)?;
+        if !job.wait_for_active_process_zero(deadline)? {
+            return Err("fixture Job members did not exit before deadline".into());
+        }
+        // ACTIVE_PROCESS_ZERO can precede the process handle's signaled state.
+        // Join that final exit under the same deadline instead of racing it.
+        while self
+            .child
+            .try_wait()
+            .map_err(|error| error.to_string())?
+            .is_none()
+        {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Err("fixture child has not signaled exit before deadline".into());
+            }
+            std::thread::sleep(remaining.min(Duration::from_millis(5)));
+        }
+        Ok(())
+    }
 }
 
 impl Drop for ManagedChildGuard {

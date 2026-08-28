@@ -62,7 +62,9 @@ pub fn action_for_client_request(request: &ClientRequest) -> Option<(ActionId, O
                 | Query::OpenArtifactContent { .. }
                 | Query::ContinueArtifactContent { .. }
                 | Query::ReleaseArtifactContent { .. } => ActionId::READ_TASK,
-                Query::OperationStatus { .. } => ActionId::READ_OPERATION,
+                Query::OperationStatus { .. } | Query::CommandReceiptStatus { .. } => {
+                    ActionId::READ_OPERATION
+                }
                 Query::InspectHostQuit => ActionId::READ_OPERATION,
                 Query::PromptLibrary(_) => ActionId::READ_PERSONAL_PROMPTS,
                 Query::TaskCockpit(
@@ -71,7 +73,8 @@ pub fn action_for_client_request(request: &ClientRequest) -> Option<(ActionId, O
                     | crate::domain::cockpit::TaskCockpitQuery::ConfigArchiveCommand { .. }
                     | crate::domain::cockpit::TaskCockpitQuery::ConfigRunCommand { .. }
                     | crate::domain::cockpit::TaskCockpitQuery::ConfigCommandDetail { .. }
-                    | crate::domain::cockpit::TaskCockpitQuery::ProviderSettings(_),
+                    | crate::domain::cockpit::TaskCockpitQuery::ProviderSettings(_)
+                    | crate::domain::cockpit::TaskCockpitQuery::RemoteAccess(_),
                 ) => {
                     // Config mutations, command-text detail, and provider settings
                     // stay host-local. Connect must not map them as READ_TASK.
@@ -373,6 +376,43 @@ mod tests {
             SessionAuthorizer::paired_owner().authorize_request(&request),
             PermissionDecision::Denied(PermissionDenyReason::UnknownAction)
         );
+    }
+
+    #[test]
+    fn remote_listener_setup_is_never_a_connect_action() {
+        use crate::host::remote_setup::{RemoteListenOptions, RemoteSetupRequest};
+        for setup in [
+            RemoteSetupRequest::Snapshot,
+            RemoteSetupRequest::PairingInfo,
+            RemoteSetupRequest::Disable {
+                command_id: crate::domain::CommandId::new(),
+            },
+            RemoteSetupRequest::Retry {
+                command_id: crate::domain::CommandId::new(),
+            },
+            RemoteSetupRequest::Enable {
+                command_id: crate::domain::CommandId::new(),
+                options: RemoteListenOptions {
+                    bind_address: "127.0.0.1".into(),
+                    port: 8443,
+                    advertised_origin: None,
+                    certificate_path: None,
+                    private_key_path: None,
+                },
+            },
+        ] {
+            let request = ClientRequest::Query(QueryEnvelope {
+                request_id: RequestId::new(),
+                client_id: ClientId::new(),
+                task_id: None,
+                query: Query::TaskCockpit(TaskCockpitQuery::RemoteAccess(setup)),
+            });
+            assert_eq!(action_for_client_request(&request), None);
+            assert_eq!(
+                SessionAuthorizer::paired_owner().authorize_request(&request),
+                PermissionDecision::Denied(PermissionDenyReason::UnknownAction)
+            );
+        }
     }
 
     #[test]

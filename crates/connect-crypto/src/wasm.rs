@@ -1,4 +1,5 @@
 use wasm_bindgen::prelude::*;
+use zeroize::Zeroizing;
 
 use crate::{
     instantiate_noise_channel, ChannelRole, CredentialPurpose, CryptoPrologue,
@@ -64,15 +65,21 @@ impl WasmConnectHandshake {
         opened_at_unix: u64,
         direct_reachable: bool,
     ) -> Result<WasmConnectHandshake, JsValue> {
-        let private = NoiseStaticPrivateKey::from_vault_bytes(fixed(&private_key)?)
+        // Own and zeroize the JS-copied private buffer on every return path,
+        // including fixed()/from_vault_bytes failures before Noise state exists.
+        let private_key = Zeroizing::new(private_key);
+        let private = NoiseStaticPrivateKey::from_vault_bytes(fixed(private_key.as_slice())?)
             .map_err(|_| redacted_error())?;
         let local_public = NoiseStaticPublicKey::from_bytes(fixed(&local_public)?)
             .map_err(|_| redacted_error())?;
         let expected_remote = expected_remote.as_deref().map(fixed).transpose()?;
-        let host_public_id = fixed(&host_public_id)?;
-        let device_public_id = device_public_id.as_deref().map(fixed).transpose()?;
-        let route_id = fixed(&route_id)?;
-        let session_id = fixed(&session_id)?;
+        let host_public_id = fixed::<16>(&host_public_id)?;
+        let device_public_id = device_public_id
+            .as_deref()
+            .map(fixed::<16>)
+            .transpose()?;
+        let route_id = fixed::<16>(&route_id)?;
+        let session_id = fixed::<16>(&session_id)?;
         let purpose = purpose(purpose_value)?;
         let identity = match device_public_id {
             Some(device) => NoiseIdentityBinding::host_device(host_public_id, device),

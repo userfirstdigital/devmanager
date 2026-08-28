@@ -1720,3 +1720,118 @@ describe("WsClient connect route and inbound bounds", () => {
     ).toBe(true);
   });
 });
+
+describe("Connect wake and suspension via WsClient", () => {
+  beforeEach(() => {
+    vi.useFakeTimers();
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+    vi.restoreAllMocks();
+  });
+
+  it("preserves elapsed hidden duration through setVisibility true for the 10s path", () => {
+    const wake = vi.fn(() => "reconnect" as const);
+    const setBackgrounded = vi.fn();
+    const transport = {
+      state: () => ({ kind: "ready" as const }),
+      wake,
+      setBackgrounded,
+      suspend: vi.fn(),
+      start: vi.fn(),
+      stop: vi.fn(),
+      subscribe: () => () => {},
+      subscribeEnvelope: () => () => {},
+      sendPayload: vi.fn(() => true),
+      requestResync: vi.fn(() => true),
+    };
+    const client = new WsClient(clientCallbacks(), {
+      transport: "connect",
+      connectTransport: transport as never,
+    });
+    client.setVisibility(false);
+    client.setVisibility(false);
+    vi.advanceTimersByTime(10_001);
+    client.setVisibility(true);
+    expect(wake).toHaveBeenCalledTimes(1);
+    expect(wake).toHaveBeenCalledWith({ hiddenDurationMs: 10_001 });
+    expect(setBackgrounded).toHaveBeenCalledWith(false);
+    expect(transport.sendPayload).not.toHaveBeenCalled();
+    expect(transport.requestResync).not.toHaveBeenCalled();
+  });
+
+  it("invokes transport.wake and resumes only on the short-wake path", () => {
+    const wake = vi.fn(() => "resume" as const);
+    const setBackgrounded = vi.fn();
+    const transport = {
+      state: () => ({ kind: "ready" as const }),
+      wake,
+      setBackgrounded,
+      suspend: vi.fn(),
+      start: vi.fn(),
+      stop: vi.fn(),
+      subscribe: () => () => {},
+      subscribeEnvelope: () => () => {},
+      sendPayload: vi.fn(() => true),
+      requestResync: vi.fn(() => true),
+    };
+    const client = new WsClient(clientCallbacks(), {
+      transport: "connect",
+      connectTransport: transport as never,
+      connectResume: () => ({
+        payloadKind: 15,
+        payload: { reason: "replay_unavailable" },
+      }),
+    });
+    client.wake();
+    expect(wake).toHaveBeenCalledWith({ hiddenDurationMs: 0 });
+    expect(transport.sendPayload).toHaveBeenCalled();
+  });
+
+  it("preserves held transport failures without reconnect loops", () => {
+    const wake = vi.fn(() => "held" as const);
+    const onHelloFailure = vi.fn();
+    const transport = {
+      state: () => ({
+        kind: "held" as const,
+        code: "browser-e2e-transport-held",
+        reason: "held",
+      }),
+      wake,
+      setBackgrounded: vi.fn(),
+      suspend: vi.fn(),
+      start: vi.fn(),
+      stop: vi.fn(),
+      subscribe: () => () => {},
+      subscribeEnvelope: () => () => {},
+    };
+    const client = new WsClient(clientCallbacks({ onHelloFailure }), {
+      transport: "connect",
+      connectTransport: transport as never,
+    });
+    client.wake();
+    expect(wake).toHaveBeenCalled();
+    expect(transport.start).not.toHaveBeenCalled();
+  });
+
+  it("suspendConnection forwards to the Connect transport", () => {
+    const suspend = vi.fn();
+    const transport = {
+      state: () => ({ kind: "ready" as const }),
+      wake: vi.fn(),
+      setBackgrounded: vi.fn(),
+      suspend,
+      start: vi.fn(),
+      stop: vi.fn(),
+      subscribe: () => () => {},
+      subscribeEnvelope: () => () => {},
+    };
+    const client = new WsClient(clientCallbacks(), {
+      transport: "connect",
+      connectTransport: transport as never,
+    });
+    client.suspendConnection();
+    expect(suspend).toHaveBeenCalledTimes(1);
+  });
+});

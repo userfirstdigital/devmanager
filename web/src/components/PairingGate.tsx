@@ -1,7 +1,7 @@
 import { LockKeyhole, MonitorSmartphone } from "lucide-react";
 import { useState, type FormEvent } from "react";
 
-import { buildPairingUrl } from "../lib/browserIdentity";
+import { buildPairingRequest } from "../lib/browserIdentity";
 
 export function PairingGate() {
   const [token, setToken] = useState("");
@@ -18,9 +18,7 @@ export function PairingGate() {
     setSubmitting(true);
     setError(null);
     try {
-      const response = await fetch(buildPairingUrl(trimmed), {
-        credentials: "include",
-      });
+      const response = await fetch("/pair", buildPairingRequest(trimmed));
       if (!response.ok && response.status !== 0) {
         const retryAfter = Number(response.headers.get("Retry-After") ?? "0");
         setSubmitting(false);
@@ -52,7 +50,7 @@ export function PairingGate() {
         </span>
         <h1>Connect to DevManager</h1>
         <p className="dm-pairing-intro">
-          Pair this iPhone once, then DevManager will reconnect automatically
+          Pair this device once, then DevManager will reconnect automatically
           whenever you return.
         </p>
         <form onSubmit={onSubmit} className="dm-pairing-form">

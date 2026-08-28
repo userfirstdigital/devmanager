@@ -7,15 +7,18 @@
 use std::collections::HashMap;
 use std::fmt;
 use std::sync::Arc;
+use std::time::Duration;
 
 use async_trait::async_trait;
 use tokio::sync::Mutex as AsyncMutex;
 
 use crate::domain::command::{CommandEnvelope, CommandReceipt};
-use crate::domain::id::{ArtifactId, RequestId, TaskId};
+use crate::domain::id::{ArtifactId, ClientId, RequestId, TaskId};
 use crate::domain::query::{QueryEnvelope, QueryReply};
-use crate::host::IpcError;
-use crate::protocol::{ClientRequest, NegotiatedParameters, ServerMessage, UpdateHandoffReply};
+use crate::host::{HostConnectDuplex, IpcError};
+use crate::protocol::{
+    CapabilitySet, ClientRequest, NegotiatedParameters, ServerMessage, UpdateHandoffReply,
+};
 
 use super::connection::UnsolicitedServerMessage;
 use super::host_client::{ArtifactContentBatch, EventReplayBatch, HostClient, HostClientConfig};
@@ -30,6 +33,18 @@ pub trait ConnectHostCommandPort: Send + Sync {
         negotiated: NegotiatedParameters,
         request: ClientRequest,
     ) -> Result<ServerMessage, IpcError>;
+
+    /// Optional host-owned Connect duplex session for the authenticated client.
+    ///
+    /// Cross-process and test adapters leave this as [`None`]. The in-process
+    /// [`crate::host::HostRequestHandle`] override returns a live
+    /// [`HostConnectDuplex`]. This never opens a second IPC relay or executor.
+    async fn open_duplex(
+        &self,
+        _client_id: ClientId,
+    ) -> Result<Option<HostConnectDuplex>, IpcError> {
+        Ok(None)
+    }
 }
 
 const MAX_CONNECT_HOST_CLIENTS: usize = 32;
@@ -324,4 +339,37 @@ pub trait HostCommandPort {
         let _ = after_sequence;
         Err(HostPortError::Unsupported)
     }
+}
+
+/// Async request seam for typed query/command helpers shared by HostClient and
+/// future fleet adapters. Not a second command bus: envelope construction,
+/// capability checks, and decode stay in [`crate::client::typed_queries`].
+///
+/// Distinct from [`HostCommandPort`] / [`ConnectHostCommandPort`] — those stay
+/// unchanged for Connect session and sync adapters.
+#[async_trait]
+pub trait AsyncHostRequestPort: Send {
+    /// Captured authenticated client identity for envelope construction.
+    fn client_id(&self) -> ClientId;
+
+    /// Captured Hello capability grant used for pre-I/O rejection.
+    fn granted_capabilities(&self) -> CapabilitySet;
+
+    /// Issue one query on the exact current transport. `None` uses the default
+    /// request completion timeout; `Some` preserves long cockpit/agent deadlines.
+    /// Transport errors retire the exact request transport before returning.
+    async fn request_query(
+        &mut self,
+        envelope: QueryEnvelope,
+        timeout: Option<Duration>,
+    ) -> Result<QueryReply, IpcError>;
+
+    /// Issue one command on the exact current transport (HostClient tracks Accepted).
+    async fn request_command(
+        &mut self,
+        envelope: CommandEnvelope,
+    ) -> Result<CommandReceipt, IpcError>;
+
+    /// Retire the exact request transport after an unexpected correlated reply.
+    async fn retire_request_transport(&mut self);
 }

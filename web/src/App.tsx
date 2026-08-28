@@ -136,6 +136,9 @@ export function App() {
     return bindAppLifecycle({
       foreground,
       setVisibility: setConnectionVisibility,
+      suspend: () => {
+        useStore.getState().client?.suspendConnection();
+      },
     });
   }, [foregroundConnection, setConnectionVisibility]);
 

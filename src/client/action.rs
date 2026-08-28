@@ -664,10 +664,17 @@ pub const fn cockpit_query_action_id(query: &TaskCockpitQuery) -> &'static str {
         TaskCockpitQuery::ConfigArchiveCommand { .. } => ACTION_CONFIG_ARCHIVE_COMMAND,
         TaskCockpitQuery::ConfigRunCommand { .. } => ACTION_CONFIG_RUN_COMMAND,
         TaskCockpitQuery::ConfigCommandDetail { .. } => ACTION_CONFIG_COMMAND_DETAIL,
-        TaskCockpitQuery::ProviderSettings(_) => ACTION_HOST_STATUS,
+        TaskCockpitQuery::ProviderSettings(_) | TaskCockpitQuery::RemoteAccess(_) => {
+            ACTION_HOST_STATUS
+        }
         TaskCockpitQuery::BrowserProcessSession => ACTION_BROWSER_NATIVE,
-        TaskCockpitQuery::Conversation { .. } => ACTION_CONVERSATION_STATUS,
-        TaskCockpitQuery::Terminal => ACTION_PROVIDER_TERMINAL_INPUT,
+        TaskCockpitQuery::Conversation { .. }
+        | TaskCockpitQuery::OpenConversationSubscription { .. }
+        | TaskCockpitQuery::ReleaseConversationSubscription { .. }
+        | TaskCockpitQuery::ProviderInputState => ACTION_CONVERSATION_STATUS,
+        TaskCockpitQuery::Terminal | TaskCockpitQuery::TerminalReadiness => {
+            ACTION_PROVIDER_TERMINAL_INPUT
+        }
         TaskCockpitQuery::WorkspaceStatus => ACTION_WORKSPACE_STATUS,
         TaskCockpitQuery::GitRepositories => ACTION_GIT_REPOSITORIES,
         TaskCockpitQuery::GitStatus

@@ -130,6 +130,8 @@ fn run(raw_args: Vec<String>) -> Result<(), HostRunError> {
         let paths = prepare_debug_paths(&args)?;
         let parent = open_and_validate_parent(args.parent_pid)?;
         let host_lock = acquire_lock(&paths.profile_root, &args.profile)?;
+        devmanager::persistence::bind_durable_host_storage(&args.profile, &paths.profile_root)
+            .map_err(|error| format!("failed to bind host storage: {error}"))?;
         let host_boot_id = host_lock.identity().boot_id;
         let bus = CommandBus::open(&paths.database)
             .map_err(|error| format!("failed to open host command bus: {error}"))?;
@@ -146,6 +148,7 @@ fn run(raw_args: Vec<String>) -> Result<(), HostRunError> {
             .map_err(|error| format!("failed to build host async runtime: {error}"))?;
         let _ = &args.instance_label;
         runtime.block_on(serve_foreground_host(
+            &host_lock,
             &args.profile,
             &paths.profile_root,
             Some(parent),
@@ -163,6 +166,11 @@ fn run(raw_args: Vec<String>) -> Result<(), HostRunError> {
         parse_production_args(raw_args)?;
         let paths = prepare_production_paths()?;
         let host_lock = acquire_lock(&paths.profile_root, PRODUCTION_HOST_PROFILE)?;
+        devmanager::persistence::bind_durable_host_storage(
+            PRODUCTION_HOST_PROFILE,
+            &paths.profile_root,
+        )
+        .map_err(|error| format!("failed to bind host storage: {error}"))?;
         let host_boot_id = host_lock.identity().boot_id;
         let bus = CommandBus::open(&paths.database)
             .map_err(|error| format!("failed to open host command bus: {error}"))?;
@@ -176,6 +184,7 @@ fn run(raw_args: Vec<String>) -> Result<(), HostRunError> {
             .build()
             .map_err(|error| format!("failed to build host async runtime: {error}"))?;
         runtime.block_on(serve_foreground_host(
+            &host_lock,
             PRODUCTION_HOST_PROFILE,
             &paths.profile_root,
             None,
@@ -1020,6 +1029,7 @@ fn spawn_connection_task(
 
 #[cfg(windows)]
 async fn serve_foreground_host(
+    host_lock: &HostLock,
     profile: &str,
     profile_root: &Path,
     parent: Option<ParentProcess>,
@@ -1052,9 +1062,8 @@ async fn serve_foreground_host(
             ..OrganizationRuntimeConfig::default()
         },
     );
-    // Narrow same-process attach seam for /api/connect. The web listener is
-    // started from remote/mod.rs (not owned here); it clones this slot after
-    // bind. Cross-process HostClient wiring is the remaining external blocker.
+    // Narrow same-process attach seam for /api/connect. The setup controller
+    // below owns listener lifetime; it clones this exact executor after bind.
     devmanager::connect::bind_host_request_handle(request_handle.clone());
 
     let organization_snapshot = organization_runtime.snapshot();
@@ -1093,24 +1102,10 @@ async fn serve_foreground_host(
         }
     };
 
-    // Named-pipe Hello is a different protocol and stays intact. Connect
-    // production is a separate factory: fail closed on identity/custody/bind
-    // rather than starting a plaintext or source-level Connect listener.
-    let _connect_startup = match devmanager::connect::ConnectProductionStartup::prepare_direct(
-        devmanager::connect::DirectBindPolicy::loopback(),
-    ) {
-        Ok(connect_startup) => {
-            eprintln!(
-                "Connect production: session ready; listener binds at /api/connect (bound={})",
-                connect_startup.listener_is_bound()
-            );
-            Some(connect_startup)
-        }
-        Err(error) => {
-            eprintln!("Connect production startup failed closed: {error}");
-            None
-        }
-    };
+    // Named-pipe Hello is a different protocol and stays intact. Connect web
+    // listener lifetime is owned by the durable host after updater recovery —
+    // not by an unbound prepare_direct placeholder and not by the desktop shell.
+    // (Controller starts below after successful handoff recovery.)
 
     // Bind the one shared updater FSM + timed IPC port to live Host Hello.
     // Clients must not create a second gate; they drive this handle's port.
@@ -1129,6 +1124,31 @@ async fn serve_foreground_host(
         return Err(error);
     }
     let _bound_updater = bound_updater;
+
+    // A bounded local-only setup controller owns listener bootstrap, explicit
+    // enable/reconfigure, and shutdown off the canonical request executor.
+    let mut remote_access = match devmanager::host::remote_setup::RemoteSetupRuntime::start(
+        host_lock,
+    ) {
+        Ok((handle, controller)) => match request_handle.bind_remote_setup(handle) {
+            Ok(()) => Some(controller),
+            Err(_) => {
+                let _ = controller.shutdown_async().await;
+                eprintln!(
+                    "devmanager-host: remote setup already bound; duplicate controller stopped"
+                );
+                None
+            }
+        },
+        Err(error) => {
+            let _ = writeln!(
+                io::stderr(),
+                "devmanager-host: remote access startup failed closed (local host retained): {error}"
+            );
+            let _ = io::stderr().flush();
+            None
+        }
+    };
 
     // Quota observation is host-owned and intentionally starts outside the
     // request/render path. Prefer the account-aware metadata cache populated
@@ -1191,6 +1211,15 @@ async fn serve_foreground_host(
                 };
                 // Drop the pending accept future (and its successor listener) BEFORE ack.
                 let _ = accept_task.take();
+                // Full-quit physical arm: stop network acceptance and join the owned
+                // remote worker BEFORE acknowledging arm. Uncertain shutdown must not ack.
+                if let Some(controller) = remote_access.take() {
+                    if let Err(error) = controller.shutdown_async().await {
+                        break HostLoopExit::Listener(format!(
+                            "remote access shutdown before arm uncertain: {error}"
+                        ));
+                    }
+                }
                 if ack.send(()).is_err() {
                     break HostLoopExit::Listener(
                         "physical-exit arm acknowledgement receiver dropped".to_string(),
@@ -1245,6 +1274,19 @@ async fn serve_foreground_host(
             }
         }
     };
+
+    // Parent exit, executor exit, and listener faults: stop web acceptance and
+    // join the owned remote worker before releasing duplex/slot/executor.
+    // Release desktop detach does not reach this path as a host-stop signal.
+    if let Some(controller) = remote_access.take() {
+        if let Err(error) = controller.shutdown_async().await {
+            let _ = writeln!(
+                io::stderr(),
+                "devmanager-host: remote access shutdown: {error}"
+            );
+            let _ = io::stderr().flush();
+        }
+    }
 
     let result =
         finish_supervised_host(exit, &mut connection_tasks, request_handle, join, armed).await;

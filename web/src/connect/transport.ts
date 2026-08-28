@@ -1,4 +1,5 @@
 import { buildWebSocketUrl } from "../lib/browserIdentity";
+import { capabilityBits, decodeHostOutput, HOST_CONVERSATION_OUTPUT, HOST_CRITICAL_OUTPUT, HOST_STREAM_OUTPUT, isHostOutputKind, protocolUuid } from "./hostOutput";
 import {
   CONNECT_BROWSER_E2E_HOLD,
   ConnectCryptoHoldError,
@@ -184,8 +185,9 @@ export function classifyInboundFrame(input: {
  */
 
 export class ConnectBrowserTransportError extends ConnectCryptoHoldError {
-
-  constructor(message = "Connect browser E2E transport is not available in this build") {
+  constructor(
+    message = "Connect browser E2E transport is not available in this build",
+  ) {
     super(message);
     this.name = "ConnectBrowserTransportError";
   }
@@ -226,13 +228,19 @@ export function encodeConnectSealedFrame(frame: {
   tag: Uint8Array;
 }): Uint8Array {
   if (frame.nonce.byteLength !== 16 || frame.tag.byteLength !== 32) {
-    throw new ConnectBrowserTransportError("invalid Connect sealed-frame nonce/tag");
+    throw new ConnectBrowserTransportError(
+      "invalid Connect sealed-frame nonce/tag",
+    );
   }
   if (!Number.isInteger(frame.version) || frame.version !== 1) {
-    throw new ConnectBrowserTransportError("unsupported Connect sealed-frame version");
+    throw new ConnectBrowserTransportError(
+      "unsupported Connect sealed-frame version",
+    );
   }
   if (frame.sequence <= 0n || frame.sequence > 0xffff_ffff_ffff_ffffn) {
-    throw new ConnectBrowserTransportError("invalid Connect sealed-frame sequence");
+    throw new ConnectBrowserTransportError(
+      "invalid Connect sealed-frame sequence",
+    );
   }
   const output = new Uint8Array(1 + 8 + 16 + frame.ciphertext.byteLength + 32);
   const view = new DataView(output.buffer);
@@ -259,7 +267,9 @@ export function decodeConnectSealedFrame(input: ArrayBuffer | Uint8Array): {
   const version = view.getUint8(0);
   const sequence = view.getBigUint64(1, false);
   if (version !== 1 || sequence === 0n) {
-    throw new ConnectBrowserTransportError("invalid Connect sealed frame header");
+    throw new ConnectBrowserTransportError(
+      "invalid Connect sealed frame header",
+    );
   }
   return {
     version,
@@ -273,6 +283,83 @@ export function decodeConnectSealedFrame(input: ArrayBuffer | Uint8Array): {
 /** The first direct Connect websocket frame binds the crypto prologue. */
 export const CONNECT_GREETING_MAGIC = "DMCN1" as const;
 export const CONNECT_GREETING_BYTES = 5 + 16 + 16 + 16;
+
+/**
+ * Cross-origin direct Connect prelude. Sent by the browser before DMCN1.
+ * Path is fixed; tickets never appear in the URL.
+ */
+export const CONNECT_CROSS_ORIGIN_MAGIC = "DMCX1" as const;
+export const CONNECT_CROSS_ORIGIN_PATH = "/api/connect/cross-origin" as const;
+export const CONNECT_CROSS_ORIGIN_TICKET_MAX_BYTES = 1_024;
+/** One absolute deadline covering DMCX1 admission through Noise+Hello. */
+export const CONNECT_CROSS_ORIGIN_HANDSHAKE_DEADLINE_MS = 30_000;
+
+/** Immutable approved target for a cross-origin Connect route. */
+export interface ConnectCrossOriginTarget {
+  /** Canonical HTTPS origin of host B. */
+  origin: string;
+  /**
+   * Exact `wss://host/api/connect/cross-origin` — no query, userinfo, or fragment.
+   * Never an arbitrary relay or user-entered fallback.
+   */
+  endpoint: string;
+}
+
+/**
+ * Validate a pinned cross-origin WebSocket endpoint. Rejects anything that is
+ * not exact WSS + path with no secrets in the URL.
+ */
+export function parseConnectCrossOriginEndpoint(
+  raw: unknown,
+  expectedOrigin?: string,
+): string | null {
+  if (typeof raw !== "string") return null;
+  const trimmed = raw.trim();
+  if (!trimmed || trimmed.length > 2_048) return null;
+  let parsed: URL;
+  try {
+    parsed = new URL(trimmed);
+  } catch {
+    return null;
+  }
+  if (parsed.protocol !== "wss:") return null;
+  if (
+    !parsed.hostname ||
+    parsed.username ||
+    parsed.password ||
+    parsed.hash ||
+    parsed.search !== ""
+  ) {
+    return null;
+  }
+  if (parsed.pathname !== CONNECT_CROSS_ORIGIN_PATH) return null;
+  const httpsOrigin = `https://${parsed.host}`;
+  if (expectedOrigin !== undefined && httpsOrigin !== expectedOrigin) {
+    return null;
+  }
+  if (expectedOrigin !== undefined) {
+    try {
+      const originUrl = new URL(expectedOrigin);
+      if (originUrl.protocol !== "https:" || originUrl.origin !== expectedOrigin) {
+        return null;
+      }
+    } catch {
+      return null;
+    }
+  }
+  return `wss://${parsed.host}${CONNECT_CROSS_ORIGIN_PATH}`;
+}
+
+export function buildConnectCrossOriginEndpoint(origin: string): string | null {
+  let parsed: URL;
+  try {
+    parsed = new URL(origin);
+  } catch {
+    return null;
+  }
+  if (parsed.protocol !== "https:" || parsed.origin !== origin) return null;
+  return `wss://${parsed.host}${CONNECT_CROSS_ORIGIN_PATH}`;
+}
 
 export interface ConnectGreeting {
   hostPublicId: Uint8Array;
@@ -378,10 +465,30 @@ interface PendingConnectRequest {
   reject(error: Error): void;
 }
 
+/** Temporary Noise static key material. Callers must wipe `privateKey`. */
+export interface ConnectHandshakeMaterial {
+  privateKey: Uint8Array;
+  localPublic?: Uint8Array;
+}
+
+/**
+ * Production custody path: unwrap per handshake. The transport wipes the
+ * returned private bytes in `finally`, including failure and cancellation.
+ */
+export type ConnectHandshakeMaterialFactory =
+  () => Promise<ConnectHandshakeMaterial>;
+
 export interface ConnectBrowserTransportOptions {
   firstPairing: boolean;
-  privateKey: Uint8Array;
+  /**
+   * Fixture/tests only. Production bootstrap must supply
+   * `handshakeMaterialFactory` instead so raw private bytes are not retained
+   * for the transport lifetime.
+   */
+  privateKey?: Uint8Array;
   localPublic: Uint8Array;
+  /** Preferred production path: private unwrap for each Noise handshake. */
+  handshakeMaterialFactory?: ConnectHandshakeMaterialFactory;
   expectedRemote?: Uint8Array;
   hostPublicId?: Uint8Array;
   devicePublicId?: Uint8Array;
@@ -394,6 +501,17 @@ export interface ConnectBrowserTransportOptions {
   capabilityGrant?: unknown;
   limits?: ConnectEnvelopeLimits;
   location?: ConnectLocationLike;
+  /**
+   * Optional immutable approved cross-origin target. When set, the transport
+   * dials only that exact WSS endpoint and never falls back to same-origin
+   * `/api/connect` or any relay advertisement.
+   */
+  explicitTarget?: ConnectCrossOriginTarget;
+  /**
+   * One-use attach ticket for the initial DMCX1 admission. Cleared after the
+   * first successful send; reconnects always emit `{type:"resume"}`.
+   */
+  crossOriginTicket?: string | null;
   cryptoLoader?: ConnectCryptoLoader;
   socketFactory?: ConnectSocketFactory;
   onState?(state: ConnectConnectionState): void;
@@ -413,6 +531,11 @@ const DEFAULT_CONNECT_LIMITS: ConnectEnvelopeLimits = {
 
 const CONNECT_RECONNECT_MIN_MS = 1_000;
 const CONNECT_RECONNECT_MAX_MS = 10_000;
+/** T3-style long background: replace the channel instead of probing a dead ready socket. */
+const CONNECT_LONG_BACKGROUND_MS = 10_000;
+/** Short wake: force reconnect when authenticated progress does not arrive. */
+const CONNECT_WAKE_WATCHDOG_MS = 3_000;
+const crossOriginMagicBytes = new TextEncoder().encode(CONNECT_CROSS_ORIGIN_MAGIC);
 const CONNECT_HELLO_KIND = 1;
 const CONNECT_CAPABILITIES_KIND = 2;
 const CONNECT_QUERY_KIND = 5;
@@ -431,8 +554,9 @@ const CRITICAL_PAYLOAD_KINDS = new Set([
   18,
   7,
   8,
+  HOST_CRITICAL_OUTPUT,
 ]);
-const EPHEMERAL_PAYLOAD_KINDS = new Set([9, 10, 11]);
+const EPHEMERAL_PAYLOAD_KINDS = new Set([9, 10, 11, HOST_STREAM_OUTPUT, HOST_CONVERSATION_OUTPUT]);
 
 function channelForPayloadKind(
   payloadKind: number,
@@ -455,7 +579,8 @@ function sameLimits(
 ): boolean {
   return (
     left.max_physical_frame_bytes === right.max_physical_frame_bytes &&
-    left.max_reassembled_message_bytes === right.max_reassembled_message_bytes &&
+    left.max_reassembled_message_bytes ===
+      right.max_reassembled_message_bytes &&
     left.max_page_items === right.max_page_items &&
     left.max_page_encoded_bytes === right.max_page_encoded_bytes &&
     left.max_chunk_bytes === right.max_chunk_bytes &&
@@ -509,7 +634,10 @@ function isBoundedResyncSnapshot(
     return false;
   }
   const reply = payload as Record<string, unknown>;
-  if (!hasExactKeys(reply, ["request_id", "outcome"]) || reply.request_id !== requestId) {
+  if (
+    !hasExactKeys(reply, ["request_id", "outcome"]) ||
+    protocolUuid(reply.request_id) !== requestId
+  ) {
     return false;
   }
   if (typeof reply.outcome !== "object" || reply.outcome === null) return false;
@@ -537,7 +665,7 @@ function isBoundedResyncSnapshot(
       "encoded_bytes",
       "next_cursor",
     ]) ||
-    !isUuidV7(page.snapshot_id) ||
+    !protocolUuid(page.snapshot_id) ||
     page.section !== "tasks" ||
     typeof page.through_sequence !== "number" ||
     !Number.isSafeInteger(page.through_sequence) ||
@@ -559,7 +687,8 @@ function isBoundedResyncSnapshot(
   }
   return (
     typeof nextCursor === "string" &&
-    new TextEncoder().encode(nextCursor).byteLength <= limits.max_cumulative_bytes
+    new TextEncoder().encode(nextCursor).byteLength <=
+      limits.max_cumulative_bytes
   );
 }
 
@@ -583,10 +712,28 @@ function base64Decode(value: string): Uint8Array {
 function secureRandomBytes(length: number): Uint8Array {
   const bytes = new Uint8Array(length);
   if (typeof globalThis.crypto?.getRandomValues !== "function") {
-    throw new ConnectBrowserTransportError("Connect browser randomness unavailable");
+    throw new ConnectBrowserTransportError(
+      "Connect browser randomness unavailable",
+    );
   }
   globalThis.crypto.getRandomValues(bytes);
   return bytes;
+}
+
+function wipeBytes(bytes: Uint8Array | null | undefined): void {
+  if (!bytes) return;
+  bytes.fill(0);
+}
+
+function releaseOwnedWasm(
+  value: { free?: () => void } | null | undefined,
+): void {
+  if (!value || typeof value.free !== "function") return;
+  try {
+    value.free();
+  } catch {
+    // Best-effort drop on replace/stop; never block reconnect.
+  }
 }
 
 function uuidV7(): string {
@@ -614,7 +761,9 @@ function uuidFromBytes(bytes: Uint8Array): string {
     (bytes[6] & 0xf0) !== 0x70 ||
     (bytes[8] & 0xc0) !== 0x80
   ) {
-    throw new ConnectBrowserTransportError("Connect greeting identifier rejected");
+    throw new ConnectBrowserTransportError(
+      "Connect greeting identifier rejected",
+    );
   }
   const hex = Array.from(bytes, (value) => value.toString(16).padStart(2, "0"));
   return `${hex.slice(0, 4).join("")}-${hex.slice(4, 6).join("")}-${hex
@@ -622,11 +771,15 @@ function uuidFromBytes(bytes: Uint8Array): string {
     .join("")}-${hex.slice(8, 10).join("")}-${hex.slice(10).join("")}`;
 }
 
-function locationForConnect(locationLike?: ConnectLocationLike): ConnectLocationLike {
+function locationForConnect(
+  locationLike?: ConnectLocationLike,
+): ConnectLocationLike {
   if (locationLike) return locationLike;
   const current = globalThis.location;
   if (!current?.protocol || !current.host) {
-    throw new ConnectBrowserTransportError("Connect browser origin unavailable");
+    throw new ConnectBrowserTransportError(
+      "Connect browser origin unavailable",
+    );
   }
   return { protocol: current.protocol, host: current.host };
 }
@@ -643,18 +796,35 @@ export class ConnectBrowserTransport {
   private handshake: ConnectWasmHandshake | null = null;
   private transport: ConnectWasmTransport | null = null;
   private greeting: ConnectGreeting | null = null;
+  private handshakeMaterialPending = false;
   private connectionId = "";
   private channelId = "";
   private outboundSequence = 1;
   private inboundSequence = 0;
   private negotiatedLimits: ConnectEnvelopeLimits | null = null;
+  private negotiatedCapabilities = 0;
   private helloAccepted = false;
   private resyncInFlight = false;
   private resyncRequestId: string | null = null;
   private stopped = false;
-  private reconnectTimer: ReturnType<typeof globalThis.setTimeout> | null = null;
+  private reconnectTimer: ReturnType<typeof globalThis.setTimeout> | null =
+    null;
   private reconnectDelayMs = CONNECT_RECONNECT_MIN_MS;
   private connectionEpoch = 0;
+  private lastAuthenticatedFrameAt = 0;
+  private backgroundedAt: number | null = null;
+  private wakeWatchdogTimer: ReturnType<typeof globalThis.setTimeout> | null =
+    null;
+  private handshakeDeadlineTimer: ReturnType<
+    typeof globalThis.setTimeout
+  > | null = null;
+  /** Cross-origin ticket retained only until first successful DMCX1 send. */
+  private pendingCrossOriginTicket: string | null = null;
+  private crossOriginTicketConsumed = false;
+  private crossOriginPreludeSent = false;
+  /** Becomes false after a successful ticket pair so reconnects use known-pin IK. */
+  private noiseFirstPairing: boolean;
+  private readonly resolvedExplicitEndpoint: string | null;
   private readonly envelopeListeners = new Set<
     (envelope: DecodedConnectEnvelope) => void
   >();
@@ -663,7 +833,87 @@ export class ConnectBrowserTransport {
     (state: ConnectConnectionState) => void
   >();
 
-  constructor(private readonly options: ConnectBrowserTransportOptions) {}
+  constructor(private readonly options: ConnectBrowserTransportOptions) {
+    const hasFactory = typeof options.handshakeMaterialFactory === "function";
+    const hasFixtureKey = options.privateKey instanceof Uint8Array;
+    if (hasFactory === hasFixtureKey) {
+      throw new ConnectBrowserTransportError(
+        "Connect transport requires exactly one of handshakeMaterialFactory or fixture privateKey",
+      );
+    }
+    if (
+      !(options.localPublic instanceof Uint8Array) ||
+      options.localPublic.byteLength !== 32
+    ) {
+      throw new ConnectBrowserTransportError(
+        "Connect transport local public identity rejected",
+      );
+    }
+    if (hasFixtureKey && options.privateKey!.byteLength !== 32) {
+      throw new ConnectBrowserTransportError(
+        "Connect transport fixture private key rejected",
+      );
+    }
+    this.noiseFirstPairing = options.firstPairing;
+    if (
+      options.expectedRemote !== undefined &&
+      (!(options.expectedRemote instanceof Uint8Array) ||
+        options.expectedRemote.byteLength !== 32)
+    ) {
+      throw new ConnectBrowserTransportError(
+        "Connect transport expected remote public key rejected",
+      );
+    }
+    if (
+      options.hostPublicId !== undefined &&
+      (!(options.hostPublicId instanceof Uint8Array) ||
+        options.hostPublicId.byteLength !== 16)
+    ) {
+      throw new ConnectBrowserTransportError(
+        "Connect transport host public id rejected",
+      );
+    }
+    if (
+      options.devicePublicId !== undefined &&
+      (!(options.devicePublicId instanceof Uint8Array) ||
+        options.devicePublicId.byteLength !== 16)
+    ) {
+      throw new ConnectBrowserTransportError(
+        "Connect transport device public id rejected",
+      );
+    }
+    if (options.explicitTarget) {
+      const endpoint = parseConnectCrossOriginEndpoint(
+        options.explicitTarget.endpoint,
+        options.explicitTarget.origin,
+      );
+      if (!endpoint) {
+        throw new ConnectBrowserTransportError(
+          "Connect cross-origin endpoint rejected",
+        );
+      }
+      this.resolvedExplicitEndpoint = endpoint;
+      if (typeof options.crossOriginTicket === "string") {
+        const ticketBytes = inboundEncoder.encode(options.crossOriginTicket);
+        if (
+          ticketBytes.byteLength === 0 ||
+          ticketBytes.byteLength > CONNECT_CROSS_ORIGIN_TICKET_MAX_BYTES
+        ) {
+          throw new ConnectBrowserTransportError(
+            "Connect cross-origin ticket rejected",
+          );
+        }
+        this.pendingCrossOriginTicket = options.crossOriginTicket;
+      }
+    } else {
+      this.resolvedExplicitEndpoint = null;
+      if (options.crossOriginTicket) {
+        throw new ConnectBrowserTransportError(
+          "Connect cross-origin ticket requires an explicit target",
+        );
+      }
+    }
+  }
 
   state(): ConnectConnectionState {
     return this.stateValue;
@@ -701,8 +951,11 @@ export class ConnectBrowserTransport {
     const epoch = ++this.connectionEpoch;
     this.setState({ kind: "loading" });
     try {
-      this.runtime = await resolveConnectCrypto(this.options.cryptoLoader);
+      const runtime = await resolveConnectCrypto(this.options.cryptoLoader);
+      if (this.stopped || epoch !== this.connectionEpoch) return;
+      this.runtime = runtime;
     } catch (error) {
+      if (this.stopped || epoch !== this.connectionEpoch) return;
       const reason =
         error instanceof ConnectCryptoHoldError
           ? error.message
@@ -714,9 +967,48 @@ export class ConnectBrowserTransport {
     this.openSocket(epoch);
   }
 
+  /**
+   * Reversible phone/bfcache suspension. Invalidates the connection generation,
+   * drops Noise/socket state, and rejects in-flight requests without permanently
+   * stopping or clearing the custody factory / listeners.
+   */
+  suspend(): void {
+    if (this.stopped) return;
+    this.clearWakeWatchdog();
+    this.clearHandshakeDeadline();
+    ++this.connectionEpoch;
+    this.handshakeMaterialPending = false;
+    this.crossOriginPreludeSent = false;
+    if (this.reconnectTimer !== null) {
+      globalThis.clearTimeout(this.reconnectTimer);
+      this.reconnectTimer = null;
+    }
+    const socket = this.socket;
+    this.socket = null;
+    try {
+      socket?.close();
+    } catch {
+      // Best effort close while preserving identity for pageshow resume.
+    }
+    this.greeting = null;
+    this.dropHandshake();
+    this.dropTransportSession();
+    this.rejectPendingRequests("Connect transport suspended");
+    this.helloAccepted = false;
+    this.resyncInFlight = false;
+    this.resyncRequestId = null;
+    this.negotiatedLimits = null;
+    this.setState({ kind: "idle" });
+  }
+
   stop(): void {
     this.stopped = true;
+    this.clearWakeWatchdog();
+    this.clearHandshakeDeadline();
+    this.relinquishCrossOriginTicket();
     ++this.connectionEpoch;
+    this.handshakeMaterialPending = false;
+    this.crossOriginPreludeSent = false;
     if (this.reconnectTimer !== null) {
       globalThis.clearTimeout(this.reconnectTimer);
       this.reconnectTimer = null;
@@ -728,8 +1020,8 @@ export class ConnectBrowserTransport {
     } catch {
       // Browser close is best effort; state is already terminal.
     }
-    this.handshake = null;
-    this.transport = null;
+    this.dropHandshake();
+    this.dropTransportSession();
     this.rejectPendingRequests("Connect transport stopped");
     this.helloAccepted = false;
     this.resyncInFlight = false;
@@ -737,20 +1029,77 @@ export class ConnectBrowserTransport {
     this.setState({ kind: "closed", reason: "Connect transport stopped" });
   }
 
+  /**
+   * Foreground recovery for Connect. A ready socket may be dead after phone
+   * suspension; long background or stale authenticated progress replaces
+   * immediately. Protocol-rejected closed stays closed on automatic wake.
+   * Held protocol failures stay held.
+   */
+  wake(input: { hiddenDurationMs?: number } = {}): "resume" | "reconnect" | "held" | "start" {
+    if (this.stopped) return "held";
+    const kind = this.stateValue.kind;
+    if (kind === "held") return "held";
+    if (
+      kind === "closed" &&
+      this.stateValue.reason === "Connect protocol rejected"
+    ) {
+      return "held";
+    }
+
+    const now = Date.now();
+    const hiddenDurationMs =
+      input.hiddenDurationMs ??
+      (this.backgroundedAt !== null ? now - this.backgroundedAt : 0);
+    const authStale =
+      this.lastAuthenticatedFrameAt > 0 &&
+      now - this.lastAuthenticatedFrameAt >= CONNECT_LONG_BACKGROUND_MS;
+
+    if (kind === "ready" || kind === "resyncing") {
+      if (hiddenDurationMs >= CONNECT_LONG_BACKGROUND_MS || authStale) {
+        this.replaceConnection();
+        return "reconnect";
+      }
+      this.armWakeWatchdog();
+      return "resume";
+    }
+
+    if (kind === "idle" || kind === "closed" || kind === "reconnecting") {
+      void this.start();
+      return "start";
+    }
+    return "start";
+  }
+
+  /** Track document hidden duration for long-background wake replacement. */
+  setBackgrounded(hidden: boolean): void {
+    if (hidden) {
+      this.backgroundedAt ??= Date.now();
+      return;
+    }
+    this.backgroundedAt = null;
+  }
+
   /** Explicit replay/resync request; no legacy websocket downgrade exists. */
   requestResync(reason: "gap" | "replay_unavailable" = "gap"): boolean {
-    if (this.stateValue.kind !== "ready" && this.stateValue.kind !== "resyncing") {
+    if (
+      this.stateValue.kind !== "ready" &&
+      this.stateValue.kind !== "resyncing"
+    ) {
       return false;
     }
     if (this.resyncInFlight) return true;
     this.setState({ kind: "resyncing" });
     const requestId = uuidV7();
     this.resyncRequestId = requestId;
-    const sent = this.sendEnvelope(CONNECT_RESYNC_KIND, {
-      channel_sequence: this.inboundSequence,
-      newest_sequence: this.inboundSequence,
-      reason,
-    }, { requestId });
+    const sent = this.sendEnvelope(
+      CONNECT_RESYNC_KIND,
+      {
+        channel_sequence: this.inboundSequence,
+        newest_sequence: this.inboundSequence,
+        reason,
+      },
+      { requestId },
+    );
     this.resyncInFlight = sent;
     if (!sent) this.resyncRequestId = null;
     return sent;
@@ -778,18 +1127,26 @@ export class ConnectBrowserTransport {
     options: ConnectRequestOptions = {},
   ): Promise<DecodedConnectEnvelope> {
     if (this.stopped) {
-      return Promise.reject(new ConnectBrowserTransportError("Connect transport stopped"));
+      return Promise.reject(
+        new ConnectBrowserTransportError("Connect transport stopped"),
+      );
     }
     if (this.stateValue.kind !== "ready") {
-      return Promise.reject(new ConnectBrowserTransportError("Connect transport is not ready"));
+      return Promise.reject(
+        new ConnectBrowserTransportError("Connect transport is not ready"),
+      );
     }
     const requestId = options.requestId ?? uuidV7();
     if (!isUuidV7(requestId)) {
-      return Promise.reject(new ConnectBrowserTransportError("invalid Connect request identity"));
+      return Promise.reject(
+        new ConnectBrowserTransportError("invalid Connect request identity"),
+      );
     }
     const operationId = options.operationId ?? null;
     if (operationId !== null && !isUuidV7(operationId)) {
-      return Promise.reject(new ConnectBrowserTransportError("invalid Connect operation identity"));
+      return Promise.reject(
+        new ConnectBrowserTransportError("invalid Connect operation identity"),
+      );
     }
     if (
       typeof payload === "object" &&
@@ -798,7 +1155,9 @@ export class ConnectBrowserTransport {
       (payload as { request_id?: unknown }).request_id !== requestId
     ) {
       return Promise.reject(
-        new ConnectBrowserTransportError("Connect request correlation mismatch"),
+        new ConnectBrowserTransportError(
+          "Connect request correlation mismatch",
+        ),
       );
     }
     return new Promise<DecodedConnectEnvelope>((resolve, reject) => {
@@ -811,31 +1170,42 @@ export class ConnectBrowserTransport {
       });
       if (!sent) {
         this.pendingRequests.delete(requestId);
-        reject(new ConnectBrowserTransportError("Connect request could not be sent"));
+        reject(
+          new ConnectBrowserTransportError("Connect request could not be sent"),
+        );
       }
     });
   }
 
   private openSocket(epoch: number): void {
-    const locationLike = locationForConnect(this.options.location);
-    const url = buildConnectWebSocketUrl(locationLike);
+    const url =
+      this.resolvedExplicitEndpoint ??
+      buildConnectWebSocketUrl(locationForConnect(this.options.location));
     const factory =
       this.options.socketFactory ??
       ((address: string) => new WebSocket(address) as unknown as ConnectSocket);
     let socket: ConnectSocket;
     try {
       // Same-origin `/api/connect` carries the paired cookie and browser
-      // Origin automatically. Pairing data is never placed in the URL.
+      // Origin automatically. Cross-origin uses an exact approved WSS path
+      // with no pairing data in the URL.
       socket = factory(url);
     } catch {
-      this.setState({ kind: "closed", reason: "Connect socket construction failed" });
+      this.setState({
+        kind: "closed",
+        reason: "Connect socket construction failed",
+      });
       return;
     }
     this.socket = socket;
     this.greeting = null;
-    this.handshake = null;
-    this.transport = null;
-    this.connectionId = uuidV7();
+    this.handshakeMaterialPending = false;
+    this.crossOriginPreludeSent = false;
+    this.dropHandshake();
+    this.dropTransportSession();
+    // The authenticated greeting supplies this identity. A browser-generated
+    // connection id would disagree with the Noise prologue's route id.
+    this.connectionId = "";
     this.channelId = uuidV7();
     this.outboundSequence = 1;
     // A new Noise channel has a new connection/channel identity and a fresh
@@ -849,10 +1219,21 @@ export class ConnectBrowserTransport {
     this.resyncRequestId = null;
     socket.binaryType = "arraybuffer";
     this.setState({ kind: "connecting" });
+    if (this.resolvedExplicitEndpoint) {
+      this.armHandshakeDeadline(epoch);
+    }
     socket.onopen = () => {
       if (epoch !== this.connectionEpoch || this.socket !== socket) return;
-      // The server greeting is the first frame; handshake starts only after
-      // DMCN1 binds route/session IDs into the Rust prologue.
+      if (this.resolvedExplicitEndpoint) {
+        try {
+          this.sendCrossOriginPrelude(socket);
+        } catch {
+          this.protocolFailure();
+          return;
+        }
+      }
+      // The server greeting is the first inbound frame; handshake starts only
+      // after DMCN1 binds route/session IDs into the Rust prologue.
     };
     socket.onmessage = (event) => {
       if (epoch !== this.connectionEpoch || this.socket !== socket) return;
@@ -860,9 +1241,12 @@ export class ConnectBrowserTransport {
     };
     socket.onclose = () => {
       if (epoch !== this.connectionEpoch || this.socket !== socket) return;
+      this.clearHandshakeDeadline();
       this.socket = null;
-      this.handshake = null;
-      this.transport = null;
+      this.handshakeMaterialPending = false;
+      this.crossOriginPreludeSent = false;
+      this.dropHandshake();
+      this.dropTransportSession();
       this.helloAccepted = false;
       this.negotiatedLimits = null;
       this.resyncInFlight = false;
@@ -875,9 +1259,53 @@ export class ConnectBrowserTransport {
     };
   }
 
-  private async handleMessage(data: unknown): Promise<void> {
-    if (typeof data === "string" || data instanceof Blob) {
+  private sendCrossOriginPrelude(socket: ConnectSocket): void {
+    if (this.crossOriginPreludeSent) {
+      throw new Error("cross-origin prelude already sent");
+    }
+    socket.send(crossOriginMagicBytes);
+    let admission: { type: "ticket"; ticket: string } | { type: "resume" };
+    if (
+      !this.crossOriginTicketConsumed &&
+      typeof this.pendingCrossOriginTicket === "string"
+    ) {
+      admission = { type: "ticket", ticket: this.pendingCrossOriginTicket };
+      this.pendingCrossOriginTicket = null;
+      this.crossOriginTicketConsumed = true;
+    } else {
+      admission = { type: "resume" };
+    }
+    socket.send(inboundEncoder.encode(JSON.stringify(admission)));
+    this.crossOriginPreludeSent = true;
+  }
+
+  private armHandshakeDeadline(epoch: number): void {
+    this.clearHandshakeDeadline();
+    this.handshakeDeadlineTimer = globalThis.setTimeout(() => {
+      this.handshakeDeadlineTimer = null;
+      if (epoch !== this.connectionEpoch || this.stopped) return;
+      if (this.helloAccepted) return;
+      this.relinquishCrossOriginTicket();
       this.protocolFailure();
+    }, CONNECT_CROSS_ORIGIN_HANDSHAKE_DEADLINE_MS);
+  }
+
+  private clearHandshakeDeadline(): void {
+    if (this.handshakeDeadlineTimer !== null) {
+      globalThis.clearTimeout(this.handshakeDeadlineTimer);
+      this.handshakeDeadlineTimer = null;
+    }
+  }
+
+  private relinquishCrossOriginTicket(): void {
+    this.pendingCrossOriginTicket = null;
+  }
+
+  private async handleMessage(data: unknown): Promise<void> {
+    const epoch = this.connectionEpoch;
+    const socket = this.socket;
+    if (typeof data === "string" || data instanceof Blob) {
+      if (this.ownsMessageContext(epoch, socket)) this.protocolFailure();
       return;
     }
     const bytes =
@@ -887,12 +1315,19 @@ export class ConnectBrowserTransport {
           ? data
           : null;
     if (!bytes) {
-      this.protocolFailure();
+      if (this.ownsMessageContext(epoch, socket)) this.protocolFailure();
       return;
     }
     try {
       if (!this.greeting) {
-        this.beginHandshake(bytes);
+        await this.beginHandshake(bytes, epoch, socket);
+        return;
+      }
+      if (!this.ownsMessageContext(epoch, socket)) return;
+      if (this.handshakeMaterialPending) {
+        // A frame arrived while private material was still unwrapping. Fail
+        // closed rather than racing an older handshake onto a new socket.
+        this.protocolFailure();
         return;
       }
       const stateKind = this.stateValue.kind;
@@ -914,39 +1349,106 @@ export class ConnectBrowserTransport {
       }
       this.protocolFailure();
     } catch {
-      this.protocolFailure();
+      if (this.ownsMessageContext(epoch, socket)) this.protocolFailure();
     }
   }
 
-  private beginHandshake(bytes: Uint8Array): void {
+  private ownsMessageContext(
+    epoch: number,
+    socket: ConnectSocket | null,
+  ): boolean {
+    return (
+      !this.stopped &&
+      epoch === this.connectionEpoch &&
+      socket !== null &&
+      this.socket === socket
+    );
+  }
+
+  private async beginHandshake(
+    bytes: Uint8Array,
+    epoch: number,
+    socket: ConnectSocket | null,
+  ): Promise<void> {
     const greeting = parseConnectGreeting(bytes);
     const runtime = this.runtime;
     if (!greeting || !runtime) throw new Error("greeting rejected");
+    if (this.handshakeMaterialPending || this.handshake) {
+      throw new Error("handshake already in progress");
+    }
     if (
       this.options.hostPublicId &&
-      base64Encode(this.options.hostPublicId) !== base64Encode(greeting.hostPublicId)
+      base64Encode(this.options.hostPublicId) !==
+        base64Encode(greeting.hostPublicId)
     ) {
       throw new Error("host binding rejected");
     }
     this.greeting = greeting;
-    const hostPublicId = this.options.hostPublicId ?? greeting.hostPublicId;
-    this.handshake = new runtime.WasmConnectHandshake(
-      runtime.connect_noise_pattern(this.options.firstPairing),
-      this.options.firstPairing,
-      this.options.role === "responder" ? 1 : 0,
-      this.options.privateKey,
-      this.options.localPublic,
-      this.options.expectedRemote,
-      hostPublicId,
-      this.options.devicePublicId,
-      greeting.routeId,
-      greeting.sessionId,
-      this.options.purpose ?? 1,
-      this.options.openedAtUnix ?? BigInt(Math.floor(Date.now() / 1000)),
-      this.options.directReachable ?? true,
-    );
+    this.connectionId = uuidFromBytes(greeting.routeId);
+    this.handshakeMaterialPending = true;
     this.setState({ kind: "handshaking" });
-    if (this.options.role !== "responder") this.sendHandshakeMessage();
+
+    let privateKey: Uint8Array | null = null;
+    let factoryOwned = false;
+    try {
+      if (this.options.handshakeMaterialFactory) {
+        const material = await this.options.handshakeMaterialFactory();
+        factoryOwned = true;
+        privateKey = material.privateKey;
+        if (
+          material.localPublic &&
+          base64Encode(material.localPublic) !==
+            base64Encode(this.options.localPublic)
+        ) {
+          throw new Error("handshake local public mismatch");
+        }
+      } else if (this.options.privateKey) {
+        privateKey = this.options.privateKey;
+      } else {
+        throw new Error("handshake material missing");
+      }
+      if (
+        !this.ownsMessageContext(epoch, socket) ||
+        this.greeting !== greeting
+      ) {
+        return;
+      }
+      if (!(privateKey instanceof Uint8Array) || privateKey.byteLength !== 32) {
+        throw new Error("handshake private key rejected");
+      }
+      const hostPublicId = this.options.hostPublicId ?? greeting.hostPublicId;
+      this.dropHandshake();
+      try {
+        this.handshake = new runtime.WasmConnectHandshake(
+          runtime.connect_noise_pattern(this.noiseFirstPairing),
+          this.noiseFirstPairing,
+          this.options.role === "responder" ? 1 : 0,
+          privateKey,
+          this.options.localPublic,
+          this.options.expectedRemote,
+          hostPublicId,
+          this.options.devicePublicId,
+          greeting.routeId,
+          greeting.sessionId,
+          this.options.purpose ?? 1,
+          this.options.openedAtUnix ?? BigInt(Math.floor(Date.now() / 1000)),
+          this.options.directReachable ?? true,
+        );
+      } catch (error) {
+        if (factoryOwned) wipeBytes(privateKey);
+        privateKey = null;
+        throw error;
+      }
+      if (this.options.role !== "responder") this.sendHandshakeMessage();
+    } finally {
+      if (factoryOwned) wipeBytes(privateKey);
+      if (
+        this.ownsMessageContext(epoch, socket) &&
+        this.greeting === greeting
+      ) {
+        this.handshakeMaterialPending = false;
+      }
+    }
   }
 
   private advanceHandshake(bytes: Uint8Array): void {
@@ -971,11 +1473,11 @@ export class ConnectBrowserTransport {
   private completeHandshake(): void {
     const handshake = this.handshake;
     if (!handshake || !handshake.is_finished()) return;
+    this.dropTransportSession();
     this.transport = handshake.finish();
-    this.handshake = null;
-    this.reconnectDelayMs = CONNECT_RECONNECT_MIN_MS;
-    // Noise completion only authenticates the channel. The application is not
-    // ready until the host's typed Hello response has been validated.
+    this.dropHandshake();
+    // Noise completion only authenticates the channel. Backoff resets only after
+    // the host's typed Hello is validated — not on Noise alone.
     this.helloAccepted = false;
     this.setState({ kind: "handshaking" });
     this.sendHello();
@@ -1005,8 +1507,11 @@ export class ConnectBrowserTransport {
     const greeting = this.greeting;
     if (!socket || !runtime || !transport || !greeting) return false;
     try {
-      const limits = this.negotiatedLimits ?? this.options.limits ?? DEFAULT_CONNECT_LIMITS;
-      const payloadBytes = runtime.encode_connect_payload_json(JSON.stringify(payload));
+      const limits =
+        this.negotiatedLimits ?? this.options.limits ?? DEFAULT_CONNECT_LIMITS;
+      const payloadBytes = runtime.encode_connect_payload_json(
+        JSON.stringify(payload),
+      );
       const sequence = this.outboundSequence;
       if (!Number.isSafeInteger(sequence) || sequence <= 0) return false;
       const privacyClass = options.privacyClass ?? "local_only";
@@ -1018,9 +1523,13 @@ export class ConnectBrowserTransport {
         !Number.isInteger(payloadVersion) ||
         payloadVersion <= 0 ||
         payloadVersion > 0xffff ||
-        !["local_only", "managed_metadata", "raw_content"].includes(privacyClass)
+        !["local_only", "managed_metadata", "raw_content"].includes(
+          privacyClass,
+        )
       ) {
-        throw new ConnectBrowserTransportError("Connect payload metadata rejected");
+        throw new ConnectBrowserTransportError(
+          "Connect payload metadata rejected",
+        );
       }
       const envelope: ConnectEnvelopeJson = {
         protocolMajor: 1,
@@ -1039,19 +1548,33 @@ export class ConnectBrowserTransport {
         payloadVersion,
         payloadBase64: base64Encode(payloadBytes),
       };
-      if (!isUuidV7(envelope.connectionId) || !isUuidV7(envelope.sessionId) || !isUuidV7(envelope.channelId)) {
-        throw new ConnectBrowserTransportError("Connect channel identity rejected");
+      if (
+        !isUuidV7(envelope.connectionId) ||
+        !isUuidV7(envelope.sessionId) ||
+        !isUuidV7(envelope.channelId)
+      ) {
+        throw new ConnectBrowserTransportError(
+          "Connect channel identity rejected",
+        );
       }
       if (envelope.requestId !== null && !isUuidV7(envelope.requestId)) {
-        throw new ConnectBrowserTransportError("Connect request identity rejected");
+        throw new ConnectBrowserTransportError(
+          "Connect request identity rejected",
+        );
       }
       if (envelope.operationId !== null && !isUuidV7(envelope.operationId)) {
-        throw new ConnectBrowserTransportError("Connect operation identity rejected");
+        throw new ConnectBrowserTransportError(
+          "Connect operation identity rejected",
+        );
       }
       const plaintext = runtime.encode_connect_envelope_json(
         JSON.stringify(envelope),
       );
-      const sealed = transport.seal(BigInt(sequence), secureRandomBytes(16), plaintext);
+      const sealed = transport.seal(
+        BigInt(sequence),
+        secureRandomBytes(16),
+        plaintext,
+      );
       socket.send(sealed);
       this.outboundSequence += 1;
       return true;
@@ -1065,7 +1588,8 @@ export class ConnectBrowserTransport {
     const runtime = this.runtime;
     const transport = this.transport;
     const greeting = this.greeting;
-    if (!runtime || !transport || !greeting) throw new Error("transport missing");
+    if (!runtime || !transport || !greeting)
+      throw new Error("transport missing");
     const sealed = decodeConnectSealedFrame(bytes);
     const envelopeBytes = transport.open(bytes);
     let parsed: unknown;
@@ -1115,11 +1639,18 @@ export class ConnectBrowserTransport {
     }
     if (
       envelope.privacyClass === "raw_content" &&
-      ![10, 11, 14].includes(envelope.payloadKind)
+      ![10, 11, 14, HOST_STREAM_OUTPUT].includes(envelope.payloadKind)
     ) {
       throw new Error("Connect privacy class rejected");
     }
-    if (this.helloAccepted && this.negotiatedLimits && !sameLimits(limits, this.negotiatedLimits)) {
+    if (isHostOutputKind(envelope.payloadKind) && envelope.privacyClass === "managed_metadata") {
+      throw new Error("Connect privacy class rejected");
+    }
+    if (
+      this.helloAccepted &&
+      this.negotiatedLimits &&
+      !sameLimits(limits, this.negotiatedLimits)
+    ) {
       throw new Error("Connect negotiated limits changed");
     }
     if (envelope.sequence <= this.inboundSequence) return;
@@ -1153,7 +1684,9 @@ export class ConnectBrowserTransport {
     let payload: unknown;
     try {
       payload = JSON.parse(
-        runtime.decode_connect_payload_json(base64Decode(envelope.payloadBase64)),
+        runtime.decode_connect_payload_json(
+          base64Decode(envelope.payloadBase64),
+        ),
       ) as unknown;
     } catch {
       throw new Error("Connect payload rejected");
@@ -1171,9 +1704,12 @@ export class ConnectBrowserTransport {
         throw new Error("Connect Hello payload rejected");
       }
       const hello = payload as Record<string, unknown>;
-      if (
-        !isConnectLimits(hello.limits)
-      ) {
+      const requested = this.options.capabilities ?? 0;
+      if (!capabilityBits(hello.capabilities) || !capabilityBits(requested) ||
+          (BigInt(hello.capabilities) & BigInt(requested)) !== BigInt(hello.capabilities)) {
+        throw new Error("Connect Hello capabilities rejected");
+      }
+      if (!isConnectLimits(hello.limits)) {
         throw new Error("Connect negotiated Hello limits rejected");
       }
       const negotiated = hello.limits;
@@ -1181,8 +1717,14 @@ export class ConnectBrowserTransport {
         throw new Error("Connect Hello limits do not match envelope");
       }
       this.negotiatedLimits = negotiated;
+      this.negotiatedCapabilities = hello.capabilities;
       this.helloAccepted = true;
+      this.clearHandshakeDeadline();
+      // Production browser Connect always uses Noise XX for every connection
+      // (including cross-origin resume). Do not flip to IK after Hello.
       this.inboundSequence = envelope.sequence;
+      this.reconnectDelayMs = CONNECT_RECONNECT_MIN_MS;
+      this.noteAuthenticatedProgress();
       this.setState({ kind: "ready" });
     } else if (isResyncSnapshotFrame) {
       if (!isBoundedResyncSnapshot(payload, envelope.requestId, limits)) {
@@ -1195,12 +1737,14 @@ export class ConnectBrowserTransport {
       this.inboundSequence = envelope.sequence;
       this.resyncInFlight = false;
       this.resyncRequestId = null;
+      this.noteAuthenticatedProgress();
       this.setState({ kind: "ready" });
     } else {
       if (envelope.sequence !== this.inboundSequence + 1) {
         throw new Error("Connect sequence gap remained unresolved");
       }
       this.inboundSequence = envelope.sequence;
+      this.noteAuthenticatedProgress();
     }
     if (
       envelope.payloadKind === CONNECT_HELLO_KIND ||
@@ -1208,11 +1752,19 @@ export class ConnectBrowserTransport {
     ) {
       if (typeof payload === "object" && payload !== null) {
         const record = payload as Record<string, unknown>;
-        if (typeof record.client_id === "string") this.options.onClientId?.(record.client_id);
-        if ("capability_grant" in record) this.options.onCapabilityGrant?.(record.capability_grant);
+        if (record.client_id !== undefined && record.client_id !== null) {
+          const clientId = protocolUuid(record.client_id);
+          if (!clientId) throw new Error("Connect client identity rejected");
+          this.options.onClientId?.(clientId);
+        }
+        if ("capability_grant" in record)
+          this.options.onCapabilityGrant?.(record.capability_grant);
       }
     }
     const decoded = { ...envelope, payload } as DecodedConnectEnvelope;
+    if (isHostOutputKind(envelope.payloadKind)) {
+      decoded.payload = decodeHostOutput(decoded, this.negotiatedCapabilities);
+    }
     const pending = envelope.requestId
       ? this.pendingRequests.get(envelope.requestId)
       : undefined;
@@ -1244,8 +1796,13 @@ export class ConnectBrowserTransport {
   private protocolFailure(): void {
     const socket = this.socket;
     this.socket = null;
-    this.handshake = null;
-    this.transport = null;
+    this.handshakeMaterialPending = false;
+    this.crossOriginPreludeSent = false;
+    this.clearWakeWatchdog();
+    this.clearHandshakeDeadline();
+    this.relinquishCrossOriginTicket();
+    this.dropHandshake();
+    this.dropTransportSession();
     this.helloAccepted = false;
     this.negotiatedLimits = null;
     this.resyncInFlight = false;
@@ -1257,6 +1814,74 @@ export class ConnectBrowserTransport {
       // Best effort close; no downgrade is attempted.
     }
     this.setState({ kind: "closed", reason: "Connect protocol rejected" });
+  }
+
+  private dropHandshake(): void {
+    const handshake = this.handshake;
+    this.handshake = null;
+    releaseOwnedWasm(handshake);
+  }
+
+  private dropTransportSession(): void {
+    const transport = this.transport;
+    this.transport = null;
+    releaseOwnedWasm(transport);
+  }
+
+  private replaceConnection(): void {
+    if (this.stopped) return;
+    this.clearWakeWatchdog();
+    this.clearHandshakeDeadline();
+    ++this.connectionEpoch;
+    this.handshakeMaterialPending = false;
+    this.crossOriginPreludeSent = false;
+    if (this.reconnectTimer !== null) {
+      globalThis.clearTimeout(this.reconnectTimer);
+      this.reconnectTimer = null;
+    }
+    const socket = this.socket;
+    this.socket = null;
+    try {
+      socket?.close();
+    } catch {
+      // Best effort; replacement start owns the next socket.
+    }
+    this.greeting = null;
+    this.dropHandshake();
+    this.dropTransportSession();
+    this.rejectPendingRequests("Connect wake replaced a stale channel");
+    this.helloAccepted = false;
+    this.resyncInFlight = false;
+    this.resyncRequestId = null;
+    this.negotiatedLimits = null;
+    this.setState({ kind: "reconnecting" });
+    void this.start();
+  }
+
+  private armWakeWatchdog(): void {
+    this.clearWakeWatchdog();
+    const epoch = this.connectionEpoch;
+    this.wakeWatchdogTimer = globalThis.setTimeout(() => {
+      this.wakeWatchdogTimer = null;
+      if (this.stopped || epoch !== this.connectionEpoch) return;
+      if (
+        this.stateValue.kind === "ready" ||
+        this.stateValue.kind === "resyncing"
+      ) {
+        this.replaceConnection();
+      }
+    }, CONNECT_WAKE_WATCHDOG_MS);
+  }
+
+  private clearWakeWatchdog(): void {
+    if (this.wakeWatchdogTimer === null) return;
+    globalThis.clearTimeout(this.wakeWatchdogTimer);
+    this.wakeWatchdogTimer = null;
+  }
+
+  private noteAuthenticatedProgress(): void {
+    this.lastAuthenticatedFrameAt = Date.now();
+    this.clearWakeWatchdog();
   }
 
   private rejectPendingRequests(reason: string): void {
@@ -1274,4 +1899,3 @@ export class ConnectBrowserTransport {
     for (const listener of this.stateListeners) listener(state);
   }
 }
-

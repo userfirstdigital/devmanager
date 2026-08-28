@@ -7,7 +7,9 @@
 use serde::{Deserialize, Serialize};
 
 use crate::domain::agent_resource::AgentResourceBinding;
-use crate::domain::id::{AgentSessionId, ConfiguredServiceId, ResourceId, TaskId, TerminalId};
+use crate::domain::id::{
+    AgentSessionId, ConfiguredServiceId, ResourceId, SubscriptionId, TaskId, TerminalId,
+};
 use crate::domain::task::{WorkspaceBindingKind, WorkspaceRef};
 use crate::providers::ProviderKind;
 use crate::terminal::protocol::TerminalSessionId;
@@ -94,6 +96,14 @@ pub enum TaskCockpitDeniedReason {
 #[serde(rename_all = "snake_case")]
 pub enum TaskCockpitUnavailableReason {
     TerminalUnavailable,
+    /// Host-attested: a provider launch/restore is queued or in flight for this task.
+    TerminalStartPending,
+    /// Host-attested: no pending launch, no live provider binding, and no
+    /// persisted launch for the exact agent — safe to StartProviderSession once.
+    TerminalNotStarted,
+    /// Host-attested: live identityless Codex PTY shows a blocking trust/setup
+    /// screen that requires user action on that host before composer input.
+    TerminalProviderSetupRequired,
     GitAuthorityNotIssued,
     FileAuthorityNotIssued,
     SshOperationUnsupported,
@@ -225,6 +235,8 @@ pub fn redact_repository_label(label: &str) -> String {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum TaskCockpitQuery {
+    /// Exact current primary-provider input fences from the owning host.
+    ProviderInputState,
     /// Read-only host configuration summary for the native configuration rail.
     /// This carries labels and capability metadata only; roots, commands,
     /// environment values, and credential material remain host-private.
@@ -274,15 +286,35 @@ pub enum TaskCockpitQuery {
     /// Local-authority provider settings snapshot / refresh / mutate.
     /// Handled before task-id requirement; Connect maps these to deny.
     ProviderSettings(crate::providers::settings::ProviderSettingsHostRequest),
+    /// Explicit local-only listener setup. Never authorized over Connect.
+    RemoteAccess(crate::host::remote_setup::RemoteSetupRequest),
     /// Read the bounded provider-neutral semantic conversation retained for
     /// the selected Task. The cursor is exclusive; zero requests the current
     /// retained window from its beginning.
     Conversation {
         after_sequence: u64,
     },
+    /// Open an ephemeral semantic-conversation subscription for the selected
+    /// Task. Returns one initial page plus a subscription id; later dirtiness
+    /// arrives as coalesced `ConversationDirty` notices (no per-token events).
+    OpenConversationSubscription {
+        after_sequence: u64,
+    },
+    /// Release one conversation subscription owned by this client/output/task.
+    ReleaseConversationSubscription {
+        subscription_id: SubscriptionId,
+    },
     /// One bounded, task-owned terminal screen using the host's exact
     /// task/agent/resource generation fence. This query never launches a PTY.
+    /// Missing attachment remains `TerminalUnavailable` for wire compatibility —
+    /// it is not authoritative absence.
     Terminal,
+    /// Opt-in readiness classification for first-send. Shares the Terminal
+    /// projection when live and chat-ready; otherwise may return
+    /// `TerminalStartPending`, `TerminalProviderSetupRequired`, or
+    /// `TerminalNotStarted`. Legacy `Terminal` callers never receive the new
+    /// reasons. Older hosts reject this variant — clients must fail closed.
+    TerminalReadiness,
     WorkspaceStatus,
     /// Bounded path-redacted catalog of repositories for the exact Task/project.
     GitRepositories,
@@ -647,12 +679,21 @@ impl AgentConnectionSnapshot {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum TaskCockpitResult {
+    ProviderInputState(ProviderInputStateProjection),
     Config(ConfigSidebarSnapshot),
     ConfigCommandDetail(ConfigCommandDetailProjection),
     AgentConnection(AgentConnectionSnapshot),
     ProviderSettings(crate::providers::settings::ProviderSettingsReply),
+    RemoteAccess(crate::host::remote_setup::RemoteSetupReply),
     BrowserProcessSession(BrowserProcessSessionProjection),
     Conversation(crate::domain::snapshot::SemanticJournalPage),
+    ConversationSubscription {
+        subscription_id: SubscriptionId,
+        page: crate::domain::snapshot::SemanticJournalPage,
+    },
+    ConversationSubscriptionReleased {
+        subscription_id: SubscriptionId,
+    },
     Terminal(TaskTerminalProjection),
     Workspace(TaskWorkspaceProjection),
     GitRepositories(TaskGitRepositoriesProjection),
@@ -678,6 +719,58 @@ pub enum TaskCockpitResult {
 pub struct BrowserProcessSessionProjection {
     pub task_id: crate::domain::id::TaskId,
     pub process_session_id: String,
+}
+
+/// Input authority without full projection maps or raw provider output.
+pub const MAX_PROVIDER_INPUT_STATE_WAITS: usize = 128;
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProviderInputStateProjection {
+    pub task_id: TaskId,
+    pub task_revision: u64,
+    pub action_epoch: u64,
+    pub agent_session_id: Option<AgentSessionId>,
+    pub runtime_generation: Option<u64>,
+    pub agent_lifecycle: Option<crate::domain::agent::AgentSessionLifecycle>,
+    pub provider_kind: Option<ProviderKind>,
+    pub provider_session_id: Option<crate::domain::agent::ProviderSessionId>,
+    pub current_turn: Option<crate::domain::id::TurnId>,
+    pub open_question: Option<crate::domain::id::QuestionId>,
+    pub open_approval: Option<crate::domain::id::ApprovalId>,
+    pub pending_wait_command_ids: Vec<crate::domain::id::CommandId>,
+}
+
+impl ProviderInputStateProjection {
+    pub fn from_snapshot(snapshot: &crate::domain::snapshot::TaskSnapshot) -> Self {
+        let agent = snapshot
+            .primary_agent_id
+            .and_then(|id| snapshot.agents.get(&id))
+            .filter(|agent| agent.task_id == snapshot.task.id);
+        let input = agent.and_then(|agent| snapshot.provider_sessions.get(&agent.id));
+        Self {
+            task_id: snapshot.task.id,
+            task_revision: snapshot.task.revision,
+            action_epoch: snapshot.task.action_epoch,
+            agent_session_id: agent.map(|a| a.id),
+            runtime_generation: agent.map(|a| a.runtime_generation),
+            agent_lifecycle: agent.map(|a| a.lifecycle),
+            provider_kind: agent.map(|a| a.provider_kind.clone()),
+            provider_session_id: agent.and_then(|a| a.provider_session_id.clone()),
+            current_turn: input.and_then(|p| p.current_turn),
+            open_question: input.and_then(|p| p.open_question),
+            open_approval: input.and_then(|p| p.open_approval),
+            pending_wait_command_ids: input
+                .map(|p| {
+                    p.waits
+                        .iter()
+                        .filter_map(|(id, wait)| wait.pending.then_some(*id))
+                        .take(MAX_PROVIDER_INPUT_STATE_WAITS + 1)
+                        .collect()
+                })
+                .unwrap_or_default(),
+        }
+    }
 }
 
 /// Bounded host-local RunCommand detail for edit. Command text is included;
@@ -785,10 +878,16 @@ pub fn cockpit_surface(query: &TaskCockpitQuery) -> TaskCockpitSurface {
         | TaskCockpitQuery::ConfigArchiveCommand { .. }
         | TaskCockpitQuery::ConfigRunCommand { .. }
         | TaskCockpitQuery::ConfigCommandDetail { .. }
-        | TaskCockpitQuery::ProviderSettings(_) => TaskCockpitSurface::Workspace,
+        | TaskCockpitQuery::ProviderSettings(_)
+        | TaskCockpitQuery::RemoteAccess(_) => TaskCockpitSurface::Workspace,
         TaskCockpitQuery::BrowserProcessSession => TaskCockpitSurface::Browser,
-        TaskCockpitQuery::Conversation { .. } => TaskCockpitSurface::Conversation,
-        TaskCockpitQuery::Terminal => TaskCockpitSurface::Terminal,
+        TaskCockpitQuery::Conversation { .. }
+        | TaskCockpitQuery::OpenConversationSubscription { .. }
+        | TaskCockpitQuery::ReleaseConversationSubscription { .. }
+        | TaskCockpitQuery::ProviderInputState => TaskCockpitSurface::Conversation,
+        TaskCockpitQuery::Terminal | TaskCockpitQuery::TerminalReadiness => {
+            TaskCockpitSurface::Terminal
+        }
         TaskCockpitQuery::WorkspaceStatus => TaskCockpitSurface::Workspace,
         TaskCockpitQuery::GitRepositories
         | TaskCockpitQuery::GitStatus
@@ -1193,6 +1292,37 @@ mod tests {
             encoded.get("task_cockpit").and_then(|value| value.as_str()),
             Some("terminal")
         );
+    }
+
+    #[test]
+    fn terminal_readiness_is_opt_in_wire_variant_on_terminal_surface() {
+        assert_eq!(
+            cockpit_surface(&TaskCockpitQuery::TerminalReadiness),
+            TaskCockpitSurface::Terminal
+        );
+        let encoded =
+            serde_json::to_value(Query::TaskCockpit(TaskCockpitQuery::TerminalReadiness))
+                .expect("encode readiness");
+        assert_eq!(
+            encoded.get("task_cockpit").and_then(|value| value.as_str()),
+            Some("terminal_readiness")
+        );
+        let unavailable = TaskCockpitResult::Unavailable {
+            surface: TaskCockpitSurface::Terminal,
+            reason: TaskCockpitUnavailableReason::TerminalNotStarted,
+        };
+        let round_trip: TaskCockpitResult =
+            serde_json::from_value(serde_json::to_value(&unavailable).expect("encode"))
+                .expect("decode");
+        assert_eq!(round_trip, unavailable);
+        let setup_required = TaskCockpitResult::Unavailable {
+            surface: TaskCockpitSurface::Terminal,
+            reason: TaskCockpitUnavailableReason::TerminalProviderSetupRequired,
+        };
+        let setup_round_trip: TaskCockpitResult =
+            serde_json::from_value(serde_json::to_value(&setup_required).expect("encode"))
+                .expect("decode setup reason");
+        assert_eq!(setup_round_trip, setup_required);
     }
 
     #[test]

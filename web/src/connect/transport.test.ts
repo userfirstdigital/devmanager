@@ -128,7 +128,8 @@ class FakeConnectWasmHandshake implements ConnectWasmHandshake {
 
 function fakeConnectRuntime(): ConnectCryptoRuntime {
   return {
-    WasmConnectHandshake: FakeConnectWasmHandshake as unknown as ConnectCryptoRuntime["WasmConnectHandshake"],
+    WasmConnectHandshake:
+      FakeConnectWasmHandshake as unknown as ConnectCryptoRuntime["WasmConnectHandshake"],
     connect_protocol_major: () => 1,
     connect_noise_pattern: (firstPairing) =>
       firstPairing
@@ -218,9 +219,7 @@ describe("selectConnectRoute", () => {
         location,
       }),
     ).toEqual({ kind: "noRoute", reason: "advertisedRelayInvalid" });
-    expect(
-      parseAdvertisedRelayUrl("https://relay.example/connect"),
-    ).toBeNull();
+    expect(parseAdvertisedRelayUrl("https://relay.example/connect")).toBeNull();
     expect(
       parseAdvertisedRelayUrl("wss://user:secret@relay.example/connect"),
     ).toBeNull();
@@ -254,15 +253,7 @@ describe("browser Connect transport boundary", () => {
       tag: new Uint8Array(32).fill(0x44),
     });
     expect(Array.from(encoded.slice(0, 9))).toEqual([
-      1,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      0,
-      7,
+      1, 0, 0, 0, 0, 0, 0, 0, 7,
     ]);
     expect(decodeConnectSealedFrame(encoded)).toMatchObject({
       version: 1,
@@ -360,6 +351,28 @@ describe("pending queue bounds and raw-terminal classification", () => {
 });
 
 describe("Connect channel sequencing and identity fences", () => {
+  it("binds the first sealed Hello to the server greeting route and session", async () => {
+    const socket = new FakeConnectSocket();
+    const transport = new ConnectBrowserTransport({
+      firstPairing: true,
+      privateKey: new Uint8Array(32).fill(1),
+      localPublic: new Uint8Array(32).fill(2),
+      location,
+      cryptoLoader: async () => fakeConnectRuntime(),
+      socketFactory: () => socket,
+    });
+    await transport.start();
+    socket.emitOpen();
+    socket.emit(connectGreeting());
+    socket.emit(new Uint8Array([0x03]));
+    const sealed = decodeConnectSealedFrame(socket.sent[socket.sent.length - 1]!);
+    const hello = JSON.parse(new TextDecoder().decode(sealed.ciphertext));
+    expect(hello.connectionId).toBe("01234567-89ab-7000-8000-000000000012");
+    expect(hello.sessionId).toBe("01234567-89ab-7000-8000-000000000013");
+    expect(hello.channelId).not.toBe(hello.connectionId);
+    transport.stop();
+  });
+
   it("does not deliver or advance an out-of-order frame before explicit resync", async () => {
     const socket = new FakeConnectSocket();
     const envelopes: number[] = [];
@@ -381,7 +394,9 @@ describe("Connect channel sequencing and identity fences", () => {
     const helloFrame = decodeConnectSealedFrame(
       socket.sent[socket.sent.length - 1] as Uint8Array,
     );
-    const hello = JSON.parse(new TextDecoder().decode(helloFrame.ciphertext)) as {
+    const hello = JSON.parse(
+      new TextDecoder().decode(helloFrame.ciphertext),
+    ) as {
       connectionId: string;
       sessionId: string;
       channelId: string;
@@ -437,7 +452,9 @@ describe("Connect channel sequencing and identity fences", () => {
     const resyncFrame = decodeConnectSealedFrame(
       socket.sent[socket.sent.length - 1] as Uint8Array,
     );
-    const resync = JSON.parse(new TextDecoder().decode(resyncFrame.ciphertext)) as {
+    const resync = JSON.parse(
+      new TextDecoder().decode(resyncFrame.ciphertext),
+    ) as {
       sequence: number;
       payloadKind: number;
       requestId: string;
@@ -503,7 +520,9 @@ describe("Connect channel sequencing and identity fences", () => {
     const helloFrame = decodeConnectSealedFrame(
       socket.sent[socket.sent.length - 1] as Uint8Array,
     );
-    const hello = JSON.parse(new TextDecoder().decode(helloFrame.ciphertext)) as {
+    const hello = JSON.parse(
+      new TextDecoder().decode(helloFrame.ciphertext),
+    ) as {
       connectionId: string;
       sessionId: string;
       channelId: string;
@@ -561,7 +580,9 @@ describe("Connect channel sequencing and identity fences", () => {
     const resyncFrame = decodeConnectSealedFrame(
       socket.sent[socket.sent.length - 1] as Uint8Array,
     );
-    const resync = JSON.parse(new TextDecoder().decode(resyncFrame.ciphertext)) as {
+    const resync = JSON.parse(
+      new TextDecoder().decode(resyncFrame.ciphertext),
+    ) as {
       requestId: string;
     };
     const unrelated = {
@@ -604,5 +625,453 @@ describe("Connect channel sequencing and identity fences", () => {
     expect(createConnectRequestId()).toMatch(
       /^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i,
     );
+  });
+});
+
+describe("Connect private handshake material factory", () => {
+  it("unwraps per handshake, wipes temporary bytes, and ignores stop races", async () => {
+    const socket = new FakeConnectSocket();
+    const privateBytes = new Uint8Array(32).fill(9);
+    let resolveMaterial:
+      | ((value: { privateKey: Uint8Array; localPublic: Uint8Array }) => void)
+      | null = null;
+    const materialPromise = new Promise<{
+      privateKey: Uint8Array;
+      localPublic: Uint8Array;
+    }>((resolve) => {
+      resolveMaterial = resolve;
+    });
+    const runtime: ConnectCryptoRuntime = {
+      ...fakeConnectRuntime(),
+      WasmConnectHandshake: vi.fn(function Handshake() {
+        return {
+          write_message: () => new Uint8Array([0x02]),
+          read_message: () => {},
+          is_finished: () => false,
+          finish: () => new FakeConnectWasmTransport(),
+          free: vi.fn(),
+        };
+      }) as unknown as ConnectCryptoRuntime["WasmConnectHandshake"],
+    };
+    const transport = new ConnectBrowserTransport({
+      firstPairing: true,
+      localPublic: new Uint8Array(32).fill(2),
+      handshakeMaterialFactory: async () => materialPromise,
+      location,
+      cryptoLoader: async () => runtime,
+      socketFactory: () => socket,
+    });
+
+    await transport.start();
+    socket.emitOpen();
+    socket.emit(connectGreeting());
+    await Promise.resolve();
+    transport.stop();
+    resolveMaterial!({
+      privateKey: privateBytes,
+      localPublic: new Uint8Array(32).fill(2),
+    });
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(transport.state()).toEqual({
+      kind: "closed",
+      reason: "Connect transport stopped",
+    });
+    expect(privateBytes.every((value) => value === 0)).toBe(true);
+    expect(runtime.WasmConnectHandshake).not.toHaveBeenCalled();
+  });
+
+  it("rejects constructing a transport with both fixture bytes and a factory", () => {
+    expect(
+      () =>
+        new ConnectBrowserTransport({
+          firstPairing: true,
+          privateKey: new Uint8Array(32).fill(1),
+          localPublic: new Uint8Array(32).fill(2),
+          handshakeMaterialFactory: async () => ({
+            privateKey: new Uint8Array(32).fill(1),
+          }),
+        }),
+    ).toThrow(/exactly one/);
+  });
+
+  it("rejects a 32-byte static key as devicePublicId at the constructor boundary", () => {
+    expect(
+      () =>
+        new ConnectBrowserTransport({
+          firstPairing: true,
+          privateKey: new Uint8Array(32).fill(1),
+          localPublic: new Uint8Array(32).fill(2),
+          devicePublicId: new Uint8Array(32).fill(3),
+        }),
+    ).toThrow(/device public id/);
+    expect(
+      () =>
+        new ConnectBrowserTransport({
+          firstPairing: true,
+          privateKey: new Uint8Array(32).fill(1),
+          localPublic: new Uint8Array(32).fill(2),
+          devicePublicId: new Uint8Array(16).fill(3),
+        }),
+    ).not.toThrow();
+  });
+
+  it("does not let an old rejected unwrap close a newer reconnect socket", async () => {
+    const sockets: FakeConnectSocket[] = [];
+    let rejectMaterial: ((error: Error) => void) | null = null;
+    let resolveMaterial:
+      | ((value: {
+          privateKey: Uint8Array;
+          localPublic: Uint8Array;
+        }) => void)
+      | null = null;
+    let materialCalls = 0;
+    const transport = new ConnectBrowserTransport({
+      firstPairing: true,
+      localPublic: new Uint8Array(32).fill(2),
+      handshakeMaterialFactory: async () => {
+        materialCalls += 1;
+        if (materialCalls === 1) {
+          return new Promise((_, reject) => {
+            rejectMaterial = reject;
+          });
+        }
+        return new Promise((resolve) => {
+          resolveMaterial = resolve;
+        });
+      },
+      location,
+      cryptoLoader: async () => fakeConnectRuntime(),
+      socketFactory: () => {
+        const socket = new FakeConnectSocket();
+        sockets.push(socket);
+        return socket;
+      },
+    });
+
+    await transport.start();
+    sockets[0]!.emitOpen();
+    sockets[0]!.emit(connectGreeting());
+    await Promise.resolve();
+    sockets[0]!.close();
+    await Promise.resolve();
+    await transport.start();
+    sockets[1]!.emitOpen();
+    sockets[1]!.emit(connectGreeting());
+    await Promise.resolve();
+    rejectMaterial!(new Error("old unwrap rejected"));
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(transport.state().kind).not.toBe("closed");
+    expect(sockets[1]!.readyState).toBe(1);
+
+    const secondKey = new Uint8Array(32).fill(5);
+    resolveMaterial!({
+      privateKey: secondKey,
+      localPublic: new Uint8Array(32).fill(2),
+    });
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(secondKey.every((value) => value === 0)).toBe(true);
+    expect(sockets[1]!.sent.length).toBeGreaterThan(0);
+    transport.stop();
+  });
+
+  it("does not let an old resolved unwrap publish onto a newer reconnect socket", async () => {
+    const sockets: FakeConnectSocket[] = [];
+    let resolveOld:
+      | ((value: {
+          privateKey: Uint8Array;
+          localPublic: Uint8Array;
+        }) => void)
+      | null = null;
+    let resolveNew:
+      | ((value: {
+          privateKey: Uint8Array;
+          localPublic: Uint8Array;
+        }) => void)
+      | null = null;
+    let materialCalls = 0;
+    const handshakeCtor = vi.fn(function Handshake() {
+      return {
+        write_message: () => new Uint8Array([0x02]),
+        read_message: () => {},
+        is_finished: () => false,
+        finish: () => new FakeConnectWasmTransport(),
+      };
+    });
+    const transport = new ConnectBrowserTransport({
+      firstPairing: true,
+      localPublic: new Uint8Array(32).fill(2),
+      handshakeMaterialFactory: async () => {
+        materialCalls += 1;
+        if (materialCalls === 1) {
+          return new Promise((resolve) => {
+            resolveOld = resolve;
+          });
+        }
+        return new Promise((resolve) => {
+          resolveNew = resolve;
+        });
+      },
+      location,
+      cryptoLoader: async () => ({
+        ...fakeConnectRuntime(),
+        WasmConnectHandshake:
+          handshakeCtor as unknown as ConnectCryptoRuntime["WasmConnectHandshake"],
+      }),
+      socketFactory: () => {
+        const socket = new FakeConnectSocket();
+        sockets.push(socket);
+        return socket;
+      },
+    });
+
+    await transport.start();
+    sockets[0]!.emitOpen();
+    sockets[0]!.emit(connectGreeting());
+    await Promise.resolve();
+    sockets[0]!.close();
+    await Promise.resolve();
+    await transport.start();
+    sockets[1]!.emitOpen();
+    sockets[1]!.emit(connectGreeting());
+    await Promise.resolve();
+
+    const oldKey = new Uint8Array(32).fill(8);
+    resolveOld!({
+      privateKey: oldKey,
+      localPublic: new Uint8Array(32).fill(2),
+    });
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(oldKey.every((value) => value === 0)).toBe(true);
+    expect(handshakeCtor).not.toHaveBeenCalled();
+
+    const newKey = new Uint8Array(32).fill(7);
+    resolveNew!({
+      privateKey: newKey,
+      localPublic: new Uint8Array(32).fill(2),
+    });
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(handshakeCtor).toHaveBeenCalledTimes(1);
+    expect(newKey.every((value) => value === 0)).toBe(true);
+    transport.stop();
+  });
+
+  it("wipes factory private bytes when the handshake constructor throws", async () => {
+    const socket = new FakeConnectSocket();
+    const privateBytes = new Uint8Array(32).fill(4);
+    const transport = new ConnectBrowserTransport({
+      firstPairing: true,
+      localPublic: new Uint8Array(32).fill(2),
+      handshakeMaterialFactory: async () => ({
+        privateKey: privateBytes,
+        localPublic: new Uint8Array(32).fill(2),
+      }),
+      location,
+      cryptoLoader: async () => ({
+        ...fakeConnectRuntime(),
+        WasmConnectHandshake: vi.fn(() => {
+          throw new Error("constructor rejected");
+        }) as unknown as ConnectCryptoRuntime["WasmConnectHandshake"],
+      }),
+      socketFactory: () => socket,
+    });
+    await transport.start();
+    socket.emitOpen();
+    socket.emit(connectGreeting());
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(privateBytes.every((value) => value === 0)).toBe(true);
+    expect(transport.state()).toEqual({
+      kind: "closed",
+      reason: "Connect protocol rejected",
+    });
+  });
+
+  it("does not apply an old loader rejection after stop or a newer generation", async () => {
+    let rejectLoader: ((error: Error) => void) | null = null;
+    const transport = new ConnectBrowserTransport({
+      firstPairing: true,
+      privateKey: new Uint8Array(32).fill(1),
+      localPublic: new Uint8Array(32).fill(2),
+      location,
+      cryptoLoader: () =>
+        new Promise((_, reject) => {
+          rejectLoader = reject;
+        }),
+      socketFactory: () => new FakeConnectSocket(),
+    });
+    const starting = transport.start();
+    await Promise.resolve();
+    transport.stop();
+    rejectLoader!(new Error("old loader rejected"));
+    await starting;
+    expect(transport.state()).toEqual({
+      kind: "closed",
+      reason: "Connect transport stopped",
+    });
+
+    let resolveOld: ((runtime: ConnectCryptoRuntime) => void) | null = null;
+    let resolveNew: ((runtime: ConnectCryptoRuntime) => void) | null = null;
+    let loads = 0;
+    const sockets: FakeConnectSocket[] = [];
+    const raced = new ConnectBrowserTransport({
+      firstPairing: true,
+      privateKey: new Uint8Array(32).fill(1),
+      localPublic: new Uint8Array(32).fill(2),
+      location,
+      cryptoLoader: () => {
+        loads += 1;
+        if (loads === 1) {
+          return new Promise((resolve) => {
+            resolveOld = resolve;
+          });
+        }
+        return new Promise((resolve) => {
+          resolveNew = resolve;
+        });
+      },
+      socketFactory: () => {
+        const socket = new FakeConnectSocket();
+        sockets.push(socket);
+        return socket;
+      },
+    });
+    const first = raced.start();
+    await Promise.resolve();
+    raced.suspend();
+    const second = raced.start();
+    await Promise.resolve();
+    resolveOld!(fakeConnectRuntime());
+    await first;
+    expect(sockets).toHaveLength(0);
+    resolveNew!(fakeConnectRuntime());
+    await second;
+    expect(sockets).toHaveLength(1);
+    expect(raced.state().kind).toBe("connecting");
+    raced.stop();
+  });
+
+  it("suspends for pagehide then allows wake/start without permanent stop", async () => {
+    const sockets: FakeConnectSocket[] = [];
+    const transport = new ConnectBrowserTransport({
+      firstPairing: true,
+      privateKey: new Uint8Array(32).fill(1),
+      localPublic: new Uint8Array(32).fill(2),
+      location,
+      cryptoLoader: async () => fakeConnectRuntime(),
+      socketFactory: () => {
+        const socket = new FakeConnectSocket();
+        sockets.push(socket);
+        return socket;
+      },
+    });
+    await transport.start();
+    sockets[0]!.emitOpen();
+    transport.suspend();
+    expect(transport.state()).toEqual({ kind: "idle" });
+    expect(sockets[0]!.readyState).toBe(3);
+    expect(transport.wake()).toBe("start");
+    await expect.poll(() => sockets.length).toBeGreaterThanOrEqual(2);
+    transport.stop();
+    expect(transport.wake()).toBe("held");
+  });
+
+  it("replaces a ready channel after long background instead of no-op start", async () => {
+    const sockets: FakeConnectSocket[] = [];
+    const transport = new ConnectBrowserTransport({
+      firstPairing: true,
+      privateKey: new Uint8Array(32).fill(1),
+      localPublic: new Uint8Array(32).fill(2),
+      location,
+      cryptoLoader: async () => fakeConnectRuntime(),
+      socketFactory: () => {
+        const socket = new FakeConnectSocket();
+        sockets.push(socket);
+        return socket;
+      },
+    });
+    await transport.start();
+    sockets[0]!.emitOpen();
+    sockets[0]!.emit(connectGreeting());
+    await expect.poll(() => sockets[0]!.sent.length).toBeGreaterThan(0);
+    sockets[0]!.emit(new Uint8Array([0x03]));
+    await expect.poll(() => sockets[0]!.sent.length).toBeGreaterThan(1);
+    const helloFrame = decodeConnectSealedFrame(
+      sockets[0]!.sent[sockets[0]!.sent.length - 1] as Uint8Array,
+    );
+    const hello = JSON.parse(
+      new TextDecoder().decode(helloFrame.ciphertext),
+    ) as {
+      connectionId: string;
+      sessionId: string;
+      channelId: string;
+    };
+    const wasmTransport = new FakeConnectWasmTransport();
+    sockets[0]!.emit(
+      wasmTransport.seal(
+        1n,
+        new Uint8Array(16).fill(3),
+        new TextEncoder().encode(
+          JSON.stringify({
+            protocolMajor: 1,
+            protocolMinor: 0,
+            connectionId: hello.connectionId,
+            sessionId: hello.sessionId,
+            channelId: hello.channelId,
+            channel: "critical",
+            sequence: 1,
+            requestId: null,
+            operationId: null,
+            limits: connectLimits,
+            compression: "none",
+            privacyClass: "local_only",
+            payloadKind: 1,
+            payloadVersion: 1,
+            payloadBase64: encodeBase64Json({
+              capabilities: 0,
+              limits: connectLimits,
+              privacy_class: "local_only",
+            }),
+          }),
+        ),
+      ),
+    );
+    expect(transport.state()).toEqual({ kind: "ready" });
+    expect(transport.wake({ hiddenDurationMs: 10_000 })).toBe("reconnect");
+    await expect.poll(() => sockets.length).toBeGreaterThan(1);
+    transport.stop();
+  });
+
+  it("does not open a new socket when wake follows protocol rejection", async () => {
+    const sockets: FakeConnectSocket[] = [];
+    const transport = new ConnectBrowserTransport({
+      firstPairing: true,
+      privateKey: new Uint8Array(32).fill(1),
+      localPublic: new Uint8Array(32).fill(2),
+      location,
+      cryptoLoader: async () => fakeConnectRuntime(),
+      socketFactory: () => {
+        const socket = new FakeConnectSocket();
+        sockets.push(socket);
+        return socket;
+      },
+    });
+    await transport.start();
+    sockets[0]!.emitOpen();
+    sockets[0]!.emit(new Uint8Array([0x00]));
+    await expect.poll(() => transport.state().kind).toBe("closed");
+    expect(transport.state()).toEqual({
+      kind: "closed",
+      reason: "Connect protocol rejected",
+    });
+    const before = sockets.length;
+    expect(transport.wake()).toBe("held");
+    await Promise.resolve();
+    expect(sockets.length).toBe(before);
+    transport.stop();
   });
 });

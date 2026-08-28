@@ -1565,7 +1565,7 @@ impl InboxRuntime {
                 self.projection_updates = self.projection_updates.saturating_add(1);
                 Ok(false)
             }
-            SubscriptionUpdate::Stream(_) => Ok(false),
+            SubscriptionUpdate::Stream(_) | SubscriptionUpdate::ConversationDirty { .. } => Ok(false),
         }
     }
 
@@ -2156,6 +2156,10 @@ impl Inbox {
         self.incremental_updates = self.incremental_updates.saturating_add(1);
     }
 
+    pub fn unread_cursor(&self) -> &UnreadCursor {
+        &self.unread
+    }
+
     pub fn set_unread_cursor(&mut self, unread: UnreadCursor) {
         self.unread = unread;
         for row in self.rows.iter_mut().chain(self.history_rows.iter_mut()) {
@@ -2264,6 +2268,12 @@ impl Inbox {
 
     pub fn history_rows(&self) -> &[TaskRowModel] {
         &self.history_rows
+    }
+
+    /// Narrow adapter: active + history rows for host-qualified presentation
+    /// merge without exposing inbox internals to the fleet layer.
+    pub fn presentation_rows(&self) -> impl Iterator<Item = &TaskRowModel> {
+        self.rows.iter().chain(self.history_rows.iter())
     }
 
     pub fn history_row(&self, task_id: TaskId) -> Option<&TaskRowModel> {

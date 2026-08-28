@@ -40,6 +40,11 @@ pub enum SubscriptionUpdate {
         newest_sequence: u64,
     },
     Stream(StreamFrame),
+    ConversationDirty {
+        subscription_id: SubscriptionId,
+        task_id: crate::domain::TaskId,
+        high_water: u64,
+    },
 }
 
 #[derive(Debug)]
@@ -545,6 +550,11 @@ impl ClientSubscription {
                 })
             }
             UnsolicitedServerMessage::Stream(frame) => Ok(SubscriptionUpdate::Stream(frame)),
+            UnsolicitedServerMessage::ConversationDirty { subscription_id, task_id, high_water } => {
+                // This advisory owns a conversation subscription, not the
+                // durable replay subscription or its cursor.
+                Ok(SubscriptionUpdate::ConversationDirty { subscription_id, task_id, high_water })
+            }
         }
     }
 
@@ -1083,6 +1093,20 @@ mod tests {
             matches!(err, SubscriptionError::ReplayOverflow { limit } if limit == MAX_PENDING_REPLAY_EVENTS)
         );
         assert_eq!(sub.pending_replay_events.len(), MAX_PENDING_REPLAY_EVENTS);
+    }
+
+    #[test]
+    fn conversation_wake_preserves_replay_cursor_and_its_own_subscription() {
+        let mut sub = ready_subscription();
+        let cursor = sub.model().unwrap().last_applied_sequence();
+        let subscription_id = SubscriptionId::new();
+        let task_id = crate::domain::TaskId::new();
+        let update = sub.handle_unsolicited_message(UnsolicitedServerMessage::ConversationDirty {
+            subscription_id, task_id, high_water: 19,
+        }).unwrap();
+        assert_eq!(update, SubscriptionUpdate::ConversationDirty { subscription_id, task_id, high_water: 19 });
+        assert_eq!(sub.state(), ClientSubscriptionState::Ready);
+        assert_eq!(sub.model().unwrap().last_applied_sequence(), cursor);
     }
 
     #[test]

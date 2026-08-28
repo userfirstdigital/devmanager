@@ -15,7 +15,6 @@ use std::error::Error;
 use std::fmt::{Display, Formatter};
 use std::fs;
 use std::path::{Path, PathBuf};
-#[cfg(test)]
 use std::sync::OnceLock;
 
 #[cfg(test)]
@@ -24,6 +23,69 @@ const APP_PROFILE_ENV: &str = "DEVMANAGER_PROFILE";
 const APP_INSTANCE_LABEL_ENV: &str = "DEVMANAGER_INSTANCE_LABEL";
 const CONFIG_FILE_NAME: &str = "config.json";
 const SESSION_FILE_NAME: &str = "session.json";
+
+/// The durable host binds the already validated/locked CLI profile once,
+/// before services resolve storage. Never mutate process environment to select
+/// a host's data: child providers and parallel tests have different lifetimes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct BoundHostStorage {
+    profile: String,
+    root: PathBuf,
+}
+
+#[cfg(not(test))]
+static BOUND_HOST_STORAGE: OnceLock<BoundHostStorage> = OnceLock::new();
+
+pub fn bind_durable_host_storage(profile: &str, root: &Path) -> Result<()> {
+    #[cfg(test)]
+    {
+        let _ = (profile, root);
+        // Unit tests always use the process-unique test root. This production
+        // bootstrap seam cannot redirect them to an installed/named profile.
+        return Err(PersistenceError::InvalidAppProfile);
+    }
+    #[cfg(not(test))]
+    {
+        let binding = validated_host_storage(profile, root)?;
+        if let Some(existing) = BOUND_HOST_STORAGE.get() {
+            return if existing == &binding {
+                Ok(())
+            } else {
+                Err(PersistenceError::InvalidAppProfile)
+            };
+        }
+        BOUND_HOST_STORAGE
+            .set(binding)
+            .map_err(|_| PersistenceError::InvalidAppProfile)
+    }
+}
+
+fn validated_host_storage(profile: &str, root: &Path) -> Result<BoundHostStorage> {
+    let AppProfile::Named(profile) =
+        AppProfile::named(profile).map_err(|_| PersistenceError::InvalidAppProfile)?
+    else {
+        return Err(PersistenceError::InvalidAppProfile);
+    };
+    if !root.is_absolute() || !root.is_dir() {
+        return Err(PersistenceError::InvalidAppProfile);
+    }
+    let root = root.canonicalize().map_err(|source| PersistenceError::Io {
+        path: root.to_path_buf(),
+        source,
+    })?;
+    let expected_name = if profile == "production" {
+        "com.userfirst.devmanager".to_string()
+    } else {
+        format!("com.userfirst.devmanager-{profile}")
+    };
+    if root.file_name().and_then(|name| name.to_str()) != Some(expected_name.as_str()) {
+        return Err(PersistenceError::InvalidAppProfile);
+    }
+    if cfg!(debug_assertions) && profile == "production" {
+        return Err(PersistenceError::InvalidAppProfile);
+    }
+    Ok(BoundHostStorage { profile, root })
+}
 
 #[derive(Debug, Clone)]
 pub struct WorkspaceSnapshot {
@@ -151,6 +213,9 @@ pub fn app_config_dir() -> Result<PathBuf> {
     }
     #[cfg(not(test))]
     {
+        if let Some(binding) = BOUND_HOST_STORAGE.get() {
+            return Ok(binding.root.clone());
+        }
         let profile = configured_storage_profile()?.or_else(default_debug_profile);
         dirs::config_dir()
             .map(|base| app_config_dir_for(&base, profile.as_deref()))
@@ -170,6 +235,10 @@ pub fn app_instance_label() -> Option<String> {
 }
 
 pub fn app_instance_profile() -> Option<String> {
+    #[cfg(not(test))]
+    if let Some(binding) = BOUND_HOST_STORAGE.get() {
+        return Some(binding.profile.clone());
+    }
     configured_profile().or_else(default_debug_profile)
 }
 
@@ -890,6 +959,29 @@ mod tests {
         let _ = fs::remove_dir_all(&path);
         fs::create_dir_all(&path).unwrap();
         path
+    }
+
+    #[test]
+    fn host_storage_binding_requires_the_exact_named_root() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let owner = directory
+            .path()
+            .join("com.userfirst.devmanager-remote-owner");
+        fs::create_dir(&owner).expect("owner root");
+        let binding = validated_host_storage("remote-owner", &owner).expect("exact root");
+        assert_eq!(binding.root, owner.canonicalize().unwrap());
+        assert_eq!(binding.profile, "remote-owner");
+        assert!(validated_host_storage("other-owner", &owner).is_err());
+        assert!(validated_host_storage("remote-owner", Path::new("relative")).is_err());
+        assert!(validated_host_storage("bad/profile", &owner).is_err());
+    }
+
+    #[test]
+    fn production_host_storage_binding_cannot_redirect_unit_tests() {
+        let before = app_config_dir().expect("test root");
+        assert!(bind_durable_host_storage("remote-owner", &before).is_err());
+        assert_eq!(app_config_dir().expect("same test root"), before);
+        assert!(before.starts_with(test_config_root()));
     }
 
     #[test]

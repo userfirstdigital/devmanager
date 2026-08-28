@@ -46,9 +46,14 @@ export function decode_connect_payload_json(input: Uint8Array): string;
 export function encode_connect_envelope_json(input: string): Uint8Array;
 
 /**
- * Encode a typed Connect payload map using the same named MessagePack
- * serializer as the native envelope. Binary payloads should be represented by
- * the envelope JSON ABI's `payloadBase64` field instead.
+ * Encode a typed Connect payload JSON document into the native named-field
+ * MessagePack wire format.
+ *
+ * Binary fields (for example native query `resume_cursor`) must use the exact
+ * marker object `{"$connectBinary":"<STANDARD padded base64>"}`. That marker
+ * serializes as MessagePack BIN. Ordinary JSON arrays remain arrays; UUID and
+ * other identity strings remain strings. Envelope `payloadBase64` is a
+ * separate envelope-level ABI and is unchanged here.
  */
 export function encode_connect_payload_json(input: string): Uint8Array;
 

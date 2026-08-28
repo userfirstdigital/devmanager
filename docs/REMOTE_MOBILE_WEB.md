@@ -1,156 +1,161 @@
-# DevManager Mobile Web App
+# Remote desktop and phone work
 
-DevManager's mobile surface is an installable, iPhone-first projection of the native host. It is designed for long sessions in which the phone is frequently locked, backgrounded, disconnected, or moved between networks while the native DevManager process continues running.
+The durable `devmanager-host` owns each task, provider, workspace and conversation
+journal. Remote clients control that owner; they never launch a local replacement
+because a connection is unavailable. A provider conversation ID is not a PTY ID.
 
-## Runtime model
+## Implementation and acceptance status
 
-The native DevManager process owns processes, PTYs, session state, semantic journals, control authority, and notification generation. The browser owns only presentation preferences, same-runtime drafts, its last installed-app route, and pending input awaiting host acknowledgement.
+This is the native-host remote path under development, not a claim that the
+complete multi-PC/WAN product has shipped. See
+[the design](superpowers/specs/2026-08-27-seamless-remote-work-design.md)
+and [current integration wave](superpowers/plans/2026-08-27-remote-wave-5.md).
 
-- Backgrounding or closing the PWA never stops a server, shell, SSH, Claude, or Codex process.
-- Foregrounding reconnects and reconciles automatically. There is no Resume, Reload, or Take Control action.
-- A warm return keeps the current route, scroll position where possible, draft, and host-authoritative session timeline.
-- An installed cold launch restores the last route only after the first host snapshot proves that the runtime and stable session still exist.
-- A native host restart creates a new runtime identity. The browser drops the old projection and same-runtime drafts instead of resurrecting stale sessions.
-- Control follows foreground interaction. A hidden, disconnected, or idle web controller becomes preemptible, and stale input generations are rejected at the host mutation boundary.
+Verified with an isolated real host:
 
-The browser stores no durable transcript or terminal journal. History exists in bounded host memory and therefore ends with the native process.
+- HTTP pairing, published host identity, Noise, assigned client identity,
+  canonical snapshots and native encrypted reconnect.
+- Two browser viewers receiving the same real Codex prompt/reply and correlated
+  provider conversation ID from a single Send click (no extra terminal Enter).
+- Cached conversations and unsent drafts surviving owner outage and page reopen,
+  with sending disabled until fresh authority is established.
+- A phone terminal control answering a provider's pre-conversation startup
+  prompt through the same runtime/epoch-fenced command path.
+- Canonical browser device enrollment and same-owner process restart: automatic
+  reconnect without pairing, retained history/draft, and a successful follow-up
+  in the same provider conversation.
+- Two encrypted host connections with the same raw task ID: a command captured
+  for A still executes on A after selecting B; stopping/reconnecting A leaves B
+  usable; A's stale admission is rejected after reconnect.
+- The production trusted-host list/forget operations reload both identities,
+  reject forgetting a changed identity, and forget exactly A without altering B.
+- A TLS/WSS cross-origin browser route with pinned Noise identity, one-use route
+  tickets, retained client identity on resume, and rejected wrong-Origin/reused
+  tickets. The temporary CA was scoped to the test client, not OS trust.
 
-## Native session views
+The latest consolidated browser gate passed 586 tests (one skipped), plus the
+production bundle build. Native workspace integration remains in progress;
+these results are not a final union or device-acceptance gate.
 
-Sessions is the default home and groups items that need attention, are active, or were recently active. Every row includes its project so similarly named sessions remain distinguishable.
+Still required: interrupted first-enrollment recovery, live revocation acceptance,
+unified native multi-host workspace, Connect
+WAN routing and physical two-PC/phone acceptance. Loopback does not prove LAN
+certificate trust, mobile sleep behavior or public WAN performance.
 
-- Claude and Codex use conversation text plus compact tool, diff, plan, question, status, and error cards.
-- Servers use status and resource summaries, native start/stop/restart controls, and wrapping selectable logs.
-- Shell and SSH use command/output groups with wrapping native text.
-- Every prompt is entered in a native HTML text area. iOS dictation, selection, autocorrection, paste, undo, and the software keyboard remain available.
-- PNG and JPEG attachment controls appear where the session supports images.
-- Raw Terminal is a lazy fallback for full-screen programs, mouse reporting, alternate-screen interfaces, or explicit advanced use. Leaving it returns to the native view.
+## Direct access without Connect
 
-AI presentation density defaults to **Calm**. Settings also offers **Minimal** and **Full** without changing the underlying session state.
+Use native **Settings → Remote access**. Read-only status does not start a
+listener. Enabling is an explicit local action; a browser cannot reconfigure
+listeners or establish host custody.
 
-## Pairing and addresses
+- Local development uses the exact loopback HTTP endpoint printed by its host.
+- LAN access requires a listen address, port, advertised HTTPS origin,
+  certificate and private-key files. The certificate must match the hostname
+  and be trusted by the connecting device.
+- Open that HTTPS origin and enter the pairing code in the form. Secrets belong
+  in the POST body, not URLs, history or referrers.
+- Keep the same origin after pairing. Cookies and browser custody are
+  origin-bound; changing a hostname is not an automatic trust migration.
 
-Enable **Settings → Remote → Host → Browser Access** in the native app. The listener defaults to `0.0.0.0:43872` for direct LAN use. Set **Browser bind address** to `127.0.0.1` when the trusted HTTPS proxy runs on the same computer. A successful invite pairs the browser, stores a signed host-specific cookie, and redirects into the app. The browser pair code remains valid for pairing additional devices until **Generate new code** or **Reset access** changes it. Generating a new code affects future pairings only; existing paired browsers remain valid. Reset access revokes every browser and creates new pairing and cookie-signing secrets.
+Plaintext LAN control, certificate-validation bypass and trusting arbitrary
+`Forwarded` headers are not supported shortcuts. DevManager does not silently
+change the firewall or install certificate trust. Do not expose the listener
+directly to the public internet. Outside-home routing uses the separately
+configured Connect service, not port forwarding.
 
-Plain LAN HTTP remains useful for diagnostics and control, but modern iPhone platform features require a secure context. Use a trusted HTTPS tunnel or reverse proxy for the installed experience. The proxy must preserve WebSocket upgrades and forward `/api/**`, `/pair`, the app shell, the manifest, and the service worker to the same DevManager listener.
+## Phone behavior
 
-Pair through the public origin itself. Copy the invite, retain its `/pair?t=...` path and query, replace the displayed local scheme/authority with the final `https://<public-host>`, and open that URL once in Safari. Pairing over the local HTTP URL and then navigating to the public hostname does not work: browser cookies are scoped to the authority that issued them.
+The inbox has active tasks, compact Done and an archive button opening a separate
+list. Task actions provide Done, explicit Restore, Rename, Archive and confirmed
+Delete after archival. These use the same persisted, host-qualified command outbox
+as Send; accepting a metadata action never clears the message draft.
 
-The trusted proxy must remove any client-supplied forwarding headers and set exactly one value for each of these headers on every forwarded HTTP and WebSocket request:
+The isolated real-browser lifecycle check exercised Done, opening Done without
+restoring, explicit Restore, Rename, Archive, archive-list opening and confirmed
+Delete. The follow-up UI corrections expand Done initially, derive archive
+progress from canonical state, and close a deleted task only when its owning
+projection confirms deletion. Those corrections passed the focused UI tests
+and the rebuilt-host real-browser recheck: Done was immediately visible,
+completed Archive no longer claimed to be closing, and confirmed Delete
+returned to the inbox without a writable deleted-task view.
 
-```text
-X-Forwarded-Proto: https
-X-Forwarded-Host: <the public host, including a non-default port>
-```
+Opening or renaming Done does not restore it. Sending a message restores it atomically on
+the host without an extra client-side reopen request. Archived and closing tasks
+require explicit Restore before sending. Selected tasks keep their semantic history
+and draft in place while the connection recovers. Terminal queries read the
+exact owner's current screen. Fixed terminal keys can answer startup prompts;
+raw terminal output is not stored in the durable browser cache.
 
-`X-Forwarded-Host` may be omitted only when the proxy preserves that same public authority in `Host`. Do not append forwarding values or send comma-separated lists. DevManager uses this exact public scheme and authority to issue `Secure` cookies and reject cross-origin WebSocket and push mutations.
+The composer uses an HTML text area for selection, paste, dictation and the
+software keyboard. Over HTTPS, Safari's **Share → Add to Home Screen** installs
+the PWA. Its start route is `/tasks?source=pwa`.
 
-Do not expose port `43872` directly to the public internet. Keep DevManager's cookie and pairing boundaries intact; do not add a proxy cache in front of authenticated API routes.
+Mobile operating systems may suspend sockets while locked. Seamlessness means
+immediate cached presentation followed by automatic authenticated catch-up,
+not uninterrupted background networking. Fresh input needs current host
+authority; offline drafts remain editable.
 
-## Production proxy and network checklist
+## One durable command path
 
-Use one of these topologies:
+Direct and future WAN clients use canonical commands/queries through shared
+Rust/WASM Noise. A pairing cookie is bootstrap admission, not a canonical
+device credential.
 
-- **Same-host proxy (recommended):** set **Browser bind address** to `127.0.0.1`; expose only the proxy's TCP `443` listener. No firewall rule is needed for `43872`.
-- **Proxy on another trusted machine:** bind to the specific private interface where possible, allow TCP `43872` only from the proxy's private IP, and deny every other source. Do not use a broad public-network or UDP rule.
+Before sending, the browser persists the exact host, client and command ID.
+Lost acknowledgment means **uncertain**, not permission to invent a new command.
+Recovery queries that owner's durable receipt. Runtime generation, action epoch,
+task revision and conversation identity stay host-validated fences.
 
-Before pairing a phone, verify all of the following:
+Acceptance, physical PTY delivery and observed provider execution are separate
+facts. Verify exact submitted text and a semantic response, not just a receipt.
+The managed Codex TUI remains the provider; this path does not start another
+app-server conversation or infer identity from transcript ordering.
 
-- the public hostname has a trusted, current TLS certificate and redirects HTTP to HTTPS without putting the invite token into an intermediate host
-- the proxy removes client-supplied `Forwarded`, `X-Forwarded-Proto`, `X-Forwarded-Host`, and related forwarding headers, then supplies the single canonical values documented above
-- WebSocket upgrades and long-lived connections are enabled; idle timeouts are long enough that ordinary phone backgrounding is handled by DevManager's reconnect path rather than a rapid proxy reconnect loop
-- `/api/**`, `/pair`, and authenticated responses are never cached; the proxy does not rewrite the service worker, manifest, hashed assets, cookies, or CSP headers
-- access logs omit or redact the `/pair` query string because it contains the invitation secret; application/error logs must not record cookies, authorization values, request bodies, prompt text, or attachment content
-- the origin is dedicated to this DevManager host; do not multiplex another app under the same authority and path space
+## Cache and upgrades
 
-The native app's `remote.json` contains cookie, pairing, TLS, and push credentials. DevManager writes it with current-user-only file permissions. Backups and diagnostic bundles must preserve that confidentiality and must not publish the file.
+IndexedDB stores bounded host-scoped metadata, semantic history, drafts, replay
+position and exact pending commands. Cache is presentation-only and never grants
+authority. A host restart must not discard drafts just because its runtime changed.
 
-## Install on iPhone
+The service worker caches static assets only, not authenticated API responses,
+raw terminals, file bodies or provider credentials. Private Noise bytes are
+encrypted with a non-extractable WebCrypto wrapping key. Ordinary upgrades
+must not rotate custody; corruption requires visible repair, not silent pairing.
 
-1. Pair through the trusted HTTPS origin in Safari.
-2. Confirm the app loads and Settings does not show **Requires a secure HTTPS address** in the notification row.
-3. Choose **Share → Add to Home Screen**.
-4. Launch the new DevManager icon rather than the original Safari tab.
+Bundle activation waits while drafts or uncertain commands make it unsafe.
+The embedded fingerprint covers web source, including tests: finish web edits
+before building the bundle and compiling Rust.
 
-The manifest starts at `/sessions?source=pwa`. Safe-area insets, standalone display, accessible zoom, light/dark appearance, and installed-only route restoration are handled by the web app.
+## Development verification
 
-## Notifications
-
-Notifications are optional and require both HTTPS and an installed Home Screen web app on supported iOS versions. DevManager requests permission only after the user taps **Enable notifications** in Settings.
-
-Notifications are limited to actionable transitions:
-
-- Claude or Codex needs input;
-- Claude or Codex completes while not being viewed;
-- a server crashes;
-- an SSH connection disconnects unexpectedly.
-
-Payloads contain only a generic action, project/session label, runtime identity, badge count, event identity, and stable deep link. Prompt text, terminal output, code, diffs, credentials, tokens, commands, and environment values are never included. A notification focuses an existing app window when possible and otherwise opens the stable session route. Viewing or acknowledging attention updates the aggregate badge. The visibly focused session does not also produce a system notification.
-
-If Settings reports that notifications are unavailable, check that the app is running from its Home Screen icon over HTTPS. Plain HTTP deliberately continues to offer the core UI without claiming installation or push support.
-
-## Provider adapters and fallback
-
-Recognized Claude Code sessions use supported command hooks to enrich the native timeline. Recognized Codex sessions use the documented app-server protocol through a loopback bridge while the normal TUI continues to run in the PTY. Both integrations are capability-detected and fail open.
-
-Custom commands, wrappers, unsupported provider versions, parser errors, or a sidecar failure never prevent the session from launching. DevManager marks the adapter as degraded and continues with its native DOM terminal projector. This fallback still wraps, selects, copies, and composes like a mobile app; only the richness of card classification changes.
-
-## Updates and offline behavior
-
-The service worker precaches only the versioned application shell, icons, and static assets. Pairing, authenticated API data, snapshots, semantic journals, terminal output, and push subscriptions are network-only and are never written to Cache Storage.
-
-A newly installed worker waits while a draft or host mutation is pending. DevManager activates it automatically at a safe visible navigation/foreground point after drafts are empty and mutations are acknowledged. If the embedded browser bundle and native host are incompatible, the app performs the same safe reconciliation and guards against reload loops.
-
-The cached shell can open while the host is unreachable, but it intentionally shows an automatic reconnect state rather than stale session content. Working offline is not supported because the host is the only runtime truth.
-
-## Security boundary
-
-The browser protocol is separate from the native remote protocol and exposes allowlisted, redacted DTOs and actions. It does not serialize SSH passwords or private keys, provider tokens, environment values, startup commands, arbitrary native settings, or unrelated sessions. Mutation payloads, image attachments, replay journals, queues, and HTTP bodies have explicit limits. Push endpoints require the paired browser cookie and subscriptions are associated with that browser installation.
-
-## Go-live smoke test
-
-A push to `master` starts release packaging. The release stays private in draft state until its complete asset-name set and exact tag commit pass the final check. Confirm the GitHub Actions `verify` job, version preparation, all platform builds, and release job are green. Confirm the published release tag points to the exact prepared commit, `latest.json` has the same version and expected platform URLs, and each updater asset has a non-empty `.sig` file.
-
-Do not restart the workstation's active DevManager host merely to test the artifact. Install on a clean/secondary Windows profile first and check:
-
-1. `https://<public-host>/api/health` returns `{"ok":true}` without a cache hit.
-2. The HTTPS app shell and manifest load, while an unpaired `/api/me` returns `401`.
-3. Use one public-origin invitation to pair two different browser installations. Both pair successfully and the code shown by the host remains unchanged. Generate a new code and confirm both paired browsers remain authorized while the old code no longer pairs a third browser.
-4. The installed Home Screen app connects its WebSocket, lists the expected projects/sessions, and sends one real prompt.
-5. Lock/background the phone, change state from the desktop, and return. The phone reconnects to the same runtime and current state without a Resume or Reconnect action.
-6. Drop and restore the phone network. Pending acknowledged input is not duplicated and current output catches up automatically.
-7. Reset browser access. Existing browser connections close and the old invite/cookie no longer authorize access.
-8. On the secondary host only, restart DevManager. The phone accepts the new blank runtime without resurrecting the old transcript or draft.
-9. Confirm the native updater verifies and offers the release before scheduling the real host restart at a point where losing the current in-memory web runtime is acceptable.
-
-## Release rollback
-
-- **Failure before GitHub Release publication:** leave the running host untouched and fix forward. If the workflow created an unpublished draft and orphan tag, delete both before retrying only after confirming that version was never public.
-- **Bad public artifact before installation:** immediately remove the bad GitHub Release so `releases/latest` falls back to the last good manifest, but retain its tag so that version can never be reused. Fix forward and publish the next higher version. A subsequent successful authoritative check replaces or discards a downloaded-but-uninstalled recalled update; until that check completes, tell affected clients not to choose **Restart to update**. Keep a copy of the failed workflow/artifact evidence for diagnosis.
-- **Bad artifact already installed:** stop further distribution, preserve the user's profile, and fix forward. Do not install an older binary over a profile written by a newer version unless backward compatibility has been explicitly verified.
-- **Proxy-only failure:** remove public routing or close TCP `443`; do not stop DevManager or delete `remote.json`. Existing native sessions continue under the desktop host while the web surface is unavailable.
-
-Installing an update restarts the native host and therefore intentionally creates a new web runtime. Schedule that restart; pushing and publishing alone do not disturb the currently running process.
-
-## Develop and verify the web app
-
-Installed release builds use the production profile. Unprofiled debug builds use `dev-debug`, `dev-watch.ps1` uses `dev-watch`, and Rust unit tests use process-unique temporary storage. Development and tests must never read or write the installed profile.
-
-Install exact dependencies and run the local Vite surface:
-
-```powershell
-npm --prefix web ci
-npm --prefix web run dev
-```
-
-Run the web gates and rebuild the tracked embedded bundle:
+Use an isolated profile and target; never restart the installed daily app.
+Root `AGENTS.md` governs process, persistence and Cargo isolation.
 
 ```powershell
 npm --prefix web test
-npm --prefix web run typecheck
 npm --prefix web run build
+# With an explicitly validated isolated CARGO_TARGET_DIR:
+cargo check --locked --lib --bins --tests
+cargo test --lib -- --test-threads=1
+cargo build --locked --bin devmanager-host --example remote-host-smoke
 ```
 
-`build.rs` never installs packages or reaches the network. It validates the tracked bundle, source fingerprint, manifest, service worker, icons, and referenced hashed assets. If source and bundle differ, run the exact `npm ci` and build commands above before compiling or packaging the Rust application.
+Run the example from that target's `debug/examples` directory. It creates an
+empty temporary workspace, profile, identity and loopback listener. Add
+`--with-codex` only for a deliberate real-provider smoke. Enter stops it;
+`restart` joins its exact owned process tree and restarts the same profile.
+Neither operation targets the installed app.
 
-The embedded web server uses no-cache responses for the app entry point, manifest, and service worker; immutable caching for content-hashed assets; SPA fallback for native deep links; NetworkOnly handling for authenticated endpoints; and restrictive content, framing, and MIME-sniffing headers.
+`remote-native-ui-smoke` prepares two real remote hosts sharing a task UUID,
+enrolls both in a third temporary native profile, and opens the canonical desktop
+shell. It depends on native trusted-host startup integration; fixture preparation
+is not an acceptance result. Build it with `devmanager-host`, copy that exact host
+binary beside the example in the isolated target's `debug/examples` directory,
+then run the example. Default mode starts no provider. Explicit `--with-codex`
+starts providers for deliberate chat checks but sends no prompts automatically.
+Closing its window tears down only its owned fixtures.
+
+Before release, exercise independent devices, owner restart, lock/wake, network
+loss, concurrent viewing, lost receipts, revocation and two owners with the same
+task UUID. Measure cached paint, catch-up and rendering separately from provider
+thinking. Confirm installed configuration hashes and process identity unchanged.

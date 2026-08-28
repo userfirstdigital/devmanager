@@ -5,7 +5,9 @@ use crate::domain::{
     SemanticJournalPayload, TaskId, TaskTerminalProjection,
 };
 
-use super::{Axis, PanePresentation, TaskWorkspace, WorkspaceError};
+#[cfg(test)]
+use super::TaskWorkspace;
+use super::{Axis, PanePresentation, Workspace, WorkspaceError};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ConversationQueryPriority {
@@ -30,11 +32,13 @@ pub fn conversation_poll_priorities_due(controller_ticks: u64) -> Vec<Conversati
     due
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct ConversationQueryPlan {
-    pub task_id: TaskId,
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ConversationQueryPlan<K = TaskId> {
+    pub task_id: K,
     pub priority: ConversationQueryPriority,
 }
+
+impl Copy for ConversationQueryPlan<TaskId> {}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum WorkspaceSelectionGesture {
@@ -45,28 +49,28 @@ pub enum WorkspaceSelectionGesture {
 /// Apply the task-list gesture without coupling the recursive model to GPUI.
 /// Plain selection focuses an open task or replaces the focused slot. Shift-
 /// selection adds or removes panes.
-pub fn apply_workspace_selection(
-    workspace: &mut Option<TaskWorkspace>,
-    task_id: TaskId,
+pub fn apply_workspace_selection<K: Clone + Ord + Eq>(
+    workspace: &mut Option<Workspace<K>>,
+    task_id: K,
     gesture: WorkspaceSelectionGesture,
 ) -> Result<(), WorkspaceError> {
     let Some(current) = workspace.as_mut() else {
-        *workspace = Some(TaskWorkspace::single(task_id));
+        *workspace = Some(Workspace::single(task_id));
         return Ok(());
     };
 
     match gesture {
         WorkspaceSelectionGesture::Plain => {
-            if current.contains_task(task_id) {
+            if current.contains_task(task_id.clone()) {
                 current.focus_task(task_id)
             } else if current.pane_count() <= 1 {
-                *workspace = Some(TaskWorkspace::single(task_id));
+                *workspace = Some(Workspace::single(task_id));
                 Ok(())
             } else {
                 current.replace_focused_task(task_id)
             }
         }
-        WorkspaceSelectionGesture::Toggle if current.contains_task(task_id) => {
+        WorkspaceSelectionGesture::Toggle if current.contains_task(task_id.clone()) => {
             let pane_id = current
                 .pane_for_task(task_id)
                 .map(|pane| pane.id)
@@ -110,6 +114,8 @@ struct PendingUserMessage {
 impl TaskConversationCache {
     pub fn as_page(&self) -> SemanticJournalPage {
         SemanticJournalPage {
+            oldest_sequence: 0,
+            cursor_rolled_over: false,
             after_sequence: 0,
             through_sequence: self.through_sequence,
             high_water: self.high_water,
@@ -149,6 +155,13 @@ impl TaskConversationCache {
     /// cursor-only polls do not force a visual reprojection.
     pub fn merge_page(&mut self, page: &SemanticJournalPage) -> bool {
         let prior_len = self.facts.len();
+        let reset_changed = page.cursor_rolled_over && prior_len > 0;
+        if page.cursor_rolled_over {
+            self.facts.clear();
+            self.high_water = 0;
+            self.through_sequence = 0;
+            self.next_sequence = None;
+        }
 
         if page.facts.is_empty() {
             self.high_water = self.high_water.max(page.high_water);
@@ -158,29 +171,36 @@ impl TaskConversationCache {
             if self.next_sequence.is_none() {
                 self.through_sequence = self.through_sequence.max(page.through_sequence);
             }
-            return false;
+            return reset_changed;
         }
 
-        let append_only = page.facts.iter().enumerate().all(|(index, fact)| {
-            let previous = index
-                .checked_sub(1)
-                .and_then(|prev| page.facts.get(prev).map(|fact| fact.sequence));
-            let ordered = previous.is_none_or(|previous| previous < fact.sequence);
-            ordered && fact.sequence > self.through_sequence
-        });
-        if append_only {
-            self.facts.extend(page.facts.iter().cloned());
-        } else {
-            for fact in &page.facts {
-                if self
-                    .facts
-                    .iter()
-                    .any(|existing| existing.sequence == fact.sequence)
-                {
-                    continue;
+        let mut changed = reset_changed;
+        let mut positions = self
+            .facts
+            .iter()
+            .enumerate()
+            .map(|(index, fact)| (fact.id, index))
+            .collect::<std::collections::HashMap<_, _>>();
+        let mut sequences = self
+            .facts
+            .iter()
+            .map(|fact| fact.sequence)
+            .collect::<std::collections::HashSet<_>>();
+        for fact in &page.facts {
+            if let Some(index) = positions.get(&fact.id).copied() {
+                if fact.sequence > self.facts[index].sequence {
+                    sequences.remove(&self.facts[index].sequence);
+                    sequences.insert(fact.sequence);
+                    self.facts[index] = fact.clone();
+                    changed = true;
                 }
+            } else if sequences.insert(fact.sequence) {
+                positions.insert(fact.id, self.facts.len());
                 self.facts.push(fact.clone());
+                changed = true;
             }
+        }
+        if changed {
             self.facts.sort_by_key(|fact| fact.sequence);
         }
         self.high_water = self.high_water.max(page.high_water);
@@ -194,7 +214,7 @@ impl TaskConversationCache {
                 .unwrap_or(self.through_sequence)
                 .max(page.through_sequence);
         }
-        self.facts.len() != prior_len
+        changed
     }
 
     fn latest_snippet(&self) -> Option<&str> {
@@ -404,34 +424,65 @@ pub enum SurfaceAdmissionError {
     WrongTask,
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct TaskSurfaceRegistry {
-    surfaces: BTreeMap<TaskId, TaskSurfaceState>,
+/// Exposes the canonical domain [`TaskId`] inside a surface-registry owner key.
+///
+/// Registry identity remains the full key `K`. Terminal admission compares only
+/// this raw task against [`TaskTerminalProjection::task_id`]. Future
+/// host-qualified keys (e.g. fleet `HostTaskKey`) implement this trait — they
+/// must not implement `PartialEq<TaskId>`, which would collapse host scope.
+pub trait SurfaceTaskKey {
+    fn domain_task_id(&self) -> TaskId;
+}
+
+impl SurfaceTaskKey for TaskId {
+    fn domain_task_id(&self) -> TaskId {
+        *self
+    }
+}
+
+impl SurfaceTaskKey for crate::client::HostTaskKey {
+    fn domain_task_id(&self) -> TaskId {
+        self.task_id
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TaskSurfaceRegistry<K = TaskId> {
+    surfaces: BTreeMap<K, TaskSurfaceState>,
     /// Monotonic cursor used to fair-rotate background conversation queries.
     background_schedule_epoch: u64,
 }
 
-impl TaskSurfaceRegistry {
-    pub fn ensure_task(&mut self, task_id: TaskId) -> &mut TaskSurfaceState {
+impl<K> Default for TaskSurfaceRegistry<K> {
+    fn default() -> Self {
+        Self {
+            surfaces: BTreeMap::new(),
+            background_schedule_epoch: 0,
+        }
+    }
+}
+
+impl<K: Clone + Ord + Eq> TaskSurfaceRegistry<K> {
+    pub fn ensure_task(&mut self, task_id: K) -> &mut TaskSurfaceState {
         self.surfaces.entry(task_id).or_default()
     }
 
-    pub fn state(&self, task_id: TaskId) -> Option<&TaskSurfaceState> {
+    pub fn state(&self, task_id: K) -> Option<&TaskSurfaceState> {
         self.surfaces.get(&task_id)
     }
 
-    pub fn retain_tasks(&mut self, task_ids: &[TaskId]) {
-        let valid: BTreeSet<_> = task_ids.iter().copied().collect();
+    pub fn retain_tasks(&mut self, task_ids: &[K]) {
+        let valid: BTreeSet<_> = task_ids.iter().cloned().collect();
         self.surfaces.retain(|task_id, _| valid.contains(task_id));
     }
 
-    pub fn begin_conversation(&mut self, task_id: TaskId, generation: u64) {
+    pub fn begin_conversation(&mut self, task_id: K, generation: u64) {
         let state = self.ensure_task(task_id);
         state.conversation_generation = generation;
         state.conversation_in_flight = true;
     }
 
-    pub fn cancel_conversation(&mut self, task_id: TaskId, generation: u64) {
+    pub fn cancel_conversation(&mut self, task_id: K, generation: u64) {
         if let Some(state) = self.surfaces.get_mut(&task_id) {
             if state.conversation_generation == generation {
                 state.conversation_in_flight = false;
@@ -439,24 +490,24 @@ impl TaskSurfaceRegistry {
         }
     }
 
-    pub fn conversation_in_flight(&self, task_id: TaskId) -> bool {
+    pub fn conversation_in_flight(&self, task_id: K) -> bool {
         self.state(task_id)
             .is_some_and(|state| state.conversation_in_flight)
     }
 
-    pub fn conversation_after_sequence(&self, task_id: TaskId) -> u64 {
+    pub fn conversation_after_sequence(&self, task_id: K) -> u64 {
         self.state(task_id)
             .map(|state| state.conversation.request_after_sequence())
             .unwrap_or(0)
     }
 
-    pub fn conversation_page(&self, task_id: TaskId) -> Option<SemanticJournalPage> {
+    pub fn conversation_page(&self, task_id: K) -> Option<SemanticJournalPage> {
         self.state(task_id).map(|state| state.presentation_page())
     }
 
     pub fn admit_conversation(
         &mut self,
-        task_id: TaskId,
+        task_id: K,
         generation: u64,
         page: &SemanticJournalPage,
     ) -> Result<ConversationAdmission, SurfaceAdmissionError> {
@@ -486,7 +537,7 @@ impl TaskSurfaceRegistry {
     /// Pending rows never advance durable high-water or request cursors.
     pub fn admit_pending_user_message(
         &mut self,
-        task_id: TaskId,
+        task_id: K,
         text: &str,
         command_id: CommandId,
     ) -> ConversationAdmission {
@@ -513,7 +564,7 @@ impl TaskSurfaceRegistry {
 
     pub fn reject_pending_user_message(
         &mut self,
-        task_id: TaskId,
+        task_id: K,
         command_id: CommandId,
     ) -> ConversationAdmission {
         let Some(state) = self.surfaces.get_mut(&task_id) else {
@@ -540,7 +591,7 @@ impl TaskSurfaceRegistry {
         }
     }
 
-    pub fn displayed_user_message_count(&self, task_id: TaskId) -> usize {
+    pub fn displayed_user_message_count(&self, task_id: K) -> usize {
         self.state(task_id)
             .map(|state| {
                 state
@@ -560,7 +611,7 @@ impl TaskSurfaceRegistry {
     /// providers whose current CLI advertises conversation hooks but does not
     /// reliably publish a terminal `Stop` event. Pending optimistic user rows
     /// keep the task working until the corresponding assistant fact arrives.
-    pub fn conversation_turn_completed(&self, task_id: TaskId) -> bool {
+    pub fn conversation_turn_completed(&self, task_id: K) -> bool {
         self.state(task_id).is_some_and(|state| {
             state.pending_user_messages.is_empty()
                 && state.conversation.latest_message_is_assistant()
@@ -569,10 +620,13 @@ impl TaskSurfaceRegistry {
 
     pub fn admit_terminal(
         &mut self,
-        task_id: TaskId,
+        task_id: K,
         projection: &TaskTerminalProjection,
-    ) -> Result<(), SurfaceAdmissionError> {
-        if projection.task_id != task_id {
+    ) -> Result<(), SurfaceAdmissionError>
+    where
+        K: SurfaceTaskKey,
+    {
+        if task_id.domain_task_id() != projection.task_id {
             return Err(SurfaceAdmissionError::WrongTask);
         }
         let state = self.ensure_task(task_id);
@@ -581,43 +635,43 @@ impl TaskSurfaceRegistry {
         Ok(())
     }
 
-    pub fn note_terminal_reconnecting(&mut self, task_id: TaskId) {
+    pub fn note_terminal_reconnecting(&mut self, task_id: K) {
         self.ensure_task(task_id).note_terminal_reconnecting();
     }
 
-    pub fn note_terminal_query_started(&mut self, task_id: TaskId) {
+    pub fn note_terminal_query_started(&mut self, task_id: K) {
         self.ensure_task(task_id).note_terminal_query_started();
     }
 
-    pub fn terminal_is_interactive(&self, task_id: TaskId) -> bool {
+    pub fn terminal_is_interactive(&self, task_id: K) -> bool {
         self.state(task_id)
             .is_some_and(TaskSurfaceState::terminal_is_interactive)
     }
 
-    pub fn terminal_label(&self, task_id: TaskId) -> &'static str {
+    pub fn terminal_label(&self, task_id: K) -> &'static str {
         self.state(task_id)
             .map(TaskSurfaceState::terminal_label)
             .unwrap_or("Terminal unavailable")
     }
 
-    pub fn terminal_empty_message(&self, task_id: TaskId) -> &'static str {
+    pub fn terminal_empty_message(&self, task_id: K) -> &'static str {
         self.state(task_id)
             .map(TaskSurfaceState::terminal_empty_message)
             .unwrap_or("Terminal unavailable")
     }
 
-    pub fn latest_snippet(&self, task_id: TaskId) -> Option<&str> {
+    pub fn latest_snippet(&self, task_id: K) -> Option<&str> {
         self.state(task_id)
             .and_then(|state| state.latest_snippet.as_deref())
     }
 
-    pub fn conversation_tail(&self, task_id: TaskId, max: usize) -> Vec<String> {
+    pub fn conversation_tail(&self, task_id: K, max: usize) -> Vec<String> {
         self.state(task_id)
             .map(|state| state.conversation.tail_snippets(max))
             .unwrap_or_default()
     }
 
-    pub fn terminal_tail(&self, task_id: TaskId, max: usize) -> Vec<String> {
+    pub fn terminal_tail(&self, task_id: K, max: usize) -> Vec<String> {
         self.state(task_id)
             .map(|state| state.terminal_tail(max))
             .unwrap_or_default()
@@ -625,14 +679,14 @@ impl TaskSurfaceRegistry {
 
     pub fn conversation_query_schedule(
         &mut self,
-        workspace: &TaskWorkspace,
+        workspace: &Workspace<K>,
         max_background: usize,
-    ) -> Vec<ConversationQueryPlan> {
+    ) -> Vec<ConversationQueryPlan<K>> {
         let focused = workspace.focused_task();
         let mut schedule = Vec::with_capacity(max_background.saturating_add(1));
-        if let Some(task_id) = focused {
-            if workspace.presentation(task_id) == Some(PanePresentation::Full)
-                && !self.conversation_in_flight(task_id)
+        if let Some(task_id) = focused.clone() {
+            if workspace.presentation(task_id.clone()) == Some(PanePresentation::Full)
+                && !self.conversation_in_flight(task_id.clone())
             {
                 schedule.push(ConversationQueryPlan {
                     task_id,
@@ -651,27 +705,28 @@ impl TaskSurfaceRegistry {
             .task_ids()
             .into_iter()
             .filter(|task_id| {
-                if self.conversation_in_flight(*task_id) {
+                if self.conversation_in_flight(task_id.clone()) {
                     return false;
                 }
-                match (Some(*task_id) == focused, workspace.presentation(*task_id)) {
+                match (
+                    focused.as_ref() == Some(task_id),
+                    workspace.presentation(task_id.clone()),
+                ) {
                     (true, Some(PanePresentation::Full)) => false,
                     (_, Some(_)) => true,
                     (_, None) => false,
                 }
             })
             .filter_map(|task_id| {
-                let pane = workspace.pane_for_task(task_id)?;
+                let pane = workspace.pane_for_task(task_id.clone())?;
                 let last_scheduled = self
-                    .state(task_id)
+                    .state(task_id.clone())
                     .map(|state| state.last_conversation_scheduled_at)
                     .unwrap_or(0);
                 Some((last_scheduled, pane.last_focused_at, task_id))
             })
             .collect();
-        background.sort_by_key(|(last_scheduled, last_focused_at, task_id)| {
-            (*last_scheduled, *last_focused_at, *task_id)
-        });
+        background.sort_by(|a, b| (a.0, a.1, &a.2).cmp(&(b.0, b.1, &b.2)));
         let selected: Vec<_> = background
             .into_iter()
             .take(max_background)
@@ -683,7 +738,8 @@ impl TaskSurfaceRegistry {
         self.background_schedule_epoch = self.background_schedule_epoch.saturating_add(1);
         let epoch = self.background_schedule_epoch;
         for task_id in selected {
-            self.ensure_task(task_id).last_conversation_scheduled_at = epoch;
+            self.ensure_task(task_id.clone())
+                .last_conversation_scheduled_at = epoch;
             schedule.push(ConversationQueryPlan {
                 task_id,
                 priority: ConversationQueryPriority::Background,
@@ -706,6 +762,8 @@ mod tests {
 
     fn page(sequence: u64, text: &str) -> SemanticJournalPage {
         SemanticJournalPage {
+            oldest_sequence: 0,
+            cursor_rolled_over: false,
             after_sequence: sequence.saturating_sub(1),
             through_sequence: sequence,
             high_water: sequence,
@@ -728,6 +786,8 @@ mod tests {
 
     fn empty_page_after(sequence: u64) -> SemanticJournalPage {
         SemanticJournalPage {
+            oldest_sequence: 0,
+            cursor_rolled_over: false,
             after_sequence: sequence,
             through_sequence: sequence,
             high_water: sequence,
@@ -735,6 +795,27 @@ mod tests {
             next_sequence: None,
             facts: Vec::new(),
         }
+    }
+
+    #[test]
+    fn semantic_upsert_replaces_cached_partial_text_by_message_identity() {
+        let mut cache = TaskConversationCache::default();
+        let first = page(1, "Hel");
+        assert!(cache.merge_page(&first));
+        let mut updated = page(4, "Hello world");
+        updated.facts[0].id = first.facts[0].id;
+        assert!(
+            cache.merge_page(&updated),
+            "same-length replacement must repaint"
+        );
+        assert_eq!(cache.fact_count(), 1);
+        assert_eq!(cache.high_water(), 4);
+        assert_eq!(cache.as_page().facts[0], updated.facts[0]);
+        assert!(
+            !cache.merge_page(&first),
+            "stale partial cannot replace final text"
+        );
+        assert_eq!(cache.as_page().facts[0], updated.facts[0]);
     }
 
     #[test]
@@ -884,11 +965,35 @@ mod tests {
     }
 
     #[test]
+    fn rolled_over_history_replaces_cached_window_and_resets_cursor() {
+        let mut cache = TaskConversationCache::default();
+        cache.merge_page(&page(80, "old generation"));
+        let mut reset = page(1, "current generation");
+        reset.oldest_sequence = 1;
+        reset.cursor_rolled_over = true;
+        assert!(cache.merge_page(&reset));
+        assert_eq!(cache.fact_count(), 1);
+        assert_eq!(cache.high_water(), 1);
+        assert_eq!(cache.request_after_sequence(), 1);
+        assert!(matches!(&cache.as_page().facts[0].payload,
+            SemanticJournalPayload::AssistantText { text } if text == "current generation"));
+
+        let mut empty = empty_page_after(0);
+        empty.cursor_rolled_over = true;
+        assert!(cache.merge_page(&empty));
+        assert_eq!(cache.fact_count(), 0);
+        assert_eq!(cache.request_after_sequence(), 0);
+        assert!(!cache.merge_page(&empty));
+    }
+
+    #[test]
     fn cursor_only_high_water_advance_does_not_return_a_visual_page() {
         let mut cache = TaskConversationCache::default();
         assert!(cache.merge_page(&page(1, "hello")));
         let prior_facts = cache.fact_count();
         assert!(!cache.merge_page(&SemanticJournalPage {
+            oldest_sequence: 0,
+            cursor_rolled_over: false,
             after_sequence: 1,
             through_sequence: 1,
             high_water: 4,
@@ -985,6 +1090,8 @@ mod tests {
 
     fn user_page(sequence: u64, text: &str) -> SemanticJournalPage {
         SemanticJournalPage {
+            oldest_sequence: 0,
+            cursor_rolled_over: false,
             after_sequence: sequence.saturating_sub(1),
             through_sequence: sequence,
             high_water: sequence,
@@ -1315,5 +1422,184 @@ mod tests {
                 "background cadence across 8/30 ticks must reach every non-interactive pane including compact"
             );
         }
+    }
+
+    /// Test-only host-scoped owner key. Carries a canonical [`TaskId`] without
+    /// implementing `PartialEq<TaskId>` (host identity must stay distinct).
+    #[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
+    struct TestHostKey {
+        host: String,
+        task: TaskId,
+    }
+
+    impl SurfaceTaskKey for TestHostKey {
+        fn domain_task_id(&self) -> TaskId {
+            self.task
+        }
+    }
+
+    fn host_key(host: &str, task: TaskId) -> TestHostKey {
+        TestHostKey {
+            host: host.to_string(),
+            task,
+        }
+    }
+
+    #[test]
+    fn production_fleet_keys_keep_conversation_surfaces_distinct() {
+        use crate::client::{HostId, HostTaskKey};
+        let task = TaskId::new();
+        let local = HostTaskKey::new(HostId::LocalProfile("dev".into()), task);
+        let remote = HostTaskKey::new(HostId::Remote([1; 16]), task);
+        assert_eq!(local.domain_task_id(), remote.domain_task_id());
+        let mut registry = TaskSurfaceRegistry::<HostTaskKey>::default();
+        registry.begin_conversation(local.clone(), 1);
+        registry.begin_conversation(remote.clone(), 1);
+        registry
+            .admit_conversation(local.clone(), 1, &page(3, "local"))
+            .unwrap();
+        registry
+            .admit_conversation(remote.clone(), 1, &page(5, "remote"))
+            .unwrap();
+        assert_eq!(registry.latest_snippet(local), Some("local"));
+        assert_eq!(registry.latest_snippet(remote), Some("remote"));
+    }
+
+    #[test]
+    fn host_qualified_surface_caches_stay_isolated_for_shared_raw_task_id() {
+        let shared = TaskId::new();
+        let local = host_key("local", shared);
+        let remote = host_key("remote", shared);
+        let mut registry = TaskSurfaceRegistry::<TestHostKey>::default();
+
+        registry.begin_conversation(local.clone(), 1);
+        let local_admit = registry
+            .admit_conversation(local.clone(), 1, &page(3, "local-only"))
+            .expect("local admit");
+        assert!(local_admit.changed);
+
+        registry.begin_conversation(remote.clone(), 2);
+        let remote_admit = registry
+            .admit_conversation(remote.clone(), 2, &page(5, "remote-only"))
+            .expect("remote admit");
+        assert!(remote_admit.changed);
+
+        assert_eq!(registry.latest_snippet(local.clone()), Some("local-only"));
+        assert_eq!(registry.latest_snippet(remote.clone()), Some("remote-only"));
+        assert_eq!(registry.conversation_after_sequence(local.clone()), 3);
+        assert_eq!(registry.conversation_after_sequence(remote.clone()), 5);
+
+        registry.retain_tasks(&[local.clone()]);
+        assert!(registry.state(local).is_some());
+        assert!(registry.state(remote).is_none());
+    }
+
+    #[test]
+    fn host_qualified_selection_and_query_schedule_keep_key_owners() {
+        let shared = TaskId::new();
+        let local = host_key("desk", shared);
+        let remote = host_key("cloud", shared);
+        let mut workspace = None;
+        apply_workspace_selection(
+            &mut workspace,
+            local.clone(),
+            WorkspaceSelectionGesture::Plain,
+        )
+        .unwrap();
+        apply_workspace_selection(
+            &mut workspace,
+            remote.clone(),
+            WorkspaceSelectionGesture::Toggle,
+        )
+        .unwrap();
+        let workspace = workspace.expect("workspace");
+        assert_eq!(workspace.pane_count(), 2);
+        assert_eq!(workspace.focused_task(), Some(remote.clone()));
+
+        let mut registry = TaskSurfaceRegistry::<TestHostKey>::default();
+        let schedule = registry.conversation_query_schedule(&workspace, 1);
+        assert_eq!(schedule.len(), 2);
+        assert_eq!(schedule[0].task_id, remote);
+        assert_eq!(schedule[0].priority, ConversationQueryPriority::Interactive);
+        assert_eq!(schedule[1].task_id, local);
+        assert_eq!(schedule[1].priority, ConversationQueryPriority::Background);
+    }
+
+    #[test]
+    fn terminal_admit_rejects_mismatched_canonical_task_for_host_key() {
+        let shared = TaskId::new();
+        let other = TaskId::new();
+        let local = host_key("local", shared);
+        let mut registry = TaskSurfaceRegistry::<TestHostKey>::default();
+        let mut projection = surface_with_terminal_lines(&["mismatch"])
+            .latest_terminal
+            .expect("projection");
+        projection.task_id = other;
+
+        assert_eq!(
+            registry.admit_terminal(local.clone(), &projection),
+            Err(SurfaceAdmissionError::WrongTask)
+        );
+        assert!(registry.state(local).is_none());
+    }
+
+    #[test]
+    fn terminal_admit_separates_same_raw_task_id_across_host_owners() {
+        let shared = TaskId::new();
+        let local = host_key("local", shared);
+        let remote = host_key("remote", shared);
+        let mut registry = TaskSurfaceRegistry::<TestHostKey>::default();
+        let mut projection = surface_with_terminal_lines(&["shared-raw"])
+            .latest_terminal
+            .expect("projection");
+        projection.task_id = shared;
+
+        registry
+            .admit_terminal(local.clone(), &projection)
+            .expect("admit under local owner");
+        registry
+            .admit_terminal(remote.clone(), &projection)
+            .expect("admit under remote owner");
+
+        assert!(registry.terminal_is_interactive(local.clone()));
+        assert!(registry.terminal_is_interactive(remote.clone()));
+        assert_eq!(
+            registry.terminal_tail(local.clone(), 1),
+            vec!["shared-raw".to_string()]
+        );
+        assert_eq!(
+            registry.terminal_tail(remote.clone(), 1),
+            vec!["shared-raw".to_string()]
+        );
+        assert_eq!(
+            registry
+                .state(local)
+                .and_then(|s| s.latest_terminal.as_ref().map(|p| p.task_id)),
+            Some(shared)
+        );
+        assert_eq!(
+            registry
+                .state(remote)
+                .and_then(|s| s.latest_terminal.as_ref().map(|p| p.task_id)),
+            Some(shared),
+            "domain TaskId on projection is unchanged; owners stay distinct"
+        );
+    }
+
+    #[test]
+    fn terminal_admit_rejects_mismatched_canonical_task_for_local_task_id() {
+        let expected = TaskId::new();
+        let other = TaskId::new();
+        let mut registry = TaskSurfaceRegistry::default();
+        let mut projection = surface_with_terminal_lines(&["local-mismatch"])
+            .latest_terminal
+            .expect("projection");
+        projection.task_id = other;
+
+        assert_eq!(
+            registry.admit_terminal(expected, &projection),
+            Err(SurfaceAdmissionError::WrongTask)
+        );
+        assert!(registry.state(expected).is_none());
     }
 }

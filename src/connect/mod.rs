@@ -4,6 +4,7 @@
 
 mod crypto;
 mod deletion_ledger;
+mod device_enrollment;
 mod direct;
 mod dispatch;
 mod envelope;
@@ -11,6 +12,7 @@ mod epoch;
 mod evidence;
 mod failure;
 mod host_listener;
+mod host_vault;
 mod identity;
 mod identity_codec;
 mod identity_store;
@@ -43,6 +45,10 @@ pub use crypto::{
     CONNECT_NOISE_PINNED_DEVICE_PATTERN,
 };
 pub use deletion_ledger::{DeletionLedgerEntry, DeletionStatus, DELETION_LEDGER};
+pub use device_enrollment::{
+    BrowserEnrollmentMetadata, DeviceEnrollmentAuthority, DeviceEnrollmentContext,
+    DeviceEnrollmentError, SharedDeviceEnrollment,
+};
 pub use direct::{
     admit_direct_request, is_trustworthy_loopback_host, query_contains_pairing_secret,
     referer_contains_pairing_secret, security_headers, DirectAdmitError, DirectBindMode,
@@ -75,6 +81,7 @@ pub use failure::{
     ConnectSurface, FailureCase, FailureClass, FailureExpectation, SimulatedFaultOutcome,
     FAILURE_MATRIX,
 };
+pub use host_vault::{derive_machine_binding, OsConnectHostVault};
 pub use host_listener::{
     ConnectWebPublication, ConnectWebTransportMarker, CONNECT_WEB_MARKER_MAX_ENDPOINT_BYTES,
     CONNECT_WEB_MARKER_MAX_JSON_BYTES, CONNECT_WEB_MARKER_TRANSPORT,
@@ -159,10 +166,11 @@ pub use relay::{
     RELAY_INITIAL_BACKOFF_MS, RELAY_MAX_BACKOFF_MS, ROUTE_TICKET_DOMAIN,
 };
 pub use schema::{
-    canonical_schema_fixtures, catalog_entry, encode_canonical_schema, payload_catalog,
+    canonical_schema_fixtures, native_browser_contract_fixtures, catalog_entry, encode_canonical_schema, payload_catalog,
     CanonicalSchemaFixture, ChunkPayload, ConnectPayload, ErrorPayload, GenericExtensionPayload,
-    HelloPayload, OperationSettlementPayload, PayloadDecodeError, PayloadDescriptor, ResyncPayload,
-    ResyncReason, StreamDeltaPayload, CONNECT_PAYLOAD_SCHEMA_VERSION,
+    HelloPayload, HostOutputLane, HostOutputPayload, OperationSettlementPayload,
+    PayloadDecodeError, PayloadDescriptor, ResyncPayload, ResyncReason, StreamDeltaPayload,
+    CONNECT_PAYLOAD_SCHEMA_VERSION,
 };
 pub use session::{
     ActionAnswer, ConnectSession, DeviceInput, SessionAdmitError, SessionReceipt,

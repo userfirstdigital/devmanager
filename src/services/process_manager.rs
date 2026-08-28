@@ -2013,6 +2013,69 @@ impl ProcessManager {
         })
     }
 
+    /// Non-blocking live-runtime presence for TerminalReadiness. `None` means
+    /// the runtime book was busy/poisoned — never treat as absence.
+    pub(crate) fn try_has_live_provider_runtime(
+        &self,
+        task_id: TaskId,
+        agent_session_id: crate::domain::AgentSessionId,
+        resource_id: ResourceId,
+        runtime_generation: u64,
+    ) -> Option<bool> {
+        let book = self.inner.provider_runtime.try_lock().ok()?;
+        Some(book.live.values().any(|live| {
+            live.task_id == task_id
+                && live.agent_session_id == agent_session_id
+                && live.fence.resource().resource_id == resource_id
+                && live.fence.resource().runtime_generation == runtime_generation
+                && !live.exit_reported
+        }))
+    }
+
+    /// Non-blocking persisted-launch classification for TerminalReadiness and
+    /// same-kind NewConversation guards.
+    /// `Ok(Some(true))` = persisted/in-memory launch present;
+    /// `Ok(Some(false))` = proved absent (including cold missing store);
+    /// `Ok(None)` / `Err` = unknown (busy lock, I/O, schema, corruption).
+    ///
+    /// Never initializes the production manager and never calls the 5s-busy
+    /// `peek_persisted_launch_spec` path.
+    pub(crate) fn try_classify_persisted_provider_launch(
+        &self,
+        agent_session_id: crate::domain::AgentSessionId,
+    ) -> Result<Option<bool>, ()> {
+        let Ok(slot) = self.inner.provider_sessions.try_lock() else {
+            return Ok(None);
+        };
+        if let Some(manager) = slot.as_ref() {
+            if manager.current(agent_session_id).is_some() {
+                return Ok(Some(true));
+            }
+        }
+        drop(slot);
+        let Some(path) = self.provider_session_store_path_for_read() else {
+            return Ok(None);
+        };
+        match crate::providers::session::SqliteProviderSessionStateStore::probe_agent_persisted_bounded(
+            &path,
+            agent_session_id,
+        ) {
+            Ok(present) => Ok(Some(present)),
+            Err(_) => Ok(None),
+        }
+    }
+
+    /// Resolve the host-owned provider-session store path without creating
+    /// directories or opening SQLite. Missing configured path is unknown.
+    fn provider_session_store_path_for_read(&self) -> Option<PathBuf> {
+        if let Some(path) = self.inner.provider_session_store_path.as_ref() {
+            return Some(path.clone());
+        }
+        crate::persistence::app_config_dir()
+            .ok()
+            .map(|root| root.join("provider-sessions.sqlite3"))
+    }
+
     pub(crate) fn drain_provider_session_failures(&self) -> Vec<ProviderSessionFailure> {
         let Ok(mut book) = self.inner.provider_runtime.lock() else {
             return Vec::new();
@@ -2050,8 +2113,24 @@ impl ProcessManager {
         {
             return false;
         }
-        self.provider_terminal_binding(task_id, agent_session_id, resource_id, runtime_generation)
-            .is_some_and(|binding| binding.action_epoch == action_epoch)
+        let Some(binding) = self.provider_terminal_binding(
+            task_id,
+            agent_session_id,
+            resource_id,
+            runtime_generation,
+        ) else {
+            return false;
+        };
+        if binding.action_epoch != action_epoch {
+            return false;
+        }
+        let lines = crate::providers::input::terminal_text_lines_from_screen(
+            &binding.runtime.snapshot(),
+        );
+        matches!(
+            crate::providers::input::classify_codex_identityless_startup_readiness(&lines),
+            crate::providers::input::CodexIdentitylessStartupReadiness::ChatComposerReady,
+        )
     }
 
     /// Close every provider session bound to one task. Missing manager state is
@@ -3475,14 +3554,15 @@ impl ProcessManager {
         logical_bytes: &[u8],
     ) -> Result<(), crate::providers::input::ProviderInputDeliveryError> {
         use crate::domain::provider_input::ProviderInputAction;
-        use crate::providers::input::{provider_composer_submit_plan, ProviderInputDeliveryError};
+        use crate::providers::input::{
+            provider_composer_submit_plan_for_mode, ProviderInputDeliveryError,
+        };
 
         let expected = crate::providers::input::provider_input_action_bytes(action)
             .map_err(|_| ProviderInputDeliveryError::BytesMismatch)?;
         if expected.as_slice() != logical_bytes {
             return Err(ProviderInputDeliveryError::BytesMismatch);
         }
-        let plan = provider_composer_submit_plan(identity.provider_kind, action)?;
 
         let key = (
             fence.resource().resource_id,
@@ -3520,12 +3600,40 @@ impl ProcessManager {
             }
         }
 
+        if identity.provider_kind == ProviderKind::Codex
+            && identity.provider_session_id.is_none()
+            && matches!(
+                action,
+                ProviderInputAction::SendNow { .. }
+                    | ProviderInputAction::SteerCurrentTurn { .. }
+                    | ProviderInputAction::QueueFollowUp { .. }
+            )
+        {
+            let lines =
+                crate::providers::input::terminal_text_lines_from_screen(&session.snapshot());
+            if !matches!(
+                crate::providers::input::classify_codex_identityless_startup_readiness(&lines),
+                crate::providers::input::CodexIdentitylessStartupReadiness::ChatComposerReady,
+            ) {
+                return Err(ProviderInputDeliveryError::RuntimeAuthorityAbsent);
+            }
+        }
+
         let session_cwd = self
             .runtime_state()
             .sessions
             .get(&live.session_id)
             .map(|state| state.cwd.clone())
             .ok_or(ProviderInputDeliveryError::SessionNotBound)?;
+
+        // Capture negotiated paste mode only after exact live fences validate,
+        // immediately before encoding. Never invent a fixed production mode.
+        let bracketed_paste = session.mode_snapshot().bracketed_paste;
+        let plan = provider_composer_submit_plan_for_mode(
+            identity.provider_kind,
+            action,
+            bracketed_paste,
+        )?;
 
         // Prove exact image bytes under cwd/.devmanager/pasted-images and retain
         // deny-write/delete handles across the whole physical sequence so a
@@ -3539,6 +3647,7 @@ impl ProcessManager {
 
         // Delays run only between physical writes and never while holding the
         // ProcessManager provider_runtime lock (released above after clone).
+        // write_provider_bytes does not flush; do not call paste_text here.
         let mut crossed_boundary = false;
         for step in plan.steps() {
             match session.write_provider_bytes(step.bytes()) {
@@ -11895,6 +12004,207 @@ mod tests {
                 runtime_generation: 9,
             }]
         );
+    }
+
+    fn paint_terminal_screen_lines(session: &TerminalSession, lines: &[&str]) {
+        let mut payload = String::from("\x1b[2J\x1b[H");
+        for line in lines {
+            payload.push_str(line);
+            payload.push_str("\r\n");
+        }
+        session.write_virtual_text(&payload);
+    }
+
+    fn install_identityless_codex_live_for_test(
+        manager: &ProcessManager,
+        session_id: &str,
+        fence: ManagedProcessFence,
+        cwd: &Path,
+    ) -> crate::providers::input::ProviderInputDeliveryIdentity {
+        use crate::domain::{ClientId, CommandId, OperationId, TurnId};
+        use crate::providers::input::ProviderInputDeliveryIdentity;
+        use crate::providers::session::{LaunchNonce, RuntimeCorrelation};
+
+        let task_id = TaskId::new();
+        let agent_session_id = AgentSessionId::new();
+        let generation = fence.resource().runtime_generation;
+        let action_epoch = 1;
+        manager.ensure_runtime_entry(
+            session_id,
+            cwd.to_path_buf(),
+            SessionDimensions {
+                cols: 100,
+                rows: 24,
+                cell_width: 8,
+                cell_height: 18,
+            },
+        );
+        manager.update_session_state(session_id, |state| {
+            state.status = SessionStatus::Running;
+        });
+        let correlation = RuntimeCorrelation::sealed(
+            task_id,
+            agent_session_id,
+            ProviderKind::Codex,
+            generation,
+            action_epoch,
+            LaunchNonce::new(),
+        );
+        manager
+            .inner
+            .provider_runtime
+            .lock()
+            .expect("provider runtime")
+            .live
+            .insert(
+                (fence.resource().resource_id, generation),
+                ProviderLiveSession {
+                    session_id: session_id.to_string(),
+                    fence: fence.clone(),
+                    correlation,
+                    task_id,
+                    agent_session_id,
+                    provider_kind: ProviderKind::Codex,
+                    provider_session_id: None,
+                    provider_identity_confirmed: false,
+                    provider_identity_acceptance_started: false,
+                    exit_reported: false,
+                    settlement_kind: ProviderSettlementKind::ObserveExit,
+                    settlement_failures: 0,
+                    next_settlement_attempt: None,
+                    failure_reported: false,
+                },
+            );
+        ProviderInputDeliveryIdentity {
+            task_id,
+            operation_id: OperationId::new(),
+            command_id: CommandId::new(),
+            client_id: ClientId::new(),
+            agent_session_id,
+            provider_kind: ProviderKind::Codex,
+            provider_session_id: None,
+            runtime_generation: generation,
+            action_epoch,
+            turn_id: TurnId::new(),
+            question_id: None,
+            approval_id: None,
+        }
+    }
+
+    #[test]
+    fn identityless_codex_startup_gate_blocks_sealed_writer_before_physical_bytes() {
+        use crate::domain::provider_input::ProviderInputAction;
+        use crate::providers::input::{
+            classify_codex_identityless_startup_readiness,
+            provider_composer_submit_plan_for_mode, CodexIdentitylessStartupReadiness,
+            ProviderInputDeliveryError,
+        };
+
+        let cwd = temp_test_dir("codex-startup-gate");
+        let _pid_file_guard = pid_file::use_test_pid_file(cwd.join("running-pids.json"));
+        let manager = ProcessManager::new();
+        let session_id = "codex-startup-gate";
+        manager
+            .spawn_shell_session(
+                session_id,
+                &cwd,
+                SessionDimensions {
+                    cols: 100,
+                    rows: 24,
+                    cell_width: 8,
+                    cell_height: 18,
+                },
+                None,
+                None,
+            )
+            .expect("spawn shell");
+        wait_for_live_session(&manager, session_id);
+        let session = manager.get_session(session_id).expect("terminal session");
+        let fence = session
+            .managed_process_fence()
+            .expect("managed fence")
+            .expect("live managed fence");
+        let identity =
+            install_identityless_codex_live_for_test(&manager, session_id, fence.clone(), &cwd);
+
+        let blocked_cases = [
+            (
+                "trust",
+                vec![
+                    "",
+                    "Do you trust the contents of this directory?",
+                    "1. Yes, continue",
+                ],
+            ),
+            (
+                "unknown-busy",
+                vec!["", "Working...", "esc to interrupt"],
+            ),
+        ];
+        for (label, lines) in blocked_cases {
+            paint_terminal_screen_lines(&session, &lines);
+            let screen_lines =
+                crate::providers::input::terminal_text_lines_from_screen(&session.snapshot());
+            assert_eq!(
+                classify_codex_identityless_startup_readiness(&screen_lines),
+                if label == "trust" {
+                    CodexIdentitylessStartupReadiness::ProviderSetupRequired
+                } else {
+                    CodexIdentitylessStartupReadiness::StartupPending
+                },
+                "{label} screen must classify before write"
+            );
+            let action = ProviderInputAction::SendNow {
+                text: "ZYGOTE_STARTUP_GATE_PROBE".into(),
+                wait: false,
+                images: Vec::new(),
+            };
+            let logical = crate::providers::input::provider_input_action_bytes(&action)
+                .expect("logical bytes");
+            assert_eq!(
+                manager.write_sealed_provider_action(&fence, &identity, &action, &logical),
+                Err(ProviderInputDeliveryError::RuntimeAuthorityAbsent),
+                "{label} must fail closed before physical bytes"
+            );
+            assert!(
+                !session.screen_text().contains("ZYGOTE_STARTUP_GATE_PROBE"),
+                "{label} must not enqueue provider bytes"
+            );
+        }
+
+        paint_terminal_screen_lines(
+            &session,
+            &["", "  › Ask Codex to do anything"],
+        );
+        let ready_lines =
+            crate::providers::input::terminal_text_lines_from_screen(&session.snapshot());
+        assert_eq!(
+            classify_codex_identityless_startup_readiness(&ready_lines),
+            CodexIdentitylessStartupReadiness::ChatComposerReady,
+        );
+        let action = ProviderInputAction::SendNow {
+            text: "hello".into(),
+            wait: false,
+            images: Vec::new(),
+        };
+        let logical =
+            crate::providers::input::provider_input_action_bytes(&action).expect("logical bytes");
+        let bracketed_paste = session.mode_snapshot().bracketed_paste;
+        let expected_plan =
+            provider_composer_submit_plan_for_mode(ProviderKind::Codex, &action, bracketed_paste)
+                .expect("ready plan");
+        assert_eq!(
+            manager.write_sealed_provider_action(&fence, &identity, &action, &logical),
+            Ok(()),
+            "chat-ready screen must reach the mode-sensitive writer"
+        );
+        assert_eq!(
+            expected_plan.steps().last().map(|step| step.bytes()),
+            Some(b"\r".as_slice()),
+            "ready first-send must preserve the existing submit boundary"
+        );
+
+        let _ = manager.close_session(session_id);
     }
 
     #[test]

@@ -81,16 +81,22 @@ pub enum PanePresentation {
     CompactAutomatic,
 }
 
+/// Recursive pane workspace keyed by task identity `K`.
+///
+/// Local callers keep [`TaskWorkspace`] / [`TaskPane`] aliases (`K = TaskId`).
+/// Future host-qualified keys (non-`Copy` enums) plug in without remapping UUIDs
+/// or spawning a separate workspace per host.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-pub struct TaskPane {
+#[serde(bound(serialize = "K: Serialize", deserialize = "K: Deserialize<'de>"))]
+pub struct TaskPane<K = TaskId> {
     pub id: PaneId,
-    pub task_id: TaskId,
+    pub task_id: K,
     pub presentation: PanePresentation,
     pub last_focused_at: u64,
 }
 
-impl TaskPane {
-    fn new(task_id: TaskId, last_focused_at: u64) -> Self {
+impl<K> TaskPane<K> {
+    fn new(task_id: K, last_focused_at: u64) -> Self {
         Self {
             id: PaneId::new(),
             task_id,
@@ -101,13 +107,14 @@ impl TaskPane {
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-pub struct SplitChild {
-    pub node: WorkspaceNode,
+#[serde(bound(serialize = "K: Serialize", deserialize = "K: Deserialize<'de>"))]
+pub struct SplitChild<K = TaskId> {
+    pub node: WorkspaceNode<K>,
     pub allocation: Allocation,
 }
 
-impl SplitChild {
-    fn auto(node: WorkspaceNode) -> Self {
+impl<K> SplitChild<K> {
+    fn auto(node: WorkspaceNode<K>) -> Self {
         Self {
             node,
             allocation: Allocation::auto(),
@@ -116,12 +123,13 @@ impl SplitChild {
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-pub enum WorkspaceNode {
-    Pane(TaskPane),
+#[serde(bound(serialize = "K: Serialize", deserialize = "K: Deserialize<'de>"))]
+pub enum WorkspaceNode<K = TaskId> {
+    Pane(TaskPane<K>),
     Split {
         id: SplitId,
         axis: Axis,
-        children: Vec<SplitChild>,
+        children: Vec<SplitChild<K>>,
     },
 }
 
@@ -160,16 +168,31 @@ pub enum WorkspaceError {
     SelfDrop,
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
-pub struct TaskWorkspace {
-    root: Option<WorkspaceNode>,
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(bound(serialize = "K: Serialize", deserialize = "K: Deserialize<'de>"))]
+pub struct Workspace<K = TaskId> {
+    root: Option<WorkspaceNode<K>>,
     focused: Option<PaneId>,
     previous_focus: Option<PaneId>,
     focus_clock: u64,
 }
 
-impl TaskWorkspace {
-    pub fn single(task_id: TaskId) -> Self {
+/// Local TaskId-keyed workspace (existing public API).
+pub type TaskWorkspace = Workspace<TaskId>;
+
+impl<K> Default for Workspace<K> {
+    fn default() -> Self {
+        Self {
+            root: None,
+            focused: None,
+            previous_focus: None,
+            focus_clock: 0,
+        }
+    }
+}
+
+impl<K: Clone + Ord + Eq> Workspace<K> {
+    pub fn single(task_id: K) -> Self {
         let focus_clock = 1;
         let pane = TaskPane::new(task_id, focus_clock);
         Self {
@@ -180,11 +203,11 @@ impl TaskWorkspace {
         }
     }
 
-    pub fn root(&self) -> Option<&WorkspaceNode> {
+    pub fn root(&self) -> Option<&WorkspaceNode<K>> {
         self.root.as_ref()
     }
 
-    pub(crate) fn root_mut(&mut self) -> Option<&mut WorkspaceNode> {
+    pub(crate) fn root_mut(&mut self) -> Option<&mut WorkspaceNode<K>> {
         self.root.as_mut()
     }
 
@@ -196,27 +219,27 @@ impl TaskWorkspace {
         self.previous_focus
     }
 
-    pub fn focused_task(&self) -> Option<TaskId> {
+    pub fn focused_task(&self) -> Option<K> {
         self.focused
             .and_then(|pane_id| self.pane(pane_id))
-            .map(|pane| pane.task_id)
+            .map(|pane| pane.task_id.clone())
     }
 
     pub fn pane_count(&self) -> usize {
         self.root.as_ref().map(count_panes).unwrap_or(0)
     }
 
-    pub fn pane(&self, pane_id: PaneId) -> Option<&TaskPane> {
+    pub fn pane(&self, pane_id: PaneId) -> Option<&TaskPane<K>> {
         self.root.as_ref().and_then(|root| find_pane(root, pane_id))
     }
 
-    pub fn pane_for_task(&self, task_id: TaskId) -> Option<&TaskPane> {
+    pub fn pane_for_task(&self, task_id: K) -> Option<&TaskPane<K>> {
         self.root
             .as_ref()
-            .and_then(|root| find_pane_for_task(root, task_id))
+            .and_then(|root| find_pane_for_task(root, &task_id))
     }
 
-    pub fn task_ids(&self) -> Vec<TaskId> {
+    pub fn task_ids(&self) -> Vec<K> {
         let mut task_ids = Vec::with_capacity(self.pane_count());
         if let Some(root) = &self.root {
             collect_task_ids(root, &mut task_ids);
@@ -224,20 +247,20 @@ impl TaskWorkspace {
         task_ids
     }
 
-    pub fn contains_task(&self, task_id: TaskId) -> bool {
+    pub fn contains_task(&self, task_id: K) -> bool {
         self.pane_for_task(task_id).is_some()
     }
 
-    pub fn presentation(&self, task_id: TaskId) -> Option<PanePresentation> {
+    pub fn presentation(&self, task_id: K) -> Option<PanePresentation> {
         self.pane_for_task(task_id).map(|pane| pane.presentation)
     }
 
     pub fn insert_after_focused(
         &mut self,
-        task_id: TaskId,
+        task_id: K,
         axis: Axis,
     ) -> Result<PaneId, WorkspaceError> {
-        if self.contains_task(task_id) {
+        if self.contains_task(task_id.clone()) {
             return Err(WorkspaceError::DuplicateTask);
         }
         if self.root.is_none() {
@@ -279,7 +302,7 @@ impl TaskWorkspace {
         Ok(())
     }
 
-    pub fn focus_task(&mut self, task_id: TaskId) -> Result<(), WorkspaceError> {
+    pub fn focus_task(&mut self, task_id: K) -> Result<(), WorkspaceError> {
         let pane_id = self
             .pane_for_task(task_id)
             .map(|pane| pane.id)
@@ -290,8 +313,8 @@ impl TaskWorkspace {
     /// Open a different task in the focused slot without discarding other panes
     /// or their manually sized split allocations. Compact presentation and the
     /// pane identity stay put so geometry/pins transfer with the slot.
-    pub fn replace_focused_task(&mut self, task_id: TaskId) -> Result<(), WorkspaceError> {
-        if self.contains_task(task_id) {
+    pub fn replace_focused_task(&mut self, task_id: K) -> Result<(), WorkspaceError> {
+        if self.contains_task(task_id.clone()) {
             return self.focus_task(task_id);
         }
         let pane_id = self.focused.ok_or(WorkspaceError::MissingPane)?;
@@ -303,11 +326,7 @@ impl TaskWorkspace {
         Ok(())
     }
 
-    pub fn set_manual_compact(
-        &mut self,
-        task_id: TaskId,
-        compact: bool,
-    ) -> Result<(), WorkspaceError> {
+    pub fn set_manual_compact(&mut self, task_id: K, compact: bool) -> Result<(), WorkspaceError> {
         let pane_id = self
             .pane_for_task(task_id)
             .map(|pane| pane.id)
@@ -417,6 +436,32 @@ impl TaskWorkspace {
         Ok(())
     }
 
+    /// Copy the exact pane tree while remapping task keys.
+    ///
+    /// Preserves pane IDs, split IDs, allocations, presentation, focus clocks,
+    /// focus/previous-focus pane IDs, and tree order. Mapping two distinct
+    /// source keys onto the same destination key is rejected (`DuplicateTask`)
+    /// rather than merging panes.
+    pub fn map_task_keys<U, F>(&self, mut map_key: F) -> Result<Workspace<U>, WorkspaceError>
+    where
+        U: Clone + Ord + Eq,
+        F: FnMut(&K) -> U,
+    {
+        let mut seen = BTreeSet::new();
+        let root = match &self.root {
+            Some(node) => Some(map_workspace_node(node, &mut map_key, &mut seen)?),
+            None => None,
+        };
+        let mapped = Workspace {
+            root,
+            focused: self.focused,
+            previous_focus: self.previous_focus,
+            focus_clock: self.focus_clock,
+        };
+        mapped.validate()?;
+        Ok(mapped)
+    }
+
     pub fn validate(&self) -> Result<(), WorkspaceError> {
         let Some(root) = &self.root else {
             return if self.focused.is_none() && self.previous_focus.is_none() {
@@ -442,7 +487,7 @@ impl TaskWorkspace {
         Ok(())
     }
 
-    pub(crate) fn pane_mut(&mut self, pane_id: PaneId) -> Option<&mut TaskPane> {
+    pub(crate) fn pane_mut(&mut self, pane_id: PaneId) -> Option<&mut TaskPane<K>> {
         self.root
             .as_mut()
             .and_then(|root| find_pane_mut(root, pane_id))
@@ -450,23 +495,23 @@ impl TaskWorkspace {
 
     pub fn pin_task_axis_size(
         &mut self,
-        task_id: TaskId,
+        task_id: K,
         logical_px: f32,
     ) -> Result<(), WorkspaceError> {
         if !logical_px.is_finite() || logical_px <= 0.0 {
             return Err(WorkspaceError::InvalidTree);
         }
         let root = self.root_mut().ok_or(WorkspaceError::MissingPane)?;
-        if set_task_allocation(root, task_id, Allocation::Pinned { logical_px }) {
+        if set_task_allocation(root, &task_id, Allocation::Pinned { logical_px }) {
             Ok(())
         } else {
             Err(WorkspaceError::MissingPane)
         }
     }
 
-    pub fn reset_task_axis_size(&mut self, task_id: TaskId) -> Result<(), WorkspaceError> {
+    pub fn reset_task_axis_size(&mut self, task_id: K) -> Result<(), WorkspaceError> {
         let root = self.root_mut().ok_or(WorkspaceError::MissingPane)?;
-        if set_task_allocation(root, task_id, Allocation::auto()) {
+        if set_task_allocation(root, &task_id, Allocation::auto()) {
             Ok(())
         } else {
             Err(WorkspaceError::MissingPane)
@@ -538,15 +583,15 @@ impl TaskWorkspace {
         Ok(())
     }
 
-    pub(crate) fn task_is_unpinned(&self, task_id: TaskId) -> bool {
+    pub(crate) fn task_is_unpinned(&self, task_id: K) -> bool {
         self.root
             .as_ref()
-            .is_some_and(|root| task_path_is_auto(root, task_id, true))
+            .is_some_and(|root| task_path_is_auto(root, &task_id, true))
     }
 
     pub(crate) fn set_presentation(
         &mut self,
-        task_id: TaskId,
+        task_id: K,
         presentation: PanePresentation,
     ) -> Result<(), WorkspaceError> {
         let pane_id = self
@@ -577,7 +622,46 @@ impl TaskWorkspace {
     }
 }
 
-fn count_panes(node: &WorkspaceNode) -> usize {
+fn map_workspace_node<K, U, F>(
+    node: &WorkspaceNode<K>,
+    map_key: &mut F,
+    seen: &mut BTreeSet<U>,
+) -> Result<WorkspaceNode<U>, WorkspaceError>
+where
+    U: Clone + Ord + Eq,
+    F: FnMut(&K) -> U,
+{
+    match node {
+        WorkspaceNode::Pane(pane) => {
+            let mapped = map_key(&pane.task_id);
+            if !seen.insert(mapped.clone()) {
+                return Err(WorkspaceError::DuplicateTask);
+            }
+            Ok(WorkspaceNode::Pane(TaskPane {
+                id: pane.id,
+                task_id: mapped,
+                presentation: pane.presentation,
+                last_focused_at: pane.last_focused_at,
+            }))
+        }
+        WorkspaceNode::Split { id, axis, children } => {
+            let mut mapped_children = Vec::with_capacity(children.len());
+            for child in children {
+                mapped_children.push(SplitChild {
+                    node: map_workspace_node(&child.node, map_key, seen)?,
+                    allocation: child.allocation,
+                });
+            }
+            Ok(WorkspaceNode::Split {
+                id: *id,
+                axis: *axis,
+                children: mapped_children,
+            })
+        }
+    }
+}
+
+fn count_panes<K>(node: &WorkspaceNode<K>) -> usize {
     match node {
         WorkspaceNode::Pane(_) => 1,
         WorkspaceNode::Split { children, .. } => {
@@ -586,7 +670,7 @@ fn count_panes(node: &WorkspaceNode) -> usize {
     }
 }
 
-fn first_pane_id(node: &WorkspaceNode) -> Option<PaneId> {
+fn first_pane_id<K>(node: &WorkspaceNode<K>) -> Option<PaneId> {
     match node {
         WorkspaceNode::Pane(pane) => Some(pane.id),
         WorkspaceNode::Split { children, .. } => children
@@ -595,7 +679,7 @@ fn first_pane_id(node: &WorkspaceNode) -> Option<PaneId> {
     }
 }
 
-fn most_recent_focus_in_node(node: &WorkspaceNode) -> Option<u64> {
+fn most_recent_focus_in_node<K>(node: &WorkspaceNode<K>) -> Option<u64> {
     match node {
         WorkspaceNode::Pane(pane) => Some(pane.last_focused_at),
         WorkspaceNode::Split { children, .. } => children
@@ -605,7 +689,7 @@ fn most_recent_focus_in_node(node: &WorkspaceNode) -> Option<u64> {
     }
 }
 
-fn find_pane(node: &WorkspaceNode, pane_id: PaneId) -> Option<&TaskPane> {
+fn find_pane<K>(node: &WorkspaceNode<K>, pane_id: PaneId) -> Option<&TaskPane<K>> {
     match node {
         WorkspaceNode::Pane(pane) => (pane.id == pane_id).then_some(pane),
         WorkspaceNode::Split { children, .. } => children
@@ -614,16 +698,19 @@ fn find_pane(node: &WorkspaceNode, pane_id: PaneId) -> Option<&TaskPane> {
     }
 }
 
-fn find_pane_for_task(node: &WorkspaceNode, task_id: TaskId) -> Option<&TaskPane> {
+fn find_pane_for_task<'a, K: PartialEq>(
+    node: &'a WorkspaceNode<K>,
+    task_id: &K,
+) -> Option<&'a TaskPane<K>> {
     match node {
-        WorkspaceNode::Pane(pane) => (pane.task_id == task_id).then_some(pane),
+        WorkspaceNode::Pane(pane) => (pane.task_id == *task_id).then_some(pane),
         WorkspaceNode::Split { children, .. } => children
             .iter()
             .find_map(|child| find_pane_for_task(&child.node, task_id)),
     }
 }
 
-fn find_pane_mut(node: &mut WorkspaceNode, pane_id: PaneId) -> Option<&mut TaskPane> {
+fn find_pane_mut<K>(node: &mut WorkspaceNode<K>, pane_id: PaneId) -> Option<&mut TaskPane<K>> {
     match node {
         WorkspaceNode::Pane(pane) => (pane.id == pane_id).then_some(pane),
         WorkspaceNode::Split { children, .. } => children
@@ -632,7 +719,7 @@ fn find_pane_mut(node: &mut WorkspaceNode, pane_id: PaneId) -> Option<&mut TaskP
     }
 }
 
-fn find_split(node: &WorkspaceNode, split_id: SplitId) -> Option<&[SplitChild]> {
+fn find_split<K>(node: &WorkspaceNode<K>, split_id: SplitId) -> Option<&[SplitChild<K>]> {
     match node {
         WorkspaceNode::Pane(_) => None,
         WorkspaceNode::Split { id, children, .. } if *id == split_id => Some(children),
@@ -642,7 +729,10 @@ fn find_split(node: &WorkspaceNode, split_id: SplitId) -> Option<&[SplitChild]> 
     }
 }
 
-fn find_split_mut(node: &mut WorkspaceNode, split_id: SplitId) -> Option<&mut Vec<SplitChild>> {
+fn find_split_mut<K>(
+    node: &mut WorkspaceNode<K>,
+    split_id: SplitId,
+) -> Option<&mut Vec<SplitChild<K>>> {
     match node {
         WorkspaceNode::Pane(_) => None,
         WorkspaceNode::Split { id, children, .. } => {
@@ -657,9 +747,9 @@ fn find_split_mut(node: &mut WorkspaceNode, split_id: SplitId) -> Option<&mut Ve
     }
 }
 
-fn collect_task_ids(node: &WorkspaceNode, task_ids: &mut Vec<TaskId>) {
+fn collect_task_ids<K: Clone>(node: &WorkspaceNode<K>, task_ids: &mut Vec<K>) {
     match node {
-        WorkspaceNode::Pane(pane) => task_ids.push(pane.task_id),
+        WorkspaceNode::Pane(pane) => task_ids.push(pane.task_id.clone()),
         WorkspaceNode::Split { children, .. } => {
             for child in children {
                 collect_task_ids(&child.node, task_ids);
@@ -668,7 +758,11 @@ fn collect_task_ids(node: &WorkspaceNode, task_ids: &mut Vec<TaskId>) {
     }
 }
 
-fn set_task_allocation(node: &mut WorkspaceNode, task_id: TaskId, allocation: Allocation) -> bool {
+fn set_task_allocation<K: PartialEq>(
+    node: &mut WorkspaceNode<K>,
+    task_id: &K,
+    allocation: Allocation,
+) -> bool {
     let WorkspaceNode::Split { children, .. } = node else {
         return false;
     };
@@ -685,13 +779,17 @@ fn set_task_allocation(node: &mut WorkspaceNode, task_id: TaskId, allocation: Al
     false
 }
 
-fn contains_task(node: &WorkspaceNode, task_id: TaskId) -> bool {
+fn contains_task<K: PartialEq>(node: &WorkspaceNode<K>, task_id: &K) -> bool {
     find_pane_for_task(node, task_id).is_some()
 }
 
-fn task_path_is_auto(node: &WorkspaceNode, task_id: TaskId, path_is_auto: bool) -> bool {
+fn task_path_is_auto<K: PartialEq>(
+    node: &WorkspaceNode<K>,
+    task_id: &K,
+    path_is_auto: bool,
+) -> bool {
     match node {
-        WorkspaceNode::Pane(pane) => pane.task_id == task_id && path_is_auto,
+        WorkspaceNode::Pane(pane) => pane.task_id == *task_id && path_is_auto,
         WorkspaceNode::Split { children, .. } => children.iter().any(|child| {
             contains_task(&child.node, task_id)
                 && task_path_is_auto(
@@ -703,13 +801,13 @@ fn task_path_is_auto(node: &WorkspaceNode, task_id: TaskId, path_is_auto: bool) 
     }
 }
 
-fn insert_pane_near(
-    node: WorkspaceNode,
+fn insert_pane_near<K>(
+    node: WorkspaceNode<K>,
     target: PaneId,
-    pane: TaskPane,
+    pane: TaskPane<K>,
     axis: Axis,
     insert_after: bool,
-) -> (WorkspaceNode, bool) {
+) -> (WorkspaceNode<K>, bool) {
     match node {
         WorkspaceNode::Pane(existing) if existing.id == target => {
             let (first, second) = if insert_after {
@@ -787,14 +885,14 @@ fn insert_pane_near(
     }
 }
 
-fn contains_pane(node: &WorkspaceNode, target: PaneId) -> bool {
+fn contains_pane<K>(node: &WorkspaceNode<K>, target: PaneId) -> bool {
     find_pane(node, target).is_some()
 }
 
-fn remove_pane_node(
-    node: WorkspaceNode,
+fn remove_pane_node<K>(
+    node: WorkspaceNode<K>,
     target: PaneId,
-) -> (Option<WorkspaceNode>, Option<TaskPane>) {
+) -> (Option<WorkspaceNode<K>>, Option<TaskPane<K>>) {
     match node {
         WorkspaceNode::Pane(pane) if pane.id == target => (None, Some(pane)),
         WorkspaceNode::Pane(pane) => (Some(WorkspaceNode::Pane(pane)), None),
@@ -842,17 +940,17 @@ fn remove_pane_node(
     }
 }
 
-fn validate_node(
-    node: &WorkspaceNode,
+fn validate_node<K: Clone + Ord + Eq>(
+    node: &WorkspaceNode<K>,
     pane_ids: &mut BTreeSet<PaneId>,
-    task_ids: &mut BTreeSet<TaskId>,
+    task_ids: &mut BTreeSet<K>,
     split_ids: &mut BTreeSet<SplitId>,
 ) -> Result<(), WorkspaceError> {
     match node {
         WorkspaceNode::Pane(pane) => {
             if pane.last_focused_at == 0
                 || !pane_ids.insert(pane.id)
-                || !task_ids.insert(pane.task_id)
+                || !task_ids.insert(pane.task_id.clone())
             {
                 return Err(WorkspaceError::InvalidTree);
             }
@@ -1101,5 +1199,152 @@ mod tests {
             Some(Allocation::Pinned { logical_px: 300.0 })
         );
         assert!(workspace.validate().is_ok());
+    }
+
+    type HostTaskKey = (String, TaskId);
+
+    fn host_key(host: &str, task: TaskId) -> HostTaskKey {
+        (host.to_string(), task)
+    }
+
+    #[test]
+    fn same_raw_task_id_on_two_hosts_are_distinct_panes() {
+        let shared = TaskId::new();
+        let local = host_key("local", shared);
+        let remote = host_key("remote", shared);
+        let mut workspace = Workspace::single(local.clone());
+        workspace
+            .insert_after_focused(remote.clone(), Axis::Horizontal)
+            .unwrap();
+
+        assert_eq!(workspace.pane_count(), 2);
+        assert!(workspace.contains_task(local.clone()));
+        assert!(workspace.contains_task(remote.clone()));
+        assert_eq!(workspace.focused_task(), Some(remote));
+        assert!(workspace.validate().is_ok());
+        assert_eq!(
+            workspace.insert_after_focused(local, Axis::Vertical),
+            Err(WorkspaceError::DuplicateTask)
+        );
+    }
+
+    #[test]
+    fn host_qualified_focus_replace_and_pins_preserve_geometry_slots() {
+        let shared = TaskId::new();
+        let other = TaskId::new();
+        let local = host_key("alpha", shared);
+        let remote = host_key("beta", shared);
+        let replacement = host_key("beta", other);
+        let mut workspace = Workspace::single(local.clone());
+        workspace
+            .insert_after_focused(remote.clone(), Axis::Horizontal)
+            .unwrap();
+        let focused_slot = workspace.focused_pane_id().unwrap();
+        workspace.set_manual_compact(remote.clone(), true).unwrap();
+        workspace.pin_task_axis_size(remote.clone(), 280.0).unwrap();
+        let split_id = match workspace.root().unwrap() {
+            WorkspaceNode::Split { id, .. } => *id,
+            _ => panic!("expected split"),
+        };
+        let pinned_before = workspace.split_child_allocation(split_id, 1);
+
+        workspace.replace_focused_task(replacement.clone()).unwrap();
+
+        assert_eq!(workspace.focused_pane_id(), Some(focused_slot));
+        assert_eq!(workspace.focused_task(), Some(replacement.clone()));
+        assert!(workspace.contains_task(local));
+        assert!(!workspace.contains_task(remote));
+        assert_eq!(
+            workspace.presentation(replacement.clone()),
+            Some(PanePresentation::CompactManual)
+        );
+        assert_eq!(workspace.split_child_allocation(split_id, 1), pinned_before);
+        workspace.focus_task(replacement).unwrap();
+        assert!(workspace.validate().is_ok());
+    }
+
+    #[test]
+    fn host_qualified_workspace_serde_roundtrip_preserves_keys() {
+        let shared = TaskId::new();
+        let local = host_key("desk", shared);
+        let remote = host_key("laptop", shared);
+        let mut workspace = Workspace::single(local.clone());
+        workspace
+            .insert_after_focused(remote.clone(), Axis::Vertical)
+            .unwrap();
+        workspace.pin_task_axis_size(local.clone(), 240.0).unwrap();
+
+        let encoded = serde_json::to_value(&workspace).expect("serialize host workspace");
+        let decoded: Workspace<HostTaskKey> =
+            serde_json::from_value(encoded).expect("deserialize host workspace");
+
+        assert_eq!(decoded.task_ids(), vec![local.clone(), remote.clone()]);
+        assert_eq!(decoded.focused_task(), Some(remote));
+        assert!(!decoded.task_is_unpinned(local));
+        assert!(decoded.validate().is_ok());
+    }
+
+    #[test]
+    fn legacy_task_id_workspace_serde_shape_is_unchanged() {
+        let first = TaskId::new();
+        let second = TaskId::new();
+        let mut workspace = TaskWorkspace::single(first);
+        workspace
+            .insert_after_focused(second, Axis::Horizontal)
+            .unwrap();
+        let value = serde_json::to_value(&workspace).expect("serialize legacy workspace");
+        let root = value.get("root").expect("root");
+        assert!(root.get("Pane").is_some() || root.get("Split").is_some());
+        if let Some(pane) = root.get("Pane") {
+            assert!(pane.get("task_id").and_then(|id| id.as_str()).is_some());
+        } else if let Some(split) = root.get("Split") {
+            let children = split.get("children").and_then(|c| c.as_array()).unwrap();
+            let task_id = &children[0]["node"]["Pane"]["task_id"];
+            assert!(task_id.as_str().is_some(), "TaskId remains a UUID string");
+        }
+        let roundtrip: TaskWorkspace =
+            serde_json::from_value(value).expect("deserialize legacy workspace");
+        assert_eq!(roundtrip.task_ids(), workspace.task_ids());
+    }
+
+    #[test]
+    fn map_task_keys_preserves_geometry_and_rejects_collisions() {
+        let first = TaskId::new();
+        let second = TaskId::new();
+        let mut workspace = TaskWorkspace::single(first);
+        workspace
+            .insert_after_focused(second, Axis::Horizontal)
+            .unwrap();
+        let focused = workspace.focused_pane_id();
+        let previous = workspace.previous_focus();
+        let split_id = match workspace.root().unwrap() {
+            WorkspaceNode::Split { id, .. } => *id,
+            _ => panic!("expected split"),
+        };
+        workspace.pin_task_axis_size(first, 240.0).unwrap();
+        workspace.set_manual_compact(second, true).unwrap();
+        let first_pane = workspace.pane_for_task(first).unwrap().id;
+        let second_pane = workspace.pane_for_task(second).unwrap().id;
+
+        let mapped = workspace
+            .map_task_keys(|task| ("local".to_string(), *task))
+            .expect("map keys");
+        assert_eq!(mapped.focused_pane_id(), focused);
+        assert_eq!(mapped.previous_focus(), previous);
+        assert_eq!(mapped.pane(first_pane).unwrap().id, first_pane);
+        assert_eq!(mapped.pane(second_pane).unwrap().id, second_pane);
+        assert_eq!(
+            mapped.presentation(("local".into(), second)),
+            Some(PanePresentation::CompactManual)
+        );
+        assert_eq!(
+            mapped.split_child_allocation(split_id, 0),
+            Some(Allocation::Pinned { logical_px: 240.0 })
+        );
+
+        assert_eq!(
+            workspace.map_task_keys(|_| "same-owner".to_string()),
+            Err(WorkspaceError::DuplicateTask)
+        );
     }
 }

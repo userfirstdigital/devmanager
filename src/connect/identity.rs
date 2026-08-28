@@ -64,6 +64,9 @@ pub enum IdentityError {
     TransitionRollbackFailed,
     TransitionPending,
     HostRotationCleanupFailed,
+    /// Host/device vault operation is unsupported on this OS or not wired yet
+    /// (rotation, device credentials, or an unbound identity that needs repair).
+    UnsupportedOperation,
 }
 
 impl fmt::Display for IdentityError {
@@ -90,6 +93,9 @@ impl fmt::Display for IdentityError {
             Self::TransitionRollbackFailed => "identity transition rollback failed",
             Self::TransitionPending => "identity transition is pending explicit recovery",
             Self::HostRotationCleanupFailed => "host rotation cleanup failed and can be retried",
+            Self::UnsupportedOperation => {
+                "Connect credential vault operation is unsupported or requires explicit repair"
+            }
         })
     }
 }

@@ -15,6 +15,8 @@ pub mod conversation;
 pub mod header_actions;
 #[path = "composer/mod.rs"]
 pub mod native_composer;
+pub mod native_fleet;
+pub mod native_host_state;
 pub mod native_shell;
 #[cfg(test)]
 mod native_ux_behavior_tests;

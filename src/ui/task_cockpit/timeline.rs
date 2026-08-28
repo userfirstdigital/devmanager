@@ -185,6 +185,8 @@ pub struct Timeline {
     list_state: ListState,
     /// High-water of the journal page last projected into this timeline.
     projected_high_water: u64,
+    /// Presentation fingerprint of the admitted page last projected here.
+    projected_presentation_signature: u64,
     projected_capabilities: Option<CapabilitySet>,
     projected_target: Option<CapturedActionTarget>,
     projected_task_revision: Option<u64>,
@@ -258,6 +260,7 @@ impl Timeline {
             following,
             list_state,
             projected_high_water: 0,
+            projected_presentation_signature: 0,
             projected_capabilities: None,
             projected_target: Some(captured_target),
             projected_task_revision: None,
@@ -451,8 +454,10 @@ impl Timeline {
         capabilities: CapabilitySet,
         target: CapturedActionTarget,
         task_revision: u64,
+        presentation_signature: u64,
     ) {
         self.projected_high_water = high_water;
+        self.projected_presentation_signature = presentation_signature;
         self.projected_capabilities = Some(capabilities);
         self.projected_target = Some(target);
         self.projected_task_revision = Some(task_revision);
@@ -465,11 +470,17 @@ impl Timeline {
         capabilities: CapabilitySet,
         target: CapturedActionTarget,
         task_revision: u64,
+        presentation_signature: u64,
     ) -> bool {
         self.projected_high_water == high_water
+            && self.projected_presentation_signature == presentation_signature
             && self.projected_capabilities == Some(capabilities)
             && self.projected_target == Some(target)
             && self.projected_task_revision == Some(task_revision)
+    }
+
+    pub fn projected_presentation_signature(&self) -> u64 {
+        self.projected_presentation_signature
     }
 
     /// Replace render rows, invalidate measured heights for overlapping

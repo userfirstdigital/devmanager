@@ -3,6 +3,7 @@ import type { TaskId, TaskResource } from "../tasks/taskId";
 import {
   DEFAULT_TASK_RESOURCE,
   isTaskResource,
+  parseTaskKeyParts,
   taskIdFromStableSessionKey,
   taskIdToStableSessionKey,
 } from "../tasks/taskId";
@@ -19,19 +20,32 @@ export type AppRoute =
 export const TASKS_ROUTE: AppRoute = { name: "tasks" };
 
 function decodeSegment(value: string | undefined): string | null {
-  if (!value) return null;
+  if (!value || value.length > 3072) return null;
   try {
     const decoded = decodeURIComponent(value);
-    return decoded.length > 0 && !decoded.includes("\0") ? decoded : null;
+    return decoded.length > 0 && validRouteSegment(decoded) ? decoded : null;
   } catch {
     return null;
   }
 }
 
+// Keep the native resume validator (remote/web/routes.rs) in sync. These
+// bounds validate a link only; the host still authorizes its execution target.
+function validRouteSegment(value: string): boolean {
+  return (
+    !/[\u0000-\u001f\u007f-\u009f\ud800-\udfff]/u.test(value) &&
+    new TextEncoder().encode(value).length <= 1024
+  );
+}
+
+function validTaskId(taskId: TaskId): boolean {
+  return validRouteSegment(taskId) && parseTaskKeyParts(taskId) !== null;
+}
+
 export function parseRoute(input: string): AppRoute {
   if (!input.startsWith("/")) return TASKS_ROUTE;
   const pathname = input.split(/[?#]/u, 1)[0] ?? "/";
-  const segments = pathname.split("/").filter(Boolean);
+  const segments = pathname.slice(1).split("/");
 
   if (segments.length === 1 && segments[0] === "tasks") {
     return { name: "tasks" };
@@ -45,7 +59,7 @@ export function parseRoute(input: string): AppRoute {
   }
   if (segments.length >= 2 && segments[0] === "tasks") {
     const taskId = decodeSegment(segments[1]);
-    if (!taskId) return TASKS_ROUTE;
+    if (!taskId || !validTaskId(taskId)) return TASKS_ROUTE;
     if (segments.length === 2) {
       return { name: "task", taskId };
     }
@@ -69,6 +83,7 @@ export function hrefForRoute(route: AppRoute): string {
     case "project":
       return `/projects/${encodeURIComponent(route.projectId)}`;
     case "task": {
+      if (!validTaskId(route.taskId)) return "/tasks";
       const base = `/tasks/${encodeURIComponent(route.taskId)}`;
       const resource = route.resource ?? DEFAULT_TASK_RESOURCE;
       return resource === DEFAULT_TASK_RESOURCE ? base : `${base}/${resource}`;
@@ -82,7 +97,7 @@ export function routeForTaskId(
   taskId: TaskId,
   resource: TaskResource = DEFAULT_TASK_RESOURCE,
 ): AppRoute {
-  if (!taskId || taskId.includes("\0")) return TASKS_ROUTE;
+  if (!validTaskId(taskId)) return TASKS_ROUTE;
   return resource === DEFAULT_TASK_RESOURCE
     ? { name: "task", taskId }
     : { name: "task", taskId, resource };

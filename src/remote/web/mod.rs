@@ -3,18 +3,24 @@ pub mod assets;
 pub mod auth;
 pub mod bridge;
 pub(crate) mod command_catalog;
+pub mod connect_identity;
+pub(crate) mod cross_origin;
 pub mod dto;
+pub(crate) mod fleet_publication;
 pub mod image_paste;
 pub(crate) mod input_executor;
 pub mod lease;
 pub mod push;
 pub(crate) mod request_executor;
+pub(crate) mod routes;
+pub(crate) mod tls;
 pub mod wire;
 
 use self::auth::{generate_web_client_id, PairingAttemptTracker, PairingThrottleStatus};
 use self::command_catalog::{
     discover_slash_commands, DiscoveredSlashCommand, DiscoveryLimits, SlashCommandProvider,
 };
+use std::collections::BTreeMap;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, UdpSocket};
 use std::path::PathBuf;
 use std::sync::{Arc, Weak};
@@ -26,7 +32,7 @@ use axum::http::{header, uri::Authority, HeaderMap, HeaderValue, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Redirect, Response};
 use axum::routing::{get, post};
-use axum::Router;
+use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
 use tokio::sync::oneshot;
 
@@ -43,6 +49,13 @@ pub use auth::{
     cookie_name_for_server_id, extract_cookie, generate_cookie_secret_hex,
     generate_web_pairing_token, sign_cookie, verify_cookie, PairedWebClient, WEB_COOKIE_NAME,
 };
+pub(crate) use connect_identity::{validate_or_bind_connect_peer, ConnectPeerLease};
+pub use connect_identity::{
+    ConnectPeerPin, ConnectPeerPublicKey, ConnectPeerTrustError, CONNECT_PEER_PUBLIC_KEY_BYTES,
+    CONNECT_PEER_PUBLIC_KEY_HEX_CHARS, MAX_CONNECT_PEER_PINS, MAX_PAIRED_COOKIE_CLIENT_ID_BYTES,
+};
+pub(crate) use tls::VerifiedDirectTransport;
+pub use tls::WebTlsConfig;
 
 const WEB_COOKIE_MAX_AGE_SECS: u64 = 60 * 60 * 24 * 365 * 10;
 const PUSH_REGISTRATION_BODY_BYTES: usize = 16 * 1024;
@@ -64,8 +77,18 @@ pub struct WebConfig {
     pub pairing_token: String,
     pub cookie_secret_hex: String,
     pub paired_clients: Vec<PairedWebClient>,
+    /// Noise static public keys for paired browser Connect peers, keyed by
+    /// cookie `client_id`. Public material only; never private keys or tokens.
+    #[serde(
+        default,
+        deserialize_with = "connect_identity::deserialize_connect_peer_keys"
+    )]
+    pub connect_peer_keys: BTreeMap<String, ConnectPeerPin>,
     pub activity_log: Vec<RemoteAccessActivityEvent>,
     pub push: push::WebPushConfig,
+    /// Optional LAN HTTPS/WSS material. `None` keeps the plain TCP listener.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tls: Option<WebTlsConfig>,
 }
 
 impl Default for WebConfig {
@@ -77,8 +100,10 @@ impl Default for WebConfig {
             pairing_token: generate_web_pairing_token(),
             cookie_secret_hex: generate_cookie_secret_hex(),
             paired_clients: Vec::new(),
+            connect_peer_keys: BTreeMap::new(),
             activity_log: Vec::new(),
             push: push::WebPushConfig::default(),
+            tls: None,
         }
     }
 }
@@ -101,6 +126,11 @@ impl WebConfig {
         if self.port == 0 {
             self.port = 43872;
         }
+        self.connect_peer_keys.retain(|client_id, _| {
+            self.paired_clients
+                .iter()
+                .any(|client| client.client_id == *client_id)
+        });
         self.push.ensure_keys();
     }
 
@@ -108,6 +138,15 @@ impl WebConfig {
     /// a wildcard address (0.0.0.0 / ::), try to discover a LAN-reachable IP so
     /// phones see something they can actually type into a browser.
     pub fn display_url(&self) -> String {
+        if let Some(tls) = self.tls.as_ref() {
+            if let Some(origin) = tls::display_advertised_origin(&tls.advertised_origin) {
+                return origin;
+            }
+            let trimmed = tls.advertised_origin.trim();
+            if !trimmed.is_empty() {
+                return trimmed.to_string();
+            }
+        }
         let host = host_for_display(&self.bind_address);
         format!("http://{host}:{}", self.port)
     }
@@ -176,7 +215,7 @@ fn sanitize_browser_metadata_text(value: &str, max_bytes: usize) -> Option<Strin
     (!bounded.is_empty()).then_some(bounded)
 }
 
-fn validate_browser_install_id(value: Option<String>) -> Result<Option<String>, String> {
+pub(super) fn validate_browser_install_id(value: Option<String>) -> Result<Option<String>, String> {
     let Some(value) = value else {
         return Ok(None);
     };
@@ -552,6 +591,17 @@ impl WebListenerHandle {
     ) -> Result<Self, ListenerBindFailure> {
         let listener_generation = lease.generation;
         let bind = format!("{}:{}", config.bind_address, config.port);
+        // Validate configured TLS before reserving cleanup admission or binding.
+        let prepared_tls =
+            match config.tls.as_ref() {
+                Some(tls) => Some(tls::prepare_web_tls(tls).map_err(|detail| {
+                    ListenerBindFailure::Other {
+                        bind: bind.clone(),
+                        detail,
+                    }
+                })?),
+                None => None,
+            };
         let shutdown_permit = reserve_web_listener_shutdown_permit(&worker_pool, &bind)?;
         let runtime = match tokio::runtime::Builder::new_multi_thread()
             .worker_threads(2)
@@ -574,15 +624,20 @@ impl WebListenerHandle {
         let (bind_result_tx, bind_result_rx) =
             std::sync::mpsc::channel::<Result<(), ListenerBindFailure>>();
 
-        let connect_startup = match crate::connect::ConnectProductionStartup::prepare_direct(
-            crate::connect::DirectBindPolicy::loopback(),
-        ) {
-            Ok(startup) => Some(std::sync::Arc::new(startup)),
-            Err(error) => {
-                eprintln!("[remote-web] Connect production startup held closed: {error}");
-                None
+        let connect_policy = match prepared_tls.as_ref() {
+            Some(prepared) => {
+                crate::connect::DirectBindPolicy::lan(prepared.advertised_host(), true)
             }
+            None => crate::connect::DirectBindPolicy::loopback(),
         };
+        let connect_startup =
+            match crate::connect::ConnectProductionStartup::prepare_direct(connect_policy) {
+                Ok(startup) => Some(std::sync::Arc::new(startup)),
+                Err(error) => {
+                    eprintln!("[remote-web] Connect production startup held closed: {error}");
+                    None
+                }
+            };
         let host_requests = crate::connect::process_connect_host_request_slot();
         let router_state = Arc::new(WebState {
             inner: Arc::downgrade(&inner),
@@ -590,6 +645,16 @@ impl WebListenerHandle {
             pairing_attempts: Arc::new(std::sync::Mutex::new(PairingAttemptTracker::default())),
             connect_startup: connect_startup.clone(),
             host_requests: host_requests.clone(),
+            cross_origin: Arc::new(std::sync::Mutex::new(
+                cross_origin::CrossOriginAdmissionRegistry::default(),
+            )),
+            cross_origin_rate: Arc::new(std::sync::Mutex::new(
+                cross_origin::CrossOriginRateBudget::default(),
+            )),
+            #[cfg(test)]
+            fleet_trust_source: None,
+            #[cfg(test)]
+            fleet_test_publication: None,
         });
 
         // /api/ws remains the legacy same-origin UI. /api/connect is the
@@ -598,6 +663,7 @@ impl WebListenerHandle {
         inner
             .connect_encryption_required
             .store(true, std::sync::atomic::Ordering::Release);
+        let plain_authority = format!("{}:{}", host_for_display(&config.bind_address), config.port);
         runtime.spawn(async move {
             let app = build_router(router_state);
             if !lease.is_current() {
@@ -617,14 +683,29 @@ impl WebListenerHandle {
                         return;
                     }
                     let _ = bind_result_tx.send(Ok(()));
-                    let _ = axum::serve(
-                        listener,
-                        app.into_make_service_with_connect_info::<SocketAddr>(),
-                    )
-                    .with_graceful_shutdown(async {
-                        let _ = shutdown_rx.await;
-                    })
-                    .await;
+                    match prepared_tls {
+                        Some(prepared) => {
+                            tls::serve_tls_accept_loop(listener, app, prepared, shutdown_rx).await;
+                        }
+                        None => {
+                            let authority = plain_authority;
+                            let app = app.layer(middleware::from_fn(move |request, next| {
+                                let authority = authority.clone();
+                                async move {
+                                    tls::inject_plain_verified_transport(request, next, authority)
+                                        .await
+                                }
+                            }));
+                            let _ = axum::serve(
+                                listener,
+                                app.into_make_service_with_connect_info::<SocketAddr>(),
+                            )
+                            .with_graceful_shutdown(async {
+                                let _ = shutdown_rx.await;
+                            })
+                            .await;
+                        }
+                    }
                 }
                 Err(error) => {
                     let _ = bind_result_tx.send(Err(ListenerBindFailure::from_io(bind, error)));
@@ -694,6 +775,26 @@ impl WebListenerHandle {
         publish_web_push_sender(&inner, self.listener_generation, sender);
     }
 
+    /// True when `start` prepared a Connect production startup for this generation.
+    pub(crate) fn connect_startup_present(&self) -> bool {
+        self.connect_startup.is_some()
+    }
+
+    /// Report the Connect production startup owned by this listener generation.
+    /// Does not open a second factory; reflects whether `start` prepared and
+    /// marked this handle's startup as bound.
+    pub(crate) fn require_connect_startup_bound(&self) -> Result<(), String> {
+        match self.connect_startup.as_ref() {
+            Some(startup) => startup
+                .require_bound_listener()
+                .map_err(|error| error.to_string()),
+            None => Err(
+                "Connect production startup was not opened for this web listener generation"
+                    .to_string(),
+            ),
+        }
+    }
+
     /// Attach the durable host's one [`crate::host::HostRequestHandle`].
     /// `start` clones the process slot into both this handle and live
     /// [`WebState`]; attach writes that shared slot so `/api/connect` observes
@@ -758,6 +859,16 @@ pub(crate) struct WebState {
     pub(crate) pairing_attempts: Arc<std::sync::Mutex<PairingAttemptTracker>>,
     pub(crate) connect_startup: Option<std::sync::Arc<crate::connect::ConnectProductionStartup>>,
     pub(crate) host_requests: crate::connect::ConnectHostRequestSlot,
+    /// Per-listener cross-origin grant/ticket admission (hash-only secrets).
+    pub(crate) cross_origin: Arc<std::sync::Mutex<cross_origin::CrossOriginAdmissionRegistry>>,
+    /// Bounded per-listener cross-origin IP rate budget (not the same-origin tracker).
+    pub(crate) cross_origin_rate: Arc<std::sync::Mutex<cross_origin::CrossOriginRateBudget>>,
+    /// Optional test seam; production leaves this `None` and reads the trust store.
+    #[cfg(test)]
+    pub(crate) fleet_trust_source: Option<Arc<dyn fleet_publication::FleetTrustSource>>,
+    /// Test-only bound Connect web publication fence; production must leave `None`.
+    #[cfg(test)]
+    pub(crate) fleet_test_publication: Option<crate::connect::ConnectWebPublication>,
 }
 
 impl WebState {
@@ -784,9 +895,14 @@ fn web_auth_error_response(error: WebAuthError) -> Response {
 }
 
 fn build_router(state: Arc<WebState>) -> Router {
-    Router::new()
-        .route("/", get(assets::index_handler))
-        .route("/pair", get(pair_handler))
+    let router = Router::new()
+        .route("/", get(assets::native_index_handler))
+        .route(
+            "/pair",
+            post(pair_post_handler).layer(DefaultBodyLimit::max(
+                crate::connect::MAX_DIRECT_PAIRING_BODY_BYTES as usize,
+            )),
+        )
         .route("/api/health", get(health_handler))
         .route("/api/me", get(me_handler))
         .route("/api/slash-commands", get(slash_commands_handler))
@@ -797,10 +913,20 @@ fn build_router(state: Arc<WebState>) -> Router {
         .route("/api/push/unsubscribe", post(push_unsubscribe_handler))
         .route("/api/ws", get(bridge::ws_handler))
         .route("/api/connect", get(bridge::connect_ws_handler))
-        .route("/*path", get(assets::static_handler))
+        .route(
+            "/api/connect/fleet-hosts",
+            get(fleet_publication::fleet_hosts_handler),
+        );
+    cross_origin::mount_cross_origin_routes(router)
+        .route("/*path", get(assets::native_static_handler))
         .layer(DefaultBodyLimit::max(PUSH_REGISTRATION_BODY_BYTES))
         .layer(middleware::from_fn(web_response_policy))
         .with_state(state)
+}
+
+#[cfg(test)]
+pub(crate) fn build_router_for_tests(state: Arc<WebState>) -> Router {
+    build_router(state)
 }
 
 fn is_dynamic_web_path(path: &str) -> bool {
@@ -826,10 +952,18 @@ async fn web_response_policy(request: Request, next: Next) -> Response {
         .headers()
         .contains_key(header::CONTENT_SECURITY_POLICY)
     {
-        response.headers_mut().insert(
-            header::CONTENT_SECURITY_POLICY,
-            assets::content_security_policy(websocket_authority.as_deref()),
-        );
+        let fleet = response
+            .extensions()
+            .get::<fleet_publication::PreparedFleetRoster>()
+            .cloned();
+        let policy = fleet_publication::content_security_policy_with_fleet(
+            websocket_authority.as_deref(),
+            fleet.as_ref(),
+        )
+        .unwrap_or_else(|_| assets::content_security_policy(None));
+        response
+            .headers_mut()
+            .insert(header::CONTENT_SECURITY_POLICY, policy);
     }
     response
 }
@@ -850,7 +984,36 @@ struct PairQuery {
     browser_install_id: Option<String>,
 }
 
-/// `/pair?t=<web_pairing_token>&label=<optional phone name>`
+/// Pairing secrets travel in a bounded POST body, never in URLs or Referer.
+/// The underlying durable browser enrollment remains shared with v0.4.1.
+async fn pair_post_handler(
+    State(state): State<Arc<WebState>>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    verified: Option<axum::Extension<VerifiedDirectTransport>>,
+    headers: HeaderMap,
+    Json(query): Json<PairQuery>,
+) -> Response {
+    if !request_is_same_origin(&headers)
+        || bridge::connect_verified_policy(
+            &headers,
+            addr.ip(),
+            verified.as_ref().map(|value| &value.0),
+        )
+        .is_none()
+    {
+        return (
+            StatusCode::FORBIDDEN,
+            "pairing requires the verified same-origin listener",
+        )
+            .into_response();
+    }
+    if query.t.as_ref().is_some_and(|token| token.len() > 128) {
+        return (StatusCode::BAD_REQUEST, "invalid pairing token").into_response();
+    }
+    pair_handler(State(state), ConnectInfo(addr), headers, Query(query)).await
+}
+
+/// Shared durable enrollment behind the bounded, same-origin POST `/pair`.
 ///
 /// Validates the token, mints a new `PairedWebClient` plus a signed cookie,
 /// and redirects to `/`. On failure returns 401 with a short message (no
@@ -934,6 +1097,7 @@ async fn pair_handler(
                         browser_version: metadata.browser_version.clone(),
                         os_family: metadata.os_family.clone(),
                         device_class: metadata.device_class.clone(),
+                        permitted_origin: None,
                     });
                     client_id
                 }
@@ -952,6 +1116,7 @@ async fn pair_handler(
                     browser_version: metadata.browser_version.clone(),
                     os_family: metadata.os_family.clone(),
                     device_class: metadata.device_class.clone(),
+                    permitted_origin: None,
                 });
                 client_id
             };
@@ -1519,6 +1684,7 @@ pub(super) fn validate_authenticated_request(
             .web
             .paired_clients
             .iter()
+            .filter(|client| client.permitted_origin.is_none())
             .map(|client| client.client_id.clone())
             .collect();
         (config.web.cookie_secret_hex.clone(), ids)
@@ -1555,11 +1721,9 @@ pub(crate) fn authenticate_request(
         |config| {
             config.web.enabled
                 && config.web.cookie_secret_hex == cookie_secret_hex
-                && config
-                    .web
-                    .paired_clients
-                    .iter()
-                    .any(|client| client.client_id == client_id)
+                && config.web.paired_clients.iter().any(|client| {
+                    client.client_id == client_id && client.permitted_origin.is_none()
+                })
         },
         |config| {
             if let Some(client) = config
@@ -1745,7 +1909,231 @@ mod tests {
             pairing_attempts: Arc::new(std::sync::Mutex::new(PairingAttemptTracker::default())),
             connect_startup: None,
             host_requests: crate::connect::ConnectHostRequestSlot::new(),
+            cross_origin: Arc::new(std::sync::Mutex::new(
+                cross_origin::CrossOriginAdmissionRegistry::default(),
+            )),
+            cross_origin_rate: Arc::new(std::sync::Mutex::new(
+                cross_origin::CrossOriginRateBudget::default(),
+            )),
+            fleet_trust_source: None,
+            fleet_test_publication: None,
         })
+    }
+
+    #[test]
+    fn cross_origin_routes_are_registered() {
+        let _profile = TestProfileGuard::new("web-cross-origin-routes");
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let service = test_service("cross-origin-routes");
+        let state = test_state(&service);
+        let grant = runtime.block_on(route_request(
+            state.clone(),
+            axum::http::Method::POST,
+            "/api/connect/cross-origin-grants",
+            {
+                let mut headers = HeaderMap::new();
+                headers.insert(header::CONTENT_TYPE, "application/json".parse().unwrap());
+                headers.insert(header::ORIGIN, "http://127.0.0.1:43872".parse().unwrap());
+                headers
+            },
+            br#"{"origin":"https://phone.example"}"#.to_vec(),
+        ));
+        assert_ne!(grant.status(), StatusCode::NOT_FOUND);
+        let pair = runtime.block_on(route_request(
+            state.clone(),
+            axum::http::Method::POST,
+            "/api/connect/cross-origin-pair",
+            {
+                let mut headers = HeaderMap::new();
+                headers.insert(header::CONTENT_TYPE, "application/json".parse().unwrap());
+                headers.insert(header::ORIGIN, "https://phone.example".parse().unwrap());
+                headers
+            },
+            br#"{"grant":"x","browserInstallId":"i","publicKey":"1111111111111111111111111111111111111111111111111111111111111111"}"#.to_vec(),
+        ));
+        assert_ne!(pair.status(), StatusCode::NOT_FOUND);
+        assert!(pair
+            .headers()
+            .get(header::ACCESS_CONTROL_ALLOW_CREDENTIALS)
+            .is_none());
+        let fleet = runtime.block_on(route_request(
+            state.clone(),
+            axum::http::Method::GET,
+            "/api/connect/fleet-hosts",
+            HeaderMap::new(),
+            Vec::new(),
+        ));
+        assert_ne!(fleet.status(), StatusCode::NOT_FOUND);
+        assert_eq!(fleet.status(), StatusCode::UNAUTHORIZED);
+        let ws = runtime.block_on(route_response(state, "/api/connect/cross-origin"));
+        assert_ne!(ws.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[test]
+    fn authenticated_native_html_injects_fleet_meta_and_private_cache() {
+        let _profile = TestProfileGuard::new("web-fleet-html-auth");
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let service = test_service("fleet-html");
+        let remote = fleet_publication::tests_support::sample_remote_for_tests(7);
+        let expected_origin = remote.origin.clone();
+        let mut owned = (*test_state(&service)).clone();
+        owned.fleet_trust_source = Some(fleet_publication::tests_support::static_source(vec![
+            remote,
+        ]));
+        owned.fleet_test_publication =
+            Some(fleet_publication::tests_support::published_test_fence());
+        let state = Arc::new(owned);
+        let mut headers =
+            runtime.block_on(pair_cookie_headers(state.clone(), "fleet-html-browser"));
+        headers.insert(header::HOST, "devmanager.test:43872".parse().unwrap());
+        let response = runtime.block_on(route_request(
+            state.clone(),
+            axum::http::Method::GET,
+            "/",
+            headers,
+            Vec::new(),
+        ));
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers().get(header::CACHE_CONTROL).unwrap(),
+            "private, no-store"
+        );
+        let csp = response
+            .headers()
+            .get(header::CONTENT_SECURITY_POLICY)
+            .unwrap()
+            .to_str()
+            .unwrap();
+        assert!(csp.contains(&expected_origin));
+        assert!(csp.contains(&expected_origin.replacen("https://", "wss://", 1)));
+        assert!(!csp.contains("wss:*"));
+        assert!(csp.contains("script-src 'self' 'wasm-unsafe-eval'"));
+        assert!(!csp.contains("script-src 'self' 'unsafe-inline'"));
+        let body = runtime
+            .block_on(axum::body::to_bytes(response.into_body(), usize::MAX))
+            .unwrap();
+        let html = String::from_utf8_lossy(&body);
+        assert!(html.contains("devmanager-connect\""));
+        assert!(html.contains("devmanager-connect-fleet"));
+        assert!(html.contains(&expected_origin));
+
+        let anonymous = runtime.block_on(route_request(
+            state,
+            axum::http::Method::GET,
+            "/",
+            {
+                let mut headers = HeaderMap::new();
+                headers.insert(header::HOST, "devmanager.test:43872".parse().unwrap());
+                headers
+            },
+            Vec::new(),
+        ));
+        assert_eq!(
+            anonymous.headers().get(header::CACHE_CONTROL).unwrap(),
+            "no-cache"
+        );
+        let anon_csp = anonymous
+            .headers()
+            .get(header::CONTENT_SECURITY_POLICY)
+            .unwrap()
+            .to_str()
+            .unwrap();
+        assert!(!anon_csp.contains(&expected_origin));
+        let anon_body = runtime
+            .block_on(axum::body::to_bytes(anonymous.into_body(), usize::MAX))
+            .unwrap();
+        let anon_html = String::from_utf8_lossy(&anon_body);
+        assert!(anon_html.contains("devmanager-connect\""));
+        assert!(!anon_html.contains("devmanager-connect-fleet"));
+        assert!(!anon_html.contains(&expected_origin));
+    }
+
+    #[test]
+    fn revoked_publication_does_not_mix_stale_self_with_fleet_meta() {
+        let _profile = TestProfileGuard::new("web-fleet-html-revoke");
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let service = test_service("fleet-html-revoke");
+        let fence = fleet_publication::tests_support::published_test_fence();
+        let remote = fleet_publication::tests_support::sample_remote_for_tests(8);
+        struct RevokeSource {
+            fence: crate::connect::ConnectWebPublication,
+            hosts: Vec<fleet_publication::FleetRemoteHostDescriptor>,
+        }
+        impl fleet_publication::FleetTrustSource for RevokeSource {
+            fn load_remote_descriptors(
+                &self,
+                publication_generation: u64,
+                admission: &crate::remote::blocking_work::RemoteWorkAdmission,
+            ) -> Result<
+                Vec<fleet_publication::FleetRemoteHostDescriptor>,
+                fleet_publication::FleetPublicationError,
+            > {
+                let _ = admission;
+                self.fence.revoke();
+                let mut hosts = self.hosts.clone();
+                for host in &mut hosts {
+                    host.generation = publication_generation;
+                }
+                Ok(hosts)
+            }
+        }
+        let mut owned = (*test_state(&service)).clone();
+        owned.fleet_trust_source = Some(Arc::new(RevokeSource {
+            fence: fence.clone(),
+            hosts: vec![remote],
+        }));
+        owned.fleet_test_publication = Some(fence);
+        let state = Arc::new(owned);
+        let mut headers = runtime.block_on(pair_cookie_headers(state.clone(), "fleet-html-revoke"));
+        headers.insert(header::HOST, "devmanager.test:43872".parse().unwrap());
+        let response = runtime.block_on(route_request(
+            state,
+            axum::http::Method::GET,
+            "/",
+            headers,
+            Vec::new(),
+        ));
+        let body = runtime
+            .block_on(axum::body::to_bytes(response.into_body(), usize::MAX))
+            .unwrap();
+        let html = String::from_utf8_lossy(&body);
+        assert!(!html.contains("devmanager-connect-fleet"));
+        assert!(html.contains("unavailable") || !html.contains("remote8.example"));
+    }
+
+    #[test]
+    fn cookie_auth_rejects_cross_origin_only_paired_client() {
+        let _profile = TestProfileGuard::new("web-cross-origin-cookie-reject");
+        let service = test_service("cross-origin-cookie");
+        let _ = crate::remote::mutate_host_config_if(
+            &service.inner,
+            |_| true,
+            |config| {
+                config.web.enabled = true;
+                config.web.paired_clients.push(PairedWebClient {
+                    client_id: "web-cross-only".into(),
+                    browser_install_id: "install-cross".into(),
+                    label: "Phone".into(),
+                    permitted_origin: Some("https://a.example".into()),
+                    ..PairedWebClient::default()
+                });
+            },
+        );
+        let state = test_state(&service);
+        let secret = service.config().web.cookie_secret_hex.clone();
+        let signed = sign_cookie(&secret, "web-cross-only").expect("sign");
+        let cookie_name = cookie_name_for_server_id(&service.config().server_id);
+        let mut headers = HeaderMap::new();
+        headers.insert(header::HOST, "127.0.0.1:43872".parse().unwrap());
+        headers.insert(header::ORIGIN, "http://127.0.0.1:43872".parse().unwrap());
+        headers.insert(
+            header::COOKIE,
+            format!("{cookie_name}={signed}").parse().unwrap(),
+        );
+        assert!(matches!(
+            validate_authenticated_request(&state, &headers),
+            Err(WebAuthError::Unauthorized)
+        ));
     }
 
     #[test]
@@ -2646,12 +3034,16 @@ mod tests {
         let mut headers = test_headers(None);
         headers.insert("x-forwarded-proto", "https".parse().unwrap());
 
-        let response = runtime.block_on(route_request(
-            state,
-            axum::http::Method::GET,
-            "/pair?t=PAIR1234",
+        // Cookie formatting is a handler unit check. Production pairing is
+        // POST-only and verified-listener admission is tested separately.
+        let response = runtime.block_on(pair_handler(
+            State(state),
+            ConnectInfo(test_addr()),
             headers,
-            Vec::new(),
+            Query(PairQuery {
+                t: Some("PAIR1234".into()),
+                ..PairQuery::default()
+            }),
         ));
         drop(runtime);
 
@@ -2732,12 +3124,14 @@ mod tests {
             .build()
             .expect("test runtime");
 
-        let pair_response = runtime.block_on(route_request(
-            state.clone(),
-            axum::http::Method::GET,
-            "/pair?t=PAIR1234",
-            HeaderMap::new(),
-            Vec::new(),
+        let pair_response = runtime.block_on(pair_handler(
+            State(state.clone()),
+            ConnectInfo(test_addr()),
+            test_headers(None),
+            Query(PairQuery {
+                t: Some("PAIR1234".into()),
+                ..PairQuery::default()
+            }),
         ));
         let cookie_header = pair_response
             .headers()

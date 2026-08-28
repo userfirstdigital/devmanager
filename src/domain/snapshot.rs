@@ -445,6 +445,11 @@ pub struct SemanticJournalFact {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SemanticJournalPage {
+    #[serde(default)]
+    pub oldest_sequence: u64,
+    /// Replace cached history with this retained window before merging facts.
+    #[serde(default)]
+    pub cursor_rolled_over: bool,
     pub after_sequence: u64,
     pub through_sequence: u64,
     pub high_water: u64,
@@ -532,6 +537,12 @@ where
 }
 
 pub fn canonical_snapshot_page_size(page: &SnapshotPage) -> Result<u32, CanonicalPageSizeError> {
+    canonical_fixed_point_page_size(page, |page, encoded_bytes| {
+        page.encoded_bytes = encoded_bytes;
+    })
+}
+
+pub fn canonical_semantic_page_size(page: &SemanticJournalPage) -> Result<u32, CanonicalPageSizeError> {
     canonical_fixed_point_page_size(page, |page, encoded_bytes| {
         page.encoded_bytes = encoded_bytes;
     })

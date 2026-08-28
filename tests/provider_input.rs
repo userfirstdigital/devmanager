@@ -1837,7 +1837,13 @@ fn available_actions_omit_turn_controls_until_a_turn_exists() {
         seed_open_task_with_agent(&path, 0x80);
     let snapshot = bus.task_snapshot(task_id).expect("snapshot").expect("task");
     let before = devmanager::providers::input::available_action_ids(&snapshot, agent_session_id);
-    assert_eq!(before, vec![ACTION_PROVIDER_SEND_NOW]);
+    assert_eq!(
+        before,
+        vec![
+            ACTION_PROVIDER_SEND_NOW,
+            devmanager::client::action::ACTION_PROVIDER_TERMINAL_INPUT
+        ]
+    );
     assert!(!before.contains(&ACTION_PROVIDER_STEER_CURRENT_TURN));
     assert!(!before.contains(&ACTION_PROVIDER_QUEUE_FOLLOW_UP));
     assert!(!before.contains(&ACTION_PROVIDER_STOP_TURN));
@@ -2231,4 +2237,69 @@ fn codex_provider_input_without_bound_session_is_accepted_for_first_turn() {
             ..
         }
     ));
+}
+
+#[test]
+fn startup_terminal_input_is_fenced_before_first_chat_turn() {
+    use devmanager::domain::command::CommandReceipt;
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path().join("startup-terminal.sqlite3");
+    let (mut bus, task_id, agent_id, epoch, revision, client_id) =
+        seed_open_task_without_provider_runtime(&path, 0x60);
+    let turn = TurnId::new();
+    let input = |generation, action_epoch, turn_id, expected_revision| CommandEnvelope {
+        command_id: CommandId::new(),
+        client_id,
+        task_id: Some(task_id),
+        issued_at_ms: 1_725_000_002_000,
+        expected_task_revision: Some(expected_revision),
+        command: Command::SubmitProviderInput(
+            SubmitProviderInputIntent::try_new(
+                agent_id,
+                generation,
+                turn_id,
+                action_epoch,
+                None,
+                None,
+                ProviderInputAction::TerminalInput { text: "\r".into() },
+            )
+            .unwrap(),
+        ),
+    };
+    // The normal fixture generation is 3. Neither stale epoch nor generation
+    // may get an onboarding exception, and rejection must not adopt a turn.
+    for invalid in [
+        input(2, epoch, turn, revision),
+        input(3, epoch + 1, turn, revision),
+    ] {
+        assert!(matches!(
+            bus.execute(invalid).unwrap(),
+            CommandReceipt::Rejected { .. }
+        ));
+    }
+    assert!(matches!(
+        bus.execute(input(3, epoch, turn, revision)).unwrap(),
+        CommandReceipt::Accepted { .. }
+    ));
+    let snapshot = bus.task_snapshot(task_id).unwrap().unwrap();
+    assert_eq!(
+        snapshot.provider_sessions[&agent_id].current_turn,
+        Some(turn)
+    );
+    assert!(matches!(
+        bus.execute(input(3, epoch, TurnId::new(), snapshot.task.revision))
+            .unwrap(),
+        CommandReceipt::Rejected { .. }
+    ));
+    drop(bus);
+    let reopened = devmanager::kernel::CommandBus::open(&path).unwrap();
+    assert_eq!(
+        reopened
+            .task_snapshot(task_id)
+            .unwrap()
+            .unwrap()
+            .provider_sessions[&agent_id]
+            .current_turn,
+        Some(turn)
+    );
 }

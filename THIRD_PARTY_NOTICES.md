@@ -231,3 +231,35 @@ PERFORMANCE OF THIS SOFTWARE.
 - License text reviewed: `https://raw.githubusercontent.com/NiiightmareXD/windows-capture/1.5.0/LICENCE`
 - The package declares `MIT`, targets Windows Graphics Capture, and uses the same `windows = 0.61.3` API family already pinned by this workspace. Its 1.5.0 manifest uses Rust edition 2024 and declares no runtime feature flags; the local toolchain and focused Windows build are the compatibility checks.
 - The reviewed API provides direct `Window::from_raw_hwnd`, `ColorFormat::Bgra8`, `CursorCaptureSettings::WithoutCursor`, `DrawBorderSettings::WithoutBorder`, and `CaptureControl` stop/join support. The preview uses the direct HWND path and does not enumerate or match window titles.
+
+## T3 Tools scoped projection / registry pattern
+
+- Upstream: T3 Tools Inc. reference copies consulted under `reference/t3/` (not shipped as application source)
+- License: MIT
+- Copyright (c) 2026 T3 Tools Inc.
+- Adapted into DevManager browser Connect sources (`web/src/connect/scopedHostTask.ts`, `web/src/connect/nativeHostRegistry.ts`, and related projection comments) for host/task qualification keys and per-host lifecycle/registry shape only.
+- Not adapted: T3 Effect/Atom runtime, bearer/DPoP transport, SSH/credential stores, or any T3 dependency graph.
+
+```
+MIT License
+
+Copyright (c) 2026 T3 Tools Inc.
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+```
