@@ -17,7 +17,7 @@ use time::{format_description, format_description::BorrowedFormatItem, OffsetDat
 use crate::ui::conversation::rows::{
     activity_toggle_label, ActivityEntry, ActivityKind, ActivityState, ConversationRow,
 };
-use crate::ui::renderers::MessageRole;
+use crate::ui::renderers::{MarkdownBlock, MarkdownDocument, MessageRole};
 use crate::ui::tokens::{mix_color, ThemeTokens};
 
 /// Target: the user bubble caps at 80 percent of the readable measure.
@@ -57,9 +57,18 @@ pub fn conversation_row_element(row: &ConversationRow, tokens: ThemeTokens) -> A
         ConversationRow::Message {
             role: MessageRole::User,
             text,
+            markdown,
             occurred_at_ms,
             ..
-        } => message_row_element(row, text.clone(), *occurred_at_ms, true, false, tokens),
+        } => message_row_element(
+            row,
+            text.clone(),
+            markdown,
+            *occurred_at_ms,
+            true,
+            false,
+            tokens,
+        ),
         ConversationRow::Message {
             role: MessageRole::Reasoning,
             text,
@@ -67,12 +76,14 @@ pub fn conversation_row_element(row: &ConversationRow, tokens: ThemeTokens) -> A
         } => reasoning_element(text.clone(), tokens),
         ConversationRow::Message {
             text,
+            markdown,
             occurred_at_ms,
             streaming,
             ..
         } => message_row_element(
             row,
             text.clone(),
+            markdown,
             *occurred_at_ms,
             false,
             *streaming,
@@ -234,6 +245,7 @@ fn user_message_element(text: String, tokens: ThemeTokens) -> AnyElement {
 fn message_row_element(
     row: &ConversationRow,
     text: String,
+    markdown: &MarkdownDocument,
     occurred_at_ms: Option<u64>,
     user: bool,
     streaming: bool,
@@ -246,7 +258,7 @@ fn message_row_element(
     let body = if user {
         user_message_element(text.clone(), tokens)
     } else {
-        assistant_message_element(text.clone(), tokens)
+        assistant_message_element(markdown, tokens)
     };
 
     div()
@@ -349,23 +361,110 @@ fn message_meta_element(
 }
 
 /// Assistant turn. No surface, no border, no avatar, no role label.
-fn assistant_message_element(text: String, tokens: ThemeTokens) -> AnyElement {
+fn assistant_message_element(markdown: &MarkdownDocument, tokens: ThemeTokens) -> AnyElement {
     let mut block = div()
         .w_full()
         .px(px(4.0))
-        .py(px(2.0))
+        .py(px(4.0))
         .flex()
         .flex_col()
-        .gap(px(tokens.density.spacing.sm))
+        .gap(px(10.0))
         .text_color(tokens.text.primary.to_gpui())
         .line_height(px(tokens.density.typography.body_line_height));
-    for paragraph in text.split("\n\n") {
-        if paragraph.trim().is_empty() {
-            continue;
-        }
-        block = block.child(div().w_full().child(paragraph.to_string()));
+    for markdown_block in &markdown.blocks {
+        block = block.child(markdown_block_element(markdown_block, tokens));
     }
     block.into_any_element()
+}
+
+/// Native equivalent of T3's `ChatMarkdown`: hierarchy stays in the transcript
+/// instead of being flattened back to plain text, and code remains visually
+/// distinct from prose without turning the whole assistant message into a card.
+fn markdown_block_element(block: &MarkdownBlock, tokens: ThemeTokens) -> AnyElement {
+    match block {
+        MarkdownBlock::Heading { level, text } => {
+            let (size, weight, top) = match level {
+                1 => (tokens.density.typography.title, FontWeight::BOLD, 8.0),
+                2 => (tokens.density.typography.body + 2.0, FontWeight::BOLD, 6.0),
+                _ => (tokens.density.typography.body, FontWeight::SEMIBOLD, 4.0),
+            };
+            div()
+                .w_full()
+                .pt(px(top))
+                .text_size(px(size))
+                .line_height(px(size + 6.0))
+                .font_weight(weight)
+                .text_color(tokens.text.primary.to_gpui())
+                .child(text.clone())
+                .into_any_element()
+        }
+        MarkdownBlock::Paragraph { text } => div()
+            .w_full()
+            .text_size(px(tokens.density.typography.body))
+            .line_height(px(tokens.density.typography.body_line_height))
+            .text_color(tokens.text.primary.to_gpui())
+            .child(text.clone())
+            .into_any_element(),
+        MarkdownBlock::Code { language, text, .. } => {
+            let copy_text = text.clone();
+            let code_id = ElementId::Name(
+                format!("copy-conversation-code-{}", stable_code_block_hash(text)).into(),
+            );
+            div()
+                .w_full()
+                .rounded(px(tokens.density.radii.md))
+                .bg(tokens.surfaces.sunken.to_gpui())
+                .overflow_hidden()
+                .child(
+                    div()
+                        .w_full()
+                        .flex()
+                        .items_center()
+                        .justify_between()
+                        .px(px(12.0))
+                        .py(px(7.0))
+                        .bg(
+                            mix_color(tokens.surfaces.sunken, tokens.surfaces.raised, 0.55)
+                                .to_gpui(),
+                        )
+                        .text_size(px(tokens.density.typography.caption))
+                        .text_color(tokens.text.muted.to_gpui())
+                        .child(language.clone().unwrap_or_else(|| "Code".into()))
+                        .child(
+                            div()
+                                .id(code_id)
+                                .cursor_pointer()
+                                .hover(|style| style.text_color(tokens.text.primary.to_gpui()))
+                                .on_click(move |_event, _window, cx| {
+                                    cx.stop_propagation();
+                                    cx.write_to_clipboard(ClipboardItem::new_string(
+                                        copy_text.clone(),
+                                    ));
+                                })
+                                .child("Copy"),
+                        ),
+                )
+                .child(
+                    div()
+                        .w_full()
+                        .px(px(12.0))
+                        .py(px(10.0))
+                        .font(font("Cascadia Mono"))
+                        .text_size(px(tokens.density.typography.caption))
+                        .line_height(px(tokens.density.typography.caption_line_height + 2.0))
+                        .text_color(tokens.text.secondary.to_gpui())
+                        .child(text.clone()),
+                )
+                .into_any_element()
+        }
+    }
+}
+
+fn stable_code_block_hash(text: &str) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    text.hash(&mut hasher);
+    hasher.finish()
 }
 
 /// Reasoning turn. Quiet and visually subordinate to the assistant's answer.

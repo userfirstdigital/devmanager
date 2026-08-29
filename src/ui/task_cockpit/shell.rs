@@ -611,11 +611,7 @@ impl TaskCockpitShell {
         if self.timelines.contains_key(&task_id) {
             return;
         }
-        self.project_page_into_timeline(
-            task_id,
-            page,
-            conversation_presentation_signature(page),
-        );
+        self.project_page_into_timeline(task_id, page, conversation_presentation_signature(page));
     }
 
     /// Project or refresh a retained timeline when admission advances the
@@ -853,6 +849,35 @@ impl TaskCockpitShell {
             .flex()
             .flex_col()
             .child(self.conversation_timeline_surface(tokens, activity_toggle))
+            .child(footer)
+            .into_any_element()
+    }
+
+    /// Mount a conversation pane for an exact task without consulting the
+    /// cockpit's globally focused task. Recursive workspaces can keep several
+    /// conversations visible at once, so background panes must not inherit the
+    /// focused pane's timeline.
+    pub fn conversation_surface_with_footer_for_task(
+        &self,
+        task_id: TaskId,
+        tokens: crate::ui::tokens::ThemeTokens,
+        footer: AnyElement,
+        activity_toggle: Option<ActivityToggleHandler>,
+    ) -> AnyElement {
+        div()
+            .id(("native-task-conversation-surface", {
+                u64::from_be_bytes(
+                    task_id.as_bytes()[8..]
+                        .try_into()
+                        .expect("task identity tail is exactly eight bytes"),
+                )
+            }))
+            .w_full()
+            .flex_1()
+            .min_h(gpui::px(0.0))
+            .flex()
+            .flex_col()
+            .child(self.conversation_timeline_surface_for(task_id, tokens, activity_toggle))
             .child(footer)
             .into_any_element()
     }

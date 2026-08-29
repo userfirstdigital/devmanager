@@ -6,7 +6,9 @@
 //! unrenderable rather than suppressed by a denylist.
 
 use crate::domain::PlanStepStatus;
-use crate::ui::renderers::{MessageRole, TimelineItemContent, TimelineItemId, TimelineItemModel};
+use crate::ui::renderers::{
+    MarkdownDocument, MessageRole, TimelineItemContent, TimelineItemId, TimelineItemModel,
+};
 
 #[cfg(test)]
 use super::fixtures::{generic_item, message_item, plan_item, tool_item};
@@ -60,6 +62,7 @@ pub enum ConversationRow {
         id: TimelineItemId,
         role: MessageRole,
         text: String,
+        markdown: MarkdownDocument,
         occurred_at_ms: Option<u64>,
         streaming: bool,
     },
@@ -292,6 +295,7 @@ pub fn derive_conversation_rows(
                         id: item.id,
                         role,
                         text,
+                        markdown: view.markdown.clone(),
                         occurred_at_ms: view.occurred_at_ms,
                         streaming: view.streaming,
                     }),

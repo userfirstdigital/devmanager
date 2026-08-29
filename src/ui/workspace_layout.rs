@@ -62,6 +62,15 @@ pub struct WindowFrame {
     pub maximized: bool,
 }
 
+/// User-owned composer choices for one exact task. Provider discovery supplies
+/// the available values; this record preserves what the user selected.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TaskComposerPreferences {
+    pub provider: crate::providers::ProviderKind,
+    pub launch_options: crate::providers::ProviderLaunchOptions,
+}
+
 /// Smallest window worth restoring. Anything below this is storage damage or a
 /// window that was mid-minimize, and restoring it hands back an unusable shell.
 pub const MIN_WINDOW_WIDTH: f32 = 640.0;
@@ -78,7 +87,7 @@ impl WindowFrame {
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-#[serde(bound(serialize = "K: Serialize", deserialize = "K: Deserialize<'de>"))]
+#[serde(bound(serialize = "K: Serialize", deserialize = "K: Deserialize<'de> + Ord"))]
 pub struct KeyedWorkspaceLayout<K = TaskId> {
     pub sidebar_width: f32,
     pub inbox_width: f32,
@@ -111,6 +120,11 @@ pub struct KeyedWorkspaceLayout<K = TaskId> {
     /// Map keys are [`TerminalCenterKey::center_preference_key`] encodings.
     #[serde(default)]
     pub task_center_terminal: BTreeMap<String, bool>,
+    /// Exact task-owned composer selections. Keys use the same stable full-key
+    /// encoding as `task_center_terminal`, because JSON object keys must be
+    /// strings and raw TaskIds would collide across hosts.
+    #[serde(default)]
+    pub task_composer_preferences: BTreeMap<String, TaskComposerPreferences>,
     /// Last composer launch choices. Project-specific overrides can layer on
     /// these later without changing task creation semantics.
     #[serde(default)]
@@ -181,6 +195,7 @@ impl<K> Default for KeyedWorkspaceLayout<K> {
             active_dock_tab: None,
             project_scope_workspace_id: None,
             task_center_terminal: BTreeMap::new(),
+            task_composer_preferences: BTreeMap::new(),
             composer_provider: Some(crate::providers::ProviderKind::Codex),
             composer_launch_options: Some(crate::providers::ProviderLaunchOptions {
                 model: crate::providers::ProviderModel::CodexSol,
@@ -310,6 +325,8 @@ impl<K: Clone + Ord + Eq> KeyedWorkspaceLayout<K> {
             .collect();
         self.task_center_terminal
             .retain(|task_id, _| valid_keys.contains(task_id));
+        self.task_composer_preferences
+            .retain(|task_id, _| valid_keys.contains(task_id));
         *self != before
     }
 
@@ -429,6 +446,19 @@ impl KeyedWorkspaceLayout<TaskId> {
                 return Err(WorkspaceLayoutMapError::DuplicateMappedKey);
             }
         }
+        let mut task_composer_preferences = BTreeMap::new();
+        for (raw_key, preferences) in self.task_composer_preferences {
+            let Ok(task_id) = TaskId::parse(&raw_key) else {
+                continue;
+            };
+            let mapped = map_legacy_task(task_id);
+            if task_composer_preferences
+                .insert(mapped.center_preference_key(), preferences)
+                .is_some()
+            {
+                return Err(WorkspaceLayoutMapError::DuplicateMappedKey);
+            }
+        }
         Ok(KeyedWorkspaceLayout {
             sidebar_width: self.sidebar_width,
             inbox_width: self.inbox_width,
@@ -443,6 +473,7 @@ impl KeyedWorkspaceLayout<TaskId> {
             active_dock_tab: self.active_dock_tab,
             project_scope_workspace_id: self.project_scope_workspace_id,
             task_center_terminal,
+            task_composer_preferences,
             composer_provider: self.composer_provider,
             composer_launch_options: self.composer_launch_options,
         })
@@ -464,7 +495,7 @@ pub fn clamp_edge(edge: PaneEdge, value: f32) -> f32 {
 }
 
 #[derive(Serialize, Deserialize)]
-#[serde(bound(serialize = "K: Serialize", deserialize = "K: Deserialize<'de>"))]
+#[serde(bound(serialize = "K: Serialize", deserialize = "K: Deserialize<'de> + Ord"))]
 struct LayoutFile<K = TaskId> {
     schema: String,
     layout: KeyedWorkspaceLayout<K>,
@@ -1086,6 +1117,28 @@ mod tests {
                 (local.center_preference_key(), true),
                 (remote.center_preference_key(), false),
             ]),
+            task_composer_preferences: BTreeMap::from([
+                (
+                    local.center_preference_key(),
+                    TaskComposerPreferences {
+                        provider: crate::providers::ProviderKind::Codex,
+                        launch_options: crate::providers::ProviderLaunchOptions {
+                            model: crate::providers::ProviderModel::CodexTerra,
+                            ..crate::providers::ProviderLaunchOptions::default()
+                        },
+                    },
+                ),
+                (
+                    remote.center_preference_key(),
+                    TaskComposerPreferences {
+                        provider: crate::providers::ProviderKind::ClaudeCode,
+                        launch_options: crate::providers::ProviderLaunchOptions {
+                            model: crate::providers::ProviderModel::ClaudeOpus,
+                            ..crate::providers::ProviderLaunchOptions::default()
+                        },
+                    },
+                ),
+            ]),
             ..KeyedWorkspaceLayout::default()
         };
         layout.sanitize_task_workspace();
@@ -1108,6 +1161,20 @@ mod tests {
                 .task_center_terminal
                 .get(&local.center_preference_key()),
             Some(&true)
+        );
+        assert_eq!(
+            loaded
+                .task_composer_preferences
+                .get(&local.center_preference_key())
+                .map(|preferences| preferences.launch_options.model),
+            Some(crate::providers::ProviderModel::CodexTerra)
+        );
+        assert_eq!(
+            loaded
+                .task_composer_preferences
+                .get(&remote.center_preference_key())
+                .map(|preferences| preferences.launch_options.model),
+            Some(crate::providers::ProviderModel::ClaudeOpus)
         );
         assert_eq!(
             loaded

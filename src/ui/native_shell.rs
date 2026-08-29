@@ -156,26 +156,26 @@ use crate::ui::native_composer::{
     apply_suggestion, detect_trigger, filter_suggestions, ComposerCursor, PromptDocument,
     PromptSegment, TriggerKind, TriggerMenuState, TriggerSuggestion, SKILL_TRIGGER_HOLD,
 };
-use crate::ui::project_actions::{
-    ProjectActionDraft, ProjectActionEditorField, ProjectActionMenuMode, ProjectActionRow,
-    ProjectActionWorkflow,
-};
-use crate::ui::project_scope::{ProjectScope, ProjectScopeMenuState};
 use crate::ui::native_fleet::{
-    apply_fleet_workspace_selection, fleet_rows_from_inbox, forget_host_open_keys, host_display_label,
-    host_label_from_endpoint_or_key, merge_fleet_inbox, overlay_owner_config_project_labels,
-    remote_raw_terminal_allowed, FleetSelectMode,
+    apply_fleet_workspace_selection, fleet_rows_from_inbox, forget_host_open_keys,
+    host_display_label, host_label_from_endpoint_or_key, merge_fleet_inbox,
+    overlay_owner_config_project_labels, remote_raw_terminal_allowed, FleetSelectMode,
 };
 use crate::ui::native_host_state::{
     local_host_task_key, FleetInboxProjection, FleetTaskRow, HostDrainCursor, HostProjectKey,
     FLEET_DRAIN_PER_HOST,
 };
+use crate::ui::project_actions::{
+    ProjectActionDraft, ProjectActionEditorField, ProjectActionMenuMode, ProjectActionRow,
+    ProjectActionWorkflow,
+};
+use crate::ui::project_scope::{ProjectScope, ProjectScopeMenuState};
 use crate::ui::task_search::{TaskSearchCandidate, TaskSearchState};
 use crate::ui::task_workspace::{
-    conversation_poll_priorities_due,
-    Allocation, AllocationMetrics, Axis, ConversationQueryPriority, DropTarget, Edge, PaneId,
-    PaneRect, SplitId, TaskPaneBody, TaskPaneProjection, TaskPaneViewModel, TaskSurfaceRegistry,
-    TaskWorkspace, TaskWorkspaceViewChild, TaskWorkspaceViewModel, TaskWorkspaceViewNode, Viewport,
+    conversation_poll_priorities_due, Allocation, AllocationMetrics, Axis,
+    ConversationQueryPriority, DropTarget, Edge, PaneId, PaneRect, SplitId, TaskPaneBody,
+    TaskPaneProjection, TaskPaneViewModel, TaskSurfaceRegistry, TaskWorkspace,
+    TaskWorkspaceViewChild, TaskWorkspaceViewModel, TaskWorkspaceViewNode, Viewport,
     WorkspaceError, WorkspaceSelectionGesture,
 };
 use crate::ui::terminal_adapter::TerminalDockAdapter;
@@ -186,8 +186,8 @@ use crate::ui::theme_system::{
 };
 use crate::ui::tokens::{mix_color, RuntimePreferencesSnapshot, StatusMeaning};
 use crate::ui::workspace_layout::{
-    KeyedWorkspaceLayout, PaneEdge, TerminalCenterKey, WindowFrame, WorkspaceLayout,
-    WorkspaceLayoutStore,
+    KeyedWorkspaceLayout, PaneEdge, TaskComposerPreferences, TerminalCenterKey, WindowFrame,
+    WorkspaceLayout, WorkspaceLayoutStore,
 };
 
 use crate::updater::{UpdaterService, UpdaterSnapshot, UpdaterStage};
@@ -4147,11 +4147,12 @@ fn native_reconnect_source_for(
 ) -> Result<NativeReconnectSource, NativeShellError> {
     match host_id.as_remote() {
         Some(host_public_id) => {
-            let store_root = trusted_hosts::trust_store_root_for_profile(profile).map_err(|_| {
-                NativeShellError::HostConnect {
-                    message: "trusted host profile root unresolved".into(),
-                }
-            })?;
+            let store_root =
+                trusted_hosts::trust_store_root_for_profile(profile).map_err(|_| {
+                    NativeShellError::HostConnect {
+                        message: "trusted host profile root unresolved".into(),
+                    }
+                })?;
             Ok(NativeReconnectSource::TrustedRemote {
                 store_root,
                 host_public_id,
@@ -4193,9 +4194,9 @@ fn resolve_fleet_transport_reconnect(
                 host_public_id: *host_public_id,
             })
         }
-        NativeReconnectSource::Local => Err(
-            "remote host reconnect requires a trusted factory; leaving read-only".to_string(),
-        ),
+        NativeReconnectSource::Local => {
+            Err("remote host reconnect requires a trusted factory; leaving read-only".to_string())
+        }
     }
 }
 
@@ -4453,9 +4454,9 @@ impl Drop for InstalledFleetSlotGuard {
         if !remaining.is_zero() {
             let fleet = Arc::clone(&self.fleet);
             let host_id = self.host_id.clone();
-            let _ = self.runtime.block_on(async {
-                tokio::time::timeout(remaining, fleet.remove(&host_id)).await
-            });
+            let _ = self
+                .runtime
+                .block_on(async { tokio::time::timeout(remaining, fleet.remove(&host_id)).await });
         }
         if let Some(mut process) = self.process.take() {
             process.dispose(deadline);
@@ -5542,15 +5543,18 @@ async fn deferred_bootstrap_projection(
     };
 
     // Preview never enables writes; bootstrapped stays false until canonical model.
-    let sync_owned = fleet
-        .synchronize(host_id)
-        .await
-        .map_err(|error| NativeShellError::HostConnect {
-            message: preview_error.as_ref().map_or_else(
-                || error.to_string(),
-                |preview| format!("task preview failed: {preview}; canonical sync failed: {error}"),
-            ),
-        })?;
+    let sync_owned =
+        fleet
+            .synchronize(host_id)
+            .await
+            .map_err(|error| NativeShellError::HostConnect {
+                message: preview_error.as_ref().map_or_else(
+                    || error.to_string(),
+                    |preview| {
+                        format!("task preview failed: {preview}; canonical sync failed: {error}")
+                    },
+                ),
+            })?;
     validate_owned_admission(&sync_owned, &admission)?;
 
     let owned_model = fleet
@@ -5716,10 +5720,8 @@ fn native_host_worker_loop(
                             &epochs,
                             format!("{error}; reconnect failed: {recovery_error}"),
                         );
-                        if !wait_reconnect_backoff_interruptible(
-                            &reconnect_backoff,
-                            &cancellation,
-                        ) {
+                        if !wait_reconnect_backoff_interruptible(&reconnect_backoff, &cancellation)
+                        {
                             drain_cancelled_worker_commands(
                                 &command_rx,
                                 &channel_depth,
@@ -6162,13 +6164,7 @@ fn pump_fleet_subscription_once(
             }
             Err(error) if error != "native host fleet reconnect cancelled" => {
                 record_recovery_attempt_result(reconnect_backoff, Instant::now(), false);
-                publish_runtime_host_error_projection(
-                    fleet,
-                    host_id,
-                    projections,
-                    epochs,
-                    error,
-                );
+                publish_runtime_host_error_projection(fleet, host_id, projections, epochs, error);
             }
             Err(_) => {}
         }
@@ -6461,7 +6457,15 @@ fn reconnect_fleet_host(
     runtime: &tokio::runtime::Runtime,
     cancellation: &Arc<AtomicBool>,
     probe: Option<&TrustedReconnectFactoryProbe>,
-) -> Result<(Arc<ClientModel>, NativeProjectionOwner, bool, Vec<DomainEvent>), String> {
+) -> Result<
+    (
+        Arc<ClientModel>,
+        NativeProjectionOwner,
+        bool,
+        Vec<DomainEvent>,
+    ),
+    String,
+> {
     resync_or_reconnect_fleet_host(
         fleet,
         host_id,
@@ -6487,7 +6491,15 @@ fn resync_or_reconnect_fleet_host(
     cancellation: &Arc<AtomicBool>,
     force_transport_reconnect: bool,
     probe: Option<&TrustedReconnectFactoryProbe>,
-) -> Result<(Arc<ClientModel>, NativeProjectionOwner, bool, Vec<DomainEvent>), String> {
+) -> Result<
+    (
+        Arc<ClientModel>,
+        NativeProjectionOwner,
+        bool,
+        Vec<DomainEvent>,
+    ),
+    String,
+> {
     if cancellation.load(Ordering::Acquire) {
         return Err("native host fleet reconnect cancelled".to_string());
     }
@@ -8373,7 +8385,11 @@ impl AccessibilityTree {
                                     format!("Start Claude task in {label}"),
                                     "Create a new task in this project and connect Claude Code.",
                                 )
-                                .gpui(element_id.clone(), true, true),
+                                .gpui(
+                                    element_id.clone(),
+                                    true,
+                                    true,
+                                ),
                             );
                             project_action_elements.insert(
                                 element_id,
@@ -8394,7 +8410,11 @@ impl AccessibilityTree {
                                     format!("Start Codex task in {label}"),
                                     "Create a new task in this project and connect Codex.",
                                 )
-                                .gpui(element_id.clone(), true, true),
+                                .gpui(
+                                    element_id.clone(),
+                                    true,
+                                    true,
+                                ),
                             );
                             project_action_elements.insert(
                                 element_id,
@@ -8549,7 +8569,11 @@ impl AccessibilityTree {
                     "Open the project action menu for the selected project.".to_string()
                 },
             )
-            .gpui("native-shell-tools-affordance", !remote_selected, !remote_selected)
+            .gpui(
+                "native-shell-tools-affordance",
+                !remote_selected,
+                !remote_selected,
+            )
             .with_disabled(remote_selected),
             AccessibilityNode::new(
                 AccessibleRole::Button,
@@ -9523,13 +9547,11 @@ pub struct NativeShell {
     /// Pointer/AT recovery controls keyed by stable element id. Rebuilt with
     /// the accessibility tree so HostTaskKey+CommandId never remint on focus.
     composer_recovery_targets: BTreeMap<String, ComposerRecoveryTarget>,
-    /// Unstarted-draft provider/model/effort choice is owner-local so switching
-    /// drafts cannot overwrite another draft's selection. Global layout fields
-    /// still remember last-used defaults for new drafts.
-    draft_launch_prefs: BTreeMap<
-        HostTaskKey,
-        (ProviderKind, crate::providers::ProviderLaunchOptions),
-    >,
+    /// Provider/model/effort/access choice is owner-local so switching tasks
+    /// cannot overwrite another task's selection. Provider discovery owns the
+    /// available values; the user owns this selected value.
+    draft_launch_prefs:
+        BTreeMap<HostTaskKey, (ProviderKind, crate::providers::ProviderLaunchOptions)>,
     pending_automatic_titles: BTreeMap<HostTaskKey, PendingAutomaticTitle>,
     composer_images: BTreeMap<
         crate::ui::task_cockpit::draft_store::KeyedComposerDraftKey<HostTaskKey>,
@@ -9731,12 +9753,15 @@ impl Drop for NativeShell {
                 }
             }
         }
-        outcomes.extend(self.local_slot_mut().pending_host_actions.drain(..).map(|action| {
-            NativeHostActionOutcome::Uncertain {
-                action,
-                error: bounded_host_error("native shell dropped before action reconciliation"),
-            }
-        }));
+        outcomes.extend(
+            self.local_slot_mut()
+                .pending_host_actions
+                .drain(..)
+                .map(|action| NativeHostActionOutcome::Uncertain {
+                    action,
+                    error: bounded_host_error("native shell dropped before action reconciliation"),
+                }),
+        );
         if let Some(action) = self.local_slot_mut().retained_action_overflow.take() {
             outcomes.push_back(NativeHostActionOutcome::Uncertain {
                 action,
@@ -9958,12 +9983,8 @@ impl NativeShell {
             local_host_task_key(&draft_profile, task_id)
                 .expect("legacy drafts map through the exact local profile")
         });
-        let mut interaction = NativeInteraction::new(
-            layout
-                .selected_task
-                .as_ref()
-                .map(|key| key.task_id),
-        );
+        let mut interaction =
+            NativeInteraction::new(layout.selected_task.as_ref().map(|key| key.task_id));
         let initial_epochs = host_runtime
             .as_ref()
             .map(|runtime| match runtime {
@@ -9974,12 +9995,8 @@ impl NativeShell {
         interaction.sync_host_epochs(initial_epochs);
         let local_host_id = HostId::local_profile(profile.named_profile())
             .expect("isolated profile name must form a local HostId");
-        let mut local_slot = HostUiState::with_runtime(
-            local_host_id.clone(),
-            host_runtime,
-            host_state,
-            interaction,
-        );
+        let mut local_slot =
+            HostUiState::with_runtime(local_host_id.clone(), host_runtime, host_state, interaction);
         local_slot.inbox = inbox;
         local_slot.task_list = task_list;
         local_slot.header_attachment = header_attachment;
@@ -9988,6 +10005,20 @@ impl NativeShell {
         local_slot.cockpit = TaskCockpitShell::new(DockEdge::Bottom);
         let mut hosts = BTreeMap::new();
         hosts.insert(local_host_id, local_slot);
+        let draft_launch_prefs = layout
+            .task_composer_preferences
+            .iter()
+            .filter_map(|(encoded_key, preferences)| {
+                serde_json::from_str::<HostTaskKey>(encoded_key)
+                    .ok()
+                    .map(|key| {
+                        (
+                            key,
+                            (preferences.provider, preferences.launch_options.clone()),
+                        )
+                    })
+            })
+            .collect();
         let browser_profile_root = profile.root().to_path_buf();
         let browser_bridge_init = browser_command_channel(64);
         let (theme_controller, theme_error) = match ThemeController::load_at(profile.root()) {
@@ -10052,7 +10083,7 @@ impl NativeShell {
             root_editor_focus_handle,
             pending_composer_submissions: BTreeMap::new(),
             composer_recovery_targets: BTreeMap::new(),
-            draft_launch_prefs: BTreeMap::new(),
+            draft_launch_prefs,
             pending_automatic_titles: BTreeMap::new(),
             composer_images: BTreeMap::new(),
             next_composer_image_id: 1,
@@ -10170,7 +10201,8 @@ impl NativeShell {
     }
 
     pub fn host_endpoint(&self) -> &str {
-        self.local_slot().host_runtime
+        self.local_slot()
+            .host_runtime
             .as_ref()
             .map(|attachment| match attachment {
                 NativeHostRuntimeAttachment::Client(runtime) => runtime.endpoint(),
@@ -10262,7 +10294,11 @@ impl NativeShell {
         if self.remote_settings.pending.is_some() {
             return;
         }
-        let Some(mut record) = self.local_slot_mut().interaction.action(ActionRequest::HostStatus) else {
+        let Some(mut record) = self
+            .local_slot_mut()
+            .interaction
+            .action(ActionRequest::HostStatus)
+        else {
             self.remote_settings.feedback = Some("Local host is not connected.".into());
             return;
         };
@@ -10408,7 +10444,11 @@ impl NativeShell {
         &mut self,
         request: crate::providers::settings::ProviderSettingsHostRequest,
     ) -> NativeHostActionResult {
-        let Some(mut record) = self.local_slot_mut().interaction.action(ActionRequest::HostStatus) else {
+        let Some(mut record) = self
+            .local_slot_mut()
+            .interaction
+            .action(ActionRequest::HostStatus)
+        else {
             return NativeHostActionResult::Stale;
         };
         record.id = "provider.settings";
@@ -11385,7 +11425,8 @@ impl NativeShell {
     }
 
     fn note_selected_task_restore_unavailable(&mut self, task_id: TaskId) {
-        self.task_surfaces.note_terminal_reconnecting(self.local_task_key(task_id));
+        self.task_surfaces
+            .note_terminal_reconnecting(self.local_task_key(task_id));
         self.local_slot_mut().cockpit.set_attachment_unavailable(
             "The agent didn't start. Check Settings, then use +Claude or +Codex again.",
         );
@@ -11406,10 +11447,13 @@ impl NativeShell {
         let project_items = self.project_inbox_items();
         let shows_add_project = self.shows_add_project_plus();
         let composer_focused = self.composer_accessibility_focused;
-        let composer = self.composer.as_ref().map(|composer| ComposerAccessibilityState {
-            value: composer.draft_text().to_string(),
-            focused: composer_focused,
-        });
+        let composer = self
+            .composer
+            .as_ref()
+            .map(|composer| ComposerAccessibilityState {
+                value: composer.draft_text().to_string(),
+                focused: composer_focused,
+            });
         let selected_key = self.selected_task_key.clone();
         let local_host = self.local_host_id();
         let (task_list, header, welcome_copy, agent) = {
@@ -11506,19 +11550,19 @@ impl NativeShell {
                 AccessibilityNode::new(
                     AccessibleRole::Button,
                     "Change model",
-                    "Choose the model used when this provider session starts.",
+                    "Choose the model for this task.",
                 )
                 .gpui("native-composer-model", true, true),
                 AccessibilityNode::new(
                     AccessibleRole::Button,
                     "Change thinking budget",
-                    "Choose the reasoning effort used when this provider session starts.",
+                    "Choose the reasoning effort for this task.",
                 )
                 .gpui("native-composer-reasoning", true, true),
                 AccessibilityNode::new(
                     AccessibleRole::Button,
                     "Change access",
-                    "Choose the filesystem and approval access used when this provider session starts.",
+                    "Choose the filesystem and approval access for this task.",
                 )
                 .gpui("native-composer-access", true, true),
             ]);
@@ -11743,7 +11787,9 @@ impl NativeShell {
                 .gpui("native-composer-trigger-panel", true, true),
             );
         }
-        if self.local_slot().cockpit.active_tool() == CockpitDockTool::Changes && !self.layout.dock_collapsed {
+        if self.local_slot().cockpit.active_tool() == CockpitDockTool::Changes
+            && !self.layout.dock_collapsed
+        {
             if let Some(task_id) = self.local_slot().interaction.selected_task() {
                 let selected = self.selected_repository_for_task(task_id);
                 let (git, repositories) = {
@@ -11785,7 +11831,9 @@ impl NativeShell {
                 }
             }
         }
-        if self.local_slot_mut().cockpit.active_tool() == CockpitDockTool::Browser && !self.layout.dock_collapsed {
+        if self.local_slot_mut().cockpit.active_tool() == CockpitDockTool::Browser
+            && !self.layout.dock_collapsed
+        {
             for (id, label, description) in [
                 (
                     "native-browser-back",
@@ -11850,10 +11898,13 @@ impl NativeShell {
 
     fn dispatch_agent_connection_query(&mut self, reuse_handler: bool) -> NativeHostActionResult {
         let captured = if reuse_handler {
-            self.local_slot_mut().interaction
+            self.local_slot_mut()
+                .interaction
                 .action_on_current_handler(ActionRequest::HostStatus)
         } else {
-            self.local_slot_mut().interaction.action(ActionRequest::HostStatus)
+            self.local_slot_mut()
+                .interaction
+                .action(ActionRequest::HostStatus)
         };
         let Some(mut record) = captured else {
             return NativeHostActionResult::Stale;
@@ -11864,7 +11915,8 @@ impl NativeShell {
         };
         let result = self.enqueue_host_action(record);
         if matches!(result, NativeHostActionResult::Queued) {
-            self.local_slot_mut().agent_connection = Some(agent_connection_snapshot(AgentPresence::Checking));
+            self.local_slot_mut().agent_connection =
+                Some(agent_connection_snapshot(AgentPresence::Checking));
         }
         result
     }
@@ -11923,14 +11975,21 @@ impl NativeShell {
 
     fn forward_browser_host_events(&mut self) {
         for event in self.browser_host.drain_events() {
-            let _ = self.local_slot_mut().cockpit.forward_browser_host_event(&event);
+            let _ = self
+                .local_slot_mut()
+                .cockpit
+                .forward_browser_host_event(&event);
         }
     }
 
     fn apply_query_body(&mut self, action: &NativeActionRecord, body: NativeHostQueryBody) {
         if let Some(request_id) = native_request_id(&action.command) {
-            if self.local_slot_mut().first_send_readiness_requests.remove(&request_id)
-                && self.local_slot_mut()
+            if self
+                .local_slot_mut()
+                .first_send_readiness_requests
+                .remove(&request_id)
+                && self
+                    .local_slot_mut()
                     .pending_draft_first_send
                     .as_ref()
                     .is_none_or(|pending| pending.readiness_request_id != Some(request_id))
@@ -11943,7 +12002,8 @@ impl NativeShell {
         match body {
             NativeHostQueryBody::Text => {}
             NativeHostQueryBody::ConfigSidebar(snapshot) => {
-                self.local_slot_mut().config_sidebar = ConfigSidebarProjection::from_host_snapshot(&snapshot);
+                self.local_slot_mut().config_sidebar =
+                    ConfigSidebarProjection::from_host_snapshot(&snapshot);
                 if !self.local_slot_mut().config_sidebar.projects.is_empty() {
                     self.finish_add_project_after_host_accept();
                 }
@@ -11978,7 +12038,8 @@ impl NativeShell {
                 }
                 if let Some((_, task_id, TaskCockpitQuery::Terminal)) = command_parts {
                     if !matches!(&result, crate::domain::TaskCockpitResult::Terminal(_)) {
-                        self.task_surfaces.note_terminal_reconnecting(self.local_task_key(task_id));
+                        self.task_surfaces
+                            .note_terminal_reconnecting(self.local_task_key(task_id));
                         if self.local_slot_mut().interaction.selected_task() == Some(task_id) {
                             self.sync_terminal_from_cockpit();
                         }
@@ -12004,11 +12065,8 @@ impl NativeShell {
                             .conversation_page(owner.clone())
                             .and_then(|page| page.next_sequence)
                             .is_some();
-                        let after_sequence =
-                            self.conversation_after_sequence_for(owner.clone());
-                        if needs_next_page
-                            && !self.task_surfaces.conversation_in_flight(owner)
-                        {
+                        let after_sequence = self.conversation_after_sequence_for(owner.clone());
+                        if needs_next_page && !self.task_surfaces.conversation_in_flight(owner) {
                             self.dispatch_related_actions([ActionRequest::TaskCockpit {
                                 task_id,
                                 query: TaskCockpitQuery::Conversation { after_sequence },
@@ -12051,7 +12109,9 @@ impl NativeShell {
                             | crate::domain::TaskCockpitResult::ConfigCommandDetail(_)
                             | crate::domain::TaskCockpitResult::AgentConnection(_)
                     );
-                if !global_result && command_task_id != self.local_slot_mut().interaction.selected_task() {
+                if !global_result
+                    && command_task_id != self.local_slot_mut().interaction.selected_task()
+                {
                     return;
                 }
 
@@ -12059,7 +12119,8 @@ impl NativeShell {
                 // originating command still matches the focused surface.
                 self.local_slot_mut().cockpit.apply_cockpit_result(&result);
                 if let crate::domain::TaskCockpitResult::Config(snapshot) = &result {
-                    self.local_slot_mut().config_sidebar = ConfigSidebarProjection::from_host_snapshot(snapshot);
+                    self.local_slot_mut().config_sidebar =
+                        ConfigSidebarProjection::from_host_snapshot(snapshot);
                     self.finish_add_project_after_host_accept();
                     self.sync_header_projection();
                     self.refresh_accessibility_tree();
@@ -12089,7 +12150,8 @@ impl NativeShell {
                     self.apply_browser_process_session(projection);
                 }
                 if let crate::domain::TaskCockpitResult::Services(services) = &result {
-                    self.local_slot_mut().services_projection = project_services_from_task_projection(services);
+                    self.local_slot_mut().services_projection =
+                        project_services_from_task_projection(services);
                 }
                 if let crate::domain::TaskCockpitResult::Git(projection) = &result {
                     if let Some((request_id, command_task_id, query)) =
@@ -12312,10 +12374,11 @@ impl NativeShell {
             CockpitDockTool::Artifacts | CockpitDockTool::Review => (None, Vec::new()),
         };
         if let Some(action_id) = loading_action {
-            self.local_slot_mut().cockpit.begin_cockpit_query(task_id, action_id);
+            self.local_slot_mut()
+                .cockpit
+                .begin_cockpit_query(task_id, action_id);
         }
-        let after_sequence =
-            self.conversation_after_sequence_for(self.local_task_key(task_id));
+        let after_sequence = self.conversation_after_sequence_for(self.local_task_key(task_id));
         requests.insert(
             0,
             ActionRequest::TaskCockpit {
@@ -12379,10 +12442,7 @@ impl NativeShell {
                     query: TaskCockpitQuery::Terminal,
                 }],
             ),
-            CockpitDockTool::Review => (
-                None,
-                vec![ActionRequest::TaskShow { task_id }],
-            ),
+            CockpitDockTool::Review => (None, vec![ActionRequest::TaskShow { task_id }]),
             CockpitDockTool::Artifacts => (None, Vec::new()),
             CockpitDockTool::Browser | CockpitDockTool::Services => {
                 return;
@@ -12425,9 +12485,10 @@ impl NativeShell {
         for request in requests {
             if let ActionRequest::TaskCockpit {
                 task_id,
-                query: TaskCockpitQuery::FilesList {
-                    relative_directory, ..
-                },
+                query:
+                    TaskCockpitQuery::FilesList {
+                        relative_directory, ..
+                    },
             } = &request
             {
                 self.remember_files_browse_directory(
@@ -12469,13 +12530,14 @@ impl NativeShell {
     }
 
     fn admit_ready_stream_frames(&mut self, max: usize) -> bool {
-        let Some(subscription_id) = self.local_slot_mut()
-            .host_runtime
-            .as_ref()
-            .and_then(|runtime| match runtime {
-                NativeHostRuntimeAttachment::Client(runtime) => runtime.subscription_id(),
-                NativeHostRuntimeAttachment::Injected(_) => None,
-            })
+        let Some(subscription_id) =
+            self.local_slot_mut()
+                .host_runtime
+                .as_ref()
+                .and_then(|runtime| match runtime {
+                    NativeHostRuntimeAttachment::Client(runtime) => runtime.subscription_id(),
+                    NativeHostRuntimeAttachment::Injected(_) => None,
+                })
         else {
             return false;
         };
@@ -12487,7 +12549,8 @@ impl NativeShell {
         };
         let had_frames = !frames.is_empty();
         for frame in frames {
-            let _ = self.local_slot_mut()
+            let _ = self
+                .local_slot_mut()
                 .cockpit
                 .dock_mut()
                 .admit_subscription_stream(subscription_id, &frame);
@@ -12498,7 +12561,8 @@ impl NativeShell {
 
     fn sync_top_bar_from_updater(&mut self) -> bool {
         let snapshot = self.updater_snapshot.clone().or_else(|| {
-            self.local_slot_mut().host_runtime
+            self.local_slot_mut()
+                .host_runtime
                 .as_ref()
                 .and_then(|runtime| match runtime {
                     NativeHostRuntimeAttachment::Client(runtime) => {
@@ -12513,7 +12577,8 @@ impl NativeShell {
         let changed = self.updater_snapshot.as_ref() != Some(&snapshot);
         self.updater_snapshot = Some(snapshot.clone());
         let now_ms = unix_time_ms();
-        let generation = self.local_slot_mut()
+        let generation = self
+            .local_slot_mut()
             .interaction
             .host_runtime_epochs()
             .resource_generation
@@ -12595,9 +12660,12 @@ impl NativeShell {
                                     shell.pending_composer_image_prompt = false;
                                     shell.schedule_composer_image_picker(cx);
                                 }
-                                let agent_connection = shell.local_slot_mut().agent_connection.clone();
+                                let agent_connection =
+                                    shell.local_slot_mut().agent_connection.clone();
                                 let repaint = shell.controller_tick(MAX_PENDING_HOST_ACTIONS);
-                                if repaint || shell.local_slot_mut().agent_connection != agent_connection {
+                                if repaint
+                                    || shell.local_slot_mut().agent_connection != agent_connection
+                                {
                                     cx.notify();
                                 }
                                 if shell.exit_after_update {
@@ -12713,15 +12781,12 @@ impl NativeShell {
             let from_overflow = self
                 .host_slot(host_id)
                 .is_some_and(|slot| slot.pending_host_actions.is_empty());
-            let Some(action) = self
-                .host_slot(host_id)
-                .and_then(|slot| {
-                    slot.pending_host_actions
-                        .front()
-                        .cloned()
-                        .or_else(|| slot.retained_action_overflow.clone())
-                })
-            else {
+            let Some(action) = self.host_slot(host_id).and_then(|slot| {
+                slot.pending_host_actions
+                    .front()
+                    .cloned()
+                    .or_else(|| slot.retained_action_overflow.clone())
+            }) else {
                 break;
             };
             // Canceled/orphaned delete-confirmation must never replay via Retry.
@@ -12742,13 +12807,18 @@ impl NativeShell {
                     self.discard_native_query_action_for_owner(host_id, &action);
                     continue;
                 }
-                self.set_transport_failure_for_host(host_id, &action, NativeHostActionResult::Stale);
+                self.set_transport_failure_for_host(
+                    host_id,
+                    &action,
+                    NativeHostActionResult::Stale,
+                );
                 break;
             }
             // Validate the ORIGINAL admission without reminting. Generation change
             // requires a fresh user activation; try_enqueue must not retain again.
-            if let Some(NativeHostRuntimeAttachment::Client(runtime)) =
-                self.host_slot(host_id).and_then(|slot| slot.host_runtime.as_ref())
+            if let Some(NativeHostRuntimeAttachment::Client(runtime)) = self
+                .host_slot(host_id)
+                .and_then(|slot| slot.host_runtime.as_ref())
             {
                 match action.fleet_admission.as_ref() {
                     Some(admission)
@@ -12870,9 +12940,11 @@ impl NativeShell {
         if let Some(request_id) = native_request_id(&action.command) {
             if let Some(slot) = self.host_slot_mut(host_id) {
                 slot.first_send_readiness_requests.remove(&request_id);
-                if let Some(pending) = slot.pending_draft_first_send.as_mut().filter(|pending| {
-                    pending.readiness_request_id == Some(request_id)
-                }) {
+                if let Some(pending) = slot
+                    .pending_draft_first_send
+                    .as_mut()
+                    .filter(|pending| pending.readiness_request_id == Some(request_id))
+                {
                     pending.readiness_request_id = None;
                 }
             }
@@ -13014,24 +13086,22 @@ impl NativeShell {
                 }
             }
         }
-        self.pending_composer_submissions.iter().find_map(|(command_id, submission)| {
-            if &submission.key.task_id != owner {
-                return None;
-            }
-            match &submission.retention {
-                ComposerSubmissionRetention::NeverEnqueued { record } => {
-                    Some((*command_id, record))
+        self.pending_composer_submissions
+            .iter()
+            .find_map(|(command_id, submission)| {
+                if &submission.key.task_id != owner {
+                    return None;
                 }
-                ComposerSubmissionRetention::AwaitingHostOutcome => None,
-            }
-        })
+                match &submission.retention {
+                    ComposerSubmissionRetention::NeverEnqueued { record } => {
+                        Some((*command_id, record))
+                    }
+                    ComposerSubmissionRetention::AwaitingHostOutcome => None,
+                }
+            })
     }
 
-    fn owner_retains_exact_action(
-        &self,
-        host_id: &HostId,
-        action: &NativeActionRecord,
-    ) -> bool {
+    fn owner_retains_exact_action(&self, host_id: &HostId, action: &NativeActionRecord) -> bool {
         self.host_slot(host_id).is_some_and(|slot| {
             slot.pending_host_actions
                 .iter()
@@ -13043,11 +13113,7 @@ impl NativeShell {
         })
     }
 
-    fn remove_retained_action_for_owner(
-        &mut self,
-        host_id: &HostId,
-        action: &NativeActionRecord,
-    ) {
+    fn remove_retained_action_for_owner(&mut self, host_id: &HostId, action: &NativeActionRecord) {
         if let Some(slot) = self.host_slot_mut(host_id) {
             slot.pending_host_actions
                 .retain(|pending| !same_native_action_identity(pending, action));
@@ -13160,9 +13226,8 @@ impl NativeShell {
             }
             NativeHostActionResult::Disconnected => {
                 if let Some(slot) = self.host_slot_mut(&owner.host) {
-                    slot.composer_error = Some(
-                        "Retry kept the exact send; the host is disconnected.".into(),
-                    );
+                    slot.composer_error =
+                        Some("Retry kept the exact send; the host is disconnected.".into());
                 }
                 self.set_transport_failure_for_host(
                     &owner.host,
@@ -13221,9 +13286,7 @@ impl NativeShell {
             return;
         }
         self.remove_retained_action_for_owner(&owner.host, &record);
-        let _ = self
-            .pending_composer_submissions
-            .remove(&command_id);
+        let _ = self.pending_composer_submissions.remove(&command_id);
         let admission = self
             .task_surfaces
             .reject_pending_user_message(owner.clone(), command_id);
@@ -13238,9 +13301,8 @@ impl NativeShell {
             }
         }
         if let Some(slot) = self.host_slot_mut(&owner.host) {
-            slot.composer_error = Some(
-                "Draft restored. The previous send never left this machine.".into(),
-            );
+            slot.composer_error =
+                Some("Draft restored. The previous send never left this machine.".into());
         }
         self.clear_recovered_action_failure_for_owner(&owner.host);
         self.refresh_accessibility_tree();
@@ -13309,12 +13371,15 @@ impl NativeShell {
 
     fn discard_native_query_action(&mut self, action: &NativeActionRecord) {
         if let Some(request_id) = native_request_id(&action.command) {
-            self.local_slot_mut().first_send_readiness_requests.remove(&request_id);
+            self.local_slot_mut()
+                .first_send_readiness_requests
+                .remove(&request_id);
         }
         if let Some((request_id, _, TaskCockpitQuery::Terminal)) =
             Self::task_cockpit_command_parts(&action.command)
         {
-            if let Some(pending) = self.local_slot_mut()
+            if let Some(pending) = self
+                .local_slot_mut()
                 .pending_draft_first_send
                 .as_mut()
                 .filter(|pending| pending.readiness_request_id == Some(request_id))
@@ -13325,24 +13390,29 @@ impl NativeShell {
         if let Some((_, task_id, TaskCockpitQuery::Conversation { .. })) =
             Self::task_cockpit_command_parts(&action.command)
         {
-            self.task_surfaces.cancel_conversation(
-                self.local_task_key(task_id),
-                action.request_generation,
-            );
+            self.task_surfaces
+                .cancel_conversation(self.local_task_key(task_id), action.request_generation);
         }
         let request_id = native_request_id(&action.command);
-        self.local_slot_mut().pending_host_actions
+        self.local_slot_mut()
+            .pending_host_actions
             .retain(|pending| native_request_id(&pending.command) != request_id);
-        if self.local_slot_mut()
+        if self
+            .local_slot_mut()
             .retained_action_overflow
             .as_ref()
             .is_some_and(|pending| native_request_id(&pending.command) == request_id)
         {
             self.local_slot_mut().retained_action_overflow = None;
         }
-        if self.local_slot_mut().last_action_failure.as_ref().is_some_and(|failure| {
-            failure.action_id() == action.id && failure.command_id().is_none()
-        }) {
+        if self
+            .local_slot_mut()
+            .last_action_failure
+            .as_ref()
+            .is_some_and(|failure| {
+                failure.action_id() == action.id && failure.command_id().is_none()
+            })
+        {
             self.local_slot_mut().last_action_failure = None;
             self.restore_connected_host_state();
         }
@@ -13365,7 +13435,8 @@ impl NativeShell {
             self.remote_settings.feedback = Some(error.clone());
         }
         if is_agent_connection_query_command(&action.command) {
-            self.local_slot_mut().agent_connection = Some(agent_connection_snapshot(AgentPresence::CheckFailed));
+            self.local_slot_mut().agent_connection =
+                Some(agent_connection_snapshot(AgentPresence::CheckFailed));
         }
         if matches!(
             &action.command,
@@ -13378,7 +13449,8 @@ impl NativeShell {
         if let Some((_, task_id, TaskCockpitQuery::Terminal)) =
             Self::task_cockpit_command_parts(&action.command)
         {
-            self.task_surfaces.note_terminal_reconnecting(self.local_task_key(task_id));
+            self.task_surfaces
+                .note_terminal_reconnecting(self.local_task_key(task_id));
             if self.local_slot_mut().interaction.selected_task() == Some(task_id) {
                 self.sync_terminal_from_cockpit();
             }
@@ -13389,7 +13461,8 @@ impl NativeShell {
     }
 
     fn settle_native_query_request_capacity_failure(&mut self) {
-        self.local_slot_mut().last_query_detail = Some("host query not sent: host is busy".to_string());
+        self.local_slot_mut().last_query_detail =
+            Some("host query not sent: host is busy".to_string());
         self.restore_connected_host_state();
     }
 
@@ -13421,7 +13494,8 @@ impl NativeShell {
             NativeHostActionFailure::QueueFull { .. } | NativeHostActionFailure::Stale { .. } => {
                 match &self.local_slot_mut().host_state {
                     NativeHostState::Connected { .. } => self.local_slot_mut().host_state.clone(),
-                    _ => self.local_slot_mut()
+                    _ => self
+                        .local_slot_mut()
                         .host_runtime
                         .as_ref()
                         .map(|runtime| match runtime {
@@ -13479,7 +13553,9 @@ impl NativeShell {
         &mut self,
         record: &mut NativeActionRecord,
     ) -> Result<(), NativeHostActionResult> {
-        let Some(NativeHostRuntimeAttachment::Client(runtime)) = self.local_slot_mut().host_runtime.as_ref() else {
+        let Some(NativeHostRuntimeAttachment::Client(runtime)) =
+            self.local_slot_mut().host_runtime.as_ref()
+        else {
             return Ok(());
         };
         if let Some(admission) = record.fleet_admission.as_ref() {
@@ -13505,7 +13581,9 @@ impl NativeShell {
     /// stream/outcome application. Derives outcome owner from immutable action
     /// admission when the wrapper omits owner.
     fn accept_fleet_projection_message(&self, projection: &NativeHostProjection) -> bool {
-        let Some(NativeHostRuntimeAttachment::Client(runtime)) = self.local_slot().host_runtime.as_ref() else {
+        let Some(NativeHostRuntimeAttachment::Client(runtime)) =
+            self.local_slot().host_runtime.as_ref()
+        else {
             return fleet_projection_message_accepted(false, None, projection);
         };
         let live = runtime.live_owner_token().ok();
@@ -13545,7 +13623,11 @@ impl NativeShell {
         action: &NativeActionRecord,
         receipt: &crate::domain::command::CommandReceipt,
     ) {
-        self.acknowledge_applied_receipt_for_host(&self.local_host_id(), action, receipt.command_id());
+        self.acknowledge_applied_receipt_for_host(
+            &self.local_host_id(),
+            action,
+            receipt.command_id(),
+        );
     }
 
     /// Ack one Fleet retained receipt for the captured owner admission only.
@@ -13601,11 +13683,7 @@ impl NativeShell {
                 if retired {
                     self.mark_retired_delete_flow_terminal(host_id, action);
                 }
-                self.acknowledge_applied_receipt_for_host(
-                    host_id,
-                    action,
-                    receipt.command_id(),
-                );
+                self.acknowledge_applied_receipt_for_host(host_id, action, receipt.command_id());
                 true
             }
             NativeHostActionOutcome::Failed { .. }
@@ -13844,10 +13922,13 @@ impl NativeShell {
             return;
         }
         let accepted = if is_global_native_query_command(&action.command) {
-            self.local_slot_mut().interaction
+            self.local_slot_mut()
+                .interaction
                 .accepts_global_query_outcome_record(&action)
         } else {
-            self.local_slot_mut().interaction.accepts_action_outcome_record(&action)
+            self.local_slot_mut()
+                .interaction
+                .accepts_action_outcome_record(&action)
         };
         if !accepted {
             if is_native_query_command(&action.command) {
@@ -13893,9 +13974,12 @@ impl NativeShell {
                 if is_readiness_query {
                     let cancelled = self.host_slot_mut(host_id).is_some_and(|slot| {
                         slot.first_send_readiness_requests.remove(&request_id)
-                            && slot.pending_draft_first_send.as_ref().is_none_or(|pending| {
-                                pending.readiness_request_id != Some(request_id)
-                            })
+                            && slot
+                                .pending_draft_first_send
+                                .as_ref()
+                                .is_none_or(|pending| {
+                                    pending.readiness_request_id != Some(request_id)
+                                })
                     });
                     if cancelled {
                         return;
@@ -13974,20 +14058,23 @@ impl NativeShell {
                     if success {
                         slot.last_action_failure = None;
                     } else if let Some(message) = rejected_message.as_ref() {
-                        slot.last_action_failure =
-                            Some(NativeHostActionFailure::ExecutionFailed {
-                                action_id: action.id,
-                                command_id: action_command_id,
-                                message: bounded_host_error(message.clone()),
-                            });
+                        slot.last_action_failure = Some(NativeHostActionFailure::ExecutionFailed {
+                            action_id: action.id,
+                            command_id: action_command_id,
+                            message: bounded_host_error(message.clone()),
+                        });
                     }
                     if let Some(command_id) = action_command_id {
                         slot.pending_host_actions.retain(|pending| {
                             native_command_id(&pending.command) != Some(command_id)
                         });
-                        if slot.retained_action_overflow.as_ref().is_some_and(|pending| {
-                            native_command_id(&pending.command) == Some(command_id)
-                        }) {
+                        if slot
+                            .retained_action_overflow
+                            .as_ref()
+                            .is_some_and(|pending| {
+                                native_command_id(&pending.command) == Some(command_id)
+                            })
+                        {
                             slot.retained_action_overflow = None;
                         }
                     }
@@ -14008,7 +14095,11 @@ impl NativeShell {
                         rejected_message.map(|message| format!("{message}; draft kept")),
                     ));
                 }
-                NativeHostActionOutcome::Queried { action, detail, body } => {
+                NativeHostActionOutcome::Queried {
+                    action,
+                    detail,
+                    body,
+                } => {
                     slot.last_query_detail = Some(detail.clone());
                     slot.last_action_failure = None;
                     match body {
@@ -14046,7 +14137,7 @@ impl NativeShell {
                                 let admits_terminal = Self::task_cockpit_command_parts(
                                     &action.command,
                                 )
-                                .is_some_and(|( _request_id, task_id, query)| {
+                                .is_some_and(|(_request_id, task_id, query)| {
                                     matches!(
                                         query,
                                         TaskCockpitQuery::Terminal
@@ -14054,8 +14145,7 @@ impl NativeShell {
                                     ) && task_id == projection.task_id
                                 });
                                 if admits_terminal {
-                                    pending_terminal =
-                                        Some((action.clone(), projection.clone()));
+                                    pending_terminal = Some((action.clone(), projection.clone()));
                                 }
                             }
                         }
@@ -14071,11 +14161,8 @@ impl NativeShell {
                     if is_native_query_command(&action.command) {
                         // Probe transport failures settle via owner first-send below.
                     } else {
-                        settle_owner = Some((
-                            action.clone(),
-                            false,
-                            Some(format!("{error}; draft kept")),
-                        ));
+                        settle_owner =
+                            Some((action.clone(), false, Some(format!("{error}; draft kept"))));
                     }
                 }
                 NativeHostActionOutcome::Uncertain { action, error } => {
@@ -14085,11 +14172,8 @@ impl NativeShell {
                         message: bounded_host_error(error.clone()),
                     });
                     if !is_native_query_command(&action.command) {
-                        settle_owner = Some((
-                            action.clone(),
-                            false,
-                            Some(format!("{error}; draft kept")),
-                        ));
+                        settle_owner =
+                            Some((action.clone(), false, Some(format!("{error}; draft kept"))));
                     }
                 }
             }
@@ -14151,13 +14235,17 @@ impl NativeShell {
                 message.clone(),
             );
             if !settled_delete && !settled_reopen && !settled_first {
-                self.settle_composer_submission_for_owner(host_id, &action, success, message.clone());
+                self.settle_composer_submission_for_owner(
+                    host_id,
+                    &action,
+                    success,
+                    message.clone(),
+                );
             }
             if !success {
                 if matches!(
                     &action.command,
-                    NativeHostCommand::TaskRename { .. }
-                        | NativeHostCommand::TaskCreateV2 { .. }
+                    NativeHostCommand::TaskRename { .. } | NativeHostCommand::TaskCreateV2 { .. }
                 ) {
                     if let Some(slot) = self.host_slot_mut(host_id) {
                         if slot.composer_error.is_none() {
@@ -14309,10 +14397,11 @@ impl NativeShell {
             if &admission.host != owner_host {
                 return;
             }
-            if action
-                .task_id
-                .is_some_and(|task_id| admission.task_id.is_some_and(|admitted| admitted != task_id))
-            {
+            if action.task_id.is_some_and(|task_id| {
+                admission
+                    .task_id
+                    .is_some_and(|admitted| admitted != task_id)
+            }) {
                 return;
             }
         } else if owner_host != &self.local_host_id()
@@ -14321,9 +14410,8 @@ impl NativeShell {
             // Production remote outcomes require fleet admission or a parked
             // pending submission; absence is failure, not a local remint.
             if let Some(slot) = self.host_slot_mut(owner_host) {
-                slot.composer_error = Some(
-                    "Remote action outcome missing fleet admission; draft kept.".into(),
-                );
+                slot.composer_error =
+                    Some("Remote action outcome missing fleet admission; draft kept.".into());
             }
             return;
         }
@@ -14336,9 +14424,10 @@ impl NativeShell {
                 }
             }
         }
-        let owner_matches_active = self.composer_owner.as_ref().is_some_and(|key| {
-            &key.host == owner_host && action.task_id == Some(key.task_id)
-        });
+        let owner_matches_active = self
+            .composer_owner
+            .as_ref()
+            .is_some_and(|key| &key.host == owner_host && action.task_id == Some(key.task_id));
         let settled_active_composer = if owner_matches_active {
             if let Some(composer) = self.composer.as_mut() {
                 composer
@@ -14381,15 +14470,13 @@ impl NativeShell {
                         .and_then(|slot| slot.client_model.as_ref())
                         .and_then(|model| model.task(submission.key.task_id.task_id))
                         .and_then(|snapshot| {
-                            automatic_task_title(&snapshot.task.title, seed).map(
-                                |proposed_title| {
-                                    (
-                                        submission.key.task_id.clone(),
-                                        snapshot.task.title.clone(),
-                                        proposed_title,
-                                    )
-                                },
-                            )
+                            automatic_task_title(&snapshot.task.title, seed).map(|proposed_title| {
+                                (
+                                    submission.key.task_id.clone(),
+                                    snapshot.task.title.clone(),
+                                    proposed_title,
+                                )
+                            })
                         });
                     if let Some((key, expected_title, proposed_title)) = auto_title {
                         self.pending_automatic_titles.insert(
@@ -14541,9 +14628,11 @@ impl NativeShell {
                     // Exact provider-start receipt owned the deferred first send.
                 }
                 if let Some(command_id) = command_id {
-                    self.local_slot_mut().pending_host_actions
+                    self.local_slot_mut()
+                        .pending_host_actions
                         .retain(|action| native_command_id(&action.command) != Some(command_id));
-                    if self.local_slot_mut()
+                    if self
+                        .local_slot_mut()
                         .retained_action_overflow
                         .as_ref()
                         .is_some_and(|action| {
@@ -14553,9 +14642,14 @@ impl NativeShell {
                         self.local_slot_mut().retained_action_overflow = None;
                     }
                 }
-                if self.local_slot_mut().last_action_failure.as_ref().is_some_and(|failure| {
-                    failure.action_id() == action_id && failure.command_id() == command_id
-                }) {
+                if self
+                    .local_slot_mut()
+                    .last_action_failure
+                    .as_ref()
+                    .is_some_and(|failure| {
+                        failure.action_id() == action_id && failure.command_id() == command_id
+                    })
+                {
                     self.local_slot_mut().last_action_failure = None;
                     self.restore_connected_host_state();
                 }
@@ -14638,7 +14732,12 @@ impl NativeShell {
                 if let NativeHostCommand::TaskCreateV2 { arguments, .. } = &action.command {
                     let created = HostTaskKey::new(self.local_host_id(), arguments.task_id);
                     self.pending_select_task = Some(created.clone());
-                    if self.local_slot_mut().task_list.task_ids().contains(&arguments.task_id) {
+                    if self
+                        .local_slot_mut()
+                        .task_list
+                        .task_ids()
+                        .contains(&arguments.task_id)
+                    {
                         let _ = self.select_fleet_task_key(created, FleetSelectMode::Replace);
                     }
                 }
@@ -14656,9 +14755,11 @@ impl NativeShell {
                 self.local_slot_mut().last_query_detail = Some(detail);
                 self.apply_query_body(&action, body);
                 if let Some(request_id) = request_id {
-                    self.local_slot_mut().pending_host_actions
+                    self.local_slot_mut()
+                        .pending_host_actions
                         .retain(|pending| native_request_id(&pending.command) != Some(request_id));
-                    if self.local_slot_mut()
+                    if self
+                        .local_slot_mut()
                         .retained_action_overflow
                         .as_ref()
                         .is_some_and(|pending| {
@@ -14668,9 +14769,11 @@ impl NativeShell {
                         self.local_slot_mut().retained_action_overflow = None;
                     }
                 } else {
-                    self.local_slot_mut().pending_host_actions
+                    self.local_slot_mut()
+                        .pending_host_actions
                         .retain(|pending| !same_native_action_identity(pending, &action));
-                    if self.local_slot_mut()
+                    if self
+                        .local_slot_mut()
                         .retained_action_overflow
                         .as_ref()
                         .is_some_and(|pending| same_native_action_identity(pending, &action))
@@ -14678,7 +14781,8 @@ impl NativeShell {
                         self.local_slot_mut().retained_action_overflow = None;
                     }
                 }
-                if self.local_slot_mut()
+                if self
+                    .local_slot_mut()
                     .last_action_failure
                     .as_ref()
                     .is_some_and(|failure| failure.action_id() == action_id)
@@ -14720,9 +14824,11 @@ impl NativeShell {
                         draft.error = Some(error.clone());
                     }
                     let request_id = native_request_id(&action.command);
-                    self.local_slot_mut().pending_host_actions
+                    self.local_slot_mut()
+                        .pending_host_actions
                         .retain(|pending| native_request_id(&pending.command) != request_id);
-                    if self.local_slot_mut()
+                    if self
+                        .local_slot_mut()
                         .retained_action_overflow
                         .as_ref()
                         .is_some_and(|pending| native_request_id(&pending.command) == request_id)
@@ -14812,7 +14918,8 @@ impl NativeShell {
             let interval = if refreshing { 125 } else { 1875 };
             if self.controller_ticks % interval == 0
                 && self.action_lane_len() < MAX_ACTION_LANE_RECORDS / 2
-                && !self.local_slot_mut()
+                && !self
+                    .local_slot_mut()
                     .pending_host_actions
                     .iter()
                     .any(|action| action.id == "provider.settings")
@@ -14861,7 +14968,8 @@ impl NativeShell {
             repaint = true;
         }
 
-        let runtime_epochs = self.local_slot_mut()
+        let runtime_epochs = self
+            .local_slot_mut()
             .host_runtime
             .as_ref()
             .map(|runtime| match runtime {
@@ -14869,12 +14977,20 @@ impl NativeShell {
                 NativeHostRuntimeAttachment::Client(runtime) => runtime.epochs(),
             })
             .unwrap_or_default();
-        if self.local_slot_mut().interaction.sync_host_epochs(runtime_epochs) {
+        if self
+            .local_slot_mut()
+            .interaction
+            .sync_host_epochs(runtime_epochs)
+        {
             self.clear_cockpit_projection();
             repaint = true;
         }
         let mut current_epochs = self.local_slot_mut().interaction.host_runtime_epochs();
-        let mut current_navigation_epoch = self.local_slot_mut().interaction.action_epochs().navigation_epoch;
+        let mut current_navigation_epoch = self
+            .local_slot_mut()
+            .interaction
+            .action_epochs()
+            .navigation_epoch;
         self.rebind_pending_host_actions(current_epochs, current_navigation_epoch);
 
         // Observe new projections before any caller-requested reconciliation.
@@ -14890,7 +15006,8 @@ impl NativeShell {
             }
             None => Vec::new(),
         };
-        if let Some(outcome) = self.local_slot_mut()
+        if let Some(outcome) = self
+            .local_slot_mut()
             .host_runtime
             .as_mut()
             .and_then(|runtime| match runtime {
@@ -14926,7 +15043,11 @@ impl NativeShell {
                 if !epochs.is_strictly_older_than(current_epochs) {
                     self.local_slot_mut().interaction.sync_host_epochs(epochs);
                     current_epochs = self.local_slot_mut().interaction.host_runtime_epochs();
-                    current_navigation_epoch = self.local_slot_mut().interaction.action_epochs().navigation_epoch;
+                    current_navigation_epoch = self
+                        .local_slot_mut()
+                        .interaction
+                        .action_epochs()
+                        .navigation_epoch;
                     self.rebind_pending_host_actions(current_epochs, current_navigation_epoch);
                     false
                 } else {
@@ -14950,9 +15071,13 @@ impl NativeShell {
                 {
                     let after_sequence =
                         self.conversation_after_sequence_for(self.local_task_key(task_id));
-                    let visible = self.layout.task_workspace.as_ref().is_some_and(|workspace| {
-                        workspace.contains_task(self.local_task_key(task_id))
-                    });
+                    let visible = self
+                        .layout
+                        .task_workspace
+                        .as_ref()
+                        .is_some_and(|workspace| {
+                            workspace.contains_task(self.local_task_key(task_id))
+                        });
                     if visible
                         && high_water > after_sequence
                         && self.action_lane_len() < MAX_ACTION_LANE_RECORDS / 2
@@ -14960,13 +15085,15 @@ impl NativeShell {
                         let record = if self.selected_task_key.as_ref()
                             == Some(&self.local_task_key(task_id))
                         {
-                            self.local_slot_mut().interaction
-                                .action_on_current_handler(ActionRequest::TaskCockpit {
+                            self.local_slot_mut().interaction.action_on_current_handler(
+                                ActionRequest::TaskCockpit {
                                     task_id,
                                     query: TaskCockpitQuery::Conversation { after_sequence },
-                                })
+                                },
+                            )
                         } else {
-                            self.local_slot_mut().interaction
+                            self.local_slot_mut()
+                                .interaction
                                 .background_conversation_on_current_handler(task_id, after_sequence)
                         };
                         if let Some(record) = record {
@@ -15028,12 +15155,12 @@ impl NativeShell {
                                 task_id: raw_task_id,
                                 query: TaskCockpitQuery::Conversation { after_sequence },
                             }),
-                        ConversationQueryPriority::Background => slot
-                            .interaction
-                            .background_conversation_on_current_handler(
+                        ConversationQueryPriority::Background => {
+                            slot.interaction.background_conversation_on_current_handler(
                                 raw_task_id,
                                 after_sequence,
-                            ),
+                            )
+                        }
                     }
                 } else {
                     None
@@ -15045,12 +15172,13 @@ impl NativeShell {
             if due_priorities.contains(&ConversationQueryPriority::Background) {
                 if let Some(task_id) = self.local_slot_mut().interaction.selected_task() {
                     if self.local_slot_mut().cockpit.dock().showing_raw_terminal() {
-                        if let Some(record) =
-                            self.local_slot_mut().interaction
-                                .action_on_current_handler(ActionRequest::TaskCockpit {
-                                    task_id,
-                                    query: TaskCockpitQuery::Terminal,
-                                })
+                        if let Some(record) = self
+                            .local_slot_mut()
+                            .interaction
+                            .action_on_current_handler(ActionRequest::TaskCockpit {
+                                task_id,
+                                query: TaskCockpitQuery::Terminal,
+                            })
                         {
                             let _ = self.enqueue_host_action(record);
                         }
@@ -15060,10 +15188,19 @@ impl NativeShell {
         }
 
         for _ in 0..max.min(MAX_PENDING_HOST_ACTIONS) {
-            let Some(has_pending) = self.local_slot_mut().host_runtime.as_ref().map(|runtime| match runtime {
-                NativeHostRuntimeAttachment::Injected(runtime) => runtime.pending_front().is_some(),
-                NativeHostRuntimeAttachment::Client(runtime) => runtime.pending_front().is_some(),
-            }) else {
+            let Some(has_pending) =
+                self.local_slot_mut()
+                    .host_runtime
+                    .as_ref()
+                    .map(|runtime| match runtime {
+                        NativeHostRuntimeAttachment::Injected(runtime) => {
+                            runtime.pending_front().is_some()
+                        }
+                        NativeHostRuntimeAttachment::Client(runtime) => {
+                            runtime.pending_front().is_some()
+                        }
+                    })
+            else {
                 break;
             };
             if !has_pending {
@@ -15081,7 +15218,11 @@ impl NativeShell {
                 None => None,
             };
             if let Some(action) = pending_action.as_ref() {
-                if !self.local_slot_mut().interaction.accepts_action_record(action) {
+                if !self
+                    .local_slot_mut()
+                    .interaction
+                    .accepts_action_record(action)
+                {
                     let stale = match self.local_slot_mut().host_runtime.as_mut() {
                         Some(NativeHostRuntimeAttachment::Injected(runtime)) => {
                             runtime.take_pending_front()
@@ -15339,7 +15480,8 @@ impl NativeShell {
         let offset = self.task_scroll_handle.0.borrow().base_handle.offset().y / px(1.0);
         let metrics = self.theme_tokens().density.physical();
         let first_visible = (offset.max(0.0) / metrics.row_height as f32).floor() as usize;
-        let _ = self.local_slot_mut()
+        let _ = self
+            .local_slot_mut()
             .task_list
             .set_viewport(first_visible, DEFAULT_VISIBLE_ROWS);
         self.offer_first_task_if_needed();
@@ -15347,7 +15489,7 @@ impl NativeShell {
         repaint
     }
 
-        fn dispatch_due_automatic_title(&mut self) {
+    fn dispatch_due_automatic_title(&mut self) {
         let now = Instant::now();
         let Some((owner, expected_title, proposed_title)) = self
             .pending_automatic_titles
@@ -15450,7 +15592,8 @@ impl NativeShell {
     }
 
     pub(crate) fn host_runtime(&self) -> Option<&NativeHostClientRuntime> {
-        self.local_slot().host_runtime
+        self.local_slot()
+            .host_runtime
             .as_ref()
             .and_then(|attachment| match attachment {
                 NativeHostRuntimeAttachment::Client(runtime) => Some(runtime),
@@ -15459,7 +15602,8 @@ impl NativeShell {
     }
 
     pub(crate) fn host_runtime_mut(&mut self) -> Option<&mut NativeHostClientRuntime> {
-        self.local_slot_mut().host_runtime
+        self.local_slot_mut()
+            .host_runtime
             .as_mut()
             .and_then(|attachment| match attachment {
                 NativeHostRuntimeAttachment::Client(runtime) => Some(runtime),
@@ -15471,7 +15615,8 @@ impl NativeShell {
         &mut self,
         projections: Vec<NativeHostProjection>,
     ) -> Vec<NativeHostProjectionKind> {
-        let runtime_epochs = self.local_slot_mut()
+        let runtime_epochs = self
+            .local_slot_mut()
             .host_runtime
             .as_ref()
             .map(|runtime| match runtime {
@@ -15479,11 +15624,19 @@ impl NativeShell {
                 NativeHostRuntimeAttachment::Client(runtime) => runtime.epochs(),
             })
             .unwrap_or_default();
-        if self.local_slot_mut().interaction.sync_host_epochs(runtime_epochs) {
+        if self
+            .local_slot_mut()
+            .interaction
+            .sync_host_epochs(runtime_epochs)
+        {
             self.clear_cockpit_projection();
         }
         let mut current_epochs = self.local_slot_mut().interaction.host_runtime_epochs();
-        let mut current_navigation_epoch = self.local_slot_mut().interaction.action_epochs().navigation_epoch;
+        let mut current_navigation_epoch = self
+            .local_slot_mut()
+            .interaction
+            .action_epochs()
+            .navigation_epoch;
         self.rebind_pending_host_actions(current_epochs, current_navigation_epoch);
         let mut kinds = Vec::with_capacity(projections.len());
         for projection in projections {
@@ -15494,7 +15647,11 @@ impl NativeShell {
                 if !epochs.is_strictly_older_than(current_epochs) {
                     self.local_slot_mut().interaction.sync_host_epochs(epochs);
                     current_epochs = self.local_slot_mut().interaction.host_runtime_epochs();
-                    current_navigation_epoch = self.local_slot_mut().interaction.action_epochs().navigation_epoch;
+                    current_navigation_epoch = self
+                        .local_slot_mut()
+                        .interaction
+                        .action_epochs()
+                        .navigation_epoch;
                     self.rebind_pending_host_actions(current_epochs, current_navigation_epoch);
                     false
                 } else {
@@ -15535,7 +15692,8 @@ impl NativeShell {
             }
             None => Vec::new(),
         };
-        if let Some(outcome) = self.local_slot_mut()
+        if let Some(outcome) = self
+            .local_slot_mut()
             .host_runtime
             .as_mut()
             .and_then(|runtime| match runtime {
@@ -15579,7 +15737,8 @@ impl NativeShell {
             }
             None => Vec::new(),
         };
-        if let Some(outcome) = self.local_slot_mut()
+        if let Some(outcome) = self
+            .local_slot_mut()
             .host_runtime
             .as_mut()
             .and_then(|runtime| match runtime {
@@ -15637,10 +15796,14 @@ impl NativeShell {
                     };
                     return Err(attachment);
                 }
-                self.local_slot_mut().interaction.sync_host_epochs(runtime.epochs());
+                self.local_slot_mut()
+                    .interaction
+                    .sync_host_epochs(runtime.epochs());
             }
             NativeHostRuntimeAttachment::Injected(runtime) => {
-                self.local_slot_mut().interaction.sync_host_epochs(runtime.epochs());
+                self.local_slot_mut()
+                    .interaction
+                    .sync_host_epochs(runtime.epochs());
             }
         }
         let host_state = match &attachment {
@@ -15796,9 +15959,8 @@ impl NativeShell {
             .collect();
         let previous_draft_count = self.composer_drafts.len();
         // Local projection may prune local drafts for missing tasks, never other hosts.
-        self.composer_drafts.retain(|key, _| {
-            key.task_id.host != local || known.contains(&key.task_id.task_id)
-        });
+        self.composer_drafts
+            .retain(|key, _| key.task_id.host != local || known.contains(&key.task_id.task_id));
         self.composer_drafts_dirty |= self.composer_drafts.len() != previous_draft_count;
         self.refresh_accessibility_tree();
     }
@@ -15855,14 +16017,17 @@ impl NativeShell {
             .map(|workspace| workspace.task_ids().to_vec())
             .unwrap_or_else(|| keys.clone());
         self.task_surfaces.retain_tasks(&open_keys);
-        self.local_slot_mut().cockpit.retain_open_timelines(task_list.task_ids());
+        self.local_slot_mut()
+            .cockpit
+            .retain_open_timelines(task_list.task_ids());
         for key in &open_keys {
             self.task_surfaces.ensure_task(key.clone());
         }
         self.apply_task_list(task_list);
-        let selected_task_changed = self.local_slot_mut().interaction.selected_task() != previous_selected_task;
-        let selected_task_needs_initial_follow =
-            self.local_slot_mut().interaction.selected_task() != self.local_slot_mut().cockpit.selected_task();
+        let selected_task_changed =
+            self.local_slot_mut().interaction.selected_task() != previous_selected_task;
+        let selected_task_needs_initial_follow = self.local_slot_mut().interaction.selected_task()
+            != self.local_slot_mut().cockpit.selected_task();
         let preserved_unread = self.local_slot_mut().inbox.unread_cursor().clone();
         self.local_slot_mut().inbox = Inbox::from_model_with_filter(
             &model,
@@ -15870,10 +16035,16 @@ impl NativeShell {
             &preserved_unread,
         );
         self.local_slot_mut().client_model = Some(Arc::clone(&model));
-        self.local_slot_mut().interaction.bind_projected_model(Arc::clone(&model));
+        self.local_slot_mut()
+            .interaction
+            .bind_projected_model(Arc::clone(&model));
         self.local_slot_mut().services_projection = project_services_panel(&[], &[]);
         self.sync_header_projection();
-        let client_epoch = self.local_slot_mut().interaction.action_epochs().client_epoch;
+        let client_epoch = self
+            .local_slot_mut()
+            .interaction
+            .action_epochs()
+            .client_epoch;
         self.rebind_pending_client_epoch(client_epoch);
         self.sync_cockpit_follow_with_refresh(
             selected_task_changed || selected_task_needs_initial_follow,
@@ -15906,7 +16077,8 @@ impl NativeShell {
         if self.local_slot_mut().cockpit.active_tool() == tool {
             return;
         }
-        if self.local_slot_mut()
+        if self
+            .local_slot_mut()
             .cockpit
             .handle_tool_action(tool, RequestId::new())
             .is_ok()
@@ -16153,7 +16325,9 @@ impl NativeShell {
                 .map(|header| {
                     let workspace = match &header.workspace {
                         crate::ui::task_cockpit::WorkspaceProjection::Main => "main".to_string(),
-                        crate::ui::task_cockpit::WorkspaceProjection::Worktree { branch, .. } => {
+                        crate::ui::task_cockpit::WorkspaceProjection::Worktree {
+                            branch, ..
+                        } => {
                             format!("worktree · {}", bounded_header_text(branch.clone()))
                         }
                         crate::ui::task_cockpit::WorkspaceProjection::External { .. } => {
@@ -16165,7 +16339,8 @@ impl NativeShell {
                             agent.label.clone()
                         }
                         crate::ui::task_cockpit::PrimaryAgentProjection::Unavailable {
-                            label, ..
+                            label,
+                            ..
                         } => label.clone(),
                     };
                     let host_prefix = if key.host == local {
@@ -16203,7 +16378,9 @@ impl NativeShell {
                 .map(|header| {
                     let workspace = match &header.workspace {
                         crate::ui::task_cockpit::WorkspaceProjection::Main => "main".to_string(),
-                        crate::ui::task_cockpit::WorkspaceProjection::Worktree { branch, .. } => {
+                        crate::ui::task_cockpit::WorkspaceProjection::Worktree {
+                            branch, ..
+                        } => {
                             format!("worktree · {}", bounded_header_text(branch.clone()))
                         }
                         crate::ui::task_cockpit::WorkspaceProjection::External { .. } => {
@@ -16215,7 +16392,8 @@ impl NativeShell {
                             agent.label.clone()
                         }
                         crate::ui::task_cockpit::PrimaryAgentProjection::Unavailable {
-                            label, ..
+                            label,
+                            ..
                         } => label.clone(),
                     };
                     let quota = self
@@ -16281,8 +16459,8 @@ impl NativeShell {
     }
 
     fn sync_cockpit_follow(&mut self) {
-        let refresh_host_surfaces =
-            self.local_slot_mut().interaction.selected_task() != self.local_slot_mut().cockpit.selected_task();
+        let refresh_host_surfaces = self.local_slot_mut().interaction.selected_task()
+            != self.local_slot_mut().cockpit.selected_task();
         self.sync_cockpit_follow_with_refresh(refresh_host_surfaces);
     }
 
@@ -16317,11 +16495,14 @@ impl NativeShell {
             }
         }
         let workspace_focus_changed = selected_key.as_ref().is_some_and(|key| {
-            self.layout.task_workspace.as_mut().is_some_and(|workspace| {
-                workspace.focused_task().as_ref() != Some(key)
-                    && workspace.contains_task(key.clone())
-                    && workspace.focus_task(key.clone()).is_ok()
-            })
+            self.layout
+                .task_workspace
+                .as_mut()
+                .is_some_and(|workspace| {
+                    workspace.focused_task().as_ref() != Some(key)
+                        && workspace.contains_task(key.clone())
+                        && workspace.focus_task(key.clone()).is_ok()
+                })
         });
         if workspace_focus_changed {
             self.mark_layout_dirty();
@@ -16384,6 +16565,9 @@ impl NativeShell {
             self.sync_cockpit_follow();
             return;
         }
+        let refresh_host_surfaces = self
+            .host_slot(&key.host)
+            .is_some_and(|slot| slot.cockpit.selected_task() != Some(key.task_id));
         self.cache_current_composer_draft();
         let previous_selected = self.layout.selected_task.clone();
         if previous_selected.is_none() {
@@ -16392,11 +16576,15 @@ impl NativeShell {
             self.splash_fetch_in_flight = false;
             self.splash_fetch_attempted = true;
         }
-        let workspace_focus_changed = self.layout.task_workspace.as_mut().is_some_and(|workspace| {
-            workspace.focused_task().as_ref() != Some(key)
-                && workspace.contains_task(key.clone())
-                && workspace.focus_task(key.clone()).is_ok()
-        });
+        let workspace_focus_changed =
+            self.layout
+                .task_workspace
+                .as_mut()
+                .is_some_and(|workspace| {
+                    workspace.focused_task().as_ref() != Some(key)
+                        && workspace.contains_task(key.clone())
+                        && workspace.focus_task(key.clone()).is_ok()
+                });
         if workspace_focus_changed {
             self.mark_layout_dirty();
         }
@@ -16446,6 +16634,12 @@ impl NativeShell {
                 slot.cockpit.clear_timeline();
             }
         }
+        if refresh_host_surfaces {
+            self.refresh_cockpit_surfaces_for_owner(key);
+        }
+        // Eager owner queries advance the host interaction epoch. Bind the
+        // editor afterwards so the first keystroke is current, matching the
+        // established local-host ordering above.
         if let Some(model) = model {
             self.sync_task_composer_for_owner(key, model.as_ref());
         } else {
@@ -16463,9 +16657,15 @@ impl NativeShell {
         let show_terminal = self.task_center_terminal_preference(&owner);
         let was_showing_terminal = self.local_slot_mut().cockpit.dock().showing_raw_terminal();
         let result = if show_terminal {
-            self.local_slot_mut().cockpit.dock_mut().switch_to_raw_terminal(model, None)
+            self.local_slot_mut()
+                .cockpit
+                .dock_mut()
+                .switch_to_raw_terminal(model, None)
         } else {
-            self.local_slot_mut().cockpit.dock_mut().switch_to_semantic(model, None)
+            self.local_slot_mut()
+                .cockpit
+                .dock_mut()
+                .switch_to_semantic(model, None)
         };
         if let Err(error) = result {
             self.local_slot_mut().composer_error = Some(format!("{error:?}"));
@@ -16483,7 +16683,12 @@ impl NativeShell {
     /// in place. Remote owners never fall back across hosts.
     fn task_center_terminal_preference(&mut self, owner: &HostTaskKey) -> bool {
         let preference_key = owner.center_preference_key();
-        if let Some(value) = self.layout.task_center_terminal.get(&preference_key).copied() {
+        if let Some(value) = self
+            .layout
+            .task_center_terminal
+            .get(&preference_key)
+            .copied()
+        {
             return value;
         }
         if owner.host != self.local_host_id() {
@@ -16656,7 +16861,9 @@ impl NativeShell {
     /// Drafts may freely select any enabled provider; started tasks stay on the
     /// durable primary agent kind. Draft prefs are owner-keyed.
     fn composer_provider_for_launch(&self) -> Option<ProviderKind> {
-        let Some(owner) = self.composer_draft_owner().or_else(|| self.selected_task_key.clone())
+        let Some(owner) = self
+            .composer_draft_owner()
+            .or_else(|| self.selected_task_key.clone())
         else {
             return self.layout.composer_provider.clone();
         };
@@ -16664,10 +16871,10 @@ impl NativeShell {
     }
 
     fn composer_provider_for_launch_for(&self, owner: &HostTaskKey) -> Option<ProviderKind> {
+        if let Some((provider, _)) = self.draft_launch_prefs.get(owner) {
+            return Some(*provider);
+        }
         if self.selected_task_is_unstarted_draft_for(owner) {
-            if let Some((provider, _)) = self.draft_launch_prefs.get(owner) {
-                return Some(*provider);
-            }
             return self
                 .layout
                 .composer_provider
@@ -16682,25 +16889,17 @@ impl NativeShell {
         &self,
         provider: ProviderKind,
     ) -> crate::providers::ProviderLaunchOptions {
-        use crate::providers::{ProviderLaunchOptions, ProviderModel};
-        let owner = self.composer_draft_owner().or_else(|| self.selected_task_key.clone());
-        let mut options = if owner
+        use crate::providers::ProviderModel;
+        let owner = self
+            .composer_draft_owner()
+            .or_else(|| self.selected_task_key.clone());
+        let mut options = owner
             .as_ref()
-            .is_some_and(|key| self.selected_task_is_unstarted_draft_for(key))
-        {
-            owner
-                .as_ref()
-                .and_then(|key| self.draft_launch_prefs.get(key))
-                .filter(|(stored_provider, _)| *stored_provider == provider)
-                .map(|(_, options)| options.clone())
-                .or_else(|| self.layout.composer_launch_options.clone())
-                .unwrap_or_default()
-        } else {
-            self.layout
-                .composer_launch_options
-                .clone()
-                .unwrap_or_default()
-        };
+            .and_then(|key| self.draft_launch_prefs.get(key))
+            .filter(|(stored_provider, _)| *stored_provider == provider)
+            .map(|(_, options)| options.clone())
+            .or_else(|| self.layout.composer_launch_options.clone())
+            .unwrap_or_default();
         let compatible = matches!(
             (provider, options.model),
             (_, ProviderModel::ProviderDefault)
@@ -16738,20 +16937,30 @@ impl NativeShell {
         }
         self.layout.composer_provider = Some(provider);
         self.layout.composer_launch_options = Some(options.clone());
-        if let Some(owner) = self.composer_draft_owner().or_else(|| self.selected_task_key.clone())
+        if let Some(owner) = self
+            .composer_draft_owner()
+            .or_else(|| self.selected_task_key.clone())
         {
-            if self.selected_task_is_unstarted_draft_for(&owner) {
-                self.draft_launch_prefs.insert(owner, (provider, options));
-            }
+            self.draft_launch_prefs
+                .insert(owner.clone(), (provider, options.clone()));
+            self.layout.task_composer_preferences.insert(
+                owner.center_preference_key(),
+                TaskComposerPreferences {
+                    provider,
+                    launch_options: options,
+                },
+            );
         }
         self.mark_layout_dirty();
     }
 
     fn composer_launch_preferences_editable(&self) -> bool {
-        // Launch arguments are not a live provider reconfiguration API. In
-        // particular, never present a changed access preference as if it had
-        // restricted an already-running process.
-        let owner = self.composer_draft_owner().or_else(|| self.selected_task_key.clone());
+        // Launch arguments are applied by the provider adapter when a session
+        // starts. Until the provider runtime owns a turn-level configuration
+        // API, never imply that changing access/model mutated a live process.
+        let owner = self
+            .composer_draft_owner()
+            .or_else(|| self.selected_task_key.clone());
         let Some(owner) = owner else {
             return true;
         };
@@ -16759,7 +16968,8 @@ impl NativeShell {
             slot.pending_draft_first_send.is_some() || slot.pending_settled_send.is_some()
         });
         !pending_blocked
-            && (self.selected_task_key.is_none() || self.selected_task_is_unstarted_draft_for(&owner))
+            && (self.selected_task_key.is_none()
+                || self.selected_task_is_unstarted_draft_for(&owner))
     }
 
     fn open_composer_model_selector(&mut self) {
@@ -17388,7 +17598,10 @@ impl NativeShell {
         let Some(agent) = snapshot.agents.get(&agent_session_id) else {
             return;
         };
-        let key = (self.local_task_key(snapshot.task.id), agent.provider_kind.clone());
+        let key = (
+            self.local_task_key(snapshot.task.id),
+            agent.provider_kind.clone(),
+        );
         if self.slash_command_catalog_key.as_ref() == Some(&key) {
             return;
         }
@@ -17559,10 +17772,7 @@ impl NativeShell {
             self.trigger_menu = None;
             return;
         };
-        let document = PromptDocument::from_plain_text(
-            selected_task,
-            composer.draft_text(),
-        );
+        let document = PromptDocument::from_plain_text(selected_task, composer.draft_text());
         let cursor =
             ComposerCursor::from_expanded(&document, document.serialize_provider_text().len());
         let Some(trigger) = detect_trigger(&document, cursor) else {
@@ -17613,10 +17823,7 @@ impl NativeShell {
         let Some(composer) = self.composer.as_ref() else {
             return false;
         };
-        let mut document = PromptDocument::from_plain_text(
-            selected_task,
-            composer.draft_text(),
-        );
+        let mut document = PromptDocument::from_plain_text(selected_task, composer.draft_text());
         if !apply_suggestion(&mut document, &menu.trigger, &suggestion) {
             return false;
         }
@@ -17699,11 +17906,13 @@ impl NativeShell {
         };
         let selected_task_id = self.local_slot_mut().interaction.selected_task();
         let result = if visible {
-            self.local_slot_mut().cockpit
+            self.local_slot_mut()
+                .cockpit
                 .dock_mut()
                 .switch_to_raw_terminal(model.as_ref(), None)
         } else {
-            self.local_slot_mut().cockpit
+            self.local_slot_mut()
+                .cockpit
                 .dock_mut()
                 .switch_to_semantic(model.as_ref(), None)
         };
@@ -17717,7 +17926,8 @@ impl NativeShell {
             self.pending_terminal_focus = visible;
             if visible {
                 if let Some(task_id) = selected_task_id {
-                    self.task_surfaces.note_terminal_query_started(self.local_task_key(task_id));
+                    self.task_surfaces
+                        .note_terminal_query_started(self.local_task_key(task_id));
                     let _ = self.dispatch_task_cockpit_query(task_id, TaskCockpitQuery::Terminal);
                 }
             }
@@ -17745,7 +17955,8 @@ impl NativeShell {
             return false;
         };
         let Some(task_id) = self.local_slot().interaction.selected_task() else {
-            self.local_slot_mut().composer_error = Some("select a task before using its terminal".into());
+            self.local_slot_mut().composer_error =
+                Some("select a task before using its terminal".into());
             return false;
         };
         if owner.task_id != task_id {
@@ -17766,7 +17977,8 @@ impl NativeShell {
             return false;
         };
         let Some(agent) = snapshot.agents.get(&agent_session_id) else {
-            self.local_slot_mut().composer_error = Some("primary agent facts are unavailable".into());
+            self.local_slot_mut().composer_error =
+                Some("primary agent facts are unavailable".into());
             return false;
         };
         let Some(turn_id) = snapshot
@@ -17820,10 +18032,15 @@ impl NativeShell {
         if !self.local_slot_mut().cockpit.dock().showing_raw_terminal() {
             return;
         }
-        if self.local_slot_mut()
+        if self
+            .local_slot_mut()
             .interaction
             .selected_task()
-            .is_some_and(|task_id| !self.task_surfaces.terminal_is_interactive(self.local_task_key(task_id)))
+            .is_some_and(|task_id| {
+                !self
+                    .task_surfaces
+                    .terminal_is_interactive(self.local_task_key(task_id))
+            })
         {
             return;
         }
@@ -18739,7 +18956,8 @@ impl NativeShell {
                 },
             ) {
                 Ok(record) => {
-                    let Some((request_id, _, _)) = Self::task_cockpit_command_parts(&record.command)
+                    let Some((request_id, _, _)) =
+                        Self::task_cockpit_command_parts(&record.command)
                     else {
                         if let Some(slot) = self.host_slot_mut(&owner_host) {
                             slot.composer_error = Some(
@@ -19004,17 +19222,16 @@ impl NativeShell {
             }
             if let Some(slot) = self.host_slot_mut(&owner_host) {
                 slot.composer_error = Some(
-                    "Images require Send; wait for this turn to finish. Your draft was kept.".into(),
+                    "Images require Send; wait for this turn to finish. Your draft was kept."
+                        .into(),
                 );
             }
             return;
         }
         if let ComposerPayload::SendNow { text, .. } = &intent.payload {
-            let admission = self.task_surfaces.admit_pending_user_message(
-                owner_key.clone(),
-                text,
-                command_id,
-            );
+            let admission =
+                self.task_surfaces
+                    .admit_pending_user_message(owner_key.clone(), text, command_id);
             if admission.changed && self.selected_task_key.as_ref() == Some(&owner_key) {
                 if let Some(page) = admission.page {
                     self.project_owner_conversation_presentation(&owner_host, &owner_key, &page);
@@ -19031,8 +19248,7 @@ impl NativeShell {
                     let _ = composer.cancel_pending(command_id);
                 }
                 if let Some(slot) = self.host_slot_mut(&owner_host) {
-                    slot.composer_error =
-                        Some("Task projection unavailable; draft kept.".into());
+                    slot.composer_error = Some("Task projection unavailable; draft kept.".into());
                 }
                 return;
             };
@@ -19138,7 +19354,11 @@ impl NativeShell {
             .unwrap_or(&[])
     }
 
-    fn detach_composer_images_for_key(&mut self, key: KeyedComposerDraftKey<HostTaskKey>, image_ids: &[u64]) {
+    fn detach_composer_images_for_key(
+        &mut self,
+        key: KeyedComposerDraftKey<HostTaskKey>,
+        image_ids: &[u64],
+    ) {
         detach_native_composer_images_for_key(&mut self.composer_images, key, image_ids);
     }
 
@@ -19513,10 +19733,7 @@ impl NativeShell {
         TaskWorkspaceViewModel::build(workspace, &projections).ok()
     }
 
-    fn owner_pane_projection_labels(
-        &self,
-        key: &HostTaskKey,
-    ) -> (String, String, String, String) {
+    fn owner_pane_projection_labels(&self, key: &HostTaskKey) -> (String, String, String, String) {
         let slot = self.host_slot(&key.host);
         let row = slot.and_then(|slot| slot.inbox.row(key.task_id));
         let title = row
@@ -19524,13 +19741,14 @@ impl NativeShell {
             .unwrap_or_else(|| format!("Task {}", key.task_id));
         let project_name = row
             .map(|row| {
-                let from_owner_config = slot.and_then(|slot| {
-                    slot.config_sidebar.projects.iter().find_map(|project| {
-                        (ProjectId::parse(&project.workspace_id).ok() == Some(row.project_id))
-                            .then(|| project.label.clone())
+                let from_owner_config = slot
+                    .and_then(|slot| {
+                        slot.config_sidebar.projects.iter().find_map(|project| {
+                            (ProjectId::parse(&project.workspace_id).ok() == Some(row.project_id))
+                                .then(|| project.label.clone())
+                        })
                     })
-                })
-                .filter(|label| !label.trim().is_empty());
+                    .filter(|label| !label.trim().is_empty());
                 if let Some(label) = from_owner_config {
                     return label;
                 }
@@ -19549,11 +19767,14 @@ impl NativeShell {
             .and_then(|model| model.task(key.task_id))
             .and_then(|snapshot| {
                 let agent_id = snapshot.primary_agent_id?;
-                snapshot.agents.get(&agent_id).map(|agent| match agent.provider_kind {
-                    ProviderKind::ClaudeCode => "Claude",
-                    ProviderKind::Codex => "Codex",
-                    ProviderKind::Cursor => "Cursor",
-                })
+                snapshot
+                    .agents
+                    .get(&agent_id)
+                    .map(|agent| match agent.provider_kind {
+                        ProviderKind::ClaudeCode => "Claude",
+                        ProviderKind::Codex => "Codex",
+                        ProviderKind::Cursor => "Cursor",
+                    })
             })
             .unwrap_or("Agent")
             .to_string();
@@ -19861,7 +20082,6 @@ impl NativeShell {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let task_key = pane.task_id.clone();
-        let task_id = task_key.task_id;
         let pane_id = pane.pane_id;
         let focus_key = task_key.clone();
         let focus = cx.listener(move |shell, _event: &MouseDownEvent, _window, cx| {
@@ -19874,10 +20094,8 @@ impl NativeShell {
             if event.button == MouseButton::Left
                 && shell.selected_task_key.as_ref() != Some(&focus_anywhere_key)
             {
-                let _ = shell.select_fleet_task_key(
-                    focus_anywhere_key.clone(),
-                    FleetSelectMode::Replace,
-                );
+                let _ = shell
+                    .select_fleet_task_key(focus_anywhere_key.clone(), FleetSelectMode::Replace);
                 cx.notify();
             }
         });
@@ -20032,38 +20250,7 @@ impl NativeShell {
                 cx,
             )
         } else if pane.paint_terminal {
-            let lines = self.task_surfaces.terminal_tail(task_key.clone(), 24);
-            let has_lines = !lines.is_empty();
-            let empty = self.task_surfaces.terminal_empty_message(task_key.clone());
-            div()
-                .w_full()
-                .flex_1()
-                .min_h(px(0.0))
-                .overflow_y_scrollbar()
-                .flex()
-                .flex_col()
-                .gap(px(10.0))
-                .p(px(14.0))
-                .bg(tokens.surfaces.canvas.to_gpui())
-                .children(lines.into_iter().enumerate().map(|(index, line)| {
-                    div()
-                        .id((
-                            "native-task-pane-line",
-                            task_element_key.rotate_left(17) ^ index as u64,
-                        ))
-                        .w_full()
-                        .text_size(px(tokens.density.typography.body))
-                        .line_height(px(tokens.density.typography.body_line_height))
-                        .text_color(tokens.text.secondary.to_gpui())
-                        .child(bounded_workspace_snippet(&line))
-                }))
-                .children((!has_lines).then(|| {
-                    div()
-                        .text_color(tokens.text.muted.to_gpui())
-                        .child(empty)
-                        .into_any_element()
-                }))
-                .into_any_element()
+            self.task_terminal_surface_for(&task_key, tokens)
         } else {
             // Background Full panes render the same owner semantic history;
             // only the interactive composer/input is withheld.
@@ -20263,7 +20450,7 @@ impl NativeShell {
             } else {
                 0.0
             })
-            .max(1.0) as u32;
+        .max(1.0) as u32;
         {
             let Some(slot) = self.host_slot_mut(&owner.host) else {
                 return self.idle_conversation_photo_surface(tokens, Some(idle_photo_size));
@@ -20279,7 +20466,8 @@ impl NativeShell {
         if show_input {
             if let Some(steps) = self.preview_plan_steps.clone() {
                 if let Some(slot) = self.host_slot_mut(&owner.host) {
-                    slot.cockpit.install_preview_plan_steps(owner_task_id, &steps);
+                    slot.cockpit
+                        .install_preview_plan_steps(owner_task_id, &steps);
                 }
             }
         }
@@ -20670,9 +20858,7 @@ impl NativeShell {
                     .into_any_element()
             })
             .collect::<Vec<_>>();
-        let showing_provider_terminal = self
-            .host_slot(&owner.host)
-            .is_some_and(|slot| slot.cockpit.dock().showing_raw_terminal());
+        let showing_provider_terminal = self.task_center_terminal_preference(&owner);
         let composer_hairline = mix_color(tokens.surfaces.canvas, tokens.borders.subtle, 0.65);
         let composer_pill = |label: &str| {
             div()
@@ -20734,8 +20920,10 @@ impl NativeShell {
                         .on_click(open_access),
                 )
                 .into_any_element()
+        } else if self.draft_owner_composer_workflow_pending() {
+            composer_pill("Starting provider…")
         } else {
-            composer_pill("Options managed by provider")
+            composer_pill("Current session")
         };
         let usage_pill = {
             let instance_id = launch_options
@@ -21382,7 +21570,8 @@ impl NativeShell {
                     .child(composer_footer)
                     .into_any_element()
             } else if let Some(slot) = self.host_slot_mut(&owner.host) {
-                slot.cockpit.conversation_surface_with_footer_and_activity_handler(
+                slot.cockpit.conversation_surface_with_footer_for_task(
+                    owner.task_id,
                     tokens,
                     composer_footer,
                     Some(activity_toggle),
@@ -21397,7 +21586,7 @@ impl NativeShell {
             }
         };
         let center_body = if showing_provider_terminal {
-            self.center_provider_terminal_surface(tokens, cx)
+            self.center_provider_terminal_surface_for(&owner, tokens, cx)
         } else {
             div()
                 .id("native-task-conversation-interactive")
@@ -21420,36 +21609,31 @@ impl NativeShell {
             .into_any_element()
     }
 
-    fn center_provider_terminal_surface(
+    fn center_provider_terminal_surface_for(
         &self,
+        owner: &HostTaskKey,
         tokens: crate::ui::tokens::ThemeTokens,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let owner = self.selected_task_key.clone().or_else(|| {
-            self.local_slot()
-                .interaction
-                .selected_task()
-                .map(|task_id| self.local_task_key(task_id))
-        });
-        let remote = owner
-            .as_ref()
-            .is_some_and(|key| key.host != self.local_host_id());
+        let remote = owner.host != self.local_host_id();
         if remote {
-            let owner = owner.expect("remote owner");
-            return self.remote_terminal_dock_surface(tokens, owner);
+            return self.remote_terminal_dock_surface(tokens, owner.clone());
         }
         let shell_entity = cx.weak_entity();
-        let interactive = self.local_slot().interaction.selected_task().is_some_and(|task_id| {
-            self.local_slot().cockpit.dock().terminal_binding().is_some()
-                && self.task_surfaces.terminal_is_interactive(self.local_task_key(task_id))
-        });
+        let selected_owner = self.selected_task_key.as_ref() == Some(owner);
+        let interactive = selected_owner
+            && self.local_slot().interaction.selected_task() == Some(owner.task_id)
+            && self
+                .local_slot()
+                .cockpit
+                .dock()
+                .terminal_binding()
+                .is_some()
+            && self.task_surfaces.terminal_is_interactive(owner.clone());
         let summary = if interactive {
             "Provider terminal · Live · type, use arrows, Enter, or Escape"
         } else {
-            self.local_slot().interaction
-                .selected_task()
-                .map(|task_id| self.task_surfaces.terminal_label(self.local_task_key(task_id)))
-                .unwrap_or("Terminal unavailable")
+            self.task_surfaces.terminal_label(owner.clone())
         };
         let surface = div()
             .id("native-task-center-terminal-surface")
@@ -21507,6 +21691,44 @@ impl NativeShell {
             .into_any_element()
     }
 
+    fn task_terminal_surface_for(
+        &self,
+        owner: &HostTaskKey,
+        tokens: crate::ui::tokens::ThemeTokens,
+    ) -> AnyElement {
+        let label = self.task_surfaces.terminal_label(owner.clone());
+        let pane = self
+            .task_surfaces
+            .state(owner.clone())
+            .and_then(|state| state.latest_terminal.as_ref())
+            .map(crate::ui::task_cockpit::dock::ContextDock::terminal_pane_model_for_projection);
+        let surface = div()
+            .id((
+                "native-task-terminal-surface",
+                stable_host_task_element_key(owner, "terminal-surface"),
+            ))
+            .w_full()
+            .flex()
+            .flex_1()
+            .min_h(px(0.0))
+            .flex_col()
+            .bg(tokens.terminal.background.to_gpui());
+        if let Some(pane) = pane {
+            surface
+                .child(crate::terminal::view::render_terminal_surface_with_tokens(
+                    &pane, None, tokens,
+                ))
+                .into_any_element()
+        } else {
+            surface
+                .items_center()
+                .justify_center()
+                .text_color(tokens.terminal.bright_black.to_gpui())
+                .child(label)
+                .into_any_element()
+        }
+    }
+
     fn sync_task_composer(&mut self, model: &ClientModel, task_id: TaskId) {
         let key = self
             .selected_task_key
@@ -21522,15 +21744,17 @@ impl NativeShell {
             self.clear_composer_binding();
             return;
         };
-        let restore_failed = self.host_slot(&key.host).and_then(|slot| {
-            slot.agent_connection.as_ref().map(|connection| {
-                connection
-                    .restore_failed_task_ids
-                    .iter()
-                    .any(|failed| *failed == task_id)
+        let restore_failed = self
+            .host_slot(&key.host)
+            .and_then(|slot| {
+                slot.agent_connection.as_ref().map(|connection| {
+                    connection
+                        .restore_failed_task_ids
+                        .iter()
+                        .any(|failed| *failed == task_id)
+                })
             })
-        })
-        .unwrap_or(false);
+            .unwrap_or(false);
         if restore_failed {
             self.note_selected_task_restore_unavailable(task_id);
             if self.task_surfaces.conversation_page(key.clone()).is_none() {
@@ -21616,15 +21840,13 @@ impl NativeShell {
                 action_epoch: snapshot.task.action_epoch,
                 turn_id: None,
             },
-            draft: self
-                .composer_drafts
-                .get(&draft_key)
-                .cloned()
-                .unwrap_or(ComposerDraftProjection {
+            draft: self.composer_drafts.get(&draft_key).cloned().unwrap_or(
+                ComposerDraftProjection {
                     text: String::new(),
                     attachments: Vec::new(),
                     prompt: None,
-                }),
+                },
+            ),
             owned_artifacts: snapshot.artifacts.keys().copied().collect(),
             question,
             approval,
@@ -21675,7 +21897,9 @@ impl NativeShell {
     }
 
     fn clear_cockpit_projection(&mut self) {
-        self.local_slot_mut().cockpit.clear_live_surfaces_preserving_dock_memory();
+        self.local_slot_mut()
+            .cockpit
+            .clear_live_surfaces_preserving_dock_memory();
         self.terminal.rebind(None);
         self.terminal.set_preferences(self.preferences);
         self.sync_header_projection();
@@ -21683,7 +21907,13 @@ impl NativeShell {
 
     fn sync_terminal_from_cockpit(&mut self) {
         let preferences = self.preferences;
-        if self.local_slot_mut().cockpit.dock().terminal_binding().is_some() {
+        if self
+            .local_slot_mut()
+            .cockpit
+            .dock()
+            .terminal_binding()
+            .is_some()
+        {
             let model = self.local_slot_mut().cockpit.dock().terminal_pane_model();
             self.terminal.rebind(Some(model));
             self.terminal.set_preferences(preferences);
@@ -21970,9 +22200,10 @@ impl NativeShell {
                     }
                     if let ActionRequest::TaskCockpit {
                         task_id,
-                        query: TaskCockpitQuery::FilesList {
-                            relative_directory, ..
-                        },
+                        query:
+                            TaskCockpitQuery::FilesList {
+                                relative_directory, ..
+                            },
                     } = &action.request
                     {
                         shell.remember_files_browse_directory(
@@ -22372,7 +22603,8 @@ impl NativeShell {
     ) -> bool {
         self.local_slot().interaction.selected_task() == Some(task_id)
             && self.local_slot().interaction.action_epochs() == epochs
-            && self.local_slot()
+            && self
+                .local_slot()
                 .services_projection
                 .rows
                 .iter()
@@ -22802,8 +23034,10 @@ impl NativeShell {
     ) -> AnyElement {
         let label = self.task_surfaces.terminal_label(owner.clone());
         let pane = self
-            .host_slot(&owner.host)
-            .map(|slot| slot.cockpit.dock().terminal_pane_model());
+            .task_surfaces
+            .state(owner.clone())
+            .and_then(|state| state.latest_terminal.as_ref())
+            .map(crate::ui::task_cockpit::dock::ContextDock::terminal_pane_model_for_projection);
         let surface = div()
             .id("native-shell-remote-context-terminal")
             .w_full()
@@ -22814,15 +23048,9 @@ impl NativeShell {
             .bg(tokens.surfaces.sunken.to_gpui())
             .child(format!("Terminal · display only · {label}"));
         let surface = if let Some(pane) = pane {
-            surface.child(
-                div()
-                    .flex_1()
-                    .min_h(px(120.0))
-                    .overflow_hidden()
-                    .child(crate::terminal::view::render_terminal_surface_with_tokens(
-                        &pane, None, tokens,
-                    )),
-            )
+            surface.child(div().flex_1().min_h(px(120.0)).overflow_hidden().child(
+                crate::terminal::view::render_terminal_surface_with_tokens(&pane, None, tokens),
+            ))
         } else {
             surface.child(
                 div()
@@ -22939,7 +23167,8 @@ impl NativeShell {
     }
 
     fn first_workspace_project_id(&self) -> Option<crate::domain::id::ProjectId> {
-        self.local_slot().config_sidebar
+        self.local_slot()
+            .config_sidebar
             .projects
             .iter()
             .find_map(|project| crate::domain::id::ProjectId::parse(&project.workspace_id).ok())
@@ -22966,7 +23195,8 @@ impl NativeShell {
     fn current_workspace_project_id(&self) -> Option<ProjectId> {
         self.selected_project_id
             .filter(|selected| {
-                self.local_slot().config_sidebar
+                self.local_slot()
+                    .config_sidebar
                     .projects
                     .iter()
                     .any(|project| ProjectId::parse(&project.workspace_id).ok() == Some(*selected))
@@ -23002,16 +23232,17 @@ impl NativeShell {
                 }
             }
             if key.host != self.local_host_id() {
-                return Some(format!(
-                    "{} · project",
-                    self.owner_host_label(&key.host)
-                ));
+                return Some(format!("{} · project", self.owner_host_label(&key.host)));
             }
         }
-        self.local_slot().config_sidebar.projects.iter().find_map(|project| {
-            (ProjectId::parse(&project.workspace_id).ok() == Some(project_id))
-                .then(|| project.label.clone())
-        })
+        self.local_slot()
+            .config_sidebar
+            .projects
+            .iter()
+            .find_map(|project| {
+                (ProjectId::parse(&project.workspace_id).ok() == Some(project_id))
+                    .then(|| project.label.clone())
+            })
     }
 
     fn project_scope(&self) -> ProjectScope {
@@ -23125,8 +23356,6 @@ impl NativeShell {
         KeyedComposerDraftKey::from_parts(owner, agent_session_id)
     }
 
-
-
     pub fn local_task_key(&self, task_id: TaskId) -> HostTaskKey {
         HostTaskKey::new(self.local_host_id(), task_id)
     }
@@ -23141,10 +23370,7 @@ impl NativeShell {
 
     /// Test/production helper: insert a fully formed remote (or secondary) host
     /// slot that already owns its runtime attachment. Shares no HostClient.
-    pub fn attach_host_ui_slot(
-        &mut self,
-        slot: HostUiState,
-    ) -> Result<HostId, NativeShellError> {
+    pub fn attach_host_ui_slot(&mut self, slot: HostUiState) -> Result<HostId, NativeShellError> {
         if self.installed_fleet_host_ids().len() >= MAX_FLEET_HOSTS {
             return Err(NativeShellError::HostConnect {
                 message: format!("fleet host table full ({MAX_FLEET_HOSTS})"),
@@ -23182,11 +23408,8 @@ impl NativeShell {
     pub fn fleet_inbox_projection(&self) -> FleetInboxProjection {
         let mut parts = Vec::with_capacity(self.hosts.len());
         for (host_id, slot) in &self.hosts {
-            let mut projection = fleet_rows_from_inbox(
-                host_id,
-                &self.owner_host_label(host_id),
-                &slot.inbox,
-            );
+            let mut projection =
+                fleet_rows_from_inbox(host_id, &self.owner_host_label(host_id), &slot.inbox);
             // Overlay this host's configured project labels only — never look up
             // another host's config for the same raw ProjectId.
             overlay_owner_config_project_labels(&mut projection, &slot.config_sidebar);
@@ -23236,10 +23459,8 @@ impl NativeShell {
             }
         }
         let endpoint = runtime.endpoint().to_string();
-        let mut slot = HostUiState::new_empty(
-            host_id.clone(),
-            NativeHostState::Connected { endpoint },
-        );
+        let mut slot =
+            HostUiState::new_empty(host_id.clone(), NativeHostState::Connected { endpoint });
         slot.host_runtime = Some(NativeHostRuntimeAttachment::Client(runtime));
         self.hosts.insert(host_id.clone(), slot);
         self.fleet_drain_cursor
@@ -23318,6 +23539,9 @@ impl NativeShell {
             .retain(|key, _| &key.task_id.host != host_id);
         self.draft_launch_prefs
             .retain(|key, _| &key.host != host_id);
+        self.layout.task_composer_preferences.retain(|key, _| {
+            serde_json::from_str::<HostTaskKey>(key).is_ok_and(|owner| &owner.host != host_id)
+        });
         self.pending_automatic_titles
             .retain(|key, _| &key.host != host_id);
         self.composer_images
@@ -23484,9 +23708,7 @@ impl NativeShell {
                     Ok(payload) => payload,
                     Err(error) => {
                         if let Some(slot) = self.host_slot_mut(&host_id) {
-                            slot.host_state = NativeHostState::Error {
-                                message: error,
-                            };
+                            slot.host_state = NativeHostState::Error { message: error };
                             // Keep cached model/task_list/drafts for read-only display.
                         }
                         repaint = true;
@@ -23565,9 +23787,11 @@ impl NativeShell {
                 {
                     let key = HostTaskKey::new(host_id.clone(), task_id);
                     let after_sequence = self.conversation_after_sequence_for(key.clone());
-                    let visible = self.layout.task_workspace.as_ref().is_some_and(|workspace| {
-                        workspace.contains_task(key.clone())
-                    });
+                    let visible = self
+                        .layout
+                        .task_workspace
+                        .as_ref()
+                        .is_some_and(|workspace| workspace.contains_task(key.clone()));
                     if visible
                         && high_water > after_sequence
                         && self.action_lane_len_for_owner(&host_id) < MAX_ACTION_LANE_RECORDS / 2
@@ -23748,9 +23972,8 @@ impl NativeShell {
         }
         // Drop tombstones once the owning projection no longer lists the task.
         let present: HashSet<TaskId> = keys.iter().map(|key| key.task_id).collect();
-        self.known_deleted_task_keys.retain(|key| {
-            !(key.host == *host_id && !present.contains(&key.task_id))
-        });
+        self.known_deleted_task_keys
+            .retain(|key| !(key.host == *host_id && !present.contains(&key.task_id)));
         let reconcile_keys = self.union_reconcile_task_keys_with(host_id, &keys);
         if self.layout.reconcile_task_workspace(&reconcile_keys) {
             self.mark_layout_dirty();
@@ -24058,8 +24281,10 @@ impl NativeShell {
         match self.local_slot().config_sidebar.unavailable_reason {
             Some(ConfigSidebarUnavailableReason::StoreRecoveryRequired) => ShellStage::Recovery,
             Some(ConfigSidebarUnavailableReason::SnapshotMissing)
-                if !matches!(self.local_slot().host_state, NativeHostState::Connected { .. })
-                    && !self.fleet_presents_remote_cockpit() =>
+                if !matches!(
+                    self.local_slot().host_state,
+                    NativeHostState::Connected { .. }
+                ) && !self.fleet_presents_remote_cockpit() =>
             {
                 ShellStage::Connecting
             }
@@ -24573,9 +24798,7 @@ impl NativeShell {
         let unresolved_host = self
             .retired_delete_flow_commands
             .iter()
-            .filter(|retired| {
-                !retired.terminal && retired.owner.host == owner_for_pressure.host
-            })
+            .filter(|retired| !retired.terminal && retired.owner.host == owner_for_pressure.host)
             .count();
         if unresolved_total >= MAX_ACTION_LANE_RECORDS.saturating_mul(MAX_FLEET_HOSTS)
             || unresolved_host >= MAX_ACTION_LANE_RECORDS
@@ -24886,11 +25109,7 @@ impl NativeShell {
 
     /// Mark exact retired ownership terminal after a correlated Accepted/Rejected
     /// receipt only, so duplicates stay blocked while capacity can reclaim.
-    fn mark_retired_delete_flow_terminal(
-        &mut self,
-        host_id: &HostId,
-        action: &NativeActionRecord,
-    ) {
+    fn mark_retired_delete_flow_terminal(&mut self, host_id: &HostId, action: &NativeActionRecord) {
         let Some(command_id) = native_command_id(&action.command) else {
             return;
         };
@@ -25054,8 +25273,13 @@ impl NativeShell {
         self.task_surfaces.retain_tasks(&open);
         self.composer_drafts
             .retain(|draft_key, _| draft_key.task_id != *key);
-        self.draft_launch_prefs.retain(|pref_key, _| pref_key != key);
-        self.pending_automatic_titles.retain(|pending, _| pending != key);
+        self.draft_launch_prefs
+            .retain(|pref_key, _| pref_key != key);
+        self.layout
+            .task_composer_preferences
+            .remove(&key.center_preference_key());
+        self.pending_automatic_titles
+            .retain(|pending, _| pending != key);
         self.composer_images
             .retain(|draft_key, _| draft_key.task_id != *key);
         if let Some(slot) = self.host_slot_mut(&key.host) {
@@ -25556,7 +25780,8 @@ impl NativeShell {
             return;
         }
         if pending.stage == PendingDraftFirstSendStage::AwaitingRuntimeProbe {
-            if !self.pending_workflow_admission_still_live(host_id, pending.fleet_admission.as_ref())
+            if !self
+                .pending_workflow_admission_still_live(host_id, pending.fleet_admission.as_ref())
             {
                 self.cancel_pending_draft_first_send_for_host(
                     host_id,
@@ -26096,13 +26321,15 @@ impl NativeShell {
                 }
                 return;
             };
-            match composer.focus_control(pending.control, epoch).and_then(|_| {
-                if pending.attachment_only {
-                    composer.activate_attachment_only_send(epoch)
-                } else {
-                    composer.activate(pending.control, epoch)
-                }
-            }) {
+            match composer
+                .focus_control(pending.control, epoch)
+                .and_then(|_| {
+                    if pending.attachment_only {
+                        composer.activate_attachment_only_send(epoch)
+                    } else {
+                        composer.activate(pending.control, epoch)
+                    }
+                }) {
                 Ok(intent) => intent,
                 Err(error) => {
                     if let Some(slot) = self.host_slot_mut(host_id) {
@@ -26135,15 +26362,13 @@ impl NativeShell {
         } else {
             None
         };
-        let project_key = project_key.or_else(|| {
-            match self.project_scope() {
-                ProjectScope::Project(project_id) => {
-                    Some(HostProjectKey::new(self.local_host_id(), project_id))
-                }
-                ProjectScope::All => self
-                    .current_workspace_project_id()
-                    .map(|project_id| HostProjectKey::new(self.local_host_id(), project_id)),
+        let project_key = project_key.or_else(|| match self.project_scope() {
+            ProjectScope::Project(project_id) => {
+                Some(HostProjectKey::new(self.local_host_id(), project_id))
             }
+            ProjectScope::All => self
+                .current_workspace_project_id()
+                .map(|project_id| HostProjectKey::new(self.local_host_id(), project_id)),
         });
         let Some(project_key) = project_key else {
             if self.selected_owner_is_remote() {
@@ -26163,8 +26388,7 @@ impl NativeShell {
     fn begin_new_task_for_project_key(&mut self, project_key: HostProjectKey) {
         if self.host_slot(&project_key.host).is_none() {
             if let Some(slot) = self.host_slot_mut(&self.local_host_id()) {
-                slot.composer_error =
-                    Some("New task needs a connected owner host.".into());
+                slot.composer_error = Some("New task needs a connected owner host.".into());
             }
             return;
         }
@@ -26352,21 +26576,22 @@ impl NativeShell {
             self.dispatch_composer_recovery_target(target);
             return;
         }
-        let remote_local_authority = matches!(
-            element_id,
-            "native-shell-tools-affordance"
-                | "native-task-commit"
-                | "native-task-composer-attach"
-                | "native-browser-back"
-                | "native-browser-forward"
-                | "native-browser-reload"
-                | "native-browser-address"
-                | "native-browser-go"
-                | "native-sidebar-changes"
-                | "native-sidebar-services"
-        ) || NATIVE_DOCK_TABS.iter().any(|(tool, dock_element_id, _)| {
-            *dock_element_id == element_id && !Self::remote_dock_tab_supported(*tool)
-        });
+        let remote_local_authority =
+            matches!(
+                element_id,
+                "native-shell-tools-affordance"
+                    | "native-task-commit"
+                    | "native-task-composer-attach"
+                    | "native-browser-back"
+                    | "native-browser-forward"
+                    | "native-browser-reload"
+                    | "native-browser-address"
+                    | "native-browser-go"
+                    | "native-sidebar-changes"
+                    | "native-sidebar-services"
+            ) || NATIVE_DOCK_TABS.iter().any(|(tool, dock_element_id, _)| {
+                *dock_element_id == element_id && !Self::remote_dock_tab_supported(*tool)
+            });
         if remote_local_authority && self.selected_owner_is_remote() {
             if let Some(key) = self.selected_task_key.clone() {
                 if let Some(slot) = self.host_slot_mut(&key.host) {
@@ -26519,7 +26744,8 @@ impl NativeShell {
     }
 
     fn agent_presence_for(&self, provider: ConfigSidebarProviderKind) -> AgentPresence {
-        self.local_slot().agent_connection
+        self.local_slot()
+            .agent_connection
             .as_ref()
             .and_then(|snapshot| {
                 snapshot
@@ -26538,11 +26764,7 @@ impl NativeShell {
             PaletteItem::ToggleSidebar => self.toggle_pane(PaneEdge::Sidebar),
             PaletteItem::ToggleDock => self.toggle_pane(PaneEdge::Dock),
             PaletteItem::ToggleTaskCanvas => {
-                let showing = self
-                    .local_slot()
-                    .cockpit
-                    .dock()
-                    .showing_raw_terminal();
+                let showing = self.local_slot().cockpit.dock().showing_raw_terminal();
                 self.set_provider_terminal_visible(!showing)
             }
             PaletteItem::ResetLayout => self.reset_layout(),
@@ -26558,7 +26780,8 @@ impl NativeShell {
     }
 
     pub fn rendered_task_count(&self) -> usize {
-        self.local_slot().task_list
+        self.local_slot()
+            .task_list
             .rendered_task_ids()
             .len()
             .min(MAX_RENDERED_TASK_ROWS)
@@ -27336,7 +27559,9 @@ impl NativeShell {
                 "Can't load your settings",
                 "DevManager needs to recover before you can continue.".to_string(),
             )),
-            ShellStage::Welcome => Some(connect_canvas_copy(self.local_slot().agent_connection.as_ref())),
+            ShellStage::Welcome => Some(connect_canvas_copy(
+                self.local_slot().agent_connection.as_ref(),
+            )),
             ShellStage::FirstTask => Some((
                 "Start a task",
                 "Name the work you want to do. Chat, files, and the terminal open with it."
@@ -27459,7 +27684,8 @@ impl NativeShell {
             .overflow_hidden();
         let show_sidebar = stage == ShellStage::FirstTask
             || (stage == ShellStage::Welcome
-                && (self.shows_add_project_plus() || !self.local_slot().config_sidebar.projects.is_empty()));
+                && (self.shows_add_project_plus()
+                    || !self.local_slot().config_sidebar.projects.is_empty()));
         if show_sidebar {
             canvas
                 .child(self.sidebar(tokens, layout.sidebar_width, projects_heading_action))
@@ -27518,7 +27744,13 @@ impl NativeShell {
         if self.project_scope_menu.open() {
             return Some(self.render_project_scope_overlay(tokens, viewport, cx));
         }
-        if self.task_search.open() || self.local_slot().interaction.keyboard_state().task_switcher_open {
+        if self.task_search.open()
+            || self
+                .local_slot()
+                .interaction
+                .keyboard_state()
+                .task_switcher_open
+        {
             return Some(self.render_task_search_overlay(tokens, viewport, cx));
         }
         if self
@@ -27731,9 +27963,7 @@ impl NativeShell {
             return false;
         };
         match slot.host_runtime.as_ref() {
-            Some(NativeHostRuntimeAttachment::Client(runtime)) => {
-                runtime.action_admission_allows()
-            }
+            Some(NativeHostRuntimeAttachment::Client(runtime)) => runtime.action_admission_allows(),
             Some(NativeHostRuntimeAttachment::Injected(runtime)) => {
                 NativeHostClientRuntime::action_admission_allows_for(
                     matches!(runtime.host_state(), NativeHostState::Connected { .. }),
@@ -31134,10 +31364,10 @@ impl NativeShell {
                                 .select_index(index, candidates.len())
                                 .is_some()
                             {
-                                if let Some(key) =
-                                    shell.task_search.confirm_selection(&candidates)
+                                if let Some(key) = shell.task_search.confirm_selection(&candidates)
                                 {
-                                    let _ = shell.select_fleet_task_key(key, FleetSelectMode::Replace);
+                                    let _ =
+                                        shell.select_fleet_task_key(key, FleetSelectMode::Replace);
                                 }
                             }
                             shell.local_slot_mut().interaction.close_palettes();
@@ -31311,7 +31541,8 @@ impl NativeShell {
         viewport: Size<Pixels>,
         cx: &Context<Self>,
     ) -> AnyElement {
-        let configured = self.local_slot()
+        let configured = self
+            .local_slot()
             .config_sidebar
             .projects
             .iter()
@@ -31774,7 +32005,8 @@ impl NativeShell {
         else {
             return Vec::new();
         };
-        let Some(project) = self.local_slot()
+        let Some(project) = self
+            .local_slot()
             .config_sidebar
             .projects
             .iter()
@@ -31782,7 +32014,8 @@ impl NativeShell {
         else {
             return Vec::new();
         };
-        self.local_slot().config_sidebar
+        self.local_slot()
+            .config_sidebar
             .servers
             .iter()
             .filter(|server| server.project_id == project.config_id)
@@ -31831,7 +32064,8 @@ impl NativeShell {
             return;
         }
         let Some(project_id) = self.current_workspace_project_id() else {
-            self.local_slot_mut().last_query_detail = Some("Select a project before adding an action.".into());
+            self.local_slot_mut().last_query_detail =
+                Some("Select a project before adding an action.".into());
             return;
         };
         self.project_actions.open_menu(project_id);
@@ -31941,10 +32175,17 @@ impl NativeShell {
         let Some(draft) = self.project_actions.take_validated_draft() else {
             return;
         };
-        let Some(task_id) = self.local_slot_mut()
+        let Some(task_id) = self
+            .local_slot_mut()
             .interaction
             .selected_task()
-            .or_else(|| self.local_slot_mut().inbox.active_rows().first().map(|row| row.task_id))
+            .or_else(|| {
+                self.local_slot_mut()
+                    .inbox
+                    .active_rows()
+                    .first()
+                    .map(|row| row.task_id)
+            })
         else {
             if let ProjectActionMenuMode::Editor(editor) = &mut self.project_actions.mode {
                 editor.error = Some("Open a task before saving actions.".into());
@@ -32033,7 +32274,8 @@ impl NativeShell {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let configured = self.local_slot_mut()
+        let configured = self
+            .local_slot_mut()
             .config_sidebar
             .projects
             .iter()
@@ -32247,7 +32489,8 @@ impl NativeShell {
             return;
         }
         let Some(task_id) = self.local_slot_mut().interaction.selected_task() else {
-            self.local_slot_mut().last_query_detail = Some("Select a task before committing.".into());
+            self.local_slot_mut().last_query_detail =
+                Some("Select a task before committing.".into());
             return;
         };
         let Some(selector) = self.selected_repository_for_task(task_id).or_else(|| {
@@ -32445,7 +32688,8 @@ impl NativeShell {
 
     fn begin_header_open(&mut self) {
         let Some(task_id) = self.local_slot_mut().interaction.selected_task() else {
-            self.local_slot_mut().last_query_detail = Some("Select a task before opening files.".into());
+            self.local_slot_mut().last_query_detail =
+                Some("Select a task before opening files.".into());
             return;
         };
         self.layout.active_dock_tab = Some("Files".to_string());
@@ -32464,10 +32708,12 @@ impl NativeShell {
     }
 
     fn reconcile_browser_dock_lifecycle(&mut self, window: Option<&Window>) {
-        let browser_tab_active = self.local_slot_mut().cockpit.active_tool() == CockpitDockTool::Browser;
+        let browser_tab_active =
+            self.local_slot_mut().cockpit.active_tool() == CockpitDockTool::Browser;
         let dock_expanded = !self.layout.dock_collapsed;
         let host_available = self.browser_host.status().available;
-        let attached = self.local_slot_mut()
+        let attached = self
+            .local_slot_mut()
             .cockpit
             .browser_projection()
             .is_some_and(|projection| projection.attached());
@@ -32547,7 +32793,11 @@ impl NativeShell {
                 if let Ok(destination) =
                     crate::browser::BrowserNativeDestination::from_raw(parent_hwnd)
                 {
-                    if let Ok(command) = self.local_slot_mut().cockpit.attach_browser_native(destination, bounds) {
+                    if let Ok(command) = self
+                        .local_slot_mut()
+                        .cockpit
+                        .attach_browser_native(destination, bounds)
+                    {
                         let _ = self.apply_browser_native_command(&command);
                     }
                 }
@@ -32568,14 +32818,19 @@ impl NativeShell {
 
     fn browser_dock_identity(&self) -> Option<BrowserDockIdentity> {
         let task_id = self.local_slot().interaction.selected_task()?;
-        let view = self.local_slot().client_model.as_ref()?.browser_dock_view(task_id)?;
+        let view = self
+            .local_slot()
+            .client_model
+            .as_ref()?
+            .browser_dock_view(task_id)?;
         let agent_session_id = view.agent_session_id?;
         let context_id = view.context_id?;
         let resource_id = view.resource_id?;
         let workspace_key = BrowserWorkspaceKey::new(task_id.to_string(), "conversation").ok()?;
         // Prefer an already-bound projection, else the registrar (pre-bind).
         // Never synthesize a process session id.
-        let process_session_id = self.local_slot()
+        let process_session_id = self
+            .local_slot()
             .cockpit
             .browser_projection()
             .map(|projection| projection.gateway().process_session_id().to_string())
@@ -32932,10 +33187,21 @@ impl NativeShell {
         } else if self.project_scope_menu.open() {
             self.handle_project_scope_key(event, window, cx);
             true
-        } else if self.task_search.open() || self.local_slot_mut().interaction.keyboard_state().task_switcher_open {
+        } else if self.task_search.open()
+            || self
+                .local_slot_mut()
+                .interaction
+                .keyboard_state()
+                .task_switcher_open
+        {
             self.handle_task_search_key(event, window, cx);
             true
-        } else if self.local_slot_mut().interaction.keyboard_state().palette_open {
+        } else if self
+            .local_slot_mut()
+            .interaction
+            .keyboard_state()
+            .palette_open
+        {
             self.handle_palette_key(event, window, cx);
             true
         } else if self.settings_open {
@@ -33546,7 +33812,10 @@ impl NativeShell {
     ) -> AnyElement {
         let show_attachment = !self.local_slot().header_attachment.label().is_empty()
             || !self.local_slot().header_attachment.detail().is_empty();
-        let show_connection = !matches!(self.local_slot().host_state, NativeHostState::Connected { .. });
+        let show_connection = !matches!(
+            self.local_slot().host_state,
+            NativeHostState::Connected { .. }
+        );
         let project_label = self
             .current_workspace_project_label()
             .unwrap_or_else(|| "All projects".to_string());
@@ -33647,10 +33916,16 @@ impl NativeShell {
     /// Optional task-details panel, shown only while the keyboard model has it
     /// open.
     fn task_details_panel(&self, tokens: crate::ui::tokens::ThemeTokens) -> Option<AnyElement> {
-        if !self.local_slot().interaction.keyboard_state().task_details_open {
+        if !self
+            .local_slot()
+            .interaction
+            .keyboard_state()
+            .task_details_open
+        {
             return None;
         }
-        let body = self.local_slot()
+        let body = self
+            .local_slot()
             .interaction
             .selected_task()
             .map(|task_id| self.task_row_label(task_id))
@@ -33895,10 +34170,12 @@ impl NativeShell {
         let window = self.layout.window;
         let selected_task = self.layout.selected_task.clone();
         let task_workspace = self.layout.task_workspace.clone();
+        let task_composer_preferences = self.layout.task_composer_preferences.clone();
         self.layout = KeyedWorkspaceLayout {
             window,
             selected_task,
             task_workspace,
+            task_composer_preferences,
             ..KeyedWorkspaceLayout::<HostTaskKey>::default()
         };
         self.mark_layout_dirty();
@@ -33970,18 +34247,23 @@ impl NativeShell {
     }
 
     fn apply_cached_conversation_for_task(&mut self, task_id: TaskId) {
-        let Some(page) = self.task_surfaces.conversation_page(self.local_task_key(task_id)) else {
+        let Some(page) = self
+            .task_surfaces
+            .conversation_page(self.local_task_key(task_id))
+        else {
             return;
         };
         if page.facts.is_empty() {
             return;
         }
-        self.local_slot_mut().cockpit
+        self.local_slot_mut()
+            .cockpit
             .install_admitted_conversation_page(task_id, &page);
     }
 
     fn conversation_after_sequence_for(&self, task_key: HostTaskKey) -> u64 {
-        self.task_surfaces.conversation_after_sequence(task_key.clone())
+        self.task_surfaces
+            .conversation_after_sequence(task_key.clone())
     }
 
     fn project_owner_conversation_presentation(
@@ -34028,7 +34310,8 @@ impl NativeShell {
     }
 
     fn project_label_for_id(&self, project_id: ProjectId) -> String {
-        self.local_slot().config_sidebar
+        self.local_slot()
+            .config_sidebar
             .projects
             .iter()
             .find_map(|project| {
@@ -34135,7 +34418,11 @@ impl NativeShell {
             .h_full()
             .overflow_hidden()
             .flex_col()
-            .child(self.local_slot().config_sidebar.surface(tokens, projects_heading_action))
+            .child(
+                self.local_slot()
+                    .config_sidebar
+                    .surface(tokens, projects_heading_action),
+            )
             .into_any_element()
     }
 
@@ -34317,10 +34604,14 @@ impl NativeShell {
                         tokens.text.muted.to_u32(),
                     ))
                     .child(div().flex_1().child(self.project_scope().label(|id| {
-                        self.local_slot().config_sidebar.projects.iter().find_map(|project| {
-                            (ProjectId::parse(&project.workspace_id).ok() == Some(id))
-                                .then(|| project.label.as_str())
-                        })
+                        self.local_slot()
+                            .config_sidebar
+                            .projects
+                            .iter()
+                            .find_map(|project| {
+                                (ProjectId::parse(&project.workspace_id).ok() == Some(id))
+                                    .then(|| project.label.as_str())
+                            })
                     })))
                     .child(crate::icons::app_icon(
                         crate::icons::CHEVRON_DOWN,
@@ -34416,7 +34707,8 @@ impl NativeShell {
                 if self.local_slot().interaction.selected_task().is_none() {
                     self.idle_conversation_photo_surface(tokens, None)
                 } else {
-                    self.local_slot().cockpit
+                    self.local_slot()
+                        .cockpit
                         .conversation_surface(tokens, self.composer.as_ref())
                         .into_any_element()
                 },
@@ -34571,7 +34863,6 @@ impl NativeShell {
         let selected_task_key = self.selected_task_key.clone();
         let selected_task_key_for_list = selected_task_key.clone();
         let local_host_for_list = self.local_host_id();
-        let project_scope = self.project_scope();
         let open_task_ids = Arc::new(
             self.layout
                 .task_workspace
@@ -34579,33 +34870,22 @@ impl NativeShell {
                 .map(|workspace| workspace.task_ids().into_iter().collect::<HashSet<_>>())
                 .unwrap_or_default(),
         );
-        let settled_rows = self
-            .fleet_inbox_projection()
-            .done
-            .into_iter()
-            .filter(|row| {
-                row.project_id
-                    .map_or(true, |project_id| project_scope.includes(project_id))
-            })
-            .map(|row| {
-                (
-                    row.key,
-                    row.title,
-                    compact_age_label(unix_time_ms(), row.occurred_at_ms),
-                )
-            })
-            .collect::<Vec<_>>();
         let row_height = Self::inbox_row_height(tokens);
         let inbox_is_empty = inbox_items.is_empty();
         let agents_connected = snapshot_connected(self.local_slot_mut().agent_connection.as_ref());
-        let agents_checking = self.local_slot_mut().agent_connection.as_ref().is_some_and(|snapshot| {
-            snapshot
-                .agents
-                .iter()
-                .any(|row| row.presence == AgentPresence::Checking)
-        });
+        let agents_checking =
+            self.local_slot_mut()
+                .agent_connection
+                .as_ref()
+                .is_some_and(|snapshot| {
+                    snapshot
+                        .agents
+                        .iter()
+                        .any(|row| row.presence == AgentPresence::Checking)
+                });
         let provider_affordance = provider_inbox_affordance(agents_connected, agents_checking);
-        let available_agents = self.local_slot_mut()
+        let available_agents = self
+            .local_slot_mut()
             .agent_connection
             .as_ref()
             .map(inbox_agent_actions)
@@ -34618,9 +34898,6 @@ impl NativeShell {
             .any(|action| action.provider == ProviderKind::Codex);
         let shell_entity = cx.entity().downgrade();
         let services_shell_entity = shell_entity.clone();
-        let settled_shell_entity = shell_entity.clone();
-        let settled_open_task_ids = Arc::clone(&open_task_ids);
-        let settled_local_host = self.local_host_id();
         let archived_view = self.show_archived_tasks;
         let task_list_generation = selected_task_key
             .as_ref()
@@ -35296,11 +35573,12 @@ impl NativeShell {
             match shell.request_acknowledged_client_detach() {
                 Ok(_) => cx.quit(),
                 Err(error) => {
-                    shell.local_slot_mut().last_action_failure = Some(NativeHostActionFailure::ExecutionFailed {
-                        action_id: "native.client_detach",
-                        command_id: None,
-                        message: bounded_host_error(error.to_string()),
-                    });
+                    shell.local_slot_mut().last_action_failure =
+                        Some(NativeHostActionFailure::ExecutionFailed {
+                            action_id: "native.client_detach",
+                            command_id: None,
+                            message: bounded_host_error(error.to_string()),
+                        });
                 }
             }
         });
@@ -35311,11 +35589,12 @@ impl NativeShell {
             match shell.request_full_host_quit(true) {
                 Ok(_) => cx.quit(),
                 Err(error) => {
-                    shell.local_slot_mut().last_action_failure = Some(NativeHostActionFailure::ExecutionFailed {
-                        action_id: "native.host_full_quit",
-                        command_id: None,
-                        message: bounded_host_error(error.to_string()),
-                    });
+                    shell.local_slot_mut().last_action_failure =
+                        Some(NativeHostActionFailure::ExecutionFailed {
+                            action_id: "native.host_full_quit",
+                            command_id: None,
+                            message: bounded_host_error(error.to_string()),
+                        });
                 }
             }
         });
@@ -35597,10 +35876,14 @@ impl NativeShell {
                     ))
                     .child(div().flex_1().font_weight(FontWeight::SEMIBOLD).child(
                         self.project_scope().label(|id| {
-                            self.local_slot_mut().config_sidebar.projects.iter().find_map(|project| {
-                                (ProjectId::parse(&project.workspace_id).ok() == Some(id))
-                                    .then(|| project.label.as_str())
-                            })
+                            self.local_slot_mut()
+                                .config_sidebar
+                                .projects
+                                .iter()
+                                .find_map(|project| {
+                                    (ProjectId::parse(&project.workspace_id).ok() == Some(id))
+                                        .then(|| project.label.as_str())
+                                })
                         }),
                     ))
                     .child(crate::icons::app_icon(
@@ -35624,128 +35907,6 @@ impl NativeShell {
                     ),
             )
             .into_any_element();
-        let settled_panel = (!archived_view && !settled_rows.is_empty()).then(|| {
-            let settled_count = settled_rows.len();
-            // Keep a real measured height so Done stays visible when the active
-            // list would otherwise consume the full flex column.
-            let settled_body_height =
-                (settled_count.min(5) as f32 * 34.0).clamp(34.0, 212.0);
-            let rows = settled_rows.into_iter().map(|(settled_key, title, age)| {
-                let shell_for_settled = settled_shell_entity.clone();
-                let is_open = settled_open_task_ids.contains(&settled_key);
-                let is_focused = selected_task_key.as_ref() == Some(&settled_key);
-                let row = div()
-                    .id((
-                        "native-settled-task-row",
-                        stable_host_task_element_key(&settled_key, "settled"),
-                    ))
-                    .tab_stop(true)
-                    .w_full()
-                    .h(px(34.0))
-                    .flex()
-                    .items_center()
-                    .gap(px(8.0))
-                    .px(px(10.0))
-                    .rounded(px(5.0))
-                    .cursor_pointer()
-                    .text_size(px(tokens.density.typography.caption))
-                    .text_color(if is_open {
-                        tokens.text.on_selection.to_gpui()
-                    } else {
-                        tokens.text.secondary.to_gpui()
-                    })
-                    .hover(|style| style.bg(tokens.surfaces.hover.to_gpui()));
-                let row = if is_focused {
-                    row.bg(tokens.surfaces.selection.to_gpui())
-                        .border_l(px(2.0))
-                        .border_color(tokens.borders.focus.to_gpui())
-                } else if is_open {
-                    row.bg(tokens.surfaces.selection.to_gpui())
-                } else {
-                    row
-                };
-                row.on_mouse_down(
-                    MouseButton::Left,
-                    move |_event: &MouseDownEvent, window: &mut Window, app: &mut gpui::App| {
-                        let _ = shell_for_settled.update(app, |shell, cx| {
-                            cx.stop_propagation();
-                            shell.focus_handle.focus(window);
-                            let _ = shell.select_fleet_task_key(
-                                settled_key.clone(),
-                                FleetSelectMode::Replace,
-                            );
-                            // Done rows select/focus only; Restore or send reopens.
-                            shell.refresh_accessibility_tree();
-                            cx.notify();
-                        });
-                    },
-                )
-                .child(crate::icons::app_icon(
-                    crate::icons::FILE_TEXT,
-                    13.0,
-                    if is_open {
-                        tokens.text.on_selection.to_u32()
-                    } else {
-                        tokens.text.muted.to_u32()
-                    },
-                ))
-                .child(div().flex_1().min_w(px(0.0)).truncate().child(title))
-                .child(
-                    div()
-                        .flex_none()
-                        .text_color(if is_open {
-                            tokens.text.on_selection.to_gpui()
-                        } else {
-                            tokens.text.muted.to_gpui()
-                        })
-                        .child(age),
-                )
-            });
-            div()
-                .id("native-settled-section")
-                .w_full()
-                .flex()
-                .flex_col()
-                .flex_none()
-                .min_h(px(28.0 + settled_body_height))
-                .max_h(px(240.0))
-                .border_t(px(1.0))
-                .border_color(tokens.borders.subtle.to_gpui())
-                .pt(px(5.0))
-                .child(
-                    div()
-                        .w_full()
-                        .h(px(28.0))
-                        .flex()
-                        .items_center()
-                        .gap(px(7.0))
-                        .px(px(10.0))
-                        .text_size(px(tokens.density.typography.caption))
-                        .font_weight(FontWeight::SEMIBOLD)
-                        .text_color(tokens.text.muted.to_gpui())
-                        .child("Done")
-                        .child(
-                            div()
-                                .flex_1()
-                                .h(px(1.0))
-                                .bg(tokens.borders.subtle.to_gpui()),
-                        )
-                        .child(settled_count.to_string())
-                        .child(crate::icons::app_icon(
-                            crate::icons::CHEVRON_UP,
-                            11.0,
-                            tokens.text.muted.to_u32(),
-                        )),
-                )
-                .child(
-                    div()
-                        .h(px(settled_body_height))
-                        .min_h(px(34.0))
-                        .overflow_y_scrollbar()
-                        .children(rows),
-                )
-                .into_any_element()
-        });
         let inbox_panel = div()
             .id("native-shell-task-inbox")
             .w_full()
@@ -35784,7 +35945,6 @@ impl NativeShell {
                     )
                     .into_any_element()
             })
-            .children(settled_panel)
             .into_any_element();
         let sidebar_footer = div()
             .id("native-shell-sidebar-footer")
@@ -35854,84 +36014,80 @@ impl NativeShell {
                                 tokens.text.muted.to_u32(),
                             )),
                     )
-                    .child(
-                        if self.selected_owner_is_remote() {
-                            div()
-                                .id("native-sidebar-changes-unavailable")
-                                .size(px(28.0))
-                                .flex()
-                                .items_center()
-                                .justify_center()
-                                .rounded(px(6.0))
-                                .child(crate::icons::app_icon(
-                                    crate::icons::GIT_BRANCH,
-                                    14.0,
-                                    tokens.text.disabled.to_u32(),
-                                ))
-                        } else {
-                            div()
-                                .id("native-sidebar-changes")
-                                .tab_stop(true)
-                                .size(px(28.0))
-                                .flex()
-                                .items_center()
-                                .justify_center()
-                                .rounded(px(6.0))
-                                .cursor_pointer()
-                                .hover(|style| style.bg(tokens.surfaces.hover.to_gpui()))
-                                .on_click(cx.listener(|shell, _event: &ClickEvent, _window, cx| {
-                                    cx.stop_propagation();
-                                    shell.dispatch_keyboard(KeyboardShortcut::alt(
-                                        crate::ui::actions::ShortcutKey::Digit(1),
-                                    ));
-                                    cx.notify();
-                                }))
-                                .child(crate::icons::app_icon(
-                                    crate::icons::GIT_BRANCH,
-                                    14.0,
-                                    tokens.text.muted.to_u32(),
-                                ))
-                        },
-                    )
-                    .child(
-                        if self.selected_owner_is_remote() {
-                            div()
-                                .id("native-sidebar-services-unavailable")
-                                .size(px(28.0))
-                                .flex()
-                                .items_center()
-                                .justify_center()
-                                .rounded(px(6.0))
-                                .child(crate::icons::app_icon(
-                                    crate::icons::ACTIVITY,
-                                    14.0,
-                                    tokens.text.disabled.to_u32(),
-                                ))
-                        } else {
-                            div()
-                                .id("native-sidebar-services")
-                                .tab_stop(true)
-                                .size(px(28.0))
-                                .flex()
-                                .items_center()
-                                .justify_center()
-                                .rounded(px(6.0))
-                                .cursor_pointer()
-                                .hover(|style| style.bg(tokens.surfaces.hover.to_gpui()))
-                                .on_click(cx.listener(|shell, _event: &ClickEvent, _window, cx| {
-                                    cx.stop_propagation();
-                                    shell.dispatch_keyboard(KeyboardShortcut::alt(
-                                        crate::ui::actions::ShortcutKey::Digit(5),
-                                    ));
-                                    cx.notify();
-                                }))
-                                .child(crate::icons::app_icon(
-                                    crate::icons::ACTIVITY,
-                                    14.0,
-                                    tokens.text.muted.to_u32(),
-                                ))
-                        },
-                    ),
+                    .child(if self.selected_owner_is_remote() {
+                        div()
+                            .id("native-sidebar-changes-unavailable")
+                            .size(px(28.0))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .rounded(px(6.0))
+                            .child(crate::icons::app_icon(
+                                crate::icons::GIT_BRANCH,
+                                14.0,
+                                tokens.text.disabled.to_u32(),
+                            ))
+                    } else {
+                        div()
+                            .id("native-sidebar-changes")
+                            .tab_stop(true)
+                            .size(px(28.0))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .rounded(px(6.0))
+                            .cursor_pointer()
+                            .hover(|style| style.bg(tokens.surfaces.hover.to_gpui()))
+                            .on_click(cx.listener(|shell, _event: &ClickEvent, _window, cx| {
+                                cx.stop_propagation();
+                                shell.dispatch_keyboard(KeyboardShortcut::alt(
+                                    crate::ui::actions::ShortcutKey::Digit(1),
+                                ));
+                                cx.notify();
+                            }))
+                            .child(crate::icons::app_icon(
+                                crate::icons::GIT_BRANCH,
+                                14.0,
+                                tokens.text.muted.to_u32(),
+                            ))
+                    })
+                    .child(if self.selected_owner_is_remote() {
+                        div()
+                            .id("native-sidebar-services-unavailable")
+                            .size(px(28.0))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .rounded(px(6.0))
+                            .child(crate::icons::app_icon(
+                                crate::icons::ACTIVITY,
+                                14.0,
+                                tokens.text.disabled.to_u32(),
+                            ))
+                    } else {
+                        div()
+                            .id("native-sidebar-services")
+                            .tab_stop(true)
+                            .size(px(28.0))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .rounded(px(6.0))
+                            .cursor_pointer()
+                            .hover(|style| style.bg(tokens.surfaces.hover.to_gpui()))
+                            .on_click(cx.listener(|shell, _event: &ClickEvent, _window, cx| {
+                                cx.stop_propagation();
+                                shell.dispatch_keyboard(KeyboardShortcut::alt(
+                                    crate::ui::actions::ShortcutKey::Digit(5),
+                                ));
+                                cx.notify();
+                            }))
+                            .child(crate::icons::app_icon(
+                                crate::icons::ACTIVITY,
+                                14.0,
+                                tokens.text.muted.to_u32(),
+                            ))
+                    }),
             )
             .child({
                 let new_project = div()
@@ -36311,9 +36467,7 @@ impl NativeShell {
                 let message = match result {
                     NativeHostActionResult::Disconnected => "the host is disconnected",
                     NativeHostActionResult::QueueFull => "the host action queue is full",
-                    NativeHostActionResult::Stale => {
-                        "the task changed before Send was admitted"
-                    }
+                    NativeHostActionResult::Stale => "the task changed before Send was admitted",
                     NativeHostActionResult::Queued => unreachable!(),
                 };
                 let retained = !is_native_query_command(&record.command)
@@ -36324,7 +36478,9 @@ impl NativeShell {
                             || slot
                                 .retained_action_overflow
                                 .as_ref()
-                                .is_some_and(|pending| same_native_action_identity(pending, &record))
+                                .is_some_and(|pending| {
+                                    same_native_action_identity(pending, &record)
+                                })
                     });
                 if retained {
                     Err(NativeActionDispatchFailure::after_capture_retained(
@@ -36345,9 +36501,10 @@ impl NativeShell {
         for request in requests {
             if let ActionRequest::TaskCockpit {
                 task_id,
-                query: TaskCockpitQuery::FilesList {
-                    relative_directory, ..
-                },
+                query:
+                    TaskCockpitQuery::FilesList {
+                        relative_directory, ..
+                    },
             } = &request
             {
                 self.remember_files_browse_directory(
@@ -36364,7 +36521,9 @@ impl NativeShell {
                 return;
             }
             let captured = if reuse_handler {
-                self.local_slot_mut().interaction.action_on_current_handler(request)
+                self.local_slot_mut()
+                    .interaction
+                    .action_on_current_handler(request)
             } else {
                 self.local_slot_mut().interaction.action(request)
             };
@@ -36409,7 +36568,8 @@ impl NativeShell {
             }
             return None;
         }
-        let Some(mut record) = self.local_slot_mut()
+        let Some(mut record) = self
+            .local_slot_mut()
             .interaction
             .action_from_source(request, ActivationSource::Pointer { pointer_id })
         else {
@@ -36502,8 +36662,12 @@ impl NativeShell {
                 return NativeHostActionResult::Disconnected;
             };
             match slot.host_runtime.as_mut() {
-                Some(NativeHostRuntimeAttachment::Client(runtime)) => runtime.enqueue(record.clone()),
-                Some(NativeHostRuntimeAttachment::Injected(runtime)) => runtime.enqueue(record.clone()),
+                Some(NativeHostRuntimeAttachment::Client(runtime)) => {
+                    runtime.enqueue(record.clone())
+                }
+                Some(NativeHostRuntimeAttachment::Injected(runtime)) => {
+                    runtime.enqueue(record.clone())
+                }
                 None => NativeHostActionResult::Disconnected,
             }
         };
@@ -36586,7 +36750,10 @@ impl NativeShell {
         }
     }
 
-    fn enqueue_host_action_mut(&mut self, record: &mut NativeActionRecord) -> NativeHostActionResult {
+    fn enqueue_host_action_mut(
+        &mut self,
+        record: &mut NativeActionRecord,
+    ) -> NativeHostActionResult {
         let owner = record
             .fleet_admission
             .as_ref()
@@ -36604,7 +36771,8 @@ impl NativeShell {
                 format!("Can't connect · {}", bounded_host_error(message.clone()))
             }
         };
-        let with_failure = self.local_slot()
+        let with_failure = self
+            .local_slot()
             .last_action_failure
             .as_ref()
             .map_or(base.clone(), |failure| {
@@ -36905,7 +37073,9 @@ impl Render for NativeShell {
             self.sync_remote_settings_fields(window, cx);
         }
         self.sync_shell_window_title(window);
-        if self.pending_terminal_focus && self.local_slot_mut().cockpit.dock().showing_raw_terminal() {
+        if self.pending_terminal_focus
+            && self.local_slot_mut().cockpit.dock().showing_raw_terminal()
+        {
             self.terminal_focus_handle.focus(window);
             self.pending_terminal_focus = false;
         }
@@ -37255,10 +37425,7 @@ fn discard_prepared_native_composer_images(images: Vec<PreparedNativeComposerIma
 }
 
 fn detach_native_composer_images_for_key(
-    images_by_draft: &mut BTreeMap<
-        KeyedComposerDraftKey<HostTaskKey>,
-        Vec<NativeComposerImage>,
-    >,
+    images_by_draft: &mut BTreeMap<KeyedComposerDraftKey<HostTaskKey>, Vec<NativeComposerImage>>,
     key: KeyedComposerDraftKey<HostTaskKey>,
     sent_image_ids: &[u64],
 ) {
@@ -37519,74 +37686,182 @@ fn enqueue_pending_preference(
 
 #[cfg(test)]
 mod tests {
-    use super::{host_display_label, same_native_action_identity, visible_status_label, TaskCockpitQuery};
     use super::{
         // Fleet attach/selection regression helpers
         // (HostFleet / FleetSelectMode / TaskList also used below)
-        acquire_reaper_permit, admit_idle_conversation_photo_fetch, admits_host_actions,
-        agent_connection_snapshot, authorize_full_host_quit, automatic_task_title,
-        capture_runtime_projection_owner, composer_caret_visible, composer_draft_parts,
-        composer_provider_identity, decode_idle_conversation_photo_bytes,
-        detach_native_composer_images_for_key, discard_prepared_native_composer_images,
-        dispatch_pending_action, enqueue_pending_preference, ensure_isolated_host_config_base,
-        fleet_resync_needs_transport_reconnect, idle_conversation_photo_url,
-        idle_photo_dimensions_allowed, idle_photo_fetch_matches_current_canvas,
-        isolated_dev_profile, native_command_id, native_reconnect_source_for,
-        owned_matches_admission, prepare_native_composer_image, provider_inbox_affordance,
-        publish_projection, reap_retained_children, reap_retained_workers,
-        record_recovery_attempt_result, reconnect_backoff_allows,
-        reconnect_backoff_delay_after_failures, reconnect_backoff_note_failure,
-        reconnect_backoff_reset, remove_staged_image, resolve_fleet_transport_reconnect,
-        resync_or_reconnect_fleet_host, retain_child, retain_worker, retained_children,
-        retry_until_startup_deadline, runtime_connection_visible,
-        should_attempt_recovery, should_schedule_host_bootstrap_retry,
-        take_retained_action_outcomes, update_state_from_stage,
-        validate_connected_host_for_shell_launch, validate_host_projection_payloads,
-        wait_for_cancellation, wait_reconnect_backoff_interruptible,
-        worker_should_run_deferred_bootstrap, workspace_context_labels,
-        AccessibilityTree, AccessibleRole, AgentPresence, AgentSessionId, ClientId,
-        CockpitDockTool, CommandId, ComposerControl, ComposerDraftKey, ComposerDraftPart,
-        ComposerDraftProjection, FleetAdmission, FleetTransportReconnect, HostId, HostProjectKey,
-        HostUiState, IsolatedDevProfile, MainConversationCanvas, NativeAccessibilityAction,
-        NativeActionRecord, NativeComposerImage, NativeHeaderAttachment, NativeHostActionFailure,
-        NativeHostActionOutcome, NativeHostActionResult, NativeHostChildOwnership,
-        NativeHostClientRuntime, NativeHostCommand, NativeHostLaunchMode, NativeHostLaunchSpec,
-        NativeHostProjection, NativeHostProjectionKind, NativeHostQueryBody,
-        NativeHostReconnectBackoff, NativeHostRuntimeAttachment, NativeHostRuntimeEpochs,
-        NativeHostRuntimePort, NativeHostState, NativeHostWorkerCommand, NativeInteraction,
-        NativePlatformAccessibilityBridge, NativeReconnectSource, NativeShell, NativeShellMode,
-        NativeShutdownDeadline, OverlayTextFieldPart, OwnedChild, OwnedWorker, PaletteItem,
-        PendingComposerSubmission, PendingHostBootstrap, ActionEvent, ActionRequest,
-        ActivationSource, stable_host_project_element_key, stable_host_project_row_element_id,
-        stable_host_task_element_key, stable_host_task_row_element_id, ProjectActionMenuMode,
-        ProjectId, ProjectInboxItem, ProviderInboxAffordance, ProviderKind, ReaperKind, ShellStage,
-        TaskComposer, TaskId, TrustedReconnectFactoryProbe, UpdateState, UpdaterStage,
-        COMPOSER_CARET_BLINK_TICKS, CONVERSATION_COMPOSER_CONTEXT_INSET,
-        CONVERSATION_COMPOSER_HEIGHT_RESERVE, CONVERSATION_COMPOSER_INNER_RADIUS,
-        CONVERSATION_COMPOSER_INPUT_MIN_HEIGHT, CONVERSATION_COMPOSER_OUTER_RADIUS,
-        CONVERSATION_COMPOSER_PLACEHOLDER, CONVERSATION_COMPOSER_SEND_DIAMETER,
-        CONVERSATION_CONTENT_MAX_WIDTH, HOST_BOOTSTRAP_REATTACH_TICKS, MAX_ACCESSIBILITY_ACTIONS,
-        MAX_ACTION_LANE_RECORDS, MAX_ACTION_OUTCOME_PROJECTIONS, MAX_HOST_PROJECTIONS,
-        MAX_PENDING_HOST_ACTIONS, MAX_PENDING_PREFERENCES, MAX_RETAINED_CHILDREN,
-        MAX_RETAINED_WORKERS, MAX_RETRY_HOST_ACTIONS, NATIVE_SNAPSHOT_PAGE_ITEMS,
-        NATIVE_STARTUP_BUDGET, PRODUCTION_HOST_PROFILE, REMOTE_RECONNECT_BACKOFF_MAX,
-        REMOTE_RECONNECT_BACKOFF_MIN, T3_SIDEBAR_NAV_TOP_INSET, T3_SIDEBAR_ROW_HEIGHT,
-        T3_SIDEBAR_WIDTH, T3_WORKSPACE_TOPBAR_HEIGHT,
+        acquire_reaper_permit,
+        admit_idle_conversation_photo_fetch,
+        admits_host_actions,
+        agent_connection_snapshot,
+        authorize_full_host_quit,
+        automatic_task_title,
+        capture_runtime_projection_owner,
+        composer_caret_visible,
+        composer_draft_parts,
+        composer_provider_identity,
+        decode_idle_conversation_photo_bytes,
+        detach_native_composer_images_for_key,
+        discard_prepared_native_composer_images,
+        dispatch_pending_action,
+        enqueue_pending_preference,
+        ensure_isolated_host_config_base,
+        fleet_resync_needs_transport_reconnect,
+        idle_conversation_photo_url,
+        idle_photo_dimensions_allowed,
+        idle_photo_fetch_matches_current_canvas,
+        isolated_dev_profile,
+        native_command_id,
+        native_reconnect_source_for,
+        owned_matches_admission,
+        prepare_native_composer_image,
+        provider_inbox_affordance,
+        publish_projection,
+        reap_retained_children,
+        reap_retained_workers,
+        reconnect_backoff_allows,
+        reconnect_backoff_delay_after_failures,
+        reconnect_backoff_note_failure,
+        reconnect_backoff_reset,
+        record_recovery_attempt_result,
+        remove_staged_image,
+        resolve_fleet_transport_reconnect,
+        resync_or_reconnect_fleet_host,
+        retain_child,
+        retain_worker,
+        retained_children,
+        retry_until_startup_deadline,
+        runtime_connection_visible,
+        should_attempt_recovery,
+        should_schedule_host_bootstrap_retry,
+        stable_host_project_element_key,
+        stable_host_project_row_element_id,
+        stable_host_task_element_key,
+        stable_host_task_row_element_id,
+        take_retained_action_outcomes,
+        update_state_from_stage,
+        validate_connected_host_for_shell_launch,
+        validate_host_projection_payloads,
+        wait_for_cancellation,
+        wait_reconnect_backoff_interruptible,
+        worker_should_run_deferred_bootstrap,
+        workspace_context_labels,
+        AccessibilityTree,
+        AccessibleRole,
+        ActionEvent,
+        ActionRequest,
+        ActivationSource,
+        AgentPresence,
+        AgentSessionId,
+        ClientId,
+        CockpitDockTool,
+        CommandId,
+        ComposerControl,
+        ComposerDraftKey,
+        ComposerDraftPart,
+        ComposerDraftProjection,
+        FleetAdmission,
+        FleetTransportReconnect,
+        HostId,
+        HostProjectKey,
+        HostUiState,
+        IsolatedDevProfile,
+        MainConversationCanvas,
+        NativeAccessibilityAction,
+        NativeActionRecord,
+        NativeComposerImage,
+        NativeHeaderAttachment,
+        NativeHostActionFailure,
+        NativeHostActionOutcome,
+        NativeHostActionResult,
+        NativeHostChildOwnership,
+        NativeHostClientRuntime,
+        NativeHostCommand,
+        NativeHostLaunchMode,
+        NativeHostLaunchSpec,
+        NativeHostProjection,
+        NativeHostProjectionKind,
+        NativeHostQueryBody,
+        NativeHostReconnectBackoff,
+        NativeHostRuntimeAttachment,
+        NativeHostRuntimeEpochs,
+        NativeHostRuntimePort,
+        NativeHostState,
+        NativeHostWorkerCommand,
+        NativeInteraction,
+        NativePlatformAccessibilityBridge,
+        NativeReconnectSource,
+        NativeShell,
+        NativeShellMode,
+        NativeShutdownDeadline,
+        OverlayTextFieldPart,
+        OwnedChild,
+        OwnedWorker,
+        PaletteItem,
+        PendingComposerSubmission,
+        PendingHostBootstrap,
+        ProjectActionMenuMode,
+        ProjectId,
+        ProjectInboxItem,
+        ProviderInboxAffordance,
+        ProviderKind,
+        ReaperKind,
+        ShellStage,
+        TaskComposer,
+        TaskId,
+        TrustedReconnectFactoryProbe,
+        UpdateState,
+        UpdaterStage,
+        COMPOSER_CARET_BLINK_TICKS,
+        CONVERSATION_COMPOSER_CONTEXT_INSET,
+        CONVERSATION_COMPOSER_HEIGHT_RESERVE,
+        CONVERSATION_COMPOSER_INNER_RADIUS,
+        CONVERSATION_COMPOSER_INPUT_MIN_HEIGHT,
+        CONVERSATION_COMPOSER_OUTER_RADIUS,
+        CONVERSATION_COMPOSER_PLACEHOLDER,
+        CONVERSATION_COMPOSER_SEND_DIAMETER,
+        CONVERSATION_CONTENT_MAX_WIDTH,
+        HOST_BOOTSTRAP_REATTACH_TICKS,
+        MAX_ACCESSIBILITY_ACTIONS,
+        MAX_ACTION_LANE_RECORDS,
+        MAX_ACTION_OUTCOME_PROJECTIONS,
+        MAX_HOST_PROJECTIONS,
+        MAX_PENDING_HOST_ACTIONS,
+        MAX_PENDING_PREFERENCES,
+        MAX_RETAINED_CHILDREN,
+        MAX_RETAINED_WORKERS,
+        MAX_RETRY_HOST_ACTIONS,
+        NATIVE_SNAPSHOT_PAGE_ITEMS,
+        NATIVE_STARTUP_BUDGET,
+        PRODUCTION_HOST_PROFILE,
+        REMOTE_RECONNECT_BACKOFF_MAX,
+        REMOTE_RECONNECT_BACKOFF_MIN,
+        T3_SIDEBAR_NAV_TOP_INSET,
+        T3_SIDEBAR_ROW_HEIGHT,
+        T3_SIDEBAR_WIDTH,
+        T3_WORKSPACE_TOPBAR_HEIGHT,
     };
-    use super::{fleet_projection_message_accepted, NativeProjectionOwner, NativeSettingsPage, ProviderSettingsFieldFocus};
-    use crate::client::{ClientConnection, HostClient, HostClientConfig, HostTaskKey, TaskInboxPreview};
+    use super::{
+        fleet_projection_message_accepted, NativeProjectionOwner, NativeSettingsPage,
+        ProviderSettingsFieldFocus,
+    };
+    use super::{
+        host_display_label, same_native_action_identity, visible_status_label, TaskCockpitQuery,
+    };
     use crate::client::FleetError;
+    use crate::client::HostFleet;
+    use crate::client::{
+        ClientConnection, HostClient, HostClientConfig, HostTaskKey, TaskInboxPreview,
+    };
     use crate::domain::id::RequestId;
     use crate::host::IpcError;
     use crate::protocol::{Capability, CapabilitySet, FrameLimits, ProfileFingerprint};
     use crate::remote::RemoteImageAttachment;
     use crate::ui::components::text_field::{TextField, TextFieldKey};
+    use crate::ui::native_fleet::FleetSelectMode;
     use crate::ui::task_cockpit::draft_store::KeyedComposerDraftKey;
     use crate::ui::task_cockpit::Inbox;
-    use crate::ui::workspace_layout::{PaneEdge, WorkspaceLayout};
-    use crate::client::HostFleet;
-    use crate::ui::native_fleet::FleetSelectMode;
     use crate::ui::task_cockpit::TaskList;
+    use crate::ui::workspace_layout::{PaneEdge, WorkspaceLayout};
     use gpui::{AppContext, KeyDownEvent, Keystroke, WindowOptions};
     use std::collections::{BTreeMap, VecDeque};
     use std::path::PathBuf;
@@ -38518,7 +38793,8 @@ mod tests {
             crate::ui::init(cx);
             let (runtime, _) = TestRuntime::new(true, NativeHostActionResult::Queued);
             let snapshot = with_test_shell_in_app(cx, runtime, |shell| {
-                shell.local_slot_mut().agent_connection = Some(agent_connection_snapshot(AgentPresence::NotFound));
+                shell.local_slot_mut().agent_connection =
+                    Some(agent_connection_snapshot(AgentPresence::NotFound));
                 let _ = shell.element_without_handlers();
                 shell.refresh_accessibility_tree();
                 (
@@ -38787,7 +39063,8 @@ mod tests {
             crate::ui::init(cx);
             let (runtime, _) = TestRuntime::new(true, NativeHostActionResult::Queued);
             let snapshot = with_test_shell_in_app(cx, runtime, |shell| {
-                shell.local_slot_mut().agent_connection = Some(agent_connection_snapshot(AgentPresence::SignedIn));
+                shell.local_slot_mut().agent_connection =
+                    Some(agent_connection_snapshot(AgentPresence::SignedIn));
                 shell.install_named_folder_for_test("command");
                 shell.sync_header_projection();
                 let header = match shell.header_attachment() {
@@ -38843,7 +39120,8 @@ mod tests {
             crate::ui::init(cx);
             let (runtime, _) = TestRuntime::new(true, NativeHostActionResult::Queued);
             let snapshot = with_test_shell_in_app(cx, runtime, |shell| {
-                shell.local_slot_mut().agent_connection = Some(agent_connection_snapshot(AgentPresence::SignedIn));
+                shell.local_slot_mut().agent_connection =
+                    Some(agent_connection_snapshot(AgentPresence::SignedIn));
                 shell.install_named_folder_for_test("command");
                 shell.offer_first_task_if_needed();
                 (shell.new_task_overlay_open_for_test(), shell.shell_stage())
@@ -38876,7 +39154,8 @@ mod tests {
             crate::ui::init(cx);
             let (runtime, shared) = TestRuntime::new(true, NativeHostActionResult::Queued);
             let snapshot = with_test_shell_in_app(cx, runtime, |shell| {
-                shell.local_slot_mut().agent_connection = Some(agent_connection_snapshot(AgentPresence::SignedIn));
+                shell.local_slot_mut().agent_connection =
+                    Some(agent_connection_snapshot(AgentPresence::SignedIn));
                 shell.install_named_folder_for_test("command");
                 shell.dispatch_named_accessibility_action("native-inbox-plus-claude");
                 let create = shared
@@ -39055,7 +39334,8 @@ mod tests {
             crate::ui::init(cx);
             let (runtime, _) = TestRuntime::new(true, NativeHostActionResult::Queued);
             let snapshot = with_test_shell_in_app(cx, runtime, |shell| {
-                shell.local_slot_mut().agent_connection = Some(agent_connection_snapshot(AgentPresence::SignedIn));
+                shell.local_slot_mut().agent_connection =
+                    Some(agent_connection_snapshot(AgentPresence::SignedIn));
                 let welcome_shows = shell.header_shows_settings_for_test();
                 assert!(!shell.settings_open_for_test());
                 shell.dispatch_named_accessibility_action("native-header-settings");
@@ -39108,14 +39388,16 @@ mod tests {
             crate::ui::init(cx);
             let (runtime, _) = TestRuntime::new(true, NativeHostActionResult::Queued);
             let snapshot = with_test_shell_in_app(cx, runtime, |shell| {
-                shell.local_slot_mut().agent_connection = Some(agent_connection_snapshot(AgentPresence::SignedIn));
+                shell.local_slot_mut().agent_connection =
+                    Some(agent_connection_snapshot(AgentPresence::SignedIn));
                 shell.install_named_folder_for_test("command");
                 shell.settings_open = true;
                 let _ = shell.dispatch_agent_connection_query(false);
                 (
                     shell.shell_stage(),
                     shell.settings_open_for_test(),
-                    shell.local_slot()
+                    shell
+                        .local_slot()
                         .agent_connection
                         .as_ref()
                         .and_then(|snapshot| snapshot.agents.first())
@@ -39151,7 +39433,8 @@ mod tests {
             crate::ui::init(cx);
             let (runtime, _) = TestRuntime::new(true, NativeHostActionResult::QueueFull);
             let snapshot = with_test_shell_in_app(cx, runtime, |shell| {
-                shell.local_slot_mut().agent_connection = Some(agent_connection_snapshot(AgentPresence::SignedIn));
+                shell.local_slot_mut().agent_connection =
+                    Some(agent_connection_snapshot(AgentPresence::SignedIn));
                 shell.install_named_folder_for_test("command");
                 shell.settings_open = true;
                 let _ = shell.dispatch_agent_connection_query(false);
@@ -39333,7 +39616,8 @@ mod tests {
             crate::ui::init(cx);
             let (runtime, _) = TestRuntime::new(true, NativeHostActionResult::Queued);
             let snapshot = with_test_shell_in_app(cx, runtime, |shell| {
-                shell.local_slot_mut().agent_connection = Some(agent_connection_snapshot(AgentPresence::SignedIn));
+                shell.local_slot_mut().agent_connection =
+                    Some(agent_connection_snapshot(AgentPresence::SignedIn));
                 shell.install_named_folder_for_test("command");
                 let _ = shell.element_without_handlers();
                 shell.refresh_accessibility_tree();
@@ -39465,8 +39749,9 @@ mod tests {
                         endpoint: "https://add-project-remote.example:7443".into(),
                     },
                 );
-                remote_slot.host_runtime =
-                    Some(NativeHostRuntimeAttachment::Injected(Box::new(remote_runtime)));
+                remote_slot.host_runtime = Some(NativeHostRuntimeAttachment::Injected(Box::new(
+                    remote_runtime,
+                )));
                 let _ = remote_slot.interaction.sync_host_epochs(epochs);
                 shell.attach_host_ui_slot(remote_slot).expect("attach");
                 shell
@@ -39524,8 +39809,14 @@ mod tests {
             cx.quit();
         });
         let (remote_creates, local_creates) = report.borrow_mut().take().expect("report");
-        assert_eq!(remote_creates, 0, "ConfigCreateProject must never route remotely");
-        assert_eq!(local_creates, 1, "project create must target the local host");
+        assert_eq!(
+            remote_creates, 0,
+            "ConfigCreateProject must never route remotely"
+        );
+        assert_eq!(
+            local_creates, 1,
+            "project create must target the local host"
+        );
     }
 
     #[test]
@@ -39606,7 +39897,10 @@ mod tests {
             !preview_ids.iter().any(|id| id == "native-projects-add"),
             "AT must not expose Add project without canonical local authority"
         );
-        assert!(empty_shows, "connected canonical empty must enable Add project");
+        assert!(
+            empty_shows,
+            "connected canonical empty must enable Add project"
+        );
         assert!(
             empty_ids.iter().any(|id| id == "native-projects-add"),
             "canonical empty local workspace must expose Add project"
@@ -39624,8 +39918,7 @@ mod tests {
             .get_or_init(|| Mutex::new(()))
             .lock()
             .expect("headless shell test lock");
-        let (runtime, local_shared) =
-            TestRuntime::new(true, NativeHostActionResult::QueueFull);
+        let (runtime, local_shared) = TestRuntime::new(true, NativeHostActionResult::QueueFull);
         let remote_host = HostId::Remote([0x52; 16]);
         let report = std::rc::Rc::new(std::cell::RefCell::new(None));
         let report_slot = std::rc::Rc::clone(&report);
@@ -39684,8 +39977,9 @@ mod tests {
                         endpoint: "https://composer-retry-b.example:7443".into(),
                     },
                 );
-                remote_slot.host_runtime =
-                    Some(NativeHostRuntimeAttachment::Injected(Box::new(remote_runtime)));
+                remote_slot.host_runtime = Some(NativeHostRuntimeAttachment::Injected(Box::new(
+                    remote_runtime,
+                )));
                 let _ = remote_slot.interaction.sync_host_epochs(epochs);
                 shell.attach_host_ui_slot(remote_slot).expect("attach B");
                 shell
@@ -39760,9 +40054,7 @@ mod tests {
                     "B remains untouched after A settles"
                 );
                 (
-                    shell
-                        .pending_composer_submissions
-                        .contains_key(&command_id),
+                    shell.pending_composer_submissions.contains_key(&command_id),
                     local_shared.lock().expect("local").accepted.len(),
                 )
             });
@@ -39790,142 +40082,144 @@ mod tests {
         let report_slot = std::rc::Rc::clone(&report);
         gpui::Application::headless().run(move |cx| {
             crate::ui::init(cx);
-            let observed = with_test_shell_in_app(cx, runtime, |shell| {
-                shell.install_idle_conversation_photo_for_test();
-                let (model, task_id) = terminal_bound_client_model();
-                shell
-                    .apply_client_model(Arc::new(model))
-                    .expect("model");
-                let owner = HostTaskKey::new(shell.local_host_id(), task_id);
-                shell
-                    .select_fleet_task_key(owner.clone(), FleetSelectMode::Replace)
-                    .expect("select");
-                let focus_epoch = shell.local_slot().interaction.current_focus_epoch();
-                shell
-                    .composer
-                    .as_mut()
-                    .expect("composer")
-                    .replace_draft("keep this draft text", focus_epoch)
-                    .expect("draft");
-                shell.activate_composer_control(ComposerControl::SendNow);
-                let command_id = shell
-                    .pending_composer_submissions
-                    .keys()
-                    .copied()
-                    .next()
-                    .expect("command");
-                let edit_id = NativeShell::composer_recovery_element_id(
-                    super::ComposerRecoveryKind::EditDraft,
-                    &owner,
-                    command_id,
-                );
-                // Stale fences: bump runtime generation so Retry is blocked.
-                shell.local_slot_mut().interaction.set_runtime_generation(99);
-                shell.refresh_accessibility_tree();
-                let retry_id = NativeShell::composer_recovery_element_id(
-                    super::ComposerRecoveryKind::Retry,
-                    &owner,
-                    command_id,
-                );
-                shell.dispatch_named_accessibility_action(&retry_id);
-                assert_eq!(
-                    shared.lock().expect("runtime").accepted.len(),
-                    0,
-                    "stale generation must not enqueue"
-                );
-                assert!(
+            let observed =
+                with_test_shell_in_app(cx, runtime, |shell| {
+                    shell.install_idle_conversation_photo_for_test();
+                    let (model, task_id) = terminal_bound_client_model();
+                    shell.apply_client_model(Arc::new(model)).expect("model");
+                    let owner = HostTaskKey::new(shell.local_host_id(), task_id);
                     shell
-                        .local_slot()
-                        .composer_error
-                        .as_deref()
-                        .is_some_and(|message| message.contains("Retry blocked")),
-                    "stale retry must explain the block"
-                );
-
-                shell.dispatch_named_accessibility_action(&edit_id);
-                assert!(
-                    !shell.pending_composer_submissions.contains_key(&command_id),
-                    "Edit draft removes only the never-enqueued retain"
-                );
-                assert!(
-                    shell.pending_action_for_test().is_none(),
-                    "exact retained record must be removed"
-                );
-                assert_eq!(
-                    shell.composer.as_ref().map(TaskComposer::draft_text),
-                    Some("keep this draft text"),
-                    "Edit draft preserves composer text"
-                );
-                assert!(
+                        .select_fleet_task_key(owner.clone(), FleetSelectMode::Replace)
+                        .expect("select");
+                    let focus_epoch = shell.local_slot().interaction.current_focus_epoch();
                     shell
                         .composer
-                        .as_ref()
-                        .and_then(TaskComposer::pending_intent)
-                        .is_none(),
-                    "composer pending must cancel without implicit resend"
-                );
-
-                // Fresh successful enqueue is AwaitingHostOutcome — Edit must refuse.
-                {
-                    let mut state = shared.lock().expect("runtime");
-                    state.admission = NativeHostActionResult::Queued;
-                    state.accepted.clear();
-                }
-                let _ = shell.local_slot_mut().interaction.sync_host_epochs(
-                    NativeHostRuntimeEpochs {
-                        connection_epoch: 1,
-                        resource_generation: 1,
-                        runtime_generation: 99,
-                    },
-                );
-                let focus_epoch = shell.rearm_composer_focus().expect("fresh input focus");
-                shell
-                    .composer
-                    .as_mut()
-                    .expect("composer")
-                    .replace_draft("second send", focus_epoch)
-                    .expect("draft");
-                shell.activate_composer_control(ComposerControl::SendNow);
-                let queued_id = shell
-                    .pending_composer_submissions
-                    .keys()
-                    .copied()
-                    .next()
-                    .expect("queued command");
-                assert!(matches!(
-                    shell
+                        .as_mut()
+                        .expect("composer")
+                        .replace_draft("keep this draft text", focus_epoch)
+                        .expect("draft");
+                    shell.activate_composer_control(ComposerControl::SendNow);
+                    let command_id = shell
                         .pending_composer_submissions
-                        .get(&queued_id)
-                        .map(|submission| &submission.retention),
-                    Some(super::ComposerSubmissionRetention::AwaitingHostOutcome)
-                ));
-                let refuse_edit = NativeShell::composer_recovery_element_id(
-                    super::ComposerRecoveryKind::EditDraft,
-                    &owner,
-                    queued_id,
-                );
-                shell.composer_recovery_targets.insert(
-                    refuse_edit.clone(),
-                    super::ComposerRecoveryTarget {
-                        owner: owner.clone(),
-                        command_id: queued_id,
-                        kind: super::ComposerRecoveryKind::EditDraft,
-                    },
-                );
-                shell.dispatch_named_accessibility_action(&refuse_edit);
-                assert!(
-                    shell.pending_composer_submissions.contains_key(&queued_id),
-                    "uncertain/admitted send must refuse Edit draft"
-                );
-                (
+                        .keys()
+                        .copied()
+                        .next()
+                        .expect("command");
+                    let edit_id = NativeShell::composer_recovery_element_id(
+                        super::ComposerRecoveryKind::EditDraft,
+                        &owner,
+                        command_id,
+                    );
+                    // Stale fences: bump runtime generation so Retry is blocked.
                     shell
-                        .local_slot()
-                        .composer_error
-                        .clone()
-                        .unwrap_or_default(),
-                    shared.lock().expect("runtime").accepted.len(),
-                )
-            });
+                        .local_slot_mut()
+                        .interaction
+                        .set_runtime_generation(99);
+                    shell.refresh_accessibility_tree();
+                    let retry_id = NativeShell::composer_recovery_element_id(
+                        super::ComposerRecoveryKind::Retry,
+                        &owner,
+                        command_id,
+                    );
+                    shell.dispatch_named_accessibility_action(&retry_id);
+                    assert_eq!(
+                        shared.lock().expect("runtime").accepted.len(),
+                        0,
+                        "stale generation must not enqueue"
+                    );
+                    assert!(
+                        shell
+                            .local_slot()
+                            .composer_error
+                            .as_deref()
+                            .is_some_and(|message| message.contains("Retry blocked")),
+                        "stale retry must explain the block"
+                    );
+
+                    shell.dispatch_named_accessibility_action(&edit_id);
+                    assert!(
+                        !shell.pending_composer_submissions.contains_key(&command_id),
+                        "Edit draft removes only the never-enqueued retain"
+                    );
+                    assert!(
+                        shell.pending_action_for_test().is_none(),
+                        "exact retained record must be removed"
+                    );
+                    assert_eq!(
+                        shell.composer.as_ref().map(TaskComposer::draft_text),
+                        Some("keep this draft text"),
+                        "Edit draft preserves composer text"
+                    );
+                    assert!(
+                        shell
+                            .composer
+                            .as_ref()
+                            .and_then(TaskComposer::pending_intent)
+                            .is_none(),
+                        "composer pending must cancel without implicit resend"
+                    );
+
+                    // Fresh successful enqueue is AwaitingHostOutcome — Edit must refuse.
+                    {
+                        let mut state = shared.lock().expect("runtime");
+                        state.admission = NativeHostActionResult::Queued;
+                        state.accepted.clear();
+                    }
+                    let _ = shell.local_slot_mut().interaction.sync_host_epochs(
+                        NativeHostRuntimeEpochs {
+                            connection_epoch: 1,
+                            resource_generation: 1,
+                            runtime_generation: 99,
+                        },
+                    );
+                    let focus_epoch = shell.rearm_composer_focus().expect("fresh input focus");
+                    shell
+                        .composer
+                        .as_mut()
+                        .expect("composer")
+                        .replace_draft("second send", focus_epoch)
+                        .expect("draft");
+                    shell.activate_composer_control(ComposerControl::SendNow);
+                    let queued_id = shell
+                        .pending_composer_submissions
+                        .keys()
+                        .copied()
+                        .next()
+                        .expect("queued command");
+                    assert!(matches!(
+                        shell
+                            .pending_composer_submissions
+                            .get(&queued_id)
+                            .map(|submission| &submission.retention),
+                        Some(super::ComposerSubmissionRetention::AwaitingHostOutcome)
+                    ));
+                    let refuse_edit = NativeShell::composer_recovery_element_id(
+                        super::ComposerRecoveryKind::EditDraft,
+                        &owner,
+                        queued_id,
+                    );
+                    shell.composer_recovery_targets.insert(
+                        refuse_edit.clone(),
+                        super::ComposerRecoveryTarget {
+                            owner: owner.clone(),
+                            command_id: queued_id,
+                            kind: super::ComposerRecoveryKind::EditDraft,
+                        },
+                    );
+                    shell.dispatch_named_accessibility_action(&refuse_edit);
+                    assert!(
+                        shell.pending_composer_submissions.contains_key(&queued_id),
+                        "uncertain/admitted send must refuse Edit draft"
+                    );
+                    (
+                        shell
+                            .local_slot()
+                            .composer_error
+                            .clone()
+                            .unwrap_or_default(),
+                        shared.lock().expect("runtime").accepted.len(),
+                    )
+                });
             *report_slot.borrow_mut() = Some(observed);
             cx.quit();
         });
@@ -40044,10 +40338,7 @@ mod tests {
             },
             ProjectInboxItem::Task {
                 project_id,
-                task_key: HostTaskKey::new(
-                    HostId::local_profile("dev").expect("host"),
-                    task_id,
-                ),
+                task_key: HostTaskKey::new(HostId::local_profile("dev").expect("host"), task_id),
                 settled: false,
                 archived: false,
             },
@@ -40112,10 +40403,7 @@ mod tests {
             ProjectInboxItem::DoneHeader { task_count: 1 },
             ProjectInboxItem::Task {
                 project_id,
-                task_key: HostTaskKey::new(
-                    HostId::local_profile("dev").expect("host"),
-                    task_id,
-                ),
+                task_key: HostTaskKey::new(HostId::local_profile("dev").expect("host"), task_id),
                 settled: true,
                 archived: false,
             },
@@ -40379,7 +40667,10 @@ mod tests {
                     shell.client_model_snapshot().as_ref().unwrap(),
                 )
                 .expect("task list");
-                let _ = shell.local_slot_mut().interaction.navigation_mouse_down(task_id, &list);
+                let _ = shell
+                    .local_slot_mut()
+                    .interaction
+                    .navigation_mouse_down(task_id, &list);
                 shell.sync_cockpit_follow();
                 shell
                     .replace_composer_platform_text(None, "keep me")
@@ -40996,7 +41287,10 @@ mod tests {
                     ),
                 );
             let repaint = shell.controller_tick_for_test(MAX_PENDING_HOST_ACTIONS);
-            (shell.local_slot_mut().interaction.host_runtime_epochs(), repaint)
+            (
+                shell.local_slot_mut().interaction.host_runtime_epochs(),
+                repaint,
+            )
         });
         assert!(repaint, "an asynchronously drained projection must repaint");
         assert_eq!(
@@ -41145,7 +41439,10 @@ mod tests {
                     shell.last_action_receipt().cloned(),
                     shell.last_action_failure().cloned(),
                     shell.pending_action_for_test().cloned(),
-                    matches!(shell.local_slot_mut().host_state, NativeHostState::Connected { .. }),
+                    matches!(
+                        shell.local_slot_mut().host_state,
+                        NativeHostState::Connected { .. }
+                    ),
                 )
             });
         assert_eq!(receipt, None, "a stale query must not publish a receipt");
@@ -41172,7 +41469,10 @@ mod tests {
                 .expect("accepted global query");
 
             shell.local_slot_mut().interaction.set_client_model(None);
-            assert!(shell.local_slot_mut().interaction.sync_selected_task(Some(TaskId::new())));
+            assert!(shell
+                .local_slot_mut()
+                .interaction
+                .sync_selected_task(Some(TaskId::new())));
             let epochs = shared.lock().expect("test runtime state").epochs;
             shared
                 .lock()
@@ -41252,7 +41552,10 @@ mod tests {
                     shell.last_action_failure().cloned(),
                     shell.pending_action_for_test().cloned(),
                     shell.last_query_detail().map(str::to_string),
-                    matches!(shell.local_slot_mut().host_state, NativeHostState::Connected { .. }),
+                    matches!(
+                        shell.local_slot_mut().host_state,
+                        NativeHostState::Connected { .. }
+                    ),
                     shell.local_slot_mut().composer_error.clone(),
                 )
             });
@@ -41286,7 +41589,10 @@ mod tests {
                 .projections
                 .push_back(NativeHostProjection::client_model(Arc::new(model)).at_epochs(epochs));
             let _ = shell.drain_host_projections(MAX_PENDING_HOST_ACTIONS);
-            matches!(shell.local_slot_mut().host_state, NativeHostState::Connected { .. })
+            matches!(
+                shell.local_slot_mut().host_state,
+                NativeHostState::Connected { .. }
+            )
         });
         assert!(
             connected,
@@ -41329,7 +41635,10 @@ mod tests {
                 shell.last_action_failure().cloned(),
                 shell.pending_action_for_test().cloned(),
                 shell.last_query_detail().map(str::to_string),
-                matches!(shell.local_slot_mut().host_state, NativeHostState::Connected { .. }),
+                matches!(
+                    shell.local_slot_mut().host_state,
+                    NativeHostState::Connected { .. }
+                ),
             )
         });
         assert_eq!(
@@ -41359,7 +41668,10 @@ mod tests {
                 shell.last_action_failure().cloned(),
                 shell.pending_action_for_test().cloned(),
                 shell.last_query_detail().map(str::to_string),
-                matches!(shell.local_slot_mut().host_state, NativeHostState::Disconnected),
+                matches!(
+                    shell.local_slot_mut().host_state,
+                    NativeHostState::Disconnected
+                ),
             )
         });
         assert!(
@@ -41397,7 +41709,10 @@ mod tests {
                 shell.last_action_failure().cloned(),
                 shell.pending_action_for_test().cloned(),
                 shell.last_query_detail().map(str::to_string),
-                matches!(shell.local_slot_mut().host_state, NativeHostState::Connected { .. }),
+                matches!(
+                    shell.local_slot_mut().host_state,
+                    NativeHostState::Connected { .. }
+                ),
             )
         });
         assert!(
@@ -41430,7 +41745,8 @@ mod tests {
         let (runtime, local_shared) = TestRuntime::new(true, NativeHostActionResult::Queued);
         let isolated = with_test_shell_in_app(cx, runtime, |shell| {
             local_shared.lock().expect("local").connected = false;
-            let _ = shell.dispatch_action_for_test(crate::ui::components::ActionRequest::HostStatus);
+            let _ =
+                shell.dispatch_action_for_test(crate::ui::components::ActionRequest::HostStatus);
             let local_detail = shell.last_query_detail().map(str::to_string);
             let (remote_runtime, remote_shared) =
                 TestRuntime::new(true, NativeHostActionResult::QueueFull);
@@ -41441,8 +41757,9 @@ mod tests {
                     endpoint: "https://query-admit-remote.example:7443".into(),
                 },
             );
-            remote_slot.host_runtime =
-                Some(NativeHostRuntimeAttachment::Injected(Box::new(remote_runtime)));
+            remote_slot.host_runtime = Some(NativeHostRuntimeAttachment::Injected(Box::new(
+                remote_runtime,
+            )));
             let _ = remote_slot.interaction.sync_host_epochs(epochs);
             shell.attach_host_ui_slot(remote_slot).expect("attach");
             let (model, task_id) = terminal_bound_client_model();
@@ -41497,20 +41814,25 @@ mod tests {
             isolated.0, isolated.3,
             "remote same-TaskId query failure must not rewrite local last_query_detail"
         );
-        assert_eq!(isolated.4, 0, "remote query must not enqueue while saturated");
+        assert_eq!(
+            isolated.4, 0,
+            "remote query must not enqueue while saturated"
+        );
     }
 
     fn action_outcome_retention_pressure_keeps_exact_overflow_record(cx: &mut gpui::App) {
         let (runtime, _shared) = TestRuntime::new(true, NativeHostActionResult::Queued);
         let (pending_len, overflow, failure) = with_test_shell_in_app(cx, runtime, |shell| {
             for _ in 0..MAX_RETRY_HOST_ACTIONS {
-                let action = shell.local_slot_mut()
+                let action = shell
+                    .local_slot_mut()
                     .interaction
                     .action(test_task_create_v2("retry-lane mutation"))
                     .expect("retry-lane action identity");
                 assert!(shell.retain_pending_host_action(action));
             }
-            let overflow = shell.local_slot_mut()
+            let overflow = shell
+                .local_slot_mut()
                 .interaction
                 .action(test_task_create_v2("outcome overflow mutation"))
                 .expect("outcome overflow identity");
@@ -41542,23 +41864,30 @@ mod tests {
         let _ = take_retained_action_outcomes(MAX_ACTION_LANE_RECORDS);
         let (runtime, shared) = TestRuntime::new(true, NativeHostActionResult::Queued);
         let expected = with_test_shell_in_app(cx, runtime, |shell| {
-            let pending = shell.local_slot_mut()
+            let pending = shell
+                .local_slot_mut()
                 .interaction
                 .action(crate::ui::components::ActionRequest::HostStatus)
                 .expect("pending action");
-            let overflow = shell.local_slot_mut()
+            let overflow = shell
+                .local_slot_mut()
                 .interaction
                 .action(crate::ui::components::ActionRequest::HostStatus)
                 .expect("overflow action");
-            let deferred = shell.local_slot_mut()
+            let deferred = shell
+                .local_slot_mut()
                 .interaction
                 .action(crate::ui::components::ActionRequest::HostStatus)
                 .expect("deferred action");
-            let runtime_pending = shell.local_slot_mut()
+            let runtime_pending = shell
+                .local_slot_mut()
                 .interaction
                 .action(crate::ui::components::ActionRequest::HostStatus)
                 .expect("runtime pending action");
-            shell.local_slot_mut().pending_host_actions.push_back(pending.clone());
+            shell
+                .local_slot_mut()
+                .pending_host_actions
+                .push_back(pending.clone());
             shell.local_slot_mut().retained_action_overflow = Some(overflow.clone());
             let mut state = shared.lock().expect("test runtime state");
             state.pending.push_back(runtime_pending.clone());
@@ -42037,9 +42366,7 @@ mod tests {
         // Receive must NOT release — in-flight still occupies the lane.
         assert_eq!(channel_depth.load(Ordering::Acquire), 1);
         // Concurrent UI preflight must still see the outstanding reservation.
-        assert!(
-            super::action_lane_total(channel_depth.load(Ordering::Acquire), 0, 0) >= 1
-        );
+        assert!(super::action_lane_total(channel_depth.load(Ordering::Acquire), 0, 0) >= 1);
         // Publish keeps the same reservation (outcomes are not double-counted).
         assert_eq!(
             super::action_lane_total(channel_depth.load(Ordering::Acquire), 0, 0),
@@ -42054,7 +42381,8 @@ mod tests {
         let local = AtomicUsize::new(MAX_ACTION_LANE_RECORDS);
         let remote = AtomicUsize::new(0);
         assert!(
-            super::action_lane_total(local.load(Ordering::Acquire), 0, 0) >= MAX_ACTION_LANE_RECORDS
+            super::action_lane_total(local.load(Ordering::Acquire), 0, 0)
+                >= MAX_ACTION_LANE_RECORDS
         );
         assert_eq!(
             super::action_lane_total(remote.load(Ordering::Acquire), 0, 0),
@@ -42624,7 +42952,8 @@ mod tests {
             let (model, task_id) = open_task_without_agent_client_model();
             let project_id = model.task(task_id).expect("task").task.project_id;
             with_test_shell_in_app(cx, runtime, |shell| {
-                shell.local_slot_mut().agent_connection = Some(agent_connection_snapshot(AgentPresence::SignedIn));
+                shell.local_slot_mut().agent_connection =
+                    Some(agent_connection_snapshot(AgentPresence::SignedIn));
                 shell.install_project_for_test("DevManager", project_id);
                 shell
                     .apply_client_model(Arc::new(model))
@@ -42662,7 +42991,10 @@ mod tests {
 
                 shell.begin_new_task_for_project(project_id);
                 assert_eq!(
-                    shell.new_task.as_ref().map(|draft| draft.project_key.project_id),
+                    shell
+                        .new_task
+                        .as_ref()
+                        .map(|draft| draft.project_key.project_id),
                     Some(project_id),
                     "task creation must retain the project whose header launched it"
                 );
@@ -42677,7 +43009,8 @@ mod tests {
         let (runtime, shared) = TestRuntime::new(true, NativeHostActionResult::Queued);
         let (model, task_id) = open_task_without_agent_client_model();
         let report = with_test_shell_in_app(cx, runtime, |shell| {
-            shell.local_slot_mut().agent_connection = Some(agent_connection_snapshot(AgentPresence::SignedIn));
+            shell.local_slot_mut().agent_connection =
+                Some(agent_connection_snapshot(AgentPresence::SignedIn));
             shell.install_named_folder_for_test("command");
             shell
                 .apply_client_model(Arc::new(model))
@@ -42686,7 +43019,10 @@ mod tests {
                 shell.client_model_snapshot().as_ref().unwrap(),
             )
             .expect("task list");
-            let _ = shell.local_slot_mut().interaction.navigation_mouse_down(task_id, &list);
+            let _ = shell
+                .local_slot_mut()
+                .interaction
+                .navigation_mouse_down(task_id, &list);
             shell.sync_cockpit_follow();
             let accepted = shared.lock().expect("test runtime state").accepted.clone();
             let cockpit_queries: Vec<_> = accepted
@@ -42701,13 +43037,19 @@ mod tests {
                 .collect();
             let admissible = cockpit_queries
                 .iter()
-                .filter(|record| shell.local_slot_mut().interaction.accepts_action_record(record))
+                .filter(|record| {
+                    shell
+                        .local_slot_mut()
+                        .interaction
+                        .accepts_action_record(record)
+                })
                 .count();
             (
                 shell.task_row_title(task_id),
                 shell.shell_stage(),
                 shell.host_status_text(),
-                shell.local_slot()
+                shell
+                    .local_slot()
                     .cockpit
                     .conversation_hold_message()
                     .unwrap_or("")
@@ -43073,8 +43415,7 @@ mod tests {
         (builder.finish().expect("client model"), task_id)
     }
 
-    fn two_task_terminal_bound_client_model(
-    ) -> (crate::client::ClientModel, TaskId, TaskId) {
+    fn two_task_terminal_bound_client_model() -> (crate::client::ClientModel, TaskId, TaskId) {
         use crate::client::ClientModelBuilder;
         use crate::domain::{
             agent::{AgentRole, AgentSessionFacts, AgentSessionLifecycle},
@@ -43151,8 +43492,7 @@ mod tests {
                 role: AgentRole::Primary,
                 provider_kind: crate::providers::ProviderKind::ClaudeCode,
                 provider_session_id: Some(
-                    crate::domain::ProviderSessionId::new("provider-ready")
-                        .expect("provider id"),
+                    crate::domain::ProviderSessionId::new("provider-ready").expect("provider id"),
                 ),
                 lifecycle: AgentSessionLifecycle::Open,
                 runtime_generation: 1,
@@ -43208,7 +43548,10 @@ mod tests {
                     .expect("pending model"),
             )
             .expect("task list");
-            let _ = shell.local_slot_mut().interaction.navigation_mouse_down(task_id, &list);
+            let _ = shell
+                .local_slot_mut()
+                .interaction
+                .navigation_mouse_down(task_id, &list);
             shell.sync_cockpit_follow();
             shell
                 .replace_composer_platform_text(None, "keep this draft")
@@ -43257,7 +43600,10 @@ mod tests {
                 shell.client_model_snapshot().as_ref().expect("Codex model"),
             )
             .expect("task list");
-            let _ = shell.local_slot_mut().interaction.navigation_mouse_down(task_id, &list);
+            let _ = shell
+                .local_slot_mut()
+                .interaction
+                .navigation_mouse_down(task_id, &list);
             shell.sync_cockpit_follow();
 
             assert!(shell
@@ -43297,7 +43643,10 @@ mod tests {
             screen: Default::default(),
         };
         with_test_shell_in_app(cx, runtime, |shell| {
-            shell.local_slot_mut().interaction.sync_selected_task(Some(task_id));
+            shell
+                .local_slot_mut()
+                .interaction
+                .sync_selected_task(Some(task_id));
             shell.apply_client_model(Arc::new(model)).unwrap();
             let action = shell
                 .dispatch_action_recorded(crate::ui::components::ActionRequest::TaskCockpit {
@@ -43309,7 +43658,10 @@ mod tests {
                 .unwrap()
                 .0;
             let epochs = shell.local_slot_mut().interaction.action_epochs();
-            shell.local_slot_mut().first_send_readiness_requests.insert(request_id);
+            shell
+                .local_slot_mut()
+                .first_send_readiness_requests
+                .insert(request_id);
             shell.local_slot_mut().pending_draft_first_send = Some(super::PendingDraftFirstSend {
                 owner: shell.local_task_key(task_id),
                 task_id,
@@ -43338,7 +43690,10 @@ mod tests {
                 )),
             });
             assert!(shell.local_slot_mut().pending_draft_first_send.is_none());
-            assert!(!shell.local_slot_mut().first_send_readiness_requests.contains(&request_id));
+            assert!(!shell
+                .local_slot_mut()
+                .first_send_readiness_requests
+                .contains(&request_id));
             assert_eq!(
                 shell.local_slot_mut().composer_error.as_deref(),
                 Some("Provider startup timed out. Draft kept.")
@@ -43346,11 +43701,14 @@ mod tests {
         });
     }
 
-    fn started_composer_cannot_misrepresent_launch_preferences(cx: &mut gpui::App) {
+    fn started_composer_does_not_misrepresent_launch_preferences(cx: &mut gpui::App) {
         let (runtime, _shared) = TestRuntime::new(true, NativeHostActionResult::Queued);
         let (model, task_id) = terminal_bound_client_model();
         with_test_shell_in_app(cx, runtime, |shell| {
-            shell.local_slot_mut().interaction.sync_selected_task(Some(task_id));
+            shell
+                .local_slot_mut()
+                .interaction
+                .sync_selected_task(Some(task_id));
             shell.apply_client_model(Arc::new(model)).unwrap();
             let before = shell.layout.composer_launch_options.clone();
             assert!(!shell.composer_launch_preferences_editable());
@@ -43377,7 +43735,10 @@ mod tests {
                 shell.client_model_snapshot().as_ref().unwrap(),
             )
             .expect("task list");
-            let _ = shell.local_slot_mut().interaction.navigation_mouse_down(task_id, &list);
+            let _ = shell
+                .local_slot_mut()
+                .interaction
+                .navigation_mouse_down(task_id, &list);
             shell.sync_cockpit_follow();
             assert_eq!(shell.cockpit().selected_task(), Some(task_id));
             let label = shell.task_row_label_for_test(task_id);
@@ -43422,20 +43783,30 @@ mod tests {
                 shell.client_model_snapshot().as_ref().unwrap(),
             )
             .expect("task list");
-            let _ = shell.local_slot_mut().interaction.navigation_mouse_down(task_id, &list);
+            let _ = shell
+                .local_slot_mut()
+                .interaction
+                .navigation_mouse_down(task_id, &list);
             shell.sync_cockpit_follow();
-            assert!(shell.local_slot_mut().composer_error.is_none(), "composer initially binds");
+            assert!(
+                shell.local_slot_mut().composer_error.is_none(),
+                "composer initially binds"
+            );
 
             let before = shell.local_slot_mut().interaction.current_focus_epoch();
             let _ =
                 shell.dispatch_action_for_test(crate::ui::components::ActionRequest::HostStatus);
-            assert_ne!(shell.local_slot_mut().interaction.current_focus_epoch(), before);
+            assert_ne!(
+                shell.local_slot_mut().interaction.current_focus_epoch(),
+                before
+            );
             shell
                 .apply_client_model(Arc::clone(&model))
                 .expect("refresh model after focus change");
 
             assert_eq!(
-                shell.local_slot_mut().composer_error, None,
+                shell.local_slot_mut().composer_error,
+                None,
                 "a current host projection must rebind the composer to the new focus epoch"
             );
             assert_eq!(
@@ -43459,7 +43830,10 @@ mod tests {
                 shell.client_model_snapshot().as_ref().unwrap(),
             )
             .expect("task list");
-            let _ = shell.local_slot_mut().interaction.navigation_mouse_down(task_id, &list);
+            let _ = shell
+                .local_slot_mut()
+                .interaction
+                .navigation_mouse_down(task_id, &list);
             shell.sync_cockpit_follow();
 
             let focus_epoch = shell.local_slot_mut().interaction.current_focus_epoch();
@@ -43474,7 +43848,10 @@ mod tests {
             shell.sync_cockpit_follow();
             assert!(shell.composer.is_none(), "deselection parks the composer");
 
-            shell.local_slot_mut().interaction.sync_selected_task(Some(task_id));
+            shell
+                .local_slot_mut()
+                .interaction
+                .sync_selected_task(Some(task_id));
             shell.sync_cockpit_follow();
             assert_eq!(
                 shell
@@ -43503,7 +43880,10 @@ mod tests {
                 shell.client_model_snapshot().as_ref().unwrap(),
             )
             .expect("task list");
-            let _ = shell.local_slot_mut().interaction.navigation_mouse_down(task_id, &list);
+            let _ = shell
+                .local_slot_mut()
+                .interaction
+                .navigation_mouse_down(task_id, &list);
             shell.sync_cockpit_follow();
             let focus_epoch = shell.local_slot_mut().interaction.current_focus_epoch();
             shell
@@ -43526,7 +43906,10 @@ mod tests {
                 shell.client_model_snapshot().as_ref().unwrap(),
             )
             .expect("task list");
-            let _ = shell.local_slot_mut().interaction.navigation_mouse_down(task_id, &list);
+            let _ = shell
+                .local_slot_mut()
+                .interaction
+                .navigation_mouse_down(task_id, &list);
             shell.sync_cockpit_follow();
             assert_eq!(
                 shell
@@ -43550,7 +43933,10 @@ mod tests {
                 shell.client_model_snapshot().as_ref().unwrap(),
             )
             .expect("task list");
-            let _ = shell.local_slot_mut().interaction.navigation_mouse_down(task_id, &list);
+            let _ = shell
+                .local_slot_mut()
+                .interaction
+                .navigation_mouse_down(task_id, &list);
             shell.sync_cockpit_follow();
 
             let focus_epoch = shell.local_slot_mut().interaction.current_focus_epoch();
@@ -43598,7 +43984,10 @@ mod tests {
                     .expect("pending model"),
             )
             .expect("task list");
-            let _ = shell.local_slot_mut().interaction.navigation_mouse_down(task_id, &list);
+            let _ = shell
+                .local_slot_mut()
+                .interaction
+                .navigation_mouse_down(task_id, &list);
             shell.sync_cockpit_follow();
 
             let focus_epoch = shell.local_slot_mut().interaction.current_focus_epoch();
@@ -43651,7 +44040,10 @@ mod tests {
                 shell.client_model_snapshot().as_ref().expect("Codex model"),
             )
             .expect("task list");
-            let _ = shell.local_slot_mut().interaction.navigation_mouse_down(task_id, &list);
+            let _ = shell
+                .local_slot_mut()
+                .interaction
+                .navigation_mouse_down(task_id, &list);
             shell.sync_cockpit_follow();
             shell
                 .replace_composer_platform_text(None, "/")
@@ -43695,7 +44087,10 @@ mod tests {
                 shell.client_model_snapshot().as_ref().unwrap(),
             )
             .expect("task list");
-            let _ = shell.local_slot_mut().interaction.navigation_mouse_down(task_id, &list);
+            let _ = shell
+                .local_slot_mut()
+                .interaction
+                .navigation_mouse_down(task_id, &list);
             shell.sync_cockpit_follow();
             assert!(
                 shell.splash_image.is_none(),
@@ -43899,7 +44294,8 @@ mod tests {
         let (model, task_id) = open_task_without_agent_client_model();
         let project_id = model.task(task_id).expect("task").task.project_id;
         with_test_shell_in_app(cx, runtime, |shell| {
-            shell.local_slot_mut().agent_connection = Some(agent_connection_snapshot(AgentPresence::SignedIn));
+            shell.local_slot_mut().agent_connection =
+                Some(agent_connection_snapshot(AgentPresence::SignedIn));
             shell.install_project_for_test("DevManager", project_id);
             shell
                 .apply_client_model(Arc::new(model))
@@ -44130,7 +44526,10 @@ mod tests {
                 shell.client_model_snapshot().as_ref().unwrap(),
             )
             .expect("task list");
-            let _ = shell.local_slot_mut().interaction.navigation_mouse_down(task_id, &list);
+            let _ = shell
+                .local_slot_mut()
+                .interaction
+                .navigation_mouse_down(task_id, &list);
             shell.sync_cockpit_follow();
             let focus_epoch = shell.local_slot_mut().interaction.current_focus_epoch();
             shell
@@ -44148,7 +44547,8 @@ mod tests {
                     .activate(ComposerControl::SendNow, focus_epoch)
                     .expect("submit intent")
             };
-            let submitted = shell.local_slot_mut()
+            let submitted = shell
+                .local_slot_mut()
                 .interaction
                 .action(
                     intent
@@ -44159,7 +44559,8 @@ mod tests {
             let submitted_command_id =
                 native_command_id(&submitted.command).expect("provider command identity");
 
-            let unrelated = shell.local_slot_mut()
+            let unrelated = shell
+                .local_slot_mut()
                 .interaction
                 .action(test_task_create_v2("unrelated accepted task"))
                 .expect("unrelated command action");
@@ -44219,7 +44620,10 @@ mod tests {
                 shell.client_model_snapshot().as_ref().unwrap(),
             )
             .expect("task list");
-            let _ = shell.local_slot_mut().interaction.navigation_mouse_down(task_id, &list);
+            let _ = shell
+                .local_slot_mut()
+                .interaction
+                .navigation_mouse_down(task_id, &list);
             shell.sync_cockpit_follow();
 
             let focus_epoch = shell.local_slot_mut().interaction.current_focus_epoch();
@@ -44240,7 +44644,8 @@ mod tests {
                     .expect("submit intent")
             };
             let command_id = intent.command_id;
-            let submitted = shell.local_slot_mut()
+            let submitted = shell
+                .local_slot_mut()
                 .interaction
                 .action(
                     intent
@@ -44298,7 +44703,10 @@ mod tests {
                 shell.client_model_snapshot().as_ref().unwrap(),
             )
             .expect("task list");
-            let _ = shell.local_slot_mut().interaction.navigation_mouse_down(task_id, &list);
+            let _ = shell
+                .local_slot_mut()
+                .interaction
+                .navigation_mouse_down(task_id, &list);
             shell.sync_cockpit_follow();
             let before = shared
                 .lock()
@@ -44340,7 +44748,10 @@ mod tests {
         let (runtime, shared) = TestRuntime::new(true, NativeHostActionResult::Queued);
         let (model, task_id) = terminal_bound_client_model();
         with_test_shell_in_app(cx, runtime, |shell| {
-            shell.local_slot_mut().interaction.sync_selected_task(Some(task_id));
+            shell
+                .local_slot_mut()
+                .interaction
+                .sync_selected_task(Some(task_id));
             assert_eq!(shell.local_slot_mut().cockpit.selected_task(), None);
             shared.lock().expect("runtime").accepted.clear();
 
@@ -44348,7 +44759,10 @@ mod tests {
                 .apply_client_model(Arc::new(model))
                 .expect("apply first restored model");
 
-            assert_eq!(shell.local_slot_mut().cockpit.selected_task(), Some(task_id));
+            assert_eq!(
+                shell.local_slot_mut().cockpit.selected_task(),
+                Some(task_id)
+            );
             assert!(
                 shared
                     .lock()
@@ -44372,7 +44786,10 @@ mod tests {
                 shell.client_model_snapshot().as_ref().unwrap(),
             )
             .expect("task list");
-            let _ = shell.local_slot_mut().interaction.navigation_mouse_down(task_id, &list);
+            let _ = shell
+                .local_slot_mut()
+                .interaction
+                .navigation_mouse_down(task_id, &list);
             shell.sync_cockpit_follow();
             let first = shared.lock().expect("runtime").accepted.len();
 
@@ -44398,7 +44815,10 @@ mod tests {
                 shell.client_model_snapshot().as_ref().unwrap(),
             )
             .expect("task list");
-            let _ = shell.local_slot_mut().interaction.navigation_mouse_down(task_id, &list);
+            let _ = shell
+                .local_slot_mut()
+                .interaction
+                .navigation_mouse_down(task_id, &list);
             shell.sync_cockpit_follow();
 
             let assert_queries =
@@ -44590,7 +45010,10 @@ mod tests {
                 shell.client_model_snapshot().as_ref().unwrap(),
             )
             .expect("task list");
-            let _ = shell.local_slot_mut().interaction.navigation_mouse_down(task_id, &list);
+            let _ = shell
+                .local_slot_mut()
+                .interaction
+                .navigation_mouse_down(task_id, &list);
             shell.sync_cockpit_follow();
 
             shell.begin_task_delete(task_id);
@@ -44785,7 +45208,10 @@ mod tests {
                 shell.client_model_snapshot().as_ref().unwrap(),
             )
             .expect("task list");
-            let _ = shell.local_slot_mut().interaction.navigation_mouse_down(task_id, &list);
+            let _ = shell
+                .local_slot_mut()
+                .interaction
+                .navigation_mouse_down(task_id, &list);
 
             shell.begin_task_delete(task_id);
             shell.confirm_task_delete();
@@ -44840,7 +45266,8 @@ mod tests {
             shell.begin_task_delete(task_id);
             shell.confirm_task_delete();
             shell.begin_new_task_for_project(
-                shell.local_slot()
+                shell
+                    .local_slot()
                     .client_model
                     .as_ref()
                     .and_then(|model| model.tasks().get(&task_id))
@@ -44946,7 +45373,10 @@ mod tests {
                 shell.client_model_snapshot().as_ref().unwrap(),
             )
             .expect("task list");
-            let _ = shell.local_slot_mut().interaction.navigation_mouse_down(task_id, &list);
+            let _ = shell
+                .local_slot_mut()
+                .interaction
+                .navigation_mouse_down(task_id, &list);
             shell.begin_task_delete(task_id);
             shell.confirm_task_delete();
             let archive_record = shared
@@ -45098,7 +45528,8 @@ mod tests {
         let (model, task_id) =
             terminal_bound_client_model_with_attention(crate::domain::task::TaskAttention::Failed);
         let report = with_test_shell_in_app(cx, runtime, |shell| {
-            shell.local_slot_mut().agent_connection = Some(agent_connection_snapshot(AgentPresence::SignedIn));
+            shell.local_slot_mut().agent_connection =
+                Some(agent_connection_snapshot(AgentPresence::SignedIn));
             shell.install_named_folder_for_test("command");
             shell
                 .apply_client_model(Arc::new(model))
@@ -45107,7 +45538,10 @@ mod tests {
                 shell.client_model_snapshot().as_ref().unwrap(),
             )
             .expect("task list");
-            let _ = shell.local_slot_mut().interaction.navigation_mouse_down(task_id, &list);
+            let _ = shell
+                .local_slot_mut()
+                .interaction
+                .navigation_mouse_down(task_id, &list);
             shell.sync_cockpit_follow();
             shell.refresh_accessibility_tree();
             let element_ids: Vec<String> = shell
@@ -45138,7 +45572,8 @@ mod tests {
                 shell.delete_task.as_ref().map(|draft| draft.owner.task_id)
             };
             (
-                shell.local_slot()
+                shell
+                    .local_slot()
                     .cockpit
                     .conversation_hold_message()
                     .unwrap_or("")
@@ -45236,7 +45671,10 @@ mod tests {
                 shell.client_model_snapshot().as_ref().unwrap(),
             )
             .expect("task list");
-            let _ = shell.local_slot_mut().interaction.navigation_mouse_down(task_id, &list);
+            let _ = shell
+                .local_slot_mut()
+                .interaction
+                .navigation_mouse_down(task_id, &list);
             shell.sync_cockpit_follow();
 
             shell.dispatch_keyboard_for_test(KeyboardShortcut::alt(ShortcutKey::Digit(4)));
@@ -45263,7 +45701,13 @@ mod tests {
                 shell.main_conversation_canvas(),
                 MainConversationCanvas::TaskTerminal
             );
-            assert!(shell.local_slot_mut().interaction.keyboard_state().terminal_open);
+            assert!(
+                shell
+                    .local_slot_mut()
+                    .interaction
+                    .keyboard_state()
+                    .terminal_open
+            );
 
             let before = shared.lock().expect("runtime").accepted.len();
             shell.dispatch_keyboard_for_test(KeyboardShortcut::ctrl(ShortcutKey::Character('m')));
@@ -45271,7 +45715,13 @@ mod tests {
                 shell.last_keyboard_action(),
                 Some(crate::ui::actions::KeyboardAction::OpenTaskDetails)
             );
-            assert!(shell.local_slot_mut().interaction.keyboard_state().task_details_open);
+            assert!(
+                shell
+                    .local_slot_mut()
+                    .interaction
+                    .keyboard_state()
+                    .task_details_open
+            );
             let accepted = shared.lock().expect("runtime").accepted.clone();
             assert!(
                 accepted.len() > before && accepted.iter().any(|record| {
@@ -45305,7 +45755,7 @@ mod tests {
             selected_task_composer_waits_for_durable_provider_identity(cx);
             selected_codex_task_composer_allows_first_prompt_without_provider_identity(cx);
             cancelled_first_send_readiness_preserves_startup_error(cx);
-            started_composer_cannot_misrepresent_launch_preferences(cx);
+            started_composer_does_not_misrepresent_launch_preferences(cx);
             selected_task_composer_rebinds_after_focus_epoch_advances(cx);
             task_switch_parks_and_restores_unsent_composer_draft(cx);
             task_draft_survives_native_shell_remount(cx);
@@ -45404,7 +45854,10 @@ mod tests {
                                     shell.client_model_snapshot().as_ref().expect("model"),
                                 )
                                 .expect("task list");
-                            let _ = shell.local_slot_mut().interaction.navigation_mouse_down(task_id, &list);
+                            let _ = shell
+                                .local_slot_mut()
+                                .interaction
+                                .navigation_mouse_down(task_id, &list);
                             shell.sync_cockpit_follow();
                             assert!(
                                 !shell.slash_command_catalog.is_empty(),
@@ -45470,14 +45923,20 @@ mod tests {
             with_test_shell_in_app(cx, runtime, |shell| {
                 shell.layout.selected_task = Some(shell.local_task_key(task_id));
                 shell.layout.active_dock_tab = Some("Review".to_string());
-                shell.local_slot_mut().interaction.sync_selected_task(Some(task_id));
+                shell
+                    .local_slot_mut()
+                    .interaction
+                    .sync_selected_task(Some(task_id));
                 shell.selected_task_key = Some(shell.local_task_key(task_id));
 
                 shell
                     .apply_client_model(Arc::new(model))
                     .expect("apply canonical model");
 
-                assert_eq!(shell.local_slot_mut().cockpit.active_tool(), CockpitDockTool::Review);
+                assert_eq!(
+                    shell.local_slot_mut().cockpit.active_tool(),
+                    CockpitDockTool::Review
+                );
             });
             cx.quit();
         });
@@ -45528,7 +45987,10 @@ mod tests {
                                     shell.client_model_snapshot().as_ref().expect("model"),
                                 )
                                 .expect("task list");
-                            let _ = shell.local_slot_mut().interaction.navigation_mouse_down(task_id, &list);
+                            let _ = shell
+                                .local_slot_mut()
+                                .interaction
+                                .navigation_mouse_down(task_id, &list);
                             shell.sync_cockpit_follow();
                             shell.composer_focus_handle.focus(window);
                         });
@@ -45644,13 +46106,37 @@ mod tests {
         let empty_branch = source
             .split("if self.honest_empty_conversation_for(&owner)")
             .nth(1)
-            .and_then(|tail| tail.split("} else if let Some(slot) = self.host_slot_mut(&owner.host) {").next())
+            .and_then(|tail| {
+                tail.split("} else if let Some(slot) = self.host_slot_mut(&owner.host) {")
+                    .next()
+            })
             .expect("owner-bound honest empty conversation render branch");
         assert!(
             empty_branch.contains("native-task-conversation-surface")
                 && empty_branch.contains("native-empty-conversation")
                 && empty_branch.contains(".child(composer_footer)"),
             "zero-row conversations must keep the canonical surface + composer/footer contract"
+        );
+    }
+
+    #[test]
+    fn workspace_panes_render_their_exact_task_and_done_has_one_scroll_owner() {
+        let source = include_str!("native_shell.rs");
+        let task_surface = concat!("conversation_surface_with_footer_", "for_task(");
+        let terminal_surface = concat!("center_provider_terminal_surface_", "for(");
+        let duplicate_done = concat!("native-settled-", "section");
+
+        assert!(
+            source.contains(task_surface),
+            "every workspace pane must render the timeline keyed by its own task"
+        );
+        assert!(
+            source.contains(terminal_surface),
+            "every workspace pane must render the terminal keyed by its own task"
+        );
+        assert!(
+            !source.contains(duplicate_done),
+            "Done belongs only to the unified scroll list"
         );
     }
 
@@ -45968,8 +46454,7 @@ mod tests {
             "failed UI attach must return the runtime so Drop cannot detach the shared host"
         );
         assert!(
-            attach_fleet.matches("return Err((").count() >= 3
-                && attach_fleet.contains("runtime,"),
+            attach_fleet.matches("return Err((").count() >= 3 && attach_fleet.contains("runtime,"),
             "every pre-insertion reject must return (error, runtime)"
         );
         assert!(
@@ -45992,8 +46477,7 @@ mod tests {
             &source[start..end]
         };
         assert!(
-            connect.contains("RemoteBlockingWork::spawn")
-                && connect.contains("connect_blocking"),
+            connect.contains("RemoteBlockingWork::spawn") && connect.contains("connect_blocking"),
             "async connect must run the same connect_blocking bootstrap on RemoteBlockingWork"
         );
         assert!(
@@ -46129,8 +46613,7 @@ mod tests {
             &source[start..end]
         };
         assert!(
-            drop_impl.contains("self.runtime.block_on")
-                && drop_impl.contains("fleet.remove"),
+            drop_impl.contains("self.runtime.block_on") && drop_impl.contains("fleet.remove"),
             "guard Drop must synchronously remove the exact fleet driver on the blocking lane"
         );
         assert!(
@@ -46148,8 +46631,7 @@ mod tests {
             &source[start..end]
         };
         assert!(
-            connect.contains("RemoteBlockingWork::spawn")
-                && connect.contains("connect_blocking"),
+            connect.contains("RemoteBlockingWork::spawn") && connect.contains("connect_blocking"),
             "async connect must run connect_blocking on RemoteBlockingWork"
         );
     }
@@ -46591,7 +47073,9 @@ mod tests {
             .enable_all()
             .build()
             .expect("runtime");
-        let _ = runtime.block_on(fleet.disconnect(&host)).expect("disconnect");
+        let _ = runtime
+            .block_on(fleet.disconnect(&host))
+            .expect("disconnect");
         assert!(!fleet.is_connected(&host).expect("state"));
         assert!(fleet.admit_host(&host).is_err());
         let owner = capture_runtime_projection_owner(&fleet, &host).expect("owner");
@@ -47407,10 +47891,7 @@ mod tests {
             let observed = entity.update(cx, |shell, _cx| {
                 let local = shell.local_host_id();
                 let local_preview = TaskInboxPreview::from_tasks_for_test(
-                    BTreeMap::from([(
-                        shared_task,
-                        preview_task_snapshot(shared_task, "local-A"),
-                    )]),
+                    BTreeMap::from([(shared_task, preview_task_snapshot(shared_task, "local-A"))]),
                     1,
                 );
                 shell
@@ -47424,13 +47905,11 @@ mod tests {
                         endpoint: "fleet://remote".into(),
                     },
                 );
-                remote_slot.host_runtime =
-                    Some(NativeHostRuntimeAttachment::Injected(Box::new(remote_runtime)));
+                remote_slot.host_runtime = Some(NativeHostRuntimeAttachment::Injected(Box::new(
+                    remote_runtime,
+                )));
                 let remote_preview = TaskInboxPreview::from_tasks_for_test(
-                    BTreeMap::from([(
-                        shared_task,
-                        preview_task_snapshot(shared_task, "remote-A"),
-                    )]),
+                    BTreeMap::from([(shared_task, preview_task_snapshot(shared_task, "remote-A"))]),
                     2,
                 );
                 remote_slot.inbox = Inbox::from_task_preview(&remote_preview);
@@ -47495,7 +47974,10 @@ mod tests {
                 );
                 assert!(shell.draft_launch_prefs.contains_key(&local_key));
                 assert_eq!(
-                    shell.composer_drafts.get(&local_draft).map(|d| d.text.as_str()),
+                    shell
+                        .composer_drafts
+                        .get(&local_draft)
+                        .map(|d| d.text.as_str()),
                     Some("dirty-A")
                 );
                 assert_eq!(shell.fleet_inbox_projection().rail_rows().count(), 1);
@@ -47544,8 +48026,9 @@ mod tests {
                         endpoint: "fleet://remote-b".into(),
                     },
                 );
-                remote_slot.host_runtime =
-                    Some(NativeHostRuntimeAttachment::Injected(Box::new(remote_runtime)));
+                remote_slot.host_runtime = Some(NativeHostRuntimeAttachment::Injected(Box::new(
+                    remote_runtime,
+                )));
                 shell
                     .attach_host_ui_slot(remote_slot)
                     .expect("attach remote");
@@ -47586,8 +48069,7 @@ mod tests {
         let workspace = tempfile::tempdir().expect("workspace");
         let profile = isolated_dev_profile(workspace.path()).expect("profile");
         let fleet = Arc::new(HostFleet::new());
-        let host_id =
-            HostId::local_profile(profile.named_profile()).expect("local host id");
+        let host_id = HostId::local_profile(profile.named_profile()).expect("local host id");
         // Preflight rejects None before fleet.contains / construction.
         let err = NativeHostClientRuntime::attach_installed(
             &profile,
@@ -47647,8 +48129,9 @@ mod tests {
                     },
                 );
                 // Only remote is open; local draft is intentionally unopened.
-                shell.layout.task_workspace =
-                    Some(crate::ui::task_workspace::Workspace::single(open_remote.clone()));
+                shell.layout.task_workspace = Some(crate::ui::task_workspace::Workspace::single(
+                    open_remote.clone(),
+                ));
                 shell.selected_task_key = Some(open_remote.clone());
                 let (remote_runtime, _) = TestRuntime::new(true, NativeHostActionResult::Queued);
                 let mut remote_slot = HostUiState::new_empty(
@@ -47657,8 +48140,9 @@ mod tests {
                         endpoint: "fleet://remote".into(),
                     },
                 );
-                remote_slot.host_runtime =
-                    Some(NativeHostRuntimeAttachment::Injected(Box::new(remote_runtime)));
+                remote_slot.host_runtime = Some(NativeHostRuntimeAttachment::Injected(Box::new(
+                    remote_runtime,
+                )));
                 shell
                     .attach_host_ui_slot(remote_slot)
                     .expect("attach remote");
@@ -47714,8 +48198,9 @@ mod tests {
                         endpoint: "fleet://remote-select".into(),
                     },
                 );
-                remote_slot.host_runtime =
-                    Some(NativeHostRuntimeAttachment::Injected(Box::new(remote_runtime)));
+                remote_slot.host_runtime = Some(NativeHostRuntimeAttachment::Injected(Box::new(
+                    remote_runtime,
+                )));
                 remote_slot.task_list =
                     TaskList::from_virtual_task_ids(vec![remote_task]).expect("list");
                 shell
@@ -47774,261 +48259,271 @@ mod tests {
                     cx,
                 )
             });
-            let observed = entity.update(cx, |shell, _cx| {
-                shell.install_idle_conversation_photo_for_test();
-                // Same raw TaskId + AgentSessionId on both hosts.
-                let (model, shared_task) = terminal_bound_client_model();
-                let model = Arc::new(model);
-                let agent = model
-                    .task(shared_task)
-                    .and_then(|snapshot| snapshot.primary_agent_id)
-                    .expect("shared agent");
-                shell
-                    .apply_client_model(Arc::clone(&model))
-                    .expect("local model");
-                let local = shell.local_host_id();
-                let local_key = HostTaskKey::new(local.clone(), shared_task);
-                let remote_key = HostTaskKey::new(remote_host.clone(), shared_task);
+            let observed =
+                entity.update(cx, |shell, _cx| {
+                    shell.install_idle_conversation_photo_for_test();
+                    // Same raw TaskId + AgentSessionId on both hosts.
+                    let (model, shared_task) = terminal_bound_client_model();
+                    let model = Arc::new(model);
+                    let agent = model
+                        .task(shared_task)
+                        .and_then(|snapshot| snapshot.primary_agent_id)
+                        .expect("shared agent");
+                    shell
+                        .apply_client_model(Arc::clone(&model))
+                        .expect("local model");
+                    let local = shell.local_host_id();
+                    let local_key = HostTaskKey::new(local.clone(), shared_task);
+                    let remote_key = HostTaskKey::new(remote_host.clone(), shared_task);
 
-                let (remote_runtime, remote_shared) =
-                    TestRuntime::new(true, NativeHostActionResult::Queued);
-                let mut remote_slot = HostUiState::new_empty(
-                    remote_host.clone(),
-                    NativeHostState::Connected {
-                        endpoint: "fleet://remote-chat".into(),
-                    },
-                );
-                let epochs = remote_runtime.epochs();
-                remote_slot.host_runtime =
-                    Some(NativeHostRuntimeAttachment::Injected(Box::new(remote_runtime)));
-                let _ = remote_slot.interaction.sync_host_epochs(epochs);
-                shell
-                    .attach_host_ui_slot(remote_slot)
-                    .expect("attach remote");
-                shell
-                    .apply_client_model_for_host(&remote_host, Arc::clone(&model))
-                    .expect("remote model");
-
-                shell
-                    .select_fleet_task_key(remote_key.clone(), FleetSelectMode::Replace)
-                    .expect("select remote A");
-                assert_eq!(shell.composer_owner_key(), Some(&remote_key));
-                let focus_a = shell
-                    .host_slot(&remote_host)
-                    .map(|slot| slot.interaction.current_focus_epoch())
-                    .expect("remote focus");
-                shell
-                    .composer
-                    .as_mut()
-                    .expect("remote composer")
-                    .replace_draft("remote-A-send", focus_a)
-                    .expect("type A draft");
-                let intent = {
-                    let composer = shell.composer.as_mut().expect("composer");
-                    composer
-                        .focus_control(ComposerControl::SendNow, focus_a)
-                        .expect("focus send");
-                    composer
-                        .activate(ComposerControl::SendNow, focus_a)
-                        .expect("submit A send")
-                };
-                let command_id = intent.command_id;
-                shell.dispatch_composer_intent(intent);
-                assert!(
-                    shell.pending_composer_submissions.contains_key(&command_id),
-                    "SendNow must park A's pending submission"
-                );
-                let remote_send_count = remote_shared
-                    .lock()
-                    .expect("remote")
-                    .accepted
-                    .iter()
-                    .filter(|record| native_command_id(&record.command) == Some(command_id))
-                    .count();
-                let local_send_count = local_shared
-                    .lock()
-                    .expect("local")
-                    .accepted
-                    .iter()
-                    .filter(|record| native_command_id(&record.command) == Some(command_id))
-                    .count();
-                assert_eq!(remote_send_count, 1, "A runtime must receive the send");
-                assert_eq!(local_send_count, 0, "B/local runtime must never receive A's send");
-                let submitted = remote_shared
-                    .lock()
-                    .expect("remote")
-                    .accepted
-                    .iter()
-                    .find(|record| native_command_id(&record.command) == Some(command_id))
-                    .cloned()
-                    .expect("A send record");
-
-                // Focus B and type a newer draft while A's receipt is in flight.
-                shell
-                    .select_fleet_task_key(local_key.clone(), FleetSelectMode::Replace)
-                    .expect("focus B");
-                let focus_b = shell.local_slot().interaction.current_focus_epoch();
-                shell
-                    .composer
-                    .as_mut()
-                    .expect("local composer")
-                    .replace_draft("local-B-newer", focus_b)
-                    .expect("type B draft");
-                shell.cache_current_composer_draft();
-                let b_draft_key = NativeShell::fleet_draft_key_for(local_key.clone(), agent);
-                assert_eq!(
-                    shell.composer_drafts.get(&b_draft_key).map(|d| d.text.as_str()),
-                    Some("local-B-newer")
-                );
-                let focused_before = shell.selected_task_key.clone();
-
-                // Stale/mismatched owner receipt must not clear A's pending.
-                let mut foreign = submitted.clone();
-                foreign.fleet_admission = Some(FleetAdmission {
-                    host: local.clone(),
-                    task_id: Some(shared_task),
-                    generation: 1,
-                    client_id: ClientId::new(),
-                });
-                shell.apply_epoch_fenced_action_outcome_for_host(
-                    &remote_host,
-                    NativeHostActionOutcome::Accepted {
-                        action: foreign,
-                        receipt: crate::domain::command::CommandReceipt::Accepted {
-                            command_id,
-                            operation_id: crate::domain::id::OperationId::new(),
-                            task_revision: None,
-                            event_ids: Vec::new(),
-                            prompt_mutation: None,
+                    let (remote_runtime, remote_shared) =
+                        TestRuntime::new(true, NativeHostActionResult::Queued);
+                    let mut remote_slot = HostUiState::new_empty(
+                        remote_host.clone(),
+                        NativeHostState::Connected {
+                            endpoint: "fleet://remote-chat".into(),
                         },
-                    },
-                );
-                assert!(
-                    shell.pending_composer_submissions.contains_key(&command_id),
-                    "mismatched owner receipt must not clear A's pending"
-                );
+                    );
+                    let epochs = remote_runtime.epochs();
+                    remote_slot.host_runtime = Some(NativeHostRuntimeAttachment::Injected(
+                        Box::new(remote_runtime),
+                    ));
+                    let _ = remote_slot.interaction.sync_host_epochs(epochs);
+                    shell
+                        .attach_host_ui_slot(remote_slot)
+                        .expect("attach remote");
+                    shell
+                        .apply_client_model_for_host(&remote_host, Arc::clone(&model))
+                        .expect("remote model");
 
-                // Receipt-before-projection path.
-                shell.apply_epoch_fenced_action_outcome_for_host(
-                    &remote_host,
-                    NativeHostActionOutcome::Accepted {
-                        action: submitted.clone(),
-                        receipt: crate::domain::command::CommandReceipt::Accepted {
-                            command_id,
-                            operation_id: crate::domain::id::OperationId::new(),
-                            task_revision: None,
-                            event_ids: Vec::new(),
-                            prompt_mutation: None,
-                        },
-                    },
-                );
-                assert!(
-                    !shell.pending_composer_submissions.contains_key(&command_id),
-                    "matched A receipt must clear only A's pending"
-                );
-                assert_eq!(
-                    shell.composer_drafts.get(&b_draft_key).map(|d| d.text.as_str()),
-                    Some("local-B-newer"),
-                    "B/newer draft must survive A's settlement"
-                );
-                assert_eq!(
-                    shell.selected_task_key, focused_before,
-                    "background settlement must not steal focus from B"
-                );
+                    shell
+                        .select_fleet_task_key(remote_key.clone(), FleetSelectMode::Replace)
+                        .expect("select remote A");
+                    assert_eq!(shell.composer_owner_key(), Some(&remote_key));
+                    let focus_a = shell
+                        .host_slot(&remote_host)
+                        .map(|slot| slot.interaction.current_focus_epoch())
+                        .expect("remote focus");
+                    shell
+                        .composer
+                        .as_mut()
+                        .expect("remote composer")
+                        .replace_draft("remote-A-send", focus_a)
+                        .expect("type A draft");
+                    let intent = {
+                        let composer = shell.composer.as_mut().expect("composer");
+                        composer
+                            .focus_control(ComposerControl::SendNow, focus_a)
+                            .expect("focus send");
+                        composer
+                            .activate(ComposerControl::SendNow, focus_a)
+                            .expect("submit A send")
+                    };
+                    let command_id = intent.command_id;
+                    shell.dispatch_composer_intent(intent);
+                    assert!(
+                        shell.pending_composer_submissions.contains_key(&command_id),
+                        "SendNow must park A's pending submission"
+                    );
+                    let remote_send_count = remote_shared
+                        .lock()
+                        .expect("remote")
+                        .accepted
+                        .iter()
+                        .filter(|record| native_command_id(&record.command) == Some(command_id))
+                        .count();
+                    let local_send_count = local_shared
+                        .lock()
+                        .expect("local")
+                        .accepted
+                        .iter()
+                        .filter(|record| native_command_id(&record.command) == Some(command_id))
+                        .count();
+                    assert_eq!(remote_send_count, 1, "A runtime must receive the send");
+                    assert_eq!(
+                        local_send_count, 0,
+                        "B/local runtime must never receive A's send"
+                    );
+                    let submitted = remote_shared
+                        .lock()
+                        .expect("remote")
+                        .accepted
+                        .iter()
+                        .find(|record| native_command_id(&record.command) == Some(command_id))
+                        .cloned()
+                        .expect("A send record");
 
-                // Projection-before-receipt order: park another A send, push model
-                // projection first, then settle via drain outcome.
-                shell
-                    .select_fleet_task_key(remote_key.clone(), FleetSelectMode::Replace)
-                    .expect("reselect A");
-                let focus_a2 = shell
-                    .host_slot(&remote_host)
-                    .map(|slot| slot.interaction.current_focus_epoch())
-                    .expect("remote focus");
-                shell
-                    .composer
-                    .as_mut()
-                    .expect("remote composer")
-                    .replace_draft("remote-A-second", focus_a2)
-                    .expect("type A2");
-                let intent2 = {
-                    let composer = shell.composer.as_mut().expect("composer");
-                    composer
-                        .focus_control(ComposerControl::SendNow, focus_a2)
-                        .expect("focus send");
-                    composer
-                        .activate(ComposerControl::SendNow, focus_a2)
-                        .expect("submit A2")
-                };
-                let command_id2 = intent2.command_id;
-                shell.dispatch_composer_intent(intent2);
-                let submitted2 = remote_shared
-                    .lock()
-                    .expect("remote")
-                    .accepted
-                    .last()
-                    .cloned()
-                    .expect("A2 send");
-                shell
-                    .select_fleet_task_key(local_key.clone(), FleetSelectMode::Replace)
-                    .expect("focus B again");
-                remote_shared.lock().expect("remote").projections.push_back(
-                    NativeHostProjection::client_model(Arc::clone(&model)).at_epochs(epochs),
-                );
-                remote_shared.lock().expect("remote").projections.push_back(
-                    NativeHostProjection {
-                        kind: NativeHostProjectionKind::Replay,
-                        client_model: None,
-                        task_preview: None,
-                        error: None,
-                        epochs: Some(epochs),
-                        action_outcome: Some(NativeHostActionOutcome::Accepted {
-                            action: submitted2,
+                    // Focus B and type a newer draft while A's receipt is in flight.
+                    shell
+                        .select_fleet_task_key(local_key.clone(), FleetSelectMode::Replace)
+                        .expect("focus B");
+                    let focus_b = shell.local_slot().interaction.current_focus_epoch();
+                    shell
+                        .composer
+                        .as_mut()
+                        .expect("local composer")
+                        .replace_draft("local-B-newer", focus_b)
+                        .expect("type B draft");
+                    shell.cache_current_composer_draft();
+                    let b_draft_key = NativeShell::fleet_draft_key_for(local_key.clone(), agent);
+                    assert_eq!(
+                        shell
+                            .composer_drafts
+                            .get(&b_draft_key)
+                            .map(|d| d.text.as_str()),
+                        Some("local-B-newer")
+                    );
+                    let focused_before = shell.selected_task_key.clone();
+
+                    // Stale/mismatched owner receipt must not clear A's pending.
+                    let mut foreign = submitted.clone();
+                    foreign.fleet_admission = Some(FleetAdmission {
+                        host: local.clone(),
+                        task_id: Some(shared_task),
+                        generation: 1,
+                        client_id: ClientId::new(),
+                    });
+                    shell.apply_epoch_fenced_action_outcome_for_host(
+                        &remote_host,
+                        NativeHostActionOutcome::Accepted {
+                            action: foreign,
                             receipt: crate::domain::command::CommandReceipt::Accepted {
-                                command_id: command_id2,
+                                command_id,
                                 operation_id: crate::domain::id::OperationId::new(),
                                 task_revision: None,
                                 event_ids: Vec::new(),
                                 prompt_mutation: None,
                             },
-                        }),
-                        owner: None,
-                        durable_events: None,
-                    },
-                );
-                let _ = shell.drain_fleet_host_projections_round_robin(8);
-                let local_send_total = local_shared
-                    .lock()
-                    .expect("local")
-                    .accepted
-                    .iter()
-                    .filter(|record| {
-                        matches!(
-                            record.command,
-                            NativeHostCommand::ProviderInput { .. }
-                        )
-                    })
-                    .count();
-                let remote_send_total = remote_shared
-                    .lock()
-                    .expect("remote")
-                    .accepted
-                    .iter()
-                    .filter(|record| {
-                        matches!(
-                            record.command,
-                            NativeHostCommand::ProviderInput { .. }
-                        )
-                    })
-                    .count();
-                (
-                    !shell.pending_composer_submissions.contains_key(&command_id2),
-                    shell.composer_drafts.get(&b_draft_key).map(|d| d.text.clone()),
-                    shell.selected_task_key.clone(),
-                    local_send_total,
-                    remote_send_total,
-                )
-            });
+                        },
+                    );
+                    assert!(
+                        shell.pending_composer_submissions.contains_key(&command_id),
+                        "mismatched owner receipt must not clear A's pending"
+                    );
+
+                    // Receipt-before-projection path.
+                    shell.apply_epoch_fenced_action_outcome_for_host(
+                        &remote_host,
+                        NativeHostActionOutcome::Accepted {
+                            action: submitted.clone(),
+                            receipt: crate::domain::command::CommandReceipt::Accepted {
+                                command_id,
+                                operation_id: crate::domain::id::OperationId::new(),
+                                task_revision: None,
+                                event_ids: Vec::new(),
+                                prompt_mutation: None,
+                            },
+                        },
+                    );
+                    assert!(
+                        !shell.pending_composer_submissions.contains_key(&command_id),
+                        "matched A receipt must clear only A's pending"
+                    );
+                    assert_eq!(
+                        shell
+                            .composer_drafts
+                            .get(&b_draft_key)
+                            .map(|d| d.text.as_str()),
+                        Some("local-B-newer"),
+                        "B/newer draft must survive A's settlement"
+                    );
+                    assert_eq!(
+                        shell.selected_task_key, focused_before,
+                        "background settlement must not steal focus from B"
+                    );
+
+                    // Projection-before-receipt order: park another A send, push model
+                    // projection first, then settle via drain outcome.
+                    shell
+                        .select_fleet_task_key(remote_key.clone(), FleetSelectMode::Replace)
+                        .expect("reselect A");
+                    let focus_a2 = shell
+                        .host_slot(&remote_host)
+                        .map(|slot| slot.interaction.current_focus_epoch())
+                        .expect("remote focus");
+                    shell
+                        .composer
+                        .as_mut()
+                        .expect("remote composer")
+                        .replace_draft("remote-A-second", focus_a2)
+                        .expect("type A2");
+                    let intent2 = {
+                        let composer = shell.composer.as_mut().expect("composer");
+                        composer
+                            .focus_control(ComposerControl::SendNow, focus_a2)
+                            .expect("focus send");
+                        composer
+                            .activate(ComposerControl::SendNow, focus_a2)
+                            .expect("submit A2")
+                    };
+                    let command_id2 = intent2.command_id;
+                    shell.dispatch_composer_intent(intent2);
+                    let submitted2 = remote_shared
+                        .lock()
+                        .expect("remote")
+                        .accepted
+                        .last()
+                        .cloned()
+                        .expect("A2 send");
+                    shell
+                        .select_fleet_task_key(local_key.clone(), FleetSelectMode::Replace)
+                        .expect("focus B again");
+                    remote_shared.lock().expect("remote").projections.push_back(
+                        NativeHostProjection::client_model(Arc::clone(&model)).at_epochs(epochs),
+                    );
+                    remote_shared.lock().expect("remote").projections.push_back(
+                        NativeHostProjection {
+                            kind: NativeHostProjectionKind::Replay,
+                            client_model: None,
+                            task_preview: None,
+                            error: None,
+                            epochs: Some(epochs),
+                            action_outcome: Some(NativeHostActionOutcome::Accepted {
+                                action: submitted2,
+                                receipt: crate::domain::command::CommandReceipt::Accepted {
+                                    command_id: command_id2,
+                                    operation_id: crate::domain::id::OperationId::new(),
+                                    task_revision: None,
+                                    event_ids: Vec::new(),
+                                    prompt_mutation: None,
+                                },
+                            }),
+                            owner: None,
+                            durable_events: None,
+                        },
+                    );
+                    let _ = shell.drain_fleet_host_projections_round_robin(8);
+                    let local_send_total = local_shared
+                        .lock()
+                        .expect("local")
+                        .accepted
+                        .iter()
+                        .filter(|record| {
+                            matches!(record.command, NativeHostCommand::ProviderInput { .. })
+                        })
+                        .count();
+                    let remote_send_total = remote_shared
+                        .lock()
+                        .expect("remote")
+                        .accepted
+                        .iter()
+                        .filter(|record| {
+                            matches!(record.command, NativeHostCommand::ProviderInput { .. })
+                        })
+                        .count();
+                    (
+                        !shell
+                            .pending_composer_submissions
+                            .contains_key(&command_id2),
+                        shell
+                            .composer_drafts
+                            .get(&b_draft_key)
+                            .map(|d| d.text.clone()),
+                        shell.selected_task_key.clone(),
+                        local_send_total,
+                        remote_send_total,
+                    )
+                });
             *report_slot.borrow_mut() = Some(observed);
             drop(entity);
             cx.quit();
@@ -48046,7 +48541,10 @@ mod tests {
                 .is_some_and(|key| key.host != HostId::Remote([0x44; 16])),
             "settlement must not steal focus back to remote A"
         );
-        assert_eq!(local_accepted, 0, "local runtime must never receive remote sends");
+        assert_eq!(
+            local_accepted, 0,
+            "local runtime must never receive remote sends"
+        );
         assert!(remote_accepted >= 2, "remote runtime captured both sends");
     }
 
@@ -48084,12 +48582,13 @@ mod tests {
                         crate::domain::task::TaskLifecycle::Settled,
                     );
                 let settled_model = Arc::new(settled_model);
-                let (open_model, open_task) = terminal_bound_client_model_with_kind_provider_at_epoch(
-                    crate::domain::task::TaskAttention::None,
-                    ProviderKind::Codex,
-                    Some("provider-conversation-ready"),
-                    1,
-                );
+                let (open_model, open_task) =
+                    terminal_bound_client_model_with_kind_provider_at_epoch(
+                        crate::domain::task::TaskAttention::None,
+                        ProviderKind::Codex,
+                        Some("provider-conversation-ready"),
+                        1,
+                    );
                 assert_eq!(shared_task, open_task);
                 let open_model = Arc::new(open_model);
                 shell
@@ -48108,8 +48607,9 @@ mod tests {
                     },
                 );
                 let epochs = remote_runtime.epochs();
-                remote_slot.host_runtime =
-                    Some(NativeHostRuntimeAttachment::Injected(Box::new(remote_runtime)));
+                remote_slot.host_runtime = Some(NativeHostRuntimeAttachment::Injected(Box::new(
+                    remote_runtime,
+                )));
                 let _ = remote_slot.interaction.sync_host_epochs(epochs);
                 shell
                     .attach_host_ui_slot(remote_slot)
@@ -48311,8 +48811,7 @@ mod tests {
                     NativeHostActionOutcome::Accepted {
                         action: stale_reopen.clone(),
                         receipt: crate::domain::command::CommandReceipt::Accepted {
-                            command_id: native_command_id(&stale_reopen.command)
-                                .expect("id"),
+                            command_id: native_command_id(&stale_reopen.command).expect("id"),
                             operation_id: crate::domain::id::OperationId::new(),
                             task_revision: None,
                             event_ids: Vec::new(),
@@ -48355,12 +48854,18 @@ mod tests {
             stale_error,
             local_pending_clear,
         ) = report.borrow_mut().take().expect("reopen report");
-        assert!(advanced, "Open projection must clear reopen pending then send");
+        assert!(
+            advanced,
+            "Open projection must clear reopen pending then send"
+        );
         assert!(
             remote_inputs >= 1,
             "exact owner must receive one follow-up send after reopen"
         );
-        assert!(cancelled, "focus switch must cancel remote reopen follow-up");
+        assert!(
+            cancelled,
+            "focus switch must cancel remote reopen follow-up"
+        );
         assert!(
             remote_error
                 .as_deref()
@@ -48440,22 +48945,24 @@ mod tests {
                     },
                 );
                 let epochs = remote_runtime.epochs();
-                remote_slot.host_runtime =
-                    Some(NativeHostRuntimeAttachment::Injected(Box::new(remote_runtime)));
+                remote_slot.host_runtime = Some(NativeHostRuntimeAttachment::Injected(Box::new(
+                    remote_runtime,
+                )));
                 let _ = remote_slot.interaction.sync_host_epochs(epochs);
-                shell
-                    .attach_host_ui_slot(remote_slot)
-                    .expect("attach");
+                shell.attach_host_ui_slot(remote_slot).expect("attach");
                 shell
                     .apply_client_model_for_host(&remote_host, Arc::clone(&draft_model))
                     .expect("remote draft");
                 shell
                     .select_fleet_task_key(remote_key.clone(), FleetSelectMode::Replace)
                     .expect("select remote draft");
-                let focus = shell
-                    .host_slot(&remote_host)
-                    .map(|slot| slot.interaction.current_focus_epoch())
-                    .expect("focus");
+                shell.set_composer_model(crate::providers::ProviderModel::CodexTerra);
+                shell.set_composer_reasoning(crate::providers::ProviderReasoningEffort::High);
+                shell.set_composer_access(crate::providers::ProviderAccessMode::ReadOnly);
+                // Model the real text-input gesture: the eager conversation query
+                // advances the host interaction epoch after the composer binds, so
+                // editing must first rearm the exact remote owner.
+                let focus = shell.rearm_composer_focus().expect("fresh remote focus");
                 shell
                     .composer
                     .as_mut()
@@ -48491,7 +48998,11 @@ mod tests {
                     })
                     .cloned()
                     .collect();
-                assert_eq!(probes.len(), 1, "first send must probe TerminalReadiness before start");
+                assert_eq!(
+                    probes.len(),
+                    1,
+                    "first send must probe TerminalReadiness before start"
+                );
                 assert_eq!(
                     remote_shared
                         .lock()
@@ -48534,7 +49045,8 @@ mod tests {
                         body: NativeHostQueryBody::TaskCockpit(
                             crate::domain::TaskCockpitResult::Unavailable {
                                 surface: crate::domain::TaskCockpitSurface::Terminal,
-                                reason: crate::domain::TaskCockpitUnavailableReason::TerminalNotStarted,
+                                reason:
+                                    crate::domain::TaskCockpitUnavailableReason::TerminalNotStarted,
                             },
                         ),
                     },
@@ -48549,7 +49061,26 @@ mod tests {
                     })
                     .cloned()
                     .collect();
-                assert_eq!(starts.len(), 1, "NotStarted probe must dispatch exactly one start");
+                assert_eq!(
+                    starts.len(),
+                    1,
+                    "NotStarted probe must dispatch exactly one start"
+                );
+                let NativeHostCommand::ProviderStart { arguments, .. } = &starts[0].command else {
+                    unreachable!("filtered to provider start")
+                };
+                assert_eq!(
+                    arguments.launch_options.model,
+                    crate::providers::ProviderModel::CodexTerra
+                );
+                assert_eq!(
+                    arguments.launch_options.reasoning_effort,
+                    crate::providers::ProviderReasoningEffort::High
+                );
+                assert_eq!(
+                    arguments.launch_options.access,
+                    crate::providers::ProviderAccessMode::ReadOnly
+                );
                 assert_eq!(
                     local_shared
                         .lock()
@@ -48574,8 +49105,7 @@ mod tests {
                         .host_slot(&remote_host)
                         .and_then(|slot| slot.pending_draft_first_send.as_ref())
                         .is_some_and(|pending| {
-                            pending.stage
-                                == super::PendingDraftFirstSendStage::AwaitingStartReceipt
+                            pending.stage == super::PendingDraftFirstSendStage::AwaitingStartReceipt
                         }),
                     "missing start receipt must keep waiting"
                 );
@@ -48814,20 +49344,17 @@ mod tests {
                         endpoint: "fleet://done".into(),
                     },
                 );
-                remote_slot.host_runtime =
-                    Some(NativeHostRuntimeAttachment::Injected(Box::new(remote_runtime)));
+                remote_slot.host_runtime = Some(NativeHostRuntimeAttachment::Injected(Box::new(
+                    remote_runtime,
+                )));
                 let mut snapshot = preview_task_snapshot(shared, "done-remote");
                 snapshot.task.lifecycle = crate::domain::task::TaskLifecycle::Settled;
-                let preview = TaskInboxPreview::from_tasks_for_test(
-                    BTreeMap::from([(shared, snapshot)]),
-                    1,
-                );
+                let preview =
+                    TaskInboxPreview::from_tasks_for_test(BTreeMap::from([(shared, snapshot)]), 1);
                 remote_slot.inbox = Inbox::from_task_preview(&preview);
                 remote_slot.task_list =
                     TaskList::from_virtual_task_ids(vec![shared]).expect("list");
-                shell
-                    .attach_host_ui_slot(remote_slot)
-                    .expect("attach");
+                shell.attach_host_ui_slot(remote_slot).expect("attach");
                 shell
                     .select_fleet_task_key(remote_key.clone(), FleetSelectMode::Replace)
                     .expect("open done");
@@ -48836,18 +49363,13 @@ mod tests {
                     .host_slot(&remote_host)
                     .and_then(|slot| slot.inbox.row(shared))
                     .map(|row| row.lifecycle);
-                (
-                    shell.selected_task_key.clone(),
-                    lifecycle,
-                    accepted,
-                )
+                (shell.selected_task_key.clone(), lifecycle, accepted)
             });
             *report_slot.borrow_mut() = Some(observed);
             drop(entity);
             cx.quit();
         });
-        let (selected, lifecycle, accepted) =
-            report.borrow_mut().take().expect("done report");
+        let (selected, lifecycle, accepted) = report.borrow_mut().take().expect("done report");
         assert_eq!(
             selected.as_ref().map(|key| &key.host),
             Some(&HostId::Remote([0x55; 16]))
@@ -48857,7 +49379,10 @@ mod tests {
             Some(crate::domain::task::TaskLifecycle::Settled),
             "Done click must not restore lifecycle"
         );
-        assert_eq!(accepted, 0, "Done click must not dispatch a restore command");
+        assert_eq!(
+            accepted, 0,
+            "Done click must not dispatch a restore command"
+        );
     }
 
     #[test]
@@ -48920,8 +49445,9 @@ mod tests {
                         endpoint: "https://live-codex.example:9443".into(),
                     },
                 );
-                remote_slot.host_runtime =
-                    Some(NativeHostRuntimeAttachment::Injected(Box::new(remote_runtime)));
+                remote_slot.host_runtime = Some(NativeHostRuntimeAttachment::Injected(Box::new(
+                    remote_runtime,
+                )));
                 let _ = remote_slot.interaction.sync_host_epochs(epochs);
                 shell.attach_host_ui_slot(remote_slot).expect("attach");
                 shell
@@ -49009,7 +49535,10 @@ mod tests {
         });
         let (probes, starts, sends) = report.borrow_mut().take().expect("report");
         assert_eq!(probes, 1, "exactly one TerminalReadiness probe");
-        assert_eq!(starts, 0, "live identityless Codex must not StartProviderSession");
+        assert_eq!(
+            starts, 0,
+            "live identityless Codex must not StartProviderSession"
+        );
         assert_eq!(sends, 1, "exact attestation must advance one send");
     }
 
@@ -49270,9 +49799,18 @@ mod tests {
             remote_error.as_deref(),
             Some(super::codex_provider_setup_composer_error())
         );
-        assert!(local_error.is_none(), "local host must not inherit remote trust hold");
-        assert!(!remote_pending, "remote setup hold must not keep a pending first-send");
-        assert!(!local_pending, "local host must not gain remote pending state");
+        assert!(
+            local_error.is_none(),
+            "local host must not inherit remote trust hold"
+        );
+        assert!(
+            !remote_pending,
+            "remote setup hold must not keep a pending first-send"
+        );
+        assert!(
+            !local_pending,
+            "local host must not gain remote pending state"
+        );
     }
 
     #[test]
@@ -49403,7 +49941,10 @@ mod tests {
             cx.quit();
         });
         let (sends, draft, pending) = report.borrow_mut().take().expect("report");
-        assert_eq!(sends, 0, "setup hold must not auto-submit after trust completes");
+        assert_eq!(
+            sends, 0,
+            "setup hold must not auto-submit after trust completes"
+        );
         assert_eq!(draft, "still mine after trust");
         assert!(!pending, "setup hold must require a fresh Send gesture");
     }
@@ -49441,13 +49982,12 @@ mod tests {
                         1,
                     );
                 let draft_model = Arc::new(draft_model);
-                let (ready_model, _) =
-                    terminal_bound_client_model_with_kind_provider_at_epoch(
-                        crate::domain::task::TaskAttention::None,
-                        ProviderKind::Codex,
-                        Some("ready-after-start"),
-                        1,
-                    );
+                let (ready_model, _) = terminal_bound_client_model_with_kind_provider_at_epoch(
+                    crate::domain::task::TaskAttention::None,
+                    ProviderKind::Codex,
+                    Some("ready-after-start"),
+                    1,
+                );
                 let ready_model = Arc::new(ready_model);
                 let (remote_runtime, remote_shared) =
                     TestRuntime::new(true, NativeHostActionResult::Queued);
@@ -49458,8 +49998,9 @@ mod tests {
                         endpoint: "https://deferred-draft.example:7443".into(),
                     },
                 );
-                remote_slot.host_runtime =
-                    Some(NativeHostRuntimeAttachment::Injected(Box::new(remote_runtime)));
+                remote_slot.host_runtime = Some(NativeHostRuntimeAttachment::Injected(Box::new(
+                    remote_runtime,
+                )));
                 let _ = remote_slot.interaction.sync_host_epochs(epochs);
                 shell.attach_host_ui_slot(remote_slot).expect("attach");
                 shell
@@ -49859,7 +50400,10 @@ mod tests {
             cx.quit();
         });
         let (still_pending, probes, starts) = report.borrow_mut().take().expect("report");
-        assert!(still_pending, "StartPending must keep waiting under original owner");
+        assert!(
+            still_pending,
+            "StartPending must keep waiting under original owner"
+        );
         assert_eq!(probes, 2, "StartPending must requery TerminalReadiness");
         assert_eq!(starts, 0, "StartPending must never Start");
     }
@@ -49906,8 +50450,9 @@ mod tests {
                         endpoint: "https://probe-error.example:6443".into(),
                     },
                 );
-                remote_slot.host_runtime =
-                    Some(NativeHostRuntimeAttachment::Injected(Box::new(remote_runtime)));
+                remote_slot.host_runtime = Some(NativeHostRuntimeAttachment::Injected(Box::new(
+                    remote_runtime,
+                )));
                 let _ = remote_slot.interaction.sync_host_epochs(epochs);
                 shell.attach_host_ui_slot(remote_slot).expect("attach");
                 shell
@@ -50194,8 +50739,9 @@ mod tests {
                         endpoint: "https://lane-bounds.example:5443".into(),
                     },
                 );
-                remote_slot.host_runtime =
-                    Some(NativeHostRuntimeAttachment::Injected(Box::new(remote_runtime)));
+                remote_slot.host_runtime = Some(NativeHostRuntimeAttachment::Injected(Box::new(
+                    remote_runtime,
+                )));
                 let _ = remote_slot.interaction.sync_host_epochs(epochs);
                 shell.attach_host_ui_slot(remote_slot).expect("attach");
                 shell
@@ -50251,8 +50797,7 @@ mod tests {
                         FleetSelectMode::Replace,
                     )
                     .expect("select remote for settle");
-                remote_shared.lock().expect("remote").admission =
-                    NativeHostActionResult::QueueFull;
+                remote_shared.lock().expect("remote").admission = NativeHostActionResult::QueueFull;
                 // Free one remote slot so capture is allowed, then QueueFull retains.
                 if let Some(slot) = shell.host_slot_mut(&remote_host) {
                     let _ = slot.pending_host_actions.pop_front();
@@ -50288,7 +50833,10 @@ mod tests {
         let (remote_ok, retained_same, still_same, local_full, remote_busy) =
             report.borrow_mut().take().expect("report");
         assert!(remote_ok, "remote-empty must admit while local is full");
-        assert!(retained_same, "QueueFull retention must keep exact identity");
+        assert!(
+            retained_same,
+            "QueueFull retention must keep exact identity"
+        );
         assert!(still_same, "already-retained identity must not remint");
         assert!(local_full);
         assert!(remote_busy);
@@ -50336,12 +50884,13 @@ mod tests {
                     shell.local_slot().config_sidebar.projects.is_empty(),
                     "local workspace must stay empty"
                 );
-                let (model_a, shared_task) = terminal_bound_client_model_with_kind_provider_at_epoch(
-                    crate::domain::task::TaskAttention::None,
-                    ProviderKind::Codex,
-                    Some("codex-session-a"),
-                    3,
-                );
+                let (model_a, shared_task) =
+                    terminal_bound_client_model_with_kind_provider_at_epoch(
+                        crate::domain::task::TaskAttention::None,
+                        ProviderKind::Codex,
+                        Some("codex-session-a"),
+                        3,
+                    );
                 let (model_b, task_b) = terminal_bound_client_model_with_kind_provider_at_epoch(
                     crate::domain::task::TaskAttention::None,
                     ProviderKind::Codex,
@@ -50349,11 +50898,7 @@ mod tests {
                     3,
                 );
                 assert_eq!(shared_task, task_b, "shared raw TaskId across remotes");
-                let project_id = model_a
-                    .task(shared_task)
-                    .expect("task")
-                    .task
-                    .project_id;
+                let project_id = model_a.task(shared_task).expect("task").task.project_id;
 
                 let (runtime_a, _) = TestRuntime::new(true, NativeHostActionResult::Queued);
                 let epochs_a = runtime_a.epochs();
@@ -50429,7 +50974,13 @@ mod tests {
                 let projection = shell.fleet_inbox_projection();
                 let labels: Vec<_> = projection
                     .rail_rows()
-                    .map(|row| (row.key.host.clone(), row.host_label.clone(), row.project_label.clone()))
+                    .map(|row| {
+                        (
+                            row.key.host.clone(),
+                            row.host_label.clone(),
+                            row.project_label.clone(),
+                        )
+                    })
                     .collect();
                 let status_provider: Vec<_> = projection
                     .rail_rows()
@@ -50521,10 +51072,16 @@ mod tests {
             !fallback_a.ends_with("01a04553") && fallback_a.contains("aa"),
             "fallback must use entropy tail, got {fallback_a}"
         );
-        assert_eq!(label_a.2, "Apps A", "owner config overlay must apply via outcome");
+        assert_eq!(
+            label_a.2, "Apps A",
+            "owner config overlay must apply via outcome"
+        );
         for (host, status, provider) in &status_provider {
             assert_eq!(provider, "Codex", "{host:?} provider");
-            assert_ne!(status, "Open", "{host:?} must use projected status, got {status}");
+            assert_ne!(
+                status, "Open",
+                "{host:?} must use projected status, got {status}"
+            );
             assert_ne!(status, "Agent");
         }
         assert!(remote_selected);
@@ -50582,8 +51139,9 @@ mod tests {
                         endpoint: "fleet://create-guard".into(),
                     },
                 );
-                remote_slot.host_runtime =
-                    Some(NativeHostRuntimeAttachment::Injected(Box::new(remote_runtime)));
+                remote_slot.host_runtime = Some(NativeHostRuntimeAttachment::Injected(Box::new(
+                    remote_runtime,
+                )));
                 shell.attach_host_ui_slot(remote_slot).expect("attach");
                 shell
                     .apply_client_model_for_host(&remote_host, Arc::clone(&model))
@@ -50760,21 +51318,20 @@ mod tests {
                     Some(host_a.clone())
                 );
                 shell.submit_new_task();
-                assert!(
-                    remote_a.lock().expect("a").accepted.iter().any(|record| {
-                        matches!(record.command, NativeHostCommand::TaskCreateV2 { .. })
-                    })
-                );
-                assert!(
-                    remote_b.lock().expect("b").accepted.iter().all(|record| {
+                assert!(remote_a.lock().expect("a").accepted.iter().any(|record| {
+                    matches!(record.command, NativeHostCommand::TaskCreateV2 { .. })
+                }));
+                assert!(remote_b.lock().expect("b").accepted.iter().all(|record| {
+                    !matches!(record.command, NativeHostCommand::TaskCreateV2 { .. })
+                }));
+                assert!(local_shared
+                    .lock()
+                    .expect("local")
+                    .accepted
+                    .iter()
+                    .all(|record| {
                         !matches!(record.command, NativeHostCommand::TaskCreateV2 { .. })
-                    })
-                );
-                assert!(
-                    local_shared.lock().expect("local").accepted.iter().all(|record| {
-                        !matches!(record.command, NativeHostCommand::TaskCreateV2 { .. })
-                    })
-                );
+                    }));
 
                 shell
                     .select_fleet_task_key(key_a.clone(), FleetSelectMode::Replace)
@@ -50809,11 +51366,9 @@ mod tests {
                 shell.submit_task_rename();
                 assert!(!shell.pending_automatic_titles.contains_key(&key_a));
                 assert!(shell.pending_automatic_titles.contains_key(&key_b));
-                assert!(
-                    remote_a.lock().expect("a").accepted.iter().any(|record| {
-                        matches!(record.command, NativeHostCommand::TaskRename { .. })
-                    })
-                );
+                assert!(remote_a.lock().expect("a").accepted.iter().any(|record| {
+                    matches!(record.command, NativeHostCommand::TaskRename { .. })
+                }));
 
                 shell
                     .select_fleet_task_key(key_a.clone(), FleetSelectMode::Replace)
@@ -50871,17 +51426,15 @@ mod tests {
                         },
                     },
                 );
-                assert!(
-                    remote_a.lock().expect("a").accepted.iter().all(|record| {
-                        !matches!(
-                            record.command,
-                            NativeHostCommand::TaskLifecycle {
-                                command: crate::domain::command::Command::DeleteTask,
-                                ..
-                            }
-                        )
-                    })
-                );
+                assert!(remote_a.lock().expect("a").accepted.iter().all(|record| {
+                    !matches!(
+                        record.command,
+                        NativeHostCommand::TaskLifecycle {
+                            command: crate::domain::command::Command::DeleteTask,
+                            ..
+                        }
+                    )
+                }));
 
                 shell.begin_task_delete_key(key_a.clone());
                 shell.confirm_task_delete();
@@ -50947,17 +51500,15 @@ mod tests {
                 shell
                     .apply_client_model_for_host(&host_b, Arc::clone(&archived_model))
                     .expect("archived B before receipt");
-                assert!(
-                    remote_b.lock().expect("b").accepted.iter().all(|record| {
-                        !matches!(
-                            record.command,
-                            NativeHostCommand::TaskLifecycle {
-                                command: crate::domain::command::Command::DeleteTask,
-                                ..
-                            }
-                        )
-                    })
-                );
+                assert!(remote_b.lock().expect("b").accepted.iter().all(|record| {
+                    !matches!(
+                        record.command,
+                        NativeHostCommand::TaskLifecycle {
+                            command: crate::domain::command::Command::DeleteTask,
+                            ..
+                        }
+                    )
+                }));
                 let archive_b_id = native_command_id(&archive_b.command).expect("b archive");
                 shell.apply_epoch_fenced_action_outcome_for_host(
                     &host_b,
@@ -50972,17 +51523,15 @@ mod tests {
                         },
                     },
                 );
-                assert!(
-                    remote_b.lock().expect("b").accepted.iter().any(|record| {
-                        matches!(
-                            record.command,
-                            NativeHostCommand::TaskLifecycle {
-                                command: crate::domain::command::Command::DeleteTask,
-                                ..
-                            }
-                        )
-                    })
-                );
+                assert!(remote_b.lock().expect("b").accepted.iter().any(|record| {
+                    matches!(
+                        record.command,
+                        NativeHostCommand::TaskLifecycle {
+                            command: crate::domain::command::Command::DeleteTask,
+                            ..
+                        }
+                    )
+                }));
 
                 // A already has archived_model installed; confirm queues DeleteTask
                 // directly (AwaitingDelete), not another archive.
@@ -50992,8 +51541,7 @@ mod tests {
                         .and_then(|slot| slot.client_model.as_ref())
                         .and_then(|model| model.tasks().get(&shared_task))
                         .is_some_and(|snapshot| {
-                            snapshot.task.lifecycle
-                                == crate::domain::task::TaskLifecycle::Archived
+                            snapshot.task.lifecycle == crate::domain::task::TaskLifecycle::Archived
                         }),
                     "precondition: A projection must already be Archived"
                 );
@@ -52062,22 +52610,22 @@ mod tests {
             crate::ui::init(cx);
             with_test_shell_in_app(cx, runtime, |shell| {
                 let (model, task_id) = terminal_bound_client_model();
-                shell
-                    .apply_client_model(Arc::new(model))
-                    .expect("model");
+                shell.apply_client_model(Arc::new(model)).expect("model");
                 let local = shell.local_host_id();
                 let owner = HostTaskKey::new(local.clone(), task_id);
 
                 // Pre-fill with terminal markers (resolved late results), then one
                 // real cancel→retire unresolved path, then prove confirm reclaims.
                 for index in 0..MAX_ACTION_LANE_RECORDS {
-                    shell.retired_delete_flow_commands.push(super::RetiredDeleteFlowCommand {
-                        owner: owner.clone(),
-                        command_id: CommandId::new(),
-                        connection_epoch: 1,
-                        runtime_generation: 1 + index as u64,
-                        terminal: true,
-                    });
+                    shell
+                        .retired_delete_flow_commands
+                        .push(super::RetiredDeleteFlowCommand {
+                            owner: owner.clone(),
+                            command_id: CommandId::new(),
+                            connection_epoch: 1,
+                            runtime_generation: 1 + index as u64,
+                            terminal: true,
+                        });
                 }
                 shell.begin_task_delete_key(owner.clone());
                 shell.confirm_task_delete();
@@ -52103,9 +52651,10 @@ mod tests {
                 // Cancel before a correlated terminal receipt: keep unresolved.
                 shell.cancel_delete_task_flow();
                 assert!(
-                    shell.retired_delete_flow_commands.iter().any(|retired| {
-                        retired.command_id == archive_id && !retired.terminal
-                    }),
+                    shell
+                        .retired_delete_flow_commands
+                        .iter()
+                        .any(|retired| { retired.command_id == archive_id && !retired.terminal }),
                     "cancel must retire without claiming terminal"
                 );
                 // Uncertain / mismatched Accepted must stay unresolved + unadvanced.
@@ -52114,9 +52663,10 @@ mod tests {
                     error: "wire uncertain".into(),
                 });
                 assert!(
-                    shell.retired_delete_flow_commands.iter().any(|retired| {
-                        retired.command_id == archive_id && !retired.terminal
-                    }),
+                    shell
+                        .retired_delete_flow_commands
+                        .iter()
+                        .any(|retired| { retired.command_id == archive_id && !retired.terminal }),
                     "Uncertain must not resolve cancellation ownership"
                 );
                 assert!(shell.delete_task.is_none());
@@ -52131,9 +52681,10 @@ mod tests {
                     },
                 });
                 assert!(
-                    shell.retired_delete_flow_commands.iter().any(|retired| {
-                        retired.command_id == archive_id && !retired.terminal
-                    }),
+                    shell
+                        .retired_delete_flow_commands
+                        .iter()
+                        .any(|retired| { retired.command_id == archive_id && !retired.terminal }),
                     "mismatched Accepted must stay unresolved"
                 );
                 // Correlated Accepted resolves terminal capacity.
@@ -52149,9 +52700,10 @@ mod tests {
                 });
                 assert!(shell.delete_task.is_none());
                 assert!(
-                    shell.retired_delete_flow_commands.iter().any(|retired| {
-                        retired.command_id == archive_id && retired.terminal
-                    }),
+                    shell
+                        .retired_delete_flow_commands
+                        .iter()
+                        .any(|retired| { retired.command_id == archive_id && retired.terminal }),
                     "correlated late result must mark the exact retired marker terminal"
                 );
                 assert!(
@@ -52169,7 +52721,9 @@ mod tests {
 
                 // After terminal eviction, duplicate Failed/Uncertain with provenance
                 // must still not enter generic retry/pending action.
-                shell.retired_delete_flow_commands.retain(|retired| retired.command_id != archive_id);
+                shell
+                    .retired_delete_flow_commands
+                    .retain(|retired| retired.command_id != archive_id);
                 let pending_before = shell
                     .host_slot(&local)
                     .map(|slot| slot.pending_host_actions.len())
@@ -52207,13 +52761,15 @@ mod tests {
                 shell.cancel_delete_task_flow();
                 shell.retired_delete_flow_commands.clear();
                 for _ in 0..MAX_ACTION_LANE_RECORDS {
-                    shell.retired_delete_flow_commands.push(super::RetiredDeleteFlowCommand {
-                        owner: owner.clone(),
-                        command_id: CommandId::new(),
-                        connection_epoch: 2,
-                        runtime_generation: 2,
-                        terminal: false,
-                    });
+                    shell
+                        .retired_delete_flow_commands
+                        .push(super::RetiredDeleteFlowCommand {
+                            owner: owner.clone(),
+                            command_id: CommandId::new(),
+                            connection_epoch: 2,
+                            runtime_generation: 2,
+                            terminal: false,
+                        });
                 }
                 shell.begin_task_delete_key(owner.clone());
                 shell.confirm_task_delete();
@@ -52246,20 +52802,24 @@ mod tests {
                 let (model, task_id) = terminal_bound_client_model();
                 let model = Arc::new(model);
                 shell.apply_client_model(Arc::clone(&model)).expect("local");
-                let shared_a = attach_remote_test_host_with_shared(shell, &host_a, Arc::clone(&model));
-                let shared_b = attach_remote_test_host_with_shared(shell, &host_b, Arc::clone(&model));
+                let shared_a =
+                    attach_remote_test_host_with_shared(shell, &host_a, Arc::clone(&model));
+                let shared_b =
+                    attach_remote_test_host_with_shared(shell, &host_b, Arc::clone(&model));
                 let key_a = HostTaskKey::new(host_a.clone(), task_id);
                 let key_b = HostTaskKey::new(host_b.clone(), task_id);
 
                 // Saturate host A unresolved UI markers; B must still confirm.
                 for _ in 0..MAX_ACTION_LANE_RECORDS {
-                    shell.retired_delete_flow_commands.push(super::RetiredDeleteFlowCommand {
-                        owner: key_a.clone(),
-                        command_id: CommandId::new(),
-                        connection_epoch: 1,
-                        runtime_generation: 1,
-                        terminal: false,
-                    });
+                    shell
+                        .retired_delete_flow_commands
+                        .push(super::RetiredDeleteFlowCommand {
+                            owner: key_a.clone(),
+                            command_id: CommandId::new(),
+                            connection_epoch: 1,
+                            runtime_generation: 1,
+                            terminal: false,
+                        });
                 }
                 shell
                     .select_fleet_task_key(key_b.clone(), FleetSelectMode::Replace)
@@ -52289,11 +52849,7 @@ mod tests {
                             .all(|retired| retired.owner.host != host_a),
                         "forget must clear forgotten-host UI retirement markers"
                     );
-                    let _ = attach_remote_test_host_with_shared(
-                        shell,
-                        &host_a,
-                        Arc::clone(&model),
-                    );
+                    let _ = attach_remote_test_host_with_shared(shell, &host_a, Arc::clone(&model));
                 }
                 shell
                     .select_fleet_task_key(key_b.clone(), FleetSelectMode::Replace)
@@ -52302,7 +52858,8 @@ mod tests {
                 shell.confirm_task_delete();
                 assert!(
                     shell.delete_task.as_ref().is_some_and(|d| {
-                        d.owner == key_b && matches!(d.stage, super::DeleteTaskStage::AwaitingArchive { .. })
+                        d.owner == key_b
+                            && matches!(d.stage, super::DeleteTaskStage::AwaitingArchive { .. })
                     }),
                     "surviving host B must confirm after forget/cancel capacity churn"
                 );
@@ -52366,13 +52923,16 @@ mod tests {
                 assert!(
                     slot.retained_action_overflow
                         .as_ref()
-                        .is_none_or(|pending| native_command_id(&pending.command) != Some(retained_id)),
+                        .is_none_or(
+                            |pending| native_command_id(&pending.command) != Some(retained_id)
+                        ),
                     "late Uncertain must discard exact overflow confirmation"
                 );
                 assert!(
-                    shell.retired_delete_flow_commands.iter().any(|retired| {
-                        retired.command_id == retained_id && !retired.terminal
-                    }),
+                    shell
+                        .retired_delete_flow_commands
+                        .iter()
+                        .any(|retired| { retired.command_id == retained_id && !retired.terminal }),
                     "Uncertain must keep unresolved retirement ownership"
                 );
                 assert!(shell.delete_task.is_none());
@@ -52419,18 +52979,19 @@ mod tests {
                     },
                 );
                 assert!(
-                    shell.retired_delete_flow_commands.iter().any(|retired| {
-                        retired.command_id == retained_id && !retired.terminal
-                    }),
+                    shell
+                        .retired_delete_flow_commands
+                        .iter()
+                        .any(|retired| { retired.command_id == retained_id && !retired.terminal }),
                     "mismatched Accepted must stay unresolved"
                 );
                 assert!(
-                    shell
-                        .host_slot(&host_b)
-                        .is_some_and(|slot| slot
-                            .pending_host_actions
-                            .iter()
-                            .all(|pending| native_command_id(&pending.command) != Some(retained_id))),
+                    shell.host_slot(&host_b).is_some_and(|slot| slot
+                        .pending_host_actions
+                        .iter()
+                        .all(|pending| {
+                            native_command_id(&pending.command) != Some(retained_id)
+                        })),
                     "mismatched Accepted must discard exact pending"
                 );
                 let _ = shared_a;
@@ -52480,9 +53041,15 @@ mod tests {
                     }),
                     "archived rows must expose delete affordance in the AT/GPUI tree"
                 );
-                assert!(!super::task_rail_row_capture_consumes_button(gpui::MouseButton::Left));
-                assert!(super::task_rail_row_capture_consumes_button(gpui::MouseButton::Right));
-                assert!(super::task_rail_row_capture_consumes_button(gpui::MouseButton::Middle));
+                assert!(!super::task_rail_row_capture_consumes_button(
+                    gpui::MouseButton::Left
+                ));
+                assert!(super::task_rail_row_capture_consumes_button(
+                    gpui::MouseButton::Right
+                ));
+                assert!(super::task_rail_row_capture_consumes_button(
+                    gpui::MouseButton::Middle
+                ));
                 shell
                     .select_fleet_task_key(key_a.clone(), FleetSelectMode::Replace)
                     .expect("focus A");
@@ -52512,8 +53079,8 @@ mod tests {
         use crate::client::{ClientConnection, HostClient, HostClientConfig, HostFleet};
         use crate::domain::command::{CommandEnvelope, CommandReceipt, RejectionCode};
         use crate::protocol::{
-            Capability, CapabilitySet, FrameLimits, ProfileFingerprint, ServerHello, PROTOCOL_MAJOR,
-            PROTOCOL_MINOR,
+            Capability, CapabilitySet, FrameLimits, ProfileFingerprint, ServerHello,
+            PROTOCOL_MAJOR, PROTOCOL_MINOR,
         };
 
         let runtime = tokio::runtime::Builder::new_multi_thread()
@@ -52617,10 +53184,7 @@ mod tests {
                     )
                     .await
             });
-            assert_eq!(
-                runtime.block_on(handle.wait_command_admitted()),
-                command_id
-            );
+            assert_eq!(runtime.block_on(handle.wait_command_admitted()), command_id);
             runtime
                 .block_on(handle.dispatch_accepted(CommandReceipt::Rejected {
                     command_id,
@@ -52791,13 +53355,15 @@ mod tests {
                 {
                     *cmd = command_cancel;
                 }
-                shell.retired_delete_flow_commands.push(super::RetiredDeleteFlowCommand {
-                    owner: HostTaskKey::new(peer_host_shell.clone(), task_id),
-                    command_id: command_cancel,
-                    connection_epoch: cancel_action.connection_epoch,
-                    runtime_generation: cancel_action.runtime_generation,
-                    terminal: false,
-                });
+                shell
+                    .retired_delete_flow_commands
+                    .push(super::RetiredDeleteFlowCommand {
+                        owner: HostTaskKey::new(peer_host_shell.clone(), task_id),
+                        command_id: command_cancel,
+                        connection_epoch: cancel_action.connection_epoch,
+                        runtime_generation: cancel_action.runtime_generation,
+                        terminal: false,
+                    });
                 shell.apply_epoch_fenced_action_outcome_for_host(
                     &peer_host_shell,
                     NativeHostActionOutcome::Uncertain {
@@ -52870,10 +53436,7 @@ mod tests {
                     )
                     .await
             });
-            assert_eq!(
-                runtime.block_on(handle.wait_command_admitted()),
-                command_b
-            );
+            assert_eq!(runtime.block_on(handle.wait_command_admitted()), command_b);
             runtime
                 .block_on(handle.dispatch_accepted(CommandReceipt::Rejected {
                     command_id: command_b,
@@ -52936,7 +53499,6 @@ mod tests {
             .expect("physical fleet.remove teardown");
     }
 
-
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn async_connect_future_drop_cancels_worker_before_admit() {
         use std::sync::{Arc, Barrier};
@@ -52992,7 +53554,11 @@ mod tests {
         );
     }
 
-    fn test_conversation_user_page(sequence: u64, after: u64, text: &str) -> crate::domain::SemanticJournalPage {
+    fn test_conversation_user_page(
+        sequence: u64,
+        after: u64,
+        text: &str,
+    ) -> crate::domain::SemanticJournalPage {
         use crate::domain::{
             EventId, PrivacyClass, SemanticJournalFact, SemanticJournalPage, SemanticJournalPayload,
         };
@@ -53141,7 +53707,7 @@ mod tests {
             with_test_shell_profile_in_app_cx(cx, profile, runtime, |shell, _cx| {
                 let (model, task_id) = terminal_bound_client_model();
                 let model = std::sync::Arc::new(model);
-                let (remote_runtime, _) =
+                let (remote_runtime, remote_shared) =
                     TestRuntime::new(true, NativeHostActionResult::Queued);
                 let mut remote_slot = HostUiState::new_empty(
                     remote_host.clone(),
@@ -53149,9 +53715,12 @@ mod tests {
                         endpoint: "fleet://remote-conversation".into(),
                     },
                 );
-                remote_slot.host_runtime =
-                    Some(NativeHostRuntimeAttachment::Injected(Box::new(remote_runtime)));
-                shell.attach_host_ui_slot(remote_slot).expect("attach remote");
+                remote_slot.host_runtime = Some(NativeHostRuntimeAttachment::Injected(Box::new(
+                    remote_runtime,
+                )));
+                shell
+                    .attach_host_ui_slot(remote_slot)
+                    .expect("attach remote");
                 shell
                     .apply_client_model_for_host(&remote_host, std::sync::Arc::clone(&model))
                     .expect("remote model");
@@ -53161,6 +53730,27 @@ mod tests {
                         FleetSelectMode::Replace,
                     )
                     .expect("select remote task");
+                assert!(
+                    remote_shared
+                        .lock()
+                        .expect("remote runtime")
+                        .accepted
+                        .iter()
+                        .any(|record| matches!(
+                            &record.command,
+                            super::NativeHostCommand::TaskCockpitQuery {
+                                task_id: queried_task,
+                                query: TaskCockpitQuery::Conversation { after_sequence: 0 },
+                                ..
+                            } if *queried_task == task_id
+                        )),
+                    "first remote focus must request its conversation immediately"
+                );
+                remote_shared
+                    .lock()
+                    .expect("remote runtime")
+                    .accepted
+                    .clear();
 
                 let mut user_page = test_conversation_user_page(5, 0, "hello from user");
                 user_page.next_sequence = Some(6);
@@ -53173,8 +53763,7 @@ mod tests {
                     user_page,
                 );
 
-                let assistant_page =
-                    test_conversation_assistant_page(6, 5, 7, "assistant reply");
+                let assistant_page = test_conversation_assistant_page(6, 5, 7, "assistant reply");
                 let action_assistant =
                     dispatch_conversation_query_for_test(shell, &remote_host, task_id, 5);
                 apply_conversation_query_outcome_for_test(
@@ -53186,7 +53775,9 @@ mod tests {
 
                 let roles = timeline_message_roles_for_test(shell, &remote_host, task_id);
                 assert!(
-                    roles.iter().any(|role| *role == crate::ui::renderers::MessageRole::User),
+                    roles
+                        .iter()
+                        .any(|role| *role == crate::ui::renderers::MessageRole::User),
                     "merged admission must retain the durable user row"
                 );
                 assert!(
@@ -53222,17 +53813,19 @@ mod tests {
                     .expect("local model");
                 prepare_local_task_shell(shell, std::sync::Arc::clone(&model), shared_task);
 
-                let (remote_runtime, _) =
-                    TestRuntime::new(true, NativeHostActionResult::Queued);
+                let (remote_runtime, _) = TestRuntime::new(true, NativeHostActionResult::Queued);
                 let mut remote_slot = HostUiState::new_empty(
                     remote_host.clone(),
                     NativeHostState::Connected {
                         endpoint: "fleet://remote-owner-isolation".into(),
                     },
                 );
-                remote_slot.host_runtime =
-                    Some(NativeHostRuntimeAttachment::Injected(Box::new(remote_runtime)));
-                shell.attach_host_ui_slot(remote_slot).expect("attach remote");
+                remote_slot.host_runtime = Some(NativeHostRuntimeAttachment::Injected(Box::new(
+                    remote_runtime,
+                )));
+                shell
+                    .attach_host_ui_slot(remote_slot)
+                    .expect("attach remote");
                 shell
                     .apply_client_model_for_host(&remote_host, std::sync::Arc::clone(&model))
                     .expect("remote model");
@@ -53240,12 +53833,7 @@ mod tests {
                 let local_page = test_conversation_user_page(3, 0, "local-only user");
                 let local_action =
                     dispatch_conversation_query_for_test(shell, &local, shared_task, 0);
-                apply_conversation_query_outcome_for_test(
-                    shell,
-                    &local,
-                    local_action,
-                    local_page,
-                );
+                apply_conversation_query_outcome_for_test(shell, &local, local_action, local_page);
 
                 shell
                     .select_fleet_task_key(
@@ -53311,7 +53899,9 @@ mod tests {
                 use crate::domain::{
                     agent::{AgentRole, AgentSessionFacts, AgentSessionLifecycle},
                     id::{AgentSessionId, EnvironmentId, ProjectId, ResourceId, SnapshotId},
-                    resource::{OwnerKind, ResourceFacts, ResourceKind, ResourceLifecycle, ResourceRecipe},
+                    resource::{
+                        OwnerKind, ResourceFacts, ResourceKind, ResourceLifecycle, ResourceRecipe,
+                    },
                     snapshot::{SnapshotItem, SnapshotPage, SnapshotSection, TaskSnapshotItem},
                     task::{
                         ReviewReadiness, TaskActivity, TaskAssignment, TaskConnectivity, TaskFacts,
@@ -53378,31 +53968,35 @@ mod tests {
                     (background_task, background_agent, 0xb7),
                 ] {
                     agents.push(SnapshotItem::AgentSession(AgentSessionFacts {
-                                id: agent_id,
-                                task_id,
-                                role: AgentRole::Primary,
-                                provider_kind: crate::providers::ProviderKind::ClaudeCode,
-                                provider_session_id: Some(
-                                    crate::domain::ProviderSessionId::new("provider-ready")
-                                        .expect("provider id"),
-                                ),
-                                lifecycle: AgentSessionLifecycle::Open,
-                                runtime_generation: 1,
-                                revision: 0,
-                            }));
+                        id: agent_id,
+                        task_id,
+                        role: AgentRole::Primary,
+                        provider_kind: crate::providers::ProviderKind::ClaudeCode,
+                        provider_session_id: Some(
+                            crate::domain::ProviderSessionId::new("provider-ready")
+                                .expect("provider id"),
+                        ),
+                        lifecycle: AgentSessionLifecycle::Open,
+                        runtime_generation: 1,
+                        revision: 0,
+                    }));
                     resources.push(SnapshotItem::Resource(ResourceFacts {
-                                id: ResourceId::from_bytes(uuid(resource_tail)).expect("resource"),
-                                task_id: Some(task_id),
-                                owner_kind: OwnerKind::Task,
-                                resource_kind: ResourceKind::Terminal,
-                                lifecycle: ResourceLifecycle::Active,
-                                recipe: ResourceRecipe::Terminal { cols: 80, rows: 24 },
-                                runtime_generation: 1,
-                                updated_at_ms: 1,
-                            }));
+                        id: ResourceId::from_bytes(uuid(resource_tail)).expect("resource"),
+                        task_id: Some(task_id),
+                        owner_kind: OwnerKind::Task,
+                        resource_kind: ResourceKind::Terminal,
+                        lifecycle: ResourceLifecycle::Active,
+                        recipe: ResourceRecipe::Terminal { cols: 80, rows: 24 },
+                        runtime_generation: 1,
+                        updated_at_ms: 1,
+                    }));
                 }
-                builder.ingest_page(page(SnapshotSection::AgentSessions, agents)).expect("agents");
-                builder.ingest_page(page(SnapshotSection::Resources, resources)).expect("resources");
+                builder
+                    .ingest_page(page(SnapshotSection::AgentSessions, agents))
+                    .expect("agents");
+                builder
+                    .ingest_page(page(SnapshotSection::Resources, resources))
+                    .expect("resources");
                 builder
                     .ingest_page(page(SnapshotSection::Artifacts, Vec::new()))
                     .expect("artifacts");
@@ -53487,21 +54081,23 @@ mod tests {
                 let first_action = dispatch_conversation_query_for_test(shell, &local, task_id, 0);
                 let _second_action =
                     dispatch_conversation_query_for_test(shell, &local, task_id, 0);
-                assert_ne!(first_action.request_generation, _second_action.request_generation);
-                let before_page = shell.task_surfaces.conversation_page(shell.local_task_key(task_id));
+                assert_ne!(
+                    first_action.request_generation,
+                    _second_action.request_generation
+                );
+                let before_page = shell
+                    .task_surfaces
+                    .conversation_page(shell.local_task_key(task_id));
                 let before_rows = timeline_message_roles_for_test(shell, &local, task_id);
                 assert!(before_rows.is_empty(), "fixture starts without messages");
 
                 let stale_page = test_conversation_user_page(5, 0, "stale must not land");
-                apply_conversation_query_outcome_for_test(
-                    shell,
-                    &local,
-                    first_action,
-                    stale_page,
-                );
+                apply_conversation_query_outcome_for_test(shell, &local, first_action, stale_page);
 
                 assert_eq!(
-                    shell.task_surfaces.conversation_page(shell.local_task_key(task_id)),
+                    shell
+                        .task_surfaces
+                        .conversation_page(shell.local_task_key(task_id)),
                     before_page,
                     "stale generation must reject before mutating retained conversation state"
                 );
@@ -53643,7 +54239,10 @@ mod tests {
                     .host_slot(&local)
                     .and_then(|slot| slot.cockpit.timeline_for(task_id))
                     .map(|timeline| timeline.rows().as_ptr());
-                assert_eq!(rows_ptr, rows_ptr_after, "replay paint must not reproject rows");
+                assert_eq!(
+                    rows_ptr, rows_ptr_after,
+                    "replay paint must not reproject rows"
+                );
                 assert_eq!(
                     shell.interactive_conversation_builds,
                     builds.saturating_add(1),
@@ -53669,7 +54268,9 @@ mod tests {
                 use crate::domain::{
                     agent::{AgentRole, AgentSessionFacts, AgentSessionLifecycle},
                     id::{AgentSessionId, EnvironmentId, ProjectId, ResourceId, SnapshotId},
-                    resource::{OwnerKind, ResourceFacts, ResourceKind, ResourceLifecycle, ResourceRecipe},
+                    resource::{
+                        OwnerKind, ResourceFacts, ResourceKind, ResourceLifecycle, ResourceRecipe,
+                    },
                     snapshot::{SnapshotItem, SnapshotPage, SnapshotSection, TaskSnapshotItem},
                     task::{
                         ReviewReadiness, TaskActivity, TaskAssignment, TaskConnectivity, TaskFacts,
@@ -53730,8 +54331,10 @@ mod tests {
                             role: AgentRole::Primary,
                             provider_kind: crate::providers::ProviderKind::ClaudeCode,
                             provider_session_id: Some(
-                                crate::domain::ProviderSessionId::new("provider-conversation-ready")
-                                    .expect("provider id"),
+                                crate::domain::ProviderSessionId::new(
+                                    "provider-conversation-ready",
+                                )
+                                .expect("provider id"),
                             ),
                             lifecycle: AgentSessionLifecycle::Open,
                             runtime_generation: 1,
@@ -53786,12 +54389,7 @@ mod tests {
 
                 let user_page = test_conversation_user_page(5, 0, "exact prompt");
                 let user_action = dispatch_conversation_query_for_test(shell, &local, task_id, 0);
-                apply_conversation_query_outcome_for_test(
-                    shell,
-                    &local,
-                    user_action,
-                    user_page,
-                );
+                apply_conversation_query_outcome_for_test(shell, &local, user_action, user_page);
                 assert_eq!(
                     shell
                         .task_row_status_for_owner(&owner)
@@ -53800,8 +54398,7 @@ mod tests {
                     "durable user without assistant must not clear Working early"
                 );
 
-                let assistant_page =
-                    test_conversation_assistant_page(6, 5, 7, "matched assistant");
+                let assistant_page = test_conversation_assistant_page(6, 5, 7, "matched assistant");
                 let assistant_action =
                     dispatch_conversation_query_for_test(shell, &local, task_id, 5);
                 apply_conversation_query_outcome_for_test(
@@ -53835,10 +54432,13 @@ mod tests {
                 endpoint: "fleet://remote-query-admission".into(),
             },
         );
-        remote_slot.host_runtime =
-            Some(NativeHostRuntimeAttachment::Injected(Box::new(remote_runtime)));
+        remote_slot.host_runtime = Some(NativeHostRuntimeAttachment::Injected(Box::new(
+            remote_runtime,
+        )));
         let _ = remote_slot.interaction.sync_host_epochs(epochs);
-        shell.attach_host_ui_slot(remote_slot).expect("attach remote");
+        shell
+            .attach_host_ui_slot(remote_slot)
+            .expect("attach remote");
         shell
             .apply_client_model_for_host(remote_host, model)
             .expect("remote model");
@@ -53864,12 +54464,8 @@ mod tests {
                         FleetSelectMode::Replace,
                     )
                     .expect("select first remote task");
-                let stale_action = dispatch_conversation_query_for_test(
-                    shell,
-                    &remote_host,
-                    first_task,
-                    0,
-                );
+                let stale_action =
+                    dispatch_conversation_query_for_test(shell, &remote_host, first_task, 0);
                 let preserved_detail = "preserved remote panel detail".to_string();
                 let preserved_tool = shell
                     .host_slot(&remote_host)
@@ -53885,8 +54481,7 @@ mod tests {
                 }
                 let owner_first = HostTaskKey::new(remote_host.clone(), first_task);
                 let before_page = shell.task_surfaces.conversation_page(owner_first.clone());
-                let before_rows =
-                    timeline_message_roles_for_test(shell, &remote_host, first_task);
+                let before_rows = timeline_message_roles_for_test(shell, &remote_host, first_task);
 
                 shell
                     .select_fleet_task_key(
@@ -53903,7 +54498,10 @@ mod tests {
                 );
 
                 let slot = shell.host_slot(&remote_host).expect("remote slot");
-                assert_eq!(slot.last_query_detail.as_deref(), Some(preserved_detail.as_str()));
+                assert_eq!(
+                    slot.last_query_detail.as_deref(),
+                    Some(preserved_detail.as_str())
+                );
                 assert!(
                     matches!(
                         slot.last_action_failure.as_ref(),
@@ -53985,7 +54583,10 @@ mod tests {
                 );
 
                 let slot = shell.host_slot(&remote_host).expect("remote slot");
-                assert_eq!(slot.last_query_detail.as_deref(), Some(preserved_detail.as_str()));
+                assert_eq!(
+                    slot.last_query_detail.as_deref(),
+                    Some(preserved_detail.as_str())
+                );
                 assert!(
                     matches!(
                         slot.last_action_failure.as_ref(),
@@ -54021,12 +54622,7 @@ mod tests {
                         FleetSelectMode::Replace,
                     )
                     .expect("select remote task");
-                let action = dispatch_conversation_query_for_test(
-                    shell,
-                    &remote_host,
-                    task_id,
-                    0,
-                );
+                let action = dispatch_conversation_query_for_test(shell, &remote_host, task_id, 0);
                 apply_conversation_query_outcome_for_test(
                     shell,
                     &remote_host,
@@ -54035,7 +54631,9 @@ mod tests {
                 );
                 let roles = timeline_message_roles_for_test(shell, &remote_host, task_id);
                 assert!(
-                    roles.iter().any(|role| *role == crate::ui::renderers::MessageRole::User),
+                    roles
+                        .iter()
+                        .any(|role| *role == crate::ui::renderers::MessageRole::User),
                     "current foreground query must project admitted rows"
                 );
                 assert_eq!(
@@ -54104,8 +54702,7 @@ mod tests {
                     test_conversation_assistant_page(6, 0, 6, "background assistant"),
                 );
 
-                let roles =
-                    timeline_message_roles_for_test(shell, &remote_host, background_task);
+                let roles = timeline_message_roles_for_test(shell, &remote_host, background_task);
                 assert!(
                     roles
                         .iter()
@@ -54143,15 +54740,15 @@ mod tests {
                         endpoint: "fleet://remote-send-focus".into(),
                     },
                 );
-                remote_slot.host_runtime =
-                    Some(NativeHostRuntimeAttachment::Injected(Box::new(remote_runtime)));
+                remote_slot.host_runtime = Some(NativeHostRuntimeAttachment::Injected(Box::new(
+                    remote_runtime,
+                )));
                 let _ = remote_slot.interaction.sync_host_epochs(epochs);
-                shell.attach_host_ui_slot(remote_slot).expect("attach remote");
                 shell
-                    .apply_client_model_for_host(
-                        &remote_host,
-                        std::sync::Arc::clone(&model),
-                    )
+                    .attach_host_ui_slot(remote_slot)
+                    .expect("attach remote");
+                shell
+                    .apply_client_model_for_host(&remote_host, std::sync::Arc::clone(&model))
                     .expect("remote model");
                 let remote_key = HostTaskKey::new(remote_host.clone(), shared_task);
                 shell
@@ -54174,15 +54771,11 @@ mod tests {
                     .accepted
                     .iter()
                     .find(|record| {
-                        matches!(
-                            record.command,
-                            NativeHostCommand::ProviderInput { .. }
-                        )
+                        matches!(record.command, NativeHostCommand::ProviderInput { .. })
                     })
                     .cloned()
                     .expect("remote pending send");
-                let command_id =
-                    native_command_id(&submitted.command).expect("send command id");
+                let command_id = native_command_id(&submitted.command).expect("send command id");
                 assert!(
                     shell.pending_composer_submissions.contains_key(&command_id),
                     "SendNow must park pending submission on remote owner"
@@ -54247,8 +54840,7 @@ mod tests {
                 );
                 let owner = HostTaskKey::new(remote_host.clone(), task_id);
                 let before_page = shell.task_surfaces.conversation_page(owner.clone());
-                let before_rows =
-                    timeline_message_roles_for_test(shell, &remote_host, task_id);
+                let before_rows = timeline_message_roles_for_test(shell, &remote_host, task_id);
                 apply_conversation_query_outcome_for_test(
                     shell,
                     &remote_host,
@@ -54284,10 +54876,13 @@ mod tests {
                 endpoint: "fleet://remote-tools".into(),
             },
         );
-        remote_slot.host_runtime =
-            Some(NativeHostRuntimeAttachment::Injected(Box::new(remote_runtime)));
+        remote_slot.host_runtime = Some(NativeHostRuntimeAttachment::Injected(Box::new(
+            remote_runtime,
+        )));
         let _ = remote_slot.interaction.sync_host_epochs(epochs);
-        shell.attach_host_ui_slot(remote_slot).expect("attach remote");
+        shell
+            .attach_host_ui_slot(remote_slot)
+            .expect("attach remote");
         shell
             .apply_client_model_for_host(remote_host, model)
             .expect("remote model");
@@ -54381,7 +54976,9 @@ mod tests {
                         _ => None,
                     })
                     .collect::<Vec<_>>();
-                assert!(changes.iter().any(|q| matches!(q, TaskCockpitQuery::WorkspaceStatus)));
+                assert!(changes
+                    .iter()
+                    .any(|q| matches!(q, TaskCockpitQuery::WorkspaceStatus)));
                 assert!(changes
                     .iter()
                     .any(|q| matches!(q, TaskCockpitQuery::GitRepositories)));
@@ -54418,7 +55015,9 @@ mod tests {
                 assert_eq!(review.identity.task_id, shared_task);
                 assert!(
                     shell.host_slot(&host_a).is_some_and(|slot| {
-                        slot.cockpit.live_projection().is_none_or(|live| live.files.is_none())
+                        slot.cockpit
+                            .live_projection()
+                            .is_none_or(|live| live.files.is_none())
                     }),
                     "host A Files projection must remain untouched"
                 );
@@ -54491,9 +55090,8 @@ mod tests {
                     .and_then(|slot| slot.cockpit.live_projection())
                     .and_then(|projection| projection.files.clone());
                 assert!(
-                    live.as_ref()
-                        .is_none_or(|files| files.task_id != first_task
-                            || files.entries.iter().all(|e| e.relative_path != "stale.md")),
+                    live.as_ref().is_none_or(|files| files.task_id != first_task
+                        || files.entries.iter().all(|e| e.relative_path != "stale.md")),
                     "stale FilesList after focus switch must not land"
                 );
             });
@@ -54580,9 +55178,11 @@ mod tests {
                     "owner surface must admit the remote terminal projection"
                 );
                 assert!(
-                    shell
-                        .host_slot(&remote_host)
-                        .is_some_and(|slot| slot.cockpit.dock().terminal_binding().is_some()),
+                    shell.host_slot(&remote_host).is_some_and(|slot| slot
+                        .cockpit
+                        .dock()
+                        .terminal_binding()
+                        .is_some()),
                     "owner dock must retain the replica binding"
                 );
                 let before_local = local_shared.lock().expect("local").accepted.len();
@@ -54613,11 +55213,8 @@ mod tests {
             crate::ui::init(cx);
             with_test_shell_in_app(cx, runtime, |shell| {
                 let (model, task_id) = terminal_bound_client_model();
-                let shared = attach_remote_test_host_with_shared(
-                    shell,
-                    &remote_host,
-                    Arc::new(model),
-                );
+                let shared =
+                    attach_remote_test_host_with_shared(shell, &remote_host, Arc::new(model));
                 let owner = HostTaskKey::new(remote_host.clone(), task_id);
                 shell
                     .select_fleet_task_key(owner.clone(), FleetSelectMode::Replace)
@@ -55001,8 +55598,7 @@ mod tests {
                     "pre-fixture dock must not already hold a replica/last_valid terminal view"
                 );
                 assert_eq!(
-                    before_fingerprint.last_sequence,
-                    0,
+                    before_fingerprint.last_sequence, 0,
                     "pre-fixture dock sequence must not already carry a terminal projection"
                 );
                 let before_surface_terminal = shell
@@ -55070,17 +55666,20 @@ mod tests {
                     "forged Terminal body must not change the dock projection fingerprint"
                 );
                 assert_eq!(
-                    after_fingerprint.last_sequence,
-                    before_fingerprint.last_sequence,
+                    after_fingerprint.last_sequence, before_fingerprint.last_sequence,
                     "forged sequence must not advance the dock fingerprint last_sequence"
                 );
                 assert!(
-                    !shell
-                        .host_slot(&remote_host)
-                        .is_some_and(|slot| slot.cockpit.dock().replica_view().is_some())
-                        && !shell
-                            .host_slot(&remote_host)
-                            .is_some_and(|slot| slot.cockpit.dock().last_valid_view().is_some()),
+                    !shell.host_slot(&remote_host).is_some_and(|slot| slot
+                        .cockpit
+                        .dock()
+                        .replica_view()
+                        .is_some())
+                        && !shell.host_slot(&remote_host).is_some_and(|slot| slot
+                            .cockpit
+                            .dock()
+                            .last_valid_view()
+                            .is_some()),
                     "forged Terminal body must leave replica_view and last_valid_view absent"
                 );
                 let after_surface = shell
@@ -55191,11 +55790,8 @@ mod tests {
             with_test_shell_in_app(cx, runtime, |shell| {
                 let (model, task_id) = terminal_bound_client_model();
                 let model = Arc::new(model);
-                let shared = attach_remote_test_host_with_shared(
-                    shell,
-                    &remote_host,
-                    Arc::clone(&model),
-                );
+                let shared =
+                    attach_remote_test_host_with_shared(shell, &remote_host, Arc::clone(&model));
                 let owner = HostTaskKey::new(remote_host.clone(), task_id);
                 shell
                     .select_fleet_task_key(owner.clone(), FleetSelectMode::Replace)
@@ -55226,15 +55822,20 @@ mod tests {
                     "catalog may cache while Files is active"
                 );
                 assert!(
-                    !shared.lock().expect("remote").accepted.iter().any(|record| {
-                        matches!(
-                            &record.command,
-                            NativeHostCommand::TaskCockpitQuery {
-                                query: TaskCockpitQuery::GitStatusTargeted { .. },
-                                ..
-                            }
-                        )
-                    }),
+                    !shared
+                        .lock()
+                        .expect("remote")
+                        .accepted
+                        .iter()
+                        .any(|record| {
+                            matches!(
+                                &record.command,
+                                NativeHostCommand::TaskCockpitQuery {
+                                    query: TaskCockpitQuery::GitStatusTargeted { .. },
+                                    ..
+                                }
+                            )
+                        }),
                     "GitStatus follow-up must defer until Changes is the active focused tool"
                 );
 

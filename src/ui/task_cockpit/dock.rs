@@ -1078,6 +1078,34 @@ impl ContextDock {
         if self.current_memory().last_sequence == projection.sequence {
             return Ok(false);
         }
+        let view = Self::terminal_session_view_from_projection(projection);
+        self.admit_host_view(
+            HostStreamCursor::from_identity(actual, projection.sequence, true),
+            view,
+        )?;
+        Ok(true)
+    }
+
+    pub fn terminal_pane_model_for_projection(
+        projection: &TaskTerminalProjection,
+    ) -> TerminalPaneModel {
+        let view = Self::terminal_session_view_from_projection(projection);
+        terminal_pane_from_replica(ReplicaPaneRequest {
+            active_project: "",
+            session_label: projection.title.as_deref().unwrap_or("task terminal"),
+            replica_view: Some(&view),
+            last_valid_view: None,
+            overlay: TerminalReplicaOverlay::None,
+            selection: None,
+            search: None,
+            search_highlight: None,
+            scrollbar: None,
+        })
+    }
+
+    fn terminal_session_view_from_projection(
+        projection: &TaskTerminalProjection,
+    ) -> TerminalSessionView {
         let mut dimensions = crate::state::SessionDimensions::default();
         dimensions.cols = projection.screen.cols.clamp(1, u16::MAX as usize) as u16;
         dimensions.rows = projection.screen.rows.clamp(1, u16::MAX as usize) as u16;
@@ -1158,12 +1186,7 @@ impl ContextDock {
                 })
                 .collect();
         }
-        let view = TerminalSessionView { runtime, screen };
-        self.admit_host_view(
-            HostStreamCursor::from_identity(actual, projection.sequence, true),
-            view,
-        )?;
-        Ok(true)
+        TerminalSessionView { runtime, screen }
     }
 
     pub fn present_host_overlay(
