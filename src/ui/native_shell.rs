@@ -14891,6 +14891,33 @@ impl NativeShell {
         slot.host_state = runtime_state;
     }
 
+    fn reconcile_recovered_local_host_state(&mut self) -> bool {
+        let recovered_state = {
+            let slot = self.local_slot();
+            if slot.client_model.is_none()
+                || slot.last_action_failure.is_some()
+                || !matches!(
+                    slot.host_state,
+                    NativeHostState::Disconnected | NativeHostState::Error { .. }
+                )
+            {
+                return false;
+            }
+            slot.host_runtime.as_ref().and_then(|runtime| {
+                let state = match runtime {
+                    NativeHostRuntimeAttachment::Injected(runtime) => runtime.host_state(),
+                    NativeHostRuntimeAttachment::Client(runtime) => runtime.host_state(),
+                };
+                matches!(state, NativeHostState::Connected { .. }).then_some(state)
+            })
+        };
+        let Some(recovered_state) = recovered_state else {
+            return false;
+        };
+        self.local_slot_mut().host_state = recovered_state;
+        true
+    }
+
     fn controller_tick(&mut self, max: usize) -> bool {
         self.controller_ticks = self.controller_ticks.saturating_add(1);
         if self.settings_open
@@ -14942,6 +14969,9 @@ impl NativeShell {
             repaint = true;
         }
         if self.poll_trusted_hosts() {
+            repaint = true;
+        }
+        if self.reconcile_recovered_local_host_state() {
             repaint = true;
         }
         if should_schedule_host_bootstrap_retry(
@@ -39904,6 +39934,43 @@ mod tests {
         assert!(
             empty_ids.iter().any(|id| id == "native-projects-add"),
             "canonical empty local workspace must expose Add project"
+        );
+    }
+
+    #[test]
+    fn connected_runtime_reconciles_a_stale_recovery_deadline_error() {
+        if rerun_headless_shell_test_in_child(
+            "ui::native_shell::tests::connected_runtime_reconciles_a_stale_recovery_deadline_error",
+        ) {
+            return;
+        }
+        let _test_guard = HEADLESS_SHELL_TEST_LOCK
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .expect("headless shell test lock");
+        let completed = std::rc::Rc::new(std::cell::RefCell::new(None));
+        let completed_for_app = std::rc::Rc::clone(&completed);
+        gpui::Application::headless().run(move |cx| {
+            crate::ui::init(cx);
+            let (runtime, _) = TestRuntime::new(true, NativeHostActionResult::Queued);
+            let snapshot = with_test_shell_in_app(cx, runtime, |shell| {
+                shell
+                    .apply_client_model(Arc::new(empty_canonical_client_model()))
+                    .expect("canonical model");
+                shell.local_slot_mut().host_state = NativeHostState::Error {
+                    message: "native host fleet recovery deadline expired".to_string(),
+                };
+
+                shell.controller_tick(0);
+                shell.host_status_text()
+            });
+            *completed_for_app.borrow_mut() = Some(snapshot);
+            cx.quit();
+        });
+        assert_eq!(
+            completed.borrow().as_deref(),
+            Some("Connected"),
+            "a live runtime must replace a stale recovery error with its current connection state"
         );
     }
 
