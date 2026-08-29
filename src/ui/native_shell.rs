@@ -35125,6 +35125,9 @@ impl NativeShell {
             component.input = tokens.borders.default.to_gpui().into();
             component.ring = tokens.borders.focus.to_gpui().into();
             component.caret = tokens.actions.primary.default.background.to_gpui().into();
+            component.link = tokens.status.external.to_gpui().into();
+            component.link_hover = tokens.actions.primary.hover.background.to_gpui().into();
+            component.link_active = tokens.actions.primary.selected.background.to_gpui().into();
             component.muted = tokens.surfaces.sunken.to_gpui().into();
             component.muted_foreground = tokens.text.muted.to_gpui().into();
             component.popover = tokens.surfaces.raised.to_gpui().into();

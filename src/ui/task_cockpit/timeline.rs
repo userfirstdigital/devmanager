@@ -59,8 +59,10 @@ fn timeline_row_element(
     row: &ConversationRow,
     tokens: ThemeTokens,
     activity_toggle: Option<ActivityToggleHandler>,
+    window: &mut Window,
+    cx: &mut App,
 ) -> AnyElement {
-    let visual = conversation_row_element(row, tokens);
+    let visual = conversation_row_element(row, tokens, window, cx);
     let ConversationRow::ActivityToggle { group, .. } = row else {
         return visual;
     };
@@ -411,20 +413,19 @@ impl Timeline {
                                     .into_any_element()
                             }))
                             .child(
-                                list(
-                                    list_state,
-                                    move |ix, _window: &mut Window, _cx: &mut App| {
-                                        rows.get(ix)
-                                            .map(|row| {
-                                                timeline_row_element(
-                                                    row,
-                                                    tokens,
-                                                    activity_toggle_for_rows.clone(),
-                                                )
-                                            })
-                                            .unwrap_or_else(|| div().into_any_element())
-                                    },
-                                )
+                                list(list_state, move |ix, window: &mut Window, cx: &mut App| {
+                                    rows.get(ix)
+                                        .map(|row| {
+                                            timeline_row_element(
+                                                row,
+                                                tokens,
+                                                activity_toggle_for_rows.clone(),
+                                                window,
+                                                cx,
+                                            )
+                                        })
+                                        .unwrap_or_else(|| div().into_any_element())
+                                })
                                 .flex_1(),
                             ),
                     ),
@@ -1286,6 +1287,18 @@ mod tests {
         assert_eq!(
             first.list_state().item_count(),
             second.list_state().item_count()
+        );
+    }
+
+    #[test]
+    fn timeline_assistant_paint_uses_native_gfm_backend() {
+        use crate::ui::conversation::render::{
+            assistant_message_paint_backend, AssistantMarkdownBackend,
+        };
+        assert_eq!(
+            assistant_message_paint_backend(),
+            AssistantMarkdownBackend::NativeGfm,
+            "timeline list closure receives Window/App so assistant rows can use TextView::markdown"
         );
     }
 }

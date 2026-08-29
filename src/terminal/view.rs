@@ -64,6 +64,9 @@ pub struct TerminalRenderPalette {
 impl TerminalRenderPalette {
     /// Map every chrome / named default color from the caller's active tokens.
     pub fn from_tokens(tokens: ThemeTokens) -> Self {
+        // v0.4.1 hierarchy: darkest terminal cell plane, readable chrome labels,
+        // success-colored cursor visibility. ANSI cell colors stay process-owned
+        // in `effective_cell_style`; only default/named chrome is remapped here.
         Self {
             canvas: tokens.surfaces.canvas.to_u32(),
             panel: tokens.surfaces.sunken.to_u32(),
@@ -74,8 +77,8 @@ impl TerminalRenderPalette {
             border: tokens.borders.default.to_u32(),
             text_primary: tokens.text.primary.to_u32(),
             text_muted: tokens.text.muted.to_u32(),
-            text_subtle: tokens.text.disabled.to_u32(),
-            text_dim: tokens.text.disabled.to_u32(),
+            text_subtle: tokens.text.muted.to_u32(),
+            text_dim: tokens.text.muted.to_u32(),
             selection_bg: tokens.terminal.selection.to_u32(),
             selection_text: tokens.text.on_selection.to_u32(),
             primary: tokens.actions.primary.default.background.to_u32(),
@@ -86,7 +89,7 @@ impl TerminalRenderPalette {
             success: tokens.status.success.to_u32(),
             terminal_bg: tokens.terminal.background.to_u32(),
             terminal_fg: tokens.terminal.foreground.to_u32(),
-            terminal_cursor: tokens.terminal.cursor.to_u32(),
+            terminal_cursor: tokens.status.success.to_u32(),
             terminal_selection: tokens.terminal.selection.to_u32(),
             scrollbar_track: tokens.surfaces.raised.to_u32(),
             scrollbar_thumb: tokens.text.muted.to_u32(),
@@ -1932,8 +1935,8 @@ mod theme_palette_tests {
         assert_eq!(palette.border, 0x060606);
         assert_eq!(palette.text_primary, 0x070707);
         assert_eq!(palette.text_muted, 0x080808);
-        assert_eq!(palette.text_subtle, 0x090909);
-        assert_eq!(palette.text_dim, 0x090909);
+        assert_eq!(palette.text_subtle, 0x080808);
+        assert_eq!(palette.text_dim, 0x080808);
         assert_eq!(palette.selection_text, 0x0a0a0a);
         assert_eq!(palette.primary, 0x0b0b0b);
         assert_eq!(palette.primary_muted, 0x0c0c0c);
@@ -1943,7 +1946,7 @@ mod theme_palette_tests {
         assert_eq!(palette.success, 0x101010);
         assert_eq!(palette.terminal_bg, PREVIEW_SENTINEL.to_u32());
         assert_eq!(palette.terminal_fg, 0x121212);
-        assert_eq!(palette.terminal_cursor, 0x131313);
+        assert_eq!(palette.terminal_cursor, 0x101010);
         assert_eq!(palette.terminal_selection, 0x141414);
         assert_eq!(palette.selection_bg, 0x141414);
         assert_eq!(palette.scrollbar_track, 0x020202);
@@ -2038,5 +2041,164 @@ mod theme_palette_tests {
         assert_eq!(style.foreground, palette.selection_text);
         assert_eq!(style.background, palette.selection_bg);
         assert!(style.paint_background);
+    }
+
+    #[test]
+    fn effective_style_preserves_explicit_ansi_rgb_background_and_text_attrs() {
+        let palette = terminal_render_palette_from_tokens(sentinel_tokens());
+        let cell = TerminalCellSnapshot {
+            character: 'Z',
+            zero_width: Vec::new(),
+            foreground: 0x22c55e,
+            background: 0x1e3a5f,
+            bold: true,
+            dim: true,
+            italic: true,
+            underline: true,
+            undercurl: true,
+            strike: true,
+            hidden: false,
+            has_hyperlink: false,
+            default_background: false,
+            default_foreground: false,
+        };
+        let style = effective_cell_style(&cell, false, None, palette);
+        assert_eq!(style.foreground, 0x22c55e);
+        assert_eq!(style.background, 0x1e3a5f);
+        assert!(style.paint_background);
+        assert!(style.bold);
+        assert!(style.dim);
+        assert!(style.italic);
+        assert!(style.underline);
+        assert!(style.undercurl);
+        assert!(style.strike);
+        assert_ne!(style.foreground, palette.terminal_fg);
+        assert_ne!(style.background, palette.terminal_bg);
+    }
+
+    #[test]
+    fn effective_style_block_cursor_uses_visible_palette_cursor() {
+        use crate::terminal::session::TerminalCursorSnapshot;
+        use alacritty_terminal::vte::ansi::CursorShape;
+
+        let palette = terminal_render_palette_from_tokens(sentinel_tokens());
+        let cell = TerminalCellSnapshot {
+            character: 'c',
+            zero_width: Vec::new(),
+            foreground: 0xe4e4e7,
+            background: 0x09090b,
+            bold: false,
+            dim: true,
+            italic: false,
+            underline: false,
+            undercurl: false,
+            strike: false,
+            hidden: false,
+            has_hyperlink: false,
+            default_background: true,
+            default_foreground: true,
+        };
+        let cursor = TerminalCursorSnapshot {
+            row: 0,
+            column: 0,
+            shape: CursorShape::Block,
+        };
+        let style = effective_cell_style(&cell, false, Some(cursor), palette);
+        assert_eq!(style.background, palette.terminal_cursor);
+        assert_eq!(style.foreground, palette.panel);
+        assert!(style.bold);
+        assert!(!style.dim);
+        assert!(style.paint_background);
+    }
+
+    fn relative_luminance(color: u32) -> f32 {
+        let channel = |value: u32| {
+            let c = (value as f32) / 255.0;
+            if c <= 0.04045 {
+                c / 12.92
+            } else {
+                ((c + 0.055) / 1.055).powf(2.4)
+            }
+        };
+        let r = channel((color >> 16) & 0xff);
+        let g = channel((color >> 8) & 0xff);
+        let b = channel(color & 0xff);
+        0.2126 * r + 0.7152 * g + 0.0722 * b
+    }
+
+    fn contrast_ratio(a: u32, b: u32) -> f32 {
+        let (lighter, darker) = {
+            let la = relative_luminance(a);
+            let lb = relative_luminance(b);
+            if la >= lb {
+                (la, lb)
+            } else {
+                (lb, la)
+            }
+        };
+        (lighter + 0.05) / (darker + 0.05)
+    }
+
+    #[test]
+    fn v041_derived_chrome_hierarchy_is_readable() {
+        let legacy = TerminalRenderPalette::legacy_default();
+        assert!(
+            relative_luminance(legacy.terminal_bg) < relative_luminance(legacy.canvas),
+            "terminal cell plane must sit darker than outer canvas"
+        );
+        assert!(
+            relative_luminance(legacy.terminal_bg) < relative_luminance(legacy.panel_header),
+            "terminal cell plane must sit darker than header chrome"
+        );
+        assert!(
+            contrast_ratio(legacy.terminal_fg, legacy.terminal_bg) >= 7.0,
+            "monospace default fg needs strong contrast on terminal bg"
+        );
+        assert_eq!(legacy.terminal_cursor, theme::SUCCESS_TEXT);
+        assert_ne!(legacy.scrollbar_thumb, legacy.scrollbar_track);
+        assert_ne!(legacy.selection_bg, legacy.terminal_bg);
+
+        let tokens = dark(Density::Comfortable, Scale::Scale100);
+        let palette = terminal_render_palette_from_tokens(tokens);
+        assert!(
+            relative_luminance(palette.terminal_bg) <= relative_luminance(palette.canvas),
+            "themed terminal bg must not wash above canvas"
+        );
+        assert!(
+            contrast_ratio(palette.terminal_fg, palette.terminal_bg) >= 4.5,
+            "themed terminal fg/bg must stay readable"
+        );
+        assert_eq!(
+            palette.terminal_cursor,
+            tokens.status.success.to_u32(),
+            "cursor chrome follows v0.4.1 success-colored visibility via ThemeTokens"
+        );
+        assert_eq!(
+            palette.text_dim,
+            tokens.text.muted.to_u32(),
+            "chrome labels use muted (readable) rather than disabled"
+        );
+        assert_eq!(palette.scrollbar_thumb, tokens.text.muted.to_u32());
+        assert_ne!(palette.scrollbar_thumb, palette.scrollbar_track);
+        // Explicit ANSI must remain process-owned even after chrome remapping.
+        let ansi = TerminalCellSnapshot {
+            character: '!',
+            zero_width: Vec::new(),
+            foreground: 0xfacc15,
+            background: 0x1d4ed8,
+            bold: false,
+            dim: false,
+            italic: false,
+            underline: false,
+            undercurl: false,
+            strike: false,
+            hidden: false,
+            has_hyperlink: false,
+            default_background: false,
+            default_foreground: false,
+        };
+        let style = effective_cell_style(&ansi, false, None, palette);
+        assert_eq!(style.foreground, 0xfacc15);
+        assert_eq!(style.background, 0x1d4ed8);
     }
 }

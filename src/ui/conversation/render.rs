@@ -8,17 +8,93 @@
 //! in the first place (see `rows.rs`).
 
 use gpui::{
-    div, font, px, AnyElement, ClipboardItem, ElementId, Font, FontFeatures, FontWeight,
-    InteractiveElement, IntoElement, ParentElement, StatefulInteractiveElement, Styled,
+    div, font, px, rems, AnyElement, App, ClipboardItem, ElementId, Font, FontFeatures, FontWeight,
+    InteractiveElement, IntoElement, ParentElement, StatefulInteractiveElement, Styled, Window,
+};
+use gpui_component::{
+    text::{TextView, TextViewStyle},
+    ActiveTheme,
 };
 use std::sync::{Arc, OnceLock};
 use time::{format_description, format_description::BorrowedFormatItem, OffsetDateTime, UtcOffset};
 
 use crate::ui::conversation::rows::{
     activity_toggle_label, ActivityEntry, ActivityKind, ActivityState, ConversationRow,
+    ConversationRowKey,
 };
-use crate::ui::renderers::{MarkdownBlock, MarkdownDocument, MessageRole};
-use crate::ui::tokens::{mix_color, ThemeTokens};
+use crate::ui::renderers::{MarkdownDocument, MessageRole};
+use crate::ui::tokens::{mix_color, ThemeMode, ThemeTokens};
+
+/// Production assistant markdown backend.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AssistantMarkdownBackend {
+    /// gpui-component `TextView::markdown` (GFM).
+    NativeGfm,
+    /// Legacy home-grown heading/paragraph/code painter (must not remain selected).
+    LegacyHomeGrownBlocks,
+}
+
+/// Paint plan for one message body. Stable identity is derived from
+/// the conversation row key so streaming updates and virtualization recycle the
+/// same `TextView` keyed state instead of minting a fresh entity each repaint.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MessageMarkdownPlan {
+    pub backend: AssistantMarkdownBackend,
+    pub selectable: bool,
+    pub source: String,
+    pub text_view_key: String,
+}
+
+/// Representative T3-shaped markdown used by focused render-seam tests.
+pub fn representative_t3_gfm_markdown() -> &'static str {
+    "\
+# Release notes
+
+Paragraph with **strong**, *emphasis*, and `inline code`.
+
+> Calm blockquote for secondary guidance.
+
+- Unordered item
+  - Nested unordered item
+1. Ordered item
+2. Second ordered item
+- [ ] Task item still open
+- [x] Task item done
+
+| Column | Value |
+| --- | --- |
+| Link | [docs](https://example.com/docs) |
+
+```rust
+fn paint() {}
+```
+"
+}
+
+pub fn message_text_view_key(row_key: &ConversationRowKey, user: bool) -> String {
+    let role = if user { "user" } else { "assistant" };
+    format!("conversation-{role}-gfm-{row_key:?}")
+}
+
+pub fn plan_message_markdown_render(
+    row_key: &ConversationRowKey,
+    source: &str,
+    selectable: bool,
+    user: bool,
+) -> MessageMarkdownPlan {
+    MessageMarkdownPlan {
+        backend: AssistantMarkdownBackend::NativeGfm,
+        selectable,
+        source: source.to_string(),
+        text_view_key: message_text_view_key(row_key, user),
+    }
+}
+
+/// Backend actually used by [`assistant_message_element`]. Tests require this
+/// to match [`AssistantMarkdownBackend::NativeGfm`] once the TextView path is live.
+pub fn assistant_message_paint_backend() -> AssistantMarkdownBackend {
+    AssistantMarkdownBackend::NativeGfm
+}
 
 /// Target: the user bubble caps at 80 percent of the readable measure.
 const USER_BUBBLE_FRACTION: f32 = 0.80;
@@ -52,7 +128,12 @@ fn message_meta_opacity(revealed: bool) -> f32 {
 
 use crate::ui::task_cockpit::timeline::CONVERSATION_CONTENT_MAX_WIDTH;
 
-pub fn conversation_row_element(row: &ConversationRow, tokens: ThemeTokens) -> AnyElement {
+pub fn conversation_row_element(
+    row: &ConversationRow,
+    tokens: ThemeTokens,
+    window: &mut Window,
+    cx: &mut App,
+) -> AnyElement {
     match row {
         ConversationRow::Message {
             role: MessageRole::User,
@@ -68,6 +149,8 @@ pub fn conversation_row_element(row: &ConversationRow, tokens: ThemeTokens) -> A
             true,
             false,
             tokens,
+            window,
+            cx,
         ),
         ConversationRow::Message {
             role: MessageRole::Reasoning,
@@ -88,6 +171,8 @@ pub fn conversation_row_element(row: &ConversationRow, tokens: ThemeTokens) -> A
             false,
             *streaming,
             tokens,
+            window,
+            cx,
         ),
         ConversationRow::Error { text, .. } => error_element(text.clone(), tokens),
         ConversationRow::Activity { entries, state, .. } => {
@@ -130,37 +215,77 @@ pub fn conversation_row_height(row: &ConversationRow, tokens: ThemeTokens) -> u3
     let line_height = tokens.density.typography.body_line_height.max(1.0);
     let caption_line_height = tokens.density.typography.caption_line_height.max(1.0);
     let text_lines = |text: &str| text.lines().count().max(1) as f32;
-    match row {
+    let height = match row {
         ConversationRow::Message {
             role: MessageRole::Reasoning,
             text,
             ..
-        } => (16.0 + text_lines(text) * caption_line_height) as u32,
+        } => 16.0 + text_lines(text) * caption_line_height,
         ConversationRow::Message {
             role: MessageRole::User,
             text,
             ..
-        } => (24.0 + text_lines(text) * line_height + 4.0 + caption_line_height) as u32,
+        } => 24.0 + markdown_body_height(text, tokens) + 4.0 + caption_line_height,
         ConversationRow::Message { text, .. } => {
-            (4.0 + text_lines(text) * line_height + 4.0 + caption_line_height) as u32
+            4.0 + markdown_body_height(text, tokens) + 4.0 + caption_line_height
         }
         ConversationRow::Error { text, .. } => {
-            (32.0 + caption_line_height + text_lines(text) * line_height) as u32
+            32.0 + caption_line_height + text_lines(text) * line_height
         }
         ConversationRow::Activity { entries, .. } => {
-            activity_row_height(entries, caption_line_height) as u32
+            activity_row_height(entries, caption_line_height)
         }
-        ConversationRow::ActivityToggle { .. } => (ICON_SLOT + 4.0) as u32,
+        ConversationRow::ActivityToggle { .. } => ICON_SLOT + 4.0,
         ConversationRow::Question {
             prompt, choices, ..
-        } => {
-            (28.0 + text_lines(prompt) * line_height + if choices.is_empty() { 0.0 } else { 32.0 })
-                as u32
+        } => 28.0 + text_lines(prompt) * line_height + if choices.is_empty() { 0.0 } else { 32.0 },
+        ConversationRow::TurnFold { .. } => 24.0,
+        ConversationRow::Working { .. } => 20.0,
+    };
+    height.max(16.0).min(u32::MAX as f32) as u32
+}
+
+/// Match the native GFM block cadence closely enough for scroll anchoring and
+/// follow-to-bottom bookkeeping. The previous fixed `line_count * line_height`
+/// estimate flattened paragraph gaps and code/table padding, then truncated the
+/// entire message at 480px. That made a long, correctly painted answer appear
+/// to start above the viewport or jump while streaming.
+fn markdown_body_height(text: &str, tokens: ThemeTokens) -> f32 {
+    let body_line = tokens.density.typography.body_line_height.max(1.0);
+    let code_line = (tokens.density.typography.caption_line_height + 2.0).max(1.0);
+    let paragraph_gap = (tokens.density.typography.body * 0.55).max(4.0);
+    let mut height = 0.0;
+    let mut in_fence = false;
+    let mut fence_lines = 0usize;
+
+    for line in text.lines() {
+        let trimmed = line.trim_start();
+        if trimmed.starts_with("```") || trimmed.starts_with("~~~") {
+            if in_fence {
+                height += 24.0 + fence_lines.max(1) as f32 * code_line + paragraph_gap;
+                fence_lines = 0;
+            }
+            in_fence = !in_fence;
+            continue;
         }
-        ConversationRow::TurnFold { .. } => 24.0 as u32,
-        ConversationRow::Working { .. } => 20.0 as u32,
+        if in_fence {
+            fence_lines = fence_lines.saturating_add(1);
+            continue;
+        }
+        if trimmed.is_empty() {
+            height += paragraph_gap;
+        } else if trimmed.starts_with('#') {
+            height += body_line + 5.0;
+        } else if trimmed.starts_with('|') {
+            height += body_line + 8.0;
+        } else {
+            height += body_line;
+        }
     }
-    .clamp(16, 480)
+    if in_fence {
+        height += 24.0 + fence_lines.max(1) as f32 * code_line;
+    }
+    height.max(body_line)
 }
 
 /// Keep timeline virtualization aware of the surfaced Tasks card. The card
@@ -221,7 +346,15 @@ fn turn_fold_element(label: &str, expanded: bool, tokens: ThemeTokens) -> AnyEle
 /// Right alignment uses `justify_end()` on a row. Aligning with `items_end()`
 /// on a column collapses its children to zero width in GPUI and they never
 /// paint -- measured, not assumed, while building the prototype this ports.
-fn user_message_element(text: String, tokens: ThemeTokens) -> AnyElement {
+fn user_message_element(
+    row_key: &ConversationRowKey,
+    text: &str,
+    markdown: &MarkdownDocument,
+    tokens: ThemeTokens,
+    window: &mut Window,
+    cx: &mut App,
+) -> AnyElement {
+    let view = native_markdown_view(row_key, text, markdown, true, tokens, window, cx);
     div()
         .w_full()
         .flex()
@@ -233,7 +366,7 @@ fn user_message_element(text: String, tokens: ThemeTokens) -> AnyElement {
                 .rounded(px(USER_BUBBLE_RADIUS))
                 .bg(tokens.surfaces.raised.to_gpui())
                 .text_color(tokens.text.primary.to_gpui())
-                .child(text),
+                .child(view),
         )
         .into_any_element()
 }
@@ -250,15 +383,15 @@ fn message_row_element(
     user: bool,
     streaming: bool,
     tokens: ThemeTokens,
+    window: &mut Window,
+    cx: &mut App,
 ) -> AnyElement {
-    let group = format!(
-        "conversation-message-{:?}",
-        crate::ui::conversation::rows::conversation_row_key(row)
-    );
+    let row_key = crate::ui::conversation::rows::conversation_row_key(row);
+    let group = format!("conversation-message-{row_key:?}");
     let body = if user {
-        user_message_element(text.clone(), tokens)
+        user_message_element(&row_key, &text, markdown, tokens, window, cx)
     } else {
-        assistant_message_element(markdown, tokens)
+        assistant_message_element(&row_key, &text, markdown, tokens, window, cx)
     };
 
     div()
@@ -360,104 +493,101 @@ fn message_meta_element(
     meta.into_any_element()
 }
 
-/// Assistant turn. No surface, no border, no avatar, no role label.
-fn assistant_message_element(markdown: &MarkdownDocument, tokens: ThemeTokens) -> AnyElement {
-    let mut block = div()
+/// Assistant turn. No surface, no border, no avatar, no role label. Body paints
+/// through selectable gpui-component GFM (`TextView::markdown`) with a stable
+/// keyed identity so streaming and virtualization do not remint state.
+fn assistant_message_element(
+    row_key: &ConversationRowKey,
+    text: &str,
+    markdown: &MarkdownDocument,
+    tokens: ThemeTokens,
+    window: &mut Window,
+    cx: &mut App,
+) -> AnyElement {
+    debug_assert_eq!(
+        assistant_message_paint_backend(),
+        AssistantMarkdownBackend::NativeGfm
+    );
+    let view = native_markdown_view(row_key, text, markdown, false, tokens, window, cx);
+
+    div()
         .w_full()
         .px(px(4.0))
         .py(px(4.0))
-        .flex()
-        .flex_col()
-        .gap(px(10.0))
         .text_color(tokens.text.primary.to_gpui())
-        .line_height(px(tokens.density.typography.body_line_height));
-    for markdown_block in &markdown.blocks {
-        block = block.child(markdown_block_element(markdown_block, tokens));
-    }
-    block.into_any_element()
+        .line_height(px(tokens.density.typography.body_line_height))
+        .child(view)
+        .into_any_element()
 }
 
-/// Native equivalent of T3's `ChatMarkdown`: hierarchy stays in the transcript
-/// instead of being flattened back to plain text, and code remains visually
-/// distinct from prose without turning the whole assistant message into a card.
-fn markdown_block_element(block: &MarkdownBlock, tokens: ThemeTokens) -> AnyElement {
-    match block {
-        MarkdownBlock::Heading { level, text } => {
-            let (size, weight, top) = match level {
-                1 => (tokens.density.typography.title, FontWeight::BOLD, 8.0),
-                2 => (tokens.density.typography.body + 2.0, FontWeight::BOLD, 6.0),
-                _ => (tokens.density.typography.body, FontWeight::SEMIBOLD, 4.0),
-            };
-            div()
-                .w_full()
-                .pt(px(top))
-                .text_size(px(size))
-                .line_height(px(size + 6.0))
-                .font_weight(weight)
-                .text_color(tokens.text.primary.to_gpui())
-                .child(text.clone())
-                .into_any_element()
-        }
-        MarkdownBlock::Paragraph { text } => div()
-            .w_full()
-            .text_size(px(tokens.density.typography.body))
-            .line_height(px(tokens.density.typography.body_line_height))
-            .text_color(tokens.text.primary.to_gpui())
-            .child(text.clone())
-            .into_any_element(),
-        MarkdownBlock::Code { language, text, .. } => {
-            let copy_text = text.clone();
-            let code_id = ElementId::Name(
-                format!("copy-conversation-code-{}", stable_code_block_hash(text)).into(),
-            );
-            div()
-                .w_full()
-                .rounded(px(tokens.density.radii.md))
-                .bg(tokens.surfaces.sunken.to_gpui())
-                .overflow_hidden()
-                .child(
-                    div()
-                        .w_full()
-                        .flex()
-                        .items_center()
-                        .justify_between()
-                        .px(px(12.0))
-                        .py(px(7.0))
-                        .bg(
-                            mix_color(tokens.surfaces.sunken, tokens.surfaces.raised, 0.55)
-                                .to_gpui(),
-                        )
-                        .text_size(px(tokens.density.typography.caption))
-                        .text_color(tokens.text.muted.to_gpui())
-                        .child(language.clone().unwrap_or_else(|| "Code".into()))
-                        .child(
-                            div()
-                                .id(code_id)
-                                .cursor_pointer()
-                                .hover(|style| style.text_color(tokens.text.primary.to_gpui()))
-                                .on_click(move |_event, _window, cx| {
-                                    cx.stop_propagation();
-                                    cx.write_to_clipboard(ClipboardItem::new_string(
-                                        copy_text.clone(),
-                                    ));
-                                })
-                                .child("Copy"),
-                        ),
-                )
-                .child(
-                    div()
-                        .w_full()
-                        .px(px(12.0))
-                        .py(px(10.0))
-                        .font(font("Cascadia Mono"))
-                        .text_size(px(tokens.density.typography.caption))
-                        .line_height(px(tokens.density.typography.caption_line_height + 2.0))
-                        .text_color(tokens.text.secondary.to_gpui())
-                        .child(text.clone()),
-                )
-                .into_any_element()
-        }
-    }
+fn native_markdown_view(
+    row_key: &ConversationRowKey,
+    text: &str,
+    markdown: &MarkdownDocument,
+    user: bool,
+    tokens: ThemeTokens,
+    window: &mut Window,
+    cx: &mut App,
+) -> TextView {
+    let plan = plan_message_markdown_render(row_key, text, markdown.selectable, user);
+    let code_action_scope = plan.text_view_key.clone();
+    let body_size = tokens.density.typography.body;
+    let mut text_style = TextViewStyle::default();
+    text_style.highlight_theme = cx.theme().highlight_theme.clone();
+    text_style.is_dark = !matches!(tokens.mode, ThemeMode::Light);
+    TextView::markdown(
+        ElementId::Name(plan.text_view_key.clone().into()),
+        plan.source,
+        window,
+        cx,
+    )
+    .selectable(plan.selectable)
+    .style(
+        text_style
+            .paragraph_gap(rems(0.55))
+            .heading_font_size(move |level, _base| match level {
+                1 => px(body_size + 4.0),
+                2 => px(body_size + 2.0),
+                _ => px(body_size),
+            })
+            .code_block(
+                gpui::StyleRefinement::default()
+                    .font(font("Cascadia Mono"))
+                    .text_size(px(tokens.density.typography.caption)),
+            ),
+    )
+    .code_block_actions(move |block, _window, _cx| {
+        let copy_text = block.code().to_string();
+        let lang = block
+            .lang()
+            .map(|name| name.to_string())
+            .unwrap_or_else(|| "Code".into());
+        let code_id = ElementId::Name(
+            format!(
+                "copy-conversation-gfm-code-{}",
+                stable_code_block_hash(&format!("{code_action_scope}:{copy_text}"))
+            )
+            .into(),
+        );
+        div()
+            .flex()
+            .items_center()
+            .gap(px(8.0))
+            .px(px(8.0))
+            .py(px(4.0))
+            .text_size(px(11.0))
+            .child(lang)
+            .child(
+                div()
+                    .id(code_id)
+                    .cursor_pointer()
+                    .on_click(move |_event, _window, cx| {
+                        cx.stop_propagation();
+                        cx.write_to_clipboard(ClipboardItem::new_string(copy_text.clone()));
+                    })
+                    .child("Copy"),
+            )
+    })
 }
 
 fn stable_code_block_hash(text: &str) -> u64 {
@@ -809,6 +939,91 @@ fn working_element(elapsed_ms: Option<u64>, step: Option<&str>, tokens: ThemeTok
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn sample_assistant_document() -> MarkdownDocument {
+        MarkdownDocument {
+            selectable: true,
+            copyable: true,
+            html_executed: false,
+            prose_wraps: true,
+            blocks: Vec::new(),
+            pending_links: vec![],
+        }
+    }
+
+    #[test]
+    fn message_render_plan_preserves_exact_gfm_and_stable_role_identity() {
+        let doc = sample_assistant_document();
+        let row_key = ConversationRowKey::Message("stable-event".into());
+        let source = representative_t3_gfm_markdown();
+        let plan = plan_message_markdown_render(&row_key, source, doc.selectable, false);
+        let grown = format!("{source}\ntrailing streamed chunk");
+        let plan_grown = plan_message_markdown_render(&row_key, &grown, doc.selectable, false);
+        let user_plan = plan_message_markdown_render(&row_key, source, doc.selectable, true);
+
+        assert_eq!(plan.backend, AssistantMarkdownBackend::NativeGfm);
+        assert!(plan.selectable);
+        assert_eq!(
+            plan.source, source,
+            "provider Markdown must not be reconstructed"
+        );
+        assert_eq!(
+            plan.text_view_key, plan_grown.text_view_key,
+            "streaming must not mint a new TextView key"
+        );
+        assert_ne!(plan.text_view_key, user_plan.text_view_key);
+        assert_eq!(user_plan.source, source);
+    }
+
+    #[test]
+    fn assistant_message_paint_path_selects_native_gfm() {
+        assert_eq!(
+            assistant_message_paint_backend(),
+            AssistantMarkdownBackend::NativeGfm,
+            "assistant turns must paint through TextView::markdown, not the home-grown block painter"
+        );
+    }
+
+    #[test]
+    fn long_rich_markdown_height_is_not_truncated_at_the_legacy_480px_cap() {
+        let tokens = crate::ui::tokens::theme(
+            ThemeMode::Dark,
+            crate::ui::tokens::Density::Comfortable,
+            crate::ui::tokens::Scale::Scale100,
+        );
+        let text = (0..80)
+            .map(|index| format!("- readable list item {index}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let row = ConversationRow::Message {
+            id: crate::ui::renderers::TimelineItemId::Event(crate::domain::EventId::new()),
+            role: MessageRole::Assistant,
+            text,
+            markdown: sample_assistant_document(),
+            occurred_at_ms: None,
+            streaming: false,
+        };
+
+        assert!(
+            conversation_row_height(&row, tokens) > 480,
+            "scroll/follow bookkeeping must cover the full painted answer"
+        );
+    }
+
+    #[test]
+    fn fenced_code_and_table_padding_are_part_of_scroll_height() {
+        let tokens = crate::ui::tokens::theme(
+            ThemeMode::Dark,
+            crate::ui::tokens::Density::Comfortable,
+            crate::ui::tokens::Scale::Scale100,
+        );
+        let plain = "one\ntwo\nthree\nfour";
+        let rich = "```rust\none\ntwo\n```\n\n| three | four |";
+        assert!(
+            markdown_body_height(rich, tokens) > markdown_body_height(plain, tokens),
+            "native code/table chrome adds real vertical extent"
+        );
+    }
 
     #[test]
     fn no_conversation_row_renderer_draws_a_border() {
