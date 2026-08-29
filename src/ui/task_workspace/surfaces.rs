@@ -1,4 +1,5 @@
 use std::collections::{BTreeMap, BTreeSet};
+use std::time::Duration;
 
 use crate::domain::{
     CommandId, EventId, PrivacyClass, SemanticJournalFact, SemanticJournalPage,
@@ -15,21 +16,24 @@ pub enum ConversationQueryPriority {
     Background,
 }
 
-/// Focused interactive conversation poll cadence (~128 ms at 16 ms ticks).
-pub const INTERACTIVE_CONVERSATION_POLL_TICKS: u64 = 8;
-/// Background pane / terminal conversation poll cadence (~480 ms at 16 ms ticks).
-pub const BACKGROUND_CONVERSATION_POLL_TICKS: u64 = 30;
+/// Slow recovery heartbeat when a ConversationDirty push may have been missed.
+/// Primary conversation refresh is push-driven; this is not an idle poll cadence.
+pub const CONVERSATION_RECOVERY_HEARTBEAT: Duration = Duration::from_secs(30);
 
-/// Which conversation priorities are due on this controller tick.
-pub fn conversation_poll_priorities_due(controller_ticks: u64) -> Vec<ConversationQueryPriority> {
-    let mut due = Vec::new();
-    if controller_ticks % INTERACTIVE_CONVERSATION_POLL_TICKS == 0 {
-        due.push(ConversationQueryPriority::Interactive);
+/// Which conversation priorities are due for slow recovery polling.
+///
+/// Ordinary interactive refresh is push-driven via `ConversationDirty`. This
+/// returns priorities only after the recovery heartbeat has elapsed.
+pub fn conversation_poll_priorities_due(
+    elapsed_since_recovery: Duration,
+) -> Vec<ConversationQueryPriority> {
+    if elapsed_since_recovery < CONVERSATION_RECOVERY_HEARTBEAT {
+        return Vec::new();
     }
-    if controller_ticks % BACKGROUND_CONVERSATION_POLL_TICKS == 0 {
-        due.push(ConversationQueryPriority::Background);
-    }
-    due
+    vec![
+        ConversationQueryPriority::Interactive,
+        ConversationQueryPriority::Background,
+    ]
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1113,29 +1117,30 @@ mod tests {
     }
 
     #[test]
-    fn conversation_poll_cadence_is_faster_for_interactive_than_background() {
-        assert_eq!(INTERACTIVE_CONVERSATION_POLL_TICKS, 8);
-        assert_eq!(BACKGROUND_CONVERSATION_POLL_TICKS, 30);
-        assert_eq!(
-            conversation_poll_priorities_due(8),
-            vec![ConversationQueryPriority::Interactive]
+    fn conversation_refresh_is_push_primary_with_slow_recovery_heartbeat_only() {
+        // Sub-second elapsed must not schedule queries — ConversationDirty owns
+        // ordinary refresh. The old 8/30 × 16ms cadences (~128ms / ~480ms) are
+        // exactly the idle CPU regression this rejects.
+        assert!(
+            conversation_poll_priorities_due(Duration::from_millis(128)).is_empty(),
+            "must not poll conversations on the old ~128ms interactive cadence"
+        );
+        assert!(
+            conversation_poll_priorities_due(Duration::from_millis(480)).is_empty(),
+            "must not poll conversations on the old ~480ms background cadence"
+        );
+        assert!(
+            conversation_poll_priorities_due(Duration::from_millis(29_999)).is_empty(),
+            "recovery heartbeat must stay empty before the full interval"
         );
         assert_eq!(
-            conversation_poll_priorities_due(30),
-            vec![ConversationQueryPriority::Background]
-        );
-        assert_eq!(
-            conversation_poll_priorities_due(120),
+            conversation_poll_priorities_due(CONVERSATION_RECOVERY_HEARTBEAT),
             vec![
                 ConversationQueryPriority::Interactive,
                 ConversationQueryPriority::Background
             ]
         );
-        assert!(conversation_poll_priorities_due(7).is_empty());
-        assert_eq!(
-            conversation_poll_priorities_due(16),
-            vec![ConversationQueryPriority::Interactive]
-        );
+        assert!(CONVERSATION_RECOVERY_HEARTBEAT >= Duration::from_secs(30));
     }
 
     #[test]
@@ -1390,21 +1395,15 @@ mod tests {
         let mut registry = TaskSurfaceRegistry::default();
 
         let mut seen = BTreeSet::new();
-        for tick in 1u64..=90 {
-            let due = conversation_poll_priorities_due(tick);
-            let max_background = if due.contains(&ConversationQueryPriority::Background) {
-                2
-            } else {
-                0
-            };
-            let before_epoch = registry.background_schedule_epoch;
-            let schedule = registry.conversation_query_schedule(&workspace, max_background);
-            if max_background == 0 {
-                assert_eq!(registry.background_schedule_epoch, before_epoch);
-                assert!(schedule
-                    .iter()
-                    .all(|plan| { plan.priority == ConversationQueryPriority::Interactive }));
-            }
+        // Recovery heartbeats (not high-frequency ticks) must still rotate
+        // background panes, including compact summaries.
+        for _ in 0..8 {
+            let due = conversation_poll_priorities_due(CONVERSATION_RECOVERY_HEARTBEAT);
+            assert!(
+                due.contains(&ConversationQueryPriority::Background),
+                "recovery heartbeat must admit background conversation refresh"
+            );
+            let schedule = registry.conversation_query_schedule(&workspace, 2);
             for plan in schedule {
                 if !due.contains(&plan.priority) {
                     continue;
@@ -1419,9 +1418,13 @@ mod tests {
         for task in &others {
             assert!(
                 seen.contains(task),
-                "background cadence across 8/30 ticks must reach every non-interactive pane including compact"
+                "recovery heartbeat scheduling must reach every non-interactive pane including compact"
             );
         }
+        assert!(
+            conversation_poll_priorities_due(Duration::from_millis(128)).is_empty(),
+            "background coverage must not rely on high-frequency 8/30 tick polling"
+        );
     }
 
     /// Test-only host-scoped owner key. Carries a canonical [`TaskId`] without

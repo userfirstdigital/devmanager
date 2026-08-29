@@ -76,6 +76,11 @@ const MAX_PROCESS_OP_HOST_STRING_BYTES: usize = 32 * 1024;
 /// per-tick ceiling so a large Job cannot monopolize the process worker.
 const RESOURCE_SAMPLE_MAX_MEMBERS_PER_TICK: usize = 512;
 const RESOURCE_SAMPLE_TICK_BUDGET: Duration = Duration::from_millis(40);
+/// Lifecycle and exit reconciliation stays responsive, but full Windows Job
+/// accounting is deliberately slower: sampling it every lifecycle tick caused
+/// a visible one-second CPU spike even while the host was otherwise idle.
+const PROCESS_BACKGROUND_RECONCILE_INTERVAL: Duration = Duration::from_secs(1);
+const RESOURCE_SAMPLE_INTERVAL: Duration = Duration::from_secs(10);
 
 #[derive(Debug, Default)]
 struct ManagedJobObservationSnapshot {
@@ -5481,6 +5486,7 @@ fn debug_enabled() -> bool {
 fn spawn_background_tasks(inner: Weak<ProcessManagerInner>) -> thread::JoinHandle<()> {
     thread::spawn(move || {
         let mut system = sysinfo::System::new();
+        let mut last_resource_sample = None;
         loop {
             let Some(inner) = inner.upgrade() else {
                 break;
@@ -5502,7 +5508,11 @@ fn spawn_background_tasks(inner: Weak<ProcessManagerInner>) -> thread::JoinHandl
                 break;
             }
 
-            refresh_resource_snapshots(&inner, &mut system);
+            let now = Instant::now();
+            if resource_sample_due(last_resource_sample, now) {
+                refresh_resource_snapshots(&inner, &mut system);
+                last_resource_sample = Some(now);
+            }
             reconcile_ai_activity(&inner);
             reconcile_provider_terminal_exits(&inner);
             handle_auto_restart(&inner);
@@ -5510,9 +5520,13 @@ fn spawn_background_tasks(inner: Weak<ProcessManagerInner>) -> thread::JoinHandl
 
             drop(inner);
 
-            thread::park_timeout(Duration::from_secs(1));
+            thread::park_timeout(PROCESS_BACKGROUND_RECONCILE_INTERVAL);
         }
     })
+}
+
+fn resource_sample_due(last_sample: Option<Instant>, now: Instant) -> bool {
+    last_sample.is_none_or(|last| now.saturating_duration_since(last) >= RESOURCE_SAMPLE_INTERVAL)
 }
 
 fn refresh_resource_snapshots(inner: &ProcessManagerInner, system: &mut sysinfo::System) {
@@ -15103,6 +15117,25 @@ mod tests {
         );
         change_notifier();
         output_notifier(Vec::new(), TerminalModeSnapshot::default());
+    }
+
+    #[test]
+    fn resource_sampling_is_slower_than_lifecycle_reconciliation() {
+        let started = Instant::now();
+        assert!(resource_sample_due(None, started));
+        assert!(!resource_sample_due(
+            Some(started),
+            started + PROCESS_BACKGROUND_RECONCILE_INTERVAL
+        ));
+        assert!(!resource_sample_due(
+            Some(started),
+            started + RESOURCE_SAMPLE_INTERVAL - Duration::from_millis(1)
+        ));
+        assert!(resource_sample_due(
+            Some(started),
+            started + RESOURCE_SAMPLE_INTERVAL
+        ));
+        assert!(RESOURCE_SAMPLE_INTERVAL > PROCESS_BACKGROUND_RECONCILE_INTERVAL);
     }
 
     #[test]

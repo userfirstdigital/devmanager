@@ -24,7 +24,7 @@ use std::process::{Child, Command, Stdio};
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, SyncSender, TryRecvError, TrySendError};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
@@ -176,7 +176,7 @@ use crate::ui::task_workspace::{
     ConversationQueryPriority, DropTarget, Edge, PaneId, PaneRect, SplitId, TaskPaneBody,
     TaskPaneProjection, TaskPaneViewModel, TaskSurfaceRegistry, TaskWorkspace,
     TaskWorkspaceViewChild, TaskWorkspaceViewModel, TaskWorkspaceViewNode, Viewport,
-    WorkspaceError, WorkspaceSelectionGesture,
+    WorkspaceError, WorkspaceSelectionGesture, CONVERSATION_RECOVERY_HEARTBEAT,
 };
 use crate::ui::terminal_adapter::TerminalDockAdapter;
 pub use crate::ui::terminal_adapter::{TerminalDockState, TERMINAL_ADAPTER_DEPENDENCY};
@@ -333,7 +333,6 @@ const MAX_HOST_PROJECTION_MESSAGES: usize = MAX_HOST_PROJECTIONS + MAX_ACTION_OU
 const MAX_RETRY_HOST_ACTIONS: usize = MAX_ACTION_LANE_RECORDS - 1;
 const MAX_ACCESSIBILITY_ACTIONS: usize = 32;
 const MAX_PENDING_PREFERENCES: usize = 8;
-const CONTROLLER_TICK_INTERVAL: Duration = Duration::from_millis(16);
 const REMOTE_RECONNECT_BACKOFF_MIN: Duration = Duration::from_millis(250);
 const REMOTE_RECONNECT_BACKOFF_MAX: Duration = Duration::from_secs(5);
 // A failed initial rendezvous must not strand the shell on "Can't connect"
@@ -371,19 +370,206 @@ const NATIVE_ISOLATED_STARTUP_BUDGET: Duration = Duration::from_secs(30);
 const MAX_RETAINED_WORKERS: usize = 8;
 const MAX_RETAINED_CHILDREN: usize = 8;
 const MAX_RETAINED_ACTION_BATCHES: usize = 8;
+/// Legacy 16ms pump retained only as a regression baseline for deadline tests.
+const CONTROLLER_TICK_INTERVAL: Duration = Duration::from_millis(16);
+/// Idle/recovery controller wait floor. Must stay hundreds of ms+, never 16ms.
+const CONTROLLER_IDLE_RECOVERY_INTERVAL: Duration = Duration::from_secs(1);
+/// Host worker command/subscription idle slice — separate from UI scheduling.
+const HOST_WORKER_IDLE_WAIT: Duration = Duration::from_millis(50);
+const COMPOSER_CARET_BLINK_INTERVAL: Duration = Duration::from_millis(512);
+const HOST_BOOTSTRAP_REATTACH_INTERVAL: Duration = Duration::from_secs(1);
+const PROVIDER_SETTINGS_REFRESH_INTERVAL: Duration = Duration::from_secs(2);
+const PROVIDER_SETTINGS_IDLE_INTERVAL: Duration = Duration::from_secs(30);
+
+/// Shared edge-triggered wake so projection/action publication can interrupt a
+/// deadline wait without a 60Hz idle timer. Cloning shares the same core.
+#[derive(Clone, Debug)]
+struct ControllerWake {
+    pending: Arc<AtomicBool>,
+    lock: Arc<Mutex<()>>,
+    cvar: Arc<Condvar>,
+    notify: Arc<tokio::sync::Notify>,
+}
+
+impl Default for ControllerWake {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl ControllerWake {
+    fn new() -> Self {
+        Self {
+            pending: Arc::new(AtomicBool::new(false)),
+            lock: Arc::new(Mutex::new(())),
+            cvar: Arc::new(Condvar::new()),
+            notify: Arc::new(tokio::sync::Notify::new()),
+        }
+    }
+
+    fn notify(&self) {
+        self.pending.store(true, Ordering::Release);
+        {
+            let _guard = self.lock.lock();
+            self.cvar.notify_one();
+        }
+        self.notify.notify_one();
+    }
+
+    fn take_pending(&self) -> bool {
+        self.pending.swap(false, Ordering::AcqRel)
+    }
+
+    fn wait_timeout_blocking(&self, timeout: Duration) {
+        if self.take_pending() {
+            return;
+        }
+        let Ok(guard) = self.lock.lock() else {
+            return;
+        };
+        let result = self
+            .cvar
+            .wait_timeout_while(guard, timeout, |_| !self.pending.load(Ordering::Acquire));
+        drop(result);
+        let _ = self.take_pending();
+    }
+
+    async fn wait_timeout_async(&self, timeout: Duration, timer: &gpui::BackgroundExecutor) {
+        if self.take_pending() {
+            return;
+        }
+        let sleep = timer.timer(timeout);
+        let notified = self.notify.notified();
+        futures_util::pin_mut!(sleep);
+        futures_util::pin_mut!(notified);
+        let _ = futures_util::future::select(notified, sleep).await;
+        let _ = self.take_pending();
+    }
+}
+
+/// Worker-facing retargetable handle. Many host runtimes bind to one shell wake
+/// without replacing the controller's stable clone.
+#[derive(Clone, Debug)]
+struct ControllerWakeBridge {
+    target: Arc<Mutex<ControllerWake>>,
+}
+
+impl ControllerWakeBridge {
+    fn unbound() -> Self {
+        Self {
+            target: Arc::new(Mutex::new(ControllerWake::new())),
+        }
+    }
+
+    fn bind(&self, wake: &ControllerWake) {
+        if let Ok(mut target) = self.target.lock() {
+            *target = wake.clone();
+        }
+    }
+
+    fn notify(&self) {
+        if let Ok(target) = self.target.lock() {
+            target.notify();
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct ControllerWaitInputs {
+    composer_focused: bool,
+    drafts_dirty: bool,
+    layout_dirty: bool,
+    remote_settings_open: bool,
+    provider_settings_refreshing: bool,
+    bootstrap_retry_armed: bool,
+    since_last_composer_persist: Option<Duration>,
+    since_last_layout_persist: Option<Duration>,
+    since_last_remote_poll: Option<Duration>,
+    since_last_provider_poll: Option<Duration>,
+    since_last_bootstrap_retry: Option<Duration>,
+    since_last_conversation_recovery: Option<Duration>,
+    since_last_caret_toggle: Option<Duration>,
+}
+
+fn duration_until(interval: Duration, since: Duration) -> Duration {
+    interval.saturating_sub(since)
+}
+
+fn duration_until_phase_boundary(interval: Duration, since: Duration) -> Duration {
+    let interval_ms = interval.as_millis().max(1);
+    let phase = since.as_millis() % interval_ms;
+    let remaining = interval_ms - phase;
+    Duration::from_millis(remaining as u64).max(Duration::from_millis(1))
+}
+
+fn next_controller_wait(inputs: ControllerWaitInputs) -> Duration {
+    let mut wait = CONTROLLER_IDLE_RECOVERY_INTERVAL;
+    let consider = |wait: Duration, candidate: Duration| wait.min(candidate);
+
+    if inputs.composer_focused {
+        let since = inputs.since_last_caret_toggle.unwrap_or(Duration::ZERO);
+        wait = consider(
+            wait,
+            duration_until_phase_boundary(COMPOSER_CARET_BLINK_INTERVAL, since),
+        );
+    }
+    if inputs.drafts_dirty {
+        let since = inputs
+            .since_last_composer_persist
+            .unwrap_or(COMPOSER_DRAFT_PERSIST_INTERVAL);
+        wait = consider(wait, duration_until(COMPOSER_DRAFT_PERSIST_INTERVAL, since));
+    }
+    if inputs.layout_dirty {
+        let since = inputs
+            .since_last_layout_persist
+            .unwrap_or(LAYOUT_PERSIST_INTERVAL);
+        wait = consider(wait, duration_until(LAYOUT_PERSIST_INTERVAL, since));
+    }
+    if inputs.remote_settings_open {
+        let since = inputs
+            .since_last_remote_poll
+            .unwrap_or(Duration::from_secs(1));
+        wait = consider(wait, duration_until(Duration::from_secs(1), since));
+    }
+    if inputs.bootstrap_retry_armed {
+        let since = inputs
+            .since_last_bootstrap_retry
+            .unwrap_or(HOST_BOOTSTRAP_REATTACH_INTERVAL);
+        wait = consider(
+            wait,
+            duration_until(HOST_BOOTSTRAP_REATTACH_INTERVAL, since),
+        );
+    }
+    let provider_interval = if inputs.provider_settings_refreshing {
+        PROVIDER_SETTINGS_REFRESH_INTERVAL
+    } else {
+        PROVIDER_SETTINGS_IDLE_INTERVAL
+    };
+    if let Some(since) = inputs.since_last_provider_poll {
+        wait = consider(wait, duration_until(provider_interval, since));
+    }
+    let since_recovery = inputs
+        .since_last_conversation_recovery
+        .unwrap_or(Duration::ZERO);
+    wait = consider(
+        wait,
+        duration_until(CONVERSATION_RECOVERY_HEARTBEAT, since_recovery),
+    );
+    wait
+}
 
 fn should_schedule_host_bootstrap_retry(
     enabled: bool,
     has_runtime: bool,
     has_pending_bootstrap: bool,
     connection_failed: bool,
-    controller_ticks: usize,
+    since_last_retry: Option<Duration>,
 ) -> bool {
     enabled
         && !has_runtime
         && !has_pending_bootstrap
         && connection_failed
-        && controller_ticks % HOST_BOOTSTRAP_REATTACH_TICKS == 0
+        && since_last_retry.is_none_or(|elapsed| elapsed >= HOST_BOOTSTRAP_REATTACH_INTERVAL)
 }
 
 fn idle_photo_fetch_matches_current_canvas(
@@ -402,8 +588,24 @@ enum ComposerDraftPart {
     Caret,
 }
 
-fn composer_caret_visible(focused: bool, controller_ticks: usize) -> bool {
-    focused && (controller_ticks / COMPOSER_CARET_BLINK_TICKS) % 2 == 0
+fn composer_caret_visible(focused: bool, since_caret_epoch: Duration) -> bool {
+    focused && (since_caret_epoch.as_millis() / COMPOSER_CARET_BLINK_INTERVAL.as_millis()) % 2 == 0
+}
+
+fn caret_phase_repaint(
+    focused: bool,
+    elapsed: Duration,
+    last_rendered: Option<bool>,
+) -> (bool, Option<bool>) {
+    if !focused {
+        return (false, None);
+    }
+    let visible = composer_caret_visible(true, elapsed);
+    if last_rendered == Some(visible) {
+        (false, last_rendered)
+    } else {
+        (true, Some(visible))
+    }
 }
 
 /// Matching live Terminal runtime for the task's primary agent — enough to
@@ -4069,6 +4271,7 @@ pub(crate) struct NativeHostClientRuntime {
     worker_overflow: Arc<Mutex<VecDeque<NativeHostActionOutcome>>>,
     /// Ordinary close/detach never arms host quit; full-quit uses inspect/confirm.
     lifecycle: NativeClientLifecycle,
+    controller_wake: ControllerWakeBridge,
 }
 
 /// Explicit client-to-host lifecycle intent owned by the shell runtime.
@@ -4850,6 +5053,8 @@ impl NativeHostClientRuntime {
         let worker_overflow_for_worker = Arc::clone(&worker_overflow);
         let channel_depth_for_worker = Arc::clone(&channel_depth);
         let owns_local_for_worker = owns_local_authority;
+        let controller_wake = ControllerWakeBridge::unbound();
+        let controller_wake_for_worker = controller_wake.clone();
         let reconnect_source = native_reconnect_source_for(profile, &host_id)?;
         let reconnect_source_for_worker = reconnect_source.clone();
         let action_reaper_permit = match acquire_reaper_permit(ReaperKind::ActionBatch) {
@@ -4889,6 +5094,7 @@ impl NativeHostClientRuntime {
                         updater_for_worker,
                         deferred_action_outcome_for_worker,
                         worker_overflow_for_worker,
+                        controller_wake_for_worker,
                     )
                 }) {
                 Ok(handle) => handle,
@@ -4929,6 +5135,7 @@ impl NativeHostClientRuntime {
             deferred_action_outcome,
             worker_overflow,
             lifecycle: NativeClientLifecycle::Connected,
+            controller_wake,
         })
     }
 
@@ -4944,6 +5151,10 @@ impl NativeHostClientRuntime {
 
     pub(crate) fn endpoint(&self) -> &str {
         &self.endpoint
+    }
+
+    fn bind_controller_wake(&self, wake: &ControllerWake) {
+        self.controller_wake.bind(wake);
     }
 
     pub(crate) fn updater(&self) -> &UpdaterService {
@@ -5624,8 +5835,11 @@ fn native_host_worker_loop(
     updater: UpdaterService,
     deferred_action_outcome: Arc<Mutex<Option<NativeHostActionOutcome>>>,
     worker_overflow: Arc<Mutex<VecDeque<NativeHostActionOutcome>>>,
+    controller_wake: ControllerWakeBridge,
 ) {
+    install_worker_controller_wake(controller_wake);
     let Some(runtime) = runtime else {
+        clear_worker_controller_wake();
         return;
     };
     let mut reconnect_backoff = NativeHostReconnectBackoff::default();
@@ -5741,7 +5955,7 @@ fn native_host_worker_loop(
             }
             continue;
         }
-        match command_rx.recv_timeout(CONTROLLER_TICK_INTERVAL) {
+        match command_rx.recv_timeout(HOST_WORKER_IDLE_WAIT) {
             Ok(NativeHostWorkerCommand::Shutdown) => {
                 drain_cancelled_worker_commands(
                     &command_rx,
@@ -5970,6 +6184,7 @@ fn native_host_worker_loop(
             &stream_frames,
         );
     }
+    clear_worker_controller_wake();
 }
 
 fn recover_deferred_bootstrap_projection(
@@ -6641,29 +6856,61 @@ fn publish_projection(
         .filter(|queued| queued.action_outcome.is_some())
         .count();
     let is_action_outcome = projection.action_outcome.is_some();
-    if is_action_outcome {
+    let published = if is_action_outcome {
         if action_outcome_count >= MAX_ACTION_OUTCOME_PROJECTIONS {
-            return false;
+            false
+        } else {
+            if queue.len() >= MAX_HOST_PROJECTION_MESSAGES {
+                let Some(index) = queue
+                    .iter()
+                    .position(|queued| queued.action_outcome.is_none())
+                else {
+                    return false;
+                };
+                let _ = queue.remove(index);
+            }
+            queue.push_back(projection);
+            true
         }
-        if queue.len() >= MAX_HOST_PROJECTION_MESSAGES {
-            let Some(index) = queue
-                .iter()
-                .position(|queued| queued.action_outcome.is_none())
-            else {
-                return false;
-            };
-            let _ = queue.remove(index);
+    } else {
+        let normal_count = queue.len().saturating_sub(action_outcome_count);
+        if normal_count < MAX_HOST_PROJECTIONS && queue.len() < MAX_HOST_PROJECTION_MESSAGES {
+            queue.push_back(projection);
+            true
+        } else {
+            false
         }
-        queue.push_back(projection);
-        return true;
+    };
+    drop(queue);
+    if published {
+        notify_controller_wake_from_worker();
     }
+    published
+}
 
-    let normal_count = queue.len().saturating_sub(action_outcome_count);
-    if normal_count < MAX_HOST_PROJECTIONS && queue.len() < MAX_HOST_PROJECTION_MESSAGES {
-        queue.push_back(projection);
-        return true;
-    }
-    false
+thread_local! {
+    static WORKER_CONTROLLER_WAKE: RefCell<Option<ControllerWakeBridge>> =
+        const { RefCell::new(None) };
+}
+
+fn install_worker_controller_wake(wake: ControllerWakeBridge) {
+    WORKER_CONTROLLER_WAKE.with(|slot| {
+        *slot.borrow_mut() = Some(wake);
+    });
+}
+
+fn clear_worker_controller_wake() {
+    WORKER_CONTROLLER_WAKE.with(|slot| {
+        *slot.borrow_mut() = None;
+    });
+}
+
+fn notify_controller_wake_from_worker() {
+    WORKER_CONTROLLER_WAKE.with(|slot| {
+        if let Some(wake) = slot.borrow().as_ref() {
+            wake.notify();
+        }
+    });
 }
 
 async fn execute_native_command(
@@ -9502,6 +9749,7 @@ pub struct NativeShell {
     keyboard: KeyboardModel,
     last_keyboard_action: Option<KeyboardAction>,
     accessibility_tree: AccessibilityTree,
+    accessibility_tree_builds: usize,
     terminal: TerminalDockAdapter,
     focus_handle: FocusHandle,
     terminal_focus_handle: FocusHandle,
@@ -9509,6 +9757,12 @@ pub struct NativeShell {
     task_scroll_handle: UniformListScrollHandle,
     controller_task: Option<Task<()>>,
     controller_ticks: usize,
+    controller_wake: ControllerWake,
+    last_conversation_recovery_at: Option<Instant>,
+    last_provider_settings_poll: Option<Instant>,
+    last_bootstrap_retry_at: Option<Instant>,
+    composer_caret_epoch: Instant,
+    composer_caret_visible_rendered: Option<bool>,
     task_surfaces: TaskSurfaceRegistry<HostTaskKey>,
     top_bar: Option<TopBarProjectionController>,
     composer: Option<TaskComposer>,
@@ -9993,6 +10247,10 @@ impl NativeShell {
             })
             .unwrap_or_default();
         interaction.sync_host_epochs(initial_epochs);
+        let controller_wake = ControllerWake::new();
+        if let Some(NativeHostRuntimeAttachment::Client(runtime)) = host_runtime.as_ref() {
+            runtime.bind_controller_wake(&controller_wake);
+        }
         let local_host_id = HostId::local_profile(profile.named_profile())
             .expect("isolated profile name must form a local HostId");
         let mut local_slot =
@@ -10059,6 +10317,7 @@ impl NativeShell {
             keyboard: KeyboardModel::default(),
             last_keyboard_action: None,
             accessibility_tree,
+            accessibility_tree_builds: 0,
             terminal: TerminalDockAdapter::unavailable_with_preferences(preferences),
             focus_handle: cx.focus_handle().tab_stop(true),
             terminal_focus_handle: cx.focus_handle().tab_stop(true),
@@ -10066,6 +10325,12 @@ impl NativeShell {
             task_scroll_handle: UniformListScrollHandle::new(),
             controller_task: None,
             controller_ticks: 0,
+            controller_wake,
+            last_conversation_recovery_at: Some(Instant::now()),
+            last_provider_settings_poll: Some(Instant::now()),
+            last_bootstrap_retry_at: None,
+            composer_caret_epoch: Instant::now(),
+            composer_caret_visible_rendered: None,
             selected_task_key: layout.selected_task.clone(),
             composer_owner: layout.selected_task.clone(),
             fleet_drain_cursor: HostDrainCursor::default(),
@@ -11444,6 +11709,7 @@ impl NativeShell {
     }
 
     fn refresh_accessibility_tree(&mut self) {
+        self.accessibility_tree_builds = self.accessibility_tree_builds.saturating_add(1);
         let project_items = self.project_inbox_items();
         let shows_add_project = self.shows_add_project_plus();
         let composer_focused = self.composer_accessibility_focused;
@@ -11466,7 +11732,7 @@ impl NativeShell {
             )
         };
         let stage = self.shell_stage();
-        self.accessibility_tree = AccessibilityTree::for_stage(
+        let mut next = AccessibilityTree::for_stage(
             stage,
             &task_list,
             selected_key.as_ref(),
@@ -11871,9 +12137,12 @@ impl NativeShell {
             );
         }
         if !overlay_nodes.is_empty() {
-            self.accessibility_tree
-                .push_dynamic_overlay_nodes(overlay_nodes);
+            next.push_dynamic_overlay_nodes(overlay_nodes);
         }
+        if next == self.accessibility_tree {
+            return;
+        }
+        self.accessibility_tree = next;
         self.platform_accessibility.sync(&self.accessibility_tree);
     }
 
@@ -12644,13 +12913,27 @@ impl NativeShell {
     }
 
     fn start_controller(&mut self, cx: &mut Context<Self>) {
+        // Admit the first controller pass immediately instead of sleeping the
+        // idle recovery floor before bootstrap/projection work can run.
+        self.controller_wake.notify();
         let timer = cx.background_executor().clone();
+        let wake = self.controller_wake.clone();
         let task = cx.spawn(
             move |this: gpui::WeakEntity<NativeShell>, cx: &mut gpui::AsyncApp| {
                 let mut async_cx = cx.clone();
                 async move {
                     loop {
-                        timer.timer(CONTROLLER_TICK_INTERVAL).await;
+                        let wait = match this
+                            .update(&mut async_cx, |shell, _cx| shell.controller_wait_deadline())
+                        {
+                            Ok(wait) => wait,
+                            Err(_) => break,
+                        };
+                        if wait.is_zero() {
+                            timer.timer(Duration::from_millis(1)).await;
+                        } else {
+                            wake.wait_timeout_async(wait, &timer).await;
+                        }
                         if this
                             .update(&mut async_cx, |shell, cx| {
                                 if shell.pending_folder_prompt {
@@ -12687,6 +12970,39 @@ impl NativeShell {
         self.controller_tick(max)
     }
 
+    fn controller_wait_deadline(&self) -> Duration {
+        let now = Instant::now();
+        let since = |at: Option<Instant>| at.map(|instant| now.saturating_duration_since(instant));
+        let bootstrap_retry_armed = self.retry_host_bootstrap
+            && self.local_slot().host_runtime.is_none()
+            && self.pending_bootstrap.is_none()
+            && matches!(
+                self.local_slot().host_state,
+                NativeHostState::Disconnected | NativeHostState::Error { .. }
+            );
+        let provider_settings_refreshing = self.settings_open
+            || self
+                .provider_settings
+                .as_ref()
+                .is_some_and(|ctl| ctl.metadata_in_flight() || ctl.health_in_flight());
+        next_controller_wait(ControllerWaitInputs {
+            composer_focused: self.composer_accessibility_focused,
+            drafts_dirty: self.composer_drafts_dirty,
+            layout_dirty: self.layout_dirty,
+            remote_settings_open: self.settings_open
+                && self.settings_page == NativeSettingsPage::RemoteAccess,
+            provider_settings_refreshing,
+            bootstrap_retry_armed,
+            since_last_composer_persist: since(self.last_composer_draft_persist),
+            since_last_layout_persist: since(self.last_layout_persist),
+            since_last_remote_poll: since(self.remote_settings.last_poll),
+            since_last_provider_poll: since(self.last_provider_settings_poll),
+            since_last_bootstrap_retry: since(self.last_bootstrap_retry_at),
+            since_last_conversation_recovery: since(self.last_conversation_recovery_at),
+            since_last_caret_toggle: Some(now.saturating_duration_since(self.composer_caret_epoch)),
+        })
+    }
+
     #[cfg(test)]
     fn pending_action_for_test(&self) -> Option<&NativeActionRecord> {
         self.local_slot().pending_host_actions.front()
@@ -12702,6 +13018,7 @@ impl NativeShell {
 
     pub fn queue_preferences(&mut self, preferences: RuntimePreferencesSnapshot) {
         enqueue_pending_preference(&mut self.pending_preferences, preferences);
+        self.controller_wake.notify();
     }
 
     pub fn queue_preferences_for_test(&mut self, preferences: RuntimePreferencesSnapshot) {
@@ -14920,6 +15237,7 @@ impl NativeShell {
 
     fn controller_tick(&mut self, max: usize) -> bool {
         self.controller_ticks = self.controller_ticks.saturating_add(1);
+        let now = Instant::now();
         if self.settings_open
             && self.settings_page == NativeSettingsPage::RemoteAccess
             && self.remote_settings.pending.is_none()
@@ -14942,8 +15260,15 @@ impl NativeShell {
                     .provider_settings
                     .as_ref()
                     .is_some_and(|ctl| ctl.metadata_in_flight() || ctl.health_in_flight());
-            let interval = if refreshing { 125 } else { 1875 };
-            if self.controller_ticks % interval == 0
+            let interval = if refreshing {
+                PROVIDER_SETTINGS_REFRESH_INTERVAL
+            } else {
+                PROVIDER_SETTINGS_IDLE_INTERVAL
+            };
+            let due = self
+                .last_provider_settings_poll
+                .is_none_or(|last| now.saturating_duration_since(last) >= interval);
+            if due
                 && self.action_lane_len() < MAX_ACTION_LANE_RECORDS / 2
                 && !self
                     .local_slot_mut()
@@ -14951,28 +15276,35 @@ impl NativeShell {
                     .iter()
                     .any(|action| action.id == "provider.settings")
             {
+                self.last_provider_settings_poll = Some(now);
                 self.request_provider_settings_snapshot();
             }
         }
-        let mut repaint = self.composer_accessibility_focused
-            && self.controller_ticks % COMPOSER_CARET_BLINK_TICKS == 0;
+        let caret_elapsed = now.saturating_duration_since(self.composer_caret_epoch);
+        let (caret_repaint, next_rendered) = caret_phase_repaint(
+            self.composer_accessibility_focused,
+            caret_elapsed,
+            self.composer_caret_visible_rendered,
+        );
+        self.composer_caret_visible_rendered = next_rendered;
+        let mut semantic_repaint = false;
         if let Some(preferences) = self.pending_preferences.pop_back() {
             self.pending_preferences.clear();
             self.preferences = preferences;
             self.terminal.set_preferences(preferences);
-            repaint = true;
+            semantic_repaint = true;
         }
 
         // Poll background connect/attach before draining projections so a late
         // runtime is owned by exactly one shell attachment.
         if self.poll_pending_host_bootstrap() {
-            repaint = true;
+            semantic_repaint = true;
         }
         if self.poll_trusted_hosts() {
-            repaint = true;
+            semantic_repaint = true;
         }
         if self.reconcile_recovered_local_host_state() {
-            repaint = true;
+            semantic_repaint = true;
         }
         if should_schedule_host_bootstrap_retry(
             self.retry_host_bootstrap,
@@ -14982,8 +15314,10 @@ impl NativeShell {
                 self.local_slot_mut().host_state,
                 NativeHostState::Disconnected | NativeHostState::Error { .. }
             ),
-            self.controller_ticks,
+            self.last_bootstrap_retry_at
+                .map(|at| now.saturating_duration_since(at)),
         ) {
+            self.last_bootstrap_retry_at = Some(now);
             match spawn_pending_host_bootstrap(self.profile.clone(), ProcessNativeHostBootstrap) {
                 Ok(pending) => {
                     self.pending_bootstrap = Some(pending);
@@ -14995,7 +15329,7 @@ impl NativeShell {
                     };
                 }
             }
-            repaint = true;
+            semantic_repaint = true;
         }
 
         let runtime_epochs = self
@@ -15013,7 +15347,7 @@ impl NativeShell {
             .sync_host_epochs(runtime_epochs)
         {
             self.clear_cockpit_projection();
-            repaint = true;
+            semantic_repaint = true;
         }
         let mut current_epochs = self.local_slot_mut().interaction.host_runtime_epochs();
         let mut current_navigation_epoch = self
@@ -15140,19 +15474,24 @@ impl NativeShell {
         }
         if had_projections {
             self.local_slot_mut().last_projection_kinds = accepted_projection_kinds;
-            repaint = true;
+            semantic_repaint = true;
         }
         if self.hosts.len() > 1 {
-            repaint |= self.drain_fleet_host_projections_round_robin(max);
+            semantic_repaint |= self.drain_fleet_host_projections_round_robin(max);
         }
-        repaint |= self.admit_ready_stream_frames(max);
-        repaint |= self.sync_top_bar_from_updater();
+        semantic_repaint |= self.admit_ready_stream_frames(max);
+        semantic_repaint |= self.sync_top_bar_from_updater();
 
-        // Keep the primary conversation live without refreshing inactive dock
-        // tools. Interactive panes poll faster; background panes stay on the
-        // slower cadence. The host page is bounded and replaces the previous
-        // retained window, so polling cannot grow client memory.
-        let due_priorities = conversation_poll_priorities_due(self.controller_ticks as u64);
+        // ConversationDirty is the primary refresh signal. A slow recovery
+        // heartbeat covers missed pushes without high-frequency idle polling.
+        let recovery_elapsed = self
+            .last_conversation_recovery_at
+            .map(|at| now.saturating_duration_since(at))
+            .unwrap_or(CONVERSATION_RECOVERY_HEARTBEAT);
+        let due_priorities = conversation_poll_priorities_due(recovery_elapsed);
+        if !due_priorities.is_empty() {
+            self.last_conversation_recovery_at = Some(now);
+        }
         if !due_priorities.is_empty() && self.action_lane_len() < MAX_ACTION_LANE_RECORDS / 2 {
             let max_background = if due_priorities.contains(&ConversationQueryPriority::Background)
             {
@@ -15236,7 +15575,7 @@ impl NativeShell {
             if !has_pending {
                 break;
             }
-            repaint = true;
+            semantic_repaint = true;
 
             let pending_action = match self.local_slot_mut().host_runtime.as_ref() {
                 Some(NativeHostRuntimeAttachment::Injected(runtime)) => {
@@ -15396,7 +15735,7 @@ impl NativeShell {
                     .task_for_platform_node(request.target_node)
                 {
                     let _ = self.select_fleet_task_key(task_key, FleetSelectMode::Replace);
-                    repaint = true;
+                    semantic_repaint = true;
                     continue;
                 }
             }
@@ -15408,7 +15747,6 @@ impl NativeShell {
                     match action {
                         ProjectAccessibilityAction::Toggle(project_key) => {
                             self.toggle_project(project_key);
-                            self.refresh_accessibility_tree();
                         }
                         ProjectAccessibilityAction::StartAgent(project_key, _) => {
                             if project_key.host == self.local_host_id() {
@@ -15419,7 +15757,7 @@ impl NativeShell {
                             self.begin_new_task_for_project_key(project_key);
                         }
                     }
-                    repaint = true;
+                    semantic_repaint = true;
                     continue;
                 }
             }
@@ -15433,54 +15771,53 @@ impl NativeShell {
             match request.action {
                 accesskit::Action::Click => {
                     self.dispatch_named_accessibility_action(&element_id);
-                    repaint = true;
+                    semantic_repaint = true;
                 }
                 accesskit::Action::Focus if element_id == "native-task-composer-input" => {
                     self.request_composer_accessibility_focus();
-                    repaint = true;
+                    semantic_repaint = true;
                 }
                 accesskit::Action::Focus if element_id == "native-browser-address" => {
                     self.browser_address_focused = true;
                     self.browser_address_select_all = true;
-                    repaint = true;
+                    semantic_repaint = true;
                 }
                 accesskit::Action::Focus if element_id == "native-task-search-input" => {
                     self.pending_task_search_focus = true;
-                    repaint = true;
+                    semantic_repaint = true;
                 }
                 accesskit::Action::Focus if element_id == "native-rename-task-name" => {
                     if let Some(draft) = self.rename_task.as_mut() {
                         draft.title.focus();
                     }
                     self.pending_root_overlay_focus = true;
-                    repaint = true;
+                    semantic_repaint = true;
                 }
                 accesskit::Action::Focus if element_id == "native-add-project-name" => {
                     if let Some(draft) = self.add_project.as_mut() {
                         draft.name.focus();
                     }
                     self.pending_root_overlay_focus = true;
-                    repaint = true;
+                    semantic_repaint = true;
                 }
                 accesskit::Action::SetValue if element_id == "native-task-composer-input" => {
                     if let Some(accesskit::ActionData::Value(value)) = request.data {
                         self.replace_composer_accessibility_value(&value);
-                        repaint = true;
+                        semantic_repaint = true;
                     }
                 }
                 accesskit::Action::SetValue if element_id == "native-browser-address" => {
                     if let Some(accesskit::ActionData::Value(value)) = request.data {
                         self.browser_address_draft = value.to_string();
                         self.browser_address_select_all = false;
-                        repaint = true;
+                        semantic_repaint = true;
                     }
                 }
                 accesskit::Action::SetValue if element_id == "native-task-search-input" => {
                     if let Some(accesskit::ActionData::Value(value)) = request.data {
                         self.task_search.set_query(value);
                         self.pending_task_search_focus = true;
-                        self.refresh_accessibility_tree();
-                        repaint = true;
+                        semantic_repaint = true;
                     }
                 }
                 accesskit::Action::SetValue if element_id == "native-rename-task-name" => {
@@ -15489,8 +15826,7 @@ impl NativeShell {
                             let _ = draft.title.focus();
                             let _ = draft.title.set_value(value.to_string());
                         }
-                        self.refresh_accessibility_tree();
-                        repaint = true;
+                        semantic_repaint = true;
                     }
                 }
                 accesskit::Action::SetValue if element_id == "native-add-project-name" => {
@@ -15499,8 +15835,7 @@ impl NativeShell {
                             let _ = draft.name.focus();
                             let _ = draft.name.set_value(value.to_string());
                         }
-                        self.refresh_accessibility_tree();
-                        repaint = true;
+                        semantic_repaint = true;
                     }
                 }
                 _ => {}
@@ -15510,13 +15845,19 @@ impl NativeShell {
         let offset = self.task_scroll_handle.0.borrow().base_handle.offset().y / px(1.0);
         let metrics = self.theme_tokens().density.physical();
         let first_visible = (offset.max(0.0) / metrics.row_height as f32).floor() as usize;
+        let previous_viewport = self.local_slot().task_list.virtual_window();
         let _ = self
             .local_slot_mut()
             .task_list
             .set_viewport(first_visible, DEFAULT_VISIBLE_ROWS);
+        if self.local_slot().task_list.virtual_window() != previous_viewport {
+            semantic_repaint = true;
+        }
         self.offer_first_task_if_needed();
-        self.refresh_accessibility_tree();
-        repaint
+        if semantic_repaint {
+            self.refresh_accessibility_tree();
+        }
+        caret_repaint || semantic_repaint
     }
 
     fn dispatch_due_automatic_title(&mut self) {
@@ -15829,6 +16170,8 @@ impl NativeShell {
                 self.local_slot_mut()
                     .interaction
                     .sync_host_epochs(runtime.epochs());
+                runtime.bind_controller_wake(&self.controller_wake);
+                self.controller_wake.notify();
             }
             NativeHostRuntimeAttachment::Injected(runtime) => {
                 self.local_slot_mut()
@@ -20617,8 +20960,10 @@ impl NativeShell {
         } else {
             CONVERSATION_COMPOSER_PLACEHOLDER
         };
-        let caret_visible =
-            composer_caret_visible(self.composer_accessibility_focused, self.controller_ticks);
+        let caret_visible = composer_caret_visible(
+            self.composer_accessibility_focused,
+            Instant::now().saturating_duration_since(self.composer_caret_epoch),
+        );
         let draft_selection = self
             .composer
             .as_ref()
@@ -23489,6 +23834,8 @@ impl NativeShell {
             }
         }
         let endpoint = runtime.endpoint().to_string();
+        runtime.bind_controller_wake(&self.controller_wake);
+        self.controller_wake.notify();
         let mut slot =
             HostUiState::new_empty(host_id.clone(), NativeHostState::Connected { endpoint });
         slot.host_runtime = Some(NativeHostRuntimeAttachment::Client(runtime));
@@ -37124,6 +37471,9 @@ impl Render for NativeShell {
             self.composer.is_some() && self.composer_focus_handle.is_focused(window);
         if self.composer_accessibility_focused != composer_is_focused {
             self.composer_accessibility_focused = composer_is_focused;
+            self.composer_caret_epoch = Instant::now();
+            self.composer_caret_visible_rendered = None;
+            self.controller_wake.notify();
             self.refresh_accessibility_tree();
         }
         // `bounds()` is GPUI's current drawable HWND size and its hit-testing
@@ -37726,6 +38076,7 @@ mod tests {
         authorize_full_host_quit,
         automatic_task_title,
         capture_runtime_projection_owner,
+        caret_phase_repaint,
         composer_caret_visible,
         composer_draft_parts,
         composer_provider_identity,
@@ -37742,6 +38093,7 @@ mod tests {
         isolated_dev_profile,
         native_command_id,
         native_reconnect_source_for,
+        next_controller_wait,
         owned_matches_admission,
         prepare_native_composer_image,
         provider_inbox_affordance,
@@ -37789,6 +38141,9 @@ mod tests {
         ComposerDraftKey,
         ComposerDraftPart,
         ComposerDraftProjection,
+        ControllerWaitInputs,
+        ControllerWake,
+        ControllerWakeBridge,
         FleetAdmission,
         FleetTransportReconnect,
         HostId,
@@ -37841,7 +38196,10 @@ mod tests {
         TrustedReconnectFactoryProbe,
         UpdateState,
         UpdaterStage,
+        COMPOSER_CARET_BLINK_INTERVAL,
         COMPOSER_CARET_BLINK_TICKS,
+        CONTROLLER_IDLE_RECOVERY_INTERVAL,
+        CONTROLLER_TICK_INTERVAL,
         CONVERSATION_COMPOSER_CONTEXT_INSET,
         CONVERSATION_COMPOSER_HEIGHT_RESERVE,
         CONVERSATION_COMPOSER_INNER_RADIUS,
@@ -37850,7 +38208,9 @@ mod tests {
         CONVERSATION_COMPOSER_PLACEHOLDER,
         CONVERSATION_COMPOSER_SEND_DIAMETER,
         CONVERSATION_CONTENT_MAX_WIDTH,
+        HOST_BOOTSTRAP_REATTACH_INTERVAL,
         HOST_BOOTSTRAP_REATTACH_TICKS,
+        HOST_WORKER_IDLE_WAIT,
         MAX_ACCESSIBILITY_ACTIONS,
         MAX_ACTION_LANE_RECORDS,
         MAX_ACTION_OUTCOME_PROJECTIONS,
@@ -38439,9 +38799,9 @@ mod tests {
                 ComposerDraftPart::Text("d".into()),
             ]
         );
-        assert!(composer_caret_visible(true, 0));
-        assert!(!composer_caret_visible(true, COMPOSER_CARET_BLINK_TICKS));
-        assert!(!composer_caret_visible(false, 0));
+        assert!(composer_caret_visible(true, Duration::ZERO));
+        assert!(!composer_caret_visible(true, COMPOSER_CARET_BLINK_INTERVAL));
+        assert!(!composer_caret_visible(false, Duration::ZERO));
     }
 
     #[test]
@@ -38501,8 +38861,294 @@ mod tests {
     }
 
     #[test]
+    fn idle_controller_deadline_is_not_sixteen_ms_busy_poll() {
+        let wait = next_controller_wait(ControllerWaitInputs {
+            composer_focused: false,
+            drafts_dirty: false,
+            layout_dirty: false,
+            remote_settings_open: false,
+            provider_settings_refreshing: false,
+            bootstrap_retry_armed: false,
+            since_last_composer_persist: None,
+            since_last_layout_persist: None,
+            since_last_remote_poll: None,
+            since_last_provider_poll: None,
+            since_last_bootstrap_retry: None,
+            since_last_conversation_recovery: Some(Duration::from_millis(0)),
+            since_last_caret_toggle: None,
+        });
+        assert!(
+            wait >= Duration::from_millis(500),
+            "idle controller wait must be hundreds of ms or more, got {wait:?}"
+        );
+        assert_ne!(
+            wait, CONTROLLER_TICK_INTERVAL,
+            "idle scheduling must not keep the historical 16ms busy-poll"
+        );
+        assert!(CONTROLLER_IDLE_RECOVERY_INTERVAL >= Duration::from_millis(500));
+        assert!(HOST_WORKER_IDLE_WAIT > CONTROLLER_TICK_INTERVAL);
+    }
+
+    #[test]
+    fn controller_wake_interrupts_deadline_wait_promptly() {
+        let wake = ControllerWake::new();
+        let started = Instant::now();
+        let wake_for_waiter = wake.clone();
+        let joined = std::thread::spawn(move || {
+            wake_for_waiter.wait_timeout_blocking(Duration::from_secs(5));
+        });
+        std::thread::sleep(Duration::from_millis(20));
+        wake.notify();
+        joined.join().expect("wake waiter");
+        assert!(
+            started.elapsed() < Duration::from_millis(750),
+            "published wake must interrupt a multi-second deadline wait promptly, elapsed {:?}",
+            started.elapsed()
+        );
+        assert!(
+            !wake.take_pending(),
+            "waiter must consume the pending wake edge"
+        );
+    }
+
+    #[test]
+    fn runtime_wake_bound_after_controller_creation_reaches_stable_shell_wake() {
+        let shell_wake = ControllerWake::new();
+        let bridge = ControllerWakeBridge::unbound();
+        let started = Instant::now();
+        let waiter = {
+            let wake = shell_wake.clone();
+            std::thread::spawn(move || {
+                wake.wait_timeout_blocking(Duration::from_secs(5));
+            })
+        };
+        std::thread::sleep(Duration::from_millis(20));
+        // Controller already owns shell_wake; a later-attached runtime must
+        // forward into that same target instead of replacing it.
+        bridge.bind(&shell_wake);
+        bridge.notify();
+        waiter.join().expect("stable wake waiter");
+        assert!(
+            started.elapsed() < Duration::from_millis(750),
+            "runtime publication bound after controller start must wake promptly, elapsed {:?}",
+            started.elapsed()
+        );
+    }
+
+    #[test]
+    fn multiple_runtime_wake_bridges_share_one_controller_target() {
+        let shell_wake = ControllerWake::new();
+        let local = ControllerWakeBridge::unbound();
+        let remote = ControllerWakeBridge::unbound();
+        local.bind(&shell_wake);
+        remote.bind(&shell_wake);
+        let started = Instant::now();
+        let waiter = {
+            let wake = shell_wake.clone();
+            std::thread::spawn(move || {
+                wake.wait_timeout_blocking(Duration::from_secs(5));
+            })
+        };
+        std::thread::sleep(Duration::from_millis(20));
+        remote.notify();
+        waiter.join().expect("shared wake waiter");
+        assert!(
+            started.elapsed() < Duration::from_millis(750),
+            "any bound runtime wake source must reach the single controller target, elapsed {:?}",
+            started.elapsed()
+        );
+        local.notify();
+        assert!(
+            shell_wake.take_pending(),
+            "local bridge must keep notifying the same shell wake after remote"
+        );
+    }
+
+    #[test]
+    fn caret_repaint_detects_phase_change_after_delayed_boundary_wake() {
+        let elapsed = COMPOSER_CARET_BLINK_INTERVAL + Duration::from_millis(50);
+        let current = composer_caret_visible(true, elapsed);
+        let near_sample =
+            composer_caret_visible(true, elapsed.saturating_sub(Duration::from_millis(1)));
+        assert_eq!(
+            current, near_sample,
+            "delayed wakes land both samples in the same phase"
+        );
+        let (repaint, rendered) = caret_phase_repaint(true, elapsed, Some(!current));
+        assert!(
+            repaint,
+            "stored last-rendered phase must repaint across a delayed boundary"
+        );
+        assert_eq!(rendered, Some(current));
+        let (again, _) = caret_phase_repaint(true, elapsed, rendered);
+        assert!(!again, "same rendered phase must not repaint again");
+    }
+
+    #[test]
+    fn accessibility_tree_differs_when_visible_task_field_changes_with_stable_ids() {
+        use crate::ui::task_cockpit::TaskList;
+
+        let project_id = ProjectId::new();
+        let task_id = TaskId::new();
+        let task_list = TaskList::from_virtual_task_ids(vec![task_id]).expect("single-task list");
+        let host = HostId::local_profile("dev").expect("host");
+        let snapshot = agent_connection_snapshot(AgentPresence::SignedIn);
+        let items_alpha = vec![
+            ProjectInboxItem::Project {
+                project_id,
+                label: "Alpha".to_string(),
+                expanded: true,
+                task_count: 1,
+                host: host.clone(),
+            },
+            ProjectInboxItem::Task {
+                project_id,
+                task_key: HostTaskKey::new(host.clone(), task_id),
+                settled: false,
+                archived: false,
+            },
+        ];
+        let items_beta = vec![
+            ProjectInboxItem::Project {
+                project_id,
+                label: "Beta".to_string(),
+                expanded: true,
+                task_count: 1,
+                host: host.clone(),
+            },
+            ProjectInboxItem::Task {
+                project_id,
+                task_key: HostTaskKey::new(host.clone(), task_id),
+                settled: false,
+                archived: false,
+            },
+        ];
+        let tree_alpha = AccessibilityTree::for_task_list_with_projects(
+            &task_list,
+            Some(task_id),
+            &NativeHeaderAttachment::default(),
+            Some(&snapshot),
+            &items_alpha,
+        );
+        let tree_beta = AccessibilityTree::for_task_list_with_projects(
+            &task_list,
+            Some(task_id),
+            &NativeHeaderAttachment::default(),
+            Some(&snapshot),
+            &items_beta,
+        );
+        assert_eq!(
+            tree_alpha.rendered_task_count,
+            tree_beta.rendered_task_count
+        );
+        assert_eq!(
+            tree_alpha.task_node_ids.len(),
+            tree_beta.task_node_ids.len(),
+            "task identity count must stay constant"
+        );
+        assert_ne!(
+            tree_alpha, tree_beta,
+            "exact tree compare must observe accessibility-visible field changes"
+        );
+    }
+
+    #[test]
+    fn idle_controller_tick_does_not_rebuild_accessibility_state() {
+        if rerun_headless_shell_test_in_child(
+            "ui::native_shell::tests::idle_controller_tick_does_not_rebuild_accessibility_state",
+        ) {
+            return;
+        }
+        let _test_guard = HEADLESS_SHELL_TEST_LOCK
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .expect("headless shell test lock");
+        let completed = std::rc::Rc::new(std::cell::RefCell::new(None));
+        let completed_for_app = std::rc::Rc::clone(&completed);
+        gpui::Application::headless().run(move |cx| {
+            crate::ui::init(cx);
+            let (runtime, _) = TestRuntime::new(true, NativeHostActionResult::Queued);
+            let result = with_test_shell_in_app(cx, runtime, |shell| {
+                shell.refresh_accessibility_tree();
+                let generation_before = shell.platform_accessibility.generation();
+                let nodes_before = shell.platform_accessibility.node_count();
+                let builds_before = shell.accessibility_tree_builds;
+                for _ in 0..5 {
+                    let _ = shell.controller_tick_for_test(MAX_PENDING_HOST_ACTIONS);
+                }
+                (
+                    generation_before,
+                    nodes_before,
+                    builds_before,
+                    shell.platform_accessibility.generation(),
+                    shell.platform_accessibility.node_count(),
+                    shell.accessibility_tree_builds,
+                )
+            });
+            *completed_for_app.borrow_mut() = Some(result);
+            cx.quit();
+        });
+        let (
+            generation_before,
+            nodes_before,
+            builds_before,
+            generation_after,
+            nodes_after,
+            builds_after,
+        ) = completed.borrow_mut().take().expect("idle a11y result");
+        assert_eq!(
+            generation_after, generation_before,
+            "idle/no-op controller passes must not rebuild accessibility state"
+        );
+        assert_eq!(nodes_after, nodes_before);
+        assert_eq!(
+            builds_after, builds_before,
+            "idle/no-op controller passes must not reconstruct the accessibility tree"
+        );
+    }
+
+    #[test]
+    fn caret_only_controller_tick_does_not_rebuild_accessibility_tree() {
+        if rerun_headless_shell_test_in_child(
+            "ui::native_shell::tests::caret_only_controller_tick_does_not_rebuild_accessibility_tree",
+        ) {
+            return;
+        }
+        let _test_guard = HEADLESS_SHELL_TEST_LOCK
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .expect("headless shell test lock");
+        let completed = std::rc::Rc::new(std::cell::RefCell::new(None));
+        let completed_for_app = std::rc::Rc::clone(&completed);
+        gpui::Application::headless().run(move |cx| {
+            crate::ui::init(cx);
+            let (runtime, _) = TestRuntime::new(true, NativeHostActionResult::Queued);
+            let result = with_test_shell_in_app(cx, runtime, |shell| {
+                for _ in 0..5 {
+                    let _ = shell.controller_tick_for_test(MAX_PENDING_HOST_ACTIONS);
+                }
+                shell.refresh_accessibility_tree();
+                let builds_before = shell.accessibility_tree_builds;
+                shell.composer_accessibility_focused = true;
+                shell.composer_caret_epoch = Instant::now() - Duration::from_millis(600);
+                shell.composer_caret_visible_rendered = Some(true);
+                let repainted = shell.controller_tick_for_test(MAX_PENDING_HOST_ACTIONS);
+                (repainted, builds_before, shell.accessibility_tree_builds)
+            });
+            *completed_for_app.borrow_mut() = Some(result);
+            cx.quit();
+        });
+        let (repainted, builds_before, builds_after) = completed
+            .borrow_mut()
+            .take()
+            .expect("caret-only a11y result");
+        assert!(repainted, "caret phase change must still request repaint");
+        assert_eq!(builds_after, builds_before);
+    }
+
+    #[test]
     fn failed_shell_first_bootstrap_retries_only_without_an_owned_runtime_or_worker() {
-        let due = HOST_BOOTSTRAP_REATTACH_TICKS;
+        let due = Some(HOST_BOOTSTRAP_REATTACH_INTERVAL);
         assert!(should_schedule_host_bootstrap_retry(
             true, false, false, true, due
         ));
@@ -38523,7 +39169,7 @@ mod tests {
             false,
             false,
             true,
-            due - 1
+            Some(HOST_BOOTSTRAP_REATTACH_INTERVAL - Duration::from_millis(1))
         ));
     }
 
@@ -40056,6 +40702,7 @@ mod tests {
                 shell
                     .select_fleet_task_key(remote_key.clone(), FleetSelectMode::Replace)
                     .expect("select B");
+                remote_shared.lock().expect("remote").accepted.clear();
                 shell.refresh_accessibility_tree();
                 assert!(
                     !shell.composer_recovery_targets.contains_key(&retry_id),
@@ -46679,8 +47326,10 @@ mod tests {
                 .expect("guard drop end");
             &source[start..end]
         };
+        let compact_drop_impl = drop_impl.split_whitespace().collect::<String>();
         assert!(
-            drop_impl.contains("self.runtime.block_on") && drop_impl.contains("fleet.remove"),
+            compact_drop_impl.contains("self.runtime.block_on")
+                && compact_drop_impl.contains("fleet.remove"),
             "guard Drop must synchronously remove the exact fleet driver on the blocking lane"
         );
         assert!(
@@ -49425,18 +50074,33 @@ mod tests {
                 shell
                     .select_fleet_task_key(remote_key.clone(), FleetSelectMode::Replace)
                     .expect("open done");
-                let accepted = shared_state.lock().expect("state").accepted.len();
+                let restore_commands = shared_state
+                    .lock()
+                    .expect("state")
+                    .accepted
+                    .iter()
+                    .filter(|record| {
+                        matches!(
+                            record.command,
+                            NativeHostCommand::TaskLifecycle {
+                                command: crate::domain::command::Command::ReopenTask,
+                                ..
+                            }
+                        )
+                    })
+                    .count();
                 let lifecycle = shell
                     .host_slot(&remote_host)
                     .and_then(|slot| slot.inbox.row(shared))
                     .map(|row| row.lifecycle);
-                (shell.selected_task_key.clone(), lifecycle, accepted)
+                (shell.selected_task_key.clone(), lifecycle, restore_commands)
             });
             *report_slot.borrow_mut() = Some(observed);
             drop(entity);
             cx.quit();
         });
-        let (selected, lifecycle, accepted) = report.borrow_mut().take().expect("done report");
+        let (selected, lifecycle, restore_commands) =
+            report.borrow_mut().take().expect("done report");
         assert_eq!(
             selected.as_ref().map(|key| &key.host),
             Some(&HostId::Remote([0x55; 16]))
@@ -49447,7 +50111,7 @@ mod tests {
             "Done click must not restore lifecycle"
         );
         assert_eq!(
-            accepted, 0,
+            restore_commands, 0,
             "Done click must not dispatch a restore command"
         );
     }
@@ -55595,6 +56259,7 @@ mod tests {
                 shell
                     .select_fleet_task_key(key_b.clone(), FleetSelectMode::Replace)
                     .expect("focus B");
+                shared_b.lock().expect("b").accepted.clear();
                 shell.select_changes_repository_for_owner_gated(
                     &key_a,
                     crate::domain::cockpit::TaskRepositorySelector::Workspace,
