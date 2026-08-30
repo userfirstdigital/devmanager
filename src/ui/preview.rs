@@ -76,7 +76,17 @@ pub struct PreviewRootFixture {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PreviewConversationFixture {
+    #[serde(default)]
     pub plan_steps: Vec<PreviewPlanStepFixture>,
+    #[serde(default)]
+    pub messages: Vec<PreviewMessageFixture>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PreviewMessageFixture {
+    pub role: String,
+    pub text: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -89,8 +99,13 @@ pub struct PreviewPlanStepFixture {
 
 impl PreviewConversationFixture {
     fn validate(&self) -> Result<(), String> {
-        if self.plan_steps.is_empty() || self.plan_steps.len() > 32 {
-            return Err("preview conversation must carry 1..=32 plan steps".to_string());
+        if (self.plan_steps.is_empty() && self.messages.is_empty())
+            || self.plan_steps.len() > 32
+            || self.messages.len() > 32
+        {
+            return Err(
+                "preview conversation must carry 1..=32 messages or plan steps".to_string(),
+            );
         }
         let mut identities = BTreeSet::new();
         for step in &self.plan_steps {
@@ -106,6 +121,16 @@ impl PreviewConversationFixture {
             }
             if !identities.insert(step.step_id.as_str()) {
                 return Err("preview plan step identities must be unique".to_string());
+            }
+        }
+        for message in &self.messages {
+            if !matches!(
+                message.role.as_str(),
+                "user" | "assistant" | "reasoning" | "error"
+            ) || message.text.trim().is_empty()
+                || message.text.len() > 64 * 1024
+            {
+                return Err("preview conversation message is invalid".to_string());
             }
         }
         Ok(())
@@ -888,7 +913,25 @@ impl PreviewRoot {
                     status: step.status.clone(),
                 })
                 .collect();
-            let _ = shell.update(cx, |shell, _cx| shell.install_preview_plan_steps(steps));
+            let messages = conversation
+                .messages
+                .iter()
+                .map(
+                    |message| crate::ui::task_cockpit::timeline::PreviewConversationMessage {
+                        role: match message.role.as_str() {
+                            "user" => crate::ui::renderers::MessageRole::User,
+                            "assistant" => crate::ui::renderers::MessageRole::Assistant,
+                            "reasoning" => crate::ui::renderers::MessageRole::Reasoning,
+                            "error" => crate::ui::renderers::MessageRole::Error,
+                            _ => unreachable!("preview conversation role was validated"),
+                        },
+                        text: message.text.clone(),
+                    },
+                )
+                .collect();
+            let _ = shell.update(cx, |shell, _cx| {
+                shell.install_preview_conversation(steps, messages)
+            });
         }
         self.native_shell = Some(shell);
         Ok(self)
@@ -940,7 +983,25 @@ impl PreviewRoot {
                     status: step.status.clone(),
                 })
                 .collect();
-            let _ = shell.update(cx, |shell, _cx| shell.install_preview_plan_steps(steps));
+            let messages = conversation
+                .messages
+                .iter()
+                .map(
+                    |message| crate::ui::task_cockpit::timeline::PreviewConversationMessage {
+                        role: match message.role.as_str() {
+                            "user" => crate::ui::renderers::MessageRole::User,
+                            "assistant" => crate::ui::renderers::MessageRole::Assistant,
+                            "reasoning" => crate::ui::renderers::MessageRole::Reasoning,
+                            "error" => crate::ui::renderers::MessageRole::Error,
+                            _ => unreachable!("preview conversation role was validated"),
+                        },
+                        text: message.text.clone(),
+                    },
+                )
+                .collect();
+            let _ = shell.update(cx, |shell, _cx| {
+                shell.install_preview_conversation(steps, messages)
+            });
         }
         self.native_shell = Some(shell);
         Ok(self)

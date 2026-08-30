@@ -33,7 +33,8 @@ use crate::domain::EventId;
 use crate::ui::components::interaction::{AccessibilityMetadata, AccessibleRole};
 #[cfg(debug_assertions)]
 use crate::ui::renderers::{
-    InteractionEligibility, PlanView, RendererSelection, SemanticKind, TimelineItemContent,
+    InteractionEligibility, MarkdownBlock, MarkdownDocument, MessageRole, MessageView, PlanView,
+    RendererSelection, SemanticKind, TimelineItemContent,
 };
 
 pub const DEFAULT_OVERSCAN: usize = 4;
@@ -53,6 +54,13 @@ pub struct PreviewPlanStep {
     pub step_id: String,
     pub title: String,
     pub status: String,
+}
+
+#[cfg(debug_assertions)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PreviewConversationMessage {
+    pub role: MessageRole,
+    pub text: String,
 }
 
 fn timeline_row_element(
@@ -289,9 +297,56 @@ impl Timeline {
 
     #[cfg(debug_assertions)]
     pub(crate) fn for_preview_plan_steps(task_id: TaskId, steps: &[PreviewPlanStep]) -> Self {
-        let items = steps
+        Self::for_preview_conversation(task_id, steps, &[])
+    }
+
+    #[cfg(debug_assertions)]
+    pub(crate) fn for_preview_conversation(
+        task_id: TaskId,
+        steps: &[PreviewPlanStep],
+        messages: &[PreviewConversationMessage],
+    ) -> Self {
+        let mut items = messages
             .iter()
-            .map(|step| TimelineItemModel {
+            .map(|message| {
+                let role = match message.role {
+                    MessageRole::User => "You",
+                    MessageRole::Assistant => "Assistant",
+                    MessageRole::Reasoning => "Reasoning",
+                    MessageRole::Error => "Error",
+                };
+                TimelineItemModel {
+                    id: TimelineItemId::Event(EventId::new()),
+                    task_id,
+                    renderer_selection: RendererSelection::Specialized(SemanticKind::Message),
+                    interaction: InteractionEligibility::None,
+                    content: TimelineItemContent::Message(MessageView {
+                        role: role.to_string(),
+                        role_kind: message.role,
+                        occurred_at_ms: None,
+                        streaming: false,
+                        markdown: MarkdownDocument {
+                            source: message.text.clone(),
+                            selectable: true,
+                            copyable: true,
+                            html_executed: false,
+                            prose_wraps: true,
+                            blocks: vec![MarkdownBlock::Paragraph {
+                                text: message.text.clone(),
+                            }],
+                            pending_links: Vec::new(),
+                        },
+                    }),
+                    activated_on_enter: false,
+                    accessibility: AccessibilityMetadata::new(AccessibleRole::Region, role)
+                        .expect("static preview role is accessible"),
+                    turn_id: None,
+                    related_event_id: None,
+                }
+            })
+            .collect::<Vec<_>>();
+        items.extend(steps.iter().map(|step| {
+            TimelineItemModel {
                 id: TimelineItemId::Event(EventId::new()),
                 task_id,
                 renderer_selection: RendererSelection::Specialized(SemanticKind::Plan),
@@ -310,8 +365,8 @@ impl Timeline {
                 .expect("validated preview plan title"),
                 turn_id: None,
                 related_event_id: None,
-            })
-            .collect();
+            }
+        }));
         Self::assemble(
             task_id,
             JournalAvailability::LiveProjection,

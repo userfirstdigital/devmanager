@@ -32,6 +32,9 @@ pub trait AttachedTerminalRuntime: Send + Sync {
     ) -> Result<(), TerminalError>;
     fn screen_snapshot(&self) -> TerminalScreenSnapshot;
     fn session_view(&self) -> Result<TerminalSessionView, TerminalError>;
+    /// Move the runtime-owned viewport through canonical scrollback. This is
+    /// view state only: it never writes bytes to the provider PTY.
+    fn scroll_lines(&self, delta_lines: i32) -> Result<(), TerminalError>;
     fn bound_history(&self, max_lines: usize);
     fn install_output_sink(&self, sink: TerminalOutputSink) -> Result<(), TerminalError>;
     fn install_lifecycle_sink(&self, sink: TerminalLifecycleSink) -> Result<(), TerminalError>;
@@ -89,6 +92,10 @@ impl AttachedTerminalRuntime for TerminalSession {
 
     fn session_view(&self) -> Result<TerminalSessionView, TerminalError> {
         TerminalSession::session_view(self).ok_or(TerminalError::CanonicalReaderPoisoned)
+    }
+
+    fn scroll_lines(&self, delta_lines: i32) -> Result<(), TerminalError> {
+        TerminalSession::scroll(self, delta_lines).map_err(|_| TerminalError::RuntimeIo)
     }
 
     fn bound_history(&self, max_lines: usize) {
@@ -376,6 +383,28 @@ impl HostedTerminal {
                 replica.view().ok_or(TerminalError::CanonicalReaderPoisoned)
             }
             ProjectionSource::Attached(runtime) => runtime.session_view(),
+        }
+    }
+
+    fn scroll_lines(&self, delta_lines: i32) -> Result<(), TerminalError> {
+        match &self.projection {
+            ProjectionSource::Attached(runtime) => {
+                let screen = runtime.session_view()?.screen;
+                if screen.mode.mouse_reporting() {
+                    runtime.write_bytes(
+                        &mouse_scroll_bytes(screen.mode, screen.rows, screen.cols, delta_lines),
+                        self.attachment_fence(),
+                    )
+                } else if screen.mode.alternate_screen && screen.mode.alternate_scroll {
+                    runtime.write_bytes(
+                        &alternate_scroll_bytes(delta_lines),
+                        self.attachment_fence(),
+                    )
+                } else {
+                    runtime.scroll_lines(delta_lines)
+                }
+            }
+            ProjectionSource::Fixture(_) => Err(TerminalError::RuntimeIo),
         }
     }
 
@@ -1492,6 +1521,9 @@ impl TerminalService {
             .ok_or(TerminalError::NotFound)?;
         hosted.ensure_open()?;
         hosted.drain_attached_output(*terminal_id)?;
+        if hosted.sequence == TerminalSequence::ZERO {
+            hosted.bump_sequence()?;
+        }
         let agent_session_id = hosted.agent_session_id.ok_or(TerminalError::InvalidFence)?;
         let runtime_generation = hosted
             .runtime_generation
@@ -1507,9 +1539,38 @@ impl TerminalService {
             action_epoch,
             resource_id: hosted.resource_id,
             resource_generation: hosted.generation.get(),
-            sequence: hosted.sequence.get().max(1),
+            sequence: hosted.sequence.get(),
             view,
         }))
+    }
+
+    /// Scroll the one exact live terminal already owned by `task_id`.
+    /// Ambiguous or missing task bindings fail closed; no terminal is created.
+    pub fn scroll_task_terminal(
+        &self,
+        task_id: TaskId,
+        delta_lines: i32,
+    ) -> Result<(), TerminalError> {
+        let mut terminals = self.lock()?;
+        let matching = terminals
+            .iter()
+            .filter_map(|(id, hosted)| (hosted.task_id == task_id && !hosted.closed).then_some(*id))
+            .collect::<Vec<_>>();
+        let [terminal_id] = matching.as_slice() else {
+            return if matching.is_empty() {
+                Err(TerminalError::NotFound)
+            } else {
+                Err(TerminalError::InvalidFence)
+            };
+        };
+        let hosted = terminals
+            .get_mut(terminal_id)
+            .ok_or(TerminalError::NotFound)?;
+        hosted.ensure_open()?;
+        hosted.drain_attached_output(*terminal_id)?;
+        hosted.scroll_lines(delta_lines)?;
+        hosted.bump_sequence()?;
+        Ok(())
     }
 
     fn lock(
@@ -1528,6 +1589,62 @@ fn session_dimensions(size: TerminalSize) -> SessionDimensions {
         cell_width: 8,
         cell_height: 18,
     }
+}
+
+/// Preserve the v0.4.1 terminal contract for full-screen TUIs: when the PTY
+/// enables alternate-scroll mode, wheel motion is input for the application,
+/// not scrollback for the empty alternate buffer.
+fn alternate_scroll_bytes(delta_lines: i32) -> Vec<u8> {
+    let command = if delta_lines > 0 { b'A' } else { b'B' };
+    let mut content = Vec::with_capacity(delta_lines.unsigned_abs() as usize * 3);
+    for _ in 0..delta_lines.unsigned_abs() {
+        content.extend_from_slice(&[0x1b, b'O', command]);
+    }
+    content
+}
+
+/// Full-screen TUIs commonly enable mouse capture instead of alternate-scroll.
+/// Preserve v0.4.1's wheel protocol, using the terminal center cell because the
+/// host service intentionally has no native-window coordinate authority.
+fn mouse_scroll_bytes(
+    mode: TerminalModeSnapshot,
+    rows: usize,
+    columns: usize,
+    delta_lines: i32,
+) -> Vec<u8> {
+    let button = if delta_lines > 0 { 64 } else { 65 };
+    let row = rows.saturating_sub(1) / 2;
+    let column = columns.saturating_sub(1) / 2;
+    let report = if mode.sgr_mouse {
+        format!("\u{1b}[<{button};{};{}M", column + 1, row + 1).into_bytes()
+    } else {
+        normal_mouse_scroll_bytes(column, row, button, mode.utf8_mouse).unwrap_or_default()
+    };
+    report.repeat(delta_lines.unsigned_abs() as usize)
+}
+
+fn normal_mouse_scroll_bytes(column: usize, row: usize, button: u8, utf8: bool) -> Option<Vec<u8>> {
+    let max_point = if utf8 { 2015 } else { 223 };
+    if row >= max_point || column >= max_point {
+        return None;
+    }
+
+    let mut message = vec![b'\x1b', b'[', b'M', 32 + button];
+    let encode_position = |position: usize| -> Vec<u8> {
+        let position = 32 + 1 + position;
+        vec![(0xC0 + position / 64) as u8, (0x80 + (position & 63)) as u8]
+    };
+    if utf8 && column >= 95 {
+        message.extend(encode_position(column));
+    } else {
+        message.push(32 + 1 + column as u8);
+    }
+    if utf8 && row >= 95 {
+        message.extend(encode_position(row));
+    } else {
+        message.push(32 + 1 + row as u8);
+    }
+    Some(message)
 }
 
 fn rows_from_screen(screen: &TerminalScreenSnapshot) -> Vec<String> {
@@ -1553,6 +1670,8 @@ pub struct MockAttachedRuntime {
     fence: Mutex<AttachmentFence>,
     title: Mutex<Option<String>>,
     history_bound: Mutex<usize>,
+    scroll_requests: Mutex<Vec<i32>>,
+    mode: Mutex<TerminalModeSnapshot>,
 }
 
 impl MockAttachedRuntime {
@@ -1575,6 +1694,8 @@ impl MockAttachedRuntime {
             }),
             title: Mutex::new(None),
             history_bound: Mutex::new(10_000),
+            scroll_requests: Mutex::new(Vec::new()),
+            mode: Mutex::new(TerminalModeSnapshot::default()),
         })
     }
 
@@ -1591,6 +1712,17 @@ impl MockAttachedRuntime {
 
     pub fn history_bound(&self) -> usize {
         *self.history_bound.lock().expect("history")
+    }
+
+    pub fn scroll_requests(&self) -> Vec<i32> {
+        self.scroll_requests
+            .lock()
+            .map(|requests| requests.clone())
+            .unwrap_or_default()
+    }
+
+    pub fn set_mode(&self, mode: TerminalModeSnapshot) {
+        *self.mode.lock().expect("mode") = mode;
     }
 
     pub fn set_fail_write(&self, fail: bool) {
@@ -1715,7 +1847,7 @@ impl AttachedTerminalRuntime for MockAttachedRuntime {
             total_lines: rows.len(),
             rows: usize::from(size.rows),
             cols: usize::from(size.cols),
-            mode: TerminalModeSnapshot::default(),
+            mode: *self.mode.lock().expect("mode"),
         }
     }
 
@@ -1734,6 +1866,14 @@ impl AttachedTerminalRuntime for MockAttachedRuntime {
             runtime,
             screen: self.screen_snapshot(),
         })
+    }
+
+    fn scroll_lines(&self, delta_lines: i32) -> Result<(), TerminalError> {
+        self.scroll_requests
+            .lock()
+            .map_err(|_| TerminalError::CanonicalReaderPoisoned)?
+            .push(delta_lines);
+        Ok(())
     }
 
     fn bound_history(&self, max_lines: usize) {
@@ -2039,6 +2179,118 @@ mod tests {
         assert_eq!(projected.terminal_id, terminal_id);
         assert_eq!(projected.task_id, task);
         assert_eq!(projected.view.screen.cols, 40);
+    }
+
+    #[test]
+    fn task_terminal_scroll_reaches_the_exact_attached_runtime() {
+        let service = TerminalService::new();
+        let task = TaskId::new();
+        let runtime = MockAttachedRuntime::new(TerminalSize::new(40, 8).expect("size"));
+        let terminal_id = service
+            .attach(
+                task,
+                TerminalSpec::new(
+                    TerminalSessionId::new(),
+                    TerminalSize::new(40, 8).expect("size"),
+                )
+                .expect("spec"),
+                runtime.clone(),
+            )
+            .expect("attach");
+        service
+            .bind_task_identity(terminal_id, crate::domain::AgentSessionId::new(), 1, 1)
+            .expect("bind identity");
+        let before = service
+            .task_terminal_view(task)
+            .expect("project before scroll")
+            .expect("task terminal before scroll")
+            .sequence;
+
+        service
+            .scroll_task_terminal(task, 7)
+            .expect("scroll exact task terminal");
+
+        assert_eq!(runtime.scroll_requests(), vec![7]);
+        let after = service
+            .task_terminal_view(task)
+            .expect("project after scroll")
+            .expect("task terminal after scroll")
+            .sequence;
+        assert!(
+            after > before,
+            "scroll-only projections must not be deduplicated"
+        );
+    }
+
+    #[test]
+    fn task_terminal_scroll_forwards_wheel_to_an_alternate_screen_tui() {
+        let service = TerminalService::new();
+        let task = TaskId::new();
+        let runtime = MockAttachedRuntime::new(TerminalSize::new(40, 8).expect("size"));
+        runtime.set_mode(TerminalModeSnapshot {
+            alternate_screen: true,
+            alternate_scroll: true,
+            ..TerminalModeSnapshot::default()
+        });
+        let terminal_id = service
+            .attach(
+                task,
+                TerminalSpec::new(
+                    TerminalSessionId::new(),
+                    TerminalSize::new(40, 8).expect("size"),
+                )
+                .expect("spec"),
+                runtime.clone(),
+            )
+            .expect("attach");
+        service
+            .bind_task_identity(terminal_id, crate::domain::AgentSessionId::new(), 1, 1)
+            .expect("bind identity");
+
+        service
+            .scroll_task_terminal(task, 2)
+            .expect("scroll full-screen TUI");
+
+        assert_eq!(runtime.written_bytes(), b"\x1bOA\x1bOA".to_vec());
+        assert!(runtime.scroll_requests().is_empty());
+    }
+
+    #[test]
+    fn task_terminal_scroll_forwards_mouse_wheel_to_a_mouse_reporting_tui() {
+        let service = TerminalService::new();
+        let task = TaskId::new();
+        let runtime = MockAttachedRuntime::new(TerminalSize::new(40, 8).expect("size"));
+        runtime.set_mode(TerminalModeSnapshot {
+            alternate_screen: true,
+            mouse_report_click: true,
+            sgr_mouse: true,
+            alternate_scroll: true,
+            ..TerminalModeSnapshot::default()
+        });
+        let terminal_id = service
+            .attach(
+                task,
+                TerminalSpec::new(
+                    TerminalSessionId::new(),
+                    TerminalSize::new(40, 8).expect("size"),
+                )
+                .expect("spec"),
+                runtime.clone(),
+            )
+            .expect("attach");
+        service
+            .bind_task_identity(terminal_id, crate::domain::AgentSessionId::new(), 1, 1)
+            .expect("bind identity");
+
+        service
+            .scroll_task_terminal(task, 2)
+            .expect("scroll mouse-reporting TUI");
+
+        assert_eq!(
+            runtime.written_bytes(),
+            b"\x1b[<64;20;4M\x1b[<64;20;4M".to_vec()
+        );
+        assert!(runtime.scroll_requests().is_empty());
     }
 
     #[test]

@@ -173,11 +173,18 @@ pub(crate) fn serve_task_cockpit(dispatch: TaskCockpitDispatch<'_>) -> QueryOutc
             if !dispatch.capabilities.contains(Capability::ProviderInput) {
                 return QueryOutcome::Err(QueryError::UnsupportedCapability);
             }
-            let state = crate::domain::cockpit::ProviderInputStateProjection::from_snapshot(&snapshot);
-            if state.pending_wait_command_ids.len() > crate::domain::cockpit::MAX_PROVIDER_INPUT_STATE_WAITS {
-                return QueryOutcome::Err(QueryError::Unavailable { reason: "provider_wait_limit" });
+            let state =
+                crate::domain::cockpit::ProviderInputStateProjection::from_snapshot(&snapshot);
+            if state.pending_wait_command_ids.len()
+                > crate::domain::cockpit::MAX_PROVIDER_INPUT_STATE_WAITS
+            {
+                return QueryOutcome::Err(QueryError::Unavailable {
+                    reason: "provider_wait_limit",
+                });
             }
-            QueryOutcome::Ok(QueryResult::TaskCockpit(TaskCockpitResult::ProviderInputState(state)))
+            QueryOutcome::Ok(QueryResult::TaskCockpit(
+                TaskCockpitResult::ProviderInputState(state),
+            ))
         }
         TaskCockpitQuery::ConfigSnapshot
         | TaskCockpitQuery::AgentConnection
@@ -226,8 +233,33 @@ pub(crate) fn serve_task_cockpit(dispatch: TaskCockpitDispatch<'_>) -> QueryOutc
                 reason: "conversation_subscription_executor",
             })
         }
-        TaskCockpitQuery::Terminal | TaskCockpitQuery::TerminalReadiness => {
+        TaskCockpitQuery::Terminal
+        | TaskCockpitQuery::TerminalScroll { .. }
+        | TaskCockpitQuery::TerminalReadiness => {
             let readiness_query = matches!(dispatch.query, TaskCockpitQuery::TerminalReadiness);
+            if let TaskCockpitQuery::TerminalScroll { delta_lines } = dispatch.query {
+                if *delta_lines == 0 || delta_lines.unsigned_abs() > 256 {
+                    return denied(
+                        TaskCockpitSurface::Terminal,
+                        TaskCockpitDeniedReason::Unauthorized,
+                    );
+                }
+                if dispatch
+                    .terminal_service
+                    .ok_or(())
+                    .and_then(|service| {
+                        service
+                            .scroll_task_terminal(task_id, *delta_lines)
+                            .map_err(|_| ())
+                    })
+                    .is_err()
+                {
+                    return unavailable(
+                        TaskCockpitSurface::Terminal,
+                        TaskCockpitUnavailableReason::TerminalUnavailable,
+                    );
+                }
+            }
             serve_task_terminal(&dispatch, task_id, &snapshot, readiness_query)
         }
         TaskCockpitQuery::WorkspaceStatus => QueryOutcome::Ok(QueryResult::TaskCockpit(
@@ -678,14 +710,24 @@ pub(crate) fn serve_conversation(
     // Sort retained pointers and resolve replacement links outside the journal
     // mutex; provider token recording must not wait on page projection.
     let replay = capture.map(|capture| capture.into_replay());
-    let cursor_rolled_over = replay.as_ref().is_some_and(|r| r.cursor_rolled_over || after_sequence > r.through_sequence)
+    let cursor_rolled_over = replay
+        .as_ref()
+        .is_some_and(|r| r.cursor_rolled_over || after_sequence > r.through_sequence)
         || (replay.is_none() && after_sequence > 0);
 
     let (oldest_sequence, high_water, events) = match replay {
-        Some(replay) => (replay.oldest_sequence, replay.through_sequence, replay.events),
+        Some(replay) => (
+            replay.oldest_sequence,
+            replay.through_sequence,
+            replay.events,
+        ),
         None => (0, 0, Vec::new()),
     };
-    let after_sequence = if cursor_rolled_over { 0 } else { after_sequence };
+    let after_sequence = if cursor_rolled_over {
+        0
+    } else {
+        after_sequence
+    };
     // Fixed high-water for this capture. `after_sequence` is a forward exclusive
     // cursor: return the next retained prefix page in ascending sequence order.
     let replaced = events
@@ -695,15 +737,22 @@ pub(crate) fn serve_conversation(
     // An upsert receives a new replay sequence, but remains the same visible
     // message. Keep its original identity through retained replacement links;
     // clients can then replace cached partial text instead of appending copies.
-    let links = events.iter().filter_map(|event| event.replaces_sequence
-        .map(|previous| (event.sequence, previous)))
+    let links = events
+        .iter()
+        .filter_map(|event| {
+            event
+                .replaces_sequence
+                .map(|previous| (event.sequence, previous))
+        })
         .collect::<std::collections::BTreeMap<_, _>>();
     let mut identities = std::collections::BTreeMap::new();
     for event in &events {
         let mut original = event.sequence;
         while let Some(previous) = links.get(&original).copied() {
             if previous == 0 || previous >= original {
-                return QueryOutcome::Err(QueryError::Unavailable { reason: "semantic_replacement_lineage" });
+                return QueryOutcome::Err(QueryError::Unavailable {
+                    reason: "semantic_replacement_lineage",
+                });
             }
             original = identities.get(&previous).copied().unwrap_or(previous);
         }
@@ -756,7 +805,9 @@ pub(crate) fn serve_conversation(
         // would fetch the same omitted terminal output again.
         page.through_sequence = if more_retained { page_end } else { high_water };
         let Ok(encoded_bytes) = crate::domain::snapshot::canonical_semantic_page_size(&page) else {
-            return QueryOutcome::Err(QueryError::Unavailable { reason: "semantic_page_encode" });
+            return QueryOutcome::Err(QueryError::Unavailable {
+                reason: "semantic_page_encode",
+            });
         };
         if encoded_bytes as usize <= MAX_CONVERSATION_PAGE_BYTES {
             page.encoded_bytes = encoded_bytes;
@@ -764,7 +815,9 @@ pub(crate) fn serve_conversation(
         }
         // Never emit an empty continuation that cannot advance.
         if page.facts.len() <= 1 {
-            return QueryOutcome::Err(QueryError::Unavailable { reason: "semantic_fact_too_large" });
+            return QueryOutcome::Err(QueryError::Unavailable {
+                reason: "semantic_fact_too_large",
+            });
         }
         page.facts.pop();
     }
@@ -2343,7 +2396,9 @@ fn unavailable(surface: TaskCockpitSurface, reason: TaskCockpitUnavailableReason
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::domain::command::{Command, CommandEnvelope, CommandReceipt, CreateTaskRequestIntent};
+    use crate::domain::command::{
+        Command, CommandEnvelope, CommandReceipt, CreateTaskRequestIntent,
+    };
     use crate::domain::task::{
         ReviewReadiness, TaskActivity, TaskAssignment, TaskAttention, TaskConnectivity,
     };
@@ -2857,7 +2912,7 @@ mod tests {
                 action_epoch: None,
                 runtime_generation: None,
                 config: None,
-            provider_launch_hint: ProviderLaunchReadinessHint::Unknown,
+                provider_launch_hint: ProviderLaunchReadinessHint::Unknown,
             });
             let QueryOutcome::Ok(QueryResult::TaskCockpit(TaskCockpitResult::Conversation(page))) =
                 outcome
@@ -2883,7 +2938,10 @@ mod tests {
             vec![129, 130]
         );
         assert_eq!(second.next_sequence, None);
-        assert_eq!(second.encoded_bytes as usize, rmp_serde::to_vec_named(&second).unwrap().len());
+        assert_eq!(
+            second.encoded_bytes as usize,
+            rmp_serde::to_vec_named(&second).unwrap().len()
+        );
 
         let reset = query_page(900);
         assert!(reset.cursor_rolled_over);
@@ -2891,37 +2949,58 @@ mod tests {
         assert_eq!(reset.oldest_sequence, 1);
         assert_eq!(reset.facts.first().unwrap().sequence, 1);
         assert_eq!(reset.next_sequence, Some(128));
-        assert_eq!(reset.encoded_bytes as usize, rmp_serde::to_vec_named(&reset).unwrap().len());
+        assert_eq!(
+            reset.encoded_bytes as usize,
+            rmp_serde::to_vec_named(&reset).unwrap().len()
+        );
     }
 
     #[test]
     fn conversation_incremental_upserts_preserve_original_message_identity() {
-        use crate::remote::presentation::{SemanticEventDraft, SemanticEventKind,
-            SemanticRetention, SemanticSource, StableSessionKey, SemanticJournalStore};
+        use crate::remote::presentation::{
+            SemanticEventDraft, SemanticEventKind, SemanticJournalStore, SemanticRetention,
+            SemanticSource, StableSessionKey,
+        };
         let (_repository, bus, client_id, task_id, _) = create_bound_task();
         let journal = std::sync::Mutex::new(SemanticJournalStore::default());
         let query_page = |after_sequence| {
             let query = TaskCockpitQuery::Conversation { after_sequence };
             let outcome = serve_task_cockpit(TaskCockpitDispatch {
-                capabilities: CapabilitySet::from_capabilities([Capability::TaskCockpit,
-                    Capability::SemanticConversation]),
-                envelope_task_id: Some(task_id), client_id,
-                connection_id: Uuid::now_v7(), request_id: RequestId::new(), query: &query,
-                bus: &bus, service_runtime: None, semantic_journal: Some(&journal),
-                terminal_service: None, ssh_endpoints: None, ssh_runtime: None,
-                workspace_projects: None, coordinator: None, action_epoch: None,
-                runtime_generation: None, config: None,
-            provider_launch_hint: ProviderLaunchReadinessHint::Unknown,
+                capabilities: CapabilitySet::from_capabilities([
+                    Capability::TaskCockpit,
+                    Capability::SemanticConversation,
+                ]),
+                envelope_task_id: Some(task_id),
+                client_id,
+                connection_id: Uuid::now_v7(),
+                request_id: RequestId::new(),
+                query: &query,
+                bus: &bus,
+                service_runtime: None,
+                semantic_journal: Some(&journal),
+                terminal_service: None,
+                ssh_endpoints: None,
+                ssh_runtime: None,
+                workspace_projects: None,
+                coordinator: None,
+                action_epoch: None,
+                runtime_generation: None,
+                config: None,
+                provider_launch_hint: ProviderLaunchReadinessHint::Unknown,
             });
-            let QueryOutcome::Ok(QueryResult::TaskCockpit(TaskCockpitResult::Conversation(page))) = outcome
-                else { panic!("conversation page expected") };
+            let QueryOutcome::Ok(QueryResult::TaskCockpit(TaskCockpitResult::Conversation(page))) =
+                outcome
+            else {
+                panic!("conversation page expected")
+            };
             page
         };
         let mut first_id = None;
         for (index, text) in ["Hel", "Hello", "Hello world"].into_iter().enumerate() {
             journal.lock().unwrap().record(SemanticEventDraft {
                 stable_session_key: StableSessionKey::from_tab(task_id.to_string()),
-                occurred_at_epoch_ms: index as u64 + 1, source: SemanticSource::Claude,
+                occurred_at_epoch_ms: index as u64 + 1,
+                source: SemanticSource::Claude,
                 kind: SemanticEventKind::UserMessage { text: text.into() },
                 retention: SemanticRetention::Canonical,
                 deduplication_key: Some("stable-message".into()),
@@ -2939,8 +3018,8 @@ mod tests {
 
     #[test]
     fn provider_input_state_is_exact_primary_agent_and_capability_gated() {
-        use crate::domain::cockpit::ProviderInputStateProjection;
         use crate::domain::agent::{AgentRole, AgentSessionFacts, ProviderSessionId};
+        use crate::domain::cockpit::ProviderInputStateProjection;
         use crate::domain::provider_input::ProviderSessionProjection;
         use crate::providers::ProviderKind;
 
@@ -2949,15 +3028,24 @@ mod tests {
         let empty = ProviderInputStateProjection::from_snapshot(&snapshot);
         assert_eq!(empty.task_id, task_id);
         assert!(empty.agent_session_id.is_none());
-        let mut agent = AgentSessionFacts::new(task_id, AgentRole::Primary, ProviderKind::ClaudeCode,
-            Some(ProviderSessionId::new("exact-provider-conversation").unwrap())).unwrap();
+        let mut agent = AgentSessionFacts::new(
+            task_id,
+            AgentRole::Primary,
+            ProviderKind::ClaudeCode,
+            Some(ProviderSessionId::new("exact-provider-conversation").unwrap()),
+        )
+        .unwrap();
         agent.runtime_generation = 7;
         snapshot.primary_agent_id = Some(agent.id);
         snapshot.agents.insert(agent.id, agent.clone());
         let question = crate::domain::QuestionId::new();
-        snapshot.provider_sessions.insert(agent.id, ProviderSessionProjection {
-            open_question: Some(question), ..Default::default()
-        });
+        snapshot.provider_sessions.insert(
+            agent.id,
+            ProviderSessionProjection {
+                open_question: Some(question),
+                ..Default::default()
+            },
+        );
         let state = ProviderInputStateProjection::from_snapshot(&snapshot);
         assert_eq!(state.runtime_generation, Some(7));
         assert_eq!(state.agent_session_id, Some(agent.id));
@@ -2965,24 +3053,51 @@ mod tests {
         assert_eq!(state.open_question, Some(question));
         // Even a malformed foreign primary reference cannot grant input authority.
         snapshot.agents.get_mut(&agent.id).unwrap().task_id = TaskId::new();
-        assert!(ProviderInputStateProjection::from_snapshot(&snapshot).agent_session_id.is_none());
+        assert!(ProviderInputStateProjection::from_snapshot(&snapshot)
+            .agent_session_id
+            .is_none());
 
         for allowed in [false, true] {
-            let caps = if allowed { CapabilitySet::from_capabilities([Capability::TaskCockpit, Capability::ProviderInput]) }
-                else { CapabilitySet::from_capabilities([Capability::TaskCockpit]) };
+            let caps = if allowed {
+                CapabilitySet::from_capabilities([
+                    Capability::TaskCockpit,
+                    Capability::ProviderInput,
+                ])
+            } else {
+                CapabilitySet::from_capabilities([Capability::TaskCockpit])
+            };
             let outcome = serve_task_cockpit(TaskCockpitDispatch {
-                capabilities: caps, envelope_task_id: Some(task_id), client_id,
-                connection_id: Uuid::now_v7(), request_id: RequestId::new(),
-                query: &TaskCockpitQuery::ProviderInputState, bus: &bus,
-                service_runtime: None, semantic_journal: None, terminal_service: None,
-                ssh_endpoints: None, ssh_runtime: None, workspace_projects: None,
-                coordinator: None, action_epoch: None, runtime_generation: None, config: None,
+                capabilities: caps,
+                envelope_task_id: Some(task_id),
+                client_id,
+                connection_id: Uuid::now_v7(),
+                request_id: RequestId::new(),
+                query: &TaskCockpitQuery::ProviderInputState,
+                bus: &bus,
+                service_runtime: None,
+                semantic_journal: None,
+                terminal_service: None,
+                ssh_endpoints: None,
+                ssh_runtime: None,
+                workspace_projects: None,
+                coordinator: None,
+                action_epoch: None,
+                runtime_generation: None,
+                config: None,
                 provider_launch_hint: ProviderLaunchReadinessHint::Unknown,
             });
             if allowed {
-                assert!(matches!(outcome, QueryOutcome::Ok(QueryResult::TaskCockpit(TaskCockpitResult::ProviderInputState(_)))));
+                assert!(matches!(
+                    outcome,
+                    QueryOutcome::Ok(QueryResult::TaskCockpit(
+                        TaskCockpitResult::ProviderInputState(_)
+                    ))
+                ));
             } else {
-                assert!(matches!(outcome, QueryOutcome::Err(QueryError::UnsupportedCapability)));
+                assert!(matches!(
+                    outcome,
+                    QueryOutcome::Err(QueryError::UnsupportedCapability)
+                ));
             }
         }
     }
@@ -3588,14 +3703,28 @@ mod tests {
         // `git worktree add --detach` has a valid reference (local to this test).
         std::fs::write(repository.path().join("seed.txt"), "seed\n").expect("seed file");
         let add = std::process::Command::new("git")
-            .args(["-c", "user.name=Cockpit Test", "-c", "user.email=cockpit@example.invalid"])
+            .args([
+                "-c",
+                "user.name=Cockpit Test",
+                "-c",
+                "user.email=cockpit@example.invalid",
+            ])
             .args(["add", "seed.txt"])
             .current_dir(repository.path())
             .output()
             .expect("git add seed");
-        assert!(add.status.success(), "{}", String::from_utf8_lossy(&add.stderr));
+        assert!(
+            add.status.success(),
+            "{}",
+            String::from_utf8_lossy(&add.stderr)
+        );
         let commit = std::process::Command::new("git")
-            .args(["-c", "user.name=Cockpit Test", "-c", "user.email=cockpit@example.invalid"])
+            .args([
+                "-c",
+                "user.name=Cockpit Test",
+                "-c",
+                "user.email=cockpit@example.invalid",
+            ])
             .args(["commit", "-m", "seed"])
             .current_dir(repository.path())
             .output()
@@ -3645,7 +3774,9 @@ mod tests {
         ));
         let QueryOutcome::Ok(QueryResult::TaskCockpit(TaskCockpitResult::Git(status))) = targeted
         else {
-            panic!("Workspace GitStatusTargeted must succeed with an external sibling: {targeted:?}");
+            panic!(
+                "Workspace GitStatusTargeted must succeed with an external sibling: {targeted:?}"
+            );
         };
         assert_eq!(status.selector, Some(TaskRepositorySelector::Workspace));
         assert!(
@@ -3748,8 +3879,9 @@ mod tests {
             .expect("task")
             .task
             .revision;
-        let mut agent = AgentSessionFacts::new(task_id, AgentRole::Primary, ProviderKind::Codex, None)
-            .expect("agent");
+        let mut agent =
+            AgentSessionFacts::new(task_id, AgentRole::Primary, ProviderKind::Codex, None)
+                .expect("agent");
         agent.runtime_generation = 1;
         let agent_id = agent.id;
         let receipt = bus
@@ -3813,7 +3945,10 @@ mod tests {
                 },
             })
             .expect("set primary");
-        assert!(matches!(receipt, CommandReceipt::Accepted { .. }), "{receipt:?}");
+        assert!(
+            matches!(receipt, CommandReceipt::Accepted { .. }),
+            "{receipt:?}"
+        );
         (
             repository,
             bus,
@@ -4046,10 +4181,7 @@ mod tests {
 
     #[test]
     fn terminal_readiness_live_binding_without_attachment_is_pending_not_absence() {
-        let source = include_str!(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/src/host/cockpit.rs"
-        ));
+        let source = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/host/cockpit.rs"));
         let start = source
             .find("fn classify_terminal_readiness_absence(")
             .expect("classify_terminal_readiness_absence");

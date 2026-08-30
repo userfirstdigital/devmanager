@@ -309,6 +309,13 @@ pub enum TaskCockpitQuery {
     /// Missing attachment remains `TerminalUnavailable` for wire compatibility —
     /// it is not authoritative absence.
     Terminal,
+    /// Move the exact task terminal's host-owned viewport through scrollback
+    /// and return the resulting bounded screen. Positive values move toward
+    /// older rows; negative values return toward the live prompt. This never
+    /// writes PTY input unless the terminal application owns wheel reporting.
+    TerminalScroll {
+        delta_lines: i32,
+    },
     /// Opt-in readiness classification for first-send. Shares the Terminal
     /// projection when live and chat-ready; otherwise may return
     /// `TerminalStartPending`, `TerminalProviderSetupRequired`, or
@@ -885,9 +892,9 @@ pub fn cockpit_surface(query: &TaskCockpitQuery) -> TaskCockpitSurface {
         | TaskCockpitQuery::OpenConversationSubscription { .. }
         | TaskCockpitQuery::ReleaseConversationSubscription { .. }
         | TaskCockpitQuery::ProviderInputState => TaskCockpitSurface::Conversation,
-        TaskCockpitQuery::Terminal | TaskCockpitQuery::TerminalReadiness => {
-            TaskCockpitSurface::Terminal
-        }
+        TaskCockpitQuery::Terminal
+        | TaskCockpitQuery::TerminalScroll { .. }
+        | TaskCockpitQuery::TerminalReadiness => TaskCockpitSurface::Terminal,
         TaskCockpitQuery::WorkspaceStatus => TaskCockpitSurface::Workspace,
         TaskCockpitQuery::GitRepositories
         | TaskCockpitQuery::GitStatus
@@ -1300,9 +1307,8 @@ mod tests {
             cockpit_surface(&TaskCockpitQuery::TerminalReadiness),
             TaskCockpitSurface::Terminal
         );
-        let encoded =
-            serde_json::to_value(Query::TaskCockpit(TaskCockpitQuery::TerminalReadiness))
-                .expect("encode readiness");
+        let encoded = serde_json::to_value(Query::TaskCockpit(TaskCockpitQuery::TerminalReadiness))
+            .expect("encode readiness");
         assert_eq!(
             encoded.get("task_cockpit").and_then(|value| value.as_str()),
             Some("terminal_readiness")

@@ -197,6 +197,7 @@ fn message_item(role_kind: MessageRole, text: &str) -> TimelineItemModel {
             occurred_at_ms: None,
             streaming: false,
             markdown: MarkdownDocument {
+                source: text.to_string(),
                 selectable: true,
                 copyable: true,
                 html_executed: false,

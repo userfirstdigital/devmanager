@@ -126,9 +126,9 @@ use crate::ui::task_cockpit::draft_store::{
     ComposerDraftKey, ComposerDraftStore, KeyedComposerDraftKey,
 };
 use crate::ui::task_cockpit::shell::TaskCockpitShell;
-#[cfg(debug_assertions)]
-use crate::ui::task_cockpit::timeline::PreviewPlanStep;
 use crate::ui::task_cockpit::timeline::{ActivityToggleHandler, CONVERSATION_CONTENT_MAX_WIDTH};
+#[cfg(debug_assertions)]
+use crate::ui::task_cockpit::timeline::{PreviewConversationMessage, PreviewPlanStep};
 use crate::ui::task_cockpit::{
     action_is_current, one_fresh_quota_observations, project_services_from_task_projection,
     project_services_panel, render_panel_action, render_task_browser_dock,
@@ -9751,6 +9751,10 @@ pub struct NativeShell {
     accessibility_tree: AccessibilityTree,
     accessibility_tree_builds: usize,
     terminal: TerminalDockAdapter,
+    /// Sub-line wheel remainder retained across smooth touchpad events. The
+    /// host owns the terminal viewport; this only coalesces local input into
+    /// bounded whole-line scroll requests.
+    terminal_scroll_px: f32,
     focus_handle: FocusHandle,
     terminal_focus_handle: FocusHandle,
     composer_focus_handle: FocusHandle,
@@ -9925,6 +9929,8 @@ pub struct NativeShell {
     /// without persisting fake provider events or sending a provider prompt.
     #[cfg(debug_assertions)]
     preview_plan_steps: Option<Vec<PreviewPlanStep>>,
+    #[cfg(debug_assertions)]
+    preview_conversation_messages: Option<Vec<PreviewConversationMessage>>,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -9953,6 +9959,18 @@ pub enum MainConversationCanvas {
     IdlePhoto { has_image: bool },
     TaskConversation,
     TaskTerminal,
+}
+
+fn terminal_scroll_lines_from_pixels(
+    remainder_px: &mut f32,
+    delta_px: f32,
+    line_height: f32,
+) -> i32 {
+    let line_height = line_height.max(1.0);
+    *remainder_px += delta_px;
+    let lines = (*remainder_px / line_height).trunc() as i32;
+    *remainder_px -= lines as f32 * line_height;
+    lines.clamp(-256, 256)
 }
 
 /// Rate limit for window-frame writes while the user drags a window edge.
@@ -10319,6 +10337,7 @@ impl NativeShell {
             accessibility_tree,
             accessibility_tree_builds: 0,
             terminal: TerminalDockAdapter::unavailable_with_preferences(preferences),
+            terminal_scroll_px: 0.0,
             focus_handle: cx.focus_handle().tab_stop(true),
             terminal_focus_handle: cx.focus_handle().tab_stop(true),
             composer_focus_handle: cx.focus_handle().tab_stop(true),
@@ -10437,6 +10456,8 @@ impl NativeShell {
             pending_select_task: None,
             #[cfg(debug_assertions)]
             preview_plan_steps: None,
+            #[cfg(debug_assertions)]
+            preview_conversation_messages: None,
         };
         #[cfg(not(test))]
         {
@@ -10459,6 +10480,16 @@ impl NativeShell {
     #[cfg(debug_assertions)]
     pub(crate) fn install_preview_plan_steps(&mut self, steps: Vec<PreviewPlanStep>) {
         self.preview_plan_steps = Some(steps);
+    }
+
+    #[cfg(debug_assertions)]
+    pub(crate) fn install_preview_conversation(
+        &mut self,
+        steps: Vec<PreviewPlanStep>,
+        messages: Vec<PreviewConversationMessage>,
+    ) {
+        self.preview_plan_steps = Some(steps);
+        self.preview_conversation_messages = Some(messages);
     }
 
     pub fn host_connection(&self) -> &DevTestHostConnection {
@@ -14458,6 +14489,7 @@ impl NativeShell {
                                     matches!(
                                         query,
                                         TaskCockpitQuery::Terminal
+                                            | TaskCockpitQuery::TerminalScroll { .. }
                                             | TaskCockpitQuery::TerminalReadiness
                                     ) && task_id == projection.task_id
                                 });
@@ -14646,7 +14678,9 @@ impl NativeShell {
         };
         if !matches!(
             query,
-            TaskCockpitQuery::Terminal | TaskCockpitQuery::TerminalReadiness
+            TaskCockpitQuery::Terminal
+                | TaskCockpitQuery::TerminalScroll { .. }
+                | TaskCockpitQuery::TerminalReadiness
         ) {
             return;
         }
@@ -18235,6 +18269,7 @@ impl NativeShell {
     }
 
     fn set_provider_terminal_visible(&mut self, visible: bool) {
+        self.terminal_scroll_px = 0.0;
         if let Some(key) = self.selected_task_key.clone() {
             if key.host != self.local_host_id() {
                 let model = self
@@ -20163,6 +20198,19 @@ impl NativeShell {
         workspace_size: Size<Pixels>,
         cx: &mut Context<Self>,
     ) -> AnyElement {
+        if self.preview_conversation_installed() {
+            let owner = self.selected_task_key.clone().or_else(|| {
+                self.layout.task_workspace.as_ref().and_then(|workspace| {
+                    workspace
+                        .focused_task()
+                        .or_else(|| workspace.task_ids().into_iter().next())
+                })
+            });
+            if let Some(owner) = owner {
+                return self.task_conversation_surface_for(owner, true, tokens, workspace_size, cx);
+            }
+        }
+
         let pane_count = self
             .layout
             .task_workspace
@@ -20622,7 +20670,7 @@ impl NativeShell {
                 size(pane_size.width, px(body_height)),
                 cx,
             )
-        } else if pane.paint_terminal {
+        } else if pane.paint_terminal && !self.preview_conversation_installed() {
             self.task_terminal_surface_for(&task_key, tokens)
         } else {
             // Background Full panes render the same owner semantic history;
@@ -20836,12 +20884,15 @@ impl NativeShell {
             }
         }
         #[cfg(debug_assertions)]
-        if show_input {
-            if let Some(steps) = self.preview_plan_steps.clone() {
-                if let Some(slot) = self.host_slot_mut(&owner.host) {
-                    slot.cockpit
-                        .install_preview_plan_steps(owner_task_id, &steps);
-                }
+        if self.preview_conversation_installed() {
+            let steps = self.preview_plan_steps.clone().unwrap_or_default();
+            let messages = self
+                .preview_conversation_messages
+                .clone()
+                .unwrap_or_default();
+            if let Some(slot) = self.host_slot_mut(&owner.host) {
+                slot.cockpit
+                    .install_preview_conversation(owner_task_id, &steps, &messages);
             }
         }
         #[cfg(test)]
@@ -22038,7 +22089,10 @@ impl NativeShell {
             return surface.into_any_element();
         }
         let shell_for_focus = shell_entity.clone();
-        let shell_for_key = shell_entity;
+        let shell_for_key = shell_entity.clone();
+        let shell_for_scroll = shell_entity;
+        let scroll_owner = owner.clone();
+        let terminal_line_height = tokens.density.typography.code_line_height;
         surface
             .tab_stop(true)
             .track_focus(&self.terminal_focus_handle)
@@ -22059,6 +22113,41 @@ impl NativeShell {
                     let _ = shell_for_key.update(app, |shell, cx| {
                         cx.stop_propagation();
                         shell.handle_provider_terminal_key(event, window, cx);
+                        cx.notify();
+                    });
+                },
+            )
+            .on_scroll_wheel(
+                move |event: &ScrollWheelEvent, window: &mut Window, app: &mut gpui::App| {
+                    let _ = shell_for_scroll.update(app, |shell, cx| {
+                        cx.stop_propagation();
+                        window.prevent_default();
+                        if shell.selected_task_key.as_ref() != Some(&scroll_owner) {
+                            return;
+                        }
+                        let delta: f32 = event
+                            .delta
+                            .pixel_delta(px(terminal_line_height.max(1.0)))
+                            .y
+                            .into();
+                        let delta_lines = terminal_scroll_lines_from_pixels(
+                            &mut shell.terminal_scroll_px,
+                            delta,
+                            terminal_line_height,
+                        );
+                        if delta_lines == 0 {
+                            return;
+                        }
+                        if let Err(error) = shell.dispatch_action_recorded_for_owner(
+                            &scroll_owner.host,
+                            ActionRequest::TaskCockpit {
+                                task_id: scroll_owner.task_id,
+                                query: TaskCockpitQuery::TerminalScroll { delta_lines },
+                            },
+                        ) {
+                            #[cfg(debug_assertions)]
+                            eprintln!("devmanager: terminal wheel dispatch failed: {error:?}");
+                        }
                         cx.notify();
                     });
                 },
@@ -34026,7 +34115,23 @@ impl NativeShell {
 
     /// Whether the globally selected owner's dock is showing the raw terminal
     /// canvas. Remote owners use the same visibility bit for display-only mode.
+    fn preview_conversation_installed(&self) -> bool {
+        #[cfg(debug_assertions)]
+        {
+            return self.preview_plan_steps.is_some()
+                || self.preview_conversation_messages.is_some();
+        }
+        #[cfg(not(debug_assertions))]
+        {
+            false
+        }
+    }
+
     fn owner_showing_raw_terminal(&self) -> bool {
+        if self.preview_conversation_installed() {
+            return false;
+        }
+
         let Some(key) = self.selected_task_key.as_ref() else {
             return self.local_slot().cockpit.dock().showing_raw_terminal();
         };
@@ -35132,7 +35237,13 @@ impl NativeShell {
             component.muted_foreground = tokens.text.muted.to_gpui().into();
             component.popover = tokens.surfaces.raised.to_gpui().into();
             component.popover_foreground = tokens.text.primary.to_gpui().into();
-            component.accent = tokens.surfaces.hover.to_gpui().into();
+            // gpui-component uses `accent` as the background for inline code.
+            // A full hover surface turns every identifier in technical prose
+            // into a high-contrast grey stripe; T3's muted chip is intentionally
+            // quieter. Dedicated button/menu hover slots remain unchanged.
+            component.accent = mix_color(tokens.surfaces.canvas, tokens.surfaces.hover, 0.52)
+                .to_gpui()
+                .into();
             component.accent_foreground = tokens.text.primary.to_gpui().into();
             component.selection = tokens.surfaces.selection.to_gpui().into();
             component.primary = tokens.actions.primary.default.background.to_gpui().into();
@@ -38123,6 +38234,7 @@ mod tests {
         stable_host_task_element_key,
         stable_host_task_row_element_id,
         take_retained_action_outcomes,
+        terminal_scroll_lines_from_pixels,
         update_state_from_stage,
         validate_connected_host_for_shell_launch,
         validate_host_projection_payloads,
@@ -38263,6 +38375,25 @@ mod tests {
     use std::sync::mpsc::SyncSender;
     use std::sync::{Arc, Mutex, OnceLock};
     use std::time::{Duration, Instant};
+
+    #[test]
+    fn terminal_scroll_accumulates_smooth_pixels_into_whole_lines() {
+        let mut remainder = 0.0;
+        assert_eq!(
+            terminal_scroll_lines_from_pixels(&mut remainder, 7.0, 18.0),
+            0
+        );
+        assert_eq!(
+            terminal_scroll_lines_from_pixels(&mut remainder, 12.0, 18.0),
+            1
+        );
+        assert_eq!(remainder, 1.0);
+        assert_eq!(
+            terminal_scroll_lines_from_pixels(&mut remainder, -37.0, 18.0),
+            -2
+        );
+        assert_eq!(remainder, 0.0);
+    }
 
     #[test]
     fn missing_provider_projection_is_valid_for_a_first_send() {

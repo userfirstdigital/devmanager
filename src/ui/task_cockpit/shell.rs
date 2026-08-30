@@ -762,7 +762,17 @@ impl TaskCockpitShell {
         task_id: TaskId,
         steps: &[PreviewPlanStep],
     ) {
-        let timeline = Timeline::for_preview_plan_steps(task_id, steps);
+        self.install_preview_conversation(task_id, steps, &[]);
+    }
+
+    #[cfg(debug_assertions)]
+    pub(crate) fn install_preview_conversation(
+        &mut self,
+        task_id: TaskId,
+        steps: &[PreviewPlanStep],
+        messages: &[crate::ui::task_cockpit::timeline::PreviewConversationMessage],
+    ) {
+        let timeline = Timeline::for_preview_conversation(task_id, steps, messages);
         self.timelines.insert(task_id, timeline);
         self.focused_timeline_task = Some(task_id);
         self.timeline_error = None;

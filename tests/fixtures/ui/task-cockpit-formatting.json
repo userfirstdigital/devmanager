@@ -1,0 +1,25 @@
+{
+  "schema": "devmanager.ui.preview/v1",
+  "id": "task-cockpit-formatting",
+  "title": "Conversation formatting acceptance",
+  "capture": {
+    "cursor": "excluded",
+    "border": "excluded"
+  },
+  "root": {
+    "kind": "task-cockpit",
+    "label": "Task Cockpit",
+    "conversation": {
+      "messages": [
+        {
+          "role": "user",
+          "text": "Show every supported Markdown treatment in one compact answer."
+        },
+        {
+          "role": "assistant",
+          "text": "# Heading one\n## Heading two\n### Heading three\n#### Heading four\n\nNormal prose with **bold**, *italic*, ~~strikethrough~~, `inline_code`, and an [HTTPS link](https://example.com).\n\n> A two-line blockquote\n> with a clear left rule.\n\n- First bullet\n  - Nested bullet\n- Second bullet\n\n1. First step\n   1. Nested step\n2. Second step\n\n- [x] Completed item\n- [ ] Pending item\n\n```rust\nfn main() {\n    let answer = 42;\n    if answer > 0 {\n        println!(\"answer = {answer}\");\n    }\n}\n```\n\n| State | Meaning | Tone |\n| --- | --- | --- |\n| Idle | Ready | Neutral |\n| Working | In progress | Accent |\n| Done | Complete | Success |\n\n---\n\nUnicode: ✓ ⚠ → — 🙂"
+        }
+      ]
+    }
+  }
+}

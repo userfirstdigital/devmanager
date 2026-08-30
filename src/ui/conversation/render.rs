@@ -110,6 +110,28 @@ const PLAN_CARD_HORIZONTAL_INSET: f32 = 22.0;
 const META_REST_OPACITY: f32 = 0.0;
 const META_REVEALED_OPACITY: f32 = 1.0;
 
+/// T3 keeps chat prose at `text-sm leading-relaxed` even when navigation uses
+/// Compact density. Technical answers therefore remain readable instead of
+/// collapsing into the app-wide 13/18px compact metrics.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct ConversationMarkdownMetrics {
+    body_size: f32,
+    body_line_height: f32,
+    paragraph_gap_rems: f32,
+    heading_sizes: [f32; 4],
+}
+
+fn conversation_markdown_metrics(
+    _density: crate::ui::tokens::Density,
+) -> ConversationMarkdownMetrics {
+    ConversationMarkdownMetrics {
+        body_size: 14.0,
+        body_line_height: 23.0,
+        paragraph_gap_rems: 0.65,
+        heading_sizes: [17.5, 15.75, 14.0, 12.25],
+    }
+}
+
 fn tabular_numeral_font() -> Font {
     // GPUI 0.2.2 can refine font features only through `Styled::font`, so
     // start from its system-UI font helper and change just the feature set.
@@ -251,9 +273,10 @@ pub fn conversation_row_height(row: &ConversationRow, tokens: ThemeTokens) -> u3
 /// entire message at 480px. That made a long, correctly painted answer appear
 /// to start above the viewport or jump while streaming.
 fn markdown_body_height(text: &str, tokens: ThemeTokens) -> f32 {
-    let body_line = tokens.density.typography.body_line_height.max(1.0);
+    let metrics = conversation_markdown_metrics(tokens.density.density);
+    let body_line = metrics.body_line_height;
     let code_line = (tokens.density.typography.caption_line_height + 2.0).max(1.0);
-    let paragraph_gap = (tokens.density.typography.body * 0.55).max(4.0);
+    let paragraph_gap = metrics.body_size * metrics.paragraph_gap_rems;
     let mut height = 0.0;
     let mut in_fence = false;
     let mut fence_lines = 0usize;
@@ -354,6 +377,7 @@ fn user_message_element(
     window: &mut Window,
     cx: &mut App,
 ) -> AnyElement {
+    let metrics = conversation_markdown_metrics(tokens.density.density);
     let view = native_markdown_view(row_key, text, markdown, true, tokens, window, cx);
     div()
         .w_full()
@@ -361,10 +385,14 @@ fn user_message_element(
         .justify_end()
         .child(
             div()
+                .min_w(px(0.0))
+                .flex_shrink()
                 .max_w(px(CONVERSATION_CONTENT_MAX_WIDTH * USER_BUBBLE_FRACTION))
                 .p(px(12.0))
                 .rounded(px(USER_BUBBLE_RADIUS))
                 .bg(tokens.surfaces.raised.to_gpui())
+                .text_size(px(metrics.body_size))
+                .line_height(px(metrics.body_line_height))
                 .text_color(tokens.text.primary.to_gpui())
                 .child(view),
         )
@@ -508,14 +536,16 @@ fn assistant_message_element(
         assistant_message_paint_backend(),
         AssistantMarkdownBackend::NativeGfm
     );
+    let metrics = conversation_markdown_metrics(tokens.density.density);
     let view = native_markdown_view(row_key, text, markdown, false, tokens, window, cx);
 
     div()
         .w_full()
         .px(px(4.0))
         .py(px(4.0))
-        .text_color(tokens.text.primary.to_gpui())
-        .line_height(px(tokens.density.typography.body_line_height))
+        .text_size(px(metrics.body_size))
+        .text_color(mix_color(tokens.surfaces.canvas, tokens.text.primary, 0.86).to_gpui())
+        .line_height(px(metrics.body_line_height))
         .child(view)
         .into_any_element()
 }
@@ -531,7 +561,7 @@ fn native_markdown_view(
 ) -> TextView {
     let plan = plan_message_markdown_render(row_key, text, markdown.selectable, user);
     let code_action_scope = plan.text_view_key.clone();
-    let body_size = tokens.density.typography.body;
+    let metrics = conversation_markdown_metrics(tokens.density.density);
     let mut text_style = TextViewStyle::default();
     text_style.highlight_theme = cx.theme().highlight_theme.clone();
     text_style.is_dark = !matches!(tokens.mode, ThemeMode::Light);
@@ -544,11 +574,12 @@ fn native_markdown_view(
     .selectable(plan.selectable)
     .style(
         text_style
-            .paragraph_gap(rems(0.55))
+            .paragraph_gap(rems(metrics.paragraph_gap_rems))
             .heading_font_size(move |level, _base| match level {
-                1 => px(body_size + 4.0),
-                2 => px(body_size + 2.0),
-                _ => px(body_size),
+                1 => px(metrics.heading_sizes[0]),
+                2 => px(metrics.heading_sizes[1]),
+                3 => px(metrics.heading_sizes[2]),
+                _ => px(metrics.heading_sizes[3]),
             })
             .code_block(
                 gpui::StyleRefinement::default()
@@ -942,6 +973,7 @@ mod tests {
 
     fn sample_assistant_document() -> MarkdownDocument {
         MarkdownDocument {
+            source: String::new(),
             selectable: true,
             copyable: true,
             html_executed: false,
@@ -1062,6 +1094,19 @@ mod tests {
     fn the_readable_measure_matches_the_t3_reference() {
         assert_eq!(CONVERSATION_CONTENT_MAX_WIDTH, 768.0);
         assert_eq!(PLAN_CARD_HORIZONTAL_INSET, 22.0);
+    }
+
+    #[test]
+    fn chat_typography_matches_t3_in_compact_and_comfortable_density() {
+        let compact = conversation_markdown_metrics(crate::ui::tokens::Density::Compact);
+        let comfortable = conversation_markdown_metrics(crate::ui::tokens::Density::Comfortable);
+
+        for metrics in [compact, comfortable] {
+            assert_eq!(metrics.body_size, 14.0);
+            assert_eq!(metrics.body_line_height, 23.0);
+            assert_eq!(metrics.paragraph_gap_rems, 0.65);
+            assert_eq!(metrics.heading_sizes, [17.5, 15.75, 14.0, 12.25]);
+        }
     }
 
     #[test]

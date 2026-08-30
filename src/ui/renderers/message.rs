@@ -31,6 +31,10 @@ pub struct MessageView {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MarkdownDocument {
+    /// Exact provider-authored Markdown. Structural blocks support semantic
+    /// inspection, but they are intentionally lossy (heading markers and code
+    /// fences are not retained), so the painter and Copy action must use this.
+    pub source: String,
     pub selectable: bool,
     pub copyable: bool,
     pub html_executed: bool,
@@ -226,6 +230,7 @@ fn parse_markdown(source: &str) -> MarkdownDocument {
     flush_paragraph(&mut paragraph_lines, &mut blocks, &mut pending_links);
 
     MarkdownDocument {
+        source: source.to_string(),
         selectable: true,
         copyable: true,
         html_executed: false,
@@ -297,6 +302,7 @@ mod role_tests {
             occurred_at_ms: None,
             streaming: false,
             markdown: MarkdownDocument {
+                source: String::new(),
                 selectable: true,
                 copyable: true,
                 html_executed: false,

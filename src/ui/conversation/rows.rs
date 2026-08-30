@@ -288,7 +288,7 @@ pub fn derive_conversation_rows(
         match &item.content {
             TimelineItemContent::Message(view) => {
                 flush(&mut rows, &mut pending, &mut pending_anchor);
-                let text = view.markdown.plain_text();
+                let text = view.markdown.source.clone();
                 match view.role_kind {
                     MessageRole::Error => rows.push(ConversationRow::Error { id: item.id, text }),
                     role => rows.push(ConversationRow::Message {
@@ -590,6 +590,21 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn message_rows_preserve_exact_markdown_for_native_gfm_painting() {
+        let source = "# Heading\n\n```rust\nfn main() {}\n```\n\n| A | B |\n|---|---|\n| 1 | 2 |";
+        let rows = derive_conversation_rows(
+            &[message_item(MessageRole::Assistant, source)],
+            ConversationVerbosity::Calm,
+        );
+        let ConversationRow::Message { text, .. } = &rows[0] else {
+            panic!("expected an assistant message");
+        };
+        assert_eq!(text, source);
+        assert!(text.contains("```rust"));
+        assert!(text.contains("|---|---|"));
     }
 
     #[test]
