@@ -264,6 +264,7 @@ pub struct TaskSurfaceState {
     pub latest_snippet: Option<String>,
     pub latest_terminal: Option<TaskTerminalProjection>,
     pub terminal_attachment: TerminalAttachmentState,
+    terminal_query_in_flight: bool,
     pending_user_messages: Vec<PendingUserMessage>,
 }
 
@@ -277,14 +278,45 @@ pub enum TerminalAttachmentState {
     Exited,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CenterSurfaceLoadingState {
+    ConversationInitial,
+    ConversationSync,
+    TerminalInitial,
+    TerminalSync,
+}
+
 impl TaskSurfaceState {
+    pub fn center_loading_state(
+        &self,
+        showing_terminal: bool,
+    ) -> Option<CenterSurfaceLoadingState> {
+        if showing_terminal {
+            self.terminal_query_in_flight
+                .then_some(if self.latest_terminal.is_some() {
+                    CenterSurfaceLoadingState::TerminalSync
+                } else {
+                    CenterSurfaceLoadingState::TerminalInitial
+                })
+        } else {
+            self.conversation_in_flight
+                .then_some(if self.conversation_has_content() {
+                    CenterSurfaceLoadingState::ConversationSync
+                } else {
+                    CenterSurfaceLoadingState::ConversationInitial
+                })
+        }
+    }
+
     pub fn note_terminal_query_started(&mut self) {
+        self.terminal_query_in_flight = true;
         if self.latest_terminal.is_none() {
             self.terminal_attachment = TerminalAttachmentState::Starting;
         }
     }
 
     pub fn note_terminal_reconnecting(&mut self) {
+        self.terminal_query_in_flight = false;
         if self.latest_terminal.is_some() {
             self.terminal_attachment = TerminalAttachmentState::StaleReconnecting;
         } else {
@@ -293,11 +325,21 @@ impl TaskSurfaceState {
     }
 
     pub fn note_terminal_unavailable(&mut self) {
+        self.terminal_query_in_flight = false;
         self.terminal_attachment = TerminalAttachmentState::Unavailable;
     }
 
     pub fn note_terminal_exited(&mut self) {
+        self.terminal_query_in_flight = false;
         self.terminal_attachment = TerminalAttachmentState::Exited;
+    }
+
+    pub fn terminal_query_in_flight(&self) -> bool {
+        self.terminal_query_in_flight
+    }
+
+    pub fn conversation_has_content(&self) -> bool {
+        self.conversation.fact_count() > 0 || !self.pending_user_messages.is_empty()
     }
 
     pub fn terminal_is_interactive(&self) -> bool {
@@ -636,6 +678,7 @@ impl<K: Clone + Ord + Eq> TaskSurfaceRegistry<K> {
         let state = self.ensure_task(task_id);
         state.latest_terminal = Some(projection.clone());
         state.terminal_attachment = TerminalAttachmentState::Live;
+        state.terminal_query_in_flight = false;
         Ok(())
     }
 
@@ -843,11 +886,70 @@ mod tests {
         let mut empty = TaskSurfaceState::default();
         empty.note_terminal_query_started();
         assert_eq!(empty.terminal_attachment, TerminalAttachmentState::Starting);
+        assert!(
+            empty.terminal_query_in_flight(),
+            "the empty terminal surface must expose its active load"
+        );
 
         let mut live = surface_with_terminal_lines(&["ready"]);
         live.note_terminal_query_started();
         assert_eq!(live.terminal_attachment, TerminalAttachmentState::Live);
         assert_eq!(live.terminal_tail(1), vec!["ready".to_string()]);
+        assert!(
+            live.terminal_query_in_flight(),
+            "cached terminal content must stay visible while its refresh is active"
+        );
+        live.note_terminal_reconnecting();
+        assert!(
+            !live.terminal_query_in_flight(),
+            "a failed refresh must stop the loading animation"
+        );
+    }
+
+    #[test]
+    fn conversation_loading_distinguishes_first_load_from_cached_sync() {
+        let task = TaskId::new();
+        let mut registry = TaskSurfaceRegistry::default();
+        registry.ensure_task(task);
+
+        registry.begin_conversation(task, 1);
+        let first = registry.state(task).expect("first-load surface");
+        assert!(first.conversation_in_flight);
+        assert_eq!(
+            first.center_loading_state(false),
+            Some(CenterSurfaceLoadingState::ConversationInitial)
+        );
+        assert!(
+            !first.conversation_has_content(),
+            "a first request must render a loading state instead of pretending the chat is empty"
+        );
+
+        registry
+            .admit_conversation(task, 1, &page(1, "cached reply"))
+            .expect("admit cached conversation");
+        registry.begin_conversation(task, 2);
+        let syncing = registry.state(task).expect("syncing surface");
+        assert!(syncing.conversation_in_flight);
+        assert_eq!(
+            syncing.center_loading_state(false),
+            Some(CenterSurfaceLoadingState::ConversationSync)
+        );
+        assert!(
+            syncing.conversation_has_content(),
+            "a refresh must preserve cached content behind a compact syncing indicator"
+        );
+
+        let mut terminal = TaskSurfaceState::default();
+        terminal.note_terminal_query_started();
+        assert_eq!(
+            terminal.center_loading_state(true),
+            Some(CenterSurfaceLoadingState::TerminalInitial)
+        );
+        terminal.latest_terminal = surface_with_terminal_lines(&["cached"]).latest_terminal;
+        assert_eq!(
+            terminal.center_loading_state(true),
+            Some(CenterSurfaceLoadingState::TerminalSync)
+        );
     }
 
     #[test]

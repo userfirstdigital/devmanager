@@ -679,6 +679,9 @@ pub const fn cockpit_query_action_id(query: &TaskCockpitQuery) -> &'static str {
         TaskCockpitQuery::GitRepositories => ACTION_GIT_REPOSITORIES,
         TaskCockpitQuery::GitStatus
         | TaskCockpitQuery::GitStatusTargeted { .. }
+        | TaskCockpitQuery::GitFileDiffTargeted { .. }
+        | TaskCockpitQuery::GitHistoryTargeted { .. }
+        | TaskCockpitQuery::GitCommitDiffTargeted { .. }
         | TaskCockpitQuery::GitMutate { .. }
         | TaskCockpitQuery::GitMutateTargeted { .. } => ACTION_GIT_STATUS,
         TaskCockpitQuery::FilesList { .. } => ACTION_FILES_LIST,

@@ -331,6 +331,23 @@ pub enum TaskCockpitQuery {
     GitStatusTargeted {
         selector: TaskRepositorySelector,
     },
+    /// Bounded host-owned diff for one repository-relative changed file.
+    GitFileDiffTargeted {
+        selector: TaskRepositorySelector,
+        relative_path: String,
+        staged: bool,
+    },
+    /// Bounded recent history for one selected repository.
+    GitHistoryTargeted {
+        selector: TaskRepositorySelector,
+        limit: u16,
+        skip: u32,
+    },
+    /// Bounded patch for one exact commit selected from Git history.
+    GitCommitDiffTargeted {
+        selector: TaskRepositorySelector,
+        commit_hash: String,
+    },
     FilesList {
         relative_directory: Option<String>,
         limit: u16,
@@ -412,6 +429,65 @@ pub struct TaskGitProjection {
     pub behind: u32,
     pub change_count: u32,
     pub detached: bool,
+    /// Bounded, workspace-relative status rows for the native Git window.
+    /// Paths are repository-relative and remain bound to `selector`; no host
+    /// filesystem root crosses the client boundary.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub entries: Vec<TaskGitEntryProjection>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TaskGitEntryStatus {
+    Modified,
+    Added,
+    Deleted,
+    Renamed,
+    Copied,
+    TypeChanged,
+    Untracked,
+    Conflict,
+    Submodule,
+    Unknown,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TaskGitEntryProjection {
+    pub relative_path: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub original_relative_path: Option<String>,
+    pub status: TaskGitEntryStatus,
+    pub staged: bool,
+    pub unstaged: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TaskGitFileDiffProjection {
+    pub task_id: TaskId,
+    pub selector: TaskRepositorySelector,
+    pub relative_path: String,
+    pub staged: bool,
+    pub diff: crate::git::git_service::GitDiffResult,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TaskGitHistoryProjection {
+    pub task_id: TaskId,
+    pub selector: TaskRepositorySelector,
+    pub entries: Vec<crate::git::git_service::GitLogEntry>,
+    pub skip: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TaskGitCommitDiffProjection {
+    pub task_id: TaskId,
+    pub selector: TaskRepositorySelector,
+    pub commit_hash: String,
+    pub diff: crate::git::git_service::GitDiffResult,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -705,6 +781,9 @@ pub enum TaskCockpitResult {
     Workspace(TaskWorkspaceProjection),
     GitRepositories(TaskGitRepositoriesProjection),
     Git(TaskGitProjection),
+    GitFileDiff(TaskGitFileDiffProjection),
+    GitHistory(TaskGitHistoryProjection),
+    GitCommitDiff(TaskGitCommitDiffProjection),
     FilesList(TaskFilesListProjection),
     FilesRead(TaskFilesReadProjection),
     Ssh(TaskSshProjection),
@@ -842,6 +921,7 @@ pub fn git_projection(task_id: TaskId, workspace: &WorkspaceRef) -> TaskGitProje
         behind: 0,
         change_count: 0,
         detached: false,
+        entries: Vec::new(),
     }
 }
 
@@ -899,6 +979,9 @@ pub fn cockpit_surface(query: &TaskCockpitQuery) -> TaskCockpitSurface {
         TaskCockpitQuery::GitRepositories
         | TaskCockpitQuery::GitStatus
         | TaskCockpitQuery::GitStatusTargeted { .. }
+        | TaskCockpitQuery::GitFileDiffTargeted { .. }
+        | TaskCockpitQuery::GitHistoryTargeted { .. }
+        | TaskCockpitQuery::GitCommitDiffTargeted { .. }
         | TaskCockpitQuery::GitMutate { .. }
         | TaskCockpitQuery::GitMutateTargeted { .. } => TaskCockpitSurface::Git,
         TaskCockpitQuery::FilesList { .. }
@@ -1238,6 +1321,7 @@ mod tests {
             behind: 0,
             change_count: 2,
             detached: false,
+            entries: Vec::new(),
         }));
         let encoded = serde_json::to_string(&status).expect("encode status");
         assert!(!encoded.contains("C:"));

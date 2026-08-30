@@ -36,7 +36,7 @@ pub struct GitStatusResult {
     pub is_rebasing: bool,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GitLogEntry {
     pub hash: String,
     pub full_hash: String,
@@ -47,7 +47,7 @@ pub struct GitLogEntry {
     pub refs: Vec<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GitBranch {
     pub name: String,
     pub is_current: bool,
@@ -63,7 +63,7 @@ pub enum DiffLineKind {
     HunkHeader,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GitDiffLine {
     pub kind: DiffLineKind,
     pub content: String,
@@ -71,13 +71,13 @@ pub struct GitDiffLine {
     pub new_lineno: Option<u32>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GitDiffHunk {
     pub header: String,
     pub lines: Vec<GitDiffLine>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GitDiffResult {
     pub hunks: Vec<GitDiffHunk>,
     pub is_binary: bool,

@@ -81,6 +81,7 @@ mod tests {
                 behind: 0,
                 change_count: 1,
                 detached: false,
+                entries: Vec::new(),
             },
             status_id,
             task_id,
@@ -106,6 +107,7 @@ mod tests {
             behind: 0,
             change_count: 1,
             detached: false,
+            entries: Vec::new(),
         };
         // Duplicate same-shape mutate with another request id must not complete.
         assert!(!workflow.complete_from_command(
@@ -165,6 +167,7 @@ mod tests {
                 behind: 0,
                 change_count: 1,
                 detached: false,
+                entries: Vec::new(),
             },
             other_id,
             task_id,

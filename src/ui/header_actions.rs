@@ -374,6 +374,7 @@ mod tests {
             behind: 0,
             change_count,
             detached: false,
+            entries: Vec::new(),
         }
     }
 

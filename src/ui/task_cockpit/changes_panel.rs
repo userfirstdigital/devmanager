@@ -302,6 +302,7 @@ mod tests {
             behind: 1,
             change_count: 4,
             detached: false,
+            entries: Vec::new(),
         };
         let panel = ChangesPanelProjection::from_host(
             Some(&git),
@@ -389,6 +390,7 @@ mod tests {
             behind: 0,
             change_count: 3,
             detached: false,
+            entries: Vec::new(),
         };
         let panel = ChangesPanelProjection::from_host(
             Some(&foreign),
@@ -445,6 +447,7 @@ mod tests {
             behind: 0,
             change_count: 5,
             detached: false,
+            entries: Vec::new(),
         };
         let panel = ChangesPanelProjection::from_host(
             Some(&stale_git),
@@ -485,6 +488,7 @@ mod tests {
             behind: 0,
             change_count: 2,
             detached: false,
+            entries: Vec::new(),
         };
         let foreign_catalog = TaskGitRepositoriesProjection {
             task_id: TaskId::new(),

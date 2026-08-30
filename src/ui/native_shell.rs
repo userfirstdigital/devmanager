@@ -30,14 +30,14 @@ use std::time::{Duration, Instant};
 
 use gpui::prelude::FluentBuilder;
 use gpui::{
-    anchored, canvas, deferred, div, fill, img, point, px, size, uniform_list, AnyElement, App,
-    AppContext, Application, Bounds, ClickEvent, ClipboardEntry, Context, ElementId,
-    ElementInputHandler, Entity, EntityInputHandler, FocusHandle, FontWeight, Hsla, ImageFormat,
-    ImageSource, InteractiveElement, IntoElement, KeyDownEvent, MouseButton, MouseDownEvent,
-    MouseMoveEvent, MouseUpEvent, ObjectFit, ParentElement, PathPromptOptions, Pixels, Point,
-    Render, RenderImage, ScrollWheelEvent, SharedString, Size, StatefulInteractiveElement, Styled,
-    StyledImage, Subscription, Task, TextAlign, TextRun, UTF16Selection, UniformListScrollHandle,
-    Window, WindowBounds, WindowOptions, WrappedLine,
+    anchored, canvas, deferred, div, fill, img, point, px, size, uniform_list, Animation,
+    AnimationExt, AnyElement, App, AppContext, Application, Bounds, ClickEvent, ClipboardEntry,
+    Context, ElementId, ElementInputHandler, Entity, EntityInputHandler, FocusHandle, FontWeight,
+    Hsla, ImageFormat, ImageSource, InteractiveElement, IntoElement, KeyDownEvent, MouseButton,
+    MouseDownEvent, MouseMoveEvent, MouseUpEvent, ObjectFit, ParentElement, PathPromptOptions,
+    Pixels, Point, Render, RenderImage, ScrollWheelEvent, SharedString, Size,
+    StatefulInteractiveElement, Styled, StyledImage, Subscription, Task, TextAlign, TextRun,
+    UTF16Selection, UniformListScrollHandle, Window, WindowBounds, WindowOptions, WrappedLine,
 };
 use gpui_component::button::{Button, ButtonVariants};
 use gpui_component::input::{Input, InputState};
@@ -173,9 +173,9 @@ use crate::ui::project_scope::{ProjectScope, ProjectScopeMenuState};
 use crate::ui::task_search::{TaskSearchCandidate, TaskSearchState};
 use crate::ui::task_workspace::{
     conversation_poll_priorities_due, Allocation, AllocationMetrics, Axis,
-    ConversationQueryPriority, DropTarget, Edge, PaneId, PaneRect, SplitId, TaskPaneBody,
-    TaskPaneProjection, TaskPaneViewModel, TaskSurfaceRegistry, TaskWorkspace,
-    TaskWorkspaceViewChild, TaskWorkspaceViewModel, TaskWorkspaceViewNode, Viewport,
+    CenterSurfaceLoadingState, ConversationQueryPriority, DropTarget, Edge, PaneId, PaneRect,
+    SplitId, TaskPaneBody, TaskPaneProjection, TaskPaneViewModel, TaskSurfaceRegistry,
+    TaskWorkspace, TaskWorkspaceViewChild, TaskWorkspaceViewModel, TaskWorkspaceViewNode, Viewport,
     WorkspaceError, WorkspaceSelectionGesture, CONVERSATION_RECOVERY_HEARTBEAT,
 };
 use crate::ui::terminal_adapter::TerminalDockAdapter;
@@ -7191,14 +7191,21 @@ async fn execute_native_command(
             let _ = request_id;
             let action_id = action::cockpit_query_action_id(&query);
             match query_task_cockpit(&mut port, task_id, query).await? {
-                Ok(result) => Ok(NativeHostExecutionResult::Query {
-                    detail: bounded_host_error(format!(
-                        "{} · {:?}",
-                        action_id,
-                        std::mem::discriminant(&result)
-                    )),
-                    body: NativeHostQueryBody::TaskCockpit(result),
-                }),
+                Ok(result) => {
+                    let detail = match &result {
+                        crate::domain::TaskCockpitResult::Denied {
+                            surface, reason, ..
+                        } => format!("{action_id}: {surface:?} denied: {reason:?}"),
+                        crate::domain::TaskCockpitResult::Unavailable {
+                            surface, reason, ..
+                        } => format!("{action_id}: {surface:?} unavailable: {reason:?}"),
+                        _ => action_id.to_string(),
+                    };
+                    Ok(NativeHostExecutionResult::Query {
+                        detail: bounded_host_error(detail),
+                        body: NativeHostQueryBody::TaskCockpit(result),
+                    })
+                }
                 Err(error) => Ok(NativeHostExecutionResult::QueryFailed(bounded_host_error(
                     format!("task cockpit query failed: {error:?}"),
                 ))),
@@ -10096,6 +10103,333 @@ impl Drop for NativeShell {
     }
 }
 
+#[derive(Clone)]
+struct NativeGitWindowSnapshot {
+    tokens: crate::ui::tokens::ThemeTokens,
+    repositories: Vec<crate::domain::cockpit::TaskRepositoryCatalogEntry>,
+    status: Option<crate::domain::cockpit::TaskGitProjection>,
+    file_diff: Option<crate::domain::cockpit::TaskGitFileDiffProjection>,
+    history: Option<crate::domain::cockpit::TaskGitHistoryProjection>,
+    commit_diff: Option<crate::domain::cockpit::TaskGitCommitDiffProjection>,
+    feedback: Option<String>,
+}
+
+impl NativeGitWindowSnapshot {
+    fn from_shell(
+        shell: &NativeShell,
+        owner: &HostTaskKey,
+        selected_repository: &TaskRepositorySelector,
+    ) -> Self {
+        let slot = shell.host_slot(&owner.host);
+        let projection = slot.and_then(|slot| slot.cockpit.live_projection());
+        Self {
+            tokens: shell.theme_tokens(),
+            repositories: projection
+                .and_then(|projection| projection.repositories.clone())
+                .filter(|catalog| catalog.task_id == owner.task_id)
+                .map(|catalog| catalog.repositories)
+                .unwrap_or_default(),
+            status: projection
+                .and_then(|projection| projection.git.clone())
+                .filter(|git| {
+                    git.task_id == owner.task_id
+                        && git.selector.as_ref() == Some(selected_repository)
+                }),
+            file_diff: projection.and_then(|projection| projection.git_file_diff.clone()),
+            history: projection.and_then(|projection| projection.git_history.clone()),
+            commit_diff: projection.and_then(|projection| projection.git_commit_diff.clone()),
+            feedback: slot
+                .and_then(|slot| slot.last_query_detail.clone())
+                .filter(|detail| {
+                    let detail = detail.to_ascii_lowercase();
+                    detail.contains("failed")
+                        || detail.contains("denied")
+                        || detail.contains("unavailable")
+                        || detail.contains("error")
+                }),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NativeGitView {
+    Changes,
+    History,
+}
+
+struct NativeGitWindow {
+    shell: Entity<NativeShell>,
+    owner: HostTaskKey,
+    selected_repository: TaskRepositorySelector,
+    snapshot: NativeGitWindowSnapshot,
+    active_view: NativeGitView,
+    show_repository_menu: bool,
+    selected_file: Option<String>,
+    selected_commit: Option<String>,
+    commit_summary: Entity<InputState>,
+    commit_description: Entity<InputState>,
+    _shell_subscription: Subscription,
+}
+
+impl NativeGitWindow {
+    fn new(
+        shell: Entity<NativeShell>,
+        owner: HostTaskKey,
+        selected_repository: TaskRepositorySelector,
+        snapshot: NativeGitWindowSnapshot,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let commit_summary =
+            cx.new(|cx| InputState::new(window, cx).placeholder("Summary (required)"));
+        let commit_description =
+            cx.new(|cx| InputState::new(window, cx).placeholder("Description"));
+        let timer = cx.background_executor().clone();
+        let shell_subscription = cx.observe(&shell, move |this, shell, cx| {
+            let owner = this.owner.clone();
+            let selected_repository = this.selected_repository.clone();
+            let timer = timer.clone();
+            cx.spawn(
+                move |this: gpui::WeakEntity<NativeGitWindow>, cx: &mut gpui::AsyncApp| {
+                    let mut async_cx = cx.clone();
+                    async move {
+                        // The observed shell may still be finishing the update
+                        // that emitted this notification. Read it on the next
+                        // executor turn so the Git window never double-leases
+                        // its parent entity while painting.
+                        timer.timer(Duration::from_millis(1)).await;
+                        let snapshot = shell
+                            .read_with(&async_cx, |shell, _| {
+                                NativeGitWindowSnapshot::from_shell(
+                                    shell,
+                                    &owner,
+                                    &selected_repository,
+                                )
+                            })
+                            .ok();
+                        let Some(snapshot) = snapshot else {
+                            return;
+                        };
+                        let _ = this.update(&mut async_cx, |this, cx| {
+                            this.snapshot = snapshot;
+                            cx.notify();
+                        });
+                    }
+                },
+            )
+            .detach();
+        });
+        Self {
+            shell,
+            owner,
+            selected_repository,
+            snapshot,
+            active_view: NativeGitView::Changes,
+            show_repository_menu: false,
+            selected_file: None,
+            selected_commit: None,
+            commit_summary,
+            commit_description,
+            _shell_subscription: shell_subscription,
+        }
+    }
+
+    fn request_status(&self, cx: &mut Context<Self>) {
+        let owner = self.owner.clone();
+        let selector = self.selected_repository.clone();
+        let _ = self.shell.update(cx, |shell, _| {
+            shell.selected_repository = Some((owner.clone(), selector.clone()));
+            let _ = shell.dispatch_action_recorded_for_owner(
+                &owner.host,
+                ActionRequest::TaskCockpit {
+                    task_id: owner.task_id,
+                    query: TaskCockpitQuery::GitStatusTargeted { selector },
+                },
+            );
+        });
+    }
+
+    fn request_file_diff(&self, relative_path: String, staged: bool, cx: &mut Context<Self>) {
+        let owner = self.owner.clone();
+        let selector = self.selected_repository.clone();
+        let _ = self.shell.update(cx, |shell, _| {
+            let _ = shell.dispatch_action_recorded_for_owner(
+                &owner.host,
+                ActionRequest::TaskCockpit {
+                    task_id: owner.task_id,
+                    query: TaskCockpitQuery::GitFileDiffTargeted {
+                        selector,
+                        relative_path,
+                        staged,
+                    },
+                },
+            );
+        });
+    }
+
+    fn request_history(&self, cx: &mut Context<Self>) {
+        let owner = self.owner.clone();
+        let selector = self.selected_repository.clone();
+        let _ = self.shell.update(cx, |shell, _| {
+            let _ = shell.dispatch_action_recorded_for_owner(
+                &owner.host,
+                ActionRequest::TaskCockpit {
+                    task_id: owner.task_id,
+                    query: TaskCockpitQuery::GitHistoryTargeted {
+                        selector,
+                        limit: 100,
+                        skip: 0,
+                    },
+                },
+            );
+        });
+    }
+
+    fn request_commit_diff(&self, commit_hash: String, cx: &mut Context<Self>) {
+        let owner = self.owner.clone();
+        let selector = self.selected_repository.clone();
+        let _ = self.shell.update(cx, |shell, _| {
+            let _ = shell.dispatch_action_recorded_for_owner(
+                &owner.host,
+                ActionRequest::TaskCockpit {
+                    task_id: owner.task_id,
+                    query: TaskCockpitQuery::GitCommitDiffTargeted {
+                        selector,
+                        commit_hash,
+                    },
+                },
+            );
+        });
+    }
+
+    fn mutate(&self, intent: crate::domain::cockpit::TaskGitMutateIntent, cx: &mut Context<Self>) {
+        let owner = self.owner.clone();
+        let selector = self.selected_repository.clone();
+        let _ = self.shell.update(cx, |shell, _| {
+            let _ = shell.dispatch_action_recorded_for_owner(
+                &owner.host,
+                ActionRequest::TaskCockpit {
+                    task_id: owner.task_id,
+                    query: TaskCockpitQuery::GitMutateTargeted {
+                        selector,
+                        intent,
+                        confirm: true,
+                    },
+                },
+            );
+        });
+    }
+}
+
+fn native_git_diff_rows(
+    diff: &crate::git::git_service::GitDiffResult,
+    tokens: &crate::ui::tokens::ThemeTokens,
+) -> Vec<AnyElement> {
+    if diff.is_binary {
+        return vec![div()
+            .p(px(16.0))
+            .text_color(tokens.text.muted.to_gpui())
+            .child("Binary file changed")
+            .into_any_element()];
+    }
+    let mut rows = Vec::new();
+    let mut index = 0usize;
+    for hunk in &diff.hunks {
+        rows.push(
+            div()
+                .id(("native-git-diff-hunk", index))
+                .w_full()
+                .px(px(12.0))
+                .py(px(6.0))
+                .font_family("Consolas")
+                .text_size(px(tokens.density.typography.caption))
+                .bg(tokens.surfaces.selection.to_gpui())
+                .text_color(tokens.text.secondary.to_gpui())
+                .child(hunk.header.clone())
+                .into_any_element(),
+        );
+        index += 1;
+        for line in &hunk.lines {
+            let (prefix, background, foreground) = match line.kind {
+                crate::git::git_service::DiffLineKind::Add => (
+                    "+",
+                    tokens.status.success_surface.to_gpui(),
+                    tokens.status.success_foreground.to_gpui(),
+                ),
+                crate::git::git_service::DiffLineKind::Delete => (
+                    "−",
+                    tokens.status.destructive_surface.to_gpui(),
+                    tokens.status.destructive_foreground.to_gpui(),
+                ),
+                crate::git::git_service::DiffLineKind::HunkHeader => (
+                    " ",
+                    tokens.surfaces.selection.to_gpui(),
+                    tokens.text.secondary.to_gpui(),
+                ),
+                crate::git::git_service::DiffLineKind::Context => (
+                    " ",
+                    tokens.surfaces.canvas.to_gpui(),
+                    tokens.text.primary.to_gpui(),
+                ),
+            };
+            rows.push(
+                div()
+                    .id(("native-git-diff-line", index))
+                    .w_full()
+                    .flex()
+                    .font_family("Consolas")
+                    .text_size(px(tokens.density.typography.caption))
+                    .bg(background)
+                    .text_color(foreground)
+                    .child(
+                        div()
+                            .w(px(44.0))
+                            .flex_none()
+                            .px(px(6.0))
+                            .text_color(tokens.text.muted.to_gpui())
+                            .child(
+                                line.old_lineno
+                                    .map(|line| line.to_string())
+                                    .unwrap_or_default(),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .w(px(44.0))
+                            .flex_none()
+                            .px(px(6.0))
+                            .text_color(tokens.text.muted.to_gpui())
+                            .child(
+                                line.new_lineno
+                                    .map(|line| line.to_string())
+                                    .unwrap_or_default(),
+                            ),
+                    )
+                    .child(div().w(px(20.0)).flex_none().child(prefix))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .whitespace_nowrap()
+                            .child(line.content.clone()),
+                    )
+                    .into_any_element(),
+            );
+            index += 1;
+        }
+    }
+    if rows.is_empty() {
+        rows.push(
+            div()
+                .p(px(16.0))
+                .text_color(tokens.text.muted.to_gpui())
+                .child("No patch content for this selection")
+                .into_any_element(),
+        );
+    }
+    rows
+}
+
 impl NativeShell {
     pub fn new(profile: IsolatedDevProfile, cx: &mut Context<Self>) -> Self {
         Self::new_with_host_runtime_and_preferences(
@@ -12625,6 +12959,11 @@ impl NativeShell {
         let Some(task_id) = self.local_slot_mut().interaction.selected_task() else {
             return;
         };
+        let owner = self.local_task_key(task_id);
+        let terminal_query_in_flight = self
+            .task_surfaces
+            .state(owner.clone())
+            .is_some_and(|state| state.terminal_query_in_flight());
         let (loading_action, mut requests) = match self.local_slot_mut().cockpit.active_tool() {
             CockpitDockTool::Changes => (
                 Some(crate::client::action::ACTION_GIT_STATUS),
@@ -12665,11 +13004,15 @@ impl NativeShell {
                 }],
             ),
             CockpitDockTool::Terminal => (
-                Some(crate::client::action::ACTION_PROVIDER_TERMINAL_INPUT),
-                vec![ActionRequest::TaskCockpit {
-                    task_id,
-                    query: TaskCockpitQuery::Terminal,
-                }],
+                (!terminal_query_in_flight)
+                    .then_some(crate::client::action::ACTION_PROVIDER_TERMINAL_INPUT),
+                (!terminal_query_in_flight)
+                    .then_some(ActionRequest::TaskCockpit {
+                        task_id,
+                        query: TaskCockpitQuery::Terminal,
+                    })
+                    .into_iter()
+                    .collect(),
             ),
             CockpitDockTool::Artifacts | CockpitDockTool::Review => (None, Vec::new()),
         };
@@ -12678,14 +13021,16 @@ impl NativeShell {
                 .cockpit
                 .begin_cockpit_query(task_id, action_id);
         }
-        let after_sequence = self.conversation_after_sequence_for(self.local_task_key(task_id));
-        requests.insert(
-            0,
-            ActionRequest::TaskCockpit {
-                task_id,
-                query: TaskCockpitQuery::Conversation { after_sequence },
-            },
-        );
+        if !self.task_surfaces.conversation_in_flight(owner.clone()) {
+            let after_sequence = self.conversation_after_sequence_for(owner);
+            requests.insert(
+                0,
+                ActionRequest::TaskCockpit {
+                    task_id,
+                    query: TaskCockpitQuery::Conversation { after_sequence },
+                },
+            );
+        }
         self.dispatch_related_actions(requests);
     }
 
@@ -12711,6 +13056,10 @@ impl NativeShell {
         let task_id = key.task_id;
         let files_directory = self.files_relative_directory_for_owner(key);
         let after_sequence = self.conversation_after_sequence_for(key.clone());
+        let terminal_query_in_flight = self
+            .task_surfaces
+            .state(key.clone())
+            .is_some_and(|state| state.terminal_query_in_flight());
         let (loading_action, mut requests) = match active_tool {
             CockpitDockTool::Changes => (
                 Some(crate::client::action::ACTION_GIT_STATUS),
@@ -12736,11 +13085,15 @@ impl NativeShell {
                 }],
             ),
             CockpitDockTool::Terminal => (
-                Some(crate::client::action::ACTION_PROVIDER_TERMINAL_INPUT),
-                vec![ActionRequest::TaskCockpit {
-                    task_id,
-                    query: TaskCockpitQuery::Terminal,
-                }],
+                (!terminal_query_in_flight)
+                    .then_some(crate::client::action::ACTION_PROVIDER_TERMINAL_INPUT),
+                (!terminal_query_in_flight)
+                    .then_some(ActionRequest::TaskCockpit {
+                        task_id,
+                        query: TaskCockpitQuery::Terminal,
+                    })
+                    .into_iter()
+                    .collect(),
             ),
             CockpitDockTool::Review => (None, vec![ActionRequest::TaskShow { task_id }]),
             CockpitDockTool::Artifacts => (None, Vec::new()),
@@ -12753,13 +13106,15 @@ impl NativeShell {
                 slot.cockpit.begin_cockpit_query(task_id, action_id);
             }
         }
-        requests.insert(
-            0,
-            ActionRequest::TaskCockpit {
-                task_id,
-                query: TaskCockpitQuery::Conversation { after_sequence },
-            },
-        );
+        if !self.task_surfaces.conversation_in_flight(key.clone()) {
+            requests.insert(
+                0,
+                ActionRequest::TaskCockpit {
+                    task_id,
+                    query: TaskCockpitQuery::Conversation { after_sequence },
+                },
+            );
+        }
         self.dispatch_related_actions_for_owner(&key.host, requests);
     }
 
@@ -15094,6 +15449,8 @@ impl NativeShell {
                 }
                 // Fleet retains receipts until exact UI ownership/correlation/application.
                 // Receiving on the worker is not acceptance; ack only after apply.
+                let local_host = self.local_host_id();
+                let _ = self.request_terminal_refresh_after_accepted_input(&local_host, &action);
                 self.acknowledge_settled_command_receipt(&action, &receipt);
             }
             NativeHostActionOutcome::Queried {
@@ -18428,6 +18785,50 @@ impl NativeShell {
         }
     }
 
+    /// Raw provider-terminal bytes are acknowledged independently from the
+    /// terminal screen projection. Refresh the exact visible owner as soon as
+    /// the host accepts those bytes; otherwise the UI waits for the unrelated
+    /// 30-second conversation recovery heartbeat before showing local echo.
+    fn request_terminal_refresh_after_accepted_input(
+        &mut self,
+        host_id: &HostId,
+        action: &NativeActionRecord,
+    ) -> bool {
+        if host_id != &self.local_host_id() {
+            return false;
+        }
+        let NativeHostCommand::ProviderInput {
+            action_id,
+            arguments,
+            ..
+        } = &action.command
+        else {
+            return false;
+        };
+        if *action_id != crate::client::action::ACTION_PROVIDER_TERMINAL_INPUT {
+            return false;
+        }
+        let owner = HostTaskKey::new(host_id.clone(), arguments.task_id);
+        if self.selected_task_key.as_ref() != Some(&owner)
+            || !self
+                .host_slot(host_id)
+                .is_some_and(|slot| slot.cockpit.dock().showing_raw_terminal())
+        {
+            return false;
+        }
+        self.task_surfaces.note_terminal_query_started(owner);
+        self.dispatch_action_recorded_for_owner_inner(
+            host_id,
+            ActionRequest::TaskCockpit {
+                task_id: arguments.task_id,
+                query: TaskCockpitQuery::Terminal,
+            },
+            true,
+            NativeActionPurpose::Ordinary,
+        )
+        .is_ok()
+    }
+
     fn handle_provider_terminal_key(
         &mut self,
         event: &KeyDownEvent,
@@ -21285,6 +21686,10 @@ impl NativeShell {
             })
             .collect::<Vec<_>>();
         let showing_provider_terminal = self.task_center_terminal_preference(&owner);
+        let center_loading_state = self
+            .task_surfaces
+            .state(owner.clone())
+            .and_then(|state| state.center_loading_state(showing_provider_terminal));
         let composer_hairline = mix_color(tokens.surfaces.canvas, tokens.borders.subtle, 0.65);
         let composer_pill = |label: &str| {
             div()
@@ -21975,7 +22380,9 @@ impl NativeShell {
                     }
                 });
             });
-            if self.honest_empty_conversation_for(&owner) {
+            if self.honest_empty_conversation_for(&owner)
+                && center_loading_state != Some(CenterSurfaceLoadingState::ConversationInitial)
+            {
                 // Keep the canonical conversation-with-footer contract: empty
                 // body replaces only the timeline region, never the composer.
                 div()
@@ -22024,15 +22431,93 @@ impl NativeShell {
                 .child(conversation)
                 .into_any_element()
         };
+        let loading_overlay = center_loading_state
+            .map(|state| Self::center_surface_loading_overlay(&owner, state, show_input, tokens));
         div()
             .id("native-task-center-canvas")
+            .relative()
             .w_full()
             .flex()
             .flex_1()
             .min_h(px(0.0))
             .flex_col()
             .child(center_body)
+            .children(loading_overlay)
             .into_any_element()
+    }
+
+    fn center_surface_loading_overlay(
+        owner: &HostTaskKey,
+        state: CenterSurfaceLoadingState,
+        show_input: bool,
+        tokens: crate::ui::tokens::ThemeTokens,
+    ) -> AnyElement {
+        let (label, initial) = match state {
+            CenterSurfaceLoadingState::ConversationInitial => ("Loading conversation…", true),
+            CenterSurfaceLoadingState::ConversationSync => ("Syncing conversation…", false),
+            CenterSurfaceLoadingState::TerminalInitial => ("Starting terminal…", true),
+            CenterSurfaceLoadingState::TerminalSync => ("Syncing terminal…", false),
+        };
+        let animation_key = stable_host_task_element_key(owner, "center-loading-pulse");
+        let pulse = div()
+            .flex_none()
+            .size(px(7.0))
+            .rounded_full()
+            .bg(tokens.actions.primary.default.background.to_gpui())
+            .with_animation(
+                ("native-center-loading-pulse", animation_key),
+                Animation::new(Duration::from_millis(900))
+                    .repeat()
+                    .with_easing(|delta| {
+                        let triangle = if delta <= 0.5 {
+                            delta * 2.0
+                        } else {
+                            (1.0 - delta) * 2.0
+                        };
+                        0.35 + triangle * 0.65
+                    }),
+                |dot, opacity| dot.opacity(opacity),
+            );
+        let chip = div()
+            .flex()
+            .items_center()
+            .gap(px(tokens.density.spacing.xs))
+            .px(px(tokens.density.spacing.sm))
+            .py(px(tokens.density.spacing.xs))
+            .rounded_full()
+            .border(px(1.0))
+            .border_color(tokens.borders.subtle.to_gpui())
+            .bg(tokens.surfaces.raised.to_gpui())
+            .shadow_sm()
+            .text_size(px(tokens.density.typography.caption))
+            .text_color(tokens.text.secondary.to_gpui())
+            .child(pulse)
+            .child(label);
+        let overlay = div()
+            .id((
+                "native-center-loading-overlay",
+                stable_host_task_element_key(owner, "center-loading-overlay"),
+            ))
+            .absolute()
+            .left(px(0.0))
+            .right(px(0.0))
+            .flex()
+            .justify_center();
+        if initial {
+            overlay
+                .top(px(0.0))
+                .bottom(px(if show_input {
+                    CONVERSATION_COMPOSER_HEIGHT_RESERVE
+                } else {
+                    0.0
+                }))
+                .items_center()
+                .bg(tokens.surfaces.canvas.to_gpui())
+                .child(chip)
+                .into_any_element()
+        } else {
+            overlay.top(px(12.0)).child(chip).into_any_element()
+        }
     }
 
     fn center_provider_terminal_surface_for(
@@ -33152,6 +33637,75 @@ impl NativeShell {
         self.select_changes_repository_for_owner(&self.local_task_key(task_id), selector);
     }
 
+    fn open_native_git_window(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
+        let Some(owner) = self.selected_task_key.clone() else {
+            self.local_slot_mut().last_query_detail =
+                Some("Select a task before opening Git.".into());
+            return;
+        };
+        if owner.host != self.local_host_id() {
+            if let Some(slot) = self.host_slot_mut(&owner.host) {
+                slot.last_query_detail = Some(Self::remote_local_authority_reason().into());
+            }
+            return;
+        }
+        let selector = self
+            .selected_repository_for_owner(&owner)
+            .or_else(|| {
+                self.repository_catalog_for_owner(&owner)
+                    .and_then(crate::ui::task_cockpit::changes_panel::default_repository_selector)
+            })
+            .unwrap_or(TaskRepositorySelector::Workspace);
+        self.selected_repository = Some((owner.clone(), selector.clone()));
+        self.dispatch_related_actions_for_owner(
+            &owner.host,
+            [
+                ActionRequest::TaskCockpit {
+                    task_id: owner.task_id,
+                    query: TaskCockpitQuery::GitRepositories,
+                },
+                ActionRequest::TaskCockpit {
+                    task_id: owner.task_id,
+                    query: TaskCockpitQuery::GitStatusTargeted {
+                        selector: selector.clone(),
+                    },
+                },
+            ],
+        );
+
+        let snapshot = NativeGitWindowSnapshot::from_shell(self, &owner, &selector);
+        let shell = cx.entity();
+        // GPUI paints a newly opened window synchronously. Defer this window until
+        // this click's NativeShell update lease has ended, otherwise the Git
+        // view's first render cannot safely read its parent shell projection.
+        cx.defer(move |cx| {
+            let bounds = Bounds::centered(None, size(px(1024.0), px(700.0)), cx);
+            let _ = cx.open_window(
+                WindowOptions {
+                    window_bounds: Some(WindowBounds::Windowed(bounds)),
+                    titlebar: Some(gpui::TitlebarOptions {
+                        title: Some("Git".into()),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                },
+                move |git_window, cx| {
+                    let git_view = cx.new(|cx| {
+                        NativeGitWindow::new(
+                            shell.clone(),
+                            owner.clone(),
+                            selector.clone(),
+                            snapshot.clone(),
+                            git_window,
+                            cx,
+                        )
+                    });
+                    cx.new(|cx| gpui_component::Root::new(git_view, git_window, cx))
+                },
+            );
+        });
+    }
+
     fn begin_header_open(&mut self) {
         let Some(task_id) = self.local_slot_mut().interaction.selected_task() else {
             self.local_slot_mut().last_query_detail =
@@ -36529,11 +37083,9 @@ impl NativeShell {
                             .rounded(px(6.0))
                             .cursor_pointer()
                             .hover(|style| style.bg(tokens.surfaces.hover.to_gpui()))
-                            .on_click(cx.listener(|shell, _event: &ClickEvent, _window, cx| {
+                            .on_click(cx.listener(|shell, _event: &ClickEvent, window, cx| {
                                 cx.stop_propagation();
-                                shell.dispatch_keyboard(KeyboardShortcut::alt(
-                                    crate::ui::actions::ShortcutKey::Digit(1),
-                                ));
+                                shell.open_native_git_window(window, cx);
                                 cx.notify();
                             }))
                             .child(crate::icons::app_icon(
@@ -37555,6 +38107,620 @@ impl EntityInputHandler for NativeShell {
         } else {
             None
         }
+    }
+}
+
+impl Render for NativeGitWindow {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let tokens = self.snapshot.tokens.clone();
+        let repositories = self.snapshot.repositories.clone();
+        let status = self.snapshot.status.clone();
+        let file_diff = self.snapshot.file_diff.clone();
+        let history = self.snapshot.history.clone();
+        let commit_diff = self.snapshot.commit_diff.clone();
+        let feedback = self.snapshot.feedback.clone();
+        let selected_label = repositories
+            .iter()
+            .find(|entry| entry.selector == self.selected_repository)
+            .map(|entry| entry.label.clone())
+            .unwrap_or_else(|| "Workspace".into());
+        let branch = status
+            .as_ref()
+            .and_then(|status| status.branch.clone())
+            .unwrap_or_else(|| "No branch".into());
+        let loading = status.is_none();
+        let entries = status
+            .as_ref()
+            .map(|status| status.entries.clone())
+            .unwrap_or_default();
+        let staged_paths = entries
+            .iter()
+            .filter(|entry| entry.staged)
+            .map(|entry| entry.relative_path.clone())
+            .collect::<Vec<_>>();
+        let unstaged_paths = entries
+            .iter()
+            .filter(|entry| !entry.staged || entry.unstaged)
+            .map(|entry| entry.relative_path.clone())
+            .collect::<Vec<_>>();
+        let active_file = self
+            .selected_file
+            .as_ref()
+            .and_then(|path| entries.iter().find(|entry| &entry.relative_path == path))
+            .cloned();
+        let active_file_diff = self.selected_file.as_ref().and_then(|path| {
+            file_diff.as_ref().filter(|diff| {
+                diff.task_id == self.owner.task_id
+                    && diff.selector == self.selected_repository
+                    && &diff.relative_path == path
+            })
+        });
+        let history_entries = history
+            .as_ref()
+            .filter(|history| {
+                history.task_id == self.owner.task_id
+                    && history.selector == self.selected_repository
+            })
+            .map(|history| history.entries.clone())
+            .unwrap_or_default();
+        let active_commit_diff = self.selected_commit.as_ref().and_then(|hash| {
+            commit_diff.as_ref().filter(|diff| {
+                diff.task_id == self.owner.task_id
+                    && diff.selector == self.selected_repository
+                    && &diff.commit_hash == hash
+            })
+        });
+
+        let refresh = cx.listener(|this, _event: &ClickEvent, _window, cx| {
+            this.request_status(cx);
+            if this.active_view == NativeGitView::History {
+                this.request_history(cx);
+            }
+            cx.notify();
+        });
+        let toggle_repositories = cx.listener(|this, _event: &ClickEvent, _window, cx| {
+            this.show_repository_menu = !this.show_repository_menu;
+            cx.notify();
+        });
+        let show_changes = cx.listener(|this, _event: &ClickEvent, _window, cx| {
+            this.active_view = NativeGitView::Changes;
+            cx.notify();
+        });
+        let show_history = cx.listener(|this, _event: &ClickEvent, _window, cx| {
+            this.active_view = NativeGitView::History;
+            this.request_history(cx);
+            cx.notify();
+        });
+        let repo_menu = self.show_repository_menu.then(|| {
+            div()
+                .id("native-git-repository-menu")
+                .absolute()
+                .top(px(38.0))
+                .left(px(12.0))
+                .w(px(300.0))
+                .max_h(px(320.0))
+                .overflow_y_scroll()
+                .p(px(6.0))
+                .rounded(px(tokens.density.radii.md))
+                .border(px(1.0))
+                .border_color(tokens.borders.subtle.to_gpui())
+                .bg(tokens.surfaces.raised.to_gpui())
+                .shadow_lg()
+                .children(repositories.iter().enumerate().map(|(index, entry)| {
+                    let selector = entry.selector.clone();
+                    let label = entry.label.clone();
+                    let available = entry.available;
+                    let selected = selector == self.selected_repository;
+                    div()
+                        .id(("native-git-repository", index))
+                        .w_full()
+                        .px(px(10.0))
+                        .py(px(8.0))
+                        .rounded(px(tokens.density.radii.sm))
+                        .when(selected, |row| row.bg(tokens.surfaces.selection.to_gpui()))
+                        .when(available, |row| {
+                            row.cursor_pointer()
+                                .hover(|style| style.bg(tokens.surfaces.hover.to_gpui()))
+                        })
+                        .on_click(cx.listener(move |this, _event: &ClickEvent, _window, cx| {
+                            if available {
+                                this.selected_repository = selector.clone();
+                                this.selected_file = None;
+                                this.selected_commit = None;
+                                this.show_repository_menu = false;
+                                this.request_status(cx);
+                                if this.active_view == NativeGitView::History {
+                                    this.request_history(cx);
+                                }
+                                cx.notify();
+                            }
+                        }))
+                        .child(label)
+                        .into_any_element()
+                }))
+                .into_any_element()
+        });
+
+        let file_rows = entries.iter().enumerate().map(|(index, entry)| {
+            let path = entry.relative_path.clone();
+            let path_for_select = path.clone();
+            let path_for_toggle = path.clone();
+            let staged = entry.staged;
+            let unstaged = entry.unstaged;
+            let selected = self.selected_file.as_deref() == Some(path.as_str());
+            let status_label = match entry.status {
+                crate::domain::cockpit::TaskGitEntryStatus::Modified => "M",
+                crate::domain::cockpit::TaskGitEntryStatus::Added => "A",
+                crate::domain::cockpit::TaskGitEntryStatus::Deleted => "D",
+                crate::domain::cockpit::TaskGitEntryStatus::Renamed => "R",
+                crate::domain::cockpit::TaskGitEntryStatus::Copied => "C",
+                crate::domain::cockpit::TaskGitEntryStatus::TypeChanged => "T",
+                crate::domain::cockpit::TaskGitEntryStatus::Untracked => "?",
+                crate::domain::cockpit::TaskGitEntryStatus::Conflict => "!",
+                crate::domain::cockpit::TaskGitEntryStatus::Submodule => "S",
+                crate::domain::cockpit::TaskGitEntryStatus::Unknown => "·",
+            };
+            div()
+                .id(("native-git-file", index))
+                .w_full()
+                .flex()
+                .items_center()
+                .gap(px(8.0))
+                .px(px(10.0))
+                .py(px(7.0))
+                .when(selected, |row| row.bg(tokens.surfaces.selection.to_gpui()))
+                .cursor_pointer()
+                .hover(|style| style.bg(tokens.surfaces.hover.to_gpui()))
+                .on_click(cx.listener(move |this, _event: &ClickEvent, _window, cx| {
+                    this.selected_file = Some(path_for_select.clone());
+                    this.request_file_diff(path_for_select.clone(), staged && !unstaged, cx);
+                    cx.notify();
+                }))
+                .child(
+                    div()
+                        .id(("native-git-stage-file", index))
+                        .size(px(18.0))
+                        .flex_none()
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .rounded(px(4.0))
+                        .border(px(1.0))
+                        .border_color(if staged {
+                            tokens.actions.primary.default.background.to_gpui()
+                        } else {
+                            tokens.borders.default.to_gpui()
+                        })
+                        .when(staged, |box_| {
+                            box_.bg(tokens.actions.primary.default.background.to_gpui())
+                                .text_color(tokens.actions.primary.default.foreground.to_gpui())
+                        })
+                        .on_click(cx.listener(move |this, _event: &ClickEvent, _window, cx| {
+                            cx.stop_propagation();
+                            let intent = if staged {
+                                crate::domain::cockpit::TaskGitMutateIntent::Unstage {
+                                    relative_paths: vec![path_for_toggle.clone()],
+                                }
+                            } else {
+                                crate::domain::cockpit::TaskGitMutateIntent::Stage {
+                                    relative_paths: vec![path_for_toggle.clone()],
+                                }
+                            };
+                            this.mutate(intent, cx);
+                            cx.notify();
+                        }))
+                        .child(if staged { "✓" } else { "" }),
+                )
+                .child(
+                    div()
+                        .w(px(18.0))
+                        .flex_none()
+                        .text_color(tokens.text.muted.to_gpui())
+                        .child(status_label),
+                )
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .overflow_hidden()
+                        .text_ellipsis()
+                        .child(path),
+                )
+                .into_any_element()
+        });
+        let active_file_diff_rows = active_file_diff
+            .map(|projection| native_git_diff_rows(&projection.diff, &tokens))
+            .unwrap_or_default();
+        let history_rows = history_entries.iter().enumerate().map(|(index, entry)| {
+            let commit_hash = entry.full_hash.clone();
+            let selected = self.selected_commit.as_deref() == Some(entry.full_hash.as_str());
+            div()
+                .id(("native-git-history-entry", index))
+                .w_full()
+                .flex()
+                .flex_col()
+                .gap(px(3.0))
+                .px(px(12.0))
+                .py(px(9.0))
+                .border_b(px(1.0))
+                .border_color(tokens.borders.subtle.to_gpui())
+                .when(selected, |row| row.bg(tokens.surfaces.selection.to_gpui()))
+                .cursor_pointer()
+                .hover(|style| style.bg(tokens.surfaces.hover.to_gpui()))
+                .on_click(cx.listener(move |this, _event: &ClickEvent, _window, cx| {
+                    this.selected_commit = Some(commit_hash.clone());
+                    this.request_commit_diff(commit_hash.clone(), cx);
+                    cx.notify();
+                }))
+                .child(
+                    div()
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .child(entry.subject.clone()),
+                )
+                .child(
+                    div()
+                        .flex()
+                        .gap(px(8.0))
+                        .text_size(px(tokens.density.typography.caption))
+                        .text_color(tokens.text.muted.to_gpui())
+                        .child(entry.hash.clone())
+                        .child(entry.author_name.clone())
+                        .child(entry.date.clone()),
+                )
+                .into_any_element()
+        });
+        let active_commit_diff_rows = active_commit_diff
+            .map(|projection| native_git_diff_rows(&projection.diff, &tokens))
+            .unwrap_or_default();
+
+        let commit = cx.listener(|this, _event: &ClickEvent, window, cx| {
+            let summary = this.commit_summary.read(cx).value().trim().to_string();
+            if summary.is_empty() {
+                return;
+            }
+            let description = this.commit_description.read(cx).value().trim().to_string();
+            let message = if description.is_empty() {
+                summary
+            } else {
+                format!("{summary}\n\n{description}")
+            };
+            this.mutate(
+                crate::domain::cockpit::TaskGitMutateIntent::Commit { message },
+                cx,
+            );
+            this.commit_summary
+                .update(cx, |field, cx| field.set_value("", window, cx));
+            this.commit_description
+                .update(cx, |field, cx| field.set_value("", window, cx));
+            cx.notify();
+        });
+
+        div()
+            .id("native-git-window")
+            .relative()
+            .size_full()
+            .flex()
+            .flex_col()
+            .bg(tokens.surfaces.canvas.to_gpui())
+            .text_color(tokens.text.primary.to_gpui())
+            .child(
+                div()
+                    .h(px(48.0))
+                    .flex_none()
+                    .flex()
+                    .items_center()
+                    .gap(px(8.0))
+                    .px(px(12.0))
+                    .border_b(px(1.0))
+                    .border_color(tokens.borders.subtle.to_gpui())
+                    .child(
+                        Button::new("native-git-repository-selector")
+                            .label(selected_label)
+                            .dropdown_caret(true)
+                            .on_click(toggle_repositories),
+                    )
+                    .child(
+                        div()
+                            .px(px(10.0))
+                            .py(px(6.0))
+                            .rounded(px(tokens.density.radii.sm))
+                            .bg(tokens.surfaces.sunken.to_gpui())
+                            .child(branch),
+                    )
+                    .child(div().flex_1())
+                    .children(status.as_ref().map(|status| {
+                        div()
+                            .text_size(px(tokens.density.typography.caption))
+                            .text_color(tokens.text.secondary.to_gpui())
+                            .child(format!("↑{}  ↓{}", status.ahead, status.behind))
+                            .into_any_element()
+                    }))
+                    .child(Button::new("native-git-refresh").label("Refresh").on_click(refresh)),
+            )
+            .child(
+                div()
+                    .h(px(38.0))
+                    .flex_none()
+                    .flex()
+                    .items_end()
+                    .px(px(12.0))
+                    .border_b(px(1.0))
+                    .border_color(tokens.borders.subtle.to_gpui())
+                    .child(
+                        div()
+                            .id("native-git-tab-changes")
+                            .px(px(12.0))
+                            .py(px(8.0))
+                            .when(self.active_view == NativeGitView::Changes, |tab| {
+                                tab.border_b(px(2.0)).border_color(
+                                    tokens.actions.primary.default.background.to_gpui(),
+                                )
+                            })
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .cursor_pointer()
+                            .on_click(show_changes)
+                            .child("Changes"),
+                    )
+                    .child(
+                        div()
+                            .id("native-git-tab-history")
+                            .px(px(12.0))
+                            .py(px(8.0))
+                            .when(self.active_view == NativeGitView::History, |tab| {
+                                tab.border_b(px(2.0)).border_color(
+                                    tokens.actions.primary.default.background.to_gpui(),
+                                )
+                            })
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .cursor_pointer()
+                            .on_click(show_history)
+                            .child("History"),
+                    ),
+            )
+            .children((self.active_view == NativeGitView::Changes).then(|| {
+                div()
+                    .flex_1()
+                    .min_h(px(0.0))
+                    .flex()
+                    .child(
+                        div()
+                            .w(px(380.0))
+                            .flex_none()
+                            .flex()
+                            .flex_col()
+                            .border_r(px(1.0))
+                            .border_color(tokens.borders.subtle.to_gpui())
+                            .child(
+                                div()
+                                    .h(px(38.0))
+                                    .flex_none()
+                                    .flex()
+                                    .items_center()
+                                    .justify_between()
+                                    .px(px(10.0))
+                                    .border_b(px(1.0))
+                                    .border_color(tokens.borders.subtle.to_gpui())
+                                    .child(format!("{} changed files", entries.len()))
+                                    .children((!unstaged_paths.is_empty()).then(|| {
+                                        let paths = unstaged_paths.clone();
+                                        Button::new("native-git-stage-all")
+                                            .label("Stage all")
+                                            .small()
+                                            .on_click(cx.listener(
+                                                move |this, _event: &ClickEvent, _window, cx| {
+                                                    this.mutate(
+                                                        crate::domain::cockpit::TaskGitMutateIntent::Stage {
+                                                            relative_paths: paths.clone(),
+                                                        },
+                                                        cx,
+                                                    );
+                                                    cx.notify();
+                                                },
+                                            ))
+                                            .into_any_element()
+                                    })),
+                            )
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_h(px(0.0))
+                                    .overflow_y_scrollbar()
+                                    .children(file_rows),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .min_h(px(0.0))
+                            .p(px(24.0))
+                            .children(if loading {
+                                Some(
+                                    div()
+                                        .size_full()
+                                        .flex()
+                                        .items_center()
+                                        .justify_center()
+                                        .text_color(tokens.text.muted.to_gpui())
+                                        .child("Loading repository status…")
+                                        .into_any_element(),
+                                )
+                            } else if let Some(file) = active_file {
+                                Some(
+                                    div()
+                                        .flex()
+                                        .flex_col()
+                                        .gap(px(12.0))
+                                        .child(
+                                            div()
+                                                .text_size(px(tokens.density.typography.title))
+                                                .font_weight(FontWeight::SEMIBOLD)
+                                                .child(file.relative_path),
+                                        )
+                                        .child(
+                                            div()
+                                                .text_color(tokens.text.secondary.to_gpui())
+                                                .child(format!(
+                                                    "{:?} · {}{}",
+                                                    file.status,
+                                                    if file.staged { "staged" } else { "unstaged" },
+                                                    if file.unstaged && file.staged {
+                                                        " with additional working-tree changes"
+                                                    } else {
+                                                        ""
+                                                    }
+                                                )),
+                                        )
+                                        .child(
+                                            div()
+                                                .flex_1()
+                                                .min_h(px(0.0))
+                                                .overflow_y_scrollbar()
+                                                .when(active_file_diff_rows.is_empty(), |view| {
+                                                    view.text_color(tokens.text.muted.to_gpui())
+                                                        .child("Loading diff…")
+                                                })
+                                                .children(active_file_diff_rows),
+                                        )
+                                        .into_any_element(),
+                                )
+                            } else {
+                                Some(
+                                    div()
+                                        .size_full()
+                                        .flex()
+                                        .items_center()
+                                        .justify_center()
+                                        .text_color(tokens.text.muted.to_gpui())
+                                        .child(if entries.is_empty() {
+                                            "Working tree is clean"
+                                        } else {
+                                            "Select a changed file"
+                                        })
+                                        .into_any_element(),
+                                )
+                            }),
+                    )
+                    .into_any_element()
+            }))
+            .children((self.active_view == NativeGitView::History).then(|| {
+                div()
+                    .flex_1()
+                    .min_h(px(0.0))
+                    .flex()
+                    .child(
+                        div()
+                            .w(px(380.0))
+                            .flex_none()
+                            .flex()
+                            .flex_col()
+                            .border_r(px(1.0))
+                            .border_color(tokens.borders.subtle.to_gpui())
+                            .child(
+                                div()
+                                    .h(px(38.0))
+                                    .flex_none()
+                                    .flex()
+                                    .items_center()
+                                    .px(px(12.0))
+                                    .border_b(px(1.0))
+                                    .border_color(tokens.borders.subtle.to_gpui())
+                                    .child(if history.is_none() {
+                                        "Loading history…".to_string()
+                                    } else {
+                                        format!("{} recent commits", history_entries.len())
+                                    }),
+                            )
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_h(px(0.0))
+                                    .overflow_y_scrollbar()
+                                    .children(history_rows),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .min_h(px(0.0))
+                            .p(px(18.0))
+                            .overflow_y_scrollbar()
+                            .when(self.selected_commit.is_none(), |view| {
+                                view.flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .text_color(tokens.text.muted.to_gpui())
+                                    .child("Select a commit to inspect its patch")
+                            })
+                            .when(
+                                self.selected_commit.is_some()
+                                    && active_commit_diff_rows.is_empty(),
+                                |view| {
+                                    view.text_color(tokens.text.muted.to_gpui())
+                                        .child("Loading commit diff…")
+                                },
+                            )
+                            .children(active_commit_diff_rows),
+                    )
+                    .into_any_element()
+            }))
+            .children(feedback.map(|message| {
+                div()
+                    .flex_none()
+                    .px(px(14.0))
+                    .py(px(6.0))
+                    .bg(tokens.status.warning_surface.to_gpui())
+                    .text_color(tokens.status.warning_foreground.to_gpui())
+                    .child(message)
+                    .into_any_element()
+            }))
+            .children((self.active_view == NativeGitView::Changes).then(|| {
+                div()
+                    .flex_none()
+                    .flex()
+                    .items_end()
+                    .gap(px(10.0))
+                    .p(px(12.0))
+                    .border_t(px(1.0))
+                    .border_color(tokens.borders.subtle.to_gpui())
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .flex()
+                            .flex_col()
+                            .gap(px(6.0))
+                            .child(Input::new(&self.commit_summary).small())
+                            .child(Input::new(&self.commit_description).small()),
+                    )
+                    .children((!staged_paths.is_empty()).then(|| {
+                        let paths = staged_paths.clone();
+                        Button::new("native-git-unstage-all")
+                            .label("Unstage all")
+                            .on_click(cx.listener(
+                                move |this, _event: &ClickEvent, _window, cx| {
+                                    this.mutate(
+                                        crate::domain::cockpit::TaskGitMutateIntent::Unstage {
+                                            relative_paths: paths.clone(),
+                                        },
+                                        cx,
+                                    );
+                                    cx.notify();
+                                },
+                            ))
+                            .into_any_element()
+                    }))
+                    .child(
+                        Button::new("native-git-commit")
+                            .label("Commit")
+                            .primary()
+                            .disabled(staged_paths.is_empty())
+                            .on_click(commit),
+                    )
+                    .into_any_element()
+            }))
+            .children(repo_menu)
     }
 }
 
@@ -45694,13 +46860,10 @@ mod tests {
             shell.refresh_selected_cockpit_surfaces();
             assert_queries(
                 &shared,
-                &[
-                    crate::domain::TaskCockpitQuery::Conversation { after_sequence: 0 },
-                    crate::domain::TaskCockpitQuery::FilesList {
-                        relative_directory: None,
-                        limit: 64,
-                    },
-                ],
+                &[crate::domain::TaskCockpitQuery::FilesList {
+                    relative_directory: None,
+                    limit: 64,
+                }],
             );
 
             let _ = shell.local_slot_mut().cockpit.handle_tool_action(
@@ -45712,7 +46875,6 @@ mod tests {
             assert_queries(
                 &shared,
                 &[
-                    crate::domain::TaskCockpitQuery::Conversation { after_sequence: 0 },
                     crate::domain::TaskCockpitQuery::WorkspaceStatus,
                     crate::domain::TaskCockpitQuery::GitRepositories,
                 ],
@@ -45724,10 +46886,7 @@ mod tests {
             ));
             assert_queries(
                 &shared,
-                &[
-                    crate::domain::TaskCockpitQuery::Conversation { after_sequence: 0 },
-                    crate::domain::TaskCockpitQuery::ServiceSnapshots,
-                ],
+                &[crate::domain::TaskCockpitQuery::ServiceSnapshots],
             );
             assert!(
                 shared
@@ -56066,6 +57225,156 @@ mod tests {
     }
 
     #[test]
+    fn accepted_local_terminal_input_requests_an_immediate_screen_refresh() {
+        if rerun_headless_shell_test_in_child(
+            "ui::native_shell::tests::accepted_local_terminal_input_requests_an_immediate_screen_refresh",
+        ) {
+            return;
+        }
+        let (runtime, shared) = TestRuntime::new(true, NativeHostActionResult::Queued);
+        gpui::Application::headless().run(move |cx| {
+            crate::ui::init(cx);
+            with_test_shell_in_app(cx, runtime, |shell| {
+                let (model, task_id) = terminal_bound_client_model();
+                let model = Arc::new(model);
+                let snapshot = model.task(task_id).expect("task").clone();
+                let agent_id = snapshot.primary_agent_id.expect("agent");
+                let resource = snapshot
+                    .resources
+                    .values()
+                    .find(|resource| {
+                        resource.resource_kind == crate::domain::resource::ResourceKind::Terminal
+                    })
+                    .expect("terminal resource")
+                    .clone();
+                shell.apply_client_model(Arc::clone(&model)).expect("model");
+                let owner = HostTaskKey::new(shell.local_host_id(), task_id);
+                shell
+                    .select_fleet_task_key(owner.clone(), FleetSelectMode::Replace)
+                    .expect("select local task");
+                shell.set_provider_terminal_visible(true);
+
+                let terminal_query = shared
+                    .lock()
+                    .expect("runtime")
+                    .accepted
+                    .iter()
+                    .find(|record| {
+                        matches!(
+                            record.command,
+                            NativeHostCommand::TaskCockpitQuery {
+                                query: TaskCockpitQuery::Terminal,
+                                ..
+                            }
+                        )
+                    })
+                    .cloned()
+                    .expect("initial terminal query");
+                shell.apply_epoch_fenced_action_outcome_for_host(
+                    &owner.host,
+                    NativeHostActionOutcome::Queried {
+                        action: terminal_query,
+                        detail: "terminal".into(),
+                        body: NativeHostQueryBody::TaskCockpit(
+                            crate::domain::TaskCockpitResult::Terminal(
+                                crate::domain::cockpit::TaskTerminalProjection {
+                                    task_id,
+                                    terminal_id: crate::domain::TerminalId::new(),
+                                    session_id:
+                                        crate::terminal::protocol::TerminalSessionId::new(),
+                                    agent_session_id: agent_id,
+                                    resource_id: resource.id,
+                                    runtime_generation: snapshot.agents[&agent_id]
+                                        .runtime_generation,
+                                    resource_generation: resource.runtime_generation,
+                                    action_epoch: snapshot.task.action_epoch,
+                                    accepts_input_without_conversation_id: false,
+                                    sequence: 7,
+                                    title: Some("local-live".into()),
+                                    text_lines: vec!["> ".into()],
+                                    screen: Default::default(),
+                                },
+                            ),
+                        ),
+                    },
+                );
+                shared.lock().expect("runtime").accepted.clear();
+
+                let input_command_id = CommandId::new();
+                shell
+                    .dispatch_action_recorded(ActionRequest::ProviderInput(
+                        crate::client::action::ProviderInputActionRequest {
+                            command_id: input_command_id,
+                            action_id:
+                                crate::client::action::ACTION_PROVIDER_TERMINAL_INPUT,
+                            arguments: crate::client::action::ProviderInputArguments {
+                                task_id,
+                                agent_session_id: agent_id,
+                                runtime_generation: snapshot.agents[&agent_id]
+                                    .runtime_generation,
+                                action_epoch: snapshot.task.action_epoch,
+                                turn_id: crate::domain::TurnId::new(),
+                                question_id: None,
+                                approval_id: None,
+                                text: Some("x".into()),
+                                images: Vec::new(),
+                                wait: None,
+                                allow: None,
+                            },
+                        },
+                    ))
+                    .expect("dispatch terminal input");
+                let input = shared
+                    .lock()
+                    .expect("runtime")
+                    .accepted
+                    .iter()
+                    .find(|record| {
+                        matches!(
+                            &record.command,
+                            NativeHostCommand::ProviderInput { action_id, .. }
+                                if *action_id == crate::client::action::ACTION_PROVIDER_TERMINAL_INPUT
+                        )
+                    })
+                    .cloned()
+                    .expect("terminal input");
+                let command_id = native_command_id(&input.command).expect("command id");
+                assert_eq!(command_id, input_command_id);
+                shared.lock().expect("runtime").accepted.clear();
+
+                shell.apply_epoch_fenced_action_outcome_for_host(
+                    &owner.host,
+                    NativeHostActionOutcome::Accepted {
+                        action: input,
+                        receipt: crate::domain::command::CommandReceipt::Accepted {
+                            command_id,
+                            operation_id: crate::domain::id::OperationId::new(),
+                            task_revision: None,
+                            event_ids: Vec::new(),
+                            prompt_mutation: None,
+                        },
+                    },
+                );
+
+                assert!(
+                    shared.lock().expect("runtime").accepted.iter().any(|record| {
+                        matches!(
+                            record.command,
+                            NativeHostCommand::TaskCockpitQuery {
+                                task_id: queried_task,
+                                query: TaskCockpitQuery::Terminal,
+                                ..
+                            } if queried_task == task_id
+                        )
+                    }),
+                    "accepted raw input must request a terminal projection immediately instead of waiting for the 30-second conversation recovery heartbeat"
+                );
+            });
+            cx.quit();
+        });
+    }
+
+    #[test]
     fn owner_remote_files_directory_navigation_preserves_path_on_owner() {
         if rerun_headless_shell_test_in_child(
             "ui::native_shell::tests::owner_remote_files_directory_navigation_preserves_path_on_owner",
@@ -56144,6 +57453,28 @@ mod tests {
                 shell
                     .select_fleet_task_key(owner.clone(), FleetSelectMode::Replace)
                     .expect("select");
+                let initial_conversation = shared
+                    .lock()
+                    .expect("remote")
+                    .accepted
+                    .iter()
+                    .find(|record| {
+                        matches!(
+                            &record.command,
+                            NativeHostCommand::TaskCockpitQuery {
+                                query: TaskCockpitQuery::Conversation { .. },
+                                ..
+                            }
+                        )
+                    })
+                    .cloned()
+                    .expect("initial conversation query");
+                apply_conversation_query_outcome_for_test(
+                    shell,
+                    &remote_host,
+                    initial_conversation,
+                    test_conversation_user_page(1, 0, "initial-conversation"),
+                );
                 let _ = shell
                     .host_slot_mut(&remote_host)
                     .expect("remote")

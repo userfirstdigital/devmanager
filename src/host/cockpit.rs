@@ -277,6 +277,35 @@ pub(crate) fn serve_task_cockpit(dispatch: TaskCockpitDispatch<'_>) -> QueryOutc
         TaskCockpitQuery::GitStatusTargeted { selector } => {
             serve_git_status_targeted(&dispatch, task_id, &snapshot.task, selector)
         }
+        TaskCockpitQuery::GitFileDiffTargeted {
+            selector,
+            relative_path,
+            staged,
+        } => serve_git_file_diff_targeted(
+            &dispatch,
+            task_id,
+            &snapshot.task,
+            selector,
+            relative_path,
+            *staged,
+        ),
+        TaskCockpitQuery::GitHistoryTargeted {
+            selector,
+            limit,
+            skip,
+        } => {
+            serve_git_history_targeted(&dispatch, task_id, &snapshot.task, selector, *limit, *skip)
+        }
+        TaskCockpitQuery::GitCommitDiffTargeted {
+            selector,
+            commit_hash,
+        } => serve_git_commit_diff_targeted(
+            &dispatch,
+            task_id,
+            &snapshot.task,
+            selector,
+            commit_hash,
+        ),
         TaskCockpitQuery::GitMutate { intent, confirm } => serve_git_mutate_targeted(
             &dispatch,
             task_id,
@@ -1296,6 +1325,113 @@ fn serve_git_status_targeted(
     }
 }
 
+fn serve_git_file_diff_targeted(
+    dispatch: &TaskCockpitDispatch<'_>,
+    task_id: TaskId,
+    task: &crate::domain::task::TaskFacts,
+    selector: &TaskRepositorySelector,
+    relative_path: &str,
+    staged: bool,
+) -> QueryOutcome {
+    if relative_path.len() > MAX_COCKPIT_READ_BYTES as usize
+        || cockpit_repo_paths(&[relative_path.to_string()]).is_err()
+    {
+        return denied(
+            TaskCockpitSurface::Git,
+            TaskCockpitDeniedReason::PathTraversal,
+        );
+    }
+    let (repository, resolved) =
+        match open_git_repository_targeted(dispatch, task_id, task, selector) {
+            Ok(opened) => opened,
+            Err(outcome) => return outcome,
+        };
+    match crate::git::git_service::diff_file(&repository, relative_path, staged) {
+        Ok(diff) => QueryOutcome::Ok(QueryResult::TaskCockpit(TaskCockpitResult::GitFileDiff(
+            crate::domain::cockpit::TaskGitFileDiffProjection {
+                task_id,
+                selector: resolved.selector,
+                relative_path: relative_path.to_string(),
+                staged,
+                diff,
+            },
+        ))),
+        Err(error) => {
+            eprintln!("devmanager-host: cockpit Git file diff failed: {error}");
+            unavailable(
+                TaskCockpitSurface::Git,
+                TaskCockpitUnavailableReason::GitAuthorityNotIssued,
+            )
+        }
+    }
+}
+
+fn serve_git_history_targeted(
+    dispatch: &TaskCockpitDispatch<'_>,
+    task_id: TaskId,
+    task: &crate::domain::task::TaskFacts,
+    selector: &TaskRepositorySelector,
+    limit: u16,
+    skip: u32,
+) -> QueryOutcome {
+    if limit == 0 || limit > 100 || skip > 10_000 {
+        return QueryOutcome::Err(QueryError::InvalidRequest);
+    }
+    let (repository, resolved) =
+        match open_git_repository_targeted(dispatch, task_id, task, selector) {
+            Ok(opened) => opened,
+            Err(outcome) => return outcome,
+        };
+    match crate::git::git_service::log(&repository, u32::from(limit), skip) {
+        Ok(entries) => QueryOutcome::Ok(QueryResult::TaskCockpit(TaskCockpitResult::GitHistory(
+            crate::domain::cockpit::TaskGitHistoryProjection {
+                task_id,
+                selector: resolved.selector,
+                entries,
+                skip,
+            },
+        ))),
+        Err(error) => {
+            eprintln!("devmanager-host: cockpit Git history failed: {error}");
+            unavailable(
+                TaskCockpitSurface::Git,
+                TaskCockpitUnavailableReason::GitAuthorityNotIssued,
+            )
+        }
+    }
+}
+
+fn serve_git_commit_diff_targeted(
+    dispatch: &TaskCockpitDispatch<'_>,
+    task_id: TaskId,
+    task: &crate::domain::task::TaskFacts,
+    selector: &TaskRepositorySelector,
+    commit_hash: &str,
+) -> QueryOutcome {
+    let (repository, resolved) =
+        match open_git_repository_targeted(dispatch, task_id, task, selector) {
+            Ok(opened) => opened,
+            Err(outcome) => return outcome,
+        };
+    match crate::git::git_service::diff_commit(&repository, commit_hash) {
+        Ok(diff) => QueryOutcome::Ok(QueryResult::TaskCockpit(TaskCockpitResult::GitCommitDiff(
+            crate::domain::cockpit::TaskGitCommitDiffProjection {
+                task_id,
+                selector: resolved.selector,
+                commit_hash: commit_hash.to_string(),
+                diff,
+            },
+        ))),
+        Err(error) => {
+            eprintln!("devmanager-host: cockpit Git commit diff failed: {error}");
+            unavailable(
+                TaskCockpitSurface::Git,
+                TaskCockpitUnavailableReason::GitAuthorityNotIssued,
+            )
+        }
+    }
+}
+
 fn serve_git_mutate_targeted(
     dispatch: &TaskCockpitDispatch<'_>,
     task_id: TaskId,
@@ -1484,6 +1620,50 @@ fn git_status_outcome(
                     .filter(|entry| entry.kind != StatusKind::Unknown)
                     .count() as u32,
                 detached: status.is_detached,
+                entries: status
+                    .entries
+                    .iter()
+                    .take(usize::from(MAX_COCKPIT_FILE_LIST))
+                    .map(|entry| crate::domain::cockpit::TaskGitEntryProjection {
+                        relative_path: entry.path.display_lossy().into_owned(),
+                        original_relative_path: entry
+                            .original_path
+                            .as_ref()
+                            .map(|path| path.display_lossy().into_owned()),
+                        status: match entry.kind {
+                            StatusKind::Modified => {
+                                crate::domain::cockpit::TaskGitEntryStatus::Modified
+                            }
+                            StatusKind::Added => crate::domain::cockpit::TaskGitEntryStatus::Added,
+                            StatusKind::Deleted => {
+                                crate::domain::cockpit::TaskGitEntryStatus::Deleted
+                            }
+                            StatusKind::Renamed => {
+                                crate::domain::cockpit::TaskGitEntryStatus::Renamed
+                            }
+                            StatusKind::Copied => {
+                                crate::domain::cockpit::TaskGitEntryStatus::Copied
+                            }
+                            StatusKind::TypeChanged => {
+                                crate::domain::cockpit::TaskGitEntryStatus::TypeChanged
+                            }
+                            StatusKind::Untracked => {
+                                crate::domain::cockpit::TaskGitEntryStatus::Untracked
+                            }
+                            StatusKind::Conflict => {
+                                crate::domain::cockpit::TaskGitEntryStatus::Conflict
+                            }
+                            StatusKind::Submodule => {
+                                crate::domain::cockpit::TaskGitEntryStatus::Submodule
+                            }
+                            StatusKind::Unknown => {
+                                crate::domain::cockpit::TaskGitEntryStatus::Unknown
+                            }
+                        },
+                        staged: entry.is_staged(),
+                        unstaged: entry.is_unstaged(),
+                    })
+                    .collect(),
             },
         ))),
         Err(error) => {
@@ -3784,9 +3964,95 @@ mod tests {
             "current worktree changes must populate without authorizing the sibling backlink"
         );
         assert!(
+            status
+                .entries
+                .iter()
+                .any(|entry| entry.relative_path == "cockpit-change.txt"),
+            "the native Git window must receive bounded repository-relative status rows"
+        );
+        assert!(
+            status.entries.iter().all(|entry| !entry
+                .relative_path
+                .contains(repository.path().to_string_lossy().as_ref())),
+            "Git status rows must never disclose the authorized repository root"
+        );
+        assert!(
             !sibling.join("cockpit-change.txt").exists(),
             "status must not mutate or require the sibling checkout"
         );
+
+        let file_diff = serve_task_cockpit(dispatch(
+            &bus,
+            client_id,
+            task_id,
+            &TaskCockpitQuery::GitFileDiffTargeted {
+                selector: TaskRepositorySelector::Workspace,
+                relative_path: "cockpit-change.txt".into(),
+                staged: false,
+            },
+            Some(&roots),
+            Some(&coordinator),
+            Some(1),
+            Some(1),
+        ));
+        let QueryOutcome::Ok(QueryResult::TaskCockpit(TaskCockpitResult::GitFileDiff(file_diff))) =
+            file_diff
+        else {
+            panic!("targeted file diff failed: {file_diff:?}");
+        };
+        assert_eq!(file_diff.relative_path, "cockpit-change.txt");
+        assert!(file_diff.diff.hunks.iter().any(|hunk| {
+            hunk.lines.iter().any(|line| {
+                line.kind == crate::git::git_service::DiffLineKind::Add && line.content == "visible"
+            })
+        }));
+
+        let history = serve_task_cockpit(dispatch(
+            &bus,
+            client_id,
+            task_id,
+            &TaskCockpitQuery::GitHistoryTargeted {
+                selector: TaskRepositorySelector::Workspace,
+                limit: 25,
+                skip: 0,
+            },
+            Some(&roots),
+            Some(&coordinator),
+            Some(1),
+            Some(1),
+        ));
+        let QueryOutcome::Ok(QueryResult::TaskCockpit(TaskCockpitResult::GitHistory(history))) =
+            history
+        else {
+            panic!("targeted Git history failed: {history:?}");
+        };
+        let seed = history.entries.first().expect("seed history entry");
+        assert_eq!(seed.subject, "seed");
+
+        let commit_diff = serve_task_cockpit(dispatch(
+            &bus,
+            client_id,
+            task_id,
+            &TaskCockpitQuery::GitCommitDiffTargeted {
+                selector: TaskRepositorySelector::Workspace,
+                commit_hash: seed.full_hash.clone(),
+            },
+            Some(&roots),
+            Some(&coordinator),
+            Some(1),
+            Some(1),
+        ));
+        let QueryOutcome::Ok(QueryResult::TaskCockpit(TaskCockpitResult::GitCommitDiff(
+            commit_diff,
+        ))) = commit_diff
+        else {
+            panic!("targeted commit diff failed: {commit_diff:?}");
+        };
+        assert!(commit_diff.diff.hunks.iter().any(|hunk| {
+            hunk.lines.iter().any(|line| {
+                line.kind == crate::git::git_service::DiffLineKind::Add && line.content == "seed"
+            })
+        }));
     }
 
     #[test]

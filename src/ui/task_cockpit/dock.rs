@@ -2130,6 +2130,7 @@ mod process_census_tests {
                 behind: 0,
                 change_count: 1,
                 detached: false,
+                entries: Vec::new(),
             },
         ));
         dock.bind_cockpit_projection(projection);

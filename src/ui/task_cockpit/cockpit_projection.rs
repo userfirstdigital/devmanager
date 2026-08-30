@@ -12,7 +12,8 @@ use crate::client::action::{
 };
 use crate::domain::cockpit::{
     TaskCockpitDeniedReason, TaskCockpitResult, TaskCockpitSurface, TaskCockpitUnavailableReason,
-    TaskFileEntry, TaskFilesListProjection, TaskFilesReadProjection, TaskGitProjection,
+    TaskFileEntry, TaskFilesListProjection, TaskFilesReadProjection, TaskGitCommitDiffProjection,
+    TaskGitFileDiffProjection, TaskGitHistoryProjection, TaskGitProjection,
     TaskGitRepositoriesProjection, TaskServiceHealth, TaskServiceLogs, TaskServiceProjection,
     TaskServiceRuntimeState, TaskSshProjection, TaskTerminalProjection, TaskWorkspaceProjection,
 };
@@ -60,6 +61,9 @@ pub struct TaskCockpitLiveProjection {
     pub workspace: Option<TaskWorkspaceProjection>,
     pub repositories: Option<TaskGitRepositoriesProjection>,
     pub git: Option<TaskGitProjection>,
+    pub git_file_diff: Option<TaskGitFileDiffProjection>,
+    pub git_history: Option<TaskGitHistoryProjection>,
+    pub git_commit_diff: Option<TaskGitCommitDiffProjection>,
     pub files: Option<TaskFilesListProjection>,
     pub file_read: Option<TaskFilesReadProjection>,
     pub ssh: Option<TaskSshProjection>,
@@ -76,6 +80,9 @@ impl TaskCockpitLiveProjection {
             workspace: None,
             repositories: None,
             git: None,
+            git_file_diff: None,
+            git_history: None,
+            git_commit_diff: None,
             files: None,
             file_read: None,
             ssh: None,
@@ -105,6 +112,18 @@ impl TaskCockpitLiveProjection {
                 self.reconcile_git_with_catalog();
                 self.load =
                     load_for_ready_or_empty(value.change_count == 0 && value.branch.is_none());
+            }
+            TaskCockpitResult::GitFileDiff(value) if value.task_id == self.task_id => {
+                self.git_file_diff = Some(value.clone());
+                self.load = CockpitSurfaceLoad::Ready;
+            }
+            TaskCockpitResult::GitHistory(value) if value.task_id == self.task_id => {
+                self.git_history = Some(value.clone());
+                self.load = load_for_ready_or_empty(value.entries.is_empty());
+            }
+            TaskCockpitResult::GitCommitDiff(value) if value.task_id == self.task_id => {
+                self.git_commit_diff = Some(value.clone());
+                self.load = CockpitSurfaceLoad::Ready;
             }
             TaskCockpitResult::FilesList(value) if value.task_id == self.task_id => {
                 self.files = Some(value.clone());
@@ -151,6 +170,24 @@ impl TaskCockpitLiveProjection {
             }
             TaskCockpitResult::Git(_) => {
                 self.git = None;
+                self.load = CockpitSurfaceLoad::Error {
+                    message: "task cockpit result does not match the selected task".into(),
+                };
+            }
+            TaskCockpitResult::GitFileDiff(_) => {
+                self.git_file_diff = None;
+                self.load = CockpitSurfaceLoad::Error {
+                    message: "task cockpit result does not match the selected task".into(),
+                };
+            }
+            TaskCockpitResult::GitHistory(_) => {
+                self.git_history = None;
+                self.load = CockpitSurfaceLoad::Error {
+                    message: "task cockpit result does not match the selected task".into(),
+                };
+            }
+            TaskCockpitResult::GitCommitDiff(_) => {
+                self.git_commit_diff = None;
                 self.load = CockpitSurfaceLoad::Error {
                     message: "task cockpit result does not match the selected task".into(),
                 };
@@ -322,6 +359,7 @@ mod tests {
             behind: 0,
             change_count: 2,
             detached: false,
+            entries: Vec::new(),
         }
     }
 
@@ -391,6 +429,7 @@ mod tests {
             behind: 0,
             change_count: 1,
             detached: false,
+            entries: Vec::new(),
         }));
         assert!(projection.git.is_some());
 
@@ -461,6 +500,7 @@ mod tests {
             behind: 0,
             change_count: 9,
             detached: false,
+            entries: Vec::new(),
         }));
         assert!(matches!(projection.load, CockpitSurfaceLoad::Error { .. }));
         assert!(projection.git.is_none());
