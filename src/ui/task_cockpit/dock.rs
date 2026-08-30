@@ -1174,7 +1174,18 @@ impl ContextDock {
                 })
                 .collect();
         }
-        if screen.cells.is_empty() {
+        if !screen.lines.is_empty() {
+            for indexed in &screen.cells {
+                if let Some(cell) = screen
+                    .lines
+                    .get_mut(indexed.row)
+                    .and_then(|row| row.get_mut(indexed.column))
+                {
+                    *cell = indexed.cell.clone();
+                }
+            }
+        }
+        if screen.cells.is_empty() || !screen.lines.is_empty() {
             screen.cells = screen
                 .lines
                 .iter()
@@ -1904,6 +1915,62 @@ fn bound_exit_summary(value: &str) -> String {
 #[cfg(test)]
 mod process_census_tests {
     use super::*;
+
+    #[test]
+    fn projected_terminal_overlays_sparse_ansi_cells_on_plain_text_rows() {
+        use crate::terminal::session::{
+            TerminalCellSnapshot, TerminalIndexedCellSnapshot, TerminalScreenSnapshot,
+        };
+
+        let task_id = TaskId::new();
+        let agent_session_id = AgentSessionId::new();
+        let styled = TerminalCellSnapshot {
+            character: '!',
+            zero_width: Vec::new(),
+            foreground: 0xffb000,
+            background: 0,
+            bold: true,
+            dim: false,
+            italic: false,
+            underline: false,
+            undercurl: false,
+            strike: false,
+            hidden: false,
+            has_hyperlink: false,
+            default_background: true,
+            default_foreground: false,
+        };
+        let projection = TaskTerminalProjection {
+            task_id,
+            terminal_id: crate::domain::TerminalId::new(),
+            session_id: crate::terminal::protocol::TerminalSessionId::new(),
+            agent_session_id,
+            resource_id: crate::domain::ResourceId::new(),
+            runtime_generation: 1,
+            resource_generation: 1,
+            action_epoch: 1,
+            accepts_input_without_conversation_id: false,
+            sequence: 1,
+            title: None,
+            text_lines: vec!["x!".into()],
+            screen: TerminalScreenSnapshot {
+                cols: 2,
+                rows: 1,
+                cells: vec![TerminalIndexedCellSnapshot {
+                    row: 0,
+                    column: 1,
+                    cell: styled.clone(),
+                }],
+                ..TerminalScreenSnapshot::default()
+            },
+        };
+
+        let view = ContextDock::terminal_session_view_from_projection(&projection);
+
+        assert_eq!(view.screen.lines[0][0].character, 'x');
+        assert!(view.screen.lines[0][0].default_foreground);
+        assert_eq!(view.screen.lines[0][1], styled);
+    }
 
     fn terminal_view() -> TerminalSessionView {
         use crate::state::SessionDimensions;

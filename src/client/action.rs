@@ -674,6 +674,7 @@ pub const fn cockpit_query_action_id(query: &TaskCockpitQuery) -> &'static str {
         | TaskCockpitQuery::ProviderInputState => ACTION_CONVERSATION_STATUS,
         TaskCockpitQuery::Terminal
         | TaskCockpitQuery::TerminalScroll { .. }
+        | TaskCockpitQuery::TerminalResize { .. }
         | TaskCockpitQuery::TerminalReadiness => ACTION_PROVIDER_TERMINAL_INPUT,
         TaskCockpitQuery::WorkspaceStatus => ACTION_WORKSPACE_STATUS,
         TaskCockpitQuery::GitRepositories => ACTION_GIT_REPOSITORIES,

@@ -19,6 +19,16 @@ pub enum ConversationQueryPriority {
 /// Slow recovery heartbeat when a ConversationDirty push may have been missed.
 /// Primary conversation refresh is push-driven; this is not an idle poll cadence.
 pub const CONVERSATION_RECOVERY_HEARTBEAT: Duration = Duration::from_secs(30);
+/// A task already projected as working gets one bounded completion check each
+/// second while it remains open. Idle tasks remain push-driven and do not poll.
+pub const WORKING_CONVERSATION_POLL_INTERVAL: Duration = Duration::from_secs(1);
+
+pub fn working_conversation_poll_due(
+    projected_working: bool,
+    elapsed_since_poll: Duration,
+) -> bool {
+    projected_working && elapsed_since_poll >= WORKING_CONVERSATION_POLL_INTERVAL
+}
 
 /// Which conversation priorities are due for slow recovery polling.
 ///
@@ -320,7 +330,12 @@ impl TaskSurfaceState {
         if self.latest_terminal.is_some() {
             self.terminal_attachment = TerminalAttachmentState::StaleReconnecting;
         } else {
-            self.terminal_attachment = TerminalAttachmentState::Unavailable;
+            // A missing first projection after a transient transport/query
+            // failure is still a recoverable startup state. Only an explicit
+            // authoritative unsupported/exited result may label the terminal
+            // unavailable; otherwise returning tasks flash a false terminal
+            // failure while the host reconnects.
+            self.terminal_attachment = TerminalAttachmentState::Starting;
         }
     }
 
@@ -904,6 +919,13 @@ mod tests {
             !live.terminal_query_in_flight(),
             "a failed refresh must stop the loading animation"
         );
+
+        empty.note_terminal_reconnecting();
+        assert_eq!(
+            empty.terminal_attachment,
+            TerminalAttachmentState::Starting,
+            "a transient first-load failure must remain retryable rather than falsely reporting an unsupported terminal"
+        );
     }
 
     #[test]
@@ -1243,6 +1265,16 @@ mod tests {
             ]
         );
         assert!(CONVERSATION_RECOVERY_HEARTBEAT >= Duration::from_secs(30));
+    }
+
+    #[test]
+    fn working_conversations_use_a_bounded_one_second_completion_poll() {
+        assert!(!working_conversation_poll_due(
+            true,
+            Duration::from_millis(999)
+        ));
+        assert!(working_conversation_poll_due(true, Duration::from_secs(1)));
+        assert!(!working_conversation_poll_due(false, Duration::from_secs(30)));
     }
 
     #[test]

@@ -172,7 +172,8 @@ use crate::ui::project_actions::{
 use crate::ui::project_scope::{ProjectScope, ProjectScopeMenuState};
 use crate::ui::task_search::{TaskSearchCandidate, TaskSearchState};
 use crate::ui::task_workspace::{
-    conversation_poll_priorities_due, Allocation, AllocationMetrics, Axis,
+    conversation_poll_priorities_due, working_conversation_poll_due, Allocation,
+    AllocationMetrics, Axis,
     CenterSurfaceLoadingState, ConversationQueryPriority, DropTarget, Edge, PaneId, PaneRect,
     SplitId, TaskPaneBody, TaskPaneProjection, TaskPaneViewModel, TaskSurfaceRegistry,
     TaskWorkspace, TaskWorkspaceViewChild, TaskWorkspaceViewModel, TaskWorkspaceViewNode, Viewport,
@@ -606,6 +607,38 @@ fn caret_phase_repaint(
     } else {
         (true, Some(visible))
     }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CodexReasoningPickerPath {
+    Standard(usize),
+    Advanced(usize),
+}
+
+/// Drive Codex's own live `/model` picker using stable navigation keys rather
+/// than mutating a launch-only label. The provider catalog supplies the two
+/// indices; Home/End make the sequence independent of the highlighted rows.
+fn codex_model_picker_input(
+    model_index: usize,
+    effort: Option<CodexReasoningPickerPath>,
+) -> String {
+    let mut input = String::from("/model\r\u{1b}[F\r\u{1b}[H");
+    input.push_str(&"\u{1b}[B".repeat(model_index));
+    input.push('\r');
+    match effort {
+        None => {}
+        Some(CodexReasoningPickerPath::Standard(index)) => {
+            input.push_str("\u{1b}[H");
+            input.push_str(&"\u{1b}[B".repeat(index));
+            input.push('\r');
+        }
+        Some(CodexReasoningPickerPath::Advanced(index)) => {
+            input.push_str("\u{1b}[F\r\u{1b}[H");
+            input.push_str(&"\u{1b}[B".repeat(index));
+            input.push('\r');
+        }
+    }
+    input
 }
 
 /// Matching live Terminal runtime for the task's primary agent — enough to
@@ -9635,6 +9668,12 @@ struct RootEditorInputProxy {
     focus_handle: FocusHandle,
 }
 
+struct TerminalInputProxy {
+    shell: gpui::WeakEntity<NativeShell>,
+    focus_handle: FocusHandle,
+    marked_text: Option<String>,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ComposerSelectorKind {
     Provider,
@@ -9764,8 +9803,15 @@ pub struct NativeShell {
     terminal_scroll_px: f32,
     /// Per-HostTaskKey terminal text selection. Never keyed by raw TaskId alone.
     terminal_selections: BTreeMap<HostTaskKey, crate::terminal::view::TerminalSelection>,
+    /// Last resize requested for each owner while the host projection catches
+    /// up. This prevents GPUI paint churn from flooding identical PTY resizes.
+    pending_terminal_resizes: BTreeMap<HostTaskKey, (u16, u16)>,
     /// Owner currently dragging a terminal selection, if any.
     selecting_terminal_owner: Option<HostTaskKey>,
+    /// Exact center terminal most recently clicked for keyboard input. GPUI's
+    /// canvas selection can retain an earlier AccessKit row focus, so this
+    /// owner-qualified arm keeps ordinary keydown delivery deterministic.
+    terminal_input_owner: Option<HostTaskKey>,
     focus_handle: FocusHandle,
     terminal_focus_handle: FocusHandle,
     composer_focus_handle: FocusHandle,
@@ -9774,6 +9820,7 @@ pub struct NativeShell {
     controller_ticks: usize,
     controller_wake: ControllerWake,
     last_conversation_recovery_at: Option<Instant>,
+    last_working_conversation_poll_at: Option<Instant>,
     last_provider_settings_poll: Option<Instant>,
     last_bootstrap_retry_at: Option<Instant>,
     composer_caret_epoch: Instant,
@@ -9798,6 +9845,10 @@ pub struct NativeShell {
     /// Active IME marked range in UTF-16 units. This is platform editing
     /// state, not provider conversation state, and is discarded on commit.
     composer_marked_range: Option<Range<usize>>,
+    /// GPUI permits one platform input registration per entity. The terminal
+    /// therefore owns a forwarding entity instead of racing the composer's
+    /// `NativeShell` registration for Windows WM_CHAR/IME delivery.
+    terminal_input_proxy: Option<Entity<TerminalInputProxy>>,
     /// IME marked range for the root-focused overlay editors (search/new-task/
     /// rename/add-project/browser/theme name), kept distinct from composer IME.
     root_editor_marked_range: Option<Range<usize>>,
@@ -10000,6 +10051,22 @@ fn native_center_terminal_chrome_plan() -> NativeCenterTerminalChrome {
         outer_padding: false,
         embeds_renderer: true,
     }
+}
+
+fn center_terminal_interactive(
+    selected_owner: bool,
+    selected_task_matches: bool,
+    task_surface_interactive: bool,
+) -> bool {
+    selected_owner && selected_task_matches && task_surface_interactive
+}
+
+fn root_routes_key_to_terminal(
+    terminal_focused: bool,
+    terminal_input_armed: bool,
+    center_interactive: bool,
+) -> bool {
+    (terminal_focused || terminal_input_armed) && center_interactive
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -10697,6 +10764,15 @@ impl NativeShell {
             })
         };
         let root_editor_focus_handle = root_editor_input_proxy.read(cx).focus_handle.clone();
+        let terminal_input_proxy = {
+            let shell = cx.weak_entity();
+            cx.new(|proxy_cx| TerminalInputProxy {
+                shell,
+                focus_handle: proxy_cx.focus_handle().tab_stop(true),
+                marked_text: None,
+            })
+        };
+        let terminal_focus_handle = terminal_input_proxy.read(cx).focus_handle.clone();
         let mut shell = Self {
             host_connection: profile.host_connection(),
             profile,
@@ -10724,15 +10800,18 @@ impl NativeShell {
             terminal: TerminalDockAdapter::unavailable_with_preferences(preferences),
             terminal_scroll_px: 0.0,
             terminal_selections: BTreeMap::new(),
+            pending_terminal_resizes: BTreeMap::new(),
             selecting_terminal_owner: None,
+            terminal_input_owner: None,
             focus_handle: cx.focus_handle().tab_stop(true),
-            terminal_focus_handle: cx.focus_handle().tab_stop(true),
+            terminal_focus_handle,
             composer_focus_handle: cx.focus_handle().tab_stop(true),
             task_scroll_handle: UniformListScrollHandle::new(),
             controller_task: None,
             controller_ticks: 0,
             controller_wake,
             last_conversation_recovery_at: Some(Instant::now()),
+            last_working_conversation_poll_at: Some(Instant::now()),
             last_provider_settings_poll: Some(Instant::now()),
             last_bootstrap_retry_at: None,
             composer_caret_epoch: Instant::now(),
@@ -10749,6 +10828,7 @@ impl NativeShell {
             pending_root_overlay_focus: false,
             pending_terminal_focus: false,
             composer_marked_range: None,
+            terminal_input_proxy: Some(terminal_input_proxy),
             root_editor_marked_range: None,
             root_editor_input_proxy: Some(root_editor_input_proxy),
             root_editor_focus_handle,
@@ -12229,7 +12309,7 @@ impl NativeShell {
                 )),
             );
         }
-        if composer.is_some() && self.composer_launch_preferences_editable() {
+        if composer.is_some() && self.composer_model_reasoning_editable() {
             overlay_nodes.extend([
                 AccessibilityNode::new(
                     AccessibleRole::Button,
@@ -12243,13 +12323,17 @@ impl NativeShell {
                     "Choose the reasoning effort for this task.",
                 )
                 .gpui("native-composer-reasoning", true, true),
+            ]);
+        }
+        if composer.is_some() && self.composer_launch_preferences_editable() {
+            overlay_nodes.push(
                 AccessibilityNode::new(
                     AccessibleRole::Button,
                     "Change access",
                     "Choose the filesystem and approval access for this task.",
                 )
                 .gpui("native-composer-access", true, true),
-            ]);
+            );
         }
         self.composer_recovery_targets.clear();
         if let Some(owner) = selected_key.clone() {
@@ -15926,6 +16010,63 @@ impl NativeShell {
         semantic_repaint |= self.admit_ready_stream_frames(max);
         semantic_repaint |= self.sync_top_bar_from_updater();
 
+        // ConversationDirty remains the primary path. While an open task is
+        // visibly working, issue one bounded completion check per second so a
+        // missed dirty notice cannot leave the rail stuck on Working. Idle and
+        // settled tasks never enter this loop.
+        let working_poll_elapsed = self
+            .last_working_conversation_poll_at
+            .map(|at| now.saturating_duration_since(at))
+            .unwrap_or(crate::ui::task_workspace::WORKING_CONVERSATION_POLL_INTERVAL);
+        let working_open = self
+            .layout
+            .task_workspace
+            .as_ref()
+            .map(|workspace| {
+                workspace
+                    .task_ids()
+                    .into_iter()
+                    .filter(|key| {
+                        matches!(
+                            self.task_row_status_for_owner(key),
+                            Some(VisibleTaskStatus::Working | VisibleTaskStatus::Settling)
+                        ) && !self.task_surfaces.conversation_in_flight(key.clone())
+                    })
+                    .take(2)
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        if working_conversation_poll_due(!working_open.is_empty(), working_poll_elapsed)
+            && self.action_lane_len() < MAX_ACTION_LANE_RECORDS / 2
+        {
+            self.last_working_conversation_poll_at = Some(now);
+            for key in working_open {
+                if self.action_lane_len() >= MAX_ACTION_LANE_RECORDS / 2 {
+                    break;
+                }
+                let after_sequence = self.conversation_after_sequence_for(key.clone());
+                let selected = self.selected_task_key.as_ref() == Some(&key);
+                let record = self.host_slot_mut(&key.host).and_then(|slot| {
+                    if selected {
+                        slot.interaction.action_on_current_handler(
+                            ActionRequest::TaskCockpit {
+                                task_id: key.task_id,
+                                query: TaskCockpitQuery::Conversation { after_sequence },
+                            },
+                        )
+                    } else {
+                        slot.interaction.background_conversation_on_current_handler(
+                            key.task_id,
+                            after_sequence,
+                        )
+                    }
+                });
+                if let Some(mut record) = record {
+                    let _ = self.enqueue_host_action_for_owner(&key.host, &mut record);
+                }
+            }
+        }
+
         // ConversationDirty is the primary refresh signal. A slow recovery
         // heartbeat covers missed pushes without high-frequency idle polling.
         let recovery_elapsed = self
@@ -16220,6 +16361,13 @@ impl NativeShell {
                 accesskit::Action::Focus if element_id == "native-task-composer-input" => {
                     self.request_composer_accessibility_focus();
                     semantic_repaint = true;
+                }
+                accesskit::Action::Focus if element_id == "native-task-terminal-rows" => {
+                    if self.selected_center_terminal_is_interactive() {
+                        self.arm_selected_provider_terminal_input();
+                        self.pending_terminal_focus = true;
+                        semantic_repaint = true;
+                    }
                 }
                 accesskit::Action::Focus if element_id == "native-browser-address" => {
                     self.browser_address_focused = true;
@@ -17752,6 +17900,14 @@ impl NativeShell {
         if !self.composer_launch_preferences_editable() {
             return;
         }
+        self.store_composer_preferences_unchecked(provider, options);
+    }
+
+    fn store_composer_preferences_unchecked(
+        &mut self,
+        provider: ProviderKind,
+        options: crate::providers::ProviderLaunchOptions,
+    ) {
         self.layout.composer_provider = Some(provider);
         self.layout.composer_launch_options = Some(options.clone());
         if let Some(owner) = self
@@ -17769,6 +17925,23 @@ impl NativeShell {
             );
         }
         self.mark_layout_dirty();
+    }
+
+    fn composer_model_reasoning_editable(&self) -> bool {
+        if self.composer_launch_preferences_editable() {
+            return true;
+        }
+        let Some(owner) = self
+            .composer_draft_owner()
+            .or_else(|| self.selected_task_key.clone())
+        else {
+            return false;
+        };
+        owner.host == self.local_host_id()
+            && matches!(
+                self.task_provider_kind_for_owner(&owner),
+                Some(ProviderKind::ClaudeCode | ProviderKind::Codex)
+            )
     }
 
     fn composer_launch_preferences_editable(&self) -> bool {
@@ -17809,7 +17982,15 @@ impl NativeShell {
     }
 
     fn open_composer_selector(&mut self, kind: ComposerSelectorKind) {
-        if !self.composer_launch_preferences_editable() {
+        let editable = match kind {
+            ComposerSelectorKind::Model | ComposerSelectorKind::Reasoning => {
+                self.composer_model_reasoning_editable()
+            }
+            ComposerSelectorKind::Provider | ComposerSelectorKind::Access => {
+                self.composer_launch_preferences_editable()
+            }
+        };
+        if !editable {
             return;
         }
         if self.composer_selector == Some(kind) {
@@ -17911,7 +18092,11 @@ impl NativeShell {
         options.model = model;
         options.custom_model_slug = None;
         self.normalize_composer_effort_for_model(&mut options, provider);
-        self.store_draft_launch_prefs(provider, options);
+        if self.composer_launch_preferences_editable() {
+            self.store_draft_launch_prefs(provider, options);
+        } else if self.apply_live_session_preferences(provider, &options, true, false) {
+            self.store_composer_preferences_unchecked(provider, options);
+        }
         self.composer_selector = None;
     }
 
@@ -17923,7 +18108,11 @@ impl NativeShell {
         options.custom_model_slug = Some(slug);
         options.model = crate::providers::ProviderModel::ProviderDefault;
         self.normalize_composer_effort_for_model(&mut options, provider);
-        self.store_draft_launch_prefs(provider, options);
+        if self.composer_launch_preferences_editable() {
+            self.store_draft_launch_prefs(provider, options);
+        } else if self.apply_live_session_preferences(provider, &options, true, false) {
+            self.store_composer_preferences_unchecked(provider, options);
+        }
         self.composer_selector = None;
     }
 
@@ -17933,8 +18122,175 @@ impl NativeShell {
             .unwrap_or(ProviderKind::Codex);
         let mut options = self.composer_launch_options_for(provider);
         options.reasoning_effort = effort;
-        self.store_draft_launch_prefs(provider, options);
+        if self.composer_launch_preferences_editable() {
+            self.store_draft_launch_prefs(provider, options);
+        } else if self.apply_live_session_preferences(provider, &options, false, true) {
+            self.store_composer_preferences_unchecked(provider, options);
+        }
         self.composer_selector = None;
+    }
+
+    fn apply_live_session_preferences(
+        &mut self,
+        provider: ProviderKind,
+        options: &crate::providers::ProviderLaunchOptions,
+        change_model: bool,
+        change_reasoning: bool,
+    ) -> bool {
+        let Some(owner) = self
+            .composer_draft_owner()
+            .or_else(|| self.selected_task_key.clone())
+        else {
+            return false;
+        };
+        if owner.host != self.local_host_id()
+            || self.task_provider_kind_for_owner(&owner) != Some(provider)
+        {
+            return false;
+        }
+
+        if provider == ProviderKind::Codex {
+            let input = match self.codex_live_picker_input(options) {
+                Ok(input) => input,
+                Err(message) => {
+                    self.local_slot_mut().composer_error = Some(message);
+                    return false;
+                }
+            };
+            return self.dispatch_provider_runtime_text_for_owner(&owner, input, false);
+        }
+
+        let mut commands = Vec::new();
+        if change_model {
+            let Some(slug) = self.selected_model_slug_for_effort(provider, options) else {
+                self.local_slot_mut().composer_error = Some(
+                    "Choose a concrete model before changing a running session.".into(),
+                );
+                return false;
+            };
+            match provider {
+                ProviderKind::ClaudeCode => commands.push(format!("/model {slug}\r")),
+                ProviderKind::Codex => unreachable!("handled above"),
+                ProviderKind::Cursor => return false,
+            }
+        }
+        if change_reasoning {
+            let effort = match options.reasoning_effort {
+                crate::providers::ProviderReasoningEffort::ProviderDefault => "auto",
+                crate::providers::ProviderReasoningEffort::Low => "low",
+                crate::providers::ProviderReasoningEffort::Medium => "medium",
+                crate::providers::ProviderReasoningEffort::High => "high",
+                crate::providers::ProviderReasoningEffort::ExtraHigh => "xhigh",
+                crate::providers::ProviderReasoningEffort::Max => "max",
+                crate::providers::ProviderReasoningEffort::Ultra => "ultra",
+            };
+            match provider {
+                ProviderKind::ClaudeCode => commands.push(format!("/effort {effort}\r")),
+                ProviderKind::Codex => unreachable!("handled above"),
+                ProviderKind::Cursor => return false,
+            }
+        }
+        commands
+            .into_iter()
+            .all(|command| self.dispatch_provider_runtime_text_for_owner(&owner, command, false))
+    }
+
+    fn codex_live_picker_input(
+        &self,
+        options: &crate::providers::ProviderLaunchOptions,
+    ) -> Result<String, String> {
+        use crate::providers::ProviderReasoningEffort as Effort;
+        use crate::ui::provider_metadata::{efforts_from_supported, entry_for_slug};
+
+        let slug = self
+            .selected_model_slug_for_effort(ProviderKind::Codex, options)
+            .ok_or_else(|| "Choose a concrete Codex model for this running session.".to_string())?;
+        let instance_id = options.provider_instance_id.as_deref().unwrap_or_else(|| {
+            crate::providers::settings::default_instance_id_for_kind(ProviderKind::Codex)
+        });
+        let catalog = self.provider_settings.as_ref().and_then(|controller| {
+            controller
+                .model_catalogs()
+                .iter()
+                .find(|catalog| catalog.instance_id == instance_id)
+        });
+        let model_slugs = catalog
+            .map(|catalog| {
+                catalog
+                    .models
+                    .iter()
+                    .filter(|model| {
+                        !model.hidden
+                            && !model.is_custom
+                            && !model.slug.starts_with("codex-auto-")
+                    })
+                    .map(|model| model.slug.clone())
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_else(|| {
+                crate::ui::provider_settings::builtin_model_slugs(
+                    crate::providers::settings::ProviderDriverKind::Codex,
+                )
+                .into_iter()
+                .filter(|slug| !slug.starts_with("codex-auto-"))
+                .collect()
+            });
+        let model_index = model_slugs
+            .iter()
+            .position(|candidate| candidate == &slug)
+            .ok_or_else(|| format!("Codex no longer advertises {slug}; refresh Providers."))?;
+
+        let entry = catalog.and_then(|catalog| entry_for_slug(catalog, &slug));
+        let mut supported = entry
+            .map(|entry| efforts_from_supported(&entry.supported_efforts))
+            .unwrap_or_else(|| {
+                vec![
+                    Effort::Low,
+                    Effort::Medium,
+                    Effort::High,
+                    Effort::ExtraHigh,
+                    Effort::Max,
+                    Effort::Ultra,
+                ]
+            });
+        supported.retain(|effort| *effort != Effort::ProviderDefault);
+        if supported.len() <= 1 {
+            return Ok(codex_model_picker_input(model_index, None));
+        }
+        let target = if options.reasoning_effort == Effort::ProviderDefault {
+            entry
+                .and_then(|entry| entry.default_effort.as_deref())
+                .and_then(|token| {
+                    efforts_from_supported(&[token.to_string()])
+                        .into_iter()
+                        .find(|effort| *effort != Effort::ProviderDefault)
+                })
+                .unwrap_or(Effort::Medium)
+        } else {
+            options.reasoning_effort
+        };
+        let standard = supported
+            .iter()
+            .copied()
+            .filter(|effort| !matches!(effort, Effort::Max | Effort::Ultra))
+            .collect::<Vec<_>>();
+        let advanced = supported
+            .iter()
+            .copied()
+            .filter(|effort| matches!(effort, Effort::Max | Effort::Ultra))
+            .collect::<Vec<_>>();
+        let path = standard
+            .iter()
+            .position(|effort| *effort == target)
+            .map(CodexReasoningPickerPath::Standard)
+            .or_else(|| {
+                advanced
+                    .iter()
+                    .position(|effort| *effort == target)
+                    .map(CodexReasoningPickerPath::Advanced)
+            })
+            .ok_or_else(|| format!("{slug} does not advertise the selected reasoning level."))?;
+        Ok(codex_model_picker_input(model_index, Some(path)))
     }
 
     fn set_composer_access(&mut self, access: crate::providers::ProviderAccessMode) {
@@ -18165,10 +18521,14 @@ impl NativeShell {
                         .find(|c| c.instance_id == instance_id),
                 );
                 let mut choices = Vec::new();
-                choices.push((
-                    "Provider default".into(),
-                    ComposerSelectorChoice::Model(crate::providers::ProviderModel::ProviderDefault),
-                ));
+                if self.composer_launch_preferences_editable() {
+                    choices.push((
+                        "Provider default".into(),
+                        ComposerSelectorChoice::Model(
+                            crate::providers::ProviderModel::ProviderDefault,
+                        ),
+                    ));
+                }
                 for slug in ordered {
                     let choice = match (provider, slug.as_str()) {
                         (ProviderKind::Codex, "gpt-5.6-sol") => {
@@ -18690,6 +19050,9 @@ impl NativeShell {
 
     fn set_provider_terminal_visible(&mut self, visible: bool) {
         self.terminal_scroll_px = 0.0;
+        if !visible {
+            self.terminal_input_owner = None;
+        }
         if let Some(key) = self.selected_task_key.clone() {
             if key.host != self.local_host_id() {
                 if !visible {
@@ -18786,14 +19149,41 @@ impl NativeShell {
         if text.is_empty() {
             return false;
         }
-        let local = self.local_host_id();
         let Some(owner) = self.selected_task_key.clone() else {
             return false;
         };
-        if owner.host != local {
+        self.dispatch_provider_runtime_text_for_owner(&owner, text, true)
+    }
+
+    fn selected_center_terminal_is_interactive(&self) -> bool {
+        let Some(owner) = self.selected_task_key.as_ref() else {
             return false;
+        };
+        center_terminal_interactive(
+            owner.host == self.local_host_id(),
+            self.local_slot().interaction.selected_task() == Some(owner.task_id),
+            self.task_surfaces.terminal_is_interactive(owner.clone()),
+        )
+    }
+
+    fn terminal_input_is_armed(&self) -> bool {
+        self.terminal_input_owner.as_ref() == self.selected_task_key.as_ref()
+            && self.selected_center_terminal_is_interactive()
+    }
+
+    fn arm_selected_provider_terminal_input(&mut self) {
+        if self.selected_center_terminal_is_interactive() {
+            self.terminal_input_owner = self.selected_task_key.clone();
         }
-        if !self.local_slot().cockpit.dock().showing_raw_terminal() {
+    }
+
+    fn dispatch_provider_runtime_text_for_owner(
+        &mut self,
+        owner: &HostTaskKey,
+        text: String,
+        require_interactive_terminal: bool,
+    ) -> bool {
+        if text.is_empty() || owner.host != self.local_host_id() {
             return false;
         }
         let model = self.local_slot().client_model.clone();
@@ -18810,7 +19200,9 @@ impl NativeShell {
             return false;
         }
         let task_key = self.local_task_key(task_id);
-        if !self.task_surfaces.terminal_is_interactive(task_key.clone()) {
+        if require_interactive_terminal
+            && !self.task_surfaces.terminal_is_interactive(task_key.clone())
+        {
             self.local_slot_mut().composer_error =
                 Some(self.task_surfaces.terminal_label(task_key).to_string());
             return false;
@@ -18828,15 +19220,15 @@ impl NativeShell {
                 Some("primary agent facts are unavailable".into());
             return false;
         };
-        let Some(turn_id) = snapshot
+        let turn_id = snapshot
             .provider_sessions
             .get(&agent_session_id)
             .and_then(|provider| provider.current_turn)
-        else {
-            // Hold keystrokes until the turn exists. Switching into Terminal must
-            // not surface a red "turn not ready" composer error.
-            return false;
-        };
+            // Raw terminal input targets the exact provider runtime rather than
+            // a semantic turn. The host accepts it between turns (and during
+            // first-run onboarding), so use a correlation id when no turn is
+            // currently open instead of dropping the keystroke.
+            .unwrap_or_else(crate::domain::TurnId::new);
         let request =
             ActionRequest::ProviderInput(crate::client::action::ProviderInputActionRequest {
                 command_id: CommandId::new(),
@@ -18858,6 +19250,17 @@ impl NativeShell {
         match self.dispatch_action_checked(request) {
             Ok(()) => {
                 self.local_slot_mut().composer_error = None;
+                self.task_surfaces
+                    .note_terminal_query_started(owner.clone());
+                let _ = self.dispatch_action_recorded_for_owner_inner(
+                    &owner.host,
+                    ActionRequest::TaskCockpit {
+                        task_id,
+                        query: TaskCockpitQuery::Terminal,
+                    },
+                    true,
+                    NativeActionPurpose::Ordinary,
+                );
                 true
             }
             Err(failure) => {
@@ -18892,9 +19295,7 @@ impl NativeShell {
         }
         let owner = HostTaskKey::new(host_id.clone(), arguments.task_id);
         if self.selected_task_key.as_ref() != Some(&owner)
-            || !self
-                .host_slot(host_id)
-                .is_some_and(|slot| slot.cockpit.dock().showing_raw_terminal())
+            || !self.selected_center_terminal_is_interactive()
         {
             return false;
         }
@@ -18928,7 +19329,7 @@ impl NativeShell {
             }
             return;
         }
-        if !self.local_slot_mut().cockpit.dock().showing_raw_terminal() {
+        if !self.selected_center_terminal_is_interactive() {
             return;
         }
         if self
@@ -22040,6 +22441,34 @@ impl NativeShell {
                         .on_click(open_access),
                 )
                 .into_any_element()
+        } else if self.composer_model_reasoning_editable() {
+            div()
+                .flex()
+                .flex_wrap()
+                .items_center()
+                .gap(px(2.0))
+                .child(
+                    Button::new("native-composer-model")
+                        .label(model_label)
+                        .ghost()
+                        .xsmall()
+                        .dropdown_caret(true)
+                        .max_w(px(160.0))
+                        .overflow_hidden()
+                        .compact()
+                        .on_click(open_model),
+                )
+                .child(
+                    Button::new("native-composer-reasoning")
+                        .label(reasoning_label)
+                        .ghost()
+                        .xsmall()
+                        .dropdown_caret(true)
+                        .compact()
+                        .on_click(open_reasoning),
+                )
+                .child(composer_pill(access_label))
+                .into_any_element()
         } else if self.draft_owner_composer_workflow_pending() {
             composer_pill("Starting provider…")
         } else {
@@ -22827,15 +23256,33 @@ impl NativeShell {
         }
         let shell_entity = cx.weak_entity();
         let selected_owner = self.selected_task_key.as_ref() == Some(owner);
-        let interactive = selected_owner
-            && self.local_slot().interaction.selected_task() == Some(owner.task_id)
-            && self
-                .local_slot()
-                .cockpit
-                .dock()
-                .terminal_binding()
-                .is_some()
-            && self.task_surfaces.terminal_is_interactive(owner.clone());
+        let interactive = center_terminal_interactive(
+            selected_owner,
+            self.local_slot().interaction.selected_task() == Some(owner.task_id),
+            self.task_surfaces.terminal_is_interactive(owner.clone()),
+        );
+        let terminal_input_registration = interactive.then(|| {
+            let input_proxy = self
+                .terminal_input_proxy
+                .as_ref()
+                .expect("terminal input proxy is initialized with the shell")
+                .clone();
+            let focus_handle = self.terminal_focus_handle.clone();
+            canvas(
+                |_, _, _| (),
+                move |bounds, _, window, cx| {
+                    window.handle_input(
+                        &focus_handle,
+                        ElementInputHandler::new(bounds, input_proxy),
+                        cx,
+                    );
+                },
+            )
+            .absolute()
+            .top(px(0.0))
+            .left(px(0.0))
+            .size_full()
+        });
         let chrome = native_center_terminal_chrome_plan();
         let pane = self
             .task_surfaces
@@ -22865,6 +23312,7 @@ impl NativeShell {
         let _ = _adapter_theme_contract;
         let mut surface = div()
             .id("native-task-center-terminal-surface")
+            .relative()
             .w_full()
             .flex()
             .flex_1()
@@ -22913,14 +23361,17 @@ impl NativeShell {
         let scroll_owner = owner.clone();
         let terminal_line_height = tokens.density.typography.code_line_height;
         surface
+            .children(terminal_input_registration)
             .tab_stop(true)
             .track_focus(&self.terminal_focus_handle)
             .cursor_text()
-            .on_mouse_down(
-                MouseButton::Left,
-                move |_event: &MouseDownEvent, window: &mut Window, app: &mut gpui::App| {
+            .capture_any_mouse_down(
+                move |event: &MouseDownEvent, window: &mut Window, app: &mut gpui::App| {
+                    if event.button != MouseButton::Left {
+                        return;
+                    }
                     let _ = shell_for_focus.update(app, |shell, cx| {
-                        cx.stop_propagation();
+                        shell.arm_selected_provider_terminal_input();
                         shell.terminal_focus_handle.focus(window);
                         shell.pending_terminal_focus = false;
                         cx.notify();
@@ -22989,6 +23440,11 @@ impl NativeShell {
         if self.selected_task_key.as_ref() != Some(owner) {
             let _ = self.select_fleet_task_key(owner.clone(), FleetSelectMode::Replace);
         }
+        if self.selected_task_key.as_ref() == Some(owner)
+            && self.selected_center_terminal_is_interactive()
+        {
+            self.terminal_input_owner = Some(owner.clone());
+        }
         self.pending_terminal_focus = false;
     }
 
@@ -23000,10 +23456,17 @@ impl NativeShell {
         let shell_down = shell_entity.clone();
         let shell_move = shell_entity.clone();
         let shell_up = shell_entity.clone();
+        let shell_layout = shell_entity.clone();
+        let owner_layout = owner.clone();
         let owner_down = owner.clone();
         let owner_move = owner.clone();
         let owner_up = owner;
         crate::terminal::view::TerminalGridInteraction {
+            on_layout: Arc::new(move |(cols, rows), _window, app| {
+                let _ = shell_layout.update(app, |shell, _cx| {
+                    shell.request_terminal_resize_for_owner(&owner_layout, cols, rows);
+                });
+            }),
             on_mouse_down: Arc::new(move |_, event, window, app| {
                 let _ = shell_down.update(app, |shell, cx| {
                     shell.prepare_terminal_owner_for_grid_pointer(&owner_down, window);
@@ -23036,6 +23499,48 @@ impl NativeShell {
                 });
             }),
         }
+    }
+
+    fn request_terminal_resize_for_owner(
+        &mut self,
+        owner: &HostTaskKey,
+        cols: u16,
+        rows: u16,
+    ) -> bool {
+        let desired = (cols, rows);
+        let current = self
+            .task_surfaces
+            .state(owner.clone())
+            .and_then(|state| state.latest_terminal.as_ref())
+            .map(|terminal| {
+                (
+                    terminal.screen.cols.clamp(1, u16::MAX as usize) as u16,
+                    terminal.screen.rows.clamp(1, u16::MAX as usize) as u16,
+                )
+            });
+        if current == Some(desired) {
+            self.pending_terminal_resizes.remove(owner);
+            return false;
+        }
+        if self.pending_terminal_resizes.get(owner) == Some(&desired) {
+            return false;
+        }
+        let dispatched = self
+            .dispatch_action_recorded_for_owner_inner(
+                &owner.host,
+                ActionRequest::TaskCockpit {
+                    task_id: owner.task_id,
+                    query: TaskCockpitQuery::TerminalResize { cols, rows },
+                },
+                true,
+                NativeActionPurpose::Ordinary,
+            )
+            .is_ok();
+        if dispatched {
+            self.pending_terminal_resizes
+                .insert(owner.clone(), desired);
+        }
+        dispatched
     }
 
     fn task_terminal_surface_for(
@@ -24496,11 +25001,13 @@ impl NativeShell {
             .tab_stop(true)
             .track_focus(&self.terminal_focus_handle)
             .cursor_text()
-            .on_mouse_down(
-                MouseButton::Left,
-                move |_event: &MouseDownEvent, window: &mut Window, app: &mut gpui::App| {
+            .capture_any_mouse_down(
+                move |event: &MouseDownEvent, window: &mut Window, app: &mut gpui::App| {
+                    if event.button != MouseButton::Left {
+                        return;
+                    }
                     let _ = shell_for_focus.update(app, |shell, cx| {
-                        cx.stop_propagation();
+                        shell.arm_selected_provider_terminal_input();
                         shell.terminal_focus_handle.focus(window);
                         shell.pending_terminal_focus = false;
                         cx.notify();
@@ -24957,6 +25464,9 @@ impl NativeShell {
         key: HostTaskKey,
         mode: FleetSelectMode,
     ) -> Result<(), String> {
+        if self.terminal_input_owner.as_ref() != Some(&key) {
+            self.terminal_input_owner = None;
+        }
         if key.host.as_remote().is_some() && !remote_raw_terminal_allowed(&key.host) {
             // Selection itself is allowed; raw terminal input is refused later.
         }
@@ -35211,6 +35721,7 @@ impl NativeShell {
                 cx.stop_propagation();
                 shell.set_provider_terminal_visible(true);
                 if !shell.selected_owner_is_remote() {
+                    shell.arm_selected_provider_terminal_input();
                     shell.terminal_focus_handle.focus(window);
                     shell.pending_terminal_focus = false;
                 }
@@ -37199,6 +37710,7 @@ impl NativeShell {
             let show_terminal = !shell.owner_showing_raw_terminal();
             shell.set_provider_terminal_visible(show_terminal);
             if show_terminal && !shell.selected_owner_is_remote() {
+                shell.arm_selected_provider_terminal_input();
                 shell.terminal_focus_handle.focus(window);
                 shell.pending_terminal_focus = false;
             } else if !show_terminal {
@@ -37681,6 +38193,16 @@ impl NativeShell {
             .relative()
             .track_focus(&self.focus_handle)
             .on_key_down(cx.listener(|shell, event: &KeyDownEvent, window, cx| {
+                if root_routes_key_to_terminal(
+                    shell.terminal_focus_handle.is_focused(window),
+                    shell.terminal_input_is_armed(),
+                    shell.selected_center_terminal_is_interactive(),
+                ) {
+                    shell.handle_provider_terminal_key(event, window, cx);
+                    cx.stop_propagation();
+                    cx.notify();
+                    return;
+                }
                 let modifiers = event.keystroke.modifiers;
                 let platform_text = shell.root_editor_value().is_some()
                     && !modifiers.control
@@ -38279,6 +38801,128 @@ impl NativeShell {
     }
 }
 
+impl EntityInputHandler for TerminalInputProxy {
+    fn text_for_range(
+        &mut self,
+        range_utf16: Range<usize>,
+        adjusted_range: &mut Option<Range<usize>>,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> Option<String> {
+        let value = self.marked_text.as_deref().unwrap_or_default();
+        let (start_scalar, start_utf16) =
+            NativeShell::scalar_boundary_for_utf16(value, range_utf16.start);
+        let (mut end_scalar, mut end_utf16) =
+            NativeShell::scalar_boundary_for_utf16(value, range_utf16.end);
+        if end_scalar < start_scalar {
+            end_scalar = start_scalar;
+            end_utf16 = start_utf16;
+        }
+        adjusted_range.replace(start_utf16..end_utf16);
+        let start = value
+            .char_indices()
+            .nth(start_scalar)
+            .map(|(index, _)| index)
+            .unwrap_or(value.len());
+        let end = value
+            .char_indices()
+            .nth(end_scalar)
+            .map(|(index, _)| index)
+            .unwrap_or(value.len());
+        Some(value[start..end].to_string())
+    }
+
+    fn selected_text_range(
+        &mut self,
+        _ignore_disabled_input: bool,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> Option<UTF16Selection> {
+        let cursor = self
+            .marked_text
+            .as_deref()
+            .unwrap_or_default()
+            .encode_utf16()
+            .count();
+        Some(UTF16Selection {
+            range: cursor..cursor,
+            reversed: false,
+        })
+    }
+
+    fn marked_text_range(
+        &self,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> Option<Range<usize>> {
+        self.marked_text.as_ref().map(|text| {
+            let len = text.encode_utf16().count();
+            0..len
+        })
+    }
+
+    fn unmark_text(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
+        let Some(text) = self.marked_text.take() else {
+            return;
+        };
+        let _ = self.shell.update(cx, |shell, shell_cx| {
+            let _ = shell.dispatch_provider_terminal_text(text);
+            shell_cx.notify();
+        });
+    }
+
+    fn replace_text_in_range(
+        &mut self,
+        _range_utf16: Option<Range<usize>>,
+        text: &str,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.marked_text = None;
+        let text = text.to_string();
+        let _ = self.shell.update(cx, |shell, shell_cx| {
+            let _ = shell.dispatch_provider_terminal_text(text);
+            shell_cx.notify();
+        });
+    }
+
+    fn replace_and_mark_text_in_range(
+        &mut self,
+        _range_utf16: Option<Range<usize>>,
+        new_text: &str,
+        _new_selected_range: Option<Range<usize>>,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) {
+        self.marked_text = Some(new_text.to_string());
+    }
+
+    fn bounds_for_range(
+        &mut self,
+        _range_utf16: Range<usize>,
+        element_bounds: Bounds<Pixels>,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> Option<Bounds<Pixels>> {
+        Some(element_bounds)
+    }
+
+    fn character_index_for_point(
+        &mut self,
+        _point: Point<Pixels>,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> Option<usize> {
+        Some(
+            self.marked_text
+                .as_deref()
+                .unwrap_or_default()
+                .encode_utf16()
+                .count(),
+        )
+    }
+}
+
 impl EntityInputHandler for RootEditorInputProxy {
     fn text_for_range(
         &mut self,
@@ -38545,7 +39189,9 @@ impl EntityInputHandler for NativeShell {
         window: &mut Window,
         _cx: &mut Context<Self>,
     ) -> Option<usize> {
-        if self.composer_focus_handle.is_focused(window) {
+        if self.terminal_focus_handle.is_focused(window) {
+            Some(0)
+        } else if self.composer_focus_handle.is_focused(window) {
             let _ = window;
             let scalar = self.composer_scalar_index_for_position(point)?;
             let text = self.composer.as_ref()?.draft_text();
@@ -39178,9 +39824,7 @@ impl Render for NativeShell {
             self.sync_remote_settings_fields(window, cx);
         }
         self.sync_shell_window_title(window);
-        if self.pending_terminal_focus
-            && self.local_slot_mut().cockpit.dock().showing_raw_terminal()
-        {
+        if self.pending_terminal_focus && self.selected_center_terminal_is_interactive() {
             self.terminal_focus_handle.focus(window);
             self.pending_terminal_focus = false;
         }
@@ -39714,7 +40358,7 @@ fn visible_status_label(status: VisibleTaskStatus) -> &'static str {
         VisibleTaskStatus::Working => "Working",
         VisibleTaskStatus::Settling => "Settling",
         VisibleTaskStatus::ReadyForReview => "Ready for review",
-        VisibleTaskStatus::Idle => "Idle",
+        VisibleTaskStatus::Idle => "Waiting",
     }
 }
 
@@ -39805,6 +40449,7 @@ mod tests {
         automatic_task_title,
         capture_runtime_projection_owner,
         caret_phase_repaint,
+        center_terminal_interactive,
         composer_caret_visible,
         composer_draft_parts,
         composer_provider_identity,
@@ -39834,6 +40479,7 @@ mod tests {
         reconnect_backoff_reset,
         record_recovery_attempt_result,
         remove_staged_image,
+        root_routes_key_to_terminal,
         resolve_fleet_transport_reconnect,
         resync_or_reconnect_fleet_host,
         retain_child,
@@ -39965,6 +40611,7 @@ mod tests {
     };
     use super::{
         host_display_label, same_native_action_identity, visible_status_label, TaskCockpitQuery,
+        VisibleTaskStatus,
     };
     use crate::client::FleetError;
     use crate::client::HostFleet;
@@ -39989,6 +40636,11 @@ mod tests {
     use std::sync::mpsc::SyncSender;
     use std::sync::{Arc, Mutex, OnceLock};
     use std::time::{Duration, Instant};
+
+    #[test]
+    fn idle_task_status_is_presented_as_waiting() {
+        assert_eq!(visible_status_label(VisibleTaskStatus::Idle), "Waiting");
+    }
 
     #[test]
     fn terminal_scroll_accumulates_smooth_pixels_into_whole_lines() {
@@ -46422,7 +47074,7 @@ mod tests {
         });
     }
 
-    fn started_composer_does_not_misrepresent_launch_preferences(cx: &mut gpui::App) {
+    fn started_composer_keeps_provider_and_access_launch_only(cx: &mut gpui::App) {
         let (runtime, _shared) = TestRuntime::new(true, NativeHostActionResult::Queued);
         let (model, task_id) = terminal_bound_client_model();
         with_test_shell_in_app(cx, runtime, |shell| {
@@ -46433,12 +47085,128 @@ mod tests {
             shell.apply_client_model(Arc::new(model)).unwrap();
             let before = shell.layout.composer_launch_options.clone();
             assert!(!shell.composer_launch_preferences_editable());
+            assert!(shell.composer_model_reasoning_editable());
             shell.set_composer_access(crate::providers::ProviderAccessMode::ReadOnly);
-            shell.set_composer_reasoning(crate::providers::ProviderReasoningEffort::Ultra);
-            shell.set_composer_custom_model("different-model".into());
             shell.open_composer_access_selector();
             assert!(shell.composer_selector.is_none());
             assert_eq!(shell.layout.composer_launch_options, before);
+        });
+    }
+
+    #[test]
+    fn codex_live_model_picker_navigation_targets_model_and_reasoning_rows() {
+        assert_eq!(
+            super::codex_model_picker_input(
+                2,
+                Some(super::CodexReasoningPickerPath::Standard(3)),
+            ),
+            "/model\r\u{1b}[F\r\u{1b}[H\u{1b}[B\u{1b}[B\r\u{1b}[H\u{1b}[B\u{1b}[B\u{1b}[B\r"
+        );
+        assert_eq!(
+            super::codex_model_picker_input(
+                0,
+                Some(super::CodexReasoningPickerPath::Advanced(1)),
+            ),
+            "/model\r\u{1b}[F\r\u{1b}[H\r\u{1b}[F\r\u{1b}[H\u{1b}[B\r"
+        );
+    }
+
+    #[test]
+    fn started_claude_session_model_and_reasoning_choices_write_real_runtime_commands() {
+        if rerun_headless_shell_test_in_child(
+            "ui::native_shell::tests::started_claude_session_model_and_reasoning_choices_write_real_runtime_commands",
+        ) {
+            return;
+        }
+        let (runtime, shared) = TestRuntime::new(true, NativeHostActionResult::Queued);
+        let (model, task_id) = terminal_bound_client_model();
+        gpui::Application::headless().run(move |cx| {
+            crate::ui::init(cx);
+            with_test_shell_in_app(cx, runtime, |shell| {
+            let model = Arc::new(model);
+            let snapshot = model.task(task_id).expect("task").clone();
+            let agent_id = snapshot.primary_agent_id.expect("agent");
+            let resource = snapshot
+                .resources
+                .values()
+                .find(|resource| {
+                    resource.resource_kind == crate::domain::resource::ResourceKind::Terminal
+                })
+                .expect("terminal resource")
+                .clone();
+            shell.apply_client_model(Arc::clone(&model)).expect("model");
+            let owner = HostTaskKey::new(shell.local_host_id(), task_id);
+            shell
+                .select_fleet_task_key(owner.clone(), FleetSelectMode::Replace)
+                .expect("select local task");
+            shell.set_provider_terminal_visible(true);
+            let terminal_query = shared
+                .lock()
+                .expect("runtime")
+                .accepted
+                .iter()
+                .find(|record| {
+                    matches!(
+                        record.command,
+                        NativeHostCommand::TaskCockpitQuery {
+                            query: TaskCockpitQuery::Terminal,
+                            ..
+                        }
+                    )
+                })
+                .cloned()
+                .expect("initial terminal query");
+            shell.apply_epoch_fenced_action_outcome_for_host(
+                &owner.host,
+                NativeHostActionOutcome::Queried {
+                    action: terminal_query,
+                    detail: "terminal".into(),
+                    body: NativeHostQueryBody::TaskCockpit(
+                        crate::domain::TaskCockpitResult::Terminal(
+                            crate::domain::cockpit::TaskTerminalProjection {
+                                task_id,
+                                terminal_id: crate::domain::TerminalId::new(),
+                                session_id: crate::terminal::protocol::TerminalSessionId::new(),
+                                agent_session_id: agent_id,
+                                resource_id: resource.id,
+                                runtime_generation: snapshot.agents[&agent_id]
+                                    .runtime_generation,
+                                resource_generation: resource.runtime_generation,
+                                action_epoch: snapshot.task.action_epoch,
+                                accepts_input_without_conversation_id: false,
+                                sequence: 7,
+                                title: Some("local-live".into()),
+                                text_lines: vec!["> ".into()],
+                                screen: Default::default(),
+                            },
+                        ),
+                    ),
+                },
+            );
+            shared.lock().expect("runtime").accepted.clear();
+
+            shell.set_composer_model(crate::providers::ProviderModel::ClaudeOpus);
+            shell.set_composer_reasoning(crate::providers::ProviderReasoningEffort::High);
+
+            let texts = shared
+                .lock()
+                .expect("runtime")
+                .accepted
+                .iter()
+                .filter_map(|record| match &record.command {
+                    NativeHostCommand::ProviderInput {
+                        action_id,
+                        arguments,
+                        ..
+                    } if *action_id == crate::client::action::ACTION_PROVIDER_TERMINAL_INPUT => {
+                        arguments.text.clone()
+                    }
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(texts, vec!["/model opus\r", "/effort high\r"]);
+            });
+            cx.quit();
         });
     }
 
@@ -46464,7 +47232,7 @@ mod tests {
             assert_eq!(shell.cockpit().selected_task(), Some(task_id));
             let label = shell.task_row_label_for_test(task_id);
             assert!(
-                label.contains("Bound terminal task") && label.contains("Idle"),
+                label.contains("Bound terminal task") && label.contains("Waiting"),
                 "expected title/status projection, got {label}"
             );
             assert!(
@@ -48469,7 +49237,7 @@ mod tests {
             selected_task_composer_waits_for_durable_provider_identity(cx);
             selected_codex_task_composer_allows_first_prompt_without_provider_identity(cx);
             cancelled_first_send_readiness_preserves_startup_error(cx);
-            started_composer_does_not_misrepresent_launch_preferences(cx);
+            started_composer_keeps_provider_and_access_launch_only(cx);
             selected_task_composer_rebinds_after_focus_epoch_advances(cx);
             task_switch_parks_and_restores_unsent_composer_draft(cx);
             task_draft_survives_native_shell_remount(cx);
@@ -48763,8 +49531,142 @@ mod tests {
     }
 
     #[test]
+    fn terminal_pointer_focus_dispatches_a_printable_key_in_a_real_window() {
+        const TEST_NAME: &str =
+            "ui::native_shell::tests::terminal_pointer_focus_dispatches_a_printable_key_in_a_real_window";
+        if rerun_headless_shell_test_in_child(TEST_NAME) {
+            return;
+        }
+
+        let completed = std::rc::Rc::new(std::cell::Cell::new(false));
+        let completed_for_app = std::rc::Rc::clone(&completed);
+        gpui::Application::new().run(move |cx| {
+            crate::ui::init(cx);
+            let workspace = tempfile::tempdir().expect("workspace tempdir");
+            let profile = isolated_dev_profile(workspace.path()).expect("isolated profile");
+            let (runtime, shared) = TestRuntime::new(true, NativeHostActionResult::Queued);
+            let shared_for_window = Arc::clone(&shared);
+            let (model, task_id) = terminal_bound_client_model();
+            let model = Arc::new(model);
+            let snapshot = model.task(task_id).expect("task").clone();
+            let agent_id = snapshot.primary_agent_id.expect("agent");
+            let resource = snapshot
+                .resources
+                .values()
+                .find(|resource| {
+                    resource.resource_kind == crate::domain::resource::ResourceKind::Terminal
+                })
+                .expect("terminal resource")
+                .clone();
+            let window = cx
+                .open_window(
+                    WindowOptions {
+                        show: false,
+                        ..WindowOptions::default()
+                    },
+                    move |window, cx| {
+                        let entity = cx.new(|cx| {
+                            NativeShell::new_with_host_runtime_port(
+                                profile,
+                                Box::new(runtime),
+                                crate::ui::tokens::RuntimePreferencesSnapshot::default(),
+                                cx,
+                            )
+                        });
+                        entity.update(cx, |shell, _cx| {
+                            shell.apply_client_model(Arc::clone(&model)).expect("model");
+                            let owner = HostTaskKey::new(shell.local_host_id(), task_id);
+                            shell
+                                .select_fleet_task_key(owner.clone(), FleetSelectMode::Replace)
+                                .expect("select local task");
+                            shell.set_provider_terminal_visible(true);
+                            let terminal_query = shared_for_window
+                                .lock()
+                                .expect("runtime")
+                                .accepted
+                                .iter()
+                                .find(|record| {
+                                    matches!(
+                                        record.command,
+                                        NativeHostCommand::TaskCockpitQuery {
+                                            query: TaskCockpitQuery::Terminal,
+                                            ..
+                                        }
+                                    )
+                                })
+                                .cloned()
+                                .expect("terminal query");
+                            shell.apply_epoch_fenced_action_outcome_for_host(
+                                &owner.host,
+                                NativeHostActionOutcome::Queried {
+                                    action: terminal_query,
+                                    detail: "terminal".into(),
+                                    body: NativeHostQueryBody::TaskCockpit(
+                                        crate::domain::TaskCockpitResult::Terminal(
+                                            crate::domain::cockpit::TaskTerminalProjection {
+                                                task_id,
+                                                terminal_id: crate::domain::TerminalId::new(),
+                                                session_id: crate::terminal::protocol::TerminalSessionId::new(),
+                                                agent_session_id: agent_id,
+                                                resource_id: resource.id,
+                                                runtime_generation: snapshot.agents[&agent_id]
+                                                    .runtime_generation,
+                                                resource_generation: resource.runtime_generation,
+                                                action_epoch: snapshot.task.action_epoch,
+                                                accepts_input_without_conversation_id: false,
+                                                sequence: 7,
+                                                title: Some("local-live".into()),
+                                                text_lines: vec!["> ".into()],
+                                                screen: Default::default(),
+                                            },
+                                        ),
+                                    ),
+                                },
+                            );
+                            shell.prepare_terminal_owner_for_grid_pointer(&owner, window);
+                        });
+                        entity
+                    },
+                )
+                .expect("open hidden terminal window");
+            let entity = window.entity(cx).expect("terminal root entity");
+            let any_window = window.into();
+            shared.lock().expect("runtime").accepted.clear();
+            cx.refresh_windows();
+
+            cx.update_window(any_window, |_root, window, cx| {
+                assert!(
+                    entity.read(cx).terminal_focus_handle.is_focused(window),
+                    "terminal pointer focus must own the real GPUI window focus"
+                );
+                assert!(
+                    window.dispatch_keystroke(Keystroke::parse("x").expect("terminal key"), cx),
+                    "the focused terminal must consume a printable key"
+                );
+            })
+            .expect("dispatch terminal key");
+
+            assert!(shared.lock().expect("runtime").accepted.iter().any(|record| {
+                matches!(
+                    &record.command,
+                    NativeHostCommand::ProviderInput { action_id, arguments, .. }
+                        if *action_id == crate::client::action::ACTION_PROVIDER_TERMINAL_INPUT
+                            && arguments.text.as_deref() == Some("x")
+                )
+            }));
+            completed_for_app.set(true);
+            cx.quit();
+        });
+        assert!(completed.get(), "hidden terminal input scenario completed");
+    }
+
+    #[test]
     fn printable_composer_keys_reach_the_platform_text_input_handler() {
         let source = include_str!("native_shell.rs");
+        let production_source = source
+            .split("#[cfg(test)]\nmod tests")
+            .next()
+            .expect("production native shell source");
         let listener_start = source
             .find("let key = cx.listener(|shell, event: &KeyDownEvent")
             .expect("composer key listener");
@@ -48781,6 +49683,26 @@ mod tests {
             source.contains("fn replace_text_in_range(")
                 && source.contains("self.replace_composer_platform_text(range_utf16, text)"),
             "the registered EntityInputHandler must mutate the task draft"
+        );
+        assert!(
+            production_source.contains("struct TerminalInputProxy")
+                && production_source.contains("terminal_input_proxy")
+                && production_source.contains("impl EntityInputHandler for TerminalInputProxy")
+                && production_source.contains("ElementInputHandler::new(bounds, input_proxy)")
+                && production_source.contains("shell.dispatch_provider_terminal_text(text)"),
+            "the terminal must own a distinct GPUI input entity and forward WM_CHAR/IME text to the provider runtime"
+        );
+        assert!(
+            production_source.contains("center_terminal_interactive(")
+                && !production_source.contains(".dock()\n                .terminal_binding()"),
+            "a restored center terminal must mount its focus and input handlers without a legacy dock binding"
+        );
+        assert!(
+            production_source.contains(
+                "accesskit::Action::Focus if element_id == \"native-task-terminal-rows\""
+            ) && production_source.contains("self.pending_terminal_focus = true;")
+                && production_source.contains("self.selected_center_terminal_is_interactive()"),
+            "AccessKit focus, pending focus transfer, and keyboard routing must use the selected center-terminal surface instead of the legacy dock mode"
         );
         assert!(
             source.contains("self.replace_root_platform_text(range_utf16, text)")
@@ -48806,6 +49728,22 @@ mod tests {
             source.contains("native-empty-conversation") && source.contains("No messages yet"),
             "valid empty timelines must show an honest empty conversation state"
         );
+    }
+
+    #[test]
+    fn restored_center_terminal_is_interactive_from_its_task_surface() {
+        assert!(center_terminal_interactive(true, true, true));
+        assert!(!center_terminal_interactive(false, true, true));
+        assert!(!center_terminal_interactive(true, false, true));
+        assert!(!center_terminal_interactive(true, true, false));
+    }
+
+    #[test]
+    fn root_key_route_requires_terminal_focus_and_the_interactive_center_surface() {
+        assert!(root_routes_key_to_terminal(true, false, true));
+        assert!(root_routes_key_to_terminal(false, true, true));
+        assert!(!root_routes_key_to_terminal(false, false, true));
+        assert!(!root_routes_key_to_terminal(true, true, false));
     }
 
     #[test]
@@ -57142,7 +58080,7 @@ mod tests {
                     shell
                         .task_row_status_for_owner(&owner)
                         .map(visible_status_label),
-                    Some("Idle"),
+                    Some("Waiting"),
                     "exact prompt reconciliation plus assistant reply must clear Working"
                 );
             });
@@ -57932,9 +58870,9 @@ mod tests {
     }
 
     #[test]
-    fn accepted_local_terminal_input_requests_an_immediate_screen_refresh() {
+    fn local_terminal_input_between_turns_dispatches_and_requests_an_immediate_screen_refresh() {
         if rerun_headless_shell_test_in_child(
-            "ui::native_shell::tests::accepted_local_terminal_input_requests_an_immediate_screen_refresh",
+            "ui::native_shell::tests::local_terminal_input_between_turns_dispatches_and_requests_an_immediate_screen_refresh",
         ) {
             return;
         }
@@ -58005,66 +58943,51 @@ mod tests {
                         ),
                     },
                 );
-                shared.lock().expect("runtime").accepted.clear();
-
-                let input_command_id = CommandId::new();
                 shell
-                    .dispatch_action_recorded(ActionRequest::ProviderInput(
-                        crate::client::action::ProviderInputActionRequest {
-                            command_id: input_command_id,
-                            action_id:
-                                crate::client::action::ACTION_PROVIDER_TERMINAL_INPUT,
-                            arguments: crate::client::action::ProviderInputArguments {
-                                task_id,
-                                agent_session_id: agent_id,
-                                runtime_generation: snapshot.agents[&agent_id]
-                                    .runtime_generation,
-                                action_epoch: snapshot.task.action_epoch,
-                                turn_id: crate::domain::TurnId::new(),
-                                question_id: None,
-                                approval_id: None,
-                                text: Some("x".into()),
-                                images: Vec::new(),
-                                wait: None,
-                                allow: None,
-                            },
-                        },
-                    ))
-                    .expect("dispatch terminal input");
-                let input = shared
-                    .lock()
-                    .expect("runtime")
-                    .accepted
-                    .iter()
-                    .find(|record| {
-                        matches!(
-                            &record.command,
-                            NativeHostCommand::ProviderInput { action_id, .. }
-                                if *action_id == crate::client::action::ACTION_PROVIDER_TERMINAL_INPUT
-                        )
-                    })
-                    .cloned()
-                    .expect("terminal input");
-                let command_id = native_command_id(&input.command).expect("command id");
-                assert_eq!(command_id, input_command_id);
-                shared.lock().expect("runtime").accepted.clear();
-
-                shell.apply_epoch_fenced_action_outcome_for_host(
-                    &owner.host,
-                    NativeHostActionOutcome::Accepted {
-                        action: input,
-                        receipt: crate::domain::command::CommandReceipt::Accepted {
-                            command_id,
-                            operation_id: crate::domain::id::OperationId::new(),
-                            task_revision: None,
-                            event_ids: Vec::new(),
-                            prompt_mutation: None,
-                        },
-                    },
+                    .local_slot_mut()
+                    .cockpit
+                    .dock_mut()
+                    .switch_to_semantic(model.as_ref(), None)
+                    .expect("simulate restored center-terminal preference with semantic dock");
+                assert!(
+                    !shell.local_slot().cockpit.dock().showing_raw_terminal(),
+                    "regression requires the independent dock mode to differ after restart"
                 );
+                assert!(
+                    shell.task_surfaces.terminal_is_interactive(owner.clone()),
+                    "the visible center terminal remains the authoritative interactive surface"
+                );
+                assert!(
+                    shell.selected_center_terminal_is_interactive(),
+                    "focus and keyboard routing must follow the restored center terminal rather than the independent dock mode"
+                );
+                shell.arm_terminal_owner_for_grid_pointer(&owner);
+                assert!(
+                    shell.terminal_input_is_armed(),
+                    "a terminal grid click must arm root key routing even when AccessKit retains the prior task-row focus"
+                );
+                shared.lock().expect("runtime").accepted.clear();
 
                 assert!(
-                    shared.lock().expect("runtime").accepted.iter().any(|record| {
+                    snapshot
+                        .provider_sessions
+                        .get(&agent_id)
+                        .is_none_or(|provider| provider.current_turn.is_none()),
+                    "fixture must reproduce the between-turn terminal state"
+                );
+                assert!(shell.dispatch_provider_terminal_text("x".into()));
+
+                let accepted = &shared.lock().expect("runtime").accepted;
+                assert!(accepted.iter().any(|record| {
+                    matches!(
+                        &record.command,
+                        NativeHostCommand::ProviderInput { action_id, arguments, .. }
+                            if *action_id == crate::client::action::ACTION_PROVIDER_TERMINAL_INPUT
+                                && arguments.text.as_deref() == Some("x")
+                    )
+                }), "between-turn terminal text must be admitted immediately");
+                assert!(
+                    accepted.iter().any(|record| {
                         matches!(
                             record.command,
                             NativeHostCommand::TaskCockpitQuery {
@@ -58074,8 +58997,52 @@ mod tests {
                             } if queried_task == task_id
                         )
                     }),
-                    "accepted raw input must request a terminal projection immediately instead of waiting for the 30-second conversation recovery heartbeat"
+                    "raw input must queue a terminal projection immediately instead of waiting for its receipt or the 30-second conversation recovery heartbeat"
                 );
+            });
+            cx.quit();
+        });
+    }
+
+    #[test]
+    fn terminal_layout_resize_is_owner_qualified_and_deduplicated() {
+        if rerun_headless_shell_test_in_child(
+            "ui::native_shell::tests::terminal_layout_resize_is_owner_qualified_and_deduplicated",
+        ) {
+            return;
+        }
+        let (runtime, shared) = TestRuntime::new(true, NativeHostActionResult::Queued);
+        gpui::Application::headless().run(move |cx| {
+            crate::ui::init(cx);
+            with_test_shell_in_app(cx, runtime, |shell| {
+                let (model, task_id) = terminal_bound_client_model();
+                shell.apply_client_model(Arc::new(model)).expect("model");
+                let owner = HostTaskKey::new(shell.local_host_id(), task_id);
+                shell
+                    .select_fleet_task_key(owner.clone(), FleetSelectMode::Replace)
+                    .expect("select local task");
+                shared.lock().expect("runtime").accepted.clear();
+
+                assert!(shell.request_terminal_resize_for_owner(&owner, 120, 42));
+                assert!(!shell.request_terminal_resize_for_owner(&owner, 120, 42));
+
+                let resizes = shared
+                    .lock()
+                    .expect("runtime")
+                    .accepted
+                    .iter()
+                    .filter(|record| {
+                        matches!(
+                            record.command,
+                            NativeHostCommand::TaskCockpitQuery {
+                                task_id: queried_task,
+                                query: TaskCockpitQuery::TerminalResize { cols: 120, rows: 42 },
+                                ..
+                            } if queried_task == task_id
+                        )
+                    })
+                    .count();
+                assert_eq!(resizes, 1, "paint churn must not flood resize queries");
             });
             cx.quit();
         });

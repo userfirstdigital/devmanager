@@ -9,8 +9,11 @@ use std::time::{Duration, Instant};
 const AI_ACTIVITY_BURST_WINDOW: Duration = Duration::from_secs(1);
 const AI_ACTIVITY_MIN_BURST_EVENTS: u8 = 3;
 const AI_IDLE_GRACE_PERIOD: Duration = Duration::from_secs(3);
-const AI_BACKGROUND_READY_THRESHOLD: Duration = Duration::from_secs(30);
-const AI_FOREGROUND_READY_THRESHOLD: Duration = Duration::from_secs(60);
+// A confirmed provider-output burst followed by the idle grace period is a
+// completed turn regardless of how quickly the model answered. The separate
+// confirm delay still suppresses transient pauses/resumed output.
+const AI_BACKGROUND_READY_THRESHOLD: Duration = Duration::from_secs(1);
+const AI_FOREGROUND_READY_THRESHOLD: Duration = Duration::from_secs(1);
 const AI_ACTIVITY_SUPPRESSION_AFTER_RESIZE: Duration = Duration::from_secs(2);
 const AI_NOTIFICATION_CONFIRM_DELAY: Duration = Duration::from_secs(2);
 const USER_EXIT_GRACE_PERIOD: Duration = Duration::from_secs(3);
@@ -1417,6 +1420,26 @@ mod tests {
 
         let confirmed = session.check_pending_notification(idle_at + AI_NOTIFICATION_CONFIRM_DELAY);
         assert_eq!(confirmed, AiIdleTransition::ForegroundReady);
+    }
+
+    #[test]
+    fn short_completed_ai_turn_still_schedules_a_notification() {
+        let mut session = test_ai_session();
+        let base = Instant::now();
+        let session_id = session.session_id.clone();
+
+        session.note_output_activity_at(base + Duration::from_millis(100));
+        session.note_output_activity_at(base + Duration::from_millis(200));
+        session.note_output_activity_at(base + Duration::from_millis(300));
+        session.reconcile_ai_idle(
+            Some(session_id.as_str()),
+            base + Duration::from_millis(300) + AI_IDLE_GRACE_PERIOD,
+        );
+
+        assert!(
+            session.pending_notification.is_some(),
+            "a real provider response should notify even when it completes quickly"
+        );
     }
 
     #[test]

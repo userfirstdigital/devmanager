@@ -474,8 +474,16 @@ pub fn parse_codex_rate_limits(result: &JsonValue) -> Result<CachedUsageSnapshot
         .get("rateLimitsByLimitId")
         .and_then(JsonValue::as_object)
     {
-        for (scope, snapshot) in groups {
-            push_codex_limit_snapshot(&mut windows, Some(scope), snapshot);
+        if let Some(main) = groups.get("codex") {
+            // `account/rateLimits/read` can include internal rollout/model
+            // buckets such as `codex_bangalfox`. The provider's canonical
+            // `codex` bucket is the account quota users recognize; leaking
+            // implementation bucket names makes the compact meter misleading.
+            push_codex_limit_snapshot(&mut windows, None, main);
+        } else if let Some((_scope, snapshot)) = groups.iter().next() {
+            // Older/experimental servers may omit the canonical bucket. Keep
+            // the one available quota usable without exposing its internal id.
+            push_codex_limit_snapshot(&mut windows, None, snapshot);
         }
     } else if let Some(snapshot) = result.get("rateLimits").filter(|value| !value.is_null()) {
         push_codex_limit_snapshot(&mut windows, None, snapshot);

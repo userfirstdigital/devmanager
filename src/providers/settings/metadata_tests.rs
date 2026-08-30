@@ -141,11 +141,12 @@ fn codex_rate_limits_use_dynamic_duration_not_five_hour_label() {
                          "secondary": {"usedPercent": 30, "windowDurationMins": 10080}}
     }});
     let nested = parse_codex_rate_limits(&nested).unwrap();
-    assert_eq!(nested.windows.len(), 3);
+    assert_eq!(nested.windows.len(), 1);
     assert_eq!(nested.windows[0].remaining_percent, Some(26));
-    assert_eq!(nested.windows[1].id, "codex_spark:primary");
-    assert_eq!(nested.windows[1].remaining_percent, Some(88));
-    assert_eq!(nested.windows[2].remaining_percent, Some(70));
+    assert!(nested
+        .windows
+        .iter()
+        .all(|window| !window.label.contains("codex_spark")));
 }
 
 #[test]

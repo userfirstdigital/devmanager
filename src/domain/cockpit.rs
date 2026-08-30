@@ -316,6 +316,13 @@ pub enum TaskCockpitQuery {
     TerminalScroll {
         delta_lines: i32,
     },
+    /// Resize the exact task-owned PTY to the native terminal grid measured by
+    /// the client. The host validates the bounded dimensions and never creates
+    /// or retargets a terminal through this query.
+    TerminalResize {
+        cols: u16,
+        rows: u16,
+    },
     /// Opt-in readiness classification for first-send. Shares the Terminal
     /// projection when live and chat-ready; otherwise may return
     /// `TerminalStartPending`, `TerminalProviderSetupRequired`, or
@@ -647,8 +654,9 @@ pub struct TaskTerminalProjection {
     pub sequence: u64,
     pub title: Option<String>,
     /// Bounded plain-text rows used by the native IPC projection. The host
-    /// deliberately does not serialize thousands of rich cell structs across
-    /// the one-megabyte transport; the client rebuilds default-themed cells.
+    /// avoids serializing thousands of default cells across the one-megabyte
+    /// transport; the client rebuilds those rows and overlays only sparse
+    /// styled cells retained in `screen.cells`.
     #[serde(default)]
     pub text_lines: Vec<String>,
     pub screen: TerminalScreenSnapshot,
@@ -974,6 +982,7 @@ pub fn cockpit_surface(query: &TaskCockpitQuery) -> TaskCockpitSurface {
         | TaskCockpitQuery::ProviderInputState => TaskCockpitSurface::Conversation,
         TaskCockpitQuery::Terminal
         | TaskCockpitQuery::TerminalScroll { .. }
+        | TaskCockpitQuery::TerminalResize { .. }
         | TaskCockpitQuery::TerminalReadiness => TaskCockpitSurface::Terminal,
         TaskCockpitQuery::WorkspaceStatus => TaskCockpitSurface::Workspace,
         TaskCockpitQuery::GitRepositories
@@ -1382,6 +1391,24 @@ mod tests {
         assert_eq!(
             encoded.get("task_cockpit").and_then(|value| value.as_str()),
             Some("terminal")
+        );
+    }
+
+    #[test]
+    fn terminal_resize_is_a_typed_terminal_surface_query() {
+        let query = TaskCockpitQuery::TerminalResize {
+            cols: 120,
+            rows: 42,
+        };
+        assert_eq!(cockpit_surface(&query), TaskCockpitSurface::Terminal);
+        let encoded = serde_json::to_value(Query::TaskCockpit(query)).expect("encode resize");
+        assert_eq!(
+            encoded
+                .get("task_cockpit")
+                .and_then(|value| value.get("terminal_resize"))
+                .and_then(|value| value.get("rows"))
+                .and_then(|value| value.as_u64()),
+            Some(42)
         );
     }
 

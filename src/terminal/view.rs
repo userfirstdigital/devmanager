@@ -190,6 +190,23 @@ pub struct TerminalTextBounds {
     pub cols: usize,
 }
 
+/// Translate the actual painted terminal canvas into the bounded PTY grid.
+/// This is deliberately based on the canvas bounds rather than the last host
+/// projection, so the terminal follows free-form pane resizing in both axes.
+pub fn terminal_grid_size_for_bounds(
+    width: f32,
+    height: f32,
+    cell_width: f32,
+    line_height: f32,
+) -> (u16, u16) {
+    let cols = (width.max(cell_width) / cell_width.max(1.0)).floor() as u16;
+    let rows = (height.max(line_height) / line_height.max(1.0)).floor() as u16;
+    (
+        cols.clamp(1, crate::terminal::protocol::MAX_TERMINAL_COLS),
+        rows.clamp(1, crate::terminal::protocol::MAX_TERMINAL_ROWS),
+    )
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TerminalSelectionRange {
     pub start_row: usize,
@@ -210,6 +227,7 @@ pub struct TerminalGridPointerEvent {
 /// Optional selection interaction registered against the actual painted grid bounds.
 #[derive(Clone)]
 pub struct TerminalGridInteraction {
+    pub on_layout: Arc<dyn Fn((u16, u16), &mut Window, &mut App) + Send + Sync>,
     pub on_mouse_down:
         Arc<dyn Fn(&MouseDownEvent, TerminalGridPointerEvent, &mut Window, &mut App) + Send + Sync>,
     pub on_mouse_move:
@@ -1261,7 +1279,16 @@ fn render_grid_canvas(
     line_height: f32,
 ) -> impl IntoElement {
     canvas(
-        move |_bounds, _window, _cx| {
+        move |bounds, window, cx| {
+            if let Some(interaction) = grid_selection.as_ref() {
+                let size = terminal_grid_size_for_bounds(
+                    f32::from(bounds.size.width),
+                    f32::from(bounds.size.height),
+                    cell_width,
+                    line_height,
+                );
+                (interaction.on_layout)(size, window, cx);
+            }
             (
                 background_runs,
                 search_highlight,
@@ -2825,7 +2852,8 @@ mod selection_helper_tests {
         begin_simple_selection, extend_selection_head, finish_simple_selection,
         selected_text_from_lines, selected_text_from_screen, selection_mode_for_click,
         selection_range_from, terminal_ctrl_c_action, terminal_endpoint_for_mouse,
-        terminal_selection_for_click, top_visible_buffer_line, TerminalCellSide,
+        terminal_grid_size_for_bounds, terminal_selection_for_click, top_visible_buffer_line,
+        TerminalCellSide,
         TerminalCtrlCAction, TerminalGridPosition, TerminalSelectionEndpoint,
         TerminalSelectionMode, TerminalSelectionRange, TerminalTextBounds,
     };
@@ -2849,6 +2877,18 @@ mod selection_helper_tests {
             default_background: true,
             default_foreground: true,
         }
+    }
+
+    #[test]
+    fn terminal_grid_size_uses_the_full_painted_bounds() {
+        assert_eq!(
+            terminal_grid_size_for_bounds(1_200.0, 756.0, 10.0, 18.0),
+            (120, 42)
+        );
+        assert_eq!(
+            terminal_grid_size_for_bounds(2.0, 2.0, 10.0, 18.0),
+            (1, 1)
+        );
     }
 
     #[test]

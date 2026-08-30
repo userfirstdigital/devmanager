@@ -235,6 +235,7 @@ pub(crate) fn serve_task_cockpit(dispatch: TaskCockpitDispatch<'_>) -> QueryOutc
         }
         TaskCockpitQuery::Terminal
         | TaskCockpitQuery::TerminalScroll { .. }
+        | TaskCockpitQuery::TerminalResize { .. }
         | TaskCockpitQuery::TerminalReadiness => {
             let readiness_query = matches!(dispatch.query, TaskCockpitQuery::TerminalReadiness);
             if let TaskCockpitQuery::TerminalScroll { delta_lines } = dispatch.query {
@@ -250,6 +251,29 @@ pub(crate) fn serve_task_cockpit(dispatch: TaskCockpitDispatch<'_>) -> QueryOutc
                     .and_then(|service| {
                         service
                             .scroll_task_terminal(task_id, *delta_lines)
+                            .map_err(|_| ())
+                    })
+                    .is_err()
+                {
+                    return unavailable(
+                        TaskCockpitSurface::Terminal,
+                        TaskCockpitUnavailableReason::TerminalUnavailable,
+                    );
+                }
+            }
+            if let TaskCockpitQuery::TerminalResize { cols, rows } = dispatch.query {
+                let Ok(size) = crate::terminal::protocol::TerminalSize::new(*cols, *rows) else {
+                    return denied(
+                        TaskCockpitSurface::Terminal,
+                        TaskCockpitDeniedReason::Unauthorized,
+                    );
+                };
+                if dispatch
+                    .terminal_service
+                    .ok_or(())
+                    .and_then(|service| {
+                        service
+                            .resize_task_terminal(task_id, size)
                             .map_err(|_| ())
                     })
                     .is_err()
@@ -484,7 +508,20 @@ fn compact_terminal_screen_for_wire(
             line
         })
         .collect();
-    screen.cells.clear();
+    screen.cells.retain(|indexed| {
+        let cell = &indexed.cell;
+        !cell.default_foreground
+            || !cell.default_background
+            || cell.bold
+            || cell.dim
+            || cell.italic
+            || cell.underline
+            || cell.undercurl
+            || cell.strike
+            || cell.hidden
+            || cell.has_hyperlink
+            || !cell.zero_width.is_empty()
+    });
     screen.lines.clear();
     (screen, text_lines)
 }
@@ -2587,6 +2624,64 @@ mod tests {
     use crate::workspace::{WorkspaceRequest, WorkspaceResourceCoordinator};
     use std::fs;
     use std::path::Path;
+
+    #[test]
+    fn compact_terminal_wire_projection_preserves_sparse_ansi_styles() {
+        use crate::terminal::session::{
+            TerminalCellSnapshot, TerminalIndexedCellSnapshot, TerminalScreenSnapshot,
+        };
+
+        let plain = TerminalCellSnapshot {
+            character: 'x',
+            zero_width: Vec::new(),
+            foreground: 0,
+            background: 0,
+            bold: false,
+            dim: false,
+            italic: false,
+            underline: false,
+            undercurl: false,
+            strike: false,
+            hidden: false,
+            has_hyperlink: false,
+            default_background: true,
+            default_foreground: true,
+        };
+        let styled = TerminalCellSnapshot {
+            character: '!',
+            foreground: 0xffb000,
+            bold: true,
+            default_foreground: false,
+            ..plain.clone()
+        };
+        let screen = TerminalScreenSnapshot {
+            cols: 2,
+            rows: 1,
+            lines: vec![vec![plain.clone(), styled.clone()]],
+            cells: vec![
+                TerminalIndexedCellSnapshot {
+                    row: 0,
+                    column: 0,
+                    cell: plain,
+                },
+                TerminalIndexedCellSnapshot {
+                    row: 0,
+                    column: 1,
+                    cell: styled.clone(),
+                },
+            ],
+            ..TerminalScreenSnapshot::default()
+        };
+
+        let (wire, text_lines) = compact_terminal_screen_for_wire(screen);
+
+        assert_eq!(text_lines, vec!["x!".to_string()]);
+        assert!(wire.lines.is_empty());
+        assert_eq!(wire.cells.len(), 1, "only styled overrides cross IPC");
+        assert_eq!(wire.cells[0].row, 0);
+        assert_eq!(wire.cells[0].column, 1);
+        assert_eq!(wire.cells[0].cell, styled);
+    }
 
     #[test]
     fn provider_lifecycle_projects_canonical_plan_status_and_sequence_identity() {

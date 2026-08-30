@@ -1573,6 +1573,33 @@ impl TerminalService {
         Ok(())
     }
 
+    /// Resize the one exact live terminal already owned by `task_id`.
+    /// Ambiguous or missing task bindings fail closed; no terminal is created
+    /// or retargeted by this path.
+    pub fn resize_task_terminal(
+        &self,
+        task_id: TaskId,
+        size: TerminalSize,
+    ) -> Result<(), TerminalError> {
+        let mut terminals = self.lock()?;
+        let matching = terminals
+            .iter()
+            .filter_map(|(id, hosted)| (hosted.task_id == task_id && !hosted.closed).then_some(*id))
+            .collect::<Vec<_>>();
+        let [terminal_id] = matching.as_slice() else {
+            return if matching.is_empty() {
+                Err(TerminalError::NotFound)
+            } else {
+                Err(TerminalError::InvalidFence)
+            };
+        };
+        let hosted = terminals
+            .get_mut(terminal_id)
+            .ok_or(TerminalError::NotFound)?;
+        hosted.ensure_open()?;
+        hosted.resize(*terminal_id, size, None)
+    }
+
     fn lock(
         &self,
     ) -> Result<std::sync::MutexGuard<'_, HashMap<TerminalId, HostedTerminal>>, TerminalError> {
@@ -2220,6 +2247,38 @@ mod tests {
             after > before,
             "scroll-only projections must not be deduplicated"
         );
+    }
+
+    #[test]
+    fn task_terminal_resize_reaches_the_exact_attached_runtime() {
+        let service = TerminalService::new();
+        let task = TaskId::new();
+        let runtime = MockAttachedRuntime::new(TerminalSize::new(40, 8).expect("size"));
+        let terminal_id = service
+            .attach(
+                task,
+                TerminalSpec::new(
+                    TerminalSessionId::new(),
+                    TerminalSize::new(40, 8).expect("size"),
+                )
+                .expect("spec"),
+                runtime.clone(),
+            )
+            .expect("attach");
+        service
+            .bind_task_identity(terminal_id, crate::domain::AgentSessionId::new(), 1, 1)
+            .expect("bind identity");
+
+        service
+            .resize_task_terminal(task, TerminalSize::new(120, 42).expect("larger pane"))
+            .expect("resize exact task terminal");
+
+        let projected = service
+            .task_terminal_view(task)
+            .expect("project resized terminal")
+            .expect("task terminal");
+        assert_eq!(projected.view.screen.cols, 120);
+        assert_eq!(projected.view.screen.rows, 42);
     }
 
     #[test]

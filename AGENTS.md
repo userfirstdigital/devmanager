@@ -43,6 +43,10 @@
   separate locks, so parallel full-suite execution can race and poison the
   remote profile lock. Focused tests that do not mutate profile state may run
   normally.
+- In a fresh isolated target, build `devmanager-process-test-helper` before the
+  complete library suite. Process-lifecycle tests launch that exact sibling
+  executable; letting the suite start without it creates misleading spawn
+  failures that are test-environment defects rather than product regressions.
 - Do not set an external `DEVMANAGER_PROFILE` for the complete unit-test suite;
   individual profile-sensitive tests own and restore that variable.
 - Every Rust integration train must pass `cargo check --locked --lib --bins
