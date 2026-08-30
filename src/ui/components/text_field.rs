@@ -120,6 +120,17 @@ pub enum TextFieldKey {
     Enter,
     Escape,
     Tab,
+    Undo,
+    Redo,
+}
+
+const MAX_TEXT_FIELD_HISTORY: usize = 64;
+
+#[derive(Clone)]
+struct TextFieldSnapshot {
+    value: String,
+    cursor: usize,
+    selection_anchor: Option<usize>,
 }
 
 pub struct TextField {
@@ -136,6 +147,8 @@ pub struct TextField {
     sensitive: bool,
     interaction: InteractionStateModel,
     accessibility: AccessibilityMetadata,
+    undo_history: Vec<TextFieldSnapshot>,
+    redo_history: Vec<TextFieldSnapshot>,
 }
 
 impl TextField {
@@ -166,6 +179,8 @@ impl TextField {
             read_only: false,
             sensitive: false,
             interaction: InteractionStateModel::default(),
+            undo_history: Vec::new(),
+            redo_history: Vec::new(),
         })
     }
 
@@ -304,6 +319,8 @@ impl TextField {
         self.value = value;
         self.cursor = self.value.chars().count();
         self.selection_anchor = None;
+        self.undo_history.clear();
+        self.redo_history.clear();
         self.refresh_accessibility_value();
         Ok(())
     }
@@ -407,6 +424,8 @@ impl TextField {
                 self.set_cursor(self.value.chars().count(), false);
                 Ok(true)
             }
+            TextFieldKey::Undo => Ok(self.undo()),
+            TextFieldKey::Redo => Ok(self.redo()),
             TextFieldKey::Enter | TextFieldKey::Escape | TextFieldKey::Tab => Ok(false),
         }
     }
@@ -464,6 +483,9 @@ impl TextField {
         next.replace_range(start..end, text);
         self.validate_value(&next)?;
         let changed = next != self.value;
+        if changed {
+            self.push_undo_snapshot();
+        }
         self.value = next;
         self.cursor = range.start + text.chars().count();
         self.selection_anchor = None;
@@ -481,6 +503,7 @@ impl TextField {
         };
         let start = byte_index_at_scalar(&self.value, range.start);
         let end = byte_index_at_scalar(&self.value, range.end);
+        self.push_undo_snapshot();
         self.value.replace_range(start..end, "");
         self.cursor = range.start;
         self.selection_anchor = None;
@@ -511,6 +534,7 @@ impl TextField {
         }
         let start = byte_index_at_scalar(&self.value, self.cursor - 1);
         let end = byte_index_at_scalar(&self.value, self.cursor);
+        self.push_undo_snapshot();
         self.value.replace_range(start..end, "");
         self.cursor -= 1;
         self.refresh_accessibility_value();
@@ -523,8 +547,68 @@ impl TextField {
         }
         let start = byte_index_at_scalar(&self.value, self.cursor);
         let end = byte_index_at_scalar(&self.value, self.cursor + 1);
+        self.push_undo_snapshot();
         self.value.replace_range(start..end, "");
         self.refresh_accessibility_value();
+        true
+    }
+
+    fn snapshot(&self) -> TextFieldSnapshot {
+        TextFieldSnapshot {
+            value: self.value.clone(),
+            cursor: self.cursor,
+            selection_anchor: self.selection_anchor,
+        }
+    }
+
+    fn push_undo_snapshot(&mut self) {
+        if self.undo_history.len() == MAX_TEXT_FIELD_HISTORY {
+            self.undo_history.remove(0);
+        }
+        let snapshot = self.snapshot();
+        self.undo_history.push(snapshot);
+        self.redo_history.clear();
+    }
+
+    fn restore_snapshot(&mut self, snapshot: TextFieldSnapshot) {
+        self.value = snapshot.value;
+        self.cursor = snapshot.cursor.min(self.value.chars().count());
+        self.selection_anchor = snapshot
+            .selection_anchor
+            .map(|anchor| anchor.min(self.value.chars().count()))
+            .filter(|anchor| *anchor != self.cursor);
+        self.refresh_accessibility_value();
+    }
+
+    fn undo(&mut self) -> bool {
+        if self.read_only {
+            return false;
+        }
+        let Some(previous) = self.undo_history.pop() else {
+            return false;
+        };
+        if self.redo_history.len() == MAX_TEXT_FIELD_HISTORY {
+            self.redo_history.remove(0);
+        }
+        let current = self.snapshot();
+        self.redo_history.push(current);
+        self.restore_snapshot(previous);
+        true
+    }
+
+    fn redo(&mut self) -> bool {
+        if self.read_only {
+            return false;
+        }
+        let Some(next) = self.redo_history.pop() else {
+            return false;
+        };
+        if self.undo_history.len() == MAX_TEXT_FIELD_HISTORY {
+            self.undo_history.remove(0);
+        }
+        let current = self.snapshot();
+        self.undo_history.push(current);
+        self.restore_snapshot(next);
         true
     }
 }
@@ -632,5 +716,25 @@ mod tests {
         assert_eq!(field.value(), "a12de");
         assert_eq!(field.cursor(), 3);
         assert_eq!(field.selection_range(), None);
+    }
+
+    #[test]
+    fn undo_and_redo_restore_replaced_selection_and_cursor() {
+        let mut field = focused_field("original");
+        field.select_all();
+        let epoch = field.focus_epoch();
+        assert!(field
+            .replace_range(0..8, "replacement", epoch)
+            .expect("replace"));
+        assert_eq!(field.value(), "replacement");
+
+        assert!(field.handle_key(TextFieldKey::Undo, epoch).expect("undo"));
+        assert_eq!(field.value(), "original");
+        assert!(field.is_all_selected());
+
+        assert!(field.handle_key(TextFieldKey::Redo, epoch).expect("redo"));
+        assert_eq!(field.value(), "replacement");
+        assert_eq!(field.cursor(), "replacement".chars().count());
+        assert!(field.selection_range().is_none());
     }
 }

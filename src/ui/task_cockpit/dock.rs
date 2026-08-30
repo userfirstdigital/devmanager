@@ -697,6 +697,14 @@ impl ContextDock {
         self.terminal_presentation() == TerminalPresentation::Raw
     }
 
+    /// Return to the semantic conversation canvas without consulting terminal
+    /// runtime identity. Leaving a terminal is a local presentation choice and
+    /// must remain available while that terminal is unbound, reconnecting, or
+    /// waiting for a resync.
+    pub fn show_semantic(&mut self) {
+        self.set_terminal_presentation(TerminalPresentation::Semantic);
+    }
+
     pub fn is_collapsed(&self) -> bool {
         self.current_memory().collapsed
     }
@@ -2055,6 +2063,18 @@ mod process_census_tests {
                 .map(|tab| tab.shortcut),
             Some(DockShortcut::AltTool(4))
         );
+    }
+
+    #[test]
+    fn semantic_canvas_remains_available_without_a_terminal_binding() {
+        let task_id = TaskId::new();
+        let mut dock = ContextDock::new(DockEdge::Right);
+        dock.follow_task(task_id);
+        dock.set_terminal_presentation(TerminalPresentation::Raw);
+
+        assert!(dock.showing_raw_terminal());
+        dock.show_semantic();
+        assert!(!dock.showing_raw_terminal());
     }
 
     #[test]

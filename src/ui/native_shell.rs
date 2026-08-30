@@ -18692,6 +18692,14 @@ impl NativeShell {
         self.terminal_scroll_px = 0.0;
         if let Some(key) = self.selected_task_key.clone() {
             if key.host != self.local_host_id() {
+                if !visible {
+                    if let Some(slot) = self.host_slot_mut(&key.host) {
+                        slot.cockpit.dock_mut().show_semantic();
+                    }
+                    self.set_task_center_terminal_preference(&key, false);
+                    self.pending_terminal_focus = false;
+                    return;
+                }
                 let model = self
                     .host_slot(&key.host)
                     .and_then(|slot| slot.client_model.clone());
@@ -18728,6 +18736,17 @@ impl NativeShell {
                 }
                 return;
             }
+        }
+        if !visible {
+            let selected_task_id = self.local_slot().interaction.selected_task();
+            self.local_slot_mut().cockpit.dock_mut().show_semantic();
+            if let Some(task_id) = selected_task_id {
+                let owner = self.local_task_key(task_id);
+                self.set_task_center_terminal_preference(&owner, false);
+            }
+            self.pending_terminal_focus = false;
+            self.sync_terminal_from_cockpit();
+            return;
         }
         let Some(model) = self.local_slot_mut().client_model.as_ref().cloned() else {
             return;
@@ -19680,6 +19699,32 @@ impl NativeShell {
         if command && key == "a" {
             if let Some(composer) = self.composer.as_mut() {
                 let _ = composer.select_all_draft(epoch);
+            }
+            window.prevent_default();
+            cx.stop_propagation();
+            return;
+        }
+        if command && (key == "z" || key == "y") {
+            let redo = key == "y" || event.keystroke.modifiers.shift;
+            let handled = self
+                .composer
+                .as_mut()
+                .and_then(|composer| {
+                    composer
+                        .handle_key(
+                            if redo {
+                                TextFieldKey::Redo
+                            } else {
+                                TextFieldKey::Undo
+                            },
+                            epoch,
+                        )
+                        .ok()
+                })
+                .unwrap_or(false);
+            if handled {
+                self.composer_marked_range = None;
+                self.cache_current_composer_draft();
             }
             window.prevent_default();
             cx.stop_propagation();
@@ -22037,7 +22082,13 @@ impl NativeShell {
                 .text_color(tokens.text.disabled.to_gpui())
                 .child(if send_available { "↑" } else { "…" })
         };
-        let composer_footer = if show_input && self.composer.is_some() {
+        let owns_input = show_input && self.selected_task_key.as_ref() == Some(&owner);
+        let composer_footer = if !owns_input {
+            // Background Full panes keep their complete live conversation but
+            // do not impersonate an editable composer. The selected pane alone
+            // owns GPUI text focus and the input footer.
+            div().id("native-task-composer-hidden").into_any_element()
+        } else if self.composer.is_some() {
             div()
                 .id("native-task-composer")
                 .w_full()
@@ -22786,17 +22837,23 @@ impl NativeShell {
                 .is_some()
             && self.task_surfaces.terminal_is_interactive(owner.clone());
         let chrome = native_center_terminal_chrome_plan();
-        let pane = self.pane_with_owner_selection(
-            owner,
-            self.local_slot().cockpit.dock().terminal_pane_model(),
-        );
+        let pane = self
+            .task_surfaces
+            .state(owner.clone())
+            .and_then(|state| state.latest_terminal.as_ref())
+            .map(crate::ui::task_cockpit::dock::ContextDock::terminal_pane_model_for_projection)
+            .or_else(|| {
+                let pane = self.local_slot().cockpit.dock().terminal_pane_model();
+                pane.session.is_some().then_some(pane)
+            })
+            .map(|pane| self.pane_with_owner_selection(owner, pane));
         // Keep the adapter theme-token contract referenced on this paint path.
         let _adapter_theme_contract = self.terminal.element_with_tokens(tokens);
-        let grid = if chrome.embeds_renderer {
+        let grid = if chrome.embeds_renderer && pane.is_some() {
             let interaction = interactive
                 .then(|| self.terminal_grid_interaction_for_shared(owner.clone(), &shell_entity));
             crate::terminal::view::render_terminal_surface_with_tokens_and_grid(
-                &pane,
+                pane.as_ref().expect("terminal pane checked above"),
                 None,
                 interaction,
                 tokens,
@@ -22831,7 +22888,22 @@ impl NativeShell {
                     .child(summary),
             );
         }
-        let surface = surface.child(div().flex_1().min_h(px(0.0)).overflow_hidden().child(grid));
+        let surface = if pane.is_some() {
+            surface.child(div().flex_1().min_h(px(0.0)).overflow_hidden().child(grid))
+        } else {
+            surface.child(
+                div()
+                    .flex_1()
+                    .min_h(px(0.0))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .px(px(tokens.density.spacing.lg))
+                    .text_size(px(tokens.density.typography.body))
+                    .text_color(tokens.terminal.bright_black.to_gpui())
+                    .child(self.task_surfaces.terminal_label(owner.clone())),
+            )
+        };
         if !interactive {
             return surface.into_any_element();
         }
@@ -24891,6 +24963,10 @@ impl NativeShell {
         // Done/Archived open via selection; never restore lifecycle from a click.
         apply_fleet_workspace_selection(&mut self.layout.task_workspace, key.clone(), mode)
             .map_err(|error| format!("{error:?}"))?;
+        // Selector choices belong to the composer owner that opened them. A task
+        // switch must never leave that transient menu floating over the next
+        // conversation with stale provider/model choices.
+        self.dismiss_composer_selector();
         let selected = self
             .layout
             .task_workspace
@@ -42363,9 +42439,11 @@ mod tests {
                     .apply_client_model_for_host(&remote_host, Arc::clone(&model))
                     .expect("remote model");
                 let remote_key = HostTaskKey::new(remote_host.clone(), task_id);
+                shell.open_composer_model_selector();
                 shell
                     .select_fleet_task_key(remote_key, FleetSelectMode::Replace)
                     .expect("select remote");
+                assert_eq!(shell.composer_selector, None);
                 assert!(
                     shell.shows_add_project_plus(),
                     "connected local Welcome/Add must remain usable"

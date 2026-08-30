@@ -4489,9 +4489,44 @@ fn attest_codex_cmd_wrapper(contents: &str) -> bool {
     let lines = normalized_wrapper_lines(contents);
     let bin_launch = "endlocal & goto #_undefined_# 2>nul || title %comspec% & set pathext=%pathext:;.js;=;% & \"%_prog%\" \"%dp0%\\..\\@openai\\codex\\bin\\codex.js\" %*";
     let global_launch = "endlocal & goto #_undefined_# 2>nul || title %comspec% & set pathext=%pathext:;.js;=;% & \"%_prog%\" \"%dp0%\\node_modules\\@openai\\codex\\bin\\codex.js\" %*";
-    strict_wrapper_lines(&lines, &required, required.len(), |line| {
+    if strict_wrapper_lines(&lines, &required, required.len(), |line| {
         line == bin_launch || line == global_launch
-    })
+    }) {
+        return true;
+    }
+
+    // npm 11 moved PATHEXT normalization into the `node` fallback branch.
+    // Keep accepting only the exact generated wrapper: the fixed line order,
+    // one of the two known Codex script locations, and no additional command.
+    let current_required = [
+        "@echo off",
+        "goto start",
+        ":find_dp0",
+        "set dp0=%~dp0",
+        "exit /b",
+        ":start",
+        "setlocal",
+        "call :find_dp0",
+        "if exist \"%dp0%\\node.exe\" (",
+        "set \"_prog=%dp0%\\node.exe\"",
+        ") else (",
+        "set \"_prog=node\"",
+        "set pathext=%pathext:;.js;=;%",
+        ")",
+    ];
+    let current_bin_launch = "endlocal & goto #_undefined_# 2>nul || title %comspec% & \"%_prog%\" \"%dp0%\\..\\@openai\\codex\\bin\\codex.js\" %*";
+    let current_global_launch = "endlocal & goto #_undefined_# 2>nul || title %comspec% & \"%_prog%\" \"%dp0%\\node_modules\\@openai\\codex\\bin\\codex.js\" %*";
+    // This exact generated assignment contains semicolons as PATHEXT data, so
+    // it cannot pass the generic shell-separator rejection used above. Compare
+    // the entire fixed prefix literally, then admit exactly one known launch.
+    lines.len() == current_required.len() + 1
+        && lines[..current_required.len()]
+            .iter()
+            .map(String::as_str)
+            .eq(current_required)
+        && lines
+            .last()
+            .is_some_and(|line| line == current_bin_launch || line == current_global_launch)
 }
 
 #[cfg(target_os = "windows")]
@@ -5347,6 +5382,31 @@ endLocal & goto #_undefined_# 2>NUL || title %COMSPEC% & set PATHEXT=%PATHEXT:;.
             ProviderKind::Codex,
             std::path::Path::new("codex.cmd"),
             &global_wrapper
+        ));
+
+        let current_npm_wrapper = r#"@ECHO off
+GOTO start
+:find_dp0
+SET dp0=%~dp0
+EXIT /b
+:start
+SETLOCAL
+CALL :find_dp0
+
+IF EXIST "%dp0%\node.exe" (
+  SET "_prog=%dp0%\node.exe"
+) ELSE (
+  SET "_prog=node"
+  SET PATHEXT=%PATHEXT:;.JS;=;%
+)
+
+endLocal & goto #_undefined_# 2>NUL || title %COMSPEC% & "%_prog%"  "%dp0%\node_modules\@openai\codex\bin\codex.js" %*
+"#;
+        assert!(attest_codex_cmd_wrapper(current_npm_wrapper));
+        assert!(attest_provider_wrapper(
+            ProviderKind::Codex,
+            std::path::Path::new("codex.cmd"),
+            current_npm_wrapper
         ));
 
         let cursor_cmd = r#"@echo off
