@@ -22,6 +22,11 @@
   unrelated global Cargo or rustc processes. If a worker violates this rule,
   stop that exact worker tree, preserve its source diff, and move/clean only the
   verified generated target before continuing.
+- If an isolated target exhausts disk space or linker/PDB capacity, first join
+  the exact Cargo, rustc, and linker tree and verify its target path. Clean only
+  that generated target, then rebuild it with incremental compilation and debug
+  symbols disabled when the verification lane does not require them. Never start
+  a retry while an orphaned compiler or linker still owns the target.
 - A delegated Cursor CLI wrapper is an owned long-lived process until its exact
   wrapper and all descendants have exited. An agent response or source commit
   is not proof that the Cursor wrapper stopped: it can continue executing a
