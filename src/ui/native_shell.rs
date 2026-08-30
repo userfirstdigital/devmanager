@@ -9762,6 +9762,10 @@ pub struct NativeShell {
     /// host owns the terminal viewport; this only coalesces local input into
     /// bounded whole-line scroll requests.
     terminal_scroll_px: f32,
+    /// Per-HostTaskKey terminal text selection. Never keyed by raw TaskId alone.
+    terminal_selections: BTreeMap<HostTaskKey, crate::terminal::view::TerminalSelection>,
+    /// Owner currently dragging a terminal selection, if any.
+    selecting_terminal_owner: Option<HostTaskKey>,
     focus_handle: FocusHandle,
     terminal_focus_handle: FocusHandle,
     composer_focus_handle: FocusHandle,
@@ -9978,6 +9982,53 @@ fn terminal_scroll_lines_from_pixels(
     let lines = (*remainder_px / line_height).trunc() as i32;
     *remainder_px -= lines as f32 * line_height;
     lines.clamp(-256, 256)
+}
+
+/// Observable NativeShell outer chrome for the center terminal. The renderer
+/// already owns the 22px header; NativeShell must not add a second caption or
+/// padding envelope around it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct NativeCenterTerminalChrome {
+    summary_caption: bool,
+    outer_padding: bool,
+    embeds_renderer: bool,
+}
+
+fn native_center_terminal_chrome_plan() -> NativeCenterTerminalChrome {
+    NativeCenterTerminalChrome {
+        summary_caption: false,
+        outer_padding: false,
+        embeds_renderer: true,
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TerminalGridPointerPhase {
+    Down,
+    Move,
+    Up,
+}
+
+fn terminal_selection_store_set(
+    store: &mut BTreeMap<HostTaskKey, crate::terminal::view::TerminalSelection>,
+    owner: HostTaskKey,
+    selection: Option<crate::terminal::view::TerminalSelection>,
+) {
+    match selection {
+        Some(selection) => {
+            store.insert(owner, selection);
+        }
+        None => {
+            store.remove(&owner);
+        }
+    }
+}
+
+fn terminal_selection_store_get(
+    store: &BTreeMap<HostTaskKey, crate::terminal::view::TerminalSelection>,
+    owner: &HostTaskKey,
+) -> Option<crate::terminal::view::TerminalSelection> {
+    store.get(owner).copied()
 }
 
 /// Rate limit for window-frame writes while the user drags a window edge.
@@ -10672,6 +10723,8 @@ impl NativeShell {
             accessibility_tree_builds: 0,
             terminal: TerminalDockAdapter::unavailable_with_preferences(preferences),
             terminal_scroll_px: 0.0,
+            terminal_selections: BTreeMap::new(),
+            selecting_terminal_owner: None,
             focus_handle: cx.focus_handle().tab_stop(true),
             terminal_focus_handle: cx.focus_handle().tab_stop(true),
             composer_focus_handle: cx.focus_handle().tab_stop(true),
@@ -18444,24 +18497,34 @@ impl NativeShell {
         Ok(epoch)
     }
 
+    /// Write composer feedback onto an exact HostTaskKey's host slot.
+    /// Never falls back to the local slot when that owner is absent.
+    fn set_composer_error_for_owner(&mut self, owner: &HostTaskKey, message: impl Into<String>) {
+        if let Some(slot) = self.host_slot_mut(&owner.host) {
+            slot.composer_error = Some(message.into());
+        }
+    }
+
+    fn clear_composer_error_for_owner(&mut self, owner: &HostTaskKey) {
+        if let Some(slot) = self.host_slot_mut(&owner.host) {
+            slot.composer_error = None;
+        }
+    }
+
     /// Write composer feedback onto the draft owner's host slot only.
     fn set_draft_owner_composer_error(&mut self, message: impl Into<String>) {
         let message = message.into();
         if let Some(owner) = self.composer_draft_owner() {
-            if let Some(slot) = self.host_slot_mut(&owner.host) {
-                slot.composer_error = Some(message);
-                return;
-            }
+            self.set_composer_error_for_owner(&owner, message);
+            return;
         }
         self.local_slot_mut().composer_error = Some(message);
     }
 
     fn clear_draft_owner_composer_error(&mut self) {
         if let Some(owner) = self.composer_draft_owner() {
-            if let Some(slot) = self.host_slot_mut(&owner.host) {
-                slot.composer_error = None;
-                return;
-            }
+            self.clear_composer_error_for_owner(&owner);
+            return;
         }
         self.local_slot_mut().composer_error = None;
     }
@@ -18836,6 +18899,14 @@ impl NativeShell {
         cx: &mut Context<Self>,
     ) {
         if self.selected_owner_is_remote() {
+            // Remote projected terminals stay non-writable, but Ctrl+C still copies.
+            let command = event.keystroke.modifiers.control || event.keystroke.modifiers.platform;
+            if command
+                && event.keystroke.key.eq_ignore_ascii_case("c")
+                && self.copy_selected_terminal_text(cx)
+            {
+                window.prevent_default();
+            }
             return;
         }
         if !self.local_slot_mut().cockpit.dock().showing_raw_terminal() {
@@ -18854,6 +18925,18 @@ impl NativeShell {
             return;
         }
         let command = event.keystroke.modifiers.control || event.keystroke.modifiers.platform;
+        if command
+            && event.keystroke.key.eq_ignore_ascii_case("c")
+            && matches!(
+                crate::terminal::view::terminal_ctrl_c_action(self.selected_terminal_has_text()),
+                crate::terminal::view::TerminalCtrlCAction::CopySelection
+            )
+        {
+            if self.copy_selected_terminal_text(cx) {
+                window.prevent_default();
+            }
+            return;
+        }
         let text = if command && event.keystroke.key.eq_ignore_ascii_case("v") {
             cx.read_from_clipboard().and_then(|item| item.text())
         } else {
@@ -18863,6 +18946,167 @@ impl NativeShell {
             let _ = self.dispatch_provider_terminal_text(text);
             window.prevent_default();
         }
+    }
+
+    fn selected_terminal_has_text(&self) -> bool {
+        self.selected_task_key
+            .as_ref()
+            .and_then(|owner| self.selected_terminal_text_for(owner))
+            .is_some_and(|text| !text.is_empty())
+    }
+
+    fn selected_terminal_text_for(&self, owner: &HostTaskKey) -> Option<String> {
+        let selection = terminal_selection_store_get(&self.terminal_selections, owner)?;
+        let screen = self.terminal_screen_for_owner(owner)?;
+        let range = crate::terminal::view::selection_range_from(selection, screen.cols)?;
+        let text = crate::terminal::view::selected_text_from_screen(&screen, range);
+        (!text.is_empty()).then_some(text)
+    }
+
+    fn terminal_screen_for_owner(
+        &self,
+        owner: &HostTaskKey,
+    ) -> Option<crate::terminal::session::TerminalScreenSnapshot> {
+        if owner.host == self.local_host_id() {
+            return self
+                .local_slot()
+                .cockpit
+                .dock()
+                .terminal_pane_model()
+                .session
+                .map(|session| session.screen);
+        }
+        self.task_surfaces
+            .state(owner.clone())
+            .and_then(|state| state.latest_terminal.as_ref())
+            .map(|projection| {
+                crate::ui::task_cockpit::dock::ContextDock::terminal_pane_model_for_projection(
+                    projection,
+                )
+                .session
+                .map(|session| session.screen)
+            })
+            .flatten()
+    }
+
+    fn copy_selected_terminal_text(&mut self, cx: &mut Context<Self>) -> bool {
+        let Some(owner) = self.selected_task_key.clone() else {
+            return false;
+        };
+        let Some(text) = self.selected_terminal_text_for(&owner) else {
+            return false;
+        };
+        cx.write_to_clipboard(gpui::ClipboardItem::new_string(text));
+        true
+    }
+
+    fn apply_terminal_grid_pointer(
+        &mut self,
+        owner: HostTaskKey,
+        event: crate::terminal::view::TerminalGridPointerEvent,
+        phase: TerminalGridPointerPhase,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(screen) = self.terminal_screen_for_owner(&owner) else {
+            return;
+        };
+        let mut endpoint = event.endpoint;
+        endpoint.position.row = crate::terminal::view::buffer_line_for_viewport_row(
+            &screen,
+            screen.display_offset,
+            endpoint.position.row,
+        );
+        match phase {
+            TerminalGridPointerPhase::Down => {
+                if event.shift {
+                    if let Some(selection) = self.terminal_selections.get_mut(&owner) {
+                        crate::terminal::view::extend_selection_head(selection, endpoint);
+                    } else {
+                        terminal_selection_store_set(
+                            &mut self.terminal_selections,
+                            owner.clone(),
+                            Some(crate::terminal::view::begin_simple_selection(endpoint)),
+                        );
+                    }
+                    self.selecting_terminal_owner = Some(owner);
+                    cx.notify();
+                    return;
+                }
+                match crate::terminal::view::selection_mode_for_click(event.click_count) {
+                    Some(crate::terminal::view::TerminalSelectionMode::Simple) => {
+                        terminal_selection_store_set(
+                            &mut self.terminal_selections,
+                            owner.clone(),
+                            Some(crate::terminal::view::begin_simple_selection(endpoint)),
+                        );
+                        self.selecting_terminal_owner = Some(owner);
+                    }
+                    Some(
+                        mode @ (crate::terminal::view::TerminalSelectionMode::Semantic
+                        | crate::terminal::view::TerminalSelectionMode::Lines),
+                    ) => {
+                        terminal_selection_store_set(
+                            &mut self.terminal_selections,
+                            owner.clone(),
+                            crate::terminal::view::terminal_selection_for_click(
+                                &screen,
+                                endpoint.position,
+                                mode,
+                            ),
+                        );
+                        self.selecting_terminal_owner = None;
+                    }
+                    None => return,
+                }
+                cx.notify();
+            }
+            TerminalGridPointerPhase::Move => {
+                if self.selecting_terminal_owner.as_ref() != Some(&owner) || !event.dragging {
+                    return;
+                }
+                if let Some(selection) = self.terminal_selections.get_mut(&owner) {
+                    let before = *selection;
+                    crate::terminal::view::extend_selection_head(selection, endpoint);
+                    if *selection != before {
+                        cx.notify();
+                    }
+                }
+            }
+            TerminalGridPointerPhase::Up => {
+                if self.selecting_terminal_owner.as_ref() == Some(&owner) {
+                    let finished = crate::terminal::view::finish_simple_selection(
+                        self.terminal_selections.get(&owner).copied(),
+                    );
+                    terminal_selection_store_set(
+                        &mut self.terminal_selections,
+                        owner.clone(),
+                        finished,
+                    );
+                    self.selecting_terminal_owner = None;
+                    cx.notify();
+                }
+            }
+        }
+    }
+
+    fn pane_with_owner_selection(
+        &self,
+        owner: &HostTaskKey,
+        mut pane: crate::terminal::view::TerminalPaneModel,
+    ) -> crate::terminal::view::TerminalPaneModel {
+        if let Some(selection) = terminal_selection_store_get(&self.terminal_selections, owner) {
+            if let Some(session) = pane.session.as_ref() {
+                if let Some(range) =
+                    crate::terminal::view::selection_range_from(selection, session.screen.cols)
+                {
+                    pane.selection = crate::terminal::view::selection_snapshot_for_viewport(
+                        range,
+                        &session.screen,
+                    );
+                }
+            }
+        }
+        pane
     }
 
     fn flush_composer_drafts_if_due(&mut self, force: bool) {
@@ -20349,15 +20593,9 @@ impl NativeShell {
             ImageFormat::Png => "image/png",
             ImageFormat::Jpeg => "image/jpeg",
             _ => {
-                if let Some(owner) = self.composer_draft_owner() {
-                    if let Some(slot) = self.host_slot_mut(&owner.host) {
-                        slot.composer_error =
-                            Some("Unsupported pasted image type. Try PNG or JPEG.".to_string());
-                    }
-                } else {
-                    self.local_slot_mut().composer_error =
-                        Some("Unsupported pasted image type. Try PNG or JPEG.".to_string());
-                }
+                self.set_draft_owner_composer_error(
+                    "Unsupported pasted image type. Try PNG or JPEG.",
+                );
                 return true;
             }
         };
@@ -20373,13 +20611,14 @@ impl NativeShell {
             bytes: image.bytes,
         };
         let Some(expected_key) = self.current_composer_draft_key() else {
-            self.local_slot_mut().composer_error = Some("composer is unavailable".to_string());
+            self.set_draft_owner_composer_error("composer is unavailable");
             return true;
         };
+        let expected_owner = expected_key.task_id.clone();
         let workspace = match self.selected_task_workspace_root() {
             Ok(workspace) => workspace,
             Err(error) => {
-                self.local_slot_mut().composer_error = Some(error);
+                self.set_composer_error_for_owner(&expected_owner, error);
                 return true;
             }
         };
@@ -20396,8 +20635,10 @@ impl NativeShell {
                             shell
                                 .admit_prepared_native_composer_images(expected_key, vec![prepared])
                         }) {
-                            Ok(()) => shell.local_slot_mut().composer_error = None,
-                            Err(error) => shell.local_slot_mut().composer_error = Some(error),
+                            Ok(()) => shell.clear_composer_error_for_owner(&expected_owner),
+                            Err(error) => {
+                                shell.set_composer_error_for_owner(&expected_owner, error)
+                            }
                         }
                         shell.pending_composer_focus = true;
                         cx.notify();
@@ -20422,13 +20663,14 @@ impl NativeShell {
             return;
         }
         let Some(expected_key) = self.current_composer_draft_key() else {
-            self.local_slot_mut().composer_error = Some("composer is unavailable".to_string());
+            self.set_draft_owner_composer_error("composer is unavailable");
             return;
         };
+        let expected_owner = expected_key.task_id.clone();
         let workspace = match self.selected_task_workspace_root() {
             Ok(workspace) => workspace,
             Err(error) => {
-                self.local_slot_mut().composer_error = Some(error);
+                self.set_composer_error_for_owner(&expected_owner, error);
                 return;
             }
         };
@@ -20456,8 +20698,10 @@ impl NativeShell {
                         match prepared.and_then(|prepared| {
                             shell.admit_prepared_native_composer_images(expected_key, prepared)
                         }) {
-                            Ok(()) => shell.local_slot_mut().composer_error = None,
-                            Err(error) => shell.local_slot_mut().composer_error = Some(error),
+                            Ok(()) => shell.clear_composer_error_for_owner(&expected_owner),
+                            Err(error) => {
+                                shell.set_composer_error_for_owner(&expected_owner, error)
+                            }
                         }
                         shell.pending_composer_focus = true;
                         cx.notify();
@@ -21072,7 +21316,7 @@ impl NativeShell {
                 cx,
             )
         } else if pane.paint_terminal && !self.preview_conversation_installed() {
-            self.task_terminal_surface_for(&task_key, tokens)
+            self.task_terminal_surface_for(&task_key, tokens, cx)
         } else {
             // Background Full panes render the same owner semantic history;
             // only the interactive composer/input is withheld.
@@ -22528,7 +22772,7 @@ impl NativeShell {
     ) -> AnyElement {
         let remote = owner.host != self.local_host_id();
         if remote {
-            return self.remote_terminal_dock_surface(tokens, owner.clone());
+            return self.remote_terminal_dock_surface(tokens, owner.clone(), cx.weak_entity());
         }
         let shell_entity = cx.weak_entity();
         let selected_owner = self.selected_task_key.as_ref() == Some(owner);
@@ -22541,35 +22785,53 @@ impl NativeShell {
                 .terminal_binding()
                 .is_some()
             && self.task_surfaces.terminal_is_interactive(owner.clone());
-        let summary = if interactive {
-            "Provider terminal · Live · type, use arrows, Enter, or Escape"
+        let chrome = native_center_terminal_chrome_plan();
+        let pane = self.pane_with_owner_selection(
+            owner,
+            self.local_slot().cockpit.dock().terminal_pane_model(),
+        );
+        // Keep the adapter theme-token contract referenced on this paint path.
+        let _adapter_theme_contract = self.terminal.element_with_tokens(tokens);
+        let grid = if chrome.embeds_renderer {
+            let interaction = interactive
+                .then(|| self.terminal_grid_interaction_for_shared(owner.clone(), &shell_entity));
+            crate::terminal::view::render_terminal_surface_with_tokens_and_grid(
+                &pane,
+                None,
+                interaction,
+                tokens,
+            )
+            .into_any_element()
         } else {
-            self.task_surfaces.terminal_label(owner.clone())
+            div().into_any_element()
         };
-        let surface = div()
+        let _ = _adapter_theme_contract;
+        let mut surface = div()
             .id("native-task-center-terminal-surface")
             .w_full()
             .flex()
             .flex_1()
             .min_h(px(0.0))
             .flex_col()
-            .gap(px(tokens.density.spacing.xs))
-            .p(px(tokens.density.spacing.md))
             .bg(tokens.terminal.background.to_gpui())
-            .text_color(tokens.terminal.foreground.to_gpui())
-            .child(
+            .text_color(tokens.terminal.foreground.to_gpui());
+        if chrome.outer_padding {
+            surface = surface.p(px(tokens.density.spacing.md));
+        }
+        if chrome.summary_caption {
+            let summary = if interactive {
+                "Provider terminal · Live · type, use arrows, Enter, or Escape"
+            } else {
+                self.task_surfaces.terminal_label(owner.clone())
+            };
+            surface = surface.child(
                 div()
                     .text_size(px(tokens.density.typography.caption))
                     .text_color(tokens.terminal.bright_black.to_gpui())
                     .child(summary),
-            )
-            .child(
-                div()
-                    .flex_1()
-                    .min_h(px(0.0))
-                    .overflow_hidden()
-                    .child(self.terminal.element_with_tokens(tokens)),
             );
+        }
+        let surface = surface.child(div().flex_1().min_h(px(0.0)).overflow_hidden().child(grid));
         if !interactive {
             return surface.into_any_element();
         }
@@ -22640,17 +22902,84 @@ impl NativeShell {
             .into_any_element()
     }
 
+    fn prepare_terminal_owner_for_grid_pointer(
+        &mut self,
+        owner: &HostTaskKey,
+        window: &mut Window,
+    ) {
+        self.arm_terminal_owner_for_grid_pointer(owner);
+        self.terminal_focus_handle.focus(window);
+    }
+
+    /// Selection + pending-focus arm used before grid pointer selection applies.
+    /// Separated so headless tests can prove owner Replace without a Window.
+    fn arm_terminal_owner_for_grid_pointer(&mut self, owner: &HostTaskKey) {
+        if self.selected_task_key.as_ref() != Some(owner) {
+            let _ = self.select_fleet_task_key(owner.clone(), FleetSelectMode::Replace);
+        }
+        self.pending_terminal_focus = false;
+    }
+
+    fn terminal_grid_interaction_for_shared(
+        &self,
+        owner: HostTaskKey,
+        shell_entity: &gpui::WeakEntity<NativeShell>,
+    ) -> crate::terminal::view::TerminalGridInteraction {
+        let shell_down = shell_entity.clone();
+        let shell_move = shell_entity.clone();
+        let shell_up = shell_entity.clone();
+        let owner_down = owner.clone();
+        let owner_move = owner.clone();
+        let owner_up = owner;
+        crate::terminal::view::TerminalGridInteraction {
+            on_mouse_down: Arc::new(move |_, event, window, app| {
+                let _ = shell_down.update(app, |shell, cx| {
+                    shell.prepare_terminal_owner_for_grid_pointer(&owner_down, window);
+                    shell.apply_terminal_grid_pointer(
+                        owner_down.clone(),
+                        event,
+                        TerminalGridPointerPhase::Down,
+                        cx,
+                    );
+                });
+            }),
+            on_mouse_move: Arc::new(move |_, event, _window, app| {
+                let _ = shell_move.update(app, |shell, cx| {
+                    shell.apply_terminal_grid_pointer(
+                        owner_move.clone(),
+                        event,
+                        TerminalGridPointerPhase::Move,
+                        cx,
+                    );
+                });
+            }),
+            on_mouse_up: Arc::new(move |_, event, _window, app| {
+                let _ = shell_up.update(app, |shell, cx| {
+                    shell.apply_terminal_grid_pointer(
+                        owner_up.clone(),
+                        event,
+                        TerminalGridPointerPhase::Up,
+                        cx,
+                    );
+                });
+            }),
+        }
+    }
+
     fn task_terminal_surface_for(
         &self,
         owner: &HostTaskKey,
         tokens: crate::ui::tokens::ThemeTokens,
+        cx: &mut Context<Self>,
     ) -> AnyElement {
         let label = self.task_surfaces.terminal_label(owner.clone());
         let pane = self
             .task_surfaces
             .state(owner.clone())
             .and_then(|state| state.latest_terminal.as_ref())
-            .map(crate::ui::task_cockpit::dock::ContextDock::terminal_pane_model_for_projection);
+            .map(crate::ui::task_cockpit::dock::ContextDock::terminal_pane_model_for_projection)
+            .map(|pane| self.pane_with_owner_selection(owner, pane));
+        let shell_entity = cx.weak_entity();
         let surface = div()
             .id((
                 "native-task-terminal-surface",
@@ -22663,10 +22992,17 @@ impl NativeShell {
             .flex_col()
             .bg(tokens.terminal.background.to_gpui());
         if let Some(pane) = pane {
+            let interaction =
+                self.terminal_grid_interaction_for_shared(owner.clone(), &shell_entity);
             surface
-                .child(crate::terminal::view::render_terminal_surface_with_tokens(
-                    &pane, None, tokens,
-                ))
+                .child(
+                    crate::terminal::view::render_terminal_surface_with_tokens_and_grid(
+                        &pane,
+                        None,
+                        Some(interaction),
+                        tokens,
+                    ),
+                )
                 .into_any_element()
         } else {
             surface
@@ -23755,7 +24091,17 @@ impl NativeShell {
         match active_tool {
             CockpitDockTool::Terminal => {
                 if remote {
-                    self.remote_terminal_dock_surface(tokens, owner_key.expect("remote owner"))
+                    match shell_entity {
+                        Some(entity) => self.remote_terminal_dock_surface(
+                            tokens,
+                            owner_key.expect("remote owner"),
+                            entity,
+                        ),
+                        None => div()
+                            .id("native-shell-remote-context-terminal")
+                            .child("Terminal unavailable")
+                            .into_any_element(),
+                    }
                 } else {
                     self.terminal_dock_surface(tokens, shell_entity)
                 }
@@ -23975,31 +24321,57 @@ impl NativeShell {
         }
     }
 
-    /// Display-only remote terminal replica. No focus/key handlers, no local PTY adapter.
+    /// Display-only remote terminal replica. Local selection/copy only; no PTY write path.
     fn remote_terminal_dock_surface(
         &self,
         tokens: crate::ui::tokens::ThemeTokens,
         owner: HostTaskKey,
+        shell_entity: gpui::WeakEntity<NativeShell>,
     ) -> AnyElement {
-        let label = self.task_surfaces.terminal_label(owner.clone());
+        let _label = self.task_surfaces.terminal_label(owner.clone());
         let pane = self
             .task_surfaces
             .state(owner.clone())
             .and_then(|state| state.latest_terminal.as_ref())
-            .map(crate::ui::task_cockpit::dock::ContextDock::terminal_pane_model_for_projection);
-        let surface = div()
+            .map(crate::ui::task_cockpit::dock::ContextDock::terminal_pane_model_for_projection)
+            .map(|pane| self.pane_with_owner_selection(&owner, pane));
+        let chrome = native_center_terminal_chrome_plan();
+        let mut surface = div()
             .id("native-shell-remote-context-terminal")
             .w_full()
             .flex()
             .flex_col()
-            .gap(px(tokens.density.spacing.xs))
-            .p(px(tokens.density.physical().control_padding as f32))
-            .bg(tokens.surfaces.sunken.to_gpui())
-            .child(format!("Terminal · display only · {label}"));
+            .bg(tokens.surfaces.sunken.to_gpui());
+        if chrome.outer_padding {
+            surface = surface.p(px(tokens.density.physical().control_padding as f32));
+        }
+        if chrome.summary_caption {
+            surface = surface.child(format!("Terminal · display only · {_label}"));
+        }
         let surface = if let Some(pane) = pane {
-            surface.child(div().flex_1().min_h(px(120.0)).overflow_hidden().child(
-                crate::terminal::view::render_terminal_surface_with_tokens(&pane, None, tokens),
-            ))
+            let interaction =
+                self.terminal_grid_interaction_for_shared(owner.clone(), &shell_entity);
+            let shell_for_key = shell_entity;
+            surface
+                .child(div().flex_1().min_h(px(120.0)).overflow_hidden().child(
+                    crate::terminal::view::render_terminal_surface_with_tokens_and_grid(
+                        &pane,
+                        None,
+                        Some(interaction),
+                        tokens,
+                    ),
+                ))
+                .tab_stop(true)
+                .track_focus(&self.terminal_focus_handle)
+                .on_key_down(
+                    move |event: &KeyDownEvent, window: &mut Window, app: &mut gpui::App| {
+                        let _ = shell_for_key.update(app, |shell, cx| {
+                            cx.stop_propagation();
+                            shell.handle_provider_terminal_key(event, window, cx);
+                            cx.notify();
+                        });
+                    },
+                )
         } else {
             surface.child(
                 div()
@@ -39559,6 +39931,263 @@ mod tests {
             -2
         );
         assert_eq!(remainder, 0.0);
+    }
+
+    #[test]
+    fn native_center_terminal_chrome_plan_drops_duplicate_outer_caption_and_padding() {
+        let plan = super::native_center_terminal_chrome_plan();
+        assert!(
+            !plan.summary_caption,
+            "NativeShell must not paint a second Provider terminal caption"
+        );
+        assert!(
+            !plan.outer_padding,
+            "NativeShell must not wrap the renderer in outer padding"
+        );
+        assert!(plan.embeds_renderer);
+    }
+
+    #[test]
+    fn same_raw_task_id_keeps_independent_terminal_selection_per_host() {
+        let task_id = TaskId::new();
+        let local = HostTaskKey::new(
+            HostId::local_profile("selection-local").expect("host"),
+            task_id,
+        );
+        let remote = HostTaskKey::new(HostId::Remote([0x42; 16]), task_id);
+        let mut store = BTreeMap::new();
+        let local_selection = crate::terminal::view::begin_simple_selection(
+            crate::terminal::view::TerminalSelectionEndpoint {
+                position: crate::terminal::view::TerminalGridPosition { row: 0, column: 0 },
+                side: crate::terminal::view::TerminalCellSide::Left,
+            },
+        );
+        let mut remote_selection = local_selection;
+        crate::terminal::view::extend_selection_head(
+            &mut remote_selection,
+            crate::terminal::view::TerminalSelectionEndpoint {
+                position: crate::terminal::view::TerminalGridPosition { row: 0, column: 3 },
+                side: crate::terminal::view::TerminalCellSide::Right,
+            },
+        );
+        super::terminal_selection_store_set(&mut store, local.clone(), Some(local_selection));
+        super::terminal_selection_store_set(&mut store, remote.clone(), Some(remote_selection));
+        assert_ne!(
+            super::terminal_selection_store_get(&store, &local),
+            super::terminal_selection_store_get(&store, &remote),
+            "same TaskId on two hosts must keep isolated selections"
+        );
+        super::terminal_selection_store_set(&mut store, local, None);
+        assert!(super::terminal_selection_store_get(&store, &remote).is_some());
+    }
+
+    #[test]
+    fn terminal_ctrl_c_precedence_copies_before_interrupt() {
+        assert_eq!(
+            crate::terminal::view::terminal_ctrl_c_action(true),
+            crate::terminal::view::TerminalCtrlCAction::CopySelection
+        );
+        assert_eq!(
+            crate::terminal::view::terminal_ctrl_c_action(false),
+            crate::terminal::view::TerminalCtrlCAction::Interrupt
+        );
+    }
+
+    #[test]
+    fn composer_image_admit_routes_errors_to_exact_draft_owner_slot() {
+        if rerun_headless_shell_test_in_child(
+            "ui::native_shell::tests::composer_image_admit_routes_errors_to_exact_draft_owner_slot",
+        ) {
+            return;
+        }
+        let (runtime, _) = TestRuntime::new(true, NativeHostActionResult::Queued);
+        let workspace = tempfile::tempdir().expect("workspace");
+        let profile = isolated_dev_profile(workspace.path()).expect("profile");
+        let remote_host = HostId::Remote([0x44; 16]);
+        let report = std::rc::Rc::new(std::cell::RefCell::new(None));
+        let report_slot = std::rc::Rc::clone(&report);
+        gpui::Application::headless().run(move |cx| {
+            crate::ui::init(cx);
+            let entity = cx.new(|cx| {
+                NativeShell::new_with_host_runtime_port(
+                    profile,
+                    Box::new(runtime),
+                    crate::ui::tokens::RuntimePreferencesSnapshot::default(),
+                    cx,
+                )
+            });
+            let observed = entity.update(cx, |shell, _cx| {
+                let (remote_runtime, _) = TestRuntime::new(true, NativeHostActionResult::Queued);
+                let mut remote_slot = HostUiState::new_empty(
+                    remote_host.clone(),
+                    NativeHostState::Connected {
+                        endpoint: "fleet://image-owner".into(),
+                    },
+                );
+                remote_slot.host_runtime = Some(NativeHostRuntimeAttachment::Injected(Box::new(
+                    remote_runtime,
+                )));
+                shell
+                    .attach_host_ui_slot(remote_slot)
+                    .expect("attach remote");
+                let task_id = TaskId::new();
+                let remote_owner = HostTaskKey::new(remote_host.clone(), task_id);
+                shell.composer_owner = Some(remote_owner);
+                shell.set_draft_owner_composer_error("image-admit-failed");
+                (
+                    shell.local_slot().composer_error.clone(),
+                    shell
+                        .host_slot(&remote_host)
+                        .and_then(|slot| slot.composer_error.clone()),
+                )
+            });
+            *report_slot.borrow_mut() = Some(observed);
+            drop(entity);
+            cx.quit();
+        });
+        let (local_error, remote_error) = report.borrow_mut().take().expect("report");
+        assert!(
+            local_error.is_none(),
+            "image paste errors must not land on the local slot for a remote draft owner"
+        );
+        assert_eq!(remote_error.as_deref(), Some("image-admit-failed"));
+    }
+
+    #[test]
+    fn async_image_completion_feedback_stays_on_captured_owner_after_focus_switch() {
+        if rerun_headless_shell_test_in_child(
+            "ui::native_shell::tests::async_image_completion_feedback_stays_on_captured_owner_after_focus_switch",
+        ) {
+            return;
+        }
+        let (runtime, _) = TestRuntime::new(true, NativeHostActionResult::Queued);
+        let workspace = tempfile::tempdir().expect("workspace");
+        let profile = isolated_dev_profile(workspace.path()).expect("profile");
+        let remote_host = HostId::Remote([0x45; 16]);
+        let report = std::rc::Rc::new(std::cell::RefCell::new(None));
+        let report_slot = std::rc::Rc::clone(&report);
+        gpui::Application::headless().run(move |cx| {
+            crate::ui::init(cx);
+            let entity = cx.new(|cx| {
+                NativeShell::new_with_host_runtime_port(
+                    profile,
+                    Box::new(runtime),
+                    crate::ui::tokens::RuntimePreferencesSnapshot::default(),
+                    cx,
+                )
+            });
+            let observed = entity.update(cx, |shell, _cx| {
+                let (remote_runtime, _) = TestRuntime::new(true, NativeHostActionResult::Queued);
+                let mut remote_slot = HostUiState::new_empty(
+                    remote_host.clone(),
+                    NativeHostState::Connected {
+                        endpoint: "fleet://image-a".into(),
+                    },
+                );
+                remote_slot.host_runtime = Some(NativeHostRuntimeAttachment::Injected(Box::new(
+                    remote_runtime,
+                )));
+                shell
+                    .attach_host_ui_slot(remote_slot)
+                    .expect("attach remote");
+                let task_a = TaskId::new();
+                let task_b = TaskId::new();
+                let owner_a = HostTaskKey::new(remote_host.clone(), task_a);
+                let owner_b = shell.local_task_key(task_b);
+                // Capture A as the in-flight paste owner, then switch composer to local B.
+                shell.composer_owner = Some(owner_a.clone());
+                let captured = owner_a.clone();
+                shell.composer_owner = Some(owner_b.clone());
+                shell.local_slot_mut().composer_error = Some("local-b-preexisting".into());
+                shell.set_composer_error_for_owner(&captured, "decode-failed-for-a");
+                (
+                    shell
+                        .host_slot(&remote_host)
+                        .and_then(|slot| slot.composer_error.clone()),
+                    shell.local_slot().composer_error.clone(),
+                    shell.composer_owner.clone(),
+                )
+            });
+            *report_slot.borrow_mut() = Some(observed);
+            drop(entity);
+            cx.quit();
+        });
+        let (remote_error, local_error, current_owner) =
+            report.borrow_mut().take().expect("report");
+        assert_eq!(remote_error.as_deref(), Some("decode-failed-for-a"));
+        assert_eq!(
+            local_error.as_deref(),
+            Some("local-b-preexisting"),
+            "completion feedback for captured A must not overwrite local B"
+        );
+        assert!(
+            current_owner
+                .as_ref()
+                .is_some_and(|owner| matches!(owner.host, HostId::LocalProfile(_))),
+            "composer focus stayed on local B"
+        );
+    }
+
+    #[test]
+    fn grid_pointer_prepare_selects_owner_and_clears_pending_terminal_focus() {
+        if rerun_headless_shell_test_in_child(
+            "ui::native_shell::tests::grid_pointer_prepare_selects_owner_and_clears_pending_terminal_focus",
+        ) {
+            return;
+        }
+        let (runtime, _) = TestRuntime::new(true, NativeHostActionResult::Queued);
+        let workspace = tempfile::tempdir().expect("workspace");
+        let profile = isolated_dev_profile(workspace.path()).expect("profile");
+        let remote_host = HostId::Remote([0x46; 16]);
+        let report = std::rc::Rc::new(std::cell::RefCell::new(None));
+        let report_slot = std::rc::Rc::clone(&report);
+        gpui::Application::headless().run(move |cx| {
+            crate::ui::init(cx);
+            let entity = cx.new(|cx| {
+                NativeShell::new_with_host_runtime_port(
+                    profile,
+                    Box::new(runtime),
+                    crate::ui::tokens::RuntimePreferencesSnapshot::default(),
+                    cx,
+                )
+            });
+            let observed = entity.update(cx, |shell, _cx| {
+                let (remote_runtime, _) = TestRuntime::new(true, NativeHostActionResult::Queued);
+                let mut remote_slot = HostUiState::new_empty(
+                    remote_host.clone(),
+                    NativeHostState::Connected {
+                        endpoint: "fleet://terminal-focus".into(),
+                    },
+                );
+                remote_slot.host_runtime = Some(NativeHostRuntimeAttachment::Injected(Box::new(
+                    remote_runtime,
+                )));
+                shell
+                    .attach_host_ui_slot(remote_slot)
+                    .expect("attach remote");
+                let remote_owner = HostTaskKey::new(remote_host.clone(), TaskId::new());
+                shell.pending_terminal_focus = true;
+                shell.selected_task_key = None;
+                shell.arm_terminal_owner_for_grid_pointer(&remote_owner);
+                (
+                    shell.selected_task_key.clone(),
+                    shell.pending_terminal_focus,
+                )
+            });
+            *report_slot.borrow_mut() = Some(observed);
+            drop(entity);
+            cx.quit();
+        });
+        let (selected, pending) = report.borrow_mut().take().expect("report");
+        assert_eq!(
+            selected.as_ref().map(|key| &key.host),
+            Some(&HostId::Remote([0x46; 16])),
+            "grid pointer must select the exact HostTaskKey before selection applies"
+        );
+        assert!(
+            !pending,
+            "pending_terminal_focus must clear so Ctrl+C reaches the copy handler"
+        );
     }
 
     #[test]

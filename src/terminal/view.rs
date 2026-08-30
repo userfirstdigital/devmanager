@@ -12,8 +12,9 @@ use crate::ui::tokens::ThemeTokens;
 use alacritty_terminal::vte::ansi::CursorShape;
 use gpui::{
     canvas, div, fill, img, point, px, rgb, size, AnyElement, App, Bounds, Hsla, ImageSource,
-    InteractiveElement, IntoElement, MouseButton, MouseDownEvent, ObjectFit, ParentElement,
-    SharedString, StrikethroughStyle, Styled, StyledImage, TextRun, UnderlineStyle, Window,
+    InteractiveElement, IntoElement, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent,
+    ObjectFit, ParentElement, Pixels, Point, SharedString, StrikethroughStyle, Styled, StyledImage,
+    TextRun, UnderlineStyle, Window,
 };
 use std::sync::Arc;
 
@@ -139,6 +140,88 @@ pub struct TerminalSelectionSnapshot {
     pub start_column: usize,
     pub end_row: usize,
     pub end_column: usize,
+}
+
+/// Absolute buffer cell coordinates used by selection anchors.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct TerminalGridPosition {
+    pub row: usize,
+    pub column: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum TerminalCellSide {
+    Left,
+    Right,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct TerminalSelectionEndpoint {
+    pub position: TerminalGridPosition,
+    pub side: TerminalCellSide,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TerminalSelectionMode {
+    Simple,
+    Semantic,
+    Lines,
+}
+
+/// Active drag/click selection for one terminal pane.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TerminalSelection {
+    pub anchor: TerminalSelectionEndpoint,
+    pub head: TerminalSelectionEndpoint,
+    pub moved: bool,
+    pub mode: TerminalSelectionMode,
+}
+
+/// Painted grid metrics used for hit-testing. Origin is window-space.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct TerminalTextBounds {
+    pub left: f32,
+    pub top: f32,
+    pub width: f32,
+    pub height: f32,
+    pub cell_width: f32,
+    pub row_height: f32,
+    pub rows: usize,
+    pub cols: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TerminalSelectionRange {
+    pub start_row: usize,
+    pub start_column: usize,
+    pub end_row: usize,
+    pub end_column: usize,
+}
+
+/// Grid pointer payload delivered from the painted cell plane.
+#[derive(Debug, Clone, Copy)]
+pub struct TerminalGridPointerEvent {
+    pub endpoint: TerminalSelectionEndpoint,
+    pub click_count: usize,
+    pub shift: bool,
+    pub dragging: bool,
+}
+
+/// Optional selection interaction registered against the actual painted grid bounds.
+#[derive(Clone)]
+pub struct TerminalGridInteraction {
+    pub on_mouse_down:
+        Arc<dyn Fn(&MouseDownEvent, TerminalGridPointerEvent, &mut Window, &mut App) + Send + Sync>,
+    pub on_mouse_move:
+        Arc<dyn Fn(&MouseMoveEvent, TerminalGridPointerEvent, &mut Window, &mut App) + Send + Sync>,
+    pub on_mouse_up:
+        Arc<dyn Fn(&MouseUpEvent, TerminalGridPointerEvent, &mut Window, &mut App) + Send + Sync>,
+}
+
+impl std::fmt::Debug for TerminalGridInteraction {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("TerminalGridInteraction")
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -398,7 +481,12 @@ pub fn render_terminal_surface(
     model: &TerminalPaneModel,
     actions: Option<TerminalPaneActions>,
 ) -> impl IntoElement {
-    render_terminal_surface_with_palette(model, actions, TerminalRenderPalette::legacy_default())
+    render_terminal_surface_with_palette(
+        model,
+        actions,
+        None,
+        TerminalRenderPalette::legacy_default(),
+    )
 }
 
 /// Themed terminal surface: every non-ANSI chrome color comes from `tokens`.
@@ -407,12 +495,33 @@ pub fn render_terminal_surface_with_tokens(
     actions: Option<TerminalPaneActions>,
     tokens: ThemeTokens,
 ) -> impl IntoElement {
-    render_terminal_surface_with_palette(model, actions, TerminalRenderPalette::from_tokens(tokens))
+    render_terminal_surface_with_palette(
+        model,
+        actions,
+        None,
+        TerminalRenderPalette::from_tokens(tokens),
+    )
+}
+
+/// Themed terminal surface with grid-local selection hit-testing.
+pub fn render_terminal_surface_with_tokens_and_grid(
+    model: &TerminalPaneModel,
+    actions: Option<TerminalPaneActions>,
+    grid_selection: Option<TerminalGridInteraction>,
+    tokens: ThemeTokens,
+) -> impl IntoElement {
+    render_terminal_surface_with_palette(
+        model,
+        actions,
+        grid_selection,
+        TerminalRenderPalette::from_tokens(tokens),
+    )
 }
 
 fn render_terminal_surface_with_palette(
     model: &TerminalPaneModel,
     actions: Option<TerminalPaneActions>,
+    grid_selection: Option<TerminalGridInteraction>,
     palette: TerminalRenderPalette,
 ) -> impl IntoElement {
     let mut actions = actions;
@@ -527,6 +636,7 @@ fn render_terminal_surface_with_palette(
             model.search_highlight,
             model.scrollbar,
             scrollbar_actions,
+            grid_selection,
             model.font_size,
             model.cell_width,
             model.line_height,
@@ -760,6 +870,7 @@ fn render_grid(
     search_highlight: Option<TerminalSearchHighlight>,
     scrollbar: Option<TerminalScrollbarModel>,
     scrollbar_actions: Option<TerminalScrollbarActions>,
+    grid_selection: Option<TerminalGridInteraction>,
     font_size: f32,
     cell_width: f32,
     line_height: f32,
@@ -780,6 +891,8 @@ fn render_grid(
             color: palette.primary_muted,
         }
     });
+    let grid_rows = session.screen.rows.max(1);
+    let grid_cols = session.screen.cols.max(1);
 
     div()
         .flex_1()
@@ -800,6 +913,9 @@ fn render_grid(
                     search_highlight,
                     text_runs,
                     cursor_overlay,
+                    grid_selection,
+                    grid_rows,
+                    grid_cols,
                     font_size,
                     cell_width,
                     line_height,
@@ -1137,17 +1253,28 @@ fn render_grid_canvas(
     search_highlight: Option<TerminalBackgroundRect>,
     text_runs: Vec<TerminalTextRun>,
     cursor_overlay: Option<TerminalCursorOverlay>,
+    grid_selection: Option<TerminalGridInteraction>,
+    grid_rows: usize,
+    grid_cols: usize,
     font_size: f32,
     cell_width: f32,
     line_height: f32,
 ) -> impl IntoElement {
     canvas(
-        move |_bounds, _window, _cx| (background_runs, search_highlight, text_runs, cursor_overlay),
+        move |_bounds, _window, _cx| {
+            (
+                background_runs,
+                search_highlight,
+                text_runs,
+                cursor_overlay,
+                grid_selection,
+            )
+        },
         move |bounds: Bounds<_>,
-              (background_runs, search_highlight, text_runs, cursor_overlay),
+              (background_runs, search_highlight, text_runs, cursor_overlay, grid_selection),
               window,
               cx| {
-            for run in background_runs {
+            for run in &background_runs {
                 let position = point(
                     bounds.origin.x + px(run.start_column as f32 * cell_width),
                     bounds.origin.y + px(run.row as f32 * line_height),
@@ -1165,9 +1292,9 @@ fn render_grid_canvas(
                 window.paint_quad(fill(Bounds::new(position, run_size), rgb(run.color)));
             }
 
-            for run in text_runs {
+            for run in &text_runs {
                 let shaped_line = window.text_system().shape_line(
-                    SharedString::from(run.text),
+                    SharedString::from(run.text.clone()),
                     px(font_size),
                     &[run.style.clone()],
                     None,
@@ -1195,6 +1322,115 @@ fn render_grid_canvas(
                     _ => Bounds::new(position, size(px(cell_width), px(line_height))),
                 };
                 window.paint_quad(fill(cursor_bounds, rgb(cursor.color)));
+            }
+
+            if let Some(interaction) = grid_selection.as_ref() {
+                let text_bounds = TerminalTextBounds {
+                    left: f32::from(bounds.origin.x),
+                    top: f32::from(bounds.origin.y),
+                    width: (grid_cols as f32 * cell_width)
+                        .min(f32::from(bounds.size.width))
+                        .max(cell_width),
+                    height: (grid_rows as f32 * line_height)
+                        .min(f32::from(bounds.size.height))
+                        .max(line_height),
+                    cell_width,
+                    row_height: line_height,
+                    rows: grid_rows,
+                    cols: grid_cols,
+                };
+                let on_mouse_down = interaction.on_mouse_down.clone();
+                window.on_mouse_event({
+                    let text_bounds = text_bounds;
+                    move |event: &MouseDownEvent, _, window, cx| {
+                        if event.button != MouseButton::Left {
+                            return;
+                        }
+                        let Some(endpoint) =
+                            terminal_endpoint_for_mouse(event.position, text_bounds, true)
+                        else {
+                            return;
+                        };
+                        cx.stop_propagation();
+                        window.prevent_default();
+                        (on_mouse_down)(
+                            event,
+                            TerminalGridPointerEvent {
+                                endpoint,
+                                click_count: event.click_count,
+                                shift: event.modifiers.shift,
+                                dragging: false,
+                            },
+                            window,
+                            cx,
+                        );
+                    }
+                });
+                let on_mouse_move = interaction.on_mouse_move.clone();
+                window.on_mouse_event({
+                    let text_bounds = text_bounds;
+                    move |event: &MouseMoveEvent, _, window, cx| {
+                        if !event.dragging() {
+                            return;
+                        }
+                        let Some(endpoint) =
+                            terminal_endpoint_for_mouse(event.position, text_bounds, true)
+                        else {
+                            return;
+                        };
+                        cx.stop_propagation();
+                        window.prevent_default();
+                        (on_mouse_move)(
+                            event,
+                            TerminalGridPointerEvent {
+                                endpoint,
+                                click_count: 1,
+                                shift: event.modifiers.shift,
+                                dragging: true,
+                            },
+                            window,
+                            cx,
+                        );
+                    }
+                });
+                let on_mouse_up = interaction.on_mouse_up.clone();
+                window.on_mouse_event({
+                    let text_bounds = text_bounds;
+                    move |event: &MouseUpEvent, _, window, cx| {
+                        let Some(endpoint) =
+                            terminal_endpoint_for_mouse(event.position, text_bounds, true)
+                        else {
+                            (on_mouse_up)(
+                                event,
+                                TerminalGridPointerEvent {
+                                    endpoint: TerminalSelectionEndpoint {
+                                        position: TerminalGridPosition { row: 0, column: 0 },
+                                        side: TerminalCellSide::Left,
+                                    },
+                                    click_count: 1,
+                                    shift: event.modifiers.shift,
+                                    dragging: false,
+                                },
+                                window,
+                                cx,
+                            );
+                            return;
+                        };
+                        cx.stop_propagation();
+                        window.prevent_default();
+                        (on_mouse_up)(
+                            event,
+                            TerminalGridPointerEvent {
+                                endpoint,
+                                click_count: 1,
+                                shift: event.modifiers.shift,
+                                dragging: false,
+                            },
+                            window,
+                            cx,
+                        );
+                    }
+                });
             }
         },
     )
@@ -1743,6 +1979,386 @@ fn line_selection_range(
     (start < end).then_some((start, end))
 }
 
+pub fn selection_mode_for_click(click_count: usize) -> Option<TerminalSelectionMode> {
+    match click_count {
+        0 => None,
+        1 => Some(TerminalSelectionMode::Simple),
+        2 => Some(TerminalSelectionMode::Semantic),
+        _ => Some(TerminalSelectionMode::Lines),
+    }
+}
+
+pub fn ordered_selection_endpoints(
+    anchor: TerminalSelectionEndpoint,
+    head: TerminalSelectionEndpoint,
+) -> (TerminalSelectionEndpoint, TerminalSelectionEndpoint) {
+    if anchor <= head {
+        (anchor, head)
+    } else {
+        (head, anchor)
+    }
+}
+
+pub fn boundary_column(endpoint: TerminalSelectionEndpoint, screen_cols: usize) -> usize {
+    match endpoint.side {
+        TerminalCellSide::Left => endpoint.position.column.min(screen_cols),
+        TerminalCellSide::Right => (endpoint.position.column + 1).min(screen_cols),
+    }
+}
+
+fn endpoint_at_boundary(
+    row: usize,
+    boundary: usize,
+    screen_cols: usize,
+) -> TerminalSelectionEndpoint {
+    if screen_cols == 0 || boundary == 0 {
+        return TerminalSelectionEndpoint {
+            position: TerminalGridPosition { row, column: 0 },
+            side: TerminalCellSide::Left,
+        };
+    }
+
+    TerminalSelectionEndpoint {
+        position: TerminalGridPosition {
+            row,
+            column: boundary
+                .saturating_sub(1)
+                .min(screen_cols.saturating_sub(1)),
+        },
+        side: TerminalCellSide::Right,
+    }
+}
+
+pub fn top_visible_buffer_line(screen: &crate::terminal::session::TerminalScreenSnapshot) -> usize {
+    screen
+        .total_lines
+        .saturating_sub(screen.rows.max(1))
+        .saturating_sub(screen.display_offset)
+}
+
+pub fn buffer_line_for_viewport_row(
+    screen: &crate::terminal::session::TerminalScreenSnapshot,
+    display_offset: usize,
+    viewport_row: usize,
+) -> usize {
+    let top = screen
+        .total_lines
+        .saturating_sub(screen.rows.max(1))
+        .saturating_sub(display_offset);
+    top.saturating_add(viewport_row.min(screen.rows.saturating_sub(1)))
+        .min(screen.total_lines.saturating_sub(1))
+}
+
+pub fn semantic_selection_bounds(
+    line: &[TerminalCellSnapshot],
+    column: usize,
+    screen_cols: usize,
+) -> (usize, usize) {
+    let len = line.len().min(screen_cols);
+    if len == 0 {
+        return (0, 0);
+    }
+
+    let column = column.min(len.saturating_sub(1));
+    let whitespace = line[column].character.is_whitespace();
+    let mut start = column;
+    while start > 0 && line[start - 1].character.is_whitespace() == whitespace {
+        start -= 1;
+    }
+
+    let mut end = column + 1;
+    while end < len && line[end].character.is_whitespace() == whitespace {
+        end += 1;
+    }
+
+    (start, end)
+}
+
+pub fn terminal_selection_for_click(
+    screen: &crate::terminal::session::TerminalScreenSnapshot,
+    position: TerminalGridPosition,
+    mode: TerminalSelectionMode,
+) -> Option<TerminalSelection> {
+    let visible_top = top_visible_buffer_line(screen);
+    let viewport_row = position
+        .row
+        .saturating_sub(visible_top)
+        .min(screen.lines.len().saturating_sub(1));
+    match mode {
+        TerminalSelectionMode::Simple => Some(TerminalSelection {
+            anchor: TerminalSelectionEndpoint {
+                position,
+                side: TerminalCellSide::Left,
+            },
+            head: TerminalSelectionEndpoint {
+                position,
+                side: TerminalCellSide::Left,
+            },
+            moved: false,
+            mode,
+        }),
+        TerminalSelectionMode::Semantic => {
+            let line = screen.lines.get(viewport_row)?;
+            let (start, end) = semantic_selection_bounds(line, position.column, screen.cols);
+            Some(TerminalSelection {
+                anchor: endpoint_at_boundary(position.row, start, screen.cols),
+                head: endpoint_at_boundary(position.row, end, screen.cols),
+                moved: start != end,
+                mode,
+            })
+        }
+        TerminalSelectionMode::Lines => Some(TerminalSelection {
+            anchor: endpoint_at_boundary(position.row, 0, screen.cols),
+            head: endpoint_at_boundary(position.row, screen.cols, screen.cols),
+            moved: screen.cols > 0,
+            mode,
+        }),
+    }
+}
+
+/// Hit-test a window-space point against the actual painted grid bounds.
+pub fn terminal_endpoint_for_mouse(
+    position: Point<Pixels>,
+    bounds: TerminalTextBounds,
+    clamp_to_terminal: bool,
+) -> Option<TerminalSelectionEndpoint> {
+    if bounds.cols == 0 || bounds.rows == 0 {
+        return None;
+    }
+
+    let left = bounds.left;
+    let top = bounds.top;
+    let right = bounds.left + bounds.width;
+    let bottom = bounds.top + bounds.height;
+    let mut x: f32 = position.x.into();
+    let mut y: f32 = position.y.into();
+
+    if !clamp_to_terminal && (x < left || y < top || x >= right || y >= bottom) {
+        return None;
+    }
+
+    if clamp_to_terminal {
+        x = x.clamp(left, right);
+        y = y.clamp(top, bottom);
+    }
+
+    let relative_x = (x - left).max(0.0);
+    let relative_y = (y - top).max(0.0);
+    let mut column = (relative_x / bounds.cell_width).floor() as usize;
+    let mut row = (relative_y / bounds.row_height).floor() as usize;
+    let mut side = if relative_x % bounds.cell_width > bounds.cell_width / 2.0 {
+        TerminalCellSide::Right
+    } else {
+        TerminalCellSide::Left
+    };
+
+    if relative_x >= bounds.width {
+        column = bounds.cols.saturating_sub(1);
+        side = TerminalCellSide::Right;
+    } else {
+        column = column.min(bounds.cols.saturating_sub(1));
+    }
+
+    if y < top {
+        row = 0;
+        side = TerminalCellSide::Left;
+    } else if relative_y >= bounds.height {
+        row = bounds.rows.saturating_sub(1);
+        side = TerminalCellSide::Right;
+    } else {
+        row = row.min(bounds.rows.saturating_sub(1));
+    }
+
+    Some(TerminalSelectionEndpoint {
+        position: TerminalGridPosition { row, column },
+        side,
+    })
+}
+
+pub fn selection_range_from(
+    selection: TerminalSelection,
+    screen_cols: usize,
+) -> Option<TerminalSelectionRange> {
+    if !selection.moved {
+        return None;
+    }
+
+    let (start, end) = ordered_selection_endpoints(selection.anchor, selection.head);
+    let start_column = boundary_column(start, screen_cols);
+    let end_column = boundary_column(end, screen_cols);
+    if start.position.row == end.position.row && start_column == end_column {
+        return None;
+    }
+
+    Some(TerminalSelectionRange {
+        start_row: start.position.row,
+        start_column,
+        end_row: end.position.row,
+        end_column,
+    })
+}
+
+pub fn selection_snapshot_for_viewport(
+    range: TerminalSelectionRange,
+    screen: &crate::terminal::session::TerminalScreenSnapshot,
+) -> Option<TerminalSelectionSnapshot> {
+    let visible_top = top_visible_buffer_line(screen);
+    let visible_bottom = visible_top.saturating_add(screen.rows.saturating_sub(1));
+    if range.end_row < visible_top || range.start_row > visible_bottom {
+        return None;
+    }
+
+    let start_row = range.start_row.max(visible_top) - visible_top;
+    let end_row = range.end_row.min(visible_bottom) - visible_top;
+    let start_column = if range.start_row < visible_top {
+        0
+    } else {
+        range.start_column
+    };
+    let end_column = if range.end_row > visible_bottom {
+        screen.cols
+    } else {
+        range.end_column
+    };
+    if start_row == end_row && start_column == end_column {
+        return None;
+    }
+
+    Some(TerminalSelectionSnapshot {
+        start_row,
+        start_column,
+        end_row,
+        end_column,
+    })
+}
+
+/// Extract selected text from scrollback/line text with trailing-space trim per row.
+pub fn selected_text_from_lines(lines: &[&str], selection: TerminalSelectionRange) -> String {
+    let mut selected = Vec::new();
+    for row in selection.start_row..=selection.end_row {
+        let line = lines.get(row).copied().unwrap_or_default();
+        let characters: Vec<char> = line.chars().collect();
+        let start = if row == selection.start_row {
+            selection.start_column.min(characters.len())
+        } else {
+            0
+        };
+        let end = if row == selection.end_row {
+            selection.end_column.min(characters.len())
+        } else {
+            characters.len()
+        };
+        let mut segment: String = characters[start..end].iter().collect();
+        while segment.ends_with(' ') {
+            segment.pop();
+        }
+        selected.push(segment);
+    }
+    selected.join("\n")
+}
+
+pub fn selected_text_from_screen(
+    screen: &crate::terminal::session::TerminalScreenSnapshot,
+    selection: TerminalSelectionRange,
+) -> String {
+    let visible_top = top_visible_buffer_line(screen);
+    let visible_bottom = visible_top.saturating_add(screen.rows.saturating_sub(1));
+    if selection.end_row < visible_top || selection.start_row > visible_bottom {
+        return String::new();
+    }
+
+    let clipped = TerminalSelectionRange {
+        start_row: selection.start_row.max(visible_top),
+        start_column: if selection.start_row < visible_top {
+            0
+        } else {
+            selection.start_column
+        },
+        end_row: selection.end_row.min(visible_bottom),
+        end_column: if selection.end_row > visible_bottom {
+            screen.cols
+        } else {
+            selection.end_column
+        },
+    };
+    if clipped.start_row > clipped.end_row {
+        return String::new();
+    }
+
+    let lines: Vec<String> = screen
+        .lines
+        .iter()
+        .map(|line| line.iter().map(|cell| cell.character).collect::<String>())
+        .collect();
+    let mut selected = Vec::new();
+    for buffer_row in clipped.start_row..=clipped.end_row {
+        let viewport_row = buffer_row.saturating_sub(visible_top);
+        let line = lines
+            .get(viewport_row)
+            .map(String::as_str)
+            .unwrap_or_default();
+        let characters: Vec<char> = line.chars().collect();
+        let start = if buffer_row == clipped.start_row {
+            clipped.start_column.min(characters.len())
+        } else {
+            0
+        };
+        let end = if buffer_row == clipped.end_row {
+            clipped.end_column.min(characters.len())
+        } else {
+            characters.len()
+        };
+        let mut segment: String = characters.get(start..end).unwrap_or(&[]).iter().collect();
+        while segment.ends_with(' ') {
+            segment.pop();
+        }
+        selected.push(segment);
+    }
+    selected.join("\n")
+}
+
+pub fn begin_simple_selection(endpoint: TerminalSelectionEndpoint) -> TerminalSelection {
+    TerminalSelection {
+        anchor: endpoint,
+        head: endpoint,
+        moved: false,
+        mode: TerminalSelectionMode::Simple,
+    }
+}
+
+pub fn extend_selection_head(
+    selection: &mut TerminalSelection,
+    endpoint: TerminalSelectionEndpoint,
+) {
+    selection.head = endpoint;
+    selection.moved = selection.anchor != endpoint;
+    selection.mode = TerminalSelectionMode::Simple;
+}
+
+pub fn finish_simple_selection(selection: Option<TerminalSelection>) -> Option<TerminalSelection> {
+    let selection = selection?;
+    if !selection.moved && matches!(selection.mode, TerminalSelectionMode::Simple) {
+        None
+    } else {
+        Some(selection)
+    }
+}
+
+/// Ctrl+C copies when a committed selection exists; otherwise it remains interrupt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TerminalCtrlCAction {
+    CopySelection,
+    Interrupt,
+}
+
+pub fn terminal_ctrl_c_action(has_copyable_selection: bool) -> TerminalCtrlCAction {
+    if has_copyable_selection {
+        TerminalCtrlCAction::CopySelection
+    } else {
+        TerminalCtrlCAction::Interrupt
+    }
+}
+
 fn is_meaningful_title(title: &str) -> bool {
     let t = title.trim();
     if t.is_empty() {
@@ -2200,5 +2816,212 @@ mod theme_palette_tests {
         let style = effective_cell_style(&ansi, false, None, palette);
         assert_eq!(style.foreground, 0xfacc15);
         assert_eq!(style.background, 0x1d4ed8);
+    }
+}
+
+#[cfg(test)]
+mod selection_helper_tests {
+    use super::{
+        begin_simple_selection, extend_selection_head, finish_simple_selection,
+        selected_text_from_lines, selected_text_from_screen, selection_mode_for_click,
+        selection_range_from, terminal_ctrl_c_action, terminal_endpoint_for_mouse,
+        terminal_selection_for_click, top_visible_buffer_line, TerminalCellSide,
+        TerminalCtrlCAction, TerminalGridPosition, TerminalSelectionEndpoint,
+        TerminalSelectionMode, TerminalSelectionRange, TerminalTextBounds,
+    };
+    use crate::terminal::session::{TerminalCellSnapshot, TerminalScreenSnapshot};
+    use gpui::{point, px};
+
+    fn snapshot_cell(character: char) -> TerminalCellSnapshot {
+        TerminalCellSnapshot {
+            character,
+            zero_width: Vec::new(),
+            foreground: 0,
+            background: 0,
+            bold: false,
+            dim: false,
+            italic: false,
+            underline: false,
+            undercurl: false,
+            strike: false,
+            hidden: false,
+            has_hyperlink: false,
+            default_background: true,
+            default_foreground: true,
+        }
+    }
+
+    #[test]
+    fn selected_text_from_screen_maps_absolute_buffer_rows_through_visible_top() {
+        // total=100, rows=2, offset=0 → visible_top = 98 (buffer rows 98..=99).
+        let line0: Vec<_> = "hello world".chars().map(snapshot_cell).collect();
+        let line1: Vec<_> = "second line".chars().map(snapshot_cell).collect();
+        let screen = TerminalScreenSnapshot {
+            lines: vec![line0, line1],
+            cols: 11,
+            rows: 2,
+            total_lines: 100,
+            history_size: 98,
+            display_offset: 0,
+            ..Default::default()
+        };
+        assert_eq!(top_visible_buffer_line(&screen), 98);
+        let range = TerminalSelectionRange {
+            start_row: 98,
+            start_column: 0,
+            end_row: 99,
+            end_column: 6,
+        };
+        assert_eq!(
+            selected_text_from_screen(&screen, range),
+            "hello world\nsecond"
+        );
+    }
+
+    #[test]
+    fn selected_text_from_screen_respects_scrolled_back_display_offset() {
+        // total=12, rows=3, display_offset=2 → visible_top = 7.
+        let lines: Vec<Vec<_>> = ["alpha   ", "bravo   ", "charlie "]
+            .into_iter()
+            .map(|line| line.chars().map(snapshot_cell).collect())
+            .collect();
+        let screen = TerminalScreenSnapshot {
+            lines,
+            cols: 8,
+            rows: 3,
+            total_lines: 12,
+            history_size: 9,
+            display_offset: 2,
+            ..Default::default()
+        };
+        assert_eq!(top_visible_buffer_line(&screen), 7);
+        let range = TerminalSelectionRange {
+            start_row: 7,
+            start_column: 0,
+            end_row: 8,
+            end_column: 5,
+        };
+        assert_eq!(selected_text_from_screen(&screen, range), "alpha\nbravo");
+    }
+
+    #[test]
+    fn drag_ordered_selection_extracts_exact_multiline_trimmed_text() {
+        let lines = ["alpha   ", "bravo   ", "charlie "];
+        let mut selection = begin_simple_selection(TerminalSelectionEndpoint {
+            position: TerminalGridPosition { row: 0, column: 0 },
+            side: TerminalCellSide::Left,
+        });
+        extend_selection_head(
+            &mut selection,
+            TerminalSelectionEndpoint {
+                position: TerminalGridPosition { row: 1, column: 4 },
+                side: TerminalCellSide::Right,
+            },
+        );
+        let range = selection_range_from(selection, 8).expect("moved selection");
+        assert_eq!(selected_text_from_lines(&lines, range), "alpha\nbravo");
+
+        // Reverse drag must order the same way.
+        let mut reverse = begin_simple_selection(TerminalSelectionEndpoint {
+            position: TerminalGridPosition { row: 1, column: 4 },
+            side: TerminalCellSide::Right,
+        });
+        extend_selection_head(
+            &mut reverse,
+            TerminalSelectionEndpoint {
+                position: TerminalGridPosition { row: 0, column: 0 },
+                side: TerminalCellSide::Left,
+            },
+        );
+        let reverse_range = selection_range_from(reverse, 8).expect("moved selection");
+        assert_eq!(
+            selected_text_from_lines(&lines, reverse_range),
+            "alpha\nbravo"
+        );
+    }
+
+    #[test]
+    fn copy_vs_interrupt_key_precedence_follows_selection_presence() {
+        assert_eq!(
+            terminal_ctrl_c_action(true),
+            TerminalCtrlCAction::CopySelection
+        );
+        assert_eq!(
+            terminal_ctrl_c_action(false),
+            TerminalCtrlCAction::Interrupt
+        );
+        assert!(
+            finish_simple_selection(Some(begin_simple_selection(TerminalSelectionEndpoint {
+                position: TerminalGridPosition { row: 0, column: 0 },
+                side: TerminalCellSide::Left,
+            })))
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn hit_testing_clamps_to_actual_grid_bounds() {
+        let bounds = TerminalTextBounds {
+            left: 10.0,
+            top: 20.0,
+            width: 40.0,
+            height: 20.0,
+            cell_width: 10.0,
+            row_height: 10.0,
+            rows: 2,
+            cols: 4,
+        };
+        let left_half =
+            terminal_endpoint_for_mouse(point(px(14.0), px(25.0)), bounds, true).unwrap();
+        let right_half =
+            terminal_endpoint_for_mouse(point(px(17.0), px(25.0)), bounds, true).unwrap();
+        let outside =
+            terminal_endpoint_for_mouse(point(px(200.0), px(200.0)), bounds, true).unwrap();
+        let rejected = terminal_endpoint_for_mouse(point(px(200.0), px(200.0)), bounds, false);
+
+        assert_eq!(left_half.position.column, 0);
+        assert_eq!(left_half.side, TerminalCellSide::Left);
+        assert_eq!(right_half.position.column, 0);
+        assert_eq!(right_half.side, TerminalCellSide::Right);
+        assert_eq!(outside.position.row, 1);
+        assert_eq!(outside.position.column, 3);
+        assert_eq!(outside.side, TerminalCellSide::Right);
+        assert!(rejected.is_none());
+    }
+
+    #[test]
+    fn semantic_and_line_click_modes_select_expected_ranges() {
+        assert_eq!(
+            selection_mode_for_click(2),
+            Some(TerminalSelectionMode::Semantic)
+        );
+        assert_eq!(
+            selection_mode_for_click(3),
+            Some(TerminalSelectionMode::Lines)
+        );
+        let line: Vec<TerminalCellSnapshot> = "cargo test".chars().map(snapshot_cell).collect();
+        let screen = TerminalScreenSnapshot {
+            lines: vec![line],
+            cols: 10,
+            rows: 1,
+            total_lines: 1,
+            ..Default::default()
+        };
+        let semantic = terminal_selection_for_click(
+            &screen,
+            TerminalGridPosition { row: 0, column: 2 },
+            TerminalSelectionMode::Semantic,
+        )
+        .unwrap();
+        let range = selection_range_from(semantic, screen.cols).unwrap();
+        assert_eq!(
+            range,
+            TerminalSelectionRange {
+                start_row: 0,
+                start_column: 0,
+                end_row: 0,
+                end_column: 5,
+            }
+        );
     }
 }
