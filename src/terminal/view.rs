@@ -228,6 +228,10 @@ pub struct TerminalGridPointerEvent {
 #[derive(Clone)]
 pub struct TerminalGridInteraction {
     pub on_layout: Arc<dyn Fn((u16, u16), &mut Window, &mut App) + Send + Sync>,
+    /// Paint-local platform input registration. Zed registers terminal input
+    /// against the exact painted grid bounds, keeping mouse focus, IME, and the
+    /// PTY cell plane under one focus owner.
+    pub on_paint: Arc<dyn Fn(Bounds<Pixels>, &mut Window, &mut App) + Send + Sync>,
     pub on_mouse_down:
         Arc<dyn Fn(&MouseDownEvent, TerminalGridPointerEvent, &mut Window, &mut App) + Send + Sync>,
     pub on_mouse_move:
@@ -1352,6 +1356,7 @@ fn render_grid_canvas(
             }
 
             if let Some(interaction) = grid_selection.as_ref() {
+                (interaction.on_paint)(bounds, window, cx);
                 let text_bounds = TerminalTextBounds {
                     left: f32::from(bounds.origin.x),
                     top: f32::from(bounds.origin.y),
@@ -2853,8 +2858,7 @@ mod selection_helper_tests {
         selected_text_from_lines, selected_text_from_screen, selection_mode_for_click,
         selection_range_from, terminal_ctrl_c_action, terminal_endpoint_for_mouse,
         terminal_grid_size_for_bounds, terminal_selection_for_click, top_visible_buffer_line,
-        TerminalCellSide,
-        TerminalCtrlCAction, TerminalGridPosition, TerminalSelectionEndpoint,
+        TerminalCellSide, TerminalCtrlCAction, TerminalGridPosition, TerminalSelectionEndpoint,
         TerminalSelectionMode, TerminalSelectionRange, TerminalTextBounds,
     };
     use crate::terminal::session::{TerminalCellSnapshot, TerminalScreenSnapshot};
@@ -2885,10 +2889,7 @@ mod selection_helper_tests {
             terminal_grid_size_for_bounds(1_200.0, 756.0, 10.0, 18.0),
             (120, 42)
         );
-        assert_eq!(
-            terminal_grid_size_for_bounds(2.0, 2.0, 10.0, 18.0),
-            (1, 1)
-        );
+        assert_eq!(terminal_grid_size_for_bounds(2.0, 2.0, 10.0, 18.0), (1, 1));
     }
 
     #[test]

@@ -172,9 +172,8 @@ use crate::ui::project_actions::{
 use crate::ui::project_scope::{ProjectScope, ProjectScopeMenuState};
 use crate::ui::task_search::{TaskSearchCandidate, TaskSearchState};
 use crate::ui::task_workspace::{
-    conversation_poll_priorities_due, working_conversation_poll_due, Allocation,
-    AllocationMetrics, Axis,
-    CenterSurfaceLoadingState, ConversationQueryPriority, DropTarget, Edge, PaneId, PaneRect,
+    conversation_poll_priorities_due, working_conversation_poll_due, Allocation, AllocationMetrics,
+    Axis, CenterSurfaceLoadingState, ConversationQueryPriority, DropTarget, Edge, PaneId, PaneRect,
     SplitId, TaskPaneBody, TaskPaneProjection, TaskPaneViewModel, TaskSurfaceRegistry,
     TaskWorkspace, TaskWorkspaceViewChild, TaskWorkspaceViewModel, TaskWorkspaceViewNode, Viewport,
     WorkspaceError, WorkspaceSelectionGesture, CONVERSATION_RECOVERY_HEARTBEAT,
@@ -9668,10 +9667,15 @@ struct RootEditorInputProxy {
     focus_handle: FocusHandle,
 }
 
-struct TerminalInputProxy {
+struct NativeTerminalInputHandler {
     shell: gpui::WeakEntity<NativeShell>,
-    focus_handle: FocusHandle,
-    marked_text: Option<String>,
+    cursor_bounds: Bounds<Pixels>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct PendingTerminalEcho {
+    text: String,
+    after_sequence: u64,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -9808,12 +9812,19 @@ pub struct NativeShell {
     pending_terminal_resizes: BTreeMap<HostTaskKey, (u16, u16)>,
     /// Owner currently dragging a terminal selection, if any.
     selecting_terminal_owner: Option<HostTaskKey>,
+    /// Printable bytes accepted from the native input handler but not yet
+    /// reflected by a canonical host terminal projection. This is a bounded
+    /// paint-only echo; the next newer host sequence replaces it.
+    pending_terminal_echoes: BTreeMap<HostTaskKey, PendingTerminalEcho>,
     /// Exact center terminal most recently clicked for keyboard input. GPUI's
     /// canvas selection can retain an earlier AccessKit row focus, so this
     /// owner-qualified arm keeps ordinary keydown delivery deterministic.
     terminal_input_owner: Option<HostTaskKey>,
     focus_handle: FocusHandle,
     terminal_focus_handle: FocusHandle,
+    /// IME composition belongs to the rendered terminal view, matching Zed's
+    /// terminal input handler rather than a detached proxy entity.
+    terminal_marked_text: Option<String>,
     composer_focus_handle: FocusHandle,
     task_scroll_handle: UniformListScrollHandle,
     controller_task: Option<Task<()>>,
@@ -9845,10 +9856,6 @@ pub struct NativeShell {
     /// Active IME marked range in UTF-16 units. This is platform editing
     /// state, not provider conversation state, and is discarded on commit.
     composer_marked_range: Option<Range<usize>>,
-    /// GPUI permits one platform input registration per entity. The terminal
-    /// therefore owns a forwarding entity instead of racing the composer's
-    /// `NativeShell` registration for Windows WM_CHAR/IME delivery.
-    terminal_input_proxy: Option<Entity<TerminalInputProxy>>,
     /// IME marked range for the root-focused overlay editors (search/new-task/
     /// rename/add-project/browser/theme name), kept distinct from composer IME.
     root_editor_marked_range: Option<Range<usize>>,
@@ -10780,15 +10787,6 @@ impl NativeShell {
             })
         };
         let root_editor_focus_handle = root_editor_input_proxy.read(cx).focus_handle.clone();
-        let terminal_input_proxy = {
-            let shell = cx.weak_entity();
-            cx.new(|proxy_cx| TerminalInputProxy {
-                shell,
-                focus_handle: proxy_cx.focus_handle().tab_stop(true),
-                marked_text: None,
-            })
-        };
-        let terminal_focus_handle = terminal_input_proxy.read(cx).focus_handle.clone();
         let mut shell = Self {
             host_connection: profile.host_connection(),
             profile,
@@ -10818,9 +10816,11 @@ impl NativeShell {
             terminal_selections: BTreeMap::new(),
             pending_terminal_resizes: BTreeMap::new(),
             selecting_terminal_owner: None,
+            pending_terminal_echoes: BTreeMap::new(),
             terminal_input_owner: None,
             focus_handle: cx.focus_handle().tab_stop(true),
-            terminal_focus_handle,
+            terminal_focus_handle: cx.focus_handle().tab_stop(true),
+            terminal_marked_text: None,
             composer_focus_handle: cx.focus_handle().tab_stop(true),
             task_scroll_handle: UniformListScrollHandle::new(),
             controller_task: None,
@@ -10844,7 +10844,6 @@ impl NativeShell {
             pending_root_overlay_focus: false,
             pending_terminal_focus: false,
             composer_marked_range: None,
-            terminal_input_proxy: Some(terminal_input_proxy),
             root_editor_marked_range: None,
             root_editor_input_proxy: Some(root_editor_input_proxy),
             root_editor_focus_handle,
@@ -12865,14 +12864,16 @@ impl NativeShell {
                 }
 
                 if let crate::domain::TaskCockpitResult::Terminal(projection) = &result {
+                    let owner = self.local_task_key(projection.task_id);
                     if command_task_id != Some(projection.task_id)
                         || self
                             .task_surfaces
-                            .admit_terminal(self.local_task_key(projection.task_id), projection)
+                            .admit_terminal(owner.clone(), projection)
                             .is_err()
                     {
                         return;
                     }
+                    self.settle_pending_terminal_echo(&owner, projection.sequence);
                 }
 
                 let global_command = Self::task_cockpit_command_parts(&action.command).is_some_and(
@@ -15186,8 +15187,7 @@ impl NativeShell {
         host_id: &HostId,
         action: &NativeActionRecord,
     ) {
-        let Some((_request_id, task_id, query)) =
-            Self::task_cockpit_command_parts(&action.command)
+        let Some((_request_id, task_id, query)) = Self::task_cockpit_command_parts(&action.command)
         else {
             return;
         };
@@ -15247,6 +15247,7 @@ impl NativeShell {
         {
             return;
         }
+        self.settle_pending_terminal_echo(&owner, projection.sequence);
         let model = self
             .host_slot(host_id)
             .and_then(|slot| slot.client_model.clone());
@@ -16099,17 +16100,14 @@ impl NativeShell {
                 let selected = self.selected_task_key.as_ref() == Some(&key);
                 let record = self.host_slot_mut(&key.host).and_then(|slot| {
                     if selected {
-                        slot.interaction.action_on_current_handler(
-                            ActionRequest::TaskCockpit {
+                        slot.interaction
+                            .action_on_current_handler(ActionRequest::TaskCockpit {
                                 task_id: key.task_id,
                                 query: TaskCockpitQuery::Conversation { after_sequence },
-                            },
-                        )
+                            })
                     } else {
-                        slot.interaction.background_conversation_on_current_handler(
-                            key.task_id,
-                            after_sequence,
-                        )
+                        slot.interaction
+                            .background_conversation_on_current_handler(key.task_id, after_sequence)
                     }
                 });
                 if let Some(mut record) = record {
@@ -17914,7 +17912,11 @@ impl NativeShell {
             .and_then(|key| self.draft_launch_prefs.get(key))
             .filter(|(stored_provider, _)| *stored_provider == provider)
             .map(|(_, options)| options.clone())
-            .or_else(|| self.layout.composer_launch_options.clone())
+            .or_else(|| {
+                (self.layout.composer_provider == Some(provider))
+                    .then(|| self.layout.composer_launch_options.clone())
+                    .flatten()
+            })
             .unwrap_or_default();
         let compatible = matches!(
             (provider, options.model),
@@ -18214,9 +18216,8 @@ impl NativeShell {
         let mut commands = Vec::new();
         if change_model {
             let Some(slug) = self.selected_model_slug_for_effort(provider, options) else {
-                self.local_slot_mut().composer_error = Some(
-                    "Choose a concrete model before changing a running session.".into(),
-                );
+                self.local_slot_mut().composer_error =
+                    Some("Choose a concrete model before changing a running session.".into());
                 return false;
             };
             match provider {
@@ -18271,9 +18272,7 @@ impl NativeShell {
                     .models
                     .iter()
                     .filter(|model| {
-                        !model.hidden
-                            && !model.is_custom
-                            && !model.slug.starts_with("codex-auto-")
+                        !model.hidden && !model.is_custom && !model.slug.starts_with("codex-auto-")
                     })
                     .map(|model| model.slug.clone())
                     .collect::<Vec<_>>()
@@ -19292,7 +19291,7 @@ impl NativeShell {
                     turn_id,
                     question_id: None,
                     approval_id: None,
-                    text: Some(text),
+                    text: Some(text.clone()),
                     images: Vec::new(),
                     wait: None,
                     allow: None,
@@ -19300,6 +19299,7 @@ impl NativeShell {
             });
         match self.dispatch_action_checked(request) {
             Ok(()) => {
+                self.note_pending_terminal_echo(owner, &text);
                 self.local_slot_mut().composer_error = None;
                 self.task_surfaces
                     .note_terminal_query_started(owner.clone());
@@ -19315,9 +19315,50 @@ impl NativeShell {
                 true
             }
             Err(failure) => {
+                self.pending_terminal_echoes.remove(owner);
                 self.local_slot_mut().composer_error = Some(failure.message);
                 false
             }
+        }
+    }
+
+    fn note_pending_terminal_echo(&mut self, owner: &HostTaskKey, input: &str) {
+        let after_sequence = self
+            .task_surfaces
+            .state(owner.clone())
+            .and_then(|state| state.latest_terminal.as_ref())
+            .map(|projection| projection.sequence)
+            .unwrap_or(0);
+        let pending = self
+            .pending_terminal_echoes
+            .entry(owner.clone())
+            .or_insert_with(|| PendingTerminalEcho {
+                text: String::new(),
+                after_sequence,
+            });
+        pending.after_sequence = pending.after_sequence.max(after_sequence);
+        for character in input.chars() {
+            match character {
+                '\u{7f}' | '\u{8}' => {
+                    pending.text.pop();
+                }
+                '\u{15}' | '\r' | '\n' => pending.text.clear(),
+                character if !character.is_control() => pending.text.push(character),
+                _ => {}
+            }
+        }
+        if pending.text.is_empty() {
+            self.pending_terminal_echoes.remove(owner);
+        }
+    }
+
+    fn settle_pending_terminal_echo(&mut self, owner: &HostTaskKey, sequence: u64) {
+        if self
+            .pending_terminal_echoes
+            .get(owner)
+            .is_some_and(|pending| sequence > pending.after_sequence)
+        {
+            self.pending_terminal_echoes.remove(owner);
         }
     }
 
@@ -19565,6 +19606,12 @@ impl NativeShell {
         owner: &HostTaskKey,
         mut pane: crate::terminal::view::TerminalPaneModel,
     ) -> crate::terminal::view::TerminalPaneModel {
+        if let (Some(pending), Some(session)) = (
+            self.pending_terminal_echoes.get(owner),
+            pane.session.as_mut(),
+        ) {
+            overlay_pending_terminal_echo(&mut session.screen, &pending.text);
+        }
         if let Some(selection) = terminal_selection_store_get(&self.terminal_selections, owner) {
             if let Some(session) = pane.session.as_ref() {
                 if let Some(range) =
@@ -23312,28 +23359,6 @@ impl NativeShell {
             self.local_slot().interaction.selected_task() == Some(owner.task_id),
             self.task_surfaces.terminal_is_interactive(owner.clone()),
         );
-        let terminal_input_registration = interactive.then(|| {
-            let input_proxy = self
-                .terminal_input_proxy
-                .as_ref()
-                .expect("terminal input proxy is initialized with the shell")
-                .clone();
-            let focus_handle = self.terminal_focus_handle.clone();
-            canvas(
-                |_, _, _| (),
-                move |bounds, _, window, cx| {
-                    window.handle_input(
-                        &focus_handle,
-                        ElementInputHandler::new(bounds, input_proxy),
-                        cx,
-                    );
-                },
-            )
-            .absolute()
-            .top(px(0.0))
-            .left(px(0.0))
-            .size_full()
-        });
         let chrome = native_center_terminal_chrome_plan();
         let pane = self
             .task_surfaces
@@ -23348,8 +23373,9 @@ impl NativeShell {
         // Keep the adapter theme-token contract referenced on this paint path.
         let _adapter_theme_contract = self.terminal.element_with_tokens(tokens);
         let grid = if chrome.embeds_renderer && pane.is_some() {
-            let interaction = interactive
-                .then(|| self.terminal_grid_interaction_for_shared(owner.clone(), &shell_entity));
+            let interaction = interactive.then(|| {
+                self.terminal_grid_interaction_for_shared(owner.clone(), true, &shell_entity)
+            });
             crate::terminal::view::render_terminal_surface_with_tokens_and_grid(
                 pane.as_ref().expect("terminal pane checked above"),
                 None,
@@ -23412,15 +23438,12 @@ impl NativeShell {
         let scroll_owner = owner.clone();
         let terminal_line_height = tokens.density.typography.code_line_height;
         surface
-            .children(terminal_input_registration)
             .tab_stop(true)
             .track_focus(&self.terminal_focus_handle)
             .cursor_text()
-            .capture_any_mouse_down(
-                move |event: &MouseDownEvent, window: &mut Window, app: &mut gpui::App| {
-                    if event.button != MouseButton::Left {
-                        return;
-                    }
+            .on_mouse_down(
+                MouseButton::Left,
+                move |_event: &MouseDownEvent, window: &mut Window, app: &mut gpui::App| {
                     let _ = shell_for_focus.update(app, |shell, cx| {
                         shell.arm_selected_provider_terminal_input();
                         shell.terminal_focus_handle.focus(window);
@@ -23502,12 +23525,15 @@ impl NativeShell {
     fn terminal_grid_interaction_for_shared(
         &self,
         owner: HostTaskKey,
+        register_input: bool,
         shell_entity: &gpui::WeakEntity<NativeShell>,
     ) -> crate::terminal::view::TerminalGridInteraction {
         let shell_down = shell_entity.clone();
         let shell_move = shell_entity.clone();
         let shell_up = shell_entity.clone();
         let shell_layout = shell_entity.clone();
+        let shell_paint = shell_entity.clone();
+        let focus_handle = self.terminal_focus_handle.clone();
         let owner_layout = owner.clone();
         let owner_down = owner.clone();
         let owner_move = owner.clone();
@@ -23517,6 +23543,18 @@ impl NativeShell {
                 let _ = shell_layout.update(app, |shell, _cx| {
                     shell.request_terminal_resize_for_owner(&owner_layout, cols, rows);
                 });
+            }),
+            on_paint: Arc::new(move |bounds, window, app| {
+                if register_input {
+                    window.handle_input(
+                        &focus_handle,
+                        NativeTerminalInputHandler {
+                            shell: shell_paint.clone(),
+                            cursor_bounds: bounds,
+                        },
+                        app,
+                    );
+                }
             }),
             on_mouse_down: Arc::new(move |_, event, window, app| {
                 let _ = shell_down.update(app, |shell, cx| {
@@ -23588,8 +23626,7 @@ impl NativeShell {
             )
             .is_ok();
         if dispatched {
-            self.pending_terminal_resizes
-                .insert(owner.clone(), desired);
+            self.pending_terminal_resizes.insert(owner.clone(), desired);
         }
         dispatched
     }
@@ -23620,8 +23657,11 @@ impl NativeShell {
             .flex_col()
             .bg(tokens.terminal.background.to_gpui());
         if let Some(pane) = pane {
-            let interaction =
-                self.terminal_grid_interaction_for_shared(owner.clone(), &shell_entity);
+            let interaction = self.terminal_grid_interaction_for_shared(
+                owner.clone(),
+                self.selected_center_terminal_is_interactive(),
+                &shell_entity,
+            );
             surface
                 .child(
                     crate::terminal::view::render_terminal_surface_with_tokens_and_grid(
@@ -24978,7 +25018,7 @@ impl NativeShell {
         }
         let surface = if let Some(pane) = pane {
             let interaction =
-                self.terminal_grid_interaction_for_shared(owner.clone(), &shell_entity);
+                self.terminal_grid_interaction_for_shared(owner.clone(), false, &shell_entity);
             let shell_for_key = shell_entity;
             surface
                 .child(div().flex_1().min_h(px(120.0)).overflow_hidden().child(
@@ -38890,19 +38930,24 @@ impl NativeShell {
     }
 }
 
-impl EntityInputHandler for TerminalInputProxy {
+impl gpui::InputHandler for NativeTerminalInputHandler {
     fn text_for_range(
         &mut self,
         range_utf16: Range<usize>,
         adjusted_range: &mut Option<Range<usize>>,
         _window: &mut Window,
-        _cx: &mut Context<Self>,
+        cx: &mut App,
     ) -> Option<String> {
-        let value = self.marked_text.as_deref().unwrap_or_default();
+        let value = self
+            .shell
+            .read_with(cx, |shell, _| {
+                shell.terminal_marked_text.clone().unwrap_or_default()
+            })
+            .ok()?;
         let (start_scalar, start_utf16) =
-            NativeShell::scalar_boundary_for_utf16(value, range_utf16.start);
+            NativeShell::scalar_boundary_for_utf16(&value, range_utf16.start);
         let (mut end_scalar, mut end_utf16) =
-            NativeShell::scalar_boundary_for_utf16(value, range_utf16.end);
+            NativeShell::scalar_boundary_for_utf16(&value, range_utf16.end);
         if end_scalar < start_scalar {
             end_scalar = start_scalar;
             end_utf16 = start_utf16;
@@ -38925,37 +38970,40 @@ impl EntityInputHandler for TerminalInputProxy {
         &mut self,
         _ignore_disabled_input: bool,
         _window: &mut Window,
-        _cx: &mut Context<Self>,
+        cx: &mut App,
     ) -> Option<UTF16Selection> {
         let cursor = self
-            .marked_text
-            .as_deref()
-            .unwrap_or_default()
-            .encode_utf16()
-            .count();
+            .shell
+            .read_with(cx, |shell, _| {
+                shell
+                    .terminal_marked_text
+                    .as_deref()
+                    .unwrap_or_default()
+                    .encode_utf16()
+                    .count()
+            })
+            .ok()?;
         Some(UTF16Selection {
             range: cursor..cursor,
             reversed: false,
         })
     }
 
-    fn marked_text_range(
-        &self,
-        _window: &mut Window,
-        _cx: &mut Context<Self>,
-    ) -> Option<Range<usize>> {
-        self.marked_text.as_ref().map(|text| {
-            let len = text.encode_utf16().count();
-            0..len
-        })
+    fn marked_text_range(&mut self, _window: &mut Window, cx: &mut App) -> Option<Range<usize>> {
+        self.shell
+            .read_with(cx, |shell, _| {
+                shell.terminal_marked_text.as_ref().map(|text| {
+                    let len = text.encode_utf16().count();
+                    0..len
+                })
+            })
+            .ok()
+            .flatten()
     }
 
-    fn unmark_text(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
-        let Some(text) = self.marked_text.take() else {
-            return;
-        };
+    fn unmark_text(&mut self, _window: &mut Window, cx: &mut App) {
         let _ = self.shell.update(cx, |shell, shell_cx| {
-            let _ = shell.dispatch_provider_terminal_text(text);
+            shell.terminal_marked_text = None;
             shell_cx.notify();
         });
     }
@@ -38965,11 +39013,11 @@ impl EntityInputHandler for TerminalInputProxy {
         _range_utf16: Option<Range<usize>>,
         text: &str,
         _window: &mut Window,
-        cx: &mut Context<Self>,
+        cx: &mut App,
     ) {
-        self.marked_text = None;
         let text = text.to_string();
         let _ = self.shell.update(cx, |shell, shell_cx| {
+            shell.terminal_marked_text = None;
             let _ = shell.dispatch_provider_terminal_text(text);
             shell_cx.notify();
         });
@@ -38981,34 +39029,35 @@ impl EntityInputHandler for TerminalInputProxy {
         new_text: &str,
         _new_selected_range: Option<Range<usize>>,
         _window: &mut Window,
-        _cx: &mut Context<Self>,
+        cx: &mut App,
     ) {
-        self.marked_text = Some(new_text.to_string());
+        let marked = new_text.to_string();
+        let _ = self.shell.update(cx, |shell, shell_cx| {
+            shell.terminal_marked_text = Some(marked);
+            shell_cx.notify();
+        });
     }
 
     fn bounds_for_range(
         &mut self,
         _range_utf16: Range<usize>,
-        element_bounds: Bounds<Pixels>,
         _window: &mut Window,
-        _cx: &mut Context<Self>,
+        _cx: &mut App,
     ) -> Option<Bounds<Pixels>> {
-        Some(element_bounds)
+        Some(self.cursor_bounds)
     }
 
     fn character_index_for_point(
         &mut self,
         _point: Point<Pixels>,
         _window: &mut Window,
-        _cx: &mut Context<Self>,
+        _cx: &mut App,
     ) -> Option<usize> {
-        Some(
-            self.marked_text
-                .as_deref()
-                .unwrap_or_default()
-                .encode_utf16()
-                .count(),
-        )
+        None
+    }
+
+    fn apple_press_and_hold_enabled(&mut self) -> bool {
+        false
     }
 }
 
@@ -40174,6 +40223,82 @@ fn native_terminal_key_text(keystroke: &gpui::Keystroke) -> Option<String> {
     }
 }
 
+fn overlay_pending_terminal_echo(
+    screen: &mut crate::terminal::session::TerminalScreenSnapshot,
+    text: &str,
+) {
+    let Some(mut cursor) = screen.cursor else {
+        return;
+    };
+    if text.is_empty() || cursor.row >= screen.rows || screen.cols == 0 {
+        return;
+    }
+    let base_cell = screen
+        .cells
+        .iter()
+        .find(|indexed| indexed.row == cursor.row && indexed.column == cursor.column)
+        .or_else(|| {
+            screen
+                .cells
+                .iter()
+                .rev()
+                .find(|indexed| indexed.row == cursor.row && indexed.column < cursor.column)
+        })
+        .map(|indexed| indexed.cell.clone())
+        .unwrap_or_else(|| crate::terminal::session::TerminalCellSnapshot {
+            character: ' ',
+            zero_width: Vec::new(),
+            foreground: 0,
+            background: 0,
+            bold: false,
+            dim: false,
+            italic: false,
+            underline: false,
+            undercurl: false,
+            strike: false,
+            hidden: false,
+            has_hyperlink: false,
+            default_background: true,
+            default_foreground: true,
+        });
+
+    for character in text.chars().filter(|character| !character.is_control()) {
+        if cursor.column >= screen.cols {
+            break;
+        }
+        let mut cell = base_cell.clone();
+        cell.character = character;
+        cell.zero_width.clear();
+        cell.hidden = false;
+        if let Some(indexed) = screen
+            .cells
+            .iter_mut()
+            .find(|indexed| indexed.row == cursor.row && indexed.column == cursor.column)
+        {
+            indexed.cell = cell.clone();
+        } else {
+            screen
+                .cells
+                .push(crate::terminal::session::TerminalIndexedCellSnapshot {
+                    row: cursor.row,
+                    column: cursor.column,
+                    cell: cell.clone(),
+                });
+        }
+        if let Some(line) = screen.lines.get_mut(cursor.row) {
+            if cursor.column < line.len() {
+                line[cursor.column] = cell;
+            }
+        }
+        cursor.column += 1;
+    }
+    screen
+        .cells
+        .sort_by_key(|indexed| (indexed.row, indexed.column));
+    cursor.column = cursor.column.min(screen.cols.saturating_sub(1));
+    screen.cursor = Some(cursor);
+}
+
 fn fetch_idle_conversation_photo() -> Option<Arc<RenderImage>> {
     #[cfg(test)]
     {
@@ -40556,6 +40681,7 @@ mod tests {
         native_command_id,
         native_reconnect_source_for,
         next_controller_wait,
+        overlay_pending_terminal_echo,
         owned_matches_admission,
         prepare_native_composer_image,
         provider_inbox_affordance,
@@ -40568,13 +40694,13 @@ mod tests {
         reconnect_backoff_reset,
         record_recovery_attempt_result,
         remove_staged_image,
-        root_routes_key_to_terminal, stale_task_row_routes_key_to_terminal,
         resolve_fleet_transport_reconnect,
         resync_or_reconnect_fleet_host,
         retain_child,
         retain_worker,
         retained_children,
         retry_until_startup_deadline,
+        root_routes_key_to_terminal,
         runtime_connection_visible,
         should_attempt_recovery,
         should_schedule_host_bootstrap_retry,
@@ -40582,6 +40708,7 @@ mod tests {
         stable_host_project_row_element_id,
         stable_host_task_element_key,
         stable_host_task_row_element_id,
+        stale_task_row_routes_key_to_terminal,
         take_retained_action_outcomes,
         terminal_scroll_lines_from_pixels,
         update_state_from_stage,
@@ -43119,6 +43246,39 @@ mod tests {
         assert_eq!(moved, expected_moved);
         assert_eq!(dismissed, None);
         assert_eq!(after_enter, None);
+    }
+
+    #[test]
+    fn composer_defaults_do_not_reuse_a_different_providers_custom_model() {
+        if rerun_headless_shell_test_in_child(
+            "ui::native_shell::tests::composer_defaults_do_not_reuse_a_different_providers_custom_model",
+        ) {
+            return;
+        }
+        let completed = std::rc::Rc::new(std::cell::RefCell::new(None));
+        let completed_for_app = std::rc::Rc::clone(&completed);
+        gpui::Application::headless().run(move |cx| {
+            crate::ui::init(cx);
+            let (runtime, _) = TestRuntime::new(true, NativeHostActionResult::Queued);
+            let observed = with_test_shell_in_app(cx, runtime, |shell| {
+                let mut claude = crate::providers::ProviderLaunchOptions::default();
+                claude.custom_model_slug = Some("opus[1m]".into());
+                shell.layout.composer_provider = Some(ProviderKind::ClaudeCode);
+                shell.layout.composer_launch_options = Some(claude);
+                shell.composer_launch_options_for(ProviderKind::Codex)
+            });
+            *completed_for_app.borrow_mut() = Some(observed);
+            cx.quit();
+        });
+        let codex = completed.borrow().clone().expect("codex defaults");
+        assert_eq!(codex.custom_model_slug, None);
+        assert!(matches!(
+            codex.model,
+            crate::providers::ProviderModel::ProviderDefault
+                | crate::providers::ProviderModel::CodexSol
+                | crate::providers::ProviderModel::CodexTerra
+                | crate::providers::ProviderModel::CodexLuna
+        ));
     }
 
     #[test]
@@ -47185,17 +47345,11 @@ mod tests {
     #[test]
     fn codex_live_model_picker_navigation_targets_model_and_reasoning_rows() {
         assert_eq!(
-            super::codex_model_picker_input(
-                2,
-                Some(super::CodexReasoningPickerPath::Standard(3)),
-            ),
+            super::codex_model_picker_input(2, Some(super::CodexReasoningPickerPath::Standard(3)),),
             "/model\r\u{1b}[F\r\u{1b}[H\u{1b}[B\u{1b}[B\r\u{1b}[H\u{1b}[B\u{1b}[B\u{1b}[B\r"
         );
         assert_eq!(
-            super::codex_model_picker_input(
-                0,
-                Some(super::CodexReasoningPickerPath::Advanced(1)),
-            ),
+            super::codex_model_picker_input(0, Some(super::CodexReasoningPickerPath::Advanced(1)),),
             "/model\r\u{1b}[F\r\u{1b}[H\r\u{1b}[F\r\u{1b}[H\u{1b}[B\r"
         );
     }
@@ -47212,88 +47366,90 @@ mod tests {
         gpui::Application::headless().run(move |cx| {
             crate::ui::init(cx);
             with_test_shell_in_app(cx, runtime, |shell| {
-            let model = Arc::new(model);
-            let snapshot = model.task(task_id).expect("task").clone();
-            let agent_id = snapshot.primary_agent_id.expect("agent");
-            let resource = snapshot
-                .resources
-                .values()
-                .find(|resource| {
-                    resource.resource_kind == crate::domain::resource::ResourceKind::Terminal
-                })
-                .expect("terminal resource")
-                .clone();
-            shell.apply_client_model(Arc::clone(&model)).expect("model");
-            let owner = HostTaskKey::new(shell.local_host_id(), task_id);
-            shell
-                .select_fleet_task_key(owner.clone(), FleetSelectMode::Replace)
-                .expect("select local task");
-            shell.set_provider_terminal_visible(true);
-            let terminal_query = shared
-                .lock()
-                .expect("runtime")
-                .accepted
-                .iter()
-                .find(|record| {
-                    matches!(
-                        record.command,
-                        NativeHostCommand::TaskCockpitQuery {
-                            query: TaskCockpitQuery::Terminal,
-                            ..
-                        }
-                    )
-                })
-                .cloned()
-                .expect("initial terminal query");
-            shell.apply_epoch_fenced_action_outcome_for_host(
-                &owner.host,
-                NativeHostActionOutcome::Queried {
-                    action: terminal_query,
-                    detail: "terminal".into(),
-                    body: NativeHostQueryBody::TaskCockpit(
-                        crate::domain::TaskCockpitResult::Terminal(
-                            crate::domain::cockpit::TaskTerminalProjection {
-                                task_id,
-                                terminal_id: crate::domain::TerminalId::new(),
-                                session_id: crate::terminal::protocol::TerminalSessionId::new(),
-                                agent_session_id: agent_id,
-                                resource_id: resource.id,
-                                runtime_generation: snapshot.agents[&agent_id]
-                                    .runtime_generation,
-                                resource_generation: resource.runtime_generation,
-                                action_epoch: snapshot.task.action_epoch,
-                                accepts_input_without_conversation_id: false,
-                                sequence: 7,
-                                title: Some("local-live".into()),
-                                text_lines: vec!["> ".into()],
-                                screen: Default::default(),
-                            },
+                let model = Arc::new(model);
+                let snapshot = model.task(task_id).expect("task").clone();
+                let agent_id = snapshot.primary_agent_id.expect("agent");
+                let resource = snapshot
+                    .resources
+                    .values()
+                    .find(|resource| {
+                        resource.resource_kind == crate::domain::resource::ResourceKind::Terminal
+                    })
+                    .expect("terminal resource")
+                    .clone();
+                shell.apply_client_model(Arc::clone(&model)).expect("model");
+                let owner = HostTaskKey::new(shell.local_host_id(), task_id);
+                shell
+                    .select_fleet_task_key(owner.clone(), FleetSelectMode::Replace)
+                    .expect("select local task");
+                shell.set_provider_terminal_visible(true);
+                let terminal_query = shared
+                    .lock()
+                    .expect("runtime")
+                    .accepted
+                    .iter()
+                    .find(|record| {
+                        matches!(
+                            record.command,
+                            NativeHostCommand::TaskCockpitQuery {
+                                query: TaskCockpitQuery::Terminal,
+                                ..
+                            }
+                        )
+                    })
+                    .cloned()
+                    .expect("initial terminal query");
+                shell.apply_epoch_fenced_action_outcome_for_host(
+                    &owner.host,
+                    NativeHostActionOutcome::Queried {
+                        action: terminal_query,
+                        detail: "terminal".into(),
+                        body: NativeHostQueryBody::TaskCockpit(
+                            crate::domain::TaskCockpitResult::Terminal(
+                                crate::domain::cockpit::TaskTerminalProjection {
+                                    task_id,
+                                    terminal_id: crate::domain::TerminalId::new(),
+                                    session_id: crate::terminal::protocol::TerminalSessionId::new(),
+                                    agent_session_id: agent_id,
+                                    resource_id: resource.id,
+                                    runtime_generation: snapshot.agents[&agent_id]
+                                        .runtime_generation,
+                                    resource_generation: resource.runtime_generation,
+                                    action_epoch: snapshot.task.action_epoch,
+                                    accepts_input_without_conversation_id: false,
+                                    sequence: 7,
+                                    title: Some("local-live".into()),
+                                    text_lines: vec!["> ".into()],
+                                    screen: Default::default(),
+                                },
+                            ),
                         ),
-                    ),
-                },
-            );
-            shared.lock().expect("runtime").accepted.clear();
+                    },
+                );
+                shared.lock().expect("runtime").accepted.clear();
 
-            shell.set_composer_model(crate::providers::ProviderModel::ClaudeOpus);
-            shell.set_composer_reasoning(crate::providers::ProviderReasoningEffort::High);
+                shell.set_composer_model(crate::providers::ProviderModel::ClaudeOpus);
+                shell.set_composer_reasoning(crate::providers::ProviderReasoningEffort::High);
 
-            let texts = shared
-                .lock()
-                .expect("runtime")
-                .accepted
-                .iter()
-                .filter_map(|record| match &record.command {
-                    NativeHostCommand::ProviderInput {
-                        action_id,
-                        arguments,
-                        ..
-                    } if *action_id == crate::client::action::ACTION_PROVIDER_TERMINAL_INPUT => {
-                        arguments.text.clone()
-                    }
-                    _ => None,
-                })
-                .collect::<Vec<_>>();
-            assert_eq!(texts, vec!["/model opus\r", "/effort high\r"]);
+                let texts = shared
+                    .lock()
+                    .expect("runtime")
+                    .accepted
+                    .iter()
+                    .filter_map(|record| match &record.command {
+                        NativeHostCommand::ProviderInput {
+                            action_id,
+                            arguments,
+                            ..
+                        } if *action_id
+                            == crate::client::action::ACTION_PROVIDER_TERMINAL_INPUT =>
+                        {
+                            arguments.text.clone()
+                        }
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>();
+                assert_eq!(texts, vec!["/model opus\r", "/effort high\r"]);
             });
             cx.quit();
         });
@@ -49750,6 +49906,89 @@ mod tests {
     }
 
     #[test]
+    fn native_terminal_owns_one_zed_style_focus_and_platform_input_path() {
+        let source = include_str!("native_shell.rs");
+        let production_source = source
+            .split("mod tests {")
+            .next()
+            .expect("production native shell source");
+
+        assert!(
+            production_source.contains("impl gpui::InputHandler for NativeTerminalInputHandler"),
+            "the native terminal must use Zed's paint-local InputHandler pattern"
+        );
+        assert!(
+            production_source.contains("window.handle_input(")
+                && production_source.contains("&focus_handle,")
+                && production_source.contains("NativeTerminalInputHandler {"),
+            "the painted terminal grid must register platform text input on its own focus handle"
+        );
+        assert!(
+            !production_source.contains("struct TerminalInputProxy"),
+            "terminal focus and IME ownership must not be split through a detached proxy entity"
+        );
+    }
+
+    #[test]
+    fn pending_terminal_echo_paints_at_the_real_cursor_without_mutating_canonical_state() {
+        use crate::terminal::session::{
+            TerminalCellSnapshot, TerminalCursorSnapshot, TerminalIndexedCellSnapshot,
+            TerminalScreenSnapshot,
+        };
+        use alacritty_terminal::vte::ansi::CursorShape;
+
+        fn cell(character: char) -> TerminalCellSnapshot {
+            TerminalCellSnapshot {
+                character,
+                zero_width: Vec::new(),
+                foreground: 0,
+                background: 0,
+                bold: false,
+                dim: false,
+                italic: false,
+                underline: false,
+                undercurl: false,
+                strike: false,
+                hidden: false,
+                has_hyperlink: false,
+                default_background: true,
+                default_foreground: true,
+            }
+        }
+
+        let mut screen = TerminalScreenSnapshot {
+            cells: vec![TerminalIndexedCellSnapshot {
+                row: 0,
+                column: 0,
+                cell: cell('>'),
+            }],
+            lines: vec![vec![cell('>'); 8]],
+            cursor: Some(TerminalCursorSnapshot {
+                row: 0,
+                column: 2,
+                shape: CursorShape::Block,
+            }),
+            rows: 1,
+            cols: 8,
+            ..Default::default()
+        };
+
+        overlay_pending_terminal_echo(&mut screen, "go");
+
+        assert_eq!(screen.lines[0][2].character, 'g');
+        assert_eq!(screen.lines[0][3].character, 'o');
+        assert_eq!(screen.cursor.expect("cursor").column, 4);
+        assert!(screen
+            .cells
+            .iter()
+            .any(|indexed| indexed.column == 2 && indexed.cell.character == 'g'));
+        assert!(screen
+            .cells
+            .iter()
+            .any(|indexed| indexed.column == 3 && indexed.cell.character == 'o'));
+    }
+
+    #[test]
     fn printable_composer_keys_reach_the_platform_text_input_handler() {
         let source = include_str!("native_shell.rs");
         let production_source = source
@@ -49774,12 +50013,12 @@ mod tests {
             "the registered EntityInputHandler must mutate the task draft"
         );
         assert!(
-            production_source.contains("struct TerminalInputProxy")
-                && production_source.contains("terminal_input_proxy")
-                && production_source.contains("impl EntityInputHandler for TerminalInputProxy")
-                && production_source.contains("ElementInputHandler::new(bounds, input_proxy)")
+            production_source.contains("struct NativeTerminalInputHandler")
+                && production_source
+                    .contains("impl gpui::InputHandler for NativeTerminalInputHandler")
+                && production_source.contains("NativeTerminalInputHandler {")
                 && production_source.contains("shell.dispatch_provider_terminal_text(text)"),
-            "the terminal must own a distinct GPUI input entity and forward WM_CHAR/IME text to the provider runtime"
+            "the terminal must register Zed-style paint-local platform input and forward WM_CHAR/IME text to the provider runtime"
         );
         assert!(
             production_source.contains("center_terminal_interactive(")
@@ -49859,7 +50098,9 @@ mod tests {
 
     #[test]
     fn stale_task_row_forwards_only_non_activation_keys_to_visible_terminal() {
-        assert!(stale_task_row_routes_key_to_terminal("x", false, true, true));
+        assert!(stale_task_row_routes_key_to_terminal(
+            "x", false, true, true
+        ));
         assert!(stale_task_row_routes_key_to_terminal(
             "backspace",
             true,
@@ -49872,7 +50113,9 @@ mod tests {
         assert!(!stale_task_row_routes_key_to_terminal(
             "space", true, true, true
         ));
-        assert!(!stale_task_row_routes_key_to_terminal("x", true, true, false));
+        assert!(!stale_task_row_routes_key_to_terminal(
+            "x", true, true, false
+        ));
     }
 
     #[test]

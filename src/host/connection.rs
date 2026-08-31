@@ -3002,6 +3002,7 @@ impl HostRequestExecutor {
                     let Some(job) = job else {
                         break;
                     };
+                    let accepted_provider_input = accepted_provider_input_task_id(&job.request);
                     let result = if is_agent_connection_query(&job.request) {
                         self.dispatch_agent_connection(job.negotiated, job.request, job.output_id).await
                     } else if is_task_create_with_primary_provider(&job.request) {
@@ -3011,6 +3012,11 @@ impl HostRequestExecutor {
                     } else {
                         self.dispatch_job(job.negotiated, job.request, job.output_id, job.routing)
                     };
+                    if let Some(task_id) = accepted_provider_input
+                        .filter(|_| provider_input_was_accepted(&result))
+                    {
+                        self.drive_provider_input_after_acceptance(task_id);
+                    }
                     // If the connection task went away, drop the reply; do not panic.
                     let _ = job.reply.send(result);
                 }
@@ -3077,6 +3083,7 @@ impl HostRequestExecutor {
                             "supervised executor request queue closed unexpectedly".into(),
                         ));
                     };
+                    let accepted_provider_input = accepted_provider_input_task_id(&job.request);
                     let result = if is_agent_connection_query(&job.request) {
                         self.dispatch_agent_connection(job.negotiated, job.request, job.output_id).await
                     } else if is_task_create_with_primary_provider(&job.request) {
@@ -3086,6 +3093,11 @@ impl HostRequestExecutor {
                     } else {
                         self.dispatch_job(job.negotiated, job.request, job.output_id, job.routing)
                     };
+                    if let Some(task_id) = accepted_provider_input
+                        .filter(|_| provider_input_was_accepted(&result))
+                    {
+                        self.drive_provider_input_after_acceptance(task_id);
+                    }
                     let _ = job.reply.send(result);
                 }
                 control = self.control_rx.recv(), if !self.control_closed => {
@@ -3390,6 +3402,35 @@ impl HostRequestExecutor {
                 let _ = ack.send(sequence);
             }
         }
+    }
+
+    /// A fresh durable provider input is an explicit retry signal. Attempt one
+    /// bounded outbox pass immediately; if the exact provider runtime is absent,
+    /// schedule its persisted restart now instead of waiting for the periodic
+    /// maintenance tick. Discovery and process launch remain on the
+    /// cancellation-owned restore-future lane.
+    fn drive_provider_input_after_acceptance(&mut self, task_id: TaskId) {
+        self.provider_restore_failed_action_epochs.remove(&task_id);
+        let held_restart = if let Some(runtime) = self.configured_service_runtime.as_mut() {
+            match self.bus.run_provider_dispatch(&runtime.provider_dispatch) {
+                Ok(crate::providers::dispatch::ProviderDispatchOutcome::Held {
+                    task_id,
+                    reason,
+                }) => Some((task_id, reason)),
+                Ok(_) => None,
+                Err(error) => {
+                    eprintln!("devmanager-host: immediate provider dispatch failed: {error}");
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        if let Some((task_id, reason)) = held_restart {
+            self.queue_held_provider_restart(task_id, reason);
+        }
+        self.queue_one_provider_restore();
+        self.fan_out_live_durable_events();
     }
 
     /// Pump the host-owned configured supervisor on the maintenance lane. The
@@ -3751,6 +3792,8 @@ impl HostRequestExecutor {
                     outcome.task_id
                 );
             }
+            let task_id = outcome.task_id;
+            self.drive_provider_input_after_acceptance(task_id);
         }
     }
 
@@ -6653,6 +6696,26 @@ fn is_provider_start_request(request: &ClientRequest) -> bool {
     )
 }
 
+fn accepted_provider_input_task_id(request: &ClientRequest) -> Option<TaskId> {
+    match request {
+        ClientRequest::Command(envelope)
+            if matches!(&envelope.command, Command::SubmitProviderInput(_)) =>
+        {
+            envelope.task_id
+        }
+        _ => None,
+    }
+}
+
+fn provider_input_was_accepted(result: &Result<DuplexExecuteCompletion, IpcError>) -> bool {
+    matches!(
+        result,
+        Ok(DuplexExecuteCompletion::CallerMustWrite(
+            ServerMessage::CommandReceipt(CommandReceipt::Accepted { .. })
+        ))
+    )
+}
+
 fn is_agent_connection_query(request: &ClientRequest) -> bool {
     matches!(
         request,
@@ -7254,7 +7317,8 @@ fn dispatch_authenticated_request_inner(
                             action_epoch: None,
                             runtime_generation: None,
                             config: None,
-                            provider_launch_hint: super::cockpit::ProviderLaunchReadinessHint::Unknown,
+                            provider_launch_hint:
+                                super::cockpit::ProviderLaunchReadinessHint::Unknown,
                         });
                     return Ok(ServerMessage::QueryReply(QueryReply {
                         request_id: envelope.request_id,
@@ -9253,11 +9317,9 @@ mod output_tests {
             0x00, 0xd7,
         ])
         .expect("project");
-        let project_roots = WorkspaceProjectRoots::try_from_pairs([(
-            project_id,
-            repository.path().to_path_buf(),
-        )])
-        .expect("project roots");
+        let project_roots =
+            WorkspaceProjectRoots::try_from_pairs([(project_id, repository.path().to_path_buf())])
+                .expect("project roots");
         let (requests, executor) =
             HostRequestExecutor::start_with_workspace_projects(bus, project_roots);
 
@@ -11102,11 +11164,9 @@ mod output_tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let bus = CommandBus::open(&dir.path().join("duplex-caller-owned.db")).expect("bus");
         let project_id = ProjectId::new();
-        let project_roots = WorkspaceProjectRoots::try_from_pairs([(
-            project_id,
-            repository.path().to_path_buf(),
-        )])
-        .expect("project roots");
+        let project_roots =
+            WorkspaceProjectRoots::try_from_pairs([(project_id, repository.path().to_path_buf())])
+                .expect("project roots");
         let (requests, executor) =
             HostRequestExecutor::start_without_automatic_maintenance_with_workspace_projects(
                 bus,
@@ -13040,6 +13100,53 @@ mod output_tests {
         assert!(
             source.contains("Some(_) if self.provider_restore_pending =>"),
             "readiness hint must stay Unknown while restore enumeration is pending/failed"
+        );
+    }
+
+    #[test]
+    fn accepted_provider_input_drives_delivery_and_exact_restore_immediately() {
+        let source = include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/src/host/connection.rs"
+        ));
+        assert_eq!(
+            source
+                .matches("accepted_provider_input_task_id(&job.request)")
+                .count(),
+            3,
+            "both executor loops must capture provider-input ownership before moving the request"
+        );
+        assert_eq!(
+            source
+                .matches("drive_provider_input_after_acceptance(task_id)")
+                .count(),
+            4,
+            "both executor loops and successful exact restore must drive the provider outbox"
+        );
+
+        let start = source
+            .find("fn drive_provider_input_after_acceptance(")
+            .expect("immediate provider-input driver");
+        let body = &source[start..];
+        let end = body
+            .find("\n    fn reconcile_configured_services(")
+            .expect("maintenance reconciler follows immediate driver");
+        let body = &body[..end];
+        assert!(
+            body.contains("provider_restore_failed_action_epochs.remove(&task_id)"),
+            "a fresh accepted input must explicitly rearm exact restore after a prior transient failure"
+        );
+        assert!(
+            body.contains("run_provider_dispatch"),
+            "accepted input must attempt one bounded delivery pass immediately"
+        );
+        assert!(
+            body.contains("queue_held_provider_restart"),
+            "a held delivery must schedule the exact persisted provider restart"
+        );
+        assert!(
+            body.contains("queue_one_provider_restore"),
+            "the exact restore must start without waiting for periodic maintenance"
         );
     }
 

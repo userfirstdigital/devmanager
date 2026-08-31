@@ -167,6 +167,12 @@
   canonical physical size at the desktop scale, stage the oversized position,
   flush DWM, then issue a real move-only transition farther off-screen and flush
   again before capture; inspect the bottom pixels, not only the PNG dimensions.
+- Native terminal input acceptance requires a Computer Use pass against the
+  actual rendered provider prompt in the rebuilt live shell. Verify physical
+  key text appears immediately, a control-key edit works, drag selection can be
+  copied, and wheel scrolling moves and restores the terminal buffer. Focus
+  handles, optimistic-echo unit tests, or a visually correct static capture are
+  necessary diagnostics but are not live terminal acceptance by themselves.
 
 ## Lean phase execution
 

@@ -114,8 +114,9 @@ fn hold_disposition(error: ProviderInputDeliveryError) -> WriteFailureDispositio
     }
 }
 
-/// One bounded provider effect pass. It is intentionally called by host
-/// maintenance, never by the request dispatcher or UI hot path.
+/// One bounded provider effect pass. The host calls it after durable provider
+/// input acceptance, after exact-session restoration, and as a maintenance
+/// fallback. It never runs in the UI process.
 pub struct ProviderDispatchRuntime {
     authority: Box<dyn ProviderDispatchWriteAuthority>,
 }
