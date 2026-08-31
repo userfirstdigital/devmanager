@@ -330,12 +330,11 @@ impl TaskSurfaceState {
         if self.latest_terminal.is_some() {
             self.terminal_attachment = TerminalAttachmentState::StaleReconnecting;
         } else {
-            // A missing first projection after a transient transport/query
-            // failure is still a recoverable startup state. Only an explicit
-            // authoritative unsupported/exited result may label the terminal
-            // unavailable; otherwise returning tasks flash a false terminal
-            // failure while the host reconnects.
-            self.terminal_attachment = TerminalAttachmentState::Starting;
+            // Starting is an in-flight promise, not a generic retry label.
+            // Once the exact query settles without a projection, stop the
+            // spinner and surface a retryable unavailable state. A later
+            // query can enter Starting again without losing cached output.
+            self.terminal_attachment = TerminalAttachmentState::Unavailable;
         }
     }
 
@@ -923,8 +922,13 @@ mod tests {
         empty.note_terminal_reconnecting();
         assert_eq!(
             empty.terminal_attachment,
-            TerminalAttachmentState::Starting,
-            "a transient first-load failure must remain retryable rather than falsely reporting an unsupported terminal"
+            TerminalAttachmentState::Unavailable,
+            "a failed first load must stop presenting an unbounded startup state; a later retry may re-enter Starting"
+        );
+        assert_eq!(
+            empty.center_loading_state(true),
+            None,
+            "a failed first load must clear its loading animation"
         );
     }
 

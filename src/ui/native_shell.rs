@@ -10064,9 +10064,25 @@ fn center_terminal_interactive(
 fn root_routes_key_to_terminal(
     terminal_focused: bool,
     terminal_input_armed: bool,
+    center_terminal_visible: bool,
     center_interactive: bool,
 ) -> bool {
-    (terminal_focused || terminal_input_armed) && center_interactive
+    (terminal_focused || terminal_input_armed || center_terminal_visible) && center_interactive
+}
+
+fn stale_task_row_routes_key_to_terminal(
+    key: &str,
+    terminal_input_armed: bool,
+    center_terminal_visible: bool,
+    center_interactive: bool,
+) -> bool {
+    !matches!(key, "enter" | "space")
+        && root_routes_key_to_terminal(
+            false,
+            terminal_input_armed,
+            center_terminal_visible,
+            center_interactive,
+        )
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -14994,25 +15010,30 @@ impl NativeShell {
                     }
                 }
                 NativeHostActionOutcome::Failed { action, error } => {
-                    slot.last_action_failure = Some(NativeHostActionFailure::ExecutionFailed {
-                        action_id: action.id,
-                        command_id: native_command_id(&action.command),
-                        message: bounded_host_error(error.clone()),
-                    });
                     if is_native_query_command(&action.command) {
-                        // Probe transport failures settle via owner first-send below.
+                        slot.last_query_detail = Some(bounded_host_error(error.clone()));
+                        slot.last_action_failure = None;
                     } else {
+                        slot.last_action_failure = Some(NativeHostActionFailure::ExecutionFailed {
+                            action_id: action.id,
+                            command_id: native_command_id(&action.command),
+                            message: bounded_host_error(error.clone()),
+                        });
                         settle_owner =
                             Some((action.clone(), false, Some(format!("{error}; draft kept"))));
                     }
                 }
                 NativeHostActionOutcome::Uncertain { action, error } => {
-                    slot.last_action_failure = Some(NativeHostActionFailure::ExecutionUncertain {
-                        action_id: action.id,
-                        command_id: native_command_id(&action.command),
-                        message: bounded_host_error(error.clone()),
-                    });
-                    if !is_native_query_command(&action.command) {
+                    if is_native_query_command(&action.command) {
+                        slot.last_query_detail = Some(bounded_host_error(error.clone()));
+                        slot.last_action_failure = None;
+                    } else {
+                        slot.last_action_failure =
+                            Some(NativeHostActionFailure::ExecutionUncertain {
+                                action_id: action.id,
+                                command_id: native_command_id(&action.command),
+                                message: bounded_host_error(error.clone()),
+                            });
                         settle_owner =
                             Some((action.clone(), false, Some(format!("{error}; draft kept"))));
                     }
@@ -15130,6 +15151,7 @@ impl NativeShell {
         }
         if let NativeHostActionOutcome::Failed { action, error } = &outcome {
             if is_native_query_command(&action.command) {
+                self.settle_terminal_query_failure_for_host(host_id, action);
                 let _ = self.settle_pending_draft_first_send_probe_transport_failure_for_host(
                     host_id,
                     action,
@@ -15139,6 +15161,7 @@ impl NativeShell {
         }
         if let NativeHostActionOutcome::Uncertain { action, error } = &outcome {
             if is_native_query_command(&action.command) {
+                self.settle_terminal_query_failure_for_host(host_id, action);
                 let _ = self.settle_pending_draft_first_send_probe_transport_failure_for_host(
                     host_id,
                     action,
@@ -15152,6 +15175,34 @@ impl NativeShell {
             if !matches!(outcome, NativeHostActionOutcome::Queried { .. }) {
                 self.task_surfaces.cancel_conversation(key, generation);
             }
+        }
+    }
+
+    /// Settle the visible terminal's exact query lease after a host-side
+    /// transport failure. Query errors are panel state, not task failures, and
+    /// must never leave Starting/Syncing active indefinitely.
+    fn settle_terminal_query_failure_for_host(
+        &mut self,
+        host_id: &HostId,
+        action: &NativeActionRecord,
+    ) {
+        let Some((_request_id, task_id, query)) =
+            Self::task_cockpit_command_parts(&action.command)
+        else {
+            return;
+        };
+        if !matches!(
+            query,
+            TaskCockpitQuery::Terminal | TaskCockpitQuery::TerminalScroll { .. }
+        ) {
+            return;
+        }
+        let owner = HostTaskKey::new(host_id.clone(), task_id);
+        self.task_surfaces.note_terminal_reconnecting(owner);
+        if host_id == &self.local_host_id()
+            && self.local_slot().interaction.selected_task() == Some(task_id)
+        {
+            self.sync_terminal_from_cockpit();
         }
     }
 
@@ -37301,7 +37352,7 @@ impl NativeShell {
                             };
                         let key_handler =
                             move |event: &KeyDownEvent,
-                                  _window: &mut Window,
+                                  window: &mut Window,
                                   app: &mut gpui::App| {
                                 if matches!(event.keystroke.key.as_str(), "enter" | "space") {
                                     let _ = shell_for_key.update(app, |shell, cx| {
@@ -37315,6 +37366,30 @@ impl NativeShell {
                                         let _ = shell.select_fleet_task_key(task_key_key.clone(), mode);
                                         shell.refresh_accessibility_tree();
                                         cx.notify();
+                                    });
+                                } else {
+                                    // Windows UI Automation and some pointer paths can
+                                    // leave GPUI focus on the selected rail row even after
+                                    // the user clicks the terminal canvas. Preserve the
+                                    // row's Enter/Space semantics above, but forward every
+                                    // other key to the exact visible interactive terminal.
+                                    let _ = shell_for_key.update(app, |shell, cx| {
+                                        let center_terminal_visible = shell
+                                            .selected_task_key
+                                            .clone()
+                                            .is_some_and(|owner| {
+                                                shell.task_center_terminal_preference(&owner)
+                                            });
+                                        if stale_task_row_routes_key_to_terminal(
+                                            event.keystroke.key.as_str(),
+                                            shell.terminal_input_is_armed(),
+                                            center_terminal_visible,
+                                            shell.selected_center_terminal_is_interactive(),
+                                        ) {
+                                            cx.stop_propagation();
+                                            shell.handle_provider_terminal_key(event, window, cx);
+                                            cx.notify();
+                                        }
                                     });
                                 }
                             };
@@ -38193,31 +38268,45 @@ impl NativeShell {
             .relative()
             .track_focus(&self.focus_handle)
             .on_key_down(cx.listener(|shell, event: &KeyDownEvent, window, cx| {
+                // Root editors own text before the center terminal. In
+                // particular, a terminal armed by an earlier click must not
+                // steal rename/search/settings input after an overlay opens.
+                if shell.root_editor_value().is_some() {
+                    let modifiers = event.keystroke.modifiers;
+                    let platform_text = !modifiers.control
+                        && !modifiers.platform
+                        && !modifiers.alt
+                        && matches!(
+                            Self::overlay_key_input(event),
+                            Some(crate::ui::components::text_field::TextFieldKey::Character(
+                                _
+                            ))
+                        );
+                    if platform_text {
+                        // WM_CHAR/IME owns printable text. Consuming the
+                        // keydown prevents the active EntityInputHandler from
+                        // receiving paste, composed Unicode, or automation.
+                        return;
+                    }
+                    if shell.handle_overlay_key(event, window, cx) {
+                        cx.stop_propagation();
+                        cx.notify();
+                    }
+                    return;
+                }
+                let center_terminal_visible = shell
+                    .selected_task_key
+                    .clone()
+                    .is_some_and(|owner| shell.task_center_terminal_preference(&owner));
                 if root_routes_key_to_terminal(
                     shell.terminal_focus_handle.is_focused(window),
                     shell.terminal_input_is_armed(),
+                    center_terminal_visible,
                     shell.selected_center_terminal_is_interactive(),
                 ) {
                     shell.handle_provider_terminal_key(event, window, cx);
                     cx.stop_propagation();
                     cx.notify();
-                    return;
-                }
-                let modifiers = event.keystroke.modifiers;
-                let platform_text = shell.root_editor_value().is_some()
-                    && !modifiers.control
-                    && !modifiers.platform
-                    && !modifiers.alt
-                    && matches!(
-                        Self::overlay_key_input(event),
-                        Some(crate::ui::components::text_field::TextFieldKey::Character(
-                            _
-                        ))
-                    );
-                if platform_text {
-                    // WM_CHAR/IME owns printable text. Consuming the keydown
-                    // here prevents GPUI's active EntityInputHandler from ever
-                    // receiving paste, composed Unicode, or automation text.
                     return;
                 }
                 if shell.handle_overlay_key(event, window, cx) {
@@ -40479,7 +40568,7 @@ mod tests {
         reconnect_backoff_reset,
         record_recovery_attempt_result,
         remove_staged_image,
-        root_routes_key_to_terminal,
+        root_routes_key_to_terminal, stale_task_row_routes_key_to_terminal,
         resolve_fleet_transport_reconnect,
         resync_or_reconnect_fleet_host,
         retain_child,
@@ -49728,6 +49817,24 @@ mod tests {
             source.contains("native-empty-conversation") && source.contains("No messages yet"),
             "valid empty timelines must show an honest empty conversation state"
         );
+        let root_listener = source
+            .rsplit(".id(\"native-shell-root\")")
+            .next()
+            .expect("native shell root")
+            .split(".on_key_down(cx.listener(|shell, event: &KeyDownEvent, window, cx|")
+            .nth(1)
+            .and_then(|tail| tail.split(".on_mouse_move(").next())
+            .expect("root key listener");
+        let editor_guard = root_listener
+            .find("shell.root_editor_value().is_some()")
+            .expect("root editor priority guard");
+        let terminal_route = root_listener
+            .find("root_routes_key_to_terminal(")
+            .expect("terminal route");
+        assert!(
+            editor_guard < terminal_route,
+            "rename/search/settings editors must take priority over a previously armed terminal"
+        );
     }
 
     #[test]
@@ -49739,11 +49846,33 @@ mod tests {
     }
 
     #[test]
-    fn root_key_route_requires_terminal_focus_and_the_interactive_center_surface() {
-        assert!(root_routes_key_to_terminal(true, false, true));
-        assert!(root_routes_key_to_terminal(false, true, true));
-        assert!(!root_routes_key_to_terminal(false, false, true));
-        assert!(!root_routes_key_to_terminal(true, true, false));
+    fn root_key_route_follows_visible_interactive_terminal_mode() {
+        assert!(root_routes_key_to_terminal(true, false, false, true));
+        assert!(root_routes_key_to_terminal(false, true, false, true));
+        assert!(
+            root_routes_key_to_terminal(false, false, true, true),
+            "visible terminal mode must own printable keys even when platform accessibility focus lags on the prior task row"
+        );
+        assert!(!root_routes_key_to_terminal(false, false, false, true));
+        assert!(!root_routes_key_to_terminal(true, true, true, false));
+    }
+
+    #[test]
+    fn stale_task_row_forwards_only_non_activation_keys_to_visible_terminal() {
+        assert!(stale_task_row_routes_key_to_terminal("x", false, true, true));
+        assert!(stale_task_row_routes_key_to_terminal(
+            "backspace",
+            true,
+            true,
+            true
+        ));
+        assert!(!stale_task_row_routes_key_to_terminal(
+            "enter", true, true, true
+        ));
+        assert!(!stale_task_row_routes_key_to_terminal(
+            "space", true, true, true
+        ));
+        assert!(!stale_task_row_routes_key_to_terminal("x", true, true, false));
     }
 
     #[test]
@@ -58762,6 +58891,82 @@ mod tests {
                     live.as_ref().is_none_or(|files| files.task_id != first_task
                         || files.entries.iter().all(|e| e.relative_path != "stale.md")),
                     "stale FilesList after focus switch must not land"
+                );
+            });
+            cx.quit();
+        });
+    }
+
+    #[test]
+    fn failed_terminal_query_clears_the_exact_owner_loading_state() {
+        if rerun_headless_shell_test_in_child(
+            "ui::native_shell::tests::failed_terminal_query_clears_the_exact_owner_loading_state",
+        ) {
+            return;
+        }
+        let (runtime, shared) = TestRuntime::new(true, NativeHostActionResult::Queued);
+        gpui::Application::headless().run(move |cx| {
+            crate::ui::init(cx);
+            with_test_shell_in_app(cx, runtime, |shell| {
+                let (model, task_id) = terminal_bound_client_model();
+                shell.apply_client_model(Arc::new(model)).expect("model");
+                let owner = HostTaskKey::new(shell.local_host_id(), task_id);
+                shell
+                    .select_fleet_task_key(owner.clone(), FleetSelectMode::Replace)
+                    .expect("select local task");
+                shell.set_provider_terminal_visible(true);
+
+                let action = shared
+                    .lock()
+                    .expect("runtime")
+                    .accepted
+                    .iter()
+                    .find(|record| {
+                        matches!(
+                            record.command,
+                            NativeHostCommand::TaskCockpitQuery {
+                                query: TaskCockpitQuery::Terminal,
+                                ..
+                            }
+                        )
+                    })
+                    .cloned()
+                    .expect("terminal query");
+                assert!(
+                    shell
+                        .task_surfaces
+                        .state(owner.clone())
+                        .and_then(|state| state.center_loading_state(true))
+                        .is_some(),
+                    "an admitted first terminal query must show bounded loading feedback"
+                );
+
+                shell.apply_epoch_fenced_action_outcome_for_host(
+                    &owner.host,
+                    NativeHostActionOutcome::Failed {
+                        action,
+                        error: "terminal snapshot timed out".into(),
+                    },
+                );
+
+                let surface = shell
+                    .task_surfaces
+                    .state(owner)
+                    .expect("owner terminal surface");
+                assert_eq!(
+                    surface.center_loading_state(true),
+                    None,
+                    "a settled failure must clear the exact owner's loading animation"
+                );
+                assert_eq!(surface.terminal_label(), "Terminal unavailable");
+                assert_eq!(
+                    shell.last_query_detail(),
+                    Some("terminal snapshot timed out")
+                );
+                assert_eq!(
+                    shell.last_action_failure(),
+                    None,
+                    "a terminal panel query failure is not a durable task failure"
                 );
             });
             cx.quit();
