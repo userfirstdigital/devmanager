@@ -6414,7 +6414,19 @@ impl<L: ProviderProcessLauncher, S: ProviderSessionStateStore> ProviderSessionMa
             }
         }
         for agent_id in agent_ids {
-            self.close_agent_session(agent_id)?;
+            match self.close_agent_session(agent_id) {
+                Ok(()) => {}
+                Err(ProviderSessionError::StopFailed(_)) => {
+                    // The bounded native teardown can expire at the same
+                    // instant the Job publishes exact ACTIVE_PROCESS_ZERO.
+                    // `settle_runtime` deliberately makes a Stopping retry
+                    // observational, so consume that proof within this one
+                    // task-level lifecycle gesture instead of requiring the
+                    // user to click Archive/Delete twice.
+                    self.close_agent_session(agent_id)?;
+                }
+                Err(error) => return Err(error),
+            }
         }
         Ok(())
     }
@@ -6500,6 +6512,7 @@ impl<L: ProviderProcessLauncher, S: ProviderSessionStateStore> ProviderSessionMa
         runtime: &ProviderRuntime,
         final_state: PersistedRuntimeLifecycle,
     ) -> Result<(), ProviderSessionError> {
+        let retrying_stopping = runtime.lifecycle() == RuntimeLifecycle::Stopping;
         match runtime.lifecycle() {
             RuntimeLifecycle::Running | RuntimeLifecycle::Stopping | RuntimeLifecycle::Exited => {}
             lifecycle => return Err(ProviderSessionError::RuntimeNotLive { lifecycle }),
@@ -6532,10 +6545,18 @@ impl<L: ProviderProcessLauncher, S: ProviderSessionStateStore> ProviderSessionMa
                     agent_session_id: agent_id,
                     generation: runtime.generation(),
                 })?;
-        let settlement = self
-            .launcher
-            .stop_and_join(&mut slot.lease)
-            .map_err(ProviderSessionError::StopFailed)?;
+        let observed_zero = if retrying_stopping {
+            self.launcher.observe_root_exit(&slot.lease).ok().flatten()
+        } else {
+            None
+        };
+        let settlement = match observed_zero {
+            Some(settlement) => settlement,
+            None => self
+                .launcher
+                .stop_and_join(&mut slot.lease)
+                .map_err(ProviderSessionError::StopFailed)?,
+        };
         #[cfg(test)]
         self.crash_if(ProviderSessionCrashPoint::AfterJoinedZero);
         if !settlement.matches_fence(&runtime.fence()) {
@@ -11643,6 +11664,67 @@ mod tests {
                 .lifecycle(),
             PersistedRuntimeLifecycle::Running
         );
+    }
+
+    #[test]
+    fn close_retry_accepts_exact_zero_after_the_initial_stop_path_failed() {
+        let launcher = FixtureProviderProcessLauncher::new();
+        let agent = AgentSessionFacts::new(
+            TaskId::new(),
+            AgentRole::Primary,
+            ProviderKind::ClaudeCode,
+            None,
+        )
+        .unwrap();
+        let mut manager = ProviderSessionManager::new(launcher.clone());
+        let runtime = manager.start(test_request(agent.clone())).unwrap();
+
+        launcher.set_stop_error(Some(ProviderLaunchError::StopFailed));
+        assert!(matches!(
+            manager.close_agent_session(agent.id),
+            Err(ProviderSessionError::StopFailed(
+                ProviderLaunchError::StopFailed
+            ))
+        ));
+        assert_eq!(runtime.lifecycle(), RuntimeLifecycle::Stopping);
+        assert_eq!(launcher.snapshot().stop_attempts(), 1);
+
+        // The process can reach exact Job-member zero after the bounded stop
+        // path has returned an error. A retry must consume that authenticated
+        // zero proof instead of re-entering the failed teardown executor.
+        launcher.set_joined_active_process_zero(true);
+        launcher.set_stop_error(Some(ProviderLaunchError::StopFailed));
+        manager.close_agent_session(agent.id).unwrap();
+
+        assert_eq!(runtime.lifecycle(), RuntimeLifecycle::Closed);
+        assert_eq!(launcher.snapshot().stop_attempts(), 1);
+        assert_eq!(launcher.snapshot().lease_drops(), 1);
+    }
+
+    #[test]
+    fn close_task_consumes_exact_zero_after_the_initial_stop_path_failed() {
+        let launcher = FixtureProviderProcessLauncher::new();
+        let agent = AgentSessionFacts::new(
+            TaskId::new(),
+            AgentRole::Primary,
+            ProviderKind::ClaudeCode,
+            None,
+        )
+        .unwrap();
+        let mut manager = ProviderSessionManager::new(launcher.clone());
+        let runtime = manager.start(test_request(agent.clone())).unwrap();
+
+        // Production teardown can hit its bounded waiter just as the Job
+        // reaches exact zero. A task-level lifecycle action is one user
+        // gesture, so it must consume the now-available proof without asking
+        // the user to click Archive/Delete a second time.
+        launcher.set_stop_error(Some(ProviderLaunchError::StopFailed));
+        launcher.set_joined_active_process_zero(true);
+        manager.close_task(agent.task_id).unwrap();
+
+        assert_eq!(runtime.lifecycle(), RuntimeLifecycle::Closed);
+        assert_eq!(launcher.snapshot().stop_attempts(), 1);
+        assert_eq!(launcher.snapshot().lease_drops(), 1);
     }
 
     #[test]

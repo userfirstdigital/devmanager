@@ -105,6 +105,9 @@ function makeSession(
     Pick<
       NativeHostSession,
       | "sendText"
+      | "answerQuestion"
+      | "readConfigSnapshot"
+      | "createTaskAndSend"
       | "mutateTask"
       | "settleTask"
       | "reopenTask"
@@ -124,7 +127,16 @@ function makeSession(
     unwatchTask: vi.fn(async () => undefined),
     setDraft: vi.fn(async () => undefined),
     sendText: vi.fn(async () => ({ ok: true as const, commandId: "cmd-1" })),
+    answerQuestion: vi.fn(async () => ({ ok: true as const, commandId: "cmd-answer" })),
+    readConfigSnapshot: vi.fn(async () => ({
+      revision: 1,
+      projects: [{ configId: "devmanager", label: "DevManager", rootConfigured: true,
+        workspaceId: TASK_ID, folders: [] }],
+      providers: [{ provider: "codex" as const, commandConfigured: false }],
+    })),
+    createTaskAndSend: vi.fn(async () => ({ ok: true as const, taskId: SECOND_TASK_ID, commandId: "cmd-create" })),
     sendTerminalKey: vi.fn(async () => ({ ok: true as const, commandId: "cmd-key" })),
+    sendTerminalText: vi.fn(async () => ({ ok: true as const, commandId: "cmd-terminal-text" })),
     readTerminal: vi.fn(async (taskId: string) => ({ taskId, sequence: 1, title: null, textLines: ["Codex ready"] })),
     mutateTask,
     settleTask: overrides.settleTask ?? vi.fn(async (taskId: string) => mutateTask(taskId, { kind: "settle" })),
@@ -172,6 +184,70 @@ describe("NativeRemoteApp", () => {
     expect(session.view().tasks.get(TASK_ID)?.lifecycle).toBe("settled");
   });
 
+  it("answers the latest open question through the owner session", async () => {
+    const waiting = { ...task(TASK_ID, "Needs input"), attention: "needs_answer" };
+    const base = makeView();
+    const questionFact = {
+      id: "fact-question",
+      sequence: 3,
+      occurredAtMs: 3,
+      provider: "codex",
+      schemaVersion: 1,
+      kind: "question",
+      visibility: "conversation",
+      privacyClass: "local_only" as const,
+      redacted: false,
+      payload: { kind: "question" as const, question_id: "question-1", prompt: "Which API?", options: ["REST", "GraphQL"] },
+    };
+    const session = makeSession(makeView({
+      tasks: new Map([[TASK_ID, waiting]]),
+      conversations: new Map([[TASK_ID, {
+        ...base.conversations.get(TASK_ID)!,
+        throughSequence: 3,
+        highWater: 3,
+        facts: [...base.conversations.get(TASK_ID)!.facts, questionFact],
+      }]]),
+    }));
+    render(<NativeRemoteApp hostPublicId={HOST_ID} session={session} />);
+    fireEvent.click(screen.getByRole("button", { name: /needs input/i }));
+    fireEvent.click(screen.getByRole("button", { name: "REST" }));
+    await waitFor(() => expect(session.answerQuestion).toHaveBeenCalledWith(TASK_ID, "REST"));
+  });
+
+  it("keeps a new task ephemeral until the first message is sent", async () => {
+    const session = makeSession();
+    render(<NativeRemoteApp hostPublicId={HOST_ID} session={session} />);
+    fireEvent.click(screen.getByRole("button", { name: "New task" }));
+    const project = await screen.findByRole("button", { name: "DevManager" });
+    expect(session.createTaskAndSend).not.toHaveBeenCalled();
+    fireEvent.click(project);
+    expect(screen.getByRole("region", { name: "Unsaved new task" })).not.toBeNull();
+    expect(session.createTaskAndSend).not.toHaveBeenCalled();
+    fireEvent.change(screen.getByRole("combobox", { name: "Model" }), {
+      target: { value: "codex_terra" },
+    });
+    fireEvent.change(screen.getByRole("combobox", { name: "Thinking" }), {
+      target: { value: "high" },
+    });
+    fireEvent.change(screen.getByRole("combobox", { name: "Access" }), {
+      target: { value: "workspace_write" },
+    });
+    fireEvent.change(screen.getByRole("textbox", { name: "Message" }), {
+      target: { value: "Build the remote feature" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Send" }));
+    await waitFor(() => expect(session.createTaskAndSend).toHaveBeenCalledWith({
+      projectId: TASK_ID,
+      provider: "codex",
+      launchOptions: {
+        model: "codex_terra",
+        reasoningEffort: "high",
+        access: "workspace_write",
+      },
+      text: "Build the remote feature",
+    }));
+  });
+
   it("opens the owner terminal on demand without replacing the chat draft", async () => {
     const session = makeSession();
     render(<NativeRemoteApp hostPublicId={HOST_ID} session={session} />);
@@ -187,6 +263,25 @@ describe("NativeRemoteApp", () => {
     fireEvent.click(screen.getByRole("button", { name: "Show conversation" }));
     expect((screen.getByRole("textbox", { name: "Message" }) as HTMLTextAreaElement).value).toBe("unsent");
     expect(session.sendText).not.toHaveBeenCalled();
+  });
+
+  it("sends typed terminal text with Enter through the owner session", async () => {
+    const session = makeSession();
+    render(<NativeRemoteApp hostPublicId={HOST_ID} session={session} />);
+    fireEvent.click(screen.getByRole("button", { name: /investigate mobile sync/i }));
+    fireEvent.click(screen.getByRole("button", { name: "Show terminal" }));
+    expect(await screen.findByText("Codex ready")).not.toBeNull();
+
+    fireEvent.change(screen.getByRole("textbox", { name: "Terminal input" }), {
+      target: { value: "help" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Send terminal input" }));
+
+    await waitFor(() =>
+      expect(session.sendTerminalText).toHaveBeenCalledWith(TASK_ID, "help"),
+    );
+    expect((screen.getByRole("textbox", { name: "Terminal input" }) as HTMLInputElement).value)
+      .toBe("");
   });
 
   it("does not show a contradictory waiting message when the terminal is unavailable", async () => {
@@ -235,6 +330,7 @@ describe("NativeRemoteApp", () => {
     render(<NativeRemoteApp hostPublicId={HOST_ID} session={session} />);
     expect(screen.getByText("Connect protocol rejected")).not.toBeNull();
     expect(screen.getByRole("button", { name: /investigate mobile sync/i })).not.toBeNull();
+    expect((screen.getByRole("button", { name: "New task" }) as HTMLButtonElement).disabled).toBe(true);
   });
 
   it("keeps the offline draft editable while disabling send", () => {

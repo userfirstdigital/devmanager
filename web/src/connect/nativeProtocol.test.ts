@@ -16,6 +16,7 @@ import {
   buildCommandReceiptStatusQuery,
   buildContinueEventReplayQuery,
   buildBeginCloseTaskCommand,
+  buildCreateTaskV2Command,
   buildDeleteTaskCommand,
   buildGlobalOpenEventReplayQuery,
   buildOpenConversationSubscriptionQuery,
@@ -27,10 +28,13 @@ import {
   buildReopenTaskCommand,
   buildResumeTasksSnapshotPageQuery,
   buildSettleTaskCommand,
+  buildStartProviderSessionCommand,
   buildSubmitProviderInputSendNow,
   buildSubmitProviderTerminalKey,
   buildTaskCockpitConversationQuery,
+  buildTaskCockpitConfigSnapshotQuery,
   buildTaskCockpitTerminalQuery,
+  buildSubmitProviderAnswerQuestion,
   buildTaskSnapshotQuery,
   connectBinaryMarker,
   copyResumeCursorBytes,
@@ -43,10 +47,12 @@ import {
   decodeQueryReply,
   decodeSemanticJournalPage,
   decodeTaskCockpitTerminalResult,
+  decodeTaskCockpitConfigSnapshotResult,
   decodeTaskSnapshotItem,
   decodeTaskSnapshotQueryResult,
   firstTurnIdFromCommandId,
   isMetadataTaskCommand,
+  isTaskCreateV2Command,
   isProviderSendNowCommand,
   requiredCapabilitiesForCommand,
   requiredCapabilitiesForQuery,
@@ -58,6 +64,7 @@ const CLIENT = "018f0000-0000-7000-8000-0000000000b2";
 const REQUEST = "018f0000-0000-7000-8000-0000000000c3";
 const TASK = "018f0000-0000-7000-8000-0000000000d4";
 const AGENT = "018f0000-0000-7000-8000-0000000000e5";
+const RESOURCE = "018f0000-0000-7000-8000-0000000000e6";
 const COMMAND = "018f0000-0000-7000-8000-0000000000f6";
 const FOREIGN_HOST = "018f0000-0000-7000-8000-00000000aaaa";
 const FOREIGN_TASK = "018f0000-0000-7000-8000-00000000dead";
@@ -146,6 +153,7 @@ function providerInputState(overrides: Record<string, unknown> = {}) {
     task_revision: 7,
     action_epoch: 3,
     agent_session_id: AGENT,
+    resource_id: RESOURCE,
     runtime_generation: 4,
     agent_lifecycle: "open",
     provider_kind: "codex",
@@ -205,6 +213,12 @@ describe("nativeProtocol query builders", () => {
     expect(
       buildTaskCockpitTerminalQuery({ ...authority, taskId: TASK }).payload,
     ).toMatchObject({ query: { task_cockpit: "terminal" } });
+    expect(buildTaskCockpitConfigSnapshotQuery(authority).payload).toEqual({
+      request_id: REQUEST,
+      client_id: CLIENT,
+      task_id: null,
+      query: { task_cockpit: "config_snapshot" },
+    });
     expect(
       buildProviderInputStateQuery({ ...authority, taskId: TASK }).payload,
     ).toMatchObject({ query: { task_cockpit: "provider_input_state" } });
@@ -396,6 +410,118 @@ describe("nativeProtocol query builders", () => {
   });
 });
 
+describe("deferred browser task creation", () => {
+  it("builds one host-resolved main-workspace task only on first send", () => {
+    const environment = "018f0000-0000-7000-8000-000000000401";
+    const project = "018f0000-0000-7000-8000-000000000402";
+    const request = buildCreateTaskV2Command({
+      authority,
+      commandId: COMMAND,
+      taskId: TASK,
+      environmentId: environment,
+      projectId: project,
+      provider: "claude",
+      title: "New Claude task",
+      issuedAtMs: 10,
+    });
+    expect(request.payload).toMatchObject({
+      task_id: null,
+      expected_task_revision: null,
+      command: { create_task_v2: {
+        id: TASK,
+        environment_id: environment,
+        project_id: project,
+        workspace: { choice: "main", path: null, branch: null, external_confirmed: false },
+        primary_provider: "claude",
+        defer_primary_provider_start: false,
+      } },
+    });
+    expect(isTaskCreateV2Command(request.payload)).toBe(true);
+    expect(requiredCapabilitiesForCommand((request.payload as { command: unknown }).command)).toBe(0n);
+    expect(() => buildCreateTaskV2Command({
+      authority,
+      commandId: COMMAND,
+      taskId: TASK,
+      environmentId: environment,
+      projectId: project,
+      provider: "claude_code" as never,
+      title: "Invalid provider",
+      issuedAtMs: 10,
+    })).toThrow(/provider rejected/);
+  });
+});
+
+describe("provider launch option authority", () => {
+  const base = {
+    authority,
+    commandId: COMMAND,
+    taskId: TASK,
+    agentSessionId: AGENT,
+    resourceId: RESOURCE,
+    expectedTaskRevision: 7,
+    actionEpoch: 3,
+    issuedAtMs: 10,
+  };
+
+  it("encodes provider-owned values while rejecting cross-provider models and efforts", () => {
+    expect(buildStartProviderSessionCommand({
+      ...base,
+      provider: "codex",
+      launchOptions: { model: "codex_terra", reasoningEffort: "low", access: "full_access" },
+    }).payload).toMatchObject({ command: { start_provider_session: {
+      provider_kind: "codex",
+      launch_options: {
+        model: "codex_terra",
+        reasoning_effort: "low",
+        access: "full_access",
+      },
+    } } });
+    expect(() => buildStartProviderSessionCommand({
+      ...base,
+      provider: "codex",
+      launchOptions: { model: "claude_opus", reasoningEffort: "low", access: "full_access" },
+    })).toThrow(/model rejected/);
+    expect(() => buildStartProviderSessionCommand({
+      ...base,
+      provider: "claude",
+      launchOptions: { model: "claude_sonnet", reasoningEffort: "ultra", access: "full_access" },
+    })).toThrow(/reasoning effort rejected/);
+
+    const persisted = buildStartProviderSessionCommand({
+      ...base,
+      provider: "codex",
+      launchOptions: { model: "codex_terra", reasoningEffort: "low", access: "full_access" },
+    });
+    expect(() => buildCommandReceiptStatusQuery({
+      ...authority,
+      taskId: TASK,
+      commandPayload: persisted.payload,
+    })).not.toThrow();
+  });
+});
+
+describe("native config snapshot", () => {
+  it("decodes only bounded redacted project and provider metadata", () => {
+    const reply = decodeQueryReply({ request_id: REQUEST, outcome: { ok: {
+      task_cockpit: { config: {
+        revision: 9,
+        projects: [{ config_id: "devmanager", label: "DevManager", root_configured: true,
+          workspace_id: TASK, folders: [{ config_id: "api", label: "API", server_count: 2 }] }],
+        servers: [], ssh_connections: [],
+        providers: [{ provider: "codex", command_configured: true },
+          { provider: "claude", command_configured: false }],
+      } },
+    } } }, REQUEST);
+    expect(decodeTaskCockpitConfigSnapshotResult(reply)).toEqual({
+      revision: 9,
+      projects: [{ configId: "devmanager", label: "DevManager", rootConfigured: true,
+        workspaceId: TASK, folders: [{ configId: "api", label: "API", serverCount: 2 }] }],
+      providers: [{ provider: "codex", commandConfigured: true },
+        { provider: "claude", commandConfigured: false }],
+    });
+  });
+});
+
 describe("thin TaskSnapshot has no send authority", () => {
   it("decodes thin list metadata and rejects agents/provider_sessions", () => {
     const item = decodeTaskSnapshotItem({ snapshot: thinTaskSnapshot() }, {
@@ -437,6 +563,7 @@ describe("ProviderInputState fence and SendNow", () => {
     const noAgent = decodeProviderInputState(
       providerInputState({
         agent_session_id: null,
+        resource_id: null,
         runtime_generation: null,
         agent_lifecycle: null,
         provider_kind: null,
@@ -455,6 +582,7 @@ describe("ProviderInputState fence and SendNow", () => {
       decodeProviderInputState(
         providerInputState({
           agent_session_id: null,
+          resource_id: null,
           runtime_generation: null,
           agent_lifecycle: null,
           provider_kind: null,
@@ -480,6 +608,34 @@ describe("ProviderInputState fence and SendNow", () => {
         TASK,
       ),
     ).toThrow(/duplicate pending wait/);
+  });
+
+  it("builds an exact correlated question answer without weakening SendNow blockers", () => {
+    const request = buildSubmitProviderAnswerQuestion({
+      authority,
+      commandId: COMMAND,
+      issuedAtMs: 10,
+      text: "Use the first option",
+      fence: openFence({ currentTurn: CURRENT_TURN, openQuestion: QUESTION }),
+    });
+    expect(request.payload).toMatchObject({ task_id: TASK, command: {
+      submit_provider_input: {
+        turn_id: CURRENT_TURN,
+        question_id: QUESTION,
+        approval_id: null,
+        action: { answer_question: {
+          question_id: QUESTION,
+          answer: "Use the first option",
+        } },
+      },
+    } });
+    expect(() => buildSubmitProviderAnswerQuestion({
+      authority,
+      commandId: COMMAND,
+      issuedAtMs: 10,
+      text: "answer",
+      fence: openFence({ currentTurn: CURRENT_TURN }),
+    })).toThrow(/open question/);
   });
 
   it("rejects foreign task, missing fields, and missing blockers array", () => {

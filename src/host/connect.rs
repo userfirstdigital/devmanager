@@ -182,12 +182,10 @@ pub(crate) fn enforce_connect_duplex_preconditions(
         eprintln!("devmanager-host: Connect duplex rejected missing negotiated capabilities");
         return Err(IpcError::Unauthorized);
     };
-    channel
-        .bind_session(binding)
-        .map_err(|_| {
-            eprintln!("devmanager-host: Connect duplex rejected Hello session binding");
-            IpcError::Unauthorized
-        })?;
+    channel.bind_session(binding).map_err(|_| {
+        eprintln!("devmanager-host: Connect duplex rejected Hello session binding");
+        IpcError::Unauthorized
+    })?;
     Ok((binding, limits, capabilities))
 }
 
@@ -289,10 +287,11 @@ pub(crate) fn open_connect_envelope(
         eprintln!("devmanager-host: Connect duplex rejected sealed frame");
         IpcError::Unauthorized
     })?;
-    let envelope = ConnectEnvelope::decode_with_limits(&plaintext, negotiated_limits).map_err(|_| {
-        eprintln!("devmanager-host: Connect duplex rejected decoded envelope limits");
-        IpcError::Unauthorized
-    })?;
+    let envelope =
+        ConnectEnvelope::decode_with_limits(&plaintext, negotiated_limits).map_err(|_| {
+            eprintln!("devmanager-host: Connect duplex rejected decoded envelope limits");
+            IpcError::Unauthorized
+        })?;
     if envelope.sequence != frame.sequence() {
         eprintln!("devmanager-host: Connect duplex rejected envelope sequence");
         return Err(IpcError::Unauthorized);
@@ -337,12 +336,29 @@ where
         match message {
             WsMessage::Ping(_) | WsMessage::Pong(_) => continue,
             WsMessage::Close(_) => return Ok(()),
-            WsMessage::Text(_) => return Err(IpcError::Unauthorized),
+            WsMessage::Text(_) => {
+                eprintln!("devmanager-host: Connect duplex rejected text frame");
+                return Err(IpcError::Unauthorized);
+            }
             WsMessage::Binary(bytes) => {
                 if bytes.is_empty() || bytes.len() > max_bytes {
+                    eprintln!(
+                        "devmanager-host: Connect duplex rejected physical frame length {} (max {})",
+                        bytes.len(),
+                        max_bytes
+                    );
                     return Err(IpcError::Unauthorized);
                 }
-                let frame = SealedFrame::decode(&bytes).map_err(|_| IpcError::Unauthorized)?;
+                let frame = SealedFrame::decode(&bytes).map_err(|_| {
+                    eprintln!("devmanager-host: Connect duplex rejected sealed frame encoding");
+                    IpcError::Unauthorized
+                })?;
+                if std::env::var_os("DEVMANAGER_CONNECT_TRACE").is_some() {
+                    eprintln!(
+                        "devmanager-host: Connect trace duplex frame sequence={}",
+                        frame.sequence()
+                    );
+                }
                 let envelope = open_connect_envelope(
                     &channel,
                     &frame,
@@ -352,12 +368,60 @@ where
                 )?;
                 let payload = envelope
                     .decode_payload()
-                    .map_err(|_| IpcError::Unauthorized)?;
+                    .map_err(|error| {
+                        eprintln!(
+                            "devmanager-host: Connect duplex rejected typed payload kind={:?} sequence={}: {error:?}",
+                            envelope.payload_kind,
+                            envelope.sequence
+                        );
+                        if std::env::var_os("DEVMANAGER_CONNECT_TRACE").is_some()
+                            && envelope.payload_kind == crate::connect::PayloadKind::QUERY
+                        {
+                            if let Err(detail) = rmp_serde::from_slice::<
+                                crate::domain::query::QueryEnvelope,
+                            >(&envelope.payload)
+                            {
+                                eprintln!(
+                                    "devmanager-host: Connect trace query schema detail: {detail}"
+                                );
+                            }
+                        }
+                        IpcError::Unauthorized
+                    })?;
                 let request_id = envelope.request_id;
                 let operation_id = envelope.operation_id;
+                let trace_request = if std::env::var_os("DEVMANAGER_CONNECT_TRACE").is_some() {
+                    match &payload {
+                        ConnectPayload::Query(_) => Some("query".to_string()),
+                        ConnectPayload::Command(_) => Some("command".to_string()),
+                        _ => Some(format!("payload kind {}", envelope.payload_kind.get())),
+                    }
+                } else {
+                    None
+                };
+                let trace_started = std::time::Instant::now();
+                if let Some(label) = trace_request.as_deref() {
+                    eprintln!(
+                        "devmanager-host: Connect trace dispatch start sequence={} {label}",
+                        envelope.sequence
+                    );
+                }
                 let (reply, disposition) = dispatch
                     .handle_payload(&envelope, payload, Some(&bound_port as _))
                     .await;
+                if let Some(label) = trace_request.as_deref() {
+                    let outcome = match &reply {
+                        ConnectPayload::CommandReceipt(receipt) => {
+                            format!(" receipt={receipt:?}")
+                        }
+                        _ => String::new(),
+                    };
+                    eprintln!(
+                        "devmanager-host: Connect trace dispatch complete sequence={} elapsed_ms={} {label}{outcome}",
+                        envelope.sequence,
+                        trace_started.elapsed().as_millis()
+                    );
+                }
                 let (close_after_flush, wait_for_flush) =
                     if matches!(disposition, ConnectSessionDisposition::Disconnect) {
                         let (tx, rx) = tokio::sync::oneshot::channel();

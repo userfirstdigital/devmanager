@@ -38,6 +38,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 const HOOK_TRUST_FLAG: &str = "--dangerously-bypass-hook-trust";
 const DANGEROUS_NO_APPROVAL_FLAG: &str = "--dangerously-bypass-approvals-and-sandbox";
+const DISABLE_STARTUP_UPDATE_CHECK: &str = "check_for_update_on_startup=false";
 const RESUME_COMMAND: &str = "resume";
 const LOGIN_METHOD_LINE: &str = "Logged in using ChatGPT";
 const LOGIN_PLAN_LINE: &str = "ChatGPT Plus subscription";
@@ -1095,6 +1096,11 @@ fn stock_arguments(
     for arg in &options.extra_launch_args {
         arguments.push(argument(arg)?);
     }
+    // Managed provider sessions cannot stop at an unrelated CLI update prompt:
+    // that strands the durable first message behind an invisible PTY gate.
+    // Append this after caller extras so the managed no-prompt contract wins.
+    arguments.push(argument("--config")?);
+    arguments.push(argument(DISABLE_STARTUP_UPDATE_CHECK)?);
     if let Some(session_id) = session_id {
         arguments.push(argument(RESUME_COMMAND)?);
         arguments.push(argument(session_id.as_str())?);
@@ -1644,6 +1650,8 @@ mod authority_seal_tests {
                 "gpt-5.6-terra",
                 "--config",
                 "model_reasoning_effort=\"xhigh\"",
+                "--config",
+                "check_for_update_on_startup=false",
             ]
         );
     }

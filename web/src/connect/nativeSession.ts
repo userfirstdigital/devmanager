@@ -41,6 +41,7 @@ import {
   assertCapabilities,
   buildBeginCloseTaskCommand,
   buildContinueEventReplayQuery,
+  buildCreateTaskV2Command,
   buildCommandReceiptStatusQuery,
   buildDeleteTaskCommand,
   buildGlobalOpenEventReplayQuery,
@@ -54,10 +55,14 @@ import {
   buildReopenTaskCommand,
   buildResumeTasksSnapshotPageQuery,
   buildSettleTaskCommand,
+  buildStartProviderSessionCommand,
+  buildSubmitProviderAnswerQuestion,
   buildSubmitProviderInputSendNow,
   buildSubmitProviderTerminalKey,
   isProviderSendNowCommand,
+  isTaskCreateV2Command,
   buildTaskCockpitConversationQuery,
+  buildTaskCockpitConfigSnapshotQuery,
   buildTaskCockpitTerminalQuery,
   buildTaskSnapshotQuery,
   connectBinaryMarker,
@@ -71,12 +76,16 @@ import {
   decodeQueryReply,
   decodeSnapshotPageQueryResult,
   decodeTaskCockpitConversationResult,
+  decodeTaskCockpitConfigSnapshotResult,
   decodeTaskCockpitTerminalResult,
   decodeTaskSnapshotItem,
   decodeTaskSnapshotQueryResult,
   firstTurnIdFromCommandId,
   requiredCapabilitiesForQuery,
   type NativeAuthority,
+  type NativeConfigSnapshotView,
+  type NativeProviderKind,
+  type NativeProviderLaunchOptions,
   type NativeTerminalSnapshot,
   type NativeTerminalKey,
   type NativeUuid,
@@ -154,6 +163,13 @@ export type NativeTaskMutation =
   | { kind: "begin_close" }
   | { kind: "delete" }
   | { kind: "rename"; title: string };
+
+export interface NativeNewTaskRequest {
+  projectId: NativeUuid;
+  provider: NativeProviderKind;
+  launchOptions?: NativeProviderLaunchOptions;
+  text: string;
+}
 
 export interface NativeHostSessionView {
   hostPublicId: NativeUuid;
@@ -464,6 +480,22 @@ export class NativeHostSession {
     return decodeTaskCockpitTerminalResult(decodeQueryReply(response.payload, requestId), id);
   }
 
+  async readConfigSnapshot(): Promise<NativeConfigSnapshotView> {
+    const lease = this.lease;
+    if (!lease || this.connectionStatus !== "ready") {
+      throw new NativeProtocolError("Host configuration is unavailable");
+    }
+    assertCapabilities(this.capabilities, CAPABILITY_TASK_COCKPIT);
+    const requestId = this.createRequestId();
+    const response = await this.query(buildTaskCockpitConfigSnapshotQuery({
+      ...this.authorityFor(lease, requestId),
+    }));
+    if (!this.leaseMatches(lease) || this.connectionStatus !== "ready") {
+      throw new NativeProtocolError("Host configuration connection changed");
+    }
+    return decodeTaskCockpitConfigSnapshotResult(decodeQueryReply(response.payload, requestId));
+  }
+
   async sendText(
     taskId: NativeUuid,
     text: string,
@@ -471,10 +503,78 @@ export class NativeHostSession {
     return this.submitProviderInput(taskId, text);
   }
 
+  async answerQuestion(
+    taskId: NativeUuid,
+    answer: string,
+  ): Promise<{ ok: true; commandId: NativeUuid } | { ok: false; reason: NativeSendFailure }> {
+    return this.submitProviderInput(taskId, answer, undefined, true);
+  }
+
+  async createTaskAndSend(
+    input: NativeNewTaskRequest,
+  ): Promise<
+    | { ok: true; taskId: NativeUuid; commandId: NativeUuid }
+    | { ok: false; reason: NativeSendFailure; taskId: NativeUuid | null }
+  > {
+    const lease = this.lease;
+    if (!lease || this.connectionStatus !== "ready") {
+      return { ok: false, reason: "not_ready", taskId: null };
+    }
+    const projectId = protocolUuid(input.projectId);
+    const text = input.text.trim();
+    if (!projectId || !text || (input.provider !== "claude" && input.provider !== "codex")) {
+      return { ok: false, reason: "not_ready", taskId: null };
+    }
+    const taskId = protocolUuid(this.createRequestId());
+    const environmentId = protocolUuid(this.createRequestId());
+    if (!taskId || !environmentId) return { ok: false, reason: "not_ready", taskId: null };
+    const create = await this.createTaskShell(taskId, environmentId, projectId, input.provider);
+    // A locally allocated identifier is not a task until the host returns an
+    // accepted durable receipt. Exposing it on a cache/transport/rejection
+    // failure makes the UI navigate to a phantom conversation that can never
+    // appear in the canonical task snapshot.
+    if (!create.ok) return { ...create, taskId: null };
+
+    const started = await this.startTaskProvider(
+      taskId,
+      input.provider,
+      input.launchOptions ?? defaultLaunchOptions(input.provider),
+    );
+    if (!started.ok) return { ...started, taskId };
+
+    // The create receipt is durable before the provider side effect finishes.
+    // Wait for one exact ProviderInputState fence, then perform one SendNow.
+    for (let attempt = 0; attempt < 80; attempt += 1) {
+      if (!this.leaseMatches(lease) || this.connectionStatus !== "ready") {
+        return { ok: false, reason: "not_ready", taskId };
+      }
+      const ready = await this.providerInputReady(taskId);
+      if (ready) {
+        const sent = await this.sendText(taskId, text);
+        return sent.ok
+          ? { ok: true, taskId, commandId: sent.commandId }
+          : { ...sent, taskId };
+      }
+      await new Promise((resolve) => setTimeout(resolve, 250));
+    }
+    await this.refreshTaskSnapshot(taskId);
+    return { ok: false, reason: "no_agent", taskId };
+  }
+
   async sendTerminalKey(taskId: NativeUuid, key: NativeTerminalKey): Promise<
     { ok: true; commandId: NativeUuid } | { ok: false; reason: NativeSendFailure }
   > {
     return this.submitProviderInput(taskId, "", key);
+  }
+
+  async sendTerminalText(taskId: NativeUuid, text: string): Promise<
+    { ok: true; commandId: NativeUuid } | { ok: false; reason: NativeSendFailure }
+  > {
+    if (text.length === 0) return { ok: false, reason: "not_ready" };
+    // Text entered at the provider prompt is a durable conversation input,
+    // not an opaque PTY secret. The provider compositor performs paste+Enter;
+    // fixed navigation/interrupt keys retain the raw terminal-input path.
+    return this.submitProviderInput(taskId, text);
   }
 
   /**
@@ -625,6 +725,148 @@ export class NativeHostSession {
     return result;
   }
 
+  private async createTaskShell(
+    taskId: NativeUuid,
+    environmentId: NativeUuid,
+    projectId: NativeUuid,
+    provider: NativeProviderKind,
+  ): Promise<{ ok: true; commandId: NativeUuid } | { ok: false; reason: NativeSendFailure }> {
+    const lease = this.lease;
+    if (!lease || this.connectionStatus !== "ready") return { ok: false, reason: "not_ready" };
+    const commandId = this.createCommandId();
+    const issuedAtMs = this.now();
+    const request = buildCreateTaskV2Command({
+      authority: this.authorityFor(lease, this.createRequestId()),
+      commandId,
+      taskId,
+      environmentId,
+      projectId,
+      provider,
+      title: provider === "claude" ? "New Claude task" : "New Codex task",
+      issuedAtMs,
+      deferPrimaryProviderStart: true,
+    });
+    const outbox: NativeOutboxRecord = {
+      hostPublicId: this.hostPublicId,
+      clientId: lease.clientId,
+      commandId,
+      taskId,
+      commandPayload: request.payload,
+      text: "",
+      issuedAtMs,
+      status: "pending",
+      updatedAtMs: this.now(),
+    };
+    try {
+      await this.cache.putOutbox(outbox);
+    } catch {
+      return { ok: false, reason: "storage_failure" };
+    }
+    this.outbox.set(commandId, outbox);
+    this.emit();
+    const result = await this.dispatchOutbox(outbox, request, lease);
+    if (result.ok) await this.refreshTaskSnapshot(taskId);
+    return result;
+  }
+
+  private async startTaskProvider(
+    taskId: NativeUuid,
+    provider: NativeProviderKind,
+    launchOptions: NativeProviderLaunchOptions,
+  ): Promise<{ ok: true; commandId: NativeUuid } | { ok: false; reason: NativeSendFailure }> {
+    const lease = this.lease;
+    if (!lease || this.connectionStatus !== "ready") return { ok: false, reason: "not_ready" };
+    const stateRequestId = this.createRequestId();
+    let state;
+    try {
+      const response = await this.query(buildProviderInputStateQuery({
+        ...this.authorityFor(lease, stateRequestId), taskId,
+      }));
+      state = decodeProviderInputStateQueryResult(
+        decodeQueryReply(response.payload, stateRequestId),
+        this.authorityFor(lease, stateRequestId),
+        taskId,
+      );
+    } catch {
+      return { ok: false, reason: "no_agent" };
+    }
+    if (!this.leaseMatches(lease) || !state.agentSessionId || !state.resourceId ||
+        state.runtimeGeneration === null || state.agentLifecycle !== "open") {
+      return { ok: false, reason: "no_agent" };
+    }
+    const commandId = this.createCommandId();
+    const issuedAtMs = this.now();
+    const request = buildStartProviderSessionCommand({
+      authority: this.authorityFor(lease, this.createRequestId()),
+      commandId,
+      taskId,
+      issuedAtMs,
+      expectedTaskRevision: state.taskRevision,
+      actionEpoch: state.actionEpoch,
+      agentSessionId: state.agentSessionId,
+      resourceId: state.resourceId,
+      provider,
+      launchOptions,
+    });
+    const outbox: NativeOutboxRecord = {
+      hostPublicId: this.hostPublicId,
+      clientId: lease.clientId,
+      commandId,
+      taskId,
+      commandPayload: request.payload,
+      text: "",
+      issuedAtMs,
+      status: "pending",
+      updatedAtMs: this.now(),
+    };
+    try {
+      await this.cache.putOutbox(outbox);
+    } catch {
+      return { ok: false, reason: "storage_failure" };
+    }
+    this.outbox.set(commandId, outbox);
+    this.emit();
+    return this.dispatchOutbox(outbox, request, lease);
+  }
+
+  private async providerInputReady(taskId: NativeUuid): Promise<boolean> {
+    const lease = this.lease;
+    if (!lease || this.connectionStatus !== "ready") return false;
+    const requestId = this.createRequestId();
+    try {
+      const reply = await this.query(buildProviderInputStateQuery({
+        ...this.authorityFor(lease, requestId), taskId,
+      }));
+      if (!this.leaseMatches(lease)) return false;
+      const state = decodeProviderInputStateQueryResult(
+        decodeQueryReply(reply.payload, requestId),
+        this.authorityFor(lease, requestId),
+        taskId,
+      );
+      if (!state.fence || state.fence.openQuestion || state.fence.openApproval) {
+        return false;
+      }
+      // Claude's command journal requires the official SessionStart identity.
+      // Codex permits an identityless first turn, but a projected agent fence
+      // can exist before its provider-owned PTY/write authority is attached.
+      // Require a live terminal snapshot in that narrow identityless window so
+      // an accepted SendNow cannot strand in the durable outbox while startup
+      // races the provider runtime.
+      if (state.fence.providerKind === "claude") {
+        return state.fence.providerSessionId !== null;
+      }
+      if (state.fence.providerSessionId !== null) return true;
+      try {
+        await this.readTerminal(taskId);
+        return this.leaseMatches(lease) && this.connectionStatus === "ready";
+      } catch {
+        return false;
+      }
+    } catch {
+      return false;
+    }
+  }
+
   private async readTaskSnapshot(
     taskId: NativeUuid,
     lease: SessionLease,
@@ -646,17 +888,34 @@ export class NativeHostSession {
     return { revision: item.revision, lifecycle: item.lifecycle };
   }
 
-  private async submitProviderInput(taskId: NativeUuid, text: string, terminalKey?: NativeTerminalKey): Promise<
+  private async submitProviderInput(
+    taskId: NativeUuid,
+    text: string,
+    terminalKey?: NativeTerminalKey,
+    answerQuestion = false,
+  ): Promise<
     { ok: true; commandId: NativeUuid } | { ok: false; reason: NativeSendFailure }
   > {
     const id = this.requireTaskId(taskId);
     if (this.taskCommandGates.has(id)) return { ok: false, reason: "reconciliation_required" };
     this.taskCommandGates.add(id);
-    try { return await this.submitProviderInputOnce(id, text, terminalKey); }
+    try {
+      return await this.submitProviderInputOnce(
+        id,
+        text,
+        terminalKey,
+        answerQuestion,
+      );
+    }
     finally { this.taskCommandGates.delete(id); }
   }
 
-  private async submitProviderInputOnce(taskId: NativeUuid, text: string, terminalKey?: NativeTerminalKey): Promise<
+  private async submitProviderInputOnce(
+    taskId: NativeUuid,
+    text: string,
+    terminalKey?: NativeTerminalKey,
+    answerQuestion = false,
+  ): Promise<
     { ok: true; commandId: NativeUuid } | { ok: false; reason: NativeSendFailure }
   > {
     const lease = this.lease;
@@ -695,11 +954,10 @@ export class NativeHostSession {
       return { ok: false, reason: "not_ready" };
     }
     if (!state.fence) return { ok: false, reason: "no_agent" };
-    if (
-      state.fence.openQuestion ||
-      state.fence.openApproval ||
+    if (answerQuestion ? !state.fence.openQuestion : (
+      state.fence.openQuestion || state.fence.openApproval ||
       state.fence.pendingWaitCommandIds.length > 0
-    ) {
+    )) {
       return { ok: false, reason: "blockers" };
     }
 
@@ -719,9 +977,11 @@ export class NativeHostSession {
         issuedAtMs,
         fence: state.fence,
       };
-      request = terminalKey === undefined
-        ? buildSubmitProviderInputSendNow(input)
-        : buildSubmitProviderTerminalKey({ ...input, key: terminalKey });
+      request = answerQuestion
+        ? buildSubmitProviderAnswerQuestion(input)
+        : terminalKey === undefined
+          ? buildSubmitProviderInputSendNow(input)
+          : buildSubmitProviderTerminalKey({ ...input, key: terminalKey });
     } catch (error) {
       if (error instanceof NativeProtocolError) {
         if (/blocker/.test(error.message)) return { ok: false, reason: "blockers" };
@@ -809,7 +1069,8 @@ export class NativeHostSession {
     try {
       const requestId = this.createRequestId();
       const reply = await this.query(buildCommandReceiptStatusQuery({
-        ...this.authorityFor(lease, requestId), taskId: record.taskId,
+        ...this.authorityFor(lease, requestId),
+        taskId: isTaskCreateV2Command(record.commandPayload) ? null : record.taskId,
         commandPayload: record.commandPayload,
       }));
       if (!this.leaseMatches(lease)) return { ok: false, reason: "not_ready" };
@@ -961,7 +1222,7 @@ export class NativeHostSession {
       const requestId = this.createRequestId();
       const reply = await this.query(buildCommandReceiptStatusQuery({
         ...this.authorityFor(lease, requestId),
-        taskId: record.taskId,
+        taskId: isTaskCreateV2Command(record.commandPayload) ? null : record.taskId,
         commandPayload: record.commandPayload,
       }));
       if (!this.leaseMatches(lease) || this.connectionStatus !== "ready") return null;
@@ -1910,6 +2171,14 @@ function recordOf(value: unknown): Record<string, unknown> | null {
   return value !== null && typeof value === "object" && !Array.isArray(value)
     ? (value as Record<string, unknown>)
     : null;
+}
+
+function defaultLaunchOptions(provider: NativeProviderKind): NativeProviderLaunchOptions {
+  return {
+    model: provider === "codex" ? "codex_sol" : "claude_sonnet",
+    reasoningEffort: "provider_default",
+    access: "full_access",
+  };
 }
 
 export function peekFirstTurnId(commandId: NativeUuid): NativeUuid {

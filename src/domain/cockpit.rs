@@ -830,6 +830,7 @@ pub struct ProviderInputStateProjection {
     pub task_revision: u64,
     pub action_epoch: u64,
     pub agent_session_id: Option<AgentSessionId>,
+    pub resource_id: Option<ResourceId>,
     pub runtime_generation: Option<u64>,
     pub agent_lifecycle: Option<crate::domain::agent::AgentSessionLifecycle>,
     pub provider_kind: Option<ProviderKind>,
@@ -847,11 +848,19 @@ impl ProviderInputStateProjection {
             .and_then(|id| snapshot.agents.get(&id))
             .filter(|agent| agent.task_id == snapshot.task.id);
         let input = agent.and_then(|agent| snapshot.provider_sessions.get(&agent.id));
+        let resource_id = agent.and_then(|agent| {
+            snapshot.resources.values().find_map(|resource| {
+                AgentResourceBinding::from_facts(agent, resource)
+                    .ok()
+                    .map(|binding| binding.resource_id)
+            })
+        });
         Self {
             task_id: snapshot.task.id,
             task_revision: snapshot.task.revision,
             action_epoch: snapshot.task.action_epoch,
             agent_session_id: agent.map(|a| a.id),
+            resource_id,
             runtime_generation: agent.map(|a| a.runtime_generation),
             agent_lifecycle: agent.map(|a| a.lifecycle),
             provider_kind: agent.map(|a| a.provider_kind.clone()),

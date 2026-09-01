@@ -3429,7 +3429,13 @@ impl ProcessManager {
                 lease.process_id().pid(),
                 true,
             )
-            .map_err(|_| ProviderLaunchError::StopFailed)?;
+            .map_err(|error| {
+                eprintln!(
+                    "devmanager-host: sealed provider teardown failed session={} error={error}",
+                    live.session_id
+                );
+                ProviderLaunchError::StopFailed
+            })?;
             self.cleanup_ai_adapters_for_session(&live.session_id);
             if let Ok(mut book) = self.inner.provider_runtime.lock() {
                 book.live.remove(&key);
@@ -7609,10 +7615,16 @@ fn reconcile_one_provider_terminal_exit(inner: &ProcessManagerInner, session_id:
         live.clone()
     };
 
+    // This callback runs on the terminal wait actor. Task close holds the
+    // provider-session manager while the exact teardown joins that actor, so
+    // a blocking lock here creates a lock/join cycle that lasts until the
+    // teardown deadline and makes Archive/Delete appear to need two clicks.
+    // A contended manager is normal during owned close; defer to the existing
+    // bounded retry lane instead of blocking the actor being joined.
     let settlement = inner
         .provider_sessions
-        .lock()
-        .map_err(|_| "provider session manager lock poisoned".to_string())
+        .try_lock()
+        .map_err(|_| "provider session manager is busy; exit settlement deferred".to_string())
         .and_then(|mut slot| {
             let manager = slot
                 .as_mut()
@@ -16536,6 +16548,24 @@ mod tests {
         notifier();
         assert_eq!(runtime_events.load(Ordering::SeqCst), 1);
         assert_eq!(manager.runtime_revision(), after_change);
+    }
+
+    #[test]
+    fn provider_exit_reconciliation_never_blocks_the_terminal_wait_actor() {
+        let source = include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/src/services/process_manager.rs"
+        ));
+        let start = source
+            .find("fn reconcile_one_provider_terminal_exit(")
+            .expect("provider exit reconciliation function");
+        let body = &source[start..];
+        let end = body
+            .find("\nfn take_latched_codex_exact_resume_failure(")
+            .expect("next provider runtime function");
+        let body = &body[..end];
+        assert!(body.contains("provider_sessions\n        .try_lock()"));
+        assert!(!body.contains("provider_sessions\n        .lock()"));
     }
 
     #[test]

@@ -6,10 +6,12 @@ import {
   MAX_HISTORY_CONVERSATIONS_PER_HOST,
   MAX_METADATA_TASKS_PER_HOST,
   MAX_OUTBOX_ITEMS,
+  NATIVE_CACHE_DB_NAME,
+  NATIVE_CACHE_DB_VERSION,
   tasksFromSnapshotItems,
   validateOutboxCommandPayload,
 } from "./nativeCache";
-import { buildSubmitProviderInputSendNow } from "./nativeProtocol";
+import { buildStartProviderSessionCommand, buildSubmitProviderInputSendNow } from "./nativeProtocol";
 
 const HOST = "018f0000-0000-7000-8000-0000000000a1";
 const HOST_B = "018f0000-0000-7000-8000-0000000000a2";
@@ -17,6 +19,7 @@ const TASK = "018f0000-0000-7000-8000-0000000000d4";
 const CLIENT = "018f0000-0000-7000-8000-0000000000b2";
 const COMMAND = "018f0000-0000-7000-8000-0000000000f6";
 const AGENT = "018f0000-0000-7000-8000-0000000000e5";
+const RESOURCE = "018f0000-0000-7000-8000-0000000000e6";
 
 function exactPayload(text = "hi", commandId = COMMAND) {
   return buildSubmitProviderInputSendNow({
@@ -252,6 +255,30 @@ describe("nativeCache", () => {
     ).toThrow();
   });
 
+  it("rejects a persisted start command with cross-provider launch options", () => {
+    const payload = buildStartProviderSessionCommand({
+      authority: { hostPublicId: HOST, clientId: CLIENT,
+        requestId: "018f0000-0000-7000-8000-0000000000c3" },
+      commandId: COMMAND,
+      taskId: TASK,
+      agentSessionId: AGENT,
+      resourceId: RESOURCE,
+      provider: "codex",
+      expectedTaskRevision: 2,
+      actionEpoch: 1,
+      issuedAtMs: 1,
+      launchOptions: { model: "codex_terra", reasoningEffort: "low", access: "full_access" },
+    }).payload as { command: { start_provider_session: { launch_options: { model: string } } } };
+    payload.command.start_provider_session.launch_options.model = "claude_opus";
+    expect(() => validateOutboxCommandPayload(payload, {
+      hostPublicId: HOST,
+      clientId: CLIENT,
+      commandId: COMMAND,
+      taskId: TASK,
+      text: "",
+    })).toThrow(/content rejected/);
+  });
+
   it("keeps drafts across TTL windows and separates metadata vs history bounds", async () => {
     expect(MAX_METADATA_TASKS_PER_HOST).toBe(4096);
     expect(MAX_HISTORY_CONVERSATIONS_PER_HOST).toBe(64);
@@ -405,6 +432,33 @@ describe("nativeCache", () => {
     expect(
       ((await reloaded.loadHost(HOST)).outbox[0]?.commandPayload as { command: { submit_provider_input: { action: { send_now: { text: string } } } } }).command.submit_provider_input.action.send_now.text,
     ).toBe("hi");
+  });
+
+  it("durably removes a quarantined legacy outbox row before admitting a new command", async () => {
+    const factory = new IDBFactory();
+    const cache = createIndexedDbNativeCacheStore(factory);
+    await cache.loadHost(HOST);
+    const db = await new Promise<IDBDatabase>((resolve, reject) => {
+      const request = factory.open(NATIVE_CACHE_DB_NAME, NATIVE_CACHE_DB_VERSION);
+      request.onsuccess = () => resolve(request.result);
+      request.onerror = () => reject(request.error);
+    });
+    await new Promise<void>((resolve, reject) => {
+      const tx = db.transaction("outbox", "readwrite");
+      tx.objectStore("outbox").put(
+        { ...outboxRecord(), commandPayload: { command: { create_task_v2: {
+          primary_provider: "claude_code",
+        } } } },
+        `${HOST}:cmd:${COMMAND}`,
+      );
+      tx.oncomplete = () => resolve();
+      tx.onerror = () => reject(tx.error);
+    });
+
+    const next = outboxRecord(taskId(8_123), "next");
+    await expect(cache.putOutbox(next)).resolves.toBeUndefined();
+    expect((await cache.loadHost(HOST)).outbox).toEqual([next]);
+    db.close();
   });
 
   it("keeps host-prefixed IndexedDB records isolated", async () => {

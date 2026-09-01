@@ -1103,6 +1103,7 @@ pub fn native_browser_contract_fixtures() -> Vec<CanonicalSchemaFixture> {
         agent_session_id: Some(
             crate::domain::AgentSessionId::from_bytes(fixture_uuid(0x44)).unwrap(),
         ),
+        resource_id: Some(crate::domain::ResourceId::from_bytes(fixture_uuid(0x45)).unwrap()),
         runtime_generation: Some(7),
         agent_lifecycle: Some(crate::domain::agent::AgentSessionLifecycle::Open),
         provider_kind: Some(crate::providers::ProviderKind::ClaudeCode),

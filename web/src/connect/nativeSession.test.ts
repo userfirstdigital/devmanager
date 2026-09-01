@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import type {
   ConnectConnectionState,
   DecodedConnectEnvelope,
@@ -39,12 +39,16 @@ const CLIENT_B = "018f0000-0000-7000-8000-0000000000b3";
 const TASK = "018f0000-0000-7000-8000-0000000000d4";
 const TASK_B = "018f0000-0000-7000-8000-0000000000d5";
 const AGENT = "018f0000-0000-7000-8000-0000000000e5";
+const RESOURCE = "018f0000-0000-7000-8000-0000000000e6";
 const COMMAND = "018f0000-0000-7000-8000-0000000000f6";
+const COMMAND_B = "018f0000-0000-7000-8000-0000000000f7";
 const SNAPSHOT = "018f0000-0000-7000-8000-000000000101";
 const SUB = "018f0000-0000-7000-8000-000000000202";
 const SUB_B = "018f0000-0000-7000-8000-000000000204";
 const EVENT_SUB = "018f0000-0000-7000-8000-000000000203";
 const EVENT_ID = "018f0000-0000-7000-8000-000000000301";
+const QUESTION = "018f0000-0000-7000-8000-000000000302";
+const TURN = "018f0000-0000-7000-8000-000000000303";
 
 const ALL_CAPS = Number(
   CAPABILITY_PAGED_SNAPSHOTS |
@@ -147,6 +151,7 @@ function providerState(overrides: Record<string, unknown> = {}) {
     task_revision: 2,
     action_epoch: 1,
     agent_session_id: AGENT,
+    resource_id: RESOURCE,
     runtime_generation: 1,
     agent_lifecycle: "open",
     provider_kind: "codex",
@@ -257,6 +262,19 @@ function reply(requestId: string, ok: Record<string, unknown>) {
     payloadKind: NATIVE_QUERY_REPLY_KIND,
     requestId,
     payload: { request_id: requestId, outcome: { ok } },
+  });
+}
+
+function receipt(requestId: string, commandId: string) {
+  return envelope({
+    payloadKind: NATIVE_COMMAND_RECEIPT_KIND,
+    requestId,
+    payload: { accepted: {
+      command_id: commandId,
+      operation_id: "018f0000-0000-7000-8000-000000000401",
+      task_revision: 3,
+      event_ids: [],
+    } },
   });
 }
 
@@ -437,6 +455,7 @@ function defaultSyncHandler(
           task_cockpit: {
             provider_input_state: providerState({
               agent_session_id: null,
+              resource_id: null,
               runtime_generation: null,
               agent_lifecycle: null,
               provider_kind: null,
@@ -557,6 +576,205 @@ async function startLive(
 }
 
 describe("NativeHostSession corrections", () => {
+  it("does not create a browser task until first send, then waits for its provider fence", async () => {
+    const transport = new FakeTransport();
+    defaultSyncHandler(transport);
+    const base = transport.handler!;
+    let createdTask: string | null = null;
+    let createPayload: unknown;
+    let startPayload: unknown;
+    let sendPayload: unknown;
+    transport.handler = async (kind, payload, requestId) => {
+      const command = (payload as { command?: Record<string, unknown> }).command;
+      if (kind === NATIVE_COMMAND_KIND && command && "create_task_v2" in command) {
+        createPayload = structuredClone(payload);
+        createdTask = (command.create_task_v2 as { id: string }).id;
+        return receipt(requestId!, (payload as { command_id: string }).command_id);
+      }
+      if (kind === NATIVE_COMMAND_KIND && command && "submit_provider_input" in command) {
+        sendPayload = structuredClone(payload);
+        return receipt(requestId!, (payload as { command_id: string }).command_id);
+      }
+      if (kind === NATIVE_COMMAND_KIND && command && "start_provider_session" in command) {
+        startPayload = structuredClone(payload);
+        return receipt(requestId!, (payload as { command_id: string }).command_id);
+      }
+      const query = (payload as { query?: Record<string, unknown> }).query;
+      if (createdTask && query && "task_snapshot" in query) {
+        return reply(requestId!, { task_snapshot: { snapshot: taskItem(createdTask).task } });
+      }
+      if (createdTask && query?.task_cockpit === "provider_input_state") {
+        return reply(requestId!, { task_cockpit: { provider_input_state: providerState({ task_id: createdTask }) } });
+      }
+      if (createdTask && query?.task_cockpit === "terminal") {
+        return reply(requestId!, { task_cockpit: { terminal: {
+          task_id: createdTask, sequence: 1, title: null, text_lines: ["Codex ready"],
+        } } });
+      }
+      return base(kind, payload, requestId);
+    };
+    const commandIds = [COMMAND, COMMAND_B, "018f0000-0000-7000-8000-0000000000f8"];
+    const session = new NativeHostSession({
+      hostPublicId: HOST,
+      transport,
+      createCommandId: () => commandIds.shift()!,
+    });
+    await startLive(session, transport);
+    expect(createPayload).toBeUndefined();
+    const result = await session.createTaskAndSend({
+      projectId: TASK_B,
+      provider: "codex",
+      launchOptions: {
+        model: "codex_terra",
+        reasoningEffort: "high",
+        access: "workspace_write",
+      },
+      text: "Build it",
+    });
+    expect(result.ok).toBe(true);
+    expect(createPayload).toMatchObject({ task_id: null, command: { create_task_v2: {
+      project_id: TASK_B, primary_provider: "codex", defer_primary_provider_start: true,
+    } } });
+    expect(startPayload).toMatchObject({ task_id: createdTask, command: { start_provider_session: {
+      task_id: createdTask,
+      agent_session_id: AGENT,
+      resource_id: RESOURCE,
+      provider_kind: "codex",
+      mode: "new_conversation",
+      launch_options: {
+        model: "codex_terra",
+        reasoning_effort: "high",
+        access: "workspace_write",
+      },
+    } } });
+    expect(sendPayload).toMatchObject({ task_id: createdTask, command: { submit_provider_input: {
+      action: { send_now: { text: "Build it" } },
+    } } });
+    expect(session.view().outbox.size).toBe(0);
+    session.stop();
+  });
+
+  it("does not expose a phantom task id when durable creation was never accepted", async () => {
+    const transport = new FakeTransport();
+    defaultSyncHandler(transport);
+    const cache = createMemoryNativeCacheStore(() => 1_700_000_000_000);
+    cache.putOutbox = vi.fn(async () => {
+      throw new Error("durable cache unavailable");
+    });
+    const session = new NativeHostSession({
+      hostPublicId: HOST,
+      transport,
+      cache,
+    });
+    await startLive(session, transport);
+
+    await expect(session.createTaskAndSend({
+      projectId: TASK_B,
+      provider: "claude",
+      text: "Build it",
+    })).resolves.toEqual({ ok: false, reason: "storage_failure", taskId: null });
+    session.stop();
+  });
+
+  it("waits for Claude SessionStart identity before the first durable send", async () => {
+    const transport = new FakeTransport();
+    defaultSyncHandler(transport);
+    const base = transport.handler!;
+    let createdTask: string | null = null;
+    let readinessQueries = 0;
+    let sends = 0;
+    let readinessQueriesAtSend = 0;
+    transport.handler = async (kind, payload, requestId) => {
+      const command = (payload as { command?: Record<string, unknown> }).command;
+      if (kind === NATIVE_COMMAND_KIND && command && "create_task_v2" in command) {
+        createdTask = (command.create_task_v2 as { id: string }).id;
+        return receipt(requestId!, (payload as { command_id: string }).command_id);
+      }
+      if (kind === NATIVE_COMMAND_KIND && command && "submit_provider_input" in command) {
+        sends += 1;
+        readinessQueriesAtSend = readinessQueries;
+        return receipt(requestId!, (payload as { command_id: string }).command_id);
+      }
+      const query = (payload as { query?: Record<string, unknown> }).query;
+      if (createdTask && query && "task_snapshot" in query) {
+        return reply(requestId!, { task_snapshot: { snapshot: taskItem(createdTask).task } });
+      }
+      if (createdTask && query?.task_cockpit === "provider_input_state") {
+        readinessQueries += 1;
+        return reply(requestId!, { task_cockpit: { provider_input_state: providerState({
+          task_id: createdTask,
+          provider_kind: "claude",
+          provider_session_id: readinessQueries === 1 ? null : "claude-session",
+        }) } });
+      }
+      return base(kind, payload, requestId);
+    };
+    const session = new NativeHostSession({ hostPublicId: HOST, transport });
+    await startLive(session, transport);
+
+    const result = await session.createTaskAndSend({
+      projectId: TASK_B,
+      provider: "claude",
+      text: "Build it",
+    });
+    expect(result).toMatchObject({ ok: true, taskId: createdTask });
+    expect(readinessQueries).toBe(3);
+    expect(readinessQueriesAtSend).toBe(3);
+    expect(sends).toBe(1);
+    session.stop();
+  });
+
+  it("reads the host-owned redacted project/provider catalog", async () => {
+    const transport = new FakeTransport();
+    defaultSyncHandler(transport);
+    const base = transport.handler!;
+    transport.handler = async (kind, payload, requestId) => {
+      if ((payload as { query?: { task_cockpit?: string } }).query?.task_cockpit === "config_snapshot") {
+        return reply(requestId!, { task_cockpit: { config: {
+          revision: 3,
+          projects: [{ config_id: "devmanager", label: "DevManager", root_configured: true,
+            workspace_id: TASK, folders: [] }],
+          servers: [], ssh_connections: [],
+          providers: [{ provider: "codex", command_configured: true }],
+        } } });
+      }
+      return base(kind, payload, requestId);
+    };
+    const session = new NativeHostSession({ hostPublicId: HOST, transport });
+    await startLive(session, transport);
+    expect(await session.readConfigSnapshot()).toMatchObject({
+      revision: 3,
+      projects: [{ label: "DevManager", workspaceId: TASK }],
+      providers: [{ provider: "codex", commandConfigured: true }],
+    });
+    session.stop();
+  });
+
+  it("answers the exact current provider question through the durable outbox", async () => {
+    const transport = new FakeTransport();
+    defaultSyncHandler(transport);
+    const base = transport.handler!;
+    let sent: unknown;
+    transport.handler = async (kind, payload, requestId) => {
+      if ((payload as { query?: { task_cockpit?: unknown } }).query?.task_cockpit === "provider_input_state") {
+        return reply(requestId!, { task_cockpit: { provider_input_state: providerState({
+          current_turn: TURN, open_question: QUESTION,
+        }) } });
+      }
+      if (kind === NATIVE_COMMAND_KIND) sent = payload;
+      return base(kind, payload, requestId);
+    };
+    const session = new NativeHostSession({ hostPublicId: HOST, transport, createCommandId: () => COMMAND });
+    await startLive(session, transport);
+    expect(await session.answerQuestion(TASK, "Option one")).toEqual({ ok: true, commandId: COMMAND });
+    expect(sent).toMatchObject({ command: { submit_provider_input: {
+      question_id: QUESTION,
+      action: { answer_question: { question_id: QUESTION, answer: "Option one" } },
+    } } });
+    expect(session.view().outbox.size).toBe(0);
+    session.stop();
+  });
+
   it("reads a terminal only on its captured host lease and rejects late output", async () => {
     const transport = new FakeTransport();
     defaultSyncHandler(transport);

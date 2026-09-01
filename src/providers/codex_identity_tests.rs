@@ -491,14 +491,16 @@ async fn codex_trait_launch_without_correlation_is_terminal_only_dependency() {
         .unwrap();
     let arguments: Vec<&str> = spec.arguments().collect();
     assert!(arguments.iter().all(|argument| {
-        *argument != "-c"
-            && !argument.contains("hooks.")
+        !argument.contains("hooks.")
             && *argument != "--dangerously-bypass-hook-trust"
             && *argument != "app-server"
             && *argument != "exec"
             && *argument != "--last"
             && *argument != "--remote"
     }));
+    assert!(arguments
+        .windows(2)
+        .any(|pair| pair == ["--config", "check_for_update_on_startup=false"]));
     assert_eq!(
         adapter
             .last_capabilities(&identity)
@@ -529,6 +531,8 @@ async fn codex_exact_resume_is_resume_id_and_typed_failures_do_not_fallback() {
         spec.arguments().collect::<Vec<_>>(),
         [
             "--dangerously-bypass-approvals-and-sandbox",
+            "--config",
+            "check_for_update_on_startup=false",
             "resume",
             FIXTURE_SESSION_ID
         ]

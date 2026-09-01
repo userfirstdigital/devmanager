@@ -205,6 +205,13 @@ pub(crate) async fn connect_ws_handler(
     ws: WebSocketUpgrade,
     headers: HeaderMap,
 ) -> Response {
+    let connect_trace = std::env::var_os("DEVMANAGER_CONNECT_TRACE").is_some();
+    if connect_trace {
+        eprintln!(
+            "devmanager-host: Connect trace websocket request from {}",
+            addr.ip()
+        );
+    }
     let authentication = match admit_connect_ws_request(
         &state,
         &headers,
@@ -212,8 +219,19 @@ pub(crate) async fn connect_ws_handler(
         verified.as_ref().map(|value| &value.0),
     ) {
         Ok(authentication) => authentication,
-        Err(response) => return response,
+        Err(response) => {
+            if connect_trace {
+                eprintln!(
+                    "devmanager-host: Connect trace websocket admission rejected status={}",
+                    response.status()
+                );
+            }
+            return response;
+        }
     };
+    if connect_trace {
+        eprintln!("devmanager-host: Connect trace websocket admission accepted");
+    }
     let Some(inner) = state.upgrade_inner() else {
         return (StatusCode::INTERNAL_SERVER_ERROR, "host unavailable").into_response();
     };
@@ -500,6 +518,10 @@ pub(crate) async fn run_connect_session(
     mode: ConnectSessionMode,
     handshake_deadline: tokio::time::Instant,
 ) {
+    let connect_trace = std::env::var_os("DEVMANAGER_CONNECT_TRACE").is_some();
+    if connect_trace {
+        eprintln!("devmanager-host: Connect trace session entered");
+    }
     let Some(inner) = inner.upgrade() else {
         return;
     };
@@ -534,6 +556,9 @@ pub(crate) async fn run_connect_session(
         Ok(Some(channel)) => channel,
         _ => return,
     };
+    if connect_trace {
+        eprintln!("devmanager-host: Connect trace Noise channel accepted");
+    }
     let Some(authenticated_peer) = channel.authenticated_peer() else {
         return;
     };
@@ -570,6 +595,9 @@ pub(crate) async fn run_connect_session(
         return;
     };
     let paired_client_id = peer.paired_client_id().to_string();
+    if connect_trace {
+        eprintln!("devmanager-host: Connect trace paired peer validated");
+    }
     // Existing pin/cookie membership must remain valid through enrollment.
     if !peer.is_authorized() {
         return;
@@ -621,6 +649,9 @@ pub(crate) async fn run_connect_session(
         let _ = socket.close().await;
         return;
     };
+    if connect_trace {
+        eprintln!("devmanager-host: Connect trace device enrollment completed");
+    }
     peer = peer.with_identity_invalidation(
         authority.subscribe_authority(),
         authority.authority_generation(),
@@ -662,6 +693,9 @@ pub(crate) async fn run_connect_session(
             return;
         }
     };
+    if connect_trace {
+        eprintln!("devmanager-host: Connect trace application loop entered");
+    }
     loop {
         if !peer.is_authorized() {
             break;
@@ -713,6 +747,13 @@ pub(crate) async fn run_connect_session(
             Ok(payload) => payload,
             Err(_) => break,
         };
+        if connect_trace {
+            eprintln!(
+                "devmanager-host: Connect trace received application frame sequence={} kind={:?}",
+                envelope.sequence,
+                payload.channel()
+            );
+        }
         // Clone the handle then drop the slot lock before execute awaits.
         let host = host_requests.get();
         let (reply, disposition) = dispatch
@@ -769,10 +810,18 @@ pub(crate) async fn run_connect_session(
             break;
         }
         if hello_completed {
+            if connect_trace {
+                eprintln!("devmanager-host: Connect trace Hello reply flushed");
+            }
             if let (Some(host), Some(client_id)) = (host, dispatch.bound_client_id()) {
                 match tokio::time::timeout_at(handshake_deadline, host.open_duplex(client_id)).await
                 {
                     Ok(Ok(Some(duplex))) => {
+                        if connect_trace {
+                            eprintln!(
+                                "devmanager-host: Connect trace handing off duplex client_id={client_id}"
+                            );
+                        }
                         // Hello was physically flushed by SinkExt::send before
                         // the single live writer takes ownership of the socket.
                         if let Err(error) = crate::host::serve_host_connect_duplex(

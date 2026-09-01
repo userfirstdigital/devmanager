@@ -8,6 +8,7 @@ import {
   MessageSquare,
   MoreVertical,
   Pencil,
+  Plus,
   RotateCcw,
   Search,
   Send,
@@ -27,7 +28,17 @@ import type {
   NativeTaskMutation,
 } from "./nativeSession";
 import { buildNativeTimeline } from "./nativeTimeline";
-import type { NativeTerminalKey, NativeUuid, SemanticJournalFact } from "./nativeProtocol";
+import type {
+  NativeConfigSnapshotView,
+  NativeAccessMode,
+  NativeProviderKind,
+  NativeProviderLaunchOptions,
+  NativeProviderModel,
+  NativeReasoningEffort,
+  NativeTerminalKey,
+  NativeUuid,
+  SemanticJournalFact,
+} from "./nativeProtocol";
 import {
   scopedHostTaskKey,
   scopeHostTask,
@@ -67,6 +78,51 @@ type MergedTaskRow = TaskMeta & {
 };
 
 const LAST_SELECTED_TASK_KEY_PREFIX = "devmanager.connect.native.last-selected.v1:";
+const LAST_PROVIDER_KEY_PREFIX = "devmanager.connect.native.last-provider.v1:";
+const LAST_OPTIONS_KEY_PREFIX = "devmanager.connect.native.last-options.v1:";
+
+type NewTaskProject = {
+  hostPublicId: NativeUuid;
+  hostLabel: string;
+  projectId: NativeUuid;
+  projectLabel: string;
+  provider: NativeProviderKind;
+  providers: NativeProviderKind[];
+  launchOptions: NativeProviderLaunchOptions;
+};
+
+function rememberedLaunchOptions(
+  hostPublicId: string,
+  provider: NativeProviderKind,
+): NativeProviderLaunchOptions {
+  const fallback: NativeProviderLaunchOptions = {
+    model: "provider_default",
+    reasoningEffort: "provider_default",
+    access: "full_access",
+  };
+  try {
+    const raw = window.localStorage.getItem(
+      `${LAST_OPTIONS_KEY_PREFIX}${hostPublicId}:${provider}`,
+    );
+    if (!raw) return fallback;
+    const parsed = JSON.parse(raw) as Partial<NativeProviderLaunchOptions>;
+    const models: NativeProviderModel[] = provider === "codex"
+      ? ["provider_default", "codex_sol", "codex_terra", "codex_luna"]
+      : ["provider_default", "claude_opus", "claude_sonnet", "claude_haiku"];
+    const efforts: NativeReasoningEffort[] = provider === "codex"
+      ? ["provider_default", "low", "medium", "high", "extra_high", "max", "ultra"]
+      : ["provider_default", "low", "medium", "high"];
+    const access: NativeAccessMode[] = ["full_access", "workspace_write", "read_only"];
+    if (!models.includes(parsed.model as NativeProviderModel) ||
+        !efforts.includes(parsed.reasoningEffort as NativeReasoningEffort) ||
+        !access.includes(parsed.access as NativeAccessMode)) {
+      return fallback;
+    }
+    return parsed as NativeProviderLaunchOptions;
+  } catch {
+    return fallback;
+  }
+}
 
 export function NativeRemoteApp({
   hostPublicId,
@@ -133,6 +189,11 @@ export function NativeRemoteApp({
   const [search, setSearch] = useState("");
   const [hostsOpen, setHostsOpen] = useState(false);
   const [archiveOpen, setArchiveOpen] = useState(false);
+  const [newTaskProjects, setNewTaskProjects] = useState<NewTaskProject[] | null>(null);
+  const [newTaskLoading, setNewTaskLoading] = useState(false);
+  const [newTaskDraft, setNewTaskDraft] = useState<NewTaskProject | null>(null);
+  const [newTaskNotice, setNewTaskNotice] = useState<string | null>(null);
+  const [newTaskSubmitting, setNewTaskSubmitting] = useState(false);
   const [composer, setComposer] = useState<{
     ownerKey: string | null;
     text: string;
@@ -229,6 +290,7 @@ export function NativeRemoteApp({
   const doneTasks = filteredTasks.filter(isDoneTask);
   const archivedTasks = filteredTasks.filter(isArchivedTask);
   const showHostBadge = hosts.length > 1;
+  const hasLiveHost = hosts.some((entry) => entry.authenticated);
 
   const selectedTask = selected
     ? ownerView?.tasks.get(selected.taskId) ?? null
@@ -500,6 +562,121 @@ export function NativeRemoteApp({
     }
   };
 
+  const openNewTask = async () => {
+    if (newTaskLoading) return;
+    setNewTaskLoading(true);
+    setNewTaskNotice(null);
+    const rows: NewTaskProject[] = [];
+    await Promise.all(hosts.map(async (entry) => {
+      if (!entry.authenticated) return;
+      const owner = resolveSession(entry.descriptor.hostPublicId);
+      if (!owner) return;
+      try {
+        const config: NativeConfigSnapshotView = await owner.readConfigSnapshot();
+        // `commandConfigured` means the user supplied an executable override;
+        // false still uses the provider's discovered/default CLI. Treating it
+        // as availability made every ordinary installation look provider-less.
+        const available = new Set(config.providers.map((provider) => provider.provider));
+        const remembered = window.localStorage.getItem(`${LAST_PROVIDER_KEY_PREFIX}${entry.descriptor.hostPublicId}`);
+        const provider: NativeProviderKind = (remembered === "claude" || remembered === "claude_code") && available.has("claude")
+          ? "claude"
+          : remembered === "codex" && available.has("codex")
+            ? "codex"
+            : available.has("codex") ? "codex" : "claude";
+        const providers: NativeProviderKind[] = [
+          ...(available.has("codex") ? ["codex" as const] : []),
+          ...(available.has("claude") ? ["claude" as const] : []),
+        ];
+        const launchOptions = rememberedLaunchOptions(
+          entry.descriptor.hostPublicId,
+          provider,
+        );
+        if (providers.length === 0) return;
+        for (const project of config.projects) {
+          if (!project.rootConfigured || !project.workspaceId) continue;
+          rows.push({
+            hostPublicId: entry.descriptor.hostPublicId,
+            hostLabel: entry.descriptor.label,
+            projectId: project.workspaceId,
+            projectLabel: project.label,
+            provider,
+            providers,
+            launchOptions,
+          });
+        }
+      } catch {
+        // Other live hosts remain available; the empty state explains failure.
+      }
+    }));
+    rows.sort((left, right) => left.hostLabel.localeCompare(right.hostLabel) ||
+      left.projectLabel.localeCompare(right.projectLabel));
+    setNewTaskProjects(rows);
+    setNewTaskLoading(false);
+  };
+
+  const submitNewTask = async (text: string) => {
+    const draft = newTaskDraft;
+    if (!draft || newTaskSubmitting || !text.trim()) return;
+    const owner = resolveSession(draft.hostPublicId);
+    if (!owner) {
+      setNewTaskNotice("The selected host is no longer available.");
+      return;
+    }
+    setNewTaskSubmitting(true);
+    setNewTaskNotice(null);
+    window.localStorage.setItem(`${LAST_PROVIDER_KEY_PREFIX}${draft.hostPublicId}`, draft.provider);
+    window.localStorage.setItem(
+      `${LAST_OPTIONS_KEY_PREFIX}${draft.hostPublicId}:${draft.provider}`,
+      JSON.stringify(draft.launchOptions),
+    );
+    try {
+      const result = await owner.createTaskAndSend({
+        projectId: draft.projectId,
+        provider: draft.provider,
+        launchOptions: draft.launchOptions,
+        text,
+      });
+      if (result.ok) {
+        const next = { hostPublicId: draft.hostPublicId, taskId: result.taskId };
+        setNewTaskDraft(null);
+        setNewTaskProjects(null);
+        openTask(next);
+        return;
+      }
+      if (result.taskId) {
+        await owner.setDraft(result.taskId, text).catch(() => undefined);
+        setNewTaskDraft(null);
+        setNewTaskProjects(null);
+        setLocalNotice("The task was created, but its provider was not ready. Your message remains as a draft.");
+        openTask({ hostPublicId: draft.hostPublicId, taskId: result.taskId });
+      } else {
+        setNewTaskNotice(sendFailureNotice(result.reason));
+      }
+    } catch {
+      setNewTaskNotice("Task creation could not be confirmed. Check the host before retrying.");
+    } finally {
+      setNewTaskSubmitting(false);
+    }
+  };
+
+  if (newTaskDraft) {
+    return (
+      <NativeNewTaskScreen
+        draft={newTaskDraft}
+        notice={newTaskNotice}
+        onBack={() => { setNewTaskDraft(null); setNewTaskProjects(null); setNewTaskNotice(null); }}
+        onProviderChange={(provider) => setNewTaskDraft((current) => current ? {
+          ...current,
+          provider,
+          launchOptions: rememberedLaunchOptions(current.hostPublicId, provider),
+        } : null)}
+        onLaunchOptionsChange={(launchOptions) => setNewTaskDraft((current) => current ? { ...current, launchOptions } : null)}
+        onSend={submitNewTask}
+        submitting={newTaskSubmitting}
+      />
+    );
+  }
+
   if (routeUnavailable || selectedOwnerMissing) {
     return (
       <main className="dm-native-remote">
@@ -590,6 +767,17 @@ export function NativeRemoteApp({
         </div>
         <div className="dm-native-remote__header-actions">
           <button
+            aria-label="New task"
+            className="dm-native-remote__new-task-button"
+            disabled={newTaskLoading || !hasLiveHost}
+            onClick={() => void openNewTask()}
+            title={hasLiveHost ? "Create a task" : "Waiting for a live host"}
+            type="button"
+          >
+            <Plus aria-hidden="true" size={17} />
+            {newTaskLoading ? "Loading…" : "New task"}
+          </button>
+          <button
             aria-expanded={hostsOpen}
             aria-label="Host status"
             className="dm-native-remote__icon-button"
@@ -642,6 +830,26 @@ export function NativeRemoteApp({
             value={search}
           />
         </div>
+      ) : null}
+
+      {newTaskProjects ? (
+        <section aria-label="Choose a project" className="dm-native-remote__project-picker">
+          <div className="dm-native-remote__project-picker-heading">
+            <div><strong>Choose a project</strong><small>The task is saved only after your first message.</small></div>
+            <button aria-label="Close new task" onClick={() => setNewTaskProjects(null)} type="button">×</button>
+          </div>
+          {newTaskProjects.map((project) => (
+            <button
+              key={`${project.hostPublicId}:${project.projectId}`}
+              onClick={() => { setNewTaskDraft(project); setNewTaskNotice(null); }}
+              type="button"
+            >
+              <strong>{project.projectLabel}</strong>
+              {showHostBadge ? <small>{project.hostLabel}</small> : null}
+            </button>
+          ))}
+          {newTaskProjects.length === 0 ? <p>No configured project is available on a live host.</p> : null}
+        </section>
       ) : null}
 
       {hostsOpen ? (
@@ -734,6 +942,141 @@ export function NativeRemoteApp({
   );
 }
 
+function NativeNewTaskScreen({
+  draft,
+  notice,
+  onBack,
+  onProviderChange,
+  onLaunchOptionsChange,
+  onSend,
+  submitting,
+}: {
+  draft: NewTaskProject;
+  notice: string | null;
+  onBack: () => void;
+  onProviderChange: (provider: NativeProviderKind) => void;
+  onLaunchOptionsChange: (options: NativeProviderLaunchOptions) => void;
+  onSend: (text: string) => Promise<void>;
+  submitting: boolean;
+}) {
+  const [text, setText] = useState("");
+  return (
+    <main className="dm-native-remote dm-native-remote--conversation dm-native-remote--new-task">
+      <header className="dm-native-remote__conversation-header">
+        <button aria-label="Cancel new task" className="dm-native-remote__icon-button" onClick={onBack} type="button">
+          <ArrowLeft aria-hidden="true" size={20} />
+        </button>
+        <div className="dm-native-remote__conversation-title">
+          <h1>New task</h1>
+          <p>{draft.projectLabel}{draft.hostLabel ? ` · ${draft.hostLabel}` : ""}</p>
+        </div>
+        <span />
+      </header>
+      {notice ? <p className="dm-native-remote__notice" role="status"><CircleAlert aria-hidden="true" size={16} />{notice}</p> : null}
+      <section className="dm-native-remote__new-task-empty" aria-label="Unsaved new task">
+        <img src="/icons/devmanager-192.png" alt="" width={54} height={54} />
+        <h2>What should we build?</h2>
+        <p>This shell is local to your browser. It becomes a real task on {draft.hostLabel} only when you send the first message.</p>
+      </section>
+      <form className="dm-native-remote__composer dm-native-remote__composer--new" onSubmit={(event) => {
+        event.preventDefault();
+        void onSend(text);
+      }}>
+        <textarea
+          aria-label="Message"
+          autoFocus
+          disabled={submitting}
+          onChange={(event) => setText(event.target.value)}
+          placeholder="Describe the task"
+          rows={2}
+          value={text}
+        />
+        <div className="dm-native-remote__composer-options">
+          <label>
+            <span className="sr-only">Provider</span>
+            <select
+              aria-label="Provider"
+              disabled={submitting || draft.providers.length < 2}
+              onChange={(event) => onProviderChange(event.target.value as NativeProviderKind)}
+              value={draft.provider}
+            >
+              {draft.providers.includes("codex") ? <option value="codex">Codex</option> : null}
+              {draft.providers.includes("claude") ? <option value="claude">Claude Code</option> : null}
+            </select>
+          </label>
+          <label>
+            <span className="sr-only">Model</span>
+            <select
+              aria-label="Model"
+              disabled={submitting}
+              onChange={(event) => onLaunchOptionsChange({
+                ...draft.launchOptions,
+                model: event.target.value as NativeProviderModel,
+              })}
+              value={draft.launchOptions.model}
+            >
+              <option value="provider_default">Default model</option>
+              {draft.provider === "codex" ? (
+                <>
+                  <option value="codex_sol">GPT-5.6 Sol</option>
+                  <option value="codex_terra">GPT-5.6 Terra</option>
+                  <option value="codex_luna">GPT-5.6 Luna</option>
+                </>
+              ) : (
+                <>
+                  <option value="claude_opus">Claude Opus</option>
+                  <option value="claude_sonnet">Claude Sonnet</option>
+                  <option value="claude_haiku">Claude Haiku</option>
+                </>
+              )}
+            </select>
+          </label>
+          <label>
+            <span className="sr-only">Thinking</span>
+            <select
+              aria-label="Thinking"
+              disabled={submitting}
+              onChange={(event) => onLaunchOptionsChange({
+                ...draft.launchOptions,
+                reasoningEffort: event.target.value as NativeReasoningEffort,
+              })}
+              value={draft.launchOptions.reasoningEffort}
+            >
+              <option value="provider_default">Default thinking</option>
+              <option value="low">Low</option>
+              <option value="medium">Medium</option>
+              <option value="high">High</option>
+              {draft.provider === "codex" ? <option value="extra_high">Extra high</option> : null}
+              {draft.provider === "codex" ? <option value="max">Max</option> : null}
+              {draft.provider === "codex" ? <option value="ultra">Ultra</option> : null}
+            </select>
+          </label>
+          <label>
+            <span className="sr-only">Access</span>
+            <select
+              aria-label="Access"
+              disabled={submitting}
+              onChange={(event) => onLaunchOptionsChange({
+                ...draft.launchOptions,
+                access: event.target.value as NativeAccessMode,
+              })}
+              value={draft.launchOptions.access}
+            >
+              <option value="full_access">Full access</option>
+              <option value="workspace_write">Workspace write</option>
+              <option value="read_only">Read only</option>
+            </select>
+          </label>
+          <span>Main workspace</span>
+        </div>
+        <button aria-label="Send" disabled={submitting || !text.trim()} type="submit">
+          <Send aria-hidden="true" size={18} />
+        </button>
+      </form>
+    </main>
+  );
+}
+
 function HostStatusPanel({
   hosts,
   onRetryHost,
@@ -776,6 +1119,11 @@ function HostStatusPanel({
                             : "Unavailable"}
                   {entry.notice ? ` · ${entry.notice}` : ""}
                 </small>
+                {!live && entry.view.lastError ? (
+                  <small className="dm-native-remote__host-error">
+                    {entry.view.lastError}
+                  </small>
+                ) : null}
               </div>
               <div className="dm-native-remote__host-actions">
                 {entry.descriptor.isPageHost &&
@@ -879,6 +1227,8 @@ function NativeConversationScreen({
   const [renameOpen, setRenameOpen] = useState(false);
   const [renameValue, setRenameValue] = useState(title);
   const [deleteConfirm, setDeleteConfirm] = useState(false);
+  const [questionPending, setQuestionPending] = useState(false);
+  const [questionNotice, setQuestionNotice] = useState<string | null>(null);
   const menuRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
@@ -914,6 +1264,27 @@ function NativeConversationScreen({
   // Guidance only — closing/archived need Restore; Done may still SendNow.
   const requiresRestoreBeforeSend =
     lifecycle === "archived" || lifecycle === "closing";
+  const answerableQuestionId = task?.attention === "needs_answer"
+    ? [...timeline].reverse().find((item) => item.kind === "question")?.id ?? null
+    : null;
+  const answerQuestion = async (answer: string) => {
+    if (questionPending || !answer.trim()) return false;
+    setQuestionPending(true);
+    setQuestionNotice(null);
+    try {
+      const result = await session.answerQuestion(taskId, answer.trim());
+      if (!result.ok) {
+        setQuestionNotice(sendFailureNotice(result.reason));
+        return false;
+      }
+      return true;
+    } catch {
+      setQuestionNotice("The answer could not be confirmed. Check the task before retrying.");
+      return false;
+    } finally {
+      setQuestionPending(false);
+    }
+  };
 
   return (
     <main className="dm-native-remote dm-native-remote--conversation">
@@ -1102,6 +1473,12 @@ function NativeConversationScreen({
           {localNotice}
         </p>
       ) : null}
+      {questionNotice ? (
+        <p className="dm-native-remote__notice" role="status">
+          <CircleAlert aria-hidden="true" size={16} />
+          {questionNotice}
+        </p>
+      ) : null}
       {uncertain || blocked ? (
         <p className="dm-native-remote__notice dm-native-remote__notice--caution" role="status">
           <CircleAlert aria-hidden="true" size={16} />
@@ -1118,7 +1495,14 @@ function NativeConversationScreen({
           connectionStatus={connectionStatus}
         />
       ) : (
-        <SemanticTimeline facts={conversation} items={timeline} taskId={taskId} />
+        <SemanticTimeline
+          answerableQuestionId={answerableQuestionId}
+          answering={questionPending}
+          facts={conversation}
+          items={timeline}
+          onAnswerQuestion={answerQuestion}
+          taskId={taskId}
+        />
       )}
 
       {!terminalOpen ? (
@@ -1169,6 +1553,7 @@ function NativeTerminalScreen({
   const [terminalAvailable, setTerminalAvailable] = useState(false);
   const [keyPending, setKeyPending] = useState(false);
   const [keyNotice, setKeyNotice] = useState<string | null>(null);
+  const [terminalInput, setTerminalInput] = useState("");
   const keyInFlight = useRef(false);
   const active = useRef(true);
   useEffect(() => {
@@ -1185,15 +1570,36 @@ function NativeTerminalScreen({
     try {
       const result = await session.sendTerminalKey(taskId, key);
       if (active.current && !result.ok) {
-        setKeyNotice(
-          result.reason === "transport_uncertain" ||
-            result.reason === "reconciliation_required"
-            ? "Key delivery is unconfirmed. Checking its original receipt; do not repeat it yet."
-            : "Terminal key was not accepted. Check the host connection or pending approval.",
-        );
+        setKeyNotice(sendFailureNotice(result.reason));
       }
     } catch {
       if (active.current) setKeyNotice("Terminal key could not be confirmed.");
+    } finally {
+      keyInFlight.current = false;
+      if (active.current) setKeyPending(false);
+    }
+  };
+  const submitTerminalInput = async (event: React.FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    if (
+      keyInFlight.current ||
+      connectionStatus !== "ready" ||
+      !terminalAvailable ||
+      terminalInput.length === 0
+    ) return;
+    keyInFlight.current = true;
+    setKeyPending(true);
+    setKeyNotice(null);
+    try {
+      const result = await session.sendTerminalText(taskId, terminalInput);
+      if (!active.current) return;
+      if (result.ok) {
+        setTerminalInput("");
+      } else {
+        setKeyNotice(sendFailureNotice(result.reason));
+      }
+    } catch {
+      if (active.current) setKeyNotice("Terminal input could not be confirmed.");
     } finally {
       keyInFlight.current = false;
       if (active.current) setKeyPending(false);
@@ -1265,20 +1671,51 @@ function NativeTerminalScreen({
         ))}
       </div>
       <p className="dm-native-remote__eyebrow">Live owner terminal · startup controls</p>
-      {error ? <p role="status">{error}</p> : null}
       {keyNotice ? <p role="status">{keyNotice}</p> : null}
-      {text || !error ? <pre>{text || "Waiting for terminal output…"}</pre> : null}
+      <pre role={error ? "status" : undefined}>
+        {text || error || "Waiting for terminal output…"}
+      </pre>
+      <form className="dm-native-remote__terminal-input" onSubmit={submitTerminalInput}>
+        <input
+          aria-label="Terminal input"
+          autoCapitalize="none"
+          autoComplete="off"
+          disabled={keyPending || connectionStatus !== "ready" || !terminalAvailable}
+          onChange={(event) => setTerminalInput(event.target.value)}
+          placeholder="Type in the remote terminal…"
+          spellCheck={false}
+          value={terminalInput}
+        />
+        <button
+          aria-label="Send terminal input"
+          disabled={
+            keyPending ||
+            connectionStatus !== "ready" ||
+            !terminalAvailable ||
+            terminalInput.length === 0
+          }
+          type="submit"
+        >
+          <Send aria-hidden="true" size={17} />
+        </button>
+      </form>
     </section>
   );
 }
 
 function SemanticTimeline({
+  answerableQuestionId,
+  answering,
   facts,
   items,
+  onAnswerQuestion,
   taskId,
 }: {
+  answerableQuestionId: string | null;
+  answering: boolean;
   facts: readonly SemanticJournalFact[];
   items: ReturnType<typeof buildNativeTimeline>;
+  onAnswerQuestion: (answer: string) => Promise<boolean>;
   taskId: NativeUuid;
 }) {
   const scrollRef = useRef<HTMLDivElement>(null);
@@ -1356,13 +1793,15 @@ function SemanticTimeline({
               return (
                 <article className="dm-native-remote__question" key={item.id}>
                   <p>{item.prompt}</p>
-                  {item.options.length ? (
-                    <ul>
-                      {item.options.map((option) => (
-                        <li key={option}>{option}</li>
-                      ))}
-                    </ul>
-                  ) : null}
+                  {item.id === answerableQuestionId ? (
+                    <QuestionAnswer
+                      answering={answering}
+                      onAnswer={onAnswerQuestion}
+                      options={item.options}
+                    />
+                  ) : item.options.length ? (
+                    <ul>{item.options.map((option) => <li key={option}>{option}</li>)}</ul>
+                  ) : <small>Answered</small>}
                 </article>
               );
             case "error":
@@ -1378,6 +1817,44 @@ function SemanticTimeline({
         <p className="dm-native-remote__empty">No cached conversation yet.</p>
       )}
     </section>
+  );
+}
+
+function QuestionAnswer({
+  answering,
+  onAnswer,
+  options,
+}: {
+  answering: boolean;
+  onAnswer: (answer: string) => Promise<boolean>;
+  options: string[];
+}) {
+  const [answer, setAnswer] = useState("");
+  const submit = async (value: string) => {
+    if (await onAnswer(value)) setAnswer("");
+  };
+  return (
+    <div className="dm-native-remote__question-controls">
+      {options.length ? (
+        <div className="dm-native-remote__question-options">
+          {options.map((option) => (
+            <button disabled={answering} key={option} onClick={() => void submit(option)} type="button">
+              {option}
+            </button>
+          ))}
+        </div>
+      ) : null}
+      <form onSubmit={(event) => { event.preventDefault(); void submit(answer); }}>
+        <input
+          aria-label="Answer question"
+          disabled={answering}
+          onChange={(event) => setAnswer(event.target.value)}
+          placeholder="Type an answer"
+          value={answer}
+        />
+        <button disabled={answering || !answer.trim()} type="submit">Answer</button>
+      </form>
+    </div>
   );
 }
 

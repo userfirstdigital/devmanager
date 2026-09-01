@@ -8,6 +8,7 @@ import { protocolUuid } from "./hostOutput";
 import {
   decodeSemanticJournalPage,
   isNativeUnitTaskCommand,
+  isTaskCreateV2Command,
   NativeProtocolError,
   type NativeUuid,
   type SemanticJournalFact,
@@ -221,7 +222,7 @@ function exactKeys(value: Record<string, unknown>, keys: string[]): boolean {
 }
 
 /**
- * Strict outbox command envelope — SubmitProviderInput SendNow/terminal, or
+ * Strict outbox command envelope — SubmitProviderInput SendNow/terminal/question, or
  * phone-supported metadata lifecycle/rename. No arbitrary payloads.
  */
 export function validateOutboxCommandPayload(
@@ -253,7 +254,8 @@ export function validateOutboxCommandPayload(
   if (protocolUuid(payload.client_id) !== expected.clientId) {
     rejected("outbox client_id mismatch");
   }
-  if (protocolUuid(payload.task_id) !== expected.taskId) {
+  const taskCreate = isTaskCreateV2Command(payload);
+  if (taskCreate ? payload.task_id !== null : protocolUuid(payload.task_id) !== expected.taskId) {
     rejected("outbox task_id mismatch");
   }
   if (
@@ -262,13 +264,11 @@ export function validateOutboxCommandPayload(
   ) {
     rejected("outbox issued_at_ms rejected");
   }
-  if (
+  if (taskCreate ? payload.expected_task_revision !== null : (
     typeof payload.expected_task_revision !== "number" ||
     !Number.isSafeInteger(payload.expected_task_revision) ||
     payload.expected_task_revision <= 0
-  ) {
-    rejected("outbox expected_task_revision rejected");
-  }
+  )) rejected("outbox expected_task_revision rejected");
 
   if (isNativeUnitTaskCommand(payload.command)) {
     if (expected.text !== "") rejected("metadata outbox text must be empty");
@@ -292,6 +292,66 @@ export function validateOutboxCommandPayload(
     return payload;
   }
 
+  if ("create_task_v2" in command) {
+    const create = command.create_task_v2;
+    if (!isPlainObject(create) || !exactKeys(create, [
+      "id", "environment_id", "title", "description", "project_id", "workspace",
+      "primary_provider", "defer_primary_provider_start", "assignment", "created_at_ms",
+      "connectivity", "attention", "activity", "review_readiness",
+    ])) rejected("create_task_v2 shape rejected");
+    const workspace = isPlainObject(create.workspace) ? create.workspace : null;
+    if (protocolUuid(create.id) !== expected.taskId || !protocolUuid(create.environment_id) ||
+        !protocolUuid(create.project_id) || typeof create.title !== "string" || !create.title.trim() ||
+        create.description !== null || !workspace ||
+        !exactKeys(workspace, ["choice", "path", "branch", "external_confirmed"]) ||
+        workspace.choice !== "main" || workspace.path !== null || workspace.branch !== null ||
+        workspace.external_confirmed !== false ||
+        (create.primary_provider !== "claude" && create.primary_provider !== "codex") ||
+        typeof create.defer_primary_provider_start !== "boolean" || create.assignment !== "local_owner" ||
+        create.created_at_ms !== payload.issued_at_ms || create.connectivity !== "connected" ||
+        create.attention !== "none" || create.activity !== "idle" ||
+        create.review_readiness !== "not_ready" || expected.text !== "") {
+      rejected("create_task_v2 content rejected");
+    }
+    return payload;
+  }
+
+  if ("start_provider_session" in command) {
+    const start = command.start_provider_session;
+    if (!isPlainObject(start) || !exactKeys(start, [
+      "task_id", "agent_session_id", "resource_id", "provider_kind", "mode",
+      "launch_options", "expected_task_revision", "expected_action_epoch",
+    ])) rejected("start_provider_session shape rejected");
+    const options = isPlainObject(start.launch_options) ? start.launch_options : null;
+    const modelAllowed = options && (
+      options.model === "provider_default" ||
+      (start.provider_kind === "codex" &&
+        ["codex_sol", "codex_terra", "codex_luna"].includes(String(options.model))) ||
+      (start.provider_kind === "claude" &&
+        ["claude_opus", "claude_sonnet", "claude_haiku"].includes(String(options.model)))
+    );
+    const effortAllowed = options && (
+      ["provider_default", "low", "medium", "high"].includes(String(options.reasoning_effort)) ||
+      (start.provider_kind === "codex" &&
+        ["extra_high", "max", "ultra"].includes(String(options.reasoning_effort)))
+    );
+    if (protocolUuid(start.task_id) !== expected.taskId ||
+        !protocolUuid(start.agent_session_id) || !protocolUuid(start.resource_id) ||
+        (start.provider_kind !== "claude" && start.provider_kind !== "codex") ||
+        start.mode !== "new_conversation" || !options ||
+        !exactKeys(options, ["model", "reasoning_effort", "access"]) ||
+        !modelAllowed || !effortAllowed ||
+        !["full_access", "workspace_write", "read_only"].includes(String(options.access)) ||
+        typeof start.expected_task_revision !== "number" ||
+        start.expected_task_revision !== payload.expected_task_revision ||
+        typeof start.expected_action_epoch !== "number" ||
+        !Number.isSafeInteger(start.expected_action_epoch) ||
+        expected.text !== "") {
+      rejected("start_provider_session content rejected");
+    }
+    return payload;
+  }
+
   if (!exactKeys(command, ["submit_provider_input"])) {
     rejected("outbox command variant rejected");
   }
@@ -310,9 +370,7 @@ export function validateOutboxCommandPayload(
   ) {
     rejected("submit_provider_input shape rejected");
   }
-  if (submit.question_id !== null || submit.approval_id !== null) {
-    rejected("outbox blockers must be null");
-  }
+  if (submit.approval_id !== null) rejected("outbox approval must be null");
   if (!protocolUuid(submit.agent_session_id)) rejected("agent_session_id rejected");
   if (!protocolUuid(submit.turn_id)) rejected("turn_id rejected");
   if (
@@ -328,6 +386,19 @@ export function validateOutboxCommandPayload(
     rejected("action_epoch rejected");
   }
   const action = submit.action;
+  if (isPlainObject(action) && exactKeys(action, ["answer_question"])) {
+    const answer = action.answer_question;
+    const questionId = protocolUuid(submit.question_id);
+    if (!questionId || !isPlainObject(answer) ||
+        !exactKeys(answer, ["question_id", "answer"]) ||
+        protocolUuid(answer.question_id) !== questionId ||
+        typeof answer.answer !== "string" || answer.answer !== expected.text ||
+        answer.answer.length === 0) {
+      rejected("question answer shape rejected");
+    }
+    return payload;
+  }
+  if (submit.question_id !== null) rejected("outbox question must be null");
   if (isPlainObject(action) && exactKeys(action, ["terminal_input"])) {
     const terminal = action.terminal_input;
     if (!isPlainObject(terminal) || !exactKeys(terminal, ["text"]) ||
@@ -1012,10 +1083,19 @@ export function createIndexedDbNativeCacheStore(
           store,
           validated.hostPublicId,
         );
-        assertOutboxCapacity(
-          existing.map((entry) => validateOutbox(entry.value)),
-          validated,
-        );
+        const validExisting: NativeOutboxRecord[] = [];
+        for (const entry of existing) {
+          try {
+            validExisting.push(validateOutbox(entry.value));
+          } catch {
+            // Older browser bundles may have persisted a command whose wire
+            // schema is no longer canonical. Quarantine must be durable: if
+            // the invalid row remains in IndexedDB it blocks every later
+            // first message during the capacity scan.
+            store.delete(entry.key);
+          }
+        }
+        assertOutboxCapacity(validExisting, validated);
         store.put(validated, outboxKey(validated.hostPublicId, validated.commandId));
         await done;
         await memory.putOutbox(validated);

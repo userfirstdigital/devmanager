@@ -187,7 +187,14 @@ function Get-ConnectCryptoSourceFingerprint {
             & $update ([System.IO.File]::ReadAllBytes($file))
             & $update ([byte[]]@(0))
         }
-        return $script:connectCryptoHash.ToString("x16")
+        # BigInteger's hexadecimal formatter may prepend a sign-preserving zero
+        # when bit 63 is set (17 characters for an unsigned u64). Rust hashes
+        # the same state as u64, so publish exactly the low 16 hex digits.
+        $hex = $script:connectCryptoHash.ToString("x").ToLowerInvariant()
+        if ($hex.Length -gt 16) {
+            $hex = $hex.Substring($hex.Length - 16)
+        }
+        return $hex.PadLeft(16, '0')
     }
     finally {
         Remove-Variable -Scope Script -Name connectCryptoHash -ErrorAction SilentlyContinue

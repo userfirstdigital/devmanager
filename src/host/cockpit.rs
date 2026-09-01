@@ -3635,6 +3635,7 @@ mod tests {
         use crate::domain::agent::{AgentRole, AgentSessionFacts, ProviderSessionId};
         use crate::domain::cockpit::ProviderInputStateProjection;
         use crate::domain::provider_input::ProviderSessionProjection;
+        use crate::domain::resource::{OwnerKind, ResourceFacts, ResourceKind, ResourceRecipe};
         use crate::providers::ProviderKind;
 
         let (_repository, bus, client_id, task_id, _roots) = create_bound_task();
@@ -3652,6 +3653,19 @@ mod tests {
         agent.runtime_generation = 7;
         snapshot.primary_agent_id = Some(agent.id);
         snapshot.agents.insert(agent.id, agent.clone());
+        let mut resource = ResourceFacts::new(
+            Some(task_id),
+            OwnerKind::Task,
+            ResourceKind::Terminal,
+            ResourceRecipe::Terminal {
+                cols: 120,
+                rows: 40,
+            },
+            1,
+        )
+        .unwrap();
+        resource.runtime_generation = 7;
+        snapshot.resources.insert(resource.id, resource.clone());
         let question = crate::domain::QuestionId::new();
         snapshot.provider_sessions.insert(
             agent.id,
@@ -3663,6 +3677,7 @@ mod tests {
         let state = ProviderInputStateProjection::from_snapshot(&snapshot);
         assert_eq!(state.runtime_generation, Some(7));
         assert_eq!(state.agent_session_id, Some(agent.id));
+        assert_eq!(state.resource_id, Some(resource.id));
         assert_eq!(state.provider_session_id, agent.provider_session_id);
         assert_eq!(state.open_question, Some(question));
         // Even a malformed foreign primary reference cannot grant input authority.

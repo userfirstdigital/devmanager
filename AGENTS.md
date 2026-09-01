@@ -106,6 +106,12 @@
 
 ## Native live-shell discipline
 
+- A terminal/process wait actor that is synchronously joined during provider
+  teardown must never block on a manager lock held by that teardown path. Use
+  nonblocking admission and defer reconciliation to the existing bounded retry
+  lane. Lifecycle acceptance must verify the exact provider process and durable
+  running-process ledger are both gone; a changed task badge or hidden pane is
+  not proof that teardown completed.
 - Treat first-paint task preview and canonical conversation attachment as one
   recovery contract. A transient snapshot or query failure may fail closed, but
   it must retire and reconnect the exact client, retry canonical synchronization

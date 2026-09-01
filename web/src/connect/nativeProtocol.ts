@@ -52,6 +52,30 @@ export class NativeProtocolError extends Error {
 }
 
 export type NativeUuid = string;
+/** Canonical Rust ProviderKind wire names. UI labels may still say Claude Code. */
+export type NativeProviderKind = "claude" | "codex";
+export type NativeProviderModel =
+  | "provider_default"
+  | "codex_sol"
+  | "codex_terra"
+  | "codex_luna"
+  | "claude_opus"
+  | "claude_sonnet"
+  | "claude_haiku";
+export type NativeReasoningEffort =
+  | "provider_default"
+  | "low"
+  | "medium"
+  | "high"
+  | "extra_high"
+  | "max"
+  | "ultra";
+export type NativeAccessMode = "full_access" | "workspace_write" | "read_only";
+export interface NativeProviderLaunchOptions {
+  model: NativeProviderModel;
+  reasoningEffort: NativeReasoningEffort;
+  access: NativeAccessMode;
+}
 
 export type AgentLifecycle = "open" | "closing" | "closed";
 
@@ -87,6 +111,7 @@ export interface ProviderInputStateView {
   taskRevision: number;
   actionEpoch: number;
   agentSessionId: NativeUuid | null;
+  resourceId: NativeUuid | null;
   runtimeGeneration: number | null;
   agentLifecycle: AgentLifecycle | null;
   providerKind: string | null;
@@ -97,6 +122,20 @@ export interface ProviderInputStateView {
   pendingWaitCommandIds: NativeUuid[];
   /** Null when no agent is bound — thin metadata only; not SendNow authority. */
   fence: ProviderInputFence | null;
+}
+
+export interface NativeConfigProjectView {
+  configId: string;
+  label: string;
+  rootConfigured: boolean;
+  workspaceId: NativeUuid | null;
+  folders: Array<{ configId: string; label: string; serverCount: number }>;
+}
+
+export interface NativeConfigSnapshotView {
+  revision: number;
+  projects: NativeConfigProjectView[];
+  providers: Array<{ provider: "claude" | "codex"; commandConfigured: boolean }>;
 }
 
 export interface TaskSnapshotItemView {
@@ -453,6 +492,7 @@ export function requiredCapabilitiesForQuery(
     case "task_cockpit": {
       const cockpit = query.task_cockpit;
       if (cockpit === "terminal") return CAPABILITY_TASK_COCKPIT;
+      if (cockpit === "config_snapshot") return CAPABILITY_TASK_COCKPIT;
       if (cockpit === "provider_input_state") {
         return CAPABILITY_TASK_COCKPIT | CAPABILITY_PROVIDER_INPUT;
       }
@@ -496,6 +536,8 @@ export function requiredCapabilitiesForCommand(command: unknown): bigint {
   const keys = Object.keys(body);
   if (keys.length !== 1) rejected("command must contain exactly one variant");
   if (keys[0] === "submit_provider_input") return CAPABILITY_PROVIDER_INPUT;
+  if (keys[0] === "start_provider_session") return CAPABILITY_PROVIDER_INPUT;
+  if (keys[0] === "create_task_v2") return 0n;
   if (keys[0] === "rename_task") return 0n;
   rejected(`unknown command variant ${keys[0]}`);
 }
@@ -534,7 +576,12 @@ export function assertSupportedCommandVariant(command: unknown): void {
   const keys = Object.keys(body);
   if (keys.length !== 1) rejected("command variant rejected");
   const key = keys[0]!;
-  if (key === "submit_provider_input" || key === "rename_task") return;
+  if (
+    key === "submit_provider_input" ||
+    key === "start_provider_session" ||
+    key === "rename_task" ||
+    key === "create_task_v2"
+  ) return;
   if (isNativeUnitTaskCommand(key)) {
     rejected("unit command variant must be a string");
   }
@@ -626,6 +673,13 @@ export function buildTaskCockpitTerminalQuery(
   const authority = requireAuthority(input);
   const taskId = requireUuid(input.taskId, "taskId");
   return queryPayloadRequest(authority, taskId, { task_cockpit: "terminal" });
+}
+
+export function buildTaskCockpitConfigSnapshotQuery(
+  input: NativeAuthority,
+): ConnectPayloadRequest {
+  const authority = requireAuthority(input);
+  return queryPayloadRequest(authority, null, { task_cockpit: "config_snapshot" });
 }
 
 export function buildProviderInputStateQuery(
@@ -809,6 +863,12 @@ export function isMetadataTaskCommand(payload: unknown): boolean {
   return body !== null && Object.keys(body).length === 1 && "rename_task" in body;
 }
 
+export function isTaskCreateV2Command(payload: unknown): boolean {
+  const command = record(payload)?.command;
+  const body = record(command);
+  return body !== null && Object.keys(body).length === 1 && "create_task_v2" in body;
+}
+
 /** Max UTF-8 bytes for RenameTask titles on the phone path. */
 export const MAX_TASK_TITLE_BYTES = 4096;
 
@@ -819,6 +879,142 @@ export interface NativeTaskCommandInput {
   issuedAtMs: number;
   /** Exact current TaskSnapshot revision; never a guessed or stale value. */
   expectedTaskRevision: number;
+}
+
+export interface NativeCreateTaskV2Input {
+  authority: NativeAuthority;
+  commandId: NativeUuid;
+  taskId: NativeUuid;
+  environmentId: NativeUuid;
+  projectId: NativeUuid;
+  provider: NativeProviderKind;
+  title: string;
+  issuedAtMs: number;
+  deferPrimaryProviderStart?: boolean;
+}
+
+export function buildCreateTaskV2Command(
+  input: NativeCreateTaskV2Input,
+): ConnectPayloadRequest {
+  const authority = requireAuthority(input.authority);
+  const commandId = requireUuid(input.commandId, "commandId");
+  const taskId = requireUuid(input.taskId, "taskId");
+  const environmentId = requireUuid(input.environmentId, "environmentId");
+  const projectId = requireUuid(input.projectId, "projectId");
+  const issuedAtMs = requireSafeI64(input.issuedAtMs, "issuedAtMs");
+  const title = boundedText(input.title, "title", MAX_TASK_TITLE_BYTES).trim();
+  if (!title) rejected("title must be non-empty");
+  if (input.provider !== "claude" && input.provider !== "codex") {
+    rejected("provider rejected");
+  }
+  const command = { create_task_v2: {
+    id: taskId,
+    environment_id: environmentId,
+    title,
+    description: null,
+    project_id: projectId,
+    workspace: { choice: "main", path: null, branch: null, external_confirmed: false },
+    primary_provider: input.provider,
+    defer_primary_provider_start: input.deferPrimaryProviderStart === true,
+    assignment: "local_owner",
+    created_at_ms: issuedAtMs,
+    connectivity: "connected",
+    attention: "none",
+    activity: "idle",
+    review_readiness: "not_ready",
+  } };
+  requiredCapabilitiesForCommand(command);
+  return {
+    payloadKind: NATIVE_COMMAND_KIND,
+    payload: {
+      command_id: commandId,
+      client_id: authority.clientId,
+      task_id: null,
+      issued_at_ms: issuedAtMs,
+      expected_task_revision: null,
+      command,
+    },
+    requestId: authority.requestId,
+    operationId: null,
+    privacyClass: "local_only",
+    payloadVersion: 1,
+  };
+}
+
+export interface NativeStartProviderSessionInput extends NativeTaskCommandInput {
+  agentSessionId: NativeUuid;
+  resourceId: NativeUuid;
+  provider: NativeProviderKind;
+  actionEpoch: number;
+  launchOptions: NativeProviderLaunchOptions;
+}
+
+export function buildStartProviderSessionCommand(
+  input: NativeStartProviderSessionInput,
+): ConnectPayloadRequest {
+  const authority = requireAuthority(input.authority);
+  const commandId = requireUuid(input.commandId, "commandId");
+  const taskId = requireUuid(input.taskId, "taskId");
+  const issuedAtMs = requireSafeI64(input.issuedAtMs, "issuedAtMs");
+  const expectedTaskRevision = requireSafePositive(
+    input.expectedTaskRevision,
+    "expectedTaskRevision",
+  );
+  const actionEpoch = requireSafeUnsigned(input.actionEpoch, "actionEpoch");
+  validateProviderLaunchOptions(input.provider, input.launchOptions);
+  const command = {
+    start_provider_session: {
+      task_id: taskId,
+      agent_session_id: requireUuid(input.agentSessionId, "agentSessionId"),
+      resource_id: requireUuid(input.resourceId, "resourceId"),
+      provider_kind: input.provider,
+      mode: "new_conversation",
+      launch_options: {
+        model: input.launchOptions.model,
+        reasoning_effort: input.launchOptions.reasoningEffort,
+        access: input.launchOptions.access,
+      },
+      expected_task_revision: expectedTaskRevision,
+      expected_action_epoch: actionEpoch,
+    },
+  };
+  requiredCapabilitiesForCommand(command);
+  return {
+    payloadKind: NATIVE_COMMAND_KIND,
+    payload: {
+      command_id: commandId,
+      client_id: authority.clientId,
+      task_id: taskId,
+      issued_at_ms: issuedAtMs,
+      expected_task_revision: expectedTaskRevision,
+      command,
+    },
+    requestId: authority.requestId,
+    operationId: null,
+    privacyClass: "local_only",
+    payloadVersion: 1,
+  };
+}
+
+function validateProviderLaunchOptions(
+  provider: NativeProviderKind,
+  options: NativeProviderLaunchOptions,
+): void {
+  const models: NativeProviderModel[] = provider === "codex"
+    ? ["provider_default", "codex_sol", "codex_terra", "codex_luna"]
+    : ["provider_default", "claude_opus", "claude_sonnet", "claude_haiku"];
+  if (!models.includes(options.model)) {
+    rejected("provider launch model rejected");
+  }
+  const efforts: NativeReasoningEffort[] = provider === "codex"
+    ? ["provider_default", "low", "medium", "high", "extra_high", "max", "ultra"]
+    : ["provider_default", "low", "medium", "high"];
+  if (!efforts.includes(options.reasoningEffort)) {
+    rejected("provider launch reasoning effort rejected");
+  }
+  if (!["full_access", "workspace_write", "read_only"].includes(options.access)) {
+    rejected("provider launch access rejected");
+  }
 }
 
 function buildTaskCommandEnvelope(
@@ -893,7 +1089,13 @@ export interface NativeProviderSubmit {
 }
 
 export function buildSubmitProviderInputSendNow(input: NativeProviderSubmit): ConnectPayloadRequest {
-  return buildProviderInput(input, false);
+  return buildProviderInput(input, "send_now");
+}
+
+export function buildSubmitProviderAnswerQuestion(
+  input: NativeProviderSubmit,
+): ConnectPayloadRequest {
+  return buildProviderInput(input, "answer_question");
 }
 
 export function buildSubmitProviderTerminalKey(
@@ -901,10 +1103,13 @@ export function buildSubmitProviderTerminalKey(
 ): ConnectPayloadRequest {
   const text = NATIVE_TERMINAL_KEYS[input.key];
   if (typeof text !== "string") rejected("unknown terminal key");
-  return buildProviderInput({ ...input, text }, true);
+  return buildProviderInput({ ...input, text }, "terminal_input");
 }
 
-function buildProviderInput(input: NativeProviderSubmit, terminal: boolean): ConnectPayloadRequest {
+function buildProviderInput(
+  input: NativeProviderSubmit,
+  actionKind: "send_now" | "terminal_input" | "answer_question",
+): ConnectPayloadRequest {
   const authority = requireAuthority(input.authority);
   const commandId = requireUuid(input.commandId, "commandId");
   const issuedAtMs = requireSafeI64(input.issuedAtMs, "issuedAtMs");
@@ -918,13 +1123,18 @@ function buildProviderInput(input: NativeProviderSubmit, terminal: boolean): Con
   if (fence.clientId !== authority.clientId) {
     rejected("clientId mismatch");
   }
-  if (fence.agentLifecycle !== "open") {
-    rejected("non-open agent rejects SendNow");
-  }
-  if (fence.openQuestion !== null) rejected("open question blocker rejects SendNow");
-  if (fence.openApproval !== null) rejected("open approval blocker rejects SendNow");
-  if (fence.pendingWaitCommandIds.length > 0) {
-    rejected("pending wait blocker rejects SendNow");
+  if (fence.agentLifecycle !== "open") rejected("non-open agent rejects provider input");
+  const answering = actionKind === "answer_question";
+  if (answering) {
+    if (fence.openQuestion === null) rejected("answer requires an open question");
+    if (fence.currentTurn === null) rejected("answer requires a current turn");
+    if (fence.openApproval !== null) rejected("approval blocker rejects question answer");
+  } else {
+    if (fence.openQuestion !== null) rejected("open question blocker rejects SendNow");
+    if (fence.openApproval !== null) rejected("open approval blocker rejects SendNow");
+    if (fence.pendingWaitCommandIds.length > 0) {
+      rejected("pending wait blocker rejects SendNow");
+    }
   }
 
   const taskId = requireUuid(fence.taskId, "fence.taskId");
@@ -957,14 +1167,16 @@ function buildProviderInput(input: NativeProviderSubmit, terminal: boolean): Con
           runtime_generation: runtimeGeneration,
           turn_id: turnId,
           action_epoch: actionEpoch,
-          question_id: null,
+          question_id: answering ? requireUuid(fence.openQuestion, "fence.openQuestion") : null,
           approval_id: null,
-          action: terminal ? { terminal_input: { text } } : {
-            send_now: {
-              text,
-              wait: input.wait === true,
-            },
-          },
+          action: actionKind === "terminal_input"
+            ? { terminal_input: { text } }
+            : answering
+              ? { answer_question: {
+                  question_id: requireUuid(fence.openQuestion, "fence.openQuestion"),
+                  answer: text,
+                } }
+              : { send_now: { text, wait: input.wait === true } },
         },
       },
     },
@@ -1110,6 +1322,7 @@ const PROVIDER_INPUT_STATE_KEYS = [
   "task_revision",
   "action_epoch",
   "agent_session_id",
+  "resource_id",
   "runtime_generation",
   "agent_lifecycle",
   "provider_kind",
@@ -1140,6 +1353,7 @@ export function decodeProviderInputState(
   const taskRevision = requireSafePositive(root.task_revision, "task_revision");
   const actionEpoch = requireSafeUnsigned(root.action_epoch, "action_epoch");
   const agentSessionId = optionalUuid(root.agent_session_id, "agent_session_id");
+  const resourceId = optionalUuid(root.resource_id, "resource_id");
   const runtimeGeneration =
     root.runtime_generation === null
       ? null
@@ -1177,6 +1391,7 @@ export function decodeProviderInputState(
   if (agentSessionId === null) {
     if (
       runtimeGeneration !== null ||
+      resourceId !== null ||
       agentLifecycle !== null ||
       providerKind !== null ||
       providerSessionId !== null ||
@@ -1192,6 +1407,7 @@ export function decodeProviderInputState(
       taskRevision,
       actionEpoch,
       agentSessionId: null,
+      resourceId: null,
       runtimeGeneration: null,
       agentLifecycle: null,
       providerKind: null,
@@ -1213,6 +1429,7 @@ export function decodeProviderInputState(
     taskRevision,
     actionEpoch,
     agentSessionId,
+    resourceId,
     runtimeGeneration,
     agentLifecycle,
     providerKind,
@@ -1569,6 +1786,62 @@ export function decodeTaskCockpitConversationResult(
     rejected("task_cockpit result missing");
   if (!("conversation" in cockpit)) rejected("conversation result missing");
   return decodeSemanticJournalPage(cockpit.conversation);
+}
+
+export function decodeTaskCockpitConfigSnapshotResult(
+  reply: DecodedQueryReply,
+): NativeConfigSnapshotView {
+  if (reply.outcome.kind !== "ok") rejected("config snapshot query error");
+  const cockpit = record(reply.outcome.result.task_cockpit)
+    ?? rejected("task_cockpit result missing");
+  const config = record(cockpit.config) ?? rejected("config result missing");
+  if (!Array.isArray(config.projects) || config.projects.length > 1024) {
+    rejected("config projects rejected");
+  }
+  if (!Array.isArray(config.providers) || config.providers.length > 32) {
+    rejected("config providers rejected");
+  }
+  const projects = config.projects.map((rawProject, projectIndex) => {
+    const project = record(rawProject) ?? rejected(`config project ${projectIndex} rejected`);
+    if (!Array.isArray(project.folders) || project.folders.length > 1024) {
+      rejected("config folders rejected");
+    }
+    const workspaceId = project.workspace_id === ""
+      ? null
+      : requireUuid(project.workspace_id, "workspace_id");
+    return {
+      configId: boundedText(project.config_id, "project.config_id", 256),
+      label: boundedText(project.label, "project.label", 4096),
+      rootConfigured: project.root_configured === true,
+      workspaceId,
+      folders: project.folders.map((rawFolder, folderIndex) => {
+        const folder = record(rawFolder) ?? rejected(`config folder ${folderIndex} rejected`);
+        return {
+          configId: boundedText(folder.config_id, "folder.config_id", 256),
+          label: boundedText(folder.label, "folder.label", 4096),
+          serverCount: requireSafeUnsigned(folder.server_count, "folder.server_count"),
+        };
+      }),
+    };
+  });
+  const providers = config.providers.map((rawProvider, providerIndex) => {
+    const provider = record(rawProvider) ?? rejected(`config provider ${providerIndex} rejected`);
+    if (provider.provider !== "claude" && provider.provider !== "codex") {
+      rejected("config provider kind rejected");
+    }
+    if (typeof provider.command_configured !== "boolean") {
+      rejected("config provider state rejected");
+    }
+    return {
+      provider: provider.provider as "claude" | "codex",
+      commandConfigured: provider.command_configured,
+    };
+  });
+  return {
+    revision: requireSafeUnsigned(config.revision, "config.revision"),
+    projects,
+    providers,
+  };
 }
 
 export interface NativeTerminalSnapshot {
