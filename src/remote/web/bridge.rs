@@ -630,11 +630,19 @@ pub(crate) async fn run_connect_session(
         let _ = socket.close().await;
         return;
     }
+    let mut noise_limits = crate::connect::ConnectLimits::v1_default();
+    // snow transport records are bounded below DevManager's general 1 MiB
+    // frame ceiling. Keep reply pages/chunks below the record boundary with
+    // enough room for the Connect envelope and Noise authenticated metadata.
+    noise_limits.max_physical_frame_bytes = 64 * 1024;
+    noise_limits.max_page_encoded_bytes = 48 * 1024;
+    noise_limits.max_chunk_bytes = 48 * 1024;
     let mut dispatch = crate::connect::ConnectDispatchSession::bind_paired(
         paired_client_id,
         crate::connect::ConnectIdentityLiveState::Live,
     )
     .with_assigned_client_id(peer.client_id())
+    .with_limit_ceiling(noise_limits)
     .with_capability_ceiling(crate::protocol::CapabilitySet::from_bits(
         u64::MAX
             & !crate::protocol::Capability::HostShutdown.bit()
@@ -767,14 +775,35 @@ pub(crate) async fn run_connect_session(
                     Ok(Ok(Some(duplex))) => {
                         // Hello was physically flushed by SinkExt::send before
                         // the single live writer takes ownership of the socket.
-                        let _ = crate::host::serve_host_connect_duplex(
+                        if let Err(error) = crate::host::serve_host_connect_duplex(
                             socket, channel, dispatch, duplex, peer,
                         )
-                        .await;
+                        .await
+                        {
+                            eprintln!(
+                                "devmanager-host: Connect browser duplex ended after Hello: {error}"
+                            );
+                        }
                         return;
                     }
-                    Ok(Ok(None)) => break, // Remote delivery requires the owning host writer.
-                    _ => break,
+                    Ok(Ok(None)) => {
+                        eprintln!(
+                            "devmanager-host: Connect browser duplex unavailable after Hello"
+                        );
+                        break;
+                    }
+                    Ok(Err(error)) => {
+                        eprintln!(
+                            "devmanager-host: Connect browser duplex registration failed after Hello: {error}"
+                        );
+                        break;
+                    }
+                    Err(_) => {
+                        eprintln!(
+                            "devmanager-host: Connect browser duplex registration timed out after Hello"
+                        );
+                        break;
+                    }
                 }
             }
         }

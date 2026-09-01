@@ -119,6 +119,13 @@
   poll cancellation-owned restore futures alongside inbox and cockpit requests;
   dropping the executor must cancel them. Prove task-list latency while restores
   are still in flight, not only after every provider has connected.
+- Browser Connect acceptance must negotiate limits for the physical carrier,
+  prove multi-page initial task and semantic-conversation synchronization over
+  the encrypted Noise path, and decode MessagePack binary cursors in the exact
+  shape emitted by the WASM bridge. Compact optional terminal styling before
+  serialization while preserving text, cursor, mode, and fence identity; then
+  measure host CPU with a live terminal open so a bounded wire response does not
+  hide a hot refresh loop.
 - Automatic cockpit refresh must be idempotent and query only the active dock
   surface. Keep read-only file browsing on the least-authority path, use bounded
   pagination, and validate a handle-relative snapshot at stable root boundaries

@@ -6,6 +6,7 @@ on:
       - ".gitattributes"
       - ".github/workflows/web-bundle.yml"
       - "build.rs"
+      - "crates/connect-crypto/**"
       - "packaging/package-contract.json"
       - "packaging/exclusions.txt"
       - "packaging/Assert-PackageContract.ps1"
@@ -15,6 +16,10 @@ on:
       - "scripts/native-next/Invoke-ReleaseCandidate.ps1"
       - "src/remote/web/assets.rs"
       - "src/remote/web/mod.rs"
+      - "src/connect/envelope.rs"
+      - "src/connect/schema.rs"
+      - "src/protocol/crypto.rs"
+      - "src/protocol/envelope.rs"
       - "web/**"
 
 permissions:

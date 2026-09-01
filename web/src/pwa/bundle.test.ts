@@ -1,6 +1,6 @@
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, readFileSync, readdirSync, statSync } from "node:fs";
 import { execFileSync } from "node:child_process";
-import { dirname, join } from "node:path";
+import { dirname, join, relative } from "node:path";
 import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
 
@@ -10,6 +10,45 @@ const repoRoot = join(webRoot, "..");
 
 function readBundleFile(path: string): string {
   return readFileSync(join(bundleRoot, path), "utf8");
+}
+
+function connectCryptoSourceFingerprint(): string {
+  const manifest = readFileSync(
+    join(repoRoot, "crates", "connect-crypto", "artifact-sources.txt"),
+    "utf8",
+  );
+  const files: string[] = [];
+  const collect = (path: string) => {
+    if (statSync(path).isDirectory()) {
+      for (const entry of readdirSync(path).sort()) collect(join(path, entry));
+      return;
+    }
+    files.push(relative(repoRoot, path).replace(/\\/gu, "/"));
+  };
+  for (const source of manifest.split(/\r?\n/u)) {
+    const path = source.trim();
+    if (!path || path.startsWith("#")) continue;
+    collect(join(repoRoot, path));
+  }
+  let hash = 0xcbf29ce484222325n;
+  const update = (bytes: Uint8Array) => {
+    for (let index = 0; index < bytes.length; index += 1) {
+      let byte = bytes[index];
+      if (byte === 13 && bytes[index + 1] === 10) {
+        byte = 10;
+        index += 1;
+      }
+      hash ^= BigInt(byte);
+      hash = BigInt.asUintN(64, hash * 0x100000001b3n);
+    }
+  };
+  for (const path of files.sort()) {
+    update(new TextEncoder().encode(path));
+    update(new Uint8Array([0]));
+    update(readFileSync(join(repoRoot, path)));
+    update(new Uint8Array([0]));
+  }
+  return hash.toString(16).padStart(16, "0");
 }
 
 describe("production PWA bundle", () => {
@@ -100,6 +139,14 @@ describe("production PWA bundle", () => {
       expect(worker).toContain(precached);
     }
     expect(worker).not.toContain("source-fingerprint.txt");
+  });
+
+  it("embeds Connect crypto built from the current shared protocol sources", () => {
+    const manifest = JSON.parse(
+      readBundleFile("assets/wasm/connect_crypto.manifest.json"),
+    ) as { sourceFingerprint?: string };
+
+    expect(manifest.sourceFingerprint).toBe(connectCryptoSourceFingerprint());
   });
 });
 

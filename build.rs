@@ -379,6 +379,12 @@ fn validate_web_bundle() {
     println!("cargo:rerun-if-changed=web/public");
     println!("cargo:rerun-if-changed=web/config");
     println!("cargo:rerun-if-changed=web/bundle");
+    println!("cargo:rerun-if-changed=crates/connect-crypto/artifact-sources.txt");
+    if let Ok(paths) = connect_crypto_source_paths(std::path::Path::new(".")) {
+        for path in paths {
+            println!("cargo:rerun-if-changed={}", path.display());
+        }
+    }
     emit_bundle_rerun_directives(&web_dir.join("bundle"));
 
     if let Err(errors) = validate_web_bundle_at(web_dir) {
@@ -796,6 +802,21 @@ fn validate_connect_crypto_artifacts(bundle: &std::path::Path, errors: &mut Vec<
                 ));
             }
         }
+        let repository = bundle
+            .parent()
+            .and_then(std::path::Path::parent)
+            .unwrap_or_else(|| std::path::Path::new("."));
+        match connect_crypto_source_fingerprint(repository) {
+            Ok(expected) => {
+                let required = format!("\"sourceFingerprint\":\"{expected}\"");
+                if !compact.contains(&required) {
+                    errors.push(format!(
+                        "web/bundle Connect crypto artifact is stale: sources require {expected}"
+                    ));
+                }
+            }
+            Err(error) => errors.push(error),
+        }
     } else {
         errors
             .push("web/bundle/assets/wasm/connect_crypto.manifest.json is unreadable".to_string());
@@ -841,6 +862,82 @@ fn validate_connect_crypto_artifacts(bundle: &std::path::Path, errors: &mut Vec<
                 "web/bundle/assets/wasm is missing required artifact {required}"
             ));
         }
+    }
+}
+
+fn connect_crypto_source_paths(
+    repository: &std::path::Path,
+) -> Result<Vec<std::path::PathBuf>, String> {
+    let manifest = repository.join("crates/connect-crypto/artifact-sources.txt");
+    let contents = std::fs::read_to_string(&manifest)
+        .map_err(|error| format!("cannot read {}: {error}", manifest.display()))?;
+    let mut files = Vec::new();
+    for source in contents.lines().map(str::trim) {
+        if source.is_empty() || source.starts_with('#') {
+            continue;
+        }
+        let path = repository.join(source);
+        if path.is_dir() {
+            collect_connect_crypto_source_files(&path, &mut files)?;
+        } else if path.is_file() {
+            files.push(path);
+        } else {
+            return Err(format!("Connect crypto source path is missing: {source}"));
+        }
+    }
+    files.sort();
+    Ok(files)
+}
+
+fn collect_connect_crypto_source_files(
+    directory: &std::path::Path,
+    files: &mut Vec<std::path::PathBuf>,
+) -> Result<(), String> {
+    let entries = std::fs::read_dir(directory)
+        .map_err(|error| format!("cannot scan {}: {error}", directory.display()))?;
+    for entry in entries {
+        let entry = entry
+            .map_err(|error| format!("cannot inspect {}: {error}", directory.display()))?;
+        let path = entry.path();
+        if path.is_dir() {
+            collect_connect_crypto_source_files(&path, files)?;
+        } else if path.is_file() {
+            files.push(path);
+        }
+    }
+    Ok(())
+}
+
+fn connect_crypto_source_fingerprint(repository: &std::path::Path) -> Result<String, String> {
+    let mut hash = 0xcbf29ce484222325_u64;
+    for path in connect_crypto_source_paths(repository)? {
+        let relative = path
+            .strip_prefix(repository)
+            .map_err(|_| format!("Connect crypto source escaped repository: {}", path.display()))?
+            .to_string_lossy()
+            .replace('\\', "/");
+        update_connect_crypto_fingerprint(&mut hash, relative.as_bytes());
+        update_connect_crypto_fingerprint(&mut hash, &[0]);
+        let contents = std::fs::read(&path)
+            .map_err(|error| format!("cannot read {}: {error}", path.display()))?;
+        update_connect_crypto_fingerprint(&mut hash, &contents);
+        update_connect_crypto_fingerprint(&mut hash, &[0]);
+    }
+    Ok(format!("{hash:016x}"))
+}
+
+fn update_connect_crypto_fingerprint(hash: &mut u64, bytes: &[u8]) {
+    let mut index = 0;
+    while index < bytes.len() {
+        let byte = if bytes[index] == b'\r' && bytes.get(index + 1) == Some(&b'\n') {
+            index += 1;
+            b'\n'
+        } else {
+            bytes[index]
+        };
+        *hash ^= u64::from(byte);
+        *hash = hash.wrapping_mul(0x100000001b3);
+        index += 1;
     }
 }
 

@@ -373,13 +373,29 @@ export function connectBinaryMarker(bytes: Uint8Array): ConnectBinaryMarker {
 
 /** Return a copy of caller resume-cursor bytes from a marker or raw bytes. */
 export function copyResumeCursorBytes(
-  value: ConnectBinaryMarker | Uint8Array,
+  value: ConnectBinaryMarker | Uint8Array | readonly number[],
 ): Uint8Array {
   if (value instanceof Uint8Array) {
     if (value.byteLength === 0 || value.byteLength > MAX_RESUME_CURSOR_BYTES) {
       rejected("resume cursor byte length rejected");
     }
     return value.slice();
+  }
+  // The WASM MessagePack decoder represents BIN values as bounded JSON byte
+  // arrays. Markers are only the browser-to-WASM encoding form.
+  if (Array.isArray(value)) {
+    if (value.length === 0 || value.length > MAX_RESUME_CURSOR_BYTES) {
+      rejected("resume cursor byte length rejected");
+    }
+    const bytes = new Uint8Array(value.length);
+    for (let index = 0; index < value.length; index += 1) {
+      const byte = value[index];
+      if (!Number.isInteger(byte) || byte < 0 || byte > 255) {
+        rejected("resume cursor byte rejected");
+      }
+      bytes[index] = byte;
+    }
+    return bytes;
   }
   const map = record(value) ?? rejected("resume cursor marker rejected");
   if (!("$connectBinary" in map) || Object.keys(map).length !== 1) {
@@ -1466,7 +1482,9 @@ function decodeSemanticPayload(
       return {
         kind,
         call_id: boundedText(payload.call_id, "call_id", 256),
-        status: boundedText(payload.status, "status", 256),
+        // Host projections use this field for bounded command summaries and
+        // unified diffs as well as short lifecycle labels.
+        status: boundedText(payload.status, "status", MAX_SEMANTIC_TEXT_BYTES),
       };
     case "approval_request":
       return {
@@ -1568,8 +1586,26 @@ export function decodeTaskCockpitTerminalResult(
   if (reply.outcome.kind !== "ok") {
     rejected(`terminal query: ${reply.outcome.error.code}`);
   }
-  const terminal = record(record(reply.outcome.result.task_cockpit)?.terminal)
-    ?? rejected("terminal result missing");
+  const cockpit = record(reply.outcome.result.task_cockpit)
+    ?? rejected("task_cockpit result missing");
+  const unavailable = record(cockpit.unavailable);
+  if (unavailable) {
+    const reason = boundedText(unavailable.reason, "terminal unavailable reason", 128);
+    if (reason === "terminal_start_pending") {
+      rejected("Terminal is starting on the host…");
+    }
+    if (reason === "terminal_not_started") {
+      rejected("No terminal has started for this task yet.");
+    }
+    if (reason === "terminal_provider_setup_required") {
+      rejected("The provider needs setup or trust confirmation on the host.");
+    }
+    rejected("No live terminal is available for this task.");
+  }
+  const denied = record(cockpit.denied);
+  if (denied) rejected("Terminal access was denied by the host.");
+  const terminal = record(cockpit.terminal)
+    ?? rejected("The host returned no terminal state for this task.");
   const taskId = requireUuid(terminal.task_id, "terminal.task_id");
   if (taskId !== requireUuid(expectedTaskId, "expectedTaskId")) {
     rejected("terminal task mismatch");
@@ -1650,7 +1686,12 @@ export function decodeTasksSnapshotPage(value: unknown): SnapshotPageView {
     afterItem: page.after_item ?? null,
     items,
     encodedBytes,
-    nextCursor: page.next_cursor ?? null,
+    nextCursor:
+      page.next_cursor === null || page.next_cursor === undefined
+        ? null
+        : copyResumeCursorBytes(
+            page.next_cursor as ConnectBinaryMarker | Uint8Array | readonly number[],
+          ),
   };
 }
 
@@ -1809,7 +1850,7 @@ export function decodeEventReplayPageResult(
       nextCursor = copyResumeCursorBytes(page.next_cursor);
     } else {
       nextCursor = copyResumeCursorBytes(
-        page.next_cursor as ConnectBinaryMarker,
+        page.next_cursor as ConnectBinaryMarker | readonly number[],
       );
     }
   }

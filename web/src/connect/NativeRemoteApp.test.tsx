@@ -189,6 +189,25 @@ describe("NativeRemoteApp", () => {
     expect(session.sendText).not.toHaveBeenCalled();
   });
 
+  it("does not show a contradictory waiting message when the terminal is unavailable", async () => {
+    const session = makeSession();
+    vi.mocked(session.readTerminal).mockRejectedValue(
+      new Error("No live terminal is available for this task."),
+    );
+    render(<NativeRemoteApp hostPublicId={HOST_ID} session={session} />);
+
+    fireEvent.click(screen.getByRole("button", { name: /investigate mobile sync/i }));
+    fireEvent.click(screen.getByRole("button", { name: "Show terminal" }));
+
+    expect(await screen.findByText("No live terminal is available for this task.")).not.toBeNull();
+    expect(screen.queryByText("Waiting for terminal output…")).toBeNull();
+    expect(
+      (screen.getByRole("button", { name: "Terminal enter" }) as HTMLButtonElement)
+        .disabled,
+    ).toBe(true);
+    expect(session.sendTerminalKey).not.toHaveBeenCalled();
+  });
+
   it("opens a canonical watched task and renders its cached semantic conversation", async () => {
     const session = makeSession();
 
@@ -259,6 +278,21 @@ describe("NativeRemoteApp", () => {
     expect(session.setDraft).toHaveBeenLastCalledWith(TASK_ID, "");
   });
 
+  it("explains why a returned task cannot accept a message and preserves its draft", async () => {
+    const session = makeSession(makeView(), {
+      sendText: vi.fn(async () => ({ ok: false as const, reason: "no_agent" as const })),
+    });
+    render(<NativeRemoteApp hostPublicId={HOST_ID} session={session} />);
+
+    fireEvent.click(screen.getByRole("button", { name: /investigate mobile sync/i }));
+    const composer = screen.getByRole("textbox", { name: /message/i }) as HTMLTextAreaElement;
+    fireEvent.change(composer, { target: { value: "Keep this text." } });
+    fireEvent.click(screen.getByRole("button", { name: /send/i }));
+
+    expect(await screen.findByText(/no active agent session/i)).not.toBeNull();
+    expect(composer.value).toBe("Keep this text.");
+  });
+
   it("keeps Done compact at the bottom and archives behind a separate icon", () => {
     const session = makeSession(
       makeView({
@@ -275,6 +309,8 @@ describe("NativeRemoteApp", () => {
     render(<NativeRemoteApp hostPublicId={HOST_ID} session={session} />);
 
     expect(screen.getByText("Open task")).not.toBeNull();
+    expect(screen.getAllByText("Working").length).toBeGreaterThan(0);
+    expect(screen.queryByText(/active · none · connected/i)).toBeNull();
     expect(screen.getByText("Closing task")).not.toBeNull();
     expect(screen.getByText(/Archiving/i)).not.toBeNull();
     expect(screen.getByText("Done (1)")).not.toBeNull();
@@ -287,6 +323,26 @@ describe("NativeRemoteApp", () => {
     expect(screen.getByRole("region", { name: "Archived tasks" })).not.toBeNull();
     expect(screen.getByText("Archived task")).not.toBeNull();
     expect(screen.queryByRole("region", { name: "Task inbox" })).toBeNull();
+  });
+
+  it("clears the task filter when search is closed", () => {
+    const session = makeSession(
+      makeView({
+        tasks: new Map([
+          [TASK_ID, task(TASK_ID, "Snake backend")],
+          [SECOND_TASK_ID, task(SECOND_TASK_ID, "Portal frontend")],
+        ]),
+      }),
+    );
+    render(<NativeRemoteApp hostPublicId={HOST_ID} session={session} />);
+
+    fireEvent.click(screen.getByRole("button", { name: "Search tasks" }));
+    fireEvent.change(screen.getByRole("searchbox", { name: "Search tasks" }), {
+      target: { value: "snake" },
+    });
+    expect(screen.queryByText("Portal frontend")).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: "Close task search" }));
+    expect(screen.getByText("Portal frontend")).not.toBeNull();
   });
 
   it("clears an accepted cached draft when its local draft version is initially absent", async () => {

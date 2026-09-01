@@ -226,6 +226,7 @@ pub struct ConnectDispatchSession {
     negotiated: Option<NegotiatedConnect>,
     active: bool,
     capability_ceiling: CapabilitySet,
+    limit_ceiling: ConnectLimits,
     /// Opaque session-bound device proof for canonical Device-kind peers.
     device_credential: Option<DeviceCredentialProof>,
     session_epoch: Option<u64>,
@@ -247,6 +248,7 @@ impl ConnectDispatchSession {
             negotiated: None,
             active: true,
             capability_ceiling: CapabilitySet::from_bits(u64::MAX),
+            limit_ceiling: ConnectLimits::v1_default(),
             device_credential: None,
             session_epoch: None,
             // Legacy Host compatibility is explicit via with_legacy_host_compat
@@ -292,6 +294,16 @@ impl ConnectDispatchSession {
     pub fn with_capability_ceiling(mut self, ceiling: CapabilitySet) -> Self {
         if self.negotiated.is_none() {
             self.capability_ceiling = self.capability_ceiling.intersection(ceiling);
+        }
+        self
+    }
+
+    /// Restrict negotiated transport and pagination limits for a physical
+    /// carrier with a smaller record boundary (for example Noise transport).
+    /// Set before Hello; changing an active negotiation is never permitted.
+    pub(crate) fn with_limit_ceiling(mut self, ceiling: ConnectLimits) -> Self {
+        if self.negotiated.is_none() && ceiling.validate().is_ok() {
+            self.limit_ceiling = ceiling;
         }
         self
     }
@@ -567,7 +579,8 @@ impl ConnectDispatchSession {
                 "Hello cannot advertise RawContent as the default privacy class",
             ));
         }
-        let limits = ConnectLimits::v1_default()
+        let limits = self
+            .limit_ceiling
             .negotiate(hello.limits)
             .map_err(|_| {
                 DispatchFailure::fatal(CONNECT_ERROR_PROTOCOL, "Hello limits cannot be negotiated")
@@ -1227,6 +1240,26 @@ mod tests {
             }
             other => panic!("expected Hello reply, got {other:?}"),
         }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn hello_honors_carrier_limit_ceiling_before_requests_are_admitted() {
+        let binding = binding();
+        let mut ceiling = ConnectLimits::v1_default();
+        ceiling.max_physical_frame_bytes = 64 * 1024;
+        ceiling.max_page_encoded_bytes = 48 * 1024;
+        ceiling.max_chunk_bytes = 48 * 1024;
+        let mut session = ConnectDispatchSession::bind_paired(
+            "web-paired-owner".to_owned(),
+            ConnectIdentityLiveState::Live,
+        )
+        .with_legacy_host_compat()
+        .with_limit_ceiling(ceiling);
+
+        let (negotiated, _) = complete_hello(&mut session, binding).await;
+
+        assert_eq!(negotiated, ceiling);
+        assert_eq!(session.negotiated_limits(), Some(ceiling));
     }
 
     #[tokio::test(flavor = "current_thread")]

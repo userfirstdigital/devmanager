@@ -100,6 +100,16 @@ pub(crate) fn project_agent_resource(
 }
 
 pub(crate) fn serve_task_cockpit(dispatch: TaskCockpitDispatch<'_>) -> QueryOutcome {
+    serve_task_cockpit_bounded(
+        dispatch,
+        crate::domain::snapshot::MAX_SNAPSHOT_PAGE_ENCODED_BYTES,
+    )
+}
+
+pub(crate) fn serve_task_cockpit_bounded(
+    dispatch: TaskCockpitDispatch<'_>,
+    max_response_bytes: u32,
+) -> QueryOutcome {
     if !dispatch.capabilities.grants_task_cockpit() {
         return QueryOutcome::Err(QueryError::UnsupportedCapability);
     }
@@ -280,7 +290,13 @@ pub(crate) fn serve_task_cockpit(dispatch: TaskCockpitDispatch<'_>) -> QueryOutc
                     );
                 }
             }
-            serve_task_terminal(&dispatch, task_id, &snapshot, readiness_query)
+            serve_task_terminal(
+                &dispatch,
+                task_id,
+                &snapshot,
+                readiness_query,
+                max_response_bytes,
+            )
         }
         TaskCockpitQuery::WorkspaceStatus => QueryOutcome::Ok(QueryResult::TaskCockpit(
             TaskCockpitResult::Workspace(workspace_projection(task_id, &snapshot.task.workspace)),
@@ -483,9 +499,11 @@ pub(crate) fn serve_task_cockpit(dispatch: TaskCockpitDispatch<'_>) -> QueryOutc
 /// provider size. Send bounded strings and let the native client reconstruct
 /// default-themed paint cells locally while retaining cursor and mode metadata.
 const MAX_TERMINAL_STYLED_CELLS_FOR_WIRE: usize = 3_000;
+const MAX_TERMINAL_CONNECT_STYLED_CELLS: usize = 256;
 
 fn compact_terminal_screen_for_wire(
     mut screen: crate::terminal::session::TerminalScreenSnapshot,
+    styled_cell_limit: usize,
 ) -> (
     crate::terminal::session::TerminalScreenSnapshot,
     Vec<String>,
@@ -520,7 +538,6 @@ fn compact_terminal_screen_for_wire(
             || cell.has_hyperlink
             || !cell.zero_width.is_empty()
     });
-    let styled_cell_limit = MAX_TERMINAL_STYLED_CELLS_FOR_WIRE;
     if screen.cells.len() > styled_cell_limit {
         // A wide, fully coloured provider TUI can legitimately style more
         // cells than one MessagePack collection may contain. Text remains
@@ -537,7 +554,10 @@ fn compact_terminal_screen_for_wire(
 }
 
 const MAX_CONVERSATION_PAGE_ITEMS: usize = 128;
-const MAX_CONVERSATION_PAGE_BYTES: usize = 256 * 1024;
+// Keep semantic pages below the smallest supported encrypted carrier frame.
+// Noise transport messages have a hard ~64 KiB ceiling and the enclosing
+// QueryReply/Connect envelope still needs headroom around this page.
+const MAX_CONVERSATION_PAGE_BYTES: usize = 48 * 1024;
 
 /// Project one bounded semantic conversation page for a Task. Shared by the
 /// one-shot Conversation query and OpenConversationSubscription initial capture.
@@ -546,6 +566,7 @@ fn serve_task_terminal(
     task_id: TaskId,
     snapshot: &crate::domain::TaskSnapshot,
     readiness_query: bool,
+    max_response_bytes: u32,
 ) -> QueryOutcome {
     let Some(service) = dispatch.terminal_service else {
         return unavailable(
@@ -617,7 +638,13 @@ fn serve_task_terminal(
                     TaskCockpitDeniedReason::StaleFence,
                 );
             }
-            let (screen, text_lines) = compact_terminal_screen_for_wire(terminal.view.screen);
+            let styled_cell_limit = if max_response_bytes <= 64 * 1024 {
+                MAX_TERMINAL_CONNECT_STYLED_CELLS
+            } else {
+                MAX_TERMINAL_STYLED_CELLS_FOR_WIRE
+            };
+            let (screen, text_lines) =
+                compact_terminal_screen_for_wire(terminal.view.screen, styled_cell_limit);
             if readiness_query && agent.provider_session_id.is_none() {
                 use crate::providers::input::{
                     classify_codex_identityless_startup_readiness,
@@ -641,34 +668,45 @@ fn serve_task_terminal(
                     );
                 }
             }
+            let projection = TaskTerminalProjection {
+                task_id,
+                terminal_id: terminal.terminal_id,
+                session_id: terminal.session_id,
+                agent_session_id: terminal.agent_session_id,
+                resource_id: terminal.resource_id,
+                runtime_generation: terminal.runtime_generation,
+                resource_generation: terminal.resource_generation,
+                action_epoch: terminal.action_epoch,
+                focus_epoch: terminal.focus_epoch,
+                accepted_input_sequence: terminal.accepted_input_sequence,
+                accepts_input_without_conversation_id: dispatch.service_runtime.is_some_and(
+                    |manager| {
+                        manager.accepts_input_without_conversation_id(
+                            task_id,
+                            terminal.agent_session_id,
+                            terminal.resource_id,
+                            terminal.runtime_generation,
+                            terminal.action_epoch,
+                        )
+                    },
+                ),
+                sequence: terminal.sequence,
+                title: terminal.view.runtime.title,
+                text_lines,
+                screen,
+            };
+            let Some(projection) = fit_terminal_projection_for_wire(
+                projection,
+                dispatch.request_id,
+                max_response_bytes,
+            ) else {
+                return unavailable(
+                    TaskCockpitSurface::Terminal,
+                    TaskCockpitUnavailableReason::TerminalUnavailable,
+                );
+            };
             QueryOutcome::Ok(QueryResult::TaskCockpit(TaskCockpitResult::Terminal(
-                TaskTerminalProjection {
-                    task_id,
-                    terminal_id: terminal.terminal_id,
-                    session_id: terminal.session_id,
-                    agent_session_id: terminal.agent_session_id,
-                    resource_id: terminal.resource_id,
-                    runtime_generation: terminal.runtime_generation,
-                    resource_generation: terminal.resource_generation,
-                    action_epoch: terminal.action_epoch,
-                    focus_epoch: terminal.focus_epoch,
-                    accepted_input_sequence: terminal.accepted_input_sequence,
-                    accepts_input_without_conversation_id: dispatch.service_runtime.is_some_and(
-                        |manager| {
-                            manager.accepts_input_without_conversation_id(
-                                task_id,
-                                terminal.agent_session_id,
-                                terminal.resource_id,
-                                terminal.runtime_generation,
-                                terminal.action_epoch,
-                            )
-                        },
-                    ),
-                    sequence: terminal.sequence,
-                    title: terminal.view.runtime.title,
-                    text_lines,
-                    screen,
-                },
+                projection,
             )))
         }
         Ok(None) => {
@@ -685,6 +723,46 @@ fn serve_task_terminal(
             TaskCockpitSurface::Terminal,
             TaskCockpitDeniedReason::StaleFence,
         ),
+    }
+}
+
+/// Reduce only optional styled-cell detail until the complete QueryReply fits
+/// the negotiated carrier page. Plain text, cursor, mode, and fence identity
+/// remain intact, so browser/LAN clients never lose the whole connection for a
+/// richly coloured provider screen.
+fn fit_terminal_projection_for_wire(
+    mut projection: TaskTerminalProjection,
+    request_id: RequestId,
+    max_response_bytes: u32,
+) -> Option<TaskTerminalProjection> {
+    const ENVELOPE_HEADROOM: usize = 2 * 1024;
+    let budget = usize::try_from(max_response_bytes)
+        .ok()?
+        .saturating_sub(ENVELOPE_HEADROOM);
+    loop {
+        let reply = crate::domain::QueryReply {
+            request_id,
+            outcome: QueryOutcome::Ok(QueryResult::TaskCockpit(TaskCockpitResult::Terminal(
+                projection.clone(),
+            ))),
+        };
+        let encoded = rmp_serde::to_vec_named(&reply).ok()?;
+        if encoded.len() <= budget {
+            return Some(projection);
+        }
+        if !projection.screen.cells.is_empty() {
+            let discard = (projection.screen.cells.len() / 2).max(1);
+            projection.screen.cells.drain(..discard);
+            continue;
+        }
+        // Terminal text normally represents only the visible grid. Keep the
+        // newest prompt rows if an unusually tall screen still exceeds budget.
+        if projection.text_lines.len() > 1 {
+            let discard = (projection.text_lines.len() / 4).max(1);
+            projection.text_lines.drain(..discard);
+            continue;
+        }
+        return None;
     }
 }
 
@@ -2709,7 +2787,8 @@ mod tests {
             ..TerminalScreenSnapshot::default()
         };
 
-        let (wire, text_lines) = compact_terminal_screen_for_wire(screen);
+        let (wire, text_lines) =
+            compact_terminal_screen_for_wire(screen, MAX_TERMINAL_STYLED_CELLS_FOR_WIRE);
 
         assert_eq!(text_lines, vec!["x!".to_string()]);
         assert!(wire.lines.is_empty());
@@ -2763,7 +2842,8 @@ mod tests {
             ..TerminalScreenSnapshot::default()
         };
 
-        let (screen, text_lines) = compact_terminal_screen_for_wire(screen);
+        let (screen, text_lines) =
+            compact_terminal_screen_for_wire(screen, MAX_TERMINAL_STYLED_CELLS_FOR_WIRE);
         assert_eq!(screen.cells.len(), 1_155);
         let codec = MessagePackCodec::from_limits(FrameLimits::v1_default()).expect("codec");
         codec
@@ -2831,30 +2911,54 @@ mod tests {
             ..TerminalScreenSnapshot::default()
         };
 
-        let (screen, text_lines) = compact_terminal_screen_for_wire(screen);
+        let connect_screen = screen.clone();
+        let (screen, text_lines) =
+            compact_terminal_screen_for_wire(screen, MAX_TERMINAL_STYLED_CELLS_FOR_WIRE);
         assert_eq!(screen.cells.len(), MAX_TERMINAL_STYLED_CELLS_FOR_WIRE);
         assert_eq!(screen.cells.first().map(|cell| cell.row), Some(18));
         assert_eq!(screen.cells.last().map(|cell| cell.row), Some(47));
+        let (connect_screen, connect_lines) =
+            compact_terminal_screen_for_wire(connect_screen, MAX_TERMINAL_CONNECT_STYLED_CELLS);
+        assert_eq!(
+            connect_screen.cells.len(),
+            MAX_TERMINAL_CONNECT_STYLED_CELLS
+        );
+        assert_eq!(connect_screen.cells.last().map(|cell| cell.row), Some(47));
+        assert_eq!(connect_lines.len(), rows);
+        let projection = TaskTerminalProjection {
+            task_id: TaskId::new(),
+            terminal_id: crate::domain::TerminalId::new(),
+            session_id: crate::terminal::protocol::TerminalSessionId::new(),
+            agent_session_id: crate::domain::AgentSessionId::new(),
+            resource_id: crate::domain::ResourceId::new(),
+            runtime_generation: 1,
+            resource_generation: 1,
+            action_epoch: 1,
+            focus_epoch: crate::terminal::protocol::FocusEpoch::initial(),
+            accepted_input_sequence: 0,
+            accepts_input_without_conversation_id: false,
+            sequence: 1,
+            title: Some("Codex".to_string()),
+            text_lines,
+            screen,
+        };
         let codec = MessagePackCodec::from_limits(FrameLimits::v1_default()).expect("codec");
         codec
-            .encode(&TaskCockpitResult::Terminal(TaskTerminalProjection {
-                task_id: TaskId::new(),
-                terminal_id: crate::domain::TerminalId::new(),
-                session_id: crate::terminal::protocol::TerminalSessionId::new(),
-                agent_session_id: crate::domain::AgentSessionId::new(),
-                resource_id: crate::domain::ResourceId::new(),
-                runtime_generation: 1,
-                resource_generation: 1,
-                action_epoch: 1,
-                focus_epoch: crate::terminal::protocol::FocusEpoch::initial(),
-                accepted_input_sequence: 0,
-                accepts_input_without_conversation_id: false,
-                sequence: 1,
-                title: Some("Codex".to_string()),
-                text_lines,
-                screen,
-            }))
+            .encode(&TaskCockpitResult::Terminal(projection.clone()))
             .expect("an oversized styled provider screen must remain encodable");
+
+        let request_id = RequestId::new();
+        let bounded = fit_terminal_projection_for_wire(projection, request_id, 48 * 1024)
+            .expect("connect carrier projection");
+        assert_eq!(bounded.text_lines.len(), rows);
+        assert!(bounded.screen.cells.len() < MAX_TERMINAL_STYLED_CELLS_FOR_WIRE);
+        let reply = crate::domain::QueryReply {
+            request_id,
+            outcome: QueryOutcome::Ok(QueryResult::TaskCockpit(TaskCockpitResult::Terminal(
+                bounded,
+            ))),
+        };
+        assert!(rmp_serde::to_vec_named(&reply).unwrap().len() <= 46 * 1024);
     }
 
     #[test]
@@ -3402,6 +3506,67 @@ mod tests {
             reset.encoded_bytes as usize,
             rmp_serde::to_vec_named(&reset).unwrap().len()
         );
+    }
+
+    #[test]
+    fn conversation_query_pages_fit_the_encrypted_connect_carrier() {
+        use crate::remote::presentation::{
+            SemanticEventDraft, SemanticEventKind, SemanticJournalStore, SemanticRetention,
+            SemanticSource, StableSessionKey,
+        };
+
+        let (_repository, bus, client_id, task_id, _) = create_bound_task();
+        let journal = std::sync::Mutex::new(SemanticJournalStore::default());
+        let key = StableSessionKey::from_tab(task_id.to_string());
+        for index in 0..40 {
+            journal.lock().unwrap().record(SemanticEventDraft {
+                stable_session_key: key.clone(),
+                occurred_at_epoch_ms: index,
+                source: SemanticSource::Claude,
+                kind: SemanticEventKind::UserMessage {
+                    text: format!("message {index}: {}", "x".repeat(4 * 1024)),
+                },
+                retention: SemanticRetention::Canonical,
+                deduplication_key: None,
+            });
+        }
+
+        let query = TaskCockpitQuery::Conversation { after_sequence: 0 };
+        let outcome = serve_task_cockpit(TaskCockpitDispatch {
+            capabilities: CapabilitySet::from_capabilities([
+                Capability::TaskCockpit,
+                Capability::SemanticConversation,
+            ]),
+            envelope_task_id: Some(task_id),
+            client_id,
+            connection_id: Uuid::now_v7(),
+            request_id: RequestId::new(),
+            query: &query,
+            bus: &bus,
+            service_runtime: None,
+            semantic_journal: Some(&journal),
+            terminal_service: None,
+            ssh_endpoints: None,
+            ssh_runtime: None,
+            workspace_projects: None,
+            coordinator: None,
+            action_epoch: None,
+            runtime_generation: None,
+            config: None,
+            provider_launch_hint: ProviderLaunchReadinessHint::Unknown,
+        });
+        let QueryOutcome::Ok(QueryResult::TaskCockpit(TaskCockpitResult::Conversation(page))) =
+            outcome
+        else {
+            panic!("conversation page expected")
+        };
+
+        assert!(page.encoded_bytes as usize <= MAX_CONVERSATION_PAGE_BYTES);
+        assert_eq!(
+            page.encoded_bytes as usize,
+            rmp_serde::to_vec_named(&page).unwrap().len()
+        );
+        assert!(page.next_sequence.is_some(), "large history must paginate");
     }
 
     #[test]

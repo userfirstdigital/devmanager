@@ -88,6 +88,18 @@ const MAX_PROVIDER_DISPATCH_UNITS_PER_PASS: usize = 64;
 /// short idle cadence avoids rewriting the same pre-boundary hold every second.
 const PROVIDER_DISPATCH_MAINTENANCE_PERIOD: Duration = Duration::from_secs(5);
 
+fn task_resource_blocks_archive_after_cleanup_error(
+    resource: &ResourceFacts,
+    task_id: TaskId,
+) -> bool {
+    resource.owner_kind == OwnerKind::Task
+        && resource.task_id == Some(task_id)
+        && matches!(
+            resource.lifecycle,
+            ResourceLifecycle::Active | ResourceLifecycle::Releasing
+        )
+}
+
 fn run_provider_dispatch_pass(
     bus: &mut CommandBus,
     runtime: &crate::providers::dispatch::ProviderDispatchRuntime,
@@ -5201,13 +5213,30 @@ impl HostRequestExecutor {
         if let Some(runtime) = self.configured_service_runtime.as_ref() {
             if let Err(error) = runtime.manager.close_provider_task(task_id) {
                 eprintln!("devmanager-host: task close provider session stop failed: {error}");
-                // A failed cleanup is not permission to archive live resources.
-                return Ok(ServerMessage::CommandReceipt(CommandReceipt::Rejected {
-                    command_id: envelope.command_id,
-                    code: crate::domain::command::RejectionCode::InvalidTransition,
-                    current_revision: Some(snapshot.task.revision),
-                    resolution: None,
-                }));
+                // The domain resource ledger is the authority for live process
+                // custody. A stale provider-state row (for example after a CLI
+                // upgrade changes its executable hash) must not strand a task
+                // whose task-owned resources are already durably Released.
+                // Conversely, never archive through a cleanup error while any
+                // owned resource may still be live or settling.
+                let cleanup_snapshot = self
+                    .bus
+                    .task_snapshot(task_id)
+                    .map_err(map_store_error)?
+                    .ok_or(IpcError::Unavailable)?;
+                if cleanup_snapshot.resources.values().any(|resource| {
+                    task_resource_blocks_archive_after_cleanup_error(resource, task_id)
+                }) {
+                    return Ok(ServerMessage::CommandReceipt(CommandReceipt::Rejected {
+                        command_id: envelope.command_id,
+                        code: crate::domain::command::RejectionCode::InvalidTransition,
+                        current_revision: Some(snapshot.task.revision),
+                        resolution: None,
+                    }));
+                }
+                eprintln!(
+                    "devmanager-host: task close continuing after stale provider cleanup failure; all task-owned resources are released"
+                );
             }
         }
 
@@ -5894,8 +5923,8 @@ impl HostRequestExecutor {
                     Some(_) => super::cockpit::ProviderLaunchReadinessHint::NotPending,
                     None => super::cockpit::ProviderLaunchReadinessHint::Unknown,
                 };
-                let outcome =
-                    super::cockpit::serve_task_cockpit(super::cockpit::TaskCockpitDispatch {
+                let outcome = super::cockpit::serve_task_cockpit_bounded(
+                    super::cockpit::TaskCockpitDispatch {
                         capabilities: negotiated.capabilities,
                         envelope_task_id: envelope.task_id,
                         client_id: envelope.client_id,
@@ -5922,7 +5951,9 @@ impl HostRequestExecutor {
                             .as_ref()
                             .map(|admission| &admission.store.snapshot().config),
                         provider_launch_hint,
-                    });
+                    },
+                    negotiated.limits.max_page_encoded_bytes,
+                );
                 Ok(QueryReply {
                     request_id: envelope.request_id,
                     outcome,
@@ -13441,7 +13472,7 @@ mod tests {
         apply_admitted_notification_sound, next_attention_after_provider_restore_failure,
         provider_restore_failure_attention, provider_restore_success_attention,
         provider_terminal_query_may_attach, push_unique_provider_restore_intent,
-        restore_admitted_provider_launch_options,
+        restore_admitted_provider_launch_options, task_resource_blocks_archive_after_cleanup_error,
     };
     use crate::domain::agent::{
         AgentRole, AgentSessionFacts, AgentSessionLifecycle, ProviderSessionId,
@@ -13468,6 +13499,51 @@ mod tests {
     };
     use std::collections::{HashMap, HashSet, VecDeque};
     use uuid::Uuid;
+
+    #[test]
+    fn stale_provider_cleanup_only_blocks_archive_for_live_task_owned_resources() {
+        let task_id = TaskId::new();
+        let other_task_id = TaskId::new();
+        let mut owned = ResourceFacts::new(
+            Some(task_id),
+            OwnerKind::Task,
+            ResourceKind::Terminal,
+            ResourceRecipe::Terminal { cols: 80, rows: 24 },
+            1,
+        )
+        .expect("task resource");
+        assert!(task_resource_blocks_archive_after_cleanup_error(
+            &owned, task_id
+        ));
+
+        owned.lifecycle = ResourceLifecycle::Releasing;
+        assert!(task_resource_blocks_archive_after_cleanup_error(
+            &owned, task_id
+        ));
+
+        owned.lifecycle = ResourceLifecycle::Released;
+        assert!(!task_resource_blocks_archive_after_cleanup_error(
+            &owned, task_id
+        ));
+
+        owned.lifecycle = ResourceLifecycle::Active;
+        assert!(!task_resource_blocks_archive_after_cleanup_error(
+            &owned,
+            other_task_id
+        ));
+
+        let host = ResourceFacts::new(
+            None,
+            OwnerKind::Host,
+            ResourceKind::Service,
+            ResourceRecipe::service("host service").expect("service recipe"),
+            1,
+        )
+        .expect("host resource");
+        assert!(!task_resource_blocks_archive_after_cleanup_error(
+            &host, task_id
+        ));
+    }
 
     #[test]
     fn terminal_readiness_is_observational_and_never_starts_a_provider() {

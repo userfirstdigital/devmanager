@@ -33,6 +33,16 @@
   --native-border: #2b2b31;
   --native-accent: #8978ff;
   --native-caution: #ffd58a;
+  /* Shared conversation renderers use the application-level token names.
+     This route is intentionally always dark, even when the browser/OS prefers
+     a light scheme, so keep inherited Markdown/code/table tokens coherent. */
+  --dm-bg: var(--native-bg);
+  --dm-surface: var(--native-panel);
+  --dm-surface-elevated: var(--native-panel-strong);
+  --dm-label: var(--native-text);
+  --dm-secondary: var(--native-muted);
+  --dm-separator: var(--native-border);
+  --dm-accent: #a89cff;
   background: var(--native-bg);
   box-sizing: border-box;
   color: var(--native-text);
@@ -298,6 +308,23 @@
   text-overflow: ellipsis;
   white-space: nowrap;
 }
+
+.dm-native-remote__task-status::before {
+  background: var(--native-muted);
+  border-radius: 999px;
+  content: "";
+  display: inline-block;
+  height: 7px;
+  margin-right: 7px;
+  vertical-align: 1px;
+  width: 7px;
+}
+
+.dm-native-remote__task-status--working::before { background: #8b7cff; }
+.dm-native-remote__task-status--attention::before { background: var(--native-caution); }
+.dm-native-remote__task-status--danger::before { background: #ff6b79; }
+.dm-native-remote__task-status--waiting::before { background: #8b929e; }
+.dm-native-remote__task-status--offline::before { background: #5b606a; }
 
 .dm-native-remote__done {
   border-top: 1px solid var(--native-border);

@@ -452,12 +452,7 @@ export function NativeRemoteApp({
           selectedRef.current &&
           scopedHostTaskKey(selectedRef.current) === key
         ) {
-          setLocalNotice(
-            result.reason === "transport_uncertain" ||
-              result.reason === "reconciliation_required"
-              ? "Delivery is not confirmed yet. Your message is retained on this device; checking its original receipt before retrying."
-              : "Message was not accepted. Your draft is unchanged.",
-          );
+          setLocalNotice(sendFailureNotice(result.reason));
         }
         return;
       }
@@ -622,7 +617,12 @@ export function NativeRemoteApp({
             aria-expanded={searchOpen}
             aria-label={searchOpen ? "Close task search" : "Search tasks"}
             className="dm-native-remote__icon-button"
-            onClick={() => setSearchOpen((open) => !open)}
+            onClick={() =>
+              setSearchOpen((open) => {
+                if (open) setSearch("");
+                return !open;
+              })
+            }
             type="button"
           >
             <Search aria-hidden="true" size={19} />
@@ -1166,6 +1166,7 @@ function NativeTerminalScreen({
 }) {
   const [text, setText] = useState("");
   const [error, setError] = useState<string | null>(null);
+  const [terminalAvailable, setTerminalAvailable] = useState(false);
   const [keyPending, setKeyPending] = useState(false);
   const [keyNotice, setKeyNotice] = useState<string | null>(null);
   const keyInFlight = useRef(false);
@@ -1177,7 +1178,7 @@ function NativeTerminalScreen({
     };
   }, []);
   const pressKey = async (key: NativeTerminalKey) => {
-    if (keyInFlight.current || connectionStatus !== "ready") return;
+    if (keyInFlight.current || connectionStatus !== "ready" || !terminalAvailable) return;
     keyInFlight.current = true;
     setKeyPending(true);
     setKeyNotice(null);
@@ -1202,6 +1203,10 @@ function NativeTerminalScreen({
     let activeRefresh = true;
     let inFlight = false;
     let timer: ReturnType<typeof setTimeout> | undefined;
+    setTerminalAvailable(false);
+    setText("");
+    setError(null);
+    setKeyNotice(null);
     const refresh = async () => {
       if (!activeRefresh || inFlight || document.hidden || connectionStatus !== "ready")
         return;
@@ -1212,10 +1217,13 @@ function NativeTerminalScreen({
         if (activeRefresh) {
           setText(snapshot.textLines.join("\n"));
           setError(null);
+          setTerminalAvailable(true);
         }
       } catch (cause) {
-        if (activeRefresh)
+        if (activeRefresh) {
+          setTerminalAvailable(false);
           setError(cause instanceof Error ? cause.message : "Terminal unavailable");
+        }
       } finally {
         inFlight = false;
         if (activeRefresh && !document.hidden)
@@ -1249,7 +1257,7 @@ function NativeTerminalScreen({
             key={key}
             type="button"
             aria-label={`Terminal ${key}`}
-            disabled={keyPending || connectionStatus !== "ready"}
+            disabled={keyPending || connectionStatus !== "ready" || !terminalAvailable}
             onClick={() => void pressKey(key)}
           >
             {label}
@@ -1259,7 +1267,7 @@ function NativeTerminalScreen({
       <p className="dm-native-remote__eyebrow">Live owner terminal · startup controls</p>
       {error ? <p role="status">{error}</p> : null}
       {keyNotice ? <p role="status">{keyNotice}</p> : null}
-      <pre>{text || "Waiting for terminal output…"}</pre>
+      {text || !error ? <pre>{text || "Waiting for terminal output…"}</pre> : null}
     </section>
   );
 }
@@ -1382,23 +1390,33 @@ function TaskRow({
   task: TaskMeta;
   hostBadge?: string | null;
 }) {
-  const metadata = [
-    isClosingTask(task) ? "Archiving…" : null,
-    task.activity,
-    task.attention,
-    task.connectivity,
-  ].filter((value): value is string => Boolean(value));
+  const status = visibleTaskStatus(task);
+  const metadata = [hostBadge, status.label].filter(Boolean).join(" · ");
   return (
     <button className="dm-native-remote__task-row" onClick={onOpen} type="button">
       <span className="dm-native-remote__task-copy">
         <strong>{task.title ?? "Task"}</strong>
-        <small>
-          {[hostBadge, ...metadata].filter(Boolean).join(" · ")}
+        <small className={`dm-native-remote__task-status dm-native-remote__task-status--${status.tone}`}>
+          {metadata}
         </small>
       </span>
       <ChevronRight aria-hidden="true" size={18} />
     </button>
   );
+}
+
+function visibleTaskStatus(task: TaskMeta): { label: string; tone: string } {
+  if (isClosingTask(task)) return { label: "Archiving…", tone: "working" };
+  if (task.connectivity === "disconnected") return { label: "Offline", tone: "offline" };
+  if (task.attention === "failed") return { label: "Failed", tone: "danger" };
+  if (task.attention === "uncertain_outcome") return { label: "Check outcome", tone: "danger" };
+  if (task.attention === "needs_approval") return { label: "Approval needed", tone: "attention" };
+  if (task.attention === "needs_answer") return { label: "Reply needed", tone: "attention" };
+  if (task.activity === "working" || task.activity === "active") {
+    return { label: "Working", tone: "working" };
+  }
+  if (task.activity === "settling") return { label: "Finishing", tone: "working" };
+  return { label: "Waiting", tone: "waiting" };
 }
 
 function ConnectionNotice({
@@ -1453,6 +1471,28 @@ function mutationFailureNotice(
     return "Action status is uncertain. The original command ID is retained; do not repeat it yet.";
   }
   return "Task action was not accepted. Lifecycle is unchanged.";
+}
+
+function sendFailureNotice(reason: NativeSendFailure): string {
+  switch (reason) {
+    case "no_agent":
+      return "This task has no active agent session. Your draft is unchanged; restore or restart its provider from the desktop app.";
+    case "blockers":
+      return "Answer the pending question or approval before sending another message. Your draft is unchanged.";
+    case "storage_failure":
+      return "The message could not be saved to the durable outbox. Your draft is unchanged.";
+    case "client_mismatch":
+      return "This browser connection changed before the message was sent. Your draft is unchanged; reconnect before retrying.";
+    case "transport_uncertain":
+    case "reconciliation_required":
+      return "Delivery is not confirmed yet. Your message is retained on this device; checking its original receipt before retrying.";
+    case "invalid_lifecycle":
+      return "Restore this task before sending. Your draft is unchanged.";
+    case "not_ready":
+      return "The host is not ready to accept this message. Your draft is unchanged.";
+    case "rejected":
+      return "The host rejected this message. Your draft is unchanged.";
+  }
 }
 
 function compareMergedTasks(left: MergedTaskRow, right: MergedTaskRow): number {

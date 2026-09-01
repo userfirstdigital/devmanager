@@ -138,6 +138,62 @@ function Get-Sha256 {
     return (Get-FileHash -Algorithm SHA256 -LiteralPath $LiteralPath).Hash.ToLowerInvariant()
 }
 
+function Get-ConnectCryptoSourceFingerprint {
+    param([Parameter(Mandatory = $true)][string]$RepositoryRoot)
+
+    $sourceManifest = Join-Path $RepositoryRoot "crates/connect-crypto/artifact-sources.txt"
+    if (-not (Test-Path -LiteralPath $sourceManifest -PathType Leaf)) {
+        throw "Connect crypto source manifest is missing: $sourceManifest"
+    }
+
+    $files = [System.Collections.Generic.List[string]]::new()
+    foreach ($line in (Get-Content -LiteralPath $sourceManifest)) {
+        $source = $line.Trim()
+        if ([string]::IsNullOrWhiteSpace($source) -or $source.StartsWith('#')) {
+            continue
+        }
+        $absolute = [System.IO.Path]::GetFullPath((Join-Path $RepositoryRoot $source))
+        if (Test-Path -LiteralPath $absolute -PathType Container) {
+            Get-ChildItem -LiteralPath $absolute -File -Recurse | ForEach-Object { $files.Add($_.FullName) }
+        }
+        elseif (Test-Path -LiteralPath $absolute -PathType Leaf) {
+            $files.Add($absolute)
+        }
+        else {
+            throw "Connect crypto source path is missing: $source"
+        }
+    }
+
+    [System.Numerics.BigInteger]$hash = [System.Numerics.BigInteger]::Parse("14695981039346656037")
+    [System.Numerics.BigInteger]$prime = [System.Numerics.BigInteger]::Parse("1099511628211")
+    [System.Numerics.BigInteger]$mask = [System.Numerics.BigInteger]::Parse("18446744073709551615")
+    $update = {
+        param([byte[]]$Bytes)
+        for ($index = 0; $index -lt $Bytes.Length; $index++) {
+            [byte]$value = $Bytes[$index]
+            if ($value -eq 13 -and $index + 1 -lt $Bytes.Length -and $Bytes[$index + 1] -eq 10) {
+                $value = 10
+                $index++
+            }
+            $script:connectCryptoHash = (($script:connectCryptoHash -bxor [System.Numerics.BigInteger]$value) * $prime) -band $mask
+        }
+    }
+    $script:connectCryptoHash = $hash
+    try {
+        foreach ($file in @($files | Sort-Object)) {
+            $relative = [System.IO.Path]::GetRelativePath($RepositoryRoot, $file).Replace('\', '/')
+            & $update ([System.Text.Encoding]::UTF8.GetBytes($relative))
+            & $update ([byte[]]@(0))
+            & $update ([System.IO.File]::ReadAllBytes($file))
+            & $update ([byte[]]@(0))
+        }
+        return $script:connectCryptoHash.ToString("x16")
+    }
+    finally {
+        Remove-Variable -Scope Script -Name connectCryptoHash -ErrorAction SilentlyContinue
+    }
+}
+
 function Write-Utf8NoBom {
     param(
         [Parameter(Mandatory = $true)][string]$LiteralPath,
@@ -153,6 +209,7 @@ function Write-Utf8NoBom {
 
 $repoRoot = [System.IO.Path]::GetFullPath((Join-Path $PSScriptRoot "../.."))
 $crateManifestPath = Join-Path $repoRoot "crates/connect-crypto/Cargo.toml"
+$sourceFingerprint = Get-ConnectCryptoSourceFingerprint -RepositoryRoot $repoRoot
 $resolvedOutDir = Resolve-RepositoryPath $OutDir
 $targetRoot = if ([string]::IsNullOrWhiteSpace($TargetDir)) {
     Join-Path $repoRoot "target"
@@ -264,6 +321,7 @@ try {
         outputDirectory     = $resolvedOutDir
         targetDirectory     = $targetRoot
         package              = $PackageName
+        sourceFingerprint    = $sourceFingerprint
         cargoLocked         = $true
         automaticInstall    = $false
     }
@@ -373,6 +431,7 @@ try {
         rustToolchain        = $RustToolchain
         wasmBindgenVersion   = $WasmBindgenVersion
         modulePath           = $ModulePath
+        sourceFingerprint    = $sourceFingerprint
         files                = $entries
     }
     Write-Utf8NoBom `

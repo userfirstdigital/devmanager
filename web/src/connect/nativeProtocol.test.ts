@@ -105,6 +105,16 @@ describe("canonical terminal projection", () => {
     expect(() => decodeTaskCockpitTerminalResult(terminalReply({ text_lines: Array(5).fill("x".repeat(65536)) }), TASK)).toThrow();
     expect(() => decodeTaskCockpitTerminalResult(terminalReply({ sequence: -1 }), TASK)).toThrow();
   });
+  it("surfaces host terminal availability states in plain language", () => {
+    const unavailable = decodeQueryReply({
+      request_id: REQUEST,
+      outcome: { ok: { task_cockpit: { unavailable: {
+        surface: "terminal", reason: "terminal_not_started",
+      } } } },
+    }, REQUEST);
+    expect(() => decodeTaskCockpitTerminalResult(unavailable, TASK))
+      .toThrow("No terminal has started for this task yet.");
+  });
 });
 
 function thinTaskSnapshot() {
@@ -366,6 +376,8 @@ describe("nativeProtocol query builders", () => {
       1, 2, 3, 4,
     ]);
     expect(Array.from(copyResumeCursorBytes(bytes))).toEqual([1, 2, 3, 4]);
+    expect(Array.from(copyResumeCursorBytes([1, 2, 3, 4]))).toEqual([1, 2, 3, 4]);
+    expect(() => copyResumeCursorBytes([1, 256])).toThrow(/cursor byte/);
     expect(() =>
       copyResumeCursorBytes({
         $connectBinary: "A".repeat(MAX_RESUME_CURSOR_BASE64_CHARS + 4),
@@ -740,6 +752,23 @@ describe("SemanticJournalPage bounds and order", () => {
     );
     expect(fullIntermediate.facts).toHaveLength(128);
     expect(fullIntermediate.nextSequence).toBe(128);
+  });
+
+  it("accepts bounded long tool-result summaries emitted by the native host", () => {
+    const result = decodeSemanticJournalPage(page({
+      through_sequence: 1,
+      next_sequence: 1,
+      facts: [{
+        ...fact(1, "0104", "ignored"),
+        kind: "tool_result",
+        payload: { kind: "tool_result", call_id: "tool-1", status: "x".repeat(4096) },
+      }],
+    }));
+    expect(result.facts[0]?.payload).toMatchObject({
+      kind: "tool_result",
+      call_id: "tool-1",
+      status: "x".repeat(4096),
+    });
   });
 
   it("rejects order/oversize/duplicate/window violations", () => {
