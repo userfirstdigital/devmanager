@@ -291,9 +291,7 @@ pub enum TerminalAttachmentState {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum CenterSurfaceLoadingState {
     ConversationInitial,
-    ConversationSync,
     TerminalInitial,
-    TerminalSync,
 }
 
 impl TaskSurfaceState {
@@ -302,19 +300,13 @@ impl TaskSurfaceState {
         showing_terminal: bool,
     ) -> Option<CenterSurfaceLoadingState> {
         if showing_terminal {
-            self.terminal_query_in_flight
-                .then_some(if self.latest_terminal.is_some() {
-                    CenterSurfaceLoadingState::TerminalSync
-                } else {
-                    CenterSurfaceLoadingState::TerminalInitial
-                })
+            ((self.terminal_query_in_flight
+                || self.terminal_attachment == TerminalAttachmentState::Starting)
+                && self.latest_terminal.is_none())
+            .then_some(CenterSurfaceLoadingState::TerminalInitial)
         } else {
-            self.conversation_in_flight
-                .then_some(if self.conversation_has_content() {
-                    CenterSurfaceLoadingState::ConversationSync
-                } else {
-                    CenterSurfaceLoadingState::ConversationInitial
-                })
+            (self.conversation_in_flight && !self.conversation_has_content())
+                .then_some(CenterSurfaceLoadingState::ConversationInitial)
         }
     }
 
@@ -335,6 +327,19 @@ impl TaskSurfaceState {
             // spinner and surface a retryable unavailable state. A later
             // query can enter Starting again without losing cached output.
             self.terminal_attachment = TerminalAttachmentState::Unavailable;
+        }
+    }
+
+    /// A provider-owned restore is still in progress after this exact query
+    /// settled. Release the query lease so a bounded retry can be admitted,
+    /// but keep the visible startup promise instead of flashing an incorrect
+    /// unavailable state between polls.
+    pub fn note_terminal_start_pending(&mut self) {
+        self.terminal_query_in_flight = false;
+        if self.latest_terminal.is_some() {
+            self.terminal_attachment = TerminalAttachmentState::StaleReconnecting;
+        } else {
+            self.terminal_attachment = TerminalAttachmentState::Starting;
         }
     }
 
@@ -442,6 +447,28 @@ impl TaskSurfaceState {
                 .position(|pending| pending.text == *text)
             {
                 self.pending_user_messages.remove(index);
+                continue;
+            }
+
+            // Claude can coalesce multiple user steers submitted during one
+            // running turn into a single canonical hook fact separated by a
+            // carriage return. Retire the exact ordered optimistic prefix as
+            // one unit; otherwise the UI presents the canonical combined turn
+            // plus every constituent optimistic bubble again.
+            let mut remainder = text.as_str();
+            let mut matched = 0usize;
+            for pending in &self.pending_user_messages {
+                let Some(next) = remainder.strip_prefix(&pending.text) else {
+                    break;
+                };
+                matched += 1;
+                remainder = next.trim_start_matches(['\r', '\n']);
+                if remainder.is_empty() {
+                    break;
+                }
+            }
+            if matched > 1 && remainder.is_empty() {
+                self.pending_user_messages.drain(..matched);
             }
         }
     }
@@ -534,6 +561,10 @@ impl<K: Clone + Ord + Eq> TaskSurfaceRegistry<K> {
     pub fn retain_tasks(&mut self, task_ids: &[K]) {
         let valid: BTreeSet<_> = task_ids.iter().cloned().collect();
         self.surfaces.retain(|task_id, _| valid.contains(task_id));
+    }
+
+    pub fn remove_task(&mut self, task_id: K) {
+        self.surfaces.remove(&task_id);
     }
 
     pub fn begin_conversation(&mut self, task_id: K, generation: u64) {
@@ -933,7 +964,25 @@ mod tests {
     }
 
     #[test]
-    fn conversation_loading_distinguishes_first_load_from_cached_sync() {
+    fn provider_start_pending_keeps_an_honest_loading_state_between_retries() {
+        let mut empty = TaskSurfaceState::default();
+        empty.note_terminal_query_started();
+        empty.note_terminal_start_pending();
+
+        assert_eq!(empty.terminal_attachment, TerminalAttachmentState::Starting);
+        assert!(
+            !empty.terminal_query_in_flight(),
+            "the settled query must release its in-flight lease before a retry"
+        );
+        assert_eq!(
+            empty.center_loading_state(true),
+            Some(CenterSurfaceLoadingState::TerminalInitial),
+            "provider restoration is still real work and must not flash Terminal unavailable"
+        );
+    }
+
+    #[test]
+    fn conversation_loading_only_covers_the_uncached_first_load() {
         let task = TaskId::new();
         let mut registry = TaskSurfaceRegistry::default();
         registry.ensure_task(task);
@@ -958,11 +1007,12 @@ mod tests {
         assert!(syncing.conversation_in_flight);
         assert_eq!(
             syncing.center_loading_state(false),
-            Some(CenterSurfaceLoadingState::ConversationSync)
+            None,
+            "a background refresh must stay visually silent while cached conversation content is usable"
         );
         assert!(
             syncing.conversation_has_content(),
-            "a refresh must preserve cached content behind a compact syncing indicator"
+            "a refresh must preserve cached content without flashing a transient syncing indicator"
         );
 
         let mut terminal = TaskSurfaceState::default();
@@ -974,7 +1024,8 @@ mod tests {
         terminal.latest_terminal = surface_with_terminal_lines(&["cached"]).latest_terminal;
         assert_eq!(
             terminal.center_loading_state(true),
-            Some(CenterSurfaceLoadingState::TerminalSync)
+            None,
+            "a live terminal refresh must preserve cached output without flashing a syncing badge"
         );
     }
 
@@ -1054,6 +1105,8 @@ mod tests {
             runtime_generation: 1,
             resource_generation: 1,
             action_epoch: 1,
+            focus_epoch: crate::terminal::protocol::FocusEpoch::initial(),
+            accepted_input_sequence: 0,
             sequence: 1,
             title: None,
             text_lines: Vec::new(),
@@ -1180,6 +1233,26 @@ mod tests {
     }
 
     #[test]
+    fn coalesced_provider_user_fact_retires_each_ordered_optimistic_message() {
+        let task = TaskId::new();
+        let mut registry = TaskSurfaceRegistry::default();
+        registry.admit_pending_user_message(task, "first steer", CommandId::new());
+        registry.admit_pending_user_message(task, "second steer", CommandId::new());
+        assert_eq!(registry.displayed_user_message_count(task), 2);
+
+        registry.begin_conversation(task, 1);
+        registry
+            .admit_conversation(task, 1, &user_page(1, "first steer\rsecond steer"))
+            .expect("admit coalesced durable user message");
+
+        assert_eq!(
+            registry.displayed_user_message_count(task),
+            1,
+            "the provider's canonical coalesced fact must replace both optimistic rows"
+        );
+    }
+
+    #[test]
     fn pending_user_message_keeps_stable_presentation_identity() {
         let task = TaskId::new();
         let mut registry = TaskSurfaceRegistry::default();
@@ -1278,7 +1351,10 @@ mod tests {
             Duration::from_millis(999)
         ));
         assert!(working_conversation_poll_due(true, Duration::from_secs(1)));
-        assert!(!working_conversation_poll_due(false, Duration::from_secs(30)));
+        assert!(!working_conversation_poll_due(
+            false,
+            Duration::from_secs(30)
+        ));
     }
 
     #[test]

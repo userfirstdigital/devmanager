@@ -107,12 +107,18 @@ const WORKING_DOT: f32 = 4.0;
 /// Target: the floating Tasks card sits slightly inside the shared 768px
 /// conversation/composer measure.
 const PLAN_CARD_HORIZONTAL_INSET: f32 = 22.0;
+/// Keep long implementation reports inside the comfortable 65--80 character
+/// reading band while the shared conversation/composer column remains wide
+/// enough for code, tables, and the composer controls.
+const ASSISTANT_PROSE_MAX_WIDTH: f32 = 640.0;
+const ASSISTANT_TURN_LABEL: &str = "Answer";
 const META_REST_OPACITY: f32 = 0.0;
 const META_REVEALED_OPACITY: f32 = 1.0;
 
 /// T3 keeps chat prose at `text-sm leading-relaxed` even when navigation uses
-/// Compact density. Technical answers therefore remain readable instead of
-/// collapsing into the app-wide 13/18px compact metrics.
+/// Compact density. DevManager adds one pixel of type size/leading and a little
+/// more block cadence: long implementation reports are our primary surface,
+/// and the literal T3 values still read as a dense wall on a desktop panel.
 #[derive(Debug, Clone, Copy, PartialEq)]
 struct ConversationMarkdownMetrics {
     body_size: f32,
@@ -125,10 +131,10 @@ fn conversation_markdown_metrics(
     _density: crate::ui::tokens::Density,
 ) -> ConversationMarkdownMetrics {
     ConversationMarkdownMetrics {
-        body_size: 14.0,
-        body_line_height: 23.0,
-        paragraph_gap_rems: 0.65,
-        heading_sizes: [17.5, 15.75, 14.0, 12.25],
+        body_size: 16.0,
+        body_line_height: 25.0,
+        paragraph_gap_rems: 0.90,
+        heading_sizes: [22.0, 18.5, 16.0, 14.0],
     }
 }
 
@@ -247,9 +253,10 @@ pub fn conversation_row_height(row: &ConversationRow, tokens: ThemeTokens) -> u3
             role: MessageRole::User,
             text,
             ..
-        } => 24.0 + markdown_body_height(text, tokens) + 4.0 + caption_line_height,
+        } => 24.0 + markdown_body_height(text, tokens) + 6.0 + caption_line_height + 14.0,
         ConversationRow::Message { text, .. } => {
-            4.0 + markdown_body_height(text, tokens) + 4.0 + caption_line_height
+            // Answer scan anchor + its gap, body, and hover metadata.
+            18.0 + 8.0 + markdown_body_height(text, tokens) + 6.0 + caption_line_height + 12.0
         }
         ConversationRow::Error { text, .. } => {
             32.0 + caption_line_height + text_lines(text) * line_height
@@ -427,7 +434,8 @@ fn message_row_element(
         .group(group.clone())
         .flex()
         .flex_col()
-        .gap(px(4.0))
+        .gap(px(6.0))
+        .pb(px(if user { 14.0 } else { 12.0 }))
         .child(body)
         .child(message_meta_element(
             group,
@@ -521,9 +529,10 @@ fn message_meta_element(
     meta.into_any_element()
 }
 
-/// Assistant turn. No surface, no border, no avatar, no role label. Body paints
-/// through selectable gpui-component GFM (`TextView::markdown`) with a stable
-/// keyed identity so streaming and virtualization do not remint state.
+/// Assistant turn. It stays on the plain transcript canvas, but receives one
+/// quiet scan anchor so the actual answer cannot blend into preceding tool
+/// history. The narrower prose measure keeps long reports readable while code
+/// and tables can still use the wider conversation column.
 fn assistant_message_element(
     row_key: &ConversationRowKey,
     text: &str,
@@ -540,13 +549,40 @@ fn assistant_message_element(
     let view = native_markdown_view(row_key, text, markdown, false, tokens, window, cx);
 
     div()
-        .w_full()
-        .px(px(4.0))
-        .py(px(4.0))
-        .text_size(px(metrics.body_size))
-        .text_color(mix_color(tokens.surfaces.canvas, tokens.text.primary, 0.86).to_gpui())
-        .line_height(px(metrics.body_line_height))
-        .child(view)
+        .w(px(ASSISTANT_PROSE_MAX_WIDTH))
+        .max_w_full()
+        .flex()
+        .flex_col()
+        .gap(px(8.0))
+        .child(
+            div()
+                .flex()
+                .items_center()
+                .gap(px(7.0))
+                .px(px(4.0))
+                .text_size(px(tokens.density.typography.caption))
+                .font_weight(FontWeight::SEMIBOLD)
+                .text_color(tokens.text.secondary.to_gpui())
+                .child(
+                    div().flex_none().size(px(6.0)).rounded_full().bg(tokens
+                        .actions
+                        .primary
+                        .default
+                        .background
+                        .to_gpui()),
+                )
+                .child(ASSISTANT_TURN_LABEL),
+        )
+        .child(
+            div()
+                .w_full()
+                .px(px(4.0))
+                .pb(px(4.0))
+                .text_size(px(metrics.body_size))
+                .text_color(tokens.text.primary.to_gpui())
+                .line_height(px(metrics.body_line_height))
+                .child(view),
+        )
         .into_any_element()
 }
 
@@ -1094,18 +1130,25 @@ mod tests {
     fn the_readable_measure_matches_the_t3_reference() {
         assert_eq!(CONVERSATION_CONTENT_MAX_WIDTH, 768.0);
         assert_eq!(PLAN_CARD_HORIZONTAL_INSET, 22.0);
+        assert_eq!(ASSISTANT_PROSE_MAX_WIDTH, 640.0);
+        assert!(ASSISTANT_PROSE_MAX_WIDTH < CONVERSATION_CONTENT_MAX_WIDTH);
     }
 
     #[test]
-    fn chat_typography_matches_t3_in_compact_and_comfortable_density() {
+    fn assistant_turn_has_an_explicit_scan_anchor() {
+        assert_eq!(ASSISTANT_TURN_LABEL, "Answer");
+    }
+
+    #[test]
+    fn chat_typography_keeps_t3_cadence_with_more_readable_prose() {
         let compact = conversation_markdown_metrics(crate::ui::tokens::Density::Compact);
         let comfortable = conversation_markdown_metrics(crate::ui::tokens::Density::Comfortable);
 
         for metrics in [compact, comfortable] {
-            assert_eq!(metrics.body_size, 14.0);
-            assert_eq!(metrics.body_line_height, 23.0);
-            assert_eq!(metrics.paragraph_gap_rems, 0.65);
-            assert_eq!(metrics.heading_sizes, [17.5, 15.75, 14.0, 12.25]);
+            assert_eq!(metrics.body_size, 16.0);
+            assert_eq!(metrics.body_line_height, 25.0);
+            assert_eq!(metrics.paragraph_gap_rems, 0.90);
+            assert_eq!(metrics.heading_sizes, [22.0, 18.5, 16.0, 14.0]);
         }
     }
 

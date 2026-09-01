@@ -1750,25 +1750,54 @@ mod tests {
             let host = NoiseCustody::generate().expect("host");
             let other = NoiseCustody::generate().expect("other");
             let mut initiator = instantiate_noise_channel(
-                NOISE_FIRST_PAIRING_PATTERN, true, device.private(), device.public(),
-                Some(if wrong_pin { other.public() } else { host.public() }),
-                test_prologue(), ChannelRole::Initiator,
-                NoiseIdentityBinding::host_device([2; 16], [7; 16]), 10, true,
-            ).expect("pinned XX initiator");
+                NOISE_FIRST_PAIRING_PATTERN,
+                true,
+                device.private(),
+                device.public(),
+                Some(if wrong_pin {
+                    other.public()
+                } else {
+                    host.public()
+                }),
+                test_prologue(),
+                ChannelRole::Initiator,
+                NoiseIdentityBinding::host_device([2; 16], [7; 16]),
+                10,
+                true,
+            )
+            .expect("pinned XX initiator");
             let mut responder = instantiate_noise_channel(
-                NOISE_FIRST_PAIRING_PATTERN, true, host.private(), host.public(), None,
-                test_prologue(), ChannelRole::Responder,
-                NoiseIdentityBinding::host([2; 16]), 10, true,
-            ).expect("XX responder");
-            responder.read_message(&initiator.write_message().expect("first")).expect("first read");
+                NOISE_FIRST_PAIRING_PATTERN,
+                true,
+                host.private(),
+                host.public(),
+                None,
+                test_prologue(),
+                ChannelRole::Responder,
+                NoiseIdentityBinding::host([2; 16]),
+                10,
+                true,
+            )
+            .expect("XX responder");
+            responder
+                .read_message(&initiator.write_message().expect("first"))
+                .expect("first read");
             let second = responder.write_message().expect("second");
             if wrong_pin {
-                assert_eq!(initiator.read_message(&second), Err(CryptoError::UnexpectedPeer));
+                assert_eq!(
+                    initiator.read_message(&second),
+                    Err(CryptoError::UnexpectedPeer)
+                );
                 assert!(!initiator.is_finished());
             } else {
                 initiator.read_message(&second).expect("pinned host");
-                responder.read_message(&initiator.write_message().expect("third")).expect("third read");
-                let remote = initiator.finish().expect("verified transport").remote_peer();
+                responder
+                    .read_message(&initiator.write_message().expect("third"))
+                    .expect("third read");
+                let remote = initiator
+                    .finish()
+                    .expect("verified transport")
+                    .remote_peer();
                 assert_eq!(remote.static_public(), host.public());
                 assert!(remote.is_host());
                 responder.finish().expect("host transport");

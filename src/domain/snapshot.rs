@@ -542,7 +542,9 @@ pub fn canonical_snapshot_page_size(page: &SnapshotPage) -> Result<u32, Canonica
     })
 }
 
-pub fn canonical_semantic_page_size(page: &SemanticJournalPage) -> Result<u32, CanonicalPageSizeError> {
+pub fn canonical_semantic_page_size(
+    page: &SemanticJournalPage,
+) -> Result<u32, CanonicalPageSizeError> {
     canonical_fixed_point_page_size(page, |page, encoded_bytes| {
         page.encoded_bytes = encoded_bytes;
     })

@@ -529,8 +529,7 @@ async fn native_next_bootstrap_drives_visible_inbox_from_fixture_host() {
         expected_task_revision: None,
         command: Command::CreateTaskV2(CreateTaskRequestIntent {
             id: task_id,
-            environment_id: EnvironmentId::from_bytes(fixed_uuid_v7(0x79))
-                .expect("environment id"),
+            environment_id: EnvironmentId::from_bytes(fixed_uuid_v7(0x79)).expect("environment id"),
             title: "Native-next fixture inbox".into(),
             description: None,
             project_id: opaque_project_id,

@@ -1379,7 +1379,7 @@ fn render_grid_canvas(
                             return;
                         }
                         let Some(endpoint) =
-                            terminal_endpoint_for_mouse(event.position, text_bounds, true)
+                            terminal_endpoint_for_mouse(event.position, text_bounds, false)
                         else {
                             return;
                         };
@@ -1406,7 +1406,7 @@ fn render_grid_canvas(
                             return;
                         }
                         let Some(endpoint) =
-                            terminal_endpoint_for_mouse(event.position, text_bounds, true)
+                            terminal_endpoint_for_mouse(event.position, text_bounds, false)
                         else {
                             return;
                         };
@@ -1430,7 +1430,7 @@ fn render_grid_canvas(
                     let text_bounds = text_bounds;
                     move |event: &MouseUpEvent, _, window, cx| {
                         let Some(endpoint) =
-                            terminal_endpoint_for_mouse(event.position, text_bounds, true)
+                            terminal_endpoint_for_mouse(event.position, text_bounds, false)
                         else {
                             (on_mouse_up)(
                                 event,
@@ -3028,6 +3028,29 @@ mod selection_helper_tests {
         assert_eq!(outside.position.column, 3);
         assert_eq!(outside.side, TerminalCellSide::Right);
         assert!(rejected.is_none());
+    }
+
+    #[test]
+    fn rendered_terminal_grid_never_claims_pointer_events_outside_its_bounds() {
+        let source = include_str!("view.rs");
+        let start = source
+            .find("let on_mouse_down = interaction.on_mouse_down.clone();")
+            .expect("terminal grid pointer handlers");
+        let body = &source[start..];
+        let end = body
+            .find("\n            }\n        },")
+            .expect("terminal grid canvas handlers end");
+        let body = &body[..end];
+        assert_eq!(
+            body.matches("terminal_endpoint_for_mouse(event.position, text_bounds, false)")
+                .count(),
+            3,
+            "terminal mouse down, drag, and release must not clamp unrelated window events into the grid"
+        );
+        assert!(
+            !body.contains("terminal_endpoint_for_mouse(event.position, text_bounds, true)"),
+            "a visible terminal must not become a window-wide modal pointer surface"
+        );
     }
 
     #[test]

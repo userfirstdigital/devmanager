@@ -57,6 +57,35 @@ pub fn classify_codex_identityless_startup_readiness(
     CodexIdentitylessStartupReadiness::StartupPending
 }
 
+/// Detect an interactive provider-owned startup safety screen. This is only a
+/// presentation signal: the host still requires an explicit user decision and
+/// the exact terminal fences before delivering any input.
+pub fn provider_identityless_setup_required(
+    provider_kind: ProviderKind,
+    text_lines: &[String],
+) -> bool {
+    match provider_kind {
+        ProviderKind::Codex => matches!(
+            classify_codex_identityless_startup_readiness(text_lines),
+            CodexIdentitylessStartupReadiness::ProviderSetupRequired
+        ),
+        ProviderKind::ClaudeCode => is_claude_workspace_trust_screen(text_lines),
+        ProviderKind::Cursor => false,
+    }
+}
+
+fn is_claude_workspace_trust_screen(text_lines: &[String]) -> bool {
+    let has_safety_question = text_lines.iter().any(|line| {
+        let line = line.to_ascii_lowercase();
+        line.contains("quick safety check") && line.contains("project you created or one you trust")
+    });
+    let has_explicit_choice = text_lines.iter().any(|line| {
+        line.to_ascii_lowercase()
+            .contains("yes, i trust this folder")
+    });
+    has_safety_question && has_explicit_choice
+}
+
 fn is_codex_trust_directory_screen(text_lines: &[String]) -> bool {
     text_lines.iter().any(|line| {
         line.to_ascii_lowercase()
@@ -988,9 +1017,8 @@ mod tests {
             wait: false,
             images,
         };
-        let bracketed =
-            provider_composer_submit_plan_for_mode(ProviderKind::Codex, &action, true)
-                .expect("codex images bracketed");
+        let bracketed = provider_composer_submit_plan_for_mode(ProviderKind::Codex, &action, true)
+            .expect("codex images bracketed");
         let steps: Vec<&[u8]> = bracketed
             .steps()
             .iter()
@@ -1007,9 +1035,8 @@ mod tests {
             assert!(paste.delay_after().unwrap() > std::time::Duration::from_millis(120));
         }
 
-        let plain =
-            provider_composer_submit_plan_for_mode(ProviderKind::Codex, &action, false)
-                .expect("codex images plain");
+        let plain = provider_composer_submit_plan_for_mode(ProviderKind::Codex, &action, false)
+            .expect("codex images plain");
         let plain_steps: Vec<&[u8]> = plain
             .steps()
             .iter()
@@ -1037,12 +1064,9 @@ mod tests {
             wait: false,
             images: vec![ProviderImageAttachment::try_new(absolute, [9; 32], 16).expect("img")],
         };
-        let bracketed = provider_composer_submit_plan_for_mode(
-            ProviderKind::ClaudeCode,
-            &action,
-            true,
-        )
-        .expect("image-only bracketed");
+        let bracketed =
+            provider_composer_submit_plan_for_mode(ProviderKind::ClaudeCode, &action, true)
+                .expect("image-only bracketed");
         let steps: Vec<&[u8]> = bracketed
             .steps()
             .iter()
@@ -1051,12 +1075,9 @@ mod tests {
         let expected = format!("\x1b[200~{absolute}\x1b[201~");
         assert_eq!(steps, vec![expected.as_bytes(), b"\r".as_slice()]);
 
-        let plain = provider_composer_submit_plan_for_mode(
-            ProviderKind::ClaudeCode,
-            &action,
-            false,
-        )
-        .expect("image-only plain");
+        let plain =
+            provider_composer_submit_plan_for_mode(ProviderKind::ClaudeCode, &action, false)
+                .expect("image-only plain");
         let plain_steps: Vec<&[u8]> = plain
             .steps()
             .iter()
@@ -1145,19 +1166,13 @@ mod tests {
             "supplied trust screen must not be chat-ready despite bracketed paste elsewhere"
         );
 
-        let composer = vec![
-            String::new(),
-            "  › Ask Codex to do anything".into(),
-        ];
+        let composer = vec![String::new(), "  › Ask Codex to do anything".into()];
         assert_eq!(
             classify_codex_identityless_startup_readiness(&composer),
             CodexIdentitylessStartupReadiness::ChatComposerReady,
         );
 
-        let wrapped_composer = vec![
-            "  › Ask Codex to do any".into(),
-            "  thing".into(),
-        ];
+        let wrapped_composer = vec!["  › Ask Codex to do any".into(), "  thing".into()];
         assert_eq!(
             classify_codex_identityless_startup_readiness(&wrapped_composer),
             CodexIdentitylessStartupReadiness::ChatComposerReady,
@@ -1245,6 +1260,30 @@ mod tests {
             CodexIdentitylessStartupReadiness::ChatComposerReady,
             "conversation mentioning trust must not blanket-gate when composer placeholder is visible"
         );
+    }
+
+    #[test]
+    fn provider_setup_detection_recognizes_claude_workspace_trust_without_false_positives() {
+        let trust = vec![
+            "Accessing workspace:".into(),
+            r"C:\Code\userfirst\snake-game".into(),
+            "Quick safety check: Is this a project you created or one you trust?".into(),
+            "No, exit".into(),
+            "Yes, I trust this folder".into(),
+            "Enter to confirm · Esc to cancel".into(),
+        ];
+        assert!(provider_identityless_setup_required(
+            ProviderKind::ClaudeCode,
+            &trust,
+        ));
+        assert!(!provider_identityless_setup_required(
+            ProviderKind::ClaudeCode,
+            &["Claude is working…".into()],
+        ));
+        assert!(provider_identityless_setup_required(
+            ProviderKind::Codex,
+            &["Do you trust the contents of this directory?".into()],
+        ));
     }
 
     #[test]

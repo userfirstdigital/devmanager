@@ -3,8 +3,8 @@ use serde::ser::SerializeMap;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::fmt;
 
-use crate::domain::command::{CommandEnvelope, CommandReceipt};
 use crate::domain::cockpit::{TaskCockpitQuery, TaskCockpitResult};
+use crate::domain::command::{CommandEnvelope, CommandReceipt};
 use crate::domain::host::HostQuitInspection;
 use crate::domain::id::{
     ArtifactId, ClientId, OperationId, RequestId, SnapshotId, SubscriptionId, TaskId,
@@ -193,7 +193,9 @@ pub enum Query {
     /// Read-only lookup of a durable command receipt for reconnect recovery.
     /// The authenticated host client identity is supplied out-of-band by the
     /// host transport; it is never inferred from this nested command.
-    CommandReceiptStatus { command: CommandEnvelope },
+    CommandReceiptStatus {
+        command: CommandEnvelope,
+    },
     /// Task scope is taken from [`QueryEnvelope::task_id`].
     TaskSnapshot,
     /// Open (`snapshot_id` and `resume_cursor` both absent) or resume (both present).

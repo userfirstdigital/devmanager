@@ -10,7 +10,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if !cfg!(debug_assertions)
         || !(args.len() == 2
             || (args.len() == 3 && matches!(args[2].as_str(), "--readiness" | "--conversation")))
-        || !(args[0].starts_with("devmanager-native-ui-a-")
+        || !(args[0].starts_with("native-next-")
+            || args[0].starts_with("devmanager-native-ui-a-")
             || args[0].starts_with("devmanager-native-ui-b-"))
     {
         return Err(

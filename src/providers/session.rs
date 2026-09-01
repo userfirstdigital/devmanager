@@ -21,7 +21,9 @@ use crate::providers::capabilities::{
     ProviderKind,
 };
 use rusqlite::types::ValueRef;
-use rusqlite::{params, Connection, OpenFlags, OptionalExtension, Row, Transaction, TransactionBehavior};
+use rusqlite::{
+    params, Connection, OpenFlags, OptionalExtension, Row, Transaction, TransactionBehavior,
+};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -3436,7 +3438,19 @@ fn is_settled_exact_resume_relaunch(
     let ProviderLaunchMode::ResumeExact(resumed_id) = &next.launch_spec.mode else {
         return false;
     };
-    current.lifecycle == PersistedRuntimeLifecycle::Replaced
+    let settled_source = match current.lifecycle {
+        PersistedRuntimeLifecycle::Replaced => true,
+        PersistedRuntimeLifecycle::LaunchFailed => {
+            current.process_root.is_none()
+                && matches!(
+                    &current.launch_spec.mode,
+                    ProviderLaunchMode::ResumeExact(current_id)
+                        if current_id == provider_session_id
+                )
+        }
+        _ => false,
+    };
+    settled_source
         && next.lifecycle == PersistedRuntimeLifecycle::Starting
         && next.action_epoch > current.action_epoch
         && next.launch_nonce != current.launch_nonce
@@ -3449,10 +3463,6 @@ fn is_settled_exact_resume_relaunch(
         && current.launch_spec.task_id == next.launch_spec.task_id
         && current.launch_spec.resource_id == next.launch_spec.resource_id
         && current.launch_spec.provider_kind == next.launch_spec.provider_kind
-        && current.launch_spec.executable == next.launch_spec.executable
-        && current.launch_spec.runtime_dependency == next.launch_spec.runtime_dependency
-        && current.launch_spec.cwd == next.launch_spec.cwd
-        && current.launch_spec.environment == next.launch_spec.environment
         && next.launch_spec.generation == current.generation
         && next.launch_spec.launch_nonce == next.launch_nonce
 }
@@ -3597,7 +3607,7 @@ impl SqliteProviderSessionStateStore {
     /// Bounded read-only presence probe for latency-sensitive readiness.
     ///
     /// - Missing store file → `Ok(false)` (absence) — caller must own the path.
-    /// - Row present / absent → `Ok(true)` / `Ok(false)`.
+    /// - Open launch / settled-or-absent → `Ok(true)` / `Ok(false)`.
     /// - Busy, permissions, schema, or corruption → `Err` (unknown).
     ///
     /// Never creates schema, never mutates WAL/journal mode, and uses a zero
@@ -3618,16 +3628,61 @@ impl SqliteProviderSessionStateStore {
         connection
             .busy_timeout(std::time::Duration::from_millis(0))
             .map_err(|error| error.to_string())?;
-        let present: bool = connection
+        let row: Option<(String, i64, String, Vec<u8>)> = connection
             .query_row(
-                "SELECT 1 FROM provider_session_states WHERE agent_session_id = ?1 LIMIT 1",
+                "SELECT agent_session_id, revision, lifecycle, state_json
+                 FROM provider_session_states WHERE agent_session_id = ?1 LIMIT 1",
                 params![agent_session_id.to_string()],
-                |_| Ok(true),
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        bounded_state_blob(row, 3)?,
+                    ))
+                },
             )
             .optional()
-            .map_err(|error| error.to_string())?
-            .unwrap_or(false);
-        Ok(present)
+            .map_err(|error| error.to_string())?;
+        let Some((row_agent_id, row_revision, row_lifecycle, bytes)) = row else {
+            return Ok(false);
+        };
+        let state = ProviderSessionState::decode(&bytes)?;
+        let row_agent_id = row_agent_id
+            .parse::<AgentSessionId>()
+            .map_err(|error| format!("persisted row agent session identity is invalid: {error}"))?;
+        if row_agent_id != state.agent_session_id || state.agent_session_id != agent_session_id {
+            return Err("persisted agent session identity does not match the row key".to_string());
+        }
+        if checked_sql_u64(row_revision, "provider session row revision")? != state.revision
+            || row_lifecycle != persisted_lifecycle_name(state.lifecycle)
+        {
+            return Err("persisted row metadata does not match its state".to_string());
+        }
+        let open_lifecycle = matches!(
+            state.lifecycle,
+            PersistedRuntimeLifecycle::Starting
+                | PersistedRuntimeLifecycle::Running
+                | PersistedRuntimeLifecycle::Stopping
+                | PersistedRuntimeLifecycle::UnknownLeaked
+        );
+        if !open_lifecycle {
+            return Ok(false);
+        }
+        let Some((process_id, executable)) = state.process_root_identity_parts() else {
+            return Ok(true);
+        };
+        let expected =
+            crate::process::identity::ManagedProcessIdentity::new(process_id, executable)
+                .map_err(|error| format!("persisted process identity is invalid: {error}"))?;
+        match crate::process::sampler::ProcessSampler::observe_exact_process_identity(&expected) {
+            crate::process::sampler::ExactProcessIdentityStatus::Present => Ok(true),
+            crate::process::sampler::ExactProcessIdentityStatus::Absent
+            | crate::process::sampler::ExactProcessIdentityStatus::Different => Ok(false),
+            crate::process::sampler::ExactProcessIdentityStatus::Inaccessible => {
+                Err("persisted process identity could not be verified".to_string())
+            }
+        }
     }
 
     fn table_columns(connection: &Connection, table: &str) -> Result<Vec<(String, i64)>, String> {
@@ -7992,7 +8047,7 @@ mod tests {
     }
 
     #[test]
-    fn sqlite_bounded_presence_probe_is_absence_busy_safe_and_read_only() {
+    fn sqlite_bounded_presence_probe_is_open_lifecycle_busy_safe_and_read_only() {
         let path = tempfile::tempdir().expect("probe dir");
         let db = path.path().join("provider-sessions.sqlite");
         let agent = AgentSessionId::new();
@@ -8023,7 +8078,7 @@ mod tests {
             provider_session_id: None,
             process_root: None,
         };
-        store.persist(state).unwrap();
+        store.persist(state.clone()).unwrap();
         drop(store);
         assert!(
             SqliteProviderSessionStateStore::probe_agent_persisted_bounded(
@@ -8032,8 +8087,45 @@ mod tests {
             )
             .unwrap()
         );
+        let mut stale_running = state.clone();
+        stale_running.revision = stale_running.revision.saturating_add(1);
+        stale_running.process_root = Some(PersistedProcessRoot {
+            pid: u32::MAX,
+            creation_time_100ns: 1,
+            canonical_executable: stale_running
+                .launch_spec
+                .executable
+                .canonical_path()
+                .to_path_buf(),
+            executable_sha256: *stale_running.launch_spec.executable.sha256(),
+        });
+        let mut store = SqliteProviderSessionStateStore::open(&db).unwrap();
+        store.persist(stale_running.clone()).unwrap();
+        drop(store);
+        assert!(
+            !SqliteProviderSessionStateStore::probe_agent_persisted_bounded(
+                &db,
+                runtime.agent_session_id()
+            )
+            .unwrap(),
+            "a stale exact process root must not hold TerminalReadiness in StartPending"
+        );
         assert!(
             !SqliteProviderSessionStateStore::probe_agent_persisted_bounded(&db, agent).unwrap()
+        );
+        let mut store = SqliteProviderSessionStateStore::open(&db).unwrap();
+        let mut exited = stale_running;
+        exited.lifecycle = PersistedRuntimeLifecycle::Exited;
+        exited.revision = exited.revision.saturating_add(1);
+        store.persist(exited).unwrap();
+        drop(store);
+        assert!(
+            !SqliteProviderSessionStateStore::probe_agent_persisted_bounded(
+                &db,
+                runtime.agent_session_id()
+            )
+            .unwrap(),
+            "an exited provider row must not hold TerminalReadiness in StartPending forever"
         );
         std::fs::write(&db, b"corrupt-not-sqlite").unwrap();
         assert!(
@@ -8045,7 +8137,12 @@ mod tests {
         let writer = Connection::open(&locked_db).unwrap();
         writer
             .execute_batch(
-                "CREATE TABLE provider_session_states (agent_session_id TEXT PRIMARY KEY);
+                "CREATE TABLE provider_session_states (
+                    agent_session_id TEXT PRIMARY KEY,
+                    revision INTEGER NOT NULL,
+                    lifecycle TEXT NOT NULL,
+                    state_json BLOB NOT NULL
+                 );
                  BEGIN EXCLUSIVE;",
             )
             .unwrap();
@@ -8857,6 +8954,9 @@ mod tests {
     #[test]
     fn exact_resource_binding_resumes_after_verified_old_process_absence() {
         let launcher = FixtureProviderProcessLauncher::new();
+        let upgraded_cli = tempfile::tempdir().unwrap();
+        let upgraded_cli_path = upgraded_cli.path().join("upgraded-provider.exe");
+        std::fs::copy(std::env::current_exe().unwrap(), &upgraded_cli_path).unwrap();
         let mut agent = AgentSessionFacts::new(
             TaskId::new(),
             AgentRole::Primary,
@@ -8891,6 +8991,15 @@ mod tests {
         agent.provider_session_id = Some(provider_session_id.clone());
         let mut request = test_request(agent.clone());
         request.mode = ProviderSessionStartMode::ResumeExact;
+        request.launch_spec.executable = ProviderExecutable::from_path(upgraded_cli_path).unwrap();
+        request
+            .launch_spec
+            .arguments
+            .push(OsString::from("--upgraded-resume"));
+        request.launch_spec.environment.insert(
+            OsString::from("DEVMANAGER_PROVIDER_LAUNCH_NONCE"),
+            OsString::from("fresh-resume"),
+        );
         request.launch_proof = Some(
             ProviderAdapterLaunchProof::from_test(
                 request.launch_spec.clone(),
@@ -8910,6 +9019,105 @@ mod tests {
         assert_eq!(resumed.generation(), binding.runtime_generation);
         assert!(resumed.correlation().action_epoch() > old_action_epoch);
         assert_eq!(resumed.provider_session_id(), agent.provider_session_id);
+        reopened.close_agent_session(agent.id).unwrap();
+    }
+
+    #[test]
+    fn exact_resource_binding_relaunches_a_previously_resumed_session_with_fresh_launch_data() {
+        let launcher = FixtureProviderProcessLauncher::new();
+        let issuer = FixtureProviderSessionStartIssuer::default();
+        let mut agent = AgentSessionFacts::new(
+            TaskId::new(),
+            AgentRole::Primary,
+            ProviderKind::ClaudeCode,
+            None,
+        )
+        .unwrap();
+        agent.runtime_generation = 1;
+        let binding = AgentResourceBinding {
+            task_id: agent.task_id,
+            agent_session_id: agent.id,
+            resource_id: ResourceId::new(),
+            provider_kind: agent.provider_kind,
+            runtime_generation: agent.runtime_generation,
+        };
+        let path = tempfile::NamedTempFile::new().unwrap();
+        let mut manager = ProviderSessionManager::with_state_store(
+            launcher.clone(),
+            SqliteProviderSessionStateStore::open(path.path()).unwrap(),
+        );
+        let runtime = manager
+            .start_with_resource_binding(test_request(agent.clone()), binding)
+            .unwrap();
+        let provider_session_id = ProviderSessionId::new("durable-resumed-session").unwrap();
+        manager
+            .accept_provider_session_start(
+                issuer.issue(runtime.correlation(), provider_session_id.clone()),
+            )
+            .unwrap();
+        let old_action_epoch = runtime.correlation().action_epoch();
+        let slot = manager.leases.remove(&agent.id).unwrap();
+        std::mem::forget(slot.lease);
+        drop(runtime);
+        std::mem::forget(manager);
+
+        launcher.set_recovery_process_absent(true);
+        agent.provider_session_id = Some(provider_session_id.clone());
+        let mut first_resume = test_request(agent.clone());
+        first_resume.mode = ProviderSessionStartMode::ResumeExact;
+        first_resume.launch_spec.environment.insert(
+            OsString::from("DEVMANAGER_PROVIDER_LAUNCH_NONCE"),
+            OsString::from("first-resume"),
+        );
+        first_resume.launch_proof = Some(
+            ProviderAdapterLaunchProof::from_test(
+                first_resume.launch_spec.clone(),
+                ProviderSessionStartMode::ResumeExact,
+                Some(provider_session_id.clone()),
+            )
+            .unwrap(),
+        );
+        let mut first_manager = ProviderSessionManager::with_state_store(
+            launcher.clone(),
+            SqliteProviderSessionStateStore::open(path.path()).unwrap(),
+        );
+        let first_resumed = first_manager
+            .start_with_resource_binding(first_resume, binding)
+            .expect("first exact resume");
+        let first_resume_epoch = first_resumed.correlation().action_epoch();
+        assert!(first_resume_epoch > old_action_epoch);
+        let slot = first_manager.leases.remove(&agent.id).unwrap();
+        std::mem::forget(slot.lease);
+        drop(first_resumed);
+        std::mem::forget(first_manager);
+
+        let mut second_resume = test_request(agent.clone());
+        second_resume.mode = ProviderSessionStartMode::ResumeExact;
+        second_resume
+            .launch_spec
+            .arguments
+            .push(OsString::from("--fresh-resume-option"));
+        second_resume.launch_spec.environment.insert(
+            OsString::from("DEVMANAGER_PROVIDER_LAUNCH_NONCE"),
+            OsString::from("second-resume"),
+        );
+        second_resume.launch_proof = Some(
+            ProviderAdapterLaunchProof::from_test(
+                second_resume.launch_spec.clone(),
+                ProviderSessionStartMode::ResumeExact,
+                Some(provider_session_id),
+            )
+            .unwrap(),
+        );
+        let mut reopened = ProviderSessionManager::with_state_store(
+            launcher,
+            SqliteProviderSessionStateStore::open(path.path()).unwrap(),
+        );
+        let second_resumed = reopened
+            .start_with_resource_binding(second_resume, binding)
+            .expect("a previously resumed session must accept fresh launch-only data");
+
+        assert!(second_resumed.correlation().action_epoch() > first_resume_epoch);
         reopened.close_agent_session(agent.id).unwrap();
     }
 
@@ -10940,6 +11148,93 @@ mod tests {
         store
             .persist(relaunched)
             .expect("a settled launch with no provider identity is safe to replace");
+    }
+
+    #[test]
+    fn sqlite_state_accepts_exact_resume_with_fresh_launch_environment() {
+        let runtime = unit_runtime();
+        let path = tempfile::NamedTempFile::new().unwrap();
+        let provider_id = ProviderSessionId::new("durable-resume-session").unwrap();
+        let mut settled = ProviderSessionState {
+            agent_session_id: runtime.agent_session_id(),
+            task_id: runtime.task_id(),
+            generation: runtime.generation(),
+            action_epoch: runtime.correlation().action_epoch(),
+            revision: 1,
+            lifecycle: PersistedRuntimeLifecycle::Replaced,
+            launch_nonce: runtime.launch_nonce(),
+            launch_spec: runtime.launch_spec(),
+            provider_session_id: Some(provider_id.clone()),
+            process_root: Some(PersistedProcessRoot::from_fence(
+                &runtime.fence(),
+                runtime.launch_spec().executable(),
+            )),
+        };
+        settled.launch_spec.mode = ProviderLaunchMode::NewConversation;
+        let mut store = SqliteProviderSessionStateStore::open(path.path()).unwrap();
+        store.persist(settled.clone()).unwrap();
+
+        let next_nonce = LaunchNonce::new();
+        let mut relaunched = settled;
+        relaunched.revision = 2;
+        relaunched.lifecycle = PersistedRuntimeLifecycle::Starting;
+        relaunched.action_epoch += 1;
+        relaunched.launch_nonce = next_nonce;
+        relaunched.launch_spec.launch_nonce = next_nonce;
+        relaunched.launch_spec.mode = ProviderLaunchMode::ResumeExact(provider_id);
+        relaunched.launch_spec.terminal_id = TerminalId::new();
+        relaunched.launch_spec.environment.insert(
+            OsString::from("DEVMANAGER_PROVIDER_LAUNCH_NONCE"),
+            OsString::from("fresh-launch-value"),
+        );
+        relaunched.process_root = None;
+
+        store
+            .persist(relaunched)
+            .expect("an exact resume must admit its newly generated launch environment");
+    }
+
+    #[test]
+    fn sqlite_state_accepts_retry_after_settled_exact_resume_launch_failure() {
+        let runtime = unit_runtime();
+        let path = tempfile::NamedTempFile::new().unwrap();
+        let provider_id = ProviderSessionId::new("retryable-resume-session").unwrap();
+        let mut failed = ProviderSessionState {
+            agent_session_id: runtime.agent_session_id(),
+            task_id: runtime.task_id(),
+            generation: runtime.generation(),
+            action_epoch: runtime.correlation().action_epoch(),
+            revision: 1,
+            lifecycle: PersistedRuntimeLifecycle::LaunchFailed,
+            launch_nonce: runtime.launch_nonce(),
+            launch_spec: runtime.launch_spec(),
+            provider_session_id: Some(provider_id.clone()),
+            process_root: None,
+        };
+        failed.launch_spec.mode = ProviderLaunchMode::ResumeExact(provider_id.clone());
+        let mut store = SqliteProviderSessionStateStore::open(path.path()).unwrap();
+        store.persist(failed.clone()).unwrap();
+
+        let next_nonce = LaunchNonce::new();
+        let mut retried = failed;
+        retried.revision = 2;
+        retried.lifecycle = PersistedRuntimeLifecycle::Starting;
+        retried.action_epoch += 1;
+        retried.launch_nonce = next_nonce;
+        retried.launch_spec.launch_nonce = next_nonce;
+        retried.launch_spec.terminal_id = TerminalId::new();
+        retried
+            .launch_spec
+            .arguments
+            .push(OsString::from("--fresh-retry-option"));
+        retried.launch_spec.environment.insert(
+            OsString::from("DEVMANAGER_PROVIDER_LAUNCH_NONCE"),
+            OsString::from("fresh-retry-value"),
+        );
+
+        store
+            .persist(retried)
+            .expect("a joined failed resume must be retryable with fresh launch-only data");
     }
 
     #[test]

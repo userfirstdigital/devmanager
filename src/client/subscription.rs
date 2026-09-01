@@ -550,10 +550,18 @@ impl ClientSubscription {
                 })
             }
             UnsolicitedServerMessage::Stream(frame) => Ok(SubscriptionUpdate::Stream(frame)),
-            UnsolicitedServerMessage::ConversationDirty { subscription_id, task_id, high_water } => {
+            UnsolicitedServerMessage::ConversationDirty {
+                subscription_id,
+                task_id,
+                high_water,
+            } => {
                 // This advisory owns a conversation subscription, not the
                 // durable replay subscription or its cursor.
-                Ok(SubscriptionUpdate::ConversationDirty { subscription_id, task_id, high_water })
+                Ok(SubscriptionUpdate::ConversationDirty {
+                    subscription_id,
+                    task_id,
+                    high_water,
+                })
             }
         }
     }
@@ -1101,10 +1109,21 @@ mod tests {
         let cursor = sub.model().unwrap().last_applied_sequence();
         let subscription_id = SubscriptionId::new();
         let task_id = crate::domain::TaskId::new();
-        let update = sub.handle_unsolicited_message(UnsolicitedServerMessage::ConversationDirty {
-            subscription_id, task_id, high_water: 19,
-        }).unwrap();
-        assert_eq!(update, SubscriptionUpdate::ConversationDirty { subscription_id, task_id, high_water: 19 });
+        let update = sub
+            .handle_unsolicited_message(UnsolicitedServerMessage::ConversationDirty {
+                subscription_id,
+                task_id,
+                high_water: 19,
+            })
+            .unwrap();
+        assert_eq!(
+            update,
+            SubscriptionUpdate::ConversationDirty {
+                subscription_id,
+                task_id,
+                high_water: 19
+            }
+        );
         assert_eq!(sub.state(), ClientSubscriptionState::Ready);
         assert_eq!(sub.model().unwrap().last_applied_sequence(), cursor);
     }

@@ -72,7 +72,7 @@ use crate::domain::command::{
 use crate::domain::event::DomainEvent;
 use crate::domain::host::{HostQuitInspection, HostQuitWorktreeInspection};
 use crate::domain::id::SubscriptionId;
-use crate::domain::id::{AgentSessionId, CommandId, ProjectId, RequestId, TaskId};
+use crate::domain::id::{AgentSessionId, CommandId, ProjectId, RequestId, TaskId, TerminalId};
 use crate::domain::task::VisibleTaskStatus;
 use crate::domain::ClientId;
 use crate::host::IpcError;
@@ -145,6 +145,9 @@ use crate::browser::{
     browser_command_channel, BrowserCommand, BrowserCommandBridge, BrowserCommandInbox,
     BrowserGatewayHandle, BrowserGatewayRegistration, BrowserWorkspaceKey,
     BrowserWorkspaceSnapshot,
+};
+use crate::terminal::protocol::{
+    InputAck, InputId, TerminalGeneration, TerminalInputContext, TerminalInputRequest,
 };
 use crate::ui::browser_dock_lifecycle::{
     plan_browser_dock, BrowserDockIdentity, BrowserDockLifecycleError, BrowserDockPlan,
@@ -374,12 +377,22 @@ const MAX_RETAINED_ACTION_BATCHES: usize = 8;
 const CONTROLLER_TICK_INTERVAL: Duration = Duration::from_millis(16);
 /// Idle/recovery controller wait floor. Must stay hundreds of ms+, never 16ms.
 const CONTROLLER_IDLE_RECOVERY_INTERVAL: Duration = Duration::from_secs(1);
+/// Provider startup is asynchronous to the Terminal query that requested it.
+/// A short bounded retry keeps first-open feedback responsive without reviving
+/// the old hot polling loop.
+const TERMINAL_START_RETRY_INTERVAL: Duration = Duration::from_millis(350);
+const TERMINAL_ECHO_RETRY_INTERVAL: Duration = Duration::from_millis(16);
+const TERMINAL_ECHO_MAX_UNMATCHED_REFRESHES: u8 = 16;
 /// Host worker command/subscription idle slice — separate from UI scheduling.
 const HOST_WORKER_IDLE_WAIT: Duration = Duration::from_millis(50);
 const COMPOSER_CARET_BLINK_INTERVAL: Duration = Duration::from_millis(512);
 const HOST_BOOTSTRAP_REATTACH_INTERVAL: Duration = Duration::from_secs(1);
 const PROVIDER_SETTINGS_REFRESH_INTERVAL: Duration = Duration::from_secs(2);
 const PROVIDER_SETTINGS_IDLE_INTERVAL: Duration = Duration::from_secs(30);
+/// A provider startup choice is a single PTY gesture and should settle almost
+/// immediately. Never leave the panel permanently blocked if the provider
+/// changes its prompt or fails to consume the gesture.
+const PROVIDER_SETUP_RESOLUTION_TIMEOUT: Duration = Duration::from_secs(8);
 
 /// Shared edge-triggered wake so projection/action publication can interrupt a
 /// deadline wait without a 60Hz idle timer. Cloning shares the same core.
@@ -480,7 +493,9 @@ struct ControllerWaitInputs {
     drafts_dirty: bool,
     layout_dirty: bool,
     remote_settings_open: bool,
+    remote_poll_in_flight: bool,
     provider_settings_refreshing: bool,
+    provider_poll_in_flight: bool,
     bootstrap_retry_armed: bool,
     since_last_composer_persist: Option<Duration>,
     since_last_layout_persist: Option<Duration>,
@@ -489,6 +504,7 @@ struct ControllerWaitInputs {
     since_last_bootstrap_retry: Option<Duration>,
     since_last_conversation_recovery: Option<Duration>,
     since_last_caret_toggle: Option<Duration>,
+    next_terminal_requery: Option<Duration>,
 }
 
 fn duration_until(interval: Duration, since: Duration) -> Duration {
@@ -525,7 +541,7 @@ fn next_controller_wait(inputs: ControllerWaitInputs) -> Duration {
             .unwrap_or(LAYOUT_PERSIST_INTERVAL);
         wait = consider(wait, duration_until(LAYOUT_PERSIST_INTERVAL, since));
     }
-    if inputs.remote_settings_open {
+    if inputs.remote_settings_open && !inputs.remote_poll_in_flight {
         let since = inputs
             .since_last_remote_poll
             .unwrap_or(Duration::from_secs(1));
@@ -545,8 +561,10 @@ fn next_controller_wait(inputs: ControllerWaitInputs) -> Duration {
     } else {
         PROVIDER_SETTINGS_IDLE_INTERVAL
     };
-    if let Some(since) = inputs.since_last_provider_poll {
-        wait = consider(wait, duration_until(provider_interval, since));
+    if !inputs.provider_poll_in_flight {
+        if let Some(since) = inputs.since_last_provider_poll {
+            wait = consider(wait, duration_until(provider_interval, since));
+        }
     }
     let since_recovery = inputs
         .since_last_conversation_recovery
@@ -555,6 +573,9 @@ fn next_controller_wait(inputs: ControllerWaitInputs) -> Duration {
         wait,
         duration_until(CONVERSATION_RECOVERY_HEARTBEAT, since_recovery),
     );
+    if let Some(next_terminal_requery) = inputs.next_terminal_requery {
+        wait = consider(wait, next_terminal_requery.max(Duration::from_millis(1)));
+    }
     wait
 }
 
@@ -679,6 +700,22 @@ fn first_send_terminal_ready(
             })
 }
 
+fn terminal_projection_requires_provider_setup(
+    snapshot: &crate::domain::TaskSnapshot,
+    terminal: &crate::domain::TaskTerminalProjection,
+) -> bool {
+    first_send_terminal_runtime_live(snapshot, terminal)
+        && snapshot
+            .agents
+            .get(&terminal.agent_session_id)
+            .is_some_and(|agent| {
+                crate::providers::input::provider_identityless_setup_required(
+                    agent.provider_kind,
+                    &terminal.text_lines,
+                )
+            })
+}
+
 /// Authoritative TerminalReadiness says no live runtime and no pending launch.
 fn first_send_terminal_probe_not_started(result: &crate::domain::TaskCockpitResult) -> bool {
     matches!(
@@ -714,19 +751,29 @@ fn first_send_terminal_probe_provider_setup_required(
     )
 }
 
-fn codex_provider_setup_composer_error() -> &'static str {
-    "Complete Codex workspace trust on this host before sending. Your draft was kept."
-}
-
-fn hold_pending_draft_first_send_for_codex_setup(
+fn hold_pending_draft_first_send_for_provider_setup(
     slot: &mut HostUiState,
     request_id: Option<RequestId>,
 ) {
     if let Some(request_id) = request_id {
         slot.first_send_readiness_requests.remove(&request_id);
     }
-    slot.pending_draft_first_send = None;
-    slot.composer_error = Some(codex_provider_setup_composer_error().into());
+    let Some(pending) = slot.pending_draft_first_send.as_mut() else {
+        return;
+    };
+    pending.readiness_request_id = None;
+    pending.readiness_requested_at = None;
+    let owner = pending.owner.clone();
+    let first_hold = !slot.provider_setup_approvals.contains_key(&owner.task_id);
+    slot.provider_setup_approvals
+        .entry(owner.task_id)
+        .or_insert_with(|| ProviderSetupApproval {
+            owner,
+            state: ProviderSetupApprovalState::Waiting,
+        });
+    if first_hold {
+        slot.composer_error = None;
+    }
 }
 
 fn composer_provider_identity(
@@ -745,6 +792,14 @@ fn composer_provider_identity(
             )
         })
         .unwrap_or((None, None, None))
+}
+
+fn composer_waits_for_provider_identity(
+    unstarted_draft: bool,
+    provider_kind: ProviderKind,
+    provider_session_present: bool,
+) -> bool {
+    !unstarted_draft && !provider_session_present && provider_kind != ProviderKind::Codex
 }
 
 fn automatic_task_title(current_title: &str, first_prompt: &str) -> Option<String> {
@@ -829,6 +884,35 @@ fn provider_inbox_affordance(connected: bool, checking: bool) -> ProviderInboxAf
         ProviderInboxAffordance::Checking
     } else {
         ProviderInboxAffordance::DisconnectedAdd
+    }
+}
+
+fn project_creation_affordance(
+    can_add_local_project: bool,
+    provider_affordance: ProviderInboxAffordance,
+) -> ProviderInboxAffordance {
+    if can_add_local_project {
+        ProviderInboxAffordance::ConnectedAdd
+    } else if provider_affordance == ProviderInboxAffordance::Checking {
+        ProviderInboxAffordance::Checking
+    } else {
+        ProviderInboxAffordance::DisconnectedAdd
+    }
+}
+
+fn cycle_project_choice(
+    current: ProjectId,
+    choices: &[ProjectId],
+    backwards: bool,
+) -> Option<ProjectId> {
+    let current_index = choices.iter().position(|project_id| *project_id == current);
+    match (choices.len(), current_index, backwards) {
+        (0, _, _) => None,
+        (len, Some(0), true) => choices.get(len - 1).copied(),
+        (_, Some(index), true) => choices.get(index - 1).copied(),
+        (len, Some(index), false) => choices.get((index + 1) % len).copied(),
+        (_, None, true) => choices.last().copied(),
+        (_, None, false) => choices.first().copied(),
     }
 }
 
@@ -2520,6 +2604,101 @@ enum PendingDraftFirstSendStage {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+enum ProviderSetupApprovalState {
+    Waiting,
+    Resolving {
+        command_id: CommandId,
+        allow: bool,
+        started_at: Instant,
+    },
+}
+
+fn provider_setup_resolution_expired(state: &ProviderSetupApprovalState, now: Instant) -> bool {
+    matches!(
+        state,
+        ProviderSetupApprovalState::Resolving { started_at, .. }
+            if now.saturating_duration_since(*started_at) >= PROVIDER_SETUP_RESOLUTION_TIMEOUT
+    )
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ProviderSetupApproval {
+    owner: HostTaskKey,
+    state: ProviderSetupApprovalState,
+}
+
+type ProviderSetupInputCompletion = Arc<Mutex<Option<Result<InputAck, String>>>>;
+
+fn terminal_input_request(
+    client_id: ClientId,
+    terminal: &crate::domain::TaskTerminalProjection,
+    input_sequence: u64,
+    bytes: Vec<u8>,
+) -> Result<TerminalInputRequest, String> {
+    let terminal_generation = TerminalGeneration::from_raw(terminal.resource_generation)
+        .map_err(|error| format!("provider terminal generation is invalid: {error}"))?;
+    let request = TerminalInputRequest {
+        client_id,
+        input_id: InputId::new(),
+        terminal_id: terminal.terminal_id,
+        context: TerminalInputContext {
+            task_id: terminal.task_id,
+            agent_session_id: terminal.agent_session_id,
+            resource_id: terminal.resource_id,
+            runtime_generation: terminal.runtime_generation,
+            resource_generation: terminal.resource_generation,
+            session_id: terminal.session_id,
+            terminal_generation,
+            focus_epoch: terminal.focus_epoch,
+            action_epoch: terminal.action_epoch,
+            input_sequence,
+        },
+        bytes,
+    };
+    request
+        .validate()
+        .map_err(|error| format!("provider terminal input is invalid: {error}"))?;
+    Ok(request)
+}
+
+fn provider_setup_terminal_input_requests(
+    client_id: ClientId,
+    terminal: &crate::domain::TaskTerminalProjection,
+    provider_kind: ProviderKind,
+    allow: bool,
+) -> Result<Vec<TerminalInputRequest>, String> {
+    // Provider TUIs consume one keyboard gesture at a time. Claude's Ink prompt
+    // also enables application-cursor mode, which changes Down from CSI-B to
+    // SS3-B. Preserve both the negotiated cursor encoding and the distinct-write
+    // choreography used by normal provider composer input.
+    let cursor_down = if terminal.screen.mode.app_cursor {
+        b"\x1bOB".as_slice()
+    } else {
+        b"\x1b[B".as_slice()
+    };
+    let steps: Vec<&[u8]> = match (provider_kind, allow) {
+        (ProviderKind::ClaudeCode, true) => vec![cursor_down, b"\r"],
+        (ProviderKind::ClaudeCode, false) => vec![b"\r"],
+        // Codex's ratatui trust prompt highlights "Yes, continue" by default
+        // and explicitly asks for Enter. Numeric characters are editor input,
+        // not menu shortcuts, so sending `1` leaves the prompt unchanged.
+        (_, true) => vec![b"\r"],
+        (_, false) => vec![cursor_down, b"\r"],
+    };
+    steps
+        .iter()
+        .enumerate()
+        .map(|(index, bytes)| {
+            let input_sequence = terminal
+                .accepted_input_sequence
+                .checked_add(index as u64 + 1)
+                .ok_or_else(|| "provider terminal input sequence overflowed".to_string())?;
+            terminal_input_request(client_id, terminal, input_sequence, bytes.to_vec())
+        })
+        .collect()
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 struct PendingDraftFirstSend {
     /// Immutable owner captured at the Send gesture — never reminted from focus.
     owner: HostTaskKey,
@@ -2528,6 +2707,11 @@ struct PendingDraftFirstSend {
     start_command_id: Option<CommandId>,
     control: ComposerControl,
     attachment_only: bool,
+    /// Exact provider choice captured with the Send gesture. Promotion, focus,
+    /// and asynchronous readiness replies must not recompute it.
+    provider_kind: ProviderKind,
+    /// Exact model/reasoning/access selection captured with the Send gesture.
+    launch_options: crate::providers::ProviderLaunchOptions,
     stage: PendingDraftFirstSendStage,
     captured_draft: String,
     captured_artifact_ids: Vec<crate::domain::id::ArtifactId>,
@@ -2701,6 +2885,10 @@ struct OwnedStreamFrame {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum NativeHostCommand {
     Envelope(crate::domain::command::CommandEnvelope),
+    /// Exact already-attached PTY input. Unlike semantic provider input this
+    /// remains valid while a provider startup/resume prompt is waiting before
+    /// the current-generation SessionStart hook has rebound conversation ID.
+    TerminalInput(TerminalInputRequest),
     /// UI-thread browser surface command. It is intentionally not serialized
     /// through the generic host worker: the WebView host owns this exact
     /// lease and must apply it on its GPUI/COM thread.
@@ -2825,7 +3013,7 @@ impl NativeUpdateCommandIds {
 fn native_command_id(command: &NativeHostCommand) -> Option<CommandId> {
     match command {
         NativeHostCommand::Envelope(envelope) => Some(envelope.command_id),
-        NativeHostCommand::Browser(_) => None,
+        NativeHostCommand::Browser(_) | NativeHostCommand::TerminalInput(_) => None,
         NativeHostCommand::TaskCreate { command_id, .. }
         | NativeHostCommand::TaskCreateV2 { command_id, .. }
         | NativeHostCommand::TaskRename { command_id, .. }
@@ -2965,6 +3153,24 @@ struct NewTaskDraft {
     /// Frozen project owner for this dialog; focus changes must not retarget create.
     project_key: HostProjectKey,
     error: Option<String>,
+}
+
+/// Client-only task shell created after project selection. It deliberately has
+/// no kernel row, provider process, rail entry, or persisted layout/draft until
+/// the first Send gesture admits `TaskCreateV2` on its immutable owner host.
+#[derive(Clone)]
+struct EphemeralTaskDraft {
+    key: HostTaskKey,
+    project_key: HostProjectKey,
+    environment_id: crate::domain::id::EnvironmentId,
+    agent_session_id: AgentSessionId,
+    provider_kind: ProviderKind,
+    create_command_id: Option<CommandId>,
+    pending_control: Option<ComposerControl>,
+    /// Immutable provider/model/reasoning/access choice captured with the
+    /// first Send gesture. Host projection and focus churn during promotion
+    /// must not fall back to the last global provider defaults.
+    pending_launch_preferences: Option<(ProviderKind, crate::providers::ProviderLaunchOptions)>,
 }
 
 struct RenameTaskDraft {
@@ -3855,6 +4061,7 @@ impl NativeHostActionOutcome {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum NativeHostQueryBody {
     Text,
+    TerminalInput(InputAck),
     ConfigSidebar(crate::domain::ConfigSidebarSnapshot),
     AgentConnection(AgentConnectionSnapshot),
     ProviderSettings(crate::providers::settings::ProviderSettingsReply),
@@ -4749,6 +4956,50 @@ impl NativeHostClientRuntime {
                 .admit_action(HostTaskKey::new(self.host_id.clone(), task_id)),
             None => self.fleet.admit_host(&self.host_id),
         }
+    }
+
+    /// Send raw bytes to an already-live provider PTY without requiring a
+    /// provider conversation binding. This is the only valid path for startup
+    /// prompts such as Codex workspace trust, which appear before SessionStart.
+    fn submit_provider_setup_input(
+        &self,
+        admission: FleetAdmission,
+        requests: Vec<TerminalInputRequest>,
+        completion: ProviderSetupInputCompletion,
+    ) -> Result<(), String> {
+        if admission.host != self.host_id {
+            return Err("provider setup input owner changed".to_string());
+        }
+        let Some(runtime) = self.runtime_guard.as_ref().cloned() else {
+            return Err("provider setup input runtime is unavailable".to_string());
+        };
+        let fleet = Arc::clone(&self.fleet);
+        let wake = self.controller_wake.clone();
+        runtime.spawn(async move {
+            let mut result = Err("provider setup input plan was empty".to_string());
+            let request_count = requests.len();
+            for (index, request) in requests.into_iter().enumerate() {
+                result = fleet
+                    .execute_terminal_input(&admission, request)
+                    .await
+                    .map(|owned| owned.value)
+                    .map_err(|error| error.to_string());
+                if !matches!(
+                    &result,
+                    Ok(InputAck::Accepted { .. } | InputAck::Duplicate { .. })
+                ) {
+                    break;
+                }
+                if index + 1 < request_count {
+                    tokio::time::sleep(Duration::from_millis(75)).await;
+                }
+            }
+            if let Ok(mut slot) = completion.lock() {
+                *slot = Some(result);
+            }
+            wake.notify();
+        });
+        Ok(())
     }
 
     /// Acknowledge a retained command receipt only after exact UI application.
@@ -6965,6 +7216,13 @@ async fn execute_native_command(
             .request_command(envelope)
             .await
             .map(NativeHostExecutionResult::Command),
+        NativeHostCommand::TerminalInput(request) => {
+            let ack = port.execute_terminal_input(request).await?;
+            Ok(NativeHostExecutionResult::Query {
+                detail: bounded_host_error("provider terminal input"),
+                body: NativeHostQueryBody::TerminalInput(ack),
+            })
+        }
         NativeHostCommand::Browser(_) => Err(IpcError::Unavailable),
         NativeHostCommand::TaskCreate {
             arguments,
@@ -8031,8 +8289,9 @@ impl NativeInteraction {
         request_generation: u64,
         action: KeyboardAction,
     ) -> bool {
+        let exact_dismiss = action == KeyboardAction::DismissTransient;
         if self.pending_keyboard != Some((focus_epoch, request_generation, action))
-            || !self.interaction.state().can_activate()
+            || (!exact_dismiss && !self.interaction.state().can_activate())
         {
             return false;
         }
@@ -8074,6 +8333,71 @@ impl NativeInteraction {
             false,
             false,
         )
+    }
+
+    /// Capture one exact raw-terminal gesture against the already-admitted
+    /// terminal projection. Raw PTY input is intentionally not converted into
+    /// semantic provider input: setup and resume menus can precede the fresh
+    /// conversation binding that semantic input requires.
+    pub fn terminal_input(&mut self, request: TerminalInputRequest) -> Option<NativeActionRecord> {
+        request.validate().ok()?;
+        let descriptor = action::catalog()
+            .iter()
+            .find(|descriptor| descriptor.id == action::ACTION_PROVIDER_TERMINAL_INPUT)?;
+        if !self.interaction.state().can_activate()
+            || self.selected_task() != Some(request.context.task_id)
+        {
+            return None;
+        }
+        let model = self.client_model.as_ref()?;
+        let task = model.tasks().get(&request.context.task_id)?;
+        let agent = task.agents.get(&request.context.agent_session_id)?;
+        // The terminal action epoch belongs to the live provider/PTY
+        // correlation, while task.action_epoch fences durable task mutations.
+        // They legitimately diverge after restore. TerminalId, SessionId,
+        // resource/runtime generations, focus epoch, and the terminal action
+        // epoch are validated again by TerminalService at the host boundary.
+        if task.task.revision == 0 || agent.runtime_generation != request.context.runtime_generation
+        {
+            return None;
+        }
+        let expected_task_revision = task.task.revision;
+        let captured_task_action_epoch = task.task.action_epoch;
+        let task_id = request.context.task_id;
+        let (focus_epoch, request_generation) = self.begin_handler(Some(task_id));
+        let action_epoch = self.action_epoch;
+        let event_request = ActionRequest::TaskCockpit {
+            task_id,
+            query: TaskCockpitQuery::Terminal,
+        };
+        let event = ActionEvent::new(
+            event_request,
+            ActivationSource::Keyboard {
+                key: crate::ui::components::KeyboardKey::Enter,
+            },
+            focus_epoch,
+        );
+        Some(NativeActionRecord {
+            id: descriptor.id,
+            focus_epoch,
+            request_generation,
+            action_epoch,
+            connection_epoch: self.connection_epoch,
+            client_epoch: self.client_epoch,
+            navigation_epoch: self.shell.navigation_epoch(),
+            resource_generation: self.resource_generation,
+            runtime_generation: self.runtime_generation,
+            task_id: Some(task_id),
+            fleet_admission: None,
+            purpose: NativeActionPurpose::Ordinary,
+            background_read: false,
+            expected_task_revision: Some(expected_task_revision),
+            captured_task_action_epoch: Some(captured_task_action_epoch),
+            capability: descriptor.required_capability,
+            disabled_reason: None,
+            event,
+            command: NativeHostCommand::TerminalInput(request),
+        })
     }
 
     /// Capture another host query against the handler that is already open.
@@ -9676,6 +10000,17 @@ struct NativeTerminalInputHandler {
 struct PendingTerminalEcho {
     text: String,
     after_sequence: u64,
+    anchor_row: usize,
+    anchor_column: usize,
+    unmatched_refreshes: u8,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct PendingTerminalInputCursor {
+    terminal_id: TerminalId,
+    resource_generation: u64,
+    runtime_generation: u64,
+    next_sequence: u64,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -9726,6 +10061,8 @@ pub(crate) struct HostUiState {
     pub(super) pending_settled_send: Option<PendingSettledSend>,
     pub(super) pending_draft_first_send: Option<PendingDraftFirstSend>,
     pub(super) first_send_readiness_requests: HashSet<RequestId>,
+    provider_setup_approvals: BTreeMap<TaskId, ProviderSetupApproval>,
+    provider_setup_input_completions: BTreeMap<TaskId, ProviderSetupInputCompletion>,
 }
 
 impl HostUiState {
@@ -9755,6 +10092,8 @@ impl HostUiState {
             pending_settled_send: None,
             pending_draft_first_send: None,
             first_send_readiness_requests: HashSet::new(),
+            provider_setup_approvals: BTreeMap::new(),
+            provider_setup_input_completions: BTreeMap::new(),
         }
     }
 
@@ -9810,12 +10149,19 @@ pub struct NativeShell {
     /// Last resize requested for each owner while the host projection catches
     /// up. This prevents GPUI paint churn from flooding identical PTY resizes.
     pending_terminal_resizes: BTreeMap<HostTaskKey, (u16, u16)>,
+    /// Owner-qualified retries for a provider runtime that reported
+    /// TerminalStartPending. Empty during ordinary idle operation.
+    pending_terminal_requeries: BTreeMap<HostTaskKey, Instant>,
     /// Owner currently dragging a terminal selection, if any.
     selecting_terminal_owner: Option<HostTaskKey>,
     /// Printable bytes accepted from the native input handler but not yet
     /// reflected by a canonical host terminal projection. This is a bounded
     /// paint-only echo; the next newer host sequence replaces it.
     pending_terminal_echoes: BTreeMap<HostTaskKey, PendingTerminalEcho>,
+    /// Optimistic per-terminal input sequence reservation. The host still
+    /// validates every exact fence; this only prevents rapid local keystrokes
+    /// from reusing one projection's last accepted sequence before its refresh.
+    pending_terminal_input_cursors: BTreeMap<HostTaskKey, PendingTerminalInputCursor>,
     /// Exact center terminal most recently clicked for keyboard input. GPUI's
     /// canvas selection can retain an earlier AccessKit row focus, so this
     /// owner-qualified arm keeps ordinary keydown delivery deterministic.
@@ -9871,6 +10217,9 @@ pub struct NativeShell {
     /// composer. Correlate them by the original command identity so only the
     /// exact submitted draft is consumed, regardless of the selected task.
     pending_composer_submissions: BTreeMap<CommandId, PendingComposerSubmission>,
+    /// Unsaved new-task panes. These never enter workspace-layout.json or the
+    /// composer draft store; closing/restarting before first Send drops them.
+    ephemeral_tasks: BTreeMap<HostTaskKey, EphemeralTaskDraft>,
     /// Pointer/AT recovery controls keyed by stable element id. Rebuilt with
     /// the accessibility tree so HostTaskKey+CommandId never remint on focus.
     composer_recovery_targets: BTreeMap<String, ComposerRecoveryTarget>,
@@ -10069,12 +10418,18 @@ fn center_terminal_interactive(
 }
 
 fn root_routes_key_to_terminal(
+    key: &str,
     terminal_focused: bool,
     terminal_input_armed: bool,
     center_terminal_visible: bool,
     center_interactive: bool,
 ) -> bool {
-    (terminal_focused || terminal_input_armed || center_terminal_visible) && center_interactive
+    // A truly focused terminal owns Tab for provider/shell completion. When
+    // Windows leaves accessibility focus on a rail row, however, an armed or
+    // visible terminal must not steal Tab/Shift+Tab and trap focus in the row.
+    (key != "tab" || terminal_focused)
+        && (terminal_focused || terminal_input_armed || center_terminal_visible)
+        && center_interactive
 }
 
 fn stale_task_row_routes_key_to_terminal(
@@ -10083,8 +10438,13 @@ fn stale_task_row_routes_key_to_terminal(
     center_terminal_visible: bool,
     center_interactive: bool,
 ) -> bool {
-    !matches!(key, "enter" | "space")
+    // Keep activation and focus-navigation keys in the rail. Printable/editing
+    // keys may be forwarded to a visibly armed provider terminal when Windows
+    // accessibility focus lags, but Tab/Shift+Tab must always remain available
+    // to leave the stale row and reach adjacent tasks and controls.
+    !matches!(key, "enter" | "space" | "tab")
         && root_routes_key_to_terminal(
+            key,
             false,
             terminal_input_armed,
             center_terminal_visible,
@@ -10815,8 +11175,10 @@ impl NativeShell {
             terminal_scroll_px: 0.0,
             terminal_selections: BTreeMap::new(),
             pending_terminal_resizes: BTreeMap::new(),
+            pending_terminal_requeries: BTreeMap::new(),
             selecting_terminal_owner: None,
             pending_terminal_echoes: BTreeMap::new(),
+            pending_terminal_input_cursors: BTreeMap::new(),
             terminal_input_owner: None,
             focus_handle: cx.focus_handle().tab_stop(true),
             terminal_focus_handle: cx.focus_handle().tab_stop(true),
@@ -10848,6 +11210,7 @@ impl NativeShell {
             root_editor_input_proxy: Some(root_editor_input_proxy),
             root_editor_focus_handle,
             pending_composer_submissions: BTreeMap::new(),
+            ephemeral_tasks: BTreeMap::new(),
             composer_recovery_targets: BTreeMap::new(),
             draft_launch_prefs,
             pending_automatic_titles: BTreeMap::new(),
@@ -12278,6 +12641,46 @@ impl NativeShell {
             )
             .gpui("native-sidebar-new-task", true, true),
         );
+        if let Some((owner, approval_state)) = selected_key.as_ref().and_then(|owner| {
+            self.host_slot(&owner.host)
+                .and_then(|slot| slot.provider_setup_approvals.get(&owner.task_id))
+                .map(|approval| (owner, approval.state.clone()))
+        }) {
+            let provider_label = self.task_provider_label_for_owner(owner);
+            let resolving = matches!(approval_state, ProviderSetupApprovalState::Resolving { .. });
+            let mut children = Vec::new();
+            if !resolving {
+                children.push(
+                    AccessibilityNode::new(
+                        AccessibleRole::Button,
+                        format!("Reject {provider_label} workspace trust"),
+                        "Reject this provider session's request to trust the selected project workspace.",
+                    )
+                    .gpui("native-provider-setup-reject", true, true),
+                );
+                children.push(
+                    AccessibilityNode::new(
+                        AccessibleRole::Button,
+                        format!("Approve {provider_label} workspace trust"),
+                        format!("Trust the selected project workspace for this {provider_label} provider session and continue the parked message."),
+                    )
+                    .gpui("native-provider-setup-approve", true, true),
+                );
+            }
+            overlay_nodes.push(
+                AccessibilityNode::new(
+                    AccessibleRole::Region,
+                    format!("{provider_label} needs approval"),
+                    if resolving {
+                        format!("Sending your workspace trust decision to {provider_label}.")
+                    } else {
+                        format!("Choose whether {provider_label} may trust the selected project workspace for this provider session.")
+                    },
+                )
+                .gpui("native-provider-setup-approval", false, false)
+                .with_children(children),
+            );
+        }
         overlay_nodes.push(
             AccessibilityNode::new(
                 AccessibleRole::Button,
@@ -12787,6 +13190,10 @@ impl NativeShell {
         }
         match body {
             NativeHostQueryBody::Text => {}
+            NativeHostQueryBody::TerminalInput(ack) => {
+                let local = self.local_host_id();
+                self.settle_raw_terminal_input_ack(&local, action, ack);
+            }
             NativeHostQueryBody::ConfigSidebar(snapshot) => {
                 self.local_slot_mut().config_sidebar =
                     ConfigSidebarProjection::from_host_snapshot(&snapshot);
@@ -12822,10 +13229,20 @@ impl NativeShell {
                         );
                     }
                 }
-                if let Some((_, task_id, TaskCockpitQuery::Terminal)) = command_parts {
-                    if !matches!(&result, crate::domain::TaskCockpitResult::Terminal(_)) {
-                        self.task_surfaces
-                            .note_terminal_reconnecting(self.local_task_key(task_id));
+                if let Some((_, task_id, query)) = command_parts {
+                    if !matches!(
+                        query,
+                        TaskCockpitQuery::Terminal | TaskCockpitQuery::TerminalReadiness
+                    ) {
+                        // Other cockpit queries are applied below.
+                    } else if !matches!(&result, crate::domain::TaskCockpitResult::Terminal(_)) {
+                        let owner = self.local_task_key(task_id);
+                        if first_send_terminal_probe_start_pending(&result) {
+                            self.schedule_terminal_start_retry(owner);
+                        } else {
+                            self.pending_terminal_requeries.remove(&owner);
+                            self.task_surfaces.note_terminal_reconnecting(owner);
+                        }
                         if self.local_slot_mut().interaction.selected_task() == Some(task_id) {
                             self.sync_terminal_from_cockpit();
                         }
@@ -12865,6 +13282,7 @@ impl NativeShell {
 
                 if let crate::domain::TaskCockpitResult::Terminal(projection) = &result {
                     let owner = self.local_task_key(projection.task_id);
+                    self.pending_terminal_requeries.remove(&owner);
                     if command_task_id != Some(projection.task_id)
                         || self
                             .task_surfaces
@@ -12873,7 +13291,26 @@ impl NativeShell {
                     {
                         return;
                     }
-                    self.settle_pending_terminal_echo(&owner, projection.sequence);
+                    self.settle_pending_terminal_echo(&owner, projection);
+                    let codex_setup_required = self
+                        .local_slot()
+                        .client_model
+                        .as_ref()
+                        .and_then(|model| model.task(projection.task_id))
+                        .is_some_and(|snapshot| {
+                            terminal_projection_requires_provider_setup(snapshot, projection)
+                        });
+                    if codex_setup_required {
+                        self.local_slot_mut()
+                            .provider_setup_approvals
+                            .entry(projection.task_id)
+                            .or_insert_with(|| ProviderSetupApproval {
+                                owner,
+                                state: ProviderSetupApprovalState::Waiting,
+                            });
+                        self.local_slot_mut().composer_error = None;
+                        self.refresh_accessibility_tree();
+                    }
                 }
 
                 let global_command = Self::task_cockpit_command_parts(&action.command).is_some_and(
@@ -13163,7 +13600,7 @@ impl NativeShell {
                 (!terminal_query_in_flight)
                     .then_some(ActionRequest::TaskCockpit {
                         task_id,
-                        query: TaskCockpitQuery::Terminal,
+                        query: TaskCockpitQuery::TerminalReadiness,
                     })
                     .into_iter()
                     .collect(),
@@ -13186,6 +13623,96 @@ impl NativeShell {
             );
         }
         self.dispatch_related_actions(requests);
+    }
+
+    fn schedule_terminal_start_retry(&mut self, owner: HostTaskKey) {
+        self.task_surfaces
+            .ensure_task(owner.clone())
+            .note_terminal_start_pending();
+        self.pending_terminal_requeries
+            .insert(owner, Instant::now() + TERMINAL_START_RETRY_INTERVAL);
+    }
+
+    fn retry_due_terminal_queries(&mut self, now: Instant) -> bool {
+        if self.pending_terminal_requeries.is_empty() {
+            return false;
+        }
+        let due = self
+            .pending_terminal_requeries
+            .iter()
+            .filter_map(|(owner, deadline)| (*deadline <= now).then_some(owner.clone()))
+            .collect::<Vec<_>>();
+        let mut dispatched = false;
+        for owner in due {
+            self.pending_terminal_requeries.remove(&owner);
+            let visible = self
+                .layout
+                .task_workspace
+                .as_ref()
+                .is_some_and(|workspace| workspace.contains_task(owner.clone()))
+                && self.task_center_terminal_preference(&owner);
+            if self.pending_terminal_echoes.contains_key(&owner) {
+                if !visible {
+                    self.pending_terminal_echoes.remove(&owner);
+                    continue;
+                }
+                let query_in_flight = self
+                    .task_surfaces
+                    .state(owner.clone())
+                    .is_some_and(|surface| surface.terminal_query_in_flight());
+                if query_in_flight {
+                    self.pending_terminal_requeries
+                        .insert(owner, now + TERMINAL_ECHO_RETRY_INTERVAL);
+                    continue;
+                }
+                self.task_surfaces
+                    .note_terminal_query_started(owner.clone());
+                if self
+                    .dispatch_action_recorded_for_owner(
+                        &owner.host,
+                        ActionRequest::TaskCockpit {
+                            task_id: owner.task_id,
+                            query: TaskCockpitQuery::Terminal,
+                        },
+                    )
+                    .is_ok()
+                {
+                    dispatched = true;
+                } else {
+                    self.pending_terminal_echoes.remove(&owner);
+                    self.task_surfaces.note_terminal_reconnecting(owner);
+                }
+                continue;
+            }
+            let still_starting = self
+                .task_surfaces
+                .state(owner.clone())
+                .is_some_and(|surface| {
+                    !surface.terminal_query_in_flight()
+                        && surface.center_loading_state(true)
+                            == Some(CenterSurfaceLoadingState::TerminalInitial)
+                });
+            if !visible || !still_starting {
+                continue;
+            }
+            self.task_surfaces
+                .note_terminal_query_started(owner.clone());
+            if self
+                .dispatch_action_recorded_for_owner(
+                    &owner.host,
+                    ActionRequest::TaskCockpit {
+                        task_id: owner.task_id,
+                        query: TaskCockpitQuery::TerminalReadiness,
+                    },
+                )
+                .is_ok()
+            {
+                dispatched = true;
+            } else {
+                self.task_surfaces.note_terminal_reconnecting(owner);
+            }
+        }
+        dispatched
     }
 
     /// Owner-qualified active-surface refresh. Never falls back to the local
@@ -13244,7 +13771,7 @@ impl NativeShell {
                 (!terminal_query_in_flight)
                     .then_some(ActionRequest::TaskCockpit {
                         task_id,
-                        query: TaskCockpitQuery::Terminal,
+                        query: TaskCockpitQuery::TerminalReadiness,
                     })
                     .into_iter()
                     .collect(),
@@ -13525,13 +14052,24 @@ impl NativeShell {
                 .provider_settings
                 .as_ref()
                 .is_some_and(|ctl| ctl.metadata_in_flight() || ctl.health_in_flight());
+        let provider_poll_in_flight = self
+            .provider_settings
+            .as_ref()
+            .is_some_and(|ctl| ctl.metadata_in_flight() || ctl.health_in_flight())
+            || self
+                .local_slot()
+                .pending_host_actions
+                .iter()
+                .any(|action| action.id == "provider.settings");
         next_controller_wait(ControllerWaitInputs {
             composer_focused: self.composer_accessibility_focused,
             drafts_dirty: self.composer_drafts_dirty,
             layout_dirty: self.layout_dirty,
             remote_settings_open: self.settings_open
                 && self.settings_page == NativeSettingsPage::RemoteAccess,
+            remote_poll_in_flight: self.remote_settings.pending.is_some(),
             provider_settings_refreshing,
+            provider_poll_in_flight,
             bootstrap_retry_armed,
             since_last_composer_persist: since(self.last_composer_draft_persist),
             since_last_layout_persist: since(self.last_layout_persist),
@@ -13540,6 +14078,11 @@ impl NativeShell {
             since_last_bootstrap_retry: since(self.last_bootstrap_retry_at),
             since_last_conversation_recovery: since(self.last_conversation_recovery_at),
             since_last_caret_toggle: Some(now.saturating_duration_since(self.composer_caret_epoch)),
+            next_terminal_requery: self
+                .pending_terminal_requeries
+                .values()
+                .map(|deadline| deadline.saturating_duration_since(now))
+                .min(),
         })
     }
 
@@ -14232,10 +14775,13 @@ impl NativeShell {
                 .first_send_readiness_requests
                 .remove(&request_id);
         }
-        if let Some((request_id, _, TaskCockpitQuery::Terminal)) =
-            Self::task_cockpit_command_parts(&action.command)
-        {
-            if let Some(pending) = self
+        if let Some((request_id, _, query)) = Self::task_cockpit_command_parts(&action.command) {
+            if !matches!(
+                query,
+                TaskCockpitQuery::Terminal | TaskCockpitQuery::TerminalReadiness
+            ) {
+                // Not a terminal readiness lease.
+            } else if let Some(pending) = self
                 .local_slot_mut()
                 .pending_draft_first_send
                 .as_mut()
@@ -14303,13 +14849,16 @@ impl NativeShell {
                 ctl.clear_pending_on_queue_failure();
             }
         }
-        if let Some((_, task_id, TaskCockpitQuery::Terminal)) =
-            Self::task_cockpit_command_parts(&action.command)
-        {
-            self.task_surfaces
-                .note_terminal_reconnecting(self.local_task_key(task_id));
-            if self.local_slot_mut().interaction.selected_task() == Some(task_id) {
-                self.sync_terminal_from_cockpit();
+        if let Some((_, task_id, query)) = Self::task_cockpit_command_parts(&action.command) {
+            if matches!(
+                query,
+                TaskCockpitQuery::Terminal | TaskCockpitQuery::TerminalReadiness
+            ) {
+                self.task_surfaces
+                    .note_terminal_reconnecting(self.local_task_key(task_id));
+                if self.local_slot_mut().interaction.selected_task() == Some(task_id) {
+                    self.sync_terminal_from_cockpit();
+                }
             }
         }
         self.fail_header_commit_from_action(action, format!("Commit failed: {error}"));
@@ -14858,6 +15407,7 @@ impl NativeShell {
             NativeActionRecord,
             crate::domain::cockpit::TaskTerminalProjection,
         )> = None;
+        let mut pending_terminal_input_ack: Option<(NativeActionRecord, InputAck)> = None;
         let mut pending_repo_catalog: Option<TaskGitRepositoriesProjection> = None;
         if let NativeHostActionOutcome::Accepted { action, receipt } = &outcome {
             if native_command_id(&action.command) != Some(receipt.command_id()) {
@@ -14960,6 +15510,9 @@ impl NativeShell {
                     slot.last_query_detail = Some(detail.clone());
                     slot.last_action_failure = None;
                     match body {
+                        NativeHostQueryBody::TerminalInput(ack) => {
+                            pending_terminal_input_ack = Some((action.clone(), *ack));
+                        }
                         NativeHostQueryBody::ConfigSidebar(snapshot) => {
                             slot.config_sidebar =
                                 ConfigSidebarProjection::from_host_snapshot(snapshot);
@@ -15041,6 +15594,33 @@ impl NativeShell {
                 }
             }
         }
+        if let Some((action, ack)) = pending_terminal_input_ack {
+            self.settle_raw_terminal_input_ack(host_id, &action, ack);
+        }
+        if let NativeHostActionOutcome::Queried {
+            action,
+            body: NativeHostQueryBody::TaskCockpit(result),
+            ..
+        } = &outcome
+        {
+            if let Some((_request_id, task_id, query)) =
+                Self::task_cockpit_command_parts(&action.command)
+            {
+                if matches!(
+                    query,
+                    TaskCockpitQuery::Terminal | TaskCockpitQuery::TerminalReadiness
+                ) && !matches!(result, crate::domain::TaskCockpitResult::Terminal(_))
+                {
+                    let owner = HostTaskKey::new(host_id.clone(), task_id);
+                    if first_send_terminal_probe_start_pending(result) {
+                        self.schedule_terminal_start_retry(owner);
+                    } else {
+                        self.pending_terminal_requeries.remove(&owner);
+                        self.task_surfaces.note_terminal_reconnecting(owner);
+                    }
+                }
+            }
+        }
         if let Some(catalog) = pending_repo_catalog {
             let key = HostTaskKey::new(host_id.clone(), catalog.task_id);
             self.apply_repository_catalog_for_owner(&key, &catalog);
@@ -15097,7 +15677,25 @@ impl NativeShell {
                 success,
                 message.clone(),
             );
-            if !settled_delete && !settled_reopen && !settled_first {
+            let settled_setup = self.settle_provider_setup_approval_outcome_for_host(
+                host_id,
+                &action,
+                success,
+                message.clone(),
+            );
+            let settled_ephemeral = self.settle_ephemeral_task_create(
+                host_id,
+                &action,
+                success,
+                message.clone(),
+                !matches!(&outcome, NativeHostActionOutcome::Uncertain { .. }),
+            );
+            if !settled_delete
+                && !settled_reopen
+                && !settled_first
+                && !settled_setup
+                && !settled_ephemeral
+            {
                 self.settle_composer_submission_for_owner(
                     host_id,
                     &action,
@@ -15193,11 +15791,14 @@ impl NativeShell {
         };
         if !matches!(
             query,
-            TaskCockpitQuery::Terminal | TaskCockpitQuery::TerminalScroll { .. }
+            TaskCockpitQuery::Terminal
+                | TaskCockpitQuery::TerminalScroll { .. }
+                | TaskCockpitQuery::TerminalReadiness
         ) {
             return;
         }
         let owner = HostTaskKey::new(host_id.clone(), task_id);
+        self.pending_terminal_requeries.remove(&owner);
         self.task_surfaces.note_terminal_reconnecting(owner);
         if host_id == &self.local_host_id()
             && self.local_slot().interaction.selected_task() == Some(task_id)
@@ -15231,6 +15832,26 @@ impl NativeShell {
             return;
         }
         let owner = HostTaskKey::new(host_id.clone(), projection.task_id);
+        self.pending_terminal_requeries.remove(&owner);
+        let codex_setup_required = self
+            .host_slot(host_id)
+            .and_then(|slot| slot.client_model.as_ref())
+            .and_then(|model| model.task(projection.task_id))
+            .is_some_and(|snapshot| {
+                terminal_projection_requires_provider_setup(snapshot, projection)
+            });
+        if codex_setup_required {
+            if let Some(slot) = self.host_slot_mut(host_id) {
+                slot.provider_setup_approvals
+                    .entry(projection.task_id)
+                    .or_insert_with(|| ProviderSetupApproval {
+                        owner: owner.clone(),
+                        state: ProviderSetupApprovalState::Waiting,
+                    });
+                slot.composer_error = None;
+            }
+            self.refresh_accessibility_tree();
+        }
         if self.selected_task_key.as_ref() != Some(&owner) {
             return;
         }
@@ -15247,7 +15868,7 @@ impl NativeShell {
         {
             return;
         }
-        self.settle_pending_terminal_echo(&owner, projection.sequence);
+        self.settle_pending_terminal_echo(&owner, projection);
         let model = self
             .host_slot(host_id)
             .and_then(|slot| slot.client_model.clone());
@@ -15495,6 +16116,16 @@ impl NativeShell {
                         self.acknowledge_settled_command_receipt(&action, &receipt);
                         return;
                     }
+                    if self.settle_ephemeral_task_create(
+                        &local,
+                        &action,
+                        false,
+                        Some(format!("host rejected task creation: {code:?}; draft kept")),
+                        true,
+                    ) {
+                        self.acknowledge_settled_command_receipt(&action, &receipt);
+                        return;
+                    }
                     let retained = self.retain_pending_host_action(action.clone());
                     self.set_execution_failure(
                         &action,
@@ -15522,6 +16153,7 @@ impl NativeShell {
                 if self.settle_pending_draft_first_send_outcome(&action, true, None) {
                     // Exact provider-start receipt owned the deferred first send.
                 }
+                let _ = self.settle_ephemeral_task_create(&local, &action, true, None, true);
                 if let Some(command_id) = command_id {
                     self.local_slot_mut()
                         .pending_host_actions
@@ -15716,6 +16348,20 @@ impl NativeShell {
                 ) {
                     return;
                 }
+                let local = self.local_host_id();
+                if self.settle_ephemeral_task_create(
+                    &local,
+                    &action,
+                    false,
+                    Some(format!("{error}; draft kept")),
+                    true,
+                ) {
+                    let command_id = native_command_id(&action.command);
+                    self.local_slot_mut()
+                        .pending_host_actions
+                        .retain(|pending| native_command_id(&pending.command) != command_id);
+                    return;
+                }
                 if action.id == action::ACTION_CONFIG_CREATE_PROJECT {
                     if let Some(draft) = self.add_project.as_mut() {
                         draft.error = Some(error.clone());
@@ -15755,6 +16401,14 @@ impl NativeShell {
                 ) {
                     return;
                 }
+                let local = self.local_host_id();
+                let _ = self.settle_ephemeral_task_create(
+                    &local,
+                    &action,
+                    false,
+                    Some(format!("{error}; draft kept")),
+                    false,
+                );
                 let retained = self.retain_pending_host_action(action.clone());
                 self.set_execution_failure(&action, error, true);
                 if !retained {
@@ -15867,7 +16521,9 @@ impl NativeShell {
             self.composer_caret_visible_rendered,
         );
         self.composer_caret_visible_rendered = next_rendered;
-        let mut semantic_repaint = false;
+        let mut semantic_repaint = self.settle_provider_setup_input_completions();
+        semantic_repaint |= self.expire_stalled_provider_setup_approvals();
+        semantic_repaint |= self.retry_due_terminal_queries(now);
         if let Some(preferences) = self.pending_preferences.pop_back() {
             self.pending_preferences.clear();
             self.preferences = preferences;
@@ -16972,9 +17628,17 @@ impl NativeShell {
             .copied()
             .collect();
         let previous_draft_count = self.composer_drafts.len();
+        let ephemeral_keys = self
+            .ephemeral_tasks
+            .keys()
+            .cloned()
+            .collect::<BTreeSet<_>>();
         // Local projection may prune local drafts for missing tasks, never other hosts.
-        self.composer_drafts
-            .retain(|key, _| key.task_id.host != local || known.contains(&key.task_id.task_id));
+        self.composer_drafts.retain(|key, _| {
+            key.task_id.host != local
+                || known.contains(&key.task_id.task_id)
+                || ephemeral_keys.contains(&key.task_id)
+        });
         self.composer_drafts_dirty |= self.composer_drafts.len() != previous_draft_count;
         self.refresh_accessibility_tree();
     }
@@ -17008,6 +17672,9 @@ impl NativeShell {
 
     pub fn apply_client_model(&mut self, model: Arc<ClientModel>) -> Result<(), String> {
         let first_canonical = self.local_slot_mut().client_model.is_none();
+        let preserved_ephemeral_selection = self.selected_task_key.clone().filter(|key| {
+            key.host == self.local_host_id() && self.ephemeral_tasks.contains_key(key)
+        });
         let previous_selected_task = self.local_slot_mut().interaction.selected_task();
         let task_list = TaskList::from_client_model_with_settled_virtual(&model)
             .map_err(|error| format!("client model task projection failed: {error:?}"))?;
@@ -17052,6 +17719,7 @@ impl NativeShell {
         self.local_slot_mut()
             .interaction
             .bind_projected_model(Arc::clone(&model));
+        self.promote_ephemeral_tasks_for_host(&local, model.as_ref());
         self.local_slot_mut().services_projection = project_services_panel(&[], &[]);
         self.sync_header_projection();
         let client_epoch = self
@@ -17060,9 +17728,17 @@ impl NativeShell {
             .action_epochs()
             .client_epoch;
         self.rebind_pending_client_epoch(client_epoch);
-        self.sync_cockpit_follow_with_refresh(
-            selected_task_changed || selected_task_needs_initial_follow,
-        );
+        if let Some(key) = preserved_ephemeral_selection {
+            // A canonical bootstrap/reconnect still follows the host's durable
+            // raw selection internally. Restore the project-only shell as the
+            // visible owner so the user's unsent draft is not replaced by that
+            // older task before TaskCreateV2 is admitted.
+            self.sync_cockpit_follow_for_owner(&key);
+        } else {
+            self.sync_cockpit_follow_with_refresh(
+                selected_task_changed || selected_task_needs_initial_follow,
+            );
+        }
         self.try_advance_pending_delete_after_archive();
         self.try_advance_pending_settled_send();
         self.try_advance_pending_draft_first_send();
@@ -17575,6 +18251,17 @@ impl NativeShell {
     /// Owner-captured cockpit/composer follow for a full HostTaskKey. Never
     /// aliases a remote raw TaskId onto the local slot.
     fn sync_cockpit_follow_for_owner(&mut self, key: &HostTaskKey) {
+        if self.ephemeral_tasks.contains_key(key) {
+            if self.composer_owner.as_ref() != Some(key) {
+                self.cache_current_composer_draft();
+                self.clear_composer_binding();
+            }
+            self.selected_task_key = Some(key.clone());
+            self.layout.selected_task = Some(key.clone());
+            let _ = self.sync_ephemeral_task_composer(key);
+            self.sync_header_projection();
+            return;
+        }
         if key.host == self.local_host_id() {
             self.sync_cockpit_follow();
             return;
@@ -17782,7 +18469,8 @@ impl NativeShell {
             // Host offline/forgotten — keep cached remote drafts; do not purge.
             return;
         };
-        let task_known = slot.task_list.task_ids().contains(&task_id)
+        let task_known = self.ephemeral_tasks.contains_key(&owner)
+            || slot.task_list.task_ids().contains(&task_id)
             || slot
                 .client_model
                 .as_ref()
@@ -17862,14 +18550,12 @@ impl NativeShell {
     }
 
     fn selected_task_is_unstarted_draft_for(&self, key: &HostTaskKey) -> bool {
-        self.host_slot(&key.host)
-            .and_then(|slot| slot.client_model.as_ref())
-            .and_then(|model| model.task(key.task_id))
-            .is_some_and(|snapshot| snapshot.is_unstarted_draft())
-            && !self
-                .task_surfaces
-                .state(key.clone())
-                .is_some_and(|state| state.terminal_is_interactive())
+        self.ephemeral_tasks.contains_key(key)
+            || self
+                .host_slot(&key.host)
+                .and_then(|slot| slot.client_model.as_ref())
+                .and_then(|model| model.task(key.task_id))
+                .is_some_and(|snapshot| snapshot.is_unstarted_draft())
     }
 
     /// Drafts may freely select any enabled provider; started tasks stay on the
@@ -17903,11 +18589,10 @@ impl NativeShell {
         &self,
         provider: ProviderKind,
     ) -> crate::providers::ProviderLaunchOptions {
-        use crate::providers::ProviderModel;
         let owner = self
             .composer_draft_owner()
             .or_else(|| self.selected_task_key.clone());
-        let mut options = owner
+        let options = owner
             .as_ref()
             .and_then(|key| self.draft_launch_prefs.get(key))
             .filter(|(stored_provider, _)| *stored_provider == provider)
@@ -17918,6 +18603,27 @@ impl NativeShell {
                     .flatten()
             })
             .unwrap_or_default();
+        Self::normalize_composer_launch_options(provider, options)
+    }
+
+    /// Defaults for a brand-new task come from the last global selection, not
+    /// the previously focused task's immutable launch preferences.
+    fn new_task_launch_options_for(
+        &self,
+        provider: ProviderKind,
+    ) -> crate::providers::ProviderLaunchOptions {
+        let options = (self.layout.composer_provider == Some(provider))
+            .then(|| self.layout.composer_launch_options.clone())
+            .flatten()
+            .unwrap_or_default();
+        Self::normalize_composer_launch_options(provider, options)
+    }
+
+    fn normalize_composer_launch_options(
+        provider: ProviderKind,
+        mut options: crate::providers::ProviderLaunchOptions,
+    ) -> crate::providers::ProviderLaunchOptions {
+        use crate::providers::ProviderModel;
         let compatible = matches!(
             (provider, options.model),
             (_, ProviderModel::ProviderDefault)
@@ -18017,6 +18723,22 @@ impl NativeShell {
 
     fn open_composer_model_selector(&mut self) {
         self.open_composer_selector(ComposerSelectorKind::Model);
+    }
+
+    fn focus_composer_for_selector(&mut self, window: &mut Window) -> bool {
+        self.composer_focus_handle.focus(window);
+        self.pending_composer_focus = false;
+        self.composer_accessibility_focused = true;
+        match self.focus_current_composer_input() {
+            Ok(_) => {
+                self.clear_draft_owner_composer_error();
+                true
+            }
+            Err(error) => {
+                self.set_draft_owner_composer_error(error.to_string());
+                false
+            }
+        }
     }
 
     fn open_composer_provider_selector(&mut self) {
@@ -18782,6 +19504,15 @@ impl NativeShell {
                         .border_color(tokens.borders.subtle.to_gpui())
                         .shadow_sm()
                         .text_size(px(11.0))
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(|_shell, _event: &MouseDownEvent, _window, cx| {
+                                // Keep the shell-wide outside-click dismiss
+                                // from removing this menu before a row's click
+                                // commits its selected value.
+                                cx.stop_propagation();
+                            }),
+                        )
                         .children(rows),
                 )
                 .into_any_element(),
@@ -19100,6 +19831,14 @@ impl NativeShell {
 
     fn set_provider_terminal_visible(&mut self, visible: bool) {
         self.terminal_scroll_px = 0.0;
+        if visible {
+            // Browser commands are admitted for the surface that was visible
+            // when the user invoked them. An Ensure/Navigate left in this
+            // queue can otherwise create an HWND-backed WebView after the
+            // terminal has taken over the center canvas, covering GPUI and
+            // intercepting all input.
+            self.pending_browser_commands.clear();
+        }
         if !visible {
             self.terminal_input_owner = None;
         }
@@ -19111,6 +19850,7 @@ impl NativeShell {
                     }
                     self.set_task_center_terminal_preference(&key, false);
                     self.pending_terminal_focus = false;
+                    self.reconcile_browser_dock_lifecycle(None);
                     return;
                 }
                 let model = self
@@ -19143,10 +19883,11 @@ impl NativeShell {
                         &key.host,
                         ActionRequest::TaskCockpit {
                             task_id: key.task_id,
-                            query: TaskCockpitQuery::Terminal,
+                            query: TaskCockpitQuery::TerminalReadiness,
                         },
                     );
                 }
+                self.reconcile_browser_dock_lifecycle(None);
                 return;
             }
         }
@@ -19159,6 +19900,7 @@ impl NativeShell {
             }
             self.pending_terminal_focus = false;
             self.sync_terminal_from_cockpit();
+            self.reconcile_browser_dock_lifecycle(None);
             return;
         }
         let Some(model) = self.local_slot_mut().client_model.as_ref().cloned() else {
@@ -19188,11 +19930,13 @@ impl NativeShell {
                 if let Some(task_id) = selected_task_id {
                     self.task_surfaces
                         .note_terminal_query_started(self.local_task_key(task_id));
-                    let _ = self.dispatch_task_cockpit_query(task_id, TaskCockpitQuery::Terminal);
+                    let _ = self
+                        .dispatch_task_cockpit_query(task_id, TaskCockpitQuery::TerminalReadiness);
                 }
             }
         }
         self.sync_terminal_from_cockpit();
+        self.reconcile_browser_dock_lifecycle(None);
     }
 
     fn dispatch_provider_terminal_text(&mut self, text: String) -> bool {
@@ -19202,7 +19946,88 @@ impl NativeShell {
         let Some(owner) = self.selected_task_key.clone() else {
             return false;
         };
-        self.dispatch_provider_runtime_text_for_owner(&owner, text, true)
+        if owner.host != self.local_host_id() || !self.selected_center_terminal_is_interactive() {
+            return false;
+        }
+        let Some(terminal) = self
+            .task_surfaces
+            .state(owner.clone())
+            .and_then(|state| state.latest_terminal.as_ref())
+            .cloned()
+        else {
+            return false;
+        };
+        let client_id = match self
+            .host_slot(&owner.host)
+            .and_then(|slot| slot.host_runtime.as_ref())
+        {
+            Some(NativeHostRuntimeAttachment::Client(runtime)) => {
+                match runtime.current_host_admission() {
+                    Ok(admission) => admission.client_id,
+                    Err(error) => {
+                        self.local_slot_mut().composer_error = Some(error.to_string());
+                        return false;
+                    }
+                }
+            }
+            #[cfg(test)]
+            Some(NativeHostRuntimeAttachment::Injected(_)) => ClientId::new(),
+            _ => return false,
+        };
+        let cursor = self
+            .pending_terminal_input_cursors
+            .get(&owner)
+            .copied()
+            .filter(|cursor| {
+                cursor.terminal_id == terminal.terminal_id
+                    && cursor.resource_generation == terminal.resource_generation
+                    && cursor.runtime_generation == terminal.runtime_generation
+            });
+        let input_sequence = cursor
+            .map(|cursor| cursor.next_sequence)
+            .unwrap_or(terminal.accepted_input_sequence)
+            .max(terminal.accepted_input_sequence)
+            .checked_add(1);
+        let Some(input_sequence) = input_sequence else {
+            self.local_slot_mut().composer_error =
+                Some("provider terminal input sequence overflowed".into());
+            return false;
+        };
+        let request = match terminal_input_request(
+            client_id,
+            &terminal,
+            input_sequence,
+            text.as_bytes().to_vec(),
+        ) {
+            Ok(request) => request,
+            Err(message) => {
+                self.local_slot_mut().composer_error = Some(message);
+                return false;
+            }
+        };
+        let Some(mut record) = self.local_slot_mut().interaction.terminal_input(request) else {
+            return false;
+        };
+        let enqueue_result = self.enqueue_host_action_for_owner(&owner.host, &mut record);
+        match enqueue_result {
+            NativeHostActionResult::Queued => {
+                self.pending_terminal_input_cursors.insert(
+                    owner.clone(),
+                    PendingTerminalInputCursor {
+                        terminal_id: terminal.terminal_id,
+                        resource_generation: terminal.resource_generation,
+                        runtime_generation: terminal.runtime_generation,
+                        next_sequence: input_sequence,
+                    },
+                );
+                self.note_pending_terminal_echo(&owner, &text);
+                self.local_slot_mut().composer_error = None;
+                true
+            }
+            NativeHostActionResult::Disconnected
+            | NativeHostActionResult::QueueFull
+            | NativeHostActionResult::Stale => false,
+        }
     }
 
     fn selected_center_terminal_is_interactive(&self) -> bool {
@@ -19323,20 +20148,27 @@ impl NativeShell {
     }
 
     fn note_pending_terminal_echo(&mut self, owner: &HostTaskKey, input: &str) {
-        let after_sequence = self
+        let latest_terminal = self
             .task_surfaces
             .state(owner.clone())
-            .and_then(|state| state.latest_terminal.as_ref())
-            .map(|projection| projection.sequence)
-            .unwrap_or(0);
+            .and_then(|state| state.latest_terminal.as_ref());
+        let after_sequence = latest_terminal.map_or(0, |projection| projection.sequence);
+        let anchor = latest_terminal
+            .and_then(|projection| projection.screen.cursor)
+            .map(|cursor| (cursor.row, cursor.column))
+            .unwrap_or((0, 0));
         let pending = self
             .pending_terminal_echoes
             .entry(owner.clone())
             .or_insert_with(|| PendingTerminalEcho {
                 text: String::new(),
                 after_sequence,
+                anchor_row: anchor.0,
+                anchor_column: anchor.1,
+                unmatched_refreshes: 0,
             });
         pending.after_sequence = pending.after_sequence.max(after_sequence);
+        pending.unmatched_refreshes = 0;
         for character in input.chars() {
             match character {
                 '\u{7f}' | '\u{8}' => {
@@ -19352,12 +20184,40 @@ impl NativeShell {
         }
     }
 
-    fn settle_pending_terminal_echo(&mut self, owner: &HostTaskKey, sequence: u64) {
-        if self
-            .pending_terminal_echoes
-            .get(owner)
-            .is_some_and(|pending| sequence > pending.after_sequence)
-        {
+    fn settle_pending_terminal_echo(
+        &mut self,
+        owner: &HostTaskKey,
+        projection: &crate::domain::TaskTerminalProjection,
+    ) {
+        let should_retry = {
+            let Some(pending) = self.pending_terminal_echoes.get_mut(owner) else {
+                return;
+            };
+            if projection.sequence <= pending.after_sequence {
+                return;
+            }
+            // Full-screen TUIs frequently redraw or move the input row between the
+            // admission frame and the frame that echoes it. Match at the canonical
+            // cursor as well as the original anchor so an already-painted input is
+            // never overlaid a second time.
+            if terminal_projection_ends_with_before_cursor(projection, &pending.text) {
+                false
+            } else {
+                let consumed = consume_pending_terminal_echo_prefix(&projection.screen, pending);
+                pending.after_sequence = projection.sequence;
+                if consumed == 0 {
+                    pending.unmatched_refreshes = pending.unmatched_refreshes.saturating_add(1);
+                } else {
+                    pending.unmatched_refreshes = 0;
+                }
+                !pending.text.is_empty()
+                    && pending.unmatched_refreshes < TERMINAL_ECHO_MAX_UNMATCHED_REFRESHES
+            }
+        };
+        if should_retry {
+            self.pending_terminal_requeries
+                .insert(owner.clone(), Instant::now() + TERMINAL_ECHO_RETRY_INTERVAL);
+        } else {
             self.pending_terminal_echoes.remove(owner);
         }
     }
@@ -19404,15 +20264,77 @@ impl NativeShell {
         .is_ok()
     }
 
+    fn settle_raw_terminal_input_ack(
+        &mut self,
+        host_id: &HostId,
+        action: &NativeActionRecord,
+        ack: InputAck,
+    ) {
+        let NativeHostCommand::TerminalInput(request) = &action.command else {
+            return;
+        };
+        let owner = HostTaskKey::new(host_id.clone(), request.context.task_id);
+        match ack {
+            InputAck::Accepted { sequence } | InputAck::Duplicate { sequence } => {
+                if let Some(cursor) = self.pending_terminal_input_cursors.get_mut(&owner) {
+                    if cursor.terminal_id == request.terminal_id
+                        && cursor.resource_generation == request.context.resource_generation
+                        && cursor.runtime_generation == request.context.runtime_generation
+                    {
+                        cursor.next_sequence = cursor.next_sequence.max(sequence);
+                    }
+                }
+                if let Some(slot) = self.host_slot_mut(host_id) {
+                    slot.composer_error = None;
+                }
+                self.task_surfaces
+                    .note_terminal_query_started(owner.clone());
+                let _ = self.dispatch_action_recorded_for_owner_inner(
+                    host_id,
+                    ActionRequest::TaskCockpit {
+                        task_id: request.context.task_id,
+                        query: TaskCockpitQuery::Terminal,
+                    },
+                    true,
+                    NativeActionPurpose::Ordinary,
+                );
+            }
+            InputAck::Rejected { reason } => {
+                self.pending_terminal_input_cursors.remove(&owner);
+                self.pending_terminal_echoes.remove(&owner);
+                if let Some(slot) = self.host_slot_mut(host_id) {
+                    slot.composer_error = Some(format!(
+                        "The provider terminal rejected that input ({reason:?})."
+                    ));
+                }
+            }
+        }
+    }
+
     fn handle_provider_terminal_key(
         &mut self,
         event: &KeyDownEvent,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        let command = event.keystroke.modifiers.control || event.keystroke.modifiers.platform;
+        if terminal_key_is_task_switcher_shortcut(
+            event.keystroke.key.as_str(),
+            command,
+            event.keystroke.modifiers.shift,
+        ) {
+            // A provider PTY must never trap the app-level task switcher. This
+            // keeps every other pane usable while a provider-native setup
+            // prompt is waiting for the user's decision.
+            self.dispatch_keyboard(KeyboardShortcut::ctrl(
+                crate::ui::actions::ShortcutKey::Character('p'),
+            ));
+            self.focus_task_search_input(window);
+            window.prevent_default();
+            return;
+        }
         if self.selected_owner_is_remote() {
             // Remote projected terminals stay non-writable, but Ctrl+C still copies.
-            let command = event.keystroke.modifiers.control || event.keystroke.modifiers.platform;
             if command
                 && event.keystroke.key.eq_ignore_ascii_case("c")
                 && self.copy_selected_terminal_text(cx)
@@ -19436,7 +20358,6 @@ impl NativeShell {
         {
             return;
         }
-        let command = event.keystroke.modifiers.control || event.keystroke.modifiers.platform;
         if command
             && event.keystroke.key.eq_ignore_ascii_case("c")
             && matches!(
@@ -19452,7 +20373,12 @@ impl NativeShell {
         let text = if command && event.keystroke.key.eq_ignore_ascii_case("v") {
             cx.read_from_clipboard().and_then(|item| item.text())
         } else {
-            native_terminal_key_text(&event.keystroke)
+            let app_cursor = self
+                .selected_task_key
+                .as_ref()
+                .and_then(|owner| self.terminal_screen_for_owner(owner))
+                .is_some_and(|screen| screen.mode.app_cursor);
+            native_terminal_key_text(&event.keystroke, app_cursor)
         };
         if let Some(text) = text {
             let _ = self.dispatch_provider_terminal_text(text);
@@ -19641,7 +20567,13 @@ impl NativeShell {
             return;
         }
         self.last_composer_draft_persist = Some(now);
-        match self.composer_draft_store.save_keyed(&self.composer_drafts) {
+        let persisted = self
+            .composer_drafts
+            .iter()
+            .filter(|(key, _)| !self.ephemeral_tasks.contains_key(&key.task_id))
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect();
+        match self.composer_draft_store.save_keyed(&persisted) {
             Ok(()) => self.composer_drafts_dirty = false,
             Err(error) => eprintln!(
                 "devmanager: composer drafts not persisted ({}): {error}",
@@ -20376,6 +21308,15 @@ impl NativeShell {
         };
         let owner_host = owner_key.host.clone();
         let task_id = owner_key.task_id;
+        if self.ephemeral_tasks.contains_key(&owner_key)
+            && matches!(
+                control,
+                ComposerControl::SendNow | ComposerControl::Steer | ComposerControl::QueueFollowUp
+            )
+        {
+            self.begin_ephemeral_task_create(&owner_key, control);
+            return;
+        }
         // One immutable click owns reopen/start/send. A second click cannot
         // bypass that transaction while its provider is still starting.
         let blocked = self.host_slot(&owner_host).is_some_and(|slot| {
@@ -20545,6 +21486,7 @@ impl NativeShell {
             else {
                 return;
             };
+            let launch_options = self.composer_launch_options_for(provider_kind.clone());
             match self.dispatch_action_recorded_for_owner(
                 &owner_host,
                 ActionRequest::TaskCockpit {
@@ -20571,6 +21513,8 @@ impl NativeShell {
                             start_command_id: None,
                             control,
                             attachment_only,
+                            provider_kind,
+                            launch_options,
                             stage: PendingDraftFirstSendStage::AwaitingRuntimeProbe,
                             captured_draft,
                             captured_artifact_ids,
@@ -20652,6 +21596,93 @@ impl NativeShell {
             }
         };
         self.dispatch_composer_intent(intent);
+    }
+
+    fn activate_provider_setup_approval(&mut self, owner: HostTaskKey, allow: bool) {
+        let waiting = self.host_slot(&owner.host).is_some_and(|slot| {
+            slot.provider_setup_approvals
+                .get(&owner.task_id)
+                .is_some_and(|approval| {
+                    approval.owner == owner && approval.state == ProviderSetupApprovalState::Waiting
+                })
+        });
+        if !waiting {
+            return;
+        }
+        if self.selected_task_key.as_ref() != Some(&owner)
+            && self
+                .select_fleet_task_key(owner.clone(), FleetSelectMode::Replace)
+                .is_err()
+        {
+            return;
+        }
+        let Some(terminal) = self
+            .task_surfaces
+            .state(owner.clone())
+            .and_then(|surface| surface.latest_terminal.as_ref())
+            .cloned()
+        else {
+            if let Some(slot) = self.host_slot_mut(&owner.host) {
+                slot.composer_error =
+                    Some("The live provider terminal is still loading. Try approval again.".into());
+            }
+            return;
+        };
+        let command_id = CommandId::new();
+        let completion: ProviderSetupInputCompletion = Arc::new(Mutex::new(None));
+        let result = (|| {
+            let slot = self
+                .host_slot_mut(&owner.host)
+                .ok_or_else(|| "the provider host is unavailable".to_string())?;
+            let provider_kind = slot
+                .client_model
+                .as_ref()
+                .and_then(|model| model.task(owner.task_id))
+                .and_then(|snapshot| {
+                    snapshot
+                        .primary_agent_id
+                        .and_then(|agent_id| snapshot.agents.get(&agent_id))
+                })
+                .map(|agent| agent.provider_kind)
+                .ok_or_else(|| "the provider kind is unavailable".to_string())?;
+            let NativeHostRuntimeAttachment::Client(runtime) = slot
+                .host_runtime
+                .as_ref()
+                .ok_or_else(|| "the provider host is disconnected".to_string())?
+            else {
+                return Err("raw provider startup input is unavailable in this preview".to_string());
+            };
+            let admission = runtime
+                .mint_action_admission(Some(owner.task_id))
+                .map_err(|error| error.to_string())?;
+            let requests = provider_setup_terminal_input_requests(
+                admission.client_id,
+                &terminal,
+                provider_kind,
+                allow,
+            )?;
+            runtime.submit_provider_setup_input(admission, requests, Arc::clone(&completion))
+        })();
+        if let Some(slot) = self.host_slot_mut(&owner.host) {
+            match result {
+                Ok(()) => {
+                    if let Some(approval) = slot.provider_setup_approvals.get_mut(&owner.task_id) {
+                        approval.state = ProviderSetupApprovalState::Resolving {
+                            command_id,
+                            allow,
+                            started_at: Instant::now(),
+                        };
+                    }
+                    slot.provider_setup_input_completions
+                        .insert(owner.task_id, completion);
+                    slot.composer_error = None;
+                }
+                Err(message) => {
+                    slot.composer_error =
+                        Some(format!("Couldn't send the provider approval: {message}"));
+                }
+            }
+        }
     }
 
     fn activate_composer_answer_option(&mut self, index: usize, label: String) {
@@ -21331,6 +22362,35 @@ impl NativeShell {
     }
 
     fn owner_pane_projection_labels(&self, key: &HostTaskKey) -> (String, String, String, String) {
+        if let Some(draft) = self.ephemeral_tasks.get(key) {
+            let project_name = self
+                .host_slot(&draft.project_key.host)
+                .and_then(|slot| {
+                    slot.config_sidebar.projects.iter().find_map(|project| {
+                        (ProjectId::parse(&project.workspace_id).ok()
+                            == Some(draft.project_key.project_id))
+                        .then(|| project.label.clone())
+                    })
+                })
+                .filter(|label| !label.trim().is_empty())
+                .unwrap_or_else(|| "New task".to_string());
+            let provider = match draft.provider_kind {
+                ProviderKind::ClaudeCode => "Claude",
+                ProviderKind::Codex => "Codex",
+                ProviderKind::Cursor => "Cursor",
+            };
+            let status = if draft.create_command_id.is_some() {
+                "Creating"
+            } else {
+                "Not saved"
+            };
+            return (
+                "New task".to_string(),
+                project_name,
+                provider.to_string(),
+                status.to_string(),
+            );
+        }
         let slot = self.host_slot(&key.host);
         let row = slot.and_then(|slot| slot.inbox.row(key.task_id));
         let title = row
@@ -21700,10 +22760,8 @@ impl NativeShell {
             cx.notify();
         });
         let focus_anywhere_key = task_key.clone();
-        let focus_anywhere = cx.listener(move |shell, event: &MouseDownEvent, _window, cx| {
-            if event.button == MouseButton::Left
-                && shell.selected_task_key.as_ref() != Some(&focus_anywhere_key)
-            {
+        let focus_anywhere = cx.listener(move |shell, _event: &ClickEvent, _window, cx| {
+            if shell.selected_task_key.as_ref() != Some(&focus_anywhere_key) {
                 let _ = shell
                     .select_fleet_task_key(focus_anywhere_key.clone(), FleetSelectMode::Replace);
                 cx.notify();
@@ -21720,6 +22778,7 @@ impl NativeShell {
         let close = cx.listener(move |shell, _event: &ClickEvent, _window, cx| {
             cx.stop_propagation();
             let _ = shell.select_fleet_task_key(close_key.clone(), FleetSelectMode::Toggle);
+            shell.drop_ephemeral_task(&close_key);
             cx.notify();
         });
         let focus_border = if pane.focused {
@@ -21892,7 +22951,11 @@ impl NativeShell {
             .border_color(focus_border.to_gpui())
             .rounded(px(tokens.density.radii.md))
             .bg(tokens.surfaces.canvas.to_gpui())
-            .capture_any_mouse_down(focus_anywhere)
+            // Focus on the completed click, not mouse-down. Rebuilding an
+            // unfocused pane between press and release destroys the original
+            // child control, so Send/Approve/model buttons appear to click but
+            // never receive their ClickEvent.
+            .on_click(focus_anywhere)
             .can_drop(move |value, _, _| {
                 value
                     .downcast_ref::<DraggedTaskPane>()
@@ -22036,6 +23099,174 @@ impl NativeShell {
         if changed {
             self.mark_layout_dirty();
         }
+    }
+
+    fn provider_setup_approval_card(
+        &self,
+        owner: &HostTaskKey,
+        tokens: crate::ui::tokens::ThemeTokens,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
+        let approval = self
+            .host_slot(&owner.host)
+            .and_then(|slot| slot.provider_setup_approvals.get(&owner.task_id))
+            .cloned()?;
+        let provider_label = self.task_provider_label_for_owner(owner);
+        let resolving = matches!(approval.state, ProviderSetupApprovalState::Resolving { .. });
+        let setup_error = self
+            .host_slot(&owner.host)
+            .and_then(|slot| slot.composer_error.as_deref())
+            .map(str::to_string);
+        let approval_title = format!("{provider_label} needs approval");
+        let approval_detail = if resolving {
+            format!("Sending your decision to {provider_label}…")
+        } else if let Some(message) = setup_error {
+            message
+        } else {
+            format!(
+                "Trust this project workspace so {provider_label} can start. This approval applies only to this provider session."
+            )
+        };
+        let approve_owner = owner.clone();
+        let reject_owner = owner.clone();
+        let approve_setup = cx.listener(move |shell, _event: &MouseDownEvent, _window, cx| {
+            cx.stop_propagation();
+            shell.activate_provider_setup_approval(approve_owner.clone(), true);
+            cx.notify();
+        });
+        let reject_setup = cx.listener(move |shell, _event: &MouseDownEvent, _window, cx| {
+            cx.stop_propagation();
+            shell.activate_provider_setup_approval(reject_owner.clone(), false);
+            cx.notify();
+        });
+        // The component remains the visual control. A stable transparent mouse
+        // adapter owns activation because focus-driven pane rerenders can replace
+        // the component between mouse-down and GPUI's synthesized click.
+        Some(
+            div()
+                .id((
+                    "native-provider-setup-approval",
+                    stable_host_task_element_key(owner, "provider-setup-approval"),
+                ))
+                .w_full()
+                .flex_none()
+                .px(px(16.0))
+                .py(px(10.0))
+                .child(
+                    div()
+                        .w(px(CONVERSATION_CONTENT_MAX_WIDTH))
+                        .max_w_full()
+                        .mx_auto()
+                        .px(px(14.0))
+                        .py(px(12.0))
+                        .rounded(px(tokens.density.radii.lg))
+                        .border(px(1.0))
+                        .border_color(tokens.status.warning.to_gpui())
+                        .bg(tokens.status.warning_surface.to_gpui())
+                        .flex()
+                        .items_center()
+                        .gap(px(12.0))
+                        .child(
+                            div()
+                                .flex_none()
+                                .size(px(30.0))
+                                .rounded_full()
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .bg(tokens.surfaces.raised.to_gpui())
+                                .text_size(px(15.0))
+                                .child("🔐"),
+                        )
+                        .child(
+                            div()
+                                .min_w(px(0.0))
+                                .flex_1()
+                                .flex()
+                                .flex_col()
+                                .gap(px(3.0))
+                                .child(
+                                    div()
+                                        .font_weight(FontWeight::SEMIBOLD)
+                                        .text_color(tokens.status.warning_foreground.to_gpui())
+                                        .child(approval_title),
+                                )
+                                .child(
+                                    div()
+                                        .text_size(px(tokens.density.typography.caption))
+                                        .text_color(tokens.text.secondary.to_gpui())
+                                        .child(approval_detail),
+                                ),
+                        )
+                        .children((!resolving).then(|| {
+                            div()
+                                .id("native-provider-setup-approval-actions")
+                                .flex_none()
+                                .flex()
+                                .items_center()
+                                .gap(px(6.0))
+                                .child(
+                                    div()
+                                        .relative()
+                                        .child(
+                                            Button::new((
+                                                "native-provider-setup-reject",
+                                                stable_host_task_element_key(
+                                                    owner,
+                                                    "provider-setup-reject",
+                                                ),
+                                            ))
+                                            .label("Reject")
+                                            .ghost(),
+                                        )
+                                        .child(
+                                            div()
+                                                .id((
+                                                    "native-provider-setup-reject-hit-target",
+                                                    stable_host_task_element_key(
+                                                        owner,
+                                                        "provider-setup-reject-hit-target",
+                                                    ),
+                                                ))
+                                                .absolute()
+                                                .inset_0()
+                                                .cursor_pointer()
+                                                .on_mouse_down(MouseButton::Left, reject_setup),
+                                        ),
+                                )
+                                .child(
+                                    div()
+                                        .relative()
+                                        .child(
+                                            Button::new((
+                                                "native-provider-setup-approve",
+                                                stable_host_task_element_key(
+                                                    owner,
+                                                    "provider-setup-approve",
+                                                ),
+                                            ))
+                                            .label("Approve"),
+                                        )
+                                        .child(
+                                            div()
+                                                .id((
+                                                    "native-provider-setup-approve-hit-target",
+                                                    stable_host_task_element_key(
+                                                        owner,
+                                                        "provider-setup-approve-hit-target",
+                                                    ),
+                                                ))
+                                                .absolute()
+                                                .inset_0()
+                                                .cursor_pointer()
+                                                .on_mouse_down(MouseButton::Left, approve_setup),
+                                        ),
+                                )
+                                .into_any_element()
+                        })),
+                )
+                .into_any_element(),
+        )
     }
 
     fn task_conversation_surface_for(
@@ -22260,25 +23491,33 @@ impl NativeShell {
             crate::providers::ProviderAccessMode::WorkspaceWrite => "Workspace write",
             crate::providers::ProviderAccessMode::ReadOnly => "Read only",
         };
-        let open_provider = cx.listener(|shell, _event: &ClickEvent, _window, cx| {
+        let open_provider = cx.listener(|shell, _event: &ClickEvent, window, cx| {
             cx.stop_propagation();
-            shell.open_composer_provider_selector();
+            if shell.focus_composer_for_selector(window) {
+                shell.open_composer_provider_selector();
+            }
             cx.notify();
         });
-        let open_model = cx.listener(|shell, _event: &ClickEvent, _window, cx| {
+        let open_model = cx.listener(|shell, _event: &ClickEvent, window, cx| {
             cx.stop_propagation();
-            shell.open_composer_model_selector();
+            if shell.focus_composer_for_selector(window) {
+                shell.open_composer_model_selector();
+            }
             cx.notify();
         });
         let draft_provider_selectable = self.selected_task_is_unstarted_draft();
-        let open_reasoning = cx.listener(|shell, _event: &ClickEvent, _window, cx| {
+        let open_reasoning = cx.listener(|shell, _event: &ClickEvent, window, cx| {
             cx.stop_propagation();
-            shell.open_composer_reasoning_selector();
+            if shell.focus_composer_for_selector(window) {
+                shell.open_composer_reasoning_selector();
+            }
             cx.notify();
         });
-        let open_access = cx.listener(|shell, _event: &ClickEvent, _window, cx| {
+        let open_access = cx.listener(|shell, _event: &ClickEvent, window, cx| {
             cx.stop_propagation();
-            shell.open_composer_access_selector();
+            if shell.focus_composer_for_selector(window) {
+                shell.open_composer_access_selector();
+            }
             cx.notify();
         });
         let (checkout_label, branch_label) = self
@@ -23188,6 +24427,19 @@ impl NativeShell {
                 )
                 .into_any_element()
         };
+        let provider_setup_card = self.provider_setup_approval_card(&owner, tokens, cx);
+        let conversation_footer = div()
+            .id((
+                "native-task-conversation-footer",
+                stable_host_task_element_key(&owner, "conversation-footer"),
+            ))
+            .w_full()
+            .flex_none()
+            .flex()
+            .flex_col()
+            .children(provider_setup_card)
+            .child(composer_footer)
+            .into_any_element();
         let conversation = {
             let shell_entity = cx.entity().downgrade();
             let owner_key = owner.clone();
@@ -23222,13 +24474,13 @@ impl NativeShell {
                         tokens,
                         None,
                     ))
-                    .child(composer_footer)
+                    .child(conversation_footer)
                     .into_any_element()
             } else if let Some(slot) = self.host_slot_mut(&owner.host) {
                 slot.cockpit.conversation_surface_with_footer_for_task(
                     owner.task_id,
                     tokens,
-                    composer_footer,
+                    conversation_footer,
                     Some(activity_toggle),
                 )
             } else {
@@ -23236,12 +24488,26 @@ impl NativeShell {
                     .id("native-task-conversation-surface")
                     .w_full()
                     .flex_1()
-                    .child(composer_footer)
+                    .child(conversation_footer)
                     .into_any_element()
             }
         };
         let center_body = if showing_provider_terminal {
-            self.center_provider_terminal_surface_for(&owner, tokens, cx)
+            let setup_card = self.provider_setup_approval_card(&owner, tokens, cx);
+            div()
+                .id((
+                    "native-task-terminal-with-approval",
+                    stable_host_task_element_key(&owner, "terminal-with-approval"),
+                ))
+                .w_full()
+                .flex()
+                .flex_1()
+                .min_h(px(0.0))
+                .overflow_hidden()
+                .flex_col()
+                .child(self.center_provider_terminal_surface_for(&owner, tokens, cx))
+                .children(setup_card)
+                .into_any_element()
         } else {
             div()
                 .id("native-task-conversation-interactive")
@@ -23262,6 +24528,7 @@ impl NativeShell {
             .flex()
             .flex_1()
             .min_h(px(0.0))
+            .overflow_hidden()
             .flex_col()
             .child(center_body)
             .children(loading_overlay)
@@ -23276,9 +24543,7 @@ impl NativeShell {
     ) -> AnyElement {
         let (label, initial) = match state {
             CenterSurfaceLoadingState::ConversationInitial => ("Loading conversation…", true),
-            CenterSurfaceLoadingState::ConversationSync => ("Syncing conversation…", false),
             CenterSurfaceLoadingState::TerminalInitial => ("Starting terminal…", true),
-            CenterSurfaceLoadingState::TerminalSync => ("Syncing terminal…", false),
         };
         let animation_key = stable_host_task_element_key(owner, "center-loading-pulse");
         let pulse = div()
@@ -23373,9 +24638,13 @@ impl NativeShell {
         // Keep the adapter theme-token contract referenced on this paint path.
         let _adapter_theme_contract = self.terminal.element_with_tokens(tokens);
         let grid = if chrome.embeds_renderer && pane.is_some() {
-            let interaction = interactive.then(|| {
-                self.terminal_grid_interaction_for_shared(owner.clone(), true, &shell_entity)
-            });
+            // A restored terminal can paint before the host interaction model has
+            // caught up with the globally selected HostTaskKey. Keep the grid
+            // selectable in that state so its first pointer gesture can repair
+            // owner focus. Raw text/key dispatch remains fenced by
+            // selected_center_terminal_is_interactive().
+            let interaction =
+                Some(self.terminal_grid_interaction_for_shared(owner.clone(), true, &shell_entity));
             crate::terminal::view::render_terminal_surface_with_tokens_and_grid(
                 pane.as_ref().expect("terminal pane checked above"),
                 None,
@@ -23429,12 +24698,13 @@ impl NativeShell {
                     .child(self.task_surfaces.terminal_label(owner.clone())),
             )
         };
-        if !interactive {
+        if pane.is_none() {
             return surface.into_any_element();
         }
         let shell_for_focus = shell_entity.clone();
         let shell_for_key = shell_entity.clone();
         let shell_for_scroll = shell_entity;
+        let focus_owner = owner.clone();
         let scroll_owner = owner.clone();
         let terminal_line_height = tokens.density.typography.code_line_height;
         surface
@@ -23445,9 +24715,7 @@ impl NativeShell {
                 MouseButton::Left,
                 move |_event: &MouseDownEvent, window: &mut Window, app: &mut gpui::App| {
                     let _ = shell_for_focus.update(app, |shell, cx| {
-                        shell.arm_selected_provider_terminal_input();
-                        shell.terminal_focus_handle.focus(window);
-                        shell.pending_terminal_focus = false;
+                        shell.prepare_terminal_owner_for_grid_pointer(&focus_owner, window);
                         cx.notify();
                     });
                 },
@@ -23511,7 +24779,10 @@ impl NativeShell {
     /// Selection + pending-focus arm used before grid pointer selection applies.
     /// Separated so headless tests can prove owner Replace without a Window.
     fn arm_terminal_owner_for_grid_pointer(&mut self, owner: &HostTaskKey) {
-        if self.selected_task_key.as_ref() != Some(owner) {
+        let host_selection_matches = self
+            .host_slot(&owner.host)
+            .is_some_and(|slot| slot.interaction.selected_task() == Some(owner.task_id));
+        if self.selected_task_key.as_ref() != Some(owner) || !host_selection_matches {
             let _ = self.select_fleet_task_key(owner.clone(), FleetSelectMode::Replace);
         }
         if self.selected_task_key.as_ref() == Some(owner)
@@ -23657,19 +24928,51 @@ impl NativeShell {
             .flex_col()
             .bg(tokens.terminal.background.to_gpui());
         if let Some(pane) = pane {
+            let interactive = self.selected_center_terminal_is_interactive();
             let interaction = self.terminal_grid_interaction_for_shared(
                 owner.clone(),
-                self.selected_center_terminal_is_interactive(),
+                interactive,
                 &shell_entity,
             );
+            let surface = surface.child(
+                crate::terminal::view::render_terminal_surface_with_tokens_and_grid(
+                    &pane,
+                    None,
+                    Some(interaction),
+                    tokens,
+                ),
+            );
+            if !interactive {
+                return surface.into_any_element();
+            }
+
+            let shell_for_focus = cx.weak_entity();
+            let shell_for_key = cx.weak_entity();
             surface
-                .child(
-                    crate::terminal::view::render_terminal_surface_with_tokens_and_grid(
-                        &pane,
-                        None,
-                        Some(interaction),
-                        tokens,
-                    ),
+                .tab_stop(true)
+                .track_focus(&self.terminal_focus_handle)
+                .cursor_text()
+                .capture_any_mouse_down(
+                    move |event: &MouseDownEvent, window: &mut Window, app: &mut gpui::App| {
+                        if event.button != MouseButton::Left {
+                            return;
+                        }
+                        let _ = shell_for_focus.update(app, |shell, cx| {
+                            shell.arm_selected_provider_terminal_input();
+                            shell.terminal_focus_handle.focus(window);
+                            shell.pending_terminal_focus = false;
+                            cx.notify();
+                        });
+                    },
+                )
+                .on_key_down(
+                    move |event: &KeyDownEvent, window: &mut Window, app: &mut gpui::App| {
+                        let _ = shell_for_key.update(app, |shell, cx| {
+                            cx.stop_propagation();
+                            shell.handle_provider_terminal_key(event, window, cx);
+                            cx.notify();
+                        });
+                    },
                 )
                 .into_any_element()
         } else {
@@ -23747,8 +25050,11 @@ impl NativeShell {
         };
         self.refresh_slash_command_catalog(snapshot, agent_session_id);
         let provider_wait = "Waiting for the provider conversation to connect";
-        let waits_for_provider_identity = agent.provider_session_id.is_none()
-            && agent.provider_kind != crate::providers::ProviderKind::Codex;
+        let waits_for_provider_identity = composer_waits_for_provider_identity(
+            snapshot.is_unstarted_draft(),
+            agent.provider_kind,
+            agent.provider_session_id.is_some(),
+        );
         let disabled_reasons = if waits_for_provider_identity {
             [
                 ComposerControl::SendNow,
@@ -23994,6 +25300,8 @@ impl NativeShell {
                 self.refresh_accessibility_tree();
             }
             KeyboardAction::DismissTransient => {
+                self.dismiss_composer_selector();
+                self.trigger_menu = None;
                 self.add_project = None;
                 self.new_task = None;
                 self.rename_task = None;
@@ -25631,6 +26939,12 @@ impl NativeShell {
 
     /// Sync interaction/cockpit/composer against the captured owner slot only.
     fn focus_owner_task_key(&mut self, key: &HostTaskKey) -> Result<(), String> {
+        if self.ephemeral_tasks.contains_key(key) {
+            self.task_surfaces.ensure_task(key.clone());
+            self.sync_ephemeral_task_composer(key)?;
+            self.sync_header_projection();
+            return Ok(());
+        }
         let Some(slot) = self.host_slot_mut(&key.host) else {
             return Err(format!("no HostUiState for owner {:?}", key.host));
         };
@@ -25970,6 +27284,7 @@ impl NativeShell {
         if let Some(action) = slot.retained_action_overflow.as_mut() {
             action.client_epoch = client_epoch;
         }
+        self.promote_ephemeral_tasks_for_host(host_id, model.as_ref());
         // Drop tombstones once the owning projection no longer lists the task.
         let present: HashSet<TaskId> = keys.iter().map(|key| key.task_id).collect();
         self.known_deleted_task_keys
@@ -26025,6 +27340,11 @@ impl NativeShell {
                 );
             }
         }
+        // Project-only task shells are intentionally absent from every host
+        // projection until their first message admits TaskCreateV2. Canonical
+        // bootstrap/reconnect must therefore union them explicitly or a late
+        // first snapshot will silently evict the user's unsent pane.
+        keys.extend(self.ephemeral_tasks.keys().cloned());
         // Preserve open panes for hosts that still have a slot even if their
         // current projection omitted a cached key (offline/reconnect gap).
         // Exact confirmed-deleted keys are excluded so Delete cannot leave a
@@ -26680,18 +28000,10 @@ impl NativeShell {
             return;
         }
         self.selected_project_id = Some(project_id);
-        let _ = self.dispatch_action(ActionRequest::TaskCreateV2(
-            crate::client::action::TaskCreateV2Arguments {
-                task_id: TaskId::new(),
-                environment_id: crate::domain::id::EnvironmentId::new(),
-                title: placeholder_task_title(kind).to_string(),
-                description: None,
-                project_id,
-                workspace: crate::workspace::WorkspaceRequest::main(),
-                primary_provider: Some(kind),
-                defer_primary_provider_start: false,
-            },
-        ));
+        self.layout.composer_provider = Some(kind);
+        self.mark_layout_dirty();
+        self.begin_new_task_for_project(project_id);
+        self.submit_new_task();
     }
 
     fn archive_selected_task(&mut self) {
@@ -27703,8 +29015,14 @@ impl NativeShell {
             );
             return;
         };
-        let preferred_provider = self.composer_provider_for_launch_for(&pending.owner);
-        let provider_kind = preferred_provider.unwrap_or(agent.provider_kind.clone());
+        let provider_kind = pending.provider_kind.clone();
+        if provider_kind != agent.provider_kind {
+            self.cancel_pending_draft_first_send_for_host(
+                host_id,
+                "The selected provider changed before launch. Draft kept.",
+            );
+            return;
+        }
         if provider_kind == ProviderKind::Cursor {
             self.cancel_pending_draft_first_send_for_host(
                 host_id,
@@ -27718,7 +29036,7 @@ impl NativeShell {
             resource_id: resource.id,
             provider_kind: provider_kind.clone(),
             mode: crate::domain::command::ProviderStartMode::NewConversation,
-            launch_options: self.composer_launch_options_for(provider_kind),
+            launch_options: pending.launch_options.clone(),
             action_epoch: snapshot.task.action_epoch,
         };
         match self.dispatch_action_recorded_for_owner(
@@ -27819,6 +29137,23 @@ impl NativeShell {
             if let crate::domain::TaskCockpitResult::Terminal(projection) = result {
                 if first_send_terminal_runtime_live(snapshot, projection) {
                     let attested = first_send_terminal_ready(snapshot, projection);
+                    if snapshot.is_unstarted_draft() && !attested {
+                        // A terminal attachment can exist before the provider
+                        // runtime has accepted the captured launch settings.
+                        // Structural task/resource identity alone is not a
+                        // start receipt. For a genuinely unstarted draft, only
+                        // the host's explicit identityless-input attestation may
+                        // reuse that runtime; otherwise issue the exact captured
+                        // ProviderStart so model/reasoning/access are preserved.
+                        if let Some(slot) = self.host_slot_mut(host_id) {
+                            slot.first_send_readiness_requests.remove(&request_id);
+                            if let Some(pending) = slot.pending_draft_first_send.as_mut() {
+                                pending.readiness_request_id = None;
+                            }
+                        }
+                        self.dispatch_pending_draft_first_send_start_for_host(host_id);
+                        return;
+                    }
                     if let Some(slot) = self.host_slot_mut(host_id) {
                         slot.first_send_readiness_requests.remove(&request_id);
                         if let Some(pending) = slot.pending_draft_first_send.as_mut() {
@@ -27856,7 +29191,7 @@ impl NativeShell {
             }
             if first_send_terminal_probe_provider_setup_required(result) {
                 if let Some(slot) = self.host_slot_mut(host_id) {
-                    hold_pending_draft_first_send_for_codex_setup(slot, Some(request_id));
+                    hold_pending_draft_first_send_for_provider_setup(slot, Some(request_id));
                 }
                 return;
             }
@@ -27881,20 +29216,22 @@ impl NativeShell {
         // Post-start / live-reuse readiness attestation.
         if first_send_terminal_probe_provider_setup_required(result) {
             if let Some(slot) = self.host_slot_mut(host_id) {
-                hold_pending_draft_first_send_for_codex_setup(slot, Some(request_id));
+                hold_pending_draft_first_send_for_provider_setup(slot, Some(request_id));
             }
             return;
         }
         let ready = match result {
             crate::domain::TaskCockpitResult::Terminal(projection) => {
-                if matches!(
-                    crate::providers::input::classify_codex_identityless_startup_readiness(
-                        &projection.text_lines,
-                    ),
-                    crate::providers::input::CodexIdentitylessStartupReadiness::ProviderSetupRequired,
-                ) {
+                let setup_required = self
+                    .host_slot(host_id)
+                    .and_then(|slot| slot.client_model.as_ref())
+                    .and_then(|model| model.task(task_id))
+                    .is_some_and(|snapshot| {
+                        terminal_projection_requires_provider_setup(snapshot, projection)
+                    });
+                if setup_required {
                     if let Some(slot) = self.host_slot_mut(host_id) {
-                        hold_pending_draft_first_send_for_codex_setup(slot, Some(request_id));
+                        hold_pending_draft_first_send_for_provider_setup(slot, Some(request_id));
                     }
                     return;
                 }
@@ -27912,6 +29249,9 @@ impl NativeShell {
             }
         }
         if ready {
+            if let Some(slot) = self.host_slot_mut(host_id) {
+                slot.provider_setup_approvals.remove(&task_id);
+            }
             self.try_advance_pending_draft_first_send_for_host(host_id);
         }
     }
@@ -27980,6 +29320,205 @@ impl NativeShell {
         true
     }
 
+    fn settle_provider_setup_approval_outcome_for_host(
+        &mut self,
+        host_id: &HostId,
+        action: &NativeActionRecord,
+        accepted: bool,
+        message: Option<String>,
+    ) -> bool {
+        let NativeHostCommand::ProviderInput {
+            action_id,
+            arguments,
+            command_id,
+            ..
+        } = &action.command
+        else {
+            return false;
+        };
+        if *action_id != action::ACTION_PROVIDER_TERMINAL_INPUT {
+            return false;
+        }
+        let resolution = self
+            .host_slot(host_id)
+            .and_then(|slot| slot.provider_setup_approvals.get(&arguments.task_id))
+            .and_then(|approval| match approval.state {
+                ProviderSetupApprovalState::Resolving {
+                    command_id: expected,
+                    allow,
+                    ..
+                } if expected == *command_id => Some((approval.owner.clone(), allow)),
+                _ => None,
+            });
+        let Some((owner, allow)) = resolution else {
+            return false;
+        };
+        if !accepted {
+            if let Some(slot) = self.host_slot_mut(host_id) {
+                if let Some(approval) = slot.provider_setup_approvals.get_mut(&owner.task_id) {
+                    approval.state = ProviderSetupApprovalState::Waiting;
+                }
+                slot.composer_error = Some(message.unwrap_or_else(|| {
+                    "The provider approval was not delivered. Try again.".into()
+                }));
+            }
+            return true;
+        }
+        if let Some(slot) = self.host_slot_mut(host_id) {
+            slot.provider_setup_approvals.remove(&owner.task_id);
+            if let Some(pending) = slot.pending_draft_first_send.as_mut() {
+                pending.started_at = Instant::now();
+                pending.readiness_request_id = None;
+                pending.readiness_requested_at = Some(Instant::now());
+            }
+            slot.composer_error = None;
+        }
+        if !allow {
+            self.cancel_pending_draft_first_send_for_host(
+                host_id,
+                "Provider startup was not approved. Your draft was kept.",
+            );
+        }
+        true
+    }
+
+    fn settle_provider_setup_input_completions(&mut self) -> bool {
+        let hosts: Vec<HostId> = self.hosts.keys().cloned().collect();
+        let mut changed = false;
+        for host_id in hosts {
+            let task_ids = self
+                .host_slot(&host_id)
+                .map(|slot| {
+                    slot.provider_setup_input_completions
+                        .keys()
+                        .copied()
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            for task_id in task_ids {
+                let completed = self
+                    .host_slot(&host_id)
+                    .and_then(|slot| slot.provider_setup_input_completions.get(&task_id))
+                    .and_then(|completion| {
+                        completion.lock().ok().and_then(|mut result| result.take())
+                    });
+                let Some(completed) = completed else {
+                    continue;
+                };
+                let resolution = self
+                    .host_slot(&host_id)
+                    .and_then(|slot| slot.provider_setup_approvals.get(&task_id))
+                    .and_then(|approval| match approval.state {
+                        ProviderSetupApprovalState::Resolving { allow, .. } => {
+                            Some((approval.owner.clone(), allow))
+                        }
+                        ProviderSetupApprovalState::Waiting => None,
+                    });
+                if let Some(slot) = self.host_slot_mut(&host_id) {
+                    slot.provider_setup_input_completions.remove(&task_id);
+                }
+                let Some((owner, allow)) = resolution else {
+                    continue;
+                };
+                match completed {
+                    Ok(InputAck::Accepted { .. } | InputAck::Duplicate { .. }) => {
+                        if let Some(slot) = self.host_slot_mut(&host_id) {
+                            if let Some(pending) = slot.pending_draft_first_send.as_mut() {
+                                pending.started_at = Instant::now();
+                                pending.readiness_request_id = None;
+                                pending.readiness_requested_at = None;
+                            }
+                            slot.composer_error = None;
+                        }
+                        if allow {
+                            // InputAck proves only that the host wrote the
+                            // choice to the PTY. Keep the card single-flight in
+                            // Resolving until a later terminal projection proves
+                            // the provider consumed it; otherwise a fast stale
+                            // readiness poll can expose Approve a second time.
+                            self.request_pending_first_send_readiness_for_host(&host_id);
+                        } else {
+                            if let Some(slot) = self.host_slot_mut(&host_id) {
+                                slot.provider_setup_approvals.remove(&task_id);
+                            }
+                            self.cancel_pending_draft_first_send_for_host(
+                                &host_id,
+                                "Provider startup was not approved. Your draft was kept.",
+                            );
+                        }
+                    }
+                    Ok(InputAck::Rejected { reason }) => {
+                        if let Some(slot) = self.host_slot_mut(&host_id) {
+                            if let Some(approval) =
+                                slot.provider_setup_approvals.get_mut(&owner.task_id)
+                            {
+                                approval.state = ProviderSetupApprovalState::Waiting;
+                            }
+                            slot.composer_error = Some(format!(
+                                "The provider rejected the startup decision ({reason:?}). Try again."
+                            ));
+                        }
+                    }
+                    Err(message) => {
+                        if let Some(slot) = self.host_slot_mut(&host_id) {
+                            if let Some(approval) =
+                                slot.provider_setup_approvals.get_mut(&owner.task_id)
+                            {
+                                approval.state = ProviderSetupApprovalState::Waiting;
+                            }
+                            slot.composer_error = Some(format!(
+                                "The provider approval was not delivered: {message}"
+                            ));
+                        }
+                    }
+                }
+                changed = true;
+            }
+        }
+        if changed {
+            self.refresh_accessibility_tree();
+        }
+        changed
+    }
+
+    fn expire_stalled_provider_setup_approvals(&mut self) -> bool {
+        let now = Instant::now();
+        let hosts: Vec<HostId> = self.hosts.keys().cloned().collect();
+        let mut changed = false;
+        for host_id in hosts {
+            let expired = self
+                .host_slot(&host_id)
+                .map(|slot| {
+                    slot.provider_setup_approvals
+                        .iter()
+                        .filter_map(|(task_id, approval)| {
+                            provider_setup_resolution_expired(&approval.state, now)
+                                .then_some(*task_id)
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            if expired.is_empty() {
+                continue;
+            }
+            if let Some(slot) = self.host_slot_mut(&host_id) {
+                for task_id in expired {
+                    if let Some(approval) = slot.provider_setup_approvals.get_mut(&task_id) {
+                        approval.state = ProviderSetupApprovalState::Waiting;
+                    }
+                    slot.provider_setup_input_completions.remove(&task_id);
+                }
+                slot.composer_error =
+                    Some("The provider did not consume the startup decision. Try again.".into());
+                changed = true;
+            }
+        }
+        if changed {
+            self.refresh_accessibility_tree();
+        }
+        changed
+    }
+
     fn cancel_pending_draft_first_send(&mut self, message: impl Into<String>) {
         self.cancel_pending_draft_first_send_for_host(&self.local_host_id(), message);
     }
@@ -27996,6 +29535,9 @@ impl NativeShell {
                 // clearing composer_error or mutating the terminal surface.
                 // Never-enqueued probes never inserted an ID and need no retain.
                 let _ = pending.readiness_request_id;
+                slot.provider_setup_approvals.remove(&pending.task_id);
+                slot.provider_setup_input_completions
+                    .remove(&pending.task_id);
                 slot.composer_error = Some(message.into());
             }
         }
@@ -28042,13 +29584,11 @@ impl NativeShell {
         else {
             return;
         };
-        let codex_without_id = snapshot
+        let provider_without_id = snapshot
             .primary_agent_id
             .and_then(|id| snapshot.agents.get(&id))
-            .is_some_and(|agent| {
-                agent.provider_kind == ProviderKind::Codex && agent.provider_session_id.is_none()
-            });
-        if !codex_without_id {
+            .is_some_and(|agent| agent.provider_session_id.is_none());
+        if !provider_without_id {
             return;
         }
         if let Some(slot) = self.host_slot_mut(host_id) {
@@ -28060,7 +29600,7 @@ impl NativeShell {
             host_id,
             ActionRequest::TaskCockpit {
                 task_id,
-                query: TaskCockpitQuery::Terminal,
+                query: TaskCockpitQuery::TerminalReadiness,
             },
         ) {
             if let Some((request_id, _, _)) = Self::task_cockpit_command_parts(&action.command) {
@@ -28089,6 +29629,12 @@ impl NativeShell {
         else {
             return;
         };
+        if self
+            .host_slot(host_id)
+            .is_some_and(|slot| slot.provider_setup_approvals.contains_key(&pending.task_id))
+        {
+            return;
+        }
         if &pending.owner.host != host_id
             || pending.stage != PendingDraftFirstSendStage::AwaitingRuntimeProbe
             || pending.readiness_request_id.is_some()
@@ -28135,7 +29681,15 @@ impl NativeShell {
             if self.host_slot(&host_id).is_some_and(|slot| {
                 slot.pending_draft_first_send
                     .as_ref()
-                    .is_some_and(|pending| pending.started_at.elapsed() > Duration::from_secs(120))
+                    .is_some_and(|pending| {
+                        pending.started_at.elapsed() > Duration::from_secs(120)
+                            && !slot
+                                .provider_setup_approvals
+                                .get(&pending.task_id)
+                                .is_some_and(|approval| {
+                                    approval.state == ProviderSetupApprovalState::Waiting
+                                })
+                    })
             }) {
                 self.cancel_pending_draft_first_send_for_host(
                     &host_id,
@@ -28262,6 +29816,9 @@ impl NativeShell {
         }
         if snapshot.is_unstarted_draft() && !pending.ready_without_conversation_id {
             return;
+        }
+        if let Some(slot) = self.host_slot_mut(host_id) {
+            slot.provider_setup_approvals.remove(&pending.task_id);
         }
         if self.selected_task_key.as_ref() != Some(&pending.owner) {
             self.cancel_pending_draft_first_send_for_host(
@@ -28406,6 +29963,35 @@ impl NativeShell {
         self.local_slot_mut().interaction.close_palettes();
     }
 
+    fn cycle_new_task_project(&mut self, backwards: bool) {
+        let Some(draft) = self.new_task.as_ref() else {
+            return;
+        };
+        let owner_host = draft.project_key.host.clone();
+        let current = draft.project_key.project_id;
+        let choices = self
+            .host_slot(&owner_host)
+            .map(|slot| {
+                slot.config_sidebar
+                    .projects
+                    .iter()
+                    .filter_map(|project| ProjectId::parse(&project.workspace_id).ok())
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        let Some(project_id) = cycle_project_choice(current, &choices, backwards) else {
+            return;
+        };
+        let local_host = self.local_host_id();
+        if let Some(draft) = self.new_task.as_mut() {
+            draft.project_key.project_id = project_id;
+            draft.error = None;
+            if draft.project_key.host == local_host {
+                self.selected_project_id = Some(project_id);
+            }
+        }
+    }
+
     fn submit_new_task(&mut self) {
         let Some(draft) = self.new_task.as_ref() else {
             return;
@@ -28419,28 +30005,256 @@ impl NativeShell {
         }
         let provider_kind = self.new_task_provider_for_owner(&project_key.host);
         let task_id = TaskId::new();
-        if self
-            .dispatch_action_recorded_for_owner(
-                &project_key.host,
-                ActionRequest::TaskCreateV2(crate::client::action::TaskCreateV2Arguments {
-                    task_id,
-                    environment_id: crate::domain::id::EnvironmentId::new(),
-                    title: "New task".to_string(),
-                    description: None,
-                    project_id: project_key.project_id,
-                    workspace: crate::workspace::WorkspaceRequest::main(),
-                    primary_provider: Some(provider_kind),
-                    defer_primary_provider_start: true,
-                }),
-            )
-            .is_err()
-        {
-            if let Some(draft) = self.new_task.as_mut() {
-                draft.error = Some("Couldn't create the task. Try again.".into());
+        let key = HostTaskKey::new(project_key.host.clone(), task_id);
+        let options = self.new_task_launch_options_for(provider_kind);
+        self.ephemeral_tasks.insert(
+            key.clone(),
+            EphemeralTaskDraft {
+                key: key.clone(),
+                project_key,
+                environment_id: crate::domain::id::EnvironmentId::new(),
+                agent_session_id: AgentSessionId::new(),
+                provider_kind,
+                create_command_id: None,
+                pending_control: None,
+                pending_launch_preferences: None,
+            },
+        );
+        self.draft_launch_prefs
+            .insert(key.clone(), (provider_kind, options));
+        self.new_task = None;
+        if let Err(error) = self.select_fleet_task_key(key.clone(), FleetSelectMode::Replace) {
+            self.drop_ephemeral_task(&key);
+            if let Some(slot) = self.host_slot_mut(&key.host) {
+                slot.composer_error = Some(format!("Couldn't open the new task: {error}"));
+            }
+        }
+    }
+
+    fn sync_ephemeral_task_composer(&mut self, key: &HostTaskKey) -> Result<(), String> {
+        let draft = self
+            .ephemeral_tasks
+            .get(key)
+            .cloned()
+            .ok_or_else(|| "ephemeral task is unavailable".to_string())?;
+        let focus_epoch = self
+            .host_slot(&key.host)
+            .map(|slot| slot.interaction.current_focus_epoch())
+            .ok_or_else(|| "ephemeral task owner is unavailable".to_string())?;
+        let draft_key = Self::fleet_draft_key_for(key.clone(), draft.agent_session_id);
+        let projection = ComposerHostProjection {
+            fence: ComposerFence {
+                task_id: key.task_id,
+                agent_session_id: draft.agent_session_id,
+                runtime_generation: 0,
+                action_epoch: 0,
+                turn_id: None,
+            },
+            draft: self.composer_drafts.get(&draft_key).cloned().unwrap_or(
+                ComposerDraftProjection {
+                    text: String::new(),
+                    attachments: Vec::new(),
+                    prompt: None,
+                },
+            ),
+            owned_artifacts: Vec::new(),
+            question: None,
+            approval: None,
+            disabled_reasons: Vec::new(),
+        };
+        self.composer = Some(
+            TaskComposer::bind_for_task(projection, focus_epoch)
+                .map_err(|error| error.to_string())?,
+        );
+        self.composer_owner = Some(key.clone());
+        if let Some(slot) = self.host_slot_mut(&key.host) {
+            slot.composer_error = None;
+        }
+        Ok(())
+    }
+
+    fn drop_ephemeral_task(&mut self, key: &HostTaskKey) {
+        let Some(draft) = self.ephemeral_tasks.remove(key) else {
+            return;
+        };
+        let draft_key = Self::fleet_draft_key_for(key.clone(), draft.agent_session_id);
+        self.composer_drafts.remove(&draft_key);
+        self.composer_images.remove(&draft_key);
+        self.draft_launch_prefs.remove(key);
+        self.task_surfaces.remove_task(key.clone());
+        if self.composer_owner.as_ref() == Some(key) {
+            self.clear_composer_binding();
+        }
+        self.mark_layout_dirty();
+        self.composer_drafts_dirty = true;
+    }
+
+    /// First-send promotion boundary for a project-confirmed task. Until this
+    /// command is admitted, the task exists only in the native shell.
+    fn begin_ephemeral_task_create(&mut self, key: &HostTaskKey, control: ComposerControl) {
+        let Some(ephemeral) = self.ephemeral_tasks.get(key).cloned() else {
+            return;
+        };
+        if ephemeral.create_command_id.is_some() {
+            return;
+        }
+        let has_text_or_attachment = self.composer.as_ref().is_some_and(|composer| {
+            !composer.draft_text().trim().is_empty() || !composer.attachments().is_empty()
+        }) || !self.current_composer_images().is_empty();
+        if !has_text_or_attachment {
+            if let Some(slot) = self.host_slot_mut(&key.host) {
+                slot.composer_error = Some("Type a message before creating this task.".into());
             }
             return;
         }
-        self.new_task = None;
+        self.cache_current_composer_draft();
+        let captured_launch_preferences =
+            self.draft_launch_prefs
+                .get(key)
+                .cloned()
+                .unwrap_or_else(|| {
+                    (
+                        ephemeral.provider_kind,
+                        self.composer_launch_options_for(ephemeral.provider_kind),
+                    )
+                });
+        let request = ActionRequest::TaskCreateV2(crate::client::action::TaskCreateV2Arguments {
+            task_id: key.task_id,
+            environment_id: ephemeral.environment_id,
+            title: placeholder_task_title(ephemeral.provider_kind).to_string(),
+            description: None,
+            project_id: ephemeral.project_key.project_id,
+            workspace: crate::workspace::WorkspaceRequest::main(),
+            primary_provider: Some(ephemeral.provider_kind),
+            defer_primary_provider_start: true,
+        });
+        match self.dispatch_action_recorded_for_owner(&key.host, request) {
+            Ok(record) => {
+                let Some(command_id) = native_command_id(&record.command) else {
+                    if let Some(slot) = self.host_slot_mut(&key.host) {
+                        slot.composer_error = Some(
+                            "Couldn't create the task before sending. Your draft was kept.".into(),
+                        );
+                    }
+                    return;
+                };
+                if let Some(draft) = self.ephemeral_tasks.get_mut(key) {
+                    draft.create_command_id = Some(command_id);
+                    draft.pending_control = Some(control);
+                    draft.pending_launch_preferences = Some(captured_launch_preferences);
+                }
+                if let Some(slot) = self.host_slot_mut(&key.host) {
+                    slot.composer_error = None;
+                }
+            }
+            Err(failure) => {
+                if let Some(slot) = self.host_slot_mut(&key.host) {
+                    slot.composer_error = Some(format!(
+                        "Couldn't create the task before sending: {}. Your draft was kept.",
+                        failure.message
+                    ));
+                }
+            }
+        }
+    }
+
+    fn settle_ephemeral_task_create(
+        &mut self,
+        host_id: &HostId,
+        action: &NativeActionRecord,
+        success: bool,
+        message: Option<String>,
+        retryable: bool,
+    ) -> bool {
+        let Some(command_id) = native_command_id(&action.command) else {
+            return false;
+        };
+        let Some(key) = self.ephemeral_tasks.iter().find_map(|(key, draft)| {
+            (key.host == *host_id && draft.create_command_id == Some(command_id))
+                .then(|| key.clone())
+        }) else {
+            return false;
+        };
+        if !success && retryable {
+            if let Some(draft) = self.ephemeral_tasks.get_mut(&key) {
+                draft.create_command_id = None;
+                draft.pending_control = None;
+                draft.pending_launch_preferences = None;
+            }
+            if self.pending_select_task.as_ref() == Some(&key) {
+                self.pending_select_task = None;
+            }
+        }
+        if !success {
+            if let Some(slot) = self.host_slot_mut(host_id) {
+                slot.composer_error = Some(message.unwrap_or_else(|| {
+                    if retryable {
+                        "Couldn't create the task before sending. Your draft was kept.".into()
+                    } else {
+                        "Task creation may have reached the host. Reconnect to reconcile it; your draft was kept."
+                            .into()
+                    }
+                }));
+            }
+        }
+        true
+    }
+
+    /// Replace the synthetic composer binding with the host-projected agent,
+    /// carrying the exact draft and staged images forward, then continue the
+    /// original Send gesture through the normal first-message workflow.
+    fn promote_ephemeral_tasks_for_host(&mut self, host_id: &HostId, model: &ClientModel) {
+        let promotions = self
+            .ephemeral_tasks
+            .iter()
+            .filter_map(|(key, draft)| {
+                if key.host != *host_id || draft.create_command_id.is_none() {
+                    return None;
+                }
+                let agent_session_id = model.task(key.task_id)?.primary_agent_id?;
+                Some((
+                    key.clone(),
+                    draft.agent_session_id,
+                    agent_session_id,
+                    draft.pending_control.unwrap_or(ComposerControl::SendNow),
+                    draft.pending_launch_preferences.clone(),
+                ))
+            })
+            .collect::<Vec<_>>();
+        for (key, synthetic_agent, agent_session_id, control, launch_preferences) in promotions {
+            let was_active = self.composer_owner.as_ref() == Some(&key);
+            if was_active {
+                self.cache_current_composer_draft();
+            }
+            let old_draft_key = Self::fleet_draft_key_for(key.clone(), synthetic_agent);
+            let new_draft_key = Self::fleet_draft_key_for(key.clone(), agent_session_id);
+            if let Some(draft) = self.composer_drafts.remove(&old_draft_key) {
+                self.composer_drafts.insert(new_draft_key.clone(), draft);
+            }
+            if let Some(images) = self.composer_images.remove(&old_draft_key) {
+                self.composer_images.insert(new_draft_key, images);
+            }
+            if let Some((provider, options)) = launch_preferences {
+                self.draft_launch_prefs
+                    .insert(key.clone(), (provider, options.clone()));
+                self.layout.task_composer_preferences.insert(
+                    key.center_preference_key(),
+                    TaskComposerPreferences {
+                        provider,
+                        launch_options: options,
+                    },
+                );
+            }
+            self.ephemeral_tasks.remove(&key);
+            self.composer_drafts_dirty = true;
+            self.mark_layout_dirty();
+            if was_active {
+                self.clear_composer_binding();
+                self.composer_owner = Some(key.clone());
+                self.sync_task_composer_for_owner(&key, model);
+                self.activate_composer_control(control);
+            }
+        }
     }
 
     fn new_task_provider_for_owner(&self, host_id: &HostId) -> ProviderKind {
@@ -28694,6 +30508,16 @@ impl NativeShell {
             "native-task-composer-reject" => {
                 self.activate_composer_approval(ApprovalDecision::Reject { reason: None })
             }
+            "native-provider-setup-approve" => {
+                if let Some(owner) = self.selected_task_key.clone() {
+                    self.activate_provider_setup_approval(owner, true);
+                }
+            }
+            "native-provider-setup-reject" => {
+                if let Some(owner) = self.selected_task_key.clone() {
+                    self.activate_provider_setup_approval(owner, false);
+                }
+            }
             "native-add-project-submit" => {
                 if self
                     .add_project
@@ -28822,6 +30646,12 @@ impl NativeShell {
     }
 
     fn task_row_status_for_owner(&self, key: &HostTaskKey) -> Option<VisibleTaskStatus> {
+        if self
+            .host_slot(&key.host)
+            .is_some_and(|slot| slot.provider_setup_approvals.contains_key(&key.task_id))
+        {
+            return Some(VisibleTaskStatus::NeedsApproval);
+        }
         let projected = self
             .host_slot(&key.host)
             .and_then(|slot| slot.inbox.row(key.task_id))
@@ -30002,13 +31832,6 @@ impl NativeShell {
                     .items_center()
                     .justify_center()
                     .bg(Self::modal_backdrop())
-                    .on_mouse_down(
-                        MouseButton::Left,
-                        cx.listener(|shell, _event: &MouseDownEvent, window, cx| {
-                            cx.stop_propagation();
-                            shell.root_editor_focus_handle.focus(window);
-                        }),
-                    )
                     .on_key_down(cx.listener(|shell, event: &KeyDownEvent, window, cx| {
                         cx.stop_propagation();
                         shell.handle_add_project_key(event, window, cx);
@@ -30027,13 +31850,6 @@ impl NativeShell {
                             .flex()
                             .flex_col()
                             .gap(px(tokens.density.spacing.md))
-                            .on_mouse_down(
-                                MouseButton::Left,
-                                cx.listener(|shell, _event: &MouseDownEvent, window, cx| {
-                                    cx.stop_propagation();
-                                    shell.root_editor_focus_handle.focus(window);
-                                }),
-                            )
                             .child(
                                 div()
                                     .text_size(px(tokens.density.typography.heading))
@@ -33153,165 +34969,184 @@ impl NativeShell {
         } else {
             project_choices
         };
-        deferred(
-            anchored()
-                .position(point(px(0.0), px(0.0)))
-                .snap_to_window()
-                .child(
+        div()
+            .id("native-new-task-backdrop")
+            .absolute()
+            .inset_0()
+            .track_focus(&self.root_editor_focus_handle)
+            .tab_stop(true)
+            .occlude()
+            .w(viewport.width)
+            .h(viewport.height)
+            .flex()
+            .items_center()
+            .justify_center()
+            .bg(Self::modal_backdrop())
+            .on_key_down(cx.listener(|shell, event: &KeyDownEvent, window, cx| {
+                cx.stop_propagation();
+                shell.handle_new_task_key(event, window, cx);
+                cx.notify();
+            }))
+            .child(
                 div()
-                    .id("native-new-task-backdrop")
-                    .occlude()
-                    .w(viewport.width)
-                    .h(viewport.height)
+                    .id("native-new-task-dialog")
+                    .w(px(440.0))
+                    .rounded(px(tokens.density.radii.lg))
+                    .bg(tokens.surfaces.raised.to_gpui())
+                    .border(px(1.0))
+                    .border_color(tokens.borders.subtle.to_gpui())
+                    .shadow_sm()
+                    .p(px(tokens.density.spacing.xl))
                     .flex()
-                    .items_center()
-                    .justify_center()
-                    .bg(Self::modal_backdrop())
-                    .on_mouse_down(
-                        MouseButton::Left,
-                        cx.listener(|shell, _event: &MouseDownEvent, window, cx| {
-                            cx.stop_propagation();
-                            shell.root_editor_focus_handle.focus(window);
-                        }),
+                    .flex_col()
+                    .gap(px(tokens.density.spacing.md))
+                    .child(
+                        div()
+                            .text_size(px(tokens.density.typography.heading))
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(tokens.text.primary.to_gpui())
+                            .child("Create task"),
                     )
-                    .on_key_down(cx.listener(|shell, event: &KeyDownEvent, window, cx| {
-                        cx.stop_propagation();
-                        shell.handle_new_task_key(event, window, cx);
-                        cx.notify();
+                    .child(
+                        div()
+                            .text_size(px(tokens.density.typography.caption))
+                            .text_color(tokens.text.muted.to_gpui())
+                            .child("Choose the project this task should start in."),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(tokens.density.typography.caption))
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(tokens.text.muted.to_gpui())
+                            .child("Project"),
+                    )
+                    .child(
+                        div()
+                            .id("native-new-task-projects")
+                            .w_full()
+                            .flex()
+                            .flex_col()
+                            .gap(px(tokens.density.spacing.xs))
+                            .max_h(px(180.0))
+                            .overflow_y_scrollbar()
+                            .children(project_choices.into_iter().map(
+                                |(project_id, label, selected)| {
+                                    let row = div()
+                                        .id((
+                                            "native-new-task-project",
+                                            stable_project_element_key(project_id, "new-task"),
+                                        ))
+                                        .w_full()
+                                        .px(px(tokens.density.spacing.md))
+                                        .py(px(tokens.density.spacing.sm))
+                                        .rounded(px(tokens.density.radii.md))
+                                        .border(px(1.0))
+                                        .border_color(if selected {
+                                            tokens.actions.primary.default.background.to_gpui()
+                                        } else {
+                                            tokens.borders.subtle.to_gpui()
+                                        })
+                                        .bg(if selected {
+                                            tokens.surfaces.selection.to_gpui()
+                                        } else {
+                                            tokens.surfaces.overlay.to_gpui()
+                                        })
+                                        .cursor_pointer()
+                                        .hover(|style| style.bg(tokens.surfaces.hover.to_gpui()))
+                                        .child(label);
+                                    row.on_mouse_down(
+                                        MouseButton::Left,
+                                        cx.listener(
+                                            move |shell, _event: &MouseDownEvent, _window, cx| {
+                                                cx.stop_propagation();
+                                                let local_host = shell.local_host_id();
+                                                if let Some(draft) = shell.new_task.as_mut() {
+                                                    draft.project_key.project_id = project_id;
+                                                    draft.error = None;
+                                                    if draft.project_key.host == local_host {
+                                                        shell.selected_project_id =
+                                                            Some(project_id);
+                                                    }
+                                                }
+                                                cx.notify();
+                                            },
+                                        ),
+                                    )
+                                },
+                            )),
+                    )
+                    .children(error.map(|message| {
+                        div()
+                            .text_size(px(tokens.density.typography.caption))
+                            .text_color(tokens.status.destructive.to_gpui())
+                            .child(message)
                     }))
                     .child(
                         div()
-                            .id("native-new-task-dialog")
-                            .w(px(440.0))
-                            .rounded(px(tokens.density.radii.lg))
-                            .bg(tokens.surfaces.raised.to_gpui())
-                            .border(px(1.0))
-                            .border_color(tokens.borders.subtle.to_gpui())
-                            .shadow_sm()
-                            .p(px(tokens.density.spacing.xl))
                             .flex()
-                            .flex_col()
-                            .gap(px(tokens.density.spacing.md))
-                            .on_mouse_down(
-                                MouseButton::Left,
-                                cx.listener(|shell, _event: &MouseDownEvent, window, cx| {
-                                    cx.stop_propagation();
-                                    shell.root_editor_focus_handle.focus(window);
-                                }),
-                            )
+                            .justify_end()
+                            .gap(px(tokens.density.spacing.sm))
                             .child(
                                 div()
-                                    .text_size(px(tokens.density.typography.heading))
-                                    .font_weight(FontWeight::SEMIBOLD)
-                                    .text_color(tokens.text.primary.to_gpui())
-                                    .child("Create task"),
-                            )
-                            .child(
-                                div()
-                                    .text_size(px(tokens.density.typography.caption))
-                                    .text_color(tokens.text.muted.to_gpui())
-                                    .child("Choose the project this task should start in."),
-                            )
-                            .child(
-                                div()
-                                    .text_size(px(tokens.density.typography.caption))
-                                    .font_weight(FontWeight::SEMIBOLD)
-                                    .text_color(tokens.text.muted.to_gpui())
-                                    .child("Project"),
-                            )
-                            .child(
-                                div()
-                                    .id("native-new-task-projects")
-                                    .w_full()
-                                    .flex()
-                                    .flex_col()
-                                    .gap(px(tokens.density.spacing.xs))
-                                    .max_h(px(180.0))
-                                    .overflow_y_scrollbar()
-                                    .children(project_choices.into_iter().map(
-                                        |(project_id, label, selected)| {
-                                            let row = div().id((
-                                                "native-new-task-project",
-                                                stable_project_element_key(project_id, "new-task"),
-                                            ))
-                                                .w_full()
-                                                .px(px(tokens.density.spacing.md))
-                                                .py(px(tokens.density.spacing.sm))
-                                                .rounded(px(tokens.density.radii.md))
-                                                .border(px(1.0))
-                                                .border_color(if selected {
-                                                    tokens.actions.primary.default.background.to_gpui()
-                                                } else {
-                                                    tokens.borders.subtle.to_gpui()
-                                                })
-                                                .bg(if selected {
-                                                    tokens.surfaces.selection.to_gpui()
-                                                } else {
-                                                    tokens.surfaces.overlay.to_gpui()
-                                                })
-                                                .cursor_pointer()
-                                                .hover(|style| style.bg(tokens.surfaces.hover.to_gpui()))
-                                                .child(label);
-                                            row.on_mouse_down(
-                                                MouseButton::Left,
-                                                cx.listener(move |shell, _event: &MouseDownEvent, _window, cx| {
-                                                    cx.stop_propagation();
-                                                    let local_host = shell.local_host_id();
-                                                    if let Some(draft) = shell.new_task.as_mut() {
-                                                        draft.project_key.project_id = project_id;
-                                                        draft.error = None;
-                                                        if draft.project_key.host == local_host {
-                                                            shell.selected_project_id =
-                                                                Some(project_id);
-                                                        }
-                                                    }
-                                                    cx.notify();
-                                                }),
-                                            )
-                                        },
-                                    )),
-                            )
-                            .children(error.map(|message| {
-                                div()
-                                    .text_size(px(tokens.density.typography.caption))
-                                    .text_color(tokens.status.destructive.to_gpui())
-                                    .child(message)
-                            }))
-                            .child(
-                                div()
-                                    .flex()
-                                    .justify_end()
-                                    .gap(px(tokens.density.spacing.sm))
+                                    .relative()
                                     .child(
                                         Button::new("native-new-task-cancel")
                                             .label("Cancel")
-                                            .ghost()
-                                            .on_click(cx.listener(
-                                                |shell, _event: &ClickEvent, _window, cx| {
-                                                    cx.stop_propagation();
-                                                    shell.new_task = None;
-                                                    cx.notify();
-                                                },
-                                            )),
+                                            .ghost(),
                                     )
+                                    .child(
+                                        div()
+                                            .id("native-new-task-cancel-hit-target")
+                                            .absolute()
+                                            .inset_0()
+                                            .cursor_pointer()
+                                            .on_mouse_down(
+                                                MouseButton::Left,
+                                                cx.listener(
+                                                    |shell,
+                                                     _event: &MouseDownEvent,
+                                                     _window,
+                                                     cx| {
+                                                        cx.stop_propagation();
+                                                        shell.new_task = None;
+                                                        cx.notify();
+                                                    },
+                                                ),
+                                            ),
+                                    ),
+                            )
+                            .child(
+                                div()
+                                    .relative()
                                     .child(
                                         Button::new("native-new-task-submit")
                                             .label("Open task")
-                                            .primary()
-                                            .on_click(cx.listener(
-                                                |shell, _event: &ClickEvent, _window, cx| {
-                                                    cx.stop_propagation();
-                                                    shell.submit_new_task();
-                                                    cx.notify();
-                                                },
-                                            )),
+                                            .primary(),
+                                    )
+                                    .child(
+                                        div()
+                                            .id("native-new-task-submit-hit-target")
+                                            .absolute()
+                                            .inset_0()
+                                            .cursor_pointer()
+                                            .on_mouse_down(
+                                                MouseButton::Left,
+                                                cx.listener(
+                                                    |shell,
+                                                     _event: &MouseDownEvent,
+                                                     _window,
+                                                     cx| {
+                                                        cx.stop_propagation();
+                                                        shell.submit_new_task();
+                                                        cx.notify();
+                                                    },
+                                                ),
+                                            ),
                                     ),
                             ),
                     ),
-            ),
-        )
-        .with_priority(2)
-        .into_any_element()
+            )
+            .into_any_element()
     }
 
     fn render_task_search_overlay(
@@ -34777,8 +36612,13 @@ impl NativeShell {
     }
 
     fn reconcile_browser_dock_lifecycle(&mut self, window: Option<&Window>) {
-        let browser_tab_active =
-            self.local_slot_mut().cockpit.active_tool() == CockpitDockTool::Browser;
+        // A native WebView is an HWND-backed surface above GPUI. It must be
+        // parked while the center terminal owns the canvas (or while a remote
+        // owner is selected); otherwise a late attach/resize can cover the
+        // terminal and intercept every click and keystroke.
+        let browser_tab_active = !self.selected_owner_is_remote()
+            && !self.owner_showing_raw_terminal()
+            && self.local_slot_mut().cockpit.active_tool() == CockpitDockTool::Browser;
         let dock_expanded = !self.layout.dock_collapsed;
         let host_available = self.browser_host.status().available;
         let attached = self
@@ -35038,6 +36878,25 @@ impl NativeShell {
     }
 
     fn pump_pending_browser_commands(&mut self, window: &Window) {
+        // A native browser surface lives above GPUI. Commands captured for a
+        // previously visible Browser dock must not be replayed after the user
+        // changes owner, collapses the dock, or switches the center canvas to
+        // Terminal. Dropping them is intentional: browser chrome commands are
+        // ephemeral UI intent, not durable host actions.
+        let browser_surface_active = !self.selected_owner_is_remote()
+            && !self.owner_showing_raw_terminal()
+            && !self.layout.dock_collapsed
+            && self.local_slot().cockpit.active_tool() == CockpitDockTool::Browser
+            && self.selected_task_key.as_ref().is_some_and(|owner| {
+                owner.host == self.local_host_id()
+                    && self.local_slot().interaction.selected_task() == Some(owner.task_id)
+            })
+            && self.browser_dock_identity().is_some();
+        if !browser_surface_active {
+            self.pending_browser_commands.clear();
+            self.reconcile_browser_dock_lifecycle(Some(window));
+            return;
+        }
         while let Some((workspace_key, command)) = self.pending_browser_commands.pop_front() {
             let bridge = self.browser_bridge.clone();
             let result = bridge.with_locked_host_work_for_command(
@@ -35229,7 +37088,18 @@ impl NativeShell {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> bool {
-        if self.browser_address_focused {
+        if self.composer_selector.is_some() {
+            match event.keystroke.key.as_str() {
+                "escape" => self.dismiss_composer_selector(),
+                "arrowup" | "up" => self.move_composer_selector_highlight(-1),
+                "arrowdown" | "down" => self.move_composer_selector_highlight(1),
+                "enter" => self.confirm_composer_selector_highlight(),
+                _ => return false,
+            }
+            window.prevent_default();
+            cx.notify();
+            true
+        } else if self.browser_address_focused {
             self.handle_browser_address_key(event, window, cx);
             true
         } else if self.add_project.is_some() {
@@ -35627,9 +37497,20 @@ impl NativeShell {
             self.new_task = None;
             return;
         }
-        if key == "enter" {
-            window.prevent_default();
-            self.submit_new_task();
+        match key {
+            "up" => {
+                window.prevent_default();
+                self.cycle_new_task_project(true);
+            }
+            "down" => {
+                window.prevent_default();
+                self.cycle_new_task_project(false);
+            }
+            "enter" => {
+                window.prevent_default();
+                self.submit_new_task();
+            }
+            _ => {}
         }
     }
 
@@ -36311,6 +38192,12 @@ impl NativeShell {
         if !self.layout_dirty {
             return;
         }
+        // An unsent new-task pane is intentionally session-only. Persisting a
+        // layout that names its synthetic TaskId would resurrect a disconnected
+        // task shell on the next launch.
+        if !self.ephemeral_tasks.is_empty() {
+            return;
+        }
         let now = Instant::now();
         let due = force
             || self
@@ -36979,6 +38866,8 @@ impl NativeShell {
                         .any(|row| row.presence == AgentPresence::Checking)
                 });
         let provider_affordance = provider_inbox_affordance(agents_connected, agents_checking);
+        let project_creation_affordance =
+            project_creation_affordance(self.shows_add_project_plus(), provider_affordance);
         let available_agents = self
             .local_slot_mut()
             .agent_connection
@@ -37766,7 +39655,10 @@ impl NativeShell {
         });
         let dismiss = cx.listener(|shell, _action: &NativeDismissTransient, _window, cx| {
             cx.stop_propagation();
-            shell.dispatch_keyboard(KeyboardShortcut::escape());
+            // Escape closes shell-local transient UI even when the selected
+            // task is loading or otherwise cannot admit provider actions.
+            shell.apply_keyboard_shell_effects(KeyboardAction::DismissTransient);
+            cx.notify();
         });
         let dock_changes = cx.listener(|shell, _action: &NativeDockChanges, _window, cx| {
             cx.stop_propagation();
@@ -38232,7 +40124,7 @@ impl NativeShell {
                             .text_color(tokens.actions.primary.default.foreground.to_gpui())
                             .child("New project"),
                     );
-                match provider_affordance {
+                match project_creation_affordance {
                     ProviderInboxAffordance::ConnectedAdd => new_project
                         .on_click(cx.listener(|shell, _event: &ClickEvent, _window, cx| {
                             cx.stop_propagation();
@@ -38307,6 +40199,19 @@ impl NativeShell {
             .h(viewport.height)
             .relative()
             .track_focus(&self.focus_handle)
+            // Selector menus are visually anchored inside the compact composer
+            // controls, but their transient lifetime belongs to the complete
+            // shell. A click anywhere else must dismiss them instead of being
+            // limited to the controls row's small absolute positioning scope.
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|shell, _event: &MouseDownEvent, _window, cx| {
+                    if shell.composer_selector.is_some() {
+                        shell.dismiss_composer_selector();
+                        cx.notify();
+                    }
+                }),
+            )
             .on_key_down(cx.listener(|shell, event: &KeyDownEvent, window, cx| {
                 // Root editors own text before the center terminal. In
                 // particular, a terminal armed by an earlier click must not
@@ -38339,6 +40244,7 @@ impl NativeShell {
                     .clone()
                     .is_some_and(|owner| shell.task_center_terminal_preference(&owner));
                 if root_routes_key_to_terminal(
+                    event.keystroke.key.as_str(),
                     shell.terminal_focus_handle.is_focused(window),
                     shell.terminal_input_is_armed(),
                     center_terminal_visible,
@@ -40042,6 +41948,10 @@ pub(crate) fn run_native_shell_with_runtime(
     )
 }
 
+fn terminal_key_is_task_switcher_shortcut(key: &str, command: bool, shift: bool) -> bool {
+    command && !shift && key.eq_ignore_ascii_case("p")
+}
+
 /// Reopen where the user left the window, but only if that rectangle still
 /// overlaps a connected display. A frame stored on a monitor that is no longer
 /// attached would otherwise open the shell off-screen with no way back.
@@ -40093,6 +42003,8 @@ fn launch_native_shell(
             let host_runtime_for_window = host_runtime;
             let host_state_for_window = host_state;
             let pending_bootstrap_for_window = pending_bootstrap;
+            let shell_slot = Rc::new(RefCell::new(None));
+            let shell_slot_for_window = Rc::clone(&shell_slot);
             let window_bounds = restored_window_bounds(stored_layout, cx);
             let result = cx.open_window(
                 WindowOptions {
@@ -40132,7 +42044,8 @@ fn launch_native_shell(
                         // returns so the first timer tick has a live owner.
                         shell.start_controller(cx);
                     });
-                    entity
+                    *shell_slot_for_window.borrow_mut() = Some(entity.clone());
+                    cx.new(|cx| gpui_component::Root::new(entity, window, cx))
                 },
             );
             match result {
@@ -40148,11 +42061,15 @@ fn launch_native_shell(
                     // therefore too early on Windows. Update the now-registered
                     // window synchronously so revealing it supplies the native
                     // wake that begins the frame and controller loops.
-                    let _ = window_handle.update(cx, |shell, window, _cx| {
-                        shell.platform_accessibility.reveal_window(window);
-                        window.refresh();
-                        window.activate_window();
-                    });
+                    if let Some(shell) = shell_slot.borrow().as_ref().cloned() {
+                        let _ = window_handle.update(cx, |_root, window, cx| {
+                            let _ = shell.update(cx, |shell, _cx| {
+                                shell.platform_accessibility.reveal_window(window);
+                                window.refresh();
+                                window.activate_window();
+                            });
+                        });
+                    }
                     cx.activate(true);
                 }
             }
@@ -40170,7 +42087,7 @@ fn bounded_host_error(message: impl Into<String>) -> String {
 /// provider TUIs. Composer submission owns its own Enter choreography; this
 /// path preserves exactly one interactive key/paste gesture without adding a
 /// newline or launching another provider process.
-fn native_terminal_key_text(keystroke: &gpui::Keystroke) -> Option<String> {
+fn native_terminal_key_text(keystroke: &gpui::Keystroke, app_cursor: bool) -> Option<String> {
     let key = keystroke.key.to_ascii_lowercase();
     let modifiers = keystroke.modifiers;
     let command = modifiers.control || modifiers.platform;
@@ -40192,11 +42109,17 @@ fn native_terminal_key_text(keystroke: &gpui::Keystroke) -> Option<String> {
         "enter" => Some("\r"),
         "tab" => Some("\t"),
         "backspace" => Some("\u{7f}"),
+        "up" if app_cursor => Some("\u{1b}OA"),
         "up" => Some("\u{1b}[A"),
+        "down" if app_cursor => Some("\u{1b}OB"),
         "down" => Some("\u{1b}[B"),
+        "right" if app_cursor => Some("\u{1b}OC"),
         "right" => Some("\u{1b}[C"),
+        "left" if app_cursor => Some("\u{1b}OD"),
         "left" => Some("\u{1b}[D"),
+        "home" if app_cursor => Some("\u{1b}OH"),
         "home" => Some("\u{1b}[H"),
+        "end" if app_cursor => Some("\u{1b}OF"),
         "end" => Some("\u{1b}[F"),
         "pageup" => Some("\u{1b}[5~"),
         "pagedown" => Some("\u{1b}[6~"),
@@ -40297,6 +42220,135 @@ fn overlay_pending_terminal_echo(
         .sort_by_key(|indexed| (indexed.row, indexed.column));
     cursor.column = cursor.column.min(screen.cols.saturating_sub(1));
     screen.cursor = Some(cursor);
+}
+
+fn consume_pending_terminal_echo_prefix(
+    screen: &crate::terminal::session::TerminalScreenSnapshot,
+    pending: &mut PendingTerminalEcho,
+) -> usize {
+    if pending.text.is_empty() || screen.cols == 0 {
+        return 0;
+    }
+    let mut row = pending.anchor_row;
+    let mut column = pending.anchor_column;
+    let mut consumed_scalars = 0usize;
+    let mut consumed_bytes = 0usize;
+    for (byte_index, expected) in pending.text.char_indices() {
+        if row >= screen.rows {
+            break;
+        }
+        let observed = screen
+            .lines
+            .get(row)
+            .and_then(|line| line.get(column))
+            .map(|cell| cell.character)
+            .or_else(|| {
+                screen
+                    .cells
+                    .iter()
+                    .find(|indexed| indexed.row == row && indexed.column == column)
+                    .map(|indexed| indexed.cell.character)
+            });
+        if observed != Some(expected) {
+            break;
+        }
+        consumed_scalars = consumed_scalars.saturating_add(1);
+        consumed_bytes = byte_index.saturating_add(expected.len_utf8());
+        column = column.saturating_add(1);
+        if column >= screen.cols {
+            row = row.saturating_add(1);
+            column = 0;
+        }
+    }
+    if consumed_bytes > 0 {
+        pending.text.drain(..consumed_bytes);
+        pending.anchor_row = row;
+        pending.anchor_column = column;
+    }
+    consumed_scalars
+}
+
+fn terminal_screen_ends_with_before_cursor(
+    screen: &crate::terminal::session::TerminalScreenSnapshot,
+    text: &str,
+) -> bool {
+    let Some(cursor) = screen.cursor else {
+        return false;
+    };
+    if text.is_empty() || screen.cols == 0 || cursor.row >= screen.rows {
+        return false;
+    }
+    let mut row = cursor.row;
+    let mut column = cursor.column;
+    for expected in text.chars().rev() {
+        if column == 0 {
+            if row == 0 {
+                return false;
+            }
+            row -= 1;
+            column = screen.cols;
+        }
+        column -= 1;
+        let observed = screen
+            .lines
+            .get(row)
+            .and_then(|line| line.get(column))
+            .map(|cell| cell.character)
+            .or_else(|| {
+                screen
+                    .cells
+                    .iter()
+                    .find(|indexed| indexed.row == row && indexed.column == column)
+                    .map(|indexed| indexed.cell.character)
+            });
+        if observed != Some(expected) {
+            return false;
+        }
+    }
+    true
+}
+
+fn terminal_projection_ends_with_before_cursor(
+    projection: &crate::domain::TaskTerminalProjection,
+    text: &str,
+) -> bool {
+    let screen = &projection.screen;
+    let Some(cursor) = screen.cursor else {
+        return false;
+    };
+    if !projection.text_lines.is_empty()
+        && cursor.row < projection.text_lines.len()
+        && screen.cols > 0
+        && !text.is_empty()
+    {
+        let mut row = cursor.row;
+        let mut column = cursor.column;
+        let mut matches = true;
+        for expected in text.chars().rev() {
+            if column == 0 {
+                if row == 0 {
+                    matches = false;
+                    break;
+                }
+                row -= 1;
+                column = screen.cols;
+            }
+            column -= 1;
+            if projection
+                .text_lines
+                .get(row)
+                .and_then(|line| line.chars().nth(column))
+                != Some(expected)
+            {
+                matches = false;
+                break;
+            }
+        }
+        if matches {
+            return true;
+        }
+    }
+    terminal_screen_ends_with_before_cursor(screen, text)
 }
 
 fn fetch_idle_conversation_photo() -> Option<Arc<RenderImage>> {
@@ -40667,6 +42719,9 @@ mod tests {
         composer_caret_visible,
         composer_draft_parts,
         composer_provider_identity,
+        composer_waits_for_provider_identity,
+        consume_pending_terminal_echo_prefix,
+        cycle_project_choice,
         decode_idle_conversation_photo_bytes,
         detach_native_composer_images_for_key,
         discard_prepared_native_composer_images,
@@ -40684,7 +42739,10 @@ mod tests {
         overlay_pending_terminal_echo,
         owned_matches_admission,
         prepare_native_composer_image,
+        project_creation_affordance,
         provider_inbox_affordance,
+        provider_setup_resolution_expired,
+        provider_setup_terminal_input_requests,
         publish_projection,
         reap_retained_children,
         reap_retained_workers,
@@ -40710,6 +42768,7 @@ mod tests {
         stable_host_task_row_element_id,
         stale_task_row_routes_key_to_terminal,
         take_retained_action_outcomes,
+        terminal_key_is_task_switcher_shortcut,
         terminal_scroll_lines_from_pixels,
         update_state_from_stage,
         validate_connected_host_for_shell_launch,
@@ -40775,11 +42834,15 @@ mod tests {
         PaletteItem,
         PendingComposerSubmission,
         PendingHostBootstrap,
+        PendingTerminalEcho,
         ProjectActionMenuMode,
         ProjectId,
         ProjectInboxItem,
         ProviderInboxAffordance,
         ProviderKind,
+        ProviderSetupApproval,
+        ProviderSetupApprovalState,
+        ProviderSetupInputCompletion,
         ReaperKind,
         ShellStage,
         TaskComposer,
@@ -40814,6 +42877,7 @@ mod tests {
         NATIVE_SNAPSHOT_PAGE_ITEMS,
         NATIVE_STARTUP_BUDGET,
         PRODUCTION_HOST_PROFILE,
+        PROVIDER_SETUP_RESOLUTION_TIMEOUT,
         REMOTE_RECONNECT_BACKOFF_MAX,
         REMOTE_RECONNECT_BACKOFF_MIN,
         T3_SIDEBAR_NAV_TOP_INSET,
@@ -40838,6 +42902,7 @@ mod tests {
     use crate::host::IpcError;
     use crate::protocol::{Capability, CapabilitySet, FrameLimits, ProfileFingerprint};
     use crate::remote::RemoteImageAttachment;
+    use crate::terminal::protocol::{FocusEpoch as TerminalFocusEpoch, InputAck};
     use crate::ui::components::text_field::{TextField, TextFieldKey};
     use crate::ui::native_fleet::FleetSelectMode;
     use crate::ui::task_cockpit::draft_store::KeyedComposerDraftKey;
@@ -41135,6 +43200,32 @@ mod tests {
     }
 
     #[test]
+    fn workspace_terminal_surface_owns_focus_and_special_keys() {
+        let source = include_str!("native_shell.rs");
+        let start = source
+            .find("    fn task_terminal_surface_for(")
+            .expect("workspace terminal surface");
+        let body = &source[start..];
+        let end = body
+            .find("\n    fn sync_task_composer(")
+            .expect("workspace terminal surface end");
+        let body = &body[..end];
+
+        assert!(
+            body.contains(".track_focus(&self.terminal_focus_handle)"),
+            "the full workspace terminal must own the terminal focus handle"
+        );
+        assert!(
+            body.contains(".capture_any_mouse_down("),
+            "clicking anywhere inside the terminal pane must focus it"
+        );
+        assert!(
+            body.contains(".on_key_down("),
+            "Enter, arrows, escape, and control chords must reach the PTY"
+        );
+    }
+
+    #[test]
     fn missing_provider_projection_is_valid_for_a_first_send() {
         assert_eq!(composer_provider_identity(None), (None, None, None));
     }
@@ -41159,6 +43250,8 @@ mod tests {
             runtime_generation: snapshot.agents[&agent_id].runtime_generation,
             resource_generation: resource.runtime_generation,
             action_epoch: 1,
+            focus_epoch: crate::terminal::protocol::FocusEpoch::initial(),
+            accepted_input_sequence: 0,
             accepts_input_without_conversation_id: true,
             sequence: 1,
             title: None,
@@ -41538,26 +43631,33 @@ mod tests {
     fn native_terminal_keys_cover_provider_tui_navigation_and_text() {
         let key = |source: &str| Keystroke::parse(source).expect("valid keystroke");
         assert_eq!(
-            super::native_terminal_key_text(&key("escape")),
+            super::native_terminal_key_text(&key("escape"), false),
             Some("\u{1b}".into())
         );
         assert_eq!(
-            super::native_terminal_key_text(&key("enter")),
+            super::native_terminal_key_text(&key("enter"), false),
             Some("\r".into())
         );
         assert_eq!(
-            super::native_terminal_key_text(&key("down")),
+            super::native_terminal_key_text(&key("down"), false),
             Some("\u{1b}[B".into())
         );
         assert_eq!(
-            super::native_terminal_key_text(&key("backspace")),
+            super::native_terminal_key_text(&key("down"), true),
+            Some("\u{1b}OB".into())
+        );
+        assert_eq!(
+            super::native_terminal_key_text(&key("backspace"), false),
             Some("\u{7f}".into())
         );
         assert_eq!(
-            super::native_terminal_key_text(&key("ctrl-c")),
+            super::native_terminal_key_text(&key("ctrl-c"), false),
             Some("\u{3}".into())
         );
-        assert_eq!(super::native_terminal_key_text(&key("x")), Some("x".into()));
+        assert_eq!(
+            super::native_terminal_key_text(&key("x"), false),
+            Some("x".into())
+        );
     }
 
     #[test]
@@ -41706,6 +43806,38 @@ mod tests {
         );
     }
 
+    #[test]
+    fn local_project_creation_remains_enabled_without_a_connected_provider() {
+        assert_eq!(
+            project_creation_affordance(true, ProviderInboxAffordance::Checking),
+            ProviderInboxAffordance::ConnectedAdd
+        );
+        assert_eq!(
+            project_creation_affordance(true, ProviderInboxAffordance::DisconnectedAdd),
+            ProviderInboxAffordance::ConnectedAdd
+        );
+        assert_eq!(
+            project_creation_affordance(false, ProviderInboxAffordance::ConnectedAdd),
+            ProviderInboxAffordance::DisconnectedAdd
+        );
+    }
+
+    #[test]
+    fn new_task_project_keyboard_navigation_wraps_all_choices() {
+        let command = ProjectId::new();
+        let devmanager = ProjectId::new();
+        let snake = ProjectId::new();
+        let choices = [command, devmanager, snake];
+
+        assert_eq!(
+            cycle_project_choice(devmanager, &choices, false),
+            Some(snake)
+        );
+        assert_eq!(cycle_project_choice(snake, &choices, false), Some(command));
+        assert_eq!(cycle_project_choice(command, &choices, true), Some(snake));
+        assert_eq!(cycle_project_choice(command, &[], false), None);
+    }
+
     #[derive(Clone)]
     struct TestRuntime {
         shared: Arc<Mutex<TestRuntimeState>>,
@@ -41740,7 +43872,9 @@ mod tests {
             drafts_dirty: false,
             layout_dirty: false,
             remote_settings_open: false,
+            remote_poll_in_flight: false,
             provider_settings_refreshing: false,
+            provider_poll_in_flight: false,
             bootstrap_retry_armed: false,
             since_last_composer_persist: None,
             since_last_layout_persist: None,
@@ -41749,6 +43883,7 @@ mod tests {
             since_last_bootstrap_retry: None,
             since_last_conversation_recovery: Some(Duration::from_millis(0)),
             since_last_caret_toggle: None,
+            next_terminal_requery: None,
         });
         assert!(
             wait >= Duration::from_millis(500),
@@ -41760,6 +43895,58 @@ mod tests {
         );
         assert!(CONTROLLER_IDLE_RECOVERY_INTERVAL >= Duration::from_millis(500));
         assert!(HOST_WORKER_IDLE_WAIT > CONTROLLER_TICK_INTERVAL);
+    }
+
+    #[test]
+    fn controller_deadline_does_not_spin_while_settings_poll_is_in_flight() {
+        let overdue = Duration::from_secs(30);
+        let wait = next_controller_wait(ControllerWaitInputs {
+            composer_focused: false,
+            drafts_dirty: false,
+            layout_dirty: false,
+            remote_settings_open: true,
+            remote_poll_in_flight: true,
+            provider_settings_refreshing: true,
+            provider_poll_in_flight: true,
+            bootstrap_retry_armed: false,
+            since_last_composer_persist: None,
+            since_last_layout_persist: None,
+            since_last_remote_poll: Some(overdue),
+            since_last_provider_poll: Some(overdue),
+            since_last_bootstrap_retry: None,
+            since_last_conversation_recovery: Some(Duration::ZERO),
+            since_last_caret_toggle: None,
+            next_terminal_requery: None,
+        });
+
+        assert!(
+            wait >= Duration::from_millis(500),
+            "an in-flight settings request must be wake-driven instead of 1ms polled: {wait:?}"
+        );
+    }
+
+    #[test]
+    fn pending_terminal_echo_requery_wakes_without_restoring_idle_busy_polling() {
+        let wait = next_controller_wait(ControllerWaitInputs {
+            composer_focused: false,
+            drafts_dirty: false,
+            layout_dirty: false,
+            remote_settings_open: false,
+            remote_poll_in_flight: false,
+            provider_settings_refreshing: false,
+            provider_poll_in_flight: false,
+            bootstrap_retry_armed: false,
+            since_last_composer_persist: None,
+            since_last_layout_persist: None,
+            since_last_remote_poll: None,
+            since_last_provider_poll: None,
+            since_last_bootstrap_retry: None,
+            since_last_conversation_recovery: Some(Duration::ZERO),
+            since_last_caret_toggle: None,
+            next_terminal_requery: Some(super::TERMINAL_ECHO_RETRY_INTERVAL),
+        });
+
+        assert_eq!(wait, super::TERMINAL_ECHO_RETRY_INTERVAL);
     }
 
     #[test]
@@ -42256,6 +44443,17 @@ mod tests {
         with_test_shell_in_app_cx(cx, runtime, |shell, _cx| action(shell))
     }
 
+    fn type_and_send_ephemeral_first_message(shell: &mut NativeShell, text: &str) {
+        let epoch = shell.rearm_composer_focus().expect("ephemeral focus");
+        shell
+            .composer
+            .as_mut()
+            .expect("ephemeral composer")
+            .replace_draft(text, epoch)
+            .expect("ephemeral draft");
+        shell.activate_composer_control(ComposerControl::SendNow);
+    }
+
     fn with_test_shell_in_app_cx<R>(
         cx: &mut gpui::App,
         runtime: TestRuntime,
@@ -42687,9 +44885,9 @@ mod tests {
     }
 
     #[test]
-    fn plus_claude_creates_a_task_with_placeholder_title() {
+    fn plus_claude_opens_an_ephemeral_task_until_first_send() {
         if rerun_headless_shell_test_in_child(
-            "ui::native_shell::tests::plus_claude_creates_a_task_with_placeholder_title",
+            "ui::native_shell::tests::plus_claude_opens_an_ephemeral_task_until_first_send",
         ) {
             return;
         }
@@ -42707,30 +44905,47 @@ mod tests {
                     Some(agent_connection_snapshot(AgentPresence::SignedIn));
                 shell.install_named_folder_for_test("command");
                 shell.dispatch_named_accessibility_action("native-inbox-plus-claude");
-                let create = shared
+                let host_create_count = shared
                     .lock()
                     .expect("test runtime state")
                     .accepted
                     .iter()
-                    .rev()
-                    .find_map(|record| match &record.command {
-                        super::NativeHostCommand::TaskCreateV2 { arguments, .. } => {
-                            Some(arguments.clone())
-                        }
-                        _ => None,
-                    });
-                (create, shell.new_task_overlay_open_for_test())
+                    .filter(|record| {
+                        matches!(
+                            record.command,
+                            super::NativeHostCommand::TaskCreateV2 { .. }
+                        )
+                    })
+                    .count();
+                let selected = shell.selected_task_key.clone();
+                let ephemeral = selected
+                    .as_ref()
+                    .and_then(|key| shell.ephemeral_tasks.get(key))
+                    .map(|draft| (draft.provider_kind, draft.create_command_id));
+                (
+                    host_create_count,
+                    selected,
+                    ephemeral,
+                    shell.new_task_overlay_open_for_test(),
+                )
             });
             *completed_for_app.borrow_mut() = Some(snapshot);
             cx.quit();
         });
-        let (create, overlay_open) = completed
+        let (host_create_count, selected, ephemeral, overlay_open) = completed
             .borrow()
             .clone()
             .expect("inbox agent action snapshot");
-        let create = create.expect("plus Claude dispatches task.create.v2");
-        assert_eq!(create.title, "New Claude task");
-        assert_eq!(create.primary_provider, Some(ProviderKind::ClaudeCode));
+        assert_eq!(host_create_count, 0, "empty tasks must not reach the host");
+        assert!(
+            selected.is_some(),
+            "the ephemeral composer must be selected"
+        );
+        assert_eq!(
+            ephemeral,
+            Some((ProviderKind::ClaudeCode, None)),
+            "the provider choice is retained client-side until first Send"
+        );
         assert!(!overlay_open);
     }
 
@@ -43230,7 +45445,7 @@ mod tests {
                 let expected_moved = (initial + 1) % choices.len();
                 shell.move_composer_selector_highlight(1);
                 let moved = shell.composer_selector_highlight;
-                shell.dismiss_composer_selector();
+                shell.apply_keyboard_shell_effects(super::KeyboardAction::DismissTransient);
                 let dismissed = shell.composer_selector;
                 shell.open_composer_model_selector();
                 shell.confirm_composer_selector_highlight();
@@ -47037,6 +49252,103 @@ mod tests {
         (builder.finish().expect("client model"), task_id)
     }
 
+    fn unstarted_task_client_model_for(
+        task_id: TaskId,
+        project_id: ProjectId,
+        provider_kind: ProviderKind,
+    ) -> crate::client::ClientModel {
+        use crate::client::ClientModelBuilder;
+        use crate::domain::{
+            agent::{AgentRole, AgentSessionFacts, AgentSessionLifecycle},
+            id::{AgentSessionId, EnvironmentId, ResourceId, SnapshotId},
+            resource::{OwnerKind, ResourceFacts, ResourceKind, ResourceLifecycle, ResourceRecipe},
+            snapshot::{SnapshotItem, SnapshotPage, SnapshotSection, TaskSnapshotItem},
+            task::{
+                ReviewReadiness, TaskActivity, TaskAssignment, TaskConnectivity, TaskFacts,
+                TaskLifecycle, WorkspaceRef,
+            },
+        };
+
+        let agent_id = AgentSessionId::new();
+        let resource_id = ResourceId::new();
+        let snapshot_id = SnapshotId::new();
+        let page = |section, items| SnapshotPage {
+            snapshot_id,
+            through_sequence: 1,
+            section,
+            after_item: None,
+            items,
+            encoded_bytes: 1,
+            next_cursor: None,
+        };
+        let mut builder = ClientModelBuilder::new();
+        builder
+            .ingest_page(page(
+                SnapshotSection::Tasks,
+                vec![SnapshotItem::Task(TaskSnapshotItem {
+                    task: TaskFacts {
+                        id: task_id,
+                        environment_id: EnvironmentId::new(),
+                        title: "New Codex task".into(),
+                        description: None,
+                        project_id,
+                        workspace: WorkspaceRef::Main,
+                        assignment: TaskAssignment::LocalOwner,
+                        lifecycle: TaskLifecycle::Open,
+                        action_epoch: 0,
+                        revision: 4,
+                        created_at_ms: 1,
+                    },
+                    connectivity: TaskConnectivity::Connected,
+                    attention: crate::domain::task::TaskAttention::None,
+                    activity: TaskActivity::Idle,
+                    review_readiness: ReviewReadiness::NotReady,
+                    primary_agent_id: Some(agent_id),
+                })],
+            ))
+            .expect("tasks");
+        builder
+            .ingest_page(page(
+                SnapshotSection::AgentSessions,
+                vec![SnapshotItem::AgentSession(AgentSessionFacts {
+                    id: agent_id,
+                    task_id,
+                    role: AgentRole::Primary,
+                    provider_kind,
+                    provider_session_id: None,
+                    lifecycle: AgentSessionLifecycle::Open,
+                    runtime_generation: 1,
+                    revision: 0,
+                })],
+            ))
+            .expect("agents");
+        builder
+            .ingest_page(page(SnapshotSection::Artifacts, Vec::new()))
+            .expect("artifacts");
+        builder
+            .ingest_page(page(
+                SnapshotSection::Resources,
+                vec![SnapshotItem::Resource(ResourceFacts {
+                    id: resource_id,
+                    task_id: Some(task_id),
+                    owner_kind: OwnerKind::Task,
+                    resource_kind: ResourceKind::Terminal,
+                    recipe: ResourceRecipe::Terminal {
+                        cols: 120,
+                        rows: 40,
+                    },
+                    lifecycle: ResourceLifecycle::Active,
+                    runtime_generation: 1,
+                    updated_at_ms: 1,
+                })],
+            ))
+            .expect("resources");
+        builder
+            .ingest_page(page(SnapshotSection::Operations, Vec::new()))
+            .expect("operations");
+        builder.finish().expect("client model")
+    }
+
     fn two_task_terminal_bound_client_model() -> (crate::client::ClientModel, TaskId, TaskId) {
         use crate::client::ClientModelBuilder;
         use crate::domain::{
@@ -47185,11 +49497,11 @@ mod tests {
                 .expect("composer remains visible while provider connects")
                 .availability(ComposerControl::SendNow)
                 .expect("send availability");
-            assert!(!pending.is_available());
-            assert_eq!(
-                pending.reason(),
-                Some("Waiting for the provider conversation to connect")
+            assert!(
+                pending.is_available(),
+                "an unstarted draft must allow first Send so the provider can be launched"
             );
+            assert_eq!(pending.reason(), None);
 
             shell
                 .apply_client_model(Arc::new(ready_model))
@@ -47258,6 +49570,8 @@ mod tests {
             runtime_generation: snapshot.agents[&agent_id].runtime_generation,
             resource_generation: resource.runtime_generation,
             action_epoch: 1,
+            focus_epoch: crate::terminal::protocol::FocusEpoch::initial(),
+            accepted_input_sequence: 0,
             accepts_input_without_conversation_id: true,
             sequence: 1,
             title: None,
@@ -47290,6 +49604,8 @@ mod tests {
                 start_command_id: Some(CommandId::new()),
                 control: ComposerControl::SendNow,
                 attachment_only: false,
+                provider_kind: ProviderKind::Codex,
+                launch_options: crate::providers::ProviderLaunchOptions::default(),
                 stage: super::PendingDraftFirstSendStage::StartAcceptedAwaitingReady,
                 captured_draft: "keep my first message".into(),
                 captured_artifact_ids: Vec::new(),
@@ -47392,7 +49708,7 @@ mod tests {
                         matches!(
                             record.command,
                             NativeHostCommand::TaskCockpitQuery {
-                                query: TaskCockpitQuery::Terminal,
+                                query: TaskCockpitQuery::TerminalReadiness,
                                 ..
                             }
                         )
@@ -47416,6 +49732,8 @@ mod tests {
                                         .runtime_generation,
                                     resource_generation: resource.runtime_generation,
                                     action_epoch: snapshot.task.action_epoch,
+                                    focus_epoch: crate::terminal::protocol::FocusEpoch::initial(),
+                                    accepted_input_sequence: 0,
                                     accepts_input_without_conversation_id: false,
                                     sequence: 7,
                                     title: Some("local-live".into()),
@@ -47741,7 +50059,10 @@ mod tests {
             let send = composer
                 .availability(ComposerControl::SendNow)
                 .expect("send availability");
-            assert!(!send.is_available());
+            assert!(
+                send.is_available(),
+                "an unstarted draft remains editable and sendable before SessionStart"
+            );
             assert_eq!(
                 shell.local_slot_mut().composer_error.as_deref(),
                 None,
@@ -48074,24 +50395,21 @@ mod tests {
                 "Open task must clear the project chooser"
             );
             let accepted = shared.lock().expect("runtime").accepted.clone();
-            assert!(
-                accepted.len() > before
-                    && accepted.iter().any(|record| {
-                        matches!(
-                            record.command,
-                            super::NativeHostCommand::TaskCreateV2 {
-                                arguments: crate::client::action::TaskCreateV2Arguments {
-                                    project_id: id,
-                                    ref title,
-                                    defer_primary_provider_start: true,
-                                    ..
-                                },
-                                ..
-                            } if id == project_id && title == "New task"
-                        )
-                    }),
-                "project-only creation must dispatch a deferred New task shell"
+            assert_eq!(
+                accepted.len(),
+                before,
+                "project selection alone must not persist an empty host task"
             );
+            let ephemeral_key = shell
+                .selected_task_key
+                .clone()
+                .expect("project confirmation selects the ephemeral composer");
+            let ephemeral = shell
+                .ephemeral_tasks
+                .get(&ephemeral_key)
+                .expect("project confirmation owns one ephemeral task");
+            assert_eq!(ephemeral.project_key.project_id, project_id);
+            assert_eq!(ephemeral.create_command_id, None);
 
             shell.begin_task_rename(task_id);
             shell.refresh_accessibility_tree();
@@ -49776,6 +52094,105 @@ mod tests {
     }
 
     #[test]
+    fn new_task_chooser_takes_focus_from_terminal_and_handles_project_keys() {
+        const TEST_NAME: &str =
+            "ui::native_shell::tests::new_task_chooser_takes_focus_from_terminal_and_handles_project_keys";
+        if rerun_headless_shell_test_in_child(TEST_NAME) {
+            return;
+        }
+
+        let completed = std::rc::Rc::new(std::cell::Cell::new(false));
+        let completed_for_app = std::rc::Rc::clone(&completed);
+        gpui::Application::new().run(move |cx| {
+            crate::ui::init(cx);
+            let workspace = tempfile::tempdir().expect("workspace tempdir");
+            let profile = isolated_dev_profile(workspace.path()).expect("isolated profile");
+            let (runtime, _) = TestRuntime::new(true, NativeHostActionResult::Queued);
+            let first_project = ProjectId::new();
+            let second_project = ProjectId::new();
+            let window = cx
+                .open_window(
+                    WindowOptions {
+                        show: false,
+                        ..WindowOptions::default()
+                    },
+                    move |window, cx| {
+                        let entity = cx.new(|cx| {
+                            NativeShell::new_with_host_runtime_port(
+                                profile,
+                                Box::new(runtime),
+                                crate::ui::tokens::RuntimePreferencesSnapshot::default(),
+                                cx,
+                            )
+                        });
+                        entity.update(cx, |shell, cx| {
+                            let snapshot = crate::domain::cockpit::ConfigSidebarSnapshot {
+                                revision: 1,
+                                projects: vec![
+                                    crate::domain::cockpit::ConfigSidebarProject {
+                                        config_id: "project-1".into(),
+                                        label: "First".into(),
+                                        root_configured: true,
+                                        workspace_id: first_project.to_string(),
+                                        folders: Vec::new(),
+                                    },
+                                    crate::domain::cockpit::ConfigSidebarProject {
+                                        config_id: "project-2".into(),
+                                        label: "Second".into(),
+                                        root_configured: true,
+                                        workspace_id: second_project.to_string(),
+                                        folders: Vec::new(),
+                                    },
+                                ],
+                                servers: Vec::new(),
+                                ssh_connections: Vec::new(),
+                                providers: Vec::new(),
+                            };
+                            shell.local_slot_mut().config_sidebar =
+                                crate::ui::task_cockpit::ConfigSidebarProjection::from_host_snapshot(
+                                    &snapshot,
+                                );
+                            shell.terminal_focus_handle.focus(window);
+                            shell.begin_new_task_for_project(first_project);
+                            cx.notify();
+                        });
+                        entity
+                    },
+                )
+                .expect("open hidden new-task window");
+            let entity = window.entity(cx).expect("new-task root entity");
+            let any_window = window.into();
+            cx.refresh_windows();
+
+            cx.update_window(any_window, |_root, window, cx| {
+                assert!(
+                    entity.read(cx).root_editor_focus_handle.is_focused(window),
+                    "opening the project chooser must transfer focus away from the terminal"
+                );
+                assert!(
+                    window.dispatch_keystroke(Keystroke::parse("down").expect("down key"), cx),
+                    "project navigation must be handled by the chooser"
+                );
+            })
+            .expect("dispatch new-task chooser key");
+
+            assert_eq!(
+                entity
+                    .read(cx)
+                    .new_task
+                    .as_ref()
+                    .map(|draft| draft.project_key.project_id),
+                Some(second_project),
+                "Down must select the next project instead of reaching the terminal"
+            );
+
+            completed_for_app.set(true);
+            cx.quit();
+        });
+        assert!(completed.get(), "hidden new-task scenario completed");
+    }
+
+    #[test]
     fn terminal_pointer_focus_dispatches_a_printable_key_in_a_real_window() {
         const TEST_NAME: &str =
             "ui::native_shell::tests::terminal_pointer_focus_dispatches_a_printable_key_in_a_real_window";
@@ -49834,7 +52251,7 @@ mod tests {
                                     matches!(
                                         record.command,
                                         NativeHostCommand::TaskCockpitQuery {
-                                            query: TaskCockpitQuery::Terminal,
+                                            query: TaskCockpitQuery::TerminalReadiness,
                                             ..
                                         }
                                     )
@@ -49858,6 +52275,8 @@ mod tests {
                                                     .runtime_generation,
                                                 resource_generation: resource.runtime_generation,
                                                 action_epoch: snapshot.task.action_epoch,
+                                                focus_epoch: crate::terminal::protocol::FocusEpoch::initial(),
+                                                accepted_input_sequence: 0,
                                                 accepts_input_without_conversation_id: false,
                                                 sequence: 7,
                                                 title: Some("local-live".into()),
@@ -49894,9 +52313,7 @@ mod tests {
             assert!(shared.lock().expect("runtime").accepted.iter().any(|record| {
                 matches!(
                     &record.command,
-                    NativeHostCommand::ProviderInput { action_id, arguments, .. }
-                        if *action_id == crate::client::action::ACTION_PROVIDER_TERMINAL_INPUT
-                            && arguments.text.as_deref() == Some("x")
+                    NativeHostCommand::TerminalInput(request) if request.bytes == b"x"
                 )
             }));
             completed_for_app.set(true);
@@ -49986,6 +52403,75 @@ mod tests {
             .cells
             .iter()
             .any(|indexed| indexed.column == 3 && indexed.cell.character == 'o'));
+    }
+
+    #[test]
+    fn pending_terminal_echo_consumes_only_the_canonical_prefix() {
+        use crate::terminal::session::{
+            TerminalCellSnapshot, TerminalCursorSnapshot, TerminalIndexedCellSnapshot,
+            TerminalScreenSnapshot,
+        };
+        use alacritty_terminal::vte::ansi::CursorShape;
+
+        fn cell(character: char) -> TerminalCellSnapshot {
+            TerminalCellSnapshot {
+                character,
+                zero_width: Vec::new(),
+                foreground: 0,
+                background: 0,
+                bold: false,
+                dim: false,
+                italic: false,
+                underline: false,
+                undercurl: false,
+                strike: false,
+                hidden: false,
+                has_hyperlink: false,
+                default_background: true,
+                default_foreground: true,
+            }
+        }
+
+        let mut line = vec![cell(' '); 8];
+        line[0] = cell('>');
+        line[2] = cell('g');
+        let screen = TerminalScreenSnapshot {
+            cells: vec![
+                TerminalIndexedCellSnapshot {
+                    row: 0,
+                    column: 0,
+                    cell: cell('>'),
+                },
+                TerminalIndexedCellSnapshot {
+                    row: 0,
+                    column: 2,
+                    cell: cell('g'),
+                },
+            ],
+            lines: vec![line],
+            cursor: Some(TerminalCursorSnapshot {
+                row: 0,
+                column: 3,
+                shape: CursorShape::Block,
+            }),
+            rows: 1,
+            cols: 8,
+            ..Default::default()
+        };
+        let mut pending = PendingTerminalEcho {
+            text: "go".into(),
+            after_sequence: 10,
+            anchor_row: 0,
+            anchor_column: 2,
+            unmatched_refreshes: 0,
+        };
+
+        assert_eq!(
+            consume_pending_terminal_echo_prefix(&screen, &mut pending),
+            1
+        );
+        assert_eq!(pending.text, "o");
+        assert_eq!((pending.anchor_row, pending.anchor_column), (0, 3));
     }
 
     #[test]
@@ -50086,14 +52572,22 @@ mod tests {
 
     #[test]
     fn root_key_route_follows_visible_interactive_terminal_mode() {
-        assert!(root_routes_key_to_terminal(true, false, false, true));
-        assert!(root_routes_key_to_terminal(false, true, false, true));
+        assert!(root_routes_key_to_terminal("x", true, false, false, true));
+        assert!(root_routes_key_to_terminal("x", false, true, false, true));
         assert!(
-            root_routes_key_to_terminal(false, false, true, true),
+            root_routes_key_to_terminal("x", false, false, true, true),
             "visible terminal mode must own printable keys even when platform accessibility focus lags on the prior task row"
         );
-        assert!(!root_routes_key_to_terminal(false, false, false, true));
-        assert!(!root_routes_key_to_terminal(true, true, true, false));
+        assert!(
+            !root_routes_key_to_terminal("tab", false, true, true, true),
+            "a merely armed/visible terminal must not steal task-rail focus navigation"
+        );
+        assert!(
+            root_routes_key_to_terminal("tab", true, true, true, true),
+            "a truly focused terminal keeps native Tab completion"
+        );
+        assert!(!root_routes_key_to_terminal("x", false, false, false, true));
+        assert!(!root_routes_key_to_terminal("x", true, true, true, false));
     }
 
     #[test]
@@ -50114,7 +52608,43 @@ mod tests {
             "space", true, true, true
         ));
         assert!(!stale_task_row_routes_key_to_terminal(
+            "tab", true, true, true
+        ));
+        assert!(!stale_task_row_routes_key_to_terminal(
             "x", true, true, false
+        ));
+    }
+
+    #[test]
+    fn focused_terminal_reserves_the_task_switcher_shortcut_for_the_shell() {
+        assert!(terminal_key_is_task_switcher_shortcut("p", true, false));
+        assert!(terminal_key_is_task_switcher_shortcut("P", true, false));
+        assert!(!terminal_key_is_task_switcher_shortcut("p", false, false));
+        assert!(!terminal_key_is_task_switcher_shortcut("p", true, true));
+        assert!(!terminal_key_is_task_switcher_shortcut("c", true, false));
+    }
+
+    #[test]
+    fn unstarted_claude_draft_does_not_wait_for_a_session_created_by_first_send() {
+        assert!(!composer_waits_for_provider_identity(
+            true,
+            crate::providers::ProviderKind::ClaudeCode,
+            false,
+        ));
+        assert!(composer_waits_for_provider_identity(
+            false,
+            crate::providers::ProviderKind::ClaudeCode,
+            false,
+        ));
+        assert!(!composer_waits_for_provider_identity(
+            false,
+            crate::providers::ProviderKind::ClaudeCode,
+            true,
+        ));
+        assert!(!composer_waits_for_provider_identity(
+            false,
+            crate::providers::ProviderKind::Codex,
+            false,
         ));
     }
 
@@ -50138,7 +52668,7 @@ mod tests {
         assert!(
             empty_branch.contains("native-task-conversation-surface")
                 && empty_branch.contains("native-empty-conversation")
-                && empty_branch.contains(".child(composer_footer)"),
+                && empty_branch.contains(".child(conversation_footer)"),
             "zero-row conversations must keep the canonical surface + composer/footer contract"
         );
     }
@@ -50161,6 +52691,58 @@ mod tests {
         assert!(
             !source.contains(duplicate_done),
             "Done belongs only to the unified scroll list"
+        );
+    }
+
+    #[test]
+    fn provider_startup_approval_is_visible_in_every_owner_pane_and_routes_exact_owner() {
+        let source = include_str!("native_shell.rs");
+        let approval_card = source
+            .split("fn provider_setup_approval_card(")
+            .nth(1)
+            .and_then(|tail| tail.split("fn task_conversation_surface_for(").next())
+            .expect("provider setup approval card");
+        assert!(
+            approval_card.contains("native-provider-setup-approval")
+                && approval_card.contains("format!(\"{provider_label} needs approval\")")
+                && approval_card
+                    .contains("activate_provider_setup_approval(approve_owner.clone(), true)")
+                && approval_card
+                    .contains("activate_provider_setup_approval(reject_owner.clone(), false)")
+                && approval_card.contains("native-provider-setup-approval-actions")
+                && approval_card.contains("native-provider-setup-approve-hit-target")
+                && approval_card.contains("native-provider-setup-reject-hit-target")
+                && !approval_card.contains("hold_setup_click")
+                && approval_card.contains(".on_mouse_down(MouseButton::Left, approve_setup)")
+                && approval_card.contains(".on_mouse_down(MouseButton::Left, reject_setup)")
+                && approval_card.contains(".absolute()")
+                && approval_card.contains(".inset_0()")
+                && !approval_card.contains("capture_any_mouse_down")
+                && !approval_card.contains("deferred("),
+            "provider startup approval must keep gpui-component visuals with one stable low-level activation adapter"
+        );
+    }
+
+    #[test]
+    fn new_task_modal_uses_a_stable_component_mouse_adapter() {
+        let source = include_str!("native_shell.rs");
+        let modal = source
+            .split("fn render_new_task_overlay(")
+            .nth(1)
+            .and_then(|tail| tail.split("fn render_task_search_overlay(").next())
+            .expect("new task overlay");
+
+        assert!(
+            modal.contains("Button::new(\"native-new-task-submit\")")
+                && modal.contains("Button::new(\"native-new-task-cancel\")")
+                && modal.contains("native-new-task-cancel-hit-target")
+                && modal.contains("native-new-task-submit-hit-target")
+                && modal.contains(".on_mouse_down(")
+                && modal.contains(".absolute()")
+                && modal.contains(".inset_0()")
+                && !modal.contains("deferred(")
+                && !modal.contains("capture_any_mouse_down"),
+            "new-task buttons must keep gpui-component visuals while a stable parent hit target owns activation across focus-driven rerenders"
         );
     }
 
@@ -52982,6 +55564,43 @@ mod tests {
                 shell
                     .select_fleet_task_key(remote_key.clone(), FleetSelectMode::Replace)
                     .expect("select remote draft");
+                let draft_snapshot = draft_model.task(shared_task).expect("draft snapshot");
+                let draft_agent = draft_snapshot.primary_agent_id.expect("draft agent");
+                let draft_resource = draft_snapshot
+                    .resources
+                    .values()
+                    .find(|resource| {
+                        resource.resource_kind == crate::domain::resource::ResourceKind::Terminal
+                    })
+                    .expect("draft terminal resource");
+                shell
+                    .task_surfaces
+                    .admit_terminal(
+                        remote_key.clone(),
+                        &crate::domain::cockpit::TaskTerminalProjection {
+                            task_id: shared_task,
+                            terminal_id: crate::domain::TerminalId::new(),
+                            session_id: crate::terminal::protocol::TerminalSessionId::new(),
+                            agent_session_id: draft_agent,
+                            resource_id: draft_resource.id,
+                            runtime_generation: draft_snapshot.agents[&draft_agent]
+                                .runtime_generation,
+                            resource_generation: draft_resource.runtime_generation,
+                            action_epoch: draft_snapshot.task.action_epoch,
+                            focus_epoch: crate::terminal::protocol::FocusEpoch::initial(),
+                            accepted_input_sequence: 0,
+                            accepts_input_without_conversation_id: false,
+                            sequence: 1,
+                            title: Some("provider terminal starting".into()),
+                            text_lines: vec!["> ".into()],
+                            screen: Default::default(),
+                        },
+                    )
+                    .expect("interactive provider terminal projection");
+                assert!(
+                    shell.selected_task_is_unstarted_draft_for(&remote_key),
+                    "a terminal surface alone must not bypass the explicit first-send provider launch"
+                );
                 shell.set_composer_model(crate::providers::ProviderModel::CodexTerra);
                 shell.set_composer_reasoning(crate::providers::ProviderReasoningEffort::High);
                 shell.set_composer_access(crate::providers::ProviderAccessMode::ReadOnly);
@@ -53008,6 +55627,19 @@ mod tests {
                     "first-send pending must retain immutable remote owner at probe stage"
                 );
                 assert!(shell.local_slot().pending_draft_first_send.is_none());
+                shell.draft_launch_prefs.insert(
+                    remote_key.clone(),
+                    (
+                        ProviderKind::Codex,
+                        crate::providers::ProviderLaunchOptions {
+                            model: crate::providers::ProviderModel::CodexLuna,
+                            reasoning_effort:
+                                crate::providers::ProviderReasoningEffort::Medium,
+                            access: crate::providers::ProviderAccessMode::FullAccess,
+                            ..crate::providers::ProviderLaunchOptions::default()
+                        },
+                    ),
+                );
                 let probes: Vec<_> = remote_shared
                     .lock()
                     .expect("remote")
@@ -53067,13 +55699,30 @@ mod tests {
                     &remote_host,
                     NativeHostActionOutcome::Queried {
                         action: probe,
-                        detail: "terminal not started".into(),
+                        detail: "unattested terminal placeholder".into(),
                         body: NativeHostQueryBody::TaskCockpit(
-                            crate::domain::TaskCockpitResult::Unavailable {
-                                surface: crate::domain::TaskCockpitSurface::Terminal,
-                                reason:
-                                    crate::domain::TaskCockpitUnavailableReason::TerminalNotStarted,
-                            },
+                            crate::domain::TaskCockpitResult::Terminal(
+                                crate::domain::TaskTerminalProjection {
+                                    task_id: shared_task,
+                                    terminal_id: crate::domain::TerminalId::new(),
+                                    session_id:
+                                        crate::terminal::protocol::TerminalSessionId::new(),
+                                    agent_session_id: draft_agent,
+                                    resource_id: draft_resource.id,
+                                    runtime_generation: draft_snapshot.agents[&draft_agent]
+                                        .runtime_generation,
+                                    resource_generation: draft_resource.runtime_generation,
+                                    action_epoch: draft_snapshot.task.action_epoch,
+                                    focus_epoch:
+                                        crate::terminal::protocol::FocusEpoch::initial(),
+                                    accepted_input_sequence: 0,
+                                    accepts_input_without_conversation_id: false,
+                                    sequence: 2,
+                                    title: Some("provider terminal placeholder".into()),
+                                    text_lines: vec!["> ".into()],
+                                    screen: Default::default(),
+                                },
+                            ),
                         ),
                     },
                 );
@@ -53090,7 +55739,7 @@ mod tests {
                 assert_eq!(
                     starts.len(),
                     1,
-                    "NotStarted probe must dispatch exactly one start"
+                    "an unattested terminal placeholder must dispatch exactly one start"
                 );
                 let NativeHostCommand::ProviderStart { arguments, .. } = &starts[0].command else {
                     unreachable!("filtered to provider start")
@@ -53471,6 +56120,8 @@ mod tests {
                     runtime_generation: snapshot.agents[&agent_id].runtime_generation,
                     resource_generation: resource.runtime_generation,
                     action_epoch: 1,
+                    focus_epoch: crate::terminal::protocol::FocusEpoch::initial(),
+                    accepted_input_sequence: 0,
                     accepts_input_without_conversation_id: true,
                     sequence: 1,
                     title: None,
@@ -53496,7 +56147,7 @@ mod tests {
                     .expect("draft");
                 let remote_key = HostTaskKey::new(remote_host.clone(), task_id);
                 shell
-                    .select_fleet_task_key(remote_key, FleetSelectMode::Replace)
+                    .select_fleet_task_key(remote_key.clone(), FleetSelectMode::Replace)
                     .expect("select");
                 let focus = shell
                     .host_slot(&remote_host)
@@ -53584,9 +56235,9 @@ mod tests {
     }
 
     #[test]
-    fn first_send_trust_screen_holds_draft_without_send() {
+    fn first_send_trust_screen_presents_approval_and_keeps_pending_send() {
         if rerun_headless_shell_test_in_child(
-            "ui::native_shell::tests::first_send_trust_screen_holds_draft_without_send",
+            "ui::native_shell::tests::first_send_trust_screen_presents_approval_and_keeps_pending_send",
         ) {
             return;
         }
@@ -53636,7 +56287,7 @@ mod tests {
                     .expect("draft");
                 let remote_key = HostTaskKey::new(remote_host.clone(), task_id);
                 shell
-                    .select_fleet_task_key(remote_key, FleetSelectMode::Replace)
+                    .select_fleet_task_key(remote_key.clone(), FleetSelectMode::Replace)
                     .expect("select");
                 let focus = shell
                     .host_slot(&remote_host)
@@ -53701,23 +56352,232 @@ mod tests {
                 let pending = shell
                     .host_slot(&remote_host)
                     .and_then(|slot| slot.pending_draft_first_send.clone());
-                (sends, draft, error, pending.is_some())
+                let approval = shell
+                    .host_slot(&remote_host)
+                    .and_then(|slot| slot.provider_setup_approvals.get(&task_id))
+                    .cloned();
+                let status = shell.task_row_status_for_owner(&remote_key);
+                shell.refresh_accessibility_tree();
+                let accessibility_ids = shell
+                    .accessibility_tree
+                    .gpui_nodes()
+                    .into_iter()
+                    .map(|node| node.element_id)
+                    .collect::<std::collections::HashSet<_>>();
+                let approval_accessible = accessibility_ids
+                    .contains("native-provider-setup-approval")
+                    && accessibility_ids.contains("native-provider-setup-reject")
+                    && accessibility_ids.contains("native-provider-setup-approve");
+                let setup_command_id = CommandId::new();
+                let completion: ProviderSetupInputCompletion = Arc::new(Mutex::new(Some(Ok(
+                    InputAck::Accepted { sequence: 1 },
+                ))));
+                if let Some(slot) = shell.host_slot_mut(&remote_host) {
+                    slot.provider_setup_approvals.insert(
+                        task_id,
+                        ProviderSetupApproval {
+                            owner: remote_key.clone(),
+                            state: ProviderSetupApprovalState::Resolving {
+                                command_id: setup_command_id,
+                                allow: true,
+                                started_at: Instant::now(),
+                            },
+                        },
+                    );
+                    slot.provider_setup_input_completions
+                        .insert(task_id, completion);
+                }
+                let resolving = shell
+                    .host_slot(&remote_host)
+                    .and_then(|slot| slot.provider_setup_approvals.get(&task_id))
+                    .map(|approval| approval.state.clone());
+                assert!(shell.settle_provider_setup_input_completions());
+                let approval_after_receipt = shell
+                    .host_slot(&remote_host)
+                    .and_then(|slot| slot.provider_setup_approvals.get(&task_id))
+                    .map(|approval| approval.state.clone());
+                let pending_after_receipt = shell
+                    .host_slot(&remote_host)
+                    .is_some_and(|slot| slot.pending_draft_first_send.is_some());
+                (
+                    sends,
+                    draft,
+                    error,
+                    pending.is_some(),
+                    approval,
+                    status,
+                    approval_accessible,
+                    remote_key,
+                    resolving,
+                    setup_command_id,
+                    approval_after_receipt,
+                    pending_after_receipt,
+                )
             });
             *report_slot.borrow_mut() = Some(observed);
             drop(entity);
             cx.quit();
         });
-        let (sends, draft, error, pending) = report.borrow_mut().take().expect("report");
+        let (
+            sends,
+            draft,
+            error,
+            pending,
+            approval,
+            status,
+            approval_accessible,
+            remote_key,
+            resolving,
+            setup_command_id,
+            approval_after_receipt,
+            pending_after_receipt,
+        ) = report.borrow_mut().take().expect("report");
         assert_eq!(sends, 0, "trust screen must produce zero provider writes");
         assert_eq!(draft, "held on trust");
         assert_eq!(
-            error.as_deref(),
-            Some(super::codex_provider_setup_composer_error())
+            error, None,
+            "approval is a task state, not a composer error"
         );
         assert!(
-            !pending,
-            "setup-required hold must release the pending first-send workflow"
+            pending,
+            "the accepted Send gesture must remain parked until the user decides"
         );
+        let approval = approval.expect("provider setup approval");
+        assert_eq!(approval.owner, remote_key);
+        assert_eq!(approval.state, super::ProviderSetupApprovalState::Waiting);
+        assert_eq!(status, Some(VisibleTaskStatus::NeedsApproval));
+        assert!(
+            approval_accessible,
+            "workspace trust decision must be exposed to accessibility actions"
+        );
+        assert!(matches!(
+            resolving,
+            Some(super::ProviderSetupApprovalState::Resolving {
+                command_id,
+                allow: true,
+                ..
+            }) if command_id == setup_command_id
+        ));
+        assert!(
+            matches!(
+                approval_after_receipt,
+                Some(super::ProviderSetupApprovalState::Resolving {
+                    command_id,
+                    allow: true,
+                    ..
+                }) if command_id == setup_command_id
+            ),
+            "accepted PTY write must keep the card single-flight until the provider consumes it",
+        );
+        assert!(
+            pending_after_receipt,
+            "accepted trust must resume the original parked send workflow"
+        );
+    }
+
+    #[test]
+    fn provider_setup_resolution_is_bounded() {
+        let now = Instant::now();
+        let state = ProviderSetupApprovalState::Resolving {
+            command_id: CommandId::new(),
+            allow: true,
+            started_at: now - PROVIDER_SETUP_RESOLUTION_TIMEOUT,
+        };
+        assert!(provider_setup_resolution_expired(&state, now));
+        assert!(!provider_setup_resolution_expired(
+            &ProviderSetupApprovalState::Waiting,
+            now,
+        ));
+    }
+
+    #[test]
+    fn provider_setup_input_uses_exact_terminal_fences_without_conversation_binding() {
+        let task_id = TaskId::new();
+        let agent_session_id = crate::domain::AgentSessionId::new();
+        let resource_id = crate::domain::ResourceId::new();
+        let terminal_id = crate::domain::TerminalId::new();
+        let session_id = crate::terminal::protocol::TerminalSessionId::new();
+        let client_id = ClientId::new();
+        let terminal = crate::domain::TaskTerminalProjection {
+            task_id,
+            terminal_id,
+            session_id,
+            agent_session_id,
+            resource_id,
+            runtime_generation: 17,
+            resource_generation: 23,
+            action_epoch: 31,
+            focus_epoch: TerminalFocusEpoch::from_raw(29).expect("focus"),
+            accepted_input_sequence: 41,
+            accepts_input_without_conversation_id: false,
+            sequence: 7,
+            title: Some("Codex trust".into()),
+            text_lines: vec!["Do you trust this directory?".into()],
+            screen: Default::default(),
+        };
+
+        let approve =
+            provider_setup_terminal_input_requests(client_id, &terminal, ProviderKind::Codex, true)
+                .expect("approval requests");
+        assert_eq!(approve.len(), 1);
+        for request in &approve {
+            request.validate().expect("valid request");
+            assert_eq!(request.client_id, client_id);
+            assert_eq!(request.terminal_id, terminal_id);
+            assert_eq!(request.context.task_id, task_id);
+            assert_eq!(request.context.agent_session_id, agent_session_id);
+            assert_eq!(request.context.resource_id, resource_id);
+            assert_eq!(request.context.runtime_generation, 17);
+            assert_eq!(request.context.resource_generation, 23);
+            assert_eq!(request.context.terminal_generation.get(), 23);
+            assert_eq!(request.context.focus_epoch.get(), 29);
+            assert_eq!(request.context.action_epoch, 31);
+        }
+        assert_eq!(approve[0].context.input_sequence, 42);
+        assert_eq!(approve[0].bytes, b"\r");
+
+        let reject = provider_setup_terminal_input_requests(
+            client_id,
+            &terminal,
+            ProviderKind::Codex,
+            false,
+        )
+        .expect("rejection requests");
+        assert_eq!(reject.len(), 2);
+        assert_eq!(reject[0].bytes, b"\x1b[B");
+        assert_eq!(reject[1].bytes, b"\r");
+
+        let claude_approve = provider_setup_terminal_input_requests(
+            client_id,
+            &terminal,
+            ProviderKind::ClaudeCode,
+            true,
+        )
+        .expect("Claude approval requests");
+        assert_eq!(claude_approve.len(), 2);
+        assert_eq!(claude_approve[0].context.input_sequence, 42);
+        assert_eq!(claude_approve[0].bytes, b"\x1b[B");
+        assert_eq!(claude_approve[1].context.input_sequence, 43);
+        assert_eq!(claude_approve[1].bytes, b"\r");
+        let mut app_cursor_terminal = terminal.clone();
+        app_cursor_terminal.screen.mode.app_cursor = true;
+        let app_cursor_approve = provider_setup_terminal_input_requests(
+            client_id,
+            &app_cursor_terminal,
+            ProviderKind::ClaudeCode,
+            true,
+        )
+        .expect("Claude application-cursor approval requests");
+        assert_eq!(app_cursor_approve[0].bytes, b"\x1bOB");
+        let claude_reject = provider_setup_terminal_input_requests(
+            client_id,
+            &terminal,
+            ProviderKind::ClaudeCode,
+            false,
+        )
+        .expect("Claude rejection requests");
+        assert_eq!(claude_reject.len(), 1);
+        assert_eq!(claude_reject[0].bytes, b"\r");
     }
 
     #[test]
@@ -53828,36 +56688,54 @@ mod tests {
                         .host_slot(&remote_host)
                         .is_some_and(|slot| slot.pending_draft_first_send.is_some()),
                     shell.local_slot().pending_draft_first_send.is_some(),
+                    shell
+                        .host_slot(&remote_host)
+                        .is_some_and(|slot| slot.provider_setup_approvals.contains_key(&task_id)),
+                    shell
+                        .local_slot()
+                        .provider_setup_approvals
+                        .contains_key(&task_id),
                 )
             });
             *report_slot.borrow_mut() = Some(observed);
             drop(entity);
             cx.quit();
         });
-        let (remote_error, local_error, remote_pending, local_pending) =
-            report.borrow_mut().take().expect("report");
-        assert_eq!(
-            remote_error.as_deref(),
-            Some(super::codex_provider_setup_composer_error())
-        );
+        let (
+            remote_error,
+            local_error,
+            remote_pending,
+            local_pending,
+            remote_approval,
+            local_approval,
+        ) = report.borrow_mut().take().expect("report");
+        assert!(remote_error.is_none());
         assert!(
             local_error.is_none(),
             "local host must not inherit remote trust hold"
         );
         assert!(
-            !remote_pending,
-            "remote setup hold must not keep a pending first-send"
+            remote_pending,
+            "remote setup approval must keep the exact pending first-send"
         );
         assert!(
             !local_pending,
             "local host must not gain remote pending state"
         );
+        assert!(
+            remote_approval,
+            "remote owner must receive the approval card"
+        );
+        assert!(
+            !local_approval,
+            "local owner must not receive the remote card"
+        );
     }
 
     #[test]
-    fn codex_setup_hold_requires_fresh_send_after_trust_completes() {
+    fn codex_setup_hold_waits_for_explicit_approval_without_polling() {
         if rerun_headless_shell_test_in_child(
-            "ui::native_shell::tests::codex_setup_hold_requires_fresh_send_after_trust_completes",
+            "ui::native_shell::tests::codex_setup_hold_waits_for_explicit_approval_without_polling",
         ) {
             return;
         }
@@ -53984,10 +56862,10 @@ mod tests {
         let (sends, draft, pending) = report.borrow_mut().take().expect("report");
         assert_eq!(
             sends, 0,
-            "setup hold must not auto-submit after trust completes"
+            "setup hold must not poll or submit before the user decides"
         );
         assert_eq!(draft, "still mine after trust");
-        assert!(!pending, "setup hold must require a fresh Send gesture");
+        assert!(pending, "the original Send gesture must remain parked");
     }
 
     #[test]
@@ -55243,6 +58121,7 @@ mod tests {
                     shared_project,
                 ));
                 shell.submit_new_task();
+                type_and_send_ephemeral_first_message(shell, "create on captured remote owner");
                 let remote_creates = remote_shared
                     .lock()
                     .expect("remote")
@@ -55306,6 +58185,168 @@ mod tests {
     }
 
     #[test]
+    fn new_task_project_confirmation_opens_ephemeral_composer_without_host_create() {
+        if rerun_headless_shell_test_in_child(
+            "ui::native_shell::tests::new_task_project_confirmation_opens_ephemeral_composer_without_host_create",
+        ) {
+            return;
+        }
+        let (runtime, shared) = TestRuntime::new(true, NativeHostActionResult::Queued);
+        gpui::Application::headless().run(move |cx| {
+            crate::ui::init(cx);
+            with_test_shell_in_app(cx, runtime, |shell| {
+                let (model, task_id) = terminal_bound_client_model();
+                let project_id = model.task(task_id).expect("fixture task").task.project_id;
+                shell.install_project_for_test("ephemeral-project", project_id);
+                let model = Arc::new(model);
+                shell.apply_client_model(Arc::clone(&model)).expect("model");
+                let fixture_owner = HostTaskKey::new(shell.local_host_id(), task_id);
+                shell.composer_owner = Some(fixture_owner.clone());
+                shell.selected_task_key = Some(fixture_owner.clone());
+                shell.draft_launch_prefs.insert(
+                    fixture_owner,
+                    (
+                        ProviderKind::Codex,
+                        crate::providers::ProviderLaunchOptions::default(),
+                    ),
+                );
+                shell.layout.composer_provider = Some(ProviderKind::Codex);
+                shell.layout.composer_launch_options =
+                    Some(crate::providers::ProviderLaunchOptions {
+                        model: crate::providers::ProviderModel::CodexTerra,
+                        reasoning_effort: crate::providers::ProviderReasoningEffort::High,
+                        ..crate::providers::ProviderLaunchOptions::default()
+                    });
+
+                let creates_before = shared
+                    .lock()
+                    .expect("shared")
+                    .accepted
+                    .iter()
+                    .filter(|record| {
+                        matches!(record.command, NativeHostCommand::TaskCreateV2 { .. })
+                    })
+                    .count();
+                shell.begin_new_task_for_project(project_id);
+                shell.submit_new_task();
+                let creates_after = shared
+                    .lock()
+                    .expect("shared")
+                    .accepted
+                    .iter()
+                    .filter(|record| {
+                        matches!(record.command, NativeHostCommand::TaskCreateV2 { .. })
+                    })
+                    .count();
+
+                assert_eq!(
+                    creates_after, creates_before,
+                    "choosing a project must not persist a task before its first message"
+                );
+                assert!(shell.new_task.is_none(), "project chooser closes");
+                assert!(shell.selected_task_key.is_some(), "draft pane is selected");
+                assert!(shell.composer.is_some(), "draft pane has a real composer");
+                let draft_owner = shell.composer_owner.clone().expect("draft owner");
+                let draft_preferences = shell
+                    .draft_launch_prefs
+                    .get(&draft_owner)
+                    .expect("new task launch preferences");
+                assert_eq!(
+                    draft_preferences.1.model,
+                    crate::providers::ProviderModel::CodexTerra,
+                    "a previous task's immutable model must not override the new-task default"
+                );
+                assert_eq!(
+                    draft_preferences.1.reasoning_effort,
+                    crate::providers::ProviderReasoningEffort::High
+                );
+                shell
+                    .apply_client_model(Arc::clone(&model))
+                    .expect("late canonical refresh");
+                assert!(
+                    shell.ephemeral_tasks.contains_key(&draft_owner)
+                        && shell.composer_owner.as_ref() == Some(&draft_owner),
+                    "a late canonical snapshot must preserve the unsent ephemeral pane"
+                );
+                type_and_send_ephemeral_first_message(shell, "first message creates this task");
+                let captured_launch = shell
+                    .ephemeral_tasks
+                    .get(&draft_owner)
+                    .and_then(|draft| draft.pending_launch_preferences.as_ref())
+                    .expect("first Send captures launch preferences");
+                assert_eq!(captured_launch.0, ProviderKind::Codex);
+                assert_eq!(
+                    captured_launch.1.model,
+                    crate::providers::ProviderModel::CodexTerra
+                );
+                assert_eq!(
+                    captured_launch.1.reasoning_effort,
+                    crate::providers::ProviderReasoningEffort::High
+                );
+                let creates_after_send = shared
+                    .lock()
+                    .expect("shared")
+                    .accepted
+                    .iter()
+                    .filter(|record| {
+                        matches!(record.command, NativeHostCommand::TaskCreateV2 { .. })
+                    })
+                    .count();
+                assert_eq!(
+                    creates_after_send,
+                    creates_before + 1,
+                    "the first message admits exactly one durable create"
+                );
+                assert_eq!(
+                    shell.composer.as_ref().expect("composer").draft_text(),
+                    "first message creates this task",
+                    "create admission must preserve the draft until the real send settles"
+                );
+
+                let promoted_model = Arc::new(unstarted_task_client_model_for(
+                    draft_owner.task_id,
+                    project_id,
+                    ProviderKind::Codex,
+                ));
+                shell
+                    .apply_client_model(Arc::clone(&promoted_model))
+                    .expect("created task projection");
+                let pending = shell
+                    .local_slot()
+                    .pending_draft_first_send
+                    .as_ref()
+                    .expect("promotion must own the original Send gesture");
+                assert_eq!(pending.owner, draft_owner);
+                assert_eq!(
+                    pending.stage,
+                    super::PendingDraftFirstSendStage::AwaitingRuntimeProbe
+                );
+                assert_eq!(
+                    pending.launch_options.model,
+                    crate::providers::ProviderModel::CodexTerra
+                );
+                assert_eq!(
+                    pending.launch_options.reasoning_effort,
+                    crate::providers::ProviderReasoningEffort::High
+                );
+                assert!(
+                    shared
+                        .lock()
+                        .expect("shared")
+                        .accepted
+                        .iter()
+                        .all(|record| !matches!(
+                            record.command,
+                            NativeHostCommand::ProviderInput { .. }
+                        )),
+                    "promotion must not fall through to ordinary provider input"
+                );
+            });
+            cx.quit();
+        });
+    }
+
+    #[test]
     fn owner_remote_lifecycle_create_rename_delete_routes_and_fences() {
         if rerun_headless_shell_test_in_child(
             "ui::native_shell::tests::owner_remote_lifecycle_create_rename_delete_routes_and_fences",
@@ -55359,6 +58400,7 @@ mod tests {
                     Some(host_a.clone())
                 );
                 shell.submit_new_task();
+                type_and_send_ephemeral_first_message(shell, "remote A first message");
                 assert!(remote_a.lock().expect("a").accepted.iter().any(|record| {
                     matches!(record.command, NativeHostCommand::TaskCreateV2 { .. })
                 }));
@@ -55871,11 +58913,9 @@ mod tests {
                 assert!(shell.pending_select_task.is_none());
 
                 // --- 2: Accepted envelope + Rejected receipt ---
-                // TestRuntime enqueue leaves fleet_admission=None. Production remote
-                // settle_composer_submission_for_owner reports that gap before any
-                // Rejected draft message. Keep that guard; inject a fixture
-                // FleetAdmission only for the rejection-display scenarios below
-                // (real HostFleet ack coverage is owner_non_local_rejected_receipt…).
+                // TestRuntime enqueue leaves fleet_admission=None. Ephemeral create
+                // settlement is command/owner-correlated before ordinary composer
+                // admission settlement because no message has reached the provider.
                 if let Some(slot) = shell.host_slot_mut(&host_a) {
                     slot.composer_error = None;
                 }
@@ -55884,6 +58924,7 @@ mod tests {
                     shared_project,
                 ));
                 shell.submit_new_task();
+                type_and_send_ephemeral_first_message(shell, "rejected create keeps this draft");
                 let create_action = remote_a
                     .lock()
                     .expect("a")
@@ -55916,8 +58957,8 @@ mod tests {
                     shell
                         .host_slot(&host_a)
                         .and_then(|slot| slot.composer_error.as_ref())
-                        .is_some_and(|message| message.contains("missing fleet admission")),
-                    "remote Rejected without admission must surface the missing-admission guard"
+                        .is_some_and(|message| message.contains("rejected")),
+                    "remote Rejected create must surface the owner failure and keep the draft"
                 );
                 if let Some(slot) = shell.host_slot_mut(&host_a) {
                     slot.composer_error = None;
@@ -55934,6 +58975,7 @@ mod tests {
                     shared_project,
                 ));
                 shell.submit_new_task();
+                type_and_send_ephemeral_first_message(shell, "second rejected create draft");
                 let mut create_action = remote_a
                     .lock()
                     .expect("a")
@@ -59168,7 +62210,7 @@ mod tests {
                         matches!(
                             record.command,
                             NativeHostCommand::TaskCockpitQuery {
-                                query: TaskCockpitQuery::Terminal,
+                                query: TaskCockpitQuery::TerminalReadiness,
                                 ..
                             }
                         )
@@ -59228,7 +62270,12 @@ mod tests {
         gpui::Application::headless().run(move |cx| {
             crate::ui::init(cx);
             with_test_shell_in_app(cx, runtime, |shell| {
-                let (model, task_id) = terminal_bound_client_model();
+                let (model, task_id) = terminal_bound_client_model_with_kind_provider_at_epoch(
+                    crate::domain::task::TaskAttention::None,
+                    ProviderKind::Codex,
+                    None,
+                    1,
+                );
                 let model = Arc::new(model);
                 let snapshot = model.task(task_id).expect("task").clone();
                 let agent_id = snapshot.primary_agent_id.expect("agent");
@@ -59274,6 +62321,8 @@ mod tests {
                     runtime_generation: snapshot.agents[&agent_id].runtime_generation,
                     resource_generation: resource.runtime_generation,
                     action_epoch: 1,
+                    focus_epoch: crate::terminal::protocol::FocusEpoch::initial(),
+                    accepted_input_sequence: 0,
                     accepts_input_without_conversation_id: false,
                     sequence: 3,
                     title: Some("remote-display".into()),
@@ -59302,6 +62351,57 @@ mod tests {
                         .is_some()),
                     "owner dock must retain the replica binding"
                 );
+                let setup_action = shell
+                    .dispatch_action_recorded_for_owner(
+                        &remote_host,
+                        ActionRequest::TaskCockpit {
+                            task_id,
+                            query: TaskCockpitQuery::Terminal,
+                        },
+                    )
+                    .expect("setup terminal query");
+                let setup_terminal = crate::domain::cockpit::TaskTerminalProjection {
+                    task_id,
+                    terminal_id: crate::domain::TerminalId::new(),
+                    session_id: crate::terminal::protocol::TerminalSessionId::new(),
+                    agent_session_id: agent_id,
+                    resource_id: resource.id,
+                    runtime_generation: snapshot.agents[&agent_id].runtime_generation,
+                    resource_generation: resource.runtime_generation,
+                    action_epoch: 1,
+                    focus_epoch: crate::terminal::protocol::FocusEpoch::initial(),
+                    accepted_input_sequence: 0,
+                    accepts_input_without_conversation_id: false,
+                    sequence: 4,
+                    title: Some("remote-display".into()),
+                    text_lines: vec![
+                        "Do you trust the contents of this directory?".into(),
+                        "1. Yes, continue".into(),
+                        "2. No, quit".into(),
+                        "Press enter to continue".into(),
+                    ],
+                    screen: Default::default(),
+                };
+                shell.apply_epoch_fenced_action_outcome_for_host(
+                    &remote_host,
+                    NativeHostActionOutcome::Queried {
+                        action: setup_action,
+                        detail: "terminal setup".into(),
+                        body: NativeHostQueryBody::TaskCockpit(
+                            crate::domain::TaskCockpitResult::Terminal(setup_terminal),
+                        ),
+                    },
+                );
+                assert!(
+                    shell
+                        .host_slot(&remote_host)
+                        .is_some_and(|slot| slot.provider_setup_approvals.contains_key(&task_id)),
+                    "a live trust screen must reconstruct the owner approval after UI restart"
+                );
+                assert_eq!(
+                    shell.task_row_status_for_owner(&owner),
+                    Some(VisibleTaskStatus::NeedsApproval)
+                );
                 let before_local = local_shared.lock().expect("local").accepted.len();
                 assert!(
                     !shell.dispatch_provider_terminal_text("should-not-send".into()),
@@ -59318,9 +62418,9 @@ mod tests {
     }
 
     #[test]
-    fn local_terminal_input_between_turns_dispatches_and_requests_an_immediate_screen_refresh() {
+    fn local_terminal_input_between_turns_dispatches_exact_pty_request_without_session_binding() {
         if rerun_headless_shell_test_in_child(
-            "ui::native_shell::tests::local_terminal_input_between_turns_dispatches_and_requests_an_immediate_screen_refresh",
+            "ui::native_shell::tests::local_terminal_input_between_turns_dispatches_exact_pty_request_without_session_binding",
         ) {
             return;
         }
@@ -59340,6 +62440,12 @@ mod tests {
                     })
                     .expect("terminal resource")
                     .clone();
+                // Provider-terminal action epochs are owned by the live PTY
+                // runtime; they are not the task's durable mutation epoch.
+                let terminal_action_epoch = snapshot.task.action_epoch.saturating_add(7);
+                let terminal_id = crate::domain::TerminalId::new();
+                let terminal_session_id =
+                    crate::terminal::protocol::TerminalSessionId::new();
                 shell.apply_client_model(Arc::clone(&model)).expect("model");
                 let owner = HostTaskKey::new(shell.local_host_id(), task_id);
                 shell
@@ -59356,7 +62462,7 @@ mod tests {
                         matches!(
                             record.command,
                             NativeHostCommand::TaskCockpitQuery {
-                                query: TaskCockpitQuery::Terminal,
+                                query: TaskCockpitQuery::TerminalReadiness,
                                 ..
                             }
                         )
@@ -59372,15 +62478,16 @@ mod tests {
                             crate::domain::TaskCockpitResult::Terminal(
                                 crate::domain::cockpit::TaskTerminalProjection {
                                     task_id,
-                                    terminal_id: crate::domain::TerminalId::new(),
-                                    session_id:
-                                        crate::terminal::protocol::TerminalSessionId::new(),
+                                    terminal_id,
+                                    session_id: terminal_session_id,
                                     agent_session_id: agent_id,
                                     resource_id: resource.id,
                                     runtime_generation: snapshot.agents[&agent_id]
                                         .runtime_generation,
                                     resource_generation: resource.runtime_generation,
-                                    action_epoch: snapshot.task.action_epoch,
+                                    action_epoch: terminal_action_epoch,
+                                    focus_epoch: crate::terminal::protocol::FocusEpoch::initial(),
+                                    accepted_input_sequence: 0,
                                     accepts_input_without_conversation_id: false,
                                     sequence: 7,
                                     title: Some("local-live".into()),
@@ -59409,7 +62516,21 @@ mod tests {
                     shell.selected_center_terminal_is_interactive(),
                     "focus and keyboard routing must follow the restored center terminal rather than the independent dock mode"
                 );
+                assert!(
+                    shell.local_slot_mut().interaction.sync_selected_task(None),
+                    "fixture must reproduce a restored pane whose global owner is selected before the host interaction catches up"
+                );
+                assert_eq!(shell.selected_task_key.as_ref(), Some(&owner));
+                assert!(
+                    !shell.selected_center_terminal_is_interactive(),
+                    "the stale host interaction must initially leave the painted terminal inert"
+                );
                 shell.arm_terminal_owner_for_grid_pointer(&owner);
+                assert_eq!(
+                    shell.local_slot().interaction.selected_task(),
+                    Some(task_id),
+                    "the first grid click must repair host interaction ownership even when the global HostTaskKey already matches"
+                );
                 assert!(
                     shell.terminal_input_is_armed(),
                     "a terminal grid click must arm root key routing even when AccessKit retains the prior task-row focus"
@@ -59425,17 +62546,47 @@ mod tests {
                 );
                 assert!(shell.dispatch_provider_terminal_text("x".into()));
 
-                let accepted = &shared.lock().expect("runtime").accepted;
-                assert!(accepted.iter().any(|record| {
-                    matches!(
-                        &record.command,
-                        NativeHostCommand::ProviderInput { action_id, arguments, .. }
-                            if *action_id == crate::client::action::ACTION_PROVIDER_TERMINAL_INPUT
-                                && arguments.text.as_deref() == Some("x")
-                    )
-                }), "between-turn terminal text must be admitted immediately");
+                let terminal_input_action = shared
+                    .lock()
+                    .expect("runtime")
+                    .accepted
+                    .iter()
+                    .find(|record| {
+                        matches!(
+                            &record.command,
+                            NativeHostCommand::TerminalInput(request)
+                                if request.context.task_id == task_id
+                                    && request.context.agent_session_id == agent_id
+                                    && request.context.runtime_generation
+                                        == snapshot.agents[&agent_id].runtime_generation
+                                    && request.context.action_epoch == terminal_action_epoch
+                                    && request.context.input_sequence == 1
+                                    && request.bytes == b"x"
+                        )
+                    })
+                    .cloned()
+                    .expect("exact raw terminal input");
                 assert!(
-                    accepted.iter().any(|record| {
+                    shell.pending_terminal_input_cursors.get(&owner).is_some_and(|cursor| {
+                        cursor.next_sequence == 1
+                            && cursor.runtime_generation
+                                == snapshot.agents[&agent_id].runtime_generation
+                    }),
+                    "the next rapid keystroke must reserve a new monotonic input sequence before refresh"
+                );
+                shared.lock().expect("runtime").accepted.clear();
+                shell.apply_epoch_fenced_action_outcome_for_host(
+                    &owner.host,
+                    NativeHostActionOutcome::Queried {
+                        action: terminal_input_action,
+                        detail: "provider terminal input".into(),
+                        body: NativeHostQueryBody::TerminalInput(InputAck::Accepted {
+                            sequence: 1,
+                        }),
+                    },
+                );
+                assert!(
+                    shared.lock().expect("runtime").accepted.iter().any(|record| {
                         matches!(
                             record.command,
                             NativeHostCommand::TaskCockpitQuery {
@@ -59445,7 +62596,65 @@ mod tests {
                             } if queried_task == task_id
                         )
                     }),
-                    "raw input must queue a terminal projection immediately instead of waiting for its receipt or the 30-second conversation recovery heartbeat"
+                    "the accepted raw byte receipt must trigger an immediate terminal refresh"
+                );
+                assert_eq!(
+                    shell
+                        .pending_terminal_echoes
+                        .get(&owner)
+                        .map(|pending| pending.text.as_str()),
+                    Some("x"),
+                    "the local echo remains visible until a newer canonical projection arrives"
+                );
+                let unmatched_projection =
+                    crate::domain::cockpit::TaskTerminalProjection {
+                        task_id,
+                        terminal_id,
+                        session_id: terminal_session_id,
+                        agent_session_id: agent_id,
+                        resource_id: resource.id,
+                        runtime_generation: snapshot.agents[&agent_id].runtime_generation,
+                        resource_generation: resource.runtime_generation,
+                        action_epoch: terminal_action_epoch,
+                        focus_epoch: crate::terminal::protocol::FocusEpoch::initial(),
+                        accepted_input_sequence: 1,
+                        accepts_input_without_conversation_id: false,
+                        sequence: 8,
+                        title: Some("local-live".into()),
+                        text_lines: vec!["> ".into()],
+                        screen: Default::default(),
+                    };
+                shell.settle_pending_terminal_echo(&owner, &unmatched_projection);
+                assert!(
+                    shell.pending_terminal_echoes.contains_key(&owner),
+                    "a refresh that raced ahead of PTY echo must keep the instant paint-only echo"
+                );
+                assert!(
+                    shell.pending_terminal_requeries.contains_key(&owner),
+                    "an unmatched frame must arm a short event-driven terminal requery"
+                );
+                let canonical_projection = crate::domain::cockpit::TaskTerminalProjection {
+                    sequence: 9,
+                    text_lines: vec!["        ".into(), "    x   ".into()],
+                    // The full-screen TUI moved the input row, so the original
+                    // anchor no longer matches. The canonical cursor suffix
+                    // still proves the character arrived exactly once.
+                    screen: crate::terminal::session::TerminalScreenSnapshot {
+                        cursor: Some(crate::terminal::session::TerminalCursorSnapshot {
+                            row: 1,
+                            column: 5,
+                            shape: alacritty_terminal::vte::ansi::CursorShape::Block,
+                        }),
+                        rows: 2,
+                        cols: 8,
+                        ..Default::default()
+                    },
+                    ..unmatched_projection
+                };
+                shell.settle_pending_terminal_echo(&owner, &canonical_projection);
+                assert!(
+                    !shell.pending_terminal_echoes.contains_key(&owner),
+                    "a newer canonical PTY projection must retire the paint-only echo instead of duplicating it"
                 );
             });
             cx.quit();
@@ -59949,6 +63158,8 @@ mod tests {
                     runtime_generation: snapshot.agents[&agent_id].runtime_generation,
                     resource_generation: resource.runtime_generation,
                     action_epoch: 1,
+                    focus_epoch: crate::terminal::protocol::FocusEpoch::initial(),
+                    accepted_input_sequence: 0,
                     accepts_input_without_conversation_id: false,
                     sequence: 9,
                     title: Some("forged".into()),

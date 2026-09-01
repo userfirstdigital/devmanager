@@ -131,9 +131,10 @@ pub(crate) fn conversation_activity_summary(
     let mut parts = Vec::new();
     if !activity.running_commands.is_empty() {
         if !activity.running_shells.is_empty() {
+            let count = activity.running_shells.len();
             parts.push(format!(
-                "Running {} shell command(s)",
-                activity.running_shells.len()
+                "{count} shell command{} running",
+                if count == 1 { "" } else { "s" }
             ));
         }
         let other_tools = activity
@@ -141,7 +142,10 @@ pub(crate) fn conversation_activity_summary(
             .len()
             .saturating_sub(activity.running_shells.len());
         if other_tools > 0 {
-            parts.push(format!("{other_tools} other tool(s) running"));
+            parts.push(format!(
+                "{other_tools} other tool{} running",
+                if other_tools == 1 { "" } else { "s" }
+            ));
         }
     }
     if !activity.active_subagents.is_empty() {
@@ -246,7 +250,7 @@ impl Timeline {
             JournalAvailability::Unavailable(_) => {
                 "Semantic timeline awaiting authenticated journal"
             }
-            JournalAvailability::LiveProjection => "Conversation",
+            JournalAvailability::LiveProjection => "Working",
             #[cfg(any(test, feature = "semantic-conformance"))]
             JournalAvailability::ConformanceFixture => "Semantic timeline",
         };
@@ -461,10 +465,29 @@ impl Timeline {
                             .children(activity.map(|summary| {
                                 div()
                                     .w_full()
-                                    .flex_none()
-                                    .text_size(px(tokens.density.typography.caption))
-                                    .text_color(tokens.text.secondary.to_gpui())
-                                    .child(summary)
+                                    .flex()
+                                    .justify_start()
+                                    .child(
+                                        div()
+                                            .flex_none()
+                                            .flex()
+                                            .items_center()
+                                            .gap(px(7.0))
+                                            .px(px(10.0))
+                                            .py(px(6.0))
+                                            .rounded(px(tokens.density.radii.md))
+                                            .bg(tokens.surfaces.sunken.to_gpui())
+                                            .text_size(px(tokens.density.typography.caption))
+                                            .text_color(tokens.text.secondary.to_gpui())
+                                            .child(
+                                                div()
+                                                    .flex_none()
+                                                    .size(px(6.0))
+                                                    .rounded_full()
+                                                    .bg(tokens.status.attention.to_gpui()),
+                                            )
+                                            .child(summary),
+                                    )
                                     .into_any_element()
                             }))
                             .child(
@@ -568,7 +591,7 @@ impl Timeline {
             JournalAvailability::Unavailable(_) => {
                 "Semantic timeline awaiting authenticated journal"
             }
-            JournalAvailability::LiveProjection => "Conversation",
+            JournalAvailability::LiveProjection => "Working",
             #[cfg(any(test, feature = "semantic-conformance"))]
             JournalAvailability::ConformanceFixture => "Semantic timeline",
         };
@@ -1125,10 +1148,9 @@ mod tests {
             tool_item("shell-1", "Bash", "running"),
             generic_item("turn_state"),
         ];
-        let summary = conversation_activity_summary(&items, "Conversation")
+        let summary = conversation_activity_summary(&items, "Working")
             .expect("running tools are useful activity");
-        assert!(summary.contains("Running"));
-        assert!(summary.contains("shell"));
+        assert_eq!(summary, "Working · 1 shell command running");
         assert!(
             !summary.contains("event(s)"),
             "useful activity must still omit the raw event count: {summary}"

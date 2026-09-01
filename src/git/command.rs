@@ -4659,8 +4659,8 @@ fn validate_worktree_metadata_descriptors(
     deadline: OperationDeadline,
 ) -> Result<(), String> {
     let gitdir_descriptor = metadata.join("gitdir");
-    let resolve_gitdir_target = admission == WorktreeDescriptorAdmission::Strict
-        || same_path(metadata, current_gitdir);
+    let resolve_gitdir_target =
+        admission == WorktreeDescriptorAdmission::Strict || same_path(metadata, current_gitdir);
     if resolve_gitdir_target {
         let linked_git_file = resolve_worktree_descriptor_path(
             &gitdir_descriptor,
@@ -4737,7 +4737,8 @@ fn resolve_worktree_descriptor_path(
     deadline: OperationDeadline,
 ) -> Result<PathBuf, String> {
     let value = read_worktree_descriptor_value(descriptor, deadline)?;
-    let canonical = resolve_descriptor_value(base, &value, root, approved_external_roots, deadline)?;
+    let canonical =
+        resolve_descriptor_value(base, &value, root, approved_external_roots, deadline)?;
     let metadata = fs::symlink_metadata(&canonical)
         .map_err(|_| "linked worktree descriptor target is unavailable".to_string())?;
     if (expect_file && !metadata.is_file()) || (!expect_file && !metadata.is_dir()) {
@@ -8657,12 +8658,10 @@ impl GitRepository {
         permit: GitOperationPermit,
     ) -> Result<GitOutput, GitError> {
         if requires_strict_worktree_descriptor_admission(&arguments)
-            && self.root.graph.worktree_descriptor_admission
-                != WorktreeDescriptorAdmission::Strict
+            && self.root.graph.worktree_descriptor_admission != WorktreeDescriptorAdmission::Strict
         {
             return Err(GitError::InvalidRequest {
-                message: "Git operation requires strict worktree descriptor admission"
-                    .to_string(),
+                message: "Git operation requires strict worktree descriptor admission".to_string(),
             });
         }
         if !service_mutation_allowed(&arguments) {
@@ -8751,12 +8750,10 @@ impl GitRepository {
         let graph_transition = graph_transition_for(arguments, &policy);
         validate_argument_budget(arguments)?;
         if requires_strict_worktree_descriptor_admission(arguments)
-            && self.root.graph.worktree_descriptor_admission
-                != WorktreeDescriptorAdmission::Strict
+            && self.root.graph.worktree_descriptor_admission != WorktreeDescriptorAdmission::Strict
         {
             return Err(GitError::InvalidRequest {
-                message: "Git operation requires strict worktree descriptor admission"
-                    .to_string(),
+                message: "Git operation requires strict worktree descriptor admission".to_string(),
             });
         }
         self.validate_operation_permit(permit, &policy, arguments)?;
@@ -11559,11 +11556,9 @@ mod tests {
             observed.load(Ordering::SeqCst),
             "injected canonicalize must run after metadata"
         );
-        assert!(
-            result
-                .expect("approved Stage in-flight index absence")
-                .is_none()
-        );
+        assert!(result
+            .expect("approved Stage in-flight index absence")
+            .is_none());
     }
 
     #[test]
@@ -11823,7 +11818,10 @@ mod tests {
                 move |path| {
                     assert!(same_path(path, &index));
                     fs::remove_file(path).expect("remove index");
-                    Err(io::Error::new(io::ErrorKind::NotFound, "post-transition race"))
+                    Err(io::Error::new(
+                        io::ErrorKind::NotFound,
+                        "post-transition race",
+                    ))
                 }
             },
         )

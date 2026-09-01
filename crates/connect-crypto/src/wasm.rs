@@ -74,10 +74,7 @@ impl WasmConnectHandshake {
             .map_err(|_| redacted_error())?;
         let expected_remote = expected_remote.as_deref().map(fixed).transpose()?;
         let host_public_id = fixed::<16>(&host_public_id)?;
-        let device_public_id = device_public_id
-            .as_deref()
-            .map(fixed::<16>)
-            .transpose()?;
+        let device_public_id = device_public_id.as_deref().map(fixed::<16>).transpose()?;
         let route_id = fixed::<16>(&route_id)?;
         let session_id = fixed::<16>(&session_id)?;
         let purpose = purpose(purpose_value)?;

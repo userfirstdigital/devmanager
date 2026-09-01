@@ -163,9 +163,8 @@ fn valid_request(policy: &PreviewPathPolicy) -> PreviewRequest {
 
 #[test]
 fn component_init_registers_devmanager_resources_once() {
-    if rerun_headless_projection_test_in_child(
-        "component_init_registers_devmanager_resources_once",
-    ) {
+    if rerun_headless_projection_test_in_child("component_init_registers_devmanager_resources_once")
+    {
         return;
     }
     let _lock = HEADLESS_INIT_TEST_LOCK
@@ -595,7 +594,9 @@ fn components_gallery_fixture_is_consumed_and_validated_structurally() {
     let (_owned, policy) = checked_in_fixture_owned_output_policy();
     let request = PreviewRequest::validate(
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/ui/component-gallery.json"),
-        policy.output_root().join("component-gallery-structural.png"),
+        policy
+            .output_root()
+            .join("component-gallery-structural.png"),
         &policy,
     )
     .expect("component gallery path should be accepted");

@@ -1080,8 +1080,8 @@ impl SemanticJournalStore {
     ) -> Option<SemanticReplayCapture> {
         self.sessions.get(key).map(|session| {
             let mut capture = session.journal.capture_replay_after(0);
-            capture.cursor_rolled_over = cursor != 0
-                && cursor <= session.journal.highest_evicted_sequence;
+            capture.cursor_rolled_over =
+                cursor != 0 && cursor <= session.journal.highest_evicted_sequence;
             capture
         })
     }

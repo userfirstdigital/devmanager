@@ -44,7 +44,9 @@ pub enum IdentityLimitField {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum IdentityError {
     ProductionStoreForbidden,
-    LimitExceeded { field: IdentityLimitField },
+    LimitExceeded {
+        field: IdentityLimitField,
+    },
     DuplicateField,
     UnknownField,
     CopiedProfile,

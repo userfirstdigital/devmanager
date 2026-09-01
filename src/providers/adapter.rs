@@ -1702,6 +1702,12 @@ const PROVIDER_ENVIRONMENT_ALLOWLIST: &[&str] = &[
     "LOCALAPPDATA",
     "HOMEDRIVE",
     "HOMEPATH",
+    // Windows libraries may expand these while initializing caches. Omitting
+    // them from the sealed provider environment leaves a literal
+    // `%SystemDrive%` path, which is then resolved beneath the project cwd.
+    "SystemDrive",
+    "ProgramData",
+    "ALLUSERSPROFILE",
 ];
 
 /// Fixed provider-runtime transport defaults that are part of the sealed

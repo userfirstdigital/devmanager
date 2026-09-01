@@ -29,3 +29,22 @@
   transition and preview for Active, Done, Archive and Delete independently.
   Filtered lifecycle sections must retain the same bounded search work and
   continuation contract as the active list, including matches beyond page one.
+
+# Native component architecture
+
+- Keep the application and terminal on GPUI. The terminal data path stays
+  in-process (`PTY -> terminal parser/state -> GPUI renderer`); do not insert a
+  WebView, JavaScript bridge, or a second GUI event loop into that path.
+- Treat `gpui-component` as the shared primitive library and initialize it only
+  through `ui::init`. Expose product controls through the DevManager component
+  vocabulary in `ui::components` so tokens, density, focus, accessibility, and
+  disabled/loading/error states have one contract. Extend that vocabulary before
+  hand-building another button, input, select, menu, popover, dialog, scroll area,
+  tab, tooltip, badge, or settings row in a screen.
+- Keep bespoke GPUI rendering only where DevManager has domain-specific behavior:
+  the terminal surface, conversation transcript, recursive split workspace, and
+  task rail. Those surfaces must still consume the same theme and spacing tokens
+  and compose shared controls for their chrome.
+- Do not add another GPUI component suite unless a measured, release-blocking gap
+  cannot be filled by the pinned `gpui-component` version plus a narrow wrapper.
+  Prefer incremental migration of touched screens over a framework rewrite.

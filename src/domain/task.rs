@@ -437,14 +437,19 @@ impl WorkspaceBindingFact {
         }
         match self.kind {
             WorkspaceBindingKind::Main => {
-                if self.repository_root.is_none()
-                    || self.common_git_dir.is_none()
-                    || self.marker.is_none()
-                    || self.head.is_none()
-                    || self.admin_dir.is_some()
+                let has_repository = self.repository_root.is_some()
+                    || self.common_git_dir.is_some()
+                    || self.marker.is_some()
+                    || self.head.is_some();
+                if self.admin_dir.is_some()
                     || self.commondir.is_some()
                     || self.gitdir.is_some()
                     || self.branch.is_some()
+                    || (has_repository
+                        && (self.repository_root.is_none()
+                            || self.common_git_dir.is_none()
+                            || self.marker.is_none()
+                            || self.head.is_none()))
                 {
                     return Err(TaskValidationError::InvalidRepositoryFingerprint);
                 }

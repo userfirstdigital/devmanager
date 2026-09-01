@@ -1949,6 +1949,8 @@ mod process_census_tests {
             runtime_generation: 1,
             resource_generation: 1,
             action_epoch: 1,
+            focus_epoch: crate::terminal::protocol::FocusEpoch::initial(),
+            accepted_input_sequence: 0,
             accepts_input_without_conversation_id: false,
             sequence: 1,
             title: None,

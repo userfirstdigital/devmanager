@@ -301,6 +301,78 @@ fn historical_settled_provider_turn_remains_queryable_after_a_later_turn_settles
 }
 
 #[test]
+fn earlier_provider_write_settles_after_a_later_input_is_accepted() {
+    let dir = TempDir::new().expect("tempdir");
+    let mut store = KernelStore::open(&dir.path().join("pipelined.sqlite3")).expect("open");
+    let (first_operation_id, first_permit) = seed_provider_dispatch(&mut store, 0xA1);
+    let first_identity = identity_from_effect(first_permit.effect());
+
+    let (revision, action_epoch): (i64, i64) = store
+        .conn
+        .query_row(
+            "SELECT revision, action_epoch FROM tasks WHERE task_id = ?1",
+            [first_identity.task_id.as_bytes().as_slice()],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .expect("current task fence");
+    let second = store
+        .execute_for_test(CommandEnvelope {
+            command_id: CommandId::from_bytes(fixed_uuid_v7(0xAD)).expect("second command"),
+            client_id: first_identity.client_id,
+            task_id: Some(first_identity.task_id),
+            issued_at_ms: 1_725_003_000_100,
+            expected_task_revision: Some(u64::try_from(revision).expect("revision")),
+            command: Command::SubmitProviderInput(
+                SubmitProviderInputIntent::try_new(
+                    first_identity.agent_session_id,
+                    first_identity.runtime_generation,
+                    first_identity.turn_id,
+                    u64::try_from(action_epoch).expect("action epoch"),
+                    None,
+                    None,
+                    ProviderInputAction::SteerCurrentTurn {
+                        text: "second queued keystroke".into(),
+                    },
+                )
+                .expect("second provider input"),
+            ),
+        })
+        .expect("accept second provider input");
+    let CommandReceipt::Accepted {
+        operation_id: second_operation_id,
+        ..
+    } = second
+    else {
+        panic!("second provider input must be accepted: {second:?}");
+    };
+
+    assert!(matches!(
+        settle_with_accepting_runtime(&mut store, &first_permit),
+        OperationState::Settled { .. }
+    ));
+    let second_claim = store
+        .claim_next_dispatch(Duration::from_secs(30))
+        .expect("claim second provider input")
+        .expect("second provider input is dispatchable");
+    let second_permit = store
+        .begin_dispatch(&second_claim)
+        .expect("begin second provider input");
+    assert!(matches!(
+        settle_with_accepting_runtime(&mut store, &second_permit),
+        OperationState::Settled { .. }
+    ));
+
+    for operation_id in [first_operation_id, second_operation_id] {
+        assert!(matches!(
+            store
+                .operation_status(operation_id)
+                .expect("provider operation status"),
+            Some(OperationState::Settled { .. })
+        ));
+    }
+}
+
+#[test]
 fn delivered_send_now_can_begin_a_new_conversation_turn() {
     let dir = TempDir::new().expect("tempdir");
     let mut store = KernelStore::open(&dir.path().join("follow-up.sqlite3")).expect("open");

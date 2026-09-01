@@ -271,11 +271,7 @@ pub(crate) fn serve_task_cockpit(dispatch: TaskCockpitDispatch<'_>) -> QueryOutc
                 if dispatch
                     .terminal_service
                     .ok_or(())
-                    .and_then(|service| {
-                        service
-                            .resize_task_terminal(task_id, size)
-                            .map_err(|_| ())
-                    })
+                    .and_then(|service| service.resize_task_terminal(task_id, size).map_err(|_| ()))
                     .is_err()
                 {
                     return unavailable(
@@ -486,6 +482,8 @@ pub(crate) fn serve_task_cockpit(dispatch: TaskCockpitDispatch<'_>) -> QueryOutc
 /// named MessagePack decoder's collection/value caps at a normal 100x30
 /// provider size. Send bounded strings and let the native client reconstruct
 /// default-themed paint cells locally while retaining cursor and mode metadata.
+const MAX_TERMINAL_STYLED_CELLS_FOR_WIRE: usize = 3_000;
+
 fn compact_terminal_screen_for_wire(
     mut screen: crate::terminal::session::TerminalScreenSnapshot,
 ) -> (
@@ -522,6 +520,18 @@ fn compact_terminal_screen_for_wire(
             || cell.has_hyperlink
             || !cell.zero_width.is_empty()
     });
+    let styled_cell_limit = MAX_TERMINAL_STYLED_CELLS_FOR_WIRE;
+    if screen.cells.len() > styled_cell_limit {
+        // A wide, fully coloured provider TUI can legitimately style more
+        // cells than one MessagePack collection may contain. Text remains
+        // complete in `text_lines`; keep the newest/bottom prompt region's
+        // style overrides so the frame cannot disconnect the client.
+        screen
+            .cells
+            .sort_unstable_by_key(|indexed| (indexed.row, indexed.column));
+        let discard = screen.cells.len() - styled_cell_limit;
+        screen.cells.drain(..discard);
+    }
     screen.lines.clear();
     (screen, text_lines)
 }
@@ -582,29 +592,53 @@ fn serve_task_terminal(
                     TaskCockpitDeniedReason::StaleFence,
                 );
             }
-            let (screen, text_lines) = compact_terminal_screen_for_wire(terminal.view.screen);
-            if readiness_query
-                && agent.provider_kind == crate::providers::ProviderKind::Codex
-                && agent.provider_session_id.is_none()
+            // A terminal projection is also the client-specific attachment
+            // handshake. Raw input deliberately defaults to read-only until
+            // the host has revalidated the exact Task/Agent/Resource tuple
+            // above for this authenticated client. Without this grant every
+            // native and fleet terminal write is rejected as ReadOnly even
+            // though the caller holds ProviderInput capability.
+            if !dispatch.capabilities.contains(Capability::ProviderInput) {
+                return denied(
+                    TaskCockpitSurface::Terminal,
+                    TaskCockpitDeniedReason::CapabilityDenied,
+                );
+            }
+            if service
+                .grant_client(
+                    terminal.terminal_id,
+                    dispatch.client_id,
+                    crate::terminal::protocol::ClientInputGrant::ReadWrite,
+                )
+                .is_err()
             {
+                return denied(
+                    TaskCockpitSurface::Terminal,
+                    TaskCockpitDeniedReason::StaleFence,
+                );
+            }
+            let (screen, text_lines) = compact_terminal_screen_for_wire(terminal.view.screen);
+            if readiness_query && agent.provider_session_id.is_none() {
                 use crate::providers::input::{
                     classify_codex_identityless_startup_readiness,
-                    CodexIdentitylessStartupReadiness,
+                    provider_identityless_setup_required, CodexIdentitylessStartupReadiness,
                 };
-                match classify_codex_identityless_startup_readiness(&text_lines) {
-                    CodexIdentitylessStartupReadiness::ProviderSetupRequired => {
-                        return unavailable(
-                            TaskCockpitSurface::Terminal,
-                            TaskCockpitUnavailableReason::TerminalProviderSetupRequired,
-                        );
-                    }
-                    CodexIdentitylessStartupReadiness::StartupPending => {
-                        return unavailable(
-                            TaskCockpitSurface::Terminal,
-                            TaskCockpitUnavailableReason::TerminalStartPending,
-                        );
-                    }
-                    CodexIdentitylessStartupReadiness::ChatComposerReady => {}
+                if provider_identityless_setup_required(agent.provider_kind, &text_lines) {
+                    return unavailable(
+                        TaskCockpitSurface::Terminal,
+                        TaskCockpitUnavailableReason::TerminalProviderSetupRequired,
+                    );
+                }
+                if agent.provider_kind == crate::providers::ProviderKind::Codex
+                    && matches!(
+                        classify_codex_identityless_startup_readiness(&text_lines),
+                        CodexIdentitylessStartupReadiness::StartupPending
+                    )
+                {
+                    return unavailable(
+                        TaskCockpitSurface::Terminal,
+                        TaskCockpitUnavailableReason::TerminalStartPending,
+                    );
                 }
             }
             QueryOutcome::Ok(QueryResult::TaskCockpit(TaskCockpitResult::Terminal(
@@ -617,6 +651,8 @@ fn serve_task_terminal(
                     runtime_generation: terminal.runtime_generation,
                     resource_generation: terminal.resource_generation,
                     action_epoch: terminal.action_epoch,
+                    focus_epoch: terminal.focus_epoch,
+                    accepted_input_sequence: terminal.accepted_input_sequence,
                     accepts_input_without_conversation_id: dispatch.service_runtime.is_some_and(
                         |manager| {
                             manager.accepts_input_without_conversation_id(
@@ -2681,6 +2717,144 @@ mod tests {
         assert_eq!(wire.cells[0].row, 0);
         assert_eq!(wire.cells[0].column, 1);
         assert_eq!(wire.cells[0].cell, styled);
+    }
+
+    #[test]
+    fn normal_styled_terminal_screen_fits_the_messagepack_wire_contract() {
+        use crate::protocol::{FrameLimits, MessagePackCodec};
+        use crate::terminal::session::{
+            TerminalCellSnapshot, TerminalIndexedCellSnapshot, TerminalScreenSnapshot,
+        };
+
+        let styled = TerminalCellSnapshot {
+            character: 'x',
+            zero_width: Vec::new(),
+            foreground: 0x00ff00,
+            background: 0,
+            bold: true,
+            dim: false,
+            italic: false,
+            underline: false,
+            undercurl: false,
+            strike: false,
+            hidden: false,
+            has_hyperlink: false,
+            default_background: true,
+            default_foreground: false,
+        };
+        let rows = 15;
+        let cols = 77;
+        let lines = vec![vec![styled.clone(); cols]; rows];
+        let cells = lines
+            .iter()
+            .enumerate()
+            .flat_map(|(row, line)| {
+                line.iter()
+                    .cloned()
+                    .enumerate()
+                    .map(move |(column, cell)| TerminalIndexedCellSnapshot { row, column, cell })
+            })
+            .collect();
+        let screen = TerminalScreenSnapshot {
+            cells,
+            lines,
+            rows,
+            cols,
+            ..TerminalScreenSnapshot::default()
+        };
+
+        let (screen, text_lines) = compact_terminal_screen_for_wire(screen);
+        assert_eq!(screen.cells.len(), 1_155);
+        let codec = MessagePackCodec::from_limits(FrameLimits::v1_default()).expect("codec");
+        codec
+            .encode(&TaskCockpitResult::Terminal(TaskTerminalProjection {
+                task_id: TaskId::new(),
+                terminal_id: crate::domain::TerminalId::new(),
+                session_id: crate::terminal::protocol::TerminalSessionId::new(),
+                agent_session_id: crate::domain::AgentSessionId::new(),
+                resource_id: crate::domain::ResourceId::new(),
+                runtime_generation: 1,
+                resource_generation: 1,
+                action_epoch: 1,
+                focus_epoch: crate::terminal::protocol::FocusEpoch::initial(),
+                accepted_input_sequence: 0,
+                accepts_input_without_conversation_id: false,
+                sequence: 1,
+                title: Some("Codex".to_string()),
+                text_lines,
+                screen,
+            }))
+            .expect("a normal styled provider screen must remain encodable");
+    }
+
+    #[test]
+    fn oversized_styled_terminal_keeps_the_newest_prompt_region_within_wire_limits() {
+        use crate::protocol::{FrameLimits, MessagePackCodec};
+        use crate::terminal::session::{
+            TerminalCellSnapshot, TerminalIndexedCellSnapshot, TerminalScreenSnapshot,
+        };
+
+        let styled = TerminalCellSnapshot {
+            character: 'x',
+            zero_width: Vec::new(),
+            foreground: 0x00ff00,
+            background: 0,
+            bold: true,
+            dim: false,
+            italic: false,
+            underline: false,
+            undercurl: false,
+            strike: false,
+            hidden: false,
+            has_hyperlink: false,
+            default_background: true,
+            default_foreground: false,
+        };
+        let rows = 48;
+        let cols = 100;
+        let lines = vec![vec![styled.clone(); cols]; rows];
+        let cells = lines
+            .iter()
+            .enumerate()
+            .flat_map(|(row, line)| {
+                line.iter()
+                    .cloned()
+                    .enumerate()
+                    .map(move |(column, cell)| TerminalIndexedCellSnapshot { row, column, cell })
+            })
+            .collect();
+        let screen = TerminalScreenSnapshot {
+            cells,
+            lines,
+            rows,
+            cols,
+            ..TerminalScreenSnapshot::default()
+        };
+
+        let (screen, text_lines) = compact_terminal_screen_for_wire(screen);
+        assert_eq!(screen.cells.len(), MAX_TERMINAL_STYLED_CELLS_FOR_WIRE);
+        assert_eq!(screen.cells.first().map(|cell| cell.row), Some(18));
+        assert_eq!(screen.cells.last().map(|cell| cell.row), Some(47));
+        let codec = MessagePackCodec::from_limits(FrameLimits::v1_default()).expect("codec");
+        codec
+            .encode(&TaskCockpitResult::Terminal(TaskTerminalProjection {
+                task_id: TaskId::new(),
+                terminal_id: crate::domain::TerminalId::new(),
+                session_id: crate::terminal::protocol::TerminalSessionId::new(),
+                agent_session_id: crate::domain::AgentSessionId::new(),
+                resource_id: crate::domain::ResourceId::new(),
+                runtime_generation: 1,
+                resource_generation: 1,
+                action_epoch: 1,
+                focus_epoch: crate::terminal::protocol::FocusEpoch::initial(),
+                accepted_input_sequence: 0,
+                accepts_input_without_conversation_id: false,
+                sequence: 1,
+                title: Some("Codex".to_string()),
+                text_lines,
+                screen,
+            }))
+            .expect("an oversized styled provider screen must remain encodable");
     }
 
     #[test]

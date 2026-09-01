@@ -855,7 +855,8 @@ mod tests {
                 permitted_origin: None,
                 ..super::super::PairedWebClient::default()
             });
-        let service = crate::remote::RemoteHostService::new_web_only(config).expect("web auth shell");
+        let service =
+            crate::remote::RemoteHostService::new_web_only(config).expect("web auth shell");
         let state = Arc::new(super::super::WebState {
             inner: Arc::downgrade(&service.inner),
             listener_generation: 1,
@@ -911,7 +912,8 @@ mod tests {
         let mut config = crate::remote::RemoteHostConfig::default();
         config.web.enabled = true;
         config.web.ensure_secrets();
-        let service = crate::remote::RemoteHostService::new_web_only(config).expect("web auth shell");
+        let service =
+            crate::remote::RemoteHostService::new_web_only(config).expect("web auth shell");
         let fence = tests_support::published_test_fence();
         let remote = sample_remote(4);
         let state = Arc::new(super::super::WebState {
@@ -996,7 +998,8 @@ mod tests {
                 permitted_origin: None,
                 ..super::super::PairedWebClient::default()
             });
-        let service = crate::remote::RemoteHostService::new_web_only(config).expect("web auth shell");
+        let service =
+            crate::remote::RemoteHostService::new_web_only(config).expect("web auth shell");
         let inner = Arc::downgrade(&service.inner);
         struct RevokeOnLoad {
             inner: std::sync::Weak<crate::remote::RemoteHostInner>,
@@ -1067,7 +1070,8 @@ mod tests {
         let mut config = crate::remote::RemoteHostConfig::default();
         config.web.enabled = true;
         config.web.ensure_secrets();
-        let service = crate::remote::RemoteHostService::new_web_only(config).expect("web auth shell");
+        let service =
+            crate::remote::RemoteHostService::new_web_only(config).expect("web auth shell");
         let state = super::super::WebState {
             inner: Arc::downgrade(&service.inner),
             listener_generation: 1,

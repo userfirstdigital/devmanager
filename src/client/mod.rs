@@ -44,13 +44,13 @@ pub use connection::{
     connect, perform_client_hello, ClientConnection, ConnectAuthenticatedSession,
     ConnectionMetadata, UnsolicitedServerMessage,
 };
-pub(crate) use host_client::track_accepted_receipt;
 pub use fleet::{
     FleetAdmission, FleetError, FleetOwned, FleetRemoval, FleetRetainedCommand,
     FleetUncertainCommand, FleetUnsupportedKind, HostClientConnectFuture, HostClientFactory,
     HostFleet, HostHandle, HostId, HostTaskKey, MAX_FLEET_HOSTS,
 };
 pub use fleet_port::FleetClientPort;
+pub(crate) use host_client::track_accepted_receipt;
 pub use host_client::{
     ArtifactContentBatch, EventReplayBatch, HostClient, HostClientConfig, TrackedOperation,
 };
@@ -81,17 +81,16 @@ pub use remote_transport::{
     REMOTE_CONNECT_PATH_MAX_BYTES, REMOTE_COOKIE_MAX_BYTES, REMOTE_HTTP_MAX_BODY_BYTES,
     REMOTE_TRANSPORT_DEFAULT_DEADLINE,
 };
+pub use remote_trust::{
+    connect_trusted_host, fetch_published_host_identity, forget_trusted_host, list_trusted_hosts,
+    pair_enroll_and_connect, ConnectTrustedOptions, PairEnrollRequest, RemoteDeviceCustody,
+    RemoteDevicePublicId, RemoteTrustError, RemoteTrustStore, TrustedHostRecord,
+};
+pub use subscription::{
+    ClientSubscription, ClientSubscriptionState, SubscriptionError, SubscriptionUpdate,
+};
 pub use typed_queries::{
     confirm_host_quit, inspect_host_quit, query_agent_connection, query_config_sidebar,
     query_git_repositories, query_prompt_library, query_provider_settings, query_remote_access,
     query_task_cockpit, task_snapshot,
-};
-pub use remote_trust::{
-    connect_trusted_host, fetch_published_host_identity, forget_trusted_host, list_trusted_hosts,
-    pair_enroll_and_connect,
-    ConnectTrustedOptions, PairEnrollRequest, RemoteDeviceCustody, RemoteDevicePublicId,
-    RemoteTrustError, RemoteTrustStore, TrustedHostRecord,
-};
-pub use subscription::{
-    ClientSubscription, ClientSubscriptionState, SubscriptionError, SubscriptionUpdate,
 };

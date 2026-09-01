@@ -276,6 +276,9 @@ fn sealed_environment_preserves_home_and_normalizes_override_names() {
         "LOCALAPPDATA",
         "HOMEDRIVE",
         "HOMEPATH",
+        "SYSTEMDRIVE",
+        "PROGRAMDATA",
+        "ALLUSERSPROFILE",
     ] {
         assert_eq!(
             effective.get(&OsString::from(name)),

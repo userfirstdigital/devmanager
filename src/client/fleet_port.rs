@@ -19,6 +19,7 @@ use crate::domain::query::{QueryEnvelope, QueryReply};
 use crate::domain::ClientId;
 use crate::host::IpcError;
 use crate::protocol::CapabilitySet;
+use crate::terminal::protocol::{InputAck, TerminalInputRequest};
 use crate::updater::UpdateHandoffToken;
 use uuid::Uuid;
 
@@ -131,6 +132,26 @@ impl FleetClientPort {
     /// Generation-fenced disconnect of the captured admission only.
     pub async fn disconnect_admitted(&self) -> Result<FleetOwned<()>, FleetError> {
         self.fleet.disconnect_admitted(&self.admission).await
+    }
+
+    /// Send one fully fenced raw input gesture to the exact terminal captured
+    /// by this task-scoped admission. This deliberately bypasses provider
+    /// conversation identity: startup/resume prompts exist before a fresh
+    /// SessionStart hook can bind that identity.
+    pub async fn execute_terminal_input(
+        &self,
+        request: TerminalInputRequest,
+    ) -> Result<InputAck, IpcError> {
+        let owned = self
+            .fleet
+            .execute_terminal_input(&self.admission, request)
+            .await
+            .map_err(map_fleet_error)?;
+        if let Err(error) = self.validate_owned(&owned) {
+            let _ = self.fleet.disconnect_admitted(&self.admission).await;
+            return Err(error);
+        }
+        Ok(owned.value)
     }
 
     fn validate_owned<T>(&self, owned: &FleetOwned<T>) -> Result<(), IpcError> {

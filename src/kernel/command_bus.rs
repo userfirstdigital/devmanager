@@ -355,12 +355,7 @@ impl CommandBus {
 
         let conn = self.store.open_query_connection()?;
         let tx = conn.unchecked_transaction()?;
-        let row: Option<(
-            Vec<u8>,
-            Option<Vec<u8>>,
-            Option<Vec<u8>>,
-            Option<Vec<u8>>,
-        )> = tx
+        let row: Option<(Vec<u8>, Option<Vec<u8>>, Option<Vec<u8>>, Option<Vec<u8>>)> = tx
             .query_row(
                 "SELECT client_id, task_id, command_fingerprint, payload_digest
                  FROM command_receipts WHERE command_id = ?1",
@@ -373,7 +368,8 @@ impl CommandBus {
             return Ok(None);
         };
 
-        let stored_client_id = parse_client_receipt_id("command_receipts.client_id", &client_bytes)?;
+        let stored_client_id =
+            parse_client_receipt_id("command_receipts.client_id", &client_bytes)?;
         if stored_client_id != authenticated_client_id {
             return Err(StoreError::CommandIdConflict);
         }
@@ -476,10 +472,12 @@ impl CommandBus {
         Ok((claimed, agent, snapshot))
     }
 
-    /// Enumerate a bounded set of exact provider conversations that can be
-    /// resumed after a host/watch restart. Both the opaque provider identity
-    /// and its original resource id must have been durably bound by the same
-    /// correlated SessionStart event; partial legacy rows are skipped.
+    /// Enumerate a bounded set of exact provider conversations that must be
+    /// resumed after a host/watch restart. Idle history is intentionally lazy:
+    /// only a task that was working or has undelivered provider input starts a
+    /// process. Both the opaque provider identity and its original resource id
+    /// must have been durably bound by the same correlated SessionStart event;
+    /// partial legacy rows are skipped.
     pub(crate) fn restorable_provider_starts(
         &self,
         limit: usize,
@@ -500,6 +498,18 @@ impl CommandBus {
                AND a.lifecycle = 'open'
                AND a.provider_session_id IS NOT NULL
                AND a.provider_resource_id IS NOT NULL
+               AND (
+                    t.activity = 'working'
+                    OR EXISTS (
+                        SELECT 1
+                        FROM operations op
+                        JOIN outbox o ON o.operation_id = op.operation_id
+                        WHERE op.task_id = t.task_id
+                          AND op.state = 'accepted'
+                          AND o.destination_class = 'provider_input'
+                          AND o.state IN ('pending', 'claimed', 'dispatching')
+                    )
+               )
              ORDER BY t.updated_at_ms DESC, t.task_id ASC
              LIMIT ?1",
         )?;
@@ -1759,7 +1769,7 @@ mod provider_restart_identity_tests {
                     created_at_ms: 1_725_000_000_000,
                     connectivity: TaskConnectivity::Connected,
                     attention: TaskAttention::None,
-                    activity: TaskActivity::Idle,
+                    activity: TaskActivity::Working,
                     review_readiness: ReviewReadiness::NotReady,
                 }),
             })

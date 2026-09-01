@@ -743,11 +743,7 @@ impl TaskProjectionIndex {
         archived: bool,
         continuation: Option<&SearchContinuation>,
     ) -> SearchPage {
-        self.search_task_ids_page_scoped(
-            query,
-            SearchScope::from_archived(archived),
-            continuation,
-        )
+        self.search_task_ids_page_scoped(query, SearchScope::from_archived(archived), continuation)
     }
 
     /// Bounded settled (Done) search page with the same work/continuation
@@ -816,7 +812,9 @@ impl TaskProjectionIndex {
                     .then(|| {
                         search_tokens(&query)
                             .into_iter()
-                            .filter_map(|token| self.search.get(&token).map(|posting| (token, posting)))
+                            .filter_map(|token| {
+                                self.search.get(&token).map(|posting| (token, posting))
+                            })
                             .max_by_key(|(token, _)| token.chars().count())
                     })
                     .flatten()
@@ -4141,7 +4139,9 @@ mod tests {
             .expect("settled filler");
             let mut item = task_item(id, &format!("filler-{index}"), None);
             item.task.lifecycle = TaskLifecycle::Settled;
-            item.task.created_at_ms = (non_match_count as i64).saturating_add(1).saturating_add(index as i64);
+            item.task.created_at_ms = (non_match_count as i64)
+                .saturating_add(1)
+                .saturating_add(index as i64);
             items.push(SnapshotItem::Task(item));
         }
         let mut needle_item = task_item(needle, "settled-needle-match", None);
@@ -4163,14 +4163,7 @@ mod tests {
         let model = assemble_all_sections(
             snap,
             1,
-            vec![page(
-                snap,
-                1,
-                SnapshotSection::Tasks,
-                None,
-                items,
-                None,
-            )],
+            vec![page(snap, 1, SnapshotSection::Tasks, None, items, None)],
             Vec::new(),
         );
         (model, needle)
@@ -4203,15 +4196,16 @@ mod tests {
             "needle",
             Some(&continuation.clone().with_scope(SearchScope::Active)),
         );
-        assert!(stale_active.is_stale(), "active continuation must not drive settled");
+        assert!(
+            stale_active.is_stale(),
+            "active continuation must not drive settled"
+        );
 
         let stale_query = index.search_settled_task_ids_page("other", Some(&continuation));
         assert!(stale_query.is_stale());
 
-        let stale_revision = index.search_settled_task_ids_page(
-            "needle",
-            Some(&continuation.clone().bumped_revision()),
-        );
+        let stale_revision = index
+            .search_settled_task_ids_page("needle", Some(&continuation.clone().bumped_revision()));
         assert!(stale_revision.is_stale());
 
         let active_with_settled_cont =

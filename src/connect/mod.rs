@@ -81,11 +81,11 @@ pub use failure::{
     ConnectSurface, FailureCase, FailureClass, FailureExpectation, SimulatedFaultOutcome,
     FAILURE_MATRIX,
 };
-pub use host_vault::{derive_machine_binding, OsConnectHostVault};
 pub use host_listener::{
     ConnectWebPublication, ConnectWebTransportMarker, CONNECT_WEB_MARKER_MAX_ENDPOINT_BYTES,
     CONNECT_WEB_MARKER_MAX_JSON_BYTES, CONNECT_WEB_MARKER_TRANSPORT,
 };
+pub use host_vault::{derive_machine_binding, OsConnectHostVault};
 #[cfg(test)]
 pub(crate) use identity::bind_device_credential_from_snapshot as bind_device_credential;
 pub use identity::{
@@ -166,11 +166,11 @@ pub use relay::{
     RELAY_INITIAL_BACKOFF_MS, RELAY_MAX_BACKOFF_MS, ROUTE_TICKET_DOMAIN,
 };
 pub use schema::{
-    canonical_schema_fixtures, native_browser_contract_fixtures, catalog_entry, encode_canonical_schema, payload_catalog,
-    CanonicalSchemaFixture, ChunkPayload, ConnectPayload, ErrorPayload, GenericExtensionPayload,
-    HelloPayload, HostOutputLane, HostOutputPayload, OperationSettlementPayload,
-    PayloadDecodeError, PayloadDescriptor, ResyncPayload, ResyncReason, StreamDeltaPayload,
-    CONNECT_PAYLOAD_SCHEMA_VERSION,
+    canonical_schema_fixtures, catalog_entry, encode_canonical_schema,
+    native_browser_contract_fixtures, payload_catalog, CanonicalSchemaFixture, ChunkPayload,
+    ConnectPayload, ErrorPayload, GenericExtensionPayload, HelloPayload, HostOutputLane,
+    HostOutputPayload, OperationSettlementPayload, PayloadDecodeError, PayloadDescriptor,
+    ResyncPayload, ResyncReason, StreamDeltaPayload, CONNECT_PAYLOAD_SCHEMA_VERSION,
 };
 pub use session::{
     ActionAnswer, ConnectSession, DeviceInput, SessionAdmitError, SessionReceipt,

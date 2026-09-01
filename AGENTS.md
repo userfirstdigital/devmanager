@@ -128,7 +128,11 @@
 - Watch-mode reload must stop only the exact isolated live app and sibling-host
   paths, then verify both processes have exited before copying or launching new
   binaries. A process stop request or unlocked executable alone is not proof that
-  the old profile endpoint has been released.
+  the old profile endpoint has been released. Never recursively terminate through
+  a `conhost.exe` descendant: stop the exact verified debug-app root and wait for
+  its profile-owned sibling host to exit. In PowerShell process scripts, do not
+  reuse the reserved automatic `$Host` variable; use a task-specific name such as
+  `$hostProc`.
 
 ## Durable orchestration journals
 

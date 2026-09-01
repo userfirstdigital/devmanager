@@ -1200,15 +1200,13 @@ fn current_linked_worktree_backlink_still_requires_approved_external_roots() {
         ],
     );
 
-    let error = GitRepository::test_open(&linked).expect_err(
-        "current linked backlink must still require exact approved external roots",
-    );
+    let error = GitRepository::test_open(&linked)
+        .expect_err("current linked backlink must still require exact approved external roots");
     assert!(matches!(error, GitError::InvalidRepositoryRoot { .. }));
 
     let (gitdir, commondir, objects) = resolve_linked_worktree_git_roots(&linked);
-    let binding =
-        test_issue_git_host_binding(&linked, vec![gitdir, commondir, objects])
-            .expect("approved linked worktree authority");
+    let binding = test_issue_git_host_binding(&linked, vec![gitdir, commondir, objects])
+        .expect("approved linked worktree authority");
     let repository =
         GitRepository::from_host_binding(binding, crate::git::command::GitCancellation::new())
             .expect("open approved linked worktree");

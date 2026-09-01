@@ -12,9 +12,8 @@ use crate::domain::id::{OperationId, RequestId, TransferId};
 use crate::domain::snapshot::{MAX_SNAPSHOT_PAGE_ENCODED_BYTES, MAX_SNAPSHOT_PAGE_ITEMS};
 use crate::protocol::{
     ChunkContext as ProtocolChunkContext, ChunkError, ChunkLimitField as ProtocolChunkLimitField,
-    ChunkLimits, ChunkLimitsError, FrameLimits, MAX_PHYSICAL_FRAME_BYTES,
-    MAX_REASSEMBLED_MESSAGE_BYTES, MessagePackCodec, MessagePackError, PROTOCOL_MAJOR,
-    PROTOCOL_MINOR,
+    ChunkLimits, ChunkLimitsError, FrameLimits, MessagePackCodec, MessagePackError,
+    MAX_PHYSICAL_FRAME_BYTES, MAX_REASSEMBLED_MESSAGE_BYTES, PROTOCOL_MAJOR, PROTOCOL_MINOR,
 };
 
 use super::schema::{ConnectPayload, PayloadDecodeError};
@@ -1283,9 +1282,7 @@ impl KnownPayloadKind {
             | Self::TerminalDelta
             | Self::BrowserFrame
             | Self::HostStreamOutput
-            | Self::HostConversationOutput => {
-                ChannelKind::Ephemeral
-            }
+            | Self::HostConversationOutput => ChannelKind::Ephemeral,
         }
     }
 

@@ -1025,8 +1025,10 @@ pub struct TaskTerminalView {
     pub agent_session_id: crate::domain::AgentSessionId,
     pub runtime_generation: u64,
     pub action_epoch: u64,
+    pub focus_epoch: FocusEpoch,
     pub resource_id: crate::domain::ResourceId,
     pub resource_generation: u64,
+    pub accepted_input_sequence: u64,
     pub sequence: u64,
     pub view: TerminalSessionView,
 }
@@ -1537,8 +1539,10 @@ impl TerminalService {
             agent_session_id,
             runtime_generation,
             action_epoch,
+            focus_epoch: hosted.focus_epoch,
             resource_id: hosted.resource_id,
             resource_generation: hosted.generation.get(),
+            accepted_input_sequence: hosted.accepted_input_sequence,
             sequence: hosted.sequence.get(),
             view,
         }))

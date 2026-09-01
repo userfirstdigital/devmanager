@@ -22,7 +22,9 @@ use crate::connect::{
 use crate::domain::command::CommandEnvelope;
 use crate::domain::id::{ClientId, RequestId};
 use crate::domain::query::QueryEnvelope;
-use crate::host::{handshake_timeout, request_completion_timeout, supervise_duplex_halves, IpcError};
+use crate::host::{
+    handshake_timeout, request_completion_timeout, supervise_duplex_halves, IpcError,
+};
 use crate::protocol::{
     Capability, CapabilitySet, ClientRequest, SealedFrame, ServerMessage,
     MAX_HANDSHAKE_MESSAGE_BYTES, MAX_SEALED_FRAME_BYTES, SEALED_NONCE_BYTES,
@@ -133,8 +135,10 @@ pub async fn open_loopback_connect_ws(
     validate_loopback_connect_path(path)?;
     let url = format!("ws://127.0.0.1:{port}{path}");
     let mut request =
-        tokio_tungstenite::tungstenite::client::IntoClientRequest::into_client_request(url.as_str())
-            .map_err(|_| IpcError::Unauthorized)?;
+        tokio_tungstenite::tungstenite::client::IntoClientRequest::into_client_request(
+            url.as_str(),
+        )
+        .map_err(|_| IpcError::Unauthorized)?;
     // Fail closed if the request URI ever leaves exact loopback after parsing.
     let authority = request.uri().authority().ok_or(IpcError::Unauthorized)?;
     if authority.host() != "127.0.0.1" {
@@ -142,14 +146,15 @@ pub async fn open_loopback_connect_ws(
     }
     request.headers_mut().insert(
         tokio_tungstenite::tungstenite::http::header::ORIGIN,
-        format!("http://127.0.0.1:{port}").parse().map_err(|_| IpcError::Unauthorized)?,
+        format!("http://127.0.0.1:{port}")
+            .parse()
+            .map_err(|_| IpcError::Unauthorized)?,
     );
     if let Some(cookie) = cookie_header {
         let value = cookie.parse().map_err(|_| IpcError::Unauthorized)?;
-        request.headers_mut().insert(
-            tokio_tungstenite::tungstenite::http::header::COOKIE,
-            value,
-        );
+        request
+            .headers_mut()
+            .insert(tokio_tungstenite::tungstenite::http::header::COOKIE, value);
     }
     tokio::time::timeout(CONNECT_LOOPBACK_OPEN_TIMEOUT, async {
         let tcp = tokio::net::TcpStream::connect(("127.0.0.1", port))
@@ -560,7 +565,8 @@ where
                 let payload = envelope
                     .decode_payload()
                     .map_err(|_| IpcError::Unauthorized)?;
-                dispatch_connect_payload(&state, &unsolicited, payload, envelope.request_id).await?;
+                dispatch_connect_payload(&state, &unsolicited, payload, envelope.request_id)
+                    .await?;
             }
         }
     }
@@ -614,8 +620,14 @@ async fn dispatch_connect_payload(
 
 fn client_request_to_payload(
     request: ClientRequest,
-) -> Result<(ConnectPayload, Option<RequestId>, Option<crate::domain::id::OperationId>), IpcError>
-{
+) -> Result<
+    (
+        ConnectPayload,
+        Option<RequestId>,
+        Option<crate::domain::id::OperationId>,
+    ),
+    IpcError,
+> {
     match request {
         ClientRequest::Query(envelope) => {
             let request_id = envelope.request_id;
@@ -665,23 +677,26 @@ where
     Si: Sink<WsMessage> + Unpin,
     Si::Error: std::fmt::Display,
 {
-    tokio::time::timeout(CONNECT_WRITE_TIMEOUT.max(request_completion_timeout()), async {
-        sink.feed(WsMessage::Binary(encoded))
-            .await
-            .map_err(|error| {
+    tokio::time::timeout(
+        CONNECT_WRITE_TIMEOUT.max(request_completion_timeout()),
+        async {
+            sink.feed(WsMessage::Binary(encoded))
+                .await
+                .map_err(|error| {
+                    IpcError::Io(std::io::Error::new(
+                        std::io::ErrorKind::Other,
+                        error.to_string(),
+                    ))
+                })?;
+            sink.flush().await.map_err(|error| {
                 IpcError::Io(std::io::Error::new(
                     std::io::ErrorKind::Other,
                     error.to_string(),
                 ))
             })?;
-        sink.flush().await.map_err(|error| {
-            IpcError::Io(std::io::Error::new(
-                std::io::ErrorKind::Other,
-                error.to_string(),
-            ))
-        })?;
-        Ok(())
-    })
+            Ok(())
+        },
+    )
     .await
     .map_err(|_| IpcError::Timeout)?
 }
@@ -848,7 +863,10 @@ mod tests {
     impl Sink<WsMessage> for ChannelSink {
         type Error = std::io::Error;
 
-        fn poll_ready(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        fn poll_ready(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<Result<(), Self::Error>> {
             Poll::Ready(Ok(()))
         }
 
@@ -858,11 +876,17 @@ mod tests {
                 .map_err(|_| std::io::Error::from(std::io::ErrorKind::BrokenPipe))
         }
 
-        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        fn poll_flush(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<Result<(), Self::Error>> {
             Poll::Ready(Ok(()))
         }
 
-        fn poll_close(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        fn poll_close(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<Result<(), Self::Error>> {
             Poll::Ready(Ok(()))
         }
     }
@@ -1040,7 +1064,8 @@ mod tests {
         let host_id = fixture_uuid(0x51);
         let route = ConnectionId::new().as_bytes();
         let session = SessionId::new().as_bytes();
-        let (_device, host_custody, client_channel, _host) = production_pair(host_id, route, session);
+        let (_device, host_custody, client_channel, _host) =
+            production_pair(host_id, route, session);
         let stranger = ConnectNoiseCustody::generate().expect("stranger").public();
         let peer = client_channel.authenticated_peer().unwrap().static_public();
         assert_ne!(peer, stranger);
@@ -1049,8 +1074,15 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn query_with_unsolicited_wake_before_reply() {
-        let (connection, mut host_channel, binding, limits, assigned, to_client_tx, mut from_client_rx) =
-            attach_pair(0x61);
+        let (
+            connection,
+            mut host_channel,
+            binding,
+            limits,
+            assigned,
+            to_client_tx,
+            mut from_client_rx,
+        ) = attach_pair(0x61);
 
         let sub = SubscriptionId::from_bytes(fixture_uuid(0x71)).unwrap();
         let durable = ConnectPayload::from_host_output(
@@ -1132,8 +1164,15 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn command_receipt_round_trip() {
-        let (connection, mut host_channel, binding, limits, assigned, to_client_tx, mut from_client_rx) =
-            attach_pair(0x62);
+        let (
+            connection,
+            mut host_channel,
+            binding,
+            limits,
+            assigned,
+            to_client_tx,
+            mut from_client_rx,
+        ) = attach_pair(0x62);
         let command_id = CommandId::new();
         let receipt = CommandReceipt::Rejected {
             command_id,
@@ -1273,11 +1312,9 @@ mod tests {
         let assigned = ClientId::new();
         let binding = ChannelBinding::new(ConnectionId::new(), SessionId::new(), ChannelId::new());
         let limits = ConnectLimits::v1_default();
-        let mut dispatch = ConnectDispatchSession::bind_paired(
-            "pair".into(),
-            ConnectIdentityLiveState::Live,
-        )
-        .with_assigned_client_id(assigned);
+        let mut dispatch =
+            ConnectDispatchSession::bind_paired("pair".into(), ConnectIdentityLiveState::Live)
+                .with_assigned_client_id(assigned);
         let hello = ConnectPayload::Hello(HelloPayload {
             capabilities: ConnectClientConfig::browser_fleet_capabilities(),
             limits,

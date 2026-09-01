@@ -1664,20 +1664,21 @@ impl WorkspaceService {
         let project_root = self.canonical_configured_project_root()?;
         match request.choice {
             WorkspaceChoice::Main => {
-                let repository = discover_repository(&project_root)
-                    .ok_or_else(|| WorkspaceError::NotRepository(project_root.clone()))?;
-                if !same_path_identity(&project_root, repository.root()) {
-                    return Err(WorkspaceError::MainRootMismatch {
-                        configured_root: project_root,
-                        repository_root: repository.root().to_path_buf(),
-                    });
+                let repository = discover_repository(&project_root);
+                if let Some(repository) = repository.as_ref() {
+                    if !same_path_identity(&project_root, repository.root()) {
+                        return Err(WorkspaceError::MainRootMismatch {
+                            configured_root: project_root,
+                            repository_root: repository.root().to_path_buf(),
+                        });
+                    }
                 }
                 Ok(WorkspaceResolution::Resolved(build_binding(
                     WorkspaceKind::Main,
                     project_root.clone(),
                     None,
                     WorkspaceRef::Main,
-                    Some(repository),
+                    repository,
                     &project_root,
                 )?))
             }
@@ -3658,6 +3659,50 @@ mod cockpit_authority_tests {
                 1,
             )
             .expect("authorize rehydrated durable workspace");
+    }
+
+    #[test]
+    fn main_workspace_accepts_a_multi_folder_project_root_without_a_root_repository() {
+        let root = tempfile::tempdir().expect("workspace root");
+        fs::create_dir(root.path().join("backend")).expect("backend folder");
+        fs::create_dir(root.path().join("frontend")).expect("frontend folder");
+        let project_id = ProjectId::new();
+        let task_id = TaskId::new();
+        let roots =
+            WorkspaceProjectRoots::try_from_pairs([(project_id, root.path().to_path_buf())])
+                .expect("roots");
+        let mut service = WorkspaceService::with_task_coordinator(
+            project_id,
+            task_id,
+            &roots,
+            super::WorkspaceResourceCoordinator::new(),
+        )
+        .expect("service");
+
+        let (binding, _) = service
+            .bind_authorized_with_generation(
+                WorkspaceRequest::main(),
+                task_id,
+                ClientId::new(),
+                Uuid::now_v7(),
+                RequestId::new(),
+                CommandId::new(),
+                1,
+                1,
+            )
+            .expect("bind a multi-folder project root");
+
+        assert_eq!(binding.kind(), crate::workspace::WorkspaceKind::Main);
+        assert_eq!(
+            service
+                .runtime_working_directory()
+                .expect("runtime working directory"),
+            fs::canonicalize(root.path()).expect("canonical project root")
+        );
+        assert!(
+            binding.repository().is_none(),
+            "the project root must not pretend to be one of its child repositories"
+        );
     }
 
     #[test]

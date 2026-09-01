@@ -12,7 +12,7 @@ use crate::domain::id::{
 };
 use crate::domain::task::{WorkspaceBindingKind, WorkspaceRef};
 use crate::providers::ProviderKind;
-use crate::terminal::protocol::TerminalSessionId;
+use crate::terminal::protocol::{FocusEpoch, TerminalSessionId};
 use crate::terminal::session::TerminalScreenSnapshot;
 
 pub const MAX_COCKPIT_FILE_LIST: u16 = 64;
@@ -647,6 +647,11 @@ pub struct TaskTerminalProjection {
     pub runtime_generation: u64,
     pub resource_generation: u64,
     pub action_epoch: u64,
+    /// Exact host-owned focus fence required for raw input to this PTY.
+    pub focus_epoch: FocusEpoch,
+    /// Last raw input sequence accepted by the host for this terminal generation.
+    /// The next request must use this value plus one.
+    pub accepted_input_sequence: u64,
     /// Host-attested exception for a live Codex runtime whose launch explicitly
     /// reports conversation identity unsupported. Never inferred from PTY text.
     #[serde(default)]

@@ -1595,7 +1595,9 @@ impl InboxRuntime {
                 self.projection_updates = self.projection_updates.saturating_add(1);
                 Ok(false)
             }
-            SubscriptionUpdate::Stream(_) | SubscriptionUpdate::ConversationDirty { .. } => Ok(false),
+            SubscriptionUpdate::Stream(_) | SubscriptionUpdate::ConversationDirty { .. } => {
+                Ok(false)
+            }
         }
     }
 
@@ -2262,18 +2264,17 @@ impl Inbox {
                 .map(|page| page.total_count)
                 .unwrap_or(0),
         );
-        self.state = if self.rows.is_empty()
-            && self.settled_rows.is_empty()
-            && self.history_rows.is_empty()
-        {
-            if self.filter.is_filtered() {
-                InboxState::FilteredEmpty
+        self.state =
+            if self.rows.is_empty() && self.settled_rows.is_empty() && self.history_rows.is_empty()
+            {
+                if self.filter.is_filtered() {
+                    InboxState::FilteredEmpty
+                } else {
+                    InboxState::Empty
+                }
             } else {
-                InboxState::Empty
-            }
-        } else {
-            InboxState::Ready
-        };
+                InboxState::Ready
+            };
         self.incremental_updates = self.incremental_updates.saturating_add(1);
     }
 
@@ -3513,7 +3514,11 @@ mod tests {
         inbox.apply_model_event(&model, Some(open_id));
         assert!(!inbox.active_rows().iter().any(|row| row.task_id == open_id));
         assert_eq!(
-            inbox.settled_rows().iter().map(|row| row.task_id).collect::<Vec<_>>(),
+            inbox
+                .settled_rows()
+                .iter()
+                .map(|row| row.task_id)
+                .collect::<Vec<_>>(),
             vec![open_id]
         );
         assert_eq!(
@@ -3524,7 +3529,11 @@ mod tests {
 
         let fresh = Inbox::from_model(&model);
         assert_eq!(
-            fresh.settled_rows().iter().map(|row| row.task_id).collect::<Vec<_>>(),
+            fresh
+                .settled_rows()
+                .iter()
+                .map(|row| row.task_id)
+                .collect::<Vec<_>>(),
             vec![open_id]
         );
         assert!(fresh.active_rows().is_empty());

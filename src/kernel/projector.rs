@@ -1144,8 +1144,15 @@ pub(crate) fn apply_event(
                 };
                 if settlement.command_id != *command_id
                     || settlement.operation_id != Some(*operation_id)
-                    || settlement.delivery.is_delivered()
                 {
+                    // Acceptance and physical delivery are separate ordered
+                    // lanes. A newer accepted input may already own the
+                    // presentation slot when an earlier dispatch settles. Its
+                    // exact operation/outbox lineage was validated before this
+                    // derived event was appended, so preserve the newer slot.
+                    return Ok(());
+                }
+                if settlement.delivery.is_delivered() {
                     return Err(StoreError::Projection(
                         "provider delivery settlement mismatch".into(),
                     ));

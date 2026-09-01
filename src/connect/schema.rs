@@ -19,15 +19,15 @@ use crate::protocol::{
 };
 
 use super::envelope::{
-    ChannelKind, ConnectLimitError, ConnectLimits, ConnectPrivacyClass, KnownPayloadKind,
-    MAX_CONNECT_DIAGNOSTIC_BYTES, MAX_CONNECT_PAGE_ENCODED_BYTES,
-    MAX_CONNECT_REASSEMBLED_MESSAGE_BYTES, PayloadKind, binary_payload,
+    binary_payload, ChannelKind, ConnectLimitError, ConnectLimits, ConnectPrivacyClass,
+    KnownPayloadKind, PayloadKind, MAX_CONNECT_DIAGNOSTIC_BYTES, MAX_CONNECT_PAGE_ENCODED_BYTES,
+    MAX_CONNECT_REASSEMBLED_MESSAGE_BYTES,
 };
 use super::epoch::{FocusEpoch, TurnEpoch};
 use super::permission::HostCapabilityGrant;
 use super::presence::LastSenderHint;
 use super::transport::{
-    BrowserExtensionDescriptor, PromptExtensionDescriptor, validate_advertised_relay_url,
+    validate_advertised_relay_url, BrowserExtensionDescriptor, PromptExtensionDescriptor,
 };
 
 pub const CONNECT_PAYLOAD_SCHEMA_VERSION: u16 = 1;
@@ -379,7 +379,8 @@ impl HostOutputPayload {
             | ServerMessage::UpdateHandoff(_)
             | ServerMessage::Detached(_) => {
                 return Err(PayloadDecodeError::Ambiguous {
-                    reason: "request, reply, receipt, and detach variants are not host-output payloads",
+                    reason:
+                        "request, reply, receipt, and detach variants are not host-output payloads",
                 });
             }
         }
@@ -396,7 +397,8 @@ impl HostOutputPayload {
     ) -> Result<(), PayloadDecodeError> {
         if self.required_capabilities.intersection(negotiated) != self.required_capabilities {
             return Err(PayloadDecodeError::Ambiguous {
-                reason: "host output required_capabilities are not covered by negotiated capabilities",
+                reason:
+                    "host output required_capabilities are not covered by negotiated capabilities",
             });
         }
         Ok(())
@@ -429,7 +431,8 @@ impl HostOutputPayload {
             ) => {
                 if !self.required_capabilities.contains(Capability::EventReplay) {
                     return Err(PayloadDecodeError::Ambiguous {
-                        reason: "host critical output requires EventReplay in required_capabilities",
+                        reason:
+                            "host critical output requires EventReplay in required_capabilities",
                     });
                 }
                 if *newest_sequence < *last_delivered_sequence {
@@ -735,7 +738,8 @@ impl ConnectPayload {
             | ServerMessage::UpdateHandoff(_)
             | ServerMessage::Detached(_) => {
                 return Err(PayloadDecodeError::Ambiguous {
-                    reason: "request, reply, receipt, and detach variants are not host-output payloads",
+                    reason:
+                        "request, reply, receipt, and detach variants are not host-output payloads",
                 });
             }
         };
@@ -1085,35 +1089,78 @@ fn fixture_host_conversation() -> HostOutputPayload {
 pub fn native_browser_contract_fixtures() -> Vec<CanonicalSchemaFixture> {
     use crate::domain::cockpit::{ProviderInputStateProjection, TaskCockpitResult};
     use crate::domain::query::QueryResult;
-    use crate::domain::snapshot::{SemanticJournalFact, SemanticJournalPage, SemanticJournalPayload};
-    let mut fixtures = canonical_schema_fixtures().into_iter()
-        .filter(|f| matches!(f.payload.kind().get(), 1 | 18 | 19 | 20 | 21 | 22)).collect::<Vec<_>>();
-    let state = ProviderInputStateProjection {
-        task_id: fixture_task(0x43), task_revision: 3, action_epoch: 4,
-        agent_session_id: Some(crate::domain::AgentSessionId::from_bytes(fixture_uuid(0x44)).unwrap()),
-        runtime_generation: Some(7), agent_lifecycle: Some(crate::domain::agent::AgentSessionLifecycle::Open),
-        provider_kind: Some(crate::providers::ProviderKind::ClaudeCode),
-        provider_session_id: Some(crate::domain::agent::ProviderSessionId::new("native-exact-conversation").unwrap()),
-        current_turn: None, open_question: None, open_approval: None, pending_wait_command_ids: Vec::new(),
+    use crate::domain::snapshot::{
+        SemanticJournalFact, SemanticJournalPage, SemanticJournalPayload,
     };
-    fixtures.push(CanonicalSchemaFixture { name: "provider_input_state", payload: ConnectPayload::QueryReply(QueryReply {
-        request_id: fixture_request(0x41), outcome: QueryOutcome::Ok(QueryResult::TaskCockpit(TaskCockpitResult::ProviderInputState(state))),
-    }) });
-    for (name, reset, more) in [("conversation_final", false, false), ("conversation_page", false, true), ("conversation_rollover", true, false)] {
+    let mut fixtures = canonical_schema_fixtures()
+        .into_iter()
+        .filter(|f| matches!(f.payload.kind().get(), 1 | 18 | 19 | 20 | 21 | 22))
+        .collect::<Vec<_>>();
+    let state = ProviderInputStateProjection {
+        task_id: fixture_task(0x43),
+        task_revision: 3,
+        action_epoch: 4,
+        agent_session_id: Some(
+            crate::domain::AgentSessionId::from_bytes(fixture_uuid(0x44)).unwrap(),
+        ),
+        runtime_generation: Some(7),
+        agent_lifecycle: Some(crate::domain::agent::AgentSessionLifecycle::Open),
+        provider_kind: Some(crate::providers::ProviderKind::ClaudeCode),
+        provider_session_id: Some(
+            crate::domain::agent::ProviderSessionId::new("native-exact-conversation").unwrap(),
+        ),
+        current_turn: None,
+        open_question: None,
+        open_approval: None,
+        pending_wait_command_ids: Vec::new(),
+    };
+    fixtures.push(CanonicalSchemaFixture {
+        name: "provider_input_state",
+        payload: ConnectPayload::QueryReply(QueryReply {
+            request_id: fixture_request(0x41),
+            outcome: QueryOutcome::Ok(QueryResult::TaskCockpit(
+                TaskCockpitResult::ProviderInputState(state),
+            )),
+        }),
+    });
+    for (name, reset, more) in [
+        ("conversation_final", false, false),
+        ("conversation_page", false, true),
+        ("conversation_rollover", true, false),
+    ] {
         let mut page = SemanticJournalPage {
-            oldest_sequence: 1, cursor_rolled_over: reset, after_sequence: 0,
-            through_sequence: if more { 1 } else { 2 }, high_water: 2,
-            encoded_bytes: 0, next_sequence: more.then_some(1),
-            facts: vec![SemanticJournalFact { id: fixture_event(0x55), sequence: 1, occurred_at_ms: Some(1),
-                provider: "claude_code".into(), schema_version: 1, kind: "assistant_text".into(), visibility: "task".into(),
-                privacy_class: crate::domain::PrivacyClass::LocalOnly, redacted: false,
-                payload: SemanticJournalPayload::AssistantText { text: "Native conversation text".into() },
+            oldest_sequence: 1,
+            cursor_rolled_over: reset,
+            after_sequence: 0,
+            through_sequence: if more { 1 } else { 2 },
+            high_water: 2,
+            encoded_bytes: 0,
+            next_sequence: more.then_some(1),
+            facts: vec![SemanticJournalFact {
+                id: fixture_event(0x55),
+                sequence: 1,
+                occurred_at_ms: Some(1),
+                provider: "claude_code".into(),
+                schema_version: 1,
+                kind: "assistant_text".into(),
+                visibility: "task".into(),
+                privacy_class: crate::domain::PrivacyClass::LocalOnly,
+                redacted: false,
+                payload: SemanticJournalPayload::AssistantText {
+                    text: "Native conversation text".into(),
+                },
             }],
         };
         page.encoded_bytes = crate::domain::snapshot::canonical_semantic_page_size(&page).unwrap();
-        fixtures.push(CanonicalSchemaFixture { name, payload: ConnectPayload::QueryReply(QueryReply {
-            request_id: fixture_request(0x41), outcome: QueryOutcome::Ok(QueryResult::TaskCockpit(TaskCockpitResult::Conversation(page))),
-        }) });
+        fixtures.push(CanonicalSchemaFixture {
+            name,
+            payload: ConnectPayload::QueryReply(QueryReply {
+                request_id: fixture_request(0x41),
+                outcome: QueryOutcome::Ok(QueryResult::TaskCockpit(
+                    TaskCockpitResult::Conversation(page),
+                )),
+            }),
+        });
     }
     fixtures
 }
@@ -1553,28 +1600,24 @@ mod tests {
         };
         let caps = CapabilitySet::from_capabilities([Capability::EventReplay]);
         let host = HostOutputPayload::new(caps, durable_message.clone()).expect("construct");
-        assert!(
-            host.validate_for_lane(HostOutputLane::Critical, ConnectLimits::v1_default())
-                .is_err()
-        );
-        assert!(
-            host.validate_for_lane(HostOutputLane::Ephemeral, ConnectLimits::v1_default())
-                .is_err()
-        );
+        assert!(host
+            .validate_for_lane(HostOutputLane::Critical, ConnectLimits::v1_default())
+            .is_err());
+        assert!(host
+            .validate_for_lane(HostOutputLane::Ephemeral, ConnectLimits::v1_default())
+            .is_err());
 
         let mismatched = ConnectPayload::HostCriticalOutput(host);
         assert!(mismatched.validate(ConnectLimits::v1_default()).is_err());
 
-        assert!(
-            HostOutputPayload::new(
-                caps,
-                ServerMessage::QueryReply(QueryReply {
-                    request_id: fixture_request(0x41),
-                    outcome: QueryOutcome::Err(QueryError::NotFound),
-                }),
-            )
-            .is_err()
-        );
+        assert!(HostOutputPayload::new(
+            caps,
+            ServerMessage::QueryReply(QueryReply {
+                request_id: fixture_request(0x41),
+                outcome: QueryOutcome::Err(QueryError::NotFound),
+            }),
+        )
+        .is_err());
     }
 
     #[test]
@@ -1593,16 +1636,14 @@ mod tests {
         assert!(ConnectPayload::from_host_output(message, CapabilitySet::empty()).is_err());
 
         let host = fixture_host_durable();
-        assert!(
-            host.validate_negotiated_capabilities(CapabilitySet::empty())
-                .is_err()
-        );
-        assert!(
-            host.validate_negotiated_capabilities(CapabilitySet::from_capabilities([
+        assert!(host
+            .validate_negotiated_capabilities(CapabilitySet::empty())
+            .is_err());
+        assert!(host
+            .validate_negotiated_capabilities(CapabilitySet::from_capabilities([
                 Capability::EventReplay
             ]))
-            .is_ok()
-        );
+            .is_ok());
     }
 
     #[test]
@@ -1616,10 +1657,9 @@ mod tests {
             },
         )
         .expect("construct");
-        assert!(
-            host.validate_for_lane(HostOutputLane::Critical, ConnectLimits::v1_default())
-                .is_err()
-        );
+        assert!(host
+            .validate_for_lane(HostOutputLane::Critical, ConnectLimits::v1_default())
+            .is_err());
     }
 
     #[test]
@@ -1668,9 +1708,8 @@ mod tests {
             }),
         )
         .expect("construct");
-        assert!(
-            host.validate_for_lane(HostOutputLane::Ephemeral, tight)
-                .is_err()
-        );
+        assert!(host
+            .validate_for_lane(HostOutputLane::Ephemeral, tight)
+            .is_err());
     }
 }

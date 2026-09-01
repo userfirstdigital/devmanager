@@ -71,6 +71,57 @@ use super::shutdown::{
 /// (bounded backpressure). Requests are never silently dropped.
 pub const HOST_REQUEST_QUEUE_CAPACITY: usize = 32;
 
+/// Provider discovery/start may wait on provider-owned startup UI. Keep a
+/// small bounded lane so one task waiting for trust cannot head-of-line block
+/// an unrelated provider conversation, while still protecting the host from a
+/// restart stampede.
+const MAX_CONCURRENT_PROVIDER_RESTORES: usize = 2;
+
+/// One unavailable conversation must not head-of-line block newer provider
+/// input. Every claimed unit is still individually leased and fenced by the
+/// kernel store; this only bounds how many due units the host examines in one
+/// maintenance turn.
+const MAX_PROVIDER_DISPATCH_UNITS_PER_PASS: usize = 64;
+
+/// Durable provider input is driven immediately on acceptance and again after
+/// exact-session restore. The periodic lane is only a recovery fallback; a
+/// short idle cadence avoids rewriting the same pre-boundary hold every second.
+const PROVIDER_DISPATCH_MAINTENANCE_PERIOD: Duration = Duration::from_secs(5);
+
+fn run_provider_dispatch_pass(
+    bus: &mut CommandBus,
+    runtime: &crate::providers::dispatch::ProviderDispatchRuntime,
+) -> Result<
+    Vec<(
+        TaskId,
+        crate::providers::dispatch::ProviderDispatchHoldReason,
+    )>,
+    StoreError,
+> {
+    let mut held = Vec::new();
+    for _ in 0..MAX_PROVIDER_DISPATCH_UNITS_PER_PASS {
+        match bus.run_provider_dispatch(runtime)? {
+            crate::providers::dispatch::ProviderDispatchOutcome::Idle => break,
+            crate::providers::dispatch::ProviderDispatchOutcome::Held { task_id, reason } => {
+                held.push((task_id, reason));
+            }
+            crate::providers::dispatch::ProviderDispatchOutcome::Settled { .. }
+            | crate::providers::dispatch::ProviderDispatchOutcome::Uncertain { .. }
+            | crate::providers::dispatch::ProviderDispatchOutcome::Recovered { .. } => {}
+        }
+    }
+    Ok(held)
+}
+
+fn provider_start_requires_existing_binding(
+    mode: crate::domain::command::ProviderStartMode,
+) -> bool {
+    !matches!(
+        mode,
+        crate::domain::command::ProviderStartMode::NewConversation
+    )
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ProviderSemanticIngress {
     Question {
@@ -2578,6 +2629,16 @@ pub struct HostRequestExecutor {
     /// Tasks that already have a restore/start attempt in flight. Held dispatch
     /// must not enqueue a duplicate StartProviderSessionIntent for the same task.
     provider_restore_in_flight: HashSet<TaskId>,
+    /// Exact user-selected launch options for a provider start admitted during
+    /// this host lifetime. A held first input can race SessionStart/terminal
+    /// publication; reconstructing that retry with defaults would silently
+    /// change the selected model, reasoning effort, or access mode.
+    provider_launch_options: HashMap<TaskId, crate::providers::adapter::ProviderLaunchOptions>,
+    /// Tasks whose currently held input has no durable provider restart facts.
+    /// Keep restart lookup and logging edge-triggered until a fresh action
+    /// explicitly rearms the task.
+    provider_restart_unavailable: HashSet<TaskId>,
+    provider_dispatch_maintenance_due: Instant,
     /// A failed restore fence suppresses only the same durable action epoch.
     /// A later user action advances the epoch and may retry intentionally.
     provider_restore_failed_action_epochs: HashMap<TaskId, u64>,
@@ -2860,6 +2921,9 @@ impl HostRequestExecutor {
             provider_restore_queue: VecDeque::new(),
             provider_restore_jobs: FuturesUnordered::new(),
             provider_restore_in_flight: HashSet::new(),
+            provider_launch_options: HashMap::new(),
+            provider_restart_unavailable: HashSet::new(),
+            provider_dispatch_maintenance_due: Instant::now(),
             provider_restore_failed_action_epochs: HashMap::new(),
             provider_settings,
             provider_health_jobs: FuturesUnordered::new(),
@@ -2954,6 +3018,9 @@ impl HostRequestExecutor {
             provider_restore_queue: VecDeque::new(),
             provider_restore_jobs: FuturesUnordered::new(),
             provider_restore_in_flight: HashSet::new(),
+            provider_launch_options: HashMap::new(),
+            provider_restart_unavailable: HashSet::new(),
+            provider_dispatch_maintenance_due: Instant::now(),
             provider_restore_failed_action_epochs: HashMap::new(),
             provider_settings: None,
             provider_health_jobs: FuturesUnordered::new(),
@@ -2990,9 +3057,9 @@ impl HostRequestExecutor {
 
     async fn run(&mut self, schedule_automatic_maintenance: bool) {
         // `interval` ticks immediately. Delay the first maintenance pass so
-        // startup does not race teardown or provider restoration. Restoring one
-        // provider at a time keeps the request loop available to bootstrap the
-        // native client even when provider discovery is slow.
+        // startup does not race teardown or provider restoration. Provider
+        // restoration is bounded separately so a provider-owned trust screen
+        // cannot block an unrelated conversation from starting.
         let period = SNAPSHOT_REAPER_PERIOD.min(EVENT_REPLAY_REAPER_PERIOD);
         let mut reaper = interval_at(tokio::time::Instant::now() + period, period);
         reaper.set_missed_tick_behavior(MissedTickBehavior::Delay);
@@ -3411,23 +3478,30 @@ impl HostRequestExecutor {
     /// cancellation-owned restore-future lane.
     fn drive_provider_input_after_acceptance(&mut self, task_id: TaskId) {
         self.provider_restore_failed_action_epochs.remove(&task_id);
-        let held_restart = if let Some(runtime) = self.configured_service_runtime.as_mut() {
-            match self.bus.run_provider_dispatch(&runtime.provider_dispatch) {
-                Ok(crate::providers::dispatch::ProviderDispatchOutcome::Held {
-                    task_id,
-                    reason,
-                }) => Some((task_id, reason)),
-                Ok(_) => None,
+        self.provider_restart_unavailable.remove(&task_id);
+        self.provider_dispatch_maintenance_due =
+            Instant::now() + PROVIDER_DISPATCH_MAINTENANCE_PERIOD;
+        let held_restarts = if let Some(runtime) = self.configured_service_runtime.as_mut() {
+            match run_provider_dispatch_pass(&mut self.bus, &runtime.provider_dispatch) {
+                Ok(held) => held,
                 Err(error) => {
                     eprintln!("devmanager-host: immediate provider dispatch failed: {error}");
-                    None
+                    Vec::new()
                 }
             }
         } else {
-            None
+            Vec::new()
         };
-        if let Some((task_id, reason)) = held_restart {
-            self.queue_held_provider_restart(task_id, reason);
+        for (held_task_id, reason) in held_restarts {
+            // The launch that just completed already owns this task's exact
+            // runtime. SessionStart and the terminal attachment arrive
+            // asynchronously, so dispatch can briefly report SessionNotBound
+            // or RuntimeAuthorityAbsent here. Scheduling another start in that
+            // window races the live generation and permanently records a false
+            // restore failure. Other held tasks still need their own restart.
+            if held_task_id != task_id {
+                self.queue_held_provider_restart(held_task_id, reason);
+            }
         }
         self.queue_one_provider_restore();
         self.fan_out_live_durable_events();
@@ -3440,32 +3514,39 @@ impl HostRequestExecutor {
         // Capture dispatch/flush/failure results under the runtime borrow, then
         // release it before mutating restore queues owned by `self`. Disjoint
         // field borrows (`bus` + `configured_service_runtime`) keep this compiling.
-        let (held_restart, provider_failures) =
-            if let Some(runtime) = self.configured_service_runtime.as_mut() {
-                let bus = &mut self.bus;
-                let held_restart = match bus.run_provider_dispatch(&runtime.provider_dispatch) {
-                    Ok(crate::providers::dispatch::ProviderDispatchOutcome::Held {
-                        task_id,
-                        reason,
-                    }) => Some((task_id, reason)),
-                    Ok(_) => None,
+        let dispatch_due = Instant::now() >= self.provider_dispatch_maintenance_due;
+        if dispatch_due {
+            self.provider_dispatch_maintenance_due =
+                Instant::now() + PROVIDER_DISPATCH_MAINTENANCE_PERIOD;
+        }
+        let (held_restarts, provider_failures) = if let Some(runtime) =
+            self.configured_service_runtime.as_mut()
+        {
+            let bus = &mut self.bus;
+            runtime.manager.reconcile_provider_terminal_exits_now();
+            let held_restarts = if dispatch_due {
+                match run_provider_dispatch_pass(bus, &runtime.provider_dispatch) {
+                    Ok(held) => held,
                     Err(error) => {
                         eprintln!("devmanager-host: provider dispatch maintenance failed: {error}");
-                        None
-                    }
-                };
-                if let Ok(mut journal) = runtime.semantic_journal.lock() {
-                    if let Err(error) = journal.flush_if_dirty() {
-                        eprintln!("devmanager-host: conversation history flush failed: {error}");
+                        Vec::new()
                     }
                 }
-                let _ = runtime.manager.configured_service_snapshots();
-                let failures = runtime.manager.drain_provider_session_failures();
-                (held_restart, failures)
             } else {
-                (None, Vec::new())
+                Vec::new()
             };
-        if let Some((task_id, reason)) = held_restart {
+            if let Ok(mut journal) = runtime.semantic_journal.lock() {
+                if let Err(error) = journal.flush_if_dirty() {
+                    eprintln!("devmanager-host: conversation history flush failed: {error}");
+                }
+            }
+            let _ = runtime.manager.configured_service_snapshots();
+            let failures = runtime.manager.drain_provider_session_failures();
+            (held_restarts, failures)
+        } else {
+            (Vec::new(), Vec::new())
+        };
+        for (task_id, reason) in held_restarts {
             self.queue_held_provider_restart(task_id, reason);
         }
         for failure in provider_failures {
@@ -3500,8 +3581,12 @@ impl HostRequestExecutor {
         {
             return;
         }
+        if self.provider_restart_unavailable.contains(&task_id) {
+            return;
+        }
         match self.bus.provider_hold_restart_intent(task_id) {
-            Ok(Some(intent)) => {
+            Ok(Some(mut intent)) => {
+                self.provider_restart_unavailable.remove(&task_id);
                 if self
                     .provider_restore_failed_action_epochs
                     .get(&task_id)
@@ -3509,6 +3594,10 @@ impl HostRequestExecutor {
                 {
                     return;
                 }
+                restore_admitted_provider_launch_options(
+                    &mut intent,
+                    &self.provider_launch_options,
+                );
                 eprintln!(
                     "devmanager-host: provider input held task={} reason={reason:?}; scheduling {:?}",
                     task_id, intent.mode
@@ -3520,9 +3609,11 @@ impl HostRequestExecutor {
                 );
             }
             Ok(None) => {
-                eprintln!(
-                    "devmanager-host: provider input held task={task_id} reason={reason:?}; no restart facts"
-                );
+                if self.provider_restart_unavailable.insert(task_id) {
+                    eprintln!(
+                        "devmanager-host: provider input held task={task_id} reason={reason:?}; no restart facts"
+                    );
+                }
             }
             Err(error) => {
                 eprintln!(
@@ -3553,7 +3644,7 @@ impl HostRequestExecutor {
                 }
             }
         }
-        if !self.provider_restore_jobs.is_empty() {
+        if self.provider_restore_jobs.len() >= MAX_CONCURRENT_PROVIDER_RESTORES {
             return;
         }
         let Some(intent) = self.provider_restore_queue.pop_front() else {
@@ -3641,7 +3732,7 @@ impl HostRequestExecutor {
                     task_id,
                     provider_kind,
                     launch_options,
-                    true,
+                    provider_start_requires_existing_binding(intent.mode),
                     legacy_launch.as_ref(),
                 )?;
                 let observation = super::agent_connection::observe_with_trusted_auth(
@@ -3830,13 +3921,15 @@ impl HostRequestExecutor {
         };
         let binding = runtime
             .manager
-            .provider_terminal_binding(
+            .provider_terminal_binding_diagnostic(
                 task_id,
                 primary_agent_id,
                 resource.id,
                 agent.runtime_generation,
             )
-            .ok_or_else(|| "provider runtime did not publish its terminal binding".to_string())?;
+            .map_err(|error| {
+                format!("provider runtime did not publish its terminal binding: {error}")
+            })?;
         if binding.task_id != task_id
             || binding.agent_session_id != primary_agent_id
             || binding.resource_id != resource.id
@@ -3888,6 +3981,7 @@ impl HostRequestExecutor {
     }
 
     fn mark_provider_restore_succeeded(&mut self, task_id: TaskId) {
+        self.provider_restart_unavailable.remove(&task_id);
         let Some(snapshot) = self.bus.task_snapshot(task_id).ok().flatten() else {
             return;
         };
@@ -4975,6 +5069,9 @@ impl HostRequestExecutor {
         let provider_kind = intent.provider_kind;
         let launch_options = intent.launch_options.clone();
         let revision = snapshot.task.revision;
+        self.provider_launch_options
+            .insert(task_id, launch_options.clone());
+        self.provider_restart_unavailable.remove(&task_id);
         self.provider_restore_in_flight.insert(task_id);
         let Some(owner) = self
             .provider_settings
@@ -4998,7 +5095,7 @@ impl HostRequestExecutor {
                     task_id,
                     provider_kind,
                     launch_options,
-                    false,
+                    provider_start_requires_existing_binding(intent.mode),
                     None,
                 )
                 .map_err(|error| {
@@ -5738,6 +5835,47 @@ impl HostRequestExecutor {
                 let connection_id = output_id
                     .map(ConnectionOutputId::as_uuid)
                     .unwrap_or(Uuid::nil());
+                if matches!(
+                    query,
+                    TaskCockpitQuery::Terminal | TaskCockpitQuery::TerminalReadiness
+                ) {
+                    if let Some(runtime) = self.configured_service_runtime.as_ref() {
+                        runtime.manager.reconcile_provider_terminal_exits_now();
+                    }
+                    if provider_terminal_query_may_attach(&query) {
+                        if let Some(task_id) = envelope.task_id {
+                            // Attachment is idempotent. Retry at the user-visible
+                            // query boundary so a provider-native trust/setup prompt
+                            // becomes available as soon as the PTY exists, even if
+                            // the asynchronous launch completion raced first paint.
+                            if let Err(error) = self.attach_provider_terminal(task_id) {
+                                let restore_already_pending =
+                                    self.provider_restore_in_flight.contains(&task_id)
+                                        || self
+                                            .provider_restore_queue
+                                            .iter()
+                                            .any(|queued| queued.task_id == task_id);
+                                if !restore_already_pending {
+                                    eprintln!(
+                                        "devmanager-host: provider terminal attachment deferred task={task_id}: {error}"
+                                    );
+                                }
+                                // Opening Terminal is an explicit request for the
+                                // task's exact provider runtime. Restore it lazily
+                                // instead of keeping every settled conversation
+                                // alive in the background. This also makes an
+                                // earlier transient restore failure retryable by a
+                                // fresh user gesture.
+                                self.provider_restore_failed_action_epochs.remove(&task_id);
+                                self.queue_held_provider_restart(
+                                    task_id,
+                                    crate::providers::dispatch::ProviderDispatchHoldReason::SessionNotBound,
+                                );
+                                self.queue_one_provider_restore();
+                            }
+                        }
+                    }
+                }
                 let provider_launch_hint = match envelope.task_id {
                     Some(task_id)
                         if self.provider_restore_in_flight.contains(&task_id)
@@ -6602,6 +6740,23 @@ fn push_unique_provider_restore_intent(
     }
     queue.push_back(intent);
     true
+}
+
+fn restore_admitted_provider_launch_options(
+    intent: &mut crate::domain::command::StartProviderSessionIntent,
+    admitted: &HashMap<TaskId, crate::providers::adapter::ProviderLaunchOptions>,
+) {
+    if let Some(options) = admitted.get(&intent.task_id) {
+        intent.launch_options = options.clone();
+    }
+}
+
+fn provider_terminal_query_may_attach(query: &TaskCockpitQuery) -> bool {
+    // Readiness is a classification probe used by first-send. Starting a
+    // provider here races the explicit StartProviderSession command and loses
+    // the user's captured model/reasoning/access choices. The legacy Terminal
+    // query represents an explicit request to open/restore the runtime.
+    matches!(query, TaskCockpitQuery::Terminal)
 }
 
 /// Conservative newest-sequence hint for ResyncRequired after a live replay error.
@@ -8352,10 +8507,11 @@ mod output_tests {
     use std::time::Duration;
 
     use super::{
-        provider_restore_success_attention, ConnectionOutputHandle, ConnectionOutputId,
-        DuplexExecuteCompletion, DurableAdmitResult, EphemeralAdmitResult, EphemeralKey,
-        EventReplayRegistry, HostRequestExecutor, HostRequestHandle, LiveStreamState, LiveTail,
-        PhysicalWriteAckStatus, PrioritizedOutbound, StreamMaterializer,
+        provider_restore_success_attention, provider_start_requires_existing_binding,
+        ConnectionOutputHandle, ConnectionOutputId, DuplexExecuteCompletion, DurableAdmitResult,
+        EphemeralAdmitResult, EphemeralKey, EventReplayRegistry, HostRequestExecutor,
+        HostRequestHandle, LiveStreamState, LiveTail, PhysicalWriteAckStatus, PrioritizedOutbound,
+        StreamMaterializer, MAX_CONCURRENT_PROVIDER_RESTORES,
     };
     use crate::domain::cockpit::{TaskCockpitQuery, TaskCockpitResult};
     use crate::domain::command::{Command, CommandEnvelope, CreateTaskIntent};
@@ -13151,6 +13307,42 @@ mod output_tests {
     }
 
     #[test]
+    fn provider_restore_lane_prevents_startup_prompt_head_of_line_blocking() {
+        let source = include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/src/host/connection.rs"
+        ));
+        let start = source
+            .find("fn queue_one_provider_restore(")
+            .expect("provider restore scheduler");
+        let body = &source[start..];
+        let end = body
+            .find("\n    fn handle_provider_restore_outcome(")
+            .expect("provider restore outcome follows scheduler");
+        let body = &body[..end];
+        assert!(
+            body.contains("self.provider_restore_jobs.len() >= MAX_CONCURRENT_PROVIDER_RESTORES"),
+            "one provider-owned startup prompt must not serialize every provider restore"
+        );
+        assert!(MAX_CONCURRENT_PROVIDER_RESTORES >= 2);
+    }
+
+    #[test]
+    fn provider_launch_binding_policy_distinguishes_new_conversation_from_resume() {
+        use crate::domain::command::ProviderStartMode;
+
+        assert!(!provider_start_requires_existing_binding(
+            ProviderStartMode::NewConversation
+        ));
+        assert!(provider_start_requires_existing_binding(
+            ProviderStartMode::ResumeExact
+        ));
+        assert!(provider_start_requires_existing_binding(
+            ProviderStartMode::Open
+        ));
+    }
+
+    #[test]
     fn same_kind_new_conversation_refuses_live_or_persisted_provider() {
         let source = include_str!(concat!(
             env!("CARGO_MANIFEST_DIR"),
@@ -13248,7 +13440,8 @@ mod tests {
     use super::{
         apply_admitted_notification_sound, next_attention_after_provider_restore_failure,
         provider_restore_failure_attention, provider_restore_success_attention,
-        push_unique_provider_restore_intent,
+        provider_terminal_query_may_attach, push_unique_provider_restore_intent,
+        restore_admitted_provider_launch_options,
     };
     use crate::domain::agent::{
         AgentRole, AgentSessionFacts, AgentSessionLifecycle, ProviderSessionId,
@@ -13273,8 +13466,38 @@ mod tests {
         SemanticEventDraft, SemanticEventKind, SemanticJournalStore, SemanticRetention,
         SemanticSource, StableSessionKey,
     };
-    use std::collections::{HashSet, VecDeque};
+    use std::collections::{HashMap, HashSet, VecDeque};
     use uuid::Uuid;
+
+    #[test]
+    fn terminal_readiness_is_observational_and_never_starts_a_provider() {
+        assert!(provider_terminal_query_may_attach(
+            &crate::domain::cockpit::TaskCockpitQuery::Terminal
+        ));
+        assert!(!provider_terminal_query_may_attach(
+            &crate::domain::cockpit::TaskCockpitQuery::TerminalReadiness
+        ));
+    }
+
+    #[test]
+    fn provider_dispatch_pass_does_not_stop_at_the_first_held_conversation() {
+        let source = include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/src/host/connection.rs"
+        ));
+        let start = source
+            .find("fn run_provider_dispatch_pass(")
+            .expect("bounded provider dispatch pass");
+        let body = &source[start..];
+        let end = body
+            .find("\n}\n\nfn provider_start_requires_existing_binding")
+            .expect("dispatch pass boundary");
+        let body = &body[..end];
+        assert!(body.contains("0..MAX_PROVIDER_DISPATCH_UNITS_PER_PASS"));
+        assert!(body.contains("ProviderDispatchOutcome::Idle => break"));
+        assert!(body.contains("held.push((task_id, reason))"));
+        assert!(!body.contains("ProviderDispatchOutcome::Held { task_id, reason } => break"));
+    }
 
     struct ProviderRestoreHarness {
         bus: CommandBus,
@@ -13329,7 +13552,10 @@ mod tests {
                         created_at_ms: 1_725_000_000_000,
                         connectivity: TaskConnectivity::Connected,
                         attention: TaskAttention::None,
-                        activity: TaskActivity::Idle,
+                        // Startup only restores conversations that were
+                        // durably working (or still own undelivered input).
+                        // Idle history is intentionally lazy.
+                        activity: TaskActivity::Working,
                         review_readiness: ReviewReadiness::NotReady,
                     }),
                 })
@@ -13610,6 +13836,32 @@ mod tests {
             &mut queue, &in_flight, intent,
         ));
         assert_eq!(queue.len(), 1);
+    }
+
+    #[test]
+    fn held_first_input_preserves_admitted_provider_launch_options() {
+        let task_id = TaskId::new();
+        let mut retry = crate::domain::command::StartProviderSessionIntent {
+            task_id,
+            agent_session_id: crate::domain::AgentSessionId::new(),
+            resource_id: crate::domain::ResourceId::new(),
+            provider_kind: crate::domain::ProviderKind::Codex,
+            mode: crate::domain::command::ProviderStartMode::NewConversation,
+            launch_options: crate::providers::ProviderLaunchOptions::default(),
+            expected_task_revision: 7,
+            expected_action_epoch: 1,
+        };
+        let selected = crate::providers::ProviderLaunchOptions {
+            model: crate::providers::ProviderModel::CodexTerra,
+            reasoning_effort: crate::providers::ProviderReasoningEffort::High,
+            access: crate::providers::ProviderAccessMode::ReadOnly,
+            ..crate::providers::ProviderLaunchOptions::default()
+        };
+        let admitted = HashMap::from([(task_id, selected.clone())]);
+
+        restore_admitted_provider_launch_options(&mut retry, &admitted);
+
+        assert_eq!(retry.launch_options, selected);
     }
 
     #[test]

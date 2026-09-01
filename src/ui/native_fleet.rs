@@ -12,9 +12,7 @@ use crate::domain::id::{ProjectId, TaskId};
 use crate::domain::task::TaskLifecycle;
 use crate::ui::native_host_state::{FleetInboxProjection, FleetTaskRow};
 use crate::ui::task_cockpit::{ConfigSidebarProjection, Inbox, TaskRowModel};
-use crate::ui::task_workspace::surfaces::{
-    apply_workspace_selection, WorkspaceSelectionGesture,
-};
+use crate::ui::task_workspace::surfaces::{apply_workspace_selection, WorkspaceSelectionGesture};
 use crate::ui::task_workspace::{Workspace, WorkspaceError};
 
 /// Visible host label for the rail. Actual project names stay on each row.
@@ -65,7 +63,11 @@ fn discriminating_remote_host_label(bytes: &[u8; 16]) -> String {
 }
 
 /// Build fleet rows for one host's inbox without touching other owners.
-pub fn fleet_rows_from_inbox(host: &HostId, host_label: &str, inbox: &Inbox) -> FleetInboxProjection {
+pub fn fleet_rows_from_inbox(
+    host: &HostId,
+    host_label: &str,
+    inbox: &Inbox,
+) -> FleetInboxProjection {
     let active = inbox
         .active_rows()
         .iter()
@@ -351,7 +353,9 @@ mod tests {
     fn fleet_done_comes_from_settled_rows_and_keeps_same_uuid_hosts_independent() {
         use crate::client::ClientModelBuilder;
         use crate::domain::id::{EnvironmentId, ProjectId, SnapshotId};
-        use crate::domain::snapshot::{SnapshotItem, SnapshotPage, SnapshotSection, TaskSnapshotItem};
+        use crate::domain::snapshot::{
+            SnapshotItem, SnapshotPage, SnapshotSection, TaskSnapshotItem,
+        };
         use crate::domain::task::{
             ReviewReadiness, TaskActivity, TaskAssignment, TaskAttention, TaskConnectivity,
             TaskFacts, TaskLifecycle, WorkspaceRef,

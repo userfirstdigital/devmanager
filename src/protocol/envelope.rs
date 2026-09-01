@@ -18,8 +18,12 @@ use super::{
 
 pub const MAX_CLIENT_BUILD_BYTES: u32 = 128;
 pub const MAX_MESSAGEPACK_DEPTH: u16 = 32;
-pub const MAX_MESSAGEPACK_COLLECTION_ITEMS: u32 = 1_000;
-pub const MAX_MESSAGEPACK_VALUES: u32 = 65_536;
+// A normal native terminal projection can legitimately contain one styled
+// override per visible cell (for example a 100x30 provider TUI). Keep the
+// structural guard above that shape; the negotiated one-megabyte document
+// limit remains the hard byte/allocation boundary.
+pub const MAX_MESSAGEPACK_COLLECTION_ITEMS: u32 = 4_096;
+pub const MAX_MESSAGEPACK_VALUES: u32 = 131_072;
 const MESSAGEPACK_STACK_SLOTS: usize = MAX_MESSAGEPACK_DEPTH as usize + 1;
 
 /// Domain-separated SHA-256 binding for a normalized named profile.

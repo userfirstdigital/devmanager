@@ -1982,15 +1982,48 @@ impl ProcessManager {
         resource_id: ResourceId,
         runtime_generation: u64,
     ) -> Option<ProviderTerminalBinding> {
+        self.provider_terminal_binding_diagnostic(
+            task_id,
+            agent_session_id,
+            resource_id,
+            runtime_generation,
+        )
+        .ok()
+    }
+
+    pub(crate) fn provider_terminal_binding_diagnostic(
+        &self,
+        task_id: TaskId,
+        agent_session_id: crate::domain::AgentSessionId,
+        resource_id: ResourceId,
+        runtime_generation: u64,
+    ) -> Result<ProviderTerminalBinding, String> {
         let live = {
-            let book = self.inner.provider_runtime.lock().ok()?;
-            let live = book.live.values().find(|live| {
-                live.task_id == task_id
-                    && live.agent_session_id == agent_session_id
-                    && live.fence.resource().resource_id == resource_id
-                    && live.fence.resource().runtime_generation == runtime_generation
-                    && !live.exit_reported
-            })?;
+            let book = self
+                .inner
+                .provider_runtime
+                .lock()
+                .map_err(|_| "provider runtime book is unavailable".to_string())?;
+            let live = book
+                .live
+                .values()
+                .find(|live| live.task_id == task_id && live.agent_session_id == agent_session_id)
+                .ok_or_else(|| "provider runtime book has no task/agent entry".to_string())?;
+            if live.exit_reported {
+                return Err("provider runtime already reported exit".to_string());
+            }
+            if live.fence.resource().resource_id != resource_id {
+                return Err(format!(
+                    "provider runtime resource mismatch live={} durable={resource_id}",
+                    live.fence.resource().resource_id
+                ));
+            }
+            if live.fence.resource().runtime_generation != runtime_generation {
+                return Err(format!(
+                    "provider runtime generation mismatch live={} durable={runtime_generation}",
+                    live.fence.resource().runtime_generation
+                ));
+            }
             (
                 live.session_id.clone(),
                 live.agent_session_id,
@@ -1999,15 +2032,30 @@ impl ProcessManager {
                 live.correlation.action_epoch(),
             )
         };
+        let raw_terminal_id = live
+            .0
+            .strip_prefix("provider-")
+            .ok_or_else(|| "provider runtime session id is not terminal-shaped".to_string())?;
         let terminal_session_id =
-            crate::terminal::protocol::TerminalSessionId::parse(live.0.strip_prefix("provider-")?)
-                .ok()?;
-        let runtime = self.inner.sessions.lock().ok()?.get(&live.0)?.clone();
-        let (resource_id, generation) = runtime.current_attachment_fence().ok()?;
+            crate::terminal::protocol::TerminalSessionId::parse(raw_terminal_id)
+                .map_err(|_| "provider runtime terminal id is invalid".to_string())?;
+        let runtime = self
+            .inner
+            .sessions
+            .lock()
+            .map_err(|_| "provider terminal session book is unavailable".to_string())?
+            .get(&live.0)
+            .cloned()
+            .ok_or_else(|| "provider terminal session runtime is missing".to_string())?;
+        let (resource_id, generation) = runtime.current_attachment_fence().map_err(|error| {
+            format!("provider terminal attachment fence is unavailable: {error}")
+        })?;
         if resource_id != live.2 || generation != live.3 {
-            return None;
+            return Err(format!(
+                "provider terminal attachment fence mismatch resource={resource_id} generation={generation}"
+            ));
         }
-        Some(ProviderTerminalBinding {
+        Ok(ProviderTerminalBinding {
             task_id,
             agent_session_id: live.1,
             resource_id: live.2,
@@ -2053,8 +2101,12 @@ impl ProcessManager {
             return Ok(None);
         };
         if let Some(manager) = slot.as_ref() {
-            if manager.current(agent_session_id).is_some() {
-                return Ok(Some(true));
+            if let Some(runtime) = manager.current(agent_session_id) {
+                return Ok(Some(matches!(
+                    runtime.lifecycle(),
+                    crate::providers::session::RuntimeLifecycle::Running
+                        | crate::providers::session::RuntimeLifecycle::Stopping
+                )));
             }
         }
         drop(slot);
@@ -2086,6 +2138,13 @@ impl ProcessManager {
             return Vec::new();
         };
         book.failures.drain(..).collect()
+    }
+
+    /// Reconcile provider roots on the host maintenance/query lane as well as
+    /// the background sampler. A dead sampler or a just-exited onboarding PTY
+    /// must not leave TerminalReadiness reporting StartPending indefinitely.
+    pub(crate) fn reconcile_provider_terminal_exits_now(&self) {
+        reconcile_provider_terminal_exits(&self.inner);
     }
 
     pub(crate) fn accepts_input_without_conversation_id(
@@ -2129,9 +2188,8 @@ impl ProcessManager {
         if binding.action_epoch != action_epoch {
             return false;
         }
-        let lines = crate::providers::input::terminal_text_lines_from_screen(
-            &binding.runtime.snapshot(),
-        );
+        let lines =
+            crate::providers::input::terminal_text_lines_from_screen(&binding.runtime.snapshot());
         matches!(
             crate::providers::input::classify_codex_identityless_startup_readiness(&lines),
             crate::providers::input::CodexIdentitylessStartupReadiness::ChatComposerReady,
@@ -12109,9 +12167,8 @@ mod tests {
     fn identityless_codex_startup_gate_blocks_sealed_writer_before_physical_bytes() {
         use crate::domain::provider_input::ProviderInputAction;
         use crate::providers::input::{
-            classify_codex_identityless_startup_readiness,
-            provider_composer_submit_plan_for_mode, CodexIdentitylessStartupReadiness,
-            ProviderInputDeliveryError,
+            classify_codex_identityless_startup_readiness, provider_composer_submit_plan_for_mode,
+            CodexIdentitylessStartupReadiness, ProviderInputDeliveryError,
         };
 
         let cwd = temp_test_dir("codex-startup-gate");
@@ -12150,10 +12207,7 @@ mod tests {
                     "1. Yes, continue",
                 ],
             ),
-            (
-                "unknown-busy",
-                vec!["", "Working...", "esc to interrupt"],
-            ),
+            ("unknown-busy", vec!["", "Working...", "esc to interrupt"]),
         ];
         for (label, lines) in blocked_cases {
             paint_terminal_screen_lines(&session, &lines);
@@ -12186,10 +12240,7 @@ mod tests {
             );
         }
 
-        paint_terminal_screen_lines(
-            &session,
-            &["", "  › Ask Codex to do anything"],
-        );
+        paint_terminal_screen_lines(&session, &["", "  › Ask Codex to do anything"]);
         let ready_lines =
             crate::providers::input::terminal_text_lines_from_screen(&session.snapshot());
         assert_eq!(

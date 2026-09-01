@@ -2888,8 +2888,16 @@ fn apply_into(
             };
             if settlement.command_id != *command_id
                 || settlement.operation_id != Some(*operation_id)
-                || settlement.delivery.is_delivered()
             {
+                // Provider input is accepted on the connection lane while the
+                // destination adapter settles physical writes on its own
+                // ordered lane. A later accepted keystroke can therefore be
+                // the presentation `last_settlement` when an earlier write is
+                // durably delivered. The operation/outbox lineage validates
+                // that earlier delivery; keep the newer presentation fact.
+                return Ok(());
+            }
+            if settlement.delivery.is_delivered() {
                 return Err(ApplyError::InvalidTransition);
             }
             session.last_settlement = Some(ProviderInputSettlement {

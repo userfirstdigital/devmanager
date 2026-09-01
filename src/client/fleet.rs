@@ -1170,7 +1170,8 @@ impl HostFleet {
             }
             match hosts.get(host) {
                 Some(HostEntry::Reserved(reservation)) => {
-                    if expected_generation.is_some_and(|expected| expected != reservation.generation)
+                    if expected_generation
+                        .is_some_and(|expected| expected != reservation.generation)
                     {
                         return Err(FleetError::StaleGeneration);
                     }

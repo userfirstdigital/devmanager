@@ -17,8 +17,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use devmanager::client::action::{task_rename_command, TaskRenameArguments};
 use devmanager::client::{
     connect_trusted_host, forget_trusted_host, list_trusted_hosts, pair_enroll_and_connect,
-    ConnectTrustedOptions, FleetError, RemoteTrustError,
-    FleetRetainedCommand, HostFleet, HostId, HostTaskKey, PairEnrollRequest, RemoteTrustStore,
+    ConnectTrustedOptions, FleetError, FleetRetainedCommand, HostFleet, HostId, HostTaskKey,
+    PairEnrollRequest, RemoteTrustError, RemoteTrustStore,
 };
 use devmanager::domain::{CommandId, RequestId, TaskId};
 use devmanager::host::IpcError;
@@ -294,8 +294,10 @@ async fn run_fleet_acceptance() -> Result<(), Box<dyn std::error::Error>> {
     let mut stale_record_a = record_a.clone();
     stale_record_a.assigned_client_id = devmanager::domain::ClientId::new();
     step(
-        matches!(forget_trusted_host(&store, stale_record_a, Duration::from_secs(10)).await,
-            Err(RemoteTrustError::PinChanged)),
+        matches!(
+            forget_trusted_host(&store, stale_record_a, Duration::from_secs(10)).await,
+            Err(RemoteTrustError::PinChanged)
+        ),
         "stale Settings forget cannot remove current paired identity",
     )?;
     forget_trusted_host(&store, record_a.clone(), Duration::from_secs(10)).await?;

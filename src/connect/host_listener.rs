@@ -63,8 +63,15 @@ impl ConnectWebPublication {
         host: super::identity::HostPublicId,
         public: crate::protocol::NoiseStaticPublicKey,
     ) -> Self {
-        let key = public.as_bytes().iter().map(|byte| format!("{byte:02x}")).collect();
-        Self::with_identity(endpoint.into(), Some((uuid::Uuid::from_bytes(*host.as_bytes()).to_string(), key)))
+        let key = public
+            .as_bytes()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect();
+        Self::with_identity(
+            endpoint.into(),
+            Some((uuid::Uuid::from_bytes(*host.as_bytes()).to_string(), key)),
+        )
     }
 
     fn with_identity(endpoint: String, identity: Option<(String, String)>) -> Self {
