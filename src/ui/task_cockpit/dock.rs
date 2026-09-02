@@ -11,7 +11,6 @@ use crate::client::model::{
 };
 use crate::domain::agent::AgentRole;
 use crate::domain::id::{AgentSessionId, RequestId, ResourceId, SubscriptionId, TaskId};
-use crate::domain::resource::{ResourceKind, ResourceLifecycle};
 use crate::domain::snapshot::TaskSnapshot;
 use crate::domain::TaskTerminalProjection;
 use crate::protocol::StreamFrame;
@@ -238,6 +237,20 @@ impl TerminalRuntimeIdentity {
     }
 }
 
+/// Whether this projection carries the documented plain-shell shape.
+///
+/// `is_provider` alone cannot answer it: the field defaults to `false` when a
+/// projection is decoded from a host that predates plain shells, and those
+/// hosts only ever answered for the provider slot -- with a real agent session
+/// beside it. A shell is therefore recognised by the sentinels the host sends
+/// together with the flag, so an older host's provider projection still takes
+/// the provider path and is still fenced against the ClientModel.
+fn projection_is_plain_shell(projection: &TaskTerminalProjection) -> bool {
+    !projection.is_provider
+        && projection.agent_session_id.is_nil()
+        && projection.runtime_generation == 0
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct HostTerminalBinding {
     identity: TerminalRuntimeIdentity,
@@ -258,15 +271,13 @@ impl HostTerminalBinding {
         if !matches!(agent.role, AgentRole::Primary) {
             return Err(DockProjectionError::Unbound);
         }
-        let mut terminals = snapshot.resources.values().filter(|resource| {
-            resource.task_id == Some(snapshot.task.id)
-                && resource.resource_kind == ResourceKind::Terminal
-                && resource.lifecycle == ResourceLifecycle::Active
-        });
-        let resource = terminals.next().ok_or(DockProjectionError::Unbound)?;
-        if terminals.next().is_some() {
-            return Err(DockProjectionError::BindingMismatch);
-        }
+        // A task's plain shells are Terminal resources owned by the same task
+        // at the same runtime generation, so "the one Active Terminal resource"
+        // finds three the moment a user opens a terminal tab. Defer to the one
+        // shared rule for the provider's resource instead of re-deciding it.
+        let resource = crate::domain::agent_resource::provider_terminal_resource(snapshot, agent)
+            .map_err(|_| DockProjectionError::BindingMismatch)?
+            .ok_or(DockProjectionError::Unbound)?;
         Ok(Self {
             identity: TerminalRuntimeIdentity {
                 task_id: snapshot.task.id,
@@ -585,6 +596,10 @@ struct RememberedDockState {
     collapsed: bool,
     viewport: TerminalViewport,
     identity: Option<TerminalRuntimeIdentity>,
+    /// The one terminal resource the grid is showing for this task. `None`
+    /// means no chip has been focused yet, which is the pre-strip provider-only
+    /// state: every projection for the task is admissible.
+    focused_terminal: Option<ResourceId>,
     last_sequence: u64,
     surface_state: TerminalSurfaceState,
     exit_summary: Option<String>,
@@ -607,6 +622,7 @@ impl RememberedDockState {
             collapsed: false,
             viewport: TerminalViewport::default(),
             identity: None,
+            focused_terminal: None,
             last_sequence: 0,
             surface_state: TerminalSurfaceState::Live,
             exit_summary: None,
@@ -1057,16 +1073,50 @@ impl ContextDock {
         self.admit_host_view(cursor, view)
     }
 
+    /// Point the grid at one exact terminal resource.
+    ///
+    /// A focus change is a different PTY, so everything the dock remembers
+    /// about the previous one -- its replica, its retained overlay view, its
+    /// admitted sequence and its runtime identity -- is dropped rather than
+    /// carried across. Re-notifying the same focus is not a change and keeps
+    /// the admitted screen.
+    pub fn set_focused_terminal(&mut self, resource_id: Option<ResourceId>) {
+        if self.current_memory().focused_terminal == resource_id {
+            return;
+        }
+        self.with_memory(|memory| {
+            memory.focused_terminal = resource_id;
+            memory.identity = None;
+            memory.last_sequence = 0;
+            memory.replica_view = None;
+            memory.last_valid_view = None;
+            memory.surface_state = TerminalSurfaceState::Live;
+            memory.exit_summary = None;
+            memory.live_output.clear();
+            memory.viewport = TerminalViewport::default();
+        });
+        self.needs_resync = false;
+        self.press_owner = None;
+        self.terminal_click_completed = false;
+        self.advance_epochs();
+    }
+
+    /// The terminal resource the grid is showing, when one has been focused.
+    pub fn focused_terminal(&self) -> Option<ResourceId> {
+        self.current_memory().focused_terminal
+    }
+
     /// Admit the host's bounded task-terminal query into the existing replica
-    /// seam. The projection must exactly match the current ClientModel fence;
-    /// repeated polls at the same sequence are harmless no-ops.
+    /// seam. A provider projection must exactly match the current ClientModel
+    /// fence; a plain shell is authorized by its own durable resource instead.
+    /// Repeated polls at the same sequence are harmless no-ops, and a
+    /// projection for a terminal that is not the focused one is dropped.
     pub fn admit_task_terminal_projection(
         &mut self,
         model: &ClientModel,
         projection: &TaskTerminalProjection,
     ) -> Result<bool, DockProjectionError> {
-        let expected =
-            HostTerminalBinding::from_client_model(model, projection.task_id)?.identity();
+        let plain_shell = projection_is_plain_shell(projection);
         let actual = TerminalRuntimeIdentity::new(
             projection.task_id,
             projection.agent_session_id,
@@ -1074,14 +1124,39 @@ impl ContextDock {
             projection.runtime_generation,
             projection.resource_generation,
         );
-        if actual != expected || projection.action_epoch == 0 || projection.sequence == 0 {
-            return Err(DockProjectionError::BindingMismatch);
+        if plain_shell {
+            // A shell has no agent session, no provider runtime generation and
+            // no launch action epoch, so the ClientModel's provider binding is
+            // not its authority and comparing against it would refuse every
+            // shell. Its own durable resource generation and stream sequence
+            // are still required.
+            if projection.resource_generation == 0 || projection.sequence == 0 {
+                return Err(DockProjectionError::BindingMismatch);
+            }
+        } else {
+            let expected =
+                HostTerminalBinding::from_client_model(model, projection.task_id)?.identity();
+            if actual != expected || projection.action_epoch == 0 || projection.sequence == 0 {
+                return Err(DockProjectionError::BindingMismatch);
+            }
         }
         if self.selected_task != Some(projection.task_id) {
             return Err(DockProjectionError::ForeignIdentity);
         }
+        // The grid renders exactly one chip. A live answer for any other
+        // terminal on the task is dropped rather than painted over the visible
+        // replica; it is not an error, because both queries are legitimate.
+        if let Some(focused) = self.current_memory().focused_terminal {
+            if projection.resource_id != focused {
+                return Ok(false);
+            }
+        }
         if self.current_memory().identity.is_none() {
-            self.bind_from_model(model)?;
+            if plain_shell {
+                self.with_memory(|memory| memory.identity = Some(actual));
+            } else {
+                self.bind_from_model(model)?;
+            }
         }
         if self.current_memory().last_sequence == projection.sequence {
             return Ok(false);
@@ -1992,6 +2067,27 @@ mod process_census_tests {
     }
 
     fn census_client_model() -> (ClientModel, TaskId) {
+        let built = client_model_with_shells(0);
+        (built.model, built.task_id)
+    }
+
+    struct BuiltClientModel {
+        model: ClientModel,
+        task_id: TaskId,
+        agent_id: AgentSessionId,
+        provider_resource: ResourceId,
+        shells: Vec<ResourceId>,
+    }
+
+    /// One Task with a primary agent, its provider terminal resource, and
+    /// `shells` plain-shell terminal resources registered at the same runtime
+    /// generation -- which is exactly the shape that makes "the one Active
+    /// Terminal resource" ambiguous.
+    fn client_model_with_shells(shells: usize) -> BuiltClientModel {
+        build_client_model(shells, 1)
+    }
+
+    fn build_client_model(shells: usize, providers: usize) -> BuiltClientModel {
         use crate::client::model::ClientModelBuilder;
         use crate::domain::{
             AgentRole, AgentSessionFacts, AgentSessionLifecycle, EnvironmentId, OwnerKind,
@@ -2064,25 +2160,225 @@ mod process_census_tests {
         builder
             .ingest_page(page(SnapshotSection::Artifacts, Vec::new()))
             .expect("artifacts");
+        let terminal_resource = |id: ResourceId, plain_shell: bool| {
+            SnapshotItem::Resource(ResourceFacts {
+                id,
+                task_id: Some(task_id),
+                owner_kind: OwnerKind::Task,
+                resource_kind: ResourceKind::Terminal,
+                recipe: if plain_shell {
+                    ResourceRecipe::Terminal {
+                        cols: 40,
+                        rows: 8,
+                        launch: Some(crate::domain::resource::TerminalLaunch {
+                            cwd: std::path::PathBuf::from("C:/workspace"),
+                            program: std::path::PathBuf::from("pwsh"),
+                            args: Vec::new(),
+                        }),
+                        title: None,
+                    }
+                } else {
+                    ResourceRecipe::terminal(40, 8)
+                },
+                lifecycle: ResourceLifecycle::Active,
+                runtime_generation: 1,
+                updated_at_ms: 1,
+            })
+        };
+        let mut resources = Vec::new();
+        let mut provider_ids = Vec::new();
+        for index in 0..providers {
+            let id = if index == 0 {
+                resource_id
+            } else {
+                ResourceId::from_bytes(uuid(0xc0 + index as u8)).expect("provider resource")
+            };
+            provider_ids.push(id);
+            resources.push(terminal_resource(id, false));
+        }
+        let mut shell_ids = Vec::new();
+        for index in 0..shells {
+            let id = ResourceId::from_bytes(uuid(0xa0 + index as u8)).expect("shell resource");
+            shell_ids.push(id);
+            resources.push(terminal_resource(id, true));
+        }
         builder
-            .ingest_page(page(
-                SnapshotSection::Resources,
-                vec![SnapshotItem::Resource(ResourceFacts {
-                    id: resource_id,
-                    task_id: Some(task_id),
-                    owner_kind: OwnerKind::Task,
-                    resource_kind: ResourceKind::Terminal,
-                    recipe: ResourceRecipe::terminal(40, 8),
-                    lifecycle: ResourceLifecycle::Active,
-                    runtime_generation: 1,
-                    updated_at_ms: 1,
-                })],
-            ))
+            .ingest_page(page(SnapshotSection::Resources, resources))
             .expect("resources");
         builder
             .ingest_page(page(SnapshotSection::Operations, Vec::new()))
             .expect("operations");
-        (builder.finish().expect("client model"), task_id)
+        BuiltClientModel {
+            model: builder.finish().expect("client model"),
+            task_id,
+            agent_id,
+            provider_resource: provider_ids.first().copied().unwrap_or(resource_id),
+            shells: shell_ids,
+        }
+    }
+
+    fn shell_projection(
+        task_id: TaskId,
+        resource_id: ResourceId,
+        sequence: u64,
+    ) -> TaskTerminalProjection {
+        TaskTerminalProjection {
+            task_id,
+            terminal_id: crate::domain::TerminalId::new(),
+            session_id: crate::terminal::protocol::TerminalSessionId::new(),
+            // The documented plain-shell sentinels, exactly as the host sends
+            // them: no agent session and no provider runtime generation.
+            agent_session_id: AgentSessionId::nil(),
+            resource_id,
+            runtime_generation: 0,
+            resource_generation: 1,
+            action_epoch: 0,
+            focus_epoch: crate::terminal::protocol::FocusEpoch::initial(),
+            accepted_input_sequence: 0,
+            accepts_input_without_conversation_id: false,
+            sequence,
+            title: None,
+            text_lines: vec!["shell".into()],
+            screen: crate::terminal::session::TerminalScreenSnapshot {
+                cols: 5,
+                rows: 1,
+                ..crate::terminal::session::TerminalScreenSnapshot::default()
+            },
+            is_provider: false,
+            runtime_state: crate::domain::cockpit::TerminalRuntimeStateWire::Running,
+        }
+    }
+
+    fn provider_projection(
+        task_id: TaskId,
+        agent_session_id: AgentSessionId,
+        resource_id: ResourceId,
+        sequence: u64,
+    ) -> TaskTerminalProjection {
+        TaskTerminalProjection {
+            task_id,
+            terminal_id: crate::domain::TerminalId::new(),
+            session_id: crate::terminal::protocol::TerminalSessionId::new(),
+            agent_session_id,
+            resource_id,
+            runtime_generation: 1,
+            resource_generation: 1,
+            action_epoch: 1,
+            focus_epoch: crate::terminal::protocol::FocusEpoch::initial(),
+            accepted_input_sequence: 0,
+            accepts_input_without_conversation_id: false,
+            sequence,
+            title: None,
+            text_lines: vec!["provider".into()],
+            screen: crate::terminal::session::TerminalScreenSnapshot {
+                cols: 8,
+                rows: 1,
+                ..crate::terminal::session::TerminalScreenSnapshot::default()
+            },
+            is_provider: true,
+            runtime_state: crate::domain::cockpit::TerminalRuntimeStateWire::Running,
+        }
+    }
+
+    #[test]
+    fn provider_binding_ignores_the_tasks_plain_shells() {
+        let built = client_model_with_shells(2);
+        let binding = HostTerminalBinding::from_client_model(&built.model, built.task_id)
+            .expect("a task with open shells still has exactly one provider terminal");
+        assert_eq!(binding.identity().resource_id(), built.provider_resource);
+        assert_eq!(binding.identity().agent_session_id(), built.agent_id);
+    }
+
+    #[test]
+    fn two_provider_terminals_are_a_binding_mismatch_not_a_choice() {
+        let built = build_client_model(2, 2);
+        assert_eq!(
+            HostTerminalBinding::from_client_model(&built.model, built.task_id),
+            Err(DockProjectionError::BindingMismatch)
+        );
+    }
+
+    #[test]
+    fn focused_shell_projection_is_admitted_without_a_provider_fence() {
+        let built = client_model_with_shells(1);
+        let shell = built.shells[0];
+        let mut dock = ContextDock::new(DockEdge::Right);
+        dock.follow_task(built.task_id);
+        dock.set_focused_terminal(Some(shell));
+        let projection = shell_projection(built.task_id, shell, 1);
+        assert_eq!(
+            dock.admit_task_terminal_projection(&built.model, &projection),
+            Ok(true),
+            "a shell carries no agent session or action epoch; its authority is its resource"
+        );
+    }
+
+    #[test]
+    fn a_projection_for_an_unfocused_terminal_is_dropped_not_admitted() {
+        let built = client_model_with_shells(1);
+        let shell = built.shells[0];
+        let mut dock = ContextDock::new(DockEdge::Right);
+        dock.follow_task(built.task_id);
+        dock.set_focused_terminal(Some(shell));
+        let provider =
+            provider_projection(built.task_id, built.agent_id, built.provider_resource, 1);
+        assert_eq!(
+            dock.admit_task_terminal_projection(&built.model, &provider),
+            Ok(false),
+            "the grid shows the focused chip; another terminal screen must not overwrite it"
+        );
+    }
+
+    #[test]
+    fn changing_focus_drops_the_previous_terminal_replica_and_sequence() {
+        let built = client_model_with_shells(1);
+        let shell = built.shells[0];
+        let mut dock = ContextDock::new(DockEdge::Right);
+        dock.follow_task(built.task_id);
+        dock.set_focused_terminal(Some(built.provider_resource));
+        let provider =
+            provider_projection(built.task_id, built.agent_id, built.provider_resource, 7);
+        assert_eq!(
+            dock.admit_task_terminal_projection(&built.model, &provider),
+            Ok(true)
+        );
+        assert!(dock.terminal_pane_model().session.is_some());
+
+        dock.set_focused_terminal(Some(shell));
+        assert!(
+            dock.terminal_pane_model().session.is_none(),
+            "the previous terminal screen must not paint under the newly focused chip"
+        );
+        // Sequence memory belongs to the previous terminal, so a lower
+        // sequence from the newly focused one must still be admissible.
+        assert_eq!(
+            dock.admit_task_terminal_projection(
+                &built.model,
+                &shell_projection(built.task_id, shell, 1)
+            ),
+            Ok(true)
+        );
+    }
+
+    #[test]
+    fn setting_the_same_focus_twice_keeps_the_admitted_screen() {
+        let built = client_model_with_shells(1);
+        let shell = built.shells[0];
+        let mut dock = ContextDock::new(DockEdge::Right);
+        dock.follow_task(built.task_id);
+        dock.set_focused_terminal(Some(shell));
+        assert_eq!(
+            dock.admit_task_terminal_projection(
+                &built.model,
+                &shell_projection(built.task_id, shell, 3)
+            ),
+            Ok(true)
+        );
+        dock.set_focused_terminal(Some(shell));
+        assert!(
+            dock.terminal_pane_model().session.is_some(),
+            "a repeated focus notification is not a focus change"
+        );
     }
 
     #[test]
