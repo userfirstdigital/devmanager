@@ -111,7 +111,11 @@ pub fn action_for_client_request(request: &ClientRequest) -> Option<(ActionId, O
                 | Command::ConfirmUpdateDrain(_)
                 | Command::AbortUpdateHandoff
                 | Command::ArmUpdateInstall(_)
-                | Command::ConfirmHostQuit(_) => ActionId::MUTATE_TASK,
+                | Command::ConfirmHostQuit(_)
+                | Command::OpenShellTerminal(_)
+                | Command::CloseTerminal { .. }
+                | Command::RenameTerminal { .. }
+                | Command::SetTerminalStrip(_) => ActionId::MUTATE_TASK,
                 Command::SubmitProviderInput(_) => ActionId::SEND_PROMPT,
                 Command::PromptLibrary(_) | Command::PromptChain(_) => {
                     ActionId::READ_PERSONAL_PROMPTS

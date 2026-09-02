@@ -7,6 +7,7 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
+use crate::domain::event::Event;
 use crate::domain::resource::{ResourceFacts, ResourceKind};
 use crate::domain::{ResourceId, TaskId};
 
@@ -33,6 +34,16 @@ pub struct TerminalFacts {
     pub last_activity_at_ms: i64,
 }
 
+/// One host observation about a live terminal, before it is decided into a
+/// durable fact. These never reach `decide`: the host facts consume no task
+/// revision, so they are appended directly (see `CommandBus::record_terminal_fact`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HostTerminalFact {
+    Cwd(PathBuf),
+    Exit { code: Option<i32>, summary: String },
+    Activity,
+}
+
 impl TerminalFacts {
     pub fn registered(resource_id: ResourceId, title: Option<String>, created_at_ms: i64) -> Self {
         Self {
@@ -42,6 +53,49 @@ impl TerminalFacts {
             exit: None,
             created_at_ms,
             last_activity_at_ms: created_at_ms,
+        }
+    }
+
+    /// Decide whether a host observation becomes a durable fact.
+    ///
+    /// - `Cwd`: must be absolute; suppressed when unchanged.
+    /// - `Exit`: suppressed when an exit is already recorded.
+    /// - `Activity`: suppressed within [`TERMINAL_ACTIVITY_COALESCE_MS`] of
+    ///   `last_activity_at_ms`.
+    ///
+    /// `None` means "record nothing", never "the observation was invalid":
+    /// a host sampler has no repair to make either way.
+    pub fn decide_host_fact(&self, fact: HostTerminalFact, observed_at_ms: i64) -> Option<Event> {
+        match fact {
+            HostTerminalFact::Cwd(cwd) => {
+                if !cwd.is_absolute() || self.live_cwd.as_ref() == Some(&cwd) {
+                    return None;
+                }
+                Some(Event::TerminalCwdReported {
+                    resource_id: self.resource_id,
+                    cwd,
+                })
+            }
+            HostTerminalFact::Exit { code, summary } => {
+                if self.exit.is_some() {
+                    return None;
+                }
+                Some(Event::TerminalExited {
+                    resource_id: self.resource_id,
+                    code,
+                    summary,
+                })
+            }
+            HostTerminalFact::Activity => {
+                if observed_at_ms.saturating_sub(self.last_activity_at_ms)
+                    < TERMINAL_ACTIVITY_COALESCE_MS
+                {
+                    return None;
+                }
+                Some(Event::TerminalActivity {
+                    resource_id: self.resource_id,
+                })
+            }
         }
     }
 }
@@ -334,6 +388,107 @@ mod tests {
         assert_eq!(
             TerminalStripError::TooManyTerminals(9).to_string(),
             format!("strip holds 9 terminals, more than {MAX_PLAIN_SHELLS_PER_TASK}")
+        );
+    }
+
+    const ABSOLUTE_CWD: &str = if cfg!(windows) {
+        "C:/Code/demo/src"
+    } else {
+        "/code/demo/src"
+    };
+
+    #[test]
+    fn decide_host_fact_cwd_records_a_change_and_suppresses_the_rest() {
+        let resource_id = ResourceId::new();
+        let facts = TerminalFacts::registered(resource_id, None, 1_000);
+        let absolute = PathBuf::from(ABSOLUTE_CWD);
+
+        // A first absolute cwd is a change and is recorded.
+        assert_eq!(
+            facts.decide_host_fact(HostTerminalFact::Cwd(absolute.clone()), 1_000),
+            Some(Event::TerminalCwdReported {
+                resource_id,
+                cwd: absolute.clone(),
+            })
+        );
+
+        // The same cwd again is not a change.
+        let mut settled = facts.clone();
+        settled.live_cwd = Some(absolute.clone());
+        assert_eq!(
+            settled.decide_host_fact(HostTerminalFact::Cwd(absolute), 9_999),
+            None
+        );
+
+        // A relative cwd is never a fact.
+        assert_eq!(
+            facts.decide_host_fact(HostTerminalFact::Cwd(PathBuf::from("src")), 1_000),
+            None
+        );
+    }
+
+    #[test]
+    fn decide_host_fact_records_only_the_first_exit() {
+        let resource_id = ResourceId::new();
+        let mut facts = TerminalFacts::registered(resource_id, None, 1_000);
+        assert_eq!(
+            facts.decide_host_fact(
+                HostTerminalFact::Exit {
+                    code: Some(0),
+                    summary: "done".to_string(),
+                },
+                2_000
+            ),
+            Some(Event::TerminalExited {
+                resource_id,
+                code: Some(0),
+                summary: "done".to_string(),
+            })
+        );
+        facts.exit = Some(TerminalExit {
+            code: Some(0),
+            summary: "done".to_string(),
+            at_ms: 2_000,
+        });
+        assert_eq!(
+            facts.decide_host_fact(
+                HostTerminalFact::Exit {
+                    code: Some(1),
+                    summary: "again".to_string(),
+                },
+                3_000
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn decide_host_fact_coalesces_activity_to_the_pinned_window() {
+        let resource_id = ResourceId::new();
+        let facts = TerminalFacts::registered(resource_id, None, 1_000);
+        assert_eq!(facts.last_activity_at_ms, 1_000);
+        // Strictly inside the window is suppressed.
+        assert_eq!(
+            facts.decide_host_fact(
+                HostTerminalFact::Activity,
+                1_000 + TERMINAL_ACTIVITY_COALESCE_MS - 1
+            ),
+            None
+        );
+        // Exactly at the window and beyond are recorded.
+        assert_eq!(
+            facts.decide_host_fact(
+                HostTerminalFact::Activity,
+                1_000 + TERMINAL_ACTIVITY_COALESCE_MS
+            ),
+            Some(Event::TerminalActivity { resource_id })
+        );
+        assert_eq!(
+            facts.decide_host_fact(
+                HostTerminalFact::Activity,
+                1_000 + TERMINAL_ACTIVITY_COALESCE_MS + 1
+            ),
+            Some(Event::TerminalActivity { resource_id })
         );
     }
 

@@ -47,6 +47,7 @@ use crate::domain::snapshot::{PageLimits, TaskSnapshot, TaskSnapshotItem};
 use crate::domain::task::{
     ReviewReadiness, TaskActivity, TaskAttention, TaskConnectivity, TaskFacts, TaskLifecycle,
 };
+use crate::domain::terminal_facts::HostTerminalFact;
 use crate::kernel::artifact_content::{ArtifactContentError, ArtifactContentSession};
 use crate::kernel::dispatch::{decode_absence_receipt, DispatchCompletion, DispatchPermit};
 use crate::kernel::outbox::{
@@ -123,6 +124,18 @@ pub(crate) enum HostRestartDispositionUnit {
         action_epoch: u64,
         settled_at_ms: i64,
     },
+}
+
+/// What [`CommandBus::record_terminal_fact`] did with one host observation.
+///
+/// `Suppressed` and `UnknownTerminal` are distinct on purpose: the first is a
+/// deliberate debounce, the second says the caller is reporting on a terminal
+/// this task does not have, which a caller may want to log or stop sampling.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TerminalFactOutcome {
+    Recorded,
+    Suppressed,
+    UnknownTerminal,
 }
 
 /// Host-facing command facade. Owns the durable store; does not expose SQLite.
@@ -333,6 +346,42 @@ impl CommandBus {
         let snapshot = load_task_snapshot(&tx, task_id)?;
         tx.commit()?;
         Ok(snapshot)
+    }
+
+    /// Record one host-authored terminal fact.
+    ///
+    /// These carry no task revision (they are not task mutations), so they take
+    /// neither an operation nor a receipt and never fence on a revision: they
+    /// are appended exactly the way `Event::ProviderInputDelivered` is. The
+    /// suppression rules live in `TerminalFacts::decide_host_fact`, which is
+    /// pure and unit-tested without a database.
+    pub fn record_terminal_fact(
+        &mut self,
+        task_id: TaskId,
+        resource_id: ResourceId,
+        fact: HostTerminalFact,
+        observed_at_ms: i64,
+    ) -> Result<TerminalFactOutcome, StoreError> {
+        self.store.with_immediate_transaction(|tx| {
+            let Some(snapshot) = load_task_snapshot(tx, task_id)? else {
+                return Ok(TerminalFactOutcome::UnknownTerminal);
+            };
+            let Some(facts) = snapshot.terminal_facts.get(&resource_id) else {
+                return Ok(TerminalFactOutcome::UnknownTerminal);
+            };
+            let Some(event) = facts.decide_host_fact(fact, observed_at_ms) else {
+                return Ok(TerminalFactOutcome::Suppressed);
+            };
+            append_and_project(
+                tx,
+                EventId::new(),
+                Some(task_id),
+                None,
+                observed_at_ms,
+                event,
+            )?;
+            Ok(TerminalFactOutcome::Recorded)
+        })
     }
 
     /// Recover an exact durable command receipt for an authenticated client.
@@ -1630,7 +1679,7 @@ mod workspace_authority_tests {
 #[cfg(test)]
 mod provider_restart_identity_tests {
     use super::*;
-    use crate::domain::command::{CreateTaskIntent, ProviderStartMode};
+    use crate::domain::command::{CreateTaskIntent, OpenShellTerminalIntent, ProviderStartMode};
     use crate::domain::resource::ResourceRecipe;
     use crate::domain::task::{TaskAssignment, TaskAttention, TaskConnectivity, WorkspaceRef};
     use crate::providers::ProviderKind;
@@ -1740,6 +1789,434 @@ mod provider_restart_identity_tests {
     fn host_execute(bus: &mut CommandBus, envelope: CommandEnvelope) -> CommandReceipt {
         bus.execute_host_authorized(envelope, None, RequestId::new(), Uuid::now_v7())
             .expect("host-authorized command")
+    }
+
+    /// One task in Open lifecycle plus its current revision.
+    fn create_open_task(bus: &mut CommandBus, client_id: ClientId) -> (TaskId, u64) {
+        let task_id = TaskId::new();
+        let receipt = bus
+            .execute_for_test(CommandEnvelope {
+                command_id: CommandId::new(),
+                client_id,
+                task_id: None,
+                issued_at_ms: 1_725_000_000_000,
+                expected_task_revision: None,
+                command: Command::CreateTask(CreateTaskIntent {
+                    id: task_id,
+                    environment_id: EnvironmentId::new(),
+                    title: "Shell terminals".into(),
+                    description: None,
+                    project_id: ProjectId::new(),
+                    workspace: WorkspaceRef::Main,
+                    assignment: TaskAssignment::LocalOwner,
+                    created_at_ms: 1_725_000_000_000,
+                    connectivity: TaskConnectivity::Connected,
+                    attention: TaskAttention::None,
+                    activity: TaskActivity::Working,
+                    review_readiness: ReviewReadiness::NotReady,
+                }),
+            })
+            .expect("create task");
+        (task_id, accepted_revision(receipt))
+    }
+
+    fn plain_shell_facts(task_id: TaskId, title: Option<&str>) -> ResourceFacts {
+        ResourceFacts::new(
+            Some(task_id),
+            OwnerKind::Task,
+            ResourceKind::Terminal,
+            ResourceRecipe::Terminal {
+                cols: 120,
+                rows: 40,
+                launch: Some(crate::domain::resource::TerminalLaunch {
+                    cwd: std::path::PathBuf::from(r"C:\Code\demo"),
+                    program: std::path::PathBuf::from(r"C:\Windows\System32\cmd.exe"),
+                    args: Vec::new(),
+                }),
+                title: title.map(str::to_string),
+            },
+            1_725_000_000_100,
+        )
+        .expect("plain shell facts")
+    }
+
+    #[test]
+    #[ignore = "terminal facts loader lands in Task 5"]
+    fn open_rename_strip_and_close_shell_terminal() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let mut bus = CommandBus::open(&directory.path().join("tasks.sqlite")).expect("bus");
+        let client_id = ClientId::new();
+        let (task_id, revision) = create_open_task(&mut bus, client_id);
+
+        let shell = plain_shell_facts(task_id, None);
+        let receipt = bus
+            .execute(task_envelope(
+                client_id,
+                task_id,
+                revision,
+                Command::OpenShellTerminal(OpenShellTerminalIntent {
+                    resource: shell.clone(),
+                }),
+            ))
+            .expect("open shell");
+        let revision = accepted_revision(receipt);
+        let snapshot = bus.task_snapshot(task_id).expect("snapshot").expect("task");
+        assert!(snapshot.resources[&shell.id].recipe.is_plain_shell());
+        assert_eq!(snapshot.terminal_strip.order, vec![shell.id]);
+        assert_eq!(snapshot.terminal_strip.focused, Some(shell.id));
+
+        let receipt = bus
+            .execute(task_envelope(
+                client_id,
+                task_id,
+                revision,
+                Command::RenameTerminal {
+                    resource_id: shell.id,
+                    title: "  build ".to_string(),
+                },
+            ))
+            .expect("rename");
+        let revision = accepted_revision(receipt);
+        let snapshot = bus.task_snapshot(task_id).expect("snapshot").expect("task");
+        assert_eq!(
+            snapshot.terminal_facts[&shell.id].title.as_deref(),
+            Some("build")
+        );
+
+        let second = plain_shell_facts(task_id, Some("tests"));
+        let receipt = bus
+            .execute(task_envelope(
+                client_id,
+                task_id,
+                revision,
+                Command::OpenShellTerminal(OpenShellTerminalIntent {
+                    resource: second.clone(),
+                }),
+            ))
+            .expect("open second");
+        let revision = accepted_revision(receipt);
+        let receipt = bus
+            .execute(task_envelope(
+                client_id,
+                task_id,
+                revision,
+                Command::SetTerminalStrip(crate::domain::terminal_facts::TaskTerminalStrip {
+                    order: vec![second.id, shell.id],
+                    focused: Some(second.id),
+                }),
+            ))
+            .expect("strip");
+        let revision = accepted_revision(receipt);
+        let snapshot = bus.task_snapshot(task_id).expect("snapshot").expect("task");
+        assert_eq!(snapshot.terminal_strip.order, vec![second.id, shell.id]);
+
+        // Host facts need no revision fence and do not bump the revision.
+        let live_cwd = std::path::PathBuf::from(r"C:\Code\demo\src");
+        assert_eq!(
+            bus.record_terminal_fact(
+                task_id,
+                shell.id,
+                HostTerminalFact::Cwd(live_cwd.clone()),
+                1_725_000_000_200,
+            )
+            .expect("record cwd"),
+            TerminalFactOutcome::Recorded
+        );
+        let snapshot = bus.task_snapshot(task_id).expect("snapshot").expect("task");
+        assert_eq!(snapshot.task.revision, revision);
+        assert_eq!(
+            snapshot.terminal_facts[&shell.id].live_cwd,
+            Some(live_cwd.clone())
+        );
+        // The same cwd again is a debounce, not a second fact.
+        assert_eq!(
+            bus.record_terminal_fact(
+                task_id,
+                shell.id,
+                HostTerminalFact::Cwd(live_cwd),
+                1_725_000_000_300,
+            )
+            .expect("record cwd again"),
+            TerminalFactOutcome::Suppressed
+        );
+        // A terminal this task does not have is neither a write nor an error.
+        assert_eq!(
+            bus.record_terminal_fact(
+                task_id,
+                ResourceId::new(),
+                HostTerminalFact::Activity,
+                1_725_000_100_000,
+            )
+            .expect("record unknown"),
+            TerminalFactOutcome::UnknownTerminal
+        );
+
+        let receipt = bus
+            .execute(task_envelope(
+                client_id,
+                task_id,
+                revision,
+                Command::CloseTerminal {
+                    resource_id: shell.id,
+                },
+            ))
+            .expect("close");
+        let _ = accepted_revision(receipt);
+        let snapshot = bus.task_snapshot(task_id).expect("snapshot").expect("task");
+        assert_ne!(
+            snapshot.resources[&shell.id].lifecycle,
+            ResourceLifecycle::Active
+        );
+    }
+
+    fn provider_terminal_facts(task_id: TaskId) -> ResourceFacts {
+        ResourceFacts::new(
+            Some(task_id),
+            OwnerKind::Task,
+            ResourceKind::Terminal,
+            ResourceRecipe::terminal(120, 40),
+            1_725_000_000_100,
+        )
+        .expect("provider terminal facts")
+    }
+
+    fn rejection_code(receipt: &CommandReceipt) -> RejectionCode {
+        match receipt {
+            CommandReceipt::Rejected { code, .. } => *code,
+            other => panic!("expected a rejected receipt, got {other:?}"),
+        }
+    }
+
+    /// A provider-owned terminal has no launch, so it can never carry a title
+    /// and is never a strip tab. Both refusals must be clean rejections rather
+    /// than an apply-time failure.
+    #[test]
+    fn terminal_commands_reject_a_provider_owned_terminal() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let mut bus = CommandBus::open(&directory.path().join("tasks.sqlite")).expect("bus");
+        let client_id = ClientId::new();
+        let (task_id, revision) = create_open_task(&mut bus, client_id);
+
+        let provider = provider_terminal_facts(task_id);
+        let revision = accepted_revision(
+            bus.execute(task_envelope(
+                client_id,
+                task_id,
+                revision,
+                Command::RegisterResource {
+                    resource: provider.clone(),
+                },
+            ))
+            .expect("register provider terminal"),
+        );
+
+        let rename = bus
+            .execute(task_envelope(
+                client_id,
+                task_id,
+                revision,
+                Command::RenameTerminal {
+                    resource_id: provider.id,
+                    title: "build".to_string(),
+                },
+            ))
+            .expect("rename executes");
+        assert_eq!(rejection_code(&rename), RejectionCode::InvalidTransition);
+
+        let close = bus
+            .execute(task_envelope(
+                client_id,
+                task_id,
+                revision,
+                Command::CloseTerminal {
+                    resource_id: provider.id,
+                },
+            ))
+            .expect("close executes");
+        assert_eq!(rejection_code(&close), RejectionCode::InvalidTransition);
+
+        // A plain shell rename still refuses a title that trims to nothing.
+        let shell = plain_shell_facts(task_id, None);
+        let revision = accepted_revision(
+            bus.execute(task_envelope(
+                client_id,
+                task_id,
+                revision,
+                Command::OpenShellTerminal(OpenShellTerminalIntent {
+                    resource: shell.clone(),
+                }),
+            ))
+            .expect("open shell"),
+        );
+        let blank = bus
+            .execute(task_envelope(
+                client_id,
+                task_id,
+                revision,
+                Command::RenameTerminal {
+                    resource_id: shell.id,
+                    title: "   ".to_string(),
+                },
+            ))
+            .expect("blank rename executes");
+        assert_eq!(rejection_code(&blank), RejectionCode::InvalidTransition);
+    }
+
+    /// The strip is a permutation of the live plain shells: a subset would both
+    /// re-open a registration slot and hide a live shell from the UI.
+    #[test]
+    fn strip_must_be_a_permutation_of_the_live_shells() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let mut bus = CommandBus::open(&directory.path().join("tasks.sqlite")).expect("bus");
+        let client_id = ClientId::new();
+        let (task_id, revision) = create_open_task(&mut bus, client_id);
+
+        let first = plain_shell_facts(task_id, None);
+        let revision = accepted_revision(
+            bus.execute(task_envelope(
+                client_id,
+                task_id,
+                revision,
+                Command::OpenShellTerminal(OpenShellTerminalIntent {
+                    resource: first.clone(),
+                }),
+            ))
+            .expect("open first"),
+        );
+        let second = plain_shell_facts(task_id, None);
+        let revision = accepted_revision(
+            bus.execute(task_envelope(
+                client_id,
+                task_id,
+                revision,
+                Command::OpenShellTerminal(OpenShellTerminalIntent {
+                    resource: second.clone(),
+                }),
+            ))
+            .expect("open second"),
+        );
+
+        let omitted = bus
+            .execute(task_envelope(
+                client_id,
+                task_id,
+                revision,
+                Command::SetTerminalStrip(crate::domain::terminal_facts::TaskTerminalStrip {
+                    order: vec![second.id],
+                    focused: Some(second.id),
+                }),
+            ))
+            .expect("omitting strip executes");
+        assert_eq!(rejection_code(&omitted), RejectionCode::InvalidTransition);
+
+        let reordered = bus
+            .execute(task_envelope(
+                client_id,
+                task_id,
+                revision,
+                Command::SetTerminalStrip(crate::domain::terminal_facts::TaskTerminalStrip {
+                    order: vec![second.id, first.id],
+                    focused: Some(first.id),
+                }),
+            ))
+            .expect("reordering strip executes");
+        assert!(
+            matches!(reordered, CommandReceipt::Accepted { .. }),
+            "a permutation of every live shell is accepted, got {reordered:?}"
+        );
+    }
+
+    /// A Releasing shell still holds its registration slot: it stays in the
+    /// strip until `ResourceReleased`, and the apply-level backstop counts strip
+    /// entries. `decide` must therefore refuse the ninth shell here too, or the
+    /// backstop turns a user-facing case into an opaque apply failure.
+    #[test]
+    fn a_closing_shell_still_holds_its_slot() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let mut bus = CommandBus::open(&directory.path().join("tasks.sqlite")).expect("bus");
+        let client_id = ClientId::new();
+        let (task_id, mut revision) = create_open_task(&mut bus, client_id);
+        let mut first: Option<ResourceId> = None;
+        for _ in 0..8 {
+            let shell = plain_shell_facts(task_id, None);
+            first.get_or_insert(shell.id);
+            revision = accepted_revision(
+                bus.execute(task_envelope(
+                    client_id,
+                    task_id,
+                    revision,
+                    Command::OpenShellTerminal(OpenShellTerminalIntent { resource: shell }),
+                ))
+                .expect("open"),
+            );
+        }
+        let closing = first.expect("eight shells were opened");
+        revision = accepted_revision(
+            bus.execute(task_envelope(
+                client_id,
+                task_id,
+                revision,
+                Command::CloseTerminal {
+                    resource_id: closing,
+                },
+            ))
+            .expect("close"),
+        );
+        let snapshot = bus.task_snapshot(task_id).expect("snapshot").expect("task");
+        assert_eq!(
+            snapshot.resources[&closing].lifecycle,
+            ResourceLifecycle::Releasing
+        );
+
+        let ninth = bus
+            .execute(task_envelope(
+                client_id,
+                task_id,
+                revision,
+                Command::OpenShellTerminal(OpenShellTerminalIntent {
+                    resource: plain_shell_facts(task_id, None),
+                }),
+            ))
+            .expect("ninth executes");
+        assert_eq!(rejection_code(&ninth), RejectionCode::TooManyTerminals);
+    }
+
+    #[test]
+    fn ninth_shell_is_rejected() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let mut bus = CommandBus::open(&directory.path().join("tasks.sqlite")).expect("bus");
+        let client_id = ClientId::new();
+        let (task_id, mut revision) = create_open_task(&mut bus, client_id);
+        for _ in 0..8 {
+            let receipt = bus
+                .execute(task_envelope(
+                    client_id,
+                    task_id,
+                    revision,
+                    Command::OpenShellTerminal(OpenShellTerminalIntent {
+                        resource: plain_shell_facts(task_id, None),
+                    }),
+                ))
+                .expect("open");
+            revision = accepted_revision(receipt);
+        }
+        let receipt = bus
+            .execute(task_envelope(
+                client_id,
+                task_id,
+                revision,
+                Command::OpenShellTerminal(OpenShellTerminalIntent {
+                    resource: plain_shell_facts(task_id, None),
+                }),
+            ))
+            .expect("ninth executes");
+        assert!(matches!(
+            receipt,
+            CommandReceipt::Rejected {
+                code: RejectionCode::TooManyTerminals,
+                ..
+            }
+        ));
     }
 
     #[test]

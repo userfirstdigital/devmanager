@@ -54,10 +54,10 @@ pub use codec::{
 pub use command::{
     command_payload_digest, decide, AcceptSpecialistHandoffIntent, ArmUpdateInstallIntent,
     CancelSpecialistIntent, Command, CommandEnvelope, CommandReceipt, ConfirmHostQuitIntent,
-    ConfirmUpdateDrainIntent, CreateTaskIntent, CreateTaskRequestIntent, PrepareUpdateIntent,
-    PromotePrimaryIntent, RejectionCode, RenameTaskIntent, RequestSpecialistIntent,
-    ServiceControlAction, ServiceControlIntent, SetTaskAttentionIntent, SubmitProviderInputIntent,
-    DEFAULT_MAX_TOP_LEVEL_RUNTIMES,
+    ConfirmUpdateDrainIntent, CreateTaskIntent, CreateTaskRequestIntent, OpenShellTerminalIntent,
+    PrepareUpdateIntent, PromotePrimaryIntent, RejectionCode, RenameTaskIntent,
+    RequestSpecialistIntent, ServiceControlAction, ServiceControlIntent, SetTaskAttentionIntent,
+    SubmitProviderInputIntent, DEFAULT_MAX_TOP_LEVEL_RUNTIMES,
 };
 pub use event::{
     apply, ApplyError, DomainEvent, Event, EventSerdeError, OperationAcceptedFact,
@@ -113,6 +113,6 @@ pub use task::{
     WorkspaceChoice, WorkspaceRef,
 };
 pub use terminal_facts::{
-    TaskTerminalStrip, TerminalExit, TerminalFacts, TerminalStripError, MAX_PLAIN_SHELLS_PER_TASK,
-    TERMINAL_ACTIVITY_COALESCE_MS, TERMINAL_CWD_DEBOUNCE_MS,
+    HostTerminalFact, TaskTerminalStrip, TerminalExit, TerminalFacts, TerminalStripError,
+    MAX_PLAIN_SHELLS_PER_TASK, TERMINAL_ACTIVITY_COALESCE_MS, TERMINAL_CWD_DEBOUNCE_MS,
 };

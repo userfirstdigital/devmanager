@@ -47,6 +47,8 @@ pub enum RejectionCode {
     Closing,
     IdempotencyConflict,
     AlreadyResolved,
+    /// The task already holds MAX_PLAIN_SHELLS_PER_TASK live plain shells.
+    TooManyTerminals,
 }
 
 impl<'de> Deserialize<'de> for RejectionCode {
@@ -77,6 +79,7 @@ impl<'de> Deserialize<'de> for RejectionCode {
                     "closing" => Ok(RejectionCode::Closing),
                     "idempotency_conflict" => Ok(RejectionCode::IdempotencyConflict),
                     "already_resolved" => Ok(RejectionCode::AlreadyResolved),
+                    "too_many_terminals" => Ok(RejectionCode::TooManyTerminals),
                     _ => Err(de::Error::unknown_variant(
                         value,
                         &[
@@ -89,6 +92,7 @@ impl<'de> Deserialize<'de> for RejectionCode {
                             "closing",
                             "idempotency_conflict",
                             "already_resolved",
+                            "too_many_terminals",
                         ],
                     )),
                 }
@@ -1275,6 +1279,31 @@ pub enum Command {
     /// Arm durable staged-install readiness (recoverable). Irreversible only after
     /// durable stage marker is written by the installer path.
     ArmUpdateInstall(ArmUpdateInstallIntent),
+    /// Register one plain shell terminal on the task. The intent carries the
+    /// fully resolved launch recipe; the domain refuses anything that is not a
+    /// task-owned plain shell, and refuses the ninth live shell.
+    OpenShellTerminal(OpenShellTerminalIntent),
+    /// Begin releasing one plain shell terminal.
+    CloseTerminal {
+        resource_id: ResourceId,
+    },
+    /// Rename one plain shell terminal. The title is trimmed here and must then
+    /// satisfy `domain::resource::validate_terminal_title`.
+    RenameTerminal {
+        resource_id: ResourceId,
+        title: String,
+    },
+    /// Replace the task's terminal strip. The order must be a permutation of the
+    /// task's live plain shells.
+    SetTerminalStrip(crate::domain::terminal_facts::TaskTerminalStrip),
+}
+
+/// One plain shell terminal registration. The recipe is resolved before it
+/// reaches the domain, so `decide` only has to validate it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
+pub struct OpenShellTerminalIntent {
+    pub resource: ResourceFacts,
 }
 
 /// Typed host supervisor operation selected by a catalog action.
@@ -1640,7 +1669,149 @@ pub fn decide(
         | Command::ConfirmUpdateDrain(_)
         | Command::AbortUpdateHandoff
         | Command::ArmUpdateInstall(_) => Err(RejectionCode::InvalidTransition),
+        Command::OpenShellTerminal(intent) => {
+            decide_open_shell_terminal(snapshot, envelope, intent)
+        }
+        Command::CloseTerminal { resource_id } => {
+            let snap = require_open_or_closing_task(snapshot, envelope)?;
+            require_expected_revision(snap, envelope)?;
+            let resource = require_task_plain_shell(snap, resource_id)?;
+            if resource.lifecycle != crate::domain::resource::ResourceLifecycle::Active {
+                return Err(RejectionCode::InvalidTransition);
+            }
+            Ok(vec![Event::ResourceReleaseBegun {
+                resource_id: *resource_id,
+                runtime_generation: resource.runtime_generation,
+            }])
+        }
+        Command::RenameTerminal { resource_id, title } => {
+            let snap = require_open_or_closing_task(snapshot, envelope)?;
+            require_expected_revision(snap, envelope)?;
+            // A provider-owned terminal (`launch: None`) can never carry a
+            // title, so refuse it here with a clean rejection rather than
+            // letting `apply_into` fail the write.
+            require_task_plain_shell(snap, resource_id)?;
+            let trimmed = title.trim();
+            crate::domain::resource::validate_terminal_title(trimmed)
+                .map_err(|_| RejectionCode::InvalidTransition)?;
+            Ok(vec![Event::TerminalRenamed {
+                resource_id: *resource_id,
+                title: trimmed.to_string(),
+            }])
+        }
+        Command::SetTerminalStrip(strip) => {
+            let snap = require_open_or_closing_task(snapshot, envelope)?;
+            require_expected_revision(snap, envelope)?;
+            strip
+                .validate(snap.task.id, &snap.resources)
+                .map_err(|error| match error {
+                    crate::domain::terminal_facts::TerminalStripError::TooManyTerminals(_) => {
+                        RejectionCode::TooManyTerminals
+                    }
+                    crate::domain::terminal_facts::TerminalStripError::ForeignTask(_) => {
+                        RejectionCode::NotFound
+                    }
+                    _ => RejectionCode::InvalidTransition,
+                })?;
+            // The strip is a permutation of the live plain shells, never a
+            // subset: a subset would both re-open a registration slot and hide
+            // a live shell from every reader of the strip.
+            let live: std::collections::BTreeSet<ResourceId> = live_plain_shell_ids(snap).collect();
+            let ordered: std::collections::BTreeSet<ResourceId> =
+                strip.order.iter().copied().collect();
+            if ordered != live {
+                return Err(RejectionCode::InvalidTransition);
+            }
+            Ok(vec![Event::TaskTerminalStripSet {
+                strip: strip.clone(),
+            }])
+        }
     }
+}
+
+fn is_plain_shell_terminal(resource: &ResourceFacts) -> bool {
+    resource.resource_kind == crate::domain::resource::ResourceKind::Terminal
+        && resource.recipe.is_plain_shell()
+}
+
+/// The task's Active plain shells: the exact set the strip must be a
+/// permutation of.
+fn live_plain_shell_ids(snap: &TaskSnapshot) -> impl Iterator<Item = ResourceId> + '_ {
+    snap.resources
+        .values()
+        .filter(|resource| {
+            is_plain_shell_terminal(resource)
+                && resource.lifecycle == crate::domain::resource::ResourceLifecycle::Active
+        })
+        .map(|resource| resource.id)
+}
+
+/// Plain shells that still hold a registration slot, which is every one that is
+/// not yet Released.
+///
+/// This is deliberately wider than [`live_plain_shell_ids`]. The domain backstop
+/// in `apply_into`'s `ResourceRegistered` arm counts *strip entries*, and a shell
+/// only leaves the strip on `ResourceReleased` -- `ResourceReleaseBegun` leaves it
+/// there. Counting only Active shells here would let `decide` admit a ninth
+/// registration that the backstop then refuses as an opaque `ApplyError`, so the
+/// outer guard counts at least as many shells as the inner one.
+fn occupied_plain_shell_count(snap: &TaskSnapshot) -> usize {
+    snap.resources
+        .values()
+        .filter(|resource| {
+            is_plain_shell_terminal(resource)
+                && resource.lifecycle != crate::domain::resource::ResourceLifecycle::Released
+        })
+        .count()
+}
+
+/// Resolve one of this task's plain shell terminals, or say which check failed.
+fn require_task_plain_shell<'a>(
+    snap: &'a TaskSnapshot,
+    resource_id: &ResourceId,
+) -> Result<&'a ResourceFacts, RejectionCode> {
+    let resource = snap
+        .resources
+        .get(resource_id)
+        .ok_or(RejectionCode::NotFound)?;
+    if resource.owner_kind != crate::domain::resource::OwnerKind::Task
+        || resource.task_id != Some(snap.task.id)
+    {
+        return Err(RejectionCode::OwnershipConflict);
+    }
+    if !is_plain_shell_terminal(resource) {
+        return Err(RejectionCode::InvalidTransition);
+    }
+    Ok(resource)
+}
+
+fn decide_open_shell_terminal(
+    snapshot: Option<&TaskSnapshot>,
+    envelope: &CommandEnvelope,
+    intent: &OpenShellTerminalIntent,
+) -> Result<Vec<Event>, RejectionCode> {
+    let snap = require_runtime_capable_task(snapshot, envelope)?;
+    require_expected_revision(snap, envelope)?;
+    let resource = intent.resource.clone();
+    resource
+        .validate_for_registration()
+        .map_err(|_| RejectionCode::InvalidTransition)?;
+    if resource.owner_kind != crate::domain::resource::OwnerKind::Task
+        || resource.task_id != Some(snap.task.id)
+    {
+        return Err(RejectionCode::OwnershipConflict);
+    }
+    if !is_plain_shell_terminal(&resource) {
+        return Err(RejectionCode::InvalidTransition);
+    }
+    if snap.resources.contains_key(&resource.id) {
+        return Err(RejectionCode::AlreadyExists);
+    }
+    if occupied_plain_shell_count(snap) >= crate::domain::terminal_facts::MAX_PLAIN_SHELLS_PER_TASK
+    {
+        return Err(RejectionCode::TooManyTerminals);
+    }
+    Ok(vec![Event::ResourceRegistered { resource }])
 }
 
 fn decide_browser(

@@ -756,3 +756,75 @@ pub(crate) fn validate_pure_settled_lineage(
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::kernel::outbox::{is_pure_slice_decision_fact, is_side_effect_decision_fact};
+
+    /// The three "which list is this event on" predicates must agree for every
+    /// terminal event. They live in two modules and have been edited apart
+    /// three times now; this walks all five so the lists agree by construction.
+    #[test]
+    fn terminal_events_are_classified_identically_by_every_list() {
+        let resource_id = ResourceId::new();
+
+        // Task mutations: recorded state, a task revision, no host effect.
+        let mutations = [
+            Event::TerminalRenamed {
+                resource_id,
+                title: "build".to_string(),
+            },
+            Event::TaskTerminalStripSet {
+                strip: Default::default(),
+            },
+        ];
+        for event in &mutations {
+            let what = event.event_type();
+            assert!(event.is_task_mutation(), "{what} must be a task mutation");
+            assert!(
+                is_pure_slice_decision_fact(event),
+                "{what} must be a pure slice decision fact"
+            );
+            assert!(
+                !is_side_effect_decision_fact(event),
+                "{what} must plan no host effect"
+            );
+            assert!(
+                is_pure_decision_fact(event),
+                "{what} must be a pure lineage decision fact"
+            );
+        }
+
+        // Host-authored facts: no task revision, so they can never appear in a
+        // command's decision batch under any of the three predicates.
+        let host_facts = [
+            Event::TerminalCwdReported {
+                resource_id,
+                cwd: std::path::PathBuf::from("C:/Code/demo"),
+            },
+            Event::TerminalExited {
+                resource_id,
+                code: Some(0),
+                summary: "done".to_string(),
+            },
+            Event::TerminalActivity { resource_id },
+        ];
+        for event in &host_facts {
+            let what = event.event_type();
+            assert!(!event.is_task_mutation(), "{what} must not be a mutation");
+            assert!(
+                !is_pure_slice_decision_fact(event),
+                "{what} must not be a pure slice decision fact"
+            );
+            assert!(
+                !is_side_effect_decision_fact(event),
+                "{what} must not be a side-effect decision fact"
+            );
+            assert!(
+                !is_pure_decision_fact(event),
+                "{what} must not be a pure lineage decision fact"
+            );
+        }
+    }
+}

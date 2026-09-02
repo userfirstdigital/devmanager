@@ -1363,6 +1363,7 @@ fn rejection_code_name(code: RejectionCode) -> &'static str {
         RejectionCode::Closing => "closing",
         RejectionCode::IdempotencyConflict => "idempotency_conflict",
         RejectionCode::AlreadyResolved => "already_resolved",
+        RejectionCode::TooManyTerminals => "too_many_terminals",
     }
 }
 

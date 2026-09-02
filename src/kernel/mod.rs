@@ -43,7 +43,7 @@ impl SessionScope {
 }
 
 pub(crate) use artifact_content::{ArtifactContentError, ArtifactContentRegistry};
-pub use command_bus::{CommandBus, LoadedTaskRuntime, TaskRuntimeLoadError};
+pub use command_bus::{CommandBus, LoadedTaskRuntime, TaskRuntimeLoadError, TerminalFactOutcome};
 pub(crate) use command_bus::{HostCleanupUnit, HostRestartDispositionUnit};
 pub use dispatch::{
     AmbiguityDisposition, DispatchClaim, DispatchCompletion, DispatchPermit, ReconciliationClaim,
