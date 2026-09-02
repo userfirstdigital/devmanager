@@ -346,12 +346,30 @@ pub struct TerminalInputContext {
 }
 
 impl TerminalInputContext {
+    /// Whether this context carries the plain-shell sentinels rather than a
+    /// provider fence.
+    ///
+    /// A shell has no agent session, no provider runtime generation and no
+    /// launch action epoch, so the host sends the documented zeros for all
+    /// three. Requiring the exact triple keeps this a shape test rather than a
+    /// hole: a context that zeroes only one of them is still a malformed
+    /// provider fence and is refused by `validate`, and neither shape can
+    /// address the other kind of terminal because the host compares the
+    /// hosted terminal's own agent session against it.
+    pub fn is_plain_shell_fence(self) -> bool {
+        self.agent_session_id.is_nil() && self.runtime_generation == 0 && self.action_epoch == 0
+    }
+
     pub fn validate(self) -> Result<(), TerminalError> {
-        if self.runtime_generation == 0
-            || self.resource_generation == 0
-            || self.action_epoch == 0
-            || self.input_sequence == 0
-        {
+        // Required of every terminal, shell or provider: the durable resource
+        // generation this input is aimed at, and a real input sequence.
+        if self.resource_generation == 0 || self.input_sequence == 0 {
+            return Err(TerminalError::InvalidFence);
+        }
+        if self.is_plain_shell_fence() {
+            return Ok(());
+        }
+        if self.runtime_generation == 0 || self.action_epoch == 0 {
             return Err(TerminalError::InvalidFence);
         }
         Ok(())

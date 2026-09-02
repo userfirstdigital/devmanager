@@ -3,7 +3,8 @@ use std::sync::Arc;
 use devmanager::domain::id::{AgentSessionId, ClientId, ResourceId, TaskId};
 use devmanager::terminal::protocol::{
     ClientInputGrant, CloseReason, InputAck, InputEnvelope, InputId, InputRejectReason,
-    ResizeFence, TerminalError, TerminalSessionId, TerminalSize, TerminalSpec, ViewKind,
+    ResizeFence, TerminalError, TerminalGeneration, TerminalInputContext, TerminalInputRequest,
+    TerminalSessionId, TerminalSize, TerminalSpec, ViewKind,
 };
 use devmanager::terminal::service::{MockAttachedRuntime, TerminalRuntimeState, TerminalService};
 
@@ -498,6 +499,141 @@ fn shell_spec() -> TerminalSpec {
         TerminalSize::new(80, 24).expect("size"),
     )
     .expect("spec")
+}
+
+/// A plain shell's input fence: no agent session, no provider runtime
+/// generation, no launch action epoch -- exactly the sentinels the host puts
+/// on the shell's own projection.
+fn shell_input_request(
+    client_id: ClientId,
+    task_id: TaskId,
+    view: &devmanager::terminal::service::TaskTerminalView,
+    input_sequence: u64,
+    bytes: &[u8],
+) -> TerminalInputRequest {
+    TerminalInputRequest {
+        client_id,
+        input_id: InputId::new(),
+        terminal_id: view.terminal_id,
+        context: TerminalInputContext {
+            task_id,
+            agent_session_id: AgentSessionId::nil(),
+            resource_id: view.resource_id,
+            runtime_generation: 0,
+            resource_generation: view.resource_generation,
+            session_id: view.session_id,
+            terminal_generation: TerminalGeneration::from_raw(view.resource_generation)
+                .expect("generation"),
+            focus_epoch: view.focus_epoch,
+            action_epoch: 0,
+            input_sequence,
+        },
+        bytes: bytes.to_vec(),
+    }
+}
+
+#[test]
+fn a_shell_accepts_input_carrying_the_zero_provider_fences() {
+    let service = TerminalService::default();
+    let task_id = TaskId::new();
+    let shell = ResourceId::new();
+    let terminal_id = service
+        .attach_plain_shell(task_id, shell, 1, shell_spec(), shell_runtime(shell))
+        .expect("shell attach");
+    let client_id = ClientId::new();
+    service
+        .grant_client(terminal_id, client_id, ClientInputGrant::ReadWrite)
+        .expect("grant");
+    let view = service
+        .task_terminal_view_for(task_id, Some(shell))
+        .expect("view")
+        .expect("present");
+
+    let request = shell_input_request(client_id, task_id, &view, 1, b"ls\r");
+    assert_eq!(
+        service.write_task_input(request),
+        Ok(InputAck::Accepted { sequence: 1 }),
+        "a shell has no agent session or action epoch; its authority is its durable resource"
+    );
+}
+
+#[test]
+fn a_provider_fence_cannot_address_a_shell_and_a_shell_fence_cannot_address_a_provider() {
+    let service = TerminalService::default();
+    let task_id = TaskId::new();
+    let agent_session_id = AgentSessionId::new();
+    let provider_id = service
+        .attach_bound_task_runtime(
+            task_id,
+            shell_spec(),
+            MockAttachedRuntime::new(TerminalSize::new(80, 24).expect("size")),
+            agent_session_id,
+            1,
+            1,
+        )
+        .expect("provider attach");
+    let shell = ResourceId::new();
+    let shell_id = service
+        .attach_plain_shell(task_id, shell, 1, shell_spec(), shell_runtime(shell))
+        .expect("shell attach");
+    let client_id = ClientId::new();
+    service
+        .grant_client(provider_id, client_id, ClientInputGrant::ReadWrite)
+        .expect("grant provider");
+    service
+        .grant_client(shell_id, client_id, ClientInputGrant::ReadWrite)
+        .expect("grant shell");
+
+    let provider_view = service
+        .task_terminal_view_for(task_id, None)
+        .expect("view")
+        .expect("present");
+    let shell_view = service
+        .task_terminal_view_for(task_id, Some(shell))
+        .expect("view")
+        .expect("present");
+
+    // Shell-shaped fence aimed at the provider terminal.
+    let mut wrong = shell_input_request(client_id, task_id, &shell_view, 1, b"x");
+    wrong.terminal_id = provider_view.terminal_id;
+    wrong.context.resource_id = provider_view.resource_id;
+    wrong.context.session_id = provider_view.session_id;
+    wrong.context.focus_epoch = provider_view.focus_epoch;
+    assert_eq!(
+        service.write_task_input(wrong),
+        Ok(InputAck::Rejected {
+            reason: InputRejectReason::StaleAgent
+        }),
+        "the provider terminal still requires its real agent session"
+    );
+
+    // Provider-shaped fence aimed at the shell.
+    let provider_shaped = TerminalInputRequest {
+        client_id,
+        input_id: InputId::new(),
+        terminal_id: shell_view.terminal_id,
+        context: TerminalInputContext {
+            task_id,
+            agent_session_id,
+            resource_id: shell_view.resource_id,
+            runtime_generation: 1,
+            resource_generation: shell_view.resource_generation,
+            session_id: shell_view.session_id,
+            terminal_generation: TerminalGeneration::from_raw(shell_view.resource_generation)
+                .expect("generation"),
+            focus_epoch: shell_view.focus_epoch,
+            action_epoch: 1,
+            input_sequence: 1,
+        },
+        bytes: b"x".to_vec(),
+    };
+    assert_eq!(
+        service.write_task_input(provider_shaped),
+        Ok(InputAck::Rejected {
+            reason: InputRejectReason::StaleAgent
+        }),
+        "a shell never has an agent session, so a provider fence must not reach it"
+    );
 }
 
 #[test]

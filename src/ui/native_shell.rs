@@ -2753,6 +2753,13 @@ struct ProviderSetupApproval {
 
 type ProviderSetupInputCompletion = Arc<Mutex<Option<Result<InputAck, String>>>>;
 
+/// Build one raw-input request for the exact terminal this projection names.
+///
+/// The projection's own fences travel through unchanged, including the
+/// documented plain-shell sentinels (`AgentSessionId::nil()`, a zero provider
+/// runtime generation and a zero launch action epoch). The host decides
+/// whether that shape is admissible for the terminal it addresses; the client
+/// never invents a fence to make one fit.
 fn terminal_input_request(
     client_id: ClientId,
     terminal: &crate::domain::TaskTerminalProjection,
@@ -2760,7 +2767,7 @@ fn terminal_input_request(
     bytes: Vec<u8>,
 ) -> Result<TerminalInputRequest, String> {
     let terminal_generation = TerminalGeneration::from_raw(terminal.resource_generation)
-        .map_err(|error| format!("provider terminal generation is invalid: {error}"))?;
+        .map_err(|error| format!("terminal generation is invalid: {error}"))?;
     let request = TerminalInputRequest {
         client_id,
         input_id: InputId::new(),
@@ -2781,7 +2788,7 @@ fn terminal_input_request(
     };
     request
         .validate()
-        .map_err(|error| format!("provider terminal input is invalid: {error}"))?;
+        .map_err(|error| format!("terminal input is invalid: {error}"))?;
     Ok(request)
 }
 

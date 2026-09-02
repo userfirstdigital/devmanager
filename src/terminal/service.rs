@@ -1276,7 +1276,22 @@ impl TerminalService {
                 reason: InputRejectReason::StaleTask,
             });
         }
-        if hosted.agent_session_id != Some(context.agent_session_id) {
+        // A plain shell has no agent session, provider runtime generation, or
+        // launch action epoch, so those three provider fences do not exist to
+        // compare against: its authority is the durable resource plus the
+        // terminal generation, session, and focus epoch checked below. The
+        // shape test is still an exact one, and it is what keeps the two kinds
+        // of terminal apart in both directions -- a provider-shaped fence
+        // aimed at a shell is refused here, and a shell-shaped fence aimed at
+        // the provider fails the agent comparison because the provider's
+        // hosted agent session is never nil.
+        if hosted.is_plain_shell {
+            if !context.is_plain_shell_fence() {
+                return Ok(InputAck::Rejected {
+                    reason: InputRejectReason::StaleAgent,
+                });
+            }
+        } else if hosted.agent_session_id != Some(context.agent_session_id) {
             return Ok(InputAck::Rejected {
                 reason: InputRejectReason::StaleAgent,
             });
@@ -1286,7 +1301,7 @@ impl TerminalService {
                 reason: InputRejectReason::StaleResource,
             });
         }
-        if hosted.runtime_generation != Some(context.runtime_generation) {
+        if !hosted.is_plain_shell && hosted.runtime_generation != Some(context.runtime_generation) {
             return Ok(InputAck::Rejected {
                 reason: InputRejectReason::StaleRuntimeGeneration,
             });
@@ -1308,7 +1323,7 @@ impl TerminalService {
                 reason: InputRejectReason::StaleFocus,
             });
         }
-        if hosted.action_epoch != Some(context.action_epoch) {
+        if !hosted.is_plain_shell && hosted.action_epoch != Some(context.action_epoch) {
             return Ok(InputAck::Rejected {
                 reason: InputRejectReason::StaleAction,
             });
