@@ -90,11 +90,11 @@ use crate::remote::web::image_paste::{
 use crate::remote::RemoteImageAttachment;
 use crate::ui::actions::{
     self, DockTool, HostActions, HostStatus, KeyboardAction, KeyboardModel, KeyboardShortcut,
-    NativeDismissTransient, NativeDockArtifacts, NativeDockBrowser, NativeDockChanges,
-    NativeDockFiles, NativeDockReview, NativeDockServices, NativeDockTerminal,
-    NativeOpenCommandPalette, NativeOpenPalette, NativeOpenTaskSwitcher, NativeOpenTerminal,
-    NativeResetLayout, NativeToggleDock, NativeToggleSidebar, NativeToggleTerminal, TaskCreate,
-    TaskListAction, TaskRename, TaskShow,
+    NativeCycleTerminal, NativeCycleTerminalBack, NativeDismissTransient, NativeDockArtifacts,
+    NativeDockBrowser, NativeDockChanges, NativeDockFiles, NativeDockReview, NativeDockServices,
+    NativeDockTerminal, NativeOpenCommandPalette, NativeOpenPalette, NativeOpenShellTerminal,
+    NativeOpenTaskSwitcher, NativeOpenTerminal, NativeResetLayout, NativeToggleDock,
+    NativeToggleSidebar, NativeToggleTerminal, TaskCreate, TaskListAction, TaskRename, TaskShow,
 };
 use crate::ui::agent_connection::{
     connect_canvas_copy, inbox_agent_actions, placeholder_task_title, settings_row_copy,
@@ -390,6 +390,8 @@ const TERMINAL_ECHO_RETRY_INTERVAL: Duration = Duration::from_millis(16);
 /// so a lost answer cannot leave the strip permanently unrefreshable, which a
 /// bare in-flight boolean would.
 const TASK_TERMINALS_QUERY_LEASE: Duration = Duration::from_secs(5);
+/// Shown over the Terminal dock's photo while the Task's strip focuses nothing.
+const TERMINAL_DOCK_EMPTY_MESSAGE: &str = "No terminal selected · press + or Ctrl+Shift+`";
 const TERMINAL_ECHO_MAX_UNMATCHED_REFRESHES: u8 = 16;
 /// Host worker command/subscription idle slice — separate from UI scheduling.
 const HOST_WORKER_IDLE_WAIT: Duration = Duration::from_millis(50);
@@ -1388,6 +1390,27 @@ fn stable_host_project_row_element_id(key: &HostProjectKey) -> String {
 /// Hashing the validated service ID (and optional action label) keeps the
 /// identity stable across renders without depending on row order, while the
 /// static tuple name keeps rows and controls in separate ID namespaces.
+/// Deterministic numeric suffix for a durable resource's element identity.
+///
+/// Modelled on [`stable_service_element_key`]: GPUI's tuple element IDs accept
+/// a static name and a typed integer, never a runtime `String`, so the resource
+/// id is hashed. Keying on the resource -- not the row index -- is what keeps a
+/// chip's identity stable across a reorder.
+fn stable_resource_element_key(resource_id: ResourceId, suffix: &str) -> u64 {
+    let mut digest = Sha256::new();
+    digest.update(b"native-resource");
+    digest.update([0]);
+    digest.update(resource_id.as_bytes());
+    digest.update([0]);
+    digest.update(suffix.as_bytes());
+    let digest = digest.finalize();
+    u64::from_be_bytes(
+        digest[..8]
+            .try_into()
+            .expect("sha256 digest always contains eight bytes"),
+    )
+}
+
 fn stable_service_element_key(service_id: &str, suffix: &str) -> u64 {
     let mut digest = Sha256::new();
     digest.update(b"native-service");
@@ -2872,6 +2895,53 @@ pub(crate) struct TerminalChipRow {
     /// Redacted working directory as the host reported it, for the hover
     /// tooltip. Display only -- never a path the client may open or send back.
     pub live_cwd: Option<String>,
+}
+
+/// Which terminal chip's context menu is open, where it was opened, and any
+/// in-progress rename or close confirmation on it.
+#[derive(Clone, Debug, PartialEq)]
+struct TerminalChipMenu {
+    owner: HostTaskKey,
+    resource_id: ResourceId,
+    position: Point<Pixels>,
+    /// Inline rename draft once the Rename row has been chosen.
+    rename: Option<String>,
+    /// A running terminal takes a second Close to actually close.
+    confirming_close: bool,
+}
+
+/// The capability one terminal's raw input actually needs.
+///
+/// Separated from the shell so the rule is provable without a granted-capability
+/// fixture: a provider terminal needs `ProviderInput`, a plain shell needs only
+/// `TaskCockpit`.
+fn terminal_input_capability_granted(granted: CapabilitySet, target: TerminalTarget) -> bool {
+    match target {
+        TerminalTarget::Provider => granted.contains(Capability::ProviderInput),
+        TerminalTarget::Resource(_) => granted.contains(Capability::TaskCockpit),
+    }
+}
+
+/// Hover text for one terminal chip.
+///
+/// The exit summary and the live working directory are the two facts a chip is
+/// too small to show, and both are already redacted by the host. An exited
+/// terminal reports why; a running one reports where it is.
+pub(crate) fn terminal_chip_tooltip(row: &TerminalChipRow) -> String {
+    let mut parts = vec![row.label.clone()];
+    match &row.state {
+        crate::domain::cockpit::TerminalRuntimeStateWire::Exited { summary } => {
+            parts.push(format!("exited · {summary}"));
+        }
+        crate::domain::cockpit::TerminalRuntimeStateWire::Unknown => {
+            parts.push("state unknown".to_string());
+        }
+        crate::domain::cockpit::TerminalRuntimeStateWire::Running => {}
+    }
+    if let Some(cwd) = row.live_cwd.as_ref() {
+        parts.push(cwd.clone());
+    }
+    parts.join(" · ")
 }
 
 /// Project a Task's terminal strip into its chips, provider first.
@@ -10816,6 +10886,19 @@ pub struct NativeShell {
     splash_fetch_generation: u64,
     /// Test/observability counter for idle-photo fetch admission (not a second fetch path).
     idle_photo_fetch_spawns: usize,
+    /// Photo behind the Terminal dock's empty state.
+    ///
+    /// A separate retained slot from `splash_image`, which is cleared the
+    /// moment a task is selected so that returning to the idle canvas fetches
+    /// a fresh photo. This one is needed WHILE a task is selected, so it cannot
+    /// share that lifecycle. The fetch and decode are the same functions --
+    /// only the retention differs.
+    terminal_splash_image: Option<Arc<RenderImage>>,
+    /// One network attempt per app session, whatever its outcome.
+    terminal_splash_fetch_attempted: bool,
+    /// Which terminal chip's context menu is open. Presentation only; the
+    /// chips themselves are always read back from the admitted strip.
+    terminal_chip_menu: Option<TerminalChipMenu>,
     #[cfg(test)]
     interactive_conversation_builds: usize,
     #[cfg(test)]
@@ -11850,6 +11933,9 @@ impl NativeShell {
             splash_fetch_attempted: false,
             splash_fetch_generation: 0,
             idle_photo_fetch_spawns: 0,
+            terminal_splash_image: None,
+            terminal_splash_fetch_attempted: false,
+            terminal_chip_menu: None,
             #[cfg(test)]
             interactive_conversation_builds: 0,
             #[cfg(test)]
@@ -21148,8 +21234,7 @@ impl NativeShell {
             return false;
         };
         center_terminal_interactive(
-            self.granted_capabilities_for_host(&owner.host)
-                .contains(Capability::ProviderInput),
+            self.terminal_input_capability_granted(owner),
             self.host_slot(&owner.host)
                 .is_some_and(|slot| slot.interaction.selected_task() == Some(owner.task_id)),
             self.task_surfaces.terminal_is_interactive(owner.clone()),
@@ -25796,10 +25881,7 @@ impl NativeShell {
         let shell_entity = cx.weak_entity();
         let selected_owner = self.selected_task_key.as_ref() == Some(owner);
         let interactive = center_terminal_interactive(
-            selected_owner
-                && self
-                    .granted_capabilities_for_host(&owner.host)
-                    .contains(Capability::ProviderInput),
+            selected_owner && self.terminal_input_capability_granted(owner),
             self.host_slot(&owner.host)
                 .is_some_and(|slot| slot.interaction.selected_task() == Some(owner.task_id)),
             self.task_surfaces.terminal_is_interactive(owner.clone()),
@@ -26068,6 +26150,596 @@ impl NativeShell {
         }
     }
 
+    /// The Task's terminal strip as the host last answered it.
+    ///
+    /// Every chip the UI renders and every reorder it computes reads THIS, the
+    /// one admitted copy. Nothing on the shell keeps a second one.
+    fn terminal_strip_for(
+        &self,
+        owner: &HostTaskKey,
+    ) -> Option<crate::domain::cockpit::TaskTerminalsProjection> {
+        self.task_surfaces
+            .state(owner.clone())
+            .and_then(|state| state.strip.clone())
+    }
+
+    /// Whether one chip on the admitted strip is the Task's provider terminal.
+    fn terminal_chip_is_provider(&self, owner: &HostTaskKey, resource_id: ResourceId) -> bool {
+        self.terminal_strip_for(owner).is_some_and(|strip| {
+            strip
+                .terminals
+                .iter()
+                .any(|chip| chip.resource_id == resource_id && chip.is_provider)
+        })
+    }
+
+    /// Point the Task at one chip on its strip.
+    ///
+    /// The durable strip can only focus a PLAIN SHELL: `TaskTerminalStrip::validate`
+    /// (`src/domain/terminal_facts.rs`) refuses a focus that is not in `order`,
+    /// and `order` holds plain shells alone. "The provider chip is showing" is
+    /// therefore spelled `focused: None` -- which is also the state every Task
+    /// starts in -- and picking the provider chip additionally reveals the
+    /// provider terminal on the center canvas, where it has always lived.
+    fn focus_terminal_chip(&mut self, owner: &HostTaskKey, resource_id: ResourceId) {
+        let Some(strip) = self.terminal_strip_for(owner) else {
+            return;
+        };
+        let is_provider = self.terminal_chip_is_provider(owner, resource_id);
+        let focused = (!is_provider).then_some(resource_id);
+        let durable = crate::domain::terminal_facts::TaskTerminalStrip {
+            order: strip.order.clone(),
+            focused,
+        };
+        // Optimistic edit of the ONE admitted strip so the very next resize,
+        // scroll or screen query addresses the chip the user just clicked
+        // rather than the previous one for a whole round trip. The host's next
+        // answer overwrites it.
+        self.task_surfaces
+            .note_focused_terminal(owner.clone(), focused);
+        let _ = self.dispatch_action_recorded_for_owner(
+            &owner.host,
+            ActionRequest::TerminalSetStrip {
+                task_id: owner.task_id,
+                strip: durable,
+            },
+        );
+        if self.selected_task_key.as_ref() == Some(owner) {
+            if let Some(slot) = self.host_slot_mut(&owner.host) {
+                slot.cockpit
+                    .dock_mut()
+                    .set_focused_terminal(Some(resource_id));
+            }
+        }
+        if is_provider {
+            self.set_provider_terminal_visible(true);
+        }
+        self.task_surfaces
+            .note_terminal_query_started(owner.clone());
+        let _ = self.dispatch_action_recorded_for_owner(
+            &owner.host,
+            ActionRequest::TaskCockpit {
+                task_id: owner.task_id,
+                query: TerminalTarget::Resource(resource_id).screen_query(),
+            },
+        );
+    }
+
+    /// Ask the host to open one new plain shell on this Task.
+    ///
+    /// This is the existing host-authority lane and nothing else: the client
+    /// names the Task and an optional working directory, and the host resolves
+    /// the shell, registers the resource and answers with the refreshed strip
+    /// in the same round trip. There is no re-query to arm.
+    fn open_shell_terminal_for_owner(&mut self, owner: &HostTaskKey, cwd: Option<String>) -> bool {
+        self.dispatch_action_recorded_for_owner(
+            &owner.host,
+            ActionRequest::TerminalOpenShell {
+                task_id: owner.task_id,
+                cwd,
+            },
+        )
+        .is_ok()
+    }
+
+    /// Move strip focus one chip along, wrapping at both ends.
+    ///
+    /// With nothing focused, forward starts at the first chip and backward at
+    /// the last, so the chord is never a no-op on a Task whose strip focuses
+    /// nothing.
+    fn cycle_terminal(&mut self, backwards: bool) {
+        let Some(owner) = self.selected_task_key.clone() else {
+            return;
+        };
+        let Some(strip) = self.terminal_strip_for(&owner) else {
+            return;
+        };
+        let rows = terminal_chip_rows(&strip);
+        if rows.is_empty() {
+            return;
+        }
+        let next = match rows.iter().position(|row| row.selected) {
+            Some(current) if backwards => (current + rows.len() - 1) % rows.len(),
+            Some(current) => (current + 1) % rows.len(),
+            None if backwards => rows.len() - 1,
+            None => 0,
+        };
+        self.focus_terminal_chip(&owner, rows[next].resource_id);
+    }
+
+    /// Close one terminal.
+    ///
+    /// Deliberately does NOT pick a replacement chip. The host retires the
+    /// hosted view, drops the resource from the strip and clears focus; the
+    /// next strip answer says `focused: None` and the splash renders. Choosing
+    /// locally would fight that answer and could focus a chip the host has
+    /// already released.
+    fn close_terminal_chip(&mut self, owner: &HostTaskKey, resource_id: ResourceId) -> bool {
+        self.dispatch_action_recorded_for_owner(
+            &owner.host,
+            ActionRequest::TerminalClose {
+                task_id: owner.task_id,
+                resource_id,
+            },
+        )
+        .is_ok()
+    }
+
+    /// Set one terminal's user title. An empty title is not a rename.
+    fn rename_terminal_chip(
+        &mut self,
+        owner: &HostTaskKey,
+        resource_id: ResourceId,
+        title: String,
+    ) -> bool {
+        let title = title.trim().to_string();
+        if title.is_empty() {
+            return false;
+        }
+        self.dispatch_action_recorded_for_owner(
+            &owner.host,
+            ActionRequest::TerminalRename(crate::client::action::TerminalRenameArguments {
+                task_id: owner.task_id,
+                resource_id,
+                title,
+            }),
+        )
+        .is_ok()
+    }
+
+    /// Move one shell chip one position along the durable order.
+    ///
+    /// Slice 1 reorders through the chip menu; the GPUI shell has `on_drag`
+    /// but no drop idiom yet, so drag reorder is deferred (addendum B). The
+    /// provider chip is not in `order` at all, so it can never move -- which is
+    /// what makes "provider first" a rule rather than a position.
+    fn move_terminal_chip(
+        &mut self,
+        owner: &HostTaskKey,
+        resource_id: ResourceId,
+        backwards: bool,
+    ) -> bool {
+        let Some(strip) = self.terminal_strip_for(owner) else {
+            return false;
+        };
+        let mut order = strip.order.clone();
+        let Some(index) = order.iter().position(|id| *id == resource_id) else {
+            return false;
+        };
+        let target = if backwards {
+            index.checked_sub(1)
+        } else {
+            (index + 1 < order.len()).then_some(index + 1)
+        };
+        let Some(target) = target else {
+            return false;
+        };
+        order.swap(index, target);
+        self.dispatch_action_recorded_for_owner(
+            &owner.host,
+            ActionRequest::TerminalSetStrip {
+                task_id: owner.task_id,
+                strip: crate::domain::terminal_facts::TaskTerminalStrip {
+                    order,
+                    focused: strip.focused,
+                },
+            },
+        )
+        .is_ok()
+    }
+
+    /// Whether one chip can move in the given direction, for the menu rows.
+    fn terminal_chip_can_move(
+        &self,
+        owner: &HostTaskKey,
+        resource_id: ResourceId,
+        backwards: bool,
+    ) -> bool {
+        self.terminal_strip_for(owner)
+            .and_then(|strip| {
+                let index = strip.order.iter().position(|id| *id == resource_id)?;
+                Some(if backwards {
+                    index > 0
+                } else {
+                    index + 1 < strip.order.len()
+                })
+            })
+            .unwrap_or(false)
+    }
+
+    /// Whether closing this chip should ask first.
+    ///
+    /// A running PTY may be holding a child command whose output is the only
+    /// place its work is visible, so closing it is destructive in a way that
+    /// closing an already-exited terminal is not.
+    fn terminal_chip_close_needs_confirmation(
+        &self,
+        owner: &HostTaskKey,
+        resource_id: ResourceId,
+    ) -> bool {
+        self.terminal_strip_for(owner).is_some_and(|strip| {
+            strip.terminals.iter().any(|chip| {
+                chip.resource_id == resource_id
+                    && matches!(
+                        chip.runtime_state,
+                        crate::domain::cockpit::TerminalRuntimeStateWire::Running
+                    )
+            })
+        })
+    }
+
+    /// Whether this host has granted the capability the FOCUSED terminal's raw
+    /// input actually needs.
+    ///
+    /// Provider terminal input is provider input and needs
+    /// `Capability::ProviderInput`. A plain shell's input is not: the host
+    /// validates it on the resource id and its own generation
+    /// (`TerminalInputContext::is_plain_shell_fence`), so `TaskCockpit` -- the
+    /// capability that let the client open and address the shell at all -- is
+    /// the whole requirement. Gating a shell on ProviderInput leaves every
+    /// shell read-only on a host that grants only TaskCockpit, with no message
+    /// saying why.
+    fn terminal_input_capability_granted(&self, owner: &HostTaskKey) -> bool {
+        terminal_input_capability_granted(
+            self.granted_capabilities_for_host(&owner.host),
+            self.focused_terminal_target(owner),
+        )
+    }
+
+    /// Open the chip context menu for one terminal at the pointer.
+    fn open_terminal_chip_menu(
+        &mut self,
+        owner: HostTaskKey,
+        resource_id: ResourceId,
+        position: Point<Pixels>,
+    ) {
+        self.terminal_chip_menu = Some(TerminalChipMenu {
+            owner,
+            resource_id,
+            position,
+            rename: None,
+            confirming_close: false,
+        });
+    }
+
+    fn close_terminal_chip_menu(&mut self) {
+        self.terminal_chip_menu = None;
+    }
+
+    /// Start the inline rename field on the open chip menu, seeded with the
+    /// chip's current label.
+    fn begin_terminal_chip_rename(&mut self) {
+        let seed = self.terminal_chip_menu.as_ref().and_then(|menu| {
+            let strip = self.terminal_strip_for(&menu.owner)?;
+            terminal_chip_rows(&strip)
+                .into_iter()
+                .find(|row| row.resource_id == menu.resource_id)
+                .map(|row| row.label)
+        });
+        if let Some(menu) = self.terminal_chip_menu.as_mut() {
+            menu.rename = Some(seed.unwrap_or_default());
+        }
+    }
+
+    fn submit_terminal_chip_rename(&mut self) {
+        let Some(menu) = self.terminal_chip_menu.clone() else {
+            return;
+        };
+        let Some(title) = menu.rename else {
+            return;
+        };
+        self.rename_terminal_chip(&menu.owner, menu.resource_id, title);
+        self.close_terminal_chip_menu();
+    }
+
+    /// One photo per app session for the Terminal dock's empty state.
+    ///
+    /// Reuses the idle canvas's own fetch and decode -- bounded bytes, bounded
+    /// dimensions, BGRA swap -- on the background executor, never on the UI
+    /// thread. A failure sets no image and is not retried: the empty state
+    /// falls back to the sunken surface, which is what it renders while the
+    /// fetch is in flight anyway.
+    fn ensure_terminal_splash_image(&mut self, cx: &mut Context<Self>) {
+        if self.terminal_splash_image.is_some() || self.terminal_splash_fetch_attempted {
+            return;
+        }
+        self.terminal_splash_fetch_attempted = true;
+        let executor = cx.background_executor().clone();
+        cx.spawn(
+            move |this: gpui::WeakEntity<Self>, cx: &mut gpui::AsyncApp| {
+                let mut async_cx = cx.clone();
+                async move {
+                    let image = executor
+                        .spawn(async move { fetch_idle_conversation_photo() })
+                        .await;
+                    let _ = this.update(&mut async_cx, |shell, cx| {
+                        if let Some(image) = image {
+                            shell.terminal_splash_image = Some(image);
+                            cx.notify();
+                        }
+                    });
+                }
+            },
+        )
+        .detach();
+    }
+
+    fn render_terminal_chip_menu_overlay(
+        &self,
+        tokens: crate::ui::tokens::ThemeTokens,
+        viewport: Size<Pixels>,
+        cx: &Context<Self>,
+    ) -> AnyElement {
+        let menu = self
+            .terminal_chip_menu
+            .as_ref()
+            .expect("chip menu is open")
+            .clone();
+        let label = self
+            .terminal_strip_for(&menu.owner)
+            .map(|strip| terminal_chip_rows(&strip))
+            .and_then(|rows| {
+                rows.into_iter()
+                    .find(|row| row.resource_id == menu.resource_id)
+            })
+            .map(|row| row.label)
+            .unwrap_or_else(|| "Terminal".to_string());
+        let can_move_left = self.terminal_chip_can_move(&menu.owner, menu.resource_id, true);
+        let can_move_right = self.terminal_chip_can_move(&menu.owner, menu.resource_id, false);
+        let needs_confirm = self
+            .terminal_chip_close_needs_confirmation(&menu.owner, menu.resource_id)
+            && !menu.confirming_close;
+        let renaming = menu.rename.clone();
+        let row =
+            move |id: &'static str,
+                  text: String,
+                  enabled: bool,
+                  tone: gpui::Rgba,
+                  handler: Box<dyn Fn(&mut NativeShell, &mut Context<NativeShell>)>| {
+                let mut element = div()
+                    .id(id)
+                    .w_full()
+                    .px(px(tokens.density.spacing.md))
+                    .py(px(tokens.density.spacing.xs))
+                    .text_size(px(tokens.density.typography.body))
+                    .text_color(if enabled {
+                        tone
+                    } else {
+                        tokens.text.disabled.to_gpui()
+                    })
+                    .child(text);
+                if enabled {
+                    element = element
+                        .cursor_pointer()
+                        .hover(|style| style.bg(tokens.surfaces.hover.to_gpui()));
+                }
+                (element, enabled, handler)
+            };
+        let mut rows: Vec<AnyElement> = Vec::new();
+        if let Some(draft) = renaming {
+            rows.push(
+                div()
+                    .id("native-terminal-chip-rename")
+                    .w_full()
+                    .px(px(tokens.density.spacing.md))
+                    .py(px(tokens.density.spacing.xs))
+                    .text_size(px(tokens.density.typography.body))
+                    .text_color(tokens.text.primary.to_gpui())
+                    .child(format!("Rename to: {draft}|"))
+                    .into_any_element(),
+            );
+            rows.push(
+                div()
+                    .id("native-terminal-chip-rename-hint")
+                    .w_full()
+                    .px(px(tokens.density.spacing.md))
+                    .pb(px(tokens.density.spacing.xs))
+                    .text_size(px(tokens.density.typography.caption))
+                    .text_color(tokens.text.muted.to_gpui())
+                    .child("Type a name, Enter to apply, Escape to cancel")
+                    .into_any_element(),
+            );
+        } else {
+            for (id, text, enabled, tone, handler) in [
+                (
+                    "native-terminal-chip-menu-rename",
+                    "Rename".to_string(),
+                    true,
+                    tokens.text.primary.to_gpui(),
+                    Box::new(|shell: &mut NativeShell, _cx: &mut Context<NativeShell>| {
+                        shell.begin_terminal_chip_rename();
+                    })
+                        as Box<dyn Fn(&mut NativeShell, &mut Context<NativeShell>)>,
+                ),
+                (
+                    "native-terminal-chip-menu-move-left",
+                    "Move left".to_string(),
+                    can_move_left,
+                    tokens.text.primary.to_gpui(),
+                    Box::new(|shell: &mut NativeShell, _cx: &mut Context<NativeShell>| {
+                        if let Some(menu) = shell.terminal_chip_menu.clone() {
+                            shell.move_terminal_chip(&menu.owner, menu.resource_id, true);
+                        }
+                        shell.close_terminal_chip_menu();
+                    }),
+                ),
+                (
+                    "native-terminal-chip-menu-move-right",
+                    "Move right".to_string(),
+                    can_move_right,
+                    tokens.text.primary.to_gpui(),
+                    Box::new(|shell: &mut NativeShell, _cx: &mut Context<NativeShell>| {
+                        if let Some(menu) = shell.terminal_chip_menu.clone() {
+                            shell.move_terminal_chip(&menu.owner, menu.resource_id, false);
+                        }
+                        shell.close_terminal_chip_menu();
+                    }),
+                ),
+                (
+                    "native-terminal-chip-menu-close",
+                    if needs_confirm {
+                        "Close…".to_string()
+                    } else {
+                        "Close".to_string()
+                    },
+                    true,
+                    tokens.status.destructive.to_gpui(),
+                    Box::new(|shell: &mut NativeShell, _cx: &mut Context<NativeShell>| {
+                        let Some(menu) = shell.terminal_chip_menu.clone() else {
+                            return;
+                        };
+                        if shell
+                            .terminal_chip_close_needs_confirmation(&menu.owner, menu.resource_id)
+                            && !menu.confirming_close
+                        {
+                            if let Some(open) = shell.terminal_chip_menu.as_mut() {
+                                open.confirming_close = true;
+                            }
+                            return;
+                        }
+                        shell.close_terminal_chip(&menu.owner, menu.resource_id);
+                        shell.close_terminal_chip_menu();
+                    }),
+                ),
+            ] {
+                let (element, enabled, handler) = row(id, text, enabled, tone, handler);
+                let element = if enabled {
+                    element
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(move |shell, _event: &MouseDownEvent, _window, cx| {
+                                cx.stop_propagation();
+                                handler(shell, cx);
+                                cx.notify();
+                            }),
+                        )
+                        .into_any_element()
+                } else {
+                    element.into_any_element()
+                };
+                rows.push(element);
+            }
+            if menu.confirming_close {
+                rows.push(
+                    div()
+                        .id("native-terminal-chip-menu-close-warning")
+                        .w_full()
+                        .px(px(tokens.density.spacing.md))
+                        .pb(px(tokens.density.spacing.xs))
+                        .text_size(px(tokens.density.typography.caption))
+                        .text_color(tokens.status.destructive.to_gpui())
+                        .child("Still running. Close again to confirm.")
+                        .into_any_element(),
+                );
+            }
+        }
+        deferred(
+            anchored()
+                .position(point(px(0.0), px(0.0)))
+                .snap_to_window()
+                .child(
+                    div()
+                        .id("native-terminal-chip-menu-backdrop")
+                        .occlude()
+                        .w(viewport.width)
+                        .h(viewport.height)
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(|shell, _event: &MouseDownEvent, _window, cx| {
+                                cx.stop_propagation();
+                                shell.close_terminal_chip_menu();
+                                cx.notify();
+                            }),
+                        )
+                        .on_key_down(cx.listener(
+                            move |shell, event: &KeyDownEvent, _window, cx| {
+                                cx.stop_propagation();
+                                shell.handle_terminal_chip_menu_key(event);
+                                cx.notify();
+                            },
+                        ))
+                        .child(
+                            div()
+                                .id("native-terminal-chip-menu")
+                                .absolute()
+                                .left(menu.position.x)
+                                .top(menu.position.y)
+                                .w(px(200.0))
+                                .flex()
+                                .flex_col()
+                                .py(px(tokens.density.spacing.xs))
+                                .rounded(px(tokens.density.radii.md))
+                                .bg(tokens.surfaces.overlay.to_gpui())
+                                .border(px(1.0))
+                                .border_color(tokens.borders.subtle.to_gpui())
+                                .shadow_sm()
+                                .child(
+                                    div()
+                                        .w_full()
+                                        .px(px(tokens.density.spacing.md))
+                                        .pb(px(tokens.density.spacing.xs))
+                                        .text_size(px(tokens.density.typography.caption))
+                                        .text_color(tokens.text.muted.to_gpui())
+                                        .child(label),
+                                )
+                                .children(rows),
+                        ),
+                ),
+        )
+        .with_priority(2)
+        .into_any_element()
+    }
+
+    /// Keys the open chip menu owns: the inline rename field, and Escape.
+    fn handle_terminal_chip_menu_key(&mut self, event: &KeyDownEvent) {
+        let key = event.keystroke.key.as_str();
+        if key == "escape" {
+            self.close_terminal_chip_menu();
+            return;
+        }
+        let Some(menu) = self.terminal_chip_menu.as_mut() else {
+            return;
+        };
+        let Some(draft) = menu.rename.as_mut() else {
+            return;
+        };
+        match key {
+            "enter" => {
+                self.submit_terminal_chip_rename();
+            }
+            "backspace" => {
+                draft.pop();
+            }
+            _ => {
+                if let Some(text) = event.keystroke.key_char.as_ref() {
+                    if !text.is_empty() && !text.chars().any(char::is_control) {
+                        draft.push_str(text);
+                    }
+                }
+            }
+        }
+    }
+
     fn request_terminal_resize_for_owner(
         &mut self,
         owner: &HostTaskKey,
@@ -26075,6 +26747,17 @@ impl NativeShell {
         rows: u16,
     ) -> bool {
         let desired = (cols, rows);
+        if self
+            .terminal_strip_for(owner)
+            .is_some_and(|strip| strip.focused.is_none())
+        {
+            return false;
+        }
+        // Nothing is displayed while the splash is showing, so there is no PTY
+        // whose geometry the pane describes. `focused_terminal()` would fall
+        // through to the retained provider projection here, which would resize
+        // the provider to a pane it is not in. The newly focused terminal is
+        // resized on the next focus change instead.
         // Which PTY to resize comes from the strip focus, not from the last
         // admitted screen: a newly focused terminal has no screen for as long
         // as its first query is in flight, and that is precisely when the pane
@@ -26487,6 +27170,18 @@ impl NativeShell {
             KeyboardAction::OpenTerminal => {
                 self.set_provider_terminal_visible(true);
             }
+            KeyboardAction::OpenShellTerminal => {
+                let owner = self.selected_task_key.clone().or_else(|| {
+                    self.local_slot()
+                        .interaction
+                        .selected_task()
+                        .map(|task_id| self.local_task_key(task_id))
+                });
+                if let Some(owner) = owner {
+                    self.open_shell_terminal_for_owner(&owner, None);
+                }
+            }
+            KeyboardAction::CycleTerminal { backwards } => self.cycle_terminal(backwards),
             KeyboardAction::OpenTaskDetails => {
                 if let Some(task_id) = self.local_slot_mut().interaction.selected_task() {
                     let _ = self.dispatch_action(ActionRequest::TaskShow { task_id });
@@ -27299,7 +27994,7 @@ impl NativeShell {
                             .into_any_element(),
                     }
                 } else {
-                    self.terminal_dock_surface(tokens, shell_entity)
+                    self.terminal_dock_surface(tokens, owner_key, shell_entity)
                 }
             }
             CockpitDockTool::Browser => {
@@ -27586,36 +28281,226 @@ impl NativeShell {
         surface.into_any_element()
     }
 
+    /// The chip strip shown at the top of the Terminal dock.
+    ///
+    /// Chips come from [`terminal_chip_rows`] over the ONE admitted strip, so
+    /// order, titles and runtime state are the host's answer and never a local
+    /// copy. The trailing "+" opens a new plain shell through the existing
+    /// host-authority lane. Left-click focuses, right-click opens the chip
+    /// menu.
+    fn terminal_chip_strip(
+        &self,
+        owner: &HostTaskKey,
+        tokens: crate::ui::tokens::ThemeTokens,
+        shell_entity: Option<gpui::WeakEntity<NativeShell>>,
+    ) -> AnyElement {
+        let mut chips = div()
+            .id("native-shell-terminal-strip")
+            .w_full()
+            .flex()
+            .flex_none()
+            .items_center()
+            .gap(px(2.0))
+            .px(px(4.0))
+            .pb(px(4.0))
+            .overflow_hidden();
+        if let Some(strip) = self.terminal_strip_for(owner) {
+            for row in terminal_chip_rows(&strip) {
+                let resource_id = row.resource_id;
+                let key = stable_resource_element_key(resource_id, "chip");
+                let tooltip = terminal_chip_tooltip(&row);
+                let mut chip = div()
+                    .id(("native-terminal-chip", key))
+                    .tab_stop(true)
+                    .flex()
+                    .flex_none()
+                    .items_center()
+                    .gap(px(4.0))
+                    .h(px(24.0))
+                    .px(px(6.0))
+                    .rounded(px(tokens.density.radii.pill))
+                    .text_size(px(tokens.density.typography.caption))
+                    .line_height(px(tokens.density.typography.caption_line_height))
+                    .cursor_pointer()
+                    .tooltip(move |window, app| {
+                        gpui_component::tooltip::Tooltip::new(tooltip.clone()).build(window, app)
+                    })
+                    .child(row.label.clone());
+                // Addendum D: running is normal, exited is greyed and keeps its
+                // title, unknown is muted with a trailing "?" so "the host has
+                // not reconciled this terminal" never reads as "running".
+                chip = match &row.state {
+                    crate::domain::cockpit::TerminalRuntimeStateWire::Exited { .. } => {
+                        chip.text_color(tokens.text.disabled.to_gpui())
+                    }
+                    crate::domain::cockpit::TerminalRuntimeStateWire::Unknown => chip
+                        .text_color(tokens.text.muted.to_gpui())
+                        .child("?".to_string()),
+                    crate::domain::cockpit::TerminalRuntimeStateWire::Running => chip,
+                };
+                chip = if row.selected {
+                    chip.bg(tokens.actions.primary.default.background.to_gpui())
+                        .text_color(tokens.actions.primary.default.foreground.to_gpui())
+                } else {
+                    chip.hover(|style| style.bg(tokens.surfaces.raised.to_gpui()))
+                };
+                if let Some(entity) = shell_entity.clone() {
+                    let focus_entity = entity.clone();
+                    let focus_owner = owner.clone();
+                    let menu_owner = owner.clone();
+                    chip = chip
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            move |_event: &MouseDownEvent,
+                                  _window: &mut Window,
+                                  app: &mut gpui::App| {
+                                let _ = focus_entity.update(app, |shell, cx| {
+                                    cx.stop_propagation();
+                                    shell.focus_terminal_chip(&focus_owner, resource_id);
+                                    cx.notify();
+                                });
+                            },
+                        )
+                        .on_mouse_down(
+                            MouseButton::Right,
+                            move |event: &MouseDownEvent,
+                                  _window: &mut Window,
+                                  app: &mut gpui::App| {
+                                let _ = entity.update(app, |shell, cx| {
+                                    cx.stop_propagation();
+                                    shell.open_terminal_chip_menu(
+                                        menu_owner.clone(),
+                                        resource_id,
+                                        event.position,
+                                    );
+                                    cx.notify();
+                                });
+                            },
+                        );
+                }
+                chips = chips.child(chip);
+            }
+        }
+        let mut add = div()
+            .id("native-terminal-chip-add")
+            .tab_stop(true)
+            .flex()
+            .flex_none()
+            .items_center()
+            .h(px(24.0))
+            .px(px(6.0))
+            .rounded(px(tokens.density.radii.pill))
+            .text_size(px(tokens.density.typography.caption))
+            .text_color(tokens.text.muted.to_gpui())
+            .hover(|style| style.bg(tokens.surfaces.raised.to_gpui()))
+            .cursor_pointer()
+            .tooltip(|window, app| {
+                gpui_component::tooltip::Tooltip::new("New shell terminal · Ctrl+Shift+`")
+                    .build(window, app)
+            })
+            .child("+".to_string());
+        if let Some(entity) = shell_entity {
+            let add_owner = owner.clone();
+            add = add.on_mouse_down(
+                MouseButton::Left,
+                move |_event: &MouseDownEvent, _window: &mut Window, app: &mut gpui::App| {
+                    let _ = entity.update(app, |shell, cx| {
+                        cx.stop_propagation();
+                        shell.open_shell_terminal_for_owner(&add_owner, None);
+                        cx.notify();
+                    });
+                },
+            );
+        }
+        chips.child(add).into_any_element()
+    }
+
+    /// The Terminal dock's empty state: the session's photo under a dim
+    /// overlay, or the sunken surface alone while the fetch is in flight or
+    /// has failed.
+    fn terminal_dock_empty_state(&self, tokens: crate::ui::tokens::ThemeTokens) -> AnyElement {
+        let mut body = div()
+            .id("native-terminal-dock-empty")
+            .relative()
+            .w_full()
+            .flex()
+            .flex_1()
+            .min_h(px(120.0))
+            .items_center()
+            .justify_center()
+            .overflow_hidden()
+            .rounded(px(tokens.density.radii.md))
+            .bg(tokens.surfaces.sunken.to_gpui());
+        if let Some(photo) = self.terminal_splash_image.as_ref() {
+            body = body.child(
+                img(ImageSource::Render(Arc::clone(photo)))
+                    .absolute()
+                    .top(px(0.0))
+                    .left(px(0.0))
+                    .size_full()
+                    .object_fit(ObjectFit::Cover),
+            );
+        }
+        body.child(
+            div()
+                .relative()
+                .px(px(tokens.density.spacing.md))
+                .py(px(tokens.density.spacing.sm))
+                .rounded(px(tokens.density.radii.md))
+                .bg(Self::modal_backdrop())
+                .text_size(px(tokens.density.typography.caption))
+                .text_color(tokens.text.inverse.to_gpui())
+                .child(TERMINAL_DOCK_EMPTY_MESSAGE),
+        )
+        .into_any_element()
+    }
+
     fn terminal_dock_surface(
         &self,
         tokens: crate::ui::tokens::ThemeTokens,
+        owner: Option<HostTaskKey>,
         shell_entity: Option<gpui::WeakEntity<NativeShell>>,
     ) -> AnyElement {
         let dock = self.local_slot().cockpit.dock();
         let live_output = dock.live_output();
         let interactive = dock.showing_raw_terminal() && dock.terminal_binding().is_some();
         let summary = if interactive {
-            "Interactive provider terminal · type, use arrows, Enter, or Escape"
+            "Interactive terminal · type, use arrows, Enter, or Escape"
         } else if dock.terminal_binding().is_some() {
             "Terminal · bound to this task"
         } else {
             "Terminal · no matching task terminal"
         };
-        let surface = div()
+        // The splash replaces the body only once the host has actually answered
+        // with a strip. Before that the client does not know whether this Task
+        // has terminals at all, and a photo would be a claim it cannot make.
+        let show_splash = owner
+            .as_ref()
+            .and_then(|owner| self.terminal_strip_for(owner))
+            .is_some_and(|strip| strip.focused.is_none());
+        let mut surface = div()
             .id("native-shell-context-terminal")
             .w_full()
             .flex()
             .flex_col()
             .gap(px(tokens.density.spacing.xs))
             .p(px(tokens.density.physical().control_padding as f32))
-            .bg(tokens.surfaces.sunken.to_gpui())
-            .child(summary)
-            .children((!live_output.is_empty()).then(|| {
-                div()
-                    .text_color(tokens.text.primary.to_gpui())
-                    .child(live_output)
-            }));
-        if !interactive {
+            .bg(tokens.surfaces.sunken.to_gpui());
+        if let Some(owner) = owner.as_ref() {
+            surface = surface.child(self.terminal_chip_strip(owner, tokens, shell_entity.clone()));
+        }
+        let surface = if show_splash {
+            surface.child(self.terminal_dock_empty_state(tokens))
+        } else {
+            surface
+                .child(summary)
+                .children((!live_output.is_empty()).then(|| {
+                    div()
+                        .text_color(tokens.text.primary.to_gpui())
+                        .child(live_output)
+                }))
+        };
+        if !interactive || show_splash {
             return surface.into_any_element();
         }
         let Some(shell_for_focus) = shell_entity.clone() else {
@@ -32789,6 +33674,9 @@ impl NativeShell {
         }
         if self.project_scope_menu.open() {
             return Some(self.render_project_scope_overlay(tokens, viewport, cx));
+        }
+        if self.terminal_chip_menu.is_some() {
+            return Some(self.render_terminal_chip_menu_overlay(tokens, viewport, cx));
         }
         if self.task_search.open()
             || self
@@ -40874,6 +41762,24 @@ impl NativeShell {
                 crate::ui::actions::ShortcutKey::Backtick,
             ));
         });
+        let open_shell_terminal =
+            cx.listener(|shell, _action: &NativeOpenShellTerminal, _window, cx| {
+                cx.stop_propagation();
+                shell.dispatch_keyboard(KeyboardShortcut::ctrl_shift(
+                    crate::ui::actions::ShortcutKey::Backtick,
+                ));
+            });
+        let cycle_terminal = cx.listener(|shell, _action: &NativeCycleTerminal, _window, cx| {
+            cx.stop_propagation();
+            shell.dispatch_keyboard(KeyboardShortcut::ctrl(crate::ui::actions::ShortcutKey::Tab));
+        });
+        let cycle_terminal_back =
+            cx.listener(|shell, _action: &NativeCycleTerminalBack, _window, cx| {
+                cx.stop_propagation();
+                shell.dispatch_keyboard(KeyboardShortcut::ctrl_shift(
+                    crate::ui::actions::ShortcutKey::Tab,
+                ));
+            });
         let dismiss = cx.listener(|shell, _action: &NativeDismissTransient, _window, cx| {
             cx.stop_propagation();
             // Escape closes shell-local transient UI even when the selected
@@ -41537,6 +42443,9 @@ impl NativeShell {
             .on_action::<NativeOpenTaskSwitcher>(open_switcher)
             .on_action::<NativeOpenCommandPalette>(open_command_palette)
             .on_action::<NativeOpenTerminal>(open_terminal)
+            .on_action::<NativeOpenShellTerminal>(open_shell_terminal)
+            .on_action::<NativeCycleTerminal>(cycle_terminal)
+            .on_action::<NativeCycleTerminalBack>(cycle_terminal_back)
             .on_action::<NativeDismissTransient>(dismiss)
             .on_action::<NativeDockChanges>(dock_changes)
             .on_action::<NativeDockFiles>(dock_files)
@@ -43092,6 +44001,16 @@ impl Render for NativeShell {
             self.sync_remote_settings_fields(window, cx);
         }
         self.sync_shell_window_title(window);
+        // The Terminal dock's empty state wants a photo. Admitting the fetch
+        // only while that tool is showing keeps a session that never opens the
+        // dock from making a network request at all; the fetch itself runs on
+        // the background executor and this call returns immediately.
+        if matches!(
+            self.local_slot().cockpit.active_tool(),
+            CockpitDockTool::Terminal
+        ) {
+            self.ensure_terminal_splash_image(cx);
+        }
         if self.pending_terminal_focus && self.selected_center_terminal_is_interactive() {
             self.terminal_focus_handle.focus(window);
             self.pending_terminal_focus = false;
@@ -65889,6 +66808,396 @@ mod tests {
             });
             cx.quit();
         });
+    }
+
+    fn dispatched_strip_commands_for_test(
+        shared: &Arc<Mutex<TestRuntimeState>>,
+    ) -> Vec<crate::domain::terminal_facts::TaskTerminalStrip> {
+        shared
+            .lock()
+            .expect("runtime")
+            .accepted
+            .iter()
+            .filter_map(|record| match &record.command {
+                NativeHostCommand::TerminalSetStrip { strip, .. } => Some(strip.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn dispatched_closed_resources_for_test(
+        shared: &Arc<Mutex<TestRuntimeState>>,
+    ) -> Vec<crate::domain::id::ResourceId> {
+        shared
+            .lock()
+            .expect("runtime")
+            .accepted
+            .iter()
+            .filter_map(|record| match &record.command {
+                NativeHostCommand::TerminalClose { resource_id, .. } => Some(*resource_id),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// The whole point of a chip: clicking one aims every subsequent operation
+    /// at that terminal. A shell chip is recorded in the durable strip; the
+    /// provider chip cannot be (`TaskTerminalStrip::validate` refuses a focus
+    /// outside `order`, and `order` holds plain shells alone), so picking it is
+    /// spelled `focused: None` -- and both must query THAT chip's screen.
+    #[test]
+    fn clicking_a_chip_focuses_that_terminal_and_queries_its_screen() {
+        if rerun_headless_shell_test_in_child(
+            "ui::native_shell::tests::clicking_a_chip_focuses_that_terminal_and_queries_its_screen",
+        ) {
+            return;
+        }
+        let (runtime, _local_shared) = TestRuntime::new(true, NativeHostActionResult::Queued);
+        let remote_host = HostId::Remote([0xaf; 16]);
+        gpui::Application::headless().run(move |cx| {
+            crate::ui::init(cx);
+            with_test_shell_in_app(cx, runtime, |shell| {
+                let (model, task_id) = terminal_bound_client_model();
+                let model = Arc::new(model);
+                let provider_resource =
+                    provider_terminal_projection_for_test(&model, task_id, 1).resource_id;
+                let first = crate::domain::id::ResourceId::new();
+                let second = crate::domain::id::ResourceId::new();
+                let shared =
+                    attach_remote_test_host_with_shared(shell, &remote_host, Arc::clone(&model));
+                let owner = HostTaskKey::new(remote_host.clone(), task_id);
+                shell
+                    .select_fleet_task_key(owner.clone(), FleetSelectMode::Replace)
+                    .expect("select remote task");
+                let strip = crate::domain::cockpit::TaskTerminalsProjection {
+                    task_id,
+                    terminals: vec![
+                        terminal_chip_for_test(provider_resource, true),
+                        terminal_chip_for_test(first, false),
+                        terminal_chip_for_test(second, false),
+                    ],
+                    order: vec![first, second],
+                    focused: Some(first),
+                };
+                shell
+                    .task_surfaces
+                    .admit_terminals(owner.clone(), &strip)
+                    .expect("admit strip");
+
+                shared.lock().expect("runtime").accepted.clear();
+                shell.focus_terminal_chip(&owner, second);
+                assert_eq!(
+                    dispatched_strip_commands_for_test(&shared),
+                    vec![crate::domain::terminal_facts::TaskTerminalStrip {
+                        order: vec![first, second],
+                        focused: Some(second),
+                    }],
+                    "a shell chip records its own durable focus and keeps the order"
+                );
+                assert_eq!(
+                    shell.focused_terminal_target(&owner),
+                    super::TerminalTarget::Resource(second),
+                    "every later resize, scroll and screen query must address the clicked chip \
+                     without waiting a round trip"
+                );
+
+                shared.lock().expect("runtime").accepted.clear();
+                shell.focus_terminal_chip(&owner, provider_resource);
+                assert_eq!(
+                    dispatched_strip_commands_for_test(&shared),
+                    vec![crate::domain::terminal_facts::TaskTerminalStrip {
+                        order: vec![first, second],
+                        focused: None,
+                    }],
+                    "the provider chip is not in `order`, so picking it clears the durable focus"
+                );
+            });
+            cx.quit();
+        });
+    }
+
+    /// Ctrl+Tab walks the chips in the order they are drawn -- provider first,
+    /// then the durable order -- and wraps. With nothing focused, forward has
+    /// to start somewhere rather than doing nothing.
+    #[test]
+    fn cycling_terminals_walks_the_drawn_chip_order_and_wraps() {
+        if rerun_headless_shell_test_in_child(
+            "ui::native_shell::tests::cycling_terminals_walks_the_drawn_chip_order_and_wraps",
+        ) {
+            return;
+        }
+        let (runtime, _local_shared) = TestRuntime::new(true, NativeHostActionResult::Queued);
+        let remote_host = HostId::Remote([0xb1; 16]);
+        gpui::Application::headless().run(move |cx| {
+            crate::ui::init(cx);
+            with_test_shell_in_app(cx, runtime, |shell| {
+                let (model, task_id) = terminal_bound_client_model();
+                let model = Arc::new(model);
+                let provider_resource =
+                    provider_terminal_projection_for_test(&model, task_id, 1).resource_id;
+                let first = crate::domain::id::ResourceId::new();
+                let second = crate::domain::id::ResourceId::new();
+                attach_remote_test_host(shell, &remote_host, Arc::clone(&model));
+                let owner = HostTaskKey::new(remote_host.clone(), task_id);
+                shell
+                    .select_fleet_task_key(owner.clone(), FleetSelectMode::Replace)
+                    .expect("select remote task");
+                let admit = |shell: &mut NativeShell, focused: Option<ResourceId>| {
+                    let strip = crate::domain::cockpit::TaskTerminalsProjection {
+                        task_id,
+                        terminals: vec![
+                            terminal_chip_for_test(provider_resource, true),
+                            terminal_chip_for_test(first, false),
+                            terminal_chip_for_test(second, false),
+                        ],
+                        order: vec![first, second],
+                        focused,
+                    };
+                    shell
+                        .task_surfaces
+                        .admit_terminals(owner.clone(), &strip)
+                        .expect("admit strip");
+                };
+
+                // Focused on the first shell (drawn index 1) -> the second.
+                admit(shell, Some(first));
+                shell.cycle_terminal(false);
+                assert_eq!(
+                    shell.focused_terminal_target(&owner),
+                    super::TerminalTarget::Resource(second)
+                );
+
+                // Focused on the last chip -> wraps to the provider, which the
+                // durable strip spells `focused: None`.
+                admit(shell, Some(second));
+                shell.cycle_terminal(false);
+                assert_eq!(
+                    shell.terminal_strip_for(&owner).expect("strip").focused,
+                    None,
+                    "cycling past the last shell wraps onto the provider chip"
+                );
+
+                // Nothing focused: backward lands on the last chip rather than
+                // doing nothing at all.
+                admit(shell, None);
+                shell.cycle_terminal(true);
+                assert_eq!(
+                    shell.focused_terminal_target(&owner),
+                    super::TerminalTarget::Resource(second)
+                );
+            });
+            cx.quit();
+        });
+    }
+
+    /// Reorder is menu-driven in this slice (addendum B). Moving a chip may
+    /// only ever permute `order`; changing focus as a side effect would move
+    /// the visible terminal out from under the user.
+    #[test]
+    fn moving_a_chip_permutes_the_order_without_changing_focus() {
+        if rerun_headless_shell_test_in_child(
+            "ui::native_shell::tests::moving_a_chip_permutes_the_order_without_changing_focus",
+        ) {
+            return;
+        }
+        let (runtime, _local_shared) = TestRuntime::new(true, NativeHostActionResult::Queued);
+        let remote_host = HostId::Remote([0xc2; 16]);
+        gpui::Application::headless().run(move |cx| {
+            crate::ui::init(cx);
+            with_test_shell_in_app(cx, runtime, |shell| {
+                let (model, task_id) = terminal_bound_client_model();
+                let model = Arc::new(model);
+                let provider_resource =
+                    provider_terminal_projection_for_test(&model, task_id, 1).resource_id;
+                let first = crate::domain::id::ResourceId::new();
+                let second = crate::domain::id::ResourceId::new();
+                let shared =
+                    attach_remote_test_host_with_shared(shell, &remote_host, Arc::clone(&model));
+                let owner = HostTaskKey::new(remote_host.clone(), task_id);
+                shell
+                    .select_fleet_task_key(owner.clone(), FleetSelectMode::Replace)
+                    .expect("select remote task");
+                let strip = crate::domain::cockpit::TaskTerminalsProjection {
+                    task_id,
+                    terminals: vec![
+                        terminal_chip_for_test(provider_resource, true),
+                        terminal_chip_for_test(first, false),
+                        terminal_chip_for_test(second, false),
+                    ],
+                    order: vec![first, second],
+                    focused: Some(first),
+                };
+                shell
+                    .task_surfaces
+                    .admit_terminals(owner.clone(), &strip)
+                    .expect("admit strip");
+
+                assert!(!shell.terminal_chip_can_move(&owner, first, true));
+                assert!(shell.terminal_chip_can_move(&owner, first, false));
+                // The provider is not in `order`, so it can never move.
+                assert!(!shell.terminal_chip_can_move(&owner, provider_resource, false));
+                assert!(!shell.move_terminal_chip(&owner, provider_resource, false));
+
+                shared.lock().expect("runtime").accepted.clear();
+                assert!(shell.move_terminal_chip(&owner, first, false));
+                assert_eq!(
+                    dispatched_strip_commands_for_test(&shared),
+                    vec![crate::domain::terminal_facts::TaskTerminalStrip {
+                        order: vec![second, first],
+                        focused: Some(first),
+                    }],
+                    "move right swaps the two neighbours and leaves focus alone"
+                );
+            });
+            cx.quit();
+        });
+    }
+
+    /// Closing the focused chip must not pick a replacement locally: the host
+    /// clears focus on release and the next strip answer says `focused: None`,
+    /// which is what makes the splash render. A local pick would fight that and
+    /// could focus a terminal the host has already released. And with nothing
+    /// focused there is no PTY on screen, so no resize may be sent either.
+    #[test]
+    fn closing_the_focused_chip_picks_nothing_and_stops_resizing() {
+        if rerun_headless_shell_test_in_child(
+            "ui::native_shell::tests::closing_the_focused_chip_picks_nothing_and_stops_resizing",
+        ) {
+            return;
+        }
+        let (runtime, _local_shared) = TestRuntime::new(true, NativeHostActionResult::Queued);
+        let remote_host = HostId::Remote([0xd3; 16]);
+        gpui::Application::headless().run(move |cx| {
+            crate::ui::init(cx);
+            with_test_shell_in_app(cx, runtime, |shell| {
+                let (model, task_id) = terminal_bound_client_model();
+                let model = Arc::new(model);
+                let provider_resource =
+                    provider_terminal_projection_for_test(&model, task_id, 1).resource_id;
+                let only_shell = crate::domain::id::ResourceId::new();
+                let shared =
+                    attach_remote_test_host_with_shared(shell, &remote_host, Arc::clone(&model));
+                let owner = HostTaskKey::new(remote_host.clone(), task_id);
+                shell
+                    .select_fleet_task_key(owner.clone(), FleetSelectMode::Replace)
+                    .expect("select remote task");
+                let strip = crate::domain::cockpit::TaskTerminalsProjection {
+                    task_id,
+                    terminals: vec![
+                        terminal_chip_for_test(provider_resource, true),
+                        terminal_chip_for_test(only_shell, false),
+                    ],
+                    order: vec![only_shell],
+                    focused: Some(only_shell),
+                };
+                shell
+                    .task_surfaces
+                    .admit_terminals(owner.clone(), &strip)
+                    .expect("admit strip");
+
+                shared.lock().expect("runtime").accepted.clear();
+                assert!(shell.close_terminal_chip(&owner, only_shell));
+                assert_eq!(
+                    dispatched_closed_resources_for_test(&shared),
+                    vec![only_shell]
+                );
+                assert!(
+                    dispatched_strip_commands_for_test(&shared).is_empty(),
+                    "closing must not locally rewrite the strip or pick another chip"
+                );
+
+                // The host's next answer: the chip is gone and nothing is focused.
+                let released = crate::domain::cockpit::TaskTerminalsProjection {
+                    task_id,
+                    terminals: vec![terminal_chip_for_test(provider_resource, true)],
+                    order: Vec::new(),
+                    focused: None,
+                };
+                shell
+                    .task_surfaces
+                    .admit_terminals(owner.clone(), &released)
+                    .expect("admit released strip");
+                assert!(
+                    terminal_chip_rows(&released)
+                        .iter()
+                        .all(|row| !row.selected),
+                    "no chip is selected, so the splash is what renders"
+                );
+                shared.lock().expect("runtime").accepted.clear();
+                assert!(
+                    !shell.request_terminal_resize_for_owner(&owner, 120, 40),
+                    "nothing is displayed, so nothing may be resized"
+                );
+                assert!(
+                    dispatched_resize_queries_for_test(&shared).is_empty(),
+                    "a resize while the splash shows would address the provider PTY the pane \
+                     is not showing"
+                );
+            });
+            cx.quit();
+        });
+    }
+
+    /// A plain shell's input is validated by the host on the resource id and
+    /// its own generation, never on a provider fence, so gating it on
+    /// `ProviderInput` leaves every shell silently read-only on a host that
+    /// grants only `TaskCockpit`.
+    #[test]
+    fn a_shell_needs_only_task_cockpit_to_accept_typing() {
+        let cockpit_only = CapabilitySet::from_capabilities([Capability::TaskCockpit]);
+        let provider_only = CapabilitySet::from_capabilities([Capability::ProviderInput]);
+        let resource = super::TerminalTarget::Resource(ResourceId::new());
+        assert!(super::terminal_input_capability_granted(
+            cockpit_only,
+            resource
+        ));
+        assert!(!super::terminal_input_capability_granted(
+            cockpit_only,
+            super::TerminalTarget::Provider
+        ));
+        assert!(super::terminal_input_capability_granted(
+            provider_only,
+            super::TerminalTarget::Provider
+        ));
+        assert!(
+            !super::terminal_input_capability_granted(provider_only, resource),
+            "ProviderInput alone is not what admits a shell; TaskCockpit is"
+        );
+    }
+
+    /// The chip is too small for the two facts that matter most when something
+    /// has gone wrong, so both belong in the hover text.
+    #[test]
+    fn a_chip_tooltip_carries_its_exit_summary_and_working_directory() {
+        let running = super::TerminalChipRow {
+            resource_id: ResourceId::new(),
+            label: "build".into(),
+            selected: true,
+            state: crate::domain::cockpit::TerminalRuntimeStateWire::Running,
+            is_provider: false,
+            live_cwd: Some("crates/api".into()),
+        };
+        assert_eq!(super::terminal_chip_tooltip(&running), "build · crates/api");
+        let exited = super::TerminalChipRow {
+            state: crate::domain::cockpit::TerminalRuntimeStateWire::Exited {
+                summary: "exit code 1".into(),
+            },
+            live_cwd: None,
+            ..running.clone()
+        };
+        assert_eq!(
+            super::terminal_chip_tooltip(&exited),
+            "build · exited · exit code 1"
+        );
+        let unknown = super::TerminalChipRow {
+            state: crate::domain::cockpit::TerminalRuntimeStateWire::Unknown,
+            live_cwd: None,
+            ..running
+        };
+        assert_eq!(
+            super::terminal_chip_tooltip(&unknown),
+            "build · state unknown"
+        );
     }
 }
 

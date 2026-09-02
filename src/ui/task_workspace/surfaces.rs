@@ -844,6 +844,38 @@ impl<K: Clone + Ord + Eq> TaskSurfaceRegistry<K> {
         Ok(())
     }
 
+    /// Point the ADMITTED strip at the chip the user just picked.
+    ///
+    /// This is an optimistic edit of the one strip copy, not a second copy:
+    /// the host owns the durable focus and the next `TaskTerminals` answer
+    /// overwrites this. It exists so the very next resize, scroll or screen
+    /// query addresses the chip the user clicked instead of the previous one
+    /// for the length of a round trip. A focus the strip does not list is
+    /// refused rather than invented, and `None` is a legal value (it is what
+    /// the host records when no plain shell is focused).
+    pub fn note_focused_terminal(&mut self, task_id: K, focused: Option<ResourceId>) -> bool
+    where
+        K: SurfaceTaskKey,
+    {
+        let Some(state) = self.surfaces.get_mut(&task_id) else {
+            return false;
+        };
+        let Some(strip) = state.strip.as_mut() else {
+            return false;
+        };
+        if let Some(focused) = focused {
+            if !strip
+                .terminals
+                .iter()
+                .any(|chip| chip.resource_id == focused)
+            {
+                return false;
+            }
+        }
+        strip.focused = focused;
+        true
+    }
+
     pub fn note_terminal_reconnecting(&mut self, task_id: K) {
         self.ensure_task(task_id).note_terminal_reconnecting();
     }
