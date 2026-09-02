@@ -1924,8 +1924,22 @@ pub(crate) fn resolve_plain_shell_launch(
     shell_integration_enabled: bool,
     cwd: &Path,
 ) -> Result<ResolvedShellLaunch, String> {
-    let candidates =
+    let (candidates, excluded) =
         plain_shell_candidates(preferred_terminal, mac_profile, shell_integration_enabled);
+    // A user who wrote `default_terminal = powershell` gets a different shell
+    // than they asked for. Silently substituting one is how a setting becomes
+    // a mystery; say it once, here, where the substitution happens.
+    if !excluded.is_empty() && matches!(preferred_terminal, Some(DefaultTerminal::Powershell)) {
+        eprintln!(
+            "default_terminal=powershell is not used for task shells (exits 0xFFFF0000 under \
+             managed ConPTY); trying {}",
+            candidates
+                .iter()
+                .map(|candidate| candidate.program.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    }
     let mut tried = Vec::new();
     for candidate in candidates {
         tried.push(candidate.program.clone());
@@ -1936,11 +1950,28 @@ pub(crate) fn resolve_plain_shell_launch(
             });
         }
     }
-    Err(format!("no shell found; tried: {}", tried.join(", ")))
+    Err(no_shell_found_message(&tried, &excluded))
+}
+
+/// The refusal text for a plain shell that resolved nothing.
+///
+/// Names what was never considered as well as what was: a message listing only
+/// the tried programs reads as "powershell was not installed either", which
+/// sends the reader off installing a shell that is deliberately excluded.
+/// Separate from the resolver so the wording can be asserted without depending
+/// on which shells the machine running the test happens to have.
+fn no_shell_found_message(tried: &[String], excluded: &[String]) -> String {
+    let excluded_note = if excluded.is_empty() {
+        String::new()
+    } else {
+        format!(" ({} excluded)", excluded.join(", "))
+    };
+    format!("no shell found; tried: {}{excluded_note}", tried.join(", "))
 }
 
 /// The ordered candidates a plain shell is allowed to try, in the settings'
-/// own order minus the excluded programs and any duplicate.
+/// own order minus the excluded programs and any duplicate, plus the distinct
+/// program names the exclusion removed.
 ///
 /// Split out from the resolver so the exclusion can be proved without a real
 /// filesystem: a resolver that only ever reported "found something" could not
@@ -1949,13 +1980,17 @@ fn plain_shell_candidates(
     preferred_terminal: Option<&DefaultTerminal>,
     mac_profile: Option<&MacTerminalProfile>,
     shell_integration_enabled: bool,
-) -> Vec<ShellCandidate> {
+) -> (Vec<ShellCandidate>, Vec<String>) {
     let mut allowed: Vec<ShellCandidate> = Vec::new();
+    let mut excluded: Vec<String> = Vec::new();
     for candidate in shell_candidates(preferred_terminal, mac_profile, shell_integration_enabled) {
         if PLAIN_SHELL_EXCLUDED_PROGRAMS
             .iter()
-            .any(|excluded| candidate.program.eq_ignore_ascii_case(excluded))
+            .any(|program| candidate.program.eq_ignore_ascii_case(program))
         {
+            if !excluded.iter().any(|seen| seen == &candidate.program) {
+                excluded.push(candidate.program);
+            }
             continue;
         }
         if allowed
@@ -1966,7 +2001,7 @@ fn plain_shell_candidates(
         }
         allowed.push(candidate);
     }
-    allowed
+    (allowed, excluded)
 }
 
 #[cfg(windows)]
@@ -4231,12 +4266,14 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn plain_shell_candidates_drop_windows_powershell_and_keep_pwsh_then_cmd() {
-        let programs: Vec<String> =
-            plain_shell_candidates(Some(&DefaultTerminal::Pwsh), None, false)
-                .into_iter()
-                .map(|candidate| candidate.program)
-                .collect();
+        let (candidates, excluded) =
+            plain_shell_candidates(Some(&DefaultTerminal::Pwsh), None, false);
+        let programs: Vec<String> = candidates
+            .into_iter()
+            .map(|candidate| candidate.program)
+            .collect();
         assert_eq!(programs, vec!["pwsh".to_string(), "cmd.exe".to_string()]);
+        assert_eq!(excluded, vec!["powershell.exe".to_string()]);
         // The same exclusion holds when the setting names Windows PowerShell
         // outright: there is no way to ask for the shell that dies at 3s.
         for preferred in [
@@ -4244,7 +4281,8 @@ mod tests {
             DefaultTerminal::Cmd,
             DefaultTerminal::Bash,
         ] {
-            let programs: Vec<String> = plain_shell_candidates(Some(&preferred), None, false)
+            let (candidates, excluded) = plain_shell_candidates(Some(&preferred), None, false);
+            let programs: Vec<String> = candidates
                 .into_iter()
                 .map(|candidate| candidate.program)
                 .collect();
@@ -4259,7 +4297,33 @@ mod tests {
                 programs.iter().any(|program| program == "cmd.exe"),
                 "{preferred:?} must retain a last-resort shell: {programs:?}"
             );
+            // What was dropped is reported, not merely absent: the refusal
+            // message has to be able to say "powershell excluded" rather than
+            // let the operator read "powershell is not installed".
+            assert_eq!(
+                excluded,
+                vec!["powershell.exe".to_string()],
+                "{preferred:?} must name what it refused to consider"
+            );
         }
+    }
+
+    /// The refusal a client reads must distinguish "not installed" from
+    /// "deliberately not considered".
+    #[test]
+    fn no_shell_found_names_the_excluded_program() {
+        assert_eq!(
+            no_shell_found_message(
+                &["pwsh".to_string(), "cmd.exe".to_string()],
+                &["powershell.exe".to_string()],
+            ),
+            "no shell found; tried: pwsh, cmd.exe (powershell.exe excluded)"
+        );
+        // With nothing excluded the message must not grow an empty note.
+        assert_eq!(
+            no_shell_found_message(&["sh".to_string()], &[]),
+            "no shell found; tried: sh"
+        );
     }
 
     #[cfg(windows)]

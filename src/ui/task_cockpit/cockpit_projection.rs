@@ -522,6 +522,7 @@ mod tests {
         projection.apply_result(&TaskCockpitResult::Unavailable {
             surface: TaskCockpitSurface::Git,
             reason: TaskCockpitUnavailableReason::GitAuthorityNotIssued,
+            detail: None,
         });
         assert_eq!(
             projection.load,

@@ -533,6 +533,33 @@ fn strict_to_legacy(config: StrictAppConfig) -> std::result::Result<AppConfig, C
     })
 }
 
+/// The durable config and the terminal/UI layer carry two structurally
+/// identical copies of this enum (`config::model` and `models::config`). One
+/// conversion, here, so a variant added to either copy is a compile error in
+/// exactly one place instead of a silent default in whichever call site was
+/// forgotten. Both matches stay exhaustive on purpose — no `_` arm.
+impl From<StrictDefaultTerminal> for crate::models::DefaultTerminal {
+    fn from(terminal: StrictDefaultTerminal) -> Self {
+        match terminal {
+            StrictDefaultTerminal::Bash => Self::Bash,
+            StrictDefaultTerminal::Powershell => Self::Powershell,
+            StrictDefaultTerminal::Pwsh => Self::Pwsh,
+            StrictDefaultTerminal::Cmd => Self::Cmd,
+        }
+    }
+}
+
+/// See [`From<StrictDefaultTerminal>`](crate::models::DefaultTerminal).
+impl From<StrictMacTerminalProfile> for crate::models::MacTerminalProfile {
+    fn from(profile: StrictMacTerminalProfile) -> Self {
+        match profile {
+            StrictMacTerminalProfile::System => Self::System,
+            StrictMacTerminalProfile::Zsh => Self::Zsh,
+            StrictMacTerminalProfile::Bash => Self::Bash,
+        }
+    }
+}
+
 fn strict_settings_to_legacy(settings: StrictSettings) -> Settings {
     Settings {
         theme: settings.theme,
@@ -540,19 +567,9 @@ fn strict_settings_to_legacy(settings: StrictSettings) -> Settings {
         confirm_on_close: settings.confirm_on_close,
         minimize_to_tray: settings.minimize_to_tray,
         restore_session_on_start: nullable_to_option(settings.restore_session_on_start),
-        default_terminal: match settings.default_terminal {
-            StrictDefaultTerminal::Bash => crate::models::DefaultTerminal::Bash,
-            StrictDefaultTerminal::Powershell => crate::models::DefaultTerminal::Powershell,
-            StrictDefaultTerminal::Pwsh => crate::models::DefaultTerminal::Pwsh,
-            StrictDefaultTerminal::Cmd => crate::models::DefaultTerminal::Cmd,
-        },
-        mac_terminal_profile: nullable_to_option(settings.mac_terminal_profile).map(|profile| {
-            match profile {
-                StrictMacTerminalProfile::System => crate::models::MacTerminalProfile::System,
-                StrictMacTerminalProfile::Zsh => crate::models::MacTerminalProfile::Zsh,
-                StrictMacTerminalProfile::Bash => crate::models::MacTerminalProfile::Bash,
-            }
-        }),
+        default_terminal: settings.default_terminal.into(),
+        mac_terminal_profile: nullable_to_option(settings.mac_terminal_profile)
+            .map(crate::models::MacTerminalProfile::from),
         claude_command: nullable_to_option(settings.claude_command),
         codex_command: nullable_to_option(settings.codex_command),
         notification_sound: nullable_to_option(settings.notification_sound),

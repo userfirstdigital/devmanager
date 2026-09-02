@@ -3178,6 +3178,7 @@ fn denied(surface: TaskCockpitSurface, reason: TaskCockpitDeniedReason) -> Query
     QueryOutcome::Ok(QueryResult::TaskCockpit(TaskCockpitResult::Denied {
         surface,
         reason,
+        detail: None,
     }))
 }
 
@@ -3185,6 +3186,7 @@ fn unavailable(surface: TaskCockpitSurface, reason: TaskCockpitUnavailableReason
     QueryOutcome::Ok(QueryResult::TaskCockpit(TaskCockpitResult::Unavailable {
         surface,
         reason,
+        detail: None,
     }))
 }
 
@@ -3621,6 +3623,7 @@ mod tests {
             QueryOutcome::Ok(QueryResult::TaskCockpit(TaskCockpitResult::Unavailable {
                 surface: TaskCockpitSurface::Ssh,
                 reason: TaskCockpitUnavailableReason::WorkspaceAuthorityUnavailable,
+                ..
             }))
         ));
         let coordinator = WorkspaceResourceCoordinator::new();
@@ -3651,6 +3654,7 @@ mod tests {
             QueryOutcome::Ok(QueryResult::TaskCockpit(TaskCockpitResult::Unavailable {
                 surface: TaskCockpitSurface::Ssh,
                 reason: TaskCockpitUnavailableReason::SshTaskSupervisorAdapterMissing,
+                ..
             }))
         ));
         let foreign = serve_task_cockpit(TaskCockpitDispatch {
@@ -3680,6 +3684,7 @@ mod tests {
             QueryOutcome::Ok(QueryResult::TaskCockpit(TaskCockpitResult::Denied {
                 surface: TaskCockpitSurface::Ssh,
                 reason: TaskCockpitDeniedReason::Unauthorized,
+                ..
             }))
         ));
     }
@@ -3776,6 +3781,7 @@ mod tests {
             QueryOutcome::Ok(QueryResult::TaskCockpit(TaskCockpitResult::Denied {
                 surface: TaskCockpitSurface::Files,
                 reason: TaskCockpitDeniedReason::CapabilityDenied,
+                ..
             }))
         ));
     }
@@ -4330,6 +4336,7 @@ mod tests {
             QueryOutcome::Ok(QueryResult::TaskCockpit(TaskCockpitResult::Denied {
                 surface: TaskCockpitSurface::Files,
                 reason: TaskCockpitDeniedReason::PathTraversal,
+                ..
             }))
         ));
         let secret = serve_task_cockpit(dispatch(
@@ -4352,6 +4359,7 @@ mod tests {
             QueryOutcome::Ok(QueryResult::TaskCockpit(TaskCockpitResult::Denied {
                 surface: TaskCockpitSurface::Files,
                 reason: TaskCockpitDeniedReason::CapabilityDenied,
+                ..
             }))
         ));
         let missing = serve_task_cockpit(dispatch(
@@ -4374,6 +4382,7 @@ mod tests {
             QueryOutcome::Ok(QueryResult::TaskCockpit(TaskCockpitResult::Unavailable {
                 surface: TaskCockpitSurface::Files,
                 reason: TaskCockpitUnavailableReason::WorkspaceAuthorityUnavailable,
+                ..
             }))
         ));
         let unconfirmed = serve_task_cockpit(dispatch(
@@ -4396,6 +4405,7 @@ mod tests {
             QueryOutcome::Ok(QueryResult::TaskCockpit(TaskCockpitResult::Unavailable {
                 surface: TaskCockpitSurface::Files,
                 reason: TaskCockpitUnavailableReason::WriteUnsupported,
+                ..
             }))
         ));
         let created = serve_task_cockpit(dispatch(
@@ -4442,6 +4452,7 @@ mod tests {
             QueryOutcome::Ok(QueryResult::TaskCockpit(TaskCockpitResult::Denied {
                 surface: TaskCockpitSurface::Files,
                 reason: TaskCockpitDeniedReason::RevisionConflict,
+                ..
             }))
         ));
     }
@@ -4470,6 +4481,7 @@ mod tests {
             QueryOutcome::Ok(QueryResult::TaskCockpit(TaskCockpitResult::Denied {
                 surface: TaskCockpitSurface::Git,
                 reason: TaskCockpitDeniedReason::PathTraversal,
+                ..
             }))
         ));
         let planned = serve_task_cockpit(dispatch(
@@ -5712,6 +5724,7 @@ mod tests {
                 QueryOutcome::Ok(QueryResult::TaskCockpit(TaskCockpitResult::Unavailable {
                     surface: TaskCockpitSurface::Terminal,
                     reason: TaskCockpitUnavailableReason::TerminalUnavailable,
+                    ..
                 }))
             ),
             "{unknown:?}"
@@ -5796,6 +5809,7 @@ mod tests {
                     QueryOutcome::Ok(QueryResult::TaskCockpit(TaskCockpitResult::Denied {
                         surface: TaskCockpitSurface::Terminal,
                         reason: TaskCockpitDeniedReason::CapabilityDenied,
+                        ..
                     }))
                 ),
                 "{query:?} must be denied for a TaskCockpit-only client, got {outcome:?}"
@@ -5822,6 +5836,7 @@ mod tests {
                 QueryOutcome::Ok(QueryResult::TaskCockpit(TaskCockpitResult::Denied {
                     surface: TaskCockpitSurface::Terminal,
                     reason: TaskCockpitDeniedReason::CapabilityDenied,
+                    ..
                 }))
             ),
             "{legacy:?}"
@@ -5989,6 +6004,7 @@ mod tests {
                 QueryOutcome::Ok(QueryResult::TaskCockpit(TaskCockpitResult::Denied {
                     surface: TaskCockpitSurface::Terminal,
                     reason: TaskCockpitDeniedReason::StaleFence,
+                    ..
                 }))
             ),
             "{outcome:?}"
@@ -6131,6 +6147,7 @@ mod tests {
                 QueryOutcome::Ok(QueryResult::TaskCockpit(TaskCockpitResult::Unavailable {
                     surface: TaskCockpitSurface::Terminal,
                     reason: TaskCockpitUnavailableReason::TerminalNotStarted,
+                    ..
                 }))
             ),
             "an open shell must not collapse readiness to TerminalUnavailable, got {outcome:?}"
@@ -6185,6 +6202,7 @@ mod tests {
             QueryOutcome::Ok(QueryResult::TaskCockpit(TaskCockpitResult::Unavailable {
                 surface: TaskCockpitSurface::Terminal,
                 reason: TaskCockpitUnavailableReason::TerminalUnavailable,
+                ..
             }))
         ));
 
@@ -6213,6 +6231,7 @@ mod tests {
             QueryOutcome::Ok(QueryResult::TaskCockpit(TaskCockpitResult::Unavailable {
                 surface: TaskCockpitSurface::Terminal,
                 reason: TaskCockpitUnavailableReason::TerminalStartPending,
+                ..
             }))
         ));
 
@@ -6241,6 +6260,7 @@ mod tests {
             QueryOutcome::Ok(QueryResult::TaskCockpit(TaskCockpitResult::Unavailable {
                 surface: TaskCockpitSurface::Terminal,
                 reason: TaskCockpitUnavailableReason::TerminalUnavailable,
+                ..
             }))
         ));
 
@@ -6270,6 +6290,7 @@ mod tests {
                 QueryOutcome::Ok(QueryResult::TaskCockpit(TaskCockpitResult::Unavailable {
                     surface: TaskCockpitSurface::Terminal,
                     reason: TaskCockpitUnavailableReason::TerminalUnavailable,
+                    ..
                 }))
             ),
             "legacy Terminal must keep the closed Unavailable reason"
@@ -6300,6 +6321,7 @@ mod tests {
             QueryOutcome::Ok(QueryResult::TaskCockpit(TaskCockpitResult::Unavailable {
                 surface: TaskCockpitSurface::Terminal,
                 reason: TaskCockpitUnavailableReason::TerminalNotStarted,
+                ..
             }))
         ));
     }
@@ -6352,6 +6374,7 @@ mod tests {
             QueryOutcome::Ok(QueryResult::TaskCockpit(TaskCockpitResult::Unavailable {
                 surface: TaskCockpitSurface::Terminal,
                 reason: TaskCockpitUnavailableReason::TerminalUnavailable,
+                ..
             }))
         ));
     }

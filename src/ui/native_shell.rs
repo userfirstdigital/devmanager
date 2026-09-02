@@ -723,6 +723,7 @@ fn first_send_terminal_probe_not_started(result: &crate::domain::TaskCockpitResu
         crate::domain::TaskCockpitResult::Unavailable {
             surface: crate::domain::TaskCockpitSurface::Terminal,
             reason: crate::domain::TaskCockpitUnavailableReason::TerminalNotStarted,
+            ..
         }
     )
 }
@@ -734,6 +735,7 @@ fn first_send_terminal_probe_start_pending(result: &crate::domain::TaskCockpitRe
         crate::domain::TaskCockpitResult::Unavailable {
             surface: crate::domain::TaskCockpitSurface::Terminal,
             reason: crate::domain::TaskCockpitUnavailableReason::TerminalStartPending,
+            ..
         }
     )
 }
@@ -747,6 +749,7 @@ fn first_send_terminal_probe_provider_setup_required(
         crate::domain::TaskCockpitResult::Unavailable {
             surface: crate::domain::TaskCockpitSurface::Terminal,
             reason: crate::domain::TaskCockpitUnavailableReason::TerminalProviderSetupRequired,
+            ..
         }
     )
 }
@@ -7447,15 +7450,7 @@ async fn execute_native_command(
             let action_id = action::cockpit_query_action_id(&query);
             match query_task_cockpit(&mut port, task_id, query).await? {
                 Ok(result) => {
-                    let detail = match &result {
-                        crate::domain::TaskCockpitResult::Denied {
-                            surface, reason, ..
-                        } => format!("{action_id}: {surface:?} denied: {reason:?}"),
-                        crate::domain::TaskCockpitResult::Unavailable {
-                            surface, reason, ..
-                        } => format!("{action_id}: {surface:?} unavailable: {reason:?}"),
-                        _ => action_id.to_string(),
-                    };
+                    let detail = cockpit_result_detail(action_id, &result);
                     Ok(NativeHostExecutionResult::Query {
                         detail: bounded_host_error(detail),
                         body: NativeHostQueryBody::TaskCockpit(result),
@@ -7730,15 +7725,7 @@ async fn execute_native_command(
             let action_id = action::cockpit_query_action_id(&query);
             match query_task_cockpit(&mut port, task_id, query).await? {
                 Ok(result) => {
-                    let detail = match &result {
-                        crate::domain::TaskCockpitResult::Denied {
-                            surface, reason, ..
-                        } => format!("{action_id}: {surface:?} denied: {reason:?}"),
-                        crate::domain::TaskCockpitResult::Unavailable {
-                            surface, reason, ..
-                        } => format!("{action_id}: {surface:?} unavailable: {reason:?}"),
-                        _ => action_id.to_string(),
-                    };
+                    let detail = cockpit_result_detail(action_id, &result);
                     Ok(NativeHostExecutionResult::Query {
                         detail: bounded_host_error(detail),
                         body: NativeHostQueryBody::TaskCockpit(result),
@@ -42788,6 +42775,36 @@ fn bounded_host_error(message: impl Into<String>) -> String {
     message.into().chars().take(MAX_HOST_ERROR_CHARS).collect()
 }
 
+/// The one-line status a cockpit query result gets rendered as.
+///
+/// `Denied`/`Unavailable` carry a closed enum reason plus an optional host
+/// sentence naming the exact resolved value (`cwd is not a directory: D:/gone`).
+/// The reason alone cannot tell two different refusals apart, so append the
+/// sentence whenever the host sent one. One function, because both cockpit
+/// query arms in `execute_native_command` render the same three cases and a
+/// second copy would drift.
+fn cockpit_result_detail(action_id: &str, result: &crate::domain::TaskCockpitResult) -> String {
+    match result {
+        crate::domain::TaskCockpitResult::Denied {
+            surface,
+            reason,
+            detail,
+        } => match detail {
+            Some(detail) => format!("{action_id}: {surface:?} denied: {reason:?}: {detail}"),
+            None => format!("{action_id}: {surface:?} denied: {reason:?}"),
+        },
+        crate::domain::TaskCockpitResult::Unavailable {
+            surface,
+            reason,
+            detail,
+        } => match detail {
+            Some(detail) => format!("{action_id}: {surface:?} unavailable: {reason:?}: {detail}"),
+            None => format!("{action_id}: {surface:?} unavailable: {reason:?}"),
+        },
+        _ => action_id.to_string(),
+    }
+}
+
 /// Translate GPUI keys into the bounded byte strings understood by stock
 /// provider TUIs. Composer submission owns its own Enter choreography; this
 /// path preserves exactly one interactive key/paste gesture without adding a
@@ -43421,6 +43438,7 @@ mod tests {
         capture_runtime_projection_owner,
         caret_phase_repaint,
         center_terminal_interactive,
+        cockpit_result_detail,
         composer_caret_visible,
         composer_draft_parts,
         composer_provider_identity,
@@ -48761,6 +48779,71 @@ mod tests {
         assert_eq!(
             limits.max_page_encoded_bytes,
             FrameLimits::v1_default().max_page_encoded_bytes
+        );
+    }
+
+    /// The named cause the host resolved has to reach the operator's screen.
+    ///
+    /// `terminal.open_shell: Terminal denied: OutsideWorkspace` is the same
+    /// line for a relative path and for a directory that was deleted; the two
+    /// have different fixes, and only the host knows which happened.
+    #[test]
+    fn cockpit_refusal_rendering_appends_the_hosts_named_cause() {
+        use crate::domain::{
+            TaskCockpitDeniedReason, TaskCockpitResult, TaskCockpitSurface,
+            TaskCockpitUnavailableReason,
+        };
+
+        assert_eq!(
+            cockpit_result_detail(
+                crate::client::action::ACTION_TERMINAL_OPEN_SHELL,
+                &TaskCockpitResult::Denied {
+                    surface: TaskCockpitSurface::Terminal,
+                    reason: TaskCockpitDeniedReason::OutsideWorkspace,
+                    detail: Some("cwd is not a directory: D:/gone".into()),
+                },
+            ),
+            "terminal.open_shell: Terminal denied: OutsideWorkspace: cwd is not a directory: D:/gone"
+        );
+        assert_eq!(
+            cockpit_result_detail(
+                crate::client::action::ACTION_TERMINAL_OPEN_SHELL,
+                &TaskCockpitResult::Unavailable {
+                    surface: TaskCockpitSurface::Terminal,
+                    reason: TaskCockpitUnavailableReason::TerminalUnavailable,
+                    detail: Some(
+                        "no shell found; tried: pwsh, cmd.exe (powershell.exe excluded)".into(),
+                    ),
+                },
+            ),
+            "terminal.open_shell: Terminal unavailable: TerminalUnavailable: no shell found; \
+             tried: pwsh, cmd.exe (powershell.exe excluded)"
+        );
+        // A refusal with no named cause keeps exactly the old line: the field
+        // is additive on screen as well as on the wire.
+        assert_eq!(
+            cockpit_result_detail(
+                crate::client::action::ACTION_TERMINAL_OPEN_SHELL,
+                &TaskCockpitResult::Denied {
+                    surface: TaskCockpitSurface::Terminal,
+                    reason: TaskCockpitDeniedReason::OutsideWorkspace,
+                    detail: None,
+                },
+            ),
+            "terminal.open_shell: Terminal denied: OutsideWorkspace"
+        );
+
+        // Both cockpit query arms must render through this one function; a
+        // second inline copy is how the two drift.
+        let source = include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/src/ui/native_shell.rs"
+        ));
+        let call = format!("cockpit_result_detail{}", "(action_id, &result)");
+        assert_eq!(
+            source.matches(call.as_str()).count(),
+            2,
+            "both cockpit query arms must render refusals through one helper"
         );
     }
 
@@ -57210,7 +57293,7 @@ mod tests {
                                 surface: crate::domain::TaskCockpitSurface::Terminal,
                                 reason:
                                     crate::domain::TaskCockpitUnavailableReason::TerminalProviderSetupRequired,
-                            },
+                            detail: None,},
                         ),
                     },
                 );
@@ -57560,7 +57643,7 @@ mod tests {
                                 surface: crate::domain::TaskCockpitSurface::Terminal,
                                 reason:
                                     crate::domain::TaskCockpitUnavailableReason::TerminalProviderSetupRequired,
-                            },
+                            detail: None,},
                         ),
                     },
                 );
@@ -57712,7 +57795,7 @@ mod tests {
                                 surface: crate::domain::TaskCockpitSurface::Terminal,
                                 reason:
                                     crate::domain::TaskCockpitUnavailableReason::TerminalProviderSetupRequired,
-                            },
+                            detail: None,},
                         ),
                     },
                 );
@@ -57851,6 +57934,7 @@ mod tests {
                                 surface: crate::domain::TaskCockpitSurface::Terminal,
                                 reason:
                                     crate::domain::TaskCockpitUnavailableReason::TerminalNotStarted,
+                                detail: None,
                             },
                         ),
                     },
@@ -58017,7 +58101,7 @@ mod tests {
                             crate::domain::TaskCockpitResult::Unavailable {
                                 surface: crate::domain::TaskCockpitSurface::Terminal,
                                 reason: crate::domain::TaskCockpitUnavailableReason::TerminalUnavailable,
-                            },
+                            detail: None,},
                         ),
                     },
                 );
@@ -58155,7 +58239,7 @@ mod tests {
                                 surface: crate::domain::TaskCockpitSurface::Terminal,
                                 reason:
                                     crate::domain::TaskCockpitUnavailableReason::TerminalStartPending,
-                            },
+                            detail: None,},
                         ),
                     },
                 );
@@ -58424,6 +58508,7 @@ mod tests {
                                 surface: crate::domain::TaskCockpitSurface::Terminal,
                                 reason:
                                     crate::domain::TaskCockpitUnavailableReason::TerminalNotStarted,
+                                detail: None,
                             },
                         ),
                     },

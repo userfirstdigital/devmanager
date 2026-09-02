@@ -923,10 +923,24 @@ pub enum TaskCockpitResult {
     Denied {
         surface: TaskCockpitSurface,
         reason: TaskCockpitDeniedReason,
+        /// One host-written sentence naming the exact resolved value behind
+        /// `reason`, when the closed enum cannot carry it.
+        ///
+        /// `OutsideWorkspace` alone cannot tell "that directory is gone" from
+        /// "you gave me a relative path", and the operator reading the client
+        /// has no access to the host's stderr. Additive and optional: the wire
+        /// codec is `rmp_serde::to_vec_named`, so an older payload without the
+        /// field still decodes, and a `None` is not written at all.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        detail: Option<String>,
     },
     Unavailable {
         surface: TaskCockpitSurface,
         reason: TaskCockpitUnavailableReason,
+        /// See [`TaskCockpitResult::Denied::detail`]. `TerminalUnavailable`
+        /// covers both "no shell is installed" and "the recipe was rejected".
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        detail: Option<String>,
     },
 }
 
@@ -1203,6 +1217,7 @@ mod tests {
         let result = QueryResult::TaskCockpit(TaskCockpitResult::Denied {
             surface: TaskCockpitSurface::Files,
             reason: TaskCockpitDeniedReason::PathTraversal,
+            detail: None,
         });
         let encoded = serde_json::to_value(&result).expect("encode result");
         assert!(encoded.get("task_cockpit").is_some());
@@ -1564,6 +1579,7 @@ mod tests {
         let unavailable = TaskCockpitResult::Unavailable {
             surface: TaskCockpitSurface::Terminal,
             reason: TaskCockpitUnavailableReason::TerminalNotStarted,
+            detail: None,
         };
         let round_trip: TaskCockpitResult =
             serde_json::from_value(serde_json::to_value(&unavailable).expect("encode"))
@@ -1572,11 +1588,112 @@ mod tests {
         let setup_required = TaskCockpitResult::Unavailable {
             surface: TaskCockpitSurface::Terminal,
             reason: TaskCockpitUnavailableReason::TerminalProviderSetupRequired,
+            detail: None,
         };
         let setup_round_trip: TaskCockpitResult =
             serde_json::from_value(serde_json::to_value(&setup_required).expect("encode"))
                 .expect("decode setup reason");
         assert_eq!(setup_round_trip, setup_required);
+    }
+
+    /// `detail` is additive on a live wire shape, so both directions matter:
+    /// a payload written before the field existed must still decode, and a
+    /// refusal that has no named cause must not start emitting a null.
+    ///
+    /// Asserted through [`MessagePackCodec`], which is what the transport
+    /// actually uses (`rmp_serde::to_vec_named`, a self-describing map) — not
+    /// only through `serde_json`, which could agree while the real codec did
+    /// not.
+    #[test]
+    fn cockpit_refusals_carry_an_optional_detail_additively() {
+        use crate::protocol::{FrameLimits, MessagePackCodec};
+
+        let codec = MessagePackCodec::from_limits(FrameLimits::v1_default()).expect("codec");
+
+        // 1. The OLD shape — surface + reason, no `detail` — still decodes.
+        let legacy_denied: TaskCockpitResult = codec
+            .decode(
+                &codec
+                    .encode(&serde_json::json!({
+                        "denied": {
+                            "surface": "terminal",
+                            "reason": "outside_workspace",
+                        }
+                    }))
+                    .expect("encode legacy denied"),
+            )
+            .expect("a payload written before `detail` existed must still decode");
+        assert_eq!(
+            legacy_denied,
+            TaskCockpitResult::Denied {
+                surface: TaskCockpitSurface::Terminal,
+                reason: TaskCockpitDeniedReason::OutsideWorkspace,
+                detail: None,
+            }
+        );
+        let legacy_unavailable: TaskCockpitResult = codec
+            .decode(
+                &codec
+                    .encode(&serde_json::json!({
+                        "unavailable": {
+                            "surface": "terminal",
+                            "reason": "terminal_unavailable",
+                        }
+                    }))
+                    .expect("encode legacy unavailable"),
+            )
+            .expect("a payload written before `detail` existed must still decode");
+        assert_eq!(
+            legacy_unavailable,
+            TaskCockpitResult::Unavailable {
+                surface: TaskCockpitSurface::Terminal,
+                reason: TaskCockpitUnavailableReason::TerminalUnavailable,
+                detail: None,
+            }
+        );
+
+        // 2. A refusal with no named cause writes exactly the old bytes, so a
+        //    reader that has not been updated sees no change at all.
+        assert_eq!(
+            codec
+                .encode(&TaskCockpitResult::Denied {
+                    surface: TaskCockpitSurface::Terminal,
+                    reason: TaskCockpitDeniedReason::OutsideWorkspace,
+                    detail: None,
+                })
+                .expect("encode denied without detail"),
+            codec
+                .encode(&serde_json::json!({
+                    "denied": { "surface": "terminal", "reason": "outside_workspace" }
+                }))
+                .expect("encode legacy denied"),
+            "a None detail must not be written at all"
+        );
+
+        // 3. A named cause survives the round trip verbatim.
+        for named in [
+            TaskCockpitResult::Denied {
+                surface: TaskCockpitSurface::Terminal,
+                reason: TaskCockpitDeniedReason::OutsideWorkspace,
+                detail: Some("cwd is not a directory: D:/gone".into()),
+            },
+            TaskCockpitResult::Unavailable {
+                surface: TaskCockpitSurface::Terminal,
+                reason: TaskCockpitUnavailableReason::TerminalUnavailable,
+                detail: Some(
+                    "no shell found; tried: pwsh, cmd.exe (powershell.exe excluded)".into(),
+                ),
+            },
+        ] {
+            let round_trip: TaskCockpitResult = codec
+                .decode(&codec.encode(&named).expect("encode named"))
+                .expect("decode named");
+            assert_eq!(round_trip, named);
+            let json_round_trip: TaskCockpitResult =
+                serde_json::from_value(serde_json::to_value(&named).expect("json encode"))
+                    .expect("json decode");
+            assert_eq!(json_round_trip, named);
+        }
     }
 
     #[test]

@@ -920,6 +920,7 @@ mod workspace_security_tests {
                 crate::domain::TaskCockpitResult::Denied {
                     surface: crate::domain::TaskCockpitSurface::Files,
                     reason: crate::domain::TaskCockpitDeniedReason::PathTraversal,
+                    ..
                 }
             ))
         ));
@@ -949,6 +950,7 @@ mod workspace_security_tests {
                     surface: crate::domain::TaskCockpitSurface::Git,
                     reason:
                         crate::domain::TaskCockpitUnavailableReason::WorkspaceAuthorityUnavailable,
+                    ..
                 }
             ))
         ));
@@ -983,6 +985,7 @@ mod workspace_security_tests {
                 crate::domain::TaskCockpitResult::Unavailable {
                     surface: crate::domain::TaskCockpitSurface::Services,
                     reason: crate::domain::TaskCockpitUnavailableReason::HealthUnsupported,
+                    ..
                 }
             ))
         ));
@@ -1017,6 +1020,7 @@ mod workspace_security_tests {
                 crate::domain::TaskCockpitResult::Unavailable {
                     surface: crate::domain::TaskCockpitSurface::Services,
                     reason: crate::domain::TaskCockpitUnavailableReason::LogsUnsupported,
+                    ..
                 }
             ))
         ));
@@ -1047,6 +1051,7 @@ mod workspace_security_tests {
                 crate::domain::TaskCockpitResult::Unavailable {
                     surface: crate::domain::TaskCockpitSurface::Ssh,
                     reason: crate::domain::TaskCockpitUnavailableReason::SshOperationUnsupported,
+                    ..
                 }
             ))
         ));
@@ -4178,10 +4183,10 @@ impl HostRequestExecutor {
     /// to choose, which is why `Command::OpenShellTerminal` is refused on the
     /// client `execute` path entirely.
     ///
-    /// Every refusal is logged with the exact resolved value as well as being
-    /// returned as a typed outcome: a client only sees the surface reason, and
-    /// "that directory does not exist" and "no shell is installed" are
-    /// otherwise the same `TerminalUnavailable` on its side.
+    /// A named refusal writes one sentence to both the host log and the reply's
+    /// `detail`: the wire reason is a closed enum, so "that directory does not
+    /// exist", "that path is relative" and "no shell is installed" would
+    /// otherwise be indistinguishable on the client's side.
     ///
     /// `Ok(())` means the durable resource was registered and the process
     /// effect has been started; the caller answers with the Task's strip.
@@ -4223,9 +4228,10 @@ impl HostRequestExecutor {
         ) {
             Ok(launch) => launch,
             Err(reason) => {
-                eprintln!("devmanager-host: open shell refused task={task_id}: {reason}");
-                return Err(shell_open_unavailable(
+                return Err(shell_open_unavailable_named(
+                    task_id,
                     crate::domain::TaskCockpitUnavailableReason::TerminalUnavailable,
+                    reason,
                 ));
             }
         };
@@ -4239,6 +4245,10 @@ impl HostRequestExecutor {
             .map(|agent| agent.runtime_generation)
             .filter(|generation| *generation > 0)
             .unwrap_or(1);
+        // One clock read for one operation. The resource's `created_at` and its
+        // command's `issued_at_ms` describe the same instant; two reads let the
+        // durable record disagree with the envelope that carried it.
+        let now_ms = unix_time_ms_u64() as i64;
         let mut resource = match crate::domain::resource::ResourceFacts::new(
             Some(task_id),
             crate::domain::resource::OwnerKind::Task,
@@ -4253,7 +4263,7 @@ impl HostRequestExecutor {
                 }),
                 title: None,
             },
-            unix_time_ms_u64() as i64,
+            now_ms,
         ) {
             Ok(resource) => resource,
             Err(error) => {
@@ -4273,7 +4283,7 @@ impl HostRequestExecutor {
             command_id: crate::domain::CommandId::new(),
             client_id,
             task_id: Some(task_id),
-            issued_at_ms: unix_time_ms_u64() as i64,
+            issued_at_ms: now_ms,
             expected_task_revision: Some(expected_task_revision),
             command: Command::OpenShellTerminal(crate::domain::command::OpenShellTerminalIntent {
                 resource,
@@ -4329,13 +4339,21 @@ impl HostRequestExecutor {
     ) -> Result<PathBuf, QueryOutcome> {
         if let Some(requested) = cwd {
             let path = PathBuf::from(requested);
-            if !path.is_absolute() || !path.is_dir() {
-                eprintln!(
-                    "devmanager-host: open shell refused task={task_id}: cwd is not a directory: {}",
-                    path.display()
-                );
-                return Err(shell_open_denied(
+            // Two different mistakes, two different fixes: a relative path is
+            // the caller sending the wrong thing, a missing directory is the
+            // world having changed. One shared message made them one bug report.
+            if !path.is_absolute() {
+                return Err(shell_open_denied_named(
+                    task_id,
                     crate::domain::TaskCockpitDeniedReason::OutsideWorkspace,
+                    format!("cwd must be absolute: {}", path.display()),
+                ));
+            }
+            if !path.is_dir() {
+                return Err(shell_open_denied_named(
+                    task_id,
+                    crate::domain::TaskCockpitDeniedReason::OutsideWorkspace,
+                    format!("cwd is not a directory: {}", path.display()),
                 ));
             }
             return Ok(path);
@@ -4361,15 +4379,11 @@ impl HostRequestExecutor {
         };
         match runtime.workspace.runtime_working_directory() {
             Ok(path) if path.is_dir() => Ok(path),
-            Ok(path) => {
-                eprintln!(
-                    "devmanager-host: open shell refused task={task_id}: cwd is not a directory: {}",
-                    path.display()
-                );
-                Err(shell_open_denied(
-                    crate::domain::TaskCockpitDeniedReason::OutsideWorkspace,
-                ))
-            }
+            Ok(path) => Err(shell_open_denied_named(
+                task_id,
+                crate::domain::TaskCockpitDeniedReason::OutsideWorkspace,
+                format!("cwd is not a directory: {}", path.display()),
+            )),
             Err(error) => {
                 eprintln!(
                     "devmanager-host: open shell working directory unavailable task={task_id}: {error}"
@@ -4385,9 +4399,9 @@ impl HostRequestExecutor {
     /// host has no admitted config yet.
     ///
     /// The durable config and the terminal layer carry two structurally
-    /// identical copies of these enums (`config::model` and `models::config`),
-    /// with no conversion between them, so the mapping is spelled out here
-    /// rather than silently defaulted.
+    /// identical copies of these enums (`config::model` and `models::config`);
+    /// the one conversion between them lives in `crate::persistence` and is
+    /// shared with `strict_settings_to_legacy`.
     fn terminal_settings(
         &self,
     ) -> (
@@ -4400,28 +4414,13 @@ impl HostRequestExecutor {
         };
         let snapshot = admission.store.snapshot();
         let settings = snapshot.config.settings();
-        let default_terminal = match settings.default_terminal {
-            crate::config::DefaultTerminal::Bash => crate::models::DefaultTerminal::Bash,
-            crate::config::DefaultTerminal::Powershell => {
-                crate::models::DefaultTerminal::Powershell
-            }
-            crate::config::DefaultTerminal::Pwsh => crate::models::DefaultTerminal::Pwsh,
-            crate::config::DefaultTerminal::Cmd => crate::models::DefaultTerminal::Cmd,
-        };
-        let mac_profile = settings
-            .mac_terminal_profile
-            .clone()
-            .into_option()
-            .map(|profile| match profile {
-                crate::config::MacTerminalProfile::System => {
-                    crate::models::MacTerminalProfile::System
-                }
-                crate::config::MacTerminalProfile::Zsh => crate::models::MacTerminalProfile::Zsh,
-                crate::config::MacTerminalProfile::Bash => crate::models::MacTerminalProfile::Bash,
-            });
         (
-            default_terminal,
-            mac_profile,
+            settings.default_terminal.clone().into(),
+            settings
+                .mac_terminal_profile
+                .clone()
+                .into_option()
+                .map(crate::models::MacTerminalProfile::from),
             settings.shell_integration_enabled,
         )
     }
@@ -7174,6 +7173,7 @@ impl HostRequestExecutor {
             return QueryOutcome::Ok(QueryResult::TaskCockpit(TaskCockpitResult::Denied {
                 surface: crate::domain::cockpit::TaskCockpitSurface::Conversation,
                 reason: crate::domain::cockpit::TaskCockpitDeniedReason::MissingTask,
+                detail: None,
             }));
         };
         let Some(output_id) = output_id else {
@@ -7635,12 +7635,16 @@ fn page_limits_from_negotiated(negotiated: NegotiatedParameters) -> Result<PageL
 
 /// One refused `terminal.open_shell` the client is allowed to see the shape of.
 ///
-/// The named cause is logged at the refusal site; this carries only the closed
-/// wire reason, so the two must always be written together.
+/// The wire reason is a closed enum, so it cannot say *which* refusal this was:
+/// `OutsideWorkspace` covers both "you gave me a relative path" and "that
+/// directory is gone". Where a named cause exists, use
+/// [`shell_open_denied_named`] instead — it writes one string to both the host
+/// log and the client's `detail`, so the two can never drift.
 fn shell_open_denied(reason: crate::domain::TaskCockpitDeniedReason) -> QueryOutcome {
     QueryOutcome::Ok(QueryResult::TaskCockpit(TaskCockpitResult::Denied {
         surface: crate::domain::TaskCockpitSurface::Terminal,
         reason,
+        detail: None,
     }))
 }
 
@@ -7648,6 +7652,39 @@ fn shell_open_unavailable(reason: crate::domain::TaskCockpitUnavailableReason) -
     QueryOutcome::Ok(QueryResult::TaskCockpit(TaskCockpitResult::Unavailable {
         surface: crate::domain::TaskCockpitSurface::Terminal,
         reason,
+        detail: None,
+    }))
+}
+
+/// Log one named refusal and answer with the same sentence.
+///
+/// One `detail` string, two destinations: the operator's host log and the
+/// client that asked. Writing them separately is what let the two named
+/// messages exist only in stderr, where nobody using the client can read them.
+fn shell_open_denied_named(
+    task_id: TaskId,
+    reason: crate::domain::TaskCockpitDeniedReason,
+    detail: String,
+) -> QueryOutcome {
+    eprintln!("devmanager-host: open shell refused task={task_id}: {detail}");
+    QueryOutcome::Ok(QueryResult::TaskCockpit(TaskCockpitResult::Denied {
+        surface: crate::domain::TaskCockpitSurface::Terminal,
+        reason,
+        detail: Some(detail),
+    }))
+}
+
+/// See [`shell_open_denied_named`].
+fn shell_open_unavailable_named(
+    task_id: TaskId,
+    reason: crate::domain::TaskCockpitUnavailableReason,
+    detail: String,
+) -> QueryOutcome {
+    eprintln!("devmanager-host: open shell refused task={task_id}: {detail}");
+    QueryOutcome::Ok(QueryResult::TaskCockpit(TaskCockpitResult::Unavailable {
+        surface: crate::domain::TaskCockpitSurface::Terminal,
+        reason,
+        detail: Some(detail),
     }))
 }
 
