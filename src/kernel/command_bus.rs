@@ -2095,8 +2095,69 @@ mod provider_restart_identity_tests {
             TerminalFactOutcome::Recorded
         );
 
+        // Release a third shell all the way to Released before rebuilding, so the
+        // equality below also covers the DELETE and the strip removal -- a
+        // rebuild that reproduced only the insert paths would still pass.
+        let third = plain_shell_facts(task_id, None);
+        let revision = accepted_revision(
+            bus.execute(task_envelope(
+                client_id,
+                task_id,
+                bus.task_snapshot(task_id)
+                    .expect("snapshot")
+                    .expect("task")
+                    .task
+                    .revision,
+                Command::OpenShellTerminal(OpenShellTerminalIntent {
+                    resource: third.clone(),
+                }),
+            ))
+            .expect("open third"),
+        );
+        // The strip must stay a permutation of the live shells, so put the new
+        // shell in it and focus it -- releasing a FOCUSED tab is the case whose
+        // focus clearing the rebuild has to reproduce.
+        let revision = accepted_revision(
+            bus.execute(task_envelope(
+                client_id,
+                task_id,
+                revision,
+                Command::SetTerminalStrip(crate::domain::terminal_facts::TaskTerminalStrip {
+                    order: vec![third.id, second.id, shell.id],
+                    focused: Some(third.id),
+                }),
+            ))
+            .expect("focus the third shell"),
+        );
+        let _ = accepted_revision(
+            bus.execute(task_envelope(
+                client_id,
+                task_id,
+                revision,
+                Command::CloseTerminal {
+                    resource_id: third.id,
+                },
+            ))
+            .expect("close third"),
+        );
+        bus.settle_next_resource_release(Duration::from_secs(30))
+            .expect("settle release")
+            .expect("one release was queued");
+
         let before = bus.task_snapshot(task_id).expect("snapshot").expect("task");
+        assert_eq!(
+            before.resources[&third.id].lifecycle,
+            ResourceLifecycle::Released
+        );
+        assert!(
+            !before.terminal_facts.contains_key(&third.id),
+            "the released shell is the row the rebuild must NOT recreate"
+        );
         assert_eq!(before.terminal_strip.order, vec![second.id, shell.id]);
+        assert_eq!(
+            before.terminal_strip.focused, None,
+            "releasing the focused tab clears focus, and the rebuild must agree"
+        );
         assert_eq!(
             before.terminal_facts[&shell.id].title.as_deref(),
             Some("build")
@@ -2120,6 +2181,150 @@ mod provider_restart_identity_tests {
         assert_eq!(after.terminal_facts, before.terminal_facts);
         assert_eq!(after.terminal_strip, before.terminal_strip);
         assert_eq!(after.resources, before.resources);
+    }
+
+    /// A store that predates V16 must survive its first boot after the upgrade.
+    ///
+    /// `migrate()` creates `terminal_facts` and `task_terminal_strip` EMPTY while
+    /// the event log already holds every terminal registration, so without a
+    /// replay the next command compares a durable `apply_into` result against a
+    /// projection missing all of it and fails as `Corruption`. That is a bricked
+    /// store, not a degraded one: nothing in the process would ever repair it.
+    #[test]
+    fn upgrading_a_pre_v16_store_rebuilds_the_terminal_projection_once() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let path = directory.path().join("tasks.sqlite");
+        let client_id = ClientId::new();
+
+        let (task_id, provider_id, shell_id) = {
+            let mut bus = CommandBus::open(&path).expect("bus");
+            let (task_id, revision) = create_open_task(&mut bus, client_id);
+            let provider = provider_terminal_facts(task_id);
+            let revision = accepted_revision(
+                bus.execute(task_envelope(
+                    client_id,
+                    task_id,
+                    revision,
+                    Command::RegisterResource {
+                        resource: provider.clone(),
+                    },
+                ))
+                .expect("register provider terminal"),
+            );
+            let shell = plain_shell_facts(task_id, None);
+            let _ = accepted_revision(
+                bus.execute(task_envelope(
+                    client_id,
+                    task_id,
+                    revision,
+                    Command::OpenShellTerminal(OpenShellTerminalIntent {
+                        resource: shell.clone(),
+                    }),
+                ))
+                .expect("open shell"),
+            );
+            (task_id, provider.id, shell.id)
+        };
+
+        // Rewind the schema to V15 exactly as a store written before this task
+        // would look: the log is untouched, the two projection tables are gone.
+        {
+            let conn = Connection::open(&path).expect("raw reopen");
+            conn.execute_batch(
+                "DELETE FROM schema_migrations WHERE version = 16;\n\
+                 DROP TABLE task_terminal_strip;\n\
+                 DROP TABLE terminal_facts;",
+            )
+            .expect("rewind to v15");
+        }
+
+        let mut bus = CommandBus::open(&path).expect("reopen upgrades to v16");
+        let rebuild = bus
+            .store
+            .startup_rebuild()
+            .cloned()
+            .expect("applying V16 must replay the log into the new tables");
+        assert!(
+            rebuild.events_replayed > 0,
+            "the rebuild must have replayed the durable log"
+        );
+        assert!(
+            rebuild.drift_detected,
+            "the freshly created tables were empty, so the replay must report drift"
+        );
+
+        // (a) Both terminals are projected; only the plain shell is a strip tab.
+        let snapshot = bus.task_snapshot(task_id).expect("snapshot").expect("task");
+        assert!(
+            snapshot.terminal_facts.contains_key(&provider_id),
+            "a provider-owned terminal still carries durable facts"
+        );
+        assert!(snapshot.terminal_facts.contains_key(&shell_id));
+        assert_eq!(snapshot.terminal_strip.order, vec![shell_id]);
+        assert_eq!(snapshot.terminal_strip.focused, Some(shell_id));
+
+        // (b) The projection now agrees with a durable replay, so a command that
+        // runs the history/projection validator is Accepted rather than refused.
+        let receipt = bus
+            .execute(task_envelope(
+                client_id,
+                task_id,
+                snapshot.task.revision,
+                Command::RenameTerminal {
+                    resource_id: shell_id,
+                    title: "after upgrade".to_string(),
+                },
+            ))
+            .expect("rename executes");
+        assert!(
+            matches!(receipt, CommandReceipt::Accepted { .. }),
+            "an upgraded store must accept terminal commands, got {receipt:?}"
+        );
+        // Durable events carry wall-clock times, so derive the observation time
+        // from the projected facts rather than a literal -- a fixed constant in
+        // the past lands inside the coalesce window and reads as Suppressed.
+        let observed_at_ms = bus
+            .task_snapshot(task_id)
+            .expect("snapshot")
+            .expect("task")
+            .terminal_facts[&shell_id]
+            .last_activity_at_ms
+            + crate::domain::terminal_facts::TERMINAL_ACTIVITY_COALESCE_MS;
+        assert_eq!(
+            bus.record_terminal_fact(
+                task_id,
+                shell_id,
+                HostTerminalFact::Activity,
+                observed_at_ms
+            )
+            .expect("record activity"),
+            TerminalFactOutcome::Recorded
+        );
+        // The release path is what the validator refuses first when the
+        // projection disagrees with the log, so drive one to completion.
+        let snapshot = bus.task_snapshot(task_id).expect("snapshot").expect("task");
+        let _ = accepted_revision(
+            bus.execute(task_envelope(
+                client_id,
+                task_id,
+                snapshot.task.revision,
+                Command::CloseTerminal {
+                    resource_id: shell_id,
+                },
+            ))
+            .expect("close"),
+        );
+        bus.settle_next_resource_release(Duration::from_secs(30))
+            .expect("settle release")
+            .expect("one release was queued");
+        drop(bus);
+
+        // (c) Opening an already-current store replays nothing.
+        let bus = CommandBus::open(&path).expect("second reopen");
+        assert!(
+            bus.store.startup_rebuild().is_none(),
+            "an up-to-date schema must not trigger a projection rebuild"
+        );
     }
 
     fn provider_terminal_facts(task_id: TaskId) -> ResourceFacts {
@@ -10191,8 +10396,11 @@ fn load_terminal_facts(
             last_activity_at_ms,
         ) = row?;
         let resource_id = id16::<ResourceId>("terminal_facts.resource_id", &id_bytes)?;
-        // Same ownership guard `resources` carries: a row this task does not own
-        // must never reach a snapshot, even though the WHERE clause selected it.
+        // Same ownership guard `resources` carries. The query is already
+        // task-scoped, so in practice this is a SHAPE check: `id16` is what
+        // rejects a task_id blob that is not a valid 16-byte id. It is kept
+        // because the equality is the property the snapshot depends on, and a
+        // future unscoped query here would otherwise be silently unguarded.
         if id16::<TaskId>("terminal_facts.task_id", &row_task_id)? != task_id {
             return Err(StoreError::Projection(
                 "terminal_facts row task ownership mismatch".into(),
@@ -11388,21 +11596,9 @@ fn decode_resource_projection(
     Ok(resource)
 }
 
-fn unpack_projection_blob<T>(field: &str, bytes: &[u8]) -> Result<T, StoreError>
-where
-    T: serde::de::DeserializeOwned + serde::Serialize,
-{
-    let value: T = rmp_serde::from_slice(bytes).map_err(|err| StoreError::CodecMismatch {
-        detail: format!("{field}: {err}"),
-    })?;
-    let reencoded = projector::pack(&value)?;
-    if reencoded.as_slice() != bytes {
-        return Err(StoreError::CodecMismatch {
-            detail: format!("{field}: persisted projection blob is not lossless"),
-        });
-    }
-    Ok(value)
-}
+// One byte-lossless decoder for every packed projection blob, defined beside
+// `projector::pack` so the encoder and the decoder cannot drift apart.
+use crate::kernel::projector::unpack_projection_blob;
 
 fn id16<T>(field: &'static str, bytes: &[u8]) -> Result<T, StoreError>
 where

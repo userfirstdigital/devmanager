@@ -2822,6 +2822,28 @@ pub(crate) fn pack<T: serde::Serialize>(value: &T) -> Result<Vec<u8>, StoreError
     rmp_serde::to_vec(value).map_err(|e| StoreError::Projection(e.to_string()))
 }
 
+/// Decode a projection MessagePack blob and prove the bytes are exactly what
+/// [`pack`] would produce for the decoded value.
+///
+/// This is the ONLY decoder for a packed projection blob: the projector and the
+/// snapshot loader must agree byte-for-byte, and two decoders would be two
+/// places for that agreement to lapse.
+pub(crate) fn unpack_projection_blob<T>(field: &str, bytes: &[u8]) -> Result<T, StoreError>
+where
+    T: serde::de::DeserializeOwned + serde::Serialize,
+{
+    let value: T = rmp_serde::from_slice(bytes).map_err(|err| StoreError::CodecMismatch {
+        detail: format!("{field}: {err}"),
+    })?;
+    let reencoded = pack(&value)?;
+    if reencoded.as_slice() != bytes {
+        return Err(StoreError::CodecMismatch {
+            detail: format!("{field}: persisted projection blob is not lossless"),
+        });
+    }
+    Ok(value)
+}
+
 fn lifecycle_text(value: TaskLifecycle) -> &'static str {
     match value {
         TaskLifecycle::Open => "open",
@@ -3128,9 +3150,8 @@ fn read_terminal_strip_row(
     let Some((order_bytes, focused)) = row else {
         return Ok(None);
     };
-    let order: Vec<ResourceId> = rmp_serde::from_slice(&order_bytes).map_err(|err| {
-        StoreError::Projection(format!("task_terminal_strip.order_msgpack: {err}"))
-    })?;
+    let order: Vec<ResourceId> =
+        unpack_projection_blob("task_terminal_strip.order_msgpack", &order_bytes)?;
     let focused = match focused {
         Some(bytes) => {
             let array: [u8; 16] = bytes.as_slice().try_into().map_err(|_| {

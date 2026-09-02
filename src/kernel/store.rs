@@ -51,6 +51,10 @@ const MAX_CONNECT_IDENTITY_BYTES: usize = 64 * 1024;
 pub struct KernelStore {
     path: PathBuf,
     conn: Connection,
+    /// The projection rebuild `open` ran because it applied migrations, if it
+    /// did. `None` means the schema was already current and nothing was
+    /// replayed -- which is what a second open of the same store must report.
+    startup_rebuild: Option<ProjectionRebuild>,
 }
 
 impl fmt::Debug for KernelStore {
@@ -63,6 +67,22 @@ impl fmt::Debug for KernelStore {
 pub struct ProjectionRebuild {
     pub events_replayed: u64,
     pub drift_detected: bool,
+}
+
+/// Which migrations one `migrate()` call actually applied.
+///
+/// A migration that adds a projection table leaves that table EMPTY while the
+/// event log already contains the facts it projects, so the caller has to know
+/// that something was applied in order to replay the log into it.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct MigrationOutcome {
+    pub applied_versions: Vec<i64>,
+}
+
+impl MigrationOutcome {
+    pub fn applied_any(&self) -> bool {
+        !self.applied_versions.is_empty()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -157,15 +177,63 @@ impl KernelStore {
         let mut store = Self {
             path: canonical,
             conn,
+            startup_rebuild: None,
         };
-        store.migrate()?;
+        let migrated = store.migrate()?;
+        // A migration that introduces a projection table creates it EMPTY, and
+        // nothing else in the process ever replays the log into it. The next
+        // command would then compare a durable replay against a projection
+        // missing every row for that table and report Corruption. Replaying
+        // once here is what makes an upgrade openable; it is deliberately not a
+        // SQL backfill, because the facts live in msgpack recipes and must
+        // carry each registration event's own occurred_at_ms.
+        if migrated.applied_any() {
+            match store.rebuild_projection_tables() {
+                Ok(rebuild) => {
+                    eprintln!(
+                        "devmanager-kernel: applied migrations {:?}; projection rebuild replayed {} events, drift_detected={}",
+                        migrated.applied_versions, rebuild.events_replayed, rebuild.drift_detected
+                    );
+                    store.startup_rebuild = Some(rebuild);
+                }
+                Err(error) => {
+                    eprintln!(
+                        "devmanager-kernel: applied migrations {:?}; projection rebuild failed: {error:?}",
+                        migrated.applied_versions
+                    );
+                    return Err(error);
+                }
+            }
+        }
         store.integrity_check()?;
         Ok(store)
+    }
+
+    /// The rebuild `open` ran after applying migrations, or `None` when the
+    /// schema was already current. Opening an up-to-date store must not replay.
+    pub(crate) fn startup_rebuild(&self) -> Option<&ProjectionRebuild> {
+        self.startup_rebuild.as_ref()
     }
 
     pub fn rebuild_projections(&mut self) -> Result<ProjectionRebuild, StoreError> {
         let tx = self.conn.transaction()?;
         let result = rebuild_projections_tx(&tx)?;
+        tx.commit()?;
+        Ok(result)
+    }
+
+    /// Replay the durable log into the projection tables and nothing else.
+    ///
+    /// Deliberately NOT [`Self::rebuild_projections`]: that one additionally runs
+    /// three durable-integrity validators over `outbox`, `host_admission` and
+    /// `host_cleanup_branches`, which `open` has never run. Importing them into
+    /// startup would refuse to open a store for reasons unrelated to the
+    /// projection being repaired -- a strictly worse outcome than the gap. Those
+    /// validators still run for every explicit `rebuild_projections` caller, and
+    /// the same invariants are enforced per command at use time.
+    fn rebuild_projection_tables(&mut self) -> Result<ProjectionRebuild, StoreError> {
+        let tx = self.conn.transaction()?;
+        let result = rebuild_projection_tables_tx(&tx)?;
         tx.commit()?;
         Ok(result)
     }
@@ -659,20 +727,21 @@ impl KernelStore {
         })
     }
 
-    fn migrate(&mut self) -> Result<(), StoreError> {
+    fn migrate(&mut self) -> Result<MigrationOutcome, StoreError> {
         let manifest = schema::migration_manifest();
+        let mut outcome = MigrationOutcome::default();
         loop {
             let applied = load_applied_migrations(&self.conn)?;
             validate_applied_history(&applied, manifest)?;
 
             if applied.len() >= manifest.len() {
                 detect_interrupted_partial_schema(&self.conn, &applied)?;
-                return Ok(());
+                return Ok(outcome);
             }
 
             let next_index = applied.len();
             let Some(migration) = manifest.get(next_index) else {
-                return Ok(());
+                return Ok(outcome);
             };
 
             let expected_version = i64::try_from(next_index.checked_add(1).ok_or(
@@ -711,6 +780,7 @@ impl KernelStore {
                 ],
             )?;
             tx.commit()?;
+            outcome.applied_versions.push(migration.version);
         }
     }
 
