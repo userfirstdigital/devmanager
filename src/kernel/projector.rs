@@ -730,6 +730,35 @@ pub(crate) fn apply_event(
                     resource.updated_at_ms,
                 ],
             )?;
+            // Every terminal gets durable facts; only a plain shell (a terminal
+            // recipe carrying a launch) is a user-facing strip tab. Keep this in
+            // lockstep with the `ResourceRegistered` arm of `apply_into`.
+            if resource.resource_kind == crate::domain::resource::ResourceKind::Terminal {
+                let title = match &resource.recipe {
+                    crate::domain::resource::ResourceRecipe::Terminal { title, .. } => {
+                        title.clone()
+                    }
+                    _ => None,
+                };
+                tx.execute(
+                    &format!(
+                        "INSERT INTO {} (
+                            resource_id, task_id, title, live_cwd, exit_code, exit_summary,
+                            exited_at_ms, created_at_ms, last_activity_at_ms
+                         ) VALUES (?1, ?2, ?3, NULL, NULL, NULL, NULL, ?4, ?4)",
+                        table_name("terminal_facts", shadow)
+                    ),
+                    rusqlite::params![
+                        resource.id.as_bytes().as_slice(),
+                        task_id.as_bytes().as_slice(),
+                        title,
+                        event.occurred_at_ms,
+                    ],
+                )?;
+                if resource.recipe.is_plain_shell() {
+                    append_to_terminal_strip(tx, shadow, task_id, resource.id)?;
+                }
+            }
             bump_task_revision(tx, shadow, task_id, event)?;
         }
         Event::ResourceReleaseBegun {
@@ -764,6 +793,16 @@ pub(crate) fn apply_event(
                 ResourceLifecycle::Released,
                 event.occurred_at_ms,
             )?;
+            // The resource row survives a release; its terminal facts and its
+            // strip entry do not. `apply_into` drops exactly the same two.
+            tx.execute(
+                &format!(
+                    "DELETE FROM {} WHERE resource_id = ?1",
+                    table_name("terminal_facts", shadow)
+                ),
+                rusqlite::params![resource_id.as_bytes().as_slice()],
+            )?;
+            remove_from_terminal_strip(tx, shadow, task_id, *resource_id)?;
             bump_task_revision(tx, shadow, task_id, event)?;
         }
         Event::ProviderInputAccepted {
@@ -1577,18 +1616,75 @@ pub(crate) fn apply_event(
                 ));
             }
         }
-        // The V16 terminal tables are written in a later task. Until then the
-        // revision-consuming pair must still advance tasks.revision, or the
-        // projection falls behind the domain replay the first time a rename is
-        // persisted.
-        Event::TerminalRenamed { .. } | Event::TaskTerminalStripSet { .. } => {
+        Event::TerminalRenamed { resource_id, title } => {
             let task_id = require_task_id(event)?;
+            tx.execute(
+                &format!(
+                    "UPDATE {} SET title = ?1 WHERE resource_id = ?2",
+                    table_name("terminal_facts", shadow)
+                ),
+                rusqlite::params![title, resource_id.as_bytes().as_slice()],
+            )?;
+            require_one_change(tx, "terminal rename")?;
+            // The title also lives in the terminal recipe, and `apply_into`
+            // rewrites it there. Leaving the stored recipe behind would make the
+            // projection disagree with a durable replay of the same history,
+            // which `validate_task_history_and_projection_with_agent_sessions`
+            // reads as durable corruption.
+            rewrite_terminal_recipe_title(tx, shadow, *resource_id, Some(title.clone()))?;
             bump_task_revision(tx, shadow, task_id, event)?;
         }
-        // Host-reported facts consume no revision by design.
-        Event::TerminalCwdReported { .. }
-        | Event::TerminalExited { .. }
-        | Event::TerminalActivity { .. } => {}
+        // The three host-reported facts consume no task revision by design, so
+        // none of them bumps `tasks.revision`.
+        Event::TerminalCwdReported { resource_id, cwd } => {
+            tx.execute(
+                &format!(
+                    "UPDATE {} SET live_cwd = ?1, last_activity_at_ms = ?2 WHERE resource_id = ?3",
+                    table_name("terminal_facts", shadow)
+                ),
+                rusqlite::params![
+                    cwd.to_string_lossy().into_owned(),
+                    event.occurred_at_ms,
+                    resource_id.as_bytes().as_slice(),
+                ],
+            )?;
+            require_one_change(tx, "terminal cwd report")?;
+        }
+        Event::TerminalExited {
+            resource_id,
+            code,
+            summary,
+        } => {
+            tx.execute(
+                &format!(
+                    "UPDATE {} SET exit_code = ?1, exit_summary = ?2, exited_at_ms = ?3 \
+                     WHERE resource_id = ?4",
+                    table_name("terminal_facts", shadow)
+                ),
+                rusqlite::params![
+                    code,
+                    summary,
+                    event.occurred_at_ms,
+                    resource_id.as_bytes().as_slice(),
+                ],
+            )?;
+            require_one_change(tx, "terminal exit")?;
+        }
+        Event::TerminalActivity { resource_id } => {
+            tx.execute(
+                &format!(
+                    "UPDATE {} SET last_activity_at_ms = ?1 WHERE resource_id = ?2",
+                    table_name("terminal_facts", shadow)
+                ),
+                rusqlite::params![event.occurred_at_ms, resource_id.as_bytes().as_slice()],
+            )?;
+            require_one_change(tx, "terminal activity")?;
+        }
+        Event::TaskTerminalStripSet { strip } => {
+            let task_id = require_task_id(event)?;
+            write_terminal_strip(tx, shadow, task_id, strip)?;
+            bump_task_revision(tx, shadow, task_id, event)?;
+        }
     }
     enforce_derived_result_lineage(tx, event)?;
     Ok(())
@@ -2967,6 +3063,157 @@ fn load_operation_accepted_at_ms(
 
 fn require_valid_operation_fact(result: Result<(), OutcomeFenceError>) -> Result<(), StoreError> {
     result.map_err(|err| StoreError::Projection(err.to_string()))
+}
+
+/// Rewrite the `title` inside a stored terminal recipe, exactly as the
+/// `TerminalRenamed` arm of `apply_into` rewrites it on the in-memory resource.
+/// A non-terminal recipe is left untouched, matching that arm's `if let`.
+fn rewrite_terminal_recipe_title(
+    tx: &Transaction<'_>,
+    shadow: bool,
+    resource_id: ResourceId,
+    title: Option<String>,
+) -> Result<(), StoreError> {
+    let table = table_name("resources", shadow);
+    let recipe_bytes: Option<Vec<u8>> = tx
+        .query_row(
+            &format!("SELECT recipe FROM {table} WHERE resource_id = ?1"),
+            [resource_id.as_bytes().as_slice()],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let Some(recipe_bytes) = recipe_bytes else {
+        return Err(StoreError::Projection(
+            "terminal rename: no resources row for this terminal".into(),
+        ));
+    };
+    let mut recipe: crate::domain::resource::ResourceRecipe = rmp_serde::from_slice(&recipe_bytes)
+        .map_err(|err| StoreError::Projection(format!("resources.recipe decode: {err}")))?;
+    if let crate::domain::resource::ResourceRecipe::Terminal {
+        title: recipe_title,
+        ..
+    } = &mut recipe
+    {
+        *recipe_title = title;
+    } else {
+        return Ok(());
+    }
+    tx.execute(
+        &format!("UPDATE {table} SET recipe = ?1 WHERE resource_id = ?2"),
+        rusqlite::params![pack(&recipe)?, resource_id.as_bytes().as_slice()],
+    )?;
+    require_one_change(tx, "terminal recipe title rewrite")?;
+    Ok(())
+}
+
+/// The stored strip for a task, or `None` when the task has never had one.
+///
+/// The caller distinguishes the two: appending seeds a fresh strip, removing
+/// from an absent one must not mint an empty row.
+fn read_terminal_strip_row(
+    tx: &Transaction<'_>,
+    shadow: bool,
+    task_id: TaskId,
+) -> Result<Option<crate::domain::terminal_facts::TaskTerminalStrip>, StoreError> {
+    let row: Option<(Vec<u8>, Option<Vec<u8>>)> = tx
+        .query_row(
+            &format!(
+                "SELECT order_msgpack, focused_resource_id FROM {} WHERE task_id = ?1",
+                table_name("task_terminal_strip", shadow)
+            ),
+            rusqlite::params![task_id.as_bytes().as_slice()],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?;
+    let Some((order_bytes, focused)) = row else {
+        return Ok(None);
+    };
+    let order: Vec<ResourceId> = rmp_serde::from_slice(&order_bytes).map_err(|err| {
+        StoreError::Projection(format!("task_terminal_strip.order_msgpack: {err}"))
+    })?;
+    let focused = match focused {
+        Some(bytes) => {
+            let array: [u8; 16] = bytes.as_slice().try_into().map_err(|_| {
+                StoreError::Projection(
+                    "task_terminal_strip.focused_resource_id must be 16 bytes".into(),
+                )
+            })?;
+            Some(ResourceId::from_bytes(array).map_err(|err| {
+                StoreError::Projection(format!("task_terminal_strip.focused_resource_id: {err}"))
+            })?)
+        }
+        None => None,
+    };
+    Ok(Some(crate::domain::terminal_facts::TaskTerminalStrip {
+        order,
+        focused,
+    }))
+}
+
+/// Write the strip. `order_msgpack` uses [`pack`] because the snapshot loader
+/// re-encodes it byte-for-byte to prove the blob is lossless.
+///
+/// UPDATE-then-INSERT rather than `ON CONFLICT`, following
+/// [`upsert_provider_session_state`]: a shadow twin is built with
+/// `CREATE TEMP TABLE ... AS SELECT`, which copies no PRIMARY KEY, so an upsert
+/// clause parses on the stable table and fails on every rebuild.
+fn write_terminal_strip(
+    tx: &Transaction<'_>,
+    shadow: bool,
+    task_id: TaskId,
+    strip: &crate::domain::terminal_facts::TaskTerminalStrip,
+) -> Result<(), StoreError> {
+    let table = table_name("task_terminal_strip", shadow);
+    let order = pack(&strip.order)?;
+    let focused = strip.focused.map(|id| id.as_bytes().to_vec());
+    let changed = tx.execute(
+        &format!(
+            "UPDATE {table} SET order_msgpack = ?1, focused_resource_id = ?2 WHERE task_id = ?3"
+        ),
+        rusqlite::params![order, focused, task_id.as_bytes().as_slice()],
+    )?;
+    if changed == 0 {
+        tx.execute(
+            &format!(
+                "INSERT INTO {table} (task_id, order_msgpack, focused_resource_id) \
+                 VALUES (?1, ?2, ?3)"
+            ),
+            rusqlite::params![task_id.as_bytes().as_slice(), order, focused],
+        )?;
+    }
+    Ok(())
+}
+
+fn append_to_terminal_strip(
+    tx: &Transaction<'_>,
+    shadow: bool,
+    task_id: TaskId,
+    resource_id: ResourceId,
+) -> Result<(), StoreError> {
+    let mut strip = read_terminal_strip_row(tx, shadow, task_id)?.unwrap_or_default();
+    if !strip.order.contains(&resource_id) {
+        strip.order.push(resource_id);
+    }
+    if strip.focused.is_none() {
+        strip.focused = Some(resource_id);
+    }
+    write_terminal_strip(tx, shadow, task_id, &strip)
+}
+
+/// Remove a released terminal from the strip, clearing focus when it pointed at
+/// it. Delegates to [`crate::domain::terminal_facts::TaskTerminalStrip::remove`]
+/// so the projection and `apply_into` cannot drift on the focus rule.
+fn remove_from_terminal_strip(
+    tx: &Transaction<'_>,
+    shadow: bool,
+    task_id: TaskId,
+    resource_id: ResourceId,
+) -> Result<(), StoreError> {
+    let Some(mut strip) = read_terminal_strip_row(tx, shadow, task_id)? else {
+        return Ok(());
+    };
+    strip.remove(resource_id);
+    write_terminal_strip(tx, shadow, task_id, &strip)
 }
 
 #[cfg(test)]

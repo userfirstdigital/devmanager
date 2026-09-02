@@ -1846,7 +1846,6 @@ mod provider_restart_identity_tests {
     }
 
     #[test]
-    #[ignore = "terminal facts loader lands in Task 5"]
     fn open_rename_strip_and_close_shell_terminal() {
         let directory = tempfile::tempdir().expect("tempdir");
         let mut bus = CommandBus::open(&directory.path().join("tasks.sqlite")).expect("bus");
@@ -1966,12 +1965,161 @@ mod provider_restart_identity_tests {
                 },
             ))
             .expect("close");
-        let _ = accepted_revision(receipt);
+        let revision = accepted_revision(receipt);
         let snapshot = bus.task_snapshot(task_id).expect("snapshot").expect("task");
         assert_ne!(
             snapshot.resources[&shell.id].lifecycle,
             ResourceLifecycle::Active
         );
+
+        // Drive the release to completion. Only `ResourceReleased` drops the
+        // terminal facts and the strip entry, and it keeps the resource row —
+        // which is exactly the state `decide` must refuse afterwards.
+        let (released_task, _) = bus
+            .settle_next_resource_release(Duration::from_secs(30))
+            .expect("settle release")
+            .expect("one release was queued");
+        assert_eq!(released_task, task_id);
+        let snapshot = bus.task_snapshot(task_id).expect("snapshot").expect("task");
+        assert_eq!(
+            snapshot.resources[&shell.id].lifecycle,
+            ResourceLifecycle::Released
+        );
+        assert!(
+            !snapshot.terminal_facts.contains_key(&shell.id),
+            "a released shell keeps no terminal facts"
+        );
+        assert!(
+            !snapshot.terminal_strip.order.contains(&shell.id),
+            "a released shell keeps no strip entry"
+        );
+        assert_eq!(snapshot.terminal_strip.order, vec![second.id]);
+
+        let revision = snapshot.task.revision.max(revision);
+        let rename_released = bus
+            .execute(task_envelope(
+                client_id,
+                task_id,
+                revision,
+                Command::RenameTerminal {
+                    resource_id: shell.id,
+                    title: "gone".to_string(),
+                },
+            ))
+            .expect("rename of a released shell executes");
+        assert_eq!(rejection_code(&rename_released), RejectionCode::NotFound);
+        let close_released = bus
+            .execute(task_envelope(
+                client_id,
+                task_id,
+                revision,
+                Command::CloseTerminal {
+                    resource_id: shell.id,
+                },
+            ))
+            .expect("close of a released shell executes");
+        assert_eq!(rejection_code(&close_released), RejectionCode::NotFound);
+    }
+
+    /// The V16 tables are projections, so a full rebuild from the event log must
+    /// reproduce them byte-for-byte. This is what proves the shadow twins, both
+    /// hand-written rebuild batches, and the four `canonical_table_dump` arms are
+    /// wired: without them the rebuild reports drift or drops the rows entirely,
+    /// and every reader silently sees a task with no terminals.
+    #[test]
+    fn a_projection_rebuild_reproduces_the_terminal_tables() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let mut bus = CommandBus::open(&directory.path().join("tasks.sqlite")).expect("bus");
+        let client_id = ClientId::new();
+        let (task_id, revision) = create_open_task(&mut bus, client_id);
+
+        let shell = plain_shell_facts(task_id, None);
+        let revision = accepted_revision(
+            bus.execute(task_envelope(
+                client_id,
+                task_id,
+                revision,
+                Command::OpenShellTerminal(OpenShellTerminalIntent {
+                    resource: shell.clone(),
+                }),
+            ))
+            .expect("open shell"),
+        );
+        let second = plain_shell_facts(task_id, None);
+        let revision = accepted_revision(
+            bus.execute(task_envelope(
+                client_id,
+                task_id,
+                revision,
+                Command::OpenShellTerminal(OpenShellTerminalIntent {
+                    resource: second.clone(),
+                }),
+            ))
+            .expect("open second"),
+        );
+        let revision = accepted_revision(
+            bus.execute(task_envelope(
+                client_id,
+                task_id,
+                revision,
+                Command::RenameTerminal {
+                    resource_id: shell.id,
+                    title: "build".to_string(),
+                },
+            ))
+            .expect("rename"),
+        );
+        let _ = accepted_revision(
+            bus.execute(task_envelope(
+                client_id,
+                task_id,
+                revision,
+                Command::SetTerminalStrip(crate::domain::terminal_facts::TaskTerminalStrip {
+                    order: vec![second.id, shell.id],
+                    focused: Some(second.id),
+                }),
+            ))
+            .expect("strip"),
+        );
+        assert_eq!(
+            bus.record_terminal_fact(
+                task_id,
+                shell.id,
+                HostTerminalFact::Exit {
+                    code: Some(1),
+                    summary: "exit 1".to_string(),
+                },
+                1_725_000_000_400,
+            )
+            .expect("record exit"),
+            TerminalFactOutcome::Recorded
+        );
+
+        let before = bus.task_snapshot(task_id).expect("snapshot").expect("task");
+        assert_eq!(before.terminal_strip.order, vec![second.id, shell.id]);
+        assert_eq!(
+            before.terminal_facts[&shell.id].title.as_deref(),
+            Some("build")
+        );
+        assert_eq!(
+            before.terminal_facts[&shell.id]
+                .exit
+                .as_ref()
+                .map(|exit| exit.code),
+            Some(Some(1))
+        );
+
+        let rebuild = bus.store.rebuild_projections().expect("rebuild");
+        assert!(
+            !rebuild.drift_detected,
+            "a replay of the same log must reproduce every projection table exactly"
+        );
+        assert!(rebuild.events_replayed > 0);
+
+        let after = bus.task_snapshot(task_id).expect("snapshot").expect("task");
+        assert_eq!(after.terminal_facts, before.terminal_facts);
+        assert_eq!(after.terminal_strip, before.terminal_strip);
+        assert_eq!(after.resources, before.resources);
     }
 
     fn provider_terminal_facts(task_id: TaskId) -> ResourceFacts {
@@ -7727,7 +7875,12 @@ fn validate_task_history_and_projection_with_agent_sessions(
         && agents_match
         && snap.artifacts == projected.artifacts
         && snap.resources == projected.resources
-        && snap.provider_sessions == projected.provider_sessions;
+        && snap.provider_sessions == projected.provider_sessions
+        // The V16 terminal projection is durable state like every field above
+        // it: a projector arm that drifts from `apply_into` is corruption, and
+        // omitting these two here is what would let that drift ship unseen.
+        && snap.terminal_facts == projected.terminal_facts
+        && snap.terminal_strip == projected.terminal_strip;
     if !same_projection {
         return Err(StoreError::Corruption);
     }
@@ -9545,8 +9698,16 @@ pub(crate) fn load_task_snapshot(
                 "task {task_id} browser projection is invalid: {error}"
             ))
         })?,
-        terminal_facts: Default::default(),
-        terminal_strip: Default::default(),
+        terminal_facts: load_terminal_facts(conn, task_id).map_err(|error| {
+            StoreError::Projection(format!(
+                "task {task_id} terminal projection is invalid: {error}"
+            ))
+        })?,
+        terminal_strip: load_terminal_strip(conn, task_id).map_err(|error| {
+            StoreError::Projection(format!(
+                "task {task_id} terminal projection is invalid: {error}"
+            ))
+        })?,
     }))
 }
 
@@ -9992,6 +10153,105 @@ fn load_resources(
         resources.insert(id, resource);
     }
     Ok(resources)
+}
+
+fn load_terminal_facts(
+    conn: &Connection,
+    task_id: TaskId,
+) -> Result<BTreeMap<ResourceId, crate::domain::terminal_facts::TerminalFacts>, StoreError> {
+    let mut stmt = conn.prepare(
+        "SELECT resource_id, task_id, title, live_cwd, exit_code, exit_summary, exited_at_ms,
+                created_at_ms, last_activity_at_ms
+         FROM terminal_facts WHERE task_id = ?1 ORDER BY resource_id ASC",
+    )?;
+    let rows = stmt.query_map([task_id.as_bytes().as_slice()], |row| {
+        Ok((
+            row.get::<_, Vec<u8>>(0)?,
+            row.get::<_, Vec<u8>>(1)?,
+            row.get::<_, Option<String>>(2)?,
+            row.get::<_, Option<String>>(3)?,
+            row.get::<_, Option<i32>>(4)?,
+            row.get::<_, Option<String>>(5)?,
+            row.get::<_, Option<i64>>(6)?,
+            row.get::<_, i64>(7)?,
+            row.get::<_, i64>(8)?,
+        ))
+    })?;
+    let mut terminal_facts = BTreeMap::new();
+    for row in rows {
+        let (
+            id_bytes,
+            row_task_id,
+            title,
+            live_cwd,
+            exit_code,
+            exit_summary,
+            exited_at_ms,
+            created_at_ms,
+            last_activity_at_ms,
+        ) = row?;
+        let resource_id = id16::<ResourceId>("terminal_facts.resource_id", &id_bytes)?;
+        // Same ownership guard `resources` carries: a row this task does not own
+        // must never reach a snapshot, even though the WHERE clause selected it.
+        if id16::<TaskId>("terminal_facts.task_id", &row_task_id)? != task_id {
+            return Err(StoreError::Projection(
+                "terminal_facts row task ownership mismatch".into(),
+            ));
+        }
+        // An exit is one fact: a summary and the moment it was observed. A row
+        // carrying only one of the two is a half-written exit, not an exit.
+        let exit = match (exit_summary, exited_at_ms) {
+            (Some(summary), Some(at_ms)) => Some(crate::domain::terminal_facts::TerminalExit {
+                code: exit_code,
+                summary,
+                at_ms,
+            }),
+            (None, None) => None,
+            _ => {
+                return Err(StoreError::Projection(
+                    "terminal_facts row records a partial exit".into(),
+                ))
+            }
+        };
+        terminal_facts.insert(
+            resource_id,
+            crate::domain::terminal_facts::TerminalFacts {
+                resource_id,
+                title,
+                live_cwd: live_cwd.map(std::path::PathBuf::from),
+                exit,
+                created_at_ms,
+                last_activity_at_ms,
+            },
+        );
+    }
+    Ok(terminal_facts)
+}
+
+fn load_terminal_strip(
+    conn: &Connection,
+    task_id: TaskId,
+) -> Result<crate::domain::terminal_facts::TaskTerminalStrip, StoreError> {
+    let row: Option<(Vec<u8>, Option<Vec<u8>>)> = conn
+        .query_row(
+            "SELECT order_msgpack, focused_resource_id FROM task_terminal_strip WHERE task_id = ?1",
+            [task_id.as_bytes().as_slice()],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?;
+    let Some((order_bytes, focused)) = row else {
+        return Ok(Default::default());
+    };
+    let order: Vec<ResourceId> =
+        unpack_projection_blob("task_terminal_strip.order_msgpack", &order_bytes)?;
+    let focused = match focused {
+        Some(bytes) => Some(id16::<ResourceId>(
+            "task_terminal_strip.focused_resource_id",
+            &bytes,
+        )?),
+        None => None,
+    };
+    Ok(crate::domain::terminal_facts::TaskTerminalStrip { order, focused })
 }
 
 pub(crate) fn load_all_resources(conn: &Connection) -> Result<Vec<ResourceFacts>, StoreError> {

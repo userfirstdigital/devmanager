@@ -1215,6 +1215,8 @@ fn rebuild_projection_tables_tx(tx: &Transaction<'_>) -> Result<ProjectionRebuil
         "DELETE FROM provider_input_state;\n\
          DELETE FROM agent_sessions;\n\
          DELETE FROM artifacts;\n\
+         DELETE FROM task_terminal_strip;\n\
+         DELETE FROM terminal_facts;\n\
          DELETE FROM resources;\n\
          DELETE FROM operations;\n\
          DELETE FROM tasks;\n\
@@ -1227,6 +1229,8 @@ fn rebuild_projection_tables_tx(tx: &Transaction<'_>) -> Result<ProjectionRebuil
          INSERT INTO agent_sessions SELECT * FROM shadow_agent_sessions;\n\
          INSERT INTO artifacts SELECT * FROM shadow_artifacts;\n\
          INSERT INTO resources SELECT * FROM shadow_resources;\n\
+         INSERT INTO terminal_facts SELECT * FROM shadow_terminal_facts;\n\
+         INSERT INTO task_terminal_strip SELECT * FROM shadow_task_terminal_strip;\n\
          INSERT INTO host_admission SELECT * FROM shadow_host_admission;\n\
          INSERT INTO host_cleanup_branches SELECT * FROM shadow_host_cleanup_branches;\n\
          INSERT INTO provider_input_state SELECT * FROM shadow_provider_input_state;",
@@ -1290,6 +1294,12 @@ fn canonical_table_dump(
         }
         ("provider_input_state", true) => {
             "SELECT * FROM shadow_provider_input_state ORDER BY agent_session_id ASC"
+        }
+        ("terminal_facts", false) => "SELECT * FROM terminal_facts ORDER BY resource_id ASC",
+        ("terminal_facts", true) => "SELECT * FROM shadow_terminal_facts ORDER BY resource_id ASC",
+        ("task_terminal_strip", false) => "SELECT * FROM task_terminal_strip ORDER BY task_id ASC",
+        ("task_terminal_strip", true) => {
+            "SELECT * FROM shadow_task_terminal_strip ORDER BY task_id ASC"
         }
         _ => {
             return Err(StoreError::Projection(format!(

@@ -868,6 +868,61 @@ mod tests {
         }
     }
 
+    /// The classification predicates above are pinned, but `plan_effects` has
+    /// its own exhaustive match over the same events. Pin that too: the two
+    /// mutations plan no host effect at all, and the three host facts are
+    /// refused as decision inputs rather than silently planning nothing.
+    #[test]
+    fn terminal_events_plan_no_effects_and_host_facts_are_refused() {
+        let task_id = TaskId::from_bytes(fixed_uuid_v7(0x50)).unwrap();
+        let resource_id = ResourceId::from_bytes(fixed_uuid_v7(0x51)).unwrap();
+
+        for event in [
+            Event::TerminalRenamed {
+                resource_id,
+                title: "build".to_string(),
+            },
+            Event::TaskTerminalStripSet {
+                strip: Default::default(),
+            },
+        ] {
+            let planned =
+                plan_effects(None, task_id, std::slice::from_ref(&event)).unwrap_or_else(|error| {
+                    panic!("{} must plan cleanly, got {error:?}", event.event_type())
+                });
+            assert!(
+                planned.is_empty(),
+                "{} must plan no host effect",
+                event.event_type()
+            );
+        }
+
+        for event in [
+            Event::TerminalCwdReported {
+                resource_id,
+                cwd: std::path::PathBuf::from("C:/Code/demo"),
+            },
+            Event::TerminalExited {
+                resource_id,
+                code: Some(0),
+                summary: "done".to_string(),
+            },
+            Event::TerminalActivity { resource_id },
+        ] {
+            match plan_effects(None, task_id, std::slice::from_ref(&event)) {
+                Err(StoreError::Projection(detail)) => assert!(
+                    detail.contains("not decision inputs"),
+                    "{} must be refused as a decision input, got {detail}",
+                    event.event_type()
+                ),
+                other => panic!(
+                    "{} must not be plannable, got {other:?}",
+                    event.event_type()
+                ),
+            }
+        }
+    }
+
     #[test]
     fn command_contract_receipt_codec_version_and_unknown_fields() {
         let receipt = CommandReceipt::Accepted {

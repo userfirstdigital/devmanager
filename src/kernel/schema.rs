@@ -1382,6 +1382,30 @@ CREATE UNIQUE INDEX idx_agent_provider_resource\n\
   ON agent_sessions(provider_resource_id) WHERE provider_resource_id IS NOT NULL;\n\
 ";
 
+/// Durable per-terminal facts and the per-task terminal strip. Both are
+/// projections of the terminal events, so they carry the same foreign keys the
+/// rest of the projection uses: `ResourceReleased` deletes the facts row, so
+/// nothing here can outlive the resource it describes.
+const V16_SQL: &str = "\
+CREATE TABLE terminal_facts (\n\
+  resource_id BLOB PRIMARY KEY CHECK(length(resource_id) = 16) REFERENCES resources(resource_id),\n\
+  task_id BLOB NOT NULL CHECK(length(task_id) = 16) REFERENCES tasks(task_id),\n\
+  title TEXT,\n\
+  live_cwd TEXT,\n\
+  exit_code INTEGER,\n\
+  exit_summary TEXT,\n\
+  exited_at_ms INTEGER,\n\
+  created_at_ms INTEGER NOT NULL,\n\
+  last_activity_at_ms INTEGER NOT NULL\n\
+);\n\
+CREATE INDEX idx_terminal_facts_task ON terminal_facts(task_id);\n\
+CREATE TABLE task_terminal_strip (\n\
+  task_id BLOB PRIMARY KEY CHECK(length(task_id) = 16) REFERENCES tasks(task_id),\n\
+  order_msgpack BLOB NOT NULL,\n\
+  focused_resource_id BLOB CHECK(focused_resource_id IS NULL OR length(focused_resource_id) = 16)\n\
+);\n\
+";
+
 /// Provider input authority and durable fenced state are additive to the
 /// scoped receipt ledger. The payload digest lets typed provider retries reject
 /// a reused command id without weakening connection/session scope checks.
@@ -1661,6 +1685,12 @@ pub(crate) fn migration_manifest() -> &'static [Migration] {
                     sql: V15_SQL,
                     sha256: sha256_bytes(V15_SQL),
                 },
+                Migration {
+                    version: 16,
+                    name: "v16_terminal_facts_and_strip",
+                    sql: V16_SQL,
+                    sha256: sha256_bytes(V16_SQL),
+                },
             ];
             verify_manifest(&migrations);
             migrations
@@ -1822,6 +1852,8 @@ pub(crate) const PROJECTION_TABLES: &[&str] = &[
     "host_admission",
     "host_cleanup_branches",
     "provider_input_state",
+    "terminal_facts",
+    "task_terminal_strip",
 ];
 
 #[cfg(test)]
@@ -1977,7 +2009,7 @@ mod tests {
                 .map(|row| row.unwrap())
                 .collect()
         };
-        assert_eq!(history.len(), 15);
+        assert_eq!(history.len(), 16);
         assert_eq!(history[0], (1, "v1_initial".into(), V1_SHA256.to_vec()));
         assert_eq!(
             history[1],
@@ -2022,6 +2054,9 @@ mod tests {
         assert_eq!(history[14].0, 15);
         assert_eq!(history[14].1, "v15_agent_provider_resource_binding");
         assert_eq!(history[14].2, sha256_bytes(V15_SQL).to_vec());
+        assert_eq!(history[15].0, 16);
+        assert_eq!(history[15].1, "v16_terminal_facts_and_strip");
+        assert_eq!(history[15].2, sha256_bytes(V16_SQL).to_vec());
 
         let compacted_column: (String, i64) = conn
             .query_row(
@@ -2564,7 +2599,7 @@ mod tests {
                     row.get(0)
                 })
                 .expect("migration count");
-            assert_eq!(migration_count, 15, "prior schema V{prior_version}");
+            assert_eq!(migration_count, 16, "prior schema V{prior_version}");
             let missing_prompt_command_payloads: i64 = conn
                 .query_row(
                     "SELECT COUNT(*) FROM prompt_command_receipts
@@ -2596,6 +2631,14 @@ mod tests {
                 provider_resource_name,
                 "v15_agent_provider_resource_binding"
             );
+            let terminal_name: String = conn
+                .query_row(
+                    "SELECT name FROM schema_migrations WHERE version = 16",
+                    [],
+                    |row| row.get(0),
+                )
+                .expect("terminal migration record");
+            assert_eq!(terminal_name, "v16_terminal_facts_and_strip");
             let lineage_name: String = conn
                 .query_row(
                     "SELECT name FROM schema_migrations WHERE version = 12",
@@ -2717,8 +2760,8 @@ mod tests {
     #[test]
     fn provider_resource_v15_is_contiguous_and_hash_locked() {
         let migrations = migration_manifest();
-        assert_eq!(latest_migration_version(), 15);
-        assert_eq!(migrations.len(), 15);
+        assert_eq!(latest_migration_version(), 16);
+        assert_eq!(migrations.len(), 16);
         assert_eq!(migrations[13].version, 14);
         assert_eq!(migrations[13].name, "connect-identity-v1");
         assert_eq!(migrations[13].sha256, V14_SHA256);
@@ -2727,6 +2770,21 @@ mod tests {
         assert_eq!(migrations[14].version, 15);
         assert_eq!(migrations[14].name, "v15_agent_provider_resource_binding");
         assert_eq!(migrations[14].sha256, sha256_bytes(V15_SQL));
+        assert_eq!(migrations[15].version, 16);
+        assert_eq!(migrations[15].name, "v16_terminal_facts_and_strip");
+        assert_eq!(migrations[15].sha256, sha256_bytes(V16_SQL));
+    }
+
+    #[test]
+    fn v16_adds_terminal_facts_and_strip_tables() {
+        let migrations = migration_manifest();
+        assert_eq!(migrations.len(), 16);
+        assert_eq!(migrations[15].version, 16);
+        assert_eq!(migrations[15].name, "v16_terminal_facts_and_strip");
+        assert!(V16_SQL.contains("CREATE TABLE terminal_facts"));
+        assert!(V16_SQL.contains("CREATE TABLE task_terminal_strip"));
+        assert!(PROJECTION_TABLES.contains(&"terminal_facts"));
+        assert!(PROJECTION_TABLES.contains(&"task_terminal_strip"));
     }
 
     #[test]
