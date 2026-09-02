@@ -1,6 +1,8 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::Duration;
 
+use crate::domain::cockpit::TaskTerminalsProjection;
+use crate::domain::id::ResourceId;
 use crate::domain::{
     CommandId, EventId, PrivacyClass, SemanticJournalFact, SemanticJournalPage,
     SemanticJournalPayload, TaskId, TaskTerminalProjection,
@@ -284,7 +286,14 @@ pub struct TaskSurfaceState {
     /// bounded background wave.
     pub last_conversation_scheduled_at: u64,
     pub latest_snippet: Option<String>,
-    pub latest_terminal: Option<TaskTerminalProjection>,
+    /// One retained screen per terminal resource on the Task. The provider slot
+    /// and every plain shell live here side by side; nothing in this map is
+    /// "the" terminal on its own -- `focused_resource` decides that.
+    pub terminals: BTreeMap<ResourceId, TaskTerminalProjection>,
+    /// The Task's terminal strip as the host last answered it, when one has
+    /// been queried. `None` means the strip has never been admitted, which is
+    /// not the same as an empty strip.
+    pub strip: Option<TaskTerminalsProjection>,
     pub terminal_attachment: TerminalAttachmentState,
     terminal_query_in_flight: bool,
     pending_user_messages: Vec<PendingUserMessage>,
@@ -307,6 +316,33 @@ pub enum CenterSurfaceLoadingState {
 }
 
 impl TaskSurfaceState {
+    /// The one terminal resource this surface is currently showing.
+    ///
+    /// The host-owned strip focus wins when the strip has been admitted and
+    /// names a resource. Before that -- and for a Task whose strip query has
+    /// not landed yet -- the provider slot is the default, and a Task that has
+    /// only shells falls back to the first by resource id so a screen is never
+    /// silently dropped.
+    pub fn focused_resource(&self) -> Option<ResourceId> {
+        self.strip
+            .as_ref()
+            .and_then(|strip| strip.focused)
+            .filter(|resource_id| self.terminals.contains_key(resource_id))
+            .or_else(|| {
+                self.terminals
+                    .values()
+                    .find(|terminal| terminal.is_provider)
+                    .map(|terminal| terminal.resource_id)
+            })
+            .or_else(|| self.terminals.keys().next().copied())
+    }
+
+    /// The focused terminal's retained projection, if one has been admitted.
+    pub fn latest_terminal(&self) -> Option<&TaskTerminalProjection> {
+        self.focused_resource()
+            .and_then(|resource_id| self.terminals.get(&resource_id))
+    }
+
     pub fn center_loading_state(
         &self,
         showing_terminal: bool,
@@ -314,7 +350,7 @@ impl TaskSurfaceState {
         if showing_terminal {
             ((self.terminal_query_in_flight
                 || self.terminal_attachment == TerminalAttachmentState::Starting)
-                && self.latest_terminal.is_none())
+                && self.latest_terminal().is_none())
             .then_some(CenterSurfaceLoadingState::TerminalInitial)
         } else {
             (self.conversation_in_flight && !self.conversation_has_content())
@@ -324,14 +360,14 @@ impl TaskSurfaceState {
 
     pub fn note_terminal_query_started(&mut self) {
         self.terminal_query_in_flight = true;
-        if self.latest_terminal.is_none() {
+        if self.latest_terminal().is_none() {
             self.terminal_attachment = TerminalAttachmentState::Starting;
         }
     }
 
     pub fn note_terminal_reconnecting(&mut self) {
         self.terminal_query_in_flight = false;
-        if self.latest_terminal.is_some() {
+        if self.latest_terminal().is_some() {
             self.terminal_attachment = TerminalAttachmentState::StaleReconnecting;
         } else {
             // Starting is an in-flight promise, not a generic retry label.
@@ -348,7 +384,7 @@ impl TaskSurfaceState {
     /// unavailable state between polls.
     pub fn note_terminal_start_pending(&mut self) {
         self.terminal_query_in_flight = false;
-        if self.latest_terminal.is_some() {
+        if self.latest_terminal().is_some() {
             self.terminal_attachment = TerminalAttachmentState::StaleReconnecting;
         } else {
             self.terminal_attachment = TerminalAttachmentState::Starting;
@@ -374,7 +410,8 @@ impl TaskSurfaceState {
     }
 
     pub fn terminal_is_interactive(&self) -> bool {
-        self.terminal_attachment == TerminalAttachmentState::Live && self.latest_terminal.is_some()
+        self.terminal_attachment == TerminalAttachmentState::Live
+            && self.latest_terminal().is_some()
     }
 
     pub fn terminal_label(&self) -> &'static str {
@@ -398,7 +435,7 @@ impl TaskSurfaceState {
     }
 
     pub fn terminal_tail(&self, max: usize) -> Vec<String> {
-        let Some(terminal) = self.latest_terminal.as_ref() else {
+        let Some(terminal) = self.latest_terminal() else {
             return Vec::new();
         };
         if terminal.screen.lines.is_empty() {
@@ -742,9 +779,40 @@ impl<K: Clone + Ord + Eq> TaskSurfaceRegistry<K> {
             return Err(SurfaceAdmissionError::WrongTask);
         }
         let state = self.ensure_task(task_id);
-        state.latest_terminal = Some(projection.clone());
+        state
+            .terminals
+            .insert(projection.resource_id, projection.clone());
         state.terminal_attachment = TerminalAttachmentState::Live;
         state.terminal_query_in_flight = false;
+        Ok(())
+    }
+
+    /// Admit the Task's terminal strip.
+    ///
+    /// The strip is the host's authority on which terminals exist, so a
+    /// retained screen for a resource the strip no longer lists is dropped
+    /// here rather than left to age out. This never admits screen bytes: chips
+    /// carry no output, and the focused terminal's screen still arrives on the
+    /// ordinary terminal query.
+    pub fn admit_terminals(
+        &mut self,
+        task_id: K,
+        projection: &TaskTerminalsProjection,
+    ) -> Result<(), SurfaceAdmissionError>
+    where
+        K: SurfaceTaskKey,
+    {
+        if task_id.domain_task_id() != projection.task_id {
+            return Err(SurfaceAdmissionError::WrongTask);
+        }
+        let state = self.ensure_task(task_id);
+        state.terminals.retain(|resource_id, _| {
+            projection
+                .terminals
+                .iter()
+                .any(|chip| chip.resource_id == *resource_id)
+        });
+        state.strip = Some(projection.clone());
         Ok(())
     }
 
@@ -1042,7 +1110,7 @@ mod tests {
             terminal.center_loading_state(true),
             Some(CenterSurfaceLoadingState::TerminalInitial)
         );
-        terminal.latest_terminal = surface_with_terminal_lines(&["cached"]).latest_terminal;
+        terminal.terminals = surface_with_terminal_lines(&["cached"]).terminals;
         assert_eq!(
             terminal.center_loading_state(true),
             None,
@@ -1053,9 +1121,10 @@ mod tests {
     #[test]
     fn compact_wire_terminal_reconstructs_text_tail_from_indexed_cells() {
         let mut surface = surface_with_terminal_lines(&["first", "second"]);
+        let focused = surface.focused_resource().expect("terminal");
         surface
-            .latest_terminal
-            .as_mut()
+            .terminals
+            .get_mut(&focused)
             .expect("terminal")
             .screen
             .lines
@@ -1065,6 +1134,150 @@ mod tests {
             surface.terminal_tail(2),
             vec!["first".to_string(), "second".to_string()]
         );
+    }
+
+    /// One terminal projection for `task_id`, keyed by `resource_id`.
+    ///
+    /// `is_provider` decides which slot the projection stands for: the task's
+    /// provider terminal carries a real agent session, a plain shell carries
+    /// the documented `AgentSessionId::nil()` / zero-generation sentinels the
+    /// host sends for a shell.
+    fn terminal_projection_fixture(
+        task_id: TaskId,
+        resource_id: crate::domain::id::ResourceId,
+        is_provider: bool,
+    ) -> TaskTerminalProjection {
+        use crate::domain::id::{AgentSessionId, TerminalId};
+        use crate::terminal::protocol::TerminalSessionId;
+        use crate::terminal::session::TerminalScreenSnapshot;
+
+        TaskTerminalProjection {
+            accepts_input_without_conversation_id: false,
+            task_id,
+            terminal_id: TerminalId::new(),
+            session_id: TerminalSessionId::new(),
+            agent_session_id: if is_provider {
+                AgentSessionId::new()
+            } else {
+                AgentSessionId::nil()
+            },
+            resource_id,
+            runtime_generation: if is_provider { 1 } else { 0 },
+            resource_generation: 1,
+            action_epoch: if is_provider { 1 } else { 0 },
+            focus_epoch: crate::terminal::protocol::FocusEpoch::initial(),
+            accepted_input_sequence: 0,
+            sequence: 1,
+            title: None,
+            text_lines: Vec::new(),
+            screen: TerminalScreenSnapshot::default(),
+            is_provider,
+            runtime_state: crate::domain::cockpit::TerminalRuntimeStateWire::Running,
+        }
+    }
+
+    fn terminal_chip_fixture(
+        projection: &TaskTerminalProjection,
+    ) -> crate::domain::cockpit::TaskTerminalChip {
+        crate::domain::cockpit::TaskTerminalChip {
+            resource_id: projection.resource_id,
+            is_provider: projection.is_provider,
+            title: None,
+            label: if projection.is_provider {
+                "terminal".into()
+            } else {
+                "pwsh".into()
+            },
+            runtime_state: projection.runtime_state.clone(),
+            live_cwd: None,
+            exit: None,
+            created_at_ms: 0,
+            last_activity_at_ms: 0,
+        }
+    }
+
+    #[test]
+    fn registry_holds_one_projection_per_terminal_resource() {
+        let mut registry = TaskSurfaceRegistry::<TaskId>::default();
+        let task_id = TaskId::new();
+        let provider =
+            terminal_projection_fixture(task_id, crate::domain::id::ResourceId::new(), true);
+        let shell =
+            terminal_projection_fixture(task_id, crate::domain::id::ResourceId::new(), false);
+        registry.admit_terminal(task_id, &provider).unwrap();
+        registry.admit_terminal(task_id, &shell).unwrap();
+        let state = registry.state(task_id).unwrap();
+        assert_eq!(state.terminals.len(), 2);
+        assert!(state.terminals.contains_key(&provider.resource_id));
+        assert!(state.terminals.contains_key(&shell.resource_id));
+        // With no strip admitted the provider is the default focus, whatever
+        // order the two resource ids happen to sort in.
+        assert_eq!(state.focused_resource(), Some(provider.resource_id));
+        assert_eq!(
+            state.latest_terminal().map(|terminal| terminal.resource_id),
+            Some(provider.resource_id)
+        );
+    }
+
+    #[test]
+    fn admitted_strip_focus_selects_the_visible_terminal_and_retires_dropped_resources() {
+        let mut registry = TaskSurfaceRegistry::<TaskId>::default();
+        let task_id = TaskId::new();
+        let provider =
+            terminal_projection_fixture(task_id, crate::domain::id::ResourceId::new(), true);
+        let shell =
+            terminal_projection_fixture(task_id, crate::domain::id::ResourceId::new(), false);
+        let gone =
+            terminal_projection_fixture(task_id, crate::domain::id::ResourceId::new(), false);
+        registry.admit_terminal(task_id, &provider).unwrap();
+        registry.admit_terminal(task_id, &shell).unwrap();
+        registry.admit_terminal(task_id, &gone).unwrap();
+
+        let strip = TaskTerminalsProjection {
+            task_id,
+            terminals: vec![
+                terminal_chip_fixture(&provider),
+                terminal_chip_fixture(&shell),
+            ],
+            order: vec![shell.resource_id],
+            focused: Some(shell.resource_id),
+        };
+        registry.admit_terminals(task_id, &strip).unwrap();
+
+        let state = registry.state(task_id).unwrap();
+        assert_eq!(
+            state.terminals.len(),
+            2,
+            "a resource the strip no longer lists must not keep a cached screen"
+        );
+        assert!(!state.terminals.contains_key(&gone.resource_id));
+        assert_eq!(state.focused_resource(), Some(shell.resource_id));
+        assert_eq!(
+            state.latest_terminal().map(|terminal| terminal.resource_id),
+            Some(shell.resource_id)
+        );
+        assert_eq!(
+            state.strip.as_ref().map(|strip| strip.task_id),
+            Some(task_id)
+        );
+    }
+
+    #[test]
+    fn strip_admission_rejects_a_foreign_task() {
+        let mut registry = TaskSurfaceRegistry::<TaskId>::default();
+        let task_id = TaskId::new();
+        let other = TaskId::new();
+        let strip = TaskTerminalsProjection {
+            task_id: other,
+            terminals: Vec::new(),
+            order: Vec::new(),
+            focused: None,
+        };
+        assert_eq!(
+            registry.admit_terminals(task_id, &strip),
+            Err(SurfaceAdmissionError::WrongTask)
+        );
+        assert!(registry.state(task_id).is_none());
     }
 
     fn surface_with_terminal_lines(lines: &[&str]) -> TaskSurfaceState {
@@ -1116,7 +1329,7 @@ mod tests {
             })
             .collect();
         let mut surface = TaskSurfaceState::default();
-        surface.latest_terminal = Some(TaskTerminalProjection {
+        let projection = TaskTerminalProjection {
             accepts_input_without_conversation_id: false,
             task_id,
             terminal_id: TerminalId::new(),
@@ -1140,7 +1353,8 @@ mod tests {
             },
             is_provider: true,
             runtime_state: crate::domain::cockpit::TerminalRuntimeStateWire::Running,
-        });
+        };
+        surface.terminals.insert(projection.resource_id, projection);
         surface.terminal_attachment = TerminalAttachmentState::Live;
         surface
     }
@@ -1775,7 +1989,8 @@ mod tests {
         let local = host_key("local", shared);
         let mut registry = TaskSurfaceRegistry::<TestHostKey>::default();
         let mut projection = surface_with_terminal_lines(&["mismatch"])
-            .latest_terminal
+            .latest_terminal()
+            .cloned()
             .expect("projection");
         projection.task_id = other;
 
@@ -1793,7 +2008,8 @@ mod tests {
         let remote = host_key("remote", shared);
         let mut registry = TaskSurfaceRegistry::<TestHostKey>::default();
         let mut projection = surface_with_terminal_lines(&["shared-raw"])
-            .latest_terminal
+            .latest_terminal()
+            .cloned()
             .expect("projection");
         projection.task_id = shared;
 
@@ -1817,13 +2033,13 @@ mod tests {
         assert_eq!(
             registry
                 .state(local)
-                .and_then(|s| s.latest_terminal.as_ref().map(|p| p.task_id)),
+                .and_then(|s| s.latest_terminal().map(|p| p.task_id)),
             Some(shared)
         );
         assert_eq!(
             registry
                 .state(remote)
-                .and_then(|s| s.latest_terminal.as_ref().map(|p| p.task_id)),
+                .and_then(|s| s.latest_terminal().map(|p| p.task_id)),
             Some(shared),
             "domain TaskId on projection is unchanged; owners stay distinct"
         );
@@ -1835,7 +2051,8 @@ mod tests {
         let other = TaskId::new();
         let mut registry = TaskSurfaceRegistry::default();
         let mut projection = surface_with_terminal_lines(&["local-mismatch"])
-            .latest_terminal
+            .latest_terminal()
+            .cloned()
             .expect("projection");
         projection.task_id = other;
 

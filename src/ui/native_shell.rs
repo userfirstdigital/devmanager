@@ -20586,7 +20586,7 @@ impl NativeShell {
         let Some(terminal) = self
             .task_surfaces
             .state(owner.clone())
-            .and_then(|state| state.latest_terminal.as_ref())
+            .and_then(|state| state.latest_terminal())
             .cloned()
         else {
             return false;
@@ -20797,7 +20797,7 @@ impl NativeShell {
         let latest_terminal = self
             .task_surfaces
             .state(owner.clone())
-            .and_then(|state| state.latest_terminal.as_ref());
+            .and_then(|state| state.latest_terminal());
         let after_sequence = latest_terminal.map_or(0, |projection| projection.sequence);
         let anchor = latest_terminal
             .and_then(|projection| projection.screen.cursor)
@@ -21062,7 +21062,7 @@ impl NativeShell {
         }
         self.task_surfaces
             .state(owner.clone())
-            .and_then(|state| state.latest_terminal.as_ref())
+            .and_then(|state| state.latest_terminal())
             .map(|projection| {
                 crate::ui::task_cockpit::dock::ContextDock::terminal_pane_model_for_projection(
                     projection,
@@ -22265,7 +22265,7 @@ impl NativeShell {
         let Some(terminal) = self
             .task_surfaces
             .state(owner.clone())
-            .and_then(|surface| surface.latest_terminal.as_ref())
+            .and_then(|surface| surface.latest_terminal())
             .cloned()
         else {
             if let Some(slot) = self.host_slot_mut(&owner.host) {
@@ -25303,7 +25303,7 @@ impl NativeShell {
         let pane = self
             .task_surfaces
             .state(owner.clone())
-            .and_then(|state| state.latest_terminal.as_ref())
+            .and_then(|state| state.latest_terminal())
             .map(crate::ui::task_cockpit::dock::ContextDock::terminal_pane_model_for_projection)
             .or_else(|| {
                 let pane = self
@@ -25553,7 +25553,7 @@ impl NativeShell {
         let current = self
             .task_surfaces
             .state(owner.clone())
-            .and_then(|state| state.latest_terminal.as_ref())
+            .and_then(|state| state.latest_terminal())
             .map(|terminal| {
                 (
                     terminal.screen.cols.clamp(1, u16::MAX as usize) as u16,
@@ -25594,7 +25594,7 @@ impl NativeShell {
         let pane = self
             .task_surfaces
             .state(owner.clone())
-            .and_then(|state| state.latest_terminal.as_ref())
+            .and_then(|state| state.latest_terminal())
             .map(crate::ui::task_cockpit::dock::ContextDock::terminal_pane_model_for_projection)
             .map(|pane| self.pane_with_owner_selection(owner, pane));
         let shell_entity = cx.weak_entity();
@@ -26994,7 +26994,7 @@ impl NativeShell {
         let pane = self
             .task_surfaces
             .state(owner.clone())
-            .and_then(|state| state.latest_terminal.as_ref())
+            .and_then(|state| state.latest_terminal())
             .map(crate::ui::task_cockpit::dock::ContextDock::terminal_pane_model_for_projection)
             .map(|pane| self.pane_with_owner_selection(&owner, pane));
         let chrome = native_center_terminal_chrome_plan();
@@ -64122,7 +64122,7 @@ mod tests {
                 let before_surface_terminal = shell
                     .task_surfaces
                     .state(owner.clone())
-                    .and_then(|state| state.latest_terminal.clone());
+                    .and_then(|state| state.latest_terminal().cloned());
                 assert!(
                     before_surface_terminal.is_none(),
                     "pre-fixture task surface must not hold a terminal projection"
@@ -64207,7 +64207,7 @@ mod tests {
                 let after_surface = shell
                     .task_surfaces
                     .state(owner.clone())
-                    .and_then(|state| state.latest_terminal.as_ref());
+                    .and_then(|state| state.latest_terminal());
                 assert!(
                     after_surface.is_none(),
                     "forged Terminal body must not install a task-surface terminal projection"
