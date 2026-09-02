@@ -32,7 +32,7 @@ impl std::fmt::Display for ResourceValidationError {
             Self::InvalidTerminalTitle => {
                 write!(
                     f,
-                    "terminal title must be trimmed, non-empty, and at most {MAX_TERMINAL_TITLE_CHARS} characters"
+                    "terminal title requires a launch, and must be trimmed, non-empty, and at most {MAX_TERMINAL_TITLE_CHARS} characters"
                 )
             }
             Self::EmptyRecipe => write!(f, "resource recipe must be non-empty"),
@@ -102,6 +102,11 @@ pub enum ResourceRecipe {
         /// `None`: provider-owned terminal (the pre-V16 shape). `Some`: plain shell.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         launch: Option<TerminalLaunch>,
+        /// Only a plain shell may be titled. `projector::pack` is `rmp_serde::to_vec`
+        /// (compact), which serialises a struct variant POSITIONALLY, so a skipped
+        /// field shortens the array and `{ launch: None, title: Some(_) }` would pack
+        /// the title into launch's slot and fail to decode. `canonicalize`/`validate`
+        /// refuse that combination so it can never reach the store.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         title: Option<String>,
     },
@@ -173,6 +178,9 @@ impl ResourceRecipe {
                     launch.validate()?;
                 }
                 let title = Self::canonical_title(title)?;
+                if launch.is_none() && title.is_some() {
+                    return Err(ResourceValidationError::InvalidTerminalTitle);
+                }
                 Ok(Self::Terminal {
                     cols,
                     rows,
@@ -200,7 +208,8 @@ impl ResourceRecipe {
                     launch.validate()?;
                 }
                 if let Some(title) = title.as_ref() {
-                    if title.trim() != title
+                    if launch.is_none()
+                        || title.trim() != title
                         || title.is_empty()
                         || title.chars().count() > MAX_TERMINAL_TITLE_CHARS
                     {
@@ -370,7 +379,10 @@ mod tests {
 
     #[test]
     fn legacy_terminal_recipe_decodes_with_no_launch_or_title() {
-        // msgpack of the pre-V16 shape: {"terminal": {"cols": 120, "rows": 40}}
+        // The NAMED-MAP (IPC) encoding of the pre-V16 shape:
+        // {"terminal": {"cols": 120, "rows": 40}}. The durable form is positional --
+        // see provider_terminal_encoding_is_byte_stable_without_new_fields -- and the
+        // decoder must keep accepting both.
         let legacy = rmp_serde::to_vec(&serde_json::json!({
             "terminal": { "cols": 120, "rows": 40 }
         }))
@@ -424,6 +436,11 @@ mod tests {
             before, now,
             "absent launch/title must not change the encoding"
         );
+        assert_eq!(
+            rmp_serde::from_slice::<ResourceRecipe>(&before).expect("decode on-disk bytes"),
+            ResourceRecipe::terminal(120, 40),
+            "the on-disk bytes must still decode to the provider shape"
+        );
     }
 
     #[test]
@@ -458,12 +475,21 @@ mod tests {
         );
     }
 
+    fn sample_launch() -> TerminalLaunch {
+        TerminalLaunch {
+            cwd: std::path::PathBuf::from(r"C:\Code"),
+            program: std::path::PathBuf::from(r"C:\Windows\System32\cmd.exe"),
+            args: vec!["-NoProfile".to_string()],
+        }
+    }
+
     #[test]
     fn terminal_title_is_trimmed_and_bounded() {
+        // Only a plain shell may be titled, so the trim/bound cases all carry a launch.
         let recipe = ResourceRecipe::Terminal {
             cols: 80,
             rows: 24,
-            launch: None,
+            launch: Some(sample_launch()),
             title: Some("  build  ".to_string()),
         }
         .canonicalize()
@@ -473,18 +499,86 @@ mod tests {
             ResourceRecipe::Terminal {
                 cols: 80,
                 rows: 24,
-                launch: None,
+                launch: Some(sample_launch()),
                 title: Some("build".to_string())
             }
         );
         let too_long = ResourceRecipe::Terminal {
             cols: 80,
             rows: 24,
-            launch: None,
+            launch: Some(sample_launch()),
             title: Some("x".repeat(65)),
         };
         assert_eq!(
             too_long.validate(),
+            Err(ResourceValidationError::InvalidTerminalTitle)
+        );
+    }
+
+    #[test]
+    fn provider_terminal_may_not_be_titled() {
+        // A provider-owned terminal is labelled by its provider. It also cannot be
+        // titled on the wire: the compact codec is positional, so skipping `launch`
+        // would slide the title into launch's slot.
+        let titled_provider_terminal = ResourceRecipe::Terminal {
+            cols: 80,
+            rows: 24,
+            launch: None,
+            title: Some("build".to_string()),
+        };
+        assert_eq!(
+            titled_provider_terminal.validate(),
+            Err(ResourceValidationError::InvalidTerminalTitle)
+        );
+        assert_eq!(
+            titled_provider_terminal.canonicalize(),
+            Err(ResourceValidationError::InvalidTerminalTitle)
+        );
+    }
+
+    #[test]
+    fn every_representable_terminal_codec_shape_round_trips() {
+        // `projector::pack` is `rmp_serde::to_vec` (compact), which serialises a struct
+        // variant POSITIONALLY: {"terminal": [cols, rows, launch?, title?]}. A skipped
+        // field shortens the array, so a present field may only follow present ones --
+        // which is why (None, Some) is refused rather than encoded.
+        //
+        // The expected count is read from the msgpack array header at byte 10, i.e.
+        // after the 0x81 map header and the 8-byte "terminal" key: 0x9N for N fields.
+        let cases: Vec<(Option<TerminalLaunch>, Option<String>, u8)> = vec![
+            (None, None, 2),
+            (Some(sample_launch()), None, 3),
+            (Some(sample_launch()), Some("build".to_string()), 4),
+        ];
+        for (launch, title, packed_fields) in cases {
+            let recipe = ResourceRecipe::Terminal {
+                cols: 120,
+                rows: 40,
+                launch,
+                title,
+            }
+            .canonicalize()
+            .expect("canonical");
+            let bytes = rmp_serde::to_vec(&recipe).expect("encode");
+            assert_eq!(
+                bytes[10],
+                0x90 | packed_fields,
+                "packed field count for {recipe:?}"
+            );
+            let decoded: ResourceRecipe = rmp_serde::from_slice(&bytes).expect("decode");
+            assert_eq!(decoded, recipe, "round trip for {recipe:?}");
+        }
+
+        // The fourth combination is unrepresentable, and canonicalize is the gate that
+        // keeps it out of the store.
+        assert_eq!(
+            ResourceRecipe::Terminal {
+                cols: 120,
+                rows: 40,
+                launch: None,
+                title: Some("build".to_string()),
+            }
+            .canonicalize(),
             Err(ResourceValidationError::InvalidTerminalTitle)
         );
     }
