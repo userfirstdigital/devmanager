@@ -237,7 +237,14 @@ fn launchable_working_directory(canonical: PathBuf) -> PathBuf {
             rebuilt.push(component);
         }
     }
-    if rebuilt.as_os_str().len() >= MAX_LEGACY_PATH_CHARS {
+    // The limit is on characters the Win32 layer counts, not on the WTF-8
+    // bytes the OsStr happens to hold: a path full of non-ASCII would otherwise
+    // be judged over the limit while Windows considers it well inside.
+    if rebuilt.to_string_lossy().chars().count() >= MAX_LEGACY_PATH_CHARS {
+        eprintln!(
+            "devmanager: launch cwd {} stays in verbatim form; it exceeds the {MAX_LEGACY_PATH_CHARS}-character legacy limit and a shell that is not long-path aware will not accept it",
+            rebuilt.display()
+        );
         return canonical;
     }
     rebuilt
@@ -874,5 +881,32 @@ mod tests {
             sep = std::path::MAIN_SEPARATOR
         ));
         assert_eq!(super::launchable_working_directory(long.clone()), long);
+    }
+
+    /// The limit is on characters Windows counts, not on the WTF-8 bytes the
+    /// OsStr holds. Counting bytes would keep a non-ASCII path in the verbatim
+    /// form that `cmd.exe` silently ignores, at roughly a third of the length
+    /// Windows actually allows.
+    #[test]
+    fn the_legacy_limit_counts_characters_not_encoded_bytes() {
+        // 200 three-byte characters: well inside 260 characters, well past 260
+        // encoded bytes.
+        let segment = "中".repeat(200);
+        let verbatim = std::path::PathBuf::from(format!(
+            "{sep}{sep}?{sep}C:{sep}{segment}",
+            sep = std::path::MAIN_SEPARATOR
+        ));
+        assert!(
+            verbatim.as_os_str().len() > 260,
+            "the byte length must exceed the limit or this test proves nothing"
+        );
+        let launchable = super::launchable_working_directory(verbatim);
+        assert!(
+            matches!(
+                launchable.components().next(),
+                Some(Component::Prefix(prefix)) if matches!(prefix.kind(), Prefix::Disk(_))
+            ),
+            "a path inside the character limit must still be rewritten: {launchable:?}"
+        );
     }
 }

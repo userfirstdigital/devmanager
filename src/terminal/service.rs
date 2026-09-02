@@ -1424,6 +1424,56 @@ impl TerminalService {
     }
 
     /// Drain pending attached-reader notifications into the service projection.
+    /// The live hosted terminal for one plain shell's durable resource.
+    ///
+    /// `Ok(None)` means there is no open entry for it, which is the ordinary
+    /// answer for a shell that has already been retired.
+    pub fn shell_terminal_id(
+        &self,
+        resource_id: ResourceId,
+    ) -> Result<Option<TerminalId>, TerminalError> {
+        let terminals = self.lock()?;
+        Ok(Self::open_plain_shell_id(&terminals, resource_id))
+    }
+
+    /// One open plain shell per durable resource; `attach_plain_shell` refuses
+    /// a second, so the first match is the only match.
+    fn open_plain_shell_id(
+        terminals: &HashMap<TerminalId, HostedTerminal>,
+        resource_id: ResourceId,
+    ) -> Option<TerminalId> {
+        terminals
+            .iter()
+            .find(|(_, hosted)| {
+                hosted.resource_id == resource_id && hosted.is_plain_shell && !hosted.closed
+            })
+            .map(|(id, _)| *id)
+    }
+
+    /// Drain one plain shell's pending output and answer its delta sequence.
+    ///
+    /// This is the host fact pump's only truthful "did this terminal actually
+    /// produce anything" signal: `sequence` advances on ingested output and on
+    /// lifecycle settlement, and on nothing else -- not on the process merely
+    /// still being alive. It has to drain rather than just read, because
+    /// nothing else advances the sequence while no client is viewing the
+    /// terminal, and a counter that cannot move would make an activity gate
+    /// that can never fire.
+    ///
+    /// The terminal is addressed by its durable resource, which is the identity
+    /// the host pump carries; `NotFound` means there is no live hosted shell
+    /// for it.
+    pub fn shell_output_sequence(&self, resource_id: ResourceId) -> Result<u64, TerminalError> {
+        let mut terminals = self.lock()?;
+        let terminal_id =
+            Self::open_plain_shell_id(&terminals, resource_id).ok_or(TerminalError::NotFound)?;
+        let hosted = terminals
+            .get_mut(&terminal_id)
+            .ok_or(TerminalError::NotFound)?;
+        hosted.drain_attached_output(terminal_id)?;
+        Ok(hosted.sequence.get())
+    }
+
     pub fn pump_attached_output(&self, id: TerminalId) -> Result<(), TerminalError> {
         let mut terminals = self.lock()?;
         let hosted = terminals.get_mut(&id).ok_or(TerminalError::NotFound)?;

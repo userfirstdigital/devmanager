@@ -303,6 +303,12 @@ type ProcessManagerServerSessionSpawnerTestHook = Arc<
 
 pub(crate) struct ProcessManagerInner {
     sessions: Mutex<HashMap<String, Arc<TerminalSession>>>,
+    /// Last working directory any cwd rung actually observed, per plain shell
+    /// session key. A rung that momentarily cannot answer -- a denied
+    /// `OpenProcess`, a directory deleted under the shell -- must not make the
+    /// ladder fall back to the launch directory, because that would publish a
+    /// wrong directory as a durable fact and flap between the two.
+    shell_observed_cwd: Mutex<HashMap<String, PathBuf>>,
     browser_attachment_broker: BrowserAttachmentBroker,
     runtime_state: Arc<RwLock<RuntimeState>>,
     runtime_revision: AtomicU64,
@@ -657,6 +663,7 @@ impl ProcessManager {
         let claude_hook_temp_root = prepare_claude_overlay_process_root();
         let inner = Arc::new(ProcessManagerInner {
             sessions: Mutex::new(HashMap::new()),
+            shell_observed_cwd: Mutex::new(HashMap::new()),
             browser_attachment_broker: BrowserAttachmentBroker::default(),
             runtime_state: Arc::new(RwLock::new(RuntimeState::new(debug_enabled))),
             runtime_revision: AtomicU64::new(1),
@@ -3215,11 +3222,16 @@ impl ProcessManager {
     ///    that carry prompt integration.
     /// 2. The root process PEB, which is what `cmd.exe` and stock PowerShell
     ///    actually update on `cd`; neither emits OSC 7 under this manager.
-    /// 3. The launch directory, which stays true until the shell moves.
+    /// 3. The last directory either rung above actually observed.
+    /// 4. The launch directory, and only before any rung has ever answered.
     ///
-    /// Each rung must be absolute to be returned. `TerminalFacts` silently
-    /// refuses a relative cwd, so a relative answer here would become an
-    /// invisible dropped fact rather than a visible wrong one.
+    /// Rung 3 is what keeps a transient failure from becoming a wrong fact: a
+    /// denied `OpenProcess` or a directory deleted under the shell would
+    /// otherwise drop straight to the launch directory, publish it, and flap
+    /// back on the next tick. Every rung must be absolute to be returned --
+    /// `TerminalFacts` silently refuses a relative cwd, so a relative answer
+    /// here would become an invisible dropped fact rather than a visible wrong
+    /// one.
     pub fn shell_session_cwd(&self, session_id: TerminalSessionId) -> Option<PathBuf> {
         let key = Self::shell_session_key(session_id);
         let (reported, pid, launch_cwd) = {
@@ -3231,10 +3243,21 @@ impl ProcessManager {
                 session.cwd.clone(),
             )
         };
-        reported
+        let observed = reported
             .filter(|cwd| cwd.is_absolute())
-            .or_else(|| pid.and_then(platform_service::root_process_cwd))
-            .or_else(|| Some(launch_cwd).filter(|cwd| cwd.is_absolute()))
+            .or_else(|| pid.and_then(platform_service::root_process_cwd));
+        if let Some(observed) = observed {
+            if let Ok(mut last) = self.inner.shell_observed_cwd.lock() {
+                last.insert(key, observed.clone());
+            }
+            return Some(observed);
+        }
+        if let Ok(last) = self.inner.shell_observed_cwd.lock() {
+            if let Some(previous) = last.get(&key) {
+                return Some(previous.clone());
+            }
+        }
+        Some(launch_cwd).filter(|cwd| cwd.is_absolute())
     }
 
     /// The observed exit for one plain shell, or `None` while it is still live.
@@ -3272,6 +3295,9 @@ impl ProcessManager {
             .lock()
             .map_err(|_| "Session store poisoned".to_string())?
             .contains_key(&key);
+        if let Ok(mut last) = self.inner.shell_observed_cwd.lock() {
+            last.remove(&key);
+        }
         if !owned {
             return Ok(());
         }

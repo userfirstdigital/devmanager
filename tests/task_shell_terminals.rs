@@ -9,8 +9,10 @@ use devmanager::domain::resource::TerminalLaunch;
 use devmanager::domain::{ResourceId, TaskId};
 use devmanager::services::{pid_file, ProcessManager};
 use devmanager::state::SessionDimensions;
-use devmanager::terminal::protocol::TerminalSessionId;
+use devmanager::terminal::protocol::{CloseReason, TerminalSessionId, TerminalSize, TerminalSpec};
+use devmanager::terminal::service::{AttachedTerminalRuntime, TerminalService};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 const CMD_EXE: &str = r"C:\Windows\System32\cmd.exe";
@@ -168,11 +170,16 @@ fn closing_a_task_shell_drops_the_session_and_its_runtime() {
             dimensions(),
         )
         .expect("spawn");
+    let guard = ShellGuard {
+        manager: &manager,
+        session_id,
+    };
     assert!(manager.task_shell_runtime(session_id).is_ok());
 
     manager
         .close_task_shell_session(session_id)
         .expect("close the shell");
+    drop(guard);
 
     assert!(
         manager.task_shell_runtime(session_id).is_err(),
@@ -183,4 +190,99 @@ fn closing_a_task_shell_drops_the_session_and_its_runtime() {
     manager
         .close_task_shell_session(session_id)
         .expect("closing an already-closed shell is a no-op");
+}
+
+/// Closing a shell must retire both halves, in the order the host uses.
+///
+/// The hosted view is closed first so clients see the Exit delta, and the
+/// manager session is closed after. `close_managed_process_exact` sets
+/// `retired` instead of clearing the teardown slot, so the manager still finds
+/// the fence it requires and takes its idempotent path -- neither half is left
+/// `Failed`, `reap_incomplete`, or in its owner's map.
+#[test]
+fn closing_a_shell_retires_the_hosted_view_then_the_manager_session() {
+    let _pid_guard = use_isolated_pid_file("retire-both-halves");
+    let manager = ProcessManager::new();
+    let workdir = tempfile::tempdir().expect("workdir");
+    let task_id = TaskId::new();
+    let resource_id = ResourceId::new();
+    let session_id = manager
+        .spawn_task_shell_session(
+            task_id,
+            resource_id,
+            1,
+            1,
+            &cmd_launch(workdir.path().to_path_buf()),
+            dimensions(),
+        )
+        .expect("spawn");
+    let guard = ShellGuard {
+        manager: &manager,
+        session_id,
+    };
+
+    let service = TerminalService::new();
+    let runtime: Arc<dyn AttachedTerminalRuntime> =
+        manager.task_shell_runtime(session_id).expect("runtime");
+    let spec =
+        TerminalSpec::new(session_id, TerminalSize::new(100, 30).expect("size")).expect("spec");
+    service
+        .attach_plain_shell(task_id, resource_id, 1, spec, runtime)
+        .expect("attach the plain shell");
+    let terminal_id = service
+        .shell_terminal_id(resource_id)
+        .expect("lookup")
+        .expect("an attached shell is addressable by its resource");
+
+    // The activity gate reads this sequence. Prove it can move at all before
+    // trusting a gate built on it: a real shell prints a prompt, so a sequence
+    // that never advances would mean the gate could never fire.
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        let sequence = service
+            .shell_output_sequence(resource_id)
+            .expect("sequence for a live shell");
+        if sequence > 0 {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the hosted delta sequence never advanced for a real shell"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+
+    service
+        .close(terminal_id, CloseReason::ExplicitServiceClose)
+        .expect("the hosted view closes through its verified fence");
+    assert!(
+        service
+            .shell_terminal_id(resource_id)
+            .expect("lookup")
+            .is_none(),
+        "a closed view must not still be addressable"
+    );
+
+    manager
+        .close_task_shell_session(session_id)
+        .expect("the manager close must stay idempotent after the view teardown");
+    assert!(
+        manager.task_shell_runtime(session_id).is_err(),
+        "the manager must drop the session it no longer owns"
+    );
+    let key = format!("shell-{session_id}");
+    if let Some(state) = manager.runtime_state().sessions.get(&key) {
+        assert!(
+            !state.reap_incomplete,
+            "the second teardown must not report an incomplete reap: {:?}",
+            state.exit
+        );
+        assert_ne!(
+            state.status,
+            devmanager::state::SessionStatus::Failed,
+            "neither half may leave the session Failed: {:?}",
+            state.exit
+        );
+    }
+    drop(guard);
 }

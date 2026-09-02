@@ -41,7 +41,9 @@ use crate::domain::resource::{
     OwnerKind, ResourceFacts, ResourceKind, ResourceLifecycle, ResourceRecipe,
 };
 use crate::domain::snapshot::{PageLimits, SnapshotSection};
-use crate::domain::terminal_facts::{HostTerminalFact, TERMINAL_ACTIVITY_COALESCE_MS};
+use crate::domain::terminal_facts::{
+    HostTerminalFact, TERMINAL_ACTIVITY_COALESCE_MS, TERMINAL_CWD_DEBOUNCE_MS,
+};
 use crate::domain::ClientId;
 use crate::domain::{AgentSessionId, PresentProviderQuestionIntent};
 use crate::kernel::{
@@ -53,7 +55,7 @@ use crate::protocol::{
     NegotiatedParameters, ServerMessage, StreamFrame, StreamKey, UpdateHandoffReply,
 };
 use crate::state::SessionDimensions;
-use crate::terminal::protocol::TerminalSpec;
+use crate::terminal::protocol::{CloseReason, TerminalSpec};
 use crate::terminal::service::AttachedTerminalRuntime;
 use crate::terminal::service::TerminalService;
 #[cfg(test)]
@@ -2718,6 +2720,10 @@ struct ShellSessionLink {
     last_cwd_change: Option<Instant>,
     /// When this link last offered an activity fact. `None` means never.
     last_activity_offer: Option<Instant>,
+    /// Hosted-terminal delta sequence at the last offered activity fact.
+    /// Activity means the terminal produced output, never that its process is
+    /// still alive, so an unchanged sequence offers nothing.
+    last_activity_sequence: u64,
     exit_recorded: bool,
 }
 
@@ -2736,8 +2742,14 @@ impl ShellSessionLink {
         now: Instant,
         debounce: Duration,
     ) -> Option<PathBuf> {
-        if observed != self.last_cwd {
-            self.last_cwd = observed.clone();
+        // A sample the manager could not take is not a move. Retracting or
+        // re-arming on it would flap a settled directory against the launch
+        // directory every time a single read failed.
+        let Some(observed) = observed else {
+            return None;
+        };
+        if Some(&observed) != self.last_cwd.as_ref() {
+            self.last_cwd = Some(observed.clone());
             self.last_cwd_change = Some(now);
         }
         if !self
@@ -2747,17 +2759,27 @@ impl ShellSessionLink {
             return None;
         }
         self.last_cwd_change = None;
-        observed
+        Some(observed)
     }
 
     /// Whether this tick should offer an activity fact.
     ///
-    /// The durable rule already coalesces activity to
-    /// [`TERMINAL_ACTIVITY_COALESCE_MS`], and this defers to that same window
-    /// rather than defining a second one. It exists because the pump runs at
-    /// the one-second reaper cadence: without it every live shell would open a
-    /// write transaction every second only to be told the fact is suppressed.
-    fn should_offer_activity(&mut self, now: Instant) -> bool {
+    /// Two gates, and the first is the meaning of the fact: activity is real
+    /// terminal output, never liveness, so an unchanged hosted-terminal
+    /// sequence offers nothing however long the shell has been running. A
+    /// heartbeat here would make every idle shell look busy forever.
+    ///
+    /// The second is cost. The durable rule already coalesces activity to
+    /// [`TERMINAL_ACTIVITY_COALESCE_MS`] and this defers to that same window
+    /// rather than defining a second one; without it a chatty shell would open
+    /// a write transaction every second only to be told the fact is
+    /// suppressed. The sequence is recorded only when the offer is actually
+    /// made, so output that arrives inside the window is still reported when
+    /// the window closes.
+    fn should_offer_activity(&mut self, now: Instant, sequence: u64) -> bool {
+        if sequence == self.last_activity_sequence {
+            return false;
+        }
         let window = Duration::from_millis(TERMINAL_ACTIVITY_COALESCE_MS as u64);
         if self
             .last_activity_offer
@@ -2766,6 +2788,7 @@ impl ShellSessionLink {
             return false;
         }
         self.last_activity_offer = Some(now);
+        self.last_activity_sequence = sequence;
         true
     }
 }
@@ -2781,10 +2804,6 @@ enum AcceptedShellEffect {
         resource_id: ResourceId,
     },
 }
-
-/// A shell walking a directory tree changes cwd many times a second. Only a
-/// directory it has stayed in for this long is worth a durable fact.
-const SHELL_TERMINAL_CWD_DEBOUNCE: Duration = Duration::from_millis(2_000);
 
 fn provider_restore_success_attention(
     current: crate::domain::task::TaskAttention,
@@ -4167,25 +4186,33 @@ impl HostRequestExecutor {
             .as_ref()
             .map(|runtime| runtime.manager.clone())
         else {
-            self.record_shell_exit(
+            self.refuse_shell_terminal(
                 task_id,
                 resource_id,
-                None,
                 "host has no configured service runtime to spawn a shell in".to_string(),
             );
             return;
         };
         let snapshot = match self.bus.task_snapshot(task_id) {
             Ok(Some(snapshot)) => snapshot,
+            // No task means nothing to attribute a refusal to.
             Ok(None) => return,
             Err(error) => {
-                eprintln!("devmanager-host: shell terminal snapshot unavailable: {error}");
+                self.refuse_shell_terminal(
+                    task_id,
+                    resource_id,
+                    format!("task snapshot unavailable: {error}"),
+                );
                 return;
             }
         };
-        // The resource was just registered by the accepted command, so its
-        // absence here is a released terminal, never a recoverable state.
+        // The command that just registered this resource was accepted, so an
+        // absent resource means it was released again underneath us. There is
+        // no terminal left to carry a fact, hence log-only.
         let Some(resource) = snapshot.resources.get(&resource_id) else {
+            eprintln!(
+                "devmanager-host: shell terminal {resource_id} was released before it could spawn"
+            );
             return;
         };
         let ResourceRecipe::Terminal {
@@ -4195,16 +4222,20 @@ impl HostRequestExecutor {
             ..
         } = &resource.recipe
         else {
+            self.refuse_shell_terminal(
+                task_id,
+                resource_id,
+                "resource is not a plain shell terminal".to_string(),
+            );
             return;
         };
         let (cols, rows, launch) = (*cols, *rows, launch.clone());
         let runtime_generation = resource.runtime_generation;
         if runtime_generation == 0 {
-            self.record_shell_exit(
+            self.refuse_shell_terminal(
                 task_id,
                 resource_id,
-                None,
-                "shell terminal was registered without a runtime generation".to_string(),
+                "registered without a runtime generation".to_string(),
             );
             return;
         }
@@ -4229,19 +4260,14 @@ impl HostRequestExecutor {
         ) {
             Ok(session_id) => session_id,
             Err(error) => {
-                self.record_shell_exit(
-                    task_id,
-                    resource_id,
-                    None,
-                    format!("spawn failed: {error}"),
-                );
+                self.refuse_shell_terminal(task_id, resource_id, format!("spawn failed: {error}"));
                 return;
             }
         };
 
-        let abandon = |executor: &mut Self, summary: String| {
+        let abandon = |executor: &mut Self, reason: String| {
             let _ = manager.close_task_shell_session(session_id);
-            executor.record_shell_exit(task_id, resource_id, None, summary);
+            executor.refuse_shell_terminal(task_id, resource_id, reason);
         };
 
         let attached = match manager.task_shell_runtime(session_id) {
@@ -4288,8 +4314,25 @@ impl HostRequestExecutor {
                 last_cwd: None,
                 last_cwd_change: None,
                 last_activity_offer: None,
+                last_activity_sequence: 0,
                 exit_recorded: false,
             },
+        );
+    }
+
+    /// Refuse one plain shell and say why, in both channels.
+    ///
+    /// A registered terminal whose shell never started is indistinguishable
+    /// from one that started and died unless the reason is written down: the
+    /// exit fact is what a client can see, and the log line is what survives a
+    /// store that is itself refusing writes.
+    fn refuse_shell_terminal(&mut self, task_id: TaskId, resource_id: ResourceId, reason: String) {
+        eprintln!("devmanager-host: shell terminal {resource_id} refused: {reason}");
+        self.record_shell_exit(
+            task_id,
+            resource_id,
+            None,
+            format!("spawn refused: {reason}"),
         );
     }
 
@@ -4300,7 +4343,7 @@ impl HostRequestExecutor {
         code: Option<i32>,
         summary: String,
     ) {
-        self.record_shell_fact(
+        let _ = self.record_shell_fact(
             task_id,
             resource_id,
             HostTerminalFact::Exit { code, summary },
@@ -4319,7 +4362,7 @@ impl HostRequestExecutor {
         task_id: TaskId,
         resource_id: ResourceId,
         fact: HostTerminalFact,
-    ) {
+    ) -> Option<TerminalFactOutcome> {
         let refused_cwd = match &fact {
             HostTerminalFact::Cwd(cwd) if !cwd.is_absolute() => Some(cwd.clone()),
             _ => None,
@@ -4328,7 +4371,10 @@ impl HostRequestExecutor {
             .bus
             .record_terminal_fact(task_id, resource_id, fact, unix_time_ms_u64() as i64)
         {
-            Ok(TerminalFactOutcome::Recorded) => self.fan_out_live_durable_events(),
+            Ok(TerminalFactOutcome::Recorded) => {
+                self.fan_out_live_durable_events();
+                Some(TerminalFactOutcome::Recorded)
+            }
             Ok(TerminalFactOutcome::Suppressed) => {
                 if let Some(cwd) = refused_cwd {
                     eprintln!(
@@ -4336,10 +4382,15 @@ impl HostRequestExecutor {
                         cwd.display()
                     );
                 }
+                Some(TerminalFactOutcome::Suppressed)
             }
-            Ok(TerminalFactOutcome::UnknownTerminal) => self.close_shell_terminal(resource_id),
+            Ok(TerminalFactOutcome::UnknownTerminal) => {
+                self.close_shell_terminal(resource_id);
+                Some(TerminalFactOutcome::UnknownTerminal)
+            }
             Err(error) => {
-                eprintln!("devmanager-host: terminal {resource_id} fact was not written: {error}")
+                eprintln!("devmanager-host: terminal {resource_id} fact was not written: {error}");
+                None
             }
         }
     }
@@ -4369,6 +4420,7 @@ impl HostRequestExecutor {
             };
             let task_id = link.task_id;
             let session_id = link.session_id;
+            let last_sequence = link.last_activity_sequence;
             if link.exit_recorded {
                 continue;
             }
@@ -4381,31 +4433,77 @@ impl HostRequestExecutor {
             }
 
             let observed = manager.shell_session_cwd(session_id);
+            // A sequence this pump cannot read is not new output. `NotFound`
+            // is the ordinary answer once the hosted entry has retired.
+            let sequence = self
+                .terminal_service
+                .shell_output_sequence(resource_id)
+                .unwrap_or(last_sequence);
+            let debounce = Duration::from_millis(TERMINAL_CWD_DEBOUNCE_MS as u64);
             let Some(link) = self.shell_sessions.get_mut(&resource_id) else {
                 continue;
             };
-            let settled_cwd = link.note_cwd_sample(observed, now, SHELL_TERMINAL_CWD_DEBOUNCE);
-            let offer_activity = link.should_offer_activity(now);
+            let settled_cwd = link.note_cwd_sample(observed, now, debounce);
+            let offer_activity = link.should_offer_activity(now, sequence);
+            let mut terminal_is_gone = false;
             if let Some(cwd) = settled_cwd {
-                self.record_shell_fact(task_id, resource_id, HostTerminalFact::Cwd(cwd));
+                terminal_is_gone = matches!(
+                    self.record_shell_fact(task_id, resource_id, HostTerminalFact::Cwd(cwd)),
+                    Some(TerminalFactOutcome::UnknownTerminal)
+                );
             }
-            if offer_activity {
-                self.record_shell_fact(task_id, resource_id, HostTerminalFact::Activity);
+            // The cwd write already told us the durable terminal is gone and
+            // closed the shell; a second write in the same tick would only
+            // re-learn it.
+            if offer_activity && !terminal_is_gone {
+                let _ = self.record_shell_fact(task_id, resource_id, HostTerminalFact::Activity);
             }
         }
     }
 
-    /// Release one plain shell's host runtime.
+    /// Release one plain shell: hosted view first, then the manager session.
     ///
-    /// Only the manager session is closed. The manager's exact teardown reads
-    /// the session's managed process fence and `TerminalService::close`
-    /// consumes that same fence, so whichever ran first would leave the other
-    /// unable to release its own record. The hosted terminal entry is released
-    /// by the durable resource-release path instead.
+    /// The durable `ReleaseResource` effect does **not** reach a plain shell.
+    /// `Command::CloseTerminal` emits only `ResourceReleaseBegun`
+    /// (`src/domain/command.rs:1675`), and the sole host caller of
+    /// `settle_next_resource_release` is the task-close/archive loop
+    /// (`src/host/connection.rs:5687`); that settlement records the outbox row
+    /// as **process-empty** and performs no process effect at all
+    /// (`src/kernel/command_bus.rs:712`, whose own doc says it exists for
+    /// "failed launches [that] register a task-owned terminal without creating
+    /// an OS process"). So this method owns the whole teardown.
+    ///
+    /// Order matters and is safe in exactly this direction.
+    /// `TerminalService::close` verifies the runtime's attachment fence and
+    /// tears the process down through it, which is what retires the view so
+    /// clients receive the Exit delta.
+    /// `TerminalSession::close_managed_process_exact`
+    /// (`src/terminal/session.rs:1074`) does not clear the teardown slot: it
+    /// sets `retired` and returns `Ok` on a repeat. The manager's
+    /// `close_exact_session_owner` therefore still finds the fence it requires
+    /// (`src/services/process_manager.rs:7533`), takes the idempotent path, and
+    /// removes the session from its store. Manager-first would work equally,
+    /// but only this order guarantees the client-visible Exit delta.
     fn close_shell_terminal(&mut self, resource_id: ResourceId) {
         let Some(link) = self.shell_sessions.remove(&resource_id) else {
             return;
         };
+        match self.terminal_service.shell_terminal_id(resource_id) {
+            Ok(Some(terminal_id)) => {
+                if let Err(error) = self
+                    .terminal_service
+                    .close(terminal_id, CloseReason::ExplicitServiceClose)
+                {
+                    eprintln!(
+                        "devmanager-host: shell terminal {resource_id} view close failed: {error:?}"
+                    );
+                }
+            }
+            Ok(None) => {}
+            Err(error) => eprintln!(
+                "devmanager-host: shell terminal {resource_id} view lookup failed: {error:?}"
+            ),
+        }
         if let Some(runtime) = self.configured_service_runtime.as_ref() {
             if let Err(error) = runtime.manager.close_task_shell_session(link.session_id) {
                 eprintln!("devmanager-host: shell terminal {resource_id} close failed: {error}");
@@ -8974,7 +9072,7 @@ mod output_tests {
         ConnectionOutputId, DuplexExecuteCompletion, DurableAdmitResult, EphemeralAdmitResult,
         EphemeralKey, EventReplayRegistry, HostRequestExecutor, HostRequestHandle, LiveStreamState,
         LiveTail, PhysicalWriteAckStatus, PrioritizedOutbound, ShellSessionLink,
-        StreamMaterializer, MAX_CONCURRENT_PROVIDER_RESTORES, SHELL_TERMINAL_CWD_DEBOUNCE,
+        StreamMaterializer, MAX_CONCURRENT_PROVIDER_RESTORES,
     };
     use crate::domain::cockpit::{TaskCockpitQuery, TaskCockpitResult};
     use crate::domain::command::{Command, CommandEnvelope, CreateTaskIntent};
@@ -8991,6 +9089,7 @@ mod output_tests {
         ReviewReadiness, TaskActivity, TaskAssignment, TaskAttention, TaskConnectivity,
         WorkspaceRef,
     };
+    use crate::domain::terminal_facts::{TERMINAL_ACTIVITY_COALESCE_MS, TERMINAL_CWD_DEBOUNCE_MS};
     use crate::domain::ClientId;
     use crate::kernel::SessionScope;
     use crate::protocol::{
@@ -13697,8 +13796,13 @@ mod output_tests {
             last_cwd: None,
             last_cwd_change: None,
             last_activity_offer: None,
+            last_activity_sequence: 0,
             exit_recorded: false,
         }
+    }
+
+    fn cwd_debounce() -> std::time::Duration {
+        std::time::Duration::from_millis(TERMINAL_CWD_DEBOUNCE_MS as u64)
     }
 
     #[test]
@@ -13710,71 +13814,89 @@ mod output_tests {
 
         // A newly observed directory is not a fact yet.
         assert_eq!(
-            link.note_cwd_sample(Some(first.clone()), start, SHELL_TERMINAL_CWD_DEBOUNCE),
+            link.note_cwd_sample(Some(first.clone()), start, cwd_debounce()),
             None
         );
         // Moving on before the window elapses restarts it: a directory the
         // shell only passed through never becomes a durable fact.
-        let mid = start + SHELL_TERMINAL_CWD_DEBOUNCE / 2;
+        let mid = start + cwd_debounce() / 2;
         assert_eq!(
-            link.note_cwd_sample(Some(second.clone()), mid, SHELL_TERMINAL_CWD_DEBOUNCE),
+            link.note_cwd_sample(Some(second.clone()), mid, cwd_debounce()),
             None
         );
         assert_eq!(
-            link.note_cwd_sample(
-                Some(second.clone()),
-                start + SHELL_TERMINAL_CWD_DEBOUNCE,
-                SHELL_TERMINAL_CWD_DEBOUNCE
-            ),
+            link.note_cwd_sample(Some(second.clone()), start + cwd_debounce(), cwd_debounce()),
             None,
             "the window runs from the change, not from the first sample"
         );
 
-        let settled = mid + SHELL_TERMINAL_CWD_DEBOUNCE;
+        let settled = mid + cwd_debounce();
         assert_eq!(
-            link.note_cwd_sample(Some(second.clone()), settled, SHELL_TERMINAL_CWD_DEBOUNCE),
+            link.note_cwd_sample(Some(second.clone()), settled, cwd_debounce()),
             Some(second.clone())
         );
         // And exactly once: re-asking the store every tick to be told nothing
         // changed costs a transaction per shell per tick.
         assert_eq!(
-            link.note_cwd_sample(
-                Some(second),
-                settled + SHELL_TERMINAL_CWD_DEBOUNCE,
-                SHELL_TERMINAL_CWD_DEBOUNCE
-            ),
+            link.note_cwd_sample(Some(second), settled + cwd_debounce(), cwd_debounce()),
             None
         );
     }
 
     #[test]
-    fn activity_is_offered_once_per_durable_coalescing_window() {
+    fn activity_reports_terminal_output_not_a_living_process() {
         let mut link = shell_link_for_test();
         let start = std::time::Instant::now();
-        let window = std::time::Duration::from_millis(super::TERMINAL_ACTIVITY_COALESCE_MS as u64);
+        let window = std::time::Duration::from_millis(TERMINAL_ACTIVITY_COALESCE_MS as u64);
 
-        assert!(link.should_offer_activity(start), "the first tick offers");
-        assert!(
-            !link.should_offer_activity(start + window / 2),
-            "the pump runs every second; without this every live shell would open a              write transaction per second only to be told the fact is suppressed"
-        );
-        assert!(link.should_offer_activity(start + window));
+        // Two ticks over a silent shell. A heartbeat here would make every idle
+        // terminal read as busy for as long as it stays open.
+        assert!(!link.should_offer_activity(start, 0));
+        assert!(!link.should_offer_activity(start + window * 2, 0));
+
+        // Output moves the hosted delta sequence, and that is the activity.
+        assert!(link.should_offer_activity(start + window * 2, 7));
+
+        // Silent again afterwards: nothing more to report.
+        assert!(!link.should_offer_activity(start + window * 4, 7));
+
+        // Output arriving inside the coalescing window is held, not dropped:
+        // the sequence is banked only when the offer is actually made.
+        assert!(!link.should_offer_activity(start + window * 2 + window / 2, 9));
+        assert!(link.should_offer_activity(start + window * 4, 9));
     }
 
     #[test]
-    fn an_unsampleable_cwd_is_a_change_like_any_other_and_records_nothing() {
+    fn a_lost_cwd_sample_neither_retracts_nor_re_offers_the_settled_directory() {
         let mut link = shell_link_for_test();
         let start = std::time::Instant::now();
-        let known = std::path::PathBuf::from("/code/one");
+        let a = std::path::PathBuf::from("/code/one");
+
+        // `a` settles and is offered exactly once.
         assert_eq!(
-            link.note_cwd_sample(Some(known), start, std::time::Duration::from_millis(0)),
-            Some(std::path::PathBuf::from("/code/one"))
+            link.note_cwd_sample(Some(a.clone()), start, cwd_debounce()),
+            None
         );
+        let settled = start + cwd_debounce();
         assert_eq!(
-            link.note_cwd_sample(None, start, std::time::Duration::from_millis(0)),
-            None,
-            "losing the sample must never be published as a cwd"
+            link.note_cwd_sample(Some(a.clone()), settled, cwd_debounce()),
+            Some(a.clone())
         );
+
+        // The manager could not take this sample -- a denied OpenProcess, a
+        // directory deleted under the shell. That is not a move.
+        let lost = settled + cwd_debounce();
+        assert_eq!(link.note_cwd_sample(None, lost, cwd_debounce()), None);
+        assert_eq!(link.last_cwd.as_ref(), Some(&a), "the last cwd must stand");
+
+        // `a` coming back is not a change either, so no second fact is offered
+        // for a directory the shell never left.
+        let recovered = lost + cwd_debounce() * 2;
+        assert_eq!(
+            link.note_cwd_sample(Some(a.clone()), recovered, cwd_debounce()),
+            None
+        );
+        assert_eq!(link.last_cwd.as_ref(), Some(&a));
     }
 
     fn shell_request(command: Command) -> crate::protocol::ClientRequest {
