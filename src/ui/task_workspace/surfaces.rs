@@ -341,6 +341,30 @@ impl TaskSurfaceState {
             .or_else(|| self.terminals.keys().next().copied())
     }
 
+    /// The focused terminal: its durable resource, and whether that resource is
+    /// the Task's provider slot rather than a plain shell.
+    ///
+    /// The host-owned strip is the authority whenever one has been admitted and
+    /// names a focused chip, because it is the only source that can answer
+    /// while that terminal's first screen is still in flight -- which is
+    /// exactly the window in which a resize would otherwise be aimed at the
+    /// wrong PTY. Without a strip (or with a strip that focuses nothing) the
+    /// retained projection answers, and a Task with neither has only the
+    /// provider slot to address.
+    pub fn focused_terminal(&self) -> Option<(ResourceId, bool)> {
+        if let Some(strip) = self.strip.as_ref() {
+            if let Some(resource_id) = strip.focused {
+                let is_provider = strip
+                    .terminals
+                    .iter()
+                    .any(|chip| chip.resource_id == resource_id && chip.is_provider);
+                return Some((resource_id, is_provider));
+            }
+        }
+        self.latest_terminal()
+            .map(|terminal| (terminal.resource_id, !terminal.is_plain_shell()))
+    }
+
     /// The focused terminal's retained projection, if one has been admitted.
     pub fn latest_terminal(&self) -> Option<&TaskTerminalProjection> {
         self.focused_resource()

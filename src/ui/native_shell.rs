@@ -14202,15 +14202,22 @@ impl NativeShell {
 
     /// The terminal an owner's surface is currently showing.
     ///
-    /// Before any projection has been admitted this is the provider slot,
-    /// which is exactly what the legacy provider-only queries address and what
-    /// the client did before plain shells existed.
+    /// This is the ONE derivation of "which terminal do client-side operations
+    /// for this owner address": the strip focus when the host has told us one,
+    /// the retained projection otherwise, and the provider slot when there is
+    /// neither -- which is exactly what the legacy provider-only queries
+    /// address and what the client did before plain shells existed.
     fn focused_terminal_target(&self, owner: &HostTaskKey) -> TerminalTarget {
         self.task_surfaces
             .state(owner.clone())
-            .and_then(|state| state.latest_terminal())
-            .map(TerminalTarget::for_projection)
-            .unwrap_or(TerminalTarget::Provider)
+            .and_then(|state| state.focused_terminal())
+            .map_or(TerminalTarget::Provider, |(resource_id, is_provider)| {
+                if is_provider {
+                    TerminalTarget::Provider
+                } else {
+                    TerminalTarget::Resource(resource_id)
+                }
+            })
     }
 
     fn schedule_terminal_start_retry(&mut self, key: TerminalKey) {
@@ -16679,21 +16686,12 @@ impl NativeShell {
         if let Some(slot) = self.host_slot_mut(host_id) {
             slot.cockpit.dock_mut().set_focused_terminal(focused);
         }
-        let Some(resource_id) = focused else {
+        if focused.is_none() {
             return;
-        };
-        // The chip list says which slot the newly focused resource is. It comes
-        // from a host that answers TaskTerminals at all, so `is_provider` here
-        // is a real answer rather than a decode default.
-        let target = if projection
-            .terminals
-            .iter()
-            .any(|chip| chip.resource_id == resource_id && chip.is_provider)
-        {
-            TerminalTarget::Provider
-        } else {
-            TerminalTarget::Resource(resource_id)
-        };
+        }
+        // Same derivation the resize path uses; the strip this call just
+        // admitted is what it reads.
+        let target = self.focused_terminal_target(&owner);
         self.task_surfaces
             .note_terminal_query_started(owner.clone());
         let _ = self.dispatch_action_recorded_for_owner_inner(
@@ -25827,19 +25825,22 @@ impl NativeShell {
         rows: u16,
     ) -> bool {
         let desired = (cols, rows);
-        let focused = self
+        // Which PTY to resize comes from the strip focus, not from the last
+        // admitted screen: a newly focused terminal has no screen for as long
+        // as its first query is in flight, and that is precisely when the pane
+        // is measured. The current dimensions still come from the screen --
+        // absent one there is nothing to compare against, so the resize goes.
+        let target = self.focused_terminal_target(owner);
+        let current = self
             .task_surfaces
             .state(owner.clone())
-            .and_then(|state| state.latest_terminal());
-        let target = focused
-            .map(TerminalTarget::for_projection)
-            .unwrap_or(TerminalTarget::Provider);
-        let current = focused.map(|terminal| {
-            (
-                terminal.screen.cols.clamp(1, u16::MAX as usize) as u16,
-                terminal.screen.rows.clamp(1, u16::MAX as usize) as u16,
-            )
-        });
+            .and_then(|state| state.latest_terminal())
+            .map(|terminal| {
+                (
+                    terminal.screen.cols.clamp(1, u16::MAX as usize) as u16,
+                    terminal.screen.rows.clamp(1, u16::MAX as usize) as u16,
+                )
+            });
         let key = (owner.clone(), target);
         if current == Some(desired) {
             self.pending_terminal_resizes.remove(&key);
@@ -63423,6 +63424,124 @@ mod tests {
                 assert!(
                     !shell.pending_terminal_requeries.contains_key(&armed),
                     "the reply to that exact query must retire the retry it armed"
+                );
+            });
+            cx.quit();
+        });
+    }
+
+    fn terminal_chip_for_test(
+        resource_id: crate::domain::id::ResourceId,
+        is_provider: bool,
+    ) -> crate::domain::cockpit::TaskTerminalChip {
+        crate::domain::cockpit::TaskTerminalChip {
+            resource_id,
+            is_provider,
+            title: None,
+            label: if is_provider { "terminal" } else { "pwsh" }.into(),
+            runtime_state: crate::domain::cockpit::TerminalRuntimeStateWire::Running,
+            live_cwd: None,
+            exit: None,
+            created_at_ms: 1,
+            last_activity_at_ms: 1,
+        }
+    }
+
+    fn dispatched_resize_queries_for_test(
+        shared: &Arc<Mutex<TestRuntimeState>>,
+    ) -> Vec<TaskCockpitQuery> {
+        shared
+            .lock()
+            .expect("runtime")
+            .accepted
+            .iter()
+            .filter_map(|record| match &record.command {
+                NativeHostCommand::TaskCockpitQuery { query, .. }
+                    if matches!(
+                        query,
+                        TaskCockpitQuery::TerminalResize { .. }
+                            | TaskCockpitQuery::TerminalResizeFor { .. }
+                    ) =>
+                {
+                    Some(query.clone())
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// A newly focused shell has no screen for as long as its first query is in
+    /// flight, and that is exactly when the pane is measured and resized. The
+    /// strip focus -- not the last admitted projection -- has to decide which
+    /// PTY the resize addresses, or the provider gets resized to the shell
+    /// pane's geometry.
+    #[test]
+    fn resize_addresses_the_strip_focused_shell_before_its_first_screen_arrives() {
+        if rerun_headless_shell_test_in_child(
+            "ui::native_shell::tests::resize_addresses_the_strip_focused_shell_before_its_first_screen_arrives",
+        ) {
+            return;
+        }
+        let (runtime, _local_shared) = TestRuntime::new(true, NativeHostActionResult::Queued);
+        let remote_host = HostId::Remote([0x6b; 16]);
+        gpui::Application::headless().run(move |cx| {
+            crate::ui::init(cx);
+            with_test_shell_in_app(cx, runtime, |shell| {
+                let (model, task_id) = terminal_bound_client_model();
+                let model = Arc::new(model);
+                let provider_resource =
+                    provider_terminal_projection_for_test(&model, task_id, 1).resource_id;
+                let shell_resource = crate::domain::id::ResourceId::new();
+                let shared =
+                    attach_remote_test_host_with_shared(shell, &remote_host, Arc::clone(&model));
+                let owner = HostTaskKey::new(remote_host.clone(), task_id);
+                shell
+                    .select_fleet_task_key(owner.clone(), FleetSelectMode::Replace)
+                    .expect("select remote task");
+
+                // No strip has been admitted: the provider slot is addressed by
+                // the legacy query, exactly as before plain shells existed.
+                shared.lock().expect("runtime").accepted.clear();
+                assert!(shell.request_terminal_resize_for_owner(&owner, 90, 20));
+                assert_eq!(
+                    dispatched_resize_queries_for_test(&shared),
+                    vec![TaskCockpitQuery::TerminalResize { cols: 90, rows: 20 }],
+                    "without a strip the provider slot keeps the legacy resize"
+                );
+
+                // The strip focuses a shell whose first screen has not arrived.
+                let strip = crate::domain::cockpit::TaskTerminalsProjection {
+                    task_id,
+                    terminals: vec![
+                        terminal_chip_for_test(provider_resource, true),
+                        terminal_chip_for_test(shell_resource, false),
+                    ],
+                    order: vec![shell_resource],
+                    focused: Some(shell_resource),
+                };
+                shell
+                    .task_surfaces
+                    .admit_terminals(owner.clone(), &strip)
+                    .expect("admit strip");
+                assert!(
+                    shell
+                        .task_surfaces
+                        .state(owner.clone())
+                        .and_then(|state| state.latest_terminal())
+                        .is_none(),
+                    "the focused shell must genuinely have no admitted screen"
+                );
+
+                shared.lock().expect("runtime").accepted.clear();
+                assert!(shell.request_terminal_resize_for_owner(&owner, 100, 30));
+                assert_eq!(
+                    dispatched_resize_queries_for_test(&shared),
+                    vec![TaskCockpitQuery::TerminalResizeFor {
+                        resource_id: shell_resource,
+                        cols: 100,
+                        rows: 30
+                    }],
+                    "the resize must reach the focused shell, never the provider PTY"
                 );
             });
             cx.quit();
