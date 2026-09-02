@@ -291,6 +291,7 @@ extern "system" {
         size: *mut u32,
     ) -> i32;
     fn IsProcessInJob(process: *mut c_void, job: *mut c_void, result: *mut i32) -> i32;
+    fn GetCurrentProcess() -> *mut c_void;
 }
 
 #[cfg(windows)]
@@ -307,6 +308,10 @@ const JOB_OBJECT_ASSOCIATE_COMPLETION_PORT_INFORMATION_CLASS: u32 = 7;
 const JOB_OBJECT_EXTENDED_LIMIT_INFORMATION_CLASS: u32 = 9;
 #[cfg(windows)]
 const JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE: u32 = 0x00002000;
+#[cfg(windows)]
+const JOB_OBJECT_LIMIT_BREAKAWAY_OK: u32 = 0x00000800;
+#[cfg(windows)]
+const JOB_OBJECT_LIMIT_SILENT_BREAKAWAY_OK: u32 = 0x00001000;
 #[cfg(windows)]
 const ERROR_MORE_DATA: i32 = 234;
 #[cfg(windows)]
@@ -452,6 +457,117 @@ struct JobObjectExtendedLimitInformation {
     job_memory_limit: usize,
     peak_process_memory_used: usize,
     peak_job_memory_used: usize,
+}
+
+/// How the Job Object that contains the *current* process treats children.
+///
+/// A client that launches the durable host from inside a kill-on-close Job
+/// (Windows Terminal, some IDE launchers, CI harnesses) would otherwise hand
+/// that Job the power to kill the host, and with it every managed terminal.
+#[cfg(windows)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CurrentJobContainment {
+    /// The current process is not inside any Job.
+    NotInJob,
+    /// Inside a Job that does not kill its members when it closes.
+    Benign,
+    /// Inside a kill-on-close Job that permits explicit breakaway.
+    KillOnCloseBreakawayAllowed,
+    /// Inside a kill-on-close Job that forbids breakaway.
+    KillOnCloseBreakawayForbidden,
+}
+
+/// Inspect the current process's own Job containment without opening any
+/// foreign handle. Errors describe the failed query; they never imply a
+/// containment answer.
+#[cfg(windows)]
+pub fn current_process_job_containment() -> Result<CurrentJobContainment, String> {
+    let mut in_job = 0i32;
+    // SAFETY: the pseudo handle needs no closing and `in_job` is writable.
+    if unsafe { IsProcessInJob(GetCurrentProcess(), std::ptr::null_mut(), &mut in_job) } == 0 {
+        return Err(format!(
+            "IsProcessInJob failed: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    if in_job == 0 {
+        return Ok(CurrentJobContainment::NotInJob);
+    }
+    let mut limits = JobObjectExtendedLimitInformation::default();
+    // SAFETY: a null job handle queries the calling process's own Job, and the
+    // exact buffer size for the requested class is supplied.
+    let queried = unsafe {
+        QueryInformationJobObject(
+            std::ptr::null_mut(),
+            JOB_OBJECT_EXTENDED_LIMIT_INFORMATION_CLASS,
+            &mut limits as *mut JobObjectExtendedLimitInformation as *mut c_void,
+            std::mem::size_of::<JobObjectExtendedLimitInformation>() as u32,
+            std::ptr::null_mut(),
+        )
+    };
+    if queried == 0 {
+        return Err(format!(
+            "QueryInformationJobObject on the current Job failed: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    Ok(classify_job_limit_flags(
+        limits.basic_limit_information.limit_flags,
+    ))
+}
+
+#[cfg(windows)]
+fn classify_job_limit_flags(limit_flags: u32) -> CurrentJobContainment {
+    if limit_flags & JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE == 0 {
+        CurrentJobContainment::Benign
+    } else if limit_flags & (JOB_OBJECT_LIMIT_BREAKAWAY_OK | JOB_OBJECT_LIMIT_SILENT_BREAKAWAY_OK)
+        != 0
+    {
+        CurrentJobContainment::KillOnCloseBreakawayAllowed
+    } else {
+        CurrentJobContainment::KillOnCloseBreakawayForbidden
+    }
+}
+
+#[cfg(all(test, windows))]
+mod current_job_containment_tests {
+    use super::{
+        classify_job_limit_flags, current_process_job_containment, CurrentJobContainment,
+        JOB_OBJECT_LIMIT_BREAKAWAY_OK, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+        JOB_OBJECT_LIMIT_SILENT_BREAKAWAY_OK,
+    };
+
+    #[test]
+    fn limit_flags_classify_kill_on_close_and_breakaway() {
+        assert_eq!(classify_job_limit_flags(0), CurrentJobContainment::Benign);
+        assert_eq!(
+            classify_job_limit_flags(JOB_OBJECT_LIMIT_BREAKAWAY_OK),
+            CurrentJobContainment::Benign
+        );
+        assert_eq!(
+            classify_job_limit_flags(JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE),
+            CurrentJobContainment::KillOnCloseBreakawayForbidden
+        );
+        assert_eq!(
+            classify_job_limit_flags(
+                JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE | JOB_OBJECT_LIMIT_BREAKAWAY_OK
+            ),
+            CurrentJobContainment::KillOnCloseBreakawayAllowed
+        );
+        assert_eq!(
+            classify_job_limit_flags(
+                JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE | JOB_OBJECT_LIMIT_SILENT_BREAKAWAY_OK
+            ),
+            CurrentJobContainment::KillOnCloseBreakawayAllowed
+        );
+    }
+
+    #[test]
+    fn current_process_query_answers_without_error() {
+        // The test runner may or may not be inside a Job; the query itself must
+        // succeed either way and never report an error as containment.
+        current_process_job_containment().expect("current process Job query");
+    }
 }
 
 /// An exclusively owned kill-on-close Job Object handle.

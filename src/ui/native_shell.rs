@@ -1521,10 +1521,21 @@ pub enum NativeShellMode {
 /// Child-host lifetime policy for the shell that launched it.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum NativeHostChildOwnership {
-    /// Debug/test: kill and reap the child when the client drops.
+    /// Parent-bound debug/test host: kill and reap the child when the client drops.
     TerminateWithClient,
-    /// Production: client close detaches only; the durable host survives.
+    /// Client close detaches only; the durable host and its terminals survive.
     DetachOnClientClose,
+}
+
+/// Lifetime an isolated debug host is launched with.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum IsolatedHostLifetime {
+    /// The host polls the launching client and stops when it exits.
+    ParentBound { parent_pid: u32 },
+    /// The host outlives the client like the production host does, so a
+    /// closed dev window keeps every terminal running; the next launch
+    /// attaches to it and `dev-watch.ps1` stops it before copying a rebuild.
+    Detached,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1580,13 +1591,6 @@ impl IsolatedDevProfile {
             .and_then(|name| name.to_str())
             .unwrap_or("workspace");
         format!("DevManager — dev profile ({workspace})")
-    }
-
-    fn child_ownership(&self) -> NativeHostChildOwnership {
-        match self.mode {
-            NativeShellMode::IsolatedDebug => NativeHostChildOwnership::TerminateWithClient,
-            NativeShellMode::Production => NativeHostChildOwnership::DetachOnClientClose,
-        }
     }
 
     /// Build the one client configuration used by the native shell.
@@ -1657,7 +1661,7 @@ enum NativeHostLaunchMode {
     Isolated {
         profile: String,
         instance_label: String,
-        parent_pid: u32,
+        lifetime: IsolatedHostLifetime,
         config_base: PathBuf,
     },
     Production,
@@ -1666,14 +1670,17 @@ enum NativeHostLaunchMode {
 impl NativeHostLaunchSpec {
     pub(crate) fn for_isolated_profile(
         profile: &IsolatedDevProfile,
-        parent_pid: u32,
+        lifetime: IsolatedHostLifetime,
     ) -> Result<Self, NativeShellError> {
         if profile.is_production() {
             return Err(NativeShellError::HostConnect {
                 message: "isolated host launch requires an isolated debug profile".to_string(),
             });
         }
-        if parent_pid == 0 {
+        if matches!(
+            lifetime,
+            IsolatedHostLifetime::ParentBound { parent_pid: 0 }
+        ) {
             return Err(NativeShellError::HostConnect {
                 message: "native host parent PID must be nonzero".to_string(),
             });
@@ -1683,7 +1690,7 @@ impl NativeHostLaunchSpec {
             mode: NativeHostLaunchMode::Isolated {
                 profile: profile.named_profile().to_string(),
                 instance_label: "Native Debug".to_string(),
-                parent_pid,
+                lifetime,
                 config_base: profile.host_config_base().to_path_buf(),
             },
         })
@@ -1701,20 +1708,48 @@ impl NativeHostLaunchSpec {
             NativeHostLaunchMode::Isolated {
                 profile,
                 instance_label,
-                parent_pid,
+                lifetime,
                 config_base,
-            } => vec![
-                "--profile".to_string(),
-                profile.clone(),
-                "--instance-label".to_string(),
-                instance_label.clone(),
-                "--parent-pid".to_string(),
-                parent_pid.to_string(),
-                "--foreground".to_string(),
-                "--config-base".to_string(),
-                config_base.display().to_string(),
-            ],
+            } => {
+                let mut args = vec![
+                    "--profile".to_string(),
+                    profile.clone(),
+                    "--instance-label".to_string(),
+                    instance_label.clone(),
+                ];
+                match lifetime {
+                    IsolatedHostLifetime::ParentBound { parent_pid } => {
+                        args.push("--parent-pid".to_string());
+                        args.push(parent_pid.to_string());
+                    }
+                    IsolatedHostLifetime::Detached => {
+                        args.push("--detach-from-parent".to_string());
+                    }
+                }
+                args.extend([
+                    "--foreground".to_string(),
+                    "--config-base".to_string(),
+                    config_base.display().to_string(),
+                ]);
+                args
+            }
             NativeHostLaunchMode::Production => vec!["--foreground".to_string()],
+        }
+    }
+
+    /// Ownership follows the lifetime the host was launched with, never the
+    /// build kind alone: only a parent-bound debug host is killed with the client.
+    fn child_ownership(&self) -> NativeHostChildOwnership {
+        match &self.mode {
+            NativeHostLaunchMode::Isolated {
+                lifetime: IsolatedHostLifetime::ParentBound { .. },
+                ..
+            } => NativeHostChildOwnership::TerminateWithClient,
+            NativeHostLaunchMode::Isolated {
+                lifetime: IsolatedHostLifetime::Detached,
+                ..
+            }
+            | NativeHostLaunchMode::Production => NativeHostChildOwnership::DetachOnClientClose,
         }
     }
 }
@@ -2020,7 +2055,10 @@ impl NativeHostBootstrap for ProcessNativeHostBootstrap {
         let spec = if profile.is_production() {
             NativeHostLaunchSpec::for_production()?
         } else {
-            NativeHostLaunchSpec::for_isolated_profile(profile, std::process::id())?
+            // Debug hosts detach too: closing the dev window must not kill the
+            // terminals it owns. Parent binding stays available for harness
+            // runs that must leave no host behind.
+            NativeHostLaunchSpec::for_isolated_profile(profile, isolated_host_lifetime())?
         };
         let permit = acquire_reaper_permit(ReaperKind::Child).ok_or_else(|| {
             NativeShellError::HostConnect {
@@ -2041,17 +2079,13 @@ impl NativeHostBootstrap for ProcessNativeHostBootstrap {
         } else {
             command.stderr(Stdio::from(isolated_host_stderr_log(profile)?));
         }
-        let child = command
-            .spawn()
-            .map_err(|error| NativeShellError::HostConnect {
-                message: format!("devmanager-host launch failed: {error}"),
-            })?;
+        let child = spawn_durable_host_process(&mut command)?;
         let process = NativeHostProcess::owned_child(
             OwnedChild {
                 child,
                 _permit: permit,
             },
-            profile.child_ownership(),
+            spec.child_ownership(),
         );
         // Concurrent clients may lose the HostLock race; bounded attach retries
         // converge on the lock winner without inventing a second shutdown path.
@@ -2099,6 +2133,93 @@ fn isolated_host_stderr_log(
 
 /// Strip parent DevManager identity overrides so the sibling host resolves only
 /// from its CLI/profile contract (same removals as library/phase-gate child rules).
+/// Environment switch that restores the parent-bound debug host for harness
+/// runs that must leave no host process behind when the client exits.
+const DEBUG_HOST_PARENT_BOUND_ENV: &str = "DEVMANAGER_DEBUG_HOST_PARENT_BOUND";
+
+/// The dev client launches a detached host by default so a closed window keeps
+/// its terminals; `DEVMANAGER_DEBUG_HOST_PARENT_BOUND=1` opts back into the
+/// parent-bound lifetime.
+fn isolated_host_lifetime() -> IsolatedHostLifetime {
+    match std::env::var_os(DEBUG_HOST_PARENT_BOUND_ENV) {
+        Some(value) if !value.is_empty() && value != "0" => IsolatedHostLifetime::ParentBound {
+            parent_pid: std::process::id(),
+        },
+        _ => IsolatedHostLifetime::Detached,
+    }
+}
+
+fn durable_host_launch_error(error: std::io::Error) -> NativeShellError {
+    NativeShellError::HostConnect {
+        message: format!("devmanager-host launch failed: {error}"),
+    }
+}
+
+/// Create the host without a visible console of its own and, when this client
+/// sits inside a kill-on-close Job that permits it, outside that Job.
+///
+/// `CREATE_NO_WINDOW` gives the host a private hidden console instead of the
+/// launcher's, so closing whatever terminal started the client never delivers
+/// a console close event to the host (the herdr #1329 failure). Breakaway is
+/// only requested when the Job advertises it; a Job that forbids breakaway is
+/// reported, not refused, because a host that dies with its launcher is still
+/// better than no host.
+#[cfg(windows)]
+const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+#[cfg(windows)]
+const CREATE_BREAKAWAY_FROM_JOB: u32 = 0x0100_0000;
+
+#[cfg(windows)]
+fn durable_host_creation_flags(
+    containment: Result<crate::process::job::CurrentJobContainment, String>,
+) -> (u32, bool) {
+    use crate::process::job::CurrentJobContainment;
+    match containment {
+        Ok(CurrentJobContainment::KillOnCloseBreakawayAllowed) => {
+            (CREATE_NO_WINDOW | CREATE_BREAKAWAY_FROM_JOB, true)
+        }
+        Ok(CurrentJobContainment::KillOnCloseBreakawayForbidden) => {
+            eprintln!(
+                "devmanager: this client runs inside a kill-on-close Job that forbids breakaway; the durable host will die if that Job closes"
+            );
+            (CREATE_NO_WINDOW, false)
+        }
+        Ok(CurrentJobContainment::NotInJob) | Ok(CurrentJobContainment::Benign) => {
+            (CREATE_NO_WINDOW, false)
+        }
+        Err(error) => {
+            eprintln!("devmanager: could not inspect the client's Job containment: {error}");
+            (CREATE_NO_WINDOW, false)
+        }
+    }
+}
+
+#[cfg(windows)]
+fn spawn_durable_host_process(command: &mut Command) -> Result<Child, NativeShellError> {
+    use std::os::windows::process::CommandExt;
+    let (flags, breakaway_requested) =
+        durable_host_creation_flags(crate::process::job::current_process_job_containment());
+    command.creation_flags(flags);
+    match command.spawn() {
+        Ok(child) => Ok(child),
+        Err(error) if breakaway_requested => {
+            // Nested or foreign Jobs can still refuse breakaway at CreateProcess
+            // time. Launch inside the Job rather than refusing to start at all.
+            eprintln!(
+                "devmanager: host launch with Job breakaway failed ({error}); retrying inside the Job"
+            );
+            command.creation_flags(flags & !CREATE_BREAKAWAY_FROM_JOB);
+            command.spawn().map_err(durable_host_launch_error)
+        }
+        Err(error) => Err(durable_host_launch_error(error)),
+    }
+}
+
+#[cfg(not(windows))]
+fn spawn_durable_host_process(command: &mut Command) -> Result<Child, NativeShellError> {
+    command.spawn().map_err(durable_host_launch_error)
+}
+
 fn sanitize_spawned_host_environment(command: &mut Command) {
     for key in [
         "DEVMANAGER_PROFILE",
@@ -42918,6 +43039,7 @@ mod tests {
         HostProjectKey,
         HostUiState,
         IsolatedDevProfile,
+        IsolatedHostLifetime,
         MainConversationCanvas,
         NativeAccessibilityAction,
         NativeActionRecord,
@@ -42994,7 +43116,6 @@ mod tests {
         MAX_RETRY_HOST_ACTIONS,
         NATIVE_SNAPSHOT_PAGE_ITEMS,
         NATIVE_STARTUP_BUDGET,
-        PRODUCTION_HOST_PROFILE,
         PROVIDER_SETUP_RESOLUTION_TIMEOUT,
         REMOTE_RECONNECT_BACKOFF_MAX,
         REMOTE_RECONNECT_BACKOFF_MIN,
@@ -48171,29 +48292,71 @@ mod tests {
     }
 
     #[test]
-    fn isolated_launch_spec_parent_binds_and_production_omits_parent_pid() {
+    fn isolated_launch_lifetime_decides_args_and_ownership() {
         let workspace = tempfile::tempdir().expect("workspace");
         let isolated = isolated_dev_profile(workspace.path()).expect("isolated profile");
-        let isolated_spec = NativeHostLaunchSpec {
+        assert_eq!(isolated.mode(), NativeShellMode::IsolatedDebug);
+        let parent_bound = NativeHostLaunchSpec {
             executable: PathBuf::from("devmanager-host.exe"),
             mode: NativeHostLaunchMode::Isolated {
                 profile: isolated.named_profile().to_string(),
                 instance_label: "Native Debug".to_string(),
-                parent_pid: 42,
+                lifetime: IsolatedHostLifetime::ParentBound { parent_pid: 42 },
                 config_base: isolated.host_config_base().to_path_buf(),
             },
         };
-        let isolated_args = isolated_spec.arguments();
-        assert!(isolated_args.iter().any(|arg| arg == "--parent-pid"));
-        assert!(isolated_args.iter().any(|arg| arg == "--config-base"));
-        assert_eq!(isolated.mode(), NativeShellMode::IsolatedDebug);
+        let parent_bound_args = parent_bound.arguments();
+        assert!(parent_bound_args.iter().any(|arg| arg == "--parent-pid"));
+        assert!(!parent_bound_args
+            .iter()
+            .any(|arg| arg == "--detach-from-parent"));
+        assert!(parent_bound_args.iter().any(|arg| arg == "--config-base"));
+        assert_eq!(
+            parent_bound.child_ownership(),
+            NativeHostChildOwnership::TerminateWithClient
+        );
 
-        let production = IsolatedDevProfile {
-            workspace_root: isolated.root().to_path_buf(),
-            root: isolated.root().to_path_buf(),
-            named_profile: PRODUCTION_HOST_PROFILE.to_string(),
-            mode: NativeShellMode::Production,
+        // The dev client launches detached so a closed window keeps terminals.
+        // (Constructed directly: the sibling host executable does not exist
+        // beside the unit-test binary.)
+        let detached = NativeHostLaunchSpec {
+            executable: PathBuf::from("devmanager-host.exe"),
+            mode: NativeHostLaunchMode::Isolated {
+                profile: isolated.named_profile().to_string(),
+                instance_label: "Native Debug".to_string(),
+                lifetime: IsolatedHostLifetime::Detached,
+                config_base: isolated.host_config_base().to_path_buf(),
+            },
         };
+        if std::env::var_os(super::DEBUG_HOST_PARENT_BOUND_ENV).is_none() {
+            assert_eq!(
+                super::isolated_host_lifetime(),
+                IsolatedHostLifetime::Detached
+            );
+        }
+        let detached_args = detached.arguments();
+        assert!(detached_args
+            .iter()
+            .any(|arg| arg == "--detach-from-parent"));
+        assert!(!detached_args.iter().any(|arg| arg == "--parent-pid"));
+        assert!(detached_args.iter().any(|arg| arg == "--config-base"));
+        assert_eq!(
+            detached.child_ownership(),
+            NativeHostChildOwnership::DetachOnClientClose
+        );
+        let zero_parent = NativeHostLaunchSpec::for_isolated_profile(
+            &isolated,
+            IsolatedHostLifetime::ParentBound { parent_pid: 0 },
+        );
+        let zero_parent_error = zero_parent
+            .err()
+            .map(|error| error.to_string())
+            .expect("a zero parent pid must be rejected");
+        assert!(
+            zero_parent_error.contains("nonzero"),
+            "rejection must name the zero pid, not a missing executable: {zero_parent_error}"
+        );
+
         let production_spec = NativeHostLaunchSpec {
             executable: PathBuf::from("devmanager-host.exe"),
             mode: NativeHostLaunchMode::Production,
@@ -48202,13 +48365,36 @@ mod tests {
         assert_eq!(production_args, vec!["--foreground".to_string()]);
         assert!(!production_args.iter().any(|arg| arg == "--parent-pid"));
         assert_eq!(
-            production.child_ownership(),
+            production_spec.child_ownership(),
             NativeHostChildOwnership::DetachOnClientClose
         );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn durable_host_creation_flags_hide_console_and_break_away_only_when_allowed() {
+        use crate::process::job::CurrentJobContainment;
+        for containment in [
+            CurrentJobContainment::NotInJob,
+            CurrentJobContainment::Benign,
+            CurrentJobContainment::KillOnCloseBreakawayForbidden,
+        ] {
+            let (flags, breakaway) = super::durable_host_creation_flags(Ok(containment));
+            assert_eq!(flags, super::CREATE_NO_WINDOW, "{containment:?}");
+            assert!(!breakaway, "{containment:?}");
+        }
+        let (flags, breakaway) = super::durable_host_creation_flags(Ok(
+            CurrentJobContainment::KillOnCloseBreakawayAllowed,
+        ));
         assert_eq!(
-            isolated.child_ownership(),
-            NativeHostChildOwnership::TerminateWithClient
+            flags,
+            super::CREATE_NO_WINDOW | super::CREATE_BREAKAWAY_FROM_JOB
         );
+        assert!(breakaway);
+        let (flags, breakaway) =
+            super::durable_host_creation_flags(Err("query failed".to_string()));
+        assert_eq!(flags, super::CREATE_NO_WINDOW);
+        assert!(!breakaway);
     }
 
     #[test]

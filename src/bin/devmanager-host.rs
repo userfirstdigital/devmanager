@@ -1,8 +1,10 @@
 //! Durable `devmanager-host` entry.
 //!
 //! `ctl` dispatches before any HostLock/server bootstrap so JSON automation
-//! never races the exclusive host owner. Debug builds remain parent-bound under
-//! an isolated config base. Release builds own the Production profile at the
+//! never races the exclusive host owner. Debug builds run under an isolated
+//! config base; they are parent-bound only when launched with `--parent-pid`,
+//! and `--detach-from-parent` lets them outlive the client exactly like the
+//! production host so terminals survive a closed window. Release builds own the Production profile at the
 //! exact installed app root and survive acknowledged client detach; only
 //! inspect_host_quit + confirm_host_quit (HostShutdown) may arm full quit.
 
@@ -44,7 +46,8 @@ struct HostArgs {
     profile: String,
     #[allow(dead_code)]
     instance_label: String,
-    parent_pid: u32,
+    /// `None` when launched with `--detach-from-parent`.
+    parent_pid: Option<u32>,
     config_base: PathBuf,
     test_slow_durable_reader_client_id: Option<ClientId>,
 }
@@ -128,7 +131,10 @@ fn run(raw_args: Vec<String>) -> Result<(), HostRunError> {
     {
         let args = parse_args(raw_args)?;
         let paths = prepare_debug_paths(&args)?;
-        let parent = open_and_validate_parent(args.parent_pid)?;
+        let parent = match args.parent_pid {
+            Some(parent_pid) => Some(open_and_validate_parent(parent_pid)?),
+            None => None,
+        };
         let host_lock = acquire_lock(&paths.profile_root, &args.profile)?;
         devmanager::persistence::bind_durable_host_storage(&args.profile, &paths.profile_root)
             .map_err(|error| format!("failed to bind host storage: {error}"))?;
@@ -151,7 +157,7 @@ fn run(raw_args: Vec<String>) -> Result<(), HostRunError> {
             &host_lock,
             &args.profile,
             &paths.profile_root,
-            Some(parent),
+            parent,
             host_boot_id,
             bus,
             config_store,
@@ -224,6 +230,7 @@ fn parse_args(raw: Vec<String>) -> Result<HostArgs, String> {
     let mut profile: Option<String> = None;
     let mut instance_label: Option<String> = None;
     let mut parent_pid: Option<u32> = None;
+    let mut detach_from_parent = false;
     let mut config_base: Option<PathBuf> = None;
     let mut test_slow_durable_reader_client_id: Option<ClientId> = None;
 
@@ -253,6 +260,12 @@ fn parse_args(raw: Vec<String>) -> Result<HostArgs, String> {
                     .next()
                     .ok_or_else(|| "missing value for --instance-label".to_string())?;
                 instance_label = Some(value);
+            }
+            "--detach-from-parent" => {
+                if detach_from_parent {
+                    return Err("duplicate --detach-from-parent".to_string());
+                }
+                detach_from_parent = true;
             }
             "--parent-pid" => {
                 if parent_pid.is_some() {
@@ -305,8 +318,19 @@ fn parse_args(raw: Vec<String>) -> Result<HostArgs, String> {
         instance_label.ok_or_else(|| "missing required --instance-label".to_string())?;
     let instance_label = validate_instance_label(&instance_label_raw)?;
 
-    let parent_pid = parent_pid.ok_or_else(|| "missing required --parent-pid".to_string())?;
-    validate_parent_pid_shape(parent_pid)?;
+    let parent_pid = match (parent_pid, detach_from_parent) {
+        (Some(_), true) => {
+            return Err("--parent-pid and --detach-from-parent are mutually exclusive".to_string());
+        }
+        (Some(parent_pid), false) => {
+            validate_parent_pid_shape(parent_pid)?;
+            Some(parent_pid)
+        }
+        (None, true) => None,
+        (None, false) => {
+            return Err("missing required --parent-pid (or --detach-from-parent)".to_string());
+        }
+    };
 
     let config_base = config_base.ok_or_else(|| "missing required --config-base".to_string())?;
     let config_base = validate_config_base(&config_base)?;
@@ -394,6 +418,61 @@ fn validate_slow_durable_reader_isolation(
         ));
     }
     Ok(())
+}
+
+#[cfg(all(test, windows, debug_assertions))]
+mod detach_from_parent_args_tests {
+    use super::parse_args;
+    use tempfile::TempDir;
+
+    fn base(config_base: &TempDir, extra: &[&str]) -> Vec<String> {
+        let mut args = vec![
+            "--foreground".to_string(),
+            "--profile".to_string(),
+            "native-next-0123456789abcdef".to_string(),
+            "--instance-label".to_string(),
+            "Detach Test".to_string(),
+            "--config-base".to_string(),
+            config_base.path().display().to_string(),
+        ];
+        args.extend(extra.iter().map(|arg| arg.to_string()));
+        args
+    }
+
+    #[test]
+    fn detach_from_parent_replaces_parent_pid() {
+        let config_base = TempDir::new().expect("config base");
+        let args = parse_args(base(&config_base, &["--detach-from-parent"]))
+            .expect("detached debug host args");
+        assert_eq!(args.parent_pid, None);
+    }
+
+    #[test]
+    fn parent_pid_alone_stays_parent_bound() {
+        let config_base = TempDir::new().expect("config base");
+        let args =
+            parse_args(base(&config_base, &["--parent-pid", "4242"])).expect("parent-bound args");
+        assert_eq!(args.parent_pid, Some(4242));
+    }
+
+    #[test]
+    fn parent_pid_and_detach_are_mutually_exclusive() {
+        let config_base = TempDir::new().expect("config base");
+        let error = parse_args(base(
+            &config_base,
+            &["--parent-pid", "4242", "--detach-from-parent"],
+        ))
+        .expect_err("both lifetimes at once must be rejected");
+        assert!(error.contains("mutually exclusive"), "{error}");
+    }
+
+    #[test]
+    fn missing_lifetime_names_both_options() {
+        let config_base = TempDir::new().expect("config base");
+        let error = parse_args(base(&config_base, &[])).expect_err("a lifetime flag is required");
+        assert!(error.contains("--parent-pid"), "{error}");
+        assert!(error.contains("--detach-from-parent"), "{error}");
+    }
 }
 
 fn validate_parent_pid_shape(parent_pid: u32) -> Result<(), String> {
@@ -484,6 +563,7 @@ fn parse_production_args(raw: Vec<String>) -> Result<(), String> {
                 foreground = true;
             }
             "--parent-pid"
+            | "--detach-from-parent"
             | "--config-base"
             | "--profile"
             | "--instance-label"

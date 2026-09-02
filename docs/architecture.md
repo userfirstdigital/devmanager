@@ -11,6 +11,17 @@ Installers place both binaries as siblings so the client can attach to the exact
 
 The host owns durable state and local work: tasks, operations, process/Job trees, PTYs, provider runtimes, browser automation surfaces, workspace/Git/services, and Connect/device secrets held in the OS vault. Desktop, CLI, automation, and optional Connect clients are clients of the same typed command/event contract. UI code does not reach around the host to mutate process, task, Git, browser, or provider state.
 
+## Host lifetime and terminal survivability
+
+Terminals live exactly as long as the host process, so the host is built to outlive everything except an explicit full quit:
+
+- Closing the desktop window is a detach, never a quit. Production and isolated debug hosts both keep running; the next client launch attaches to the existing host over the profile pipe. Debug hosts are parent-bound only when a harness launches the binary directly with `--parent-pid`, or when the client runs with `DEVMANAGER_DEBUG_HOST_PARENT_BOUND=1`; otherwise the desktop client launches them with `--detach-from-parent`.
+- The client spawns the host with `CREATE_NO_WINDOW` so it never shares the launcher's console, and adds `CREATE_BREAKAWAY_FROM_JOB` when the client itself sits inside a kill-on-close Job that permits breakaway (see `current_process_job_containment`).
+- A PTY read error or EOF is never treated as child death. The reader retries with bounded backoff while the wait actor still reports the child alive; only an observed child exit ends a terminal. This is what keeps terminals through Windows sleep/resume, where ConPTY reports transient EOFs.
+- A single terminal's teardown miss is reported through diagnostics and its own kill-on-close Job handle; it never aborts the host, because an abort would end every other terminal the host owns.
+
+Every managed PTY child still runs inside a host-owned kill-on-close Job Object, so a host crash, update, or full quit ends every terminal tree. Provider conversations are then restored through exact `--resume`; shell screen contents are not persisted across a host restart.
+
 ## Protocol and identity
 
 Local compatibility uses the protocol constants in `src/protocol/capabilities.rs` (`PROTOCOL_MAJOR` / `PROTOCOL_MINOR`, currently `1.0`). Client and host builds must advertise matching package version metadata under the final shipping identity contract above; ctl automation uses `devmanager-host-ctl/<version>` against the same semver/protocol. Exact provider conversation identity (`providerSessionId`) is distinct from disposable PTY identity and is captured only from correlated current-generation Claude/Codex `SessionStart` hooks.
