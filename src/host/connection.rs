@@ -8398,10 +8398,18 @@ fn validate_authenticated_command_capability(
         Command::PrepareUpdate(_) if !capabilities.contains(Capability::UpdateHandoff) => {
             Err(IpcError::UnsupportedCapability)
         }
+        // `OpenShellTerminal` carries a fully formed `ResourceFacts` with a
+        // program, args and cwd of the sender's choosing, and the decider has
+        // no program allowlist. It is host-issuance only: the host resolves
+        // both from sealed settings and executes it through
+        // `open_shell_terminal_request`, which never passes through here (this
+        // gate runs only on client-sent envelopes). A client asks for a shell
+        // with `TaskCockpitQuery::OpenShellTerminal`, never with this command.
         Command::PresentProviderQuestion(_)
         | Command::PresentProviderApproval(_)
         | Command::SettleProviderWait(_)
         | Command::BindProviderSession { .. }
+        | Command::OpenShellTerminal(_)
         | Command::RebindUnstartedPrimaryProvider { .. } => Err(IpcError::UnsupportedCapability),
         Command::SubmitProviderInput(_) if !capabilities.contains(Capability::ProviderInput) => {
             Err(IpcError::UnsupportedCapability)
@@ -13955,6 +13963,112 @@ mod output_tests {
         assert!(super::validate_authenticated_command_capability(
             CapabilitySet::from_capabilities([Capability::ProviderInput]),
             &provider,
+        )
+        .is_ok());
+    }
+
+    /// An authenticated client may not send `Command::OpenShellTerminal`.
+    ///
+    /// The command carries a client-chosen program/args/cwd and the kernel
+    /// decider has no allowlist, so accepting one from the wire would let any
+    /// authenticated client spawn an arbitrary binary on the host. This asserts
+    /// the refusal through the real dispatch path, not just the gate function:
+    /// `CommandBus::execute`'s own `HostAuthorityRequired` refusal is defence in
+    /// depth behind it, and the live executor uses `execute_host_authorized`,
+    /// which does not refuse it.
+    #[test]
+    fn dispatch_refuses_a_client_sent_open_shell_terminal_command() {
+        use super::dispatch_authenticated_request;
+        use crate::domain::command::{Command, CommandEnvelope, OpenShellTerminalIntent};
+        use crate::domain::id::{CommandId, ResourceId, TaskId};
+        use crate::domain::resource::{
+            OwnerKind, ResourceFacts, ResourceKind, ResourceLifecycle, ResourceRecipe,
+            TerminalLaunch,
+        };
+        use crate::domain::ClientId;
+        use crate::kernel::CommandBus;
+        use crate::protocol::{Capability, CapabilitySet, ClientRequest};
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut bus = CommandBus::open(&dir.path().join("open-shell-auth-gate.db")).expect("bus");
+        let client = ClientId::new();
+        let task_id = TaskId::new();
+        let envelope = |command| {
+            ClientRequest::Command(CommandEnvelope {
+                command_id: CommandId::new(),
+                client_id: client,
+                task_id: Some(task_id),
+                issued_at_ms: 1_725_000_000_000,
+                expected_task_revision: Some(1),
+                command,
+            })
+        };
+        let open = Command::OpenShellTerminal(OpenShellTerminalIntent {
+            resource: ResourceFacts {
+                id: ResourceId::new(),
+                task_id: Some(task_id),
+                owner_kind: OwnerKind::Task,
+                resource_kind: ResourceKind::Terminal,
+                recipe: ResourceRecipe::Terminal {
+                    cols: 120,
+                    rows: 40,
+                    launch: Some(TerminalLaunch {
+                        cwd: std::path::PathBuf::from(if cfg!(windows) {
+                            "C:/code"
+                        } else {
+                            "/code"
+                        }),
+                        program: std::path::PathBuf::from("attacker.exe"),
+                        args: vec!["--payload".to_string()],
+                    }),
+                    title: None,
+                },
+                lifecycle: ResourceLifecycle::Active,
+                runtime_generation: 1,
+                updated_at_ms: 1_725_000_000_000,
+            },
+        });
+
+        // Every capability a client can hold, including the full set: this is a
+        // source refusal, not a missing bit.
+        for capabilities in [
+            CapabilitySet::empty(),
+            CapabilitySet::from_capabilities([
+                Capability::TaskCockpit,
+                Capability::ProviderInput,
+                Capability::HostShutdown,
+                Capability::ServiceSupervisor,
+            ]),
+        ] {
+            let refusal = dispatch_authenticated_request(
+                client,
+                capabilities,
+                &mut bus,
+                envelope(open.clone()),
+            );
+            assert!(
+                matches!(refusal, Err(crate::host::IpcError::UnsupportedCapability)),
+                "client-sent OpenShellTerminal must be refused; got {refusal:?}"
+            );
+        }
+
+        // The gate function itself, so a future dispatch path cannot lose it.
+        assert!(matches!(
+            super::validate_authenticated_command_capability(
+                CapabilitySet::from_capabilities([Capability::TaskCockpit]),
+                &open,
+            ),
+            Err(crate::host::IpcError::UnsupportedCapability)
+        ));
+
+        // Control: a sibling terminal mutation on the same lane is NOT refused
+        // by the gate, so the refusal above is specific to OpenShellTerminal
+        // and not the whole terminal family failing closed.
+        assert!(super::validate_authenticated_command_capability(
+            CapabilitySet::empty(),
+            &Command::CloseTerminal {
+                resource_id: ResourceId::new(),
+            },
         )
         .is_ok());
     }

@@ -115,7 +115,6 @@ pub fn action_for_client_request(request: &ClientRequest) -> Option<(ActionId, O
                 | Command::AbortUpdateHandoff
                 | Command::ArmUpdateInstall(_)
                 | Command::ConfirmHostQuit(_)
-                | Command::OpenShellTerminal(_)
                 | Command::CloseTerminal { .. }
                 | Command::RenameTerminal { .. }
                 | Command::SetTerminalStrip(_) => ActionId::MUTATE_TASK,
@@ -127,10 +126,18 @@ pub fn action_for_client_request(request: &ClientRequest) -> Option<(ActionId, O
                 // These variants are journal ingress only. Keep them outside
                 // the client action map so an authenticated client cannot
                 // accidentally turn an internal fact into a host action.
+                //
+                // `OpenShellTerminal` joins them for the same reason its query
+                // form does: opening a shell spawns a process on the host under
+                // host-chosen authority, which is not a MUTATE_TASK the way a
+                // rename is. The command form names its own program, args and
+                // cwd, so a remote principal holding MUTATE_TASK must not be
+                // able to send one; the host issues it itself.
                 Command::BindProviderSession { .. }
                 | Command::RebindUnstartedPrimaryProvider { .. }
                 | Command::PresentProviderQuestion(_)
                 | Command::PresentProviderApproval(_)
+                | Command::OpenShellTerminal(_)
                 | Command::SettleProviderWait(_) => return None,
             };
             let task_id = match &envelope.command {
@@ -448,6 +455,72 @@ mod tests {
                 PermissionDecision::Denied(PermissionDenyReason::UnknownAction)
             );
         }
+    }
+
+    /// A remote principal holding MUTATE_TASK must not be able to open a shell.
+    ///
+    /// The command names its own program, args and cwd, and the kernel decider
+    /// has no program allowlist, so mapping it as an ordinary task mutation
+    /// would make "rename this task" and "run this binary" the same permission.
+    #[test]
+    fn open_shell_terminal_is_never_a_connect_mutation() {
+        use crate::domain::command::OpenShellTerminalIntent;
+        use crate::domain::resource::{
+            OwnerKind, ResourceFacts, ResourceKind, ResourceLifecycle, ResourceRecipe,
+            TerminalLaunch,
+        };
+
+        let task_id = TaskId::new();
+        let request = ClientRequest::Command(CommandEnvelope {
+            command_id: CommandId::new(),
+            client_id: ClientId::new(),
+            task_id: Some(task_id),
+            issued_at_ms: 1,
+            expected_task_revision: Some(1),
+            command: Command::OpenShellTerminal(OpenShellTerminalIntent {
+                resource: ResourceFacts {
+                    id: crate::domain::id::ResourceId::new(),
+                    task_id: Some(task_id),
+                    owner_kind: OwnerKind::Task,
+                    resource_kind: ResourceKind::Terminal,
+                    recipe: ResourceRecipe::Terminal {
+                        cols: 120,
+                        rows: 40,
+                        launch: Some(TerminalLaunch {
+                            cwd: std::path::PathBuf::from(if cfg!(windows) {
+                                "C:/code"
+                            } else {
+                                "/code"
+                            }),
+                            program: std::path::PathBuf::from("attacker.exe"),
+                            args: Vec::new(),
+                        }),
+                        title: None,
+                    },
+                    lifecycle: ResourceLifecycle::Active,
+                    runtime_generation: 1,
+                    updated_at_ms: 1,
+                },
+            }),
+        });
+        assert_eq!(action_for_client_request(&request), None);
+        assert_eq!(
+            SessionAuthorizer::paired_owner().authorize_request(&request),
+            PermissionDecision::Denied(PermissionDenyReason::UnknownAction)
+        );
+
+        // The query form the client is supposed to use is denied here too: the
+        // host serves it locally and Connect never maps it at all.
+        let query = ClientRequest::Query(QueryEnvelope {
+            request_id: RequestId::new(),
+            client_id: ClientId::new(),
+            task_id: Some(task_id),
+            query: Query::TaskCockpit(TaskCockpitQuery::OpenShellTerminal {
+                cwd: None,
+                expected_task_revision: 1,
+            }),
+        });
+        assert_eq!(action_for_client_request(&query), None);
     }
 
     #[test]
