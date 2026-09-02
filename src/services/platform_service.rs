@@ -626,6 +626,26 @@ extern "system" {
     fn OpenProcess(desired_access: u32, inherit_handle: i32, process_id: u32) -> *mut c_void;
     fn TerminateProcess(handle: *mut c_void, exit_code: u32) -> i32;
     fn WaitForSingleObject(handle: *mut c_void, milliseconds: u32) -> u32;
+    fn ReadProcessMemory(
+        process: *mut c_void,
+        base_address: *const c_void,
+        buffer: *mut c_void,
+        size: usize,
+        bytes_read: *mut usize,
+    ) -> i32;
+    fn IsWow64Process(process: *mut c_void, wow64_process: *mut i32) -> i32;
+}
+
+#[cfg(all(windows, target_pointer_width = "64"))]
+#[link(name = "ntdll")]
+extern "system" {
+    fn NtQueryInformationProcess(
+        process: *mut c_void,
+        information_class: u32,
+        information: *mut c_void,
+        information_length: u32,
+        return_length: *mut u32,
+    ) -> i32;
 }
 
 #[cfg(windows)]
@@ -642,6 +662,143 @@ const THREAD_SUSPEND_RESUME: u32 = 0x0002;
 const INVALID_HANDLE_VALUE: *mut c_void = -1_isize as *mut c_void;
 #[cfg(windows)]
 const RESUME_THREAD_FAILED: u32 = u32::MAX;
+
+/// Root-process working directory, read from the target process's PEB.
+///
+/// This is the only rung that observes `cmd.exe` and stock PowerShell changing
+/// directory: neither emits an OSC 7 cwd report under this manager, and both
+/// update `ProcessParameters->CurrentDirectory.DosPath` through
+/// `SetCurrentDirectory`. Every cross-process read is length-checked, and any
+/// failure -- exited process, denied access, short read, WOW64 target, or a
+/// path that is not an existing absolute directory -- returns `None` rather
+/// than a guess, because a wrong answer here becomes a durable terminal fact.
+#[cfg(all(windows, target_pointer_width = "64"))]
+pub fn root_process_cwd(pid: u32) -> Option<PathBuf> {
+    // x64 / arm64 layout. PEB->ProcessParameters, then
+    // RTL_USER_PROCESS_PARAMETERS->CurrentDirectory.DosPath (a UNICODE_STRING).
+    const PROCESS_BASIC_INFORMATION_CLASS: u32 = 0;
+    const PROCESS_BASIC_INFORMATION_SIZE: usize = 48;
+    const PEB_BASE_ADDRESS_OFFSET: usize = 0x08;
+    const PEB_PROCESS_PARAMETERS_OFFSET: usize = 0x20;
+    const PARAMETERS_CURRENT_DIRECTORY_OFFSET: usize = 0x38;
+    const UNICODE_STRING_SIZE: usize = 16;
+    const UNICODE_STRING_BUFFER_OFFSET: usize = 8;
+    // UNICODE_STRING.Length is a byte count held in a u16.
+    const MAX_UNICODE_STRING_BYTES: usize = u16::MAX as usize;
+
+    if pid == 0 {
+        return None;
+    }
+    let handle = unsafe { OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, 0, pid) };
+    if handle.is_null() {
+        return None;
+    }
+    let process = ProcessHandleGuard(handle);
+
+    // A 32-bit target keeps its live directory in the 32-bit PEB; the 64-bit
+    // one read here can be stale, and a stale directory is precisely the wrong
+    // answer to publish as a fact.
+    let mut is_wow64: i32 = 0;
+    if unsafe { IsWow64Process(process.0, &mut is_wow64) } == 0 || is_wow64 != 0 {
+        return None;
+    }
+
+    let mut basic = [0u8; PROCESS_BASIC_INFORMATION_SIZE];
+    let status = unsafe {
+        NtQueryInformationProcess(
+            process.0,
+            PROCESS_BASIC_INFORMATION_CLASS,
+            basic.as_mut_ptr().cast(),
+            PROCESS_BASIC_INFORMATION_SIZE as u32,
+            std::ptr::null_mut(),
+        )
+    };
+    if status != 0 {
+        return None;
+    }
+
+    let peb = pointer_at(&basic, PEB_BASE_ADDRESS_OFFSET)?;
+    let parameters =
+        read_remote_pointer(process.0, peb.checked_add(PEB_PROCESS_PARAMETERS_OFFSET)?)?;
+    let current_directory = parameters.checked_add(PARAMETERS_CURRENT_DIRECTORY_OFFSET)?;
+
+    let mut unicode_string = [0u8; UNICODE_STRING_SIZE];
+    read_remote(process.0, current_directory, &mut unicode_string)?;
+    let length = u16::from_ne_bytes([unicode_string[0], unicode_string[1]]) as usize;
+    let buffer = pointer_at(&unicode_string, UNICODE_STRING_BUFFER_OFFSET)?;
+    if length == 0 || length % 2 != 0 || length > MAX_UNICODE_STRING_BYTES {
+        return None;
+    }
+
+    let mut bytes = vec![0u8; length];
+    read_remote(process.0, buffer, &mut bytes)?;
+    let units: Vec<u16> = bytes
+        .chunks_exact(2)
+        .map(|pair| u16::from_ne_bytes([pair[0], pair[1]]))
+        .collect();
+    let path = PathBuf::from(String::from_utf16(&units).ok()?);
+    (path.is_absolute() && path.is_dir()).then_some(path)
+}
+
+/// Non-Windows and 32-bit hosts have no PEB rung. The cwd ladder falls through
+/// to the shell's own OSC 7 report and then to the launch directory.
+#[cfg(not(all(windows, target_pointer_width = "64")))]
+pub fn root_process_cwd(_pid: u32) -> Option<PathBuf> {
+    None
+}
+
+#[cfg(all(windows, target_pointer_width = "64"))]
+const PROCESS_QUERY_INFORMATION: u32 = 0x0400;
+#[cfg(all(windows, target_pointer_width = "64"))]
+const PROCESS_VM_READ: u32 = 0x0010;
+
+#[cfg(all(windows, target_pointer_width = "64"))]
+struct ProcessHandleGuard(*mut c_void);
+
+#[cfg(all(windows, target_pointer_width = "64"))]
+impl Drop for ProcessHandleGuard {
+    fn drop(&mut self) {
+        unsafe { CloseHandle(self.0) };
+    }
+}
+
+/// Read one pointer-sized field out of an already-copied local buffer.
+#[cfg(all(windows, target_pointer_width = "64"))]
+fn pointer_at(buffer: &[u8], offset: usize) -> Option<usize> {
+    const POINTER_BYTES: usize = std::mem::size_of::<usize>();
+    let slice = buffer.get(offset..offset.checked_add(POINTER_BYTES)?)?;
+    let mut raw = [0u8; POINTER_BYTES];
+    raw.copy_from_slice(slice);
+    Some(usize::from_ne_bytes(raw))
+}
+
+/// Fill `buffer` from the target process, or report failure. A partial read is
+/// a failure: half a path is not a shorter path.
+#[cfg(all(windows, target_pointer_width = "64"))]
+fn read_remote(process: *mut c_void, address: usize, buffer: &mut [u8]) -> Option<()> {
+    if address == 0 || buffer.is_empty() {
+        return None;
+    }
+    let mut read: usize = 0;
+    let ok = unsafe {
+        ReadProcessMemory(
+            process,
+            address as *const c_void,
+            buffer.as_mut_ptr().cast(),
+            buffer.len(),
+            &mut read,
+        )
+    };
+    (ok != 0 && read == buffer.len()).then_some(())
+}
+
+#[cfg(all(windows, target_pointer_width = "64"))]
+fn read_remote_pointer(process: *mut c_void, address: usize) -> Option<usize> {
+    const POINTER_BYTES: usize = std::mem::size_of::<usize>();
+    let mut raw = [0u8; POINTER_BYTES];
+    read_remote(process, address, &mut raw)?;
+    Some(usize::from_ne_bytes(raw))
+}
 
 #[cfg(windows)]
 #[repr(C)]
@@ -1010,6 +1167,32 @@ mod tests {
         let error = snapshot_listener_pids_until(&[80], std::time::Instant::now())
             .expect_err("an expired teardown lookup must fail before platform I/O");
         assert!(error.contains("absolute deadline"));
+    }
+
+    /// The PEB reader must be proven able to SEE a directory it is supposed to
+    /// report before any caller trusts a `None` from it. Reading this process's
+    /// own PEB is the only subject whose answer is independently known.
+    #[cfg(all(windows, target_pointer_width = "64"))]
+    #[test]
+    fn root_process_cwd_reads_this_process_current_directory() {
+        let expected = std::env::current_dir()
+            .expect("test cwd")
+            .canonicalize()
+            .expect("canonical test cwd");
+        let observed = super::root_process_cwd(std::process::id())
+            .expect("the PEB reader must see this process's own current directory");
+        assert!(observed.is_absolute());
+        assert_eq!(
+            observed.canonicalize().expect("canonical observed cwd"),
+            expected
+        );
+    }
+
+    /// A pid that cannot be opened is `None`, never a stale or borrowed path.
+    #[cfg(windows)]
+    #[test]
+    fn root_process_cwd_reports_nothing_for_an_impossible_pid() {
+        assert_eq!(super::root_process_cwd(0), None);
     }
 
     #[cfg(windows)]

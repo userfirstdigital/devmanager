@@ -179,6 +179,11 @@ impl LaunchIntent {
             MAX_LAUNCH_PATH_BYTES,
             "canonical working directory path",
         )?;
+        // Canonicalization is what proves the directory exists and resolves
+        // every link, so it stays. What CreateProcess is handed afterwards is a
+        // separate question: see `launchable_working_directory`.
+        #[cfg(windows)]
+        let cwd = launchable_working_directory(cwd);
         let display_label = ProcessDisplayLabel::new(self.display_label).map_err(|error| {
             ManagedLaunchError::new(ManagedLaunchStage::Validation, error.to_string())
         })?;
@@ -195,6 +200,47 @@ impl LaunchIntent {
             display_label,
         })
     }
+}
+
+/// Windows current-directory limit for a process that is not long-path aware.
+#[cfg(windows)]
+const MAX_LEGACY_PATH_CHARS: usize = 260;
+
+/// The launch form of an already-canonicalized working directory.
+///
+/// `std::fs::canonicalize` always returns the Windows verbatim device form, and
+/// `cmd.exe` refuses one as its current directory: it starts in `%SystemRoot%`
+/// instead, silently, with no error and nothing on the terminal. Measured on a
+/// real `cmd.exe /Q` launched into a canonicalized temp directory -- its PEB
+/// reported `C:\Windows\` for the whole life of the shell, so a plain shell
+/// opened somewhere the caller never asked for and every later cwd fact was
+/// wrong rather than missing.
+///
+/// The resolved target is unchanged; only its spelling is. A verbatim path is
+/// kept as-is when it is not a plain drive path (UNC and device paths have no
+/// equivalent short form) or when the short form would exceed the legacy path
+/// limit, where the verbatim form is the only one that works at all.
+#[cfg(windows)]
+fn launchable_working_directory(canonical: PathBuf) -> PathBuf {
+    use std::path::{Component, Prefix};
+
+    let mut components = canonical.components();
+    let Some(Component::Prefix(prefix)) = components.next() else {
+        return canonical;
+    };
+    let Prefix::VerbatimDisk(letter) = prefix.kind() else {
+        return canonical;
+    };
+    let mut rebuilt = PathBuf::from(format!("{}:{}", letter as char, std::path::MAIN_SEPARATOR));
+    for component in components {
+        if !matches!(component, Component::RootDir) {
+            rebuilt.push(component);
+        }
+    }
+    if rebuilt.as_os_str().len() >= MAX_LEGACY_PATH_CHARS {
+        return canonical;
+    }
+    rebuilt
 }
 
 fn validate_launch_input_bounds(intent: &LaunchIntent) -> Result<(), ManagedLaunchError> {
@@ -778,4 +824,55 @@ fn abort_pending(
         detail.push_str(&cleanup_error.to_string());
     }
     ManagedLaunchError::new(stage, detail)
+}
+
+#[cfg(all(test, windows))]
+mod tests {
+    use std::path::{Component, Prefix};
+
+    #[test]
+    fn a_canonical_launch_directory_is_handed_over_in_the_form_cmd_accepts() {
+        let canonical = std::env::temp_dir()
+            .canonicalize()
+            .expect("canonical temp dir");
+        assert!(
+            matches!(
+                canonical.components().next(),
+                Some(Component::Prefix(prefix)) if matches!(prefix.kind(), Prefix::VerbatimDisk(_))
+            ),
+            "canonicalize must produce the verbatim form this rewrite exists for: {canonical:?}"
+        );
+
+        let launchable = super::launchable_working_directory(canonical.clone());
+        assert!(
+            matches!(
+                launchable.components().next(),
+                Some(Component::Prefix(prefix)) if matches!(prefix.kind(), Prefix::Disk(_))
+            ),
+            "cmd.exe silently ignores a verbatim current directory: {launchable:?}"
+        );
+        assert_eq!(
+            launchable.canonicalize().expect("round trip"),
+            canonical,
+            "only the spelling may change, never the resolved target"
+        );
+    }
+
+    #[test]
+    fn a_path_with_no_short_form_is_left_exactly_as_resolved() {
+        // A verbatim UNC path has no equivalent drive form, and a path past the
+        // legacy limit only works in the verbatim form: both must survive.
+        let unc = std::path::PathBuf::from(format!(
+            "{sep}{sep}?{sep}UNC{sep}server{sep}share{sep}dir",
+            sep = std::path::MAIN_SEPARATOR
+        ));
+        assert_eq!(super::launchable_working_directory(unc.clone()), unc);
+
+        let long = std::path::PathBuf::from(format!(
+            "{sep}{sep}?{sep}C:{sep}{}",
+            "segment".repeat(60),
+            sep = std::path::MAIN_SEPARATOR
+        ));
+        assert_eq!(super::launchable_working_directory(long.clone()), long);
+    }
 }

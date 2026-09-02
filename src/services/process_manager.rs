@@ -49,6 +49,7 @@ use crate::state::{
     ResourceMetricValueState, ResourceSnapshot, RuntimeState, ServerLaunchSpec, SessionDimensions,
     SessionExitState, SessionKind, SessionRuntimeState, SessionStatus, SshLaunchSpec,
 };
+use crate::terminal::protocol::TerminalSessionId;
 #[cfg(not(windows))]
 use crate::terminal::session::ManagedProcessObservationQuery;
 #[cfg(windows)]
@@ -3125,6 +3126,156 @@ impl ProcessManager {
                 Err(error)
             }
         }
+    }
+
+    /// One durable key per task-owned plain shell. Every manager entry point
+    /// and the host fact pump address the session through this, so the literal
+    /// prefix exists exactly once.
+    fn shell_session_key(session_id: TerminalSessionId) -> String {
+        format!("shell-{session_id}")
+    }
+
+    /// Spawn one task-owned plain shell terminal.
+    ///
+    /// The launch authority is issued with exactly the `resource_id` and
+    /// `resource_generation` the caller will later present to
+    /// [`crate::terminal::service::TerminalService::attach_plain_shell`], which
+    /// verifies the runtime's own attachment fence rather than overwriting it.
+    /// A mismatch there is a silent refusal, never a spawn error, so the two
+    /// must be issued from the same pair.
+    pub fn spawn_task_shell_session(
+        &self,
+        task_id: TaskId,
+        resource_id: ResourceId,
+        resource_generation: u64,
+        action_epoch: u64,
+        launch: &crate::domain::resource::TerminalLaunch,
+        dimensions: SessionDimensions,
+    ) -> Result<TerminalSessionId, String> {
+        let terminal_session_id = TerminalSessionId::new();
+        let session_id = Self::shell_session_key(terminal_session_id);
+        ensure_prior_session_teardown_settled(&self.inner, &session_id, Duration::from_secs(2))?;
+        // The issuer is owner-agnostic and already mints ProcessOwner::Task for
+        // an exact resource/generation/epoch triple; a plain shell needs the
+        // identical fence, so it reuses it rather than forking a second copy.
+        let authority = self.issue_exact_provider_terminal_authority(
+            &session_id,
+            task_id,
+            resource_id,
+            resource_generation,
+            action_epoch,
+        )?;
+        let session = TerminalSession::spawn_command(
+            session_id.clone(),
+            launch.cwd.clone(),
+            dimensions,
+            launch.program.to_string_lossy().into_owned(),
+            launch.args.clone(),
+            HashMap::new(),
+            self.log_buffer_size(),
+            None,
+            self.inner.runtime_state.clone(),
+            self.inner.debug_enabled,
+            Some(session_change_notifier(
+                self.inner.clone(),
+                session_id.clone(),
+            )),
+            Some(session_output_notifier(
+                self.inner.clone(),
+                session_id.clone(),
+            )),
+            authority,
+        )?;
+        self.inner
+            .sessions
+            .lock()
+            .map_err(|_| "Session store poisoned".to_string())?
+            .insert(session_id, Arc::new(session));
+        Ok(terminal_session_id)
+    }
+
+    /// The live runtime for one task-owned plain shell, for attachment and input.
+    pub fn task_shell_runtime(
+        &self,
+        session_id: TerminalSessionId,
+    ) -> Result<Arc<TerminalSession>, String> {
+        let key = Self::shell_session_key(session_id);
+        self.inner
+            .sessions
+            .lock()
+            .map_err(|_| "Session store poisoned".to_string())?
+            .get(&key)
+            .cloned()
+            .ok_or_else(|| format!("shell session {key} is not live"))
+    }
+
+    /// Best-known working directory for one plain shell, in rung order:
+    ///
+    /// 1. `reported_cwd`, set by the OSC 7 / kitty-shell-cwd parser for shells
+    ///    that carry prompt integration.
+    /// 2. The root process PEB, which is what `cmd.exe` and stock PowerShell
+    ///    actually update on `cd`; neither emits OSC 7 under this manager.
+    /// 3. The launch directory, which stays true until the shell moves.
+    ///
+    /// Each rung must be absolute to be returned. `TerminalFacts` silently
+    /// refuses a relative cwd, so a relative answer here would become an
+    /// invisible dropped fact rather than a visible wrong one.
+    pub fn shell_session_cwd(&self, session_id: TerminalSessionId) -> Option<PathBuf> {
+        let key = Self::shell_session_key(session_id);
+        let (reported, pid, launch_cwd) = {
+            let runtime = self.inner.runtime_state.read().ok()?;
+            let session = runtime.sessions.get(&key)?;
+            (
+                session.reported_cwd.clone(),
+                session.pid,
+                session.cwd.clone(),
+            )
+        };
+        reported
+            .filter(|cwd| cwd.is_absolute())
+            .or_else(|| pid.and_then(platform_service::root_process_cwd))
+            .or_else(|| Some(launch_cwd).filter(|cwd| cwd.is_absolute()))
+    }
+
+    /// The observed exit for one plain shell, or `None` while it is still live.
+    ///
+    /// A close request stamps a placeholder exit with no code while the session
+    /// is still `Stopping`, so reading `exit` alone would report every close as
+    /// "exited, code unknown". The status is the discriminator.
+    pub fn shell_session_exit(
+        &self,
+        session_id: TerminalSessionId,
+    ) -> Option<(Option<i32>, String)> {
+        let key = Self::shell_session_key(session_id);
+        let runtime = self.inner.runtime_state.read().ok()?;
+        let session = runtime.sessions.get(&key)?;
+        if session.status.is_live() {
+            return None;
+        }
+        session
+            .exit
+            .as_ref()
+            .map(|exit| (exit.code.map(|code| code as i32), exit.summary.clone()))
+    }
+
+    /// Close one task-owned plain shell.
+    ///
+    /// Closing an id this manager no longer owns is a no-op: the host reaches
+    /// here both from an explicit `CloseTerminal` and after the durable
+    /// resource was released under it, and in both cases the shell may already
+    /// have ended on its own.
+    pub fn close_task_shell_session(&self, session_id: TerminalSessionId) -> Result<(), String> {
+        let key = Self::shell_session_key(session_id);
+        let owned = self
+            .inner
+            .sessions
+            .lock()
+            .map_err(|_| "Session store poisoned".to_string())?
+            .contains_key(&key);
+        if !owned {
+            return Ok(());
+        }
+        self.close_session(&key)
     }
 
     pub fn write_to_session(&self, session_id: &str, text: &str) -> Result<(), String> {
