@@ -458,6 +458,23 @@ impl ConnectDispatchSession {
                 self.dispatch_request(envelope, ClientRequest::Command(command), host)
                     .await
             }
+            ConnectPayload::TerminalInput(request) => {
+                let Some(operation_id) = envelope.operation_id else {
+                    return Err(DispatchFailure::fatal(
+                        CONNECT_ERROR_PROTOCOL,
+                        "TerminalInput envelope must carry operation_id",
+                    ));
+                };
+                if operation_id.as_bytes() != request.input_id.as_bytes() {
+                    return Err(DispatchFailure::fatal(
+                        CONNECT_ERROR_PROTOCOL,
+                        "TerminalInput input_id does not match the envelope",
+                    ));
+                }
+                self.admit_post_hello_frame(envelope)?;
+                self.dispatch_request(envelope, ClientRequest::TerminalInput(request), host)
+                    .await
+            }
             ConnectPayload::Extension(extension) if extension.type_id == ORG_EXTENSION_TYPE => {
                 let negotiated = self.admit_post_hello_frame(envelope)?;
                 self.dispatch_organization_extension(envelope, extension, negotiated)
@@ -513,6 +530,7 @@ impl ConnectDispatchSession {
             }
             ConnectPayload::QueryReply(_)
             | ConnectPayload::CommandReceipt(_)
+            | ConnectPayload::TerminalInputAck(_)
             | ConnectPayload::OperationSettlement(_)
             | ConnectPayload::Presence(_)
             | ConnectPayload::TerminalDelta(_)
@@ -579,12 +597,9 @@ impl ConnectDispatchSession {
                 "Hello cannot advertise RawContent as the default privacy class",
             ));
         }
-        let limits = self
-            .limit_ceiling
-            .negotiate(hello.limits)
-            .map_err(|_| {
-                DispatchFailure::fatal(CONNECT_ERROR_PROTOCOL, "Hello limits cannot be negotiated")
-            })?;
+        let limits = self.limit_ceiling.negotiate(hello.limits).map_err(|_| {
+            DispatchFailure::fatal(CONNECT_ERROR_PROTOCOL, "Hello limits cannot be negotiated")
+        })?;
         let capabilities = advertised_connect_capabilities_for_host(host_attached)
             .intersection(hello.capabilities)
             .intersection(self.capability_ceiling);
@@ -1069,6 +1084,20 @@ fn convert_host_message(
         ConnectPayload::CommandReceipt(receipt) => {
             correlate_command_receipt(receipt, envelope)?;
         }
+        ConnectPayload::TerminalInputAck(ack) => {
+            let Some(operation_id) = envelope.operation_id else {
+                return Err(DispatchFailure::soft(
+                    CONNECT_ERROR_PROTOCOL,
+                    "TerminalInputAck requires operation correlation",
+                ));
+            };
+            if operation_id.as_bytes() != ack.input_id.as_bytes() {
+                return Err(DispatchFailure::soft(
+                    CONNECT_ERROR_PROTOCOL,
+                    "TerminalInputAck input_id does not match the envelope",
+                ));
+            }
+        }
         _ => {}
     }
     Ok(payload)
@@ -1161,6 +1190,29 @@ mod tests {
     use crate::host::HostRequestExecutor;
     use crate::kernel::CommandBus;
     use crate::protocol::CapabilitySet;
+
+    struct EchoTerminalPort;
+
+    #[async_trait::async_trait]
+    impl ConnectHostCommandPort for EchoTerminalPort {
+        async fn execute(
+            &self,
+            _negotiated: NegotiatedParameters,
+            request: ClientRequest,
+        ) -> Result<ServerMessage, IpcError> {
+            let ClientRequest::TerminalInput(request) = request else {
+                return Err(IpcError::Unsupported);
+            };
+            Ok(ServerMessage::TerminalInputAck(
+                crate::terminal::protocol::TerminalInputAck {
+                    input_id: request.input_id,
+                    ack: crate::terminal::protocol::InputAck::Accepted {
+                        sequence: request.context.input_sequence,
+                    },
+                },
+            ))
+        }
+    }
 
     fn binding() -> ChannelBinding {
         ChannelBinding::new(
@@ -1342,6 +1394,66 @@ mod tests {
         drop(handle);
         executor.abort();
         let _ = executor.await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn terminal_input_reaches_host_and_returns_exact_correlated_ack() {
+        use crate::domain::{AgentSessionId, ResourceId, TerminalId};
+        use crate::terminal::protocol::{
+            FocusEpoch, InputId, TerminalGeneration, TerminalInputContext, TerminalInputRequest,
+            TerminalSessionId,
+        };
+
+        let binding = binding();
+        let mut session = ConnectDispatchSession::bind_paired(
+            "web-paired-owner".to_owned(),
+            ConnectIdentityLiveState::Live,
+        )
+        .with_legacy_host_compat();
+        let (limits, client_id) = complete_hello(&mut session, binding).await;
+        let request = TerminalInputRequest {
+            client_id,
+            input_id: InputId::new(),
+            terminal_id: TerminalId::new(),
+            context: TerminalInputContext {
+                task_id: TaskId::new(),
+                agent_session_id: AgentSessionId::new(),
+                resource_id: ResourceId::new(),
+                runtime_generation: 2,
+                resource_generation: 3,
+                session_id: TerminalSessionId::new(),
+                terminal_generation: TerminalGeneration::initial(),
+                focus_epoch: FocusEpoch::initial(),
+                action_epoch: 4,
+                input_sequence: 5,
+            },
+            bytes: b"remote input\r".to_vec(),
+        };
+        let operation_id = OperationId::from_bytes(*request.input_id.as_bytes())
+            .expect("input id is operation id");
+        let payload = ConnectPayload::TerminalInput(request.clone());
+        let env = ConnectEnvelope::new(
+            binding,
+            payload.channel(),
+            2,
+            None,
+            Some(operation_id),
+            limits,
+            ConnectPrivacyClass::RawContent,
+            payload.clone(),
+        )
+        .expect("terminal envelope");
+        let port = EchoTerminalPort;
+        let (reply, disposition) = session.handle_payload(&env, payload, Some(&port)).await;
+        assert_eq!(disposition, ConnectSessionDisposition::Continue);
+        let ConnectPayload::TerminalInputAck(ack) = reply else {
+            panic!("expected terminal ack, got {reply:?}");
+        };
+        assert_eq!(ack.input_id, request.input_id);
+        assert_eq!(
+            ack.ack,
+            crate::terminal::protocol::InputAck::Accepted { sequence: 5 }
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]

@@ -31,9 +31,10 @@ use crate::protocol::{
 };
 
 use super::connection::{
-    complete_query_waiter_error, dispatch_server_message, finish_shared_connection,
-    new_supervisor_handles, poison_mutex, ClientConnection, ConnectAuthenticatedSession,
-    ConnectionMetadata, SharedState, SupervisorHandles, UnsolicitedInbox, WriteJob,
+    complete_query_waiter_error, complete_terminal_input_waiter_error, dispatch_server_message,
+    finish_shared_connection, new_supervisor_handles, poison_mutex, ClientConnection,
+    ConnectAuthenticatedSession, ConnectionMetadata, SharedState, SupervisorHandles,
+    UnsolicitedInbox, WriteJob,
 };
 
 const CONNECT_WS_GREETING_MAGIC: &[u8; 5] = b"DMCN1";
@@ -565,8 +566,14 @@ where
                 let payload = envelope
                     .decode_payload()
                     .map_err(|_| IpcError::Unauthorized)?;
-                dispatch_connect_payload(&state, &unsolicited, payload, envelope.request_id)
-                    .await?;
+                dispatch_connect_payload(
+                    &state,
+                    &unsolicited,
+                    payload,
+                    envelope.request_id,
+                    envelope.operation_id,
+                )
+                .await?;
             }
         }
     }
@@ -578,6 +585,7 @@ async fn dispatch_connect_payload(
     unsolicited: &UnsolicitedInbox,
     payload: ConnectPayload,
     envelope_request_id: Option<RequestId>,
+    envelope_operation_id: Option<crate::domain::id::OperationId>,
 ) -> Result<(), IpcError> {
     match payload {
         ConnectPayload::QueryReply(reply) => {
@@ -587,6 +595,9 @@ async fn dispatch_connect_payload(
             dispatch_server_message(state, unsolicited, ServerMessage::CommandReceipt(receipt))
                 .await
         }
+        ConnectPayload::TerminalInputAck(ack) => {
+            dispatch_server_message(state, unsolicited, ServerMessage::TerminalInputAck(ack)).await
+        }
         ConnectPayload::HostDurableOutput(host)
         | ConnectPayload::HostCriticalOutput(host)
         | ConnectPayload::HostStreamOutput(host)
@@ -595,15 +606,22 @@ async fn dispatch_connect_payload(
         }
         ConnectPayload::Error(error) => {
             let request_id = error.request_id.or(envelope_request_id);
-            let Some(request_id) = request_id else {
+            if let Some(request_id) = request_id {
+                return complete_query_waiter_error(state, request_id, IpcError::Unauthorized);
+            }
+            let operation_id = error.operation_id.or(envelope_operation_id);
+            let Some(operation_id) = operation_id else {
                 return Err(IpcError::Unauthorized);
             };
-            complete_query_waiter_error(state, request_id, IpcError::Unauthorized)
+            let input_id = crate::terminal::protocol::InputId::from_bytes(*operation_id.as_bytes())
+                .map_err(|_| IpcError::Unauthorized)?;
+            complete_terminal_input_waiter_error(state, input_id, IpcError::Unauthorized)
         }
         ConnectPayload::Hello(_)
         | ConnectPayload::Capabilities(_)
         | ConnectPayload::Query(_)
         | ConnectPayload::Command(_)
+        | ConnectPayload::TerminalInput(_)
         | ConnectPayload::SnapshotPage(_)
         | ConnectPayload::EventPage(_)
         | ConnectPayload::OperationSettlement(_)
@@ -634,7 +652,18 @@ fn client_request_to_payload(
             Ok((ConnectPayload::Query(envelope), Some(request_id), None))
         }
         ClientRequest::Command(envelope) => Ok((ConnectPayload::Command(envelope), None, None)),
-        ClientRequest::Detach(_) | ClientRequest::TerminalInput(_) => Err(IpcError::Unsupported),
+        ClientRequest::TerminalInput(request) => {
+            request.validate().map_err(|_| IpcError::Unavailable)?;
+            let operation_id =
+                crate::domain::id::OperationId::from_bytes(*request.input_id.as_bytes())
+                    .map_err(|_| IpcError::Unauthorized)?;
+            Ok((
+                ConnectPayload::TerminalInput(request),
+                None,
+                Some(operation_id),
+            ))
+        }
+        ClientRequest::Detach(_) => Err(IpcError::Unsupported),
     }
 }
 
@@ -651,6 +680,11 @@ fn seal_connect_frame(
     let mut nonce = [0_u8; SEALED_NONCE_BYTES];
     getrandom::fill(&mut nonce).map_err(|_| IpcError::Unavailable)?;
     let sequence = channel.next_send_sequence();
+    let privacy_class = if matches!(payload, ConnectPayload::TerminalInput(_)) {
+        ConnectPrivacyClass::RawContent
+    } else {
+        ConnectPrivacyClass::LocalOnly
+    };
     let envelope = ConnectEnvelope::new(
         binding,
         payload.channel(),
@@ -658,7 +692,7 @@ fn seal_connect_frame(
         request_id,
         operation_id,
         limits,
-        ConnectPrivacyClass::LocalOnly,
+        privacy_class,
         payload,
     )
     .map_err(|_| IpcError::Unauthorized)?;
@@ -782,7 +816,7 @@ mod tests {
     };
     use crate::domain::command::{Command, CommandEnvelope, CommandReceipt, RejectionCode};
     use crate::domain::event::{DomainEvent, Event};
-    use crate::domain::id::{CommandId, EventId, SubscriptionId, TaskId};
+    use crate::domain::id::{CommandId, EventId, OperationId, SubscriptionId, TaskId};
     use crate::domain::query::{Query, QueryEnvelope, QueryOutcome, QueryReply};
     use crate::protocol::Capability;
     use std::pin::Pin;
@@ -914,6 +948,17 @@ mod tests {
         payload: ConnectPayload,
         request_id: Option<RequestId>,
     ) -> Vec<u8> {
+        seal_payload_correlated(channel, binding, limits, payload, request_id, None)
+    }
+
+    fn seal_payload_correlated(
+        channel: &mut EndToEndChannel,
+        binding: ChannelBinding,
+        limits: ConnectLimits,
+        payload: ConnectPayload,
+        request_id: Option<RequestId>,
+        operation_id: Option<OperationId>,
+    ) -> Vec<u8> {
         let nonce = [7_u8; SEALED_NONCE_BYTES];
         let sequence = channel.next_send_sequence();
         let envelope = ConnectEnvelope::new(
@@ -921,7 +966,7 @@ mod tests {
             payload.channel(),
             sequence,
             request_id,
-            None,
+            operation_id,
             limits,
             ConnectPrivacyClass::LocalOnly,
             payload,
@@ -1206,6 +1251,90 @@ mod tests {
             )))
             .unwrap();
         assert_eq!(cmd_task.await.expect("join").expect("receipt"), receipt);
+        drop(connection);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn terminal_input_round_trip_preserves_raw_bytes_and_exact_input_id() {
+        use crate::domain::{AgentSessionId, ResourceId, TerminalId};
+        use crate::terminal::protocol::{
+            FocusEpoch, InputAck, InputId, TerminalGeneration, TerminalInputAck,
+            TerminalInputContext, TerminalInputRequest, TerminalSessionId,
+        };
+
+        let (
+            connection,
+            mut host_channel,
+            binding,
+            limits,
+            assigned,
+            to_client_tx,
+            mut from_client_rx,
+        ) = attach_pair(0x67);
+        let request = TerminalInputRequest {
+            client_id: assigned,
+            input_id: InputId::new(),
+            terminal_id: TerminalId::new(),
+            context: TerminalInputContext {
+                task_id: TaskId::new(),
+                agent_session_id: AgentSessionId::new(),
+                resource_id: ResourceId::new(),
+                runtime_generation: 2,
+                resource_generation: 3,
+                session_id: TerminalSessionId::new(),
+                terminal_generation: TerminalGeneration::initial(),
+                focus_epoch: FocusEpoch::initial(),
+                action_epoch: 4,
+                input_sequence: 5,
+            },
+            bytes: b"dir\r\x03".to_vec(),
+        };
+        let input_id = request.input_id;
+        let input_task = tokio::spawn({
+            let connection = connection.clone();
+            let request = request.clone();
+            async move { connection.execute_terminal_input(request).await }
+        });
+
+        let outbound = from_client_rx.recv().await.expect("terminal input frame");
+        let WsMessage::Binary(outbound) = outbound else {
+            panic!("binary terminal frame");
+        };
+        let frame = SealedFrame::decode(&outbound).expect("sealed frame");
+        let plaintext = host_channel
+            .open_bytes(&frame, unix_now_secs())
+            .expect("open terminal frame");
+        let envelope = ConnectEnvelope::decode_with_limits(&plaintext, limits).expect("envelope");
+        assert_eq!(
+            envelope.operation_id,
+            OperationId::from_bytes(*input_id.as_bytes()).ok()
+        );
+        assert_eq!(envelope.privacy_class, ConnectPrivacyClass::RawContent);
+        let ConnectPayload::TerminalInput(actual) = envelope.decode_payload().expect("payload")
+        else {
+            panic!("terminal input payload");
+        };
+        assert_eq!(actual, request);
+
+        let operation_id = OperationId::from_bytes(*input_id.as_bytes()).expect("operation id");
+        let response = TerminalInputAck {
+            input_id,
+            ack: InputAck::Accepted { sequence: 5 },
+        };
+        to_client_tx
+            .send(WsMessage::Binary(seal_payload_correlated(
+                &mut host_channel,
+                binding,
+                limits,
+                ConnectPayload::TerminalInputAck(response),
+                None,
+                Some(operation_id),
+            )))
+            .expect("send ack");
+        assert_eq!(
+            input_task.await.expect("join").expect("input ack"),
+            InputAck::Accepted { sequence: 5 }
+        );
         drop(connection);
     }
 

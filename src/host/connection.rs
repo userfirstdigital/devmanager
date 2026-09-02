@@ -100,6 +100,15 @@ fn task_resource_blocks_archive_after_cleanup_error(
         )
 }
 
+fn provider_cleanup_requires_resource_release_first<'a>(
+    resources: impl IntoIterator<Item = &'a ResourceFacts>,
+    task_id: TaskId,
+) -> bool {
+    resources
+        .into_iter()
+        .any(|resource| task_resource_blocks_archive_after_cleanup_error(resource, task_id))
+}
+
 fn run_provider_dispatch_pass(
     bus: &mut CommandBus,
     runtime: &crate::providers::dispatch::ProviderDispatchRuntime,
@@ -5173,6 +5182,46 @@ impl HostRequestExecutor {
     /// that path registers an Active terminal resource with no OS process, and
     /// process-empty teardown refuses live resources. Release, settle, close,
     /// then archive in this host effect.
+    fn close_provider_task_for_archive(
+        &mut self,
+        task_id: TaskId,
+        command_id: crate::domain::id::CommandId,
+        current_revision: u64,
+    ) -> Result<Option<CommandReceipt>, IpcError> {
+        let Some(runtime) = self.configured_service_runtime.as_ref() else {
+            return Ok(None);
+        };
+        if let Err(error) = runtime.manager.close_provider_task(task_id) {
+            eprintln!("devmanager-host: task close provider session stop failed: {error}");
+            // The domain resource ledger is the authority for live process
+            // custody. A stale provider-state row (for example after a CLI
+            // upgrade changes its executable hash) must not strand a task
+            // whose task-owned resources are already durably Released.
+            // Conversely, never archive through a cleanup error while any
+            // owned resource may still be live or settling.
+            let cleanup_snapshot = self
+                .bus
+                .task_snapshot(task_id)
+                .map_err(map_store_error)?
+                .ok_or(IpcError::Unavailable)?;
+            if provider_cleanup_requires_resource_release_first(
+                cleanup_snapshot.resources.values(),
+                task_id,
+            ) {
+                return Ok(Some(CommandReceipt::Rejected {
+                    command_id,
+                    code: crate::domain::command::RejectionCode::InvalidTransition,
+                    current_revision: Some(current_revision),
+                    resolution: None,
+                }));
+            }
+            eprintln!(
+                "devmanager-host: task close continuing after stale provider cleanup failure; all task-owned resources are released"
+            );
+        }
+        Ok(None)
+    }
+
     fn dispatch_task_close(
         &mut self,
         negotiated: NegotiatedParameters,
@@ -5210,33 +5259,15 @@ impl HostRequestExecutor {
                 resolution: None,
             }));
         }
-        if let Some(runtime) = self.configured_service_runtime.as_ref() {
-            if let Err(error) = runtime.manager.close_provider_task(task_id) {
-                eprintln!("devmanager-host: task close provider session stop failed: {error}");
-                // The domain resource ledger is the authority for live process
-                // custody. A stale provider-state row (for example after a CLI
-                // upgrade changes its executable hash) must not strand a task
-                // whose task-owned resources are already durably Released.
-                // Conversely, never archive through a cleanup error while any
-                // owned resource may still be live or settling.
-                let cleanup_snapshot = self
-                    .bus
-                    .task_snapshot(task_id)
-                    .map_err(map_store_error)?
-                    .ok_or(IpcError::Unavailable)?;
-                if cleanup_snapshot.resources.values().any(|resource| {
-                    task_resource_blocks_archive_after_cleanup_error(resource, task_id)
-                }) {
-                    return Ok(ServerMessage::CommandReceipt(CommandReceipt::Rejected {
-                        command_id: envelope.command_id,
-                        code: crate::domain::command::RejectionCode::InvalidTransition,
-                        current_revision: Some(snapshot.task.revision),
-                        resolution: None,
-                    }));
-                }
-                eprintln!(
-                    "devmanager-host: task close continuing after stale provider cleanup failure; all task-owned resources are released"
-                );
+        let defer_provider_cleanup =
+            provider_cleanup_requires_resource_release_first(snapshot.resources.values(), task_id);
+        if !defer_provider_cleanup {
+            if let Some(receipt) = self.close_provider_task_for_archive(
+                task_id,
+                envelope.command_id,
+                snapshot.task.revision,
+            )? {
+                return Ok(ServerMessage::CommandReceipt(receipt));
             }
         }
 
@@ -5303,6 +5334,23 @@ impl HostRequestExecutor {
             }
             self.fan_out_live_durable_events();
             released += 1;
+        }
+
+        if defer_provider_cleanup {
+            let cleanup_revision = self
+                .bus
+                .task_snapshot(task_id)
+                .map_err(map_store_error)?
+                .ok_or(IpcError::Unavailable)?
+                .task
+                .revision;
+            if let Some(receipt) = self.close_provider_task_for_archive(
+                task_id,
+                envelope.command_id,
+                cleanup_revision,
+            )? {
+                return Ok(ServerMessage::CommandReceipt(receipt));
+            }
         }
 
         let snapshot = self
@@ -13470,9 +13518,10 @@ mod output_tests {
 mod tests {
     use super::{
         apply_admitted_notification_sound, next_attention_after_provider_restore_failure,
-        provider_restore_failure_attention, provider_restore_success_attention,
-        provider_terminal_query_may_attach, push_unique_provider_restore_intent,
-        restore_admitted_provider_launch_options, task_resource_blocks_archive_after_cleanup_error,
+        provider_cleanup_requires_resource_release_first, provider_restore_failure_attention,
+        provider_restore_success_attention, provider_terminal_query_may_attach,
+        push_unique_provider_restore_intent, restore_admitted_provider_launch_options,
+        task_resource_blocks_archive_after_cleanup_error,
     };
     use crate::domain::agent::{
         AgentRole, AgentSessionFacts, AgentSessionLifecycle, ProviderSessionId,
@@ -13542,6 +13591,31 @@ mod tests {
         .expect("host resource");
         assert!(!task_resource_blocks_archive_after_cleanup_error(
             &host, task_id
+        ));
+    }
+
+    #[test]
+    fn active_task_resource_defers_provider_cleanup_until_release_settles() {
+        let task_id = TaskId::new();
+        let mut owned = ResourceFacts::new(
+            Some(task_id),
+            OwnerKind::Task,
+            ResourceKind::Terminal,
+            ResourceRecipe::Terminal { cols: 80, rows: 24 },
+            1,
+        )
+        .expect("task resource");
+        let resources = HashMap::from([(owned.id, owned.clone())]);
+        assert!(provider_cleanup_requires_resource_release_first(
+            resources.values(),
+            task_id
+        ));
+
+        owned.lifecycle = ResourceLifecycle::Released;
+        let resources = HashMap::from([(owned.id, owned)]);
+        assert!(!provider_cleanup_requires_resource_release_first(
+            resources.values(),
+            task_id
         ));
     }
 

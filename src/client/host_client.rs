@@ -240,9 +240,6 @@ impl HostClient {
     /// [`IpcError::UnsupportedCapability`] and leaves the connection live.
     /// Connect transport does not carry Detach payloads (`IpcError::Unsupported`).
     pub async fn detach(&mut self) -> Result<Uuid, IpcError> {
-        if matches!(self.transport, HostClientTransport::Connect { .. }) {
-            return Err(IpcError::Unsupported);
-        }
         if !self
             .metadata
             .granted_capabilities()
@@ -428,9 +425,6 @@ impl HostClient {
     ) -> Result<InputAck, IpcError> {
         if request.client_id != self.client_id() {
             return Err(IpcError::Unauthorized);
-        }
-        if matches!(self.transport, HostClientTransport::Connect { .. }) {
-            return Err(IpcError::Unsupported);
         }
         if !self
             .metadata

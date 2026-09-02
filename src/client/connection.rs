@@ -1849,6 +1849,24 @@ pub(crate) fn complete_query_waiter_error(
     }
 }
 
+pub(crate) fn complete_terminal_input_waiter_error(
+    state: &Arc<Mutex<SharedState>>,
+    input_id: crate::terminal::protocol::InputId,
+    error: IpcError,
+) -> Result<(), IpcError> {
+    let pending = {
+        let mut guard = state.lock().expect("client connection state");
+        guard.terminal_input_waiters.remove(&input_id)
+    };
+    match pending {
+        Some(pending) => {
+            pending.complete(Err(error));
+            Ok(())
+        }
+        None => Err(IpcError::CorrelationMismatch),
+    }
+}
+
 fn validate_server_hello(sent: &ClientHello, received: &ServerHello) -> Result<(), IpcError> {
     if received.profile_fingerprint != sent.profile_fingerprint {
         return Err(IpcError::ProfileMismatch);

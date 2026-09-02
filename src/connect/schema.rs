@@ -17,6 +17,7 @@ use crate::protocol::{
     Capability, CapabilitySet, MessagePackCodec, MessagePackError, ServerMessage, StreamFrame,
     StreamPayloadKind,
 };
+use crate::terminal::protocol::{TerminalInputAck, TerminalInputRequest};
 
 use super::envelope::{
     binary_payload, ChannelKind, ConnectLimitError, ConnectLimits, ConnectPrivacyClass,
@@ -217,6 +218,22 @@ static PAYLOAD_CATALOG: &[PayloadDescriptor] = &[
         PayloadKind::HOST_CONVERSATION_OUTPUT,
         "host_conversation_output",
         ChannelKind::Ephemeral,
+        false,
+        false,
+        MAX_CONNECT_DIAGNOSTIC_BYTES,
+    ),
+    descriptor(
+        PayloadKind::TERMINAL_INPUT,
+        "terminal_input",
+        ChannelKind::Critical,
+        true,
+        true,
+        MAX_CONNECT_REASSEMBLED_MESSAGE_BYTES,
+    ),
+    descriptor(
+        PayloadKind::TERMINAL_INPUT_ACK,
+        "terminal_input_ack",
+        ChannelKind::Critical,
         false,
         false,
         MAX_CONNECT_DIAGNOSTIC_BYTES,
@@ -526,6 +543,8 @@ pub enum ConnectPayload {
     HostCriticalOutput(HostOutputPayload),
     HostStreamOutput(HostOutputPayload),
     HostConversationOutput(HostOutputPayload),
+    TerminalInput(TerminalInputRequest),
+    TerminalInputAck(TerminalInputAck),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -605,6 +624,8 @@ impl ConnectPayload {
             Self::HostCriticalOutput(_) => PayloadKind::HOST_CRITICAL_OUTPUT,
             Self::HostStreamOutput(_) => PayloadKind::HOST_STREAM_OUTPUT,
             Self::HostConversationOutput(_) => PayloadKind::HOST_CONVERSATION_OUTPUT,
+            Self::TerminalInput(_) => PayloadKind::TERMINAL_INPUT,
+            Self::TerminalInputAck(_) => PayloadKind::TERMINAL_INPUT_ACK,
             Self::Extension(extension) => PayloadKind::new(extension.type_id)
                 .filter(|kind| kind.known().is_none() || *kind == PayloadKind::EXTENSION)
                 .unwrap_or(PayloadKind::EXTENSION),
@@ -629,7 +650,9 @@ impl ConnectPayload {
             | Self::OperationSettlement(_)
             | Self::Resync(_)
             | Self::Error(_)
-            | Self::HostCriticalOutput(_) => ChannelKind::Critical,
+            | Self::HostCriticalOutput(_)
+            | Self::TerminalInput(_)
+            | Self::TerminalInputAck(_) => ChannelKind::Critical,
             Self::SnapshotPage(_)
             | Self::EventPage(_)
             | Self::PromptExtension(_)
@@ -646,7 +669,7 @@ impl ConnectPayload {
     }
 
     pub const fn is_action(&self) -> bool {
-        matches!(self, Self::Command(_))
+        matches!(self, Self::Command(_) | Self::TerminalInput(_))
     }
 
     pub const fn is_host_output(&self) -> bool {
@@ -663,6 +686,7 @@ impl ConnectPayload {
         matches!(
             self,
             Self::TerminalDelta(_)
+                | Self::TerminalInput(_)
                 | Self::BrowserFrame(_)
                 | Self::Chunk(_)
                 | Self::HostStreamOutput(_)
@@ -684,9 +708,7 @@ impl ConnectPayload {
         match message {
             ServerMessage::QueryReply(reply) => Ok(Self::QueryReply(reply)),
             ServerMessage::CommandReceipt(receipt) => Ok(Self::CommandReceipt(receipt)),
-            ServerMessage::TerminalInputAck(_) => Err(PayloadDecodeError::Ambiguous {
-                reason: "terminal input acknowledgements are not Connect request-lane payloads",
-            }),
+            ServerMessage::TerminalInputAck(ack) => Ok(Self::TerminalInputAck(ack)),
             ServerMessage::UpdateHandoff(_) => Err(PayloadDecodeError::Ambiguous {
                 reason: "update handoff replies stay on the authenticated host control lane",
             }),
@@ -763,6 +785,8 @@ impl ConnectPayload {
             Self::QueryReply(value) => encode_named(value, limits)?,
             Self::Command(value) => encode_named(value, limits)?,
             Self::CommandReceipt(value) => encode_named(value, limits)?,
+            Self::TerminalInput(value) => encode_named(value, limits)?,
+            Self::TerminalInputAck(value) => encode_named(value, limits)?,
             Self::OperationSettlement(value) => encode_named(value, limits)?,
             Self::Presence(value) => encode_named(value, limits)?,
             Self::TerminalDelta(value) | Self::BrowserFrame(value) => encode_named(value, limits)?,
@@ -836,6 +860,8 @@ impl ConnectPayload {
             KnownPayloadKind::QueryReply => Self::QueryReply(codec.decode(bytes)?),
             KnownPayloadKind::Command => Self::Command(codec.decode(bytes)?),
             KnownPayloadKind::CommandReceipt => Self::CommandReceipt(codec.decode(bytes)?),
+            KnownPayloadKind::TerminalInput => Self::TerminalInput(codec.decode(bytes)?),
+            KnownPayloadKind::TerminalInputAck => Self::TerminalInputAck(codec.decode(bytes)?),
             KnownPayloadKind::OperationSettlement => {
                 Self::OperationSettlement(codec.decode(bytes)?)
             }
@@ -918,6 +944,12 @@ impl ConnectPayload {
             Self::TerminalDelta(delta) | Self::BrowserFrame(delta) => {
                 limits.validate_payload_len(delta.payload.len())?;
             }
+            Self::TerminalInput(request) => {
+                request
+                    .validate()
+                    .map_err(|_| PayloadDecodeError::InvalidPayload)?;
+                limits.validate_payload_len(request.bytes.len())?;
+            }
             Self::Extension(extension) => {
                 if extension.type_id == 0 || extension.schema_version == 0 {
                     return Err(PayloadDecodeError::Ambiguous {
@@ -939,6 +971,7 @@ impl ConnectPayload {
             | Self::QueryReply(_)
             | Self::Command(_)
             | Self::CommandReceipt(_)
+            | Self::TerminalInputAck(_)
             | Self::OperationSettlement(_)
             | Self::Presence(_)
             | Self::PromptExtension(_)
@@ -1476,6 +1509,56 @@ mod tests {
             .expect("convert"),
             payload
         );
+    }
+
+    #[test]
+    fn terminal_input_and_ack_round_trip_on_the_critical_raw_content_lane() {
+        use crate::domain::{AgentSessionId, ResourceId, TerminalId};
+        use crate::terminal::protocol::{
+            FocusEpoch, InputAck, InputId, TerminalGeneration, TerminalInputAck,
+            TerminalInputContext, TerminalInputRequest, TerminalSessionId,
+        };
+
+        let request = TerminalInputRequest {
+            client_id: ClientId::new(),
+            input_id: InputId::new(),
+            terminal_id: TerminalId::new(),
+            context: TerminalInputContext {
+                task_id: TaskId::new(),
+                agent_session_id: AgentSessionId::new(),
+                resource_id: ResourceId::new(),
+                runtime_generation: 7,
+                resource_generation: 8,
+                session_id: TerminalSessionId::new(),
+                terminal_generation: TerminalGeneration::initial(),
+                focus_epoch: FocusEpoch::initial(),
+                action_epoch: 9,
+                input_sequence: 10,
+            },
+            bytes: b"remote input\r".to_vec(),
+        };
+        let payload = ConnectPayload::TerminalInput(request.clone());
+        assert_eq!(payload.channel(), ChannelKind::Critical);
+        assert!(payload.allows_raw_content());
+        let limits = ConnectLimits::v1_default();
+        let bytes = payload.encode(limits).expect("encode terminal input");
+        assert_eq!(
+            ConnectPayload::decode(payload.kind(), payload.version(), &bytes, limits)
+                .expect("decode terminal input"),
+            payload
+        );
+
+        let response = TerminalInputAck {
+            input_id: request.input_id,
+            ack: InputAck::Accepted { sequence: 10 },
+        };
+        let ack = ConnectPayload::from_host_server_message(
+            crate::protocol::ServerMessage::TerminalInputAck(response),
+        )
+        .expect("terminal ack conversion");
+        assert_eq!(ack, ConnectPayload::TerminalInputAck(response));
+        assert_eq!(ack.channel(), ChannelKind::Critical);
+        assert!(!ack.allows_raw_content());
     }
 
     #[test]

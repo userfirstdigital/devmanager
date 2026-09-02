@@ -161,6 +161,21 @@ impl InputId {
         }
         Ok(Self(uuid))
     }
+
+    pub fn from_bytes(bytes: [u8; 16]) -> Result<Self, IdError> {
+        let uuid = Uuid::from_bytes(bytes);
+        if uuid.get_version_num() != 7 {
+            return Err(IdError::InvalidVersion);
+        }
+        if uuid.get_variant() != Variant::RFC4122 {
+            return Err(IdError::InvalidVariant);
+        }
+        Ok(Self(uuid))
+    }
+
+    pub fn as_bytes(&self) -> &[u8; 16] {
+        self.0.as_bytes()
+    }
 }
 
 impl Default for InputId {

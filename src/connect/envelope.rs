@@ -766,6 +766,8 @@ impl PayloadKind {
     pub const HOST_CRITICAL_OUTPUT: Self = Self(NonZeroU16::new(20).unwrap());
     pub const HOST_STREAM_OUTPUT: Self = Self(NonZeroU16::new(21).unwrap());
     pub const HOST_CONVERSATION_OUTPUT: Self = Self(NonZeroU16::new(22).unwrap());
+    pub const TERMINAL_INPUT: Self = Self(NonZeroU16::new(23).unwrap());
+    pub const TERMINAL_INPUT_ACK: Self = Self(NonZeroU16::new(24).unwrap());
 
     pub const fn new(value: u16) -> Option<Self> {
         match NonZeroU16::new(value) {
@@ -802,6 +804,8 @@ impl PayloadKind {
             20 => KnownPayloadKind::HostCriticalOutput,
             21 => KnownPayloadKind::HostStreamOutput,
             22 => KnownPayloadKind::HostConversationOutput,
+            23 => KnownPayloadKind::TerminalInput,
+            24 => KnownPayloadKind::TerminalInputAck,
             _ => return None,
         })
     }
@@ -850,11 +854,13 @@ pub enum KnownPayloadKind {
     HostCriticalOutput,
     HostStreamOutput,
     HostConversationOutput,
+    TerminalInput,
+    TerminalInputAck,
 }
 
 impl KnownPayloadKind {
     pub const fn is_action(self) -> bool {
-        matches!(self, Self::Command)
+        matches!(self, Self::Command | Self::TerminalInput)
     }
 }
 
@@ -1270,7 +1276,9 @@ impl KnownPayloadKind {
             | Self::OperationSettlement
             | Self::Resync
             | Self::Error
-            | Self::HostCriticalOutput => ChannelKind::Critical,
+            | Self::HostCriticalOutput
+            | Self::TerminalInput
+            | Self::TerminalInputAck => ChannelKind::Critical,
             Self::SnapshotPage
             | Self::EventPage
             | Self::PromptExtension
@@ -1289,7 +1297,11 @@ impl KnownPayloadKind {
     pub const fn allows_raw_content(self) -> bool {
         matches!(
             self,
-            Self::TerminalDelta | Self::BrowserFrame | Self::Chunk | Self::HostStreamOutput
+            Self::TerminalDelta
+                | Self::TerminalInput
+                | Self::BrowserFrame
+                | Self::Chunk
+                | Self::HostStreamOutput
         )
     }
 

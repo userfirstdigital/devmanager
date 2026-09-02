@@ -31,7 +31,7 @@ use crate::domain::id::{CommandId, SubscriptionId, TaskId};
 use crate::domain::query::{Query, QueryEnvelope, QueryReply};
 use crate::domain::ClientId;
 use crate::host::{profile_fingerprint_for_named_profile, IpcError};
-use crate::protocol::CapabilitySet;
+use crate::protocol::{Capability, CapabilitySet};
 use crate::remote::{BackgroundWorkStop, RemoteBackgroundWork};
 use crate::terminal::protocol::{InputAck, TerminalInputRequest};
 use crate::updater::UpdateHandoffToken;
@@ -1389,11 +1389,8 @@ impl HostFleet {
         host: &HostId,
         kind: FleetUnsupportedKind,
     ) -> Result<(), FleetError> {
-        let _caps = self.granted_capabilities(host)?;
-        if matches!(host, HostId::Remote(_)) {
-            return Err(FleetError::UnsupportedRequest(kind));
-        }
-        Ok(())
+        let caps = self.granted_capabilities(host)?;
+        classify_request_support_for(host, caps, kind)
     }
 
     pub async fn execute_command(
@@ -1812,6 +1809,24 @@ impl HostFleet {
             state.cached_model = Some(Arc::new(model));
         })
     }
+}
+
+fn classify_request_support_for(
+    host: &HostId,
+    capabilities: CapabilitySet,
+    kind: FleetUnsupportedKind,
+) -> Result<(), FleetError> {
+    if matches!(kind, FleetUnsupportedKind::RawTerminalInput) {
+        return if capabilities.contains(Capability::ProviderInput) {
+            Ok(())
+        } else {
+            Err(FleetError::UnsupportedRequest(kind))
+        };
+    }
+    if matches!(host, HostId::Remote(_)) {
+        return Err(FleetError::UnsupportedRequest(kind));
+    }
+    Ok(())
 }
 
 /// RAII install reservation: Drop removes only the exact generation Reserved slot.
@@ -2290,12 +2305,6 @@ async fn handle_request(
                     let _ = reply.send(Err(error));
                     return;
                 }
-            }
-            if matches!(admission.host, HostId::Remote(_)) {
-                let _ = reply.send(Err(FleetError::UnsupportedRequest(
-                    FleetUnsupportedKind::RawTerminalInput,
-                )));
-                return;
             }
             let token = match shared.snapshot_token() {
                 Ok(token) => token,
@@ -3864,6 +3873,32 @@ mod tests {
         assert!(matches!(
             fleet.classify_request_support(&host, FleetUnsupportedKind::RawTerminalInput),
             Ok(())
+        ));
+        assert!(classify_request_support_for(
+            &remote,
+            CapabilitySet::from_capabilities([Capability::ProviderInput]),
+            FleetUnsupportedKind::RawTerminalInput,
+        )
+        .is_ok());
+        assert!(matches!(
+            classify_request_support_for(
+                &remote,
+                CapabilitySet::empty(),
+                FleetUnsupportedKind::RawTerminalInput,
+            ),
+            Err(FleetError::UnsupportedRequest(
+                FleetUnsupportedKind::RawTerminalInput
+            ))
+        ));
+        assert!(matches!(
+            classify_request_support_for(
+                &remote,
+                CapabilitySet::from_capabilities([Capability::ProviderInput]),
+                FleetUnsupportedKind::ExplicitDetach,
+            ),
+            Err(FleetError::UnsupportedRequest(
+                FleetUnsupportedKind::ExplicitDetach
+            ))
         ));
     }
 

@@ -255,10 +255,13 @@ pub fn forget_host_open_keys(
     (remaining, selected)
 }
 
-/// Remote raw terminal is never offered for a remote owner, even when a local
-/// task shares the same raw [`TaskId`].
-pub fn remote_raw_terminal_allowed(host: &HostId) -> bool {
-    host.as_local_profile().is_some()
+/// Raw terminal input is owner-routable for both local and remote hosts.
+///
+/// The negotiated `ProviderInput` capability remains the admission authority;
+/// this UI helper only prevents the presentation layer from blanket-disabling
+/// every remote owner before its exact fleet connection can classify support.
+pub fn remote_raw_terminal_allowed(_host: &HostId) -> bool {
+    true
 }
 
 #[cfg(test)]
@@ -342,11 +345,11 @@ mod tests {
     }
 
     #[test]
-    fn remote_raw_terminal_refused() {
+    fn remote_raw_terminal_is_owner_routable() {
         assert!(remote_raw_terminal_allowed(
             &HostId::local_profile("dev").expect("local")
         ));
-        assert!(!remote_raw_terminal_allowed(&HostId::Remote([5; 16])));
+        assert!(remote_raw_terminal_allowed(&HostId::Remote([5; 16])));
     }
 
     #[test]

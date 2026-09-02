@@ -4849,7 +4849,7 @@ fn map_fleet_ipc(error: FleetError) -> IpcError {
 fn fleet_hold_message(kind: FleetUnsupportedKind) -> String {
     match kind {
         FleetUnsupportedKind::RawTerminalInput => {
-            "HOLD: raw terminal input is local-only and disabled for remote hosts".into()
+            "HOLD: this host did not grant live provider terminal input".into()
         }
         FleetUnsupportedKind::ExplicitDetach => {
             "HOLD: explicit detach is local-only and disabled for remote hosts".into()
@@ -9223,7 +9223,7 @@ impl AccessibilityTree {
                     AccessibleRole::Button,
                     "Terminal",
                     if remote_selected {
-                        "Show the remote provider terminal display in the center canvas (display only)."
+                        "Show the live remote provider terminal in the center canvas. Input is routed to the selected remote host."
                             .to_string()
                     } else {
                         "Show the bound provider terminal in the center canvas.".to_string()
@@ -9297,7 +9297,7 @@ impl AccessibilityTree {
             AccessibleRole::Region,
             "Task context dock",
             if remote_selected {
-                "Host-served Changes, Files, Review, and display-only Terminal follow the selected remote task. Browser, Services, and Artifacts stay local."
+                "Host-served Changes, Files, Services, Artifacts, Review, and live Terminal follow the selected remote task. Browser and image staging stay local."
                     .to_string()
             } else {
                 "Changes, files, browser, services, artifacts, and review tabs follow the selected task independently of the center canvas.".to_string()
@@ -10321,6 +10321,7 @@ pub struct NativeShell {
     project_scope_menu: ProjectScopeMenuState,
     project_actions: ProjectActionWorkflow,
     header_commit: HeaderCommitWorkflow,
+    header_commit_owner: Option<HostTaskKey>,
     /// Owner-scoped Changes/Commit repository selection (not persisted).
     selected_repository: Option<(HostTaskKey, TaskRepositorySelector)>,
     /// Owner-scoped Files browse directory retained across refresh (host-relative).
@@ -11279,6 +11280,7 @@ impl NativeShell {
             project_scope_menu: ProjectScopeMenuState::default(),
             project_actions: ProjectActionWorkflow::default(),
             header_commit: HeaderCommitWorkflow::default(),
+            header_commit_owner: None,
             selected_repository: None,
             files_browse_directory: None,
             browser_page_bounds: None,
@@ -13485,11 +13487,15 @@ impl NativeShell {
     }
 
     /// Queue a commit status/mutate probe and bind its exact RequestId fence.
-    fn dispatch_header_commit_query(&mut self, task_id: TaskId, query: TaskCockpitQuery) {
-        match self.dispatch_action_recorded(ActionRequest::TaskCockpit {
-            task_id,
-            query: query.clone(),
-        }) {
+    fn dispatch_header_commit_query(&mut self, owner: &HostTaskKey, query: TaskCockpitQuery) {
+        let task_id = owner.task_id;
+        match self.dispatch_action_recorded_for_owner(
+            &owner.host,
+            ActionRequest::TaskCockpit {
+                task_id,
+                query: query.clone(),
+            },
+        ) {
             Ok(record) => match native_request_id(&record.command) {
                 Some(request_id)
                     if matches!(self.header_commit.phase, HeaderCommitPhase::LoadingStatus) =>
@@ -13777,8 +13783,15 @@ impl NativeShell {
                     .collect(),
             ),
             CockpitDockTool::Review => (None, vec![ActionRequest::TaskShow { task_id }]),
+            CockpitDockTool::Services => (
+                Some(crate::client::action::ACTION_SERVICE_LOGS),
+                vec![ActionRequest::TaskCockpit {
+                    task_id,
+                    query: TaskCockpitQuery::ServiceSnapshots,
+                }],
+            ),
             CockpitDockTool::Artifacts => (None, Vec::new()),
-            CockpitDockTool::Browser | CockpitDockTool::Services => {
+            CockpitDockTool::Browser => {
                 return;
             }
         };
@@ -15409,6 +15422,10 @@ impl NativeShell {
         )> = None;
         let mut pending_terminal_input_ack: Option<(NativeActionRecord, InputAck)> = None;
         let mut pending_repo_catalog: Option<TaskGitRepositoriesProjection> = None;
+        let mut pending_header_commit_result: Option<(
+            NativeActionRecord,
+            crate::domain::TaskCockpitResult,
+        )> = None;
         if let NativeHostActionOutcome::Accepted { action, receipt } = &outcome {
             if native_command_id(&action.command) != Some(receipt.command_id()) {
                 let mismatch = "The host returned a receipt for a different command.".to_string();
@@ -15534,6 +15551,19 @@ impl NativeShell {
                             {
                                 pending_repo_catalog = Some(catalog.clone());
                             }
+                            if let crate::domain::TaskCockpitResult::Services(services) = result {
+                                slot.services_projection =
+                                    project_services_from_task_projection(services);
+                            }
+                            if matches!(
+                                result,
+                                crate::domain::TaskCockpitResult::Git(_)
+                                    | crate::domain::TaskCockpitResult::Denied { .. }
+                                    | crate::domain::TaskCockpitResult::Unavailable { .. }
+                            ) {
+                                pending_header_commit_result =
+                                    Some((action.clone(), result.clone()));
+                            }
                             if let crate::domain::TaskCockpitResult::Conversation(page) = result {
                                 if let Some(task_id) = action.task_id {
                                     admit_conversation = Some((
@@ -15596,6 +15626,47 @@ impl NativeShell {
         }
         if let Some((action, ack)) = pending_terminal_input_ack {
             self.settle_raw_terminal_input_ack(host_id, &action, ack);
+        }
+        if self
+            .header_commit_owner
+            .as_ref()
+            .is_some_and(|owner| &owner.host == host_id)
+        {
+            if let Some((action, result)) = pending_header_commit_result {
+                match result {
+                    crate::domain::TaskCockpitResult::Git(projection) => {
+                        if let Some((request_id, command_task_id, query)) =
+                            Self::task_cockpit_command_parts(&action.command)
+                        {
+                            self.header_commit.apply_status_from_command(
+                                &projection,
+                                request_id,
+                                command_task_id,
+                                query,
+                            );
+                            let _ = self.header_commit.complete_from_command(
+                                &projection,
+                                request_id,
+                                command_task_id,
+                                query,
+                            );
+                        }
+                    }
+                    crate::domain::TaskCockpitResult::Denied { reason, .. } => {
+                        self.fail_header_commit_from_action(
+                            &action,
+                            format!("Commit denied: {reason:?}"),
+                        );
+                    }
+                    crate::domain::TaskCockpitResult::Unavailable { reason, .. } => {
+                        self.fail_header_commit_from_action(
+                            &action,
+                            format!("Commit failed: {reason:?}"),
+                        );
+                    }
+                    _ => {}
+                }
+            }
         }
         if let NativeHostActionOutcome::Queried {
             action,
@@ -15750,6 +15821,16 @@ impl NativeShell {
         }
         if let NativeHostActionOutcome::Failed { action, error } = &outcome {
             if is_native_query_command(&action.command) {
+                if self
+                    .header_commit_owner
+                    .as_ref()
+                    .is_some_and(|owner| &owner.host == host_id)
+                {
+                    self.fail_header_commit_from_action(
+                        action,
+                        format!("Commit request failed: {error}"),
+                    );
+                }
                 self.settle_terminal_query_failure_for_host(host_id, action);
                 let _ = self.settle_pending_draft_first_send_probe_transport_failure_for_host(
                     host_id,
@@ -15760,6 +15841,16 @@ impl NativeShell {
         }
         if let NativeHostActionOutcome::Uncertain { action, error } = &outcome {
             if is_native_query_command(&action.command) {
+                if self
+                    .header_commit_owner
+                    .as_ref()
+                    .is_some_and(|owner| &owner.host == host_id)
+                {
+                    self.fail_header_commit_from_action(
+                        action,
+                        format!("Commit result is uncertain: {error}"),
+                    );
+                }
                 self.settle_terminal_query_failure_for_host(host_id, action);
                 let _ = self.settle_pending_draft_first_send_probe_transport_failure_for_host(
                     host_id,
@@ -19946,7 +20037,7 @@ impl NativeShell {
         let Some(owner) = self.selected_task_key.clone() else {
             return false;
         };
-        if owner.host != self.local_host_id() || !self.selected_center_terminal_is_interactive() {
+        if !self.selected_center_terminal_is_interactive() {
             return false;
         }
         let Some(terminal) = self
@@ -19965,7 +20056,9 @@ impl NativeShell {
                 match runtime.current_host_admission() {
                     Ok(admission) => admission.client_id,
                     Err(error) => {
-                        self.local_slot_mut().composer_error = Some(error.to_string());
+                        if let Some(slot) = self.host_slot_mut(&owner.host) {
+                            slot.composer_error = Some(error.to_string());
+                        }
                         return false;
                     }
                 }
@@ -19989,8 +20082,9 @@ impl NativeShell {
             .max(terminal.accepted_input_sequence)
             .checked_add(1);
         let Some(input_sequence) = input_sequence else {
-            self.local_slot_mut().composer_error =
-                Some("provider terminal input sequence overflowed".into());
+            if let Some(slot) = self.host_slot_mut(&owner.host) {
+                slot.composer_error = Some("provider terminal input sequence overflowed".into());
+            }
             return false;
         };
         let request = match terminal_input_request(
@@ -20001,11 +20095,16 @@ impl NativeShell {
         ) {
             Ok(request) => request,
             Err(message) => {
-                self.local_slot_mut().composer_error = Some(message);
+                if let Some(slot) = self.host_slot_mut(&owner.host) {
+                    slot.composer_error = Some(message);
+                }
                 return false;
             }
         };
-        let Some(mut record) = self.local_slot_mut().interaction.terminal_input(request) else {
+        let Some(mut record) = self
+            .host_slot_mut(&owner.host)
+            .and_then(|slot| slot.interaction.terminal_input(request))
+        else {
             return false;
         };
         let enqueue_result = self.enqueue_host_action_for_owner(&owner.host, &mut record);
@@ -20021,7 +20120,9 @@ impl NativeShell {
                     },
                 );
                 self.note_pending_terminal_echo(&owner, &text);
-                self.local_slot_mut().composer_error = None;
+                if let Some(slot) = self.host_slot_mut(&owner.host) {
+                    slot.composer_error = None;
+                }
                 true
             }
             NativeHostActionResult::Disconnected
@@ -20035,8 +20136,10 @@ impl NativeShell {
             return false;
         };
         center_terminal_interactive(
-            owner.host == self.local_host_id(),
-            self.local_slot().interaction.selected_task() == Some(owner.task_id),
+            self.granted_capabilities_for_host(&owner.host)
+                .contains(Capability::ProviderInput),
+            self.host_slot(&owner.host)
+                .is_some_and(|slot| slot.interaction.selected_task() == Some(owner.task_id)),
             self.task_surfaces.terminal_is_interactive(owner.clone()),
         )
     }
@@ -22036,7 +22139,7 @@ impl NativeShell {
     }
 
     fn remote_local_authority_reason() -> &'static str {
-        "Unavailable on remote hosts — browser, services, commit, raw terminal input, image staging, and project creation stay on the local machine."
+        "Unavailable on remote hosts — browser, image staging, and project creation stay on the local machine. Use the live remote terminal for full development commands."
     }
 
     fn remote_typed_dock_tool_supported(tool: CockpitDockTool) -> bool {
@@ -22044,6 +22147,8 @@ impl NativeShell {
             tool,
             CockpitDockTool::Changes
                 | CockpitDockTool::Files
+                | CockpitDockTool::Services
+                | CockpitDockTool::Artifacts
                 | CockpitDockTool::Review
                 | CockpitDockTool::Terminal
         )
@@ -22052,7 +22157,12 @@ impl NativeShell {
     fn remote_dock_tab_supported(tool: CockpitDockTool) -> bool {
         matches!(
             tool,
-            CockpitDockTool::Changes | CockpitDockTool::Files | CockpitDockTool::Review
+            CockpitDockTool::Changes
+                | CockpitDockTool::Files
+                | CockpitDockTool::Services
+                | CockpitDockTool::Artifacts
+                | CockpitDockTool::Review
+                | CockpitDockTool::Terminal
         )
     }
 
@@ -24613,15 +24723,15 @@ impl NativeShell {
         tokens: crate::ui::tokens::ThemeTokens,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let remote = owner.host != self.local_host_id();
-        if remote {
-            return self.remote_terminal_dock_surface(tokens, owner.clone(), cx.weak_entity());
-        }
         let shell_entity = cx.weak_entity();
         let selected_owner = self.selected_task_key.as_ref() == Some(owner);
         let interactive = center_terminal_interactive(
-            selected_owner,
-            self.local_slot().interaction.selected_task() == Some(owner.task_id),
+            selected_owner
+                && self
+                    .granted_capabilities_for_host(&owner.host)
+                    .contains(Capability::ProviderInput),
+            self.host_slot(&owner.host)
+                .is_some_and(|slot| slot.interaction.selected_task() == Some(owner.task_id)),
             self.task_surfaces.terminal_is_interactive(owner.clone()),
         );
         let chrome = native_center_terminal_chrome_plan();
@@ -24631,7 +24741,11 @@ impl NativeShell {
             .and_then(|state| state.latest_terminal.as_ref())
             .map(crate::ui::task_cockpit::dock::ContextDock::terminal_pane_model_for_projection)
             .or_else(|| {
-                let pane = self.local_slot().cockpit.dock().terminal_pane_model();
+                let pane = self
+                    .host_slot(&owner.host)?
+                    .cockpit
+                    .dock()
+                    .terminal_pane_model();
                 pane.session.is_some().then_some(pane)
             })
             .map(|pane| self.pane_with_owner_selection(owner, pane));
@@ -24643,8 +24757,11 @@ impl NativeShell {
             // selectable in that state so its first pointer gesture can repair
             // owner focus. Raw text/key dispatch remains fenced by
             // selected_center_terminal_is_interactive().
-            let interaction =
-                Some(self.terminal_grid_interaction_for_shared(owner.clone(), true, &shell_entity));
+            let interaction = Some(self.terminal_grid_interaction_for_shared(
+                owner.clone(),
+                interactive,
+                &shell_entity,
+            ));
             crate::terminal::view::render_terminal_surface_with_tokens_and_grid(
                 pane.as_ref().expect("terminal pane checked above"),
                 None,
@@ -25516,9 +25633,6 @@ impl NativeShell {
         if remote && !Self::remote_typed_dock_tool_supported(tool) {
             return self.remote_dock_unavailable_surface(tool, tokens);
         }
-        if matches!(tool, CockpitDockTool::Artifacts) && remote {
-            return self.remote_dock_unavailable_surface(tool, tokens);
-        }
         let Some(owner_key) = owner_key else {
             return Self::dock_empty_state(tool, tokens);
         };
@@ -25858,28 +25972,34 @@ impl NativeShell {
 
     fn service_action_is_current(
         &self,
-        task_id: TaskId,
+        owner: &HostTaskKey,
         service_id: &crate::services::model::ServiceId,
         epochs: NativeActionEpochs,
     ) -> bool {
-        self.local_slot().interaction.selected_task() == Some(task_id)
-            && self.local_slot().interaction.action_epochs() == epochs
-            && self
-                .local_slot()
-                .services_projection
-                .rows
-                .iter()
-                .any(|row| row.service_id == *service_id)
+        self.host_slot(&owner.host).is_some_and(|slot| {
+            slot.interaction.selected_task() == Some(owner.task_id)
+                && slot.interaction.action_epochs() == epochs
+                && slot
+                    .services_projection
+                    .rows
+                    .iter()
+                    .any(|row| row.service_id == *service_id)
+        })
     }
 
     fn services_dock_surface(
         &self,
         tokens: crate::ui::tokens::ThemeTokens,
         shell_entity: Option<gpui::WeakEntity<NativeShell>>,
+        owner: HostTaskKey,
     ) -> AnyElement {
-        let epochs = self.local_slot().interaction.action_epochs();
-        let task_id = self.local_slot().interaction.selected_task();
-        let rows = self.local_slot()
+        let Some(slot) = self.host_slot(&owner.host) else {
+            return Self::dock_empty_state(CockpitDockTool::Services, tokens);
+        };
+        let epochs = slot.interaction.action_epochs();
+        let selected =
+            (slot.interaction.selected_task() == Some(owner.task_id)).then_some(owner.task_id);
+        let rows = slot
             .services_projection
             .rows
             .iter()
@@ -25937,9 +26057,10 @@ impl NativeShell {
                             .border_color(tokens.borders.subtle.to_gpui())
                             .child(label);
                         if affordance.enabled {
-                            if let Some(task_id) = task_id {
+                            if let Some(task_id) = selected {
                                 if let Some(shell_entity) = shell_entity.clone() {
                                     let service_id_for_action = service_id.clone();
+                                    let owner_for_action = owner.clone();
                                     control = control
                                         .cursor_pointer()
                                         .on_mouse_down(
@@ -25952,19 +26073,21 @@ impl NativeShell {
                                                 let _ = shell_entity.update(app, |shell, cx| {
                                                     cx.stop_propagation();
                                                     if !shell.service_action_is_current(
-                                                        task_id,
+                                                        &owner_for_action,
                                                         &service_id,
                                                         epochs,
                                                     ) {
-                                                        shell.local_slot_mut().last_query_detail = Some(
+                                                        if let Some(slot) = shell.host_slot_mut(&owner_for_action.host) {
+                                                            slot.last_query_detail = Some(
                                                             "Service action expired; refresh the host projection and try again."
                                                                 .to_string(),
-                                                        );
+                                                            );
+                                                        }
                                                         return;
                                                     }
-                                                    shell.local_slot_mut()
-                                                        .interaction
-                                                        .begin_control_pointer(NATIVE_POINTER_ID);
+                                                    if let Some(slot) = shell.host_slot_mut(&owner_for_action.host) {
+                                                        slot.interaction.begin_control_pointer(NATIVE_POINTER_ID);
+                                                    }
                                                     if let Some(request) = shell
                                                         .service_action_request(
                                                             task_id,
@@ -25973,14 +26096,14 @@ impl NativeShell {
                                                             epochs,
                                                         )
                                                     {
-                                                        let _ = shell.dispatch_pointer_action(
+                                                        let _ = shell.dispatch_action_recorded_for_owner(
+                                                            &owner_for_action.host,
                                                             request,
-                                                            NATIVE_POINTER_ID,
                                                         );
                                                     }
-                                                    shell.local_slot_mut()
-                                                        .interaction
-                                                        .release_pointer(NATIVE_POINTER_ID);
+                                                    if let Some(slot) = shell.host_slot_mut(&owner_for_action.host) {
+                                                        slot.interaction.release_pointer(NATIVE_POINTER_ID);
+                                                    }
                                                 });
                                             },
                                         );
@@ -26287,24 +26410,22 @@ impl NativeShell {
                     .into_any_element()
             }
             CockpitDockTool::Services => {
-                if remote {
-                    self.remote_dock_unavailable_surface(CockpitDockTool::Services, tokens)
-                } else {
-                    self.services_dock_surface(tokens, shell_entity)
-                }
+                self.services_dock_surface(tokens, shell_entity, owner_key.expect("services owner"))
             }
             tool => self.workspace_dock_surface(tool, tokens, shell_entity),
         }
     }
 
-    /// Display-only remote terminal replica. Local selection/copy only; no PTY write path.
+    /// Owner-scoped remote terminal replica. Selection, scrolling, and PTY
+    /// input remain fenced to the exact remote host/task/runtime generation.
     fn remote_terminal_dock_surface(
         &self,
         tokens: crate::ui::tokens::ThemeTokens,
         owner: HostTaskKey,
         shell_entity: gpui::WeakEntity<NativeShell>,
     ) -> AnyElement {
-        let _label = self.task_surfaces.terminal_label(owner.clone());
+        let label = self.task_surfaces.terminal_label(owner.clone());
+        let interactive = self.selected_center_terminal_is_interactive();
         let pane = self
             .task_surfaces
             .state(owner.clone())
@@ -26316,17 +26437,27 @@ impl NativeShell {
             .id("native-shell-remote-context-terminal")
             .w_full()
             .flex()
+            .flex_1()
+            .min_h(px(0.0))
             .flex_col()
             .bg(tokens.surfaces.sunken.to_gpui());
         if chrome.outer_padding {
             surface = surface.p(px(tokens.density.physical().control_padding as f32));
         }
         if chrome.summary_caption {
-            surface = surface.child(format!("Terminal · display only · {_label}"));
+            let summary = if interactive {
+                "Remote provider terminal · Live".to_string()
+            } else {
+                label.to_string()
+            };
+            surface = surface.child(summary);
         }
         let surface = if let Some(pane) = pane {
-            let interaction =
-                self.terminal_grid_interaction_for_shared(owner.clone(), false, &shell_entity);
+            let interaction = self.terminal_grid_interaction_for_shared(
+                owner.clone(),
+                interactive,
+                &shell_entity,
+            );
             let shell_for_key = shell_entity;
             surface
                 .child(div().flex_1().min_h(px(120.0)).overflow_hidden().child(
@@ -26352,7 +26483,7 @@ impl NativeShell {
             surface.child(
                 div()
                     .text_color(tokens.text.secondary.to_gpui())
-                    .child("No matching remote terminal replica yet."),
+                    .child("Waiting for the remote provider terminal…"),
             )
         };
         surface.into_any_element()
@@ -26866,9 +26997,7 @@ impl NativeShell {
         if self.terminal_input_owner.as_ref() != Some(&key) {
             self.terminal_input_owner = None;
         }
-        if key.host.as_remote().is_some() && !remote_raw_terminal_allowed(&key.host) {
-            // Selection itself is allowed; raw terminal input is refused later.
-        }
+        debug_assert!(remote_raw_terminal_allowed(&key.host));
         // Done/Archived open via selection; never restore lifecycle from a click.
         apply_fleet_workspace_selection(&mut self.layout.task_workspace, key.clone(), mode)
             .map_err(|error| format!("{error:?}"))?;
@@ -31092,53 +31221,32 @@ impl NativeShell {
                 .child("Add action")
                 .into_any_element()
         };
-        let commit = if self.selected_owner_is_remote() {
-            div()
-                .id("native-task-commit-unavailable")
-                .h(px(26.0))
-                .flex()
-                .items_center()
-                .gap(px(6.0))
-                .px(px(10.0))
-                .rounded(px(6.0))
-                .bg(tokens.surfaces.raised.to_gpui())
-                .text_size(px(tokens.density.typography.caption))
-                .text_color(tokens.text.disabled.to_gpui())
-                .child(crate::icons::app_icon(
-                    crate::icons::GIT_BRANCH,
-                    12.0,
-                    tokens.text.disabled.to_u32(),
-                ))
-                .child("Commit (local only)")
-                .into_any_element()
-        } else {
-            div()
-                .id("native-task-commit")
-                .tab_stop(true)
-                .h(px(26.0))
-                .flex()
-                .items_center()
-                .gap(px(6.0))
-                .px(px(10.0))
-                .rounded(px(6.0))
-                .cursor_pointer()
-                .bg(tokens.surfaces.raised.to_gpui())
-                .text_size(px(tokens.density.typography.caption))
-                .text_color(tokens.text.secondary.to_gpui())
-                .hover(|style| style.bg(tokens.surfaces.overlay.to_gpui()))
-                .on_click(cx.listener(|shell, _event: &ClickEvent, _window, cx| {
-                    cx.stop_propagation();
-                    shell.begin_header_commit();
-                    cx.notify();
-                }))
-                .child(crate::icons::app_icon(
-                    crate::icons::GIT_BRANCH,
-                    12.0,
-                    tokens.text.secondary.to_u32(),
-                ))
-                .child("Commit")
-                .into_any_element()
-        };
+        let commit = div()
+            .id("native-task-commit")
+            .tab_stop(true)
+            .h(px(26.0))
+            .flex()
+            .items_center()
+            .gap(px(6.0))
+            .px(px(10.0))
+            .rounded(px(6.0))
+            .cursor_pointer()
+            .bg(tokens.surfaces.raised.to_gpui())
+            .text_size(px(tokens.density.typography.caption))
+            .text_color(tokens.text.secondary.to_gpui())
+            .hover(|style| style.bg(tokens.surfaces.overlay.to_gpui()))
+            .on_click(cx.listener(|shell, _event: &ClickEvent, _window, cx| {
+                cx.stop_propagation();
+                shell.begin_header_commit();
+                cx.notify();
+            }))
+            .child(crate::icons::app_icon(
+                crate::icons::GIT_BRANCH,
+                12.0,
+                tokens.text.secondary.to_u32(),
+            ))
+            .child("Commit")
+            .into_any_element();
         Some(
             div()
                 .id("native-conversation-panel-actions")
@@ -35811,7 +35919,7 @@ impl NativeShell {
                             MouseButton::Left,
                             cx.listener(|shell, _event: &MouseDownEvent, _window, cx| {
                                 cx.stop_propagation();
-                                shell.header_commit.cancel();
+                                shell.cancel_header_commit();
                                 cx.notify();
                             }),
                         )
@@ -36258,7 +36366,7 @@ impl NativeShell {
         match event.keystroke.key.as_str() {
             "escape" => {
                 window.prevent_default();
-                self.header_commit.cancel();
+                self.cancel_header_commit();
             }
             "enter" => {
                 window.prevent_default();
@@ -36269,16 +36377,25 @@ impl NativeShell {
                                 self.header_commit.task_id,
                                 self.header_commit.confirmed_selector().cloned(),
                             ) {
-                                self.dispatch_header_commit_query(
-                                    task_id,
-                                    TaskCockpitQuery::GitMutateTargeted {
-                                        selector,
-                                        intent: crate::domain::TaskGitMutateIntent::Commit {
-                                            message,
+                                if let Some(owner) = self
+                                    .header_commit_owner
+                                    .clone()
+                                    .filter(|owner| owner.task_id == task_id)
+                                {
+                                    self.dispatch_header_commit_query(
+                                        &owner,
+                                        TaskCockpitQuery::GitMutateTargeted {
+                                            selector,
+                                            intent: crate::domain::TaskGitMutateIntent::Commit {
+                                                message,
+                                            },
+                                            confirm: true,
                                         },
-                                        confirm: true,
-                                    },
-                                );
+                                    );
+                                } else {
+                                    self.header_commit
+                                        .fail("Commit owner changed; reopen Commit and try again.");
+                                }
                                 if matches!(
                                     self.header_commit.phase,
                                     HeaderCommitPhase::Confirming { .. }
@@ -36289,7 +36406,7 @@ impl NativeShell {
                         }
                     }
                     HeaderCommitPhase::Success { .. } | HeaderCommitPhase::Error(_) => {
-                        self.header_commit.cancel();
+                        self.cancel_header_commit();
                     }
                     _ => {}
                 }
@@ -36315,21 +36432,19 @@ impl NativeShell {
     }
 
     fn begin_header_commit(&mut self) {
-        if self.selected_owner_is_remote() {
-            if let Some(key) = self.selected_task_key.clone() {
-                if let Some(slot) = self.host_slot_mut(&key.host) {
-                    slot.composer_error = Some(Self::remote_local_authority_reason().into());
-                }
-            }
-            return;
-        }
-        let Some(task_id) = self.local_slot_mut().interaction.selected_task() else {
+        let Some(owner) = self.selected_task_key.clone().or_else(|| {
+            self.local_slot()
+                .interaction
+                .selected_task()
+                .map(|task_id| self.local_task_key(task_id))
+        }) else {
             self.local_slot_mut().last_query_detail =
                 Some("Select a task before committing.".into());
             return;
         };
-        let Some(selector) = self.selected_repository_for_task(task_id).or_else(|| {
-            self.repository_catalog_for_task(task_id)
+        let task_id = owner.task_id;
+        let Some(selector) = self.selected_repository_for_owner(&owner).or_else(|| {
+            self.repository_catalog_for_owner(&owner)
                 .and_then(crate::ui::task_cockpit::changes_panel::default_repository_selector)
         }) else {
             self.header_commit
@@ -36339,7 +36454,7 @@ impl NativeShell {
             return;
         };
         let Some(entry) = self
-            .repository_catalog_for_task(task_id)
+            .repository_catalog_for_owner(&owner)
             .and_then(|catalog| {
                 catalog
                     .repositories
@@ -36362,13 +36477,16 @@ impl NativeShell {
                 .begin_blocked(PanelDisabledReason::RepositoryReadOnly);
             return;
         }
-        self.selected_repository = Some((self.local_task_key(task_id), selector.clone()));
+        self.selected_repository = Some((owner.clone(), selector.clone()));
+        self.header_commit_owner = Some(owner.clone());
         self.header_commit
             .begin(task_id, selector.clone(), entry.label.clone());
-        self.dispatch_header_commit_query(
-            task_id,
-            TaskCockpitQuery::GitStatusTargeted { selector },
-        );
+        self.dispatch_header_commit_query(&owner, TaskCockpitQuery::GitStatusTargeted { selector });
+    }
+
+    fn cancel_header_commit(&mut self) {
+        self.header_commit.cancel();
+        self.header_commit_owner = None;
     }
 
     fn selected_repository_for_owner(&self, key: &HostTaskKey) -> Option<TaskRepositorySelector> {
@@ -37598,7 +37716,8 @@ impl NativeShell {
     }
 
     /// Whether the globally selected owner's dock is showing the raw terminal
-    /// canvas. Remote owners use the same visibility bit for display-only mode.
+    /// canvas. Remote owners use the same visibility bit for their live,
+    /// owner-routed provider terminal.
     fn preview_conversation_installed(&self) -> bool {
         #[cfg(debug_assertions)]
         {
@@ -40482,7 +40601,6 @@ impl NativeShell {
         if host_id != &self.local_host_id() {
             match &record.command {
                 NativeHostCommand::Browser(_)
-                | NativeHostCommand::ServiceControl { .. }
                 | NativeHostCommand::Updater { .. }
                 | NativeHostCommand::HostStatusQuery { .. }
                 | NativeHostCommand::ProviderSettingsQuery { .. }
@@ -44328,6 +44446,15 @@ mod tests {
             } else {
                 super::NativeHostState::Disconnected
             }
+        }
+
+        fn granted_capabilities(&self) -> CapabilitySet {
+            CapabilitySet::from_capabilities([
+                Capability::PagedSnapshots,
+                Capability::EventReplay,
+                Capability::ProviderInput,
+                Capability::TaskCockpit,
+            ])
         }
 
         fn epochs(&self) -> NativeHostRuntimeEpochs {
@@ -62259,9 +62386,9 @@ mod tests {
     }
 
     #[test]
-    fn owner_remote_terminal_admits_display_only_without_local_input() {
+    fn owner_remote_terminal_routes_live_input_only_to_remote_owner() {
         if rerun_headless_shell_test_in_child(
-            "ui::native_shell::tests::owner_remote_terminal_admits_display_only_without_local_input",
+            "ui::native_shell::tests::owner_remote_terminal_routes_live_input_only_to_remote_owner",
         ) {
             return;
         }
@@ -62287,7 +62414,8 @@ mod tests {
                     })
                     .expect("terminal resource")
                     .clone();
-                attach_remote_test_host(shell, &remote_host, Arc::clone(&model));
+                let remote_shared =
+                    attach_remote_test_host_with_shared(shell, &remote_host, Arc::clone(&model));
                 let owner = HostTaskKey::new(remote_host.clone(), task_id);
                 shell
                     .select_fleet_task_key(owner.clone(), FleetSelectMode::Replace)
@@ -62403,14 +62531,25 @@ mod tests {
                     Some(VisibleTaskStatus::NeedsApproval)
                 );
                 let before_local = local_shared.lock().expect("local").accepted.len();
+                let before_remote = remote_shared.lock().expect("remote").accepted.len();
                 assert!(
-                    !shell.dispatch_provider_terminal_text("should-not-send".into()),
-                    "display-only remote terminal must not dispatch local input"
+                    shell.dispatch_provider_terminal_text("remote-input".into()),
+                    "live remote terminal must dispatch through its owner runtime"
                 );
                 assert_eq!(
                     local_shared.lock().expect("local").accepted.len(),
                     before_local,
                     "no local terminal input command may be enqueued"
+                );
+                assert!(
+                    remote_shared.lock().expect("remote").accepted[before_remote..]
+                        .iter()
+                        .any(|record| matches!(
+                            &record.command,
+                            NativeHostCommand::TerminalInput(request)
+                                if request.context.task_id == task_id
+                                    && request.bytes == b"remote-input"
+                        ))
                 );
             });
             cx.quit();
@@ -63234,9 +63373,9 @@ mod tests {
     }
 
     #[test]
-    fn owner_remote_terminal_visual_and_at_toggle_agree_display_only() {
+    fn owner_remote_terminal_visual_at_and_input_agree_live() {
         if rerun_headless_shell_test_in_child(
-            "ui::native_shell::tests::owner_remote_terminal_visual_and_at_toggle_agree_display_only",
+            "ui::native_shell::tests::owner_remote_terminal_visual_at_and_input_agree_live",
         ) {
             return;
         }
@@ -63246,7 +63385,8 @@ mod tests {
             crate::ui::init(cx);
             with_test_shell_in_app(cx, runtime, |shell| {
                 let (model, task_id) = terminal_bound_client_model();
-                attach_remote_test_host(shell, &remote_host, Arc::new(model));
+                let remote_shared =
+                    attach_remote_test_host_with_shared(shell, &remote_host, Arc::new(model));
                 let owner = HostTaskKey::new(remote_host.clone(), task_id);
                 shell
                     .select_fleet_task_key(owner.clone(), FleetSelectMode::Replace)
@@ -63270,8 +63410,8 @@ mod tests {
                     terminal_node
                         .description()
                         .to_ascii_lowercase()
-                        .contains("display"),
-                    "AT copy must describe display-only remote terminal"
+                        .contains("live remote"),
+                    "AT copy must describe the live remote terminal"
                 );
                 assert!(!shell.owner_showing_raw_terminal());
                 shell.dispatch_named_accessibility_action("native-task-center-terminal");
@@ -63290,16 +63430,90 @@ mod tests {
                     "visual owner dock must agree with AT"
                 );
                 let before = local_shared.lock().expect("local").accepted.len();
+                let before_remote = remote_shared.lock().expect("remote").accepted.len();
+                // This fixture has not installed a terminal projection yet, so
+                // owner routing remains inert rather than falling back local.
                 assert!(!shell.dispatch_provider_terminal_text("nope".into()));
                 assert_eq!(
                     local_shared.lock().expect("local").accepted.len(),
                     before,
-                    "display-only remote must still refuse raw input"
+                    "a missing remote terminal projection must never fall back local"
+                );
+                assert_eq!(
+                    remote_shared.lock().expect("remote").accepted.len(),
+                    before_remote
                 );
                 shell.dispatch_named_accessibility_action("native-task-center-conversation");
                 assert!(
                     !shell.owner_showing_raw_terminal(),
                     "Conversation AT must restore owner canvas visibility"
+                );
+            });
+            cx.quit();
+        });
+    }
+
+    #[test]
+    fn owner_remote_commit_status_routes_only_to_remote_host() {
+        if rerun_headless_shell_test_in_child(
+            "ui::native_shell::tests::owner_remote_commit_status_routes_only_to_remote_host",
+        ) {
+            return;
+        }
+        let remote_host = HostId::Remote([0xa8; 16]);
+        let (runtime, local_shared) = TestRuntime::new(true, NativeHostActionResult::Queued);
+        gpui::Application::headless().run(move |cx| {
+            crate::ui::init(cx);
+            with_test_shell_in_app(cx, runtime, |shell| {
+                let (model, task_id) = terminal_bound_client_model();
+                let remote_shared =
+                    attach_remote_test_host_with_shared(shell, &remote_host, Arc::new(model));
+                let owner = HostTaskKey::new(remote_host.clone(), task_id);
+                shell
+                    .select_fleet_task_key(owner.clone(), FleetSelectMode::Replace)
+                    .expect("select remote");
+                let catalog = crate::domain::cockpit::TaskGitRepositoriesProjection {
+                    task_id,
+                    repositories: vec![crate::domain::cockpit::TaskRepositoryCatalogEntry {
+                        selector: crate::domain::cockpit::TaskRepositorySelector::Workspace,
+                        kind: crate::domain::cockpit::TaskRepositoryKind::Workspace,
+                        label: "Workspace".into(),
+                        available: true,
+                        read_only: false,
+                    }],
+                };
+                shell
+                    .host_slot_mut(&remote_host)
+                    .expect("remote slot")
+                    .cockpit
+                    .apply_cockpit_result(&crate::domain::TaskCockpitResult::GitRepositories(
+                        catalog.clone(),
+                    ));
+                shell.apply_repository_catalog_for_owner(&owner, &catalog);
+                let local_before = local_shared.lock().expect("local").accepted.len();
+                remote_shared.lock().expect("remote").accepted.clear();
+
+                shell.begin_header_commit();
+
+                assert_eq!(shell.header_commit_owner.as_ref(), Some(&owner));
+                assert!(matches!(
+                    shell.header_commit.phase,
+                    super::HeaderCommitPhase::LoadingStatus
+                ));
+                assert!(remote_shared.lock().expect("remote").accepted.iter().any(
+                    |record| matches!(
+                        &record.command,
+                        NativeHostCommand::TaskCockpitQuery {
+                            task_id: command_task,
+                            query: TaskCockpitQuery::GitStatusTargeted { .. },
+                            ..
+                        } if *command_task == task_id
+                    )
+                ));
+                assert_eq!(
+                    local_shared.lock().expect("local").accepted.len(),
+                    local_before,
+                    "remote Commit must never fall back to the local host"
                 );
             });
             cx.quit();
