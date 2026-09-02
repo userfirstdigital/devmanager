@@ -742,6 +742,10 @@ pub struct TaskTerminalChip {
     /// stem for a shell (`pwsh`, `cmd`), `terminal` for the provider slot.
     pub label: String,
     pub runtime_state: TerminalRuntimeStateWire,
+    /// Redacted working directory, never an absolute host path. Inside the
+    /// task's workspace root it is the path relative to that root, with `.`
+    /// meaning the root itself; anywhere else it is the final path component
+    /// alone. Display only — it is not a path a client may open or send back.
     pub live_cwd: Option<String>,
     pub exit: Option<crate::domain::terminal_facts::TerminalExit>,
     pub created_at_ms: i64,

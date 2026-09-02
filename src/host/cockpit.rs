@@ -8,7 +8,9 @@
 use uuid::Uuid;
 
 use crate::config::AppConfig;
-use crate::domain::agent_resource::{AgentResourceBinding, AgentResourceBindingError};
+use crate::domain::agent_resource::{
+    provider_terminal_resource, AgentResourceBinding, AgentResourceBindingError,
+};
 use crate::domain::cockpit::{
     cockpit_surface, relative_path_is_safe, workspace_projection, ConfigSidebarFolder,
     ConfigSidebarProject, ConfigSidebarProvider, ConfigSidebarProviderKind, ConfigSidebarServer,
@@ -614,9 +616,14 @@ fn serve_task_terminal(
         );
     };
     match service.task_terminal_view_for(task_id, resource_id) {
-        Ok(Some(terminal)) if !terminal.is_provider => {
-            serve_plain_shell_terminal(dispatch, task_id, snapshot, terminal, max_response_bytes)
-        }
+        Ok(Some(terminal)) if !terminal.is_provider => serve_plain_shell_terminal(
+            dispatch,
+            service,
+            task_id,
+            snapshot,
+            terminal,
+            max_response_bytes,
+        ),
         Ok(Some(terminal)) => {
             // The provider slot always carries its complete durable identity;
             // a plain shell never reaches this legacy provider surface.
@@ -647,19 +654,7 @@ fn serve_task_terminal(
                     TaskCockpitDeniedReason::StaleFence,
                 );
             };
-            // Plain shells are Active Terminal resources too, so the provider
-            // slot's "exactly one" fence has to exclude them or every task with
-            // an open shell would fail closed on its provider terminal.
-            let matching_resources = snapshot
-                .resources
-                .values()
-                .filter(|resource| {
-                    resource.resource_kind == crate::domain::ResourceKind::Terminal
-                        && resource.lifecycle == crate::domain::ResourceLifecycle::Active
-                        && !resource.recipe.is_plain_shell()
-                })
-                .collect::<Vec<_>>();
-            let [resource] = matching_resources.as_slice() else {
+            let Ok(Some(resource)) = provider_terminal_resource(snapshot, agent) else {
                 return denied(
                     TaskCockpitSurface::Terminal,
                     TaskCockpitDeniedReason::StaleFence,
@@ -824,17 +819,12 @@ fn runtime_state_wire(
 /// grants it, because the projection doubles as the client's attachment.
 fn serve_plain_shell_terminal(
     dispatch: &TaskCockpitDispatch<'_>,
+    service: &TerminalService,
     task_id: TaskId,
     snapshot: &crate::domain::TaskSnapshot,
     terminal: crate::terminal::service::TaskTerminalView,
     max_response_bytes: u32,
 ) -> QueryOutcome {
-    let Some(service) = dispatch.terminal_service else {
-        return unavailable(
-            TaskCockpitSurface::Terminal,
-            TaskCockpitUnavailableReason::TerminalUnavailable,
-        );
-    };
     let Some(resource) = snapshot.resources.get(&terminal.resource_id) else {
         return denied(
             TaskCockpitSurface::Terminal,
@@ -936,21 +926,27 @@ fn serve_task_terminals(
         .iter()
         .map(|summary| (summary.resource_id, summary))
         .collect::<std::collections::HashMap<_, _>>();
-    let provider_resource = snapshot
+    // Ambiguity is a refusal, not a chip the strip may quietly omit: a client
+    // shown a shells-only strip would read that as "this task has no provider
+    // terminal", which is the opposite of what an ambiguous fence means. The
+    // serve path denies it, so this does too.
+    let provider_resource = match snapshot
         .primary_agent_id
         .and_then(|agent_id| snapshot.agents.get(&agent_id))
-        .and_then(|agent| {
-            snapshot
-                .resources
-                .values()
-                .find(|resource| {
-                    resource.resource_kind == crate::domain::ResourceKind::Terminal
-                        && !resource.recipe.is_plain_shell()
-                        && resource.lifecycle == crate::domain::ResourceLifecycle::Active
-                        && resource.runtime_generation == agent.runtime_generation
-                })
-                .map(|resource| resource.id)
-        });
+        .map(|agent| provider_terminal_resource(snapshot, agent))
+    {
+        Some(Ok(resource)) => resource.map(|resource| resource.id),
+        Some(Err(_)) => {
+            return denied(
+                TaskCockpitSurface::Terminal,
+                TaskCockpitDeniedReason::StaleFence,
+            );
+        }
+        None => None,
+    };
+    let workspace_root = dispatch
+        .workspace_projects
+        .and_then(|projects| projects.root_for(snapshot.task.project_id));
     let chip_for = |resource_id: crate::domain::ResourceId, is_provider: bool| {
         let facts = snapshot.terminal_facts.get(&resource_id);
         let exit = facts.and_then(|facts| facts.exit.as_ref());
@@ -974,7 +970,7 @@ fn serve_task_terminals(
             runtime_state,
             live_cwd: facts
                 .and_then(|facts| facts.live_cwd.as_ref())
-                .map(|cwd| cwd.to_string_lossy().into_owned()),
+                .map(|cwd| redacted_terminal_cwd(cwd, workspace_root)),
             exit: exit.cloned(),
             created_at_ms: facts.map(|facts| facts.created_at_ms).unwrap_or_default(),
             last_activity_at_ms: facts
@@ -999,6 +995,36 @@ fn serve_task_terminals(
     )))
 }
 
+/// Redact one terminal's live cwd for the wire.
+///
+/// The Task Cockpit contract is that projections carry no client-authoritative
+/// absolute paths, and a shell's cwd is the one field on the strip that would
+/// otherwise be one. Inside the task's workspace root it becomes the path
+/// relative to that root (empty at the root itself, rendered as `.` so the chip
+/// has something to show); anywhere else only the final component survives, so
+/// a shell that walked to an unrelated directory discloses its name and not the
+/// path that reaches it.
+fn redacted_terminal_cwd(
+    cwd: &std::path::Path,
+    workspace_root: Option<&std::path::Path>,
+) -> String {
+    if let Some(root) = workspace_root {
+        if let Ok(relative) = cwd.strip_prefix(root) {
+            let rendered = relative.to_string_lossy().replace('\\', "/");
+            return if rendered.is_empty() {
+                ".".to_string()
+            } else {
+                rendered
+            };
+        }
+    }
+    cwd.file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        // A path with no final component is a bare root; naming the volume is
+        // the whole path, so say nothing rather than leak it.
+        .unwrap_or_else(|| ".".to_string())
+}
+
 /// Fallback display text for one terminal chip: a shell's launch program stem
 /// (`pwsh`, `cmd`), or `terminal` for the provider slot. The running child
 /// command label is a separate, later concern; this never guesses one.
@@ -1006,19 +1032,24 @@ fn terminal_label_for(
     snapshot: &crate::domain::TaskSnapshot,
     resource_id: crate::domain::ResourceId,
 ) -> String {
-    match snapshot
+    let recipe = snapshot
         .resources
         .get(&resource_id)
-        .map(|resource| &resource.recipe)
-    {
-        Some(crate::domain::resource::ResourceRecipe::Terminal {
-            launch: Some(launch),
-            ..
-        }) => launch
-            .program
-            .file_stem()
-            .map(|stem| stem.to_string_lossy().into_owned())
-            .unwrap_or_else(|| "shell".to_string()),
+        .map(|resource| &resource.recipe);
+    // `is_plain_shell` is the one definition of "carries a launch"; matching the
+    // recipe shape by hand here would be a second one, free to drift from it.
+    match recipe {
+        Some(recipe) if recipe.is_plain_shell() => match recipe {
+            crate::domain::resource::ResourceRecipe::Terminal {
+                launch: Some(launch),
+                ..
+            } => launch
+                .program
+                .file_stem()
+                .map(|stem| stem.to_string_lossy().into_owned())
+                .unwrap_or_else(|| "shell".to_string()),
+            _ => "shell".to_string(),
+        },
         _ => "terminal".to_string(),
     }
 }
@@ -1091,16 +1122,12 @@ fn classify_terminal_readiness_absence(
             TaskCockpitUnavailableReason::TerminalUnavailable,
         );
     };
-    let matching_resources = snapshot
-        .resources
-        .values()
-        .filter(|resource| {
-            resource.resource_kind == crate::domain::ResourceKind::Terminal
-                && resource.lifecycle == crate::domain::ResourceLifecycle::Active
-                && resource.runtime_generation == agent.runtime_generation
-        })
-        .collect::<Vec<_>>();
-    let [resource] = matching_resources.as_slice() else {
+    // One rule for "the provider's terminal resource", shared with the serve
+    // path and the strip. Before that helper existed this filter admitted plain
+    // shells, which are Terminal resources at the same runtime generation, so a
+    // task with any open shell classified as TerminalUnavailable instead of
+    // reaching this classifier at all.
+    let Ok(Some(resource)) = provider_terminal_resource(snapshot, agent) else {
         return unavailable(
             TaskCockpitSurface::Terminal,
             TaskCockpitUnavailableReason::TerminalUnavailable,
@@ -2884,14 +2911,12 @@ fn serve_ssh_action(
             TaskCockpitUnavailableReason::SshOperationUnsupported,
         );
     }
-    let Some(resource) = snapshot.resources.values().find(|resource| {
-        resource.task_id == Some(task_id)
-            && resource.owner_kind == crate::domain::resource::OwnerKind::Task
-            && resource.resource_kind == crate::domain::resource::ResourceKind::Terminal
-            && resource.lifecycle == crate::domain::resource::ResourceLifecycle::Active
-            && resource.runtime_generation > 0
-            && resource.runtime_generation == agent.runtime_generation
-    }) else {
+    // `agent.runtime_generation == 0` is refused just above, so the helper's
+    // generation clause carries the `> 0` this used to spell out. Taking the
+    // shared rule also stops a plain shell from being picked here: this was a
+    // `find`, so with an open shell at the agent's generation it could return
+    // the shell rather than the provider's terminal.
+    let Ok(Some(resource)) = provider_terminal_resource(&snapshot, agent) else {
         return unavailable(
             TaskCockpitSurface::Ssh,
             TaskCockpitUnavailableReason::SshOperationUnsupported,
@@ -5177,6 +5202,24 @@ mod tests {
             projection.terminals[0].runtime_state,
             TerminalRuntimeStateWire::Running
         );
+        // ResourceRegistered writes TerminalFacts for every Terminal resource,
+        // the provider's included -- only the strip push is gated on
+        // `is_plain_shell`. So the provider chip's timestamps are real facts,
+        // not the zero a chip built without them would carry.
+        let durable = bus
+            .task_snapshot(task_id)
+            .expect("lookup")
+            .expect("task")
+            .terminal_facts
+            .get(&provider_resource)
+            .cloned()
+            .expect("the provider terminal has durable facts");
+        assert!(durable.created_at_ms > 0, "{durable:?}");
+        assert_eq!(projection.terminals[0].created_at_ms, durable.created_at_ms);
+        assert_eq!(
+            projection.terminals[0].last_activity_at_ms,
+            durable.last_activity_at_ms
+        );
         // Label is the launch program's file stem; the provider slot has none.
         assert_eq!(projection.terminals[0].label, "terminal");
         assert_eq!(
@@ -5249,6 +5292,181 @@ mod tests {
         // No hosted entry and no durable exit fact is genuinely unknown; it
         // must never read as a running terminal.
         assert_eq!(retired.runtime_state, TerminalRuntimeStateWire::Unknown);
+    }
+
+    #[test]
+    fn task_terminals_reports_a_recorded_exit_after_the_hosted_entry_is_gone() {
+        use crate::domain::terminal_facts::HostTerminalFact;
+
+        let (_repository, mut bus, client_id, task_id, roots, terminals, _provider, shell_a, _b) =
+            task_with_provider_and_two_shells();
+        let terminal_id = terminals
+            .shell_terminal_id(shell_a)
+            .expect("lookup")
+            .expect("hosted shell");
+        terminals
+            .close(
+                terminal_id,
+                crate::terminal::protocol::CloseReason::ExplicitServiceClose,
+            )
+            .expect("close shell");
+        assert!(terminals.remove_closed(shell_a).expect("retire"));
+        // The host fact pump records the exit durably; the hosted entry that
+        // could have answered "Exited" is already gone by then.
+        let outcome = bus
+            .record_terminal_fact(
+                task_id,
+                shell_a,
+                HostTerminalFact::Exit {
+                    code: Some(3),
+                    summary: "exit 3".to_string(),
+                },
+                9_000,
+            )
+            .expect("record exit");
+        assert!(
+            matches!(outcome, crate::kernel::TerminalFactOutcome::Recorded),
+            "{outcome:?}"
+        );
+
+        let served = serve_task_cockpit(TaskCockpitDispatch {
+            capabilities: CapabilitySet::from_capabilities([Capability::TaskCockpit]),
+            envelope_task_id: Some(task_id),
+            client_id,
+            connection_id: Uuid::now_v7(),
+            request_id: RequestId::new(),
+            query: &TaskCockpitQuery::TaskTerminals,
+            bus: &bus,
+            service_runtime: None,
+            semantic_journal: None,
+            terminal_service: Some(&terminals),
+            ssh_endpoints: None,
+            ssh_runtime: None,
+            workspace_projects: Some(&roots),
+            coordinator: None,
+            action_epoch: None,
+            runtime_generation: None,
+            config: None,
+            provider_launch_hint: ProviderLaunchReadinessHint::Unknown,
+        });
+        let QueryOutcome::Ok(QueryResult::TaskCockpit(TaskCockpitResult::TaskTerminals(
+            projection,
+        ))) = served
+        else {
+            panic!("expected the terminal strip, got {served:?}");
+        };
+        let chip = projection
+            .terminals
+            .iter()
+            .find(|chip| chip.resource_id == shell_a)
+            .expect("exited shell still in the strip");
+        assert_eq!(
+            chip.runtime_state,
+            TerminalRuntimeStateWire::Exited {
+                summary: "exit 3".to_string()
+            }
+        );
+        assert_eq!(
+            chip.exit.as_ref().map(|exit| exit.code),
+            Some(Some(3)),
+            "{chip:?}"
+        );
+    }
+
+    #[test]
+    fn task_terminals_redacts_the_shell_cwd_against_the_workspace_root() {
+        use crate::domain::terminal_facts::HostTerminalFact;
+
+        let (
+            _repository,
+            mut bus,
+            client_id,
+            task_id,
+            roots,
+            terminals,
+            _provider,
+            shell_a,
+            shell_b,
+        ) = task_with_provider_and_two_shells();
+        let root = roots
+            .root_for(
+                bus.task_snapshot(task_id)
+                    .expect("lookup")
+                    .expect("task")
+                    .task
+                    .project_id,
+            )
+            .expect("workspace root")
+            .to_path_buf();
+        // One shell inside the workspace, one deliberately outside it.
+        let inside = root.join("crates").join("api");
+        std::fs::create_dir_all(&inside).expect("inside dir");
+        let outside = std::env::temp_dir().join("devmanager-cwd-redaction-probe");
+        std::fs::create_dir_all(&outside).expect("outside dir");
+        for (resource_id, cwd) in [(shell_a, inside.clone()), (shell_b, outside.clone())] {
+            let outcome = bus
+                .record_terminal_fact(task_id, resource_id, HostTerminalFact::Cwd(cwd), 9_100)
+                .expect("record cwd");
+            assert!(
+                matches!(outcome, crate::kernel::TerminalFactOutcome::Recorded),
+                "{outcome:?}"
+            );
+        }
+
+        let served = serve_task_cockpit(TaskCockpitDispatch {
+            capabilities: CapabilitySet::from_capabilities([Capability::TaskCockpit]),
+            envelope_task_id: Some(task_id),
+            client_id,
+            connection_id: Uuid::now_v7(),
+            request_id: RequestId::new(),
+            query: &TaskCockpitQuery::TaskTerminals,
+            bus: &bus,
+            service_runtime: None,
+            semantic_journal: None,
+            terminal_service: Some(&terminals),
+            ssh_endpoints: None,
+            ssh_runtime: None,
+            workspace_projects: Some(&roots),
+            coordinator: None,
+            action_epoch: None,
+            runtime_generation: None,
+            config: None,
+            provider_launch_hint: ProviderLaunchReadinessHint::Unknown,
+        });
+        let QueryOutcome::Ok(QueryResult::TaskCockpit(TaskCockpitResult::TaskTerminals(
+            projection,
+        ))) = served
+        else {
+            panic!("expected the terminal strip, got {served:?}");
+        };
+        let cwd_of = |resource_id| {
+            projection
+                .terminals
+                .iter()
+                .find(|chip| chip.resource_id == resource_id)
+                .and_then(|chip| chip.live_cwd.clone())
+                .expect("chip carries a cwd")
+        };
+        assert_eq!(cwd_of(shell_a), "crates/api");
+        assert_eq!(
+            cwd_of(shell_b),
+            outside
+                .file_name()
+                .expect("final component")
+                .to_string_lossy()
+        );
+        // The contract is that no absolute host path reaches the wire at all.
+        let root_text = root.to_string_lossy().to_string();
+        for chip in &projection.terminals {
+            if let Some(cwd) = &chip.live_cwd {
+                assert!(!cwd.contains(&root_text), "leaked workspace root: {cwd}");
+                assert!(
+                    !std::path::Path::new(cwd).is_absolute(),
+                    "leaked absolute path: {cwd}"
+                );
+            }
+        }
+        let _ = std::fs::remove_dir_all(&outside);
     }
 
     #[test]
@@ -5377,6 +5595,97 @@ mod tests {
         assert!(projection.is_provider);
         assert_eq!(projection.resource_id, provider_resource);
         assert!(!projection.agent_session_id.is_nil());
+    }
+
+    /// The readiness classifier used to collect every Active Terminal resource
+    /// at the agent's generation, which a task's plain shells satisfy too. One
+    /// open shell made `[resource]` fail and the classifier answered
+    /// `TerminalUnavailable` for every task that had one -- the same defect the
+    /// provider serve path carried, one function along.
+    #[test]
+    fn terminal_readiness_classification_survives_an_open_plain_shell() {
+        use crate::domain::command::OpenShellTerminalIntent;
+        use crate::services::ProcessManager;
+        use crate::terminal::service::TerminalService;
+
+        let (_repository, mut bus, client_id, task_id, roots, agent_id, _provider_resource) =
+            create_unstarted_draft_with_terminal_claim();
+        let revision = bus
+            .task_snapshot(task_id)
+            .expect("lookup")
+            .expect("task")
+            .task
+            .revision;
+        let shell = plain_shell_resource(task_id, SHELL_B_PROGRAM);
+        let receipt = bus
+            .execute(CommandEnvelope {
+                command_id: CommandId::new(),
+                client_id,
+                task_id: Some(task_id),
+                issued_at_ms: 6,
+                expected_task_revision: Some(revision),
+                command: Command::OpenShellTerminal(OpenShellTerminalIntent {
+                    resource: shell.clone(),
+                }),
+            })
+            .expect("open shell");
+        assert!(
+            matches!(receipt, CommandReceipt::Accepted { .. }),
+            "{receipt:?}"
+        );
+        let snapshot = bus.task_snapshot(task_id).expect("lookup").expect("task");
+        let agent = snapshot.agents.get(&agent_id).expect("agent");
+        assert_eq!(
+            snapshot
+                .resources
+                .values()
+                .filter(|resource| {
+                    resource.resource_kind == crate::domain::ResourceKind::Terminal
+                        && resource.lifecycle == crate::domain::ResourceLifecycle::Active
+                        && resource.runtime_generation == agent.runtime_generation
+                })
+                .count(),
+            2,
+            "the shell and the provider terminal are both Active at this generation, \
+             which is exactly the case the old filter could not tell apart"
+        );
+
+        // No hosted attachment at all, so this reaches the absence classifier.
+        let terminals = TerminalService::new();
+        let store_dir = tempfile::tempdir().expect("provider store");
+        let manager = ProcessManager::new_with_provider_session_store_path(
+            store_dir.path().join("provider-sessions.sqlite"),
+        );
+        let outcome = serve_task_cockpit(TaskCockpitDispatch {
+            capabilities: CapabilitySet::from_capabilities([Capability::TaskCockpit]),
+            envelope_task_id: Some(task_id),
+            client_id,
+            connection_id: Uuid::now_v7(),
+            request_id: RequestId::new(),
+            query: &TaskCockpitQuery::TerminalReadiness,
+            bus: &bus,
+            service_runtime: Some(&manager),
+            semantic_journal: None,
+            terminal_service: Some(&terminals),
+            ssh_endpoints: None,
+            ssh_runtime: None,
+            workspace_projects: Some(&roots),
+            coordinator: None,
+            action_epoch: None,
+            runtime_generation: None,
+            config: None,
+            provider_launch_hint: ProviderLaunchReadinessHint::NotPending,
+        });
+        assert!(
+            matches!(
+                outcome,
+                QueryOutcome::Ok(QueryResult::TaskCockpit(TaskCockpitResult::Unavailable {
+                    surface: TaskCockpitSurface::Terminal,
+                    reason: TaskCockpitUnavailableReason::TerminalNotStarted,
+                }))
+            ),
+            "an open shell must not collapse readiness to TerminalUnavailable, got {outcome:?}"
+        );
     }
 
     #[test]

@@ -111,6 +111,71 @@ impl AgentResourceBinding {
     }
 }
 
+/// More than one Active provider terminal resource matched one agent.
+///
+/// This is a refusal, not a count: `AgentResourceBinding` exists precisely so a
+/// second terminal at the same generation cannot silently become the provider
+/// runtime, and picking either one here would be that silent choice. The count
+/// travels with it so the refusal is attributable in a log.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ProviderResourceAmbiguity {
+    pub candidates: usize,
+}
+
+impl std::fmt::Display for ProviderResourceAmbiguity {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "{} active provider terminal resources match this agent generation",
+            self.candidates
+        )
+    }
+}
+
+impl std::error::Error for ProviderResourceAmbiguity {}
+
+/// The one durable terminal resource that backs `agent`'s provider runtime.
+///
+/// This is the single definition of "the provider's terminal resource" and
+/// every caller that needs it must come here. It is deliberately the exact set
+/// of [`AgentResourceBinding::from_facts`] preconditions the snapshot can decide
+/// on its own -- task-owned by this agent's task, `Terminal`, Active, and at the
+/// agent's runtime generation -- plus the one rule that arrived with plain
+/// shells: a shell is a Terminal resource too, and it is never the provider's.
+///
+/// Omitting that shell exclusion is a live defect rather than a cosmetic one,
+/// because a task's plain shells are usually registered at the same runtime
+/// generation as its agent, so a caller that collects "the one Active Terminal
+/// resource" finds three and fails closed on a perfectly healthy provider.
+///
+/// `Ok(None)` means the task genuinely has no provider terminal resource at
+/// this generation. `Err` means more than one matched, which no caller may
+/// resolve by choosing.
+pub fn provider_terminal_resource<'a>(
+    snapshot: &'a crate::domain::snapshot::TaskSnapshot,
+    agent: &AgentSessionFacts,
+) -> Result<Option<&'a ResourceFacts>, ProviderResourceAmbiguity> {
+    let matching = snapshot
+        .resources
+        .values()
+        .filter(|resource| {
+            resource.task_id == Some(agent.task_id)
+                && resource.owner_kind == OwnerKind::Task
+                && resource.resource_kind == ResourceKind::Terminal
+                && !resource.recipe.is_plain_shell()
+                && resource.lifecycle == ResourceLifecycle::Active
+                && resource.runtime_generation == agent.runtime_generation
+        })
+        .collect::<Vec<_>>();
+    match matching.as_slice() {
+        [] => Ok(None),
+        [one] => Ok(Some(one)),
+        many => Err(ProviderResourceAmbiguity {
+            candidates: many.len(),
+        }),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -156,6 +221,139 @@ mod tests {
                 updated_at_ms: 1,
             },
         )
+    }
+
+    fn snapshot_with(
+        resources: Vec<ResourceFacts>,
+        agent: &AgentSessionFacts,
+    ) -> crate::domain::snapshot::TaskSnapshot {
+        use crate::domain::task::{
+            ReviewReadiness, TaskActivity, TaskAssignment, TaskAttention, TaskConnectivity,
+            TaskFacts, TaskLifecycle, WorkspaceRef,
+        };
+        let mut snapshot = crate::domain::snapshot::TaskSnapshot {
+            task: TaskFacts {
+                id: agent.task_id,
+                environment_id: crate::domain::id::EnvironmentId::new(),
+                title: "Provider resource".into(),
+                description: None,
+                project_id: crate::domain::id::ProjectId::new(),
+                workspace: WorkspaceRef::Main,
+                assignment: TaskAssignment::LocalOwner,
+                lifecycle: TaskLifecycle::Open,
+                action_epoch: 1,
+                revision: 1,
+                created_at_ms: 1,
+            },
+            connectivity: TaskConnectivity::Connected,
+            attention: TaskAttention::None,
+            activity: TaskActivity::Idle,
+            review_readiness: ReviewReadiness::NotReady,
+            agents: std::collections::BTreeMap::new(),
+            primary_agent_id: Some(agent.id),
+            artifacts: std::collections::BTreeMap::new(),
+            resources: std::collections::BTreeMap::new(),
+            provider_sessions: std::collections::BTreeMap::new(),
+            browser: crate::domain::browser::BrowserBook::new(),
+            terminal_facts: Default::default(),
+            terminal_strip: Default::default(),
+        };
+        snapshot.agents.insert(agent.id, agent.clone());
+        for resource in resources {
+            snapshot.resources.insert(resource.id, resource);
+        }
+        snapshot
+    }
+
+    fn shell_beside(resource: &ResourceFacts, tail: u8) -> ResourceFacts {
+        let mut shell = resource.clone();
+        shell.id = ResourceId::from_bytes([
+            0x01, 0x8f, 0x60, 0xb0, 0x9c, 0x1a, 0x70, 0x01, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, tail,
+        ])
+        .expect("shell id");
+        shell.recipe = ResourceRecipe::Terminal {
+            cols: 80,
+            rows: 24,
+            launch: Some(crate::domain::resource::TerminalLaunch {
+                cwd: std::path::PathBuf::from(if cfg!(windows) { "C:/Code" } else { "/code" }),
+                program: std::path::PathBuf::from(if cfg!(windows) {
+                    "C:/Windows/System32/cmd.exe"
+                } else {
+                    "/bin/sh"
+                }),
+                args: Vec::new(),
+            }),
+            title: None,
+        };
+        assert!(shell.recipe.is_plain_shell());
+        shell
+    }
+
+    #[test]
+    fn provider_terminal_resource_ignores_plain_shells_at_the_same_generation() {
+        let (agent, resource) = facts(7);
+        let shell_a = shell_beside(&resource, 4);
+        let shell_b = shell_beside(&resource, 5);
+        let snapshot = snapshot_with(
+            vec![resource.clone(), shell_a.clone(), shell_b.clone()],
+            &agent,
+        );
+        assert_eq!(
+            provider_terminal_resource(&snapshot, &agent)
+                .expect("unambiguous")
+                .map(|found| found.id),
+            Some(resource.id),
+            "plain shells are Terminal resources at the same generation and must not count"
+        );
+
+        // Shells alone are genuine absence, not a shell promoted to provider.
+        let shells_only = snapshot_with(vec![shell_a.clone(), shell_b], &agent);
+        assert_eq!(
+            provider_terminal_resource(&shells_only, &agent).expect("unambiguous"),
+            None
+        );
+    }
+
+    #[test]
+    fn provider_terminal_resource_refuses_to_choose_between_two_candidates() {
+        let (agent, resource) = facts(7);
+        let mut second = resource.clone();
+        second.id = ResourceId::from_bytes([
+            0x01, 0x8f, 0x60, 0xb0, 0x9c, 0x1a, 0x70, 0x01, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 9,
+        ])
+        .expect("second id");
+        let snapshot = snapshot_with(vec![resource, second], &agent);
+        assert_eq!(
+            provider_terminal_resource(&snapshot, &agent),
+            Err(ProviderResourceAmbiguity { candidates: 2 })
+        );
+    }
+
+    #[test]
+    fn provider_terminal_resource_requires_active_at_the_agent_generation() {
+        let (agent, resource) = facts(7);
+        let mut stale = resource.clone();
+        stale.runtime_generation = 6;
+        assert_eq!(
+            provider_terminal_resource(&snapshot_with(vec![stale], &agent), &agent)
+                .expect("unambiguous"),
+            None
+        );
+        let mut released = resource.clone();
+        released.lifecycle = ResourceLifecycle::Released;
+        assert_eq!(
+            provider_terminal_resource(&snapshot_with(vec![released], &agent), &agent)
+                .expect("unambiguous"),
+            None
+        );
+        // Anything the helper does return must be bindable by the canonical rule.
+        let snapshot = snapshot_with(vec![resource], &agent);
+        let found = provider_terminal_resource(&snapshot, &agent)
+            .expect("unambiguous")
+            .expect("present");
+        assert!(AgentResourceBinding::from_facts(&agent, found).is_ok());
     }
 
     #[test]

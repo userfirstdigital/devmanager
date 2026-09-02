@@ -120,6 +120,14 @@ pub const ACTION_PROVIDER_NEW_CONVERSATION: &str =
     crate::providers::input::ACTION_PROVIDER_NEW_CONVERSATION;
 /// Task Cockpit action for starting one exact task-owned stock provider.
 pub const ACTION_PROVIDER_START_SESSION: &str = "provider.start_session";
+/// Read-only terminal read: one terminal's screen, or the task's whole strip.
+///
+/// Deliberately separate from `ACTION_PROVIDER_TERMINAL_INPUT`, which is
+/// Mutating and requires `Capability::ProviderInput`. Reading a plain shell or
+/// listing the strip writes nothing and is not the provider's input surface, so
+/// gating it on ProviderInput would render the whole strip disabled for a
+/// client holding only `Capability::TaskCockpit`.
+pub const ACTION_TERMINAL_VIEW: &str = "terminal.view";
 /// Read-only host query for a personal prompt metadata page.
 pub const ACTION_PROMPT_METADATA_PAGE: &str = "prompt.library.metadata_page";
 /// Read-only host query for an exact immutable prompt version page.
@@ -452,6 +460,16 @@ const ACTIONS: &[ActionDescriptor] = &[
         risk: ActionRisk::Mutating,
         argument_schema: ActionArgumentSchema::ProviderInputV1,
     },
+    ActionDescriptor {
+        id: ACTION_TERMINAL_VIEW,
+        title: "View terminal",
+        description: "Read one task terminal's bounded screen, or list the task's terminal strip.",
+        keywords: &["terminal", "view", "shell", "strip"],
+        scope: ActionScope::Task,
+        required_capability: Some(Capability::TaskCockpit),
+        risk: ActionRisk::ReadOnly,
+        argument_schema: ActionArgumentSchema::TaskId,
+    },
 ];
 
 /// Frozen V1 `task.create` arguments. The workspace is already durable; the
@@ -672,15 +690,19 @@ pub const fn cockpit_query_action_id(query: &TaskCockpitQuery) -> &'static str {
         | TaskCockpitQuery::OpenConversationSubscription { .. }
         | TaskCockpitQuery::ReleaseConversationSubscription { .. }
         | TaskCockpitQuery::ProviderInputState => ACTION_CONVERSATION_STATUS,
+        // The legacy variants keep their historical id: they are the provider's
+        // interactive terminal, and clients already gate that surface on it.
         TaskCockpitQuery::Terminal
         | TaskCockpitQuery::TerminalScroll { .. }
         | TaskCockpitQuery::TerminalResize { .. }
-        | TaskCockpitQuery::TerminalReadiness
-        | TaskCockpitQuery::TerminalFor { .. }
+        | TaskCockpitQuery::TerminalReadiness => ACTION_PROVIDER_TERMINAL_INPUT,
+        // Reading a shell or the strip writes nothing and must not require
+        // ProviderInput, or a TaskCockpit-only client renders it all disabled.
+        TaskCockpitQuery::TerminalFor { .. }
         | TaskCockpitQuery::TerminalScrollFor { .. }
         | TaskCockpitQuery::TerminalResizeFor { .. }
         | TaskCockpitQuery::TerminalReadinessFor { .. }
-        | TaskCockpitQuery::TaskTerminals => ACTION_PROVIDER_TERMINAL_INPUT,
+        | TaskCockpitQuery::TaskTerminals => ACTION_TERMINAL_VIEW,
         TaskCockpitQuery::WorkspaceStatus => ACTION_WORKSPACE_STATUS,
         TaskCockpitQuery::GitRepositories => ACTION_GIT_REPOSITORIES,
         TaskCockpitQuery::GitStatus
@@ -1765,7 +1787,7 @@ mod tests {
         ACTION_TASK_CREATE_V2, ACTION_TASK_DELETE, ACTION_TASK_LIST, ACTION_TASK_QUEUE_FOLLOW_UP,
         ACTION_TASK_RENAME, ACTION_TASK_REOPEN, ACTION_TASK_RESOLVE_APPROVAL, ACTION_TASK_SEND_NOW,
         ACTION_TASK_SETTLE, ACTION_TASK_SHOW, ACTION_TASK_STEER_CURRENT_TURN,
-        ACTION_TASK_STOP_TURN, ACTION_UPDATER_CHECK, ACTION_UPDATER_DOWNLOAD,
+        ACTION_TASK_STOP_TURN, ACTION_TERMINAL_VIEW, ACTION_UPDATER_CHECK, ACTION_UPDATER_DOWNLOAD,
         ACTION_UPDATER_INSTALL, ACTION_UPDATER_START_BACKGROUND, ACTION_WORKSPACE_STATUS,
     };
     use crate::{
@@ -1824,7 +1846,8 @@ mod tests {
         assert!(ids.contains(&ACTION_BROWSER_NATIVE));
         assert!(ids.contains(&ACTION_PROVIDER_START_SESSION));
         assert!(ids.contains(&ACTION_CONVERSATION_STATUS));
-        assert_eq!(ids.len(), 50);
+        assert!(ids.contains(&ACTION_TERMINAL_VIEW));
+        assert_eq!(ids.len(), 51);
         assert!(ids.contains(&ACTION_SERVICE_START));
         assert!(ids.contains(&ACTION_SERVICE_STOP));
         assert!(ids.contains(&ACTION_SERVICE_RESTART));
@@ -1915,6 +1938,12 @@ mod tests {
                         ActionRisk::Mutating,
                         ActionArgumentSchema::ProviderInputV1,
                         Some(Capability::ProviderInput),
+                    ),
+                    ACTION_TERMINAL_VIEW => (
+                        ActionScope::Task,
+                        ActionRisk::ReadOnly,
+                        ActionArgumentSchema::TaskId,
+                        Some(Capability::TaskCockpit),
                     ),
                     ACTION_PROVIDER_START_SESSION => (
                         ActionScope::Task,
@@ -2426,6 +2455,59 @@ mod tests {
         assert_eq!(intent.resource_id, resource_id);
         assert_eq!(intent.expected_task_revision, 5);
         assert_eq!(intent.expected_action_epoch, 0);
+    }
+
+    #[test]
+    fn terminal_reads_are_enabled_for_a_task_cockpit_only_client() {
+        use super::{
+            action_enabled, cockpit_query_action_id, disabled_reason, ActionRequest, ActionRisk,
+            ACTION_TERMINAL_VIEW,
+        };
+        use crate::domain::cockpit::TaskCockpitQuery;
+        use crate::protocol::CapabilitySet;
+
+        let task_id = TaskId::new();
+        let resource_id = ResourceId::new();
+        // A remote or fleet client is routinely granted TaskCockpit without
+        // ProviderInput. Every terminal READ must stay enabled for it.
+        let read_only = CapabilitySet::from_capabilities([Capability::TaskCockpit]);
+        for query in [
+            TaskCockpitQuery::TaskTerminals,
+            TaskCockpitQuery::TerminalFor { resource_id },
+            TaskCockpitQuery::TerminalScrollFor {
+                resource_id,
+                delta_lines: 1,
+            },
+            TaskCockpitQuery::TerminalResizeFor {
+                resource_id,
+                cols: 80,
+                rows: 24,
+            },
+            TaskCockpitQuery::TerminalReadinessFor { resource_id },
+        ] {
+            let id = cockpit_query_action_id(&query);
+            assert_eq!(id, ACTION_TERMINAL_VIEW, "{query:?}");
+            assert_eq!(disabled_reason(id, read_only), None, "{query:?}");
+            assert!(action_enabled(id, read_only), "{query:?}");
+            // The request must also resolve a descriptor; `descriptor()` panics
+            // for an id that is not in the catalog.
+            let request = ActionRequest::TaskCockpit {
+                task_id,
+                query: query.clone(),
+            };
+            assert_eq!(request.descriptor().risk, ActionRisk::ReadOnly);
+            assert_eq!(
+                request.descriptor().required_capability,
+                Some(Capability::TaskCockpit)
+            );
+        }
+
+        // The provider's interactive terminal keeps its Mutating id and its
+        // ProviderInput gate; this test must not have relaxed that.
+        let provider_id = cockpit_query_action_id(&TaskCockpitQuery::Terminal);
+        assert_eq!(provider_id, ACTION_PROVIDER_TERMINAL_INPUT);
+        assert!(!action_enabled(provider_id, read_only));
+        assert!(disabled_reason(provider_id, read_only).is_some());
     }
 
     #[test]

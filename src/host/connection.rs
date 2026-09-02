@@ -4043,20 +4043,15 @@ impl HostRequestExecutor {
             .agents
             .get(&primary_agent_id)
             .ok_or_else(|| "provider terminal agent projection is unavailable".to_string())?;
-        let matching_resources = snapshot
-            .resources
-            .values()
-            .filter(|resource| {
-                resource.resource_kind == crate::domain::ResourceKind::Terminal
-                    && resource.lifecycle == crate::domain::ResourceLifecycle::Active
-                    && resource.runtime_generation == agent.runtime_generation
-            })
-            .collect::<Vec<_>>();
-        let [resource] = matching_resources.as_slice() else {
-            return Err(
-                "provider task does not have one exact active terminal resource".to_string(),
-            );
-        };
+        // Shared rule: plain shells are Active Terminal resources registered at
+        // the task's runtime generation too, so the older "exactly one Active
+        // Terminal" filter here counted them and refused a healthy provider on
+        // any task with an open shell.
+        let resource = crate::domain::agent_resource::provider_terminal_resource(&snapshot, agent)
+            .map_err(|error| format!("provider task terminal resource is ambiguous: {error}"))?
+            .ok_or_else(|| {
+                "provider task does not have one exact active terminal resource".to_string()
+            })?;
         let binding = runtime
             .manager
             .provider_terminal_binding_diagnostic(
