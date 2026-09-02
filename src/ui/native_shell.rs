@@ -2840,6 +2840,21 @@ impl TerminalTarget {
         }
     }
 
+    /// The terminal one strip chip describes.
+    ///
+    /// A chip may address the provider by its durable resource on the way OUT
+    /// (`TerminalFor { resource_id }`), but the provider's screen answers as
+    /// `Provider` however it was asked for -- `for_projection` says so. So
+    /// anything a REPLY settles, the attachment lease above all, must key the
+    /// chip this way and not by its resource id.
+    fn for_chip(resource_id: ResourceId, is_provider: bool) -> Self {
+        if is_provider {
+            Self::Provider
+        } else {
+            Self::Resource(resource_id)
+        }
+    }
+
     /// The surface registry's attachment slot for this terminal.
     ///
     /// The registry spells the same split as `Option<ResourceId>` because it
@@ -17008,6 +17023,9 @@ impl NativeShell {
         if focused.is_none() {
             return;
         }
+        // R2 again: a strip reply that MOVES focus is a focus change like any
+        // other, so the center canvas follows it to the terminal view.
+        self.set_provider_terminal_visible(true);
         // Same derivation the resize path uses; the strip this call just
         // admitted is what it reads.
         let target = self.focused_terminal_target(&owner);
@@ -26248,12 +26266,20 @@ impl NativeShell {
                     .set_focused_terminal(Some(resource_id));
             }
         }
-        if is_provider {
+        // R2: the strip is in the dock and the output is painted by the center
+        // canvas, so focus has to bring the terminal view with it or the user
+        // clicks chips and sees nothing. Same switch the Terminal tab and
+        // Ctrl+` use -- there is no second mechanism.
+        if self.selected_task_key.as_ref() == Some(owner) {
             self.set_provider_terminal_visible(true);
         }
+        // The lease is keyed by the target that will SETTLE it. `admit_terminal`
+        // settles by the projection, and a provider screen is `Provider`
+        // however it was asked for, so keying this by the resource id would
+        // leave a slot in flight that nothing can ever release.
         self.task_surfaces.note_terminal_query_started_for(
             owner.clone(),
-            TerminalTarget::Resource(resource_id).surface_target(),
+            TerminalTarget::for_chip(resource_id, is_provider).surface_target(),
         );
         let _ = self.dispatch_action_recorded_for_owner(
             &owner.host,
@@ -67239,6 +67265,167 @@ mod tests {
             "build · state unknown"
         );
     }
+
+    fn dispatched_screen_queries_for_test(
+        shared: &Arc<Mutex<TestRuntimeState>>,
+    ) -> Vec<TaskCockpitQuery> {
+        shared
+            .lock()
+            .expect("runtime")
+            .accepted
+            .iter()
+            .filter_map(|record| match &record.command {
+                NativeHostCommand::TaskCockpitQuery { query, .. }
+                    if matches!(
+                        query,
+                        TaskCockpitQuery::Terminal | TaskCockpitQuery::TerminalFor { .. }
+                    ) =>
+                {
+                    Some(query.clone())
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// R2. The strip lives in the dock and the output is painted by the center
+    /// canvas, so focusing a chip while the center shows Conversation would
+    /// otherwise leave the user clicking chips and seeing nothing. Focus has to
+    /// bring the terminal view with it, through the same center-view switch the
+    /// Terminal tab and Ctrl+` already use.
+    #[test]
+    fn focusing_a_chip_switches_the_center_canvas_to_the_terminal_view() {
+        if rerun_headless_shell_test_in_child(
+            "ui::native_shell::tests::focusing_a_chip_switches_the_center_canvas_to_the_terminal_view",
+        ) {
+            return;
+        }
+        let (runtime, _local_shared) = TestRuntime::new(true, NativeHostActionResult::Queued);
+        let remote_host = HostId::Remote([0xe4; 16]);
+        gpui::Application::headless().run(move |cx| {
+            crate::ui::init(cx);
+            with_test_shell_in_app(cx, runtime, |shell| {
+                let (model, task_id) = terminal_bound_client_model();
+                let model = Arc::new(model);
+                let provider_resource =
+                    provider_terminal_projection_for_test(&model, task_id, 1).resource_id;
+                let shell_resource = crate::domain::id::ResourceId::new();
+                let shared =
+                    attach_remote_test_host_with_shared(shell, &remote_host, Arc::clone(&model));
+                let owner = HostTaskKey::new(remote_host.clone(), task_id);
+                shell
+                    .select_fleet_task_key(owner.clone(), FleetSelectMode::Replace)
+                    .expect("select remote task");
+                let strip = crate::domain::cockpit::TaskTerminalsProjection {
+                    task_id,
+                    terminals: vec![
+                        terminal_chip_for_test(provider_resource, true),
+                        terminal_chip_for_test(shell_resource, false),
+                    ],
+                    order: vec![shell_resource],
+                    focused: None,
+                };
+                shell
+                    .task_surfaces
+                    .admit_terminals(owner.clone(), &strip)
+                    .expect("admit strip");
+                shell.set_task_center_terminal_preference(&owner, false);
+                assert!(
+                    !shell.task_center_terminal_preference(&owner),
+                    "the center canvas starts on Conversation"
+                );
+
+                shared.lock().expect("runtime").accepted.clear();
+                shell.focus_terminal_chip(&owner, shell_resource);
+
+                assert!(
+                    shell.task_center_terminal_preference(&owner),
+                    "focusing a chip must bring the terminal view with it"
+                );
+                assert!(
+                    dispatched_screen_queries_for_test(&shared).contains(
+                        &TaskCockpitQuery::TerminalFor {
+                            resource_id: shell_resource
+                        }
+                    ),
+                    "the focused chip's own screen must be queried"
+                );
+            });
+            cx.quit();
+        });
+    }
+
+    /// Important 2. A chip addresses the provider by its durable resource, so
+    /// the outgoing query keys `Resource(provider)` -- but the provider SCREEN
+    /// answers as `Provider` however it was asked for, and `admit_terminal`
+    /// settles the attachment lease by the projection. Taking the lease under
+    /// the query's key leaves `query_in_flight` true on a slot nothing will
+    /// ever release, which pins the surface in its loading state forever.
+    #[test]
+    fn focusing_the_provider_chip_takes_the_lease_its_own_screen_releases() {
+        if rerun_headless_shell_test_in_child(
+            "ui::native_shell::tests::focusing_the_provider_chip_takes_the_lease_its_own_screen_releases",
+        ) {
+            return;
+        }
+        let (runtime, _local_shared) = TestRuntime::new(true, NativeHostActionResult::Queued);
+        let remote_host = HostId::Remote([0xf5; 16]);
+        gpui::Application::headless().run(move |cx| {
+            crate::ui::init(cx);
+            with_test_shell_in_app(cx, runtime, |shell| {
+                let (model, task_id) = terminal_bound_client_model();
+                let model = Arc::new(model);
+                let projection = provider_terminal_projection_for_test(&model, task_id, 1);
+                let provider_resource = projection.resource_id;
+                let shell_resource = crate::domain::id::ResourceId::new();
+                attach_remote_test_host(shell, &remote_host, Arc::clone(&model));
+                let owner = HostTaskKey::new(remote_host.clone(), task_id);
+                shell
+                    .select_fleet_task_key(owner.clone(), FleetSelectMode::Replace)
+                    .expect("select remote task");
+                let strip = crate::domain::cockpit::TaskTerminalsProjection {
+                    task_id,
+                    terminals: vec![
+                        terminal_chip_for_test(provider_resource, true),
+                        terminal_chip_for_test(shell_resource, false),
+                    ],
+                    order: vec![shell_resource],
+                    focused: Some(shell_resource),
+                };
+                shell
+                    .task_surfaces
+                    .admit_terminals(owner.clone(), &strip)
+                    .expect("admit strip");
+
+                shell.focus_terminal_chip(&owner, provider_resource);
+                assert!(
+                    shell
+                        .task_surfaces
+                        .terminal_query_in_flight_for(owner.clone(), None),
+                    "the lease must be taken on the slot the provider screen settles"
+                );
+
+                shell
+                    .task_surfaces
+                    .admit_terminal(owner.clone(), &projection)
+                    .expect("admit provider screen");
+                assert!(
+                    !shell
+                        .task_surfaces
+                        .terminal_query_in_flight_for(owner.clone(), None),
+                    "the provider screen releases its own slot"
+                );
+                assert!(
+                    !shell
+                        .task_surfaces
+                        .terminal_query_in_flight_for(owner.clone(), Some(provider_resource)),
+                    "no slot may keep a lease the provider screen cannot release"
+                );
+            });
+            cx.quit();
+        });
+    }
+
 }
 
 #[allow(dead_code)]
