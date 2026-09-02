@@ -164,6 +164,18 @@ impl TaskConversationCache {
             == Some(true)
     }
 
+    fn latest_message_is_user(&self) -> bool {
+        self.facts
+            .iter()
+            .rev()
+            .find_map(|fact| match &fact.payload {
+                SemanticJournalPayload::UserMessage { .. } => Some(true),
+                SemanticJournalPayload::AssistantText { .. } => Some(false),
+                _ => None,
+            })
+            == Some(true)
+    }
+
     /// Admit a monotonic page. Updates durable cursors always. Reports
     /// `facts_changed` only when the retained fact list mutates so empty or
     /// cursor-only polls do not force a visual reprojection.
@@ -706,6 +718,15 @@ impl<K: Clone + Ord + Eq> TaskSurfaceRegistry<K> {
         self.state(task_id).is_some_and(|state| {
             state.pending_user_messages.is_empty()
                 && state.conversation.latest_message_is_assistant()
+        })
+    }
+
+    /// Whether the visible conversation proves that a user turn is still in
+    /// flight. This is an ephemeral UI fact: it must not be persisted into the
+    /// durable task activity projection.
+    pub fn conversation_turn_pending(&self, task_id: K) -> bool {
+        self.state(task_id).is_some_and(|state| {
+            !state.pending_user_messages.is_empty() || state.conversation.latest_message_is_user()
         })
     }
 
@@ -1278,18 +1299,21 @@ mod tests {
         let task = TaskId::new();
         let mut registry = TaskSurfaceRegistry::default();
         registry.admit_pending_user_message(task, "hello", CommandId::new());
+        assert!(registry.conversation_turn_pending(task));
         assert!(!registry.conversation_turn_completed(task));
 
         registry.begin_conversation(task, 1);
         registry
             .admit_conversation(task, 1, &user_page(1, "hello"))
             .expect("admit durable user message");
+        assert!(registry.conversation_turn_pending(task));
         assert!(!registry.conversation_turn_completed(task));
 
         registry.begin_conversation(task, 2);
         registry
             .admit_conversation(task, 2, &page(2, "done"))
             .expect("admit assistant response");
+        assert!(!registry.conversation_turn_pending(task));
         assert!(registry.conversation_turn_completed(task));
     }
 

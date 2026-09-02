@@ -10183,10 +10183,74 @@ fn composer_reasoning_choice_label(
             .any(|candidate| candidate == effort)
     });
     if is_provider_default {
-        format!("{base} · Default")
+        format!("{base} (Default)")
     } else {
         base.into()
     }
+}
+
+fn concrete_default_effort_token(
+    supported: &[crate::providers::ProviderReasoningEffort],
+    default_token: Option<String>,
+) -> Option<String> {
+    use crate::providers::ProviderReasoningEffort as Effort;
+    if default_token.is_some() {
+        return default_token;
+    }
+    supported
+        .iter()
+        .copied()
+        .find(|effort| *effort == Effort::Medium)
+        .or_else(|| {
+            supported
+                .iter()
+                .copied()
+                .find(|effort| *effort != Effort::ProviderDefault)
+        })
+        .map(|effort| match effort {
+            Effort::Low => "low",
+            Effort::Medium => "medium",
+            Effort::High => "high",
+            Effort::ExtraHigh => "xhigh",
+            Effort::Max => "max",
+            Effort::Ultra => "ultra",
+            Effort::ProviderDefault => unreachable!("filtered above"),
+        })
+        .map(str::to_string)
+}
+
+fn provider_default_choice_slug<'a>(
+    provider: ProviderKind,
+    catalog: Option<&'a crate::ui::provider_metadata::UiModelCatalog>,
+    ordered: &'a [String],
+) -> Option<&'a str> {
+    let preferred = match provider {
+        ProviderKind::Codex => Some("gpt-5.6-sol"),
+        ProviderKind::ClaudeCode => Some("sonnet"),
+        ProviderKind::Cursor => None,
+    };
+    preferred
+        .and_then(|preferred| {
+            ordered
+                .iter()
+                .find(|slug| slug.as_str() == preferred)
+                .map(String::as_str)
+        })
+        .or_else(|| {
+            catalog.and_then(|catalog| {
+                catalog
+                    .models
+                    .iter()
+                    .find(|model| !model.hidden && !provider_default_model_slug(&model.slug))
+                    .map(|model| model.slug.as_str())
+            })
+        })
+        .or_else(|| {
+            ordered
+                .iter()
+                .find(|slug| !provider_default_model_slug(slug))
+                .map(String::as_str)
+        })
 }
 
 /// Per-host raw UI ownership. Apply/drain/actions mutate only the captured slot.
@@ -19137,6 +19201,21 @@ impl NativeShell {
         self.composer_selector_highlight = choices
             .iter()
             .position(|(_, choice)| *choice == selected)
+            .or_else(|| {
+                matches!(
+                    selected,
+                    ComposerSelectorChoice::Model(crate::providers::ProviderModel::ProviderDefault)
+                        | ComposerSelectorChoice::Reasoning(
+                            crate::providers::ProviderReasoningEffort::ProviderDefault
+                        )
+                )
+                .then(|| {
+                    choices
+                        .iter()
+                        .position(|(label, _)| label.ends_with("(Default)"))
+                })
+                .flatten()
+            })
             .unwrap_or(0);
     }
 
@@ -19450,6 +19529,57 @@ impl NativeShell {
         }
     }
 
+    fn composer_default_model_label(
+        &self,
+        provider: ProviderKind,
+        options: &crate::providers::ProviderLaunchOptions,
+    ) -> String {
+        let instance_id = options
+            .provider_instance_id
+            .as_deref()
+            .unwrap_or_else(|| crate::providers::settings::default_instance_id_for_kind(provider));
+        let catalog = self.provider_settings.as_ref().and_then(|controller| {
+            controller
+                .model_catalogs()
+                .iter()
+                .find(|catalog| catalog.instance_id == instance_id)
+        });
+        let ordered = catalog
+            .map(|catalog| {
+                catalog
+                    .models
+                    .iter()
+                    .filter(|model| !model.hidden)
+                    .map(|model| model.slug.clone())
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_else(|| {
+                crate::ui::provider_settings::builtin_model_slugs(
+                    crate::providers::settings::ProviderDriverKind::from_provider_kind(provider),
+                )
+            });
+        let default_slug = provider_default_choice_slug(provider, catalog, &ordered);
+        let label = default_slug
+            .and_then(|slug| {
+                catalog.and_then(|catalog| {
+                    catalog
+                        .models
+                        .iter()
+                        .find(|model| model.slug == slug)
+                        .map(|model| model.display_name.clone())
+                })
+            })
+            .or_else(|| {
+                default_slug.map(|slug| match slug {
+                    "gpt-5.6-sol" => "GPT-5.6 Sol".to_string(),
+                    "sonnet" => "Claude Sonnet".to_string(),
+                    other => other.to_string(),
+                })
+            })
+            .unwrap_or_else(|| "Provider model".to_string());
+        format!("{label} (Default)")
+    }
+
     fn supported_efforts_for_current_model(
         &self,
         provider: ProviderKind,
@@ -19629,23 +19759,18 @@ impl NativeShell {
                     .as_ref()
                     .map(|ctl| ctl.model_catalogs());
                 let empty: &[crate::ui::provider_metadata::UiModelCatalog] = &[];
-                let ordered = crate::ui::provider_metadata::merge_picker_slugs(
-                    &policy_ordered,
-                    catalogs
-                        .unwrap_or(empty)
-                        .iter()
-                        .find(|c| c.instance_id == instance_id),
-                );
+                let catalog = catalogs
+                    .unwrap_or(empty)
+                    .iter()
+                    .find(|catalog| catalog.instance_id == instance_id);
+                let ordered =
+                    crate::ui::provider_metadata::merge_picker_slugs(&policy_ordered, catalog);
+                let default_slug =
+                    provider_default_choice_slug(provider, catalog, &ordered).map(str::to_string);
                 let mut choices = Vec::new();
-                choices.push((
-                    "Default".into(),
-                    ComposerSelectorChoice::Model(crate::providers::ProviderModel::ProviderDefault),
-                ));
                 for slug in ordered {
-                    // Provider catalogs commonly expose their symbolic default
-                    // as a model row as well. The typed ProviderDefault choice
-                    // above is the single source of truth and avoids two rows
-                    // that launch the same provider behavior.
+                    // Symbolic defaults are provider implementation details,
+                    // not actionable picker rows. Mark the real catalog model.
                     if provider_default_model_slug(&slug) {
                         continue;
                     }
@@ -19670,13 +19795,13 @@ impl NativeShell {
                         ),
                         _ => ComposerSelectorChoice::CustomModel(slug.clone()),
                     };
-                    let label = catalogs
-                        .unwrap_or(empty)
-                        .iter()
-                        .find(|catalog| catalog.instance_id == instance_id)
+                    let mut label = catalog
                         .and_then(|catalog| catalog.models.iter().find(|model| model.slug == slug))
                         .map(|model| model.display_name.clone())
-                        .unwrap_or(slug);
+                        .unwrap_or_else(|| slug.clone());
+                    if default_slug.as_deref() == Some(slug.as_str()) {
+                        label.push_str(" (Default)");
+                    }
                     choices.push((label, choice));
                 }
                 choices
@@ -19685,8 +19810,12 @@ impl NativeShell {
                 let options = self.composer_launch_options_for(provider);
                 let (supported, default_token) =
                     self.supported_efforts_for_current_model(provider, &options);
+                let default_token = concrete_default_effort_token(&supported, default_token);
                 supported
                     .into_iter()
+                    .filter(|effort| {
+                        *effort != crate::providers::ProviderReasoningEffort::ProviderDefault
+                    })
                     .map(|effort| {
                         (
                             composer_reasoning_choice_label(effort, default_token.as_deref()),
@@ -23827,7 +23956,11 @@ impl NativeShell {
                 .unwrap_or_else(|| slug.to_string())
         } else {
             match launch_options.model {
-                crate::providers::ProviderModel::ProviderDefault => "Default".into(),
+                crate::providers::ProviderModel::ProviderDefault => self
+                    .composer_default_model_label(
+                        provider_kind.unwrap_or(ProviderKind::Codex),
+                        &launch_options,
+                    ),
                 crate::providers::ProviderModel::CodexSol => "GPT-5.6 Sol".into(),
                 crate::providers::ProviderModel::CodexTerra => "GPT-5.6 Terra".into(),
                 crate::providers::ProviderModel::CodexLuna => "GPT-5.6 Luna".into(),
@@ -23837,13 +23970,31 @@ impl NativeShell {
             }
         };
         let reasoning_label = match launch_options.reasoning_effort {
-            crate::providers::ProviderReasoningEffort::ProviderDefault => "Default",
-            crate::providers::ProviderReasoningEffort::Low => "Low",
-            crate::providers::ProviderReasoningEffort::Medium => "Medium",
-            crate::providers::ProviderReasoningEffort::High => "High",
-            crate::providers::ProviderReasoningEffort::ExtraHigh => "Extra high",
-            crate::providers::ProviderReasoningEffort::Max => "Max",
-            crate::providers::ProviderReasoningEffort::Ultra => "Ultra",
+            crate::providers::ProviderReasoningEffort::ProviderDefault => {
+                let (supported, default_token) = self.supported_efforts_for_current_model(
+                    provider_kind.unwrap_or(ProviderKind::Codex),
+                    &launch_options,
+                );
+                let default_token = concrete_default_effort_token(&supported, default_token);
+                let effort = default_token
+                    .as_deref()
+                    .and_then(|token| {
+                        crate::ui::provider_metadata::efforts_from_supported(&[token.to_string()])
+                            .into_iter()
+                            .find(|effort| {
+                                *effort
+                                    != crate::providers::ProviderReasoningEffort::ProviderDefault
+                            })
+                    })
+                    .unwrap_or(crate::providers::ProviderReasoningEffort::Medium);
+                composer_reasoning_choice_label(effort, default_token.as_deref())
+            }
+            crate::providers::ProviderReasoningEffort::Low => "Low".into(),
+            crate::providers::ProviderReasoningEffort::Medium => "Medium".into(),
+            crate::providers::ProviderReasoningEffort::High => "High".into(),
+            crate::providers::ProviderReasoningEffort::ExtraHigh => "Extra high".into(),
+            crate::providers::ProviderReasoningEffort::Max => "Max".into(),
+            crate::providers::ProviderReasoningEffort::Ultra => "Ultra".into(),
         };
         let access_label = match launch_options.access {
             crate::providers::ProviderAccessMode::FullAccess => "Full access",
@@ -31040,6 +31191,17 @@ impl NativeShell {
                     .and_then(|model| model.tasks().get(&key.task_id))
                     .map(|snapshot| snapshot.visible_status())
             })?;
+        if !matches!(
+            projected,
+            VisibleTaskStatus::Disconnected
+                | VisibleTaskStatus::Failed
+                | VisibleTaskStatus::UncertainOutcome
+                | VisibleTaskStatus::NeedsApproval
+                | VisibleTaskStatus::NeedsAnswer
+        ) && self.task_surfaces.conversation_turn_pending(key.clone())
+        {
+            return Some(VisibleTaskStatus::Working);
+        }
         if matches!(
             projected,
             VisibleTaskStatus::Working | VisibleTaskStatus::Settling
@@ -43086,6 +43248,7 @@ mod tests {
         composer_provider_identity,
         composer_reasoning_choice_label,
         composer_waits_for_provider_identity,
+        concrete_default_effort_token,
         consume_pending_terminal_echo_prefix,
         cycle_project_choice,
         decode_idle_conversation_photo_bytes,
@@ -43107,6 +43270,7 @@ mod tests {
         owned_matches_admission,
         prepare_native_composer_image,
         project_creation_affordance,
+        provider_default_choice_slug,
         provider_default_model_slug,
         provider_inbox_affordance,
         provider_setup_resolution_expired,
@@ -50101,23 +50265,57 @@ mod tests {
     }
 
     #[test]
-    fn provider_picker_has_one_symbolic_default_and_marks_concrete_default_effort() {
+    fn provider_picker_uses_only_concrete_choices_and_marks_the_actual_default() {
         use crate::providers::ProviderReasoningEffort as Effort;
+        use crate::ui::provider_metadata::{UiModelCatalog, UiModelEntry};
 
         assert!(provider_default_model_slug("default"));
         assert!(provider_default_model_slug("Auto"));
         assert!(!provider_default_model_slug("claude-fable-5-1"));
         assert_eq!(
-            composer_reasoning_choice_label(Effort::ProviderDefault, Some("high")),
-            "Default"
-        );
-        assert_eq!(
             composer_reasoning_choice_label(Effort::High, Some("high")),
-            "High · Default"
+            "High (Default)"
         );
         assert_eq!(
             composer_reasoning_choice_label(Effort::Medium, Some("high")),
             "Medium"
+        );
+        assert_eq!(
+            concrete_default_effort_token(
+                &[
+                    Effort::ProviderDefault,
+                    Effort::Low,
+                    Effort::Medium,
+                    Effort::High
+                ],
+                None,
+            )
+            .as_deref(),
+            Some("medium")
+        );
+        let mut catalog = UiModelCatalog::empty("claude", "claude");
+        for (slug, name) in [
+            ("default", "Default"),
+            ("fable", "Claude Fable"),
+            ("sonnet", "Claude Sonnet"),
+        ] {
+            catalog.models.push(UiModelEntry {
+                slug: slug.into(),
+                display_name: name.into(),
+                supports_effort: true,
+                supported_efforts: vec!["high".into()],
+                default_effort: Some("high".into()),
+                hidden: false,
+                is_custom: false,
+                is_favorite: false,
+                input_modalities: vec!["text".into()],
+            });
+        }
+        let ordered = vec!["sonnet".into(), "default".into(), "fable".into()];
+        assert_eq!(
+            provider_default_choice_slug(ProviderKind::ClaudeCode, Some(&catalog), &ordered),
+            Some("sonnet"),
+            "the concrete provider default owns the marker even when favorites reorder rows"
         );
     }
 
@@ -61830,9 +62028,9 @@ mod tests {
     }
 
     #[test]
-    fn conversation_exact_prompt_reconciliation_clears_working_status() {
+    fn live_conversation_turn_overlays_idle_task_status_until_assistant_reply() {
         if rerun_headless_shell_test_in_child(
-            "ui::native_shell::tests::conversation_exact_prompt_reconciliation_clears_working_status",
+            "ui::native_shell::tests::live_conversation_turn_overlays_idle_task_status_until_assistant_reply",
         ) {
             return;
         }
@@ -61892,7 +62090,7 @@ mod tests {
                             },
                             connectivity: TaskConnectivity::Connected,
                             attention: crate::domain::task::TaskAttention::None,
-                            activity: TaskActivity::Working,
+                            activity: TaskActivity::Idle,
                             review_readiness: ReviewReadiness::NotReady,
                             primary_agent_id: Some(agent_id),
                         })],
