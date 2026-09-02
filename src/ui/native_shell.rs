@@ -27257,6 +27257,7 @@ impl NativeShell {
                 self.pending_task_search_focus = false;
                 self.project_scope_menu.close_menu();
                 self.project_actions.close();
+                self.close_terminal_chip_menu();
                 self.refresh_accessibility_tree();
             }
             _ => {}
