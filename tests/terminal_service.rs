@@ -1,11 +1,11 @@
 use std::sync::Arc;
 
-use devmanager::domain::id::{ClientId, TaskId};
+use devmanager::domain::id::{AgentSessionId, ClientId, ResourceId, TaskId};
 use devmanager::terminal::protocol::{
     ClientInputGrant, CloseReason, InputAck, InputEnvelope, InputId, InputRejectReason,
     ResizeFence, TerminalError, TerminalSessionId, TerminalSize, TerminalSpec, ViewKind,
 };
-use devmanager::terminal::service::{MockAttachedRuntime, TerminalService};
+use devmanager::terminal::service::{MockAttachedRuntime, TerminalRuntimeState, TerminalService};
 
 fn create_fixture_terminal(
     service: &TerminalService,
@@ -486,4 +486,174 @@ fn attached_exit_settlement_survives_retired_runtime_fence() {
         service.snapshot(id).is_ok(),
         "final screen remains readable"
     );
+}
+
+fn shell_runtime(resource_id: ResourceId) -> Arc<MockAttachedRuntime> {
+    MockAttachedRuntime::with_resource_fence(TerminalSize::new(80, 24).expect("size"), resource_id)
+}
+
+fn shell_spec() -> TerminalSpec {
+    TerminalSpec::new(
+        TerminalSessionId::new(),
+        TerminalSize::new(80, 24).expect("size"),
+    )
+    .expect("spec")
+}
+
+#[test]
+fn provider_and_two_shells_coexist_on_one_task() {
+    let service = TerminalService::default();
+    let task_id = TaskId::new();
+    let provider_runtime = MockAttachedRuntime::new(TerminalSize::new(80, 24).expect("size"));
+    let provider_spec = shell_spec();
+    let provider_id = service
+        .attach_bound_task_runtime(
+            task_id,
+            provider_spec,
+            provider_runtime,
+            AgentSessionId::new(),
+            1,
+            1,
+        )
+        .expect("provider attach");
+
+    let shell_a = ResourceId::new();
+    let shell_b = ResourceId::new();
+    let a_id = service
+        .attach_plain_shell(task_id, shell_a, 1, shell_spec(), shell_runtime(shell_a))
+        .expect("shell a");
+    let b_id = service
+        .attach_plain_shell(task_id, shell_b, 1, shell_spec(), shell_runtime(shell_b))
+        .expect("shell b");
+    assert_ne!(a_id, b_id);
+
+    // Default selection still returns the provider terminal.
+    let view = service
+        .task_terminal_view_for(task_id, None)
+        .expect("view")
+        .expect("present");
+    assert_eq!(view.terminal_id, provider_id);
+    assert!(view.is_provider);
+
+    let view_a = service
+        .task_terminal_view_for(task_id, Some(shell_a))
+        .expect("view")
+        .expect("present");
+    assert_eq!(view_a.terminal_id, a_id);
+    assert!(!view_a.is_provider);
+    assert_eq!(view_a.runtime_state, TerminalRuntimeState::Running);
+    assert_eq!(view_a.agent_session_id, None);
+    assert_eq!(view_a.runtime_generation, None);
+    assert_eq!(view_a.action_epoch, None);
+
+    let summaries = service.task_terminal_summaries(task_id).expect("summaries");
+    assert_eq!(summaries.len(), 3);
+    assert_eq!(summaries.iter().filter(|s| s.is_provider).count(), 1);
+    assert!(
+        summaries[0].is_provider,
+        "the provider terminal sorts before the plain shells"
+    );
+
+    service
+        .scroll_task_terminal_for(task_id, Some(shell_b), 3)
+        .expect("scroll b");
+    service
+        .resize_task_terminal_for(
+            task_id,
+            Some(shell_b),
+            TerminalSize::new(100, 30).expect("size"),
+        )
+        .expect("resize b");
+    let view_b = service
+        .task_terminal_view_for(task_id, Some(shell_b))
+        .expect("view")
+        .expect("present");
+    assert_eq!(view_b.view.screen.cols, 100);
+    assert_eq!(view_b.terminal_id, b_id);
+
+    // The provider terminal is untouched by the shell-scoped resize.
+    let provider_after = service
+        .task_terminal_view_for(task_id, None)
+        .expect("view")
+        .expect("present");
+    assert_eq!(provider_after.view.screen.cols, 80);
+}
+
+#[test]
+fn second_plain_shell_for_same_resource_is_rejected() {
+    let service = TerminalService::default();
+    let task_id = TaskId::new();
+    let resource_id = ResourceId::new();
+    service
+        .attach_plain_shell(
+            task_id,
+            resource_id,
+            1,
+            shell_spec(),
+            shell_runtime(resource_id),
+        )
+        .expect("first");
+    let second = service.attach_plain_shell(
+        task_id,
+        resource_id,
+        1,
+        shell_spec(),
+        shell_runtime(resource_id),
+    );
+    assert!(matches!(second, Err(TerminalError::InvalidFence)));
+}
+
+#[test]
+fn plain_shell_attach_requires_the_exact_runtime_fence() {
+    let service = TerminalService::default();
+    let task_id = TaskId::new();
+    let resource_id = ResourceId::new();
+    let foreign = service.attach_plain_shell(
+        task_id,
+        resource_id,
+        1,
+        shell_spec(),
+        shell_runtime(ResourceId::new()),
+    );
+    assert!(matches!(foreign, Err(TerminalError::InvalidFence)));
+
+    let stale_generation = service.attach_plain_shell(
+        task_id,
+        resource_id,
+        2,
+        shell_spec(),
+        shell_runtime(resource_id),
+    );
+    assert!(matches!(stale_generation, Err(TerminalError::InvalidFence)));
+}
+
+#[test]
+fn plain_shells_do_not_block_the_provider_terminal() {
+    let service = TerminalService::default();
+    let task_id = TaskId::new();
+    let shell = ResourceId::new();
+    service
+        .attach_plain_shell(task_id, shell, 1, shell_spec(), shell_runtime(shell))
+        .expect("shell");
+    service
+        .attach_bound_task_runtime(
+            task_id,
+            shell_spec(),
+            MockAttachedRuntime::new(TerminalSize::new(80, 24).expect("size")),
+            AgentSessionId::new(),
+            1,
+            1,
+        )
+        .expect("provider attaches beside a plain shell");
+
+    // The legacy provider-only accessors keep resolving the provider terminal.
+    let view = service
+        .task_terminal_view(task_id)
+        .expect("view")
+        .expect("present");
+    assert!(view.is_provider);
+    service.scroll_task_terminal(task_id, 1).expect("scroll");
+    service
+        .resize_task_terminal(task_id, TerminalSize::new(90, 20).expect("size"))
+        .expect("resize");
 }

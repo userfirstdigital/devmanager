@@ -209,6 +209,12 @@ struct HostedTerminal {
     closed: bool,
     /// Root/reader exit observed; distinct from explicit service/task close.
     exit_summary: Option<String>,
+    /// True only for terminals opened by [`TerminalService::attach_plain_shell`].
+    /// The provider slot is keyed by the absence of this flag so its legacy
+    /// one-per-task selection stays exact while shells coexist beside it.
+    is_plain_shell: bool,
+    /// Durable terminal not yet reconciled with a live runtime.
+    unknown: bool,
     truncated: bool,
     output_pressure_coalesced: bool,
     provider_session_id: Option<String>,
@@ -263,6 +269,8 @@ impl HostedTerminal {
             view_count: 0,
             closed: false,
             exit_summary: None,
+            is_plain_shell: false,
+            unknown: false,
             truncated: false,
             output_pressure_coalesced: false,
             provider_session_id: None,
@@ -329,6 +337,8 @@ impl HostedTerminal {
             view_count: 0,
             closed: false,
             exit_summary: None,
+            is_plain_shell: false,
+            unknown: false,
             truncated: false,
             output_pressure_coalesced: false,
             provider_session_id: None,
@@ -346,6 +356,18 @@ impl HostedTerminal {
 
     fn is_attached(&self) -> bool {
         matches!(&self.projection, ProjectionSource::Attached(_))
+    }
+
+    /// One source of truth for the runtime state published by both the single
+    /// terminal view and the per-task strip summaries.
+    fn runtime_state(&self) -> TerminalRuntimeState {
+        if self.unknown {
+            TerminalRuntimeState::Unknown
+        } else if let Some(summary) = self.exit_summary.clone() {
+            TerminalRuntimeState::Exited { summary }
+        } else {
+            TerminalRuntimeState::Running
+        }
     }
 
     fn ensure_open(&self) -> Result<(), TerminalError> {
@@ -1017,19 +1039,43 @@ pub struct TerminalService {
     terminals: Mutex<HashMap<TerminalId, HostedTerminal>>,
 }
 
+/// Live runtime state of one hosted terminal.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TerminalRuntimeState {
+    Running,
+    Exited {
+        summary: String,
+    },
+    /// Boot window only: durable terminal not yet reconciled with a runtime.
+    Unknown,
+}
+
+/// One entry of a Task's terminal strip as the host currently hosts it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TerminalRuntimeSummary {
+    pub resource_id: ResourceId,
+    pub terminal_id: Option<TerminalId>,
+    pub state: TerminalRuntimeState,
+    pub is_provider: bool,
+    pub sequence: u64,
+}
+
 #[derive(Debug, Clone)]
 pub struct TaskTerminalView {
     pub task_id: TaskId,
     pub terminal_id: TerminalId,
     pub session_id: TerminalSessionId,
-    pub agent_session_id: crate::domain::AgentSessionId,
-    pub runtime_generation: u64,
-    pub action_epoch: u64,
+    /// Provider identity. `None` for plain shells, which have no agent session.
+    pub agent_session_id: Option<crate::domain::AgentSessionId>,
+    pub runtime_generation: Option<u64>,
+    pub action_epoch: Option<u64>,
     pub focus_epoch: FocusEpoch,
     pub resource_id: crate::domain::ResourceId,
     pub resource_generation: u64,
     pub accepted_input_sequence: u64,
     pub sequence: u64,
+    pub is_provider: bool,
+    pub runtime_state: TerminalRuntimeState,
     pub view: TerminalSessionView,
 }
 
@@ -1106,7 +1152,39 @@ impl TerminalService {
         let mut terminals = self.lock()?;
         if terminals
             .values()
-            .any(|current| current.task_id == owner && !current.closed)
+            .any(|current| current.task_id == owner && !current.closed && !current.is_plain_shell)
+        {
+            return Err(TerminalError::InvalidFence);
+        }
+        terminals.insert(terminal_id, hosted);
+        Ok(terminal_id)
+    }
+
+    /// Attach a plain shell terminal keyed by its durable resource. The runtime
+    /// must already present that exact durable fence: this service never
+    /// invents or overrides an attachment identity, because every later
+    /// write/resize/close is fenced against the runtime's own answer.
+    pub fn attach_plain_shell(
+        &self,
+        owner: TaskId,
+        resource_id: ResourceId,
+        resource_generation: u64,
+        spec: TerminalSpec,
+        runtime: Arc<dyn AttachedTerminalRuntime>,
+    ) -> Result<TerminalId, TerminalError> {
+        let generation = TerminalGeneration::from_raw(resource_generation)?;
+        let attachment = runtime.current_attachment_fence()?;
+        if attachment.resource_id != resource_id || attachment.generation != generation {
+            return Err(TerminalError::InvalidFence);
+        }
+        let spec = spec.validated()?;
+        let terminal_id = TerminalId::new();
+        let mut hosted = HostedTerminal::open_attached(owner, spec, terminal_id, runtime)?;
+        hosted.is_plain_shell = true;
+        let mut terminals = self.lock()?;
+        if terminals
+            .values()
+            .any(|current| current.resource_id == resource_id && !current.closed)
         {
             return Err(TerminalError::InvalidFence);
         }
@@ -1499,85 +1577,144 @@ impl TerminalService {
         hosted.replace_generation(id)
     }
 
-    /// Resolve the one live terminal already owned by `task_id` and return a
-    /// complete view with the exact durable/runtime fence. No terminal is
-    /// created, resized, or retargeted by this read path.
+    /// Exactly one live terminal for this task and selector, or a fail-closed
+    /// fence error. `None` keeps the pre-plain-shell provider selection: the
+    /// single non-shell terminal owned by the Task.
+    fn select_terminal(
+        terminals: &HashMap<TerminalId, HostedTerminal>,
+        task_id: TaskId,
+        resource_id: Option<ResourceId>,
+    ) -> Result<Option<TerminalId>, TerminalError> {
+        let matching = terminals
+            .iter()
+            .filter(|(_, hosted)| hosted.task_id == task_id && !hosted.closed)
+            .filter(|(_, hosted)| match resource_id {
+                Some(id) => hosted.resource_id == id,
+                None => !hosted.is_plain_shell,
+            })
+            .map(|(id, _)| *id)
+            .collect::<Vec<_>>();
+        match matching.as_slice() {
+            [] => Ok(None),
+            [one] => Ok(Some(*one)),
+            _ => Err(TerminalError::InvalidFence),
+        }
+    }
+
+    /// Resolve the one live provider terminal already owned by `task_id` and
+    /// return a complete view with the exact durable/runtime fence. No terminal
+    /// is created, resized, or retargeted by this read path.
     pub fn task_terminal_view(
         &self,
         task_id: TaskId,
     ) -> Result<Option<TaskTerminalView>, TerminalError> {
+        self.task_terminal_view_for(task_id, None)
+    }
+
+    /// Resolve one exact live terminal owned by `task_id`. `None` selects the
+    /// provider slot; `Some(resource_id)` selects the plain shell durably keyed
+    /// by that resource.
+    pub fn task_terminal_view_for(
+        &self,
+        task_id: TaskId,
+        resource_id: Option<ResourceId>,
+    ) -> Result<Option<TaskTerminalView>, TerminalError> {
         let mut terminals = self.lock()?;
-        let matching = terminals
-            .iter()
-            .filter_map(|(id, hosted)| (hosted.task_id == task_id && !hosted.closed).then_some(*id))
-            .collect::<Vec<_>>();
-        let [terminal_id] = matching.as_slice() else {
-            return if matching.is_empty() {
-                Ok(None)
-            } else {
-                Err(TerminalError::InvalidFence)
-            };
+        let Some(terminal_id) = Self::select_terminal(&terminals, task_id, resource_id)? else {
+            return Ok(None);
         };
         let hosted = terminals
-            .get_mut(terminal_id)
+            .get_mut(&terminal_id)
             .ok_or(TerminalError::NotFound)?;
         hosted.ensure_open()?;
-        hosted.drain_attached_output(*terminal_id)?;
+        hosted.drain_attached_output(terminal_id)?;
         if hosted.sequence == TerminalSequence::ZERO {
             hosted.bump_sequence()?;
         }
-        let agent_session_id = hosted.agent_session_id.ok_or(TerminalError::InvalidFence)?;
-        let runtime_generation = hosted
-            .runtime_generation
-            .ok_or(TerminalError::InvalidFence)?;
-        let action_epoch = hosted.action_epoch.ok_or(TerminalError::InvalidFence)?;
+        let is_provider = !hosted.is_plain_shell;
+        if is_provider {
+            // The provider slot stays invisible without its complete durable
+            // identity, exactly as it was before plain shells existed.
+            hosted.agent_session_id.ok_or(TerminalError::InvalidFence)?;
+            hosted
+                .runtime_generation
+                .ok_or(TerminalError::InvalidFence)?;
+            hosted.action_epoch.ok_or(TerminalError::InvalidFence)?;
+        }
+        let runtime_state = hosted.runtime_state();
         let view = hosted.session_view()?;
         Ok(Some(TaskTerminalView {
             task_id,
-            terminal_id: *terminal_id,
+            terminal_id,
             session_id: hosted.session_id,
-            agent_session_id,
-            runtime_generation,
-            action_epoch,
+            agent_session_id: hosted.agent_session_id,
+            runtime_generation: hosted.runtime_generation,
+            action_epoch: hosted.action_epoch,
             focus_epoch: hosted.focus_epoch,
             resource_id: hosted.resource_id,
             resource_generation: hosted.generation.get(),
             accepted_input_sequence: hosted.accepted_input_sequence,
             sequence: hosted.sequence.get(),
+            is_provider,
+            runtime_state,
             view,
         }))
     }
 
-    /// Scroll the one exact live terminal already owned by `task_id`.
+    /// Every live terminal owned by `task_id`, provider slot first. This is the
+    /// host-side truth the durable terminal strip is reconciled against.
+    pub fn task_terminal_summaries(
+        &self,
+        task_id: TaskId,
+    ) -> Result<Vec<TerminalRuntimeSummary>, TerminalError> {
+        let terminals = self.lock()?;
+        let mut out = terminals
+            .iter()
+            .filter(|(_, hosted)| hosted.task_id == task_id && !hosted.closed)
+            .map(|(id, hosted)| TerminalRuntimeSummary {
+                resource_id: hosted.resource_id,
+                terminal_id: Some(*id),
+                state: hosted.runtime_state(),
+                is_provider: !hosted.is_plain_shell,
+                sequence: hosted.sequence.get(),
+            })
+            .collect::<Vec<_>>();
+        out.sort_by_key(|summary| (!summary.is_provider, summary.resource_id));
+        Ok(out)
+    }
+
+    /// Scroll the one exact live provider terminal already owned by `task_id`.
     /// Ambiguous or missing task bindings fail closed; no terminal is created.
     pub fn scroll_task_terminal(
         &self,
         task_id: TaskId,
         delta_lines: i32,
     ) -> Result<(), TerminalError> {
+        self.scroll_task_terminal_for(task_id, None, delta_lines)
+    }
+
+    /// Scroll one exact live terminal owned by `task_id`, selected by durable
+    /// resource. Ambiguous or missing bindings fail closed.
+    pub fn scroll_task_terminal_for(
+        &self,
+        task_id: TaskId,
+        resource_id: Option<ResourceId>,
+        delta_lines: i32,
+    ) -> Result<(), TerminalError> {
         let mut terminals = self.lock()?;
-        let matching = terminals
-            .iter()
-            .filter_map(|(id, hosted)| (hosted.task_id == task_id && !hosted.closed).then_some(*id))
-            .collect::<Vec<_>>();
-        let [terminal_id] = matching.as_slice() else {
-            return if matching.is_empty() {
-                Err(TerminalError::NotFound)
-            } else {
-                Err(TerminalError::InvalidFence)
-            };
-        };
+        let terminal_id = Self::select_terminal(&terminals, task_id, resource_id)?
+            .ok_or(TerminalError::NotFound)?;
         let hosted = terminals
-            .get_mut(terminal_id)
+            .get_mut(&terminal_id)
             .ok_or(TerminalError::NotFound)?;
         hosted.ensure_open()?;
-        hosted.drain_attached_output(*terminal_id)?;
+        hosted.drain_attached_output(terminal_id)?;
         hosted.scroll_lines(delta_lines)?;
         hosted.bump_sequence()?;
         Ok(())
     }
 
-    /// Resize the one exact live terminal already owned by `task_id`.
+    /// Resize the one exact live provider terminal already owned by `task_id`.
     /// Ambiguous or missing task bindings fail closed; no terminal is created
     /// or retargeted by this path.
     pub fn resize_task_terminal(
@@ -1585,23 +1722,25 @@ impl TerminalService {
         task_id: TaskId,
         size: TerminalSize,
     ) -> Result<(), TerminalError> {
+        self.resize_task_terminal_for(task_id, None, size)
+    }
+
+    /// Resize one exact live terminal owned by `task_id`, selected by durable
+    /// resource. Ambiguous or missing bindings fail closed.
+    pub fn resize_task_terminal_for(
+        &self,
+        task_id: TaskId,
+        resource_id: Option<ResourceId>,
+        size: TerminalSize,
+    ) -> Result<(), TerminalError> {
         let mut terminals = self.lock()?;
-        let matching = terminals
-            .iter()
-            .filter_map(|(id, hosted)| (hosted.task_id == task_id && !hosted.closed).then_some(*id))
-            .collect::<Vec<_>>();
-        let [terminal_id] = matching.as_slice() else {
-            return if matching.is_empty() {
-                Err(TerminalError::NotFound)
-            } else {
-                Err(TerminalError::InvalidFence)
-            };
-        };
+        let terminal_id = Self::select_terminal(&terminals, task_id, resource_id)?
+            .ok_or(TerminalError::NotFound)?;
         let hosted = terminals
-            .get_mut(terminal_id)
+            .get_mut(&terminal_id)
             .ok_or(TerminalError::NotFound)?;
         hosted.ensure_open()?;
-        hosted.resize(*terminal_id, size, None)
+        hosted.resize(terminal_id, size, None)
     }
 
     fn lock(
@@ -1728,6 +1867,14 @@ impl MockAttachedRuntime {
             scroll_requests: Mutex::new(Vec::new()),
             mode: Mutex::new(TerminalModeSnapshot::default()),
         })
+    }
+
+    /// Present the exact durable resource fence a host-launched plain shell
+    /// carries, so the fenced attach paths can be exercised in tests.
+    pub fn with_resource_fence(size: TerminalSize, resource_id: ResourceId) -> Arc<Self> {
+        let runtime = Self::new(size);
+        runtime.fence.lock().expect("fence").resource_id = resource_id;
+        runtime
     }
 
     pub fn written_bytes(&self) -> Vec<u8> {
@@ -2381,8 +2528,9 @@ mod tests {
             .task_terminal_view(task)
             .expect("project")
             .expect("task terminal");
-        assert_eq!(projected.agent_session_id, agent);
-        assert_eq!(projected.runtime_generation, 7);
-        assert_eq!(projected.action_epoch, 9);
+        assert_eq!(projected.agent_session_id, Some(agent));
+        assert_eq!(projected.runtime_generation, Some(7));
+        assert_eq!(projected.action_epoch, Some(9));
+        assert!(projected.is_provider);
     }
 }

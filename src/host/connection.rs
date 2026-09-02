@@ -3962,10 +3962,10 @@ impl HostRequestExecutor {
             .task_terminal_view(task_id)
             .map_err(|error| error.to_string())?
         {
-            return if existing.agent_session_id == binding.agent_session_id
+            return if existing.agent_session_id == Some(binding.agent_session_id)
                 && existing.resource_id == binding.resource_id
-                && existing.runtime_generation == binding.runtime_generation
-                && existing.action_epoch == binding.action_epoch
+                && existing.runtime_generation == Some(binding.runtime_generation)
+                && existing.action_epoch == Some(binding.action_epoch)
             {
                 Ok(())
             } else {

@@ -576,6 +576,23 @@ fn serve_task_terminal(
     };
     match service.task_terminal_view(task_id) {
         Ok(Some(terminal)) => {
+            // The provider slot always carries its complete durable identity;
+            // a plain shell never reaches this legacy provider surface.
+            let (
+                Some(terminal_agent_session_id),
+                Some(terminal_runtime_generation),
+                Some(terminal_action_epoch),
+            ) = (
+                terminal.agent_session_id,
+                terminal.runtime_generation,
+                terminal.action_epoch,
+            )
+            else {
+                return denied(
+                    TaskCockpitSurface::Terminal,
+                    TaskCockpitDeniedReason::StaleFence,
+                );
+            };
             let Some(primary_agent_id) = snapshot.primary_agent_id else {
                 return denied(
                     TaskCockpitSurface::Terminal,
@@ -602,9 +619,9 @@ fn serve_task_terminal(
                     TaskCockpitDeniedReason::StaleFence,
                 );
             };
-            if terminal.agent_session_id != primary_agent_id
-                || terminal.runtime_generation != agent.runtime_generation
-                || terminal.action_epoch == 0
+            if terminal_agent_session_id != primary_agent_id
+                || terminal_runtime_generation != agent.runtime_generation
+                || terminal_action_epoch == 0
                 || terminal.resource_id != resource.id
                 || terminal.resource_generation != resource.runtime_generation
             {
@@ -672,21 +689,21 @@ fn serve_task_terminal(
                 task_id,
                 terminal_id: terminal.terminal_id,
                 session_id: terminal.session_id,
-                agent_session_id: terminal.agent_session_id,
+                agent_session_id: terminal_agent_session_id,
                 resource_id: terminal.resource_id,
-                runtime_generation: terminal.runtime_generation,
+                runtime_generation: terminal_runtime_generation,
                 resource_generation: terminal.resource_generation,
-                action_epoch: terminal.action_epoch,
+                action_epoch: terminal_action_epoch,
                 focus_epoch: terminal.focus_epoch,
                 accepted_input_sequence: terminal.accepted_input_sequence,
                 accepts_input_without_conversation_id: dispatch.service_runtime.is_some_and(
                     |manager| {
                         manager.accepts_input_without_conversation_id(
                             task_id,
-                            terminal.agent_session_id,
+                            terminal_agent_session_id,
                             terminal.resource_id,
-                            terminal.runtime_generation,
-                            terminal.action_epoch,
+                            terminal_runtime_generation,
+                            terminal_action_epoch,
                         )
                     },
                 ),
