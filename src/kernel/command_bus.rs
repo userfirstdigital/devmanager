@@ -355,6 +355,11 @@ impl CommandBus {
     /// are appended exactly the way `Event::ProviderInputDelivered` is. The
     /// suppression rules live in `TerminalFacts::decide_host_fact`, which is
     /// pure and unit-tested without a database.
+    ///
+    /// `UnknownTerminal` covers both "this task has no such terminal" and "there
+    /// is no such task": a host sampler can do nothing different about either,
+    /// and both mean the same thing to it -- stop sampling this id. Neither is
+    /// an error, and neither writes.
     pub fn record_terminal_fact(
         &mut self,
         task_id: TaskId,
@@ -2120,9 +2125,58 @@ mod provider_restart_identity_tests {
                 }),
             ))
             .expect("reordering strip executes");
+        let revision = accepted_revision(reordered);
+
+        // A Releasing shell keeps its strip entry until ResourceReleased, so it
+        // is still part of the permutation. Scoping the set to Active shells
+        // instead would fail every legitimate strip edit during a release.
+        let revision = accepted_revision(
+            bus.execute(task_envelope(
+                client_id,
+                task_id,
+                revision,
+                Command::CloseTerminal {
+                    resource_id: first.id,
+                },
+            ))
+            .expect("close first"),
+        );
+        let snapshot = bus.task_snapshot(task_id).expect("snapshot").expect("task");
+        assert_eq!(
+            snapshot.resources[&first.id].lifecycle,
+            ResourceLifecycle::Releasing
+        );
+
+        let without_the_closing_shell = bus
+            .execute(task_envelope(
+                client_id,
+                task_id,
+                revision,
+                Command::SetTerminalStrip(crate::domain::terminal_facts::TaskTerminalStrip {
+                    order: vec![second.id],
+                    focused: Some(second.id),
+                }),
+            ))
+            .expect("strip omitting the closing shell executes");
+        assert_eq!(
+            rejection_code(&without_the_closing_shell),
+            RejectionCode::InvalidTransition
+        );
+
+        let with_the_closing_shell = bus
+            .execute(task_envelope(
+                client_id,
+                task_id,
+                revision,
+                Command::SetTerminalStrip(crate::domain::terminal_facts::TaskTerminalStrip {
+                    order: vec![first.id, second.id],
+                    focused: Some(second.id),
+                }),
+            ))
+            .expect("strip including the closing shell executes");
         assert!(
-            matches!(reordered, CommandReceipt::Accepted { .. }),
-            "a permutation of every live shell is accepted, got {reordered:?}"
+            matches!(with_the_closing_shell, CommandReceipt::Accepted { .. }),
+            "a Releasing shell still belongs to the strip, got {with_the_closing_shell:?}"
         );
     }
 
@@ -2179,6 +2233,189 @@ mod provider_restart_identity_tests {
             ))
             .expect("ninth executes");
         assert_eq!(rejection_code(&ninth), RejectionCode::TooManyTerminals);
+    }
+
+    /// A `TaskSnapshot` holding one plain shell in the given lifecycle, with the
+    /// `TerminalFacts` that `apply_into` would have left behind for it.
+    ///
+    /// `ResourceReleased` drops the facts entry and the strip entry but keeps the
+    /// resource row, which is precisely the state `decide` has to refuse.
+    fn snapshot_with_shell(lifecycle: ResourceLifecycle) -> (TaskSnapshot, ResourceId) {
+        let task = TaskFacts::new(
+            EnvironmentId::new(),
+            "shell lifecycle",
+            None,
+            ProjectId::new(),
+            WorkspaceRef::Main,
+            TaskAssignment::LocalOwner,
+            1,
+        )
+        .expect("task");
+        let task_id = task.id;
+        let mut shell = plain_shell_facts(task_id, None);
+        shell.lifecycle = lifecycle;
+        let shell_id = shell.id;
+
+        let released = lifecycle == ResourceLifecycle::Released;
+        let mut terminal_facts = BTreeMap::new();
+        let mut terminal_strip = crate::domain::terminal_facts::TaskTerminalStrip::default();
+        if !released {
+            terminal_facts.insert(
+                shell_id,
+                crate::domain::terminal_facts::TerminalFacts::registered(shell_id, None, 1),
+            );
+            terminal_strip.order.push(shell_id);
+            terminal_strip.focused = Some(shell_id);
+        }
+
+        let snapshot = TaskSnapshot {
+            connectivity: TaskConnectivity::Connected,
+            attention: TaskAttention::None,
+            activity: TaskActivity::Idle,
+            review_readiness: ReviewReadiness::NotReady,
+            task,
+            agents: BTreeMap::new(),
+            primary_agent_id: None,
+            artifacts: BTreeMap::new(),
+            resources: BTreeMap::from([(shell_id, shell)]),
+            provider_sessions: BTreeMap::new(),
+            browser: crate::domain::browser::BrowserBook::new(),
+            terminal_facts,
+            terminal_strip,
+        };
+        (snapshot, shell_id)
+    }
+
+    /// `ResourceReleased` removes the `TerminalFacts` entry but leaves the
+    /// resource row, so a rename decided from `snap.resources` alone would be
+    /// Accepted, appended, and then fail EVERY subsequent domain replay at
+    /// `terminal_facts.get_mut(..).ok_or(NotFound)`. The kernel projector only
+    /// bumps the revision for this event, so nothing else would catch it.
+    #[test]
+    fn a_released_shell_cannot_be_renamed_or_closed() {
+        let client_id = ClientId::new();
+
+        let (released, shell_id) = snapshot_with_shell(ResourceLifecycle::Released);
+        assert!(
+            released.resources.contains_key(&shell_id),
+            "a released resource row survives; that is what makes this reachable"
+        );
+        assert!(
+            !released.terminal_facts.contains_key(&shell_id),
+            "its terminal facts do not, which is what a replay would fail on"
+        );
+        let rename = task_envelope(
+            client_id,
+            released.task.id,
+            released.task.revision,
+            Command::RenameTerminal {
+                resource_id: shell_id,
+                title: "build".to_string(),
+            },
+        );
+        assert_eq!(
+            decide(Some(&released), &rename),
+            Err(RejectionCode::NotFound)
+        );
+        let close = task_envelope(
+            client_id,
+            released.task.id,
+            released.task.revision,
+            Command::CloseTerminal {
+                resource_id: shell_id,
+            },
+        );
+        assert_eq!(
+            decide(Some(&released), &close),
+            Err(RejectionCode::NotFound)
+        );
+
+        // The same commands on a live shell still decide events, so the guard
+        // above is the lifecycle check and not an unrelated refusal.
+        let (active, shell_id) = snapshot_with_shell(ResourceLifecycle::Active);
+        let rename = task_envelope(
+            client_id,
+            active.task.id,
+            active.task.revision,
+            Command::RenameTerminal {
+                resource_id: shell_id,
+                title: "build".to_string(),
+            },
+        );
+        assert_eq!(
+            decide(Some(&active), &rename),
+            Ok(vec![Event::TerminalRenamed {
+                resource_id: shell_id,
+                title: "build".to_string(),
+            }])
+        );
+    }
+
+    /// `record_terminal_fact`'s `Recorded` path hands `append_and_project` a NULL
+    /// task revision. That branch cannot execute before Task 5 seeds
+    /// `terminal_facts`, so prove the projector rule it depends on directly:
+    /// a host terminal fact is accepted with NULL and refused with `Some`.
+    #[test]
+    fn host_terminal_facts_are_appended_without_a_task_revision() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let mut bus = CommandBus::open(&directory.path().join("tasks.sqlite")).expect("bus");
+        let client_id = ClientId::new();
+        let (task_id, revision) = create_open_task(&mut bus, client_id);
+        // A real shell, so the journal this test writes stays replayable: domain
+        // apply resolves the fact against the TerminalFacts that
+        // `ResourceRegistered` seeds.
+        let shell = plain_shell_facts(task_id, None);
+        let resource_id = shell.id;
+        let revision = accepted_revision(
+            bus.execute(task_envelope(
+                client_id,
+                task_id,
+                revision,
+                Command::OpenShellTerminal(OpenShellTerminalIntent { resource: shell }),
+            ))
+            .expect("open shell"),
+        );
+
+        // NULL revision: exactly what record_terminal_fact passes.
+        bus.store
+            .with_immediate_transaction(|tx| {
+                append_and_project(
+                    tx,
+                    EventId::new(),
+                    Some(task_id),
+                    None,
+                    1_725_000_000_500,
+                    Event::TerminalActivity { resource_id },
+                )
+            })
+            .expect("a host terminal fact is appended with a NULL task revision");
+        let snapshot = bus.task_snapshot(task_id).expect("snapshot").expect("task");
+        assert_eq!(
+            snapshot.task.revision, revision,
+            "a host fact consumes no task revision"
+        );
+
+        // The same event carrying a revision is refused by
+        // projector::enforce_envelope_task_revision_rule.
+        let refused = bus.store.with_immediate_transaction(|tx| {
+            append_and_project(
+                tx,
+                EventId::new(),
+                Some(task_id),
+                Some(revision),
+                1_725_000_000_600,
+                Event::TerminalActivity { resource_id },
+            )
+        });
+        match refused {
+            Err(StoreError::Projection(detail)) => assert!(
+                detail.contains("terminal.activity") && detail.contains("NULL task_revision"),
+                "the refusal must name the event and the rule, got {detail}"
+            ),
+            other => panic!("expected a projection refusal, got {other:?}"),
+        }
+        let snapshot = bus.task_snapshot(task_id).expect("snapshot").expect("task");
+        assert_eq!(snapshot.task.revision, revision);
     }
 
     #[test]

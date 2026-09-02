@@ -1704,22 +1704,25 @@ pub fn decide(
             require_expected_revision(snap, envelope)?;
             strip
                 .validate(snap.task.id, &snap.resources)
-                .map_err(|error| match error {
-                    crate::domain::terminal_facts::TerminalStripError::TooManyTerminals(_) => {
-                        RejectionCode::TooManyTerminals
+                .map_err(|error| {
+                    use crate::domain::terminal_facts::TerminalStripError;
+                    // Exhaustive on purpose, so a new strip error cannot fall
+                    // into a catch-all here while `apply_into` maps it exactly
+                    // (`event.rs`, the TaskTerminalStripSet arm).
+                    match error {
+                        TerminalStripError::TooManyTerminals(_) => RejectionCode::TooManyTerminals,
+                        TerminalStripError::ForeignTask(_) => RejectionCode::NotFound,
+                        TerminalStripError::Duplicate(_)
+                        | TerminalStripError::FocusedNotInOrder(_)
+                        | TerminalStripError::NotATerminal(_) => RejectionCode::InvalidTransition,
                     }
-                    crate::domain::terminal_facts::TerminalStripError::ForeignTask(_) => {
-                        RejectionCode::NotFound
-                    }
-                    _ => RejectionCode::InvalidTransition,
                 })?;
-            // The strip is a permutation of the live plain shells, never a
-            // subset: a subset would both re-open a registration slot and hide
-            // a live shell from every reader of the strip.
-            let live: std::collections::BTreeSet<ResourceId> = live_plain_shell_ids(snap).collect();
+            // The strip is a permutation of the shells that hold a slot, never
+            // a subset: a subset would both re-open a registration slot and
+            // hide a shell from every reader of the strip.
             let ordered: std::collections::BTreeSet<ResourceId> =
                 strip.order.iter().copied().collect();
-            if ordered != live {
+            if ordered != occupied_plain_shell_ids(snap) {
                 return Err(RejectionCode::InvalidTransition);
             }
             Ok(vec![Event::TaskTerminalStripSet {
@@ -1734,38 +1737,34 @@ fn is_plain_shell_terminal(resource: &ResourceFacts) -> bool {
         && resource.recipe.is_plain_shell()
 }
 
-/// The task's Active plain shells: the exact set the strip must be a
-/// permutation of.
-fn live_plain_shell_ids(snap: &TaskSnapshot) -> impl Iterator<Item = ResourceId> + '_ {
-    snap.resources
-        .values()
-        .filter(|resource| {
-            is_plain_shell_terminal(resource)
-                && resource.lifecycle == crate::domain::resource::ResourceLifecycle::Active
-        })
-        .map(|resource| resource.id)
-}
-
-/// Plain shells that still hold a registration slot, which is every one that is
-/// not yet Released.
+/// The plain shells that hold a registration slot: every one not yet Released.
 ///
-/// This is deliberately wider than [`live_plain_shell_ids`]. The domain backstop
-/// in `apply_into`'s `ResourceRegistered` arm counts *strip entries*, and a shell
-/// only leaves the strip on `ResourceReleased` -- `ResourceReleaseBegun` leaves it
-/// there. Counting only Active shells here would let `decide` admit a ninth
-/// registration that the backstop then refuses as an opaque `ApplyError`, so the
-/// outer guard counts at least as many shells as the inner one.
-fn occupied_plain_shell_count(snap: &TaskSnapshot) -> usize {
+/// This is the single definition of the set the strip must be a permutation of
+/// AND the set the per-task bound counts, because `apply_into` maintains the
+/// strip as exactly this set -- `ResourceRegistered` pushes a plain shell on and
+/// only `ResourceReleased` removes it, so a Releasing shell keeps its entry. Two
+/// definitions would drift in both directions: an Active-only set makes every
+/// legitimate strip edit fail during a release window, and an Active-only count
+/// lets `decide` admit a ninth registration that the strip-entry backstop then
+/// refuses as an opaque `ApplyError`.
+fn occupied_plain_shell_ids(snap: &TaskSnapshot) -> std::collections::BTreeSet<ResourceId> {
     snap.resources
         .values()
         .filter(|resource| {
             is_plain_shell_terminal(resource)
                 && resource.lifecycle != crate::domain::resource::ResourceLifecycle::Released
         })
-        .count()
+        .map(|resource| resource.id)
+        .collect()
 }
 
 /// Resolve one of this task's plain shell terminals, or say which check failed.
+///
+/// A Released shell is `NotFound`, not a resource in a bad state: `ResourceReleased`
+/// drops its `TerminalFacts` and its strip entry while LEAVING the resource row in
+/// place, so `snap.resources` alone would still answer "yes, a plain shell". Every
+/// terminal event decided here is applied against `terminal_facts`, so accepting
+/// one for a Released shell would mint a durable event that no replay can apply.
 fn require_task_plain_shell<'a>(
     snap: &'a TaskSnapshot,
     resource_id: &ResourceId,
@@ -1781,6 +1780,9 @@ fn require_task_plain_shell<'a>(
     }
     if !is_plain_shell_terminal(resource) {
         return Err(RejectionCode::InvalidTransition);
+    }
+    if resource.lifecycle == crate::domain::resource::ResourceLifecycle::Released {
+        return Err(RejectionCode::NotFound);
     }
     Ok(resource)
 }
@@ -1807,7 +1809,8 @@ fn decide_open_shell_terminal(
     if snap.resources.contains_key(&resource.id) {
         return Err(RejectionCode::AlreadyExists);
     }
-    if occupied_plain_shell_count(snap) >= crate::domain::terminal_facts::MAX_PLAIN_SHELLS_PER_TASK
+    if occupied_plain_shell_ids(snap).len()
+        >= crate::domain::terminal_facts::MAX_PLAIN_SHELLS_PER_TASK
     {
         return Err(RejectionCode::TooManyTerminals);
     }
