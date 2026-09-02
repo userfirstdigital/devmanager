@@ -562,6 +562,12 @@ fn is_pure_decision_fact(event: &Event) -> bool {
             | Event::ProviderQuestionPresented { .. }
             | Event::ProviderApprovalPresented { .. }
             | Event::ProviderWaitSettled { .. }
+            // Task-mutation terminal facts; keep in lockstep with
+            // `outbox::is_pure_slice_decision_fact`. The host-reported terminal
+            // facts are deliberately absent: they consume no task revision, so
+            // this validator's `is_task_mutation` test would reject them anyway.
+            | Event::TerminalRenamed { .. }
+            | Event::TaskTerminalStripSet { .. }
             | Event::Browser(_)
     )
 }
