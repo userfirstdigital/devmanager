@@ -59,6 +59,7 @@ pub enum TerminalStripError {
     FocusedNotInOrder(ResourceId),
     NotATerminal(ResourceId),
     ForeignTask(ResourceId),
+    TooManyTerminals(usize),
 }
 
 impl std::fmt::Display for TerminalStripError {
@@ -68,10 +69,16 @@ impl std::fmt::Display for TerminalStripError {
             Self::FocusedNotInOrder(id) => {
                 write!(f, "focused terminal {id} is not in the strip")
             }
-            Self::NotATerminal(id) => write!(f, "resource {id} is not a terminal"),
+            Self::NotATerminal(id) => {
+                write!(f, "resource {id} is not a plain shell terminal")
+            }
             Self::ForeignTask(id) => {
                 write!(f, "resource {id} does not belong to this task")
             }
+            Self::TooManyTerminals(count) => write!(
+                f,
+                "strip holds {count} terminals, more than {MAX_PLAIN_SHELLS_PER_TASK}"
+            ),
         }
     }
 }
@@ -84,6 +91,9 @@ impl TaskTerminalStrip {
         task_id: TaskId,
         resources: &BTreeMap<ResourceId, ResourceFacts>,
     ) -> Result<(), TerminalStripError> {
+        if self.order.len() > MAX_PLAIN_SHELLS_PER_TASK {
+            return Err(TerminalStripError::TooManyTerminals(self.order.len()));
+        }
         let mut seen = BTreeSet::new();
         for id in &self.order {
             if !seen.insert(*id) {
@@ -95,7 +105,9 @@ impl TaskTerminalStrip {
             if facts.task_id != Some(task_id) {
                 return Err(TerminalStripError::ForeignTask(*id));
             }
-            if facts.resource_kind != ResourceKind::Terminal {
+            // The strip holds plain shells only: a provider-owned terminal
+            // (a recipe with no launch) is never a user-facing tab.
+            if facts.resource_kind != ResourceKind::Terminal || !facts.recipe.is_plain_shell() {
                 return Err(TerminalStripError::NotATerminal(*id));
             }
         }
@@ -120,16 +132,43 @@ impl TaskTerminalStrip {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::domain::resource::{OwnerKind, ResourceFacts, ResourceKind, ResourceRecipe};
+
+    const SHELL_CWD: &str = if cfg!(windows) { "C:/Code" } else { "/code" };
+    const SHELL_PROGRAM: &str = if cfg!(windows) {
+        "C:/Windows/System32/cmd.exe"
+    } else {
+        "/bin/sh"
+    };
+    use crate::domain::resource::{
+        OwnerKind, ResourceFacts, ResourceKind, ResourceRecipe, TerminalLaunch,
+    };
     use crate::domain::{ResourceId, TaskId};
     use std::collections::BTreeMap;
 
+    fn plain_shell_recipe() -> ResourceRecipe {
+        ResourceRecipe::Terminal {
+            cols: 80,
+            rows: 24,
+            launch: Some(TerminalLaunch {
+                cwd: PathBuf::from(SHELL_CWD),
+                program: PathBuf::from(SHELL_PROGRAM),
+                args: vec![],
+            }),
+            title: None,
+        }
+    }
+
+    /// The strip only ever holds plain shells, so the fixture is one.
     fn terminal_resource(task_id: TaskId) -> ResourceFacts {
+        resource_with_recipe(task_id, plain_shell_recipe())
+    }
+
+    fn resource_with_recipe(task_id: TaskId, recipe: ResourceRecipe) -> ResourceFacts {
         ResourceFacts::new(
             Some(task_id),
             OwnerKind::Task,
             ResourceKind::Terminal,
-            ResourceRecipe::terminal(80, 24),
+            recipe,
             1_725_000_000_000,
         )
         .expect("terminal resource")
@@ -240,6 +279,62 @@ mod tests {
         assert_eq!(MAX_PLAIN_SHELLS_PER_TASK, 8);
         assert_eq!(TERMINAL_CWD_DEBOUNCE_MS, 2_000);
         assert_eq!(TERMINAL_ACTIVITY_COALESCE_MS, 30_000);
+    }
+
+    #[test]
+    fn strip_rejects_a_provider_terminal_and_an_oversized_order() {
+        let task_id = TaskId::new();
+        let provider = resource_with_recipe(task_id, ResourceRecipe::terminal(80, 24));
+        let mut resources = BTreeMap::new();
+        resources.insert(provider.id, provider.clone());
+        assert_eq!(
+            TaskTerminalStrip {
+                order: vec![provider.id],
+                focused: None
+            }
+            .validate(task_id, &resources),
+            Err(TerminalStripError::NotATerminal(provider.id))
+        );
+
+        let shells: Vec<ResourceFacts> = (0..=MAX_PLAIN_SHELLS_PER_TASK)
+            .map(|_| terminal_resource(task_id))
+            .collect();
+        for shell in &shells {
+            resources.insert(shell.id, shell.clone());
+        }
+        let order: Vec<ResourceId> = shells.iter().map(|shell| shell.id).collect();
+        assert_eq!(
+            TaskTerminalStrip {
+                order: order.clone(),
+                focused: None
+            }
+            .validate(task_id, &resources),
+            Err(TerminalStripError::TooManyTerminals(
+                MAX_PLAIN_SHELLS_PER_TASK + 1
+            ))
+        );
+        // Exactly at the bound still passes.
+        assert_eq!(
+            TaskTerminalStrip {
+                order: order[..MAX_PLAIN_SHELLS_PER_TASK].to_vec(),
+                focused: None
+            }
+            .validate(task_id, &resources),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn strip_error_display_names_the_plain_shell_rule_and_the_bound() {
+        let id = ResourceId::new();
+        assert_eq!(
+            TerminalStripError::NotATerminal(id).to_string(),
+            format!("resource {id} is not a plain shell terminal")
+        );
+        assert_eq!(
+            TerminalStripError::TooManyTerminals(9).to_string(),
+            format!("strip holds 9 terminals, more than {MAX_PLAIN_SHELLS_PER_TASK}")
+        );
     }
 
     #[test]

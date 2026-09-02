@@ -204,12 +204,9 @@ pub(crate) fn is_pure_slice_decision_fact(event: &Event) -> bool {
         | Event::ProviderQuestionPresented { .. }
         | Event::ProviderApprovalPresented { .. }
         | Event::ProviderWaitSettled { .. }
-        // Terminal facts and the strip are recorded state: they settle in the
-        // same transaction and plan no host effect of their own.
+        // Terminal renames and strip edits are recorded state: they consume a
+        // task revision and plan no host effect of their own.
         | Event::TerminalRenamed { .. }
-        | Event::TerminalCwdReported { .. }
-        | Event::TerminalExited { .. }
-        | Event::TerminalActivity { .. }
         | Event::TaskTerminalStripSet { .. } => true,
         Event::Browser(fact) => !browser_fact_requires_host_settlement(fact),
         Event::TaskCloseBegun { .. }
@@ -222,7 +219,13 @@ pub(crate) fn is_pure_slice_decision_fact(event: &Event) -> bool {
         | Event::OperationUncertain(_)
         | Event::ProviderInputDelivered { .. }
         | Event::HostCloseBegun { .. }
-        | Event::HostCleanupBranchCompleted { .. } => false,
+        | Event::HostCleanupBranchCompleted { .. }
+        // Host-reported terminal facts carry no task revision, so they can
+        // never be a decision fact in a pure command's batch (which requires
+        // `task_revision: Some`) — same reason ProviderInputDelivered is here.
+        | Event::TerminalCwdReported { .. }
+        | Event::TerminalExited { .. }
+        | Event::TerminalActivity { .. } => false,
     }
 }
 
@@ -497,12 +500,9 @@ pub(crate) fn plan_effects(
             | Event::ProviderQuestionPresented { .. }
             | Event::ProviderApprovalPresented { .. }
             | Event::ProviderWaitSettled { .. }
-            // Terminal facts and the strip plan no host effect; keep in
+            // Terminal renames and strip edits plan no host effect; keep in
             // lockstep with `is_pure_slice_decision_fact`.
             | Event::TerminalRenamed { .. }
-            | Event::TerminalCwdReported { .. }
-            | Event::TerminalExited { .. }
-            | Event::TerminalActivity { .. }
             | Event::TaskTerminalStripSet { .. } => {
                 pure_fact_count = pure_fact_count
                     .checked_add(1)
@@ -515,7 +515,10 @@ pub(crate) fn plan_effects(
             | Event::OperationUncertain(_)
             | Event::ProviderInputDelivered { .. }
             | Event::HostCloseBegun { .. }
-            | Event::HostCleanupBranchCompleted { .. } => {
+            | Event::HostCleanupBranchCompleted { .. }
+            | Event::TerminalCwdReported { .. }
+            | Event::TerminalExited { .. }
+            | Event::TerminalActivity { .. } => {
                 return Err(StoreError::Projection(
                     "operation outcome facts are not decision inputs for effect planning".into(),
                 ));
@@ -816,6 +819,53 @@ mod tests {
             0x01, 0x8f, 0x60, 0xb0, 0x9c, 0x1a, 0x70, 0x01, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00,
             0x00, tail,
         ]
+    }
+
+    #[test]
+    fn terminal_event_decision_classification_is_pinned() {
+        let resource_id = ResourceId::from_bytes(fixed_uuid_v7(0x40)).unwrap();
+        let pure = [
+            Event::TerminalRenamed {
+                resource_id,
+                title: "build".to_string(),
+            },
+            Event::TaskTerminalStripSet {
+                strip: Default::default(),
+            },
+        ];
+        for event in &pure {
+            assert!(
+                is_pure_slice_decision_fact(event),
+                "{} must be a pure decision fact",
+                event.event_type()
+            );
+            assert!(!is_side_effect_decision_fact(event));
+            assert!(event.is_task_mutation());
+        }
+
+        let host_facts = [
+            Event::TerminalCwdReported {
+                resource_id,
+                cwd: std::path::PathBuf::from("C:/Code/demo"),
+            },
+            Event::TerminalExited {
+                resource_id,
+                code: Some(0),
+                summary: "done".to_string(),
+            },
+            Event::TerminalActivity { resource_id },
+        ];
+        for event in &host_facts {
+            // Host facts carry no task revision, so they can never be a
+            // decision fact in a command batch.
+            assert!(
+                !is_pure_slice_decision_fact(event),
+                "{} must not be a pure decision fact",
+                event.event_type()
+            );
+            assert!(!is_side_effect_decision_fact(event));
+            assert!(!event.is_task_mutation());
+        }
     }
 
     #[test]

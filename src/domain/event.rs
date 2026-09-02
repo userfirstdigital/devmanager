@@ -35,6 +35,7 @@ use crate::domain::task::{
     ReviewReadiness, TaskActivity, TaskAttention, TaskConnectivity, TaskFacts, TaskLifecycle,
     WorkspaceRef,
 };
+use crate::domain::terminal_facts::{TerminalStripError, MAX_PLAIN_SHELLS_PER_TASK};
 use crate::providers::ProviderKind;
 
 pub const EVENT_SCHEMA_VERSION: u32 = 1;
@@ -1781,13 +1782,8 @@ impl TryFrom<EventDocument> for Event {
                 runtime_generation: p.runtime_generation,
             },
             EventBody::TerminalRenamed(p) => {
-                let trimmed = p.title.trim();
-                if trimmed.is_empty()
-                    || trimmed != p.title
-                    || trimmed.chars().count() > crate::domain::resource::MAX_TERMINAL_TITLE_CHARS
-                {
-                    return Err(EventSerdeError::Payload);
-                }
+                crate::domain::resource::validate_terminal_title(&p.title)
+                    .map_err(|_| EventSerdeError::Payload)?;
                 Event::TerminalRenamed {
                     resource_id: p.resource_id,
                     title: p.title,
@@ -2817,6 +2813,13 @@ fn apply_into(
             if snap.resources.contains_key(&resource.id) {
                 return Err(ApplyError::AlreadyExists);
             }
+            // Domain backstop for the per-task shell bound, checked before any
+            // mutation; `decide` refuses the same case with a rejection code.
+            if resource.recipe.is_plain_shell()
+                && snap.terminal_strip.order.len() >= MAX_PLAIN_SHELLS_PER_TASK
+            {
+                return Err(ApplyError::InvalidTransition);
+            }
             snap.resources.insert(resource.id, resource.clone());
             if resource.resource_kind == ResourceKind::Terminal {
                 let title = match &resource.recipe {
@@ -2895,6 +2898,8 @@ fn apply_into(
                 // rename of one could never be re-encoded as a valid recipe.
                 return Err(ApplyError::InvalidTransition);
             }
+            crate::domain::resource::validate_terminal_title(title)
+                .map_err(|_| ApplyError::InvalidTransition)?;
             let new_title = Some(title.clone());
             let facts = snap
                 .terminal_facts
@@ -2942,7 +2947,15 @@ fn apply_into(
         Event::TaskTerminalStripSet { strip } => {
             strip
                 .validate(snap.task.id, &snap.resources)
-                .map_err(|_| ApplyError::NotFound)?;
+                .map_err(|error| match error {
+                    // Only an id this task does not own reads as "not found";
+                    // every other rejection is a malformed strip.
+                    TerminalStripError::ForeignTask(_) => ApplyError::NotFound,
+                    TerminalStripError::Duplicate(_)
+                    | TerminalStripError::FocusedNotInOrder(_)
+                    | TerminalStripError::NotATerminal(_)
+                    | TerminalStripError::TooManyTerminals(_) => ApplyError::InvalidTransition,
+                })?;
             snap.terminal_strip = strip.clone();
         }
         Event::ProviderInputAccepted {
@@ -3337,7 +3350,7 @@ mod terminal_apply_tests {
         ReviewReadiness, TaskActivity, TaskAssignment, TaskAttention, TaskConnectivity, TaskFacts,
         WorkspaceRef,
     };
-    use crate::domain::terminal_facts::TaskTerminalStrip;
+    use crate::domain::terminal_facts::{TaskTerminalStrip, MAX_PLAIN_SHELLS_PER_TASK};
     use std::path::PathBuf;
 
     const CREATED_AT_MS: i64 = 1_725_000_000_000;
@@ -3558,6 +3571,103 @@ mod terminal_apply_tests {
         assert!(!snapshot.terminal_facts.contains_key(&resource_id));
         assert!(!snapshot.terminal_strip.order.contains(&resource_id));
         assert_eq!(snapshot.terminal_strip.focused, None);
+    }
+
+    #[test]
+    fn renaming_to_an_invalid_title_is_rejected_and_mutates_nothing() {
+        let (mut snapshot, resource_id) = snapshot_with_terminal_resource();
+        let long = "x".repeat(65);
+        for bad in [long.as_str(), "  padded  ", ""] {
+            assert_eq!(
+                apply_into(
+                    &mut snapshot,
+                    &Event::TerminalRenamed {
+                        resource_id,
+                        title: bad.to_string(),
+                    },
+                    1_725_000_000_500,
+                ),
+                Err(ApplyError::InvalidTransition),
+                "title {bad:?} must be refused on the write path"
+            );
+            assert_eq!(snapshot.terminal_facts[&resource_id].title, None);
+            assert!(matches!(
+                &snapshot.resources[&resource_id].recipe,
+                ResourceRecipe::Terminal { title: None, .. }
+            ));
+        }
+    }
+
+    #[test]
+    fn registering_more_plain_shells_than_the_bound_is_refused() {
+        let mut snapshot = task_snapshot();
+        for index in 0..MAX_PLAIN_SHELLS_PER_TASK {
+            let resource = terminal_resource(snapshot.task.id, plain_shell_recipe());
+            apply_into(
+                &mut snapshot,
+                &Event::ResourceRegistered { resource },
+                CREATED_AT_MS,
+            )
+            .unwrap_or_else(|error| panic!("shell {index} must register: {error}"));
+        }
+        assert_eq!(
+            snapshot.terminal_strip.order.len(),
+            MAX_PLAIN_SHELLS_PER_TASK
+        );
+
+        let ninth = terminal_resource(snapshot.task.id, plain_shell_recipe());
+        let ninth_id = ninth.id;
+        assert_eq!(
+            apply_into(
+                &mut snapshot,
+                &Event::ResourceRegistered { resource: ninth },
+                CREATED_AT_MS,
+            ),
+            Err(ApplyError::InvalidTransition)
+        );
+        assert!(!snapshot.resources.contains_key(&ninth_id));
+        assert!(!snapshot.terminal_facts.contains_key(&ninth_id));
+        assert_eq!(
+            snapshot.terminal_strip.order.len(),
+            MAX_PLAIN_SHELLS_PER_TASK
+        );
+
+        // A provider-owned terminal is not a strip tab, so the bound does not
+        // apply to it.
+        let provider = terminal_resource(snapshot.task.id, ResourceRecipe::terminal(80, 24));
+        apply_into(
+            &mut snapshot,
+            &Event::ResourceRegistered { resource: provider },
+            CREATED_AT_MS,
+        )
+        .expect("provider terminal is exempt from the shell bound");
+    }
+
+    #[test]
+    fn strip_set_rejects_a_provider_terminal() {
+        let (mut snapshot, first) = snapshot_with_terminal_resource();
+        let provider = terminal_resource(snapshot.task.id, ResourceRecipe::terminal(80, 24));
+        let provider_id = provider.id;
+        apply_into(
+            &mut snapshot,
+            &Event::ResourceRegistered { resource: provider },
+            CREATED_AT_MS,
+        )
+        .expect("register provider terminal");
+        assert_eq!(
+            apply_into(
+                &mut snapshot,
+                &Event::TaskTerminalStripSet {
+                    strip: TaskTerminalStrip {
+                        order: vec![first, provider_id],
+                        focused: Some(first),
+                    },
+                },
+                1_725_000_000_500,
+            ),
+            Err(ApplyError::InvalidTransition)
+        );
+        assert_eq!(snapshot.terminal_strip.order, vec![first]);
     }
 
     #[test]

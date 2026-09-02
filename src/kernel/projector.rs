@@ -1577,13 +1577,18 @@ pub(crate) fn apply_event(
                 ));
             }
         }
-        // Terminal facts and the terminal strip are projected in a later task
-        // (V16 projection tables); the domain replay already applies them.
-        Event::TerminalRenamed { .. }
-        | Event::TerminalCwdReported { .. }
+        // The V16 terminal tables are written in a later task. Until then the
+        // revision-consuming pair must still advance tasks.revision, or the
+        // projection falls behind the domain replay the first time a rename is
+        // persisted.
+        Event::TerminalRenamed { .. } | Event::TaskTerminalStripSet { .. } => {
+            let task_id = require_task_id(event)?;
+            bump_task_revision(tx, shadow, task_id, event)?;
+        }
+        // Host-reported facts consume no revision by design.
+        Event::TerminalCwdReported { .. }
         | Event::TerminalExited { .. }
-        | Event::TerminalActivity { .. }
-        | Event::TaskTerminalStripSet { .. } => {}
+        | Event::TerminalActivity { .. } => {}
     }
     enforce_derived_result_lineage(tx, event)?;
     Ok(())

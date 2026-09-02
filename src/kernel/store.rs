@@ -1874,15 +1874,8 @@ pub(crate) fn decode_stored_event(
         }
         "terminal.renamed" => {
             let p: TerminalRenamedPayload = unpack(payload)?;
-            let trimmed = p.title.trim();
-            if trimmed.is_empty()
-                || trimmed != p.title
-                || trimmed.chars().count() > crate::domain::resource::MAX_TERMINAL_TITLE_CHARS
-            {
-                return Err(StoreError::EventDecode(
-                    "terminal title must be trimmed, non-empty, and within the title bound".into(),
-                ));
-            }
+            crate::domain::resource::validate_terminal_title(&p.title)
+                .map_err(|error| StoreError::EventDecode(error.to_string()))?;
             Event::TerminalRenamed {
                 resource_id: p.resource_id,
                 title: p.title,
@@ -3793,6 +3786,68 @@ mod tests {
     use crate::providers::ProviderKind;
     use rusqlite::ffi::Error as FfiError;
     use tempfile::TempDir;
+
+    #[test]
+    fn terminal_events_round_trip_through_the_store_codec() {
+        let resource_id = ResourceId::new();
+        let events = vec![
+            Event::TerminalRenamed {
+                resource_id,
+                title: "build".to_string(),
+            },
+            Event::TerminalCwdReported {
+                resource_id,
+                cwd: std::path::PathBuf::from("C:/Code/demo"),
+            },
+            Event::TerminalExited {
+                resource_id,
+                code: Some(3),
+                summary: "Shell exited with code 3".to_string(),
+            },
+            Event::TerminalActivity { resource_id },
+            Event::TaskTerminalStripSet {
+                strip: crate::domain::terminal_facts::TaskTerminalStrip {
+                    order: vec![resource_id],
+                    focused: Some(resource_id),
+                },
+            },
+        ];
+        for event in events {
+            let packed = encode_event_payload(&event).expect("encode terminal event");
+            let decoded =
+                decode_stored_event(event.event_type(), i64::from(EVENT_SCHEMA_VERSION), &packed)
+                    .expect("decode terminal event");
+            assert_eq!(decoded, event);
+        }
+
+        // The decoder is the durable gate for the title rule.
+        let bad_title = rmp_serde::to_vec(&TerminalRenamedPayload {
+            resource_id,
+            title: "  padded  ".to_string(),
+        })
+        .expect("pack bad title");
+        assert!(matches!(
+            decode_stored_event(
+                "terminal.renamed",
+                i64::from(EVENT_SCHEMA_VERSION),
+                &bad_title
+            ),
+            Err(StoreError::EventDecode(_))
+        ));
+        let relative_cwd = rmp_serde::to_vec(&TerminalCwdReportedPayload {
+            resource_id,
+            cwd: std::path::PathBuf::from("demo"),
+        })
+        .expect("pack relative cwd");
+        assert!(matches!(
+            decode_stored_event(
+                "terminal.cwd_reported",
+                i64::from(EVENT_SCHEMA_VERSION),
+                &relative_cwd
+            ),
+            Err(StoreError::EventDecode(_))
+        ));
+    }
 
     #[derive(Clone)]
     struct TerminalCloseFixture {

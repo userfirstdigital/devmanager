@@ -76,6 +76,17 @@ pub enum ResourceLifecycle {
 
 pub const MAX_TERMINAL_TITLE_CHARS: usize = 64;
 
+/// The one rule for a terminal title, shared by the recipe validator, the
+/// rename event's `apply_into` arm, and both durable decoders. A title is
+/// already trimmed, non-empty, and at most [`MAX_TERMINAL_TITLE_CHARS`] chars.
+pub fn validate_terminal_title(title: &str) -> Result<(), ResourceValidationError> {
+    if title.trim() != title || title.is_empty() || title.chars().count() > MAX_TERMINAL_TITLE_CHARS
+    {
+        return Err(ResourceValidationError::InvalidTerminalTitle);
+    }
+    Ok(())
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct TerminalLaunch {
@@ -208,13 +219,10 @@ impl ResourceRecipe {
                     launch.validate()?;
                 }
                 if let Some(title) = title.as_ref() {
-                    if launch.is_none()
-                        || title.trim() != title
-                        || title.is_empty()
-                        || title.chars().count() > MAX_TERMINAL_TITLE_CHARS
-                    {
+                    if launch.is_none() {
                         return Err(ResourceValidationError::InvalidTerminalTitle);
                     }
+                    validate_terminal_title(title)?;
                 }
                 Ok(())
             }
