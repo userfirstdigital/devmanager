@@ -391,6 +391,8 @@ const TERMINAL_ECHO_RETRY_INTERVAL: Duration = Duration::from_millis(16);
 /// bare in-flight boolean would.
 const TASK_TERMINALS_QUERY_LEASE: Duration = Duration::from_secs(5);
 /// Shown over the Terminal dock's photo while the Task's strip focuses nothing.
+/// Hover text for a live "+" on the terminal strip.
+const TERMINAL_ADD_SHELL_TOOLTIP: &str = "New shell terminal · Ctrl+Shift+`";
 const TERMINAL_DOCK_EMPTY_MESSAGE: &str = "No terminal selected · press + or Ctrl+Shift+`";
 const TERMINAL_ECHO_MAX_UNMATCHED_REFRESHES: u8 = 16;
 /// Host worker command/subscription idle slice — separate from UI scheduling.
@@ -2932,6 +2934,9 @@ struct TerminalChipMenu {
     position: Point<Pixels>,
     /// Inline rename draft once the Rename row has been chosen.
     rename: Option<String>,
+    /// Why the last submitted title was refused, shown under the field. The
+    /// menu stays open carrying this so the title can be corrected in place.
+    rename_error: Option<String>,
     /// A running terminal takes a second Close to actually close.
     confirming_close: bool,
 }
@@ -2946,6 +2951,47 @@ fn terminal_input_capability_granted(granted: CapabilitySet, target: TerminalTar
         TerminalTarget::Provider => granted.contains(Capability::ProviderInput),
         TerminalTarget::Resource(_) => granted.contains(Capability::TaskCockpit),
     }
+}
+
+/// Everything the Terminal dock paints for one owner.
+///
+/// Derived from the ONE admitted strip and separated from the element tree so
+/// what the dock shows is assertable without a window: which chips, whether
+/// the "+" is live and what it says when it is not, and the empty-state
+/// message that replaces the body when no shell is focused.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct TerminalDockModel {
+    pub chips: Vec<TerminalChipRow>,
+    pub add_enabled: bool,
+    pub add_tooltip: String,
+    /// `Some` when the splash replaces the dock body.
+    pub empty_state: Option<&'static str>,
+}
+
+/// Why a Task cannot take another shell.
+///
+/// Built from the domain constant the host actually enforces, so the number in
+/// the message cannot drift from the number in the rule.
+fn terminal_shell_cap_message() -> String {
+    format!(
+        "Task has the maximum of {} shells",
+        crate::domain::terminal_facts::MAX_PLAIN_SHELLS_PER_TASK
+    )
+}
+
+/// The one terminal-title rule the chip menu and the rename dispatch share.
+///
+/// `validate_terminal_title` is the rule; this only says it in words, and it
+/// reads the bound from the same constant rather than re-spelling it.
+fn terminal_title_rejection(title: &str) -> Option<String> {
+    crate::domain::resource::validate_terminal_title(title)
+        .err()
+        .map(|_| {
+            format!(
+                "Title must be 1–{} characters",
+                crate::domain::resource::MAX_TERMINAL_TITLE_CHARS
+            )
+        })
 }
 
 /// Hover text for one terminal chip.
@@ -19316,6 +19362,7 @@ impl NativeShell {
             return;
         }
         self.cache_current_composer_draft();
+        self.retire_terminal_chip_menu_for_selection();
         let selected_task = self.local_slot().interaction.selected_task();
         let selected_key = selected_task.map(|task_id| self.local_task_key(task_id));
         let previous_selected = self.layout.selected_task.clone();
@@ -19421,6 +19468,7 @@ impl NativeShell {
             .host_slot(&key.host)
             .is_some_and(|slot| slot.cockpit.selected_task() != Some(key.task_id));
         self.cache_current_composer_draft();
+        self.retire_terminal_chip_menu_for_selection();
         let previous_selected = self.layout.selected_task.clone();
         if previous_selected.is_none() {
             self.splash_fetch_generation = self.splash_fetch_generation.saturating_add(1);
@@ -26218,6 +26266,31 @@ impl NativeShell {
             .and_then(|state| state.strip.clone())
     }
 
+    /// What the Terminal dock paints for this owner.
+    ///
+    /// One derivation shared by every dock surface that renders the strip, so
+    /// the local and fleet branches cannot drift, and one that a test can read
+    /// without a window.
+    fn terminal_dock_model(&self, owner: &HostTaskKey) -> TerminalDockModel {
+        let strip = self.terminal_strip_for(owner);
+        let shells = strip.as_ref().map_or(0, |strip| strip.order.len());
+        let at_cap = shells >= crate::domain::terminal_facts::MAX_PLAIN_SHELLS_PER_TASK;
+        TerminalDockModel {
+            chips: strip.as_ref().map(terminal_chip_rows).unwrap_or_default(),
+            add_enabled: !at_cap,
+            add_tooltip: if at_cap {
+                terminal_shell_cap_message()
+            } else {
+                TERMINAL_ADD_SHELL_TOOLTIP.to_string()
+            },
+            // The splash replaces the body only once the host has actually
+            // answered with a strip: before that the client does not know
+            // whether this Task has terminals at all.
+            empty_state: strip
+                .and_then(|strip| strip.focused.is_none().then_some(TERMINAL_DOCK_EMPTY_MESSAGE)),
+        }
+    }
+
     /// Whether one chip on the admitted strip is the Task's provider terminal.
     fn terminal_chip_is_provider(&self, owner: &HostTaskKey, resource_id: ResourceId) -> bool {
         self.terminal_strip_for(owner).is_some_and(|strip| {
@@ -26297,14 +26370,33 @@ impl NativeShell {
     /// the shell, registers the resource and answers with the refreshed strip
     /// in the same round trip. There is no re-query to arm.
     fn open_shell_terminal_for_owner(&mut self, owner: &HostTaskKey, cwd: Option<String>) -> bool {
-        self.dispatch_action_recorded_for_owner(
+        // The domain caps the strip, so a request past it can only come back
+        // refused. Refusing here costs no round trip -- but a silent local
+        // refusal is indistinguishable from a dead button, so it says which
+        // check failed.
+        if !self.terminal_dock_model(owner).add_enabled {
+            self.set_composer_error_for_owner(owner, terminal_shell_cap_message());
+            return false;
+        }
+        match self.dispatch_action_recorded_for_owner(
             &owner.host,
             ActionRequest::TerminalOpenShell {
                 task_id: owner.task_id,
                 cwd,
             },
-        )
-        .is_ok()
+        ) {
+            Ok(_) => {
+                self.clear_composer_error_for_owner(owner);
+                true
+            }
+            Err(failure) => {
+                self.set_composer_error_for_owner(
+                    owner,
+                    format!("Couldn't open a shell: {}", failure.message),
+                );
+                false
+            }
+        }
     }
 
     /// Move strip focus one chip along, wrapping at both ends.
@@ -26358,7 +26450,7 @@ impl NativeShell {
         title: String,
     ) -> bool {
         let title = title.trim().to_string();
-        if title.is_empty() {
+        if terminal_title_rejection(&title).is_some() {
             return false;
         }
         self.dispatch_action_recorded_for_owner(
@@ -26483,6 +26575,7 @@ impl NativeShell {
             resource_id,
             position,
             rename: None,
+            rename_error: None,
             confirming_close: false,
         });
     }
@@ -26513,8 +26606,40 @@ impl NativeShell {
         let Some(title) = menu.rename else {
             return;
         };
-        self.rename_terminal_chip(&menu.owner, menu.resource_id, title);
+        // A title the client already knows the host will refuse never leaves,
+        // and the menu stays open in rename mode carrying the reason so it can
+        // be corrected where it was typed.
+        if let Some(rejection) = terminal_title_rejection(title.trim()) {
+            if let Some(open) = self.terminal_chip_menu.as_mut() {
+                open.rename_error = Some(rejection);
+            }
+            return;
+        }
+        if !self.rename_terminal_chip(&menu.owner, menu.resource_id, title) {
+            if let Some(open) = self.terminal_chip_menu.as_mut() {
+                open.rename_error =
+                    Some("Couldn't send the rename to the host. Try again.".to_string());
+            }
+            return;
+        }
         self.close_terminal_chip_menu();
+    }
+
+    /// Drop a chip menu whose Task is no longer the selected one.
+    ///
+    /// The menu acts on the owner it was opened for, so one left open across a
+    /// task switch sends close, rename or reorder to the Task the user is no
+    /// longer looking at. Enforced by comparing the owner rather than by
+    /// remembering to close it, and re-checked on every paint so a selection
+    /// path added later cannot silently reintroduce the stale menu.
+    fn retire_terminal_chip_menu_for_selection(&mut self) {
+        let stale = self
+            .terminal_chip_menu
+            .as_ref()
+            .is_some_and(|menu| self.selected_task_key.as_ref() != Some(&menu.owner));
+        if stale {
+            self.terminal_chip_menu = None;
+        }
     }
 
     /// One photo per app session for the Terminal dock's empty state.
@@ -26575,6 +26700,7 @@ impl NativeShell {
             .terminal_chip_close_needs_confirmation(&menu.owner, menu.resource_id)
             && !menu.confirming_close;
         let renaming = menu.rename.clone();
+        let rename_error = menu.rename_error.clone();
         let row =
             move |id: &'static str,
                   text: String,
@@ -26624,6 +26750,17 @@ impl NativeShell {
                     .child("Type a name, Enter to apply, Escape to cancel")
                     .into_any_element(),
             );
+            rows.extend(rename_error.map(|message| {
+                div()
+                    .id("native-terminal-chip-rename-error")
+                    .w_full()
+                    .px(px(tokens.density.spacing.md))
+                    .pb(px(tokens.density.spacing.xs))
+                    .text_size(px(tokens.density.typography.caption))
+                    .text_color(tokens.status.destructive.to_gpui())
+                    .child(message)
+                    .into_any_element()
+            }));
         } else {
             for (id, text, enabled, tone, handler) in [
                 (
@@ -26782,26 +26919,30 @@ impl NativeShell {
             self.close_terminal_chip_menu();
             return;
         }
+        if key == "enter" {
+            self.submit_terminal_chip_rename();
+            return;
+        }
         let Some(menu) = self.terminal_chip_menu.as_mut() else {
             return;
         };
         let Some(draft) = menu.rename.as_mut() else {
             return;
         };
-        match key {
-            "enter" => {
-                self.submit_terminal_chip_rename();
-            }
-            "backspace" => {
-                draft.pop();
-            }
-            _ => {
-                if let Some(text) = event.keystroke.key_char.as_ref() {
-                    if !text.is_empty() && !text.chars().any(char::is_control) {
-                        draft.push_str(text);
-                    }
+        let edited = match key {
+            "backspace" => draft.pop().is_some(),
+            _ => match event.keystroke.key_char.as_ref() {
+                Some(text) if !text.is_empty() && !text.chars().any(char::is_control) => {
+                    draft.push_str(text);
+                    true
                 }
-            }
+                _ => false,
+            },
+        };
+        if edited {
+            // The rejection described the title that was submitted, not the one
+            // now in the field.
+            menu.rename_error = None;
         }
     }
 
@@ -28366,8 +28507,9 @@ impl NativeShell {
             .px(px(4.0))
             .pb(px(4.0))
             .overflow_hidden();
-        if let Some(strip) = self.terminal_strip_for(owner) {
-            for row in terminal_chip_rows(&strip) {
+        let model = self.terminal_dock_model(owner);
+        {
+            for row in model.chips.iter().cloned() {
                 let resource_id = row.resource_id;
                 let key = stable_resource_element_key(resource_id, "chip");
                 let tooltip = terminal_chip_tooltip(&row);
@@ -28443,6 +28585,7 @@ impl NativeShell {
                 chips = chips.child(chip);
             }
         }
+        let add_tooltip = model.add_tooltip.clone();
         let mut add = div()
             .id("native-terminal-chip-add")
             .tab_stop(true)
@@ -28453,15 +28596,20 @@ impl NativeShell {
             .px(px(6.0))
             .rounded(px(tokens.density.radii.pill))
             .text_size(px(tokens.density.typography.caption))
-            .text_color(tokens.text.muted.to_gpui())
-            .hover(|style| style.bg(tokens.surfaces.raised.to_gpui()))
-            .cursor_pointer()
-            .tooltip(|window, app| {
-                gpui_component::tooltip::Tooltip::new("New shell terminal · Ctrl+Shift+`")
-                    .build(window, app)
+            .tooltip(move |window, app| {
+                gpui_component::tooltip::Tooltip::new(add_tooltip.clone()).build(window, app)
             })
             .child("+".to_string());
-        if let Some(entity) = shell_entity {
+        // At the cap the "+" is inert and says so on hover rather than
+        // spending a round trip to be refused by the host with nothing shown.
+        add = if model.add_enabled {
+            add.text_color(tokens.text.muted.to_gpui())
+                .hover(|style| style.bg(tokens.surfaces.raised.to_gpui()))
+                .cursor_pointer()
+        } else {
+            add.text_color(tokens.text.disabled.to_gpui())
+        };
+        if let Some(entity) = shell_entity.filter(|_| model.add_enabled) {
             let add_owner = owner.clone();
             add = add.on_mouse_down(
                 MouseButton::Left,
@@ -28533,13 +28681,9 @@ impl NativeShell {
         } else {
             "Terminal · no matching task terminal"
         };
-        // The splash replaces the body only once the host has actually answered
-        // with a strip. Before that the client does not know whether this Task
-        // has terminals at all, and a photo would be a claim it cannot make.
         let show_splash = owner
             .as_ref()
-            .and_then(|owner| self.terminal_strip_for(owner))
-            .is_some_and(|strip| strip.focused.is_none());
+            .is_some_and(|owner| self.terminal_dock_model(owner).empty_state.is_some());
         let mut surface = div()
             .id("native-shell-context-terminal")
             .w_full()
@@ -44073,6 +44217,9 @@ impl Render for NativeShell {
         ) {
             self.ensure_terminal_splash_image(cx);
         }
+        // Re-checked every paint so a selection path added later cannot leave
+        // a menu acting on a Task that is no longer on screen.
+        self.retire_terminal_chip_menu_for_selection();
         if self.pending_terminal_focus && self.selected_center_terminal_is_interactive() {
             self.terminal_focus_handle.focus(window);
             self.pending_terminal_focus = false;
@@ -67421,6 +67568,308 @@ mod tests {
                         .task_surfaces
                         .terminal_query_in_flight_for(owner.clone(), Some(provider_resource)),
                     "no slot may keep a lease the provider screen cannot release"
+                );
+            });
+            cx.quit();
+        });
+    }
+
+
+    fn shell_strip_for_test(
+        task_id: TaskId,
+        provider_resource: crate::domain::id::ResourceId,
+        shells: &[crate::domain::id::ResourceId],
+        focused: Option<crate::domain::id::ResourceId>,
+    ) -> crate::domain::cockpit::TaskTerminalsProjection {
+        let mut terminals = vec![terminal_chip_for_test(provider_resource, true)];
+        terminals.extend(
+            shells
+                .iter()
+                .map(|resource_id| terminal_chip_for_test(*resource_id, false)),
+        );
+        crate::domain::cockpit::TaskTerminalsProjection {
+            task_id,
+            terminals,
+            order: shells.to_vec(),
+            focused,
+        }
+    }
+
+    fn dispatched_open_shell_count_for_test(shared: &Arc<Mutex<TestRuntimeState>>) -> usize {
+        shared
+            .lock()
+            .expect("runtime")
+            .accepted
+            .iter()
+            .filter(|record| {
+                matches!(
+                    record.command,
+                    NativeHostCommand::OpenShellTerminal { .. }
+                )
+            })
+            .count()
+    }
+
+    fn dispatched_rename_titles_for_test(shared: &Arc<Mutex<TestRuntimeState>>) -> Vec<String> {
+        shared
+            .lock()
+            .expect("runtime")
+            .accepted
+            .iter()
+            .filter_map(|record| match &record.command {
+                NativeHostCommand::TerminalRename { arguments, .. } => {
+                    Some(arguments.title.clone())
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// The domain caps a Task at `MAX_PLAIN_SHELLS_PER_TASK` shells, so a "+"
+    /// that always dispatches spends a round trip to be refused by the host
+    /// with nothing shown to the user. The cap is read from the constant, never
+    /// restated, and a refusal names which check failed.
+    #[test]
+    fn the_add_button_refuses_a_shell_past_the_cap_and_names_the_reason() {
+        if rerun_headless_shell_test_in_child(
+            "ui::native_shell::tests::the_add_button_refuses_a_shell_past_the_cap_and_names_the_reason",
+        ) {
+            return;
+        }
+        let (runtime, _local_shared) = TestRuntime::new(true, NativeHostActionResult::Queued);
+        let remote_host = HostId::Remote([0x11; 16]);
+        gpui::Application::headless().run(move |cx| {
+            crate::ui::init(cx);
+            with_test_shell_in_app(cx, runtime, |shell| {
+                let (model, task_id) = terminal_bound_client_model();
+                let model = Arc::new(model);
+                let provider_resource =
+                    provider_terminal_projection_for_test(&model, task_id, 1).resource_id;
+                let shells = (0..crate::domain::terminal_facts::MAX_PLAIN_SHELLS_PER_TASK)
+                    .map(|_| crate::domain::id::ResourceId::new())
+                    .collect::<Vec<_>>();
+                let shared =
+                    attach_remote_test_host_with_shared(shell, &remote_host, Arc::clone(&model));
+                let owner = HostTaskKey::new(remote_host.clone(), task_id);
+                shell
+                    .select_fleet_task_key(owner.clone(), FleetSelectMode::Replace)
+                    .expect("select remote task");
+
+                // One below the cap: the "+" is live and the request goes.
+                shell
+                    .task_surfaces
+                    .admit_terminals(
+                        owner.clone(),
+                        &shell_strip_for_test(
+                            task_id,
+                            provider_resource,
+                            &shells[..shells.len() - 1],
+                            None,
+                        ),
+                    )
+                    .expect("admit strip");
+                shared.lock().expect("runtime").accepted.clear();
+                assert!(shell.terminal_dock_model(&owner).add_enabled);
+                assert!(shell.open_shell_terminal_for_owner(&owner, None));
+                assert_eq!(dispatched_open_shell_count_for_test(&shared), 1);
+
+                // At the cap: disabled, refused locally, and the reason is shown.
+                shell
+                    .task_surfaces
+                    .admit_terminals(
+                        owner.clone(),
+                        &shell_strip_for_test(task_id, provider_resource, &shells, None),
+                    )
+                    .expect("admit full strip");
+                shared.lock().expect("runtime").accepted.clear();
+                let model = shell.terminal_dock_model(&owner);
+                assert!(!model.add_enabled, "the ninth shell has nowhere to go");
+                assert_eq!(
+                    model.add_tooltip,
+                    format!(
+                        "Task has the maximum of {} shells",
+                        crate::domain::terminal_facts::MAX_PLAIN_SHELLS_PER_TASK
+                    )
+                );
+                assert!(!shell.open_shell_terminal_for_owner(&owner, None));
+                assert_eq!(
+                    dispatched_open_shell_count_for_test(&shared),
+                    0,
+                    "a request that cannot succeed must not be sent"
+                );
+                assert_eq!(
+                    shell
+                        .host_slot(&remote_host)
+                        .and_then(|slot| slot.composer_error.clone()),
+                    Some(format!(
+                        "Task has the maximum of {} shells",
+                        crate::domain::terminal_facts::MAX_PLAIN_SHELLS_PER_TASK
+                    )),
+                    "a silent refusal is indistinguishable from a dead button"
+                );
+            });
+            cx.quit();
+        });
+    }
+
+    /// A rename the client already knows the host will refuse must say so where
+    /// the user typed it, not close the menu and look like it worked. One rule
+    /// decides: `validate_terminal_title`.
+    #[test]
+    fn a_refused_rename_keeps_the_menu_open_and_states_the_title_rule() {
+        if rerun_headless_shell_test_in_child(
+            "ui::native_shell::tests::a_refused_rename_keeps_the_menu_open_and_states_the_title_rule",
+        ) {
+            return;
+        }
+        let (runtime, _local_shared) = TestRuntime::new(true, NativeHostActionResult::Queued);
+        let remote_host = HostId::Remote([0x22; 16]);
+        gpui::Application::headless().run(move |cx| {
+            crate::ui::init(cx);
+            with_test_shell_in_app(cx, runtime, |shell| {
+                let (model, task_id) = terminal_bound_client_model();
+                let model = Arc::new(model);
+                let provider_resource =
+                    provider_terminal_projection_for_test(&model, task_id, 1).resource_id;
+                let shell_resource = crate::domain::id::ResourceId::new();
+                let shared =
+                    attach_remote_test_host_with_shared(shell, &remote_host, Arc::clone(&model));
+                let owner = HostTaskKey::new(remote_host.clone(), task_id);
+                shell
+                    .select_fleet_task_key(owner.clone(), FleetSelectMode::Replace)
+                    .expect("select remote task");
+                shell
+                    .task_surfaces
+                    .admit_terminals(
+                        owner.clone(),
+                        &shell_strip_for_test(
+                            task_id,
+                            provider_resource,
+                            &[shell_resource],
+                            Some(shell_resource),
+                        ),
+                    )
+                    .expect("admit strip");
+                let expected = format!(
+                    "Title must be 1–{} characters",
+                    crate::domain::resource::MAX_TERMINAL_TITLE_CHARS
+                );
+
+                for refused in [
+                    String::new(),
+                    "   ".to_string(),
+                    "x".repeat(crate::domain::resource::MAX_TERMINAL_TITLE_CHARS + 1),
+                ] {
+                    shell.open_terminal_chip_menu(
+                        owner.clone(),
+                        shell_resource,
+                        gpui::point(gpui::px(1.0), gpui::px(1.0)),
+                    );
+                    shell.begin_terminal_chip_rename();
+                    shell
+                        .terminal_chip_menu
+                        .as_mut()
+                        .expect("menu open")
+                        .rename = Some(refused.clone());
+                    shared.lock().expect("runtime").accepted.clear();
+                    shell.submit_terminal_chip_rename();
+                    let menu = shell
+                        .terminal_chip_menu
+                        .as_ref()
+                        .unwrap_or_else(|| panic!("menu must stay open for {refused:?}"));
+                    assert_eq!(
+                        menu.rename_error.as_deref(),
+                        Some(expected.as_str()),
+                        "the rule has to be stated where the title was typed"
+                    );
+                    assert!(
+                        menu.rename.is_some(),
+                        "the field stays in rename mode so the title can be corrected"
+                    );
+                    assert!(
+                        dispatched_rename_titles_for_test(&shared).is_empty(),
+                        "a title the client knows is invalid is never sent"
+                    );
+                }
+
+                // Exactly at the bound: accepted, dispatched, menu closes.
+                let longest = "y".repeat(crate::domain::resource::MAX_TERMINAL_TITLE_CHARS);
+                shell.open_terminal_chip_menu(
+                    owner.clone(),
+                    shell_resource,
+                    gpui::point(gpui::px(1.0), gpui::px(1.0)),
+                );
+                shell.begin_terminal_chip_rename();
+                shell
+                    .terminal_chip_menu
+                    .as_mut()
+                    .expect("menu open")
+                    .rename = Some(longest.clone());
+                shared.lock().expect("runtime").accepted.clear();
+                shell.submit_terminal_chip_rename();
+                assert!(
+                    shell.terminal_chip_menu.is_none(),
+                    "an accepted rename closes the menu"
+                );
+                assert_eq!(dispatched_rename_titles_for_test(&shared), vec![longest]);
+            });
+            cx.quit();
+        });
+    }
+
+    /// The menu acts on the owner it was opened for, so one left open across a
+    /// task switch sends close/rename/reorder to the Task the user is no longer
+    /// looking at.
+    #[test]
+    fn a_chip_menu_does_not_survive_a_task_switch() {
+        if rerun_headless_shell_test_in_child(
+            "ui::native_shell::tests::a_chip_menu_does_not_survive_a_task_switch",
+        ) {
+            return;
+        }
+        let (runtime, _local_shared) = TestRuntime::new(true, NativeHostActionResult::Queued);
+        let first_host = HostId::Remote([0x33; 16]);
+        let second_host = HostId::Remote([0x44; 16]);
+        gpui::Application::headless().run(move |cx| {
+            crate::ui::init(cx);
+            with_test_shell_in_app(cx, runtime, |shell| {
+                let (model, task_id) = terminal_bound_client_model();
+                let model = Arc::new(model);
+                let provider_resource =
+                    provider_terminal_projection_for_test(&model, task_id, 1).resource_id;
+                let shell_resource = crate::domain::id::ResourceId::new();
+                attach_remote_test_host(shell, &first_host, Arc::clone(&model));
+                attach_remote_test_host(shell, &second_host, Arc::clone(&model));
+                let first = HostTaskKey::new(first_host.clone(), task_id);
+                let second = HostTaskKey::new(second_host.clone(), task_id);
+                shell
+                    .select_fleet_task_key(first.clone(), FleetSelectMode::Replace)
+                    .expect("select first owner");
+                shell
+                    .task_surfaces
+                    .admit_terminals(
+                        first.clone(),
+                        &shell_strip_for_test(
+                            task_id,
+                            provider_resource,
+                            &[shell_resource],
+                            Some(shell_resource),
+                        ),
+                    )
+                    .expect("admit strip");
+                shell.open_terminal_chip_menu(
+                    first.clone(),
+                    shell_resource,
+                    gpui::point(gpui::px(2.0), gpui::px(2.0)),
+                );
+                assert!(shell.terminal_chip_menu.is_some());
+
+                shell
+                    .select_fleet_task_key(second.clone(), FleetSelectMode::Replace)
+                    .expect("select second owner");
+                assert!(
+                    shell.terminal_chip_menu.is_none(),
+                    "a menu that outlives its Task acts on the wrong owner"
                 );
             });
             cx.quit();
