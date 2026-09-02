@@ -26812,17 +26812,13 @@ impl NativeShell {
         rows: u16,
     ) -> bool {
         let desired = (cols, rows);
-        if self
-            .terminal_strip_for(owner)
-            .is_some_and(|strip| strip.focused.is_none())
-        {
-            return false;
-        }
-        // Nothing is displayed while the splash is showing, so there is no PTY
-        // whose geometry the pane describes. `focused_terminal()` would fall
-        // through to the retained provider projection here, which would resize
-        // the provider to a pane it is not in. The newly focused terminal is
-        // resized on the next focus change instead.
+        // Every resize request originates from a grid that IS laid out (the
+        // terminal renderer's own layout callback), so "no resize while the
+        // splash shows" holds by construction: when the dock shows the splash
+        // there is no grid there to report a size. A strip-focus guard here
+        // instead stopped the PROVIDER grid on the center canvas from ever
+        // learning its geometry, on every Task whose strip focuses no shell --
+        // which is nearly all of them.
         // Which PTY to resize comes from the strip focus, not from the last
         // admitted screen: a newly focused terminal has no screen for as long
         // as its first query is in flight, and that is precisely when the pane
@@ -67122,12 +67118,13 @@ mod tests {
     /// Closing the focused chip must not pick a replacement locally: the host
     /// clears focus on release and the next strip answer says `focused: None`,
     /// which is what makes the splash render. A local pick would fight that and
-    /// could focus a terminal the host has already released. And with nothing
-    /// focused there is no PTY on screen, so no resize may be sent either.
+    /// could focus a terminal the host has already released. `focused: None`
+    /// still paints the PROVIDER grid on the center canvas, so that grid's
+    /// layout must keep resizing the provider slot.
     #[test]
-    fn closing_the_focused_chip_picks_nothing_and_stops_resizing() {
+    fn closing_the_focused_chip_picks_nothing_and_keeps_sizing_the_provider_grid() {
         if rerun_headless_shell_test_in_child(
-            "ui::native_shell::tests::closing_the_focused_chip_picks_nothing_and_stops_resizing",
+            "ui::native_shell::tests::closing_the_focused_chip_picks_nothing_and_keeps_sizing_the_provider_grid",
         ) {
             return;
         }
@@ -67191,13 +67188,17 @@ mod tests {
                 );
                 shared.lock().expect("runtime").accepted.clear();
                 assert!(
-                    !shell.request_terminal_resize_for_owner(&owner, 120, 40),
-                    "nothing is displayed, so nothing may be resized"
+                    shell.request_terminal_resize_for_owner(&owner, 120, 40),
+                    "the provider grid on the center canvas is still laid out and must be sized"
                 );
-                assert!(
-                    dispatched_resize_queries_for_test(&shared).is_empty(),
-                    "a resize while the splash shows would address the provider PTY the pane \
-                     is not showing"
+                assert_eq!(
+                    dispatched_resize_queries_for_test(&shared),
+                    vec![TaskCockpitQuery::TerminalResize {
+                        cols: 120,
+                        rows: 40
+                    }],
+                    "with no shell focused the resize addresses the provider slot, which is what \
+                     the center canvas is painting"
                 );
             });
             cx.quit();
