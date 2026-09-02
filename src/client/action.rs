@@ -25,6 +25,7 @@ use crate::domain::provider_input::{
     ProviderInputAction, ProviderInputIntentError,
 };
 use crate::domain::query::{Query, QueryEnvelope};
+use crate::domain::resource::ResourceValidationError;
 use crate::domain::task::{
     ReviewReadiness, TaskActivity, TaskAssignment, TaskAttention, TaskConnectivity, TaskFacts,
     TaskValidationError, WorkspaceRef,
@@ -128,6 +129,19 @@ pub const ACTION_PROVIDER_START_SESSION: &str = "provider.start_session";
 /// gating it on ProviderInput would render the whole strip disabled for a
 /// client holding only `Capability::TaskCockpit`.
 pub const ACTION_TERMINAL_VIEW: &str = "terminal.view";
+/// Open one new plain shell terminal on the Task.
+///
+/// Unlike the three mutations below this is not a client-built envelope:
+/// `Command::OpenShellTerminal` is host-authority-only, so the client names
+/// the Task and an optional working directory and the host resolves the
+/// directory and the shell executable before it writes anything durable.
+pub const ACTION_TERMINAL_OPEN_SHELL: &str = "terminal.open_shell";
+/// Begin releasing one plain shell terminal owned by the Task.
+pub const ACTION_TERMINAL_CLOSE: &str = "terminal.close";
+/// Rename one plain shell terminal.
+pub const ACTION_TERMINAL_RENAME: &str = "terminal.rename";
+/// Replace the Task's plain-shell strip order and focus.
+pub const ACTION_TERMINAL_SET_STRIP: &str = "terminal.set_strip";
 /// Read-only host query for a personal prompt metadata page.
 pub const ACTION_PROMPT_METADATA_PAGE: &str = "prompt.library.metadata_page";
 /// Read-only host query for an exact immutable prompt version page.
@@ -211,6 +225,10 @@ pub enum ActionArgumentSchema {
     PromptChainPageV1,
     ServiceControlV1,
     TaskCockpitV1,
+    TerminalOpenShellV1,
+    TerminalIdV1,
+    TerminalRenameV1,
+    TerminalStripV1,
 }
 
 /// Static metadata for one catalog action.
@@ -470,6 +488,46 @@ const ACTIONS: &[ActionDescriptor] = &[
         risk: ActionRisk::ReadOnly,
         argument_schema: ActionArgumentSchema::TaskCockpitV1,
     },
+    ActionDescriptor {
+        id: ACTION_TERMINAL_OPEN_SHELL,
+        title: "Open shell terminal",
+        description: "Ask the host to open one plain shell terminal on this Task.",
+        keywords: &["terminal", "shell", "open", "new"],
+        scope: ActionScope::Task,
+        required_capability: Some(Capability::TaskCockpit),
+        risk: ActionRisk::Mutating,
+        argument_schema: ActionArgumentSchema::TerminalOpenShellV1,
+    },
+    ActionDescriptor {
+        id: ACTION_TERMINAL_CLOSE,
+        title: "Close terminal",
+        description: "Begin releasing one plain shell terminal owned by this Task.",
+        keywords: &["terminal", "shell", "close", "release"],
+        scope: ActionScope::Task,
+        required_capability: None,
+        risk: ActionRisk::Mutating,
+        argument_schema: ActionArgumentSchema::TerminalIdV1,
+    },
+    ActionDescriptor {
+        id: ACTION_TERMINAL_RENAME,
+        title: "Rename terminal",
+        description: "Rename one plain shell terminal after local canonicalization.",
+        keywords: &["terminal", "shell", "rename", "title"],
+        scope: ActionScope::Task,
+        required_capability: None,
+        risk: ActionRisk::Mutating,
+        argument_schema: ActionArgumentSchema::TerminalRenameV1,
+    },
+    ActionDescriptor {
+        id: ACTION_TERMINAL_SET_STRIP,
+        title: "Arrange terminals",
+        description: "Replace this Task's plain-shell terminal strip order and focus.",
+        keywords: &["terminal", "shell", "strip", "arrange", "order"],
+        scope: ActionScope::Task,
+        required_capability: None,
+        risk: ActionRisk::Mutating,
+        argument_schema: ActionArgumentSchema::TerminalStripV1,
+    },
 ];
 
 /// Frozen V1 `task.create` arguments. The workspace is already durable; the
@@ -538,6 +596,15 @@ pub struct TaskRenameArguments {
     pub title: String,
 }
 
+/// Caller-owned `terminal.rename` arguments validated before transport.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TerminalRenameArguments {
+    pub task_id: TaskId,
+    pub resource_id: ResourceId,
+    pub title: String,
+}
+
 /// A presentational client request backed by one of the closed catalog entries.
 ///
 /// Components may emit this value, but they do not turn it into a transport
@@ -580,6 +647,22 @@ pub enum ActionRequest {
     PromptLibrary {
         query: PromptLibraryQuery,
     },
+    /// Request one new plain shell terminal. The host resolves `cwd` (absent
+    /// means the Task's runtime working directory) and the shell executable;
+    /// the client never names a program or arguments.
+    TerminalOpenShell {
+        task_id: TaskId,
+        cwd: Option<String>,
+    },
+    TerminalClose {
+        task_id: TaskId,
+        resource_id: ResourceId,
+    },
+    TerminalRename(TerminalRenameArguments),
+    TerminalSetStrip {
+        task_id: TaskId,
+        strip: crate::domain::terminal_facts::TaskTerminalStrip,
+    },
     Updater(UpdaterAction),
 }
 
@@ -607,6 +690,10 @@ impl ActionRequest {
             },
             Self::TaskCockpit { query, .. } => cockpit_query_action_id(query),
             Self::PromptLibrary { query } => prompt_query_action_id(query),
+            Self::TerminalOpenShell { .. } => ACTION_TERMINAL_OPEN_SHELL,
+            Self::TerminalClose { .. } => ACTION_TERMINAL_CLOSE,
+            Self::TerminalRename(_) => ACTION_TERMINAL_RENAME,
+            Self::TerminalSetStrip { .. } => ACTION_TERMINAL_SET_STRIP,
             Self::Updater(action) => action.id(),
         }
     }
@@ -703,6 +790,7 @@ pub const fn cockpit_query_action_id(query: &TaskCockpitQuery) -> &'static str {
         | TaskCockpitQuery::TerminalResizeFor { .. }
         | TaskCockpitQuery::TerminalReadinessFor { .. }
         | TaskCockpitQuery::TaskTerminals => ACTION_TERMINAL_VIEW,
+        TaskCockpitQuery::OpenShellTerminal { .. } => ACTION_TERMINAL_OPEN_SHELL,
         TaskCockpitQuery::WorkspaceStatus => ACTION_WORKSPACE_STATUS,
         TaskCockpitQuery::GitRepositories => ACTION_GIT_REPOSITORIES,
         TaskCockpitQuery::GitStatus
@@ -1519,6 +1607,73 @@ pub fn task_rename_command(
     })
 }
 
+/// Build the shared `terminal.close` mutation. Release is addressed by the
+/// exact durable resource; the host owns the process teardown that follows.
+pub fn terminal_close_command(
+    command_id: CommandId,
+    client_id: ClientId,
+    issued_at_ms: i64,
+    expected_task_revision: u64,
+    task_id: TaskId,
+    resource_id: ResourceId,
+) -> CommandEnvelope {
+    CommandEnvelope {
+        command_id,
+        client_id,
+        task_id: Some(task_id),
+        issued_at_ms,
+        expected_task_revision: Some(expected_task_revision),
+        command: Command::CloseTerminal { resource_id },
+    }
+}
+
+/// Build the shared `terminal.rename` mutation after local canonicalization.
+///
+/// The title is trimmed here so the domain sees the exact durable value; an
+/// empty or oversized trim is refused before transport rather than being sent
+/// and rejected as an opaque invalid transition.
+pub fn terminal_rename_command(
+    command_id: CommandId,
+    client_id: ClientId,
+    issued_at_ms: i64,
+    expected_task_revision: u64,
+    args: TerminalRenameArguments,
+) -> Result<CommandEnvelope, ResourceValidationError> {
+    let trimmed = args.title.trim();
+    crate::domain::resource::validate_terminal_title(trimmed)?;
+    Ok(CommandEnvelope {
+        command_id,
+        client_id,
+        task_id: Some(args.task_id),
+        issued_at_ms,
+        expected_task_revision: Some(expected_task_revision),
+        command: Command::RenameTerminal {
+            resource_id: args.resource_id,
+            title: trimmed.to_string(),
+        },
+    })
+}
+
+/// Build the shared `terminal.set_strip` mutation. The domain validates that
+/// the order is a permutation of the Task's live plain shells.
+pub fn terminal_set_strip_command(
+    command_id: CommandId,
+    client_id: ClientId,
+    issued_at_ms: i64,
+    expected_task_revision: u64,
+    task_id: TaskId,
+    strip: crate::domain::terminal_facts::TaskTerminalStrip,
+) -> CommandEnvelope {
+    CommandEnvelope {
+        command_id,
+        client_id,
+        task_id: Some(task_id),
+        issued_at_ms,
+        expected_task_revision: Some(expected_task_revision),
+        command: Command::SetTerminalStrip(strip),
+    }
+}
+
 /// Build the shared `task.archive` mutation after the caller captured the
 /// exact durable revision. The host releases leftover resources, then closes.
 pub fn task_archive_command(
@@ -1768,18 +1923,19 @@ pub fn service_control_command_with_task(
 #[cfg(test)]
 mod tests {
     use super::{
-        catalog, provider_start_command, require_unique_ids, service_control_command,
-        task_cockpit_query, task_create_command, task_rename_command, task_show_query,
-        ActionArgumentSchema, ActionRisk, ActionScope, ProviderStartArguments,
-        ServiceControlArguments, TaskCreateArguments, TaskCreateV2Arguments, TaskRenameArguments,
-        ACTION_BROWSER_NATIVE, ACTION_CONFIG_ARCHIVE_COMMAND, ACTION_CONFIG_COMMAND_DETAIL,
-        ACTION_CONFIG_CREATE_PROJECT, ACTION_CONFIG_RUN_COMMAND, ACTION_CONFIG_UPSERT_COMMAND,
-        ACTION_CONVERSATION_STATUS, ACTION_FILES_LIST, ACTION_FILES_READ, ACTION_GIT_REPOSITORIES,
-        ACTION_GIT_STATUS, ACTION_HOST_ACTIONS, ACTION_HOST_STATUS, ACTION_PROMPT_CHAIN_PAGE,
-        ACTION_PROMPT_DIFF, ACTION_PROMPT_METADATA_PAGE, ACTION_PROMPT_VERSION_PAGE,
-        ACTION_PROVIDER_ANSWER_QUESTION, ACTION_PROVIDER_NEW_CONVERSATION,
-        ACTION_PROVIDER_QUEUE_FOLLOW_UP, ACTION_PROVIDER_RESOLVE_APPROVAL,
-        ACTION_PROVIDER_SEND_NOW, ACTION_PROVIDER_START_SESSION,
+        catalog, cockpit_query_action_id, descriptor, provider_start_command, require_unique_ids,
+        service_control_command, task_cockpit_query, task_create_command, task_rename_command,
+        task_show_query, terminal_close_command, terminal_rename_command,
+        terminal_set_strip_command, ActionArgumentSchema, ActionRequest, ActionRisk, ActionScope,
+        ProviderStartArguments, ServiceControlArguments, TaskCockpitQuery, TaskCreateArguments,
+        TaskCreateV2Arguments, TaskRenameArguments, TerminalRenameArguments, ACTION_BROWSER_NATIVE,
+        ACTION_CONFIG_ARCHIVE_COMMAND, ACTION_CONFIG_COMMAND_DETAIL, ACTION_CONFIG_CREATE_PROJECT,
+        ACTION_CONFIG_RUN_COMMAND, ACTION_CONFIG_UPSERT_COMMAND, ACTION_CONVERSATION_STATUS,
+        ACTION_FILES_LIST, ACTION_FILES_READ, ACTION_GIT_REPOSITORIES, ACTION_GIT_STATUS,
+        ACTION_HOST_ACTIONS, ACTION_HOST_STATUS, ACTION_PROMPT_CHAIN_PAGE, ACTION_PROMPT_DIFF,
+        ACTION_PROMPT_METADATA_PAGE, ACTION_PROMPT_VERSION_PAGE, ACTION_PROVIDER_ANSWER_QUESTION,
+        ACTION_PROVIDER_NEW_CONVERSATION, ACTION_PROVIDER_QUEUE_FOLLOW_UP,
+        ACTION_PROVIDER_RESOLVE_APPROVAL, ACTION_PROVIDER_SEND_NOW, ACTION_PROVIDER_START_SESSION,
         ACTION_PROVIDER_STEER_CURRENT_TURN, ACTION_PROVIDER_STOP_TURN,
         ACTION_PROVIDER_TERMINAL_INPUT, ACTION_SERVICE_HEALTH, ACTION_SERVICE_LOGS,
         ACTION_SERVICE_RESTART, ACTION_SERVICE_START, ACTION_SERVICE_STOP, ACTION_SSH_ACTION,
@@ -1787,8 +1943,10 @@ mod tests {
         ACTION_TASK_CREATE_V2, ACTION_TASK_DELETE, ACTION_TASK_LIST, ACTION_TASK_QUEUE_FOLLOW_UP,
         ACTION_TASK_RENAME, ACTION_TASK_REOPEN, ACTION_TASK_RESOLVE_APPROVAL, ACTION_TASK_SEND_NOW,
         ACTION_TASK_SETTLE, ACTION_TASK_SHOW, ACTION_TASK_STEER_CURRENT_TURN,
-        ACTION_TASK_STOP_TURN, ACTION_TERMINAL_VIEW, ACTION_UPDATER_CHECK, ACTION_UPDATER_DOWNLOAD,
-        ACTION_UPDATER_INSTALL, ACTION_UPDATER_START_BACKGROUND, ACTION_WORKSPACE_STATUS,
+        ACTION_TASK_STOP_TURN, ACTION_TERMINAL_CLOSE, ACTION_TERMINAL_OPEN_SHELL,
+        ACTION_TERMINAL_RENAME, ACTION_TERMINAL_SET_STRIP, ACTION_TERMINAL_VIEW,
+        ACTION_UPDATER_CHECK, ACTION_UPDATER_DOWNLOAD, ACTION_UPDATER_INSTALL,
+        ACTION_UPDATER_START_BACKGROUND, ACTION_WORKSPACE_STATUS,
     };
     use crate::{
         domain::{
@@ -1847,7 +2005,11 @@ mod tests {
         assert!(ids.contains(&ACTION_PROVIDER_START_SESSION));
         assert!(ids.contains(&ACTION_CONVERSATION_STATUS));
         assert!(ids.contains(&ACTION_TERMINAL_VIEW));
-        assert_eq!(ids.len(), 51);
+        assert!(ids.contains(&ACTION_TERMINAL_OPEN_SHELL));
+        assert!(ids.contains(&ACTION_TERMINAL_CLOSE));
+        assert!(ids.contains(&ACTION_TERMINAL_RENAME));
+        assert!(ids.contains(&ACTION_TERMINAL_SET_STRIP));
+        assert_eq!(ids.len(), 55);
         assert!(ids.contains(&ACTION_SERVICE_START));
         assert!(ids.contains(&ACTION_SERVICE_STOP));
         assert!(ids.contains(&ACTION_SERVICE_RESTART));
@@ -1944,6 +2106,30 @@ mod tests {
                         ActionRisk::ReadOnly,
                         ActionArgumentSchema::TaskCockpitV1,
                         Some(Capability::TaskCockpit),
+                    ),
+                    ACTION_TERMINAL_OPEN_SHELL => (
+                        ActionScope::Task,
+                        ActionRisk::Mutating,
+                        ActionArgumentSchema::TerminalOpenShellV1,
+                        Some(Capability::TaskCockpit),
+                    ),
+                    ACTION_TERMINAL_CLOSE => (
+                        ActionScope::Task,
+                        ActionRisk::Mutating,
+                        ActionArgumentSchema::TerminalIdV1,
+                        None,
+                    ),
+                    ACTION_TERMINAL_RENAME => (
+                        ActionScope::Task,
+                        ActionRisk::Mutating,
+                        ActionArgumentSchema::TerminalRenameV1,
+                        None,
+                    ),
+                    ACTION_TERMINAL_SET_STRIP => (
+                        ActionScope::Task,
+                        ActionRisk::Mutating,
+                        ActionArgumentSchema::TerminalStripV1,
+                        None,
                     ),
                     ACTION_PROVIDER_START_SESSION => (
                         ActionScope::Task,
@@ -2422,6 +2608,147 @@ mod tests {
         assert!(
             result.is_err(),
             "blank rename titles must fail before transport"
+        );
+    }
+
+    #[test]
+    fn terminal_actions_are_registered_and_mutating() {
+        for id in [
+            ACTION_TERMINAL_OPEN_SHELL,
+            ACTION_TERMINAL_CLOSE,
+            ACTION_TERMINAL_RENAME,
+            ACTION_TERMINAL_SET_STRIP,
+        ] {
+            let action = descriptor(id).unwrap_or_else(|| panic!("{id} registered"));
+            assert_eq!(action.scope, ActionScope::Task, "{id}");
+            assert_eq!(action.risk, ActionRisk::Mutating, "{id}");
+        }
+    }
+
+    #[test]
+    fn terminal_requests_carry_their_catalog_ids() {
+        let task_id = TaskId::new();
+        let resource_id = ResourceId::new();
+        assert_eq!(
+            ActionRequest::TerminalOpenShell { task_id, cwd: None }.id(),
+            ACTION_TERMINAL_OPEN_SHELL
+        );
+        assert_eq!(
+            ActionRequest::TerminalClose {
+                task_id,
+                resource_id
+            }
+            .id(),
+            ACTION_TERMINAL_CLOSE
+        );
+        assert_eq!(
+            ActionRequest::TerminalRename(TerminalRenameArguments {
+                task_id,
+                resource_id,
+                title: "build".into(),
+            })
+            .id(),
+            ACTION_TERMINAL_RENAME
+        );
+        assert_eq!(
+            ActionRequest::TerminalSetStrip {
+                task_id,
+                strip: crate::domain::terminal_facts::TaskTerminalStrip::default(),
+            }
+            .id(),
+            ACTION_TERMINAL_SET_STRIP
+        );
+        // Every request must resolve a descriptor; `descriptor()` panics otherwise.
+        let _ = ActionRequest::TerminalOpenShell { task_id, cwd: None }.descriptor();
+    }
+
+    #[test]
+    fn terminal_rename_command_canonicalizes_title() {
+        let envelope = terminal_rename_command(
+            CommandId::new(),
+            ClientId::new(),
+            1,
+            7,
+            TerminalRenameArguments {
+                task_id: TaskId::new(),
+                resource_id: ResourceId::new(),
+                title: "  build ".into(),
+            },
+        )
+        .expect("rename");
+        assert!(
+            matches!(envelope.command, Command::RenameTerminal { ref title, .. } if title == "build")
+        );
+        assert_eq!(envelope.expected_task_revision, Some(7));
+        assert!(terminal_rename_command(
+            CommandId::new(),
+            ClientId::new(),
+            1,
+            7,
+            TerminalRenameArguments {
+                task_id: TaskId::new(),
+                resource_id: ResourceId::new(),
+                title: "   ".into(),
+            }
+        )
+        .is_err());
+        assert!(terminal_rename_command(
+            CommandId::new(),
+            ClientId::new(),
+            1,
+            7,
+            TerminalRenameArguments {
+                task_id: TaskId::new(),
+                resource_id: ResourceId::new(),
+                title: "x".repeat(crate::domain::resource::MAX_TERMINAL_TITLE_CHARS + 1),
+            }
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn terminal_close_and_strip_factories_bind_task_and_revision() {
+        let task_id = TaskId::new();
+        let resource_id = ResourceId::new();
+        let close = terminal_close_command(
+            CommandId::new(),
+            ClientId::new(),
+            1,
+            9,
+            task_id,
+            resource_id,
+        );
+        assert_eq!(close.task_id, Some(task_id));
+        assert_eq!(close.expected_task_revision, Some(9));
+        assert!(
+            matches!(close.command, Command::CloseTerminal { resource_id: id } if id == resource_id)
+        );
+
+        let strip = crate::domain::terminal_facts::TaskTerminalStrip {
+            order: vec![resource_id],
+            focused: Some(resource_id),
+        };
+        let set = terminal_set_strip_command(
+            CommandId::new(),
+            ClientId::new(),
+            1,
+            9,
+            task_id,
+            strip.clone(),
+        );
+        assert_eq!(set.task_id, Some(task_id));
+        assert_eq!(set.expected_task_revision, Some(9));
+        assert!(matches!(set.command, Command::SetTerminalStrip(ref value) if value == &strip));
+    }
+
+    #[test]
+    fn open_shell_cockpit_query_maps_to_the_open_shell_action() {
+        assert_eq!(
+            cockpit_query_action_id(&TaskCockpitQuery::OpenShellTerminal {
+                cwd: None,
+                expected_task_revision: 4,
+            }),
+            ACTION_TERMINAL_OPEN_SHELL
         );
     }
 

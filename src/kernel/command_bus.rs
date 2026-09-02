@@ -236,6 +236,11 @@ impl CommandBus {
                 | Command::RebindUnstartedPrimaryProvider { .. }
                 | Command::ServiceControl(_)
                 | Command::StartProviderSession(_)
+                // The resource carries a resolved program, cwd and args. Only
+                // the authenticated host may choose those, so a client-built
+                // OpenShellTerminal never reaches the store: the host rebuilds
+                // the recipe and re-executes it under its own authority.
+                | Command::OpenShellTerminal(_)
         ) {
             return Err(StoreError::HostAuthorityRequired);
         }
@@ -1854,8 +1859,16 @@ mod provider_restart_identity_tests {
     }
 
     fn host_execute(bus: &mut CommandBus, envelope: CommandEnvelope) -> CommandReceipt {
+        host_execute_result(bus, envelope).expect("host-authorized command")
+    }
+
+    /// `execute`-shaped host-authorized run so a test that already inspects a
+    /// rejection keeps reading the same `Result`.
+    fn host_execute_result(
+        bus: &mut CommandBus,
+        envelope: CommandEnvelope,
+    ) -> Result<CommandReceipt, StoreError> {
         bus.execute_host_authorized(envelope, None, RequestId::new(), Uuid::now_v7())
-            .expect("host-authorized command")
     }
 
     /// One task in Open lifecycle plus its current revision.
@@ -1908,6 +1921,37 @@ mod provider_restart_identity_tests {
     }
 
     #[test]
+    fn client_execute_refuses_open_shell_terminal() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let mut bus = CommandBus::open(&directory.path().join("tasks.sqlite")).expect("bus");
+        let client_id = ClientId::new();
+        let (task_id, revision) = create_open_task(&mut bus, client_id);
+
+        // The recipe names a program, a cwd and args. Only the authenticated
+        // host may choose those, so the client path must refuse the command
+        // outright rather than journal a client-chosen launch.
+        let error = bus
+            .execute(task_envelope(
+                client_id,
+                task_id,
+                revision,
+                Command::OpenShellTerminal(OpenShellTerminalIntent {
+                    resource: plain_shell_facts(task_id, None),
+                }),
+            ))
+            .expect_err("client OpenShellTerminal must require host authority");
+        assert!(
+            matches!(error, StoreError::HostAuthorityRequired),
+            "{error:?}"
+        );
+
+        // Nothing was written: the task is untouched at its original revision.
+        let snapshot = bus.task_snapshot(task_id).expect("snapshot").expect("task");
+        assert_eq!(snapshot.task.revision, revision);
+        assert!(snapshot.terminal_strip.order.is_empty());
+    }
+
+    #[test]
     fn open_rename_strip_and_close_shell_terminal() {
         let directory = tempfile::tempdir().expect("tempdir");
         let mut bus = CommandBus::open(&directory.path().join("tasks.sqlite")).expect("bus");
@@ -1915,16 +1959,18 @@ mod provider_restart_identity_tests {
         let (task_id, revision) = create_open_task(&mut bus, client_id);
 
         let shell = plain_shell_facts(task_id, None);
-        let receipt = bus
-            .execute(task_envelope(
+        let receipt = host_execute_result(
+            &mut bus,
+            task_envelope(
                 client_id,
                 task_id,
                 revision,
                 Command::OpenShellTerminal(OpenShellTerminalIntent {
                     resource: shell.clone(),
                 }),
-            ))
-            .expect("open shell");
+            ),
+        )
+        .expect("open shell");
         let revision = accepted_revision(receipt);
         let snapshot = bus.task_snapshot(task_id).expect("snapshot").expect("task");
         assert!(snapshot.resources[&shell.id].recipe.is_plain_shell());
@@ -1950,16 +1996,18 @@ mod provider_restart_identity_tests {
         );
 
         let second = plain_shell_facts(task_id, Some("tests"));
-        let receipt = bus
-            .execute(task_envelope(
+        let receipt = host_execute_result(
+            &mut bus,
+            task_envelope(
                 client_id,
                 task_id,
                 revision,
                 Command::OpenShellTerminal(OpenShellTerminalIntent {
                     resource: second.clone(),
                 }),
-            ))
-            .expect("open second");
+            ),
+        )
+        .expect("open second");
         let revision = accepted_revision(receipt);
         let receipt = bus
             .execute(task_envelope(
@@ -2097,26 +2145,32 @@ mod provider_restart_identity_tests {
 
         let shell = plain_shell_facts(task_id, None);
         let revision = accepted_revision(
-            bus.execute(task_envelope(
-                client_id,
-                task_id,
-                revision,
-                Command::OpenShellTerminal(OpenShellTerminalIntent {
-                    resource: shell.clone(),
-                }),
-            ))
+            host_execute_result(
+                &mut bus,
+                task_envelope(
+                    client_id,
+                    task_id,
+                    revision,
+                    Command::OpenShellTerminal(OpenShellTerminalIntent {
+                        resource: shell.clone(),
+                    }),
+                ),
+            )
             .expect("open shell"),
         );
         let second = plain_shell_facts(task_id, None);
         let revision = accepted_revision(
-            bus.execute(task_envelope(
-                client_id,
-                task_id,
-                revision,
-                Command::OpenShellTerminal(OpenShellTerminalIntent {
-                    resource: second.clone(),
-                }),
-            ))
+            host_execute_result(
+                &mut bus,
+                task_envelope(
+                    client_id,
+                    task_id,
+                    revision,
+                    Command::OpenShellTerminal(OpenShellTerminalIntent {
+                        resource: second.clone(),
+                    }),
+                ),
+            )
             .expect("open second"),
         );
         let revision = accepted_revision(
@@ -2161,19 +2215,24 @@ mod provider_restart_identity_tests {
         // equality below also covers the DELETE and the strip removal -- a
         // rebuild that reproduced only the insert paths would still pass.
         let third = plain_shell_facts(task_id, None);
+        let current_revision = bus
+            .task_snapshot(task_id)
+            .expect("snapshot")
+            .expect("task")
+            .task
+            .revision;
         let revision = accepted_revision(
-            bus.execute(task_envelope(
-                client_id,
-                task_id,
-                bus.task_snapshot(task_id)
-                    .expect("snapshot")
-                    .expect("task")
-                    .task
-                    .revision,
-                Command::OpenShellTerminal(OpenShellTerminalIntent {
-                    resource: third.clone(),
-                }),
-            ))
+            host_execute_result(
+                &mut bus,
+                task_envelope(
+                    client_id,
+                    task_id,
+                    current_revision,
+                    Command::OpenShellTerminal(OpenShellTerminalIntent {
+                        resource: third.clone(),
+                    }),
+                ),
+            )
             .expect("open third"),
         );
         // The strip must stay a permutation of the live shells, so put the new
@@ -2275,14 +2334,17 @@ mod provider_restart_identity_tests {
             );
             let shell = plain_shell_facts(task_id, None);
             let _ = accepted_revision(
-                bus.execute(task_envelope(
-                    client_id,
-                    task_id,
-                    revision,
-                    Command::OpenShellTerminal(OpenShellTerminalIntent {
-                        resource: shell.clone(),
-                    }),
-                ))
+                host_execute_result(
+                    &mut bus,
+                    task_envelope(
+                        client_id,
+                        task_id,
+                        revision,
+                        Command::OpenShellTerminal(OpenShellTerminalIntent {
+                            resource: shell.clone(),
+                        }),
+                    ),
+                )
                 .expect("open shell"),
             );
             (task_id, provider.id, shell.id)
@@ -2458,14 +2520,17 @@ mod provider_restart_identity_tests {
         // A plain shell rename still refuses a title that trims to nothing.
         let shell = plain_shell_facts(task_id, None);
         let revision = accepted_revision(
-            bus.execute(task_envelope(
-                client_id,
-                task_id,
-                revision,
-                Command::OpenShellTerminal(OpenShellTerminalIntent {
-                    resource: shell.clone(),
-                }),
-            ))
+            host_execute_result(
+                &mut bus,
+                task_envelope(
+                    client_id,
+                    task_id,
+                    revision,
+                    Command::OpenShellTerminal(OpenShellTerminalIntent {
+                        resource: shell.clone(),
+                    }),
+                ),
+            )
             .expect("open shell"),
         );
         let blank = bus
@@ -2493,26 +2558,32 @@ mod provider_restart_identity_tests {
 
         let first = plain_shell_facts(task_id, None);
         let revision = accepted_revision(
-            bus.execute(task_envelope(
-                client_id,
-                task_id,
-                revision,
-                Command::OpenShellTerminal(OpenShellTerminalIntent {
-                    resource: first.clone(),
-                }),
-            ))
+            host_execute_result(
+                &mut bus,
+                task_envelope(
+                    client_id,
+                    task_id,
+                    revision,
+                    Command::OpenShellTerminal(OpenShellTerminalIntent {
+                        resource: first.clone(),
+                    }),
+                ),
+            )
             .expect("open first"),
         );
         let second = plain_shell_facts(task_id, None);
         let revision = accepted_revision(
-            bus.execute(task_envelope(
-                client_id,
-                task_id,
-                revision,
-                Command::OpenShellTerminal(OpenShellTerminalIntent {
-                    resource: second.clone(),
-                }),
-            ))
+            host_execute_result(
+                &mut bus,
+                task_envelope(
+                    client_id,
+                    task_id,
+                    revision,
+                    Command::OpenShellTerminal(OpenShellTerminalIntent {
+                        resource: second.clone(),
+                    }),
+                ),
+            )
             .expect("open second"),
         );
 
@@ -2610,12 +2681,15 @@ mod provider_restart_identity_tests {
             let shell = plain_shell_facts(task_id, None);
             first.get_or_insert(shell.id);
             revision = accepted_revision(
-                bus.execute(task_envelope(
-                    client_id,
-                    task_id,
-                    revision,
-                    Command::OpenShellTerminal(OpenShellTerminalIntent { resource: shell }),
-                ))
+                host_execute_result(
+                    &mut bus,
+                    task_envelope(
+                        client_id,
+                        task_id,
+                        revision,
+                        Command::OpenShellTerminal(OpenShellTerminalIntent { resource: shell }),
+                    ),
+                )
                 .expect("open"),
             );
         }
@@ -2637,16 +2711,18 @@ mod provider_restart_identity_tests {
             ResourceLifecycle::Releasing
         );
 
-        let ninth = bus
-            .execute(task_envelope(
+        let ninth = host_execute_result(
+            &mut bus,
+            task_envelope(
                 client_id,
                 task_id,
                 revision,
                 Command::OpenShellTerminal(OpenShellTerminalIntent {
                     resource: plain_shell_facts(task_id, None),
                 }),
-            ))
-            .expect("ninth executes");
+            ),
+        )
+        .expect("ninth executes");
         assert_eq!(rejection_code(&ninth), RejectionCode::TooManyTerminals);
     }
 
@@ -2782,12 +2858,15 @@ mod provider_restart_identity_tests {
         let shell = plain_shell_facts(task_id, None);
         let resource_id = shell.id;
         let revision = accepted_revision(
-            bus.execute(task_envelope(
-                client_id,
-                task_id,
-                revision,
-                Command::OpenShellTerminal(OpenShellTerminalIntent { resource: shell }),
-            ))
+            host_execute_result(
+                &mut bus,
+                task_envelope(
+                    client_id,
+                    task_id,
+                    revision,
+                    Command::OpenShellTerminal(OpenShellTerminalIntent { resource: shell }),
+                ),
+            )
             .expect("open shell"),
         );
 
@@ -2840,28 +2919,32 @@ mod provider_restart_identity_tests {
         let client_id = ClientId::new();
         let (task_id, mut revision) = create_open_task(&mut bus, client_id);
         for _ in 0..8 {
-            let receipt = bus
-                .execute(task_envelope(
+            let receipt = host_execute_result(
+                &mut bus,
+                task_envelope(
                     client_id,
                     task_id,
                     revision,
                     Command::OpenShellTerminal(OpenShellTerminalIntent {
                         resource: plain_shell_facts(task_id, None),
                     }),
-                ))
-                .expect("open");
+                ),
+            )
+            .expect("open");
             revision = accepted_revision(receipt);
         }
-        let receipt = bus
-            .execute(task_envelope(
+        let receipt = host_execute_result(
+            &mut bus,
+            task_envelope(
                 client_id,
                 task_id,
                 revision,
                 Command::OpenShellTerminal(OpenShellTerminalIntent {
                     resource: plain_shell_facts(task_id, None),
                 }),
-            ))
-            .expect("ninth executes");
+            ),
+        )
+        .expect("ninth executes");
         assert!(matches!(
             receipt,
             CommandReceipt::Rejected {

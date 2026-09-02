@@ -3096,6 +3096,36 @@ pub enum NativeHostCommand {
         task_id: TaskId,
         query: TaskCockpitQuery,
     },
+    /// Host-authority `terminal.open_shell`. Deliberately not a mutation
+    /// envelope: the client has no program, arguments, or resolved working
+    /// directory to put in one, so it names the Task and its revision fence
+    /// and the host builds the durable command.
+    OpenShellTerminal {
+        request_id: RequestId,
+        task_id: TaskId,
+        cwd: Option<String>,
+        expected_task_revision: u64,
+    },
+    TerminalClose {
+        task_id: TaskId,
+        resource_id: crate::domain::ResourceId,
+        expected_task_revision: u64,
+        command_id: CommandId,
+        issued_at_ms: i64,
+    },
+    TerminalRename {
+        arguments: crate::client::action::TerminalRenameArguments,
+        expected_task_revision: u64,
+        command_id: CommandId,
+        issued_at_ms: i64,
+    },
+    TerminalSetStrip {
+        task_id: TaskId,
+        strip: crate::domain::terminal_facts::TaskTerminalStrip,
+        expected_task_revision: u64,
+        command_id: CommandId,
+        issued_at_ms: i64,
+    },
     PromptLibraryQuery {
         request_id: RequestId,
         query: PromptLibraryQuery,
@@ -3139,7 +3169,10 @@ fn native_command_id(command: &NativeHostCommand) -> Option<CommandId> {
         | NativeHostCommand::TaskCreateV2 { command_id, .. }
         | NativeHostCommand::TaskRename { command_id, .. }
         | NativeHostCommand::TaskArchive { command_id, .. }
-        | NativeHostCommand::TaskLifecycle { command_id, .. } => Some(*command_id),
+        | NativeHostCommand::TaskLifecycle { command_id, .. }
+        | NativeHostCommand::TerminalClose { command_id, .. }
+        | NativeHostCommand::TerminalRename { command_id, .. }
+        | NativeHostCommand::TerminalSetStrip { command_id, .. } => Some(*command_id),
         NativeHostCommand::ServiceControl { command_id, .. } => Some(*command_id),
         NativeHostCommand::ProviderInput { command_id, .. } => Some(*command_id),
         NativeHostCommand::ProviderStart { command_id, .. } => Some(*command_id),
@@ -3152,6 +3185,7 @@ fn native_command_id(command: &NativeHostCommand) -> Option<CommandId> {
         | NativeHostCommand::HostActionsQuery { .. }
         | NativeHostCommand::TaskCockpitQuery { .. }
         | NativeHostCommand::PromptLibraryQuery { .. }
+        | NativeHostCommand::OpenShellTerminal { .. }
         | NativeHostCommand::Hold { .. } => None,
         NativeHostCommand::Updater {
             action: UpdaterAction::Install,
@@ -3173,6 +3207,7 @@ fn native_request_id(command: &NativeHostCommand) -> Option<RequestId> {
         | NativeHostCommand::HostActionsQuery { request_id }
         | NativeHostCommand::TaskCockpitQuery { request_id, .. }
         | NativeHostCommand::PromptLibraryQuery { request_id, .. }
+        | NativeHostCommand::OpenShellTerminal { request_id, .. }
         | NativeHostCommand::Updater { request_id, .. } => Some(*request_id),
         _ => None,
     }
@@ -7395,6 +7430,98 @@ async fn execute_native_command(
                 .await
                 .map(NativeHostExecutionResult::Command)
         }
+        NativeHostCommand::OpenShellTerminal {
+            request_id,
+            task_id,
+            cwd,
+            expected_task_revision,
+        } => {
+            let _ = request_id;
+            // Host authority: the client names the Task, an optional working
+            // directory, and the revision it saw. The host resolves the shell,
+            // registers the resource, and answers with the refreshed strip.
+            let query = TaskCockpitQuery::OpenShellTerminal {
+                cwd,
+                expected_task_revision,
+            };
+            let action_id = action::cockpit_query_action_id(&query);
+            match query_task_cockpit(&mut port, task_id, query).await? {
+                Ok(result) => {
+                    let detail = match &result {
+                        crate::domain::TaskCockpitResult::Denied {
+                            surface, reason, ..
+                        } => format!("{action_id}: {surface:?} denied: {reason:?}"),
+                        crate::domain::TaskCockpitResult::Unavailable {
+                            surface, reason, ..
+                        } => format!("{action_id}: {surface:?} unavailable: {reason:?}"),
+                        _ => action_id.to_string(),
+                    };
+                    Ok(NativeHostExecutionResult::Query {
+                        detail: bounded_host_error(detail),
+                        body: NativeHostQueryBody::TaskCockpit(result),
+                    })
+                }
+                Err(error) => Ok(NativeHostExecutionResult::QueryFailed(bounded_host_error(
+                    format!("{action_id} failed: {error:?}"),
+                ))),
+            }
+        }
+        NativeHostCommand::TerminalClose {
+            task_id,
+            resource_id,
+            expected_task_revision,
+            command_id,
+            issued_at_ms,
+        } => {
+            let envelope = crate::client::action::terminal_close_command(
+                command_id,
+                client_id,
+                issued_at_ms,
+                expected_task_revision,
+                task_id,
+                resource_id,
+            );
+            port.request_command(envelope)
+                .await
+                .map(NativeHostExecutionResult::Command)
+        }
+        NativeHostCommand::TerminalRename {
+            arguments,
+            expected_task_revision,
+            command_id,
+            issued_at_ms,
+        } => {
+            let envelope = crate::client::action::terminal_rename_command(
+                command_id,
+                client_id,
+                issued_at_ms,
+                expected_task_revision,
+                arguments,
+            )
+            .map_err(|_| IpcError::Unavailable)?;
+            port.request_command(envelope)
+                .await
+                .map(NativeHostExecutionResult::Command)
+        }
+        NativeHostCommand::TerminalSetStrip {
+            task_id,
+            strip,
+            expected_task_revision,
+            command_id,
+            issued_at_ms,
+        } => {
+            let envelope = crate::client::action::terminal_set_strip_command(
+                command_id,
+                client_id,
+                issued_at_ms,
+                expected_task_revision,
+                task_id,
+                strip,
+            );
+            port.request_command(envelope)
+                .await
+                .map(NativeHostExecutionResult::Command)
+        }
         NativeHostCommand::TaskArchive {
             task_id,
             expected_task_revision,
@@ -8634,9 +8761,20 @@ impl NativeInteraction {
             ActionRequest::TaskSettle { task_id }
             | ActionRequest::TaskReopen { task_id }
             | ActionRequest::TaskArchive { task_id }
-            | ActionRequest::TaskDelete { task_id } => {
+            | ActionRequest::TaskDelete { task_id }
+            | ActionRequest::TerminalOpenShell { task_id, .. }
+            | ActionRequest::TerminalClose { task_id, .. }
+            | ActionRequest::TerminalSetStrip { task_id, .. } => {
                 let model = self.client_model.as_ref()?;
                 let task = model.tasks().get(task_id)?;
+                if task.task.revision == 0 {
+                    return None;
+                }
+                (Some(task.task.revision), Some(task.task.action_epoch))
+            }
+            ActionRequest::TerminalRename(arguments) => {
+                let model = self.client_model.as_ref()?;
+                let task = model.tasks().get(&arguments.task_id)?;
                 if task.task.revision == 0 {
                     return None;
                 }
@@ -8773,6 +8911,46 @@ impl NativeInteraction {
                 command_id,
                 issued_at_ms,
             },
+            // Rename / close / arrange are ordinary client mutations: their
+            // whole payload is durable identity the client already holds.
+            // Opening a shell is not, so it takes the host-authority path.
+            ActionRequest::TerminalOpenShell { task_id, cwd } => {
+                NativeHostCommand::OpenShellTerminal {
+                    request_id,
+                    task_id: *task_id,
+                    cwd: cwd.clone(),
+                    expected_task_revision: expected_task_revision
+                        .expect("open shell revision was validated above"),
+                }
+            }
+            ActionRequest::TerminalClose {
+                task_id,
+                resource_id,
+            } => NativeHostCommand::TerminalClose {
+                task_id: *task_id,
+                resource_id: *resource_id,
+                expected_task_revision: expected_task_revision
+                    .expect("terminal close revision was validated above"),
+                command_id,
+                issued_at_ms,
+            },
+            ActionRequest::TerminalRename(arguments) => NativeHostCommand::TerminalRename {
+                arguments: arguments.clone(),
+                expected_task_revision: expected_task_revision
+                    .expect("terminal rename revision was validated above"),
+                command_id,
+                issued_at_ms,
+            },
+            ActionRequest::TerminalSetStrip { task_id, strip } => {
+                NativeHostCommand::TerminalSetStrip {
+                    task_id: *task_id,
+                    strip: strip.clone(),
+                    expected_task_revision: expected_task_revision
+                        .expect("terminal strip revision was validated above"),
+                    command_id,
+                    issued_at_ms,
+                }
+            }
             ActionRequest::Browser(BrowserActionRequest { command }) => {
                 NativeHostCommand::Browser(command.clone())
             }

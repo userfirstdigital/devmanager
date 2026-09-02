@@ -27,6 +27,8 @@ use devmanager::{
         ACTION_PROVIDER_SEND_NOW, ACTION_PROVIDER_STEER_CURRENT_TURN, ACTION_PROVIDER_STOP_TURN,
         ACTION_PROVIDER_TERMINAL_INPUT, ACTION_TASK_ARCHIVE, ACTION_TASK_CREATE,
         ACTION_TASK_CREATE_V2, ACTION_TASK_LIST, ACTION_TASK_RENAME, ACTION_TASK_SHOW,
+        ACTION_TERMINAL_CLOSE, ACTION_TERMINAL_OPEN_SHELL, ACTION_TERMINAL_RENAME,
+        ACTION_TERMINAL_SET_STRIP, ACTION_TERMINAL_VIEW,
     },
     config::paths::{resolve_app_paths, AppProfile, BuildKind, ResolvedAppPaths},
     config::{ConfigCommand, ConfigStore, Project},
@@ -369,6 +371,10 @@ fn action_catalog_ids_are_unique_and_classified() {
                 | ACTION_PROVIDER_TERMINAL_INPUT
                 | ACTION_PROVIDER_STOP_TURN
                 | ACTION_PROVIDER_NEW_CONVERSATION
+                | ACTION_TERMINAL_OPEN_SHELL
+                | ACTION_TERMINAL_CLOSE
+                | ACTION_TERMINAL_RENAME
+                | ACTION_TERMINAL_SET_STRIP
         ) {
             ActionRisk::Mutating
         } else {
@@ -388,6 +394,11 @@ fn action_catalog_ids_are_unique_and_classified() {
                 | ACTION_PROVIDER_TERMINAL_INPUT
                 | ACTION_PROVIDER_STOP_TURN
                 | ACTION_PROVIDER_NEW_CONVERSATION
+                | ACTION_TERMINAL_VIEW
+                | ACTION_TERMINAL_OPEN_SHELL
+                | ACTION_TERMINAL_CLOSE
+                | ACTION_TERMINAL_RENAME
+                | ACTION_TERMINAL_SET_STRIP
         ) {
             ActionScope::Task
         } else {

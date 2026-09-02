@@ -610,6 +610,51 @@ fn argument_schema_json(schema: ActionArgumentSchema) -> serde_json::Value {
             },
             "required": ["task_id"],
         }),
+        ActionArgumentSchema::TerminalOpenShellV1 => json!({
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "task_id": uuid(),
+                "cwd": { "type": ["string", "null"] }
+            },
+            "required": ["task_id"],
+        }),
+        ActionArgumentSchema::TerminalIdV1 => json!({
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "task_id": uuid(),
+                "resource_id": uuid()
+            },
+            "required": ["task_id", "resource_id"],
+        }),
+        ActionArgumentSchema::TerminalRenameV1 => json!({
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "task_id": uuid(),
+                "resource_id": uuid(),
+                "title": { "type": "string", "minLength": 1 }
+            },
+            "required": ["task_id", "resource_id", "title"],
+        }),
+        ActionArgumentSchema::TerminalStripV1 => json!({
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "task_id": uuid(),
+                "strip": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "properties": {
+                        "order": { "type": "array", "items": uuid() },
+                        "focused": { "type": ["string", "null"], "format": "uuid" }
+                    },
+                    "required": ["order"],
+                }
+            },
+            "required": ["task_id", "strip"],
+        }),
     }
 }
 

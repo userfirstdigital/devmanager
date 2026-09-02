@@ -132,6 +132,14 @@ pub(crate) fn serve_task_cockpit_bounded(
             reason: "config_mutate",
         });
     }
+    if matches!(dispatch.query, TaskCockpitQuery::OpenShellTerminal { .. }) {
+        // Opening a shell resolves a launch and writes a durable resource.
+        // Only the exclusive host executor holds the authority to do either,
+        // so reaching this read-only serve path is a routing bug.
+        return QueryOutcome::Err(QueryError::Unavailable {
+            reason: "open_shell_executor",
+        });
+    }
     if matches!(dispatch.query, TaskCockpitQuery::AgentConnection) {
         return QueryOutcome::Err(QueryError::Unavailable {
             reason: "agent_connection",
@@ -207,7 +215,8 @@ pub(crate) fn serve_task_cockpit_bounded(
         | TaskCockpitQuery::ConfigRunCommand { .. }
         | TaskCockpitQuery::ConfigCommandDetail { .. }
         | TaskCockpitQuery::ProviderSettings(_)
-        | TaskCockpitQuery::RemoteAccess(_) => {
+        | TaskCockpitQuery::RemoteAccess(_)
+        | TaskCockpitQuery::OpenShellTerminal { .. } => {
             unreachable!("config snapshot is handled before task-scoped lookup")
         }
         TaskCockpitQuery::BrowserProcessSession => {
@@ -5127,6 +5136,21 @@ mod tests {
 
     /// One plain shell registered on `task_id`, already carrying the runtime
     /// generation the host requires before it will spawn anything for it.
+    /// `Command::OpenShellTerminal` is host-authority-only: the launch recipe
+    /// is the host's to choose, so these fixtures execute it the way the host
+    /// executor does rather than through the client `execute` path.
+    fn host_open_shell(
+        bus: &mut crate::kernel::CommandBus,
+        envelope: CommandEnvelope,
+    ) -> Result<CommandReceipt, crate::kernel::StoreError> {
+        bus.execute_host_authorized(
+            envelope,
+            None,
+            crate::domain::RequestId::new(),
+            uuid::Uuid::now_v7(),
+        )
+    }
+
     fn plain_shell_resource(task_id: TaskId, program: &str) -> crate::domain::ResourceFacts {
         use crate::domain::resource::{
             OwnerKind, ResourceFacts, ResourceKind, ResourceRecipe, TerminalLaunch,
@@ -5201,8 +5225,9 @@ mod tests {
         let shell_a = plain_shell_resource(task_id, SHELL_A_PROGRAM);
         let shell_b = plain_shell_resource(task_id, SHELL_B_PROGRAM);
         for shell in [shell_a.clone(), shell_b.clone()] {
-            let receipt = bus
-                .execute(CommandEnvelope {
+            let receipt = host_open_shell(
+                &mut bus,
+                CommandEnvelope {
                     command_id: CommandId::new(),
                     client_id,
                     task_id: Some(task_id),
@@ -5211,8 +5236,9 @@ mod tests {
                     command: Command::OpenShellTerminal(OpenShellTerminalIntent {
                         resource: shell,
                     }),
-                })
-                .expect("open shell");
+                },
+            )
+            .expect("open shell");
             let CommandReceipt::Accepted {
                 task_revision: Some(next),
                 ..
@@ -5870,8 +5896,9 @@ mod tests {
             .task
             .revision;
         let shell = plain_shell_resource(task_id, SHELL_B_PROGRAM);
-        let receipt = bus
-            .execute(CommandEnvelope {
+        let receipt = host_open_shell(
+            &mut bus,
+            CommandEnvelope {
                 command_id: CommandId::new(),
                 client_id,
                 task_id: Some(task_id),
@@ -5880,8 +5907,9 @@ mod tests {
                 command: Command::OpenShellTerminal(OpenShellTerminalIntent {
                     resource: shell.clone(),
                 }),
-            })
-            .expect("open shell");
+            },
+        )
+        .expect("open shell");
         let CommandReceipt::Accepted {
             task_revision: Some(revision),
             ..
@@ -6036,8 +6064,9 @@ mod tests {
             .task
             .revision;
         let shell = plain_shell_resource(task_id, SHELL_B_PROGRAM);
-        let receipt = bus
-            .execute(CommandEnvelope {
+        let receipt = host_open_shell(
+            &mut bus,
+            CommandEnvelope {
                 command_id: CommandId::new(),
                 client_id,
                 task_id: Some(task_id),
@@ -6046,8 +6075,9 @@ mod tests {
                 command: Command::OpenShellTerminal(OpenShellTerminalIntent {
                     resource: shell.clone(),
                 }),
-            })
-            .expect("open shell");
+            },
+        )
+        .expect("open shell");
         assert!(
             matches!(receipt, CommandReceipt::Accepted { .. }),
             "{receipt:?}"

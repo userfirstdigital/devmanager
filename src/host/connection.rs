@@ -4170,6 +4170,262 @@ impl HostRequestExecutor {
         }
     }
 
+    /// Serve one host-authority `terminal.open_shell` request.
+    ///
+    /// The client names a Task, an optional working directory, and the exact
+    /// revision it saw. Everything else — the resolved directory, the shell
+    /// executable, its arguments, and the runtime generation — is the host's
+    /// to choose, which is why `Command::OpenShellTerminal` is refused on the
+    /// client `execute` path entirely.
+    ///
+    /// Every refusal is logged with the exact resolved value as well as being
+    /// returned as a typed outcome: a client only sees the surface reason, and
+    /// "that directory does not exist" and "no shell is installed" are
+    /// otherwise the same `TerminalUnavailable` on its side.
+    ///
+    /// `Ok(())` means the durable resource was registered and the process
+    /// effect has been started; the caller answers with the Task's strip.
+    fn open_shell_terminal_request(
+        &mut self,
+        client_id: ClientId,
+        task_id: Option<TaskId>,
+        cwd: Option<&str>,
+        expected_task_revision: u64,
+        request_id: RequestId,
+        connection_id: Uuid,
+    ) -> Result<(), QueryOutcome> {
+        let Some(task_id) = task_id else {
+            return Err(shell_open_denied(
+                crate::domain::TaskCockpitDeniedReason::MissingTask,
+            ));
+        };
+        let snapshot = match self.bus.task_snapshot(task_id) {
+            Ok(Some(snapshot)) => snapshot,
+            Ok(None) => {
+                return Err(shell_open_denied(
+                    crate::domain::TaskCockpitDeniedReason::MissingTask,
+                ))
+            }
+            Err(error) => {
+                eprintln!("devmanager-host: open shell snapshot failed task={task_id}: {error}");
+                return Err(QueryOutcome::Err(QueryError::Unavailable {
+                    reason: "task_lookup",
+                }));
+            }
+        };
+        let cwd = self.resolve_shell_terminal_cwd(task_id, cwd)?;
+        let (default_terminal, mac_profile, shell_integration_enabled) = self.terminal_settings();
+        let launch = match crate::terminal::session::resolve_plain_shell_launch(
+            Some(&default_terminal),
+            mac_profile.as_ref(),
+            shell_integration_enabled,
+            &cwd,
+        ) {
+            Ok(launch) => launch,
+            Err(reason) => {
+                eprintln!("devmanager-host: open shell refused task={task_id}: {reason}");
+                return Err(shell_open_unavailable(
+                    crate::domain::TaskCockpitUnavailableReason::TerminalUnavailable,
+                ));
+            }
+        };
+        // The shell rides the Task's live runtime generation so teardown fences
+        // it exactly like the provider terminal. A Task that has not started a
+        // provider yet has no agent to read one from; one is the first valid
+        // generation, and zero is refused outright downstream.
+        let runtime_generation = snapshot
+            .primary_agent_id
+            .and_then(|agent_id| snapshot.agents.get(&agent_id))
+            .map(|agent| agent.runtime_generation)
+            .filter(|generation| *generation > 0)
+            .unwrap_or(1);
+        let mut resource = match crate::domain::resource::ResourceFacts::new(
+            Some(task_id),
+            crate::domain::resource::OwnerKind::Task,
+            crate::domain::resource::ResourceKind::Terminal,
+            crate::domain::resource::ResourceRecipe::Terminal {
+                cols: 120,
+                rows: 40,
+                launch: Some(crate::domain::resource::TerminalLaunch {
+                    cwd: cwd.clone(),
+                    program: launch.program.clone(),
+                    args: launch.args.clone(),
+                }),
+                title: None,
+            },
+            unix_time_ms_u64() as i64,
+        ) {
+            Ok(resource) => resource,
+            Err(error) => {
+                eprintln!(
+                    "devmanager-host: open shell recipe rejected task={task_id} program={} cwd={}: {error}",
+                    launch.program.display(),
+                    cwd.display()
+                );
+                return Err(shell_open_unavailable(
+                    crate::domain::TaskCockpitUnavailableReason::TerminalUnavailable,
+                ));
+            }
+        };
+        resource.runtime_generation = runtime_generation;
+        let resource_id = resource.id;
+        let envelope = CommandEnvelope {
+            command_id: crate::domain::CommandId::new(),
+            client_id,
+            task_id: Some(task_id),
+            issued_at_ms: unix_time_ms_u64() as i64,
+            expected_task_revision: Some(expected_task_revision),
+            command: Command::OpenShellTerminal(crate::domain::command::OpenShellTerminalIntent {
+                resource,
+            }),
+        };
+        match self
+            .bus
+            .execute_host_authorized(envelope, None, request_id, connection_id)
+        {
+            Ok(CommandReceipt::Accepted { .. }) => {}
+            Ok(CommandReceipt::Rejected { code, .. }) => {
+                eprintln!(
+                    "devmanager-host: open shell rejected task={task_id} revision={expected_task_revision}: {code:?}"
+                );
+                return Err(shell_open_denied(match code {
+                    crate::domain::command::RejectionCode::RevisionConflict => {
+                        crate::domain::TaskCockpitDeniedReason::RevisionConflict
+                    }
+                    crate::domain::command::RejectionCode::OwnershipConflict => {
+                        crate::domain::TaskCockpitDeniedReason::Unauthorized
+                    }
+                    _ => crate::domain::TaskCockpitDeniedReason::StaleFence,
+                }));
+            }
+            Err(error) => {
+                eprintln!("devmanager-host: open shell execute failed task={task_id}: {error}");
+                return Err(QueryOutcome::Err(QueryError::Unavailable {
+                    reason: "open_shell_execute",
+                }));
+            }
+        }
+        // A host-issued command has no client request behind it, so nothing
+        // else publishes its events; every other host-authorized write in this
+        // executor fans out for the same reason.
+        self.fan_out_live_durable_events();
+        // Registration and the real process are two steps. The accepted-request
+        // path fires this for a client-sent command; this one is host-issued,
+        // so it has to start the effect itself.
+        self.open_shell_terminal_after_accept(task_id, resource_id);
+        Ok(())
+    }
+
+    /// Resolve the working directory one shell will start in.
+    ///
+    /// A client-supplied directory must be absolute and must exist right now:
+    /// a relative path would resolve against the host process's directory,
+    /// which is not the client's, and a missing one produces a shell that dies
+    /// on spawn with nothing to attribute it to.
+    fn resolve_shell_terminal_cwd(
+        &self,
+        task_id: TaskId,
+        cwd: Option<&str>,
+    ) -> Result<PathBuf, QueryOutcome> {
+        if let Some(requested) = cwd {
+            let path = PathBuf::from(requested);
+            if !path.is_absolute() || !path.is_dir() {
+                eprintln!(
+                    "devmanager-host: open shell refused task={task_id}: cwd is not a directory: {}",
+                    path.display()
+                );
+                return Err(shell_open_denied(
+                    crate::domain::TaskCockpitDeniedReason::OutsideWorkspace,
+                ));
+            }
+            return Ok(path);
+        }
+        let runtime = match self
+            .bus
+            .load_task_runtime(task_id, &self.workspace_projects)
+        {
+            Ok(Some(runtime)) => runtime,
+            Ok(None) => {
+                return Err(shell_open_denied(
+                    crate::domain::TaskCockpitDeniedReason::MissingTask,
+                ))
+            }
+            Err(error) => {
+                eprintln!(
+                    "devmanager-host: open shell workspace unavailable task={task_id}: {error}"
+                );
+                return Err(shell_open_unavailable(
+                    crate::domain::TaskCockpitUnavailableReason::WorkspaceAuthorityUnavailable,
+                ));
+            }
+        };
+        match runtime.workspace.runtime_working_directory() {
+            Ok(path) if path.is_dir() => Ok(path),
+            Ok(path) => {
+                eprintln!(
+                    "devmanager-host: open shell refused task={task_id}: cwd is not a directory: {}",
+                    path.display()
+                );
+                Err(shell_open_denied(
+                    crate::domain::TaskCockpitDeniedReason::OutsideWorkspace,
+                ))
+            }
+            Err(error) => {
+                eprintln!(
+                    "devmanager-host: open shell working directory unavailable task={task_id}: {error}"
+                );
+                Err(shell_open_unavailable(
+                    crate::domain::TaskCockpitUnavailableReason::WorkspaceAuthorityUnavailable,
+                ))
+            }
+        }
+    }
+
+    /// The three terminal settings a plain shell needs, defaulted when this
+    /// host has no admitted config yet.
+    ///
+    /// The durable config and the terminal layer carry two structurally
+    /// identical copies of these enums (`config::model` and `models::config`),
+    /// with no conversion between them, so the mapping is spelled out here
+    /// rather than silently defaulted.
+    fn terminal_settings(
+        &self,
+    ) -> (
+        crate::models::DefaultTerminal,
+        Option<crate::models::MacTerminalProfile>,
+        bool,
+    ) {
+        let Some(admission) = self.config_admission.as_ref() else {
+            return (crate::models::DefaultTerminal::default(), None, false);
+        };
+        let snapshot = admission.store.snapshot();
+        let settings = snapshot.config.settings();
+        let default_terminal = match settings.default_terminal {
+            crate::config::DefaultTerminal::Bash => crate::models::DefaultTerminal::Bash,
+            crate::config::DefaultTerminal::Powershell => {
+                crate::models::DefaultTerminal::Powershell
+            }
+            crate::config::DefaultTerminal::Pwsh => crate::models::DefaultTerminal::Pwsh,
+            crate::config::DefaultTerminal::Cmd => crate::models::DefaultTerminal::Cmd,
+        };
+        let mac_profile = settings
+            .mac_terminal_profile
+            .clone()
+            .into_option()
+            .map(|profile| match profile {
+                crate::config::MacTerminalProfile::System => {
+                    crate::models::MacTerminalProfile::System
+                }
+                crate::config::MacTerminalProfile::Zsh => crate::models::MacTerminalProfile::Zsh,
+                crate::config::MacTerminalProfile::Bash => crate::models::MacTerminalProfile::Bash,
+            });
+        (
+            default_terminal,
+            mac_profile,
+            settings.shell_integration_enabled,
+        )
+    }
+
     /// Start the host process effect for one accepted `OpenShellTerminal`.
     ///
     /// Every refusal records an exit fact rather than returning quietly: to a
@@ -6277,6 +6533,51 @@ impl HostRequestExecutor {
                         outcome,
                     });
                 }
+                // Opening a shell is a host-authority mutation admitted as a
+                // typed query. Serve it here, then answer with the Task's
+                // refreshed strip so one round trip both opens and shows it.
+                let query = if let TaskCockpitQuery::OpenShellTerminal {
+                    cwd,
+                    expected_task_revision,
+                } = &query
+                {
+                    if !negotiated.capabilities.grants_task_cockpit() {
+                        return Ok(QueryReply {
+                            request_id: envelope.request_id,
+                            outcome: QueryOutcome::Err(QueryError::UnsupportedCapability),
+                        });
+                    }
+                    // The envelope's client id is written into the durable
+                    // command, so it must be this connection's own. Reads may
+                    // carry a foreign id harmlessly; a write may not.
+                    if envelope.client_id != negotiated.client_id {
+                        return Ok(QueryReply {
+                            request_id: envelope.request_id,
+                            outcome: QueryOutcome::Err(QueryError::Unauthorized),
+                        });
+                    }
+                    let open_connection_id = output_id
+                        .map(ConnectionOutputId::as_uuid)
+                        .unwrap_or(Uuid::nil());
+                    match self.open_shell_terminal_request(
+                        envelope.client_id,
+                        envelope.task_id,
+                        cwd.as_deref(),
+                        *expected_task_revision,
+                        envelope.request_id,
+                        open_connection_id,
+                    ) {
+                        Ok(()) => TaskCockpitQuery::TaskTerminals,
+                        Err(outcome) => {
+                            return Ok(QueryReply {
+                                request_id: envelope.request_id,
+                                outcome,
+                            })
+                        }
+                    }
+                } else {
+                    query
+                };
                 if let TaskCockpitQuery::RemoteAccess(request) = &query {
                     let outcome = if !negotiated.capabilities.grants_task_cockpit() {
                         QueryOutcome::Err(QueryError::UnsupportedCapability)
@@ -7330,6 +7631,24 @@ fn page_limits_from_negotiated(negotiated: NegotiatedParameters) -> Result<PageL
         negotiated.limits.max_page_encoded_bytes,
     )
     .map_err(|_| IpcError::Unavailable)
+}
+
+/// One refused `terminal.open_shell` the client is allowed to see the shape of.
+///
+/// The named cause is logged at the refusal site; this carries only the closed
+/// wire reason, so the two must always be written together.
+fn shell_open_denied(reason: crate::domain::TaskCockpitDeniedReason) -> QueryOutcome {
+    QueryOutcome::Ok(QueryResult::TaskCockpit(TaskCockpitResult::Denied {
+        surface: crate::domain::TaskCockpitSurface::Terminal,
+        reason,
+    }))
+}
+
+fn shell_open_unavailable(reason: crate::domain::TaskCockpitUnavailableReason) -> QueryOutcome {
+    QueryOutcome::Ok(QueryResult::TaskCockpit(TaskCockpitResult::Unavailable {
+        surface: crate::domain::TaskCockpitSurface::Terminal,
+        reason,
+    }))
 }
 
 fn map_store_error(error: StoreError) -> IpcError {

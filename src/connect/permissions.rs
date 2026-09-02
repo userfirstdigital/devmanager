@@ -74,10 +74,13 @@ pub fn action_for_client_request(request: &ClientRequest) -> Option<(ActionId, O
                     | crate::domain::cockpit::TaskCockpitQuery::ConfigRunCommand { .. }
                     | crate::domain::cockpit::TaskCockpitQuery::ConfigCommandDetail { .. }
                     | crate::domain::cockpit::TaskCockpitQuery::ProviderSettings(_)
-                    | crate::domain::cockpit::TaskCockpitQuery::RemoteAccess(_),
+                    | crate::domain::cockpit::TaskCockpitQuery::RemoteAccess(_)
+                    | crate::domain::cockpit::TaskCockpitQuery::OpenShellTerminal { .. },
                 ) => {
-                    // Config mutations, command-text detail, and provider settings
-                    // stay host-local. Connect must not map them as READ_TASK.
+                    // Config mutations, command-text detail, provider settings,
+                    // and opening a shell stay host-local. Connect must not map
+                    // them as READ_TASK: opening a shell spawns a process on the
+                    // host under host-chosen authority, which is not a read.
                     return None;
                 }
                 // GitRepositories / targeted Git status+mutate remain Task

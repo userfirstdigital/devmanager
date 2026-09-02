@@ -1891,6 +1891,113 @@ fn shell_candidates(
     }
 }
 
+/// A plain shell's resolved launch: the exact executable and its arguments.
+///
+/// [`TerminalSession::spawn`] resolves this lazily by trying each candidate in
+/// turn. The durable `OpenShellTerminal` path cannot: it has to write one
+/// exact program into `ResourceFacts` before anything spawns, so it needs the
+/// same candidate order settled up front.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ResolvedShellLaunch {
+    pub program: PathBuf,
+    pub args: Vec<String>,
+}
+
+/// Windows PowerShell 5.1 is excluded from a plain shell's candidate list.
+///
+/// Measured under the managed (ConPTY) launch path during Task 7:
+/// `powershell.exe -NoLogo` exits about three seconds in with `0xFFFF0000`,
+/// which reaches a client as a shell that opened and immediately died. A raw
+/// `CreateProcess` of the same binary survives, so the resolver cannot detect
+/// this — the exclusion is the measurement, recorded here rather than
+/// rediscovered per shell. `pwsh` and `cmd.exe` both survive the managed path.
+const PLAIN_SHELL_EXCLUDED_PROGRAMS: &[&str] = &["powershell.exe", "powershell"];
+
+/// Resolve the first shell candidate whose executable exists for `cwd`.
+///
+/// This is the plain-shell counterpart of the candidate loop in
+/// [`TerminalSession::spawn`]. Failure names every program that was tried, so
+/// a client sees which shells were unavailable rather than a bare refusal.
+pub(crate) fn resolve_plain_shell_launch(
+    preferred_terminal: Option<&DefaultTerminal>,
+    mac_profile: Option<&MacTerminalProfile>,
+    shell_integration_enabled: bool,
+    cwd: &Path,
+) -> Result<ResolvedShellLaunch, String> {
+    let candidates =
+        plain_shell_candidates(preferred_terminal, mac_profile, shell_integration_enabled);
+    let mut tried = Vec::new();
+    for candidate in candidates {
+        tried.push(candidate.program.clone());
+        if let Ok(program) = resolve_shell_program(&candidate.program, cwd) {
+            return Ok(ResolvedShellLaunch {
+                program,
+                args: candidate.args,
+            });
+        }
+    }
+    Err(format!("no shell found; tried: {}", tried.join(", ")))
+}
+
+/// The ordered candidates a plain shell is allowed to try, in the settings'
+/// own order minus the excluded programs and any duplicate.
+///
+/// Split out from the resolver so the exclusion can be proved without a real
+/// filesystem: a resolver that only ever reported "found something" could not
+/// show which candidates it refused to consider.
+fn plain_shell_candidates(
+    preferred_terminal: Option<&DefaultTerminal>,
+    mac_profile: Option<&MacTerminalProfile>,
+    shell_integration_enabled: bool,
+) -> Vec<ShellCandidate> {
+    let mut allowed: Vec<ShellCandidate> = Vec::new();
+    for candidate in shell_candidates(preferred_terminal, mac_profile, shell_integration_enabled) {
+        if PLAIN_SHELL_EXCLUDED_PROGRAMS
+            .iter()
+            .any(|excluded| candidate.program.eq_ignore_ascii_case(excluded))
+        {
+            continue;
+        }
+        if allowed
+            .iter()
+            .any(|existing| existing.program == candidate.program)
+        {
+            continue;
+        }
+        allowed.push(candidate);
+    }
+    allowed
+}
+
+#[cfg(windows)]
+fn resolve_shell_program(program: &str, cwd: &Path) -> Result<PathBuf, String> {
+    resolve_terminal_executable(program, cwd)
+}
+
+#[cfg(not(windows))]
+fn resolve_shell_program(program: &str, cwd: &Path) -> Result<PathBuf, String> {
+    let supplied = PathBuf::from(program);
+    if supplied.is_absolute() || supplied.components().count() > 1 {
+        let candidate = if supplied.is_absolute() {
+            supplied
+        } else {
+            cwd.join(supplied)
+        };
+        return candidate.canonicalize().map_err(|error| {
+            format!(
+                "Failed to resolve shell executable `{}`: {error}",
+                candidate.display()
+            )
+        });
+    }
+    crate::diagnostics::resolve::resolve_all(program)
+        .into_iter()
+        .next()
+        .ok_or_else(|| format!("Shell executable `{program}` was not found on PATH"))?
+        .canonicalize()
+        .map_err(|error| format!("Failed to canonicalize shell executable `{program}`: {error}"))
+}
+
 pub fn bash_shell_args(shell_integration_enabled: bool) -> Vec<String> {
     if shell_integration_enabled {
         let wrapper = crate::assets::ghostty_resources_dir()
@@ -4086,6 +4193,74 @@ fn apply_shell_sequences(
 mod tests {
     use super::*;
     use std::io;
+
+    /// The durable shell recipe has to name one exact executable, so the
+    /// resolver must actually find one on this machine — a resolver that
+    /// silently returned the unresolved candidate would produce a recipe that
+    /// only fails at spawn, where it reads as "the shell died" instead of
+    /// "no shell is installed".
+    #[test]
+    fn plain_shell_resolution_names_an_existing_executable_and_skips_windows_powershell() {
+        let cwd = std::env::current_dir().expect("cwd");
+        let launch = resolve_plain_shell_launch(Some(&DefaultTerminal::Pwsh), None, false, &cwd)
+            .expect("a shell must resolve on a developer machine");
+        assert!(
+            launch.program.is_absolute(),
+            "resolved shell must be absolute: {}",
+            launch.program.display()
+        );
+        assert!(
+            launch.program.exists(),
+            "resolved shell must exist: {}",
+            launch.program.display()
+        );
+        let file_name = launch
+            .program
+            .file_name()
+            .map(|name| name.to_string_lossy().to_ascii_lowercase())
+            .unwrap_or_default();
+        assert_ne!(
+            file_name, "powershell.exe",
+            "Windows PowerShell dies ~3s into a managed launch; it is never a plain-shell candidate"
+        );
+    }
+
+    /// The exclusion is the whole point of having a separate plain-shell
+    /// candidate list, so it is asserted against the list itself rather than
+    /// inferred from whichever shell happens to be installed here.
+    #[cfg(windows)]
+    #[test]
+    fn plain_shell_candidates_drop_windows_powershell_and_keep_pwsh_then_cmd() {
+        let programs: Vec<String> =
+            plain_shell_candidates(Some(&DefaultTerminal::Pwsh), None, false)
+                .into_iter()
+                .map(|candidate| candidate.program)
+                .collect();
+        assert_eq!(programs, vec!["pwsh".to_string(), "cmd.exe".to_string()]);
+        // The same exclusion holds when the setting names Windows PowerShell
+        // outright: there is no way to ask for the shell that dies at 3s.
+        for preferred in [
+            DefaultTerminal::Powershell,
+            DefaultTerminal::Cmd,
+            DefaultTerminal::Bash,
+        ] {
+            let programs: Vec<String> = plain_shell_candidates(Some(&preferred), None, false)
+                .into_iter()
+                .map(|candidate| candidate.program)
+                .collect();
+            assert!(
+                !programs
+                    .iter()
+                    .any(|program| program.eq_ignore_ascii_case("powershell.exe")
+                        || program.eq_ignore_ascii_case("powershell")),
+                "{preferred:?} -> {programs:?}"
+            );
+            assert!(
+                programs.iter().any(|program| program == "cmd.exe"),
+                "{preferred:?} must retain a last-resort shell: {programs:?}"
+            );
+        }
+    }
 
     #[cfg(windows)]
     #[test]

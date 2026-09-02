@@ -356,6 +356,22 @@ pub enum TaskCockpitQuery {
     /// durable plain-shell order. This is a chip list only — it carries no
     /// screen bytes and never launches or attaches a PTY.
     TaskTerminals,
+    /// Host-authority request for one new plain shell terminal on this Task.
+    ///
+    /// The client never supplies a program or arguments: the host resolves the
+    /// working directory and the shell executable, builds the durable
+    /// `ResourceFacts`, and executes `Command::OpenShellTerminal` on the
+    /// client's behalf under `expected_task_revision`. It is admitted as a
+    /// typed query for the same reason `ConfigRunCommand` is — the effect is
+    /// owned by the exclusive host executor, not by a client-built envelope.
+    /// Older hosts reject this variant, so clients must fail closed.
+    OpenShellTerminal {
+        /// Optional absolute working directory. `None` means the Task's own
+        /// runtime working directory, which only the host can resolve.
+        #[serde(default)]
+        cwd: Option<String>,
+        expected_task_revision: u64,
+    },
     WorkspaceStatus,
     /// Bounded path-redacted catalog of repositories for the exact Task/project.
     GitRepositories,
@@ -1103,7 +1119,8 @@ pub fn cockpit_surface(query: &TaskCockpitQuery) -> TaskCockpitSurface {
         | TaskCockpitQuery::TerminalScrollFor { .. }
         | TaskCockpitQuery::TerminalResizeFor { .. }
         | TaskCockpitQuery::TerminalReadinessFor { .. }
-        | TaskCockpitQuery::TaskTerminals => TaskCockpitSurface::Terminal,
+        | TaskCockpitQuery::TaskTerminals
+        | TaskCockpitQuery::OpenShellTerminal { .. } => TaskCockpitSurface::Terminal,
         TaskCockpitQuery::WorkspaceStatus => TaskCockpitSurface::Workspace,
         TaskCockpitQuery::GitRepositories
         | TaskCockpitQuery::GitStatus
@@ -1585,6 +1602,14 @@ mod tests {
             },
             TaskCockpitQuery::TerminalReadinessFor { resource_id },
             TaskCockpitQuery::TaskTerminals,
+            TaskCockpitQuery::OpenShellTerminal {
+                cwd: None,
+                expected_task_revision: 4,
+            },
+            TaskCockpitQuery::OpenShellTerminal {
+                cwd: Some("C:/Code/demo".to_string()),
+                expected_task_revision: 9,
+            },
         ] {
             assert_eq!(cockpit_surface(&query), TaskCockpitSurface::Terminal);
             let encoded = serde_json::to_value(&query).expect("encode targeted terminal query");
