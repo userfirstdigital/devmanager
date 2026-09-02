@@ -384,6 +384,12 @@ const CONTROLLER_IDLE_RECOVERY_INTERVAL: Duration = Duration::from_secs(1);
 /// the old hot polling loop.
 const TERMINAL_START_RETRY_INTERVAL: Duration = Duration::from_millis(350);
 const TERMINAL_ECHO_RETRY_INTERVAL: Duration = Duration::from_millis(16);
+/// How long one outstanding `TaskTerminals` query suppresses the next.
+///
+/// This is a lease, not a poll: nothing fires when it expires. It exists only
+/// so a lost answer cannot leave the strip permanently unrefreshable, which a
+/// bare in-flight boolean would.
+const TASK_TERMINALS_QUERY_LEASE: Duration = Duration::from_secs(5);
 const TERMINAL_ECHO_MAX_UNMATCHED_REFRESHES: u8 = 16;
 /// Host worker command/subscription idle slice — separate from UI scheduling.
 const HOST_WORKER_IDLE_WAIT: Duration = Duration::from_millis(50);
@@ -2824,6 +2830,17 @@ impl TerminalTarget {
         match self {
             Self::Provider => TaskCockpitQuery::TerminalReadiness,
             Self::Resource(resource_id) => TaskCockpitQuery::TerminalReadinessFor { resource_id },
+        }
+    }
+
+    /// The scrollback query that addresses this exact terminal.
+    fn scroll_query(self, delta_lines: i32) -> TaskCockpitQuery {
+        match self {
+            Self::Provider => TaskCockpitQuery::TerminalScroll { delta_lines },
+            Self::Resource(resource_id) => TaskCockpitQuery::TerminalScrollFor {
+                resource_id,
+                delta_lines,
+            },
         }
     }
 
@@ -10689,6 +10706,12 @@ pub struct NativeShell {
     /// Owner-qualified retries for a provider runtime that reported
     /// TerminalStartPending. Empty during ordinary idle operation.
     pending_terminal_requeries: BTreeMap<TerminalKey, Instant>,
+    /// One `TaskTerminals` lease per owner, stamped when the strip query goes
+    /// out and dropped by the answer that settles it. The stamp -- rather than
+    /// a bare flag -- is what keeps a lost or refused answer from wedging the
+    /// strip closed forever: the lease simply expires and the next event
+    /// re-queries.
+    pending_task_terminals_queries: BTreeMap<HostTaskKey, Instant>,
     /// Owner currently dragging a terminal selection, if any.
     selecting_terminal_owner: Option<HostTaskKey>,
     /// Printable bytes accepted from the native input handler but not yet
@@ -11773,6 +11796,7 @@ impl NativeShell {
             terminal_selections: BTreeMap::new(),
             pending_terminal_resizes: BTreeMap::new(),
             pending_terminal_requeries: BTreeMap::new(),
+            pending_task_terminals_queries: BTreeMap::new(),
             selecting_terminal_owner: None,
             pending_terminal_echoes: BTreeMap::new(),
             pending_terminal_input_cursors: BTreeMap::new(),
@@ -13896,11 +13920,12 @@ impl NativeShell {
                 }
                 if let crate::domain::TaskCockpitResult::Terminal(projection) = &result {
                     let owner = self.local_task_key(projection.task_id);
-                    // Same rule as the fleet lane: the retry was armed under the
-                    // outgoing query's target, so only that key can retire it.
-                    if let Some(query_target) = command_parts
-                        .and_then(|(_, _, query)| TerminalTarget::for_screen_query(&query))
-                    {
+                    // Same rule as the fleet lane: the retry and the echo were
+                    // both armed under the outgoing query's target, so only
+                    // that key can retire either.
+                    let query_target = command_parts
+                        .and_then(|(_, _, query)| TerminalTarget::for_screen_query(&query));
+                    if let Some(query_target) = query_target {
                         self.pending_terminal_requeries
                             .remove(&(owner.clone(), query_target));
                     }
@@ -13912,7 +13937,13 @@ impl NativeShell {
                     {
                         return;
                     }
-                    self.settle_pending_terminal_echo(&owner, projection);
+                    if let Some(query_target) = query_target {
+                        self.settle_pending_terminal_echo(&owner, query_target, projection);
+                    }
+                    // A terminal screen reply is the third leg of the strip
+                    // cadence: a chip's runtime state, title or cwd may have
+                    // moved with it.
+                    self.request_task_terminals_refresh(&owner);
                     let codex_setup_required = self
                         .local_slot()
                         .client_model
@@ -14084,6 +14115,28 @@ impl NativeShell {
         }
     }
 
+    /// The Task a `TaskTerminals` answer belongs to, read off the command that
+    /// asked for it.
+    ///
+    /// TWO commands legitimately answer with the strip. The plain
+    /// `TaskCockpitQuery::TaskTerminals` is the obvious one; `OpenShellTerminal`
+    /// is the other, because the host opens the shell and then serves the
+    /// refreshed strip in the same round trip (`host/connection.rs`, the
+    /// `Ok(()) => TaskCockpitQuery::TaskTerminals` arm). Reading only the first
+    /// silently drops the answer to every "+" click. Anything else arriving
+    /// with a strip is a routing bug and is dropped.
+    fn task_terminals_answer_task(command: &NativeHostCommand) -> Option<TaskId> {
+        match command {
+            NativeHostCommand::TaskCockpitQuery {
+                task_id,
+                query: TaskCockpitQuery::TaskTerminals,
+                ..
+            } => Some(*task_id),
+            NativeHostCommand::OpenShellTerminal { task_id, .. } => Some(*task_id),
+            _ => None,
+        }
+    }
+
     fn task_cockpit_command_parts(
         command: &NativeHostCommand,
     ) -> Option<(RequestId, TaskId, &TaskCockpitQuery)> {
@@ -14183,7 +14236,14 @@ impl NativeShell {
             .task_surfaces
             .state(owner.clone())
             .is_some_and(|state| state.terminal_query_in_flight());
-        let (loading_action, mut requests) = match self.local_slot_mut().cockpit.active_tool() {
+        let active_tool = self.local_slot_mut().cockpit.active_tool();
+        if matches!(active_tool, CockpitDockTool::Terminal) {
+            // The Terminal tool becoming visible is the first half of the
+            // strip cadence. The strip is a different surface from the screen,
+            // so it is deliberately not gated on the screen query's lease.
+            self.request_task_terminals_refresh(&owner);
+        }
+        let (loading_action, mut requests) = match active_tool {
             CockpitDockTool::Changes => (
                 Some(crate::client::action::ACTION_GIT_STATUS),
                 vec![
@@ -14225,13 +14285,7 @@ impl NativeShell {
             CockpitDockTool::Terminal => (
                 (!terminal_query_in_flight)
                     .then_some(crate::client::action::ACTION_PROVIDER_TERMINAL_INPUT),
-                (!terminal_query_in_flight)
-                    .then_some(ActionRequest::TaskCockpit {
-                        task_id,
-                        query: TaskCockpitQuery::TerminalReadiness,
-                    })
-                    .into_iter()
-                    .collect(),
+                self.terminal_tool_refresh_requests(&owner, terminal_query_in_flight),
             ),
             CockpitDockTool::Artifacts | CockpitDockTool::Review => (None, Vec::new()),
         };
@@ -14285,6 +14339,85 @@ impl NativeShell {
                     TerminalTarget::Resource(resource_id)
                 }
             })
+    }
+
+    /// The screen-readiness request the Terminal tool issues when it becomes
+    /// visible, addressed at the chip the strip actually focuses.
+    ///
+    /// One derivation for both the local and the fleet refresh path so the two
+    /// cannot drift, and so a background task whose focused chip is a shell is
+    /// probed for THAT shell rather than for the provider slot it is not
+    /// showing.
+    fn terminal_tool_refresh_requests(
+        &self,
+        owner: &HostTaskKey,
+        screen_query_in_flight: bool,
+    ) -> Vec<ActionRequest> {
+        if screen_query_in_flight {
+            return Vec::new();
+        }
+        vec![ActionRequest::TaskCockpit {
+            task_id: owner.task_id,
+            query: self.focused_terminal_target(owner).readiness_query(),
+        }]
+    }
+
+    /// A terminal mutation the host accepted changes the strip, so ask for it.
+    ///
+    /// Close, rename and reorder are ordinary client commands: their receipt
+    /// says the host applied them and nothing else tells the client what the
+    /// strip now looks like. Opening a shell is deliberately absent -- the host
+    /// answers that one with the refreshed strip in the same round trip.
+    fn request_task_terminals_refresh_after_terminal_mutation(
+        &mut self,
+        host_id: &HostId,
+        action: &NativeActionRecord,
+    ) {
+        let task_id = match &action.command {
+            NativeHostCommand::TerminalClose { task_id, .. }
+            | NativeHostCommand::TerminalSetStrip { task_id, .. } => *task_id,
+            NativeHostCommand::TerminalRename { arguments, .. } => arguments.task_id,
+            _ => return,
+        };
+        self.request_task_terminals_refresh(&HostTaskKey::new(host_id.clone(), task_id));
+    }
+
+    /// Whether a `TaskTerminals` answer is still outstanding for this owner.
+    ///
+    /// A lease older than [`TASK_TERMINALS_QUERY_LEASE`] is treated as gone,
+    /// not as still running: the answer may have been refused, dropped by a
+    /// reconnect, or served to a lane that no longer exists, and none of those
+    /// may leave the strip permanently unrefreshable.
+    fn task_terminals_query_in_flight(&self, owner: &HostTaskKey) -> bool {
+        self.pending_task_terminals_queries
+            .get(owner)
+            .is_some_and(|issued| issued.elapsed() < TASK_TERMINALS_QUERY_LEASE)
+    }
+
+    /// Ask the host for this owner's terminal strip, unless one is already in
+    /// flight.
+    ///
+    /// This is the whole strip cadence (addendum E): the Terminal tool
+    /// becoming visible, an accepted terminal mutation, and a terminal screen
+    /// reply each call it. There is no timer.
+    fn request_task_terminals_refresh(&mut self, owner: &HostTaskKey) -> bool {
+        if self.task_terminals_query_in_flight(owner) {
+            return false;
+        }
+        let dispatched = self
+            .dispatch_action_recorded_for_owner(
+                &owner.host,
+                ActionRequest::TaskCockpit {
+                    task_id: owner.task_id,
+                    query: TaskCockpitQuery::TaskTerminals,
+                },
+            )
+            .is_ok();
+        if dispatched {
+            self.pending_task_terminals_queries
+                .insert(owner.clone(), Instant::now());
+        }
+        dispatched
     }
 
     fn schedule_terminal_start_retry(&mut self, key: TerminalKey) {
@@ -14405,6 +14538,9 @@ impl NativeShell {
             .task_surfaces
             .state(key.clone())
             .is_some_and(|state| state.terminal_query_in_flight());
+        if matches!(active_tool, CockpitDockTool::Terminal) {
+            self.request_task_terminals_refresh(key);
+        }
         let (loading_action, mut requests) = match active_tool {
             CockpitDockTool::Changes => (
                 Some(crate::client::action::ACTION_GIT_STATUS),
@@ -14432,13 +14568,7 @@ impl NativeShell {
             CockpitDockTool::Terminal => (
                 (!terminal_query_in_flight)
                     .then_some(crate::client::action::ACTION_PROVIDER_TERMINAL_INPUT),
-                (!terminal_query_in_flight)
-                    .then_some(ActionRequest::TaskCockpit {
-                        task_id,
-                        query: TaskCockpitQuery::TerminalReadiness,
-                    })
-                    .into_iter()
-                    .collect(),
+                self.terminal_tool_refresh_requests(key, terminal_query_in_flight),
             ),
             CockpitDockTool::Review => (None, vec![ActionRequest::TaskShow { task_id }]),
             CockpitDockTool::Services => (
@@ -16088,6 +16218,10 @@ impl NativeShell {
             NativeActionRecord,
             crate::domain::TaskCockpitResult,
         )> = None;
+        if let NativeHostActionOutcome::Accepted { action, .. } = &outcome {
+            let action = action.clone();
+            self.request_task_terminals_refresh_after_terminal_mutation(host_id, &action);
+        }
         if let NativeHostActionOutcome::Accepted { action, receipt } = &outcome {
             if native_command_id(&action.command) != Some(receipt.command_id()) {
                 let mismatch = "The host returned a receipt for a different command.".to_string();
@@ -16657,7 +16791,10 @@ impl NativeShell {
         {
             return;
         }
-        self.settle_pending_terminal_echo(&owner, projection);
+        self.settle_pending_terminal_echo(&owner, query_target, projection);
+        // A terminal screen reply is the third leg of the strip cadence: a
+        // chip's runtime state, title or cwd may have moved with it.
+        self.request_task_terminals_refresh(&owner);
         // The grid renders exactly one chip, so a live answer for a terminal
         // that is not the focused one is a legitimate reply that simply is not
         // on screen -- never an overwrite of the visible replica.
@@ -16709,18 +16846,17 @@ impl NativeShell {
         action: &NativeActionRecord,
         projection: &crate::domain::cockpit::TaskTerminalsProjection,
     ) {
-        let Some((_request_id, command_task, query)) =
-            Self::task_cockpit_command_parts(&action.command)
-        else {
+        let Some(command_task) = Self::task_terminals_answer_task(&action.command) else {
             return;
         };
-        if !matches!(query, TaskCockpitQuery::TaskTerminals) {
-            return;
-        }
         if command_task != projection.task_id {
             return;
         }
         let owner = HostTaskKey::new(host_id.clone(), projection.task_id);
+        // The strip lease is released by the answer that settles it, whichever
+        // of the two commands asked. A failed or dropped answer is covered by
+        // the lease's own deadline rather than by a flag nothing clears.
+        self.pending_task_terminals_queries.remove(&owner);
         let previous = self
             .task_surfaces
             .state(owner.clone())
@@ -16922,6 +17058,7 @@ impl NativeShell {
                 let action_id = action.id;
                 let command_id = native_command_id(&action.command);
                 let local = self.local_host_id();
+                self.request_task_terminals_refresh_after_terminal_mutation(&local, &action);
                 if self.matches_live_delete_flow_command(&local, &action)
                     && command_id != Some(receipt.command_id())
                 {
@@ -17707,13 +17844,17 @@ impl NativeShell {
             if due_priorities.contains(&ConversationQueryPriority::Background) {
                 if let Some(task_id) = self.local_slot_mut().interaction.selected_task() {
                     if self.local_slot_mut().cockpit.dock().showing_raw_terminal() {
-                        if let Some(record) = self
-                            .local_slot_mut()
-                            .interaction
-                            .action_on_current_handler(ActionRequest::TaskCockpit {
-                                task_id,
-                                query: TaskCockpitQuery::Terminal,
-                            })
+                        // The background refresh repaints whatever is on
+                        // screen, and that is the strip-focused chip. Asking
+                        // for the provider slot here would keep the provider's
+                        // screen fresh while the shell the user is watching
+                        // goes stale.
+                        let owner = self.local_task_key(task_id);
+                        let query = self.focused_terminal_target(&owner).screen_query();
+                        if let Some(record) =
+                            self.local_slot_mut().interaction.action_on_current_handler(
+                                ActionRequest::TaskCockpit { task_id, query },
+                            )
                         {
                             let _ = self.enqueue_host_action(record);
                         }
@@ -19250,8 +19391,15 @@ impl NativeShell {
         }
         self.pending_terminal_focus = show_terminal;
         if show_terminal && (task_follow_changed || !was_showing_terminal) {
-            self.task_surfaces.note_terminal_query_started(owner);
-            let _ = self.dispatch_task_cockpit_query(task_id, TaskCockpitQuery::Terminal);
+            // Selection is exactly when a background task's focused shell
+            // becomes visible for the first time, and `admit_owner_task_terminals`
+            // deliberately issued no screen query for it while it was
+            // unselected. Ask for the focused chip's screen, not the provider's.
+            let query = self.focused_terminal_target(&owner).screen_query();
+            self.task_surfaces
+                .note_terminal_query_started(owner.clone());
+            self.request_task_terminals_refresh(&owner);
+            let _ = self.dispatch_task_cockpit_query(task_id, query);
         }
     }
 
@@ -20826,12 +20974,16 @@ impl NativeShell {
                         slot.composer_error = Some(format!("{error:?}"));
                     }
                 } else if visible {
+                    // Same rule as the local path: probe the chip the strip
+                    // focuses, and refresh the strip that decides it.
+                    let query = self.focused_terminal_target(&key).readiness_query();
                     self.task_surfaces.note_terminal_query_started(key.clone());
+                    self.request_task_terminals_refresh(&key);
                     let _ = self.dispatch_action_recorded_for_owner(
                         &key.host,
                         ActionRequest::TaskCockpit {
                             task_id: key.task_id,
-                            query: TaskCockpitQuery::TerminalReadiness,
+                            query,
                         },
                     );
                 }
@@ -20876,10 +21028,12 @@ impl NativeShell {
             self.pending_terminal_focus = visible;
             if visible {
                 if let Some(task_id) = selected_task_id {
+                    let owner = self.local_task_key(task_id);
+                    let query = self.focused_terminal_target(&owner).readiness_query();
                     self.task_surfaces
-                        .note_terminal_query_started(self.local_task_key(task_id));
-                    let _ = self
-                        .dispatch_task_cockpit_query(task_id, TaskCockpitQuery::TerminalReadiness);
+                        .note_terminal_query_started(owner.clone());
+                    self.request_task_terminals_refresh(&owner);
+                    let _ = self.dispatch_task_cockpit_query(task_id, query);
                 }
             }
         }
@@ -21160,12 +21314,21 @@ impl NativeShell {
         }
     }
 
+    /// Settle the echo armed for the terminal the SETTLING QUERY addressed.
+    ///
+    /// The echo lane keys by the outgoing query's target, exactly as the
+    /// requery lane does, because the two legitimately differ: a chip click
+    /// addresses the provider's own resource, so the query keys
+    /// `Resource(provider_id)` while the projection answering it keys
+    /// `Provider`. Keying this by the reply would leave that echo pending
+    /// forever, and the pending text would stay painted over live output.
     fn settle_pending_terminal_echo(
         &mut self,
         owner: &HostTaskKey,
+        query_target: TerminalTarget,
         projection: &crate::domain::TaskTerminalProjection,
     ) {
-        let key = (owner.clone(), TerminalTarget::for_projection(projection));
+        let key = (owner.clone(), query_target);
         let should_retry = {
             let Some(pending) = self.pending_terminal_echoes.get_mut(&key) else {
                 return;
@@ -25774,16 +25937,7 @@ impl NativeShell {
                         if delta_lines == 0 {
                             return;
                         }
-                        if let Err(error) = shell.dispatch_action_recorded_for_owner(
-                            &scroll_owner.host,
-                            ActionRequest::TaskCockpit {
-                                task_id: scroll_owner.task_id,
-                                query: TaskCockpitQuery::TerminalScroll { delta_lines },
-                            },
-                        ) {
-                            #[cfg(debug_assertions)]
-                            eprintln!("devmanager: terminal wheel dispatch failed: {error:?}");
-                        }
+                        shell.dispatch_terminal_scroll_for_owner(&scroll_owner, delta_lines);
                         cx.notify();
                     });
                 },
@@ -25882,6 +26036,35 @@ impl NativeShell {
                     );
                 });
             }),
+        }
+    }
+
+    /// Scroll the terminal the owner's surface is actually showing.
+    ///
+    /// The wheel gesture lands on whichever chip is focused, so the scrollback
+    /// query has to follow the same derivation the resize and screen queries
+    /// use. Hardcoding the legacy provider query here scrolls the provider PTY
+    /// while the user is looking at a shell.
+    fn dispatch_terminal_scroll_for_owner(
+        &mut self,
+        owner: &HostTaskKey,
+        delta_lines: i32,
+    ) -> bool {
+        let target = self.focused_terminal_target(owner);
+        match self.dispatch_action_recorded_for_owner(
+            &owner.host,
+            ActionRequest::TaskCockpit {
+                task_id: owner.task_id,
+                query: target.scroll_query(delta_lines),
+            },
+        ) {
+            Ok(_) => true,
+            Err(error) => {
+                let _ = error;
+                #[cfg(debug_assertions)]
+                eprintln!("devmanager: terminal wheel dispatch failed: {error:?}");
+                false
+            }
         }
     }
 
@@ -43911,6 +44094,36 @@ mod terminal_target_tests {
         assert_eq!(
             TerminalTarget::for_screen_query(&TaskCockpitQuery::TaskTerminals),
             None
+        );
+    }
+
+    /// Scroll is a screen-producing query, so the same round-trip invariant the
+    /// other three obey has to hold for it: the query a target emits must key
+    /// back to that exact target, in both families.
+    #[test]
+    fn a_scroll_query_keys_back_to_the_terminal_that_emitted_it() {
+        let resource_id = ResourceId::new();
+        for target in [
+            TerminalTarget::Provider,
+            TerminalTarget::Resource(resource_id),
+        ] {
+            let query = target.scroll_query(-7);
+            assert_eq!(
+                TerminalTarget::for_screen_query(&query),
+                Some(target),
+                "{query:?} must key back to {target:?}"
+            );
+        }
+        assert_eq!(
+            TerminalTarget::Provider.scroll_query(-7),
+            TaskCockpitQuery::TerminalScroll { delta_lines: -7 }
+        );
+        assert_eq!(
+            TerminalTarget::Resource(resource_id).scroll_query(-7),
+            TaskCockpitQuery::TerminalScrollFor {
+                resource_id,
+                delta_lines: -7
+            }
         );
     }
 }
@@ -64514,7 +64727,11 @@ mod tests {
                         is_provider: true,
                         runtime_state: crate::domain::cockpit::TerminalRuntimeStateWire::Running,
                     };
-                shell.settle_pending_terminal_echo(&owner, &unmatched_projection);
+                shell.settle_pending_terminal_echo(
+                    &owner,
+                    super::TerminalTarget::Provider,
+                    &unmatched_projection,
+                );
                 assert!(
                     shell.pending_terminal_echoes.contains_key(&provider_key),
                     "a refresh that raced ahead of PTY echo must keep the instant paint-only echo"
@@ -64541,7 +64758,11 @@ mod tests {
                     },
                     ..unmatched_projection
                 };
-                shell.settle_pending_terminal_echo(&owner, &canonical_projection);
+                shell.settle_pending_terminal_echo(
+                    &owner,
+                    super::TerminalTarget::Provider,
+                    &canonical_projection,
+                );
                 assert!(
                     !shell.pending_terminal_echoes.contains_key(&provider_key),
                     "a newer canonical PTY projection must retire the paint-only echo instead of duplicating it"
@@ -65449,6 +65670,226 @@ mod tests {
         assert_eq!(rows[0].resource_id, shell);
     }
 
+    fn dispatched_scroll_queries_for_test(
+        shared: &Arc<Mutex<TestRuntimeState>>,
+    ) -> Vec<TaskCockpitQuery> {
+        shared
+            .lock()
+            .expect("runtime")
+            .accepted
+            .iter()
+            .filter_map(|record| match &record.command {
+                NativeHostCommand::TaskCockpitQuery { query, .. }
+                    if matches!(
+                        query,
+                        TaskCockpitQuery::TerminalScroll { .. }
+                            | TaskCockpitQuery::TerminalScrollFor { .. }
+                    ) =>
+                {
+                    Some(query.clone())
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// The wheel lands on whatever chip is on screen. Scrolling the provider
+    /// PTY while the user is looking at a shell moves the wrong scrollback and
+    /// looks like a dead gesture, so the scroll query has to follow the same
+    /// strip focus the resize and screen queries already follow.
+    #[test]
+    fn scroll_addresses_the_strip_focused_shell_not_the_provider() {
+        if rerun_headless_shell_test_in_child(
+            "ui::native_shell::tests::scroll_addresses_the_strip_focused_shell_not_the_provider",
+        ) {
+            return;
+        }
+        let (runtime, _local_shared) = TestRuntime::new(true, NativeHostActionResult::Queued);
+        let remote_host = HostId::Remote([0x7c; 16]);
+        gpui::Application::headless().run(move |cx| {
+            crate::ui::init(cx);
+            with_test_shell_in_app(cx, runtime, |shell| {
+                let (model, task_id) = terminal_bound_client_model();
+                let model = Arc::new(model);
+                let provider_resource =
+                    provider_terminal_projection_for_test(&model, task_id, 1).resource_id;
+                let shell_resource = crate::domain::id::ResourceId::new();
+                let shared =
+                    attach_remote_test_host_with_shared(shell, &remote_host, Arc::clone(&model));
+                let owner = HostTaskKey::new(remote_host.clone(), task_id);
+                shell
+                    .select_fleet_task_key(owner.clone(), FleetSelectMode::Replace)
+                    .expect("select remote task");
+
+                // No strip: the provider slot keeps the legacy scroll query.
+                shared.lock().expect("runtime").accepted.clear();
+                assert!(shell.dispatch_terminal_scroll_for_owner(&owner, -3));
+                assert_eq!(
+                    dispatched_scroll_queries_for_test(&shared),
+                    vec![TaskCockpitQuery::TerminalScroll { delta_lines: -3 }],
+                    "without a strip the provider slot keeps the legacy scroll"
+                );
+
+                let strip = crate::domain::cockpit::TaskTerminalsProjection {
+                    task_id,
+                    terminals: vec![
+                        terminal_chip_for_test(provider_resource, true),
+                        terminal_chip_for_test(shell_resource, false),
+                    ],
+                    order: vec![shell_resource],
+                    focused: Some(shell_resource),
+                };
+                shell
+                    .task_surfaces
+                    .admit_terminals(owner.clone(), &strip)
+                    .expect("admit strip");
+
+                shared.lock().expect("runtime").accepted.clear();
+                assert!(shell.dispatch_terminal_scroll_for_owner(&owner, -5));
+                assert_eq!(
+                    dispatched_scroll_queries_for_test(&shared),
+                    vec![TaskCockpitQuery::TerminalScrollFor {
+                        resource_id: shell_resource,
+                        delta_lines: -5
+                    }],
+                    "the wheel must scroll the focused shell, never the provider PTY"
+                );
+            });
+            cx.quit();
+        });
+    }
+
+    /// The host serves `terminal.open_shell` by opening the shell and then
+    /// serving the refreshed strip in the SAME round trip, so the strip arrives
+    /// under an `OpenShellTerminal` command rather than a `TaskTerminals` query.
+    /// A handler that reads only the query shape drops the answer to every "+"
+    /// click and the new chip never appears.
+    #[test]
+    fn the_strip_answering_an_open_shell_request_is_admitted() {
+        if rerun_headless_shell_test_in_child(
+            "ui::native_shell::tests::the_strip_answering_an_open_shell_request_is_admitted",
+        ) {
+            return;
+        }
+        let (runtime, _local_shared) = TestRuntime::new(true, NativeHostActionResult::Queued);
+        let remote_host = HostId::Remote([0x8d; 16]);
+        gpui::Application::headless().run(move |cx| {
+            crate::ui::init(cx);
+            with_test_shell_in_app(cx, runtime, |shell| {
+                let (model, task_id) = terminal_bound_client_model();
+                let model = Arc::new(model);
+                let provider_resource =
+                    provider_terminal_projection_for_test(&model, task_id, 1).resource_id;
+                let shell_resource = crate::domain::id::ResourceId::new();
+                attach_remote_test_host(shell, &remote_host, Arc::clone(&model));
+                let owner = HostTaskKey::new(remote_host.clone(), task_id);
+                shell
+                    .select_fleet_task_key(owner.clone(), FleetSelectMode::Replace)
+                    .expect("select remote task");
+
+                let action = shell
+                    .dispatch_action_recorded_for_owner(
+                        &remote_host,
+                        crate::ui::components::ActionRequest::TerminalOpenShell {
+                            task_id,
+                            cwd: None,
+                        },
+                    )
+                    .expect("dispatch open shell");
+                assert!(
+                    matches!(action.command, NativeHostCommand::OpenShellTerminal { .. }),
+                    "the open-shell request must travel on the existing host-authority lane"
+                );
+
+                let strip = crate::domain::cockpit::TaskTerminalsProjection {
+                    task_id,
+                    terminals: vec![
+                        terminal_chip_for_test(provider_resource, true),
+                        terminal_chip_for_test(shell_resource, false),
+                    ],
+                    order: vec![shell_resource],
+                    focused: Some(shell_resource),
+                };
+                shell.admit_owner_task_terminals(&remote_host, &action, &strip);
+
+                assert_eq!(
+                    shell
+                        .task_surfaces
+                        .state(owner.clone())
+                        .and_then(|state| state.strip.clone()),
+                    Some(strip),
+                    "the strip the host answered the open-shell request with must be admitted"
+                );
+            });
+            cx.quit();
+        });
+    }
+
+    /// The echo lane and the requery lane are armed by the same outgoing query
+    /// and must be retired by the same key. A chip click addresses the provider
+    /// by its durable resource, so the query keys `Resource(provider)` while the
+    /// projection answering it keys `Provider`; settling the echo by the reply
+    /// leaves the pending text painted over live output forever.
+    #[test]
+    fn an_echo_armed_by_a_resource_addressed_query_settles_on_the_provider_reply() {
+        if rerun_headless_shell_test_in_child(
+            "ui::native_shell::tests::an_echo_armed_by_a_resource_addressed_query_settles_on_the_provider_reply",
+        ) {
+            return;
+        }
+        let (runtime, _local_shared) = TestRuntime::new(true, NativeHostActionResult::Queued);
+        let remote_host = HostId::Remote([0x9e; 16]);
+        gpui::Application::headless().run(move |cx| {
+            crate::ui::init(cx);
+            with_test_shell_in_app(cx, runtime, |shell| {
+                let (model, task_id) = terminal_bound_client_model();
+                let model = Arc::new(model);
+                let projection = provider_terminal_projection_for_test(&model, task_id, 4);
+                let provider_resource = projection.resource_id;
+                attach_remote_test_host(shell, &remote_host, Arc::clone(&model));
+                let owner = HostTaskKey::new(remote_host.clone(), task_id);
+                shell
+                    .select_fleet_task_key(owner.clone(), FleetSelectMode::Replace)
+                    .expect("select remote task");
+
+                let action = shell
+                    .dispatch_action_recorded_for_owner(
+                        &remote_host,
+                        crate::ui::components::ActionRequest::TaskCockpit {
+                            task_id,
+                            query: TaskCockpitQuery::TerminalFor {
+                                resource_id: provider_resource,
+                            },
+                        },
+                    )
+                    .expect("dispatch resource-addressed terminal query");
+                let query_key = (
+                    owner.clone(),
+                    super::TerminalTarget::Resource(provider_resource),
+                );
+                let reply_key = (owner.clone(), super::TerminalTarget::Provider);
+                shell.note_pending_terminal_echo(&query_key, "x");
+                assert!(
+                    shell.pending_terminal_echoes.contains_key(&query_key),
+                    "the echo must be armed under the query's own target"
+                );
+                shell.pending_terminal_requeries.remove(&query_key);
+
+                shell.admit_owner_terminal_projection(&remote_host, &action, &projection);
+
+                assert!(
+                    shell.pending_terminal_requeries.contains_key(&query_key)
+                        || !shell.pending_terminal_echoes.contains_key(&query_key),
+                    "the provider reply to that exact query must settle the echo it armed"
+                );
+                assert!(
+                    !shell.pending_terminal_echoes.contains_key(&reply_key),
+                    "nothing may be armed under the reply's own target"
+                );
+            });
+            cx.quit();
+        });
+    }
 }
 
 #[allow(dead_code)]
