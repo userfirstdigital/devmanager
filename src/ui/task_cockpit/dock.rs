@@ -237,20 +237,6 @@ impl TerminalRuntimeIdentity {
     }
 }
 
-/// Whether this projection carries the documented plain-shell shape.
-///
-/// `is_provider` alone cannot answer it: the field defaults to `false` when a
-/// projection is decoded from a host that predates plain shells, and those
-/// hosts only ever answered for the provider slot -- with a real agent session
-/// beside it. A shell is therefore recognised by the sentinels the host sends
-/// together with the flag, so an older host's provider projection still takes
-/// the provider path and is still fenced against the ClientModel.
-fn projection_is_plain_shell(projection: &TaskTerminalProjection) -> bool {
-    !projection.is_provider
-        && projection.agent_session_id.is_nil()
-        && projection.runtime_generation == 0
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct HostTerminalBinding {
     identity: TerminalRuntimeIdentity,
@@ -1116,7 +1102,7 @@ impl ContextDock {
         model: &ClientModel,
         projection: &TaskTerminalProjection,
     ) -> Result<bool, DockProjectionError> {
-        let plain_shell = projection_is_plain_shell(projection);
+        let plain_shell = projection.is_plain_shell();
         let actual = TerminalRuntimeIdentity::new(
             projection.task_id,
             projection.agent_session_id,

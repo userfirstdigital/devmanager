@@ -318,20 +318,24 @@ pub enum CenterSurfaceLoadingState {
 impl TaskSurfaceState {
     /// The one terminal resource this surface is currently showing.
     ///
-    /// The host-owned strip focus wins when the strip has been admitted and
-    /// names a resource. Before that -- and for a Task whose strip query has
-    /// not landed yet -- the provider slot is the default, and a Task that has
-    /// only shells falls back to the first by resource id so a screen is never
-    /// silently dropped.
+    /// The host-owned strip focus wins whenever the strip has been admitted
+    /// and names a resource -- deliberately even before that terminal's first
+    /// screen has arrived, so a newly focused chip reads as "starting" rather
+    /// than silently falling back to the previous terminal. Without a strip
+    /// the provider slot is the default, and a Task that has only shells falls
+    /// back to the first by resource id so a screen is never dropped.
+    ///
+    /// The provider is recognised by the shared projection rule, not by
+    /// `is_provider` alone, so a projection decoded from a host that predates
+    /// plain shells is still found here.
     pub fn focused_resource(&self) -> Option<ResourceId> {
         self.strip
             .as_ref()
             .and_then(|strip| strip.focused)
-            .filter(|resource_id| self.terminals.contains_key(resource_id))
             .or_else(|| {
                 self.terminals
                     .values()
-                    .find(|terminal| terminal.is_provider)
+                    .find(|terminal| !terminal.is_plain_shell())
                     .map(|terminal| terminal.resource_id)
             })
             .or_else(|| self.terminals.keys().next().copied())
@@ -1259,6 +1263,35 @@ mod tests {
         assert_eq!(
             state.strip.as_ref().map(|strip| strip.task_id),
             Some(task_id)
+        );
+    }
+
+    #[test]
+    fn focus_on_a_terminal_with_no_screen_yet_shows_nothing_rather_than_the_previous_one() {
+        let mut registry = TaskSurfaceRegistry::<TaskId>::default();
+        let task_id = TaskId::new();
+        let provider =
+            terminal_projection_fixture(task_id, crate::domain::id::ResourceId::new(), true);
+        let shell =
+            terminal_projection_fixture(task_id, crate::domain::id::ResourceId::new(), false);
+        registry.admit_terminal(task_id, &provider).unwrap();
+
+        let strip = TaskTerminalsProjection {
+            task_id,
+            terminals: vec![
+                terminal_chip_fixture(&provider),
+                terminal_chip_fixture(&shell),
+            ],
+            order: vec![shell.resource_id],
+            focused: Some(shell.resource_id),
+        };
+        registry.admit_terminals(task_id, &strip).unwrap();
+
+        let state = registry.state(task_id).unwrap();
+        assert_eq!(state.focused_resource(), Some(shell.resource_id));
+        assert!(
+            state.latest_terminal().is_none(),
+            "the newly focused terminal has no screen yet; the provider's must not stand in for it"
         );
     }
 

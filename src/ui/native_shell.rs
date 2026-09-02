@@ -72,7 +72,9 @@ use crate::domain::command::{
 use crate::domain::event::DomainEvent;
 use crate::domain::host::{HostQuitInspection, HostQuitWorktreeInspection};
 use crate::domain::id::SubscriptionId;
-use crate::domain::id::{AgentSessionId, CommandId, ProjectId, RequestId, TaskId, TerminalId};
+use crate::domain::id::{
+    AgentSessionId, CommandId, ProjectId, RequestId, ResourceId, TaskId, TerminalId,
+};
 use crate::domain::task::VisibleTaskStatus;
 use crate::domain::ClientId;
 use crate::host::IpcError;
@@ -2760,6 +2762,84 @@ type ProviderSetupInputCompletion = Arc<Mutex<Option<Result<InputAck, String>>>>
 /// runtime generation and a zero launch action epoch). The host decides
 /// whether that shape is admissible for the terminal it addresses; the client
 /// never invents a fence to make one fit.
+/// Which of a Task's terminals one client-side pending record belongs to.
+///
+/// The provider slot is addressed by the legacy provider-only cockpit queries
+/// (`Terminal`, `TerminalScroll`, `TerminalResize`, `TerminalReadiness`), and
+/// those carry no resource id at all -- a retry armed before any projection
+/// has landed has no `ResourceId` to name. Spelling the provider slot as a
+/// distinct variant rather than a reserved `ResourceId` keeps "the provider"
+/// and "this exact resource" two facts that cannot be confused, and mirrors
+/// exactly the two query families the host offers.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum TerminalTarget {
+    Provider,
+    Resource(ResourceId),
+}
+
+/// Owner-qualified identity of one terminal surface on one host.
+type TerminalKey = (HostTaskKey, TerminalTarget);
+
+impl TerminalTarget {
+    /// The terminal a projection describes.
+    ///
+    /// Shell recognition is the one shared rule on the projection itself, so a
+    /// projection decoded from a host that predates plain shells still keys as
+    /// the provider slot -- which is the only terminal such a host has.
+    fn for_projection(projection: &crate::domain::TaskTerminalProjection) -> Self {
+        if projection.is_plain_shell() {
+            Self::Resource(projection.resource_id)
+        } else {
+            Self::Provider
+        }
+    }
+
+    /// The terminal a screen-producing cockpit query addresses, or `None` when
+    /// the query is not one. Resize is deliberately absent: a resize reply is
+    /// not admitted as a screen, exactly as before plain shells.
+    fn for_screen_query(query: &TaskCockpitQuery) -> Option<Self> {
+        match query {
+            TaskCockpitQuery::Terminal
+            | TaskCockpitQuery::TerminalScroll { .. }
+            | TaskCockpitQuery::TerminalReadiness => Some(Self::Provider),
+            TaskCockpitQuery::TerminalFor { resource_id }
+            | TaskCockpitQuery::TerminalScrollFor { resource_id, .. }
+            | TaskCockpitQuery::TerminalReadinessFor { resource_id } => {
+                Some(Self::Resource(*resource_id))
+            }
+            _ => None,
+        }
+    }
+
+    /// The bounded screen query that addresses this exact terminal.
+    fn screen_query(self) -> TaskCockpitQuery {
+        match self {
+            Self::Provider => TaskCockpitQuery::Terminal,
+            Self::Resource(resource_id) => TaskCockpitQuery::TerminalFor { resource_id },
+        }
+    }
+
+    /// The readiness query that addresses this exact terminal.
+    fn readiness_query(self) -> TaskCockpitQuery {
+        match self {
+            Self::Provider => TaskCockpitQuery::TerminalReadiness,
+            Self::Resource(resource_id) => TaskCockpitQuery::TerminalReadinessFor { resource_id },
+        }
+    }
+
+    /// The resize query that addresses this exact terminal.
+    fn resize_query(self, cols: u16, rows: u16) -> TaskCockpitQuery {
+        match self {
+            Self::Provider => TaskCockpitQuery::TerminalResize { cols, rows },
+            Self::Resource(resource_id) => TaskCockpitQuery::TerminalResizeFor {
+                resource_id,
+                cols,
+                rows,
+            },
+        }
+    }
+}
+
 fn terminal_input_request(
     client_id: ClientId,
     terminal: &crate::domain::TaskTerminalProjection,
@@ -10538,20 +10618,20 @@ pub struct NativeShell {
     terminal_selections: BTreeMap<HostTaskKey, crate::terminal::view::TerminalSelection>,
     /// Last resize requested for each owner while the host projection catches
     /// up. This prevents GPUI paint churn from flooding identical PTY resizes.
-    pending_terminal_resizes: BTreeMap<HostTaskKey, (u16, u16)>,
+    pending_terminal_resizes: BTreeMap<TerminalKey, (u16, u16)>,
     /// Owner-qualified retries for a provider runtime that reported
     /// TerminalStartPending. Empty during ordinary idle operation.
-    pending_terminal_requeries: BTreeMap<HostTaskKey, Instant>,
+    pending_terminal_requeries: BTreeMap<TerminalKey, Instant>,
     /// Owner currently dragging a terminal selection, if any.
     selecting_terminal_owner: Option<HostTaskKey>,
     /// Printable bytes accepted from the native input handler but not yet
     /// reflected by a canonical host terminal projection. This is a bounded
     /// paint-only echo; the next newer host sequence replaces it.
-    pending_terminal_echoes: BTreeMap<HostTaskKey, PendingTerminalEcho>,
+    pending_terminal_echoes: BTreeMap<TerminalKey, PendingTerminalEcho>,
     /// Optimistic per-terminal input sequence reservation. The host still
     /// validates every exact fence; this only prevents rapid local keystrokes
     /// from reusing one projection's last accepted sequence before its refresh.
-    pending_terminal_input_cursors: BTreeMap<HostTaskKey, PendingTerminalInputCursor>,
+    pending_terminal_input_cursors: BTreeMap<TerminalKey, PendingTerminalInputCursor>,
     /// Exact center terminal most recently clicked for keyboard input. GPUI's
     /// canvas selection can retain an earlier AccessKit row focus, so this
     /// owner-qualified arm keeps ordinary keydown delivery deterministic.
@@ -13681,17 +13761,29 @@ impl NativeShell {
                     }
                 }
                 if let Some((_, task_id, query)) = command_parts {
-                    if !matches!(
+                    // Scroll answers a screen too, but only the plain screen
+                    // and readiness queries settle a start-pending retry, and
+                    // that is true of their resource-addressed siblings as well.
+                    let settles_start = matches!(
                         query,
-                        TaskCockpitQuery::Terminal | TaskCockpitQuery::TerminalReadiness
-                    ) {
+                        TaskCockpitQuery::Terminal
+                            | TaskCockpitQuery::TerminalReadiness
+                            | TaskCockpitQuery::TerminalFor { .. }
+                            | TaskCockpitQuery::TerminalReadinessFor { .. }
+                    );
+                    if !settles_start {
                         // Other cockpit queries are applied below.
                     } else if !matches!(&result, crate::domain::TaskCockpitResult::Terminal(_)) {
                         let owner = self.local_task_key(task_id);
+                        let key = (
+                            owner.clone(),
+                            TerminalTarget::for_screen_query(&query)
+                                .unwrap_or(TerminalTarget::Provider),
+                        );
                         if first_send_terminal_probe_start_pending(&result) {
-                            self.schedule_terminal_start_retry(owner);
+                            self.schedule_terminal_start_retry(key);
                         } else {
-                            self.pending_terminal_requeries.remove(&owner);
+                            self.pending_terminal_requeries.remove(&key);
                             self.task_surfaces.note_terminal_reconnecting(owner);
                         }
                         if self.local_slot_mut().interaction.selected_task() == Some(task_id) {
@@ -13731,9 +13823,14 @@ impl NativeShell {
                     return;
                 }
 
+                if let crate::domain::TaskCockpitResult::TaskTerminals(strip) = &result {
+                    let local = self.local_host_id();
+                    self.admit_owner_task_terminals(&local, action, strip);
+                }
                 if let crate::domain::TaskCockpitResult::Terminal(projection) = &result {
                     let owner = self.local_task_key(projection.task_id);
-                    self.pending_terminal_requeries.remove(&owner);
+                    self.pending_terminal_requeries
+                        .remove(&(owner.clone(), TerminalTarget::for_projection(projection)));
                     if command_task_id != Some(projection.task_id)
                         || self
                             .task_surfaces
@@ -13802,7 +13899,10 @@ impl NativeShell {
                     self.refresh_accessibility_tree();
                 }
                 if let crate::domain::TaskCockpitResult::Terminal(projection) = &result {
-                    let model = self.local_slot().client_model.clone();
+                    let model = self
+                        .local_terminal_projection_is_focused(projection)
+                        .then(|| self.local_slot().client_model.clone())
+                        .flatten();
                     if let Some(model) = model {
                         match self
                             .local_slot_mut()
@@ -14080,12 +14180,39 @@ impl NativeShell {
         self.dispatch_related_actions(requests);
     }
 
-    fn schedule_terminal_start_retry(&mut self, owner: HostTaskKey) {
+    /// Whether the local grid is currently showing the terminal this
+    /// projection describes. A live answer for any other terminal on the task
+    /// is a legitimate reply that simply is not on screen.
+    fn local_terminal_projection_is_focused(
+        &self,
+        projection: &crate::domain::TaskTerminalProjection,
+    ) -> bool {
+        let owner = self.local_task_key(projection.task_id);
         self.task_surfaces
-            .ensure_task(owner.clone())
+            .state(owner)
+            .and_then(|state| state.focused_resource())
+            .is_none_or(|focused| focused == projection.resource_id)
+    }
+
+    /// The terminal an owner's surface is currently showing.
+    ///
+    /// Before any projection has been admitted this is the provider slot,
+    /// which is exactly what the legacy provider-only queries address and what
+    /// the client did before plain shells existed.
+    fn focused_terminal_target(&self, owner: &HostTaskKey) -> TerminalTarget {
+        self.task_surfaces
+            .state(owner.clone())
+            .and_then(|state| state.latest_terminal())
+            .map(TerminalTarget::for_projection)
+            .unwrap_or(TerminalTarget::Provider)
+    }
+
+    fn schedule_terminal_start_retry(&mut self, key: TerminalKey) {
+        self.task_surfaces
+            .ensure_task(key.0.clone())
             .note_terminal_start_pending();
         self.pending_terminal_requeries
-            .insert(owner, Instant::now() + TERMINAL_START_RETRY_INTERVAL);
+            .insert(key, Instant::now() + TERMINAL_START_RETRY_INTERVAL);
     }
 
     fn retry_due_terminal_queries(&mut self, now: Instant) -> bool {
@@ -14095,20 +14222,22 @@ impl NativeShell {
         let due = self
             .pending_terminal_requeries
             .iter()
-            .filter_map(|(owner, deadline)| (*deadline <= now).then_some(owner.clone()))
+            .filter_map(|(key, deadline)| (*deadline <= now).then_some(key.clone()))
             .collect::<Vec<_>>();
         let mut dispatched = false;
-        for owner in due {
-            self.pending_terminal_requeries.remove(&owner);
+        for key in due {
+            self.pending_terminal_requeries.remove(&key);
+            let owner = key.0.clone();
+            let target = key.1;
             let visible = self
                 .layout
                 .task_workspace
                 .as_ref()
                 .is_some_and(|workspace| workspace.contains_task(owner.clone()))
                 && self.task_center_terminal_preference(&owner);
-            if self.pending_terminal_echoes.contains_key(&owner) {
+            if self.pending_terminal_echoes.contains_key(&key) {
                 if !visible {
-                    self.pending_terminal_echoes.remove(&owner);
+                    self.pending_terminal_echoes.remove(&key);
                     continue;
                 }
                 let query_in_flight = self
@@ -14117,7 +14246,7 @@ impl NativeShell {
                     .is_some_and(|surface| surface.terminal_query_in_flight());
                 if query_in_flight {
                     self.pending_terminal_requeries
-                        .insert(owner, now + TERMINAL_ECHO_RETRY_INTERVAL);
+                        .insert(key, now + TERMINAL_ECHO_RETRY_INTERVAL);
                     continue;
                 }
                 self.task_surfaces
@@ -14127,14 +14256,14 @@ impl NativeShell {
                         &owner.host,
                         ActionRequest::TaskCockpit {
                             task_id: owner.task_id,
-                            query: TaskCockpitQuery::Terminal,
+                            query: target.screen_query(),
                         },
                     )
                     .is_ok()
                 {
                     dispatched = true;
                 } else {
-                    self.pending_terminal_echoes.remove(&owner);
+                    self.pending_terminal_echoes.remove(&key);
                     self.task_surfaces.note_terminal_reconnecting(owner);
                 }
                 continue;
@@ -14157,7 +14286,7 @@ impl NativeShell {
                     &owner.host,
                     ActionRequest::TaskCockpit {
                         task_id: owner.task_id,
-                        query: TaskCockpitQuery::TerminalReadiness,
+                        query: target.readiness_query(),
                     },
                 )
                 .is_ok()
@@ -15869,6 +15998,10 @@ impl NativeShell {
             NativeActionRecord,
             crate::domain::cockpit::TaskTerminalProjection,
         )> = None;
+        let mut pending_task_terminals: Option<(
+            NativeActionRecord,
+            crate::domain::cockpit::TaskTerminalsProjection,
+        )> = None;
         let mut pending_terminal_input_ack: Option<(NativeActionRecord, InputAck)> = None;
         let mut pending_repo_catalog: Option<TaskGitRepositoriesProjection> = None;
         let mut pending_header_commit_result: Option<(
@@ -16056,16 +16189,15 @@ impl NativeShell {
                                     &action.command,
                                 )
                                 .is_some_and(|(_request_id, task_id, query)| {
-                                    matches!(
-                                        query,
-                                        TaskCockpitQuery::Terminal
-                                            | TaskCockpitQuery::TerminalScroll { .. }
-                                            | TaskCockpitQuery::TerminalReadiness
-                                    ) && task_id == projection.task_id
+                                    TerminalTarget::for_screen_query(&query).is_some()
+                                        && task_id == projection.task_id
                                 });
                                 if admits_terminal {
                                     pending_terminal = Some((action.clone(), projection.clone()));
                                 }
+                            }
+                            if let crate::domain::TaskCockpitResult::TaskTerminals(strip) = result {
+                                pending_task_terminals = Some((action.clone(), strip.clone()));
                             }
                         }
                         _ => {}
@@ -16157,14 +16289,22 @@ impl NativeShell {
             {
                 if matches!(
                     query,
-                    TaskCockpitQuery::Terminal | TaskCockpitQuery::TerminalReadiness
+                    TaskCockpitQuery::Terminal
+                        | TaskCockpitQuery::TerminalReadiness
+                        | TaskCockpitQuery::TerminalFor { .. }
+                        | TaskCockpitQuery::TerminalReadinessFor { .. }
                 ) && !matches!(result, crate::domain::TaskCockpitResult::Terminal(_))
                 {
                     let owner = HostTaskKey::new(host_id.clone(), task_id);
+                    let key = (
+                        owner.clone(),
+                        TerminalTarget::for_screen_query(&query)
+                            .unwrap_or(TerminalTarget::Provider),
+                    );
                     if first_send_terminal_probe_start_pending(result) {
-                        self.schedule_terminal_start_retry(owner);
+                        self.schedule_terminal_start_retry(key);
                     } else {
-                        self.pending_terminal_requeries.remove(&owner);
+                        self.pending_terminal_requeries.remove(&key);
                         self.task_surfaces.note_terminal_reconnecting(owner);
                     }
                 }
@@ -16173,6 +16313,9 @@ impl NativeShell {
         if let Some(catalog) = pending_repo_catalog {
             let key = HostTaskKey::new(host_id.clone(), catalog.task_id);
             self.apply_repository_catalog_for_owner(&key, &catalog);
+        }
+        if let Some((action, strip)) = pending_task_terminals {
+            self.admit_owner_task_terminals(host_id, &action, &strip);
         }
         if let Some((action, projection)) = pending_terminal {
             self.admit_owner_terminal_projection(host_id, &action, &projection);
@@ -16358,16 +16501,12 @@ impl NativeShell {
         else {
             return;
         };
-        if !matches!(
-            query,
-            TaskCockpitQuery::Terminal
-                | TaskCockpitQuery::TerminalScroll { .. }
-                | TaskCockpitQuery::TerminalReadiness
-        ) {
+        let Some(target) = TerminalTarget::for_screen_query(&query) else {
             return;
-        }
+        };
         let owner = HostTaskKey::new(host_id.clone(), task_id);
-        self.pending_terminal_requeries.remove(&owner);
+        self.pending_terminal_requeries
+            .remove(&(owner.clone(), target));
         self.task_surfaces.note_terminal_reconnecting(owner);
         if host_id == &self.local_host_id()
             && self.local_slot().interaction.selected_task() == Some(task_id)
@@ -16389,19 +16528,15 @@ impl NativeShell {
         else {
             return;
         };
-        if !matches!(
-            query,
-            TaskCockpitQuery::Terminal
-                | TaskCockpitQuery::TerminalScroll { .. }
-                | TaskCockpitQuery::TerminalReadiness
-        ) {
+        if TerminalTarget::for_screen_query(&query).is_none() {
             return;
         }
         if command_task != projection.task_id {
             return;
         }
         let owner = HostTaskKey::new(host_id.clone(), projection.task_id);
-        self.pending_terminal_requeries.remove(&owner);
+        self.pending_terminal_requeries
+            .remove(&(owner.clone(), TerminalTarget::for_projection(projection)));
         let codex_setup_required = self
             .host_slot(host_id)
             .and_then(|slot| slot.client_model.as_ref())
@@ -16438,6 +16573,16 @@ impl NativeShell {
             return;
         }
         self.settle_pending_terminal_echo(&owner, projection);
+        // The grid renders exactly one chip, so a live answer for a terminal
+        // that is not the focused one is a legitimate reply that simply is not
+        // on screen -- never an overwrite of the visible replica.
+        let focused = self
+            .task_surfaces
+            .state(owner.clone())
+            .and_then(|state| state.focused_resource());
+        if focused.is_some_and(|focused| focused != projection.resource_id) {
+            return;
+        }
         let model = self
             .host_slot(host_id)
             .and_then(|slot| slot.client_model.clone());
@@ -16463,6 +16608,92 @@ impl NativeShell {
         if host_id == &self.local_host_id() {
             self.sync_terminal_from_cockpit();
         }
+    }
+
+    /// Admit the Task's terminal strip for one exact owner.
+    ///
+    /// The strip is the host's authority on which terminals exist and which
+    /// one is focused, so admitting it can retire a retained screen. When the
+    /// focused terminal actually changes, the dock is pointed at the new
+    /// resource -- which drops the previous terminal's replica and sequence --
+    /// and that terminal's screen is queried. `focused: None` is a valid strip
+    /// state and issues no screen query: the strip UI renders the splash.
+    fn admit_owner_task_terminals(
+        &mut self,
+        host_id: &HostId,
+        action: &NativeActionRecord,
+        projection: &crate::domain::cockpit::TaskTerminalsProjection,
+    ) {
+        let Some((_request_id, command_task, query)) =
+            Self::task_cockpit_command_parts(&action.command)
+        else {
+            return;
+        };
+        if !matches!(query, TaskCockpitQuery::TaskTerminals) {
+            return;
+        }
+        if command_task != projection.task_id {
+            return;
+        }
+        let owner = HostTaskKey::new(host_id.clone(), projection.task_id);
+        let previous = self
+            .task_surfaces
+            .state(owner.clone())
+            .and_then(|state| state.focused_resource());
+        if self
+            .task_surfaces
+            .admit_terminals(owner.clone(), projection)
+            .is_err()
+        {
+            return;
+        }
+        // Dock focus is per-selected-task presentation state. Applying it for
+        // an unselected owner would rewrite the visible task's memory.
+        if self.selected_task_key.as_ref() != Some(&owner) {
+            return;
+        }
+        if !self
+            .host_slot(host_id)
+            .is_some_and(|slot| slot.interaction.selected_task() == Some(projection.task_id))
+        {
+            return;
+        }
+        let focused = self
+            .task_surfaces
+            .state(owner.clone())
+            .and_then(|state| state.focused_resource());
+        if focused == previous {
+            return;
+        }
+        if let Some(slot) = self.host_slot_mut(host_id) {
+            slot.cockpit.dock_mut().set_focused_terminal(focused);
+        }
+        let Some(resource_id) = focused else {
+            return;
+        };
+        // The chip list says which slot the newly focused resource is. It comes
+        // from a host that answers TaskTerminals at all, so `is_provider` here
+        // is a real answer rather than a decode default.
+        let target = if projection
+            .terminals
+            .iter()
+            .any(|chip| chip.resource_id == resource_id && chip.is_provider)
+        {
+            TerminalTarget::Provider
+        } else {
+            TerminalTarget::Resource(resource_id)
+        };
+        self.task_surfaces
+            .note_terminal_query_started(owner.clone());
+        let _ = self.dispatch_action_recorded_for_owner_inner(
+            host_id,
+            ActionRequest::TaskCockpit {
+                task_id: owner.task_id,
+                query: target.screen_query(),
+            },
+            true,
+            NativeActionPurpose::Ordinary,
+        );
     }
 
     /// Shared draft/composer settlement for Accepted/Failed outcomes on any owner.
@@ -20617,9 +20848,10 @@ impl NativeShell {
             Some(NativeHostRuntimeAttachment::Injected(_)) => ClientId::new(),
             _ => return false,
         };
+        let key = (owner.clone(), TerminalTarget::for_projection(&terminal));
         let cursor = self
             .pending_terminal_input_cursors
-            .get(&owner)
+            .get(&key)
             .copied()
             .filter(|cursor| {
                 cursor.terminal_id == terminal.terminal_id
@@ -20661,7 +20893,7 @@ impl NativeShell {
         match enqueue_result {
             NativeHostActionResult::Queued => {
                 self.pending_terminal_input_cursors.insert(
-                    owner.clone(),
+                    key.clone(),
                     PendingTerminalInputCursor {
                         terminal_id: terminal.terminal_id,
                         resource_generation: terminal.resource_generation,
@@ -20669,7 +20901,7 @@ impl NativeShell {
                         next_sequence: input_sequence,
                     },
                 );
-                self.note_pending_terminal_echo(&owner, &text);
+                self.note_pending_terminal_echo(&key, &text);
                 if let Some(slot) = self.host_slot_mut(&owner.host) {
                     slot.composer_error = None;
                 }
@@ -20777,7 +21009,9 @@ impl NativeShell {
             });
         match self.dispatch_action_checked(request) {
             Ok(()) => {
-                self.note_pending_terminal_echo(owner, &text);
+                // This path is the provider's own composer input, so its echo
+                // belongs to the provider slot by construction.
+                self.note_pending_terminal_echo(&(owner.clone(), TerminalTarget::Provider), &text);
                 self.local_slot_mut().composer_error = None;
                 self.task_surfaces
                     .note_terminal_query_started(owner.clone());
@@ -20793,18 +21027,16 @@ impl NativeShell {
                 true
             }
             Err(failure) => {
-                self.pending_terminal_echoes.remove(owner);
+                self.pending_terminal_echoes
+                    .remove(&(owner.clone(), TerminalTarget::Provider));
                 self.local_slot_mut().composer_error = Some(failure.message);
                 false
             }
         }
     }
 
-    fn note_pending_terminal_echo(&mut self, owner: &HostTaskKey, input: &str) {
-        let latest_terminal = self
-            .task_surfaces
-            .state(owner.clone())
-            .and_then(|state| state.latest_terminal());
+    fn note_pending_terminal_echo(&mut self, key: &TerminalKey, input: &str) {
+        let latest_terminal = self.terminal_projection_for(key);
         let after_sequence = latest_terminal.map_or(0, |projection| projection.sequence);
         let anchor = latest_terminal
             .and_then(|projection| projection.screen.cursor)
@@ -20812,7 +21044,7 @@ impl NativeShell {
             .unwrap_or((0, 0));
         let pending = self
             .pending_terminal_echoes
-            .entry(owner.clone())
+            .entry(key.clone())
             .or_insert_with(|| PendingTerminalEcho {
                 text: String::new(),
                 after_sequence,
@@ -20833,7 +21065,22 @@ impl NativeShell {
             }
         }
         if pending.text.is_empty() {
-            self.pending_terminal_echoes.remove(owner);
+            self.pending_terminal_echoes.remove(key);
+        }
+    }
+
+    /// The retained screen for one exact terminal on one owner.
+    fn terminal_projection_for(
+        &self,
+        key: &TerminalKey,
+    ) -> Option<&crate::domain::TaskTerminalProjection> {
+        let state = self.task_surfaces.state(key.0.clone())?;
+        match key.1 {
+            TerminalTarget::Provider => state
+                .terminals
+                .values()
+                .find(|terminal| !terminal.is_plain_shell()),
+            TerminalTarget::Resource(resource_id) => state.terminals.get(&resource_id),
         }
     }
 
@@ -20842,8 +21089,9 @@ impl NativeShell {
         owner: &HostTaskKey,
         projection: &crate::domain::TaskTerminalProjection,
     ) {
+        let key = (owner.clone(), TerminalTarget::for_projection(projection));
         let should_retry = {
-            let Some(pending) = self.pending_terminal_echoes.get_mut(owner) else {
+            let Some(pending) = self.pending_terminal_echoes.get_mut(&key) else {
                 return;
             };
             if projection.sequence <= pending.after_sequence {
@@ -20869,9 +21117,9 @@ impl NativeShell {
         };
         if should_retry {
             self.pending_terminal_requeries
-                .insert(owner.clone(), Instant::now() + TERMINAL_ECHO_RETRY_INTERVAL);
+                .insert(key, Instant::now() + TERMINAL_ECHO_RETRY_INTERVAL);
         } else {
-            self.pending_terminal_echoes.remove(owner);
+            self.pending_terminal_echoes.remove(&key);
         }
     }
 
@@ -20927,9 +21175,20 @@ impl NativeShell {
             return;
         };
         let owner = HostTaskKey::new(host_id.clone(), request.context.task_id);
+        // The request's own fence says which terminal it addressed: a shell
+        // carries the documented zero sentinels, the provider carries a real
+        // agent session and runtime generation.
+        let key = (
+            owner.clone(),
+            if request.context.is_plain_shell_fence() {
+                TerminalTarget::Resource(request.context.resource_id)
+            } else {
+                TerminalTarget::Provider
+            },
+        );
         match ack {
             InputAck::Accepted { sequence } | InputAck::Duplicate { sequence } => {
-                if let Some(cursor) = self.pending_terminal_input_cursors.get_mut(&owner) {
+                if let Some(cursor) = self.pending_terminal_input_cursors.get_mut(&key) {
                     if cursor.terminal_id == request.terminal_id
                         && cursor.resource_generation == request.context.resource_generation
                         && cursor.runtime_generation == request.context.runtime_generation
@@ -20946,19 +21205,18 @@ impl NativeShell {
                     host_id,
                     ActionRequest::TaskCockpit {
                         task_id: request.context.task_id,
-                        query: TaskCockpitQuery::Terminal,
+                        query: key.1.screen_query(),
                     },
                     true,
                     NativeActionPurpose::Ordinary,
                 );
             }
             InputAck::Rejected { reason } => {
-                self.pending_terminal_input_cursors.remove(&owner);
-                self.pending_terminal_echoes.remove(&owner);
+                self.pending_terminal_input_cursors.remove(&key);
+                self.pending_terminal_echoes.remove(&key);
                 if let Some(slot) = self.host_slot_mut(host_id) {
-                    slot.composer_error = Some(format!(
-                        "The provider terminal rejected that input ({reason:?})."
-                    ));
+                    slot.composer_error =
+                        Some(format!("The terminal rejected that input ({reason:?})."));
                 }
             }
         }
@@ -21185,8 +21443,9 @@ impl NativeShell {
         owner: &HostTaskKey,
         mut pane: crate::terminal::view::TerminalPaneModel,
     ) -> crate::terminal::view::TerminalPaneModel {
+        let echo_key = (owner.clone(), self.focused_terminal_target(owner));
         if let (Some(pending), Some(session)) = (
-            self.pending_terminal_echoes.get(owner),
+            self.pending_terminal_echoes.get(&echo_key),
             pane.session.as_mut(),
         ) {
             overlay_pending_terminal_echo(&mut session.screen, &pending.text);
@@ -25557,21 +25816,25 @@ impl NativeShell {
         rows: u16,
     ) -> bool {
         let desired = (cols, rows);
-        let current = self
+        let focused = self
             .task_surfaces
             .state(owner.clone())
-            .and_then(|state| state.latest_terminal())
-            .map(|terminal| {
-                (
-                    terminal.screen.cols.clamp(1, u16::MAX as usize) as u16,
-                    terminal.screen.rows.clamp(1, u16::MAX as usize) as u16,
-                )
-            });
+            .and_then(|state| state.latest_terminal());
+        let target = focused
+            .map(TerminalTarget::for_projection)
+            .unwrap_or(TerminalTarget::Provider);
+        let current = focused.map(|terminal| {
+            (
+                terminal.screen.cols.clamp(1, u16::MAX as usize) as u16,
+                terminal.screen.rows.clamp(1, u16::MAX as usize) as u16,
+            )
+        });
+        let key = (owner.clone(), target);
         if current == Some(desired) {
-            self.pending_terminal_resizes.remove(owner);
+            self.pending_terminal_resizes.remove(&key);
             return false;
         }
-        if self.pending_terminal_resizes.get(owner) == Some(&desired) {
+        if self.pending_terminal_resizes.get(&key) == Some(&desired) {
             return false;
         }
         let dispatched = self
@@ -25579,14 +25842,14 @@ impl NativeShell {
                 &owner.host,
                 ActionRequest::TaskCockpit {
                     task_id: owner.task_id,
-                    query: TaskCockpitQuery::TerminalResize { cols, rows },
+                    query: target.resize_query(cols, rows),
                 },
                 true,
                 NativeActionPurpose::Ordinary,
             )
             .is_ok();
         if dispatched {
-            self.pending_terminal_resizes.insert(owner.clone(), desired);
+            self.pending_terminal_resizes.insert(key, desired);
         }
         dispatched
     }
@@ -29704,12 +29967,12 @@ impl NativeShell {
             );
             return;
         };
-        let Some(resource) = snapshot.resources.values().find(|resource| {
-            resource.task_id == Some(task_id)
-                && resource.resource_kind == crate::domain::ResourceKind::Terminal
-                && resource.lifecycle == crate::domain::ResourceLifecycle::Active
-                && resource.runtime_generation == agent.runtime_generation
-        }) else {
+        // A task's plain shells are Active Terminal resources at the agent's own
+        // runtime generation, so a bare search here picks one the moment a user
+        // opens a terminal tab. Defer to the one shared provider rule instead.
+        let Ok(Some(resource)) =
+            crate::domain::agent_resource::provider_terminal_resource(snapshot, agent)
+        else {
             self.cancel_pending_draft_first_send_for_host(
                 host_id,
                 "Couldn't find an active terminal resource for first send. Draft kept.",
@@ -43429,6 +43692,148 @@ fn enqueue_pending_preference(
         pending.pop_front();
     }
     pending.push_back(preferences);
+}
+
+#[cfg(test)]
+mod terminal_target_tests {
+    use super::TerminalTarget;
+    use crate::domain::cockpit::{TaskCockpitQuery, TaskTerminalProjection};
+    use crate::domain::id::{AgentSessionId, ResourceId, TaskId, TerminalId};
+
+    fn projection(is_provider: bool, resource_id: ResourceId) -> TaskTerminalProjection {
+        TaskTerminalProjection {
+            task_id: TaskId::new(),
+            terminal_id: TerminalId::new(),
+            session_id: crate::terminal::protocol::TerminalSessionId::new(),
+            agent_session_id: if is_provider {
+                AgentSessionId::new()
+            } else {
+                AgentSessionId::nil()
+            },
+            resource_id,
+            runtime_generation: if is_provider { 1 } else { 0 },
+            resource_generation: 1,
+            action_epoch: if is_provider { 1 } else { 0 },
+            focus_epoch: crate::terminal::protocol::FocusEpoch::initial(),
+            accepted_input_sequence: 0,
+            accepts_input_without_conversation_id: false,
+            sequence: 1,
+            title: None,
+            text_lines: Vec::new(),
+            screen: crate::terminal::session::TerminalScreenSnapshot::default(),
+            is_provider,
+            runtime_state: crate::domain::cockpit::TerminalRuntimeStateWire::Running,
+        }
+    }
+
+    /// The whole per-terminal keying rests on this: a pending record armed
+    /// when a query goes out must be found again when that query's projection
+    /// comes back. The provider slot is named two different ways on the wire
+    /// -- a legacy unit query, and a projection carrying a real resource id --
+    /// and both must key identically or a retry armed by one is never retired
+    /// by the other.
+    #[test]
+    fn a_provider_query_and_its_projection_key_to_the_same_terminal() {
+        let target = TerminalTarget::for_screen_query(&TaskCockpitQuery::Terminal);
+        assert_eq!(target, Some(TerminalTarget::Provider));
+        assert_eq!(
+            TerminalTarget::for_projection(&projection(true, ResourceId::new())),
+            TerminalTarget::Provider
+        );
+        assert_eq!(
+            TerminalTarget::for_screen_query(&TaskCockpitQuery::TerminalReadiness),
+            Some(TerminalTarget::Provider)
+        );
+        assert_eq!(
+            TerminalTarget::for_screen_query(&TaskCockpitQuery::TerminalScroll { delta_lines: -3 }),
+            Some(TerminalTarget::Provider)
+        );
+        assert!(matches!(
+            TerminalTarget::Provider.screen_query(),
+            TaskCockpitQuery::Terminal
+        ));
+    }
+
+    #[test]
+    fn a_shell_query_and_its_projection_key_to_the_same_terminal() {
+        let resource_id = ResourceId::new();
+        assert_eq!(
+            TerminalTarget::for_projection(&projection(false, resource_id)),
+            TerminalTarget::Resource(resource_id)
+        );
+        assert_eq!(
+            TerminalTarget::for_screen_query(&TaskCockpitQuery::TerminalFor { resource_id }),
+            Some(TerminalTarget::Resource(resource_id))
+        );
+        assert_eq!(
+            TerminalTarget::Resource(resource_id).screen_query(),
+            TaskCockpitQuery::TerminalFor { resource_id }
+        );
+        assert_eq!(
+            TerminalTarget::Resource(resource_id).readiness_query(),
+            TaskCockpitQuery::TerminalReadinessFor { resource_id }
+        );
+        assert_eq!(
+            TerminalTarget::Resource(resource_id).resize_query(80, 24),
+            TaskCockpitQuery::TerminalResizeFor {
+                resource_id,
+                cols: 80,
+                rows: 24
+            }
+        );
+    }
+
+    /// A projection from a host that predates plain shells decodes with
+    /// `is_provider: false` and still carries a real agent session. Keying it
+    /// as a shell would strand every retry armed by the legacy query it
+    /// answered.
+    #[test]
+    fn an_older_hosts_provider_projection_still_keys_as_the_provider_slot() {
+        let mut legacy = projection(true, ResourceId::new());
+        legacy.is_provider = false;
+        assert_eq!(
+            TerminalTarget::for_projection(&legacy),
+            TerminalTarget::Provider
+        );
+    }
+
+    /// Two shells on one task are two independent surfaces. Nothing about
+    /// them may collapse to one key, or a keystroke echo on one paints on the
+    /// other.
+    #[test]
+    fn two_shells_on_one_task_never_share_a_key() {
+        let first = projection(false, ResourceId::new());
+        let second = projection(false, ResourceId::new());
+        assert_ne!(
+            TerminalTarget::for_projection(&first),
+            TerminalTarget::for_projection(&second)
+        );
+    }
+
+    /// Resize does not produce a screen, so it must not be admitted as one --
+    /// the behaviour before plain shells, preserved for both query families.
+    #[test]
+    fn resize_is_not_a_screen_query() {
+        assert_eq!(
+            TerminalTarget::for_screen_query(&TaskCockpitQuery::TerminalResize {
+                cols: 80,
+                rows: 24
+            }),
+            None
+        );
+        assert_eq!(
+            TerminalTarget::for_screen_query(&TaskCockpitQuery::TerminalResizeFor {
+                resource_id: ResourceId::new(),
+                cols: 80,
+                rows: 24
+            }),
+            None
+        );
+        assert_eq!(
+            TerminalTarget::for_screen_query(&TaskCockpitQuery::TaskTerminals),
+            None
+        );
+    }
 }
 
 #[cfg(test)]
@@ -63540,6 +63945,8 @@ mod tests {
                     "fixture must reproduce the between-turn terminal state"
                 );
                 assert!(shell.dispatch_provider_terminal_text("x".into()));
+                // Every terminal in this fixture is the task's provider slot.
+                let provider_key = (owner.clone(), super::TerminalTarget::Provider);
 
                 let terminal_input_action = shared
                     .lock()
@@ -63562,7 +63969,7 @@ mod tests {
                     .cloned()
                     .expect("exact raw terminal input");
                 assert!(
-                    shell.pending_terminal_input_cursors.get(&owner).is_some_and(|cursor| {
+                    shell.pending_terminal_input_cursors.get(&provider_key).is_some_and(|cursor| {
                         cursor.next_sequence == 1
                             && cursor.runtime_generation
                                 == snapshot.agents[&agent_id].runtime_generation
@@ -63596,7 +64003,7 @@ mod tests {
                 assert_eq!(
                     shell
                         .pending_terminal_echoes
-                        .get(&owner)
+                        .get(&provider_key)
                         .map(|pending| pending.text.as_str()),
                     Some("x"),
                     "the local echo remains visible until a newer canonical projection arrives"
@@ -63623,11 +64030,11 @@ mod tests {
                     };
                 shell.settle_pending_terminal_echo(&owner, &unmatched_projection);
                 assert!(
-                    shell.pending_terminal_echoes.contains_key(&owner),
+                    shell.pending_terminal_echoes.contains_key(&provider_key),
                     "a refresh that raced ahead of PTY echo must keep the instant paint-only echo"
                 );
                 assert!(
-                    shell.pending_terminal_requeries.contains_key(&owner),
+                    shell.pending_terminal_requeries.contains_key(&provider_key),
                     "an unmatched frame must arm a short event-driven terminal requery"
                 );
                 let canonical_projection = crate::domain::cockpit::TaskTerminalProjection {
@@ -63650,7 +64057,7 @@ mod tests {
                 };
                 shell.settle_pending_terminal_echo(&owner, &canonical_projection);
                 assert!(
-                    !shell.pending_terminal_echoes.contains_key(&owner),
+                    !shell.pending_terminal_echoes.contains_key(&provider_key),
                     "a newer canonical PTY projection must retire the paint-only echo instead of duplicating it"
                 );
             });

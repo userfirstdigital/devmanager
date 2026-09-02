@@ -743,6 +743,23 @@ pub struct TaskTerminalProjection {
     pub runtime_state: TerminalRuntimeStateWire,
 }
 
+impl TaskTerminalProjection {
+    /// Whether this projection describes a plain shell rather than the Task's
+    /// provider slot.
+    ///
+    /// This is the one rule every client path must use, and it is deliberately
+    /// not `!is_provider`. That field defaults to `false` when a projection is
+    /// decoded from a host that predates plain shells, and such a host only
+    /// ever answered for the provider slot -- with a real agent session and a
+    /// real runtime generation beside it. Requiring the sentinels the host
+    /// actually sends for a shell therefore keeps an older host's provider
+    /// projection on the provider path, where it stays fenced against the
+    /// client model, instead of silently becoming an unfenced shell.
+    pub fn is_plain_shell(&self) -> bool {
+        !self.is_provider && self.agent_session_id.is_nil() && self.runtime_generation == 0
+    }
+}
+
 /// One chip of a Task's terminal strip: identity, label and liveness, with no
 /// screen bytes. The host answers this from the durable facts, so a shell whose
 /// hosted entry has already been retired still renders until `ResourceReleased`
