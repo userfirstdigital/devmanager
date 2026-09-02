@@ -112,4 +112,7 @@ pub use task::{
     TaskConnectivity, TaskFacts, TaskLifecycle, TaskValidationError, VisibleTaskStatus,
     WorkspaceChoice, WorkspaceRef,
 };
-pub use terminal_facts::{TaskTerminalStrip, TerminalExit, TerminalFacts};
+pub use terminal_facts::{
+    TaskTerminalStrip, TerminalExit, TerminalFacts, TerminalStripError, MAX_PLAIN_SHELLS_PER_TASK,
+    TERMINAL_ACTIVITY_COALESCE_MS, TERMINAL_CWD_DEBOUNCE_MS,
+};

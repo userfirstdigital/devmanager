@@ -2,7 +2,7 @@
 //!
 //! `ResourceId` is the only identity. Everything here is a recorded fact.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
@@ -61,13 +61,30 @@ pub enum TerminalStripError {
     ForeignTask(ResourceId),
 }
 
+impl std::fmt::Display for TerminalStripError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Duplicate(id) => write!(f, "duplicate terminal {id} in strip"),
+            Self::FocusedNotInOrder(id) => {
+                write!(f, "focused terminal {id} is not in the strip")
+            }
+            Self::NotATerminal(id) => write!(f, "resource {id} is not a terminal"),
+            Self::ForeignTask(id) => {
+                write!(f, "resource {id} does not belong to this task")
+            }
+        }
+    }
+}
+
+impl std::error::Error for TerminalStripError {}
+
 impl TaskTerminalStrip {
     pub fn validate(
         &self,
         task_id: TaskId,
         resources: &BTreeMap<ResourceId, ResourceFacts>,
     ) -> Result<(), TerminalStripError> {
-        let mut seen = std::collections::BTreeSet::new();
+        let mut seen = BTreeSet::new();
         for id in &self.order {
             if !seen.insert(*id) {
                 return Err(TerminalStripError::Duplicate(*id));
@@ -90,11 +107,12 @@ impl TaskTerminalStrip {
         Ok(())
     }
 
-    /// Remove a released terminal; clear focus if it pointed at it.
+    /// Remove a released terminal. Focus is cleared when it pointed at the
+    /// removed terminal; the strip then has no focused terminal at all.
     pub fn remove(&mut self, resource_id: ResourceId) {
         self.order.retain(|id| *id != resource_id);
         if self.focused == Some(resource_id) {
-            self.focused = self.order.last().copied();
+            self.focused = None;
         }
     }
 }
@@ -174,6 +192,54 @@ mod tests {
             .validate(task_id, &resources),
             Err(TerminalStripError::NotATerminal(browser.id))
         );
+    }
+
+    #[test]
+    fn remove_keeps_focus_when_another_terminal_is_removed() {
+        let task_id = TaskId::new();
+        let a = terminal_resource(task_id);
+        let b = terminal_resource(task_id);
+        let mut strip = TaskTerminalStrip {
+            order: vec![a.id, b.id],
+            focused: Some(a.id),
+        };
+        strip.remove(b.id);
+        assert_eq!(strip.order, vec![a.id]);
+        assert_eq!(strip.focused, Some(a.id));
+    }
+
+    #[test]
+    fn remove_clears_focus_when_the_focused_terminal_is_removed() {
+        let task_id = TaskId::new();
+        let a = terminal_resource(task_id);
+        let b = terminal_resource(task_id);
+        let mut strip = TaskTerminalStrip {
+            order: vec![a.id, b.id],
+            focused: Some(a.id),
+        };
+        strip.remove(a.id);
+        assert_eq!(strip.order, vec![b.id]);
+        assert_eq!(strip.focused, None);
+    }
+
+    #[test]
+    fn remove_last_terminal_empties_the_strip() {
+        let task_id = TaskId::new();
+        let a = terminal_resource(task_id);
+        let mut strip = TaskTerminalStrip {
+            order: vec![a.id],
+            focused: Some(a.id),
+        };
+        strip.remove(a.id);
+        assert!(strip.order.is_empty());
+        assert_eq!(strip.focused, None);
+    }
+
+    #[test]
+    fn strip_limits_are_pinned() {
+        assert_eq!(MAX_PLAIN_SHELLS_PER_TASK, 8);
+        assert_eq!(TERMINAL_CWD_DEBOUNCE_MS, 2_000);
+        assert_eq!(TERMINAL_ACTIVITY_COALESCE_MS, 30_000);
     }
 
     #[test]
