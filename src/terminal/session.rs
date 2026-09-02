@@ -1434,8 +1434,11 @@ impl TerminalSession {
                     &teardown,
                 );
                 #[cfg(not(windows))]
-                if self.detach_pty_and_join_actors().is_err() {
-                    std::process::abort();
+                if let Err(join_error) = self.detach_pty_and_join_actors() {
+                    eprintln!(
+                        "terminal session `{}` setup cleanup could not join actors: {join_error}",
+                        self.session_id
+                    );
                 }
                 return Err(error);
             }
@@ -1734,9 +1737,10 @@ impl Drop for TerminalSession {
                 "terminal session `{}` dropped before bounded teardown completed: {error}",
                 self.session_id
             );
-            // A live actor cannot be detached safely. The process may still
-            // own PTY resources, so every platform must fail closed here.
-            std::process::abort();
+            // Never abort the host for one session's teardown miss. This
+            // session's kill-on-close Job handle closes with it, so its own
+            // tree still ends; aborting would take every other terminal the
+            // host owns down with it. The diagnostic above records the miss.
         }
     }
 }
@@ -2388,23 +2392,27 @@ fn cleanup_failed_spawn(teardown: &Arc<ManagedTerminalTeardown>) {
     // The suspended launcher does not return until Job registration and resume
     // are one committed handoff. Every later setup failure therefore has exact
     // coordinator authority; a raw PTY ChildKiller is never minted on Windows.
+    // A cleanup miss is reported, never escalated to a host abort: the
+    // kill-on-close Job handle still ends this launch's tree when it drops,
+    // and aborting would kill every other terminal the host owns.
     match teardown.close() {
         Ok(report) if report.outcome() == crate::process::teardown::TeardownOutcome::Closed => {
             if !teardown.actors_joined() {
-                eprintln!("managed terminal setup cleanup returned before all actors joined");
-                std::process::abort();
+                eprintln!(
+                    "managed terminal setup cleanup returned before all actors joined; continuing without aborting the host"
+                );
             }
         }
         Ok(report) => {
             eprintln!(
-                "managed terminal setup cleanup did not close exactly: {:?}",
+                "managed terminal setup cleanup did not close exactly: {:?}; continuing without aborting the host",
                 report.errors()
             );
-            std::process::abort();
         }
         Err(error) => {
-            eprintln!("managed terminal setup cleanup failed: {error}");
-            std::process::abort();
+            eprintln!(
+                "managed terminal setup cleanup failed: {error}; continuing without aborting the host"
+            );
         }
     }
 }
@@ -3084,9 +3092,12 @@ fn spawn_with_command(
                 &teardown,
             );
             #[cfg(not(windows))]
-            if detach_pty_and_join_actor_slots(&input_admission, &writer, &master, &actors).is_err()
+            if let Err(join_error) =
+                detach_pty_and_join_actor_slots(&input_admission, &writer, &master, &actors)
             {
-                std::process::abort();
+                eprintln!(
+                    "terminal session `{session_id}` setup cleanup could not join actors: {join_error}"
+                );
             }
             return Err(error);
         }

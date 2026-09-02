@@ -1401,8 +1401,9 @@ pub(crate) struct ManagedTerminalTeardown {
     #[cfg(test)]
     release_test_barrier: Arc<Mutex<Option<Arc<TerminalReleaseTestBarrier>>>>,
     /// Armed immediately before the registered suspended root is resumed.
-    /// Once armed, dropping this owner without a Closed report is a process
-    /// safety invariant violation: returning would abandon Job/actor authority.
+    /// Once armed, dropping this owner without a Closed report is reported as
+    /// a teardown miss; the shared state's kill-on-close Job handle remains
+    /// the containment for the tree, and the host itself is never aborted.
     armed: AtomicBool,
 }
 
@@ -1831,18 +1832,22 @@ impl Drop for ManagedTerminalTeardown {
                 .and_then(|report| report.clone())
                 .is_some_and(|report| report.outcome() == TeardownOutcome::Closed);
             if !already_closed {
+                // An inexact close is reported, never escalated to a host
+                // abort. The kill-on-close Job handle inside the shared state
+                // still ends this terminal's tree when its last owner drops;
+                // aborting would end every other terminal the host owns.
                 match self.close() {
                     Ok(report) if report.outcome() == TeardownOutcome::Closed => {}
                     Ok(report) => {
                         eprintln!(
-                            "managed terminal authority dropped before exact close: {:?}",
+                            "managed terminal authority dropped before exact close: {:?}; continuing without aborting the host",
                             report.errors()
                         );
-                        std::process::abort();
                     }
                     Err(error) => {
-                        eprintln!("managed terminal authority drop failed exact close: {error}");
-                        std::process::abort();
+                        eprintln!(
+                            "managed terminal authority drop failed exact close: {error}; continuing without aborting the host"
+                        );
                     }
                 }
             }
