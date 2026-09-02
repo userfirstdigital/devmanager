@@ -1965,6 +1965,8 @@ mod process_census_tests {
                 }],
                 ..TerminalScreenSnapshot::default()
             },
+            is_provider: true,
+            runtime_state: crate::domain::cockpit::TerminalRuntimeStateWire::Running,
         };
 
         let view = ContextDock::terminal_session_view_from_projection(&projection);

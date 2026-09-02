@@ -46,6 +46,26 @@ macro_rules! define_id {
                 Self(Uuid::now_v7())
             }
 
+            /// Wire-valid zero sentinel for a non-optional identity field that
+            /// has no identity to carry (a plain shell terminal has no agent
+            /// session, yet `TaskTerminalProjection` keeps the field required
+            /// for wire compatibility).
+            ///
+            /// Every payload bit is zero, but the UUID version (7) and RFC 4122
+            /// variant bits are set: a true `Uuid::nil()` is version 0 and this
+            /// crate's validating deserializer would reject it, so a projection
+            /// carrying one could be encoded and never decoded.
+            pub const fn nil() -> Self {
+                Self(Uuid::from_bytes([
+                    0, 0, 0, 0, 0, 0, 0x70, 0, 0x80, 0, 0, 0, 0, 0, 0, 0,
+                ]))
+            }
+
+            /// True for [`Self::nil`], the "no identity" sentinel.
+            pub fn is_nil(&self) -> bool {
+                self.0 == Self::nil().0
+            }
+
             pub fn parse(input: &str) -> Result<Self, IdError> {
                 let uuid = Uuid::parse_str(input).map_err(|_| IdError::InvalidFormat)?;
                 Self::try_from_uuid(uuid)
@@ -283,5 +303,23 @@ mod tests {
             serde_json::to_string(&ConfiguredServiceId::new("api").expect("catalog")).expect("id");
         assert_eq!(encoded_catalog, "\"api\"");
         assert_ne!(encoded_uuid, encoded_catalog);
+    }
+
+    #[test]
+    fn nil_sentinel_round_trips_through_the_validating_wire_decoder() {
+        use super::AgentSessionId;
+        let sentinel = AgentSessionId::nil();
+        assert!(sentinel.is_nil());
+        assert!(!AgentSessionId::new().is_nil());
+        assert_eq!(sentinel.to_string(), "00000000-0000-7000-8000-000000000000");
+        // Human-readable and binary carriers both revalidate the UUID version.
+        let json = serde_json::to_string(&sentinel).expect("encode sentinel");
+        let decoded: AgentSessionId = serde_json::from_str(&json).expect("decode sentinel");
+        assert_eq!(decoded, sentinel);
+        let packed = rmp_serde::to_vec_named(&sentinel).expect("pack sentinel");
+        let unpacked: AgentSessionId = rmp_serde::from_slice(&packed).expect("unpack sentinel");
+        assert_eq!(unpacked, sentinel);
+        // A true all-zero UUID is version 0 and must stay rejected.
+        assert!(AgentSessionId::parse("00000000-0000-0000-0000-000000000000").is_err());
     }
 }

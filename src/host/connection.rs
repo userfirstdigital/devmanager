@@ -4504,6 +4504,13 @@ impl HostRequestExecutor {
                 "devmanager-host: shell terminal {resource_id} view lookup failed: {error:?}"
             ),
         }
+        // Nothing else retires a hosted entry, so the closed shell's retained
+        // deltas and attached runtime would live for the host's lifetime.
+        // Afterwards a query for this resource answers `None`, which is the
+        // correct end state: the durable strip still renders it from facts.
+        if let Err(error) = self.terminal_service.remove_closed(resource_id) {
+            eprintln!("devmanager-host: shell terminal {resource_id} retire failed: {error:?}");
+        }
         if let Some(runtime) = self.configured_service_runtime.as_ref() {
             if let Err(error) = runtime.manager.close_task_shell_session(link.session_id) {
                 eprintln!("devmanager-host: shell terminal {resource_id} close failed: {error}");

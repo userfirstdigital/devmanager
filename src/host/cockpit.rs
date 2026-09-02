@@ -16,7 +16,8 @@ use crate::domain::cockpit::{
     TaskCockpitResult, TaskCockpitSurface, TaskCockpitUnavailableReason, TaskFileEntry,
     TaskFilesListProjection, TaskFilesReadProjection, TaskGitMutateIntent, TaskGitProjection,
     TaskRepositorySelector, TaskSshEndpoint, TaskSshLifecycle, TaskSshProjection,
-    TaskSshRuntimeError, TaskSshRuntimeProjection, TaskTerminalProjection, MAX_COCKPIT_FILE_LIST,
+    TaskSshRuntimeError, TaskSshRuntimeProjection, TaskTerminalChip, TaskTerminalProjection,
+    TaskTerminalsProjection, TerminalRuntimeStateWire, MAX_COCKPIT_FILE_LIST,
     MAX_COCKPIT_READ_BYTES,
 };
 use crate::domain::id::{ClientId, CommandId, RequestId, TaskId};
@@ -243,13 +244,28 @@ pub(crate) fn serve_task_cockpit_bounded(
                 reason: "conversation_subscription_executor",
             })
         }
+        TaskCockpitQuery::TaskTerminals => serve_task_terminals(&dispatch, task_id, &snapshot),
         TaskCockpitQuery::Terminal
         | TaskCockpitQuery::TerminalScroll { .. }
         | TaskCockpitQuery::TerminalResize { .. }
-        | TaskCockpitQuery::TerminalReadiness => {
-            let readiness_query = matches!(dispatch.query, TaskCockpitQuery::TerminalReadiness);
-            if let TaskCockpitQuery::TerminalScroll { delta_lines } = dispatch.query {
-                if *delta_lines == 0 || delta_lines.unsigned_abs() > 256 {
+        | TaskCockpitQuery::TerminalReadiness
+        | TaskCockpitQuery::TerminalFor { .. }
+        | TaskCockpitQuery::TerminalScrollFor { .. }
+        | TaskCockpitQuery::TerminalResizeFor { .. }
+        | TaskCockpitQuery::TerminalReadinessFor { .. } => {
+            let readiness_query = matches!(
+                dispatch.query,
+                TaskCockpitQuery::TerminalReadiness | TaskCockpitQuery::TerminalReadinessFor { .. }
+            );
+            // `None` keeps the pre-plain-shell selection: the provider slot.
+            let selector = terminal_query_resource(dispatch.query);
+            let scroll = match dispatch.query {
+                TaskCockpitQuery::TerminalScroll { delta_lines }
+                | TaskCockpitQuery::TerminalScrollFor { delta_lines, .. } => Some(*delta_lines),
+                _ => None,
+            };
+            if let Some(delta_lines) = scroll {
+                if delta_lines == 0 || delta_lines.unsigned_abs() > 256 {
                     return denied(
                         TaskCockpitSurface::Terminal,
                         TaskCockpitDeniedReason::Unauthorized,
@@ -260,7 +276,7 @@ pub(crate) fn serve_task_cockpit_bounded(
                     .ok_or(())
                     .and_then(|service| {
                         service
-                            .scroll_task_terminal(task_id, *delta_lines)
+                            .scroll_task_terminal_for(task_id, selector, delta_lines)
                             .map_err(|_| ())
                     })
                     .is_err()
@@ -271,8 +287,13 @@ pub(crate) fn serve_task_cockpit_bounded(
                     );
                 }
             }
-            if let TaskCockpitQuery::TerminalResize { cols, rows } = dispatch.query {
-                let Ok(size) = crate::terminal::protocol::TerminalSize::new(*cols, *rows) else {
+            let resize = match dispatch.query {
+                TaskCockpitQuery::TerminalResize { cols, rows }
+                | TaskCockpitQuery::TerminalResizeFor { cols, rows, .. } => Some((*cols, *rows)),
+                _ => None,
+            };
+            if let Some((cols, rows)) = resize {
+                let Ok(size) = crate::terminal::protocol::TerminalSize::new(cols, rows) else {
                     return denied(
                         TaskCockpitSurface::Terminal,
                         TaskCockpitDeniedReason::Unauthorized,
@@ -281,7 +302,11 @@ pub(crate) fn serve_task_cockpit_bounded(
                 if dispatch
                     .terminal_service
                     .ok_or(())
-                    .and_then(|service| service.resize_task_terminal(task_id, size).map_err(|_| ()))
+                    .and_then(|service| {
+                        service
+                            .resize_task_terminal_for(task_id, selector, size)
+                            .map_err(|_| ())
+                    })
                     .is_err()
                 {
                     return unavailable(
@@ -294,6 +319,7 @@ pub(crate) fn serve_task_cockpit_bounded(
                 &dispatch,
                 task_id,
                 &snapshot,
+                selector,
                 readiness_query,
                 max_response_bytes,
             )
@@ -559,12 +585,25 @@ const MAX_CONVERSATION_PAGE_ITEMS: usize = 128;
 // QueryReply/Connect envelope still needs headroom around this page.
 const MAX_CONVERSATION_PAGE_BYTES: usize = 48 * 1024;
 
+/// The durable resource one terminal query addresses, or `None` for the
+/// provider slot. The legacy unit variants are always the provider slot.
+fn terminal_query_resource(query: &TaskCockpitQuery) -> Option<crate::domain::ResourceId> {
+    match query {
+        TaskCockpitQuery::TerminalFor { resource_id }
+        | TaskCockpitQuery::TerminalScrollFor { resource_id, .. }
+        | TaskCockpitQuery::TerminalResizeFor { resource_id, .. }
+        | TaskCockpitQuery::TerminalReadinessFor { resource_id } => Some(*resource_id),
+        _ => None,
+    }
+}
+
 /// Project one bounded semantic conversation page for a Task. Shared by the
 /// one-shot Conversation query and OpenConversationSubscription initial capture.
 fn serve_task_terminal(
     dispatch: &TaskCockpitDispatch<'_>,
     task_id: TaskId,
     snapshot: &crate::domain::TaskSnapshot,
+    resource_id: Option<crate::domain::ResourceId>,
     readiness_query: bool,
     max_response_bytes: u32,
 ) -> QueryOutcome {
@@ -574,7 +613,10 @@ fn serve_task_terminal(
             TaskCockpitUnavailableReason::TerminalUnavailable,
         );
     };
-    match service.task_terminal_view(task_id) {
+    match service.task_terminal_view_for(task_id, resource_id) {
+        Ok(Some(terminal)) if !terminal.is_provider => {
+            serve_plain_shell_terminal(dispatch, task_id, snapshot, terminal, max_response_bytes)
+        }
         Ok(Some(terminal)) => {
             // The provider slot always carries its complete durable identity;
             // a plain shell never reaches this legacy provider surface.
@@ -605,12 +647,16 @@ fn serve_task_terminal(
                     TaskCockpitDeniedReason::StaleFence,
                 );
             };
+            // Plain shells are Active Terminal resources too, so the provider
+            // slot's "exactly one" fence has to exclude them or every task with
+            // an open shell would fail closed on its provider terminal.
             let matching_resources = snapshot
                 .resources
                 .values()
                 .filter(|resource| {
                     resource.resource_kind == crate::domain::ResourceKind::Terminal
                         && resource.lifecycle == crate::domain::ResourceLifecycle::Active
+                        && !resource.recipe.is_plain_shell()
                 })
                 .collect::<Vec<_>>();
             let [resource] = matching_resources.as_slice() else {
@@ -711,6 +757,8 @@ fn serve_task_terminal(
                 title: terminal.view.runtime.title,
                 text_lines,
                 screen,
+                is_provider: terminal.is_provider,
+                runtime_state: runtime_state_wire(&terminal.runtime_state),
             };
             let Some(projection) = fit_terminal_projection_for_wire(
                 projection,
@@ -727,7 +775,10 @@ fn serve_task_terminal(
             )))
         }
         Ok(None) => {
-            if !readiness_query {
+            // Readiness classification is about the provider runtime's start.
+            // A shell selector that resolves to nothing is simply gone, and
+            // never "the provider has not started".
+            if !readiness_query || resource_id.is_some() {
                 // Legacy Terminal callers keep the closed Unavailable reason.
                 return unavailable(
                     TaskCockpitSurface::Terminal,
@@ -740,6 +791,235 @@ fn serve_task_terminal(
             TaskCockpitSurface::Terminal,
             TaskCockpitDeniedReason::StaleFence,
         ),
+    }
+}
+
+/// One-to-one mapping of the hosted runtime state onto the wire enum.
+fn runtime_state_wire(
+    state: &crate::terminal::service::TerminalRuntimeState,
+) -> TerminalRuntimeStateWire {
+    match state {
+        crate::terminal::service::TerminalRuntimeState::Running => {
+            TerminalRuntimeStateWire::Running
+        }
+        crate::terminal::service::TerminalRuntimeState::Exited { summary } => {
+            TerminalRuntimeStateWire::Exited {
+                summary: summary.clone(),
+            }
+        }
+        crate::terminal::service::TerminalRuntimeState::Unknown => {
+            TerminalRuntimeStateWire::Unknown
+        }
+    }
+}
+
+/// Serve one plain shell's screen.
+///
+/// A shell has no agent session, so there is no provider fence to revalidate:
+/// its authority is the durable resource itself. The checks are therefore the
+/// resource existing on this Task, being a plain shell, being Active, and its
+/// runtime generation matching the attachment the service holds. `ProviderInput`
+/// is deliberately not required -- a shell is not the provider's input surface
+/// -- but the terminal is still granted `ReadWrite` exactly as the provider path
+/// grants it, because the projection doubles as the client's attachment.
+fn serve_plain_shell_terminal(
+    dispatch: &TaskCockpitDispatch<'_>,
+    task_id: TaskId,
+    snapshot: &crate::domain::TaskSnapshot,
+    terminal: crate::terminal::service::TaskTerminalView,
+    max_response_bytes: u32,
+) -> QueryOutcome {
+    let Some(service) = dispatch.terminal_service else {
+        return unavailable(
+            TaskCockpitSurface::Terminal,
+            TaskCockpitUnavailableReason::TerminalUnavailable,
+        );
+    };
+    let Some(resource) = snapshot.resources.get(&terminal.resource_id) else {
+        return denied(
+            TaskCockpitSurface::Terminal,
+            TaskCockpitDeniedReason::StaleFence,
+        );
+    };
+    if resource.resource_kind != crate::domain::ResourceKind::Terminal
+        || !resource.recipe.is_plain_shell()
+        || resource.lifecycle != crate::domain::ResourceLifecycle::Active
+        || resource.runtime_generation != terminal.resource_generation
+    {
+        return denied(
+            TaskCockpitSurface::Terminal,
+            TaskCockpitDeniedReason::StaleFence,
+        );
+    }
+    if service
+        .grant_client(
+            terminal.terminal_id,
+            dispatch.client_id,
+            crate::terminal::protocol::ClientInputGrant::ReadWrite,
+        )
+        .is_err()
+    {
+        return denied(
+            TaskCockpitSurface::Terminal,
+            TaskCockpitDeniedReason::StaleFence,
+        );
+    }
+    let styled_cell_limit = if max_response_bytes <= 64 * 1024 {
+        MAX_TERMINAL_CONNECT_STYLED_CELLS
+    } else {
+        MAX_TERMINAL_STYLED_CELLS_FOR_WIRE
+    };
+    let runtime_state = runtime_state_wire(&terminal.runtime_state);
+    let (screen, text_lines) =
+        compact_terminal_screen_for_wire(terminal.view.screen, styled_cell_limit);
+    let projection = TaskTerminalProjection {
+        task_id,
+        terminal_id: terminal.terminal_id,
+        session_id: terminal.session_id,
+        // A shell has no agent session, no provider runtime generation, and no
+        // launch action epoch. These stay required on the wire, so they carry
+        // the documented zero sentinels; `is_provider: false` is what tells a
+        // client they are sentinels rather than identity.
+        agent_session_id: crate::domain::AgentSessionId::nil(),
+        resource_id: terminal.resource_id,
+        runtime_generation: 0,
+        resource_generation: terminal.resource_generation,
+        action_epoch: terminal.action_epoch.unwrap_or(0),
+        focus_epoch: terminal.focus_epoch,
+        accepted_input_sequence: terminal.accepted_input_sequence,
+        // Provider conversation identity is meaningless for a shell.
+        accepts_input_without_conversation_id: false,
+        sequence: terminal.sequence,
+        title: terminal.view.runtime.title,
+        text_lines,
+        screen,
+        is_provider: false,
+        runtime_state,
+    };
+    let Some(projection) =
+        fit_terminal_projection_for_wire(projection, dispatch.request_id, max_response_bytes)
+    else {
+        return unavailable(
+            TaskCockpitSurface::Terminal,
+            TaskCockpitUnavailableReason::TerminalUnavailable,
+        );
+    };
+    QueryOutcome::Ok(QueryResult::TaskCockpit(TaskCockpitResult::Terminal(
+        projection,
+    )))
+}
+
+/// The Task's terminal strip: the provider chip first, then the durable order.
+///
+/// Chips come from the durable facts, never from the hosted runtime map, so a
+/// shell whose hosted entry has already been retired (close closes the hosted
+/// terminal before `ResourceReleased` clears the strip) still renders, with its
+/// recorded exit if one was written and `Unknown` otherwise.
+fn serve_task_terminals(
+    dispatch: &TaskCockpitDispatch<'_>,
+    task_id: TaskId,
+    snapshot: &crate::domain::TaskSnapshot,
+) -> QueryOutcome {
+    let Some(service) = dispatch.terminal_service else {
+        return unavailable(
+            TaskCockpitSurface::Terminal,
+            TaskCockpitUnavailableReason::TerminalUnavailable,
+        );
+    };
+    let Ok(summaries) = service.task_terminal_summaries(task_id) else {
+        return denied(
+            TaskCockpitSurface::Terminal,
+            TaskCockpitDeniedReason::StaleFence,
+        );
+    };
+    let live_by_resource = summaries
+        .iter()
+        .map(|summary| (summary.resource_id, summary))
+        .collect::<std::collections::HashMap<_, _>>();
+    let provider_resource = snapshot
+        .primary_agent_id
+        .and_then(|agent_id| snapshot.agents.get(&agent_id))
+        .and_then(|agent| {
+            snapshot
+                .resources
+                .values()
+                .find(|resource| {
+                    resource.resource_kind == crate::domain::ResourceKind::Terminal
+                        && !resource.recipe.is_plain_shell()
+                        && resource.lifecycle == crate::domain::ResourceLifecycle::Active
+                        && resource.runtime_generation == agent.runtime_generation
+                })
+                .map(|resource| resource.id)
+        });
+    let chip_for = |resource_id: crate::domain::ResourceId, is_provider: bool| {
+        let facts = snapshot.terminal_facts.get(&resource_id);
+        let exit = facts.and_then(|facts| facts.exit.as_ref());
+        let runtime_state = match live_by_resource.get(&resource_id).map(|live| &live.state) {
+            Some(state) => runtime_state_wire(state),
+            // No hosted entry: the durable exit fact is the only truth there
+            // is, and its absence is genuinely unknown -- never a running
+            // terminal.
+            None => match exit {
+                Some(exit) => TerminalRuntimeStateWire::Exited {
+                    summary: exit.summary.clone(),
+                },
+                None => TerminalRuntimeStateWire::Unknown,
+            },
+        };
+        TaskTerminalChip {
+            resource_id,
+            is_provider,
+            title: facts.and_then(|facts| facts.title.clone()),
+            label: terminal_label_for(snapshot, resource_id),
+            runtime_state,
+            live_cwd: facts
+                .and_then(|facts| facts.live_cwd.as_ref())
+                .map(|cwd| cwd.to_string_lossy().into_owned()),
+            exit: exit.cloned(),
+            created_at_ms: facts.map(|facts| facts.created_at_ms).unwrap_or_default(),
+            last_activity_at_ms: facts
+                .map(|facts| facts.last_activity_at_ms)
+                .unwrap_or_default(),
+        }
+    };
+    let mut terminals = Vec::new();
+    if let Some(provider) = provider_resource {
+        terminals.push(chip_for(provider, true));
+    }
+    for resource_id in &snapshot.terminal_strip.order {
+        terminals.push(chip_for(*resource_id, false));
+    }
+    QueryOutcome::Ok(QueryResult::TaskCockpit(TaskCockpitResult::TaskTerminals(
+        TaskTerminalsProjection {
+            task_id,
+            terminals,
+            order: snapshot.terminal_strip.order.clone(),
+            focused: snapshot.terminal_strip.focused,
+        },
+    )))
+}
+
+/// Fallback display text for one terminal chip: a shell's launch program stem
+/// (`pwsh`, `cmd`), or `terminal` for the provider slot. The running child
+/// command label is a separate, later concern; this never guesses one.
+fn terminal_label_for(
+    snapshot: &crate::domain::TaskSnapshot,
+    resource_id: crate::domain::ResourceId,
+) -> String {
+    match snapshot
+        .resources
+        .get(&resource_id)
+        .map(|resource| &resource.recipe)
+    {
+        Some(crate::domain::resource::ResourceRecipe::Terminal {
+            launch: Some(launch),
+            ..
+        }) => launch
+            .program
+            .file_stem()
+            .map(|stem| stem.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "shell".to_string()),
+        _ => "terminal".to_string(),
     }
 }
 
@@ -2880,6 +3160,8 @@ mod tests {
                 title: Some("Codex".to_string()),
                 text_lines,
                 screen,
+                is_provider: true,
+                runtime_state: crate::domain::cockpit::TerminalRuntimeStateWire::Running,
             }))
             .expect("a normal styled provider screen must remain encodable");
     }
@@ -2958,6 +3240,8 @@ mod tests {
             title: Some("Codex".to_string()),
             text_lines,
             screen,
+            is_provider: true,
+            runtime_state: crate::domain::cockpit::TerminalRuntimeStateWire::Running,
         };
         let codec = MessagePackCodec::from_limits(FrameLimits::v1_default()).expect("codec");
         codec
@@ -4681,6 +4965,418 @@ mod tests {
             agent_id,
             resource_id,
         )
+    }
+
+    /// One plain shell registered on `task_id`, already carrying the runtime
+    /// generation the host requires before it will spawn anything for it.
+    fn plain_shell_resource(task_id: TaskId, program: &str) -> crate::domain::ResourceFacts {
+        use crate::domain::resource::{
+            OwnerKind, ResourceFacts, ResourceKind, ResourceRecipe, TerminalLaunch,
+        };
+        let mut resource = ResourceFacts::new(
+            Some(task_id),
+            OwnerKind::Task,
+            ResourceKind::Terminal,
+            ResourceRecipe::Terminal {
+                cols: 80,
+                rows: 24,
+                launch: Some(TerminalLaunch {
+                    cwd: std::path::PathBuf::from(SHELL_CWD),
+                    program: std::path::PathBuf::from(program),
+                    args: Vec::new(),
+                }),
+                title: None,
+            },
+            5,
+        )
+        .expect("plain shell resource");
+        resource.runtime_generation = 1;
+        resource
+    }
+
+    const SHELL_CWD: &str = if cfg!(windows) { "C:/Code" } else { "/code" };
+    const SHELL_A_PROGRAM: &str = if cfg!(windows) {
+        "C:/Windows/System32/WindowsPowerShell/v1.0/powershell.exe"
+    } else {
+        "/bin/bash"
+    };
+    const SHELL_B_PROGRAM: &str = if cfg!(windows) {
+        "C:/Windows/System32/cmd.exe"
+    } else {
+        "/bin/sh"
+    };
+
+    fn shell_terminal_spec() -> crate::terminal::protocol::TerminalSpec {
+        crate::terminal::protocol::TerminalSpec::new(
+            crate::terminal::protocol::TerminalSessionId::new(),
+            crate::terminal::protocol::TerminalSize::new(80, 24).expect("size"),
+        )
+        .expect("spec")
+    }
+
+    /// A task carrying its provider terminal plus two attached plain shells,
+    /// with the strip deliberately ordered against registration order so a
+    /// projection that echoed registration order would fail.
+    #[allow(clippy::type_complexity)]
+    fn task_with_provider_and_two_shells() -> (
+        tempfile::TempDir,
+        CommandBus,
+        ClientId,
+        TaskId,
+        WorkspaceProjectRoots,
+        crate::terminal::service::TerminalService,
+        crate::domain::ResourceId,
+        crate::domain::ResourceId,
+        crate::domain::ResourceId,
+    ) {
+        use crate::domain::command::OpenShellTerminalIntent;
+        use crate::terminal::service::{MockAttachedRuntime, TerminalService};
+
+        let (repository, mut bus, client_id, task_id, roots, agent_id, provider_resource) =
+            create_unstarted_draft_with_terminal_claim();
+        let mut revision = bus
+            .task_snapshot(task_id)
+            .expect("lookup")
+            .expect("task")
+            .task
+            .revision;
+        let shell_a = plain_shell_resource(task_id, SHELL_A_PROGRAM);
+        let shell_b = plain_shell_resource(task_id, SHELL_B_PROGRAM);
+        for shell in [shell_a.clone(), shell_b.clone()] {
+            let receipt = bus
+                .execute(CommandEnvelope {
+                    command_id: CommandId::new(),
+                    client_id,
+                    task_id: Some(task_id),
+                    issued_at_ms: 6,
+                    expected_task_revision: Some(revision),
+                    command: Command::OpenShellTerminal(OpenShellTerminalIntent {
+                        resource: shell,
+                    }),
+                })
+                .expect("open shell");
+            let CommandReceipt::Accepted {
+                task_revision: Some(next),
+                ..
+            } = receipt
+            else {
+                panic!("open shell: {receipt:?}");
+            };
+            revision = next;
+        }
+        let receipt = bus
+            .execute(CommandEnvelope {
+                command_id: CommandId::new(),
+                client_id,
+                task_id: Some(task_id),
+                issued_at_ms: 7,
+                expected_task_revision: Some(revision),
+                command: Command::SetTerminalStrip(
+                    crate::domain::terminal_facts::TaskTerminalStrip {
+                        order: vec![shell_b.id, shell_a.id],
+                        focused: Some(shell_a.id),
+                    },
+                ),
+            })
+            .expect("set strip");
+        assert!(
+            matches!(receipt, CommandReceipt::Accepted { .. }),
+            "{receipt:?}"
+        );
+
+        let size = crate::terminal::protocol::TerminalSize::new(80, 24).expect("size");
+        let terminals = TerminalService::new();
+        terminals
+            .attach_bound_task_runtime(
+                task_id,
+                shell_terminal_spec(),
+                // The hosted terminal takes its resource identity from the
+                // runtime's own attachment fence, so the mock has to present
+                // the task's durable provider resource.
+                MockAttachedRuntime::with_resource_fence(size, provider_resource),
+                agent_id,
+                1,
+                1,
+            )
+            .expect("provider attach");
+        for shell in [shell_a.id, shell_b.id] {
+            terminals
+                .attach_plain_shell(
+                    task_id,
+                    shell,
+                    1,
+                    shell_terminal_spec(),
+                    MockAttachedRuntime::with_resource_fence(size, shell),
+                )
+                .expect("shell attach");
+        }
+        (
+            repository,
+            bus,
+            client_id,
+            task_id,
+            roots,
+            terminals,
+            provider_resource,
+            shell_a.id,
+            shell_b.id,
+        )
+    }
+
+    #[test]
+    fn task_terminals_query_lists_provider_first_then_strip_order() {
+        let (
+            _repository,
+            bus,
+            client_id,
+            task_id,
+            roots,
+            terminals,
+            provider_resource,
+            shell_a,
+            shell_b,
+        ) = task_with_provider_and_two_shells();
+
+        let outcome = serve_task_cockpit(TaskCockpitDispatch {
+            capabilities: CapabilitySet::from_capabilities([Capability::TaskCockpit]),
+            envelope_task_id: Some(task_id),
+            client_id,
+            connection_id: Uuid::now_v7(),
+            request_id: RequestId::new(),
+            query: &TaskCockpitQuery::TaskTerminals,
+            bus: &bus,
+            service_runtime: None,
+            semantic_journal: None,
+            terminal_service: Some(&terminals),
+            ssh_endpoints: None,
+            ssh_runtime: None,
+            workspace_projects: Some(&roots),
+            coordinator: None,
+            action_epoch: None,
+            runtime_generation: None,
+            config: None,
+            provider_launch_hint: ProviderLaunchReadinessHint::Unknown,
+        });
+        let QueryOutcome::Ok(QueryResult::TaskCockpit(TaskCockpitResult::TaskTerminals(
+            projection,
+        ))) = outcome
+        else {
+            panic!("expected the terminal strip, got {outcome:?}");
+        };
+        assert_eq!(projection.task_id, task_id);
+        assert_eq!(projection.terminals.len(), 3);
+        assert!(projection.terminals[0].is_provider);
+        assert_eq!(projection.terminals[0].resource_id, provider_resource);
+        // The strip order is durable, not registration order.
+        assert_eq!(projection.terminals[1].resource_id, shell_b);
+        assert_eq!(projection.terminals[2].resource_id, shell_a);
+        assert!(!projection.terminals[1].is_provider);
+        assert_eq!(projection.order, vec![shell_b, shell_a]);
+        assert_eq!(projection.focused, Some(shell_a));
+        assert_eq!(
+            projection.terminals[0].runtime_state,
+            TerminalRuntimeStateWire::Running
+        );
+        // Label is the launch program's file stem; the provider slot has none.
+        assert_eq!(projection.terminals[0].label, "terminal");
+        assert_eq!(
+            projection.terminals[1].label,
+            if cfg!(windows) { "cmd" } else { "sh" }
+        );
+        assert_eq!(
+            projection.terminals[2].label,
+            if cfg!(windows) { "powershell" } else { "bash" }
+        );
+    }
+
+    #[test]
+    fn task_terminals_renders_a_retired_shell_from_durable_facts() {
+        let (_repository, bus, client_id, task_id, roots, terminals, _provider, shell_a, _shell_b) =
+            task_with_provider_and_two_shells();
+        // Close semantics: the hosted entry is closed and retired before the
+        // durable resource is released, so the chip must survive on facts.
+        let terminal_id = terminals
+            .shell_terminal_id(shell_a)
+            .expect("lookup")
+            .expect("hosted shell");
+        terminals
+            .close(
+                terminal_id,
+                crate::terminal::protocol::CloseReason::ExplicitServiceClose,
+            )
+            .expect("close shell");
+        assert!(
+            terminals.remove_closed(shell_a).expect("retire"),
+            "closed entry retires"
+        );
+        assert!(
+            !terminals.remove_closed(shell_a).expect("retire again"),
+            "retiring twice is a no-op"
+        );
+
+        let outcome = serve_task_cockpit(TaskCockpitDispatch {
+            capabilities: CapabilitySet::from_capabilities([Capability::TaskCockpit]),
+            envelope_task_id: Some(task_id),
+            client_id,
+            connection_id: Uuid::now_v7(),
+            request_id: RequestId::new(),
+            query: &TaskCockpitQuery::TaskTerminals,
+            bus: &bus,
+            service_runtime: None,
+            semantic_journal: None,
+            terminal_service: Some(&terminals),
+            ssh_endpoints: None,
+            ssh_runtime: None,
+            workspace_projects: Some(&roots),
+            coordinator: None,
+            action_epoch: None,
+            runtime_generation: None,
+            config: None,
+            provider_launch_hint: ProviderLaunchReadinessHint::Unknown,
+        });
+        let QueryOutcome::Ok(QueryResult::TaskCockpit(TaskCockpitResult::TaskTerminals(
+            projection,
+        ))) = outcome
+        else {
+            panic!("expected the terminal strip, got {outcome:?}");
+        };
+        assert_eq!(projection.terminals.len(), 3);
+        let retired = projection
+            .terminals
+            .iter()
+            .find(|chip| chip.resource_id == shell_a)
+            .expect("retired shell still in the strip");
+        // No hosted entry and no durable exit fact is genuinely unknown; it
+        // must never read as a running terminal.
+        assert_eq!(retired.runtime_state, TerminalRuntimeStateWire::Unknown);
+    }
+
+    #[test]
+    fn terminal_for_serves_a_shell_without_provider_input_capability() {
+        let (_repository, bus, client_id, task_id, roots, terminals, _provider, shell_a, _shell_b) =
+            task_with_provider_and_two_shells();
+
+        let dispatch_shell = |query: &TaskCockpitQuery| {
+            serve_task_cockpit(TaskCockpitDispatch {
+                // Deliberately no ProviderInput: a shell is not the provider's
+                // input surface, so it must not be gated on that capability.
+                capabilities: CapabilitySet::from_capabilities([Capability::TaskCockpit]),
+                envelope_task_id: Some(task_id),
+                client_id,
+                connection_id: Uuid::now_v7(),
+                request_id: RequestId::new(),
+                query,
+                bus: &bus,
+                service_runtime: None,
+                semantic_journal: None,
+                terminal_service: Some(&terminals),
+                ssh_endpoints: None,
+                ssh_runtime: None,
+                workspace_projects: Some(&roots),
+                coordinator: None,
+                action_epoch: None,
+                runtime_generation: None,
+                config: None,
+                provider_launch_hint: ProviderLaunchReadinessHint::Unknown,
+            })
+        };
+
+        let outcome = dispatch_shell(&TaskCockpitQuery::TerminalFor {
+            resource_id: shell_a,
+        });
+        let QueryOutcome::Ok(QueryResult::TaskCockpit(TaskCockpitResult::Terminal(projection))) =
+            outcome
+        else {
+            panic!("expected a shell terminal screen, got {outcome:?}");
+        };
+        assert!(!projection.is_provider);
+        assert_eq!(projection.resource_id, shell_a);
+        assert!(projection.agent_session_id.is_nil());
+        assert_eq!(projection.runtime_generation, 0);
+        assert_eq!(projection.resource_generation, 1);
+        assert!(!projection.accepts_input_without_conversation_id);
+        assert_eq!(projection.runtime_state, TerminalRuntimeStateWire::Running);
+
+        // Scroll and resize address the same shell, and leave the provider
+        // terminal's own grid untouched.
+        assert!(matches!(
+            dispatch_shell(&TaskCockpitQuery::TerminalResizeFor {
+                resource_id: shell_a,
+                cols: 100,
+                rows: 30,
+            }),
+            QueryOutcome::Ok(QueryResult::TaskCockpit(TaskCockpitResult::Terminal(_)))
+        ));
+        let resized = terminals
+            .task_terminal_view_for(task_id, Some(shell_a))
+            .expect("view")
+            .expect("present");
+        assert_eq!(resized.view.screen.cols, 100);
+        let provider = terminals
+            .task_terminal_view_for(task_id, None)
+            .expect("view")
+            .expect("present");
+        assert_eq!(provider.view.screen.cols, 80);
+        assert!(matches!(
+            dispatch_shell(&TaskCockpitQuery::TerminalScrollFor {
+                resource_id: shell_a,
+                delta_lines: 2,
+            }),
+            QueryOutcome::Ok(QueryResult::TaskCockpit(TaskCockpitResult::Terminal(_)))
+        ));
+
+        // An unknown resource is absence, never the provider terminal.
+        let unknown = dispatch_shell(&TaskCockpitQuery::TerminalFor {
+            resource_id: crate::domain::ResourceId::new(),
+        });
+        assert!(
+            matches!(
+                unknown,
+                QueryOutcome::Ok(QueryResult::TaskCockpit(TaskCockpitResult::Unavailable {
+                    surface: TaskCockpitSurface::Terminal,
+                    reason: TaskCockpitUnavailableReason::TerminalUnavailable,
+                }))
+            ),
+            "{unknown:?}"
+        );
+    }
+
+    #[test]
+    fn legacy_terminal_query_still_reaches_the_provider_beside_open_shells() {
+        let (_repository, bus, client_id, task_id, roots, terminals, provider_resource, _a, _b) =
+            task_with_provider_and_two_shells();
+
+        let outcome = serve_task_cockpit(TaskCockpitDispatch {
+            capabilities: CapabilitySet::from_capabilities([
+                Capability::TaskCockpit,
+                Capability::ProviderInput,
+            ]),
+            envelope_task_id: Some(task_id),
+            client_id,
+            connection_id: Uuid::now_v7(),
+            request_id: RequestId::new(),
+            query: &TaskCockpitQuery::Terminal,
+            bus: &bus,
+            service_runtime: None,
+            semantic_journal: None,
+            terminal_service: Some(&terminals),
+            ssh_endpoints: None,
+            ssh_runtime: None,
+            workspace_projects: Some(&roots),
+            coordinator: None,
+            action_epoch: None,
+            runtime_generation: None,
+            config: None,
+            provider_launch_hint: ProviderLaunchReadinessHint::Unknown,
+        });
+        let QueryOutcome::Ok(QueryResult::TaskCockpit(TaskCockpitResult::Terminal(projection))) =
+            outcome
+        else {
+            panic!("open shells must not hide the provider terminal, got {outcome:?}");
+        };
+        assert!(projection.is_provider);
+        assert_eq!(projection.resource_id, provider_resource);
+        assert!(!projection.agent_session_id.is_nil());
     }
 
     #[test]

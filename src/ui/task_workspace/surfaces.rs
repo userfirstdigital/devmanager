@@ -1138,6 +1138,8 @@ mod tests {
                 rows: lines.len(),
                 ..Default::default()
             },
+            is_provider: true,
+            runtime_state: crate::domain::cockpit::TerminalRuntimeStateWire::Running,
         });
         surface.terminal_attachment = TerminalAttachmentState::Live;
         surface

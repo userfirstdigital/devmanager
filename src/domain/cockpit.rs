@@ -329,6 +329,33 @@ pub enum TaskCockpitQuery {
     /// `TerminalNotStarted`. Legacy `Terminal` callers never receive the new
     /// reasons. Older hosts reject this variant — clients must fail closed.
     TerminalReadiness,
+    /// One bounded terminal screen addressed by its durable resource. This is
+    /// the plain-shell form of [`Self::Terminal`]; the legacy unit variants
+    /// above keep meaning "the provider terminal" so older clients and hosts
+    /// stay wire-compatible. A shell carries no agent session, so the host
+    /// fences it on resource lifecycle and generation only.
+    TerminalFor {
+        resource_id: ResourceId,
+    },
+    /// [`Self::TerminalScroll`] addressed by durable resource.
+    TerminalScrollFor {
+        resource_id: ResourceId,
+        delta_lines: i32,
+    },
+    /// [`Self::TerminalResize`] addressed by durable resource.
+    TerminalResizeFor {
+        resource_id: ResourceId,
+        cols: u16,
+        rows: u16,
+    },
+    /// [`Self::TerminalReadiness`] addressed by durable resource.
+    TerminalReadinessFor {
+        resource_id: ResourceId,
+    },
+    /// The Task's whole terminal strip: the provider terminal first, then the
+    /// durable plain-shell order. This is a chip list only — it carries no
+    /// screen bytes and never launches or attaches a PTY.
+    TaskTerminals,
     WorkspaceStatus,
     /// Bounded path-redacted catalog of repositories for the exact Task/project.
     GitRepositories,
@@ -636,6 +663,31 @@ pub struct TaskServiceHealth {
     pub snapshot: TaskServiceSnapshot,
 }
 
+/// Live runtime state of one hosted terminal, on the wire.
+///
+/// One-to-one with `crate::terminal::service::TerminalRuntimeState`. `Running`
+/// is the default so a projection encoded by an older host still decodes.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum TerminalRuntimeStateWire {
+    #[default]
+    Running,
+    Exited {
+        summary: String,
+    },
+    /// Boot window only: a durable terminal not yet reconciled with a runtime,
+    /// or one whose hosted entry has already been retired.
+    Unknown,
+}
+
+/// One bounded terminal screen.
+///
+/// `agent_session_id`, `runtime_generation` and `action_epoch` stay required on
+/// the wire so every existing client reader keeps compiling. A plain shell has
+/// none of them: it sends `AgentSessionId::nil()`, `runtime_generation: 0`, and
+/// an `action_epoch` of zero unless the host holds one. Read `is_provider`
+/// before trusting any of those three — `is_provider == false` means the fences
+/// are sentinels, not identity, and the provider input path must reject them.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct TaskTerminalProjection {
@@ -665,6 +717,50 @@ pub struct TaskTerminalProjection {
     #[serde(default)]
     pub text_lines: Vec<String>,
     pub screen: TerminalScreenSnapshot,
+    /// False for a plain shell. Defaults to false only for a projection that
+    /// predates plain shells, which older hosts only ever issued for the
+    /// provider slot; those hosts also send a real `agent_session_id`, so the
+    /// client's provider path stays gated on identity, never on this flag alone.
+    #[serde(default)]
+    pub is_provider: bool,
+    #[serde(default)]
+    pub runtime_state: TerminalRuntimeStateWire,
+}
+
+/// One chip of a Task's terminal strip: identity, label and liveness, with no
+/// screen bytes. The host answers this from the durable facts, so a shell whose
+/// hosted entry has already been retired still renders until `ResourceReleased`
+/// removes it from the strip.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TaskTerminalChip {
+    pub resource_id: ResourceId,
+    pub is_provider: bool,
+    /// The user-set terminal title, when one was recorded.
+    pub title: Option<String>,
+    /// Fallback display text when there is no title: the launch program's file
+    /// stem for a shell (`pwsh`, `cmd`), `terminal` for the provider slot.
+    pub label: String,
+    pub runtime_state: TerminalRuntimeStateWire,
+    pub live_cwd: Option<String>,
+    pub exit: Option<crate::domain::terminal_facts::TerminalExit>,
+    pub created_at_ms: i64,
+    pub last_activity_at_ms: i64,
+}
+
+/// The Task's whole terminal strip.
+///
+/// `terminals` leads with the provider chip when one exists, then follows
+/// `order` exactly. `focused: None` is a valid state and means no chip is
+/// selected, not that focus is unknown.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TaskTerminalsProjection {
+    pub task_id: TaskId,
+    pub terminals: Vec<TaskTerminalChip>,
+    /// The durable plain-shell order. The provider chip is never in it.
+    pub order: Vec<ResourceId>,
+    pub focused: Option<ResourceId>,
 }
 
 /// Bounded, redacted configuration projection issued by the host's canonical
@@ -791,6 +887,7 @@ pub enum TaskCockpitResult {
         subscription_id: SubscriptionId,
     },
     Terminal(TaskTerminalProjection),
+    TaskTerminals(TaskTerminalsProjection),
     Workspace(TaskWorkspaceProjection),
     GitRepositories(TaskGitRepositoriesProjection),
     Git(TaskGitProjection),
@@ -997,7 +1094,12 @@ pub fn cockpit_surface(query: &TaskCockpitQuery) -> TaskCockpitSurface {
         TaskCockpitQuery::Terminal
         | TaskCockpitQuery::TerminalScroll { .. }
         | TaskCockpitQuery::TerminalResize { .. }
-        | TaskCockpitQuery::TerminalReadiness => TaskCockpitSurface::Terminal,
+        | TaskCockpitQuery::TerminalReadiness
+        | TaskCockpitQuery::TerminalFor { .. }
+        | TaskCockpitQuery::TerminalScrollFor { .. }
+        | TaskCockpitQuery::TerminalResizeFor { .. }
+        | TaskCockpitQuery::TerminalReadinessFor { .. }
+        | TaskCockpitQuery::TaskTerminals => TaskCockpitSurface::Terminal,
         TaskCockpitQuery::WorkspaceStatus => TaskCockpitSurface::Workspace,
         TaskCockpitQuery::GitRepositories
         | TaskCockpitQuery::GitStatus
@@ -1454,6 +1556,119 @@ mod tests {
             serde_json::from_value(serde_json::to_value(&setup_required).expect("encode"))
                 .expect("decode setup reason");
         assert_eq!(setup_round_trip, setup_required);
+    }
+
+    #[test]
+    fn resource_addressed_terminal_queries_keep_the_legacy_wire_forms() {
+        // The legacy unit variants are the provider terminal and must keep
+        // decoding byte-for-byte: an older client sends exactly these.
+        for legacy in ["\"terminal\"", "\"terminal_readiness\""] {
+            let decoded: TaskCockpitQuery =
+                serde_json::from_str(legacy).expect("legacy unit form still decodes");
+            assert_eq!(cockpit_surface(&decoded), TaskCockpitSurface::Terminal);
+        }
+        let resource_id = ResourceId::new();
+        for query in [
+            TaskCockpitQuery::TerminalFor { resource_id },
+            TaskCockpitQuery::TerminalScrollFor {
+                resource_id,
+                delta_lines: -3,
+            },
+            TaskCockpitQuery::TerminalResizeFor {
+                resource_id,
+                cols: 100,
+                rows: 30,
+            },
+            TaskCockpitQuery::TerminalReadinessFor { resource_id },
+            TaskCockpitQuery::TaskTerminals,
+        ] {
+            assert_eq!(cockpit_surface(&query), TaskCockpitSurface::Terminal);
+            let encoded = serde_json::to_value(&query).expect("encode targeted terminal query");
+            let decoded: TaskCockpitQuery =
+                serde_json::from_value(encoded).expect("decode targeted terminal query");
+            assert_eq!(decoded, query);
+        }
+        let encoded = serde_json::to_value(Query::TaskCockpit(TaskCockpitQuery::TaskTerminals))
+            .expect("encode strip query");
+        assert_eq!(
+            encoded.get("task_cockpit").and_then(|value| value.as_str()),
+            Some("task_terminals")
+        );
+    }
+
+    #[test]
+    fn task_terminals_projection_round_trips_and_shells_carry_wire_valid_sentinels() {
+        let resource_id = ResourceId::new();
+        let strip = TaskCockpitResult::TaskTerminals(TaskTerminalsProjection {
+            task_id: TaskId::new(),
+            terminals: vec![
+                TaskTerminalChip {
+                    resource_id: ResourceId::new(),
+                    is_provider: true,
+                    title: None,
+                    label: "terminal".into(),
+                    runtime_state: TerminalRuntimeStateWire::Running,
+                    live_cwd: None,
+                    exit: None,
+                    created_at_ms: 0,
+                    last_activity_at_ms: 0,
+                },
+                TaskTerminalChip {
+                    resource_id,
+                    is_provider: false,
+                    title: Some("build".into()),
+                    label: "pwsh".into(),
+                    runtime_state: TerminalRuntimeStateWire::Exited {
+                        summary: "exit 0".into(),
+                    },
+                    live_cwd: Some("C:/Code".into()),
+                    exit: Some(crate::domain::terminal_facts::TerminalExit {
+                        code: Some(0),
+                        summary: "exit 0".into(),
+                        at_ms: 11,
+                    }),
+                    created_at_ms: 7,
+                    last_activity_at_ms: 9,
+                },
+            ],
+            order: vec![resource_id],
+            // No chip selected is a valid strip state, not unknown focus.
+            focused: None,
+        });
+        let round_trip: TaskCockpitResult =
+            serde_json::from_value(serde_json::to_value(&strip).expect("encode strip"))
+                .expect("decode strip");
+        assert_eq!(round_trip, strip);
+
+        // A plain shell fills the required provider identity fields with the
+        // zero sentinel; the validating id decoder must still accept them.
+        let sentinel = serde_json::to_value(AgentSessionId::nil()).expect("encode sentinel");
+        let decoded: AgentSessionId =
+            serde_json::from_value(sentinel).expect("shell sentinel must survive the wire");
+        assert!(decoded.is_nil());
+    }
+
+    #[test]
+    fn terminal_projection_defaults_the_new_shell_fields() {
+        let legacy = serde_json::json!({
+            "task_id": TaskId::new(),
+            "terminal_id": crate::domain::id::TerminalId::new(),
+            "session_id": TerminalSessionId::new(),
+            "agent_session_id": AgentSessionId::new(),
+            "resource_id": ResourceId::new(),
+            "runtime_generation": 1,
+            "resource_generation": 1,
+            "action_epoch": 1,
+            "focus_epoch": FocusEpoch::initial(),
+            "accepted_input_sequence": 0,
+            "sequence": 1,
+            "title": serde_json::Value::Null,
+            "screen": TerminalScreenSnapshot::default(),
+        });
+        let decoded: TaskTerminalProjection =
+            serde_json::from_value(legacy).expect("a pre-shell projection still decodes");
+        assert!(!decoded.is_provider);
+        assert_eq!(decoded.runtime_state, TerminalRuntimeStateWire::Running);
     }
 
     #[test]

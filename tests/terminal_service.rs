@@ -657,3 +657,47 @@ fn plain_shells_do_not_block_the_provider_terminal() {
         .resize_task_terminal(task_id, TerminalSize::new(90, 20).expect("size"))
         .expect("resize");
 }
+
+#[test]
+fn remove_closed_retires_only_a_closed_hosted_shell() {
+    let service = TerminalService::default();
+    let task_id = TaskId::new();
+    let shell = ResourceId::new();
+    let terminal_id = service
+        .attach_plain_shell(task_id, shell, 1, shell_spec(), shell_runtime(shell))
+        .expect("shell");
+
+    // A live entry is never retired: the answer distinguishes "refused" from
+    // "nothing to do" by leaving the terminal queryable.
+    assert!(!service.remove_closed(shell).expect("live entry"));
+    assert!(service
+        .task_terminal_view_for(task_id, Some(shell))
+        .expect("view")
+        .is_some());
+    assert_eq!(
+        service
+            .task_terminal_summaries(task_id)
+            .expect("summaries")
+            .len(),
+        1
+    );
+
+    service
+        .close(terminal_id, CloseReason::ExplicitServiceClose)
+        .expect("close");
+    assert!(service.remove_closed(shell).expect("closed entry"));
+    assert!(service
+        .task_terminal_summaries(task_id)
+        .expect("summaries")
+        .is_empty());
+    assert!(service
+        .task_terminal_view_for(task_id, Some(shell))
+        .expect("view")
+        .is_none());
+    // Retiring twice is a no-op rather than an error.
+    assert!(!service.remove_closed(shell).expect("already retired"));
+    assert!(matches!(
+        service.snapshot(terminal_id),
+        Err(TerminalError::NotFound)
+    ));
+}

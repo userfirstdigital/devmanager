@@ -557,6 +557,8 @@ mod tests {
             title: Some("out-of-band".into()),
             text_lines: vec!["should not land in live files".into()],
             screen: Default::default(),
+            is_provider: true,
+            runtime_state: crate::domain::cockpit::TerminalRuntimeStateWire::Running,
         }));
         assert!(
             projection.files.is_none(),

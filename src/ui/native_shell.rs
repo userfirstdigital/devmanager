@@ -43789,6 +43789,8 @@ mod tests {
             title: None,
             text_lines: Vec::new(),
             screen: Default::default(),
+            is_provider: true,
+            runtime_state: crate::domain::cockpit::TerminalRuntimeStateWire::Running,
         };
         assert!(super::first_send_terminal_ready(snapshot, &terminal));
         terminal.accepts_input_without_conversation_id = false;
@@ -50180,6 +50182,8 @@ mod tests {
             title: None,
             text_lines: Vec::new(),
             screen: Default::default(),
+            is_provider: true,
+            runtime_state: crate::domain::cockpit::TerminalRuntimeStateWire::Running,
         };
         with_test_shell_in_app(cx, runtime, |shell| {
             shell
@@ -50427,6 +50431,9 @@ mod tests {
                                     title: Some("local-live".into()),
                                     text_lines: vec!["> ".into()],
                                     screen: Default::default(),
+                                    is_provider: true,
+                                    runtime_state:
+                                        crate::domain::cockpit::TerminalRuntimeStateWire::Running,
                                 },
                             ),
                         ),
@@ -52970,6 +52977,8 @@ mod tests {
                                                 title: Some("local-live".into()),
                                                 text_lines: vec!["> ".into()],
                                                 screen: Default::default(),
+                                                is_provider: true,
+                                                runtime_state: crate::domain::cockpit::TerminalRuntimeStateWire::Running,
                                             },
                                         ),
                                     ),
@@ -56284,6 +56293,8 @@ mod tests {
                             title: Some("provider terminal starting".into()),
                             text_lines: vec!["> ".into()],
                             screen: Default::default(),
+                            is_provider: true,
+                            runtime_state: crate::domain::cockpit::TerminalRuntimeStateWire::Running,
                         },
                     )
                     .expect("interactive provider terminal projection");
@@ -56411,6 +56422,8 @@ mod tests {
                                     title: Some("provider terminal placeholder".into()),
                                     text_lines: vec!["> ".into()],
                                     screen: Default::default(),
+                                    is_provider: true,
+                                    runtime_state: crate::domain::cockpit::TerminalRuntimeStateWire::Running,
                                 },
                             ),
                         ),
@@ -56817,6 +56830,8 @@ mod tests {
                     title: None,
                     text_lines: vec!["  › Ask Codex to do anything".into()],
                     screen: Default::default(),
+                    is_provider: true,
+                    runtime_state: crate::domain::cockpit::TerminalRuntimeStateWire::Running,
                 };
                 let (remote_runtime, remote_shared) =
                     TestRuntime::new(true, NativeHostActionResult::Queued);
@@ -57204,6 +57219,8 @@ mod tests {
             title: Some("Codex trust".into()),
             text_lines: vec!["Do you trust this directory?".into()],
             screen: Default::default(),
+            is_provider: true,
+            runtime_state: crate::domain::cockpit::TerminalRuntimeStateWire::Running,
         };
 
         let approve =
@@ -63019,6 +63036,8 @@ mod tests {
                     title: Some("remote-display".into()),
                     text_lines: vec!["remote replica line".into()],
                     screen: Default::default(),
+                    is_provider: true,
+                    runtime_state: crate::domain::cockpit::TerminalRuntimeStateWire::Running,
                 };
                 shell.apply_epoch_fenced_action_outcome_for_host(
                     &remote_host,
@@ -63072,6 +63091,8 @@ mod tests {
                         "Press enter to continue".into(),
                     ],
                     screen: Default::default(),
+                    is_provider: true,
+                    runtime_state: crate::domain::cockpit::TerminalRuntimeStateWire::Running,
                 };
                 shell.apply_epoch_fenced_action_outcome_for_host(
                     &remote_host,
@@ -63195,6 +63216,8 @@ mod tests {
                                     title: Some("local-live".into()),
                                     text_lines: vec!["> ".into()],
                                     screen: Default::default(),
+                                    is_provider: true,
+                                    runtime_state: crate::domain::cockpit::TerminalRuntimeStateWire::Running,
                                 },
                             ),
                         ),
@@ -63325,6 +63348,8 @@ mod tests {
                         title: Some("local-live".into()),
                         text_lines: vec!["> ".into()],
                         screen: Default::default(),
+                        is_provider: true,
+                        runtime_state: crate::domain::cockpit::TerminalRuntimeStateWire::Running,
                     };
                 shell.settle_pending_terminal_echo(&owner, &unmatched_projection);
                 assert!(
@@ -63867,6 +63892,8 @@ mod tests {
                     title: Some("forged".into()),
                     text_lines: vec!["should-not-admit".into()],
                     screen: Default::default(),
+                    is_provider: true,
+                    runtime_state: crate::domain::cockpit::TerminalRuntimeStateWire::Running,
                 };
                 shell.apply_epoch_fenced_action_outcome_for_host(
                     &remote_host,

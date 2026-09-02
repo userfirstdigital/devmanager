@@ -1344,6 +1344,30 @@ impl TerminalService {
         Ok(report)
     }
 
+    /// Drop the hosted entry for one durable resource once it is closed.
+    ///
+    /// Nothing else ever removes a `HostedTerminal`, so without this every
+    /// shell open/close cycle leaks the closed entry, its retained deltas and
+    /// its `Arc<dyn AttachedTerminalRuntime>` for the host's lifetime.
+    ///
+    /// Returns whether an entry was removed. `false` means either that no entry
+    /// exists for that resource (already retired) or that the entry is still
+    /// open — a live terminal is never retired by this path, so the answer says
+    /// which of "nothing to do" and "refused" happened by leaving the live
+    /// entry queryable.
+    pub fn remove_closed(&self, resource_id: ResourceId) -> Result<bool, TerminalError> {
+        let mut terminals = self.lock()?;
+        let Some(terminal_id) = terminals
+            .iter()
+            .find(|(_, hosted)| hosted.resource_id == resource_id && hosted.closed)
+            .map(|(id, _)| *id)
+        else {
+            return Ok(false);
+        };
+        terminals.remove(&terminal_id);
+        Ok(true)
+    }
+
     pub fn disconnect_view(
         &self,
         id: TerminalId,
