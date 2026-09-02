@@ -2953,6 +2953,20 @@ fn terminal_input_capability_granted(granted: CapabilitySet, target: TerminalTar
     }
 }
 
+/// Which dock surface paints the Terminal tool for one owner.
+///
+/// The durable `devmanager-host` connection is bootstrapped into the shell's
+/// LOCAL slot -- `attach_host_runtime_attachment` writes `local_slot_mut()`
+/// and takes no HostId at all -- so the host this client was started for is
+/// always `HostId::LocalProfile` and always takes [`TerminalDockBranch::Local`].
+/// [`TerminalDockBranch::Remote`] is for the additional fleet hosts attached
+/// through `attach_installed_fleet_host`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum TerminalDockBranch {
+    Local,
+    Remote,
+}
+
 /// Everything the Terminal dock paints for one owner.
 ///
 /// Derived from the ONE admitted strip and separated from the element tree so
@@ -26266,6 +26280,19 @@ impl NativeShell {
             .and_then(|state| state.strip.clone())
     }
 
+    /// Which dock surface paints the Terminal tool for this owner.
+    ///
+    /// One predicate, so a test can assert which branch the durable host
+    /// actually takes instead of inferring it from a `!=` buried in the
+    /// renderer.
+    fn terminal_dock_branch_for(&self, owner: &HostTaskKey) -> TerminalDockBranch {
+        if owner.host == self.local_host_id() {
+            TerminalDockBranch::Local
+        } else {
+            TerminalDockBranch::Remote
+        }
+    }
+
     /// What the Terminal dock paints for this owner.
     ///
     /// One derivation shared by every dock surface that renders the strip, so
@@ -26286,8 +26313,12 @@ impl NativeShell {
             // The splash replaces the body only once the host has actually
             // answered with a strip: before that the client does not know
             // whether this Task has terminals at all.
-            empty_state: strip
-                .and_then(|strip| strip.focused.is_none().then_some(TERMINAL_DOCK_EMPTY_MESSAGE)),
+            empty_state: strip.and_then(|strip| {
+                strip
+                    .focused
+                    .is_none()
+                    .then_some(TERMINAL_DOCK_EMPTY_MESSAGE)
+            }),
         }
     }
 
@@ -28171,7 +28202,7 @@ impl NativeShell {
         });
         let remote = owner_key
             .as_ref()
-            .is_some_and(|key| key.host != self.local_host_id());
+            .is_some_and(|key| self.terminal_dock_branch_for(key) == TerminalDockBranch::Remote);
         let active_tool = owner_key
             .as_ref()
             .and_then(|key| {
@@ -28435,7 +28466,11 @@ impl NativeShell {
             .flex_1()
             .min_h(px(0.0))
             .flex_col()
-            .bg(tokens.surfaces.sunken.to_gpui());
+            .bg(tokens.surfaces.sunken.to_gpui())
+            // The same strip element the local branch renders. A fleet host's
+            // terminals are terminals; a second copied render block here is
+            // exactly how the two branches would drift.
+            .child(self.terminal_chip_strip(&owner, tokens, Some(shell_entity.clone())));
         if chrome.outer_padding {
             surface = surface.p(px(tokens.density.physical().control_padding as f32));
         }
@@ -67574,7 +67609,6 @@ mod tests {
         });
     }
 
-
     fn shell_strip_for_test(
         task_id: TaskId,
         provider_resource: crate::domain::id::ResourceId,
@@ -67601,12 +67635,7 @@ mod tests {
             .expect("runtime")
             .accepted
             .iter()
-            .filter(|record| {
-                matches!(
-                    record.command,
-                    NativeHostCommand::OpenShellTerminal { .. }
-                )
-            })
+            .filter(|record| matches!(record.command, NativeHostCommand::OpenShellTerminal { .. }))
             .count()
     }
 
@@ -67766,11 +67795,8 @@ mod tests {
                         gpui::point(gpui::px(1.0), gpui::px(1.0)),
                     );
                     shell.begin_terminal_chip_rename();
-                    shell
-                        .terminal_chip_menu
-                        .as_mut()
-                        .expect("menu open")
-                        .rename = Some(refused.clone());
+                    shell.terminal_chip_menu.as_mut().expect("menu open").rename =
+                        Some(refused.clone());
                     shared.lock().expect("runtime").accepted.clear();
                     shell.submit_terminal_chip_rename();
                     let menu = shell
@@ -67800,11 +67826,8 @@ mod tests {
                     gpui::point(gpui::px(1.0), gpui::px(1.0)),
                 );
                 shell.begin_terminal_chip_rename();
-                shell
-                    .terminal_chip_menu
-                    .as_mut()
-                    .expect("menu open")
-                    .rename = Some(longest.clone());
+                shell.terminal_chip_menu.as_mut().expect("menu open").rename =
+                    Some(longest.clone());
                 shared.lock().expect("runtime").accepted.clear();
                 shell.submit_terminal_chip_rename();
                 assert!(
@@ -67876,6 +67899,80 @@ mod tests {
         });
     }
 
+    /// Reachability. The durable `devmanager-host` connection is bootstrapped
+    /// into the shell's LOCAL slot -- `attach_host_runtime_attachment` writes
+    /// `local_slot_mut()` and takes no HostId -- so the host this client was
+    /// started for presents as `HostId::LocalProfile` and the context dock takes
+    /// the LOCAL branch for it. Everything the strip adds has to be reachable
+    /// there, or the whole feature ships behind a branch production never runs.
+    #[test]
+    fn the_durable_hosts_terminal_dock_takes_the_local_branch_and_renders_the_strip() {
+        if rerun_headless_shell_test_in_child(
+            "ui::native_shell::tests::the_durable_hosts_terminal_dock_takes_the_local_branch_and_renders_the_strip",
+        ) {
+            return;
+        }
+        let (runtime, _shared) = TestRuntime::new(true, NativeHostActionResult::Queued);
+        gpui::Application::headless().run(move |cx| {
+            crate::ui::init(cx);
+            with_test_shell_in_app(cx, runtime, |shell| {
+                let (model, task_id) = terminal_bound_client_model();
+                let model = Arc::new(model);
+                let provider_resource =
+                    provider_terminal_projection_for_test(&model, task_id, 1).resource_id;
+                let shell_resource = crate::domain::id::ResourceId::new();
+                shell
+                    .apply_client_model(Arc::clone(&model))
+                    .expect("local model");
+                let owner = shell.local_task_key(task_id);
+                shell
+                    .select_fleet_task_key(owner.clone(), FleetSelectMode::Replace)
+                    .expect("select the durable host's task");
+
+                assert_eq!(
+                    shell.terminal_dock_branch_for(&owner),
+                    super::TerminalDockBranch::Local,
+                    "the durable host is attached to the LOCAL slot, so its dock is the local one"
+                );
+
+                shell
+                    .task_surfaces
+                    .admit_terminals(
+                        owner.clone(),
+                        &shell_strip_for_test(task_id, provider_resource, &[shell_resource], None),
+                    )
+                    .expect("admit strip");
+
+                // What that branch paints, read from the one model both dock
+                // surfaces build their elements from.
+                let dock = shell.terminal_dock_model(&owner);
+                assert_eq!(
+                    dock.chips
+                        .iter()
+                        .map(|chip| chip.resource_id)
+                        .collect::<Vec<_>>(),
+                    vec![provider_resource, shell_resource],
+                    "both chips render, provider first"
+                );
+                assert!(dock.add_enabled, "the + is live below the cap");
+                assert_eq!(dock.add_tooltip, super::TERMINAL_ADD_SHELL_TOOLTIP);
+                assert_eq!(
+                    dock.empty_state,
+                    Some(super::TERMINAL_DOCK_EMPTY_MESSAGE),
+                    "with no shell focused the splash overlay text replaces the body"
+                );
+
+                // And the element tree for that branch actually builds with
+                // this owner and strip, rather than the model being a claim
+                // about a renderer nothing exercises.
+                let tokens = shell.theme_tokens();
+                let _ = shell.terminal_chip_strip(&owner, tokens, None);
+                let _ = shell.terminal_dock_surface(tokens, Some(owner.clone()), None);
+                let _ = shell.context_dock_surface(tokens, None);
+            });
+            cx.quit();
+        });
+    }
 }
 
 #[allow(dead_code)]
