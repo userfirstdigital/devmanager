@@ -203,7 +203,14 @@ pub(crate) fn is_pure_slice_decision_fact(event: &Event) -> bool {
         | Event::ResourceReleased { .. }
         | Event::ProviderQuestionPresented { .. }
         | Event::ProviderApprovalPresented { .. }
-        | Event::ProviderWaitSettled { .. } => true,
+        | Event::ProviderWaitSettled { .. }
+        // Terminal facts and the strip are recorded state: they settle in the
+        // same transaction and plan no host effect of their own.
+        | Event::TerminalRenamed { .. }
+        | Event::TerminalCwdReported { .. }
+        | Event::TerminalExited { .. }
+        | Event::TerminalActivity { .. }
+        | Event::TaskTerminalStripSet { .. } => true,
         Event::Browser(fact) => !browser_fact_requires_host_settlement(fact),
         Event::TaskCloseBegun { .. }
         | Event::ResourceReleaseBegun { .. }
@@ -489,7 +496,14 @@ pub(crate) fn plan_effects(
             | Event::ResourceReleased { .. }
             | Event::ProviderQuestionPresented { .. }
             | Event::ProviderApprovalPresented { .. }
-            | Event::ProviderWaitSettled { .. } => {
+            | Event::ProviderWaitSettled { .. }
+            // Terminal facts and the strip plan no host effect; keep in
+            // lockstep with `is_pure_slice_decision_fact`.
+            | Event::TerminalRenamed { .. }
+            | Event::TerminalCwdReported { .. }
+            | Event::TerminalExited { .. }
+            | Event::TerminalActivity { .. }
+            | Event::TaskTerminalStripSet { .. } => {
                 pure_fact_count = pure_fact_count
                     .checked_add(1)
                     .ok_or(StoreError::Corruption)?;

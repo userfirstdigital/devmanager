@@ -1577,6 +1577,13 @@ pub(crate) fn apply_event(
                 ));
             }
         }
+        // Terminal facts and the terminal strip are projected in a later task
+        // (V16 projection tables); the domain replay already applies them.
+        Event::TerminalRenamed { .. }
+        | Event::TerminalCwdReported { .. }
+        | Event::TerminalExited { .. }
+        | Event::TerminalActivity { .. }
+        | Event::TaskTerminalStripSet { .. } => {}
     }
     enforce_derived_result_lineage(tx, event)?;
     Ok(())

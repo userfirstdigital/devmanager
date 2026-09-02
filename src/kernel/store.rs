@@ -16,8 +16,9 @@ use crate::domain::event::{
     ProviderQuestionPresentedPayload, ProviderWaitSettledPayload, ResourceRegisteredPayload,
     ResourceReleaseBegunPayload, ResourceReleasedPayload, SpecialistClosedPayload,
     SpecialistHandoffRecordedPayload, SpecialistRequestedPayload, TaskAttentionSetPayload,
-    TaskCloseBegunPayload, TaskCreatedPayload, TaskRenamedPayload, TaskUnitPayload,
-    UnstartedPrimaryProviderReboundPayload, EVENT_SCHEMA_VERSION,
+    TaskCloseBegunPayload, TaskCreatedPayload, TaskRenamedPayload, TaskTerminalStripSetPayload,
+    TaskUnitPayload, TerminalActivityPayload, TerminalCwdReportedPayload, TerminalExitedPayload,
+    TerminalRenamedPayload, UnstartedPrimaryProviderReboundPayload, EVENT_SCHEMA_VERSION,
 };
 use crate::domain::id::{EventId, OperationId, OutboxId, TaskId};
 use crate::domain::operation::{
@@ -1538,6 +1539,33 @@ pub(crate) fn encode_event_payload(event: &Event) -> Result<Vec<u8>, StoreError>
             resource_id: *resource_id,
             runtime_generation: *runtime_generation,
         }),
+        Event::TerminalRenamed { resource_id, title } => {
+            rmp_serde::to_vec(&TerminalRenamedPayload {
+                resource_id: *resource_id,
+                title: title.clone(),
+            })
+        }
+        Event::TerminalCwdReported { resource_id, cwd } => {
+            rmp_serde::to_vec(&TerminalCwdReportedPayload {
+                resource_id: *resource_id,
+                cwd: cwd.clone(),
+            })
+        }
+        Event::TerminalExited {
+            resource_id,
+            code,
+            summary,
+        } => rmp_serde::to_vec(&TerminalExitedPayload {
+            resource_id: *resource_id,
+            code: *code,
+            summary: summary.clone(),
+        }),
+        Event::TerminalActivity { resource_id } => rmp_serde::to_vec(&TerminalActivityPayload {
+            resource_id: *resource_id,
+        }),
+        Event::TaskTerminalStripSet { strip } => rmp_serde::to_vec(&TaskTerminalStripSetPayload {
+            strip: strip.clone(),
+        }),
         Event::HostCloseBegun {
             operation_id,
             action_epoch,
@@ -1843,6 +1871,52 @@ pub(crate) fn decode_stored_event(
                 resource_id: p.resource_id,
                 runtime_generation: p.runtime_generation,
             }
+        }
+        "terminal.renamed" => {
+            let p: TerminalRenamedPayload = unpack(payload)?;
+            let trimmed = p.title.trim();
+            if trimmed.is_empty()
+                || trimmed != p.title
+                || trimmed.chars().count() > crate::domain::resource::MAX_TERMINAL_TITLE_CHARS
+            {
+                return Err(StoreError::EventDecode(
+                    "terminal title must be trimmed, non-empty, and within the title bound".into(),
+                ));
+            }
+            Event::TerminalRenamed {
+                resource_id: p.resource_id,
+                title: p.title,
+            }
+        }
+        "terminal.cwd_reported" => {
+            let p: TerminalCwdReportedPayload = unpack(payload)?;
+            if !p.cwd.is_absolute() {
+                return Err(StoreError::EventDecode(
+                    "terminal cwd must be absolute".into(),
+                ));
+            }
+            Event::TerminalCwdReported {
+                resource_id: p.resource_id,
+                cwd: p.cwd,
+            }
+        }
+        "terminal.exited" => {
+            let p: TerminalExitedPayload = unpack(payload)?;
+            Event::TerminalExited {
+                resource_id: p.resource_id,
+                code: p.code,
+                summary: p.summary,
+            }
+        }
+        "terminal.activity" => {
+            let p: TerminalActivityPayload = unpack(payload)?;
+            Event::TerminalActivity {
+                resource_id: p.resource_id,
+            }
+        }
+        "task.terminal_strip_set" => {
+            let p: TaskTerminalStripSetPayload = unpack(payload)?;
+            Event::TaskTerminalStripSet { strip: p.strip }
         }
         "host.close_begun" => {
             let p: HostCloseBegunPayload = unpack(payload)?;

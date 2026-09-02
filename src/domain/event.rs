@@ -29,7 +29,7 @@ use crate::domain::provider_input::{
     ProviderInputAction, ProviderInputSettlement, ProviderResolutionWinner, ProviderWaitFence,
     ProviderWaitRecord,
 };
-use crate::domain::resource::{ResourceFacts, ResourceLifecycle};
+use crate::domain::resource::{ResourceFacts, ResourceKind, ResourceLifecycle, ResourceRecipe};
 use crate::domain::snapshot::TaskSnapshot;
 use crate::domain::task::{
     ReviewReadiness, TaskActivity, TaskAttention, TaskConnectivity, TaskFacts, TaskLifecycle,
@@ -611,6 +611,40 @@ pub struct ResourceReleasedPayload {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+pub struct TerminalRenamedPayload {
+    pub resource_id: ResourceId,
+    pub title: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TerminalCwdReportedPayload {
+    pub resource_id: ResourceId,
+    pub cwd: std::path::PathBuf,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TerminalExitedPayload {
+    pub resource_id: ResourceId,
+    pub code: Option<i32>,
+    pub summary: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TerminalActivityPayload {
+    pub resource_id: ResourceId,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TaskTerminalStripSetPayload {
+    pub strip: crate::domain::terminal_facts::TaskTerminalStrip,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct HostCloseBegunPayload {
     pub operation_id: OperationId,
     pub action_epoch: u64,
@@ -1074,6 +1108,25 @@ pub enum Event {
         resource_id: ResourceId,
         runtime_generation: u64,
     },
+    TerminalRenamed {
+        resource_id: ResourceId,
+        title: String,
+    },
+    TerminalCwdReported {
+        resource_id: ResourceId,
+        cwd: std::path::PathBuf,
+    },
+    TerminalExited {
+        resource_id: ResourceId,
+        code: Option<i32>,
+        summary: String,
+    },
+    TerminalActivity {
+        resource_id: ResourceId,
+    },
+    TaskTerminalStripSet {
+        strip: crate::domain::terminal_facts::TaskTerminalStrip,
+    },
     HostCloseBegun {
         operation_id: OperationId,
         action_epoch: u64,
@@ -1168,6 +1221,11 @@ impl Event {
             Self::ResourceRegistered { .. } => "resource.registered",
             Self::ResourceReleaseBegun { .. } => "resource.release_begun",
             Self::ResourceReleased { .. } => "resource.released",
+            Self::TerminalRenamed { .. } => "terminal.renamed",
+            Self::TerminalCwdReported { .. } => "terminal.cwd_reported",
+            Self::TerminalExited { .. } => "terminal.exited",
+            Self::TerminalActivity { .. } => "terminal.activity",
+            Self::TaskTerminalStripSet { .. } => "task.terminal_strip_set",
             Self::HostCloseBegun { .. } => "host.close_begun",
             Self::HostCleanupBranchCompleted { .. } => "host.cleanup_branch_completed",
             Self::OperationAccepted(_) => "operation.accepted",
@@ -1195,6 +1253,11 @@ impl Event {
                 | Self::OperationCancelled(_)
                 | Self::OperationUncertain(_)
                 | Self::ProviderInputDelivered { .. }
+                // Host-reported terminal facts: durable, but they do not
+                // consume a task revision.
+                | Self::TerminalCwdReported { .. }
+                | Self::TerminalExited { .. }
+                | Self::TerminalActivity { .. }
         )
     }
 }
@@ -1242,6 +1305,16 @@ enum EventBody {
     ResourceReleaseBegun(ResourceReleaseBegunPayload),
     #[serde(rename = "resource.released")]
     ResourceReleased(ResourceReleasedPayload),
+    #[serde(rename = "terminal.renamed")]
+    TerminalRenamed(TerminalRenamedPayload),
+    #[serde(rename = "terminal.cwd_reported")]
+    TerminalCwdReported(TerminalCwdReportedPayload),
+    #[serde(rename = "terminal.exited")]
+    TerminalExited(TerminalExitedPayload),
+    #[serde(rename = "terminal.activity")]
+    TerminalActivity(TerminalActivityPayload),
+    #[serde(rename = "task.terminal_strip_set")]
+    TaskTerminalStripSet(TaskTerminalStripSetPayload),
     #[serde(rename = "host.close_begun")]
     HostCloseBegun(HostCloseBegunPayload),
     #[serde(rename = "host.cleanup_branch_completed")]
@@ -1419,6 +1492,37 @@ impl From<&Event> for EventDocument {
                 resource_id: *resource_id,
                 runtime_generation: *runtime_generation,
             }),
+            Event::TerminalRenamed { resource_id, title } => {
+                EventBody::TerminalRenamed(TerminalRenamedPayload {
+                    resource_id: *resource_id,
+                    title: title.clone(),
+                })
+            }
+            Event::TerminalCwdReported { resource_id, cwd } => {
+                EventBody::TerminalCwdReported(TerminalCwdReportedPayload {
+                    resource_id: *resource_id,
+                    cwd: cwd.clone(),
+                })
+            }
+            Event::TerminalExited {
+                resource_id,
+                code,
+                summary,
+            } => EventBody::TerminalExited(TerminalExitedPayload {
+                resource_id: *resource_id,
+                code: *code,
+                summary: summary.clone(),
+            }),
+            Event::TerminalActivity { resource_id } => {
+                EventBody::TerminalActivity(TerminalActivityPayload {
+                    resource_id: *resource_id,
+                })
+            }
+            Event::TaskTerminalStripSet { strip } => {
+                EventBody::TaskTerminalStripSet(TaskTerminalStripSetPayload {
+                    strip: strip.clone(),
+                })
+            }
             Event::HostCloseBegun {
                 operation_id,
                 action_epoch,
@@ -1676,6 +1780,37 @@ impl TryFrom<EventDocument> for Event {
                 resource_id: p.resource_id,
                 runtime_generation: p.runtime_generation,
             },
+            EventBody::TerminalRenamed(p) => {
+                let trimmed = p.title.trim();
+                if trimmed.is_empty()
+                    || trimmed != p.title
+                    || trimmed.chars().count() > crate::domain::resource::MAX_TERMINAL_TITLE_CHARS
+                {
+                    return Err(EventSerdeError::Payload);
+                }
+                Event::TerminalRenamed {
+                    resource_id: p.resource_id,
+                    title: p.title,
+                }
+            }
+            EventBody::TerminalCwdReported(p) => {
+                if !p.cwd.is_absolute() {
+                    return Err(EventSerdeError::Payload);
+                }
+                Event::TerminalCwdReported {
+                    resource_id: p.resource_id,
+                    cwd: p.cwd,
+                }
+            }
+            EventBody::TerminalExited(p) => Event::TerminalExited {
+                resource_id: p.resource_id,
+                code: p.code,
+                summary: p.summary,
+            },
+            EventBody::TerminalActivity(p) => Event::TerminalActivity {
+                resource_id: p.resource_id,
+            },
+            EventBody::TaskTerminalStripSet(p) => Event::TaskTerminalStripSet { strip: p.strip },
             EventBody::HostCloseBegun(p) => Event::HostCloseBegun {
                 operation_id: p.operation_id,
                 action_epoch: p.action_epoch,
@@ -1838,7 +1973,7 @@ impl<'de> Deserialize<'de> for Event {
 #[cfg(test)]
 mod durable_workspace_serde_tests {
     use super::{DomainEvent, Event, EventSerdeError};
-    use crate::domain::id::{EnvironmentId, EventId, ProjectId};
+    use crate::domain::id::{EnvironmentId, EventId, ProjectId, ResourceId};
     use crate::domain::snapshot::{
         EventPage, SnapshotItem, SnapshotPage, SnapshotSection, TaskSnapshotItem,
     };
@@ -1992,6 +2127,133 @@ mod durable_workspace_serde_tests {
         assert_eq!(rendered, "unknown event type");
         assert!(!rendered.contains("attacker"));
     }
+
+    #[test]
+    fn terminal_events_round_trip_json_and_msgpack() {
+        let resource_id = ResourceId::new();
+        let events = vec![
+            Event::TerminalRenamed {
+                resource_id,
+                title: "build".to_string(),
+            },
+            Event::TerminalCwdReported {
+                resource_id,
+                cwd: std::path::PathBuf::from(r"C:\Code\demo"),
+            },
+            Event::TerminalExited {
+                resource_id,
+                code: Some(0),
+                summary: "Shell exited with code 0".to_string(),
+            },
+            Event::TerminalActivity { resource_id },
+            Event::TaskTerminalStripSet {
+                strip: crate::domain::terminal_facts::TaskTerminalStrip {
+                    order: vec![resource_id],
+                    focused: Some(resource_id),
+                },
+            },
+        ];
+        for event in events {
+            let json = serde_json::to_string(&event).expect("event json");
+            let replayed: Event = serde_json::from_str(&json).expect("event replay");
+            assert_eq!(replayed, event);
+            let packed = rmp_serde::to_vec(&event).expect("event msgpack");
+            let unpacked: Event = rmp_serde::from_slice(&packed).expect("event unpack");
+            assert_eq!(unpacked, event);
+        }
+    }
+
+    #[test]
+    fn terminal_event_types_are_stable() {
+        let resource_id = ResourceId::new();
+        assert_eq!(
+            Event::TerminalRenamed {
+                resource_id,
+                title: "x".into()
+            }
+            .event_type(),
+            "terminal.renamed"
+        );
+        assert_eq!(
+            Event::TerminalCwdReported {
+                resource_id,
+                cwd: "C:\\".into()
+            }
+            .event_type(),
+            "terminal.cwd_reported"
+        );
+        assert_eq!(
+            Event::TerminalExited {
+                resource_id,
+                code: None,
+                summary: "s".into()
+            }
+            .event_type(),
+            "terminal.exited"
+        );
+        assert_eq!(
+            Event::TerminalActivity { resource_id }.event_type(),
+            "terminal.activity"
+        );
+        assert_eq!(
+            Event::TaskTerminalStripSet {
+                strip: Default::default()
+            }
+            .event_type(),
+            "task.terminal_strip_set"
+        );
+    }
+
+    #[test]
+    fn host_terminal_facts_do_not_consume_a_task_revision() {
+        let resource_id = ResourceId::new();
+        assert!(!Event::TerminalCwdReported {
+            resource_id,
+            cwd: "C:\\".into()
+        }
+        .is_task_mutation());
+        assert!(!Event::TerminalExited {
+            resource_id,
+            code: None,
+            summary: "s".into()
+        }
+        .is_task_mutation());
+        assert!(!Event::TerminalActivity { resource_id }.is_task_mutation());
+        assert!(Event::TerminalRenamed {
+            resource_id,
+            title: "x".into()
+        }
+        .is_task_mutation());
+        assert!(Event::TaskTerminalStripSet {
+            strip: Default::default()
+        }
+        .is_task_mutation());
+    }
+
+    #[test]
+    fn terminal_payloads_reject_invalid_titles_and_relative_cwd() {
+        let resource_id = ResourceId::new();
+        let renamed = serde_json::to_value(Event::TerminalRenamed {
+            resource_id,
+            title: "build".to_string(),
+        })
+        .expect("rename json");
+        let too_long = "x".repeat(65);
+        for bad_title in ["", " build", too_long.as_str()] {
+            let mut document = renamed.clone();
+            document["payload"]["title"] = serde_json::Value::String(bad_title.to_string());
+            let decoded: Result<Event, _> = serde_json::from_value(document);
+            assert!(decoded.is_err(), "title {bad_title:?} must not decode");
+        }
+        let mut cwd_document = serde_json::to_value(Event::TerminalCwdReported {
+            resource_id,
+            cwd: std::path::PathBuf::from(r"C:\Code\demo"),
+        })
+        .expect("cwd json");
+        cwd_document["payload"]["cwd"] = serde_json::Value::String("demo".to_string());
+        let decoded: Result<Event, _> = serde_json::from_value(cwd_document);
+        assert!(decoded.is_err(), "a relative cwd must not decode");
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2123,6 +2385,16 @@ pub fn apply(
             // Delivery is a durable provider-session projection change, but it
             // does not consume a task revision. Replay must still apply it so
             // rebuild/status validation agrees with the live projector.
+            apply_into(&mut snap, &event.payload, event.occurred_at_ms)?;
+            Ok(snap)
+        }
+        Event::TerminalCwdReported { .. }
+        | Event::TerminalExited { .. }
+        | Event::TerminalActivity { .. } => {
+            let mut snap = snapshot.ok_or(ApplyError::MissingSnapshot)?;
+            require_matching_task_id(&snap, event)?;
+            // Host terminal facts are durable projection changes that do not
+            // consume a task revision, exactly like ProviderInputDelivered.
             apply_into(&mut snap, &event.payload, event.occurred_at_ms)?;
             Ok(snap)
         }
@@ -2546,6 +2818,28 @@ fn apply_into(
                 return Err(ApplyError::AlreadyExists);
             }
             snap.resources.insert(resource.id, resource.clone());
+            if resource.resource_kind == ResourceKind::Terminal {
+                let title = match &resource.recipe {
+                    ResourceRecipe::Terminal { title, .. } => title.clone(),
+                    _ => None,
+                };
+                snap.terminal_facts.insert(
+                    resource.id,
+                    crate::domain::terminal_facts::TerminalFacts::registered(
+                        resource.id,
+                        title,
+                        occurred_at_ms,
+                    ),
+                );
+                // Only a plain shell (a terminal recipe carrying a launch) is a
+                // user-facing strip tab; provider-owned terminals are not.
+                if resource.recipe.is_plain_shell() {
+                    snap.terminal_strip.order.push(resource.id);
+                    if snap.terminal_strip.focused.is_none() {
+                        snap.terminal_strip.focused = Some(resource.id);
+                    }
+                }
+            }
         }
         Event::ResourceReleaseBegun {
             resource_id,
@@ -2588,6 +2882,68 @@ fn apply_into(
             }
             resource.lifecycle = ResourceLifecycle::Released;
             resource.updated_at_ms = occurred_at_ms;
+            snap.terminal_facts.remove(resource_id);
+            snap.terminal_strip.remove(*resource_id);
+        }
+        Event::TerminalRenamed { resource_id, title } => {
+            let plain_shell = match snap.resources.get(resource_id) {
+                Some(resource) => resource.recipe.is_plain_shell(),
+                None => return Err(ApplyError::NotFound),
+            };
+            if !plain_shell {
+                // `domain::resource` forbids a titled provider terminal, so a
+                // rename of one could never be re-encoded as a valid recipe.
+                return Err(ApplyError::InvalidTransition);
+            }
+            let new_title = Some(title.clone());
+            let facts = snap
+                .terminal_facts
+                .get_mut(resource_id)
+                .ok_or(ApplyError::NotFound)?;
+            facts.title = new_title.clone();
+            if let Some(ResourceRecipe::Terminal {
+                title: recipe_title,
+                ..
+            }) = snap.resources.get_mut(resource_id).map(|r| &mut r.recipe)
+            {
+                *recipe_title = new_title;
+            }
+        }
+        Event::TerminalCwdReported { resource_id, cwd } => {
+            let facts = snap
+                .terminal_facts
+                .get_mut(resource_id)
+                .ok_or(ApplyError::NotFound)?;
+            facts.live_cwd = Some(cwd.clone());
+            facts.last_activity_at_ms = occurred_at_ms;
+        }
+        Event::TerminalExited {
+            resource_id,
+            code,
+            summary,
+        } => {
+            let facts = snap
+                .terminal_facts
+                .get_mut(resource_id)
+                .ok_or(ApplyError::NotFound)?;
+            facts.exit = Some(crate::domain::terminal_facts::TerminalExit {
+                code: *code,
+                summary: summary.clone(),
+                at_ms: occurred_at_ms,
+            });
+        }
+        Event::TerminalActivity { resource_id } => {
+            let facts = snap
+                .terminal_facts
+                .get_mut(resource_id)
+                .ok_or(ApplyError::NotFound)?;
+            facts.last_activity_at_ms = occurred_at_ms;
+        }
+        Event::TaskTerminalStripSet { strip } => {
+            strip
+                .validate(snap.task.id, &snap.resources)
+                .map_err(|_| ApplyError::NotFound)?;
+            snap.terminal_strip = strip.clone();
         }
         Event::ProviderInputAccepted {
             command_id,
@@ -2967,4 +3323,341 @@ pub fn apply_all(
         )?);
     }
     snapshot.ok_or(ApplyError::MissingSnapshot)
+}
+
+#[cfg(test)]
+mod terminal_apply_tests {
+    use super::{apply, apply_into, ApplyError, DomainEvent, Event};
+    use crate::domain::id::{EnvironmentId, EventId, ProjectId, ResourceId, TaskId};
+    use crate::domain::resource::{
+        OwnerKind, ResourceFacts, ResourceKind, ResourceRecipe, TerminalLaunch,
+    };
+    use crate::domain::snapshot::TaskSnapshot;
+    use crate::domain::task::{
+        ReviewReadiness, TaskActivity, TaskAssignment, TaskAttention, TaskConnectivity, TaskFacts,
+        WorkspaceRef,
+    };
+    use crate::domain::terminal_facts::TaskTerminalStrip;
+    use std::path::PathBuf;
+
+    const CREATED_AT_MS: i64 = 1_725_000_000_000;
+
+    fn plain_shell_recipe() -> ResourceRecipe {
+        ResourceRecipe::Terminal {
+            cols: 80,
+            rows: 24,
+            launch: Some(TerminalLaunch {
+                cwd: PathBuf::from(r"C:\Code"),
+                program: PathBuf::from(r"C:\Windows\System32\cmd.exe"),
+                args: vec![],
+            }),
+            title: None,
+        }
+    }
+
+    fn terminal_resource(task_id: TaskId, recipe: ResourceRecipe) -> ResourceFacts {
+        ResourceFacts::new(
+            Some(task_id),
+            OwnerKind::Task,
+            ResourceKind::Terminal,
+            recipe,
+            CREATED_AT_MS,
+        )
+        .expect("terminal resource")
+    }
+
+    fn task_snapshot() -> TaskSnapshot {
+        let mut task = TaskFacts::new(
+            EnvironmentId::new(),
+            "shell host",
+            None,
+            ProjectId::new(),
+            WorkspaceRef::Main,
+            TaskAssignment::LocalOwner,
+            CREATED_AT_MS,
+        )
+        .expect("task facts");
+        task.revision = 1;
+        apply(
+            None,
+            &DomainEvent {
+                id: EventId::new(),
+                task_id: Some(task.id),
+                sequence: 1,
+                task_revision: Some(1),
+                occurred_at_ms: CREATED_AT_MS,
+                payload: Event::TaskCreated {
+                    task: task.clone(),
+                    connectivity: TaskConnectivity::Connected,
+                    attention: TaskAttention::None,
+                    activity: TaskActivity::Idle,
+                    review_readiness: ReviewReadiness::NotReady,
+                },
+            },
+        )
+        .expect("task created")
+    }
+
+    /// A snapshot holding one registered plain shell (a Terminal recipe with a
+    /// launch), so the strip assertions below are meaningful.
+    fn snapshot_with_terminal_resource() -> (TaskSnapshot, ResourceId) {
+        let mut snapshot = task_snapshot();
+        let resource = terminal_resource(snapshot.task.id, plain_shell_recipe());
+        let resource_id = resource.id;
+        apply_into(
+            &mut snapshot,
+            &Event::ResourceRegistered { resource },
+            CREATED_AT_MS,
+        )
+        .expect("register terminal");
+        (snapshot, resource_id)
+    }
+
+    #[test]
+    fn registering_a_plain_shell_seeds_facts_and_focuses_the_strip() {
+        let (snapshot, resource_id) = snapshot_with_terminal_resource();
+        assert_eq!(snapshot.terminal_strip.order, vec![resource_id]);
+        assert_eq!(snapshot.terminal_strip.focused, Some(resource_id));
+        let facts = &snapshot.terminal_facts[&resource_id];
+        assert_eq!(facts.created_at_ms, CREATED_AT_MS);
+        assert_eq!(facts.last_activity_at_ms, CREATED_AT_MS);
+        assert_eq!(facts.live_cwd, None);
+    }
+
+    #[test]
+    fn registering_a_provider_terminal_stays_out_of_the_strip() {
+        let mut snapshot = task_snapshot();
+        let resource = terminal_resource(snapshot.task.id, ResourceRecipe::terminal(80, 24));
+        let resource_id = resource.id;
+        apply_into(
+            &mut snapshot,
+            &Event::ResourceRegistered { resource },
+            CREATED_AT_MS,
+        )
+        .expect("register provider terminal");
+        assert!(snapshot.terminal_facts.contains_key(&resource_id));
+        assert!(snapshot.terminal_strip.order.is_empty());
+        assert_eq!(snapshot.terminal_strip.focused, None);
+    }
+
+    #[test]
+    fn renaming_a_provider_terminal_is_rejected() {
+        let mut snapshot = task_snapshot();
+        let resource = terminal_resource(snapshot.task.id, ResourceRecipe::terminal(80, 24));
+        let resource_id = resource.id;
+        apply_into(
+            &mut snapshot,
+            &Event::ResourceRegistered { resource },
+            CREATED_AT_MS,
+        )
+        .expect("register provider terminal");
+        assert_eq!(
+            apply_into(
+                &mut snapshot,
+                &Event::TerminalRenamed {
+                    resource_id,
+                    title: "build".to_string(),
+                },
+                1_725_000_000_500,
+            ),
+            Err(ApplyError::InvalidTransition)
+        );
+        assert_eq!(snapshot.terminal_facts[&resource_id].title, None);
+    }
+
+    #[test]
+    fn terminal_facts_follow_resource_lifecycle_and_events() {
+        let (mut snapshot, resource_id) = snapshot_with_terminal_resource();
+        let facts = snapshot
+            .terminal_facts
+            .get(&resource_id)
+            .expect("facts on registration");
+        assert_eq!(facts.title, None);
+        assert_eq!(facts.exit, None);
+
+        apply_into(
+            &mut snapshot,
+            &Event::TerminalRenamed {
+                resource_id,
+                title: "build".to_string(),
+            },
+            1_725_000_000_500,
+        )
+        .expect("rename");
+        assert_eq!(
+            snapshot.terminal_facts[&resource_id].title.as_deref(),
+            Some("build")
+        );
+        assert!(matches!(
+            &snapshot.resources[&resource_id].recipe,
+            ResourceRecipe::Terminal { title: Some(title), .. } if title == "build"
+        ));
+
+        apply_into(
+            &mut snapshot,
+            &Event::TerminalCwdReported {
+                resource_id,
+                cwd: PathBuf::from(r"C:\Code\demo"),
+            },
+            1_725_000_000_600,
+        )
+        .expect("cwd");
+        assert_eq!(
+            snapshot.terminal_facts[&resource_id].live_cwd,
+            Some(PathBuf::from(r"C:\Code\demo"))
+        );
+
+        apply_into(
+            &mut snapshot,
+            &Event::TerminalActivity { resource_id },
+            1_725_000_000_700,
+        )
+        .expect("activity");
+        assert_eq!(
+            snapshot.terminal_facts[&resource_id].last_activity_at_ms,
+            1_725_000_000_700
+        );
+
+        apply_into(
+            &mut snapshot,
+            &Event::TerminalExited {
+                resource_id,
+                code: Some(1),
+                summary: "Shell exited with code 1".to_string(),
+            },
+            1_725_000_000_800,
+        )
+        .expect("exit");
+        assert_eq!(
+            snapshot.terminal_facts[&resource_id]
+                .exit
+                .as_ref()
+                .map(|e| e.code),
+            Some(Some(1))
+        );
+
+        let generation = snapshot.resources[&resource_id].runtime_generation;
+        apply_into(
+            &mut snapshot,
+            &Event::ResourceReleaseBegun {
+                resource_id,
+                runtime_generation: generation,
+            },
+            1_725_000_000_900,
+        )
+        .expect("release begun");
+        apply_into(
+            &mut snapshot,
+            &Event::ResourceReleased {
+                resource_id,
+                runtime_generation: generation,
+            },
+            1_725_000_001_000,
+        )
+        .expect("released");
+        assert!(!snapshot.terminal_facts.contains_key(&resource_id));
+        assert!(!snapshot.terminal_strip.order.contains(&resource_id));
+        assert_eq!(snapshot.terminal_strip.focused, None);
+    }
+
+    #[test]
+    fn terminal_facts_events_require_a_known_terminal() {
+        let (mut snapshot, _resource_id) = snapshot_with_terminal_resource();
+        let stranger = ResourceId::new();
+        assert_eq!(
+            apply_into(
+                &mut snapshot,
+                &Event::TerminalActivity {
+                    resource_id: stranger
+                },
+                1_725_000_000_500,
+            ),
+            Err(ApplyError::NotFound)
+        );
+        assert_eq!(
+            apply_into(
+                &mut snapshot,
+                &Event::TerminalRenamed {
+                    resource_id: stranger,
+                    title: "build".to_string(),
+                },
+                1_725_000_000_500,
+            ),
+            Err(ApplyError::NotFound)
+        );
+    }
+
+    #[test]
+    fn strip_set_rejects_unknown_resource() {
+        let (mut snapshot, _resource_id) = snapshot_with_terminal_resource();
+        let result = apply_into(
+            &mut snapshot,
+            &Event::TaskTerminalStripSet {
+                strip: TaskTerminalStrip {
+                    order: vec![ResourceId::new()],
+                    focused: None,
+                },
+            },
+            1_725_000_000_500,
+        );
+        assert_eq!(result, Err(ApplyError::NotFound));
+    }
+
+    #[test]
+    fn strip_set_accepts_a_valid_strip() {
+        let (mut snapshot, first) = snapshot_with_terminal_resource();
+        let second = terminal_resource(snapshot.task.id, plain_shell_recipe());
+        let second_id = second.id;
+        apply_into(
+            &mut snapshot,
+            &Event::ResourceRegistered { resource: second },
+            CREATED_AT_MS,
+        )
+        .expect("register second terminal");
+        let strip = TaskTerminalStrip {
+            order: vec![second_id, first],
+            focused: Some(second_id),
+        };
+        apply_into(
+            &mut snapshot,
+            &Event::TaskTerminalStripSet {
+                strip: strip.clone(),
+            },
+            1_725_000_000_500,
+        )
+        .expect("strip set");
+        assert_eq!(snapshot.terminal_strip, strip);
+    }
+
+    #[test]
+    fn host_terminal_facts_apply_through_apply_without_a_task_revision() {
+        let (snapshot, resource_id) = snapshot_with_terminal_resource();
+        let task_id = snapshot.task.id;
+        let revision = snapshot.task.revision;
+        let host_fact = |task_id: Option<TaskId>, payload: Event| DomainEvent {
+            id: EventId::new(),
+            task_id,
+            sequence: 2,
+            task_revision: None,
+            occurred_at_ms: 1_725_000_000_700,
+            payload,
+        };
+        let applied = apply(
+            Some(snapshot),
+            &host_fact(Some(task_id), Event::TerminalActivity { resource_id }),
+        )
+        .expect("host activity applies with no task revision");
+        assert_eq!(applied.task.revision, revision);
+        assert_eq!(
+            applied.terminal_facts[&resource_id].last_activity_at_ms,
+            1_725_000_000_700
+        );
+
+        // A host fact still has to name its own task.
+        let foreign = apply(
+            Some(applied),
+            &host_fact(Some(TaskId::new()), Event::TerminalActivity { resource_id }),
+        );
+        assert!(matches!(foreign, Err(ApplyError::TaskMismatch)));
+    }
 }
