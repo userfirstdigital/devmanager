@@ -35,6 +35,8 @@ pub struct TaskSnapshot {
     pub resources: BTreeMap<ResourceId, ResourceFacts>,
     pub provider_sessions: BTreeMap<AgentSessionId, ProviderSessionProjection>,
     pub browser: BrowserBook,
+    pub terminal_facts: BTreeMap<ResourceId, crate::domain::terminal_facts::TerminalFacts>,
+    pub terminal_strip: crate::domain::terminal_facts::TaskTerminalStrip,
 }
 
 impl TaskSnapshot {
@@ -907,6 +909,8 @@ mod tests {
             resources: BTreeMap::new(),
             provider_sessions,
             browser,
+            terminal_facts: Default::default(),
+            terminal_strip: Default::default(),
         }
     }
 

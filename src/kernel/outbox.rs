@@ -1063,6 +1063,8 @@ mod tests {
             resources,
             provider_sessions: BTreeMap::new(),
             browser: crate::domain::browser::BrowserBook::new(),
+            terminal_facts: Default::default(),
+            terminal_strip: Default::default(),
         };
 
         let close = plan_effects(

@@ -2086,6 +2086,8 @@ pub fn apply(
                     browser.open_task(task.id).map_err(apply_browser_error)?;
                     browser
                 },
+                terminal_facts: Default::default(),
+                terminal_strip: Default::default(),
             })
         }
         Event::Browser(fact) => {

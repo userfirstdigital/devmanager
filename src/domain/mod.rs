@@ -16,6 +16,7 @@ pub mod query;
 pub mod resource;
 pub mod snapshot;
 pub mod task;
+pub mod terminal_facts;
 
 pub use crate::providers::ProviderKind;
 pub use agent::{
@@ -111,3 +112,4 @@ pub use task::{
     TaskConnectivity, TaskFacts, TaskLifecycle, TaskValidationError, VisibleTaskStatus,
     WorkspaceChoice, WorkspaceRef,
 };
+pub use terminal_facts::{TaskTerminalStrip, TerminalExit, TerminalFacts};

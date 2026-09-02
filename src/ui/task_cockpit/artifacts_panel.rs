@@ -126,6 +126,8 @@ mod tests {
             resources: BTreeMap::new(),
             provider_sessions: BTreeMap::new(),
             browser: Default::default(),
+            terminal_facts: Default::default(),
+            terminal_strip: Default::default(),
         }
     }
 

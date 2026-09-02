@@ -1687,6 +1687,8 @@ mod provider_restart_identity_tests {
             resources: BTreeMap::from([(resource_id, resource)]),
             provider_sessions: BTreeMap::new(),
             browser: crate::domain::browser::BrowserBook::new(),
+            terminal_facts: Default::default(),
+            terminal_strip: Default::default(),
         };
 
         let fresh = provider_hold_restart_intent_from_snapshot(&snapshot).expect("new intent");
@@ -8829,6 +8831,8 @@ pub(crate) fn load_task_snapshot(
                 "task {task_id} browser projection is invalid: {error}"
             ))
         })?,
+        terminal_facts: Default::default(),
+        terminal_strip: Default::default(),
     }))
 }
 

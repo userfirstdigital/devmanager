@@ -1283,6 +1283,8 @@ fn task_snapshot_from_item(item: TaskSnapshotItem) -> TaskSnapshot {
             let _ = browser.open_task(task_id);
             browser
         },
+        terminal_facts: Default::default(),
+        terminal_strip: Default::default(),
     }
 }
 
