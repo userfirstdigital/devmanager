@@ -1137,12 +1137,42 @@ impl ContextDock {
                 return Ok(false);
             }
         }
-        if self.current_memory().identity.is_none() {
-            if plain_shell {
-                self.with_memory(|memory| memory.identity = Some(actual));
-            } else {
-                self.bind_from_model(model)?;
+        match self.current_memory().identity {
+            None => {
+                if plain_shell {
+                    self.with_memory(|memory| memory.identity = Some(actual));
+                } else {
+                    self.bind_from_model(model)?;
+                }
             }
+            // A shell's PTY can be replaced under the same durable resource,
+            // which bumps the resource generation. The provider gets its reset
+            // from `bind_from_model` re-reading the client model; a shell has
+            // no such binding to re-read, so without this the stream cursor
+            // refuses every later poll as a GenerationMismatch and the dock
+            // wedges on the retired screen. A LOWER generation is still a
+            // refusal -- a retired PTY never replaces the live one.
+            Some(previous)
+                if plain_shell
+                    && previous.ids_match(actual)
+                    && actual.resource_generation() > previous.resource_generation() =>
+            {
+                self.with_memory(|memory| {
+                    memory.identity = Some(actual);
+                    memory.last_sequence = 0;
+                    memory.viewport = TerminalViewport::default();
+                    memory.surface_state = TerminalSurfaceState::Live;
+                    memory.exit_summary = None;
+                    memory.replica_view = None;
+                    memory.last_valid_view = None;
+                    memory.live_output.clear();
+                });
+                self.needs_resync = false;
+                self.press_owner = None;
+                self.terminal_click_completed = false;
+                self.advance_epochs();
+            }
+            Some(_) => {}
         }
         if self.current_memory().last_sequence == projection.sequence {
             return Ok(false);
@@ -2343,6 +2373,85 @@ mod process_census_tests {
                 &shell_projection(built.task_id, shell, 1)
             ),
             Ok(true)
+        );
+    }
+
+    /// A shell's PTY can be replaced under the same durable resource (the
+    /// resource generation bumps). The provider path resets its dock memory on
+    /// a generation bump through `bind_from_model`; a shell has no client-model
+    /// binding to re-read, so without an equivalent the dock wedges on the
+    /// stale screen and every later poll is refused as a GenerationMismatch.
+    #[test]
+    fn a_shell_generation_bump_re_derives_identity_instead_of_wedging() {
+        let built = client_model_with_shells(1);
+        let shell = built.shells[0];
+        let mut dock = ContextDock::new(DockEdge::Right);
+        dock.follow_task(built.task_id);
+        dock.set_focused_terminal(Some(shell));
+        assert_eq!(
+            dock.admit_task_terminal_projection(
+                &built.model,
+                &shell_projection(built.task_id, shell, 4)
+            ),
+            Ok(true)
+        );
+        assert_eq!(
+            dock.current_memory()
+                .identity
+                .map(|identity| identity.resource_generation()),
+            Some(1)
+        );
+        assert!(dock.terminal_pane_model().session.is_some());
+
+        let mut replaced = shell_projection(built.task_id, shell, 1);
+        replaced.resource_generation = 2;
+        assert_eq!(
+            dock.admit_task_terminal_projection(&built.model, &replaced),
+            Ok(true),
+            "a newer PTY on the same resource must be admitted, not refused forever"
+        );
+        assert_eq!(
+            dock.current_memory()
+                .identity
+                .map(|identity| identity.resource_generation()),
+            Some(2),
+            "the dock must re-derive identity at the new generation"
+        );
+        assert_eq!(
+            dock.current_memory().last_sequence,
+            1,
+            "the previous generation's sequence memory must not fence the new PTY"
+        );
+    }
+
+    #[test]
+    fn a_shell_projection_from_an_older_generation_is_still_refused() {
+        let built = client_model_with_shells(1);
+        let shell = built.shells[0];
+        let mut dock = ContextDock::new(DockEdge::Right);
+        dock.follow_task(built.task_id);
+        dock.set_focused_terminal(Some(shell));
+        let mut current = shell_projection(built.task_id, shell, 1);
+        current.resource_generation = 2;
+        assert_eq!(
+            dock.admit_task_terminal_projection(&built.model, &current),
+            Ok(true)
+        );
+
+        let stale = shell_projection(built.task_id, shell, 9);
+        assert!(
+            matches!(
+                dock.admit_task_terminal_projection(&built.model, &stale),
+                Err(DockProjectionError::GenerationMismatch { .. })
+            ),
+            "a retired PTY's screen must never replace the live one"
+        );
+        assert_eq!(
+            dock.current_memory()
+                .identity
+                .map(|identity| identity.resource_generation()),
+            Some(2),
+            "a refused stale projection must not move the bound generation"
         );
     }
 
