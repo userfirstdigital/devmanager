@@ -52,6 +52,14 @@ use std::time::Duration;
 const MAX_TERMINAL_CLIPBOARD_BYTES: usize = 1024 * 1024;
 const MAX_REMOTE_REPLAY_BYTES: usize = 4 * 1024 * 1024;
 const MAX_TERMINAL_INPUT_BYTES: usize = 4 * 1024 * 1024;
+/// First pause after a PTY read returns EOF or an error while the child is
+/// still alive. ConPTY surfaces transient EOFs and broken-pipe errors around
+/// sleep/resume; only a confirmed child exit may end the reader.
+const READER_RETRY_INITIAL_BACKOFF: Duration = Duration::from_millis(10);
+const READER_RETRY_MAX_BACKOFF: Duration = Duration::from_millis(250);
+/// Poll cadence when `Child::wait` itself fails and child liveness has to be
+/// re-observed through `try_wait` before any teardown is allowed.
+const WAIT_FALLBACK_POLL_INTERVAL: Duration = Duration::from_millis(250);
 
 #[cfg(all(test, windows))]
 static FAIL_NEXT_WAIT_ACTOR_SPAWN: AtomicBool = AtomicBool::new(false);
@@ -1368,6 +1376,7 @@ impl TerminalSession {
             return Err("previous terminal actors were not joined before restart".to_string());
         }
         let start_gate = Arc::new(TerminalActorStartGate::default());
+        let child_exited = Arc::new(AtomicBool::new(false));
         let reader_actor = match spawn_reader_thread(
             self.session_id.clone(),
             reader,
@@ -1381,8 +1390,7 @@ impl TerminalSession {
             Arc::clone(&self.service_lifecycle_sink),
             self.replay_buffer.clone(),
             Arc::clone(&start_gate),
-            #[cfg(windows)]
-            teardown_handle.clone(),
+            Arc::clone(&child_exited),
         ) {
             Ok(actor) => actor,
             Err(error) => {
@@ -1410,10 +1418,14 @@ impl TerminalSession {
             self.event_proxy.state_notifier.clone(),
             Arc::clone(&self.service_lifecycle_sink),
             Arc::clone(&start_gate),
+            Arc::clone(&child_exited),
         ) {
             Ok(actor) => actor,
             Err(error) => {
                 drop(actor_slots);
+                // No wait actor exists to publish child exit; publish it here so
+                // the reader treats the cleanup-closed PTY as final.
+                child_exited.store(true, Ordering::Release);
                 start_gate.release();
                 cleanup_failed_spawn(
                     #[cfg(not(windows))]
@@ -2551,7 +2563,7 @@ fn spawn_reader_thread(
     service_lifecycle_sink: Arc<Mutex<Option<TerminalLifecycleSink>>>,
     replay_buffer: Arc<Mutex<Vec<u8>>>,
     start_gate: Arc<TerminalActorStartGate>,
-    #[cfg(windows)] teardown: Arc<Mutex<Option<Arc<ManagedTerminalTeardown>>>>,
+    child_exited: Arc<AtomicBool>,
 ) -> Result<thread::JoinHandle<()>, String> {
     thread::Builder::new()
         .name(format!("terminal-reader-{session_id}"))
@@ -2560,10 +2572,23 @@ fn spawn_reader_thread(
             let mut parser = Processor::<StdSyncHandler>::new();
             let mut shell_sequences = ShellSequenceParser::default();
             let mut buffer = [0_u8; 4096];
+            let mut retry_backoff = READER_RETRY_INITIAL_BACKOFF;
 
             loop {
                 match reader.read(&mut buffer) {
                     Ok(0) => {
+                        if !child_exited.load(Ordering::Acquire) {
+                            // Transient EOF with a live child (ConPTY around
+                            // sleep/resume). Keep the terminal; retry the read.
+                            if debug_enabled {
+                                eprintln!(
+                                    "[terminal:{session_id}] PTY reader EOF while child alive; retrying in {retry_backoff:?}"
+                                );
+                            }
+                            thread::sleep(retry_backoff);
+                            retry_backoff = (retry_backoff * 2).min(READER_RETRY_MAX_BACKOFF);
+                            continue;
+                        }
                         if debug_enabled {
                             eprintln!("[terminal:{session_id}] PTY reader reached EOF");
                         }
@@ -2574,6 +2599,7 @@ fn spawn_reader_thread(
                         break;
                     }
                     Ok(bytes_read) => {
+                        retry_backoff = READER_RETRY_INITIAL_BACKOFF;
                         let mode = apply_terminal_output_chunk(
                             &session_id,
                             &buffer[..bytes_read],
@@ -2601,33 +2627,33 @@ fn spawn_reader_thread(
                         }
                     }
                     Err(error) => {
-                        if debug_enabled {
-                            eprintln!("[terminal:{session_id}] PTY read error: {error}");
-                        }
-                        if let Ok(mut runtime) = runtime_state.write() {
-                            if let Some(session) = runtime.sessions.get_mut(&session_id) {
-                                session.note_exit(
-                                    SessionExitState {
-                                        code: None,
-                                        signal: None,
-                                        closed_by_user: false,
-                                        summary: format!("PTY read failed: {error}"),
-                                    },
-                                    SessionStatus::Failed,
+                        if !child_exited.load(Ordering::Acquire) {
+                            // A read error is not evidence of child death. Never
+                            // mark the session failed or tear the tree down here;
+                            // the wait actor is the only exit authority.
+                            if debug_enabled {
+                                eprintln!(
+                                    "[terminal:{session_id}] PTY read error while child alive; retrying in {retry_backoff:?}: {error}"
                                 );
                             }
+                            thread::sleep(retry_backoff);
+                            retry_backoff = (retry_backoff * 2).min(READER_RETRY_MAX_BACKOFF);
+                            continue;
+                        }
+                        // The child already exited, so the closed pipe is the
+                        // expected end of stream rather than a failure.
+                        if debug_enabled {
+                            eprintln!(
+                                "[terminal:{session_id}] PTY read ended after child exit: {error}"
+                            );
                         }
                         notify_service_lifecycle(
                             &service_lifecycle_sink,
-                            TerminalLifecycleEvent::ReaderFailed {
-                                summary: format!("PTY read failed: {error}"),
-                            },
+                            TerminalLifecycleEvent::ReaderEof,
                         );
                         if let Some(notifier) = state_notifier.as_ref() {
                             notifier();
                         }
-                        #[cfg(windows)]
-                        request_managed_terminal_teardown(&teardown);
                         break;
                     }
                 }
@@ -2651,6 +2677,32 @@ fn notify_service_lifecycle(
     }
 }
 
+/// `Child::wait` failed. That is a failure to *observe* the child, not proof
+/// that it exited, so re-observe liveness through `try_wait` until the child
+/// is seen to exit. Only when both observation paths fail is the child treated
+/// as unobservable and reported as an error to the caller.
+fn observe_exit_after_wait_failure(
+    session_id: &str,
+    child: &mut (dyn Child + Send + Sync),
+    error: std::io::Error,
+    debug_enabled: bool,
+) -> Result<portable_pty::ExitStatus, String> {
+    if debug_enabled {
+        eprintln!("[terminal:{session_id}] wait failed; polling child liveness instead: {error}");
+    }
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => return Ok(status),
+            Ok(None) => thread::sleep(WAIT_FALLBACK_POLL_INTERVAL),
+            Err(poll_error) => {
+                return Err(format!(
+                    "{error}; child liveness poll also failed: {poll_error}"
+                ));
+            }
+        }
+    }
+}
+
 fn spawn_wait_thread(
     session_id: String,
     mut child: Box<dyn Child + Send + Sync>,
@@ -2662,6 +2714,7 @@ fn spawn_wait_thread(
     state_notifier: Option<SessionStateNotifier>,
     service_lifecycle_sink: Arc<Mutex<Option<TerminalLifecycleSink>>>,
     start_gate: Arc<TerminalActorStartGate>,
+    child_exited: Arc<AtomicBool>,
 ) -> Result<thread::JoinHandle<()>, String> {
     #[cfg(all(test, windows))]
     if FAIL_NEXT_WAIT_ACTOR_SPAWN.swap(false, Ordering::SeqCst) {
@@ -2671,7 +2724,19 @@ fn spawn_wait_thread(
         .name(format!("terminal-wait-{session_id}"))
         .spawn(move || {
             start_gate.wait();
-            match child.wait() {
+            let outcome = match child.wait() {
+                Ok(status) => Ok(status),
+                Err(error) => observe_exit_after_wait_failure(
+                    &session_id,
+                    child.as_mut(),
+                    error,
+                    debug_enabled,
+                ),
+            };
+            // Publish child death before any teardown so the reader actor can
+            // distinguish a closed pipe from a transient read failure.
+            child_exited.store(true, Ordering::Release);
+            match outcome {
                 Ok(status) => {
                     if debug_enabled {
                         eprintln!("[terminal:{session_id}] child exit -> {status}");
@@ -2958,6 +3023,7 @@ fn spawn_with_command(
         }
     };
     let start_gate = Arc::new(TerminalActorStartGate::default());
+    let child_exited = Arc::new(AtomicBool::new(false));
     let service_output_sink = Arc::new(Mutex::new(None));
     let service_lifecycle_sink = Arc::new(Mutex::new(None));
     let reader_actor = match spawn_reader_thread(
@@ -2973,8 +3039,7 @@ fn spawn_with_command(
         Arc::clone(&service_lifecycle_sink),
         replay_buffer.clone(),
         Arc::clone(&start_gate),
-        #[cfg(windows)]
-        teardown_handle.clone(),
+        Arc::clone(&child_exited),
     ) {
         Ok(actor) => actor,
         Err(error) => {
@@ -3003,10 +3068,14 @@ fn spawn_with_command(
         state_notifier,
         Arc::clone(&service_lifecycle_sink),
         Arc::clone(&start_gate),
+        Arc::clone(&child_exited),
     ) {
         Ok(actor) => actor,
         Err(error) => {
             drop(actor_slots);
+            // No wait actor exists to publish child exit; publish it here so
+            // the reader treats the cleanup-closed PTY as final.
+            child_exited.store(true, Ordering::Release);
             start_gate.release();
             cleanup_failed_spawn(
                 #[cfg(not(windows))]
@@ -5092,5 +5161,189 @@ mod tests {
         assert!(blank.default_background);
         assert_eq!(blank.foreground, 0x111111);
         assert_eq!(blank.background, 0x222222);
+    }
+
+    struct ScriptedPtyReader {
+        steps: std::collections::VecDeque<ScriptedReadStep>,
+        release: Arc<(Mutex<bool>, Condvar)>,
+    }
+
+    enum ScriptedReadStep {
+        Data(&'static [u8]),
+        Eof,
+        Error(io::ErrorKind),
+        BlockUntilReleased,
+    }
+
+    impl Read for ScriptedPtyReader {
+        fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+            match self.steps.pop_front() {
+                Some(ScriptedReadStep::Data(bytes)) => {
+                    buffer[..bytes.len()].copy_from_slice(bytes);
+                    Ok(bytes.len())
+                }
+                Some(ScriptedReadStep::Eof) | None => Ok(0),
+                Some(ScriptedReadStep::Error(kind)) => {
+                    Err(io::Error::new(kind, "scripted pty read failure"))
+                }
+                Some(ScriptedReadStep::BlockUntilReleased) => {
+                    let (lock, changed) = &*self.release;
+                    let mut released = lock.lock().expect("release lock");
+                    while !*released {
+                        released = changed.wait(released).expect("release wait");
+                    }
+                    Ok(0)
+                }
+            }
+        }
+    }
+
+    struct ReaderActorHarness {
+        received: Arc<Mutex<Vec<u8>>>,
+        lifecycle: Arc<Mutex<Vec<TerminalLifecycleEvent>>>,
+        start_gate: Arc<TerminalActorStartGate>,
+        child_exited: Arc<AtomicBool>,
+        handle: thread::JoinHandle<()>,
+    }
+
+    fn spawn_reader_actor_harness(
+        reader: ScriptedPtyReader,
+        child_exited: bool,
+    ) -> ReaderActorHarness {
+        let runtime_state = Arc::new(RwLock::new(RuntimeState::default()));
+        let dimensions = SessionDimensions {
+            cols: 80,
+            rows: 24,
+            cell_width: 8,
+            cell_height: 16,
+        };
+        let event_proxy = SessionEventProxy {
+            session_id: "reader-test".to_string(),
+            writer: Arc::new(Mutex::new(
+                Box::new(std::io::sink()) as Box<dyn Write + Send>
+            )),
+            input_admission: Arc::new(AtomicBool::new(false)),
+            runtime_state: runtime_state.clone(),
+            dimensions: Arc::new(Mutex::new(dimensions)),
+            debug_enabled: false,
+            state_notifier: None,
+        };
+        let term = Arc::new(Mutex::new(Term::new(
+            configured_term(100),
+            &TerminalSize::new(80, 24),
+            event_proxy,
+        )));
+        let received = Arc::new(Mutex::new(Vec::<u8>::new()));
+        let lifecycle = Arc::new(Mutex::new(Vec::<TerminalLifecycleEvent>::new()));
+        let output_sink: TerminalOutputSink = {
+            let received = Arc::clone(&received);
+            Arc::new(move |bytes, _| received.lock().expect("received").extend_from_slice(&bytes))
+        };
+        let lifecycle_sink: TerminalLifecycleSink = {
+            let lifecycle = Arc::clone(&lifecycle);
+            Arc::new(move |event| lifecycle.lock().expect("lifecycle").push(event))
+        };
+        let start_gate = Arc::new(TerminalActorStartGate::default());
+        let child_exited = Arc::new(AtomicBool::new(child_exited));
+        let handle = spawn_reader_thread(
+            "reader-test".to_string(),
+            Box::new(reader),
+            term,
+            None,
+            runtime_state,
+            false,
+            None,
+            None,
+            Arc::new(Mutex::new(Some(output_sink))),
+            Arc::new(Mutex::new(Some(lifecycle_sink))),
+            Arc::new(Mutex::new(Vec::new())),
+            Arc::clone(&start_gate),
+            Arc::clone(&child_exited),
+        )
+        .expect("reader actor");
+        ReaderActorHarness {
+            received,
+            lifecycle,
+            start_gate,
+            child_exited,
+            handle,
+        }
+    }
+
+    #[test]
+    fn reader_survives_transient_eof_and_errors_while_child_is_alive() {
+        let release = Arc::new((Mutex::new(false), Condvar::new()));
+        let reader = ScriptedPtyReader {
+            steps: std::collections::VecDeque::from(vec![
+                ScriptedReadStep::Error(io::ErrorKind::BrokenPipe),
+                ScriptedReadStep::Eof,
+                ScriptedReadStep::Error(io::ErrorKind::Interrupted),
+                ScriptedReadStep::Eof,
+                ScriptedReadStep::Data(b"still alive"),
+                ScriptedReadStep::BlockUntilReleased,
+            ]),
+            release: Arc::clone(&release),
+        };
+        let harness = spawn_reader_actor_harness(reader, false);
+        harness.start_gate.release();
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while harness.received.lock().expect("received").is_empty() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "reader never delivered output after transient EOF/errors"
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(
+            harness.received.lock().expect("received").as_slice(),
+            b"still alive"
+        );
+        assert!(
+            harness.lifecycle.lock().expect("lifecycle").is_empty(),
+            "no lifecycle exit may be published while the child lives: {:?}",
+            harness.lifecycle.lock().expect("lifecycle")
+        );
+        assert!(
+            !harness.handle.is_finished(),
+            "reader must keep running while the child lives"
+        );
+
+        // Child exit is the only authority that ends the reader.
+        harness.child_exited.store(true, Ordering::Release);
+        {
+            let (lock, changed) = &*release;
+            *lock.lock().expect("release lock") = true;
+            changed.notify_all();
+        }
+        harness
+            .handle
+            .join()
+            .expect("reader actor joins after child exit");
+        assert_eq!(
+            harness.lifecycle.lock().expect("lifecycle").as_slice(),
+            &[TerminalLifecycleEvent::ReaderEof]
+        );
+    }
+
+    #[test]
+    fn read_error_after_child_exit_is_end_of_stream_not_failure() {
+        let reader = ScriptedPtyReader {
+            steps: std::collections::VecDeque::from(vec![ScriptedReadStep::Error(
+                io::ErrorKind::BrokenPipe,
+            )]),
+            release: Arc::new((Mutex::new(false), Condvar::new())),
+        };
+        let harness = spawn_reader_actor_harness(reader, true);
+        harness.start_gate.release();
+        harness
+            .handle
+            .join()
+            .expect("reader actor joins once the child is known to be gone");
+        assert_eq!(
+            harness.lifecycle.lock().expect("lifecycle").as_slice(),
+            &[TerminalLifecycleEvent::ReaderEof]
+        );
+        assert!(harness.received.lock().expect("received").is_empty());
     }
 }
