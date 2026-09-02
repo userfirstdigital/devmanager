@@ -1060,6 +1060,25 @@ pub struct TerminalRuntimeSummary {
     pub sequence: u64,
 }
 
+/// Identity of one hosted terminal, resolved without touching it.
+///
+/// [`TerminalService::task_terminal_view_for`] drains pending output and can
+/// advance the sequence, so it is not usable for "may this caller act on this
+/// terminal?" -- by the time it answers, the caller has already changed the
+/// terminal it may turn out to have no authority over. This carries the fence
+/// fields alone so authorization can happen strictly before any viewport
+/// mutation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TaskTerminalFence {
+    pub terminal_id: TerminalId,
+    pub resource_id: ResourceId,
+    pub resource_generation: u64,
+    pub is_provider: bool,
+    pub agent_session_id: Option<crate::domain::AgentSessionId>,
+    pub runtime_generation: Option<u64>,
+    pub action_epoch: Option<u64>,
+}
+
 #[derive(Debug, Clone)]
 pub struct TaskTerminalView {
     pub task_id: TaskId,
@@ -1732,6 +1751,34 @@ impl TerminalService {
             is_provider,
             runtime_state,
             view,
+        }))
+    }
+
+    /// Resolve one exact live terminal's identity WITHOUT draining it.
+    ///
+    /// Selection is the same rule as [`Self::task_terminal_view_for`]: `None`
+    /// is the provider slot, `Some(resource_id)` the terminal keyed by that
+    /// durable resource. Callers that are about to scroll or resize use this to
+    /// authorize first, because those operations mutate the terminal and cannot
+    /// be taken back once a later fence check refuses.
+    pub fn task_terminal_fence_for(
+        &self,
+        task_id: TaskId,
+        resource_id: Option<ResourceId>,
+    ) -> Result<Option<TaskTerminalFence>, TerminalError> {
+        let terminals = self.lock()?;
+        let Some(terminal_id) = Self::select_terminal(&terminals, task_id, resource_id)? else {
+            return Ok(None);
+        };
+        let hosted = terminals.get(&terminal_id).ok_or(TerminalError::NotFound)?;
+        Ok(Some(TaskTerminalFence {
+            terminal_id,
+            resource_id: hosted.resource_id,
+            resource_generation: hosted.generation.get(),
+            is_provider: !hosted.is_plain_shell,
+            agent_session_id: hosted.agent_session_id,
+            runtime_generation: hosted.runtime_generation,
+            action_epoch: hosted.action_epoch,
         }))
     }
 

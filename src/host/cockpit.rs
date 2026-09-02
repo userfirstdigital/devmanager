@@ -266,6 +266,13 @@ pub(crate) fn serve_task_cockpit_bounded(
                 | TaskCockpitQuery::TerminalScrollFor { delta_lines, .. } => Some(*delta_lines),
                 _ => None,
             };
+            let resize = match dispatch.query {
+                TaskCockpitQuery::TerminalResize { cols, rows }
+                | TaskCockpitQuery::TerminalResizeFor { cols, rows, .. } => Some((*cols, *rows)),
+                _ => None,
+            };
+            // Bounds first: an out-of-range request is refused on its own terms
+            // and must not depend on which terminal it happened to name.
             if let Some(delta_lines) = scroll {
                 if delta_lines == 0 || delta_lines.unsigned_abs() > 256 {
                     return denied(
@@ -273,48 +280,57 @@ pub(crate) fn serve_task_cockpit_bounded(
                         TaskCockpitDeniedReason::Unauthorized,
                     );
                 }
-                if dispatch
-                    .terminal_service
-                    .ok_or(())
-                    .and_then(|service| {
-                        service
-                            .scroll_task_terminal_for(task_id, selector, delta_lines)
-                            .map_err(|_| ())
-                    })
-                    .is_err()
-                {
+            }
+            let size = match resize {
+                Some((cols, rows)) => {
+                    match crate::terminal::protocol::TerminalSize::new(cols, rows) {
+                        Ok(size) => Some(size),
+                        Err(_) => {
+                            return denied(
+                                TaskCockpitSurface::Terminal,
+                                TaskCockpitDeniedReason::Unauthorized,
+                            )
+                        }
+                    }
+                }
+                None => None,
+            };
+            if scroll.is_some() || size.is_some() {
+                let Some(service) = dispatch.terminal_service else {
                     return unavailable(
                         TaskCockpitSurface::Terminal,
                         TaskCockpitUnavailableReason::TerminalUnavailable,
-                    );
-                }
-            }
-            let resize = match dispatch.query {
-                TaskCockpitQuery::TerminalResize { cols, rows }
-                | TaskCockpitQuery::TerminalResizeFor { cols, rows, .. } => Some((*cols, *rows)),
-                _ => None,
-            };
-            if let Some((cols, rows)) = resize {
-                let Ok(size) = crate::terminal::protocol::TerminalSize::new(cols, rows) else {
-                    return denied(
-                        TaskCockpitSurface::Terminal,
-                        TaskCockpitDeniedReason::Unauthorized,
                     );
                 };
-                if dispatch
-                    .terminal_service
-                    .ok_or(())
-                    .and_then(|service| {
-                        service
-                            .resize_task_terminal_for(task_id, selector, size)
-                            .map_err(|_| ())
-                    })
-                    .is_err()
-                {
-                    return unavailable(
-                        TaskCockpitSurface::Terminal,
-                        TaskCockpitUnavailableReason::TerminalUnavailable,
-                    );
+                // Authorize BEFORE touching the terminal. Scroll and resize
+                // reach the live PTY, so a fence checked afterwards has already
+                // let an unauthorized caller move someone else's terminal.
+                if let Some(refusal) = terminal_viewport_mutation_refusal(
+                    &dispatch, service, task_id, &snapshot, selector,
+                ) {
+                    return refusal;
+                }
+                if let Some(delta_lines) = scroll {
+                    if service
+                        .scroll_task_terminal_for(task_id, selector, delta_lines)
+                        .is_err()
+                    {
+                        return unavailable(
+                            TaskCockpitSurface::Terminal,
+                            TaskCockpitUnavailableReason::TerminalUnavailable,
+                        );
+                    }
+                }
+                if let Some(size) = size {
+                    if service
+                        .resize_task_terminal_for(task_id, selector, size)
+                        .is_err()
+                    {
+                        return unavailable(
+                            TaskCockpitSurface::Terminal,
+                            TaskCockpitUnavailableReason::TerminalUnavailable,
+                        );
+                    }
                 }
             }
             serve_task_terminal(
@@ -642,46 +658,22 @@ fn serve_task_terminal(
                     TaskCockpitDeniedReason::StaleFence,
                 );
             };
-            let Some(primary_agent_id) = snapshot.primary_agent_id else {
-                return denied(
-                    TaskCockpitSurface::Terminal,
-                    TaskCockpitDeniedReason::StaleFence,
-                );
-            };
-            let Some(agent) = snapshot.agents.get(&primary_agent_id) else {
-                return denied(
-                    TaskCockpitSurface::Terminal,
-                    TaskCockpitDeniedReason::StaleFence,
-                );
-            };
-            let Ok(Some(resource)) = provider_terminal_resource(snapshot, agent) else {
-                return denied(
-                    TaskCockpitSurface::Terminal,
-                    TaskCockpitDeniedReason::StaleFence,
-                );
-            };
-            if terminal_agent_session_id != primary_agent_id
-                || terminal_runtime_generation != agent.runtime_generation
-                || terminal_action_epoch == 0
-                || terminal.resource_id != resource.id
-                || terminal.resource_generation != resource.runtime_generation
-            {
-                return denied(
-                    TaskCockpitSurface::Terminal,
-                    TaskCockpitDeniedReason::StaleFence,
-                );
-            }
             // A terminal projection is also the client-specific attachment
             // handshake. Raw input deliberately defaults to read-only until
             // the host has revalidated the exact Task/Agent/Resource tuple
-            // above for this authenticated client. Without this grant every
-            // native and fleet terminal write is rejected as ReadOnly even
-            // though the caller holds ProviderInput capability.
-            if !dispatch.capabilities.contains(Capability::ProviderInput) {
-                return denied(
-                    TaskCockpitSurface::Terminal,
-                    TaskCockpitDeniedReason::CapabilityDenied,
-                );
+            // for this authenticated client. Without that grant every native
+            // and fleet terminal write is rejected as ReadOnly even though the
+            // caller holds ProviderInput capability.
+            if let Some(refusal) = provider_terminal_fence_refusal(
+                dispatch,
+                snapshot,
+                terminal_agent_session_id,
+                terminal_runtime_generation,
+                terminal_action_epoch,
+                terminal.resource_id,
+                terminal.resource_generation,
+            ) {
+                return refusal;
             }
             if service
                 .grant_client(
@@ -703,6 +695,19 @@ fn serve_task_terminal(
             };
             let (screen, text_lines) =
                 compact_terminal_screen_for_wire(terminal.view.screen, styled_cell_limit);
+            // The fence above already proved this terminal belongs to the
+            // primary agent, so re-reading it here cannot pick a different one.
+            let Some(agent) = snapshot
+                .primary_agent_id
+                .and_then(|id| snapshot.agents.get(&id))
+            else {
+                // Unreachable given the fence above, so this must not panic in
+                // a host query path: refuse the way the fence itself would.
+                return denied(
+                    TaskCockpitSurface::Terminal,
+                    TaskCockpitDeniedReason::StaleFence,
+                );
+            };
             if readiness_query && agent.provider_session_id.is_none() {
                 use crate::providers::input::{
                     classify_codex_identityless_startup_readiness,
@@ -789,6 +794,145 @@ fn serve_task_terminal(
     }
 }
 
+/// The provider terminal's complete authorization, or the exact refusal.
+///
+/// This is the one definition of "may this client act on the provider
+/// terminal": the durable Task/Agent/Resource tuple has to still be the one the
+/// hosted terminal was attached for, and the client has to hold ProviderInput.
+/// It returns `Some(outcome)` for a refusal rather than a bool so the caller
+/// cannot flatten `StaleFence` and `CapabilityDenied` into one answer, and so a
+/// caller that must authorize BEFORE mutating a terminal runs exactly the same
+/// checks as the one that authorizes while projecting it.
+fn provider_terminal_fence_refusal(
+    dispatch: &TaskCockpitDispatch<'_>,
+    snapshot: &crate::domain::TaskSnapshot,
+    terminal_agent_session_id: crate::domain::AgentSessionId,
+    terminal_runtime_generation: u64,
+    terminal_action_epoch: u64,
+    terminal_resource_id: crate::domain::ResourceId,
+    terminal_resource_generation: u64,
+) -> Option<QueryOutcome> {
+    let stale = || {
+        Some(denied(
+            TaskCockpitSurface::Terminal,
+            TaskCockpitDeniedReason::StaleFence,
+        ))
+    };
+    let Some(primary_agent_id) = snapshot.primary_agent_id else {
+        return stale();
+    };
+    let Some(agent) = snapshot.agents.get(&primary_agent_id) else {
+        return stale();
+    };
+    let Ok(Some(resource)) = provider_terminal_resource(snapshot, agent) else {
+        return stale();
+    };
+    if terminal_agent_session_id != primary_agent_id
+        || terminal_runtime_generation != agent.runtime_generation
+        || terminal_action_epoch == 0
+        || terminal_resource_id != resource.id
+        || terminal_resource_generation != resource.runtime_generation
+    {
+        return stale();
+    }
+    if !dispatch.capabilities.contains(Capability::ProviderInput) {
+        return Some(denied(
+            TaskCockpitSurface::Terminal,
+            TaskCockpitDeniedReason::CapabilityDenied,
+        ));
+    }
+    None
+}
+
+/// One plain shell's complete authorization, or the exact refusal.
+///
+/// A shell has no agent session, so its authority is the durable resource
+/// itself: present on this task, still a plain shell, Active, and at the
+/// generation the hosted attachment was opened for. `ProviderInput` is
+/// deliberately not required -- a shell is not the provider's input surface.
+fn plain_shell_fence_refusal(
+    snapshot: &crate::domain::TaskSnapshot,
+    terminal_resource_id: crate::domain::ResourceId,
+    terminal_resource_generation: u64,
+) -> Option<QueryOutcome> {
+    let stale = || {
+        Some(denied(
+            TaskCockpitSurface::Terminal,
+            TaskCockpitDeniedReason::StaleFence,
+        ))
+    };
+    let Some(resource) = snapshot.resources.get(&terminal_resource_id) else {
+        return stale();
+    };
+    if resource.resource_kind != crate::domain::ResourceKind::Terminal
+        || !resource.recipe.is_plain_shell()
+        || resource.lifecycle != crate::domain::ResourceLifecycle::Active
+        || resource.runtime_generation != terminal_resource_generation
+    {
+        return stale();
+    }
+    None
+}
+
+/// Authorize a viewport mutation (scroll/resize) BEFORE it is applied.
+///
+/// Scroll and resize change the terminal the moment they are called, and they
+/// reach the live PTY. Running them ahead of the fence -- which is what this
+/// dispatcher used to do -- means a client with no authority over a terminal
+/// resizes the local user's PTY and only then receives its denial. The refusal
+/// here is the same one the projection path would have produced, so the two can
+/// never disagree about who may act.
+fn terminal_viewport_mutation_refusal(
+    dispatch: &TaskCockpitDispatch<'_>,
+    service: &TerminalService,
+    task_id: TaskId,
+    snapshot: &crate::domain::TaskSnapshot,
+    resource_id: Option<crate::domain::ResourceId>,
+) -> Option<QueryOutcome> {
+    let fence = match service.task_terminal_fence_for(task_id, resource_id) {
+        Ok(Some(fence)) => fence,
+        // No terminal to act on is the same closed answer the mutation itself
+        // would have produced.
+        Ok(None) => {
+            return Some(unavailable(
+                TaskCockpitSurface::Terminal,
+                TaskCockpitUnavailableReason::TerminalUnavailable,
+            ))
+        }
+        Err(_) => {
+            return Some(denied(
+                TaskCockpitSurface::Terminal,
+                TaskCockpitDeniedReason::StaleFence,
+            ))
+        }
+    };
+    if !fence.is_provider {
+        return plain_shell_fence_refusal(snapshot, fence.resource_id, fence.resource_generation);
+    }
+    // A provider terminal reached through a resource-addressed query is still
+    // the provider terminal: `resource_id` selects by durable resource and does
+    // not decide authority.
+    let (Some(agent_session_id), Some(runtime_generation), Some(action_epoch)) = (
+        fence.agent_session_id,
+        fence.runtime_generation,
+        fence.action_epoch,
+    ) else {
+        return Some(denied(
+            TaskCockpitSurface::Terminal,
+            TaskCockpitDeniedReason::StaleFence,
+        ));
+    };
+    provider_terminal_fence_refusal(
+        dispatch,
+        snapshot,
+        agent_session_id,
+        runtime_generation,
+        action_epoch,
+        fence.resource_id,
+        fence.resource_generation,
+    )
+}
+
 /// One-to-one mapping of the hosted runtime state onto the wire enum.
 fn runtime_state_wire(
     state: &crate::terminal::service::TerminalRuntimeState,
@@ -825,21 +969,10 @@ fn serve_plain_shell_terminal(
     terminal: crate::terminal::service::TaskTerminalView,
     max_response_bytes: u32,
 ) -> QueryOutcome {
-    let Some(resource) = snapshot.resources.get(&terminal.resource_id) else {
-        return denied(
-            TaskCockpitSurface::Terminal,
-            TaskCockpitDeniedReason::StaleFence,
-        );
-    };
-    if resource.resource_kind != crate::domain::ResourceKind::Terminal
-        || !resource.recipe.is_plain_shell()
-        || resource.lifecycle != crate::domain::ResourceLifecycle::Active
-        || resource.runtime_generation != terminal.resource_generation
+    if let Some(refusal) =
+        plain_shell_fence_refusal(snapshot, terminal.resource_id, terminal.resource_generation)
     {
-        return denied(
-            TaskCockpitSurface::Terminal,
-            TaskCockpitDeniedReason::StaleFence,
-        );
+        return refusal;
     }
     if service
         .grant_client(
@@ -5556,6 +5689,292 @@ mod tests {
                 }))
             ),
             "{unknown:?}"
+        );
+    }
+
+    /// Scroll and resize reach the live PTY the instant they are called, so the
+    /// dispatcher must authorize before it acts. It used to apply them first
+    /// and fence afterwards, and `TerminalScrollFor`/`TerminalResizeFor` select
+    /// by durable resource -- including the PROVIDER's resource. A Connect
+    /// client holding only TaskCockpit could therefore resize the local user's
+    /// provider PTY and only then be told CapabilityDenied.
+    #[test]
+    fn resource_addressed_viewport_ops_are_fenced_before_they_touch_the_terminal() {
+        let (
+            _repository,
+            bus,
+            client_id,
+            task_id,
+            roots,
+            terminals,
+            provider_resource,
+            shell_a,
+            _shell_b,
+        ) = task_with_provider_and_two_shells();
+
+        let dispatch_with = |capabilities: CapabilitySet, query: &TaskCockpitQuery| {
+            serve_task_cockpit(TaskCockpitDispatch {
+                capabilities,
+                envelope_task_id: Some(task_id),
+                client_id,
+                connection_id: Uuid::now_v7(),
+                request_id: RequestId::new(),
+                query,
+                bus: &bus,
+                service_runtime: None,
+                semantic_journal: None,
+                terminal_service: Some(&terminals),
+                ssh_endpoints: None,
+                ssh_runtime: None,
+                workspace_projects: Some(&roots),
+                coordinator: None,
+                action_epoch: None,
+                runtime_generation: None,
+                config: None,
+                provider_launch_hint: ProviderLaunchReadinessHint::Unknown,
+            })
+        };
+        let provider_cols = || {
+            terminals
+                .task_terminal_view_for(task_id, None)
+                .expect("view")
+                .expect("present")
+                .view
+                .screen
+                .cols
+        };
+        let read_only = CapabilitySet::from_capabilities([Capability::TaskCockpit]);
+        let before = provider_cols();
+        assert_eq!(before, 80);
+
+        // Addressing the provider's own resource does not turn a provider
+        // terminal into a shell: the capability gate still applies.
+        for query in [
+            TaskCockpitQuery::TerminalResizeFor {
+                resource_id: provider_resource,
+                cols: 200,
+                rows: 50,
+            },
+            TaskCockpitQuery::TerminalScrollFor {
+                resource_id: provider_resource,
+                delta_lines: 5,
+            },
+            TaskCockpitQuery::TerminalFor {
+                resource_id: provider_resource,
+            },
+        ] {
+            let outcome = dispatch_with(read_only, &query);
+            assert!(
+                matches!(
+                    outcome,
+                    QueryOutcome::Ok(QueryResult::TaskCockpit(TaskCockpitResult::Denied {
+                        surface: TaskCockpitSurface::Terminal,
+                        reason: TaskCockpitDeniedReason::CapabilityDenied,
+                    }))
+                ),
+                "{query:?} must be denied for a TaskCockpit-only client, got {outcome:?}"
+            );
+            assert_eq!(
+                provider_cols(),
+                before,
+                "{query:?} must not have touched the provider terminal"
+            );
+        }
+
+        // The same legacy shape is fenced the same way, and equally must not
+        // have resized anything on its way to the denial.
+        let legacy = dispatch_with(
+            read_only,
+            &TaskCockpitQuery::TerminalResize {
+                cols: 200,
+                rows: 50,
+            },
+        );
+        assert!(
+            matches!(
+                legacy,
+                QueryOutcome::Ok(QueryResult::TaskCockpit(TaskCockpitResult::Denied {
+                    surface: TaskCockpitSurface::Terminal,
+                    reason: TaskCockpitDeniedReason::CapabilityDenied,
+                }))
+            ),
+            "{legacy:?}"
+        );
+        assert_eq!(provider_cols(), before);
+
+        // The same client may resize its own shell: a shell is not the
+        // provider's input surface and never required ProviderInput.
+        let shell = dispatch_with(
+            read_only,
+            &TaskCockpitQuery::TerminalResizeFor {
+                resource_id: shell_a,
+                cols: 132,
+                rows: 43,
+            },
+        );
+        assert!(
+            matches!(
+                shell,
+                QueryOutcome::Ok(QueryResult::TaskCockpit(TaskCockpitResult::Terminal(_)))
+            ),
+            "{shell:?}"
+        );
+        assert_eq!(
+            terminals
+                .task_terminal_view_for(task_id, Some(shell_a))
+                .expect("view")
+                .expect("present")
+                .view
+                .screen
+                .cols,
+            132
+        );
+        assert_eq!(provider_cols(), before, "the shell resize is scoped");
+
+        // And a client that does hold ProviderInput still resizes the provider.
+        let granted =
+            CapabilitySet::from_capabilities([Capability::TaskCockpit, Capability::ProviderInput]);
+        let allowed = dispatch_with(
+            granted,
+            &TaskCockpitQuery::TerminalResizeFor {
+                resource_id: provider_resource,
+                cols: 100,
+                rows: 30,
+            },
+        );
+        assert!(
+            matches!(
+                allowed,
+                QueryOutcome::Ok(QueryResult::TaskCockpit(TaskCockpitResult::Terminal(_)))
+            ),
+            "{allowed:?}"
+        );
+        assert_eq!(provider_cols(), 100);
+    }
+
+    /// A shell that is releasing is no longer a terminal a client may move.
+    /// The refusal has to land before the viewport does: the durable close and
+    /// an in-flight resize race by construction, because closing a tab is
+    /// exactly when a client is still sending geometry for it.
+    #[test]
+    fn a_releasing_shell_refuses_the_resize_without_applying_it() {
+        use crate::domain::command::OpenShellTerminalIntent;
+        use crate::terminal::service::{MockAttachedRuntime, TerminalService};
+
+        let (_repository, mut bus, client_id, task_id, roots, _agent_id, _provider) =
+            create_unstarted_draft_with_terminal_claim();
+        let revision = bus
+            .task_snapshot(task_id)
+            .expect("lookup")
+            .expect("task")
+            .task
+            .revision;
+        let shell = plain_shell_resource(task_id, SHELL_B_PROGRAM);
+        let receipt = bus
+            .execute(CommandEnvelope {
+                command_id: CommandId::new(),
+                client_id,
+                task_id: Some(task_id),
+                issued_at_ms: 6,
+                expected_task_revision: Some(revision),
+                command: Command::OpenShellTerminal(OpenShellTerminalIntent {
+                    resource: shell.clone(),
+                }),
+            })
+            .expect("open shell");
+        let CommandReceipt::Accepted {
+            task_revision: Some(revision),
+            ..
+        } = receipt
+        else {
+            panic!("open shell: {receipt:?}");
+        };
+
+        let size = crate::terminal::protocol::TerminalSize::new(80, 24).expect("size");
+        let terminals = TerminalService::new();
+        terminals
+            .attach_plain_shell(
+                task_id,
+                shell.id,
+                1,
+                shell_terminal_spec(),
+                MockAttachedRuntime::with_resource_fence(size, shell.id),
+            )
+            .expect("attach shell");
+
+        // The hosted terminal stays open here on purpose: this is the window
+        // where the durable resource has left Active but the PTY is still
+        // resizable, which is precisely what the fence has to cover.
+        let receipt = bus
+            .execute(CommandEnvelope {
+                command_id: CommandId::new(),
+                client_id,
+                task_id: Some(task_id),
+                issued_at_ms: 7,
+                expected_task_revision: Some(revision),
+                command: Command::CloseTerminal {
+                    resource_id: shell.id,
+                },
+            })
+            .expect("close terminal");
+        assert!(
+            matches!(receipt, CommandReceipt::Accepted { .. }),
+            "{receipt:?}"
+        );
+        assert_ne!(
+            bus.task_snapshot(task_id)
+                .expect("lookup")
+                .expect("task")
+                .resources[&shell.id]
+                .lifecycle,
+            crate::domain::ResourceLifecycle::Active,
+            "the durable shell must have left Active for this test to mean anything"
+        );
+
+        let outcome = serve_task_cockpit(TaskCockpitDispatch {
+            capabilities: CapabilitySet::from_capabilities([Capability::TaskCockpit]),
+            envelope_task_id: Some(task_id),
+            client_id,
+            connection_id: Uuid::now_v7(),
+            request_id: RequestId::new(),
+            query: &TaskCockpitQuery::TerminalResizeFor {
+                resource_id: shell.id,
+                cols: 200,
+                rows: 50,
+            },
+            bus: &bus,
+            service_runtime: None,
+            semantic_journal: None,
+            terminal_service: Some(&terminals),
+            ssh_endpoints: None,
+            ssh_runtime: None,
+            workspace_projects: Some(&roots),
+            coordinator: None,
+            action_epoch: None,
+            runtime_generation: None,
+            config: None,
+            provider_launch_hint: ProviderLaunchReadinessHint::Unknown,
+        });
+        assert!(
+            matches!(
+                outcome,
+                QueryOutcome::Ok(QueryResult::TaskCockpit(TaskCockpitResult::Denied {
+                    surface: TaskCockpitSurface::Terminal,
+                    reason: TaskCockpitDeniedReason::StaleFence,
+                }))
+            ),
+            "{outcome:?}"
+        );
+        assert_eq!(
+            terminals
+                .task_terminal_view_for(task_id, Some(shell.id))
+                .expect("view")
+                .expect("present")
+                .view
+                .screen
+                .cols,
+            80,
+            "a refused resize must not have been applied"
         );
     }
 

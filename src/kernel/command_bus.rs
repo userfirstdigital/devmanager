@@ -1765,6 +1765,68 @@ mod provider_restart_identity_tests {
         );
     }
 
+    /// A held provider restart is scheduled from the one agent/resource join in
+    /// the snapshot. A plain shell is a task-owned Active Terminal resource at
+    /// the same runtime generation, so before `AgentResourceBinding::from_facts`
+    /// excluded shells this search found two, `exact_provider_terminal_resource`
+    /// answered `None`, and every held restart on a task with an open terminal
+    /// tab was silently never scheduled -- no error, no log, just no restart.
+    #[test]
+    fn hold_restart_intent_survives_an_open_plain_shell() {
+        let task = TaskFacts::new(
+            EnvironmentId::new(),
+            "held task with a shell",
+            None,
+            ProjectId::new(),
+            WorkspaceRef::Main,
+            TaskAssignment::LocalOwner,
+            1,
+        )
+        .expect("task");
+        let task_id = task.id;
+        let agent = AgentSessionFacts::new(task_id, AgentRole::Primary, ProviderKind::Codex, None)
+            .expect("agent");
+        let provider_resource_id = ResourceId::new();
+        let provider_resource = ResourceFacts {
+            id: provider_resource_id,
+            task_id: Some(task_id),
+            owner_kind: OwnerKind::Task,
+            resource_kind: ResourceKind::Terminal,
+            recipe: ResourceRecipe::terminal(120, 40),
+            lifecycle: ResourceLifecycle::Active,
+            runtime_generation: agent.runtime_generation,
+            updated_at_ms: 1,
+        };
+        let mut shell = plain_shell_facts(task_id, None);
+        shell.runtime_generation = agent.runtime_generation;
+        assert!(shell.recipe.is_plain_shell());
+        assert_eq!(shell.lifecycle, ResourceLifecycle::Active);
+        let snapshot = TaskSnapshot {
+            connectivity: TaskConnectivity::Connected,
+            attention: TaskAttention::None,
+            activity: TaskActivity::Idle,
+            review_readiness: ReviewReadiness::NotReady,
+            task,
+            agents: BTreeMap::from([(agent.id, agent.clone())]),
+            primary_agent_id: Some(agent.id),
+            artifacts: BTreeMap::new(),
+            resources: BTreeMap::from([
+                (provider_resource_id, provider_resource),
+                (shell.id, shell.clone()),
+            ]),
+            provider_sessions: BTreeMap::new(),
+            browser: crate::domain::browser::BrowserBook::new(),
+            terminal_facts: Default::default(),
+            terminal_strip: Default::default(),
+        };
+
+        let intent = provider_hold_restart_intent_from_snapshot(&snapshot)
+            .expect("an open shell must not cancel the held restart");
+        assert_eq!(intent.resource_id, provider_resource_id);
+        assert_ne!(intent.resource_id, shell.id);
+        assert_eq!(intent.agent_session_id, agent.id);
+    }
+
     fn accepted_revision(receipt: CommandReceipt) -> u64 {
         match receipt {
             CommandReceipt::Accepted {

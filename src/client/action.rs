@@ -468,7 +468,7 @@ const ACTIONS: &[ActionDescriptor] = &[
         scope: ActionScope::Task,
         required_capability: Some(Capability::TaskCockpit),
         risk: ActionRisk::ReadOnly,
-        argument_schema: ActionArgumentSchema::TaskId,
+        argument_schema: ActionArgumentSchema::TaskCockpitV1,
     },
 ];
 
@@ -1942,7 +1942,7 @@ mod tests {
                     ACTION_TERMINAL_VIEW => (
                         ActionScope::Task,
                         ActionRisk::ReadOnly,
-                        ActionArgumentSchema::TaskId,
+                        ActionArgumentSchema::TaskCockpitV1,
                         Some(Capability::TaskCockpit),
                     ),
                     ACTION_PROVIDER_START_SESSION => (

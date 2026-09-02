@@ -35,6 +35,12 @@ pub enum AgentResourceBindingError {
     ResourceTaskMismatch,
     ResourceMustBeTaskOwned,
     ResourceMustBeTerminal,
+    /// The resource is a plain shell terminal. A provider binding may never
+    /// point at one: a shell has no agent session, and a task's shells are
+    /// ordinarily registered at the same runtime generation as its agent, so
+    /// admitting them here makes every "the one bound resource" search
+    /// ambiguous the moment a user opens a terminal tab.
+    ResourceMustNotBePlainShell,
     AgentMustBeOpen,
     ResourceMustBeActive,
     RuntimeGenerationMismatch,
@@ -47,6 +53,9 @@ impl std::fmt::Display for AgentResourceBindingError {
             Self::ResourceMustBeTaskOwned => write!(formatter, "resource must be task-owned"),
             Self::ResourceMustBeTerminal => {
                 write!(formatter, "provider resource must be a terminal")
+            }
+            Self::ResourceMustNotBePlainShell => {
+                write!(formatter, "provider resource must not be a plain shell")
             }
             Self::AgentMustBeOpen => write!(formatter, "agent session is not open"),
             Self::ResourceMustBeActive => write!(formatter, "provider resource is not active"),
@@ -82,6 +91,12 @@ impl AgentResourceBinding {
         }
         if resource.resource_kind != ResourceKind::Terminal {
             return Err(AgentResourceBindingError::ResourceMustBeTerminal);
+        }
+        // A plain shell is a Terminal resource owned by the same task, usually
+        // at the same runtime generation, so without this every caller that
+        // searches for "the resource this agent binds to" finds the shells too.
+        if resource.recipe.is_plain_shell() {
+            return Err(AgentResourceBindingError::ResourceMustNotBePlainShell);
         }
         if agent.lifecycle != AgentSessionLifecycle::Open {
             return Err(AgentResourceBindingError::AgentMustBeOpen);
@@ -288,6 +303,24 @@ mod tests {
         };
         assert!(shell.recipe.is_plain_shell());
         shell
+    }
+
+    #[test]
+    fn a_binding_never_points_at_a_plain_shell() {
+        let (agent, resource) = facts(7);
+        // Same task, same owner, same kind, same generation, Active: a plain
+        // shell satisfies every other precondition, which is exactly why the
+        // recipe has to be checked.
+        let shell = shell_beside(&resource, 4);
+        assert_eq!(shell.task_id, resource.task_id);
+        assert_eq!(shell.runtime_generation, agent.runtime_generation);
+        assert_eq!(shell.lifecycle, ResourceLifecycle::Active);
+        assert_eq!(
+            AgentResourceBinding::from_facts(&agent, &shell),
+            Err(AgentResourceBindingError::ResourceMustNotBePlainShell)
+        );
+        // The provider's own terminal still binds.
+        assert!(AgentResourceBinding::from_facts(&agent, &resource).is_ok());
     }
 
     #[test]
