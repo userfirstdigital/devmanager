@@ -14004,6 +14004,310 @@ mod output_tests {
         .is_ok());
     }
 
+    /// Behavioural coverage of the `terminal.open_shell` host path.
+    ///
+    /// Everything below goes through a real `HostRequestExecutor` and a real
+    /// `TaskCockpitQuery::OpenShellTerminal` request, because the branches that
+    /// matter (capability, client identity, cwd resolution, revision fencing)
+    /// are all inside `dispatch_query` and `open_shell_terminal_request`, and a
+    /// unit test of the resolver cannot reach any of them.
+    ///
+    /// No shell is spawned: the fixture has no `configured_service_runtime`, so
+    /// an accepted open registers the durable resource and then records a
+    /// "spawn refused" exit fact. The assertions stop at that boundary — the
+    /// registered recipe — which is exactly what this task is responsible for.
+    #[tokio::test(flavor = "current_thread")]
+    async fn open_shell_terminal_query_resolves_cwd_and_fences_every_refusal() {
+        use std::process::Command as ProcessCommand;
+
+        use crate::domain::cockpit::TaskCockpitQuery;
+        use crate::domain::command::{Command, CommandEnvelope, CreateTaskRequestIntent};
+        use crate::domain::id::{CommandId, EnvironmentId, ProjectId, RequestId, TaskId};
+        use crate::domain::query::{
+            Query, QueryEnvelope, QueryError, QueryOutcome, QueryReply, QueryResult,
+        };
+        use crate::domain::resource::ResourceRecipe;
+        use crate::domain::task::{
+            ReviewReadiness, TaskActivity, TaskAssignment, TaskAttention, TaskConnectivity,
+        };
+        use crate::domain::{
+            TaskCockpitDeniedReason, TaskCockpitResult, TaskCockpitSurface,
+            TaskCockpitUnavailableReason,
+        };
+        use crate::kernel::CommandBus;
+        use crate::protocol::{Capability, CapabilitySet, FrameLimits, ProtocolVersion};
+        use crate::workspace::{WorkspaceProjectRoots, WorkspaceRequest};
+
+        let repository = tempfile::tempdir().expect("repository");
+        let output = ProcessCommand::new("git")
+            .args(["init", "--quiet"])
+            .current_dir(repository.path())
+            .output()
+            .expect("git init");
+        assert!(output.status.success());
+        let database = repository.path().join("open-shell-executor.sqlite");
+        let project_id = ProjectId::new();
+        let project_roots =
+            WorkspaceProjectRoots::try_from_pairs([(project_id, repository.path().to_path_buf())])
+                .expect("project roots");
+        let client = ClientId::new();
+        let stranger = ClientId::new();
+        let cockpit = |capabilities| NegotiatedParameters {
+            version: ProtocolVersion::current(),
+            client_id: client,
+            capabilities,
+            limits: FrameLimits::v1_default(),
+        };
+        let negotiated = cockpit(CapabilitySet::from_capabilities([Capability::TaskCockpit]));
+        let task_id = TaskId::new();
+        let bus = CommandBus::open(&database).expect("bus");
+        let (requests, executor) =
+            HostRequestExecutor::start_without_automatic_maintenance_with_workspace_projects(
+                bus,
+                project_roots.clone(),
+            );
+        let (out, _ports) = ConnectionOutputHandle::new(8, 16, 1);
+        let registration = requests.register_output(out).await.expect("register");
+        let handle = requests.with_output(registration.id());
+
+        // A task with no primary provider: the shell must not need one, and
+        // this keeps the fixture free of a provider launch attempt.
+        let created = handle
+            .execute(
+                negotiated.clone(),
+                ClientRequest::Command(CommandEnvelope {
+                    command_id: CommandId::new(),
+                    client_id: client,
+                    task_id: None,
+                    issued_at_ms: 1_725_000_000_900,
+                    expected_task_revision: None,
+                    command: Command::CreateTaskV2(CreateTaskRequestIntent {
+                        id: task_id,
+                        environment_id: EnvironmentId::new(),
+                        title: "Shell host".into(),
+                        description: None,
+                        project_id,
+                        workspace: WorkspaceRequest::main(),
+                        primary_provider: None,
+                        defer_primary_provider_start: true,
+                        assignment: TaskAssignment::LocalOwner,
+                        created_at_ms: 1_725_000_000_900,
+                        connectivity: TaskConnectivity::Connected,
+                        attention: TaskAttention::None,
+                        activity: TaskActivity::Idle,
+                        review_readiness: ReviewReadiness::NotReady,
+                    }),
+                }),
+            )
+            .await;
+        assert!(
+            matches!(
+                created,
+                Ok(ServerMessage::CommandReceipt(
+                    crate::domain::command::CommandReceipt::Accepted { .. }
+                ))
+            ),
+            "fixture task must be created; got {created:?}"
+        );
+
+        let open = |negotiated: NegotiatedParameters,
+                    client_id: ClientId,
+                    cwd: Option<String>,
+                    expected_task_revision: u64| {
+            let request_id = RequestId::new();
+            let request = ClientRequest::Query(QueryEnvelope {
+                request_id,
+                client_id,
+                task_id: Some(task_id),
+                query: Query::TaskCockpit(TaskCockpitQuery::OpenShellTerminal {
+                    cwd,
+                    expected_task_revision,
+                }),
+            });
+            (request_id, negotiated, request)
+        };
+        let outcome = |reply: Result<ServerMessage, crate::host::IpcError>,
+                       request_id: RequestId| match reply {
+            Ok(ServerMessage::QueryReply(QueryReply {
+                request_id: replied,
+                outcome,
+            })) => {
+                assert_eq!(
+                    replied, request_id,
+                    "reply must answer the request it was sent"
+                );
+                outcome
+            }
+            other => panic!("expected a query reply; got {other:?}"),
+        };
+
+        // 1. Missing Capability::TaskCockpit is refused before any resolution.
+        let (rid, neg, request) = open(cockpit(CapabilitySet::empty()), client, None, 1);
+        assert_eq!(
+            outcome(handle.execute(neg, request).await, rid),
+            QueryOutcome::Err(QueryError::UnsupportedCapability)
+        );
+
+        // 2. A foreign client_id is refused: that id is written into the durable
+        //    command, so a read may carry someone else's, a write may not.
+        //    The executor's own connection-scope check fires first and refuses
+        //    at the transport, ahead of dispatch_query's identity guard; either
+        //    refusal is acceptable, silently proceeding is not.
+        let (_rid, neg, request) = open(negotiated.clone(), stranger, None, 1);
+        match handle.execute(neg, request).await {
+            Err(crate::host::IpcError::Unauthorized) => {}
+            Ok(ServerMessage::QueryReply(QueryReply {
+                outcome: QueryOutcome::Err(QueryError::Unauthorized),
+                ..
+            })) => {}
+            other => panic!("a foreign client_id must be refused; got {other:?}"),
+        }
+
+        // 3. A relative cwd names itself.
+        let (rid, neg, request) = open(negotiated.clone(), client, Some("relative/dir".into()), 1);
+        match outcome(handle.execute(neg, request).await, rid) {
+            QueryOutcome::Ok(QueryResult::TaskCockpit(TaskCockpitResult::Denied {
+                surface,
+                reason,
+                detail,
+            })) => {
+                assert_eq!(surface, TaskCockpitSurface::Terminal);
+                assert_eq!(reason, TaskCockpitDeniedReason::OutsideWorkspace);
+                assert_eq!(
+                    detail.as_deref(),
+                    Some("cwd must be absolute: relative/dir"),
+                    "the client must be told which of the two cwd mistakes it made"
+                );
+            }
+            other => panic!("relative cwd must be denied; got {other:?}"),
+        }
+
+        // 4. An absolute cwd that is not a directory names the path.
+        let missing = repository.path().join("no-such-directory");
+        let (rid, neg, request) = open(
+            negotiated.clone(),
+            client,
+            Some(missing.to_string_lossy().to_string()),
+            1,
+        );
+        match outcome(handle.execute(neg, request).await, rid) {
+            QueryOutcome::Ok(QueryResult::TaskCockpit(TaskCockpitResult::Denied {
+                reason,
+                detail,
+                ..
+            })) => {
+                assert_eq!(reason, TaskCockpitDeniedReason::OutsideWorkspace);
+                let detail = detail.expect("a named cwd refusal must carry its detail");
+                assert!(
+                    detail.starts_with("cwd is not a directory: "),
+                    "unexpected detail: {detail}"
+                );
+                assert!(
+                    detail.contains("no-such-directory"),
+                    "the detail must name the path it rejected: {detail}"
+                );
+            }
+            other => panic!("a missing cwd must be denied; got {other:?}"),
+        }
+
+        // 5. A stale expected_task_revision is fenced. Revision 1 is the task's
+        //    creation; anything below it is a client that has fallen behind.
+        let (rid, neg, request) = open(negotiated.clone(), client, None, 0);
+        match outcome(handle.execute(neg, request).await, rid) {
+            QueryOutcome::Ok(QueryResult::TaskCockpit(TaskCockpitResult::Denied {
+                reason,
+                ..
+            })) => assert_eq!(reason, TaskCockpitDeniedReason::RevisionConflict),
+            other => panic!("a stale revision must be fenced; got {other:?}"),
+        }
+
+        // 6. cwd omitted: the workspace runtime working directory is used.
+        //    On a machine with no resolvable shell this is a named
+        //    TerminalUnavailable instead; both outcomes are asserted so the
+        //    test cannot pass by accident on either.
+        let revision = {
+            let bus = CommandBus::open(&database).expect("revision bus");
+            let revision = bus
+                .task_snapshot(task_id)
+                .expect("snapshot")
+                .expect("created task")
+                .task
+                .revision;
+            drop(bus);
+            revision
+        };
+        let (rid, neg, request) = open(negotiated.clone(), client, None, revision);
+        let fallback = outcome(handle.execute(neg, request).await, rid);
+        let shell_resolved = match &fallback {
+            QueryOutcome::Ok(QueryResult::TaskCockpit(TaskCockpitResult::TaskTerminals(strip))) => {
+                assert_eq!(strip.task_id, task_id);
+                assert_eq!(strip.order.len(), 1, "one shell opened: {strip:?}");
+                true
+            }
+            QueryOutcome::Ok(QueryResult::TaskCockpit(TaskCockpitResult::Unavailable {
+                reason,
+                detail,
+                ..
+            })) => {
+                assert_eq!(*reason, TaskCockpitUnavailableReason::TerminalUnavailable);
+                let detail = detail.as_deref().expect("a shell refusal must be named");
+                assert!(
+                    detail.starts_with("no shell found; tried: "),
+                    "unexpected detail: {detail}"
+                );
+                false
+            }
+            other => panic!("workspace fallback must open or name why it did not; got {other:?}"),
+        };
+
+        drop(registration);
+        drop(requests);
+        executor.abort();
+        let _ = executor.await;
+
+        if shell_resolved {
+            let bus = CommandBus::open(&database).expect("reopen bus");
+            let snapshot = bus
+                .task_snapshot(task_id)
+                .expect("snapshot")
+                .expect("created task");
+            let resource = snapshot
+                .resources
+                .values()
+                .find(|resource| {
+                    matches!(resource.recipe, ResourceRecipe::Terminal { ref launch, .. } if launch.is_some())
+                })
+                .expect("the accepted shell must be registered");
+            let ResourceRecipe::Terminal {
+                launch: Some(launch),
+                ..
+            } = &resource.recipe
+            else {
+                panic!("shell resource must carry a launch: {resource:?}");
+            };
+            let expected = bus
+                .load_task_runtime(task_id, &project_roots)
+                .expect("load runtime")
+                .expect("persisted task")
+                .workspace
+                .runtime_working_directory()
+                .expect("workspace cwd");
+            assert_eq!(
+                launch.cwd, expected,
+                "an omitted cwd must fall back to the Task's workspace directory"
+            );
+            assert!(
+                !launch
+                    .program
+                    .to_string_lossy()
+                    .to_ascii_lowercase()
+                    .replace('/', "\\")
+                    .ends_with("windowspowershell\\v1.0\\powershell.exe"),
+                "the excluded shell must never be recorded: {launch:?}"
+            );
+        }
+    }
+
     /// An authenticated client may not send `Command::OpenShellTerminal`.
     ///
     /// The command carries a client-chosen program/args/cwd and the kernel
