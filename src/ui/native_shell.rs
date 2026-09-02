@@ -50446,6 +50446,35 @@ mod tests {
         action_epoch: u64,
         lifecycle: crate::domain::task::TaskLifecycle,
     ) -> (crate::client::ClientModel, TaskId) {
+        let (model, task_id, _provider, _shells) =
+            terminal_bound_client_model_with_shells_and_lifecycle(
+                attention,
+                provider_kind,
+                provider_session_id,
+                action_epoch,
+                lifecycle,
+                0,
+            );
+        (model, task_id)
+    }
+
+    /// The same bound-terminal task, plus `shells` Active plain-shell Terminal
+    /// resources registered at the agent's own runtime generation -- which is
+    /// exactly the shape that makes "the one Active Terminal resource on this
+    /// task" ambiguous. Returns the provider resource id and the shell ids.
+    fn terminal_bound_client_model_with_shells_and_lifecycle(
+        attention: crate::domain::task::TaskAttention,
+        provider_kind: crate::providers::ProviderKind,
+        provider_session_id: Option<&str>,
+        action_epoch: u64,
+        lifecycle: crate::domain::task::TaskLifecycle,
+        shells: usize,
+    ) -> (
+        crate::client::ClientModel,
+        TaskId,
+        crate::domain::id::ResourceId,
+        Vec<crate::domain::id::ResourceId>,
+    ) {
         use crate::client::ClientModelBuilder;
         use crate::domain::{
             agent::{AgentRole, AgentSessionFacts, AgentSessionLifecycle},
@@ -50524,25 +50553,60 @@ mod tests {
         builder
             .ingest_page(page(SnapshotSection::Artifacts, Vec::new()))
             .expect("artifacts");
+        let mut resources = vec![SnapshotItem::Resource(ResourceFacts {
+            id: resource_id,
+            task_id: Some(task_id),
+            owner_kind: OwnerKind::Task,
+            resource_kind: ResourceKind::Terminal,
+            recipe: ResourceRecipe::terminal(40, 8),
+            lifecycle: ResourceLifecycle::Active,
+            runtime_generation: 1,
+            updated_at_ms: 1,
+        })];
+        let mut shell_ids = Vec::new();
+        for index in 0..shells {
+            // One shell sorts BEFORE the provider resource (0xa3) and one
+            // after, so a search that walks the resource map in key order --
+            // the shape this fixture exists to catch -- lands on a shell
+            // whichever end it starts from.
+            let tail = if index % 2 == 0 { 0x90 } else { 0xb0 } + (index as u8) / 2;
+            let shell_id = ResourceId::from_bytes(uuid(tail)).expect("shell resource");
+            shell_ids.push(shell_id);
+            resources.push(SnapshotItem::Resource(ResourceFacts {
+                id: shell_id,
+                task_id: Some(task_id),
+                owner_kind: OwnerKind::Task,
+                resource_kind: ResourceKind::Terminal,
+                recipe: ResourceRecipe::Terminal {
+                    cols: 40,
+                    rows: 8,
+                    launch: Some(crate::domain::resource::TerminalLaunch {
+                        cwd: std::path::PathBuf::from("C:/workspace"),
+                        program: std::path::PathBuf::from("pwsh"),
+                        args: Vec::new(),
+                    }),
+                    title: None,
+                },
+                lifecycle: ResourceLifecycle::Active,
+                // Deliberately the agent's own generation: a task's shells are
+                // registered at the same generation as its provider, which is
+                // why a generation-only search finds them.
+                runtime_generation: 1,
+                updated_at_ms: 1,
+            }));
+        }
         builder
-            .ingest_page(page(
-                SnapshotSection::Resources,
-                vec![SnapshotItem::Resource(ResourceFacts {
-                    id: resource_id,
-                    task_id: Some(task_id),
-                    owner_kind: OwnerKind::Task,
-                    resource_kind: ResourceKind::Terminal,
-                    recipe: ResourceRecipe::terminal(40, 8),
-                    lifecycle: ResourceLifecycle::Active,
-                    runtime_generation: 1,
-                    updated_at_ms: 1,
-                })],
-            ))
+            .ingest_page(page(SnapshotSection::Resources, resources))
             .expect("resources");
         builder
             .ingest_page(page(SnapshotSection::Operations, Vec::new()))
             .expect("operations");
-        (builder.finish().expect("client model"), task_id)
+        (
+            builder.finish().expect("client model"),
+            task_id,
+            resource_id,
+            shell_ids,
+        )
     }
 
     fn unstarted_task_client_model_for(
@@ -63546,6 +63610,131 @@ mod tests {
             });
             cx.quit();
         });
+    }
+
+    /// Addendum G: a task's plain shells are Active Terminal resources owned by
+    /// the same task at the agent's own runtime generation, so first send's
+    /// "the Active Terminal resource at this generation" search finds three the
+    /// moment a user opens a terminal tab -- and would launch the provider onto
+    /// a shell's resource. The shared provider rule is the only thing that can
+    /// answer here.
+    #[test]
+    fn first_send_launches_onto_the_provider_resource_with_two_shells_open() {
+        if rerun_headless_shell_test_in_child(
+            "ui::native_shell::tests::first_send_launches_onto_the_provider_resource_with_two_shells_open",
+        ) {
+            return;
+        }
+        let (runtime, _local_shared) = TestRuntime::new(true, NativeHostActionResult::Queued);
+        let remote_host = HostId::Remote([0x4c; 16]);
+        let report = std::rc::Rc::new(std::cell::RefCell::new(None));
+        let report_slot = std::rc::Rc::clone(&report);
+        gpui::Application::headless().run(move |cx| {
+            crate::ui::init(cx);
+            with_test_shell_in_app(cx, runtime, |shell| {
+                shell.install_idle_conversation_photo_for_test();
+                let (model, task_id, provider_resource, shells) =
+                    terminal_bound_client_model_with_shells_and_lifecycle(
+                        crate::domain::task::TaskAttention::None,
+                        ProviderKind::Codex,
+                        None,
+                        1,
+                        crate::domain::task::TaskLifecycle::Open,
+                        2,
+                    );
+                assert_eq!(shells.len(), 2, "two shells must be open on the task");
+                let model = Arc::new(model);
+                assert!(
+                    model.task(task_id).expect("task").is_unstarted_draft(),
+                    "first send only launches for a genuinely unstarted draft"
+                );
+                let shared =
+                    attach_remote_test_host_with_shared(shell, &remote_host, Arc::clone(&model));
+                let owner = HostTaskKey::new(remote_host.clone(), task_id);
+                shell
+                    .select_fleet_task_key(owner.clone(), FleetSelectMode::Replace)
+                    .expect("select remote task");
+                let focus = shell
+                    .host_slot(&remote_host)
+                    .map(|slot| slot.interaction.current_focus_epoch())
+                    .expect("focus");
+                shell
+                    .composer
+                    .as_mut()
+                    .expect("composer")
+                    .replace_draft("first send with shells open", focus)
+                    .expect("draft");
+                shell.activate_composer_control(ComposerControl::SendNow);
+
+                let probe = shared
+                    .lock()
+                    .expect("remote")
+                    .accepted
+                    .iter()
+                    .find(|record| {
+                        matches!(
+                            record.command,
+                            NativeHostCommand::TaskCockpitQuery {
+                                query: TaskCockpitQuery::TerminalReadiness,
+                                ..
+                            }
+                        )
+                    })
+                    .cloned()
+                    .expect("first-send runtime probe");
+                // Authoritative absence: the host says nothing is running, so
+                // first send must issue the captured ProviderStart.
+                shell.apply_epoch_fenced_action_outcome_for_host(
+                    &remote_host,
+                    NativeHostActionOutcome::Queried {
+                        action: probe,
+                        detail: "runtime probe".into(),
+                        body: NativeHostQueryBody::TaskCockpit(
+                            crate::domain::TaskCockpitResult::Unavailable {
+                                surface: crate::domain::TaskCockpitSurface::Terminal,
+                                reason:
+                                    crate::domain::TaskCockpitUnavailableReason::TerminalNotStarted,
+                                detail: None,
+                            },
+                        ),
+                    },
+                );
+
+                let launched: Vec<crate::domain::id::ResourceId> = shared
+                    .lock()
+                    .expect("remote")
+                    .accepted
+                    .iter()
+                    .filter_map(|record| match &record.command {
+                        NativeHostCommand::ProviderStart { arguments, .. } => {
+                            Some(arguments.resource_id)
+                        }
+                        _ => None,
+                    })
+                    .collect();
+                *report_slot.borrow_mut() = Some((
+                    launched,
+                    provider_resource,
+                    shells,
+                    shell
+                        .host_slot(&remote_host)
+                        .and_then(|slot| slot.composer_error.clone()),
+                ));
+            });
+            cx.quit();
+        });
+        let (launched, provider_resource, shells, composer_error) =
+            report.borrow_mut().take().expect("first-send report");
+        assert_eq!(
+            composer_error, None,
+            "first send must not refuse with two shells open"
+        );
+        assert_eq!(
+            launched,
+            vec![provider_resource],
+            "first send must launch onto the provider terminal resource, never a shell \
+             (shells: {shells:?})"
+        );
     }
 
     fn attach_remote_test_host_with_shared(
