@@ -104,6 +104,21 @@ pub struct NativeDockReview;
 #[action(name = "native.open_terminal")]
 pub struct NativeOpenTerminal;
 
+/// Open one new plain shell terminal on the selected Task.
+#[derive(Clone, Debug, Default, PartialEq, Eq, gpui::Action)]
+#[action(name = "native.open_shell_terminal")]
+pub struct NativeOpenShellTerminal;
+
+/// Focus the next chip on the selected Task's terminal strip.
+#[derive(Clone, Debug, Default, PartialEq, Eq, gpui::Action)]
+#[action(name = "native.cycle_terminal")]
+pub struct NativeCycleTerminal;
+
+/// Focus the previous chip on the selected Task's terminal strip.
+#[derive(Clone, Debug, Default, PartialEq, Eq, gpui::Action)]
+#[action(name = "native.cycle_terminal_back")]
+pub struct NativeCycleTerminalBack;
+
 #[derive(Clone, Debug, Default, PartialEq, Eq, gpui::Action)]
 #[action(name = "native.dismiss_transient")]
 pub struct NativeDismissTransient;
@@ -174,6 +189,15 @@ pub fn register_native_keyboard_bindings(cx: &mut gpui::App) {
         KeyBinding::new("alt-6", NativeDockArtifacts, None),
         KeyBinding::new("alt-7", NativeDockReview, None),
         KeyBinding::new("ctrl-`", NativeOpenTerminal, None),
+        KeyBinding::new("ctrl-shift-`", NativeOpenShellTerminal, None),
+        // Cycling is scoped to the terminal surface's own key context so it
+        // never steals Ctrl+Tab from the rest of the shell.
+        KeyBinding::new("ctrl-tab", NativeCycleTerminal, Some("TerminalFocused")),
+        KeyBinding::new(
+            "ctrl-shift-tab",
+            NativeCycleTerminalBack,
+            Some("TerminalFocused"),
+        ),
         KeyBinding::new("ctrl-b", NativeToggleSidebar, None),
         KeyBinding::new("ctrl-alt-b", NativeToggleDock, None),
         KeyBinding::new("ctrl-j", NativeToggleTerminal, None),
@@ -261,6 +285,7 @@ pub enum ShortcutKey {
     Character(char),
     Digit(u8),
     Backtick,
+    Tab,
     Escape,
 }
 
@@ -318,6 +343,12 @@ pub enum KeyboardAction {
     OpenTaskDetails,
     SelectDock(DockTool),
     OpenTerminal,
+    /// Open one new plain shell terminal on the selected Task.
+    OpenShellTerminal,
+    /// Move strip focus one chip forward (or backward) on the selected Task.
+    CycleTerminal {
+        backwards: bool,
+    },
     DismissTransient,
 }
 
@@ -432,6 +463,18 @@ impl Default for KeyboardModel {
                 action: KeyboardAction::OpenTerminal,
             },
             KeyboardBinding {
+                shortcut: KeyboardShortcut::ctrl_shift(ShortcutKey::Backtick),
+                action: KeyboardAction::OpenShellTerminal,
+            },
+            KeyboardBinding {
+                shortcut: KeyboardShortcut::ctrl(ShortcutKey::Tab),
+                action: KeyboardAction::CycleTerminal { backwards: false },
+            },
+            KeyboardBinding {
+                shortcut: KeyboardShortcut::ctrl_shift(ShortcutKey::Tab),
+                action: KeyboardAction::CycleTerminal { backwards: true },
+            },
+            KeyboardBinding {
                 shortcut: KeyboardShortcut::escape(),
                 action: KeyboardAction::DismissTransient,
             },
@@ -505,4 +548,35 @@ pub fn catalog(selected_task: Option<TaskId>) -> Vec<ActionPresentation> {
             }
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn shell_terminal_chords_resolve() {
+        let model = KeyboardModel::default();
+        assert_eq!(
+            model.resolve(KeyboardShortcut::ctrl_shift(ShortcutKey::Backtick)),
+            Some(KeyboardAction::OpenShellTerminal)
+        );
+        assert_eq!(
+            model.resolve(KeyboardShortcut::ctrl(ShortcutKey::Tab)),
+            Some(KeyboardAction::CycleTerminal { backwards: false })
+        );
+        assert_eq!(
+            model.resolve(KeyboardShortcut::ctrl_shift(ShortcutKey::Tab)),
+            Some(KeyboardAction::CycleTerminal { backwards: true })
+        );
+    }
+
+    #[test]
+    fn the_shell_terminal_chords_do_not_displace_the_provider_terminal_chord() {
+        let model = KeyboardModel::default();
+        assert_eq!(
+            model.resolve(KeyboardShortcut::ctrl(ShortcutKey::Backtick)),
+            Some(KeyboardAction::OpenTerminal)
+        );
+    }
 }

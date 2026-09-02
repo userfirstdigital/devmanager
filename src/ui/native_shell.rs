@@ -2840,6 +2840,68 @@ impl TerminalTarget {
     }
 }
 
+/// One rendered chip on a Task's terminal strip.
+///
+/// This is presentation only: every field is derived from the host-owned
+/// [`TaskTerminalsProjection`], and nothing here is a second copy of strip
+/// state that could drift from it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct TerminalChipRow {
+    pub resource_id: ResourceId,
+    pub label: String,
+    pub selected: bool,
+    pub state: crate::domain::cockpit::TerminalRuntimeStateWire,
+    pub is_provider: bool,
+    /// Redacted working directory as the host reported it, for the hover
+    /// tooltip. Display only -- never a path the client may open or send back.
+    pub live_cwd: Option<String>,
+}
+
+/// Project a Task's terminal strip into its chips, provider first.
+///
+/// The provider chip leads because it is not in the durable `order` (which is
+/// the plain-shell order alone). A resource named by `order` with no matching
+/// chip is skipped rather than invented, and a chip's title wins over its
+/// launch label. `focused: None` selects nothing -- the caller renders the
+/// splash for that state, and a provider chip must not silently absorb it.
+pub(crate) fn terminal_chip_rows(
+    strip: &crate::domain::cockpit::TaskTerminalsProjection,
+) -> Vec<TerminalChipRow> {
+    let by_id = strip
+        .terminals
+        .iter()
+        .map(|chip| (chip.resource_id, chip))
+        .collect::<BTreeMap<_, _>>();
+    let mut rows = Vec::new();
+    if let Some(provider) = strip.terminals.iter().find(|chip| chip.is_provider) {
+        rows.push(TerminalChipRow {
+            resource_id: provider.resource_id,
+            label: provider
+                .title
+                .clone()
+                .unwrap_or_else(|| provider.label.clone()),
+            selected: strip.focused == Some(provider.resource_id),
+            state: provider.runtime_state.clone(),
+            is_provider: true,
+            live_cwd: provider.live_cwd.clone(),
+        });
+    }
+    for resource_id in &strip.order {
+        let Some(chip) = by_id.get(resource_id) else {
+            continue;
+        };
+        rows.push(TerminalChipRow {
+            resource_id: *resource_id,
+            label: chip.title.clone().unwrap_or_else(|| chip.label.clone()),
+            selected: strip.focused == Some(*resource_id),
+            state: chip.runtime_state.clone(),
+            is_provider: false,
+            live_cwd: chip.live_cwd.clone(),
+        });
+    }
+    rows
+}
+
 fn terminal_input_request(
     client_id: ClientId,
     terminal: &crate::domain::TaskTerminalProjection,
@@ -8637,7 +8699,12 @@ impl NativeInteraction {
                 self.keyboard_state.task_details_open = true;
             }
             KeyboardAction::SelectDock(tool) => self.keyboard_state.selected_dock = Some(tool),
-            KeyboardAction::OpenTerminal => self.keyboard_state.terminal_open = true,
+            KeyboardAction::OpenTerminal | KeyboardAction::OpenShellTerminal => {
+                self.keyboard_state.terminal_open = true
+            }
+            // Cycling moves strip focus; it opens no transient layer, so the
+            // keyboard state it would report is unchanged by construction.
+            KeyboardAction::CycleTerminal { .. } => {}
             KeyboardAction::DismissTransient => {
                 self.keyboard_state = NativeKeyboardState::default();
             }
@@ -43920,6 +43987,7 @@ mod tests {
         stable_host_task_row_element_id,
         stale_task_row_routes_key_to_terminal,
         take_retained_action_outcomes,
+        terminal_chip_rows,
         terminal_key_is_task_switcher_shortcut,
         terminal_scroll_lines_from_pixels,
         update_state_from_stage,
@@ -65289,6 +65357,98 @@ mod tests {
             cx.quit();
         });
     }
+
+    use crate::domain::id::ResourceId;
+
+    fn chip_fixture(
+        resource_id: ResourceId,
+        is_provider: bool,
+        title: Option<&str>,
+        label: &str,
+    ) -> crate::domain::cockpit::TaskTerminalChip {
+        crate::domain::cockpit::TaskTerminalChip {
+            resource_id,
+            is_provider,
+            title: title.map(str::to_string),
+            label: label.to_string(),
+            runtime_state: crate::domain::cockpit::TerminalRuntimeStateWire::Running,
+            live_cwd: None,
+            exit: None,
+            created_at_ms: 1,
+            last_activity_at_ms: 1,
+        }
+    }
+
+    /// The provider chip is never in the durable `order`, so leading the strip
+    /// is the only way it can appear at all; a user title wins over the launch
+    /// label; and the strip's focus is what marks a chip selected.
+    #[test]
+    fn terminal_chip_rows_put_provider_first_and_use_titles() {
+        let task_id = TaskId::new();
+        let provider = ResourceId::new();
+        let shell = ResourceId::new();
+        let strip = crate::domain::cockpit::TaskTerminalsProjection {
+            task_id,
+            terminals: vec![
+                chip_fixture(shell, false, Some("build"), "pwsh"),
+                chip_fixture(provider, true, None, "Claude"),
+            ],
+            order: vec![shell],
+            focused: Some(shell),
+        };
+        let rows = terminal_chip_rows(&strip);
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].resource_id, provider);
+        assert_eq!(rows[0].label, "Claude");
+        assert!(!rows[0].selected);
+        assert_eq!(rows[1].resource_id, shell);
+        assert_eq!(rows[1].label, "build");
+        assert!(rows[1].selected);
+    }
+
+    /// `focused: None` is the state the host reports after the focused chip is
+    /// closed, and it is what makes the splash render. If the provider chip
+    /// absorbed it as "selected", closing the last shell would silently snap
+    /// the user back onto the provider terminal instead.
+    #[test]
+    fn terminal_chip_rows_select_nothing_when_the_strip_focuses_nothing() {
+        let provider = ResourceId::new();
+        let shell = ResourceId::new();
+        let strip = crate::domain::cockpit::TaskTerminalsProjection {
+            task_id: TaskId::new(),
+            terminals: vec![
+                chip_fixture(provider, true, None, "terminal"),
+                chip_fixture(shell, false, None, "pwsh"),
+            ],
+            order: vec![shell],
+            focused: None,
+        };
+        let rows = terminal_chip_rows(&strip);
+        assert_eq!(rows.len(), 2);
+        assert!(
+            rows.iter().all(|row| !row.selected),
+            "no chip is selected while the strip focuses nothing"
+        );
+    }
+
+    /// `order` is durable and `terminals` is live, so a resource that is being
+    /// released is named by one and absent from the other. Skipping it keeps
+    /// the strip from inventing a chip with no label or runtime state.
+    #[test]
+    fn terminal_chip_rows_skip_an_ordered_resource_with_no_live_chip() {
+        let shell = ResourceId::new();
+        let releasing = ResourceId::new();
+        let strip = crate::domain::cockpit::TaskTerminalsProjection {
+            task_id: TaskId::new(),
+            terminals: vec![chip_fixture(shell, false, None, "pwsh")],
+            order: vec![releasing, shell],
+            focused: Some(shell),
+        };
+        let rows = terminal_chip_rows(&strip);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].resource_id, shell);
+    }
+
 }
 
 #[allow(dead_code)]
