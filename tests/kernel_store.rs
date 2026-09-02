@@ -662,7 +662,7 @@ fn schema_codec_mismatch_and_integer_overflow_are_typed() {
             task_id: Some(task),
             owner_kind: OwnerKind::Task,
             resource_kind: ResourceKind::Terminal,
-            recipe: ResourceRecipe::Terminal { cols: 80, rows: 24 },
+            recipe: ResourceRecipe::terminal(80, 24),
             lifecycle: ResourceLifecycle::Active,
             runtime_generation: u64::MAX,
             updated_at_ms: 1_100,
@@ -1096,7 +1096,7 @@ fn schema_replay_rejects_domain_invalid_transitions() {
             task_id: Some(task),
             owner_kind: OwnerKind::Task,
             resource_kind: ResourceKind::Terminal,
-            recipe: ResourceRecipe::Terminal { cols: 80, rows: 24 },
+            recipe: ResourceRecipe::terminal(80, 24),
             lifecycle: ResourceLifecycle::Releasing,
             runtime_generation: 0,
             updated_at_ms: 1_100,
@@ -1843,7 +1843,7 @@ fn seed_projection_rows(path: &Path, task: TaskId) {
         rusqlite::params![
             resource.as_bytes().as_slice(),
             task.as_bytes().as_slice(),
-            rmp_serde::to_vec(&ResourceRecipe::Terminal { cols: 80, rows: 24 }).unwrap(),
+            rmp_serde::to_vec(&ResourceRecipe::terminal(80, 24)).unwrap(),
         ],
     )
     .expect("seed resource");
@@ -3010,7 +3010,7 @@ fn command_pure_already_releasing_release_resource_unsupported() {
         rusqlite::params![
             resource.as_bytes().as_slice(),
             task.as_bytes().as_slice(),
-            rmp_serde::to_vec(&ResourceRecipe::Terminal { cols: 80, rows: 24 }).unwrap(),
+            rmp_serde::to_vec(&ResourceRecipe::terminal(80, 24)).unwrap(),
         ],
     )
     .unwrap();
@@ -3330,7 +3330,7 @@ fn seed_active_resource(path: &Path, task: TaskId, resource: ResourceId, generat
         task_id: Some(task),
         owner_kind: OwnerKind::Task,
         resource_kind: ResourceKind::Terminal,
-        recipe: ResourceRecipe::Terminal { cols: 80, rows: 24 },
+        recipe: ResourceRecipe::terminal(80, 24),
         lifecycle: ResourceLifecycle::Active,
         runtime_generation: generation,
         updated_at_ms: 1,
@@ -3361,7 +3361,7 @@ fn seed_active_resource(path: &Path, task: TaskId, resource: ResourceId, generat
         rusqlite::params![
             resource.as_bytes().as_slice(),
             task.as_bytes().as_slice(),
-            rmp_serde::to_vec(&ResourceRecipe::Terminal { cols: 80, rows: 24 }).unwrap(),
+            rmp_serde::to_vec(&ResourceRecipe::terminal(80, 24)).unwrap(),
             generation as i64,
         ],
     )
@@ -3433,7 +3433,7 @@ fn recovery_loads_durable_recipes_without_claiming_process_liveness() {
     assert_eq!(recovering[1].facts().lifecycle, ResourceLifecycle::Active);
     assert_eq!(
         recovering[1].facts().recipe,
-        ResourceRecipe::Terminal { cols: 80, rows: 24 }
+        ResourceRecipe::terminal(80, 24)
     );
     assert_eq!(recovering[1].fence(), ResourceFence::new(active, 4));
     assert_eq!(recovering[2].facts().id, releasing);
@@ -3544,7 +3544,7 @@ fn recovery_validates_released_rows_and_fails_closed_on_invalid_generation() {
     conn.execute(
         "UPDATE resources SET recipe = ?1, runtime_generation = -1 WHERE resource_id = ?2",
         rusqlite::params![
-            rmp_serde::to_vec(&ResourceRecipe::Terminal { cols: 80, rows: 24 }).unwrap(),
+            rmp_serde::to_vec(&ResourceRecipe::terminal(80, 24)).unwrap(),
             resource.as_bytes().as_slice(),
         ],
     )
@@ -8304,7 +8304,7 @@ fn schema_rebuild_rejects_archive_with_live_resource() {
         task_id: Some(task),
         owner_kind: OwnerKind::Task,
         resource_kind: ResourceKind::Terminal,
-        recipe: ResourceRecipe::Terminal { cols: 80, rows: 24 },
+        recipe: ResourceRecipe::terminal(80, 24),
         lifecycle: ResourceLifecycle::Active,
         runtime_generation: 1,
         updated_at_ms: 1_100,
@@ -8442,7 +8442,7 @@ fn schema_rebuild_rejects_resource_fenced_settle_without_action_epoch() {
         task_id: Some(task),
         owner_kind: OwnerKind::Task,
         resource_kind: ResourceKind::Terminal,
-        recipe: ResourceRecipe::Terminal { cols: 80, rows: 24 },
+        recipe: ResourceRecipe::terminal(80, 24),
         lifecycle: ResourceLifecycle::Active,
         runtime_generation: 3,
         updated_at_ms: 1_050,

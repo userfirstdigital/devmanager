@@ -425,10 +425,7 @@ mod workspace_security_tests {
             Some(task_id),
             OwnerKind::Task,
             ResourceKind::Terminal,
-            ResourceRecipe::Terminal {
-                cols: 120,
-                rows: 40,
-            },
+            ResourceRecipe::terminal(120, 40),
             1_725_000_000_300,
         )
         .expect("terminal");
@@ -4710,10 +4707,7 @@ impl HostRequestExecutor {
             Some(task_id),
             OwnerKind::Task,
             ResourceKind::Terminal,
-            ResourceRecipe::Terminal {
-                cols: 120,
-                rows: 40,
-            },
+            ResourceRecipe::terminal(120, 40),
             issued_at_ms,
         )
         .map_err(|_| IpcError::Unavailable)?;
@@ -13557,7 +13551,7 @@ mod tests {
             Some(task_id),
             OwnerKind::Task,
             ResourceKind::Terminal,
-            ResourceRecipe::Terminal { cols: 80, rows: 24 },
+            ResourceRecipe::terminal(80, 24),
             1,
         )
         .expect("task resource");
@@ -13601,7 +13595,7 @@ mod tests {
             Some(task_id),
             OwnerKind::Task,
             ResourceKind::Terminal,
-            ResourceRecipe::Terminal { cols: 80, rows: 24 },
+            ResourceRecipe::terminal(80, 24),
             1,
         )
         .expect("task resource");
@@ -13759,10 +13753,7 @@ mod tests {
                             task_id: Some(task_id),
                             owner_kind: OwnerKind::Task,
                             resource_kind: ResourceKind::Terminal,
-                            recipe: ResourceRecipe::Terminal {
-                                cols: 120,
-                                rows: 40,
-                            },
+                            recipe: ResourceRecipe::terminal(120, 40),
                             lifecycle: ResourceLifecycle::Active,
                             runtime_generation: 3,
                             updated_at_ms: 1_725_000_000_100,

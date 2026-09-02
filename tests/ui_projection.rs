@@ -787,10 +787,7 @@ fn inbox_resource_item(
     kind: ResourceKind,
 ) -> SnapshotItem {
     let (recipe, lifecycle) = match kind {
-        ResourceKind::Terminal => (
-            ResourceRecipe::Terminal { cols: 80, rows: 24 },
-            ResourceLifecycle::Active,
-        ),
+        ResourceKind::Terminal => (ResourceRecipe::terminal(80, 24), ResourceLifecycle::Active),
         ResourceKind::BrowserContext => (
             ResourceRecipe::Browser {
                 start_url: "https://example.test".into(),

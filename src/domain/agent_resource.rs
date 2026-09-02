@@ -150,10 +150,7 @@ mod tests {
                 task_id: Some(task_id),
                 owner_kind: OwnerKind::Task,
                 resource_kind: ResourceKind::Terminal,
-                recipe: ResourceRecipe::Terminal {
-                    cols: 120,
-                    rows: 40,
-                },
+                recipe: ResourceRecipe::terminal(120, 40),
                 lifecycle: ResourceLifecycle::Active,
                 runtime_generation: generation,
                 updated_at_ms: 1,

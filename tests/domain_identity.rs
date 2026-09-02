@@ -436,10 +436,7 @@ fn agent_artifact_resource_and_operation_facts_bind_ownership() {
         Some(task_id),
         OwnerKind::Task,
         ResourceKind::Terminal,
-        ResourceRecipe::Terminal {
-            cols: 120,
-            rows: 40,
-        },
+        ResourceRecipe::terminal(120, 40),
         200,
     )
     .expect("resource facts");
@@ -476,7 +473,7 @@ fn agent_artifact_resource_reject_invalid_labels_and_providers() {
         None,
         OwnerKind::Host,
         ResourceKind::Terminal,
-        ResourceRecipe::Terminal { cols: 0, rows: 0 },
+        ResourceRecipe::terminal(0, 0),
         0,
     )
     .is_err());
@@ -484,7 +481,7 @@ fn agent_artifact_resource_reject_invalid_labels_and_providers() {
         Some(task_id),
         OwnerKind::Host,
         ResourceKind::Terminal,
-        ResourceRecipe::Terminal { cols: 1, rows: 1 },
+        ResourceRecipe::terminal(1, 1),
         0,
     )
     .is_err());
@@ -492,7 +489,7 @@ fn agent_artifact_resource_reject_invalid_labels_and_providers() {
         None,
         OwnerKind::Task,
         ResourceKind::Terminal,
-        ResourceRecipe::Terminal { cols: 1, rows: 1 },
+        ResourceRecipe::terminal(1, 1),
         0,
     )
     .is_err());
@@ -500,7 +497,7 @@ fn agent_artifact_resource_reject_invalid_labels_and_providers() {
         Some(task_id),
         OwnerKind::Task,
         ResourceKind::Service,
-        ResourceRecipe::Terminal { cols: 1, rows: 1 },
+        ResourceRecipe::terminal(1, 1),
         0,
     )
     .is_err());
@@ -510,7 +507,7 @@ fn agent_artifact_resource_reject_invalid_labels_and_providers() {
         task_id: Some(task_id),
         owner_kind: OwnerKind::Task,
         resource_kind: ResourceKind::Terminal,
-        recipe: ResourceRecipe::Terminal { cols: 1, rows: 1 },
+        recipe: ResourceRecipe::terminal(1, 1),
         lifecycle: ResourceLifecycle::Releasing,
         runtime_generation: 1,
         updated_at_ms: 0,

@@ -1126,10 +1126,7 @@ mod tests {
             task_id: Some(task_id),
             owner_kind: OwnerKind::Task,
             resource_kind: ResourceKind::Terminal,
-            recipe: ResourceRecipe::Terminal {
-                cols: 120,
-                rows: 40,
-            },
+            recipe: ResourceRecipe::terminal(120, 40),
             lifecycle: ResourceLifecycle::Active,
             runtime_generation: 0,
             updated_at_ms: 1_725_000_000_300,
@@ -1901,11 +1898,8 @@ mod tests {
             rusqlite::params![
                 resource.as_bytes().as_slice(),
                 missing_task.as_bytes().as_slice(),
-                rmp_serde::to_vec(&ResourceRecipe::Terminal {
-                    cols: 120,
-                    rows: 40
-                })
-                .expect("encode terminal recipe"),
+                rmp_serde::to_vec(&ResourceRecipe::terminal(120, 40))
+                    .expect("encode terminal recipe"),
             ],
         )
         .expect("seed dangling resource projection");

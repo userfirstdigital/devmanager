@@ -1670,10 +1670,7 @@ mod provider_restart_identity_tests {
             task_id: Some(task_id),
             owner_kind: OwnerKind::Task,
             resource_kind: ResourceKind::Terminal,
-            recipe: ResourceRecipe::Terminal {
-                cols: 120,
-                rows: 40,
-            },
+            recipe: ResourceRecipe::terminal(120, 40),
             lifecycle: ResourceLifecycle::Active,
             runtime_generation: agent.runtime_generation,
             updated_at_ms: 1,
@@ -1819,10 +1816,7 @@ mod provider_restart_identity_tests {
                             task_id: Some(task_id),
                             owner_kind: OwnerKind::Task,
                             resource_kind: ResourceKind::Terminal,
-                            recipe: ResourceRecipe::Terminal {
-                                cols: 120,
-                                rows: 40,
-                            },
+                            recipe: ResourceRecipe::terminal(120, 40),
                             lifecycle: ResourceLifecycle::Active,
                             runtime_generation: 7,
                             updated_at_ms: 1_725_000_000_100,

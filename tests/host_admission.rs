@@ -161,7 +161,7 @@ fn register_active_terminal(
                     task_id: Some(task),
                     owner_kind: OwnerKind::Task,
                     resource_kind: ResourceKind::Terminal,
-                    recipe: ResourceRecipe::Terminal { cols: 80, rows: 24 },
+                    recipe: ResourceRecipe::terminal(80, 24),
                     lifecycle: ResourceLifecycle::Active,
                     runtime_generation: 0,
                     updated_at_ms: 1_725_000_000_050,
