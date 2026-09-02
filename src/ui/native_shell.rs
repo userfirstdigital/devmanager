@@ -63643,6 +63643,14 @@ mod tests {
                         2,
                     );
                 assert_eq!(shells.len(), 2, "two shells must be open on the task");
+                // The guard is only real while a shell sorts on EACH side of
+                // the provider in the snapshot's BTreeMap: a first-or-last
+                // `.find` sabotage must land on a shell. Assert it, so a
+                // fixture renumbering re-vacuates this test loudly.
+                assert!(
+                    shells[0] < provider_resource && provider_resource < shells[1],
+                    "fixture must bracket the provider resource with one shell on each side"
+                );
                 let model = Arc::new(model);
                 assert!(
                     model.task(task_id).expect("task").is_unstarted_draft(),
