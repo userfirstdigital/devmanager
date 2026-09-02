@@ -294,9 +294,38 @@ pub struct TaskSurfaceState {
     /// been queried. `None` means the strip has never been admitted, which is
     /// not the same as an empty strip.
     pub strip: Option<TaskTerminalsProjection>,
-    pub terminal_attachment: TerminalAttachmentState,
-    terminal_query_in_flight: bool,
+    /// Attachment and query-lease state PER TERMINAL, keyed the way the shell
+    /// keys everything else terminal-shaped. Screens are per resource, so
+    /// these have to be too: one record per Task meant a bounded retry for an
+    /// unfocused provider relabelled the focused shell "reconnecting" and
+    /// dropped its interactivity, with nothing on screen explaining why.
+    attachments: BTreeMap<TerminalSurfaceTarget, TerminalAttachment>,
     pending_user_messages: Vec<PendingUserMessage>,
+}
+
+/// Which of a Task's terminals one attachment record belongs to.
+///
+/// `None` is the provider slot -- the terminal the legacy provider-only
+/// cockpit queries address, which carries no resource id of its own until its
+/// first projection lands. This mirrors the shell's `TerminalTarget` exactly,
+/// and `terminal_surface_target` is the one derivation between them.
+pub type TerminalSurfaceTarget = Option<ResourceId>;
+
+/// The attachment slot one projection belongs to.
+///
+/// Shell recognition is the shared rule on the projection itself, so a
+/// projection from a host that predates plain shells lands in the provider
+/// slot -- the only terminal such a host has.
+pub fn terminal_surface_target(projection: &TaskTerminalProjection) -> TerminalSurfaceTarget {
+    (projection.is_plain_shell()).then_some(projection.resource_id)
+}
+
+/// One terminal's client-side attachment: what the UI should say about it, and
+/// whether a screen query for it is outstanding.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct TerminalAttachment {
+    state: TerminalAttachmentState,
+    query_in_flight: bool,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -371,14 +400,66 @@ impl TaskSurfaceState {
             .and_then(|resource_id| self.terminals.get(&resource_id))
     }
 
+    /// The attachment slot the VISIBLE terminal uses.
+    ///
+    /// `None` is the provider slot: the legacy provider-only queries address
+    /// it and it has no resource id of its own until a projection lands, which
+    /// is the same split the shell spells as `TerminalTarget::Provider`.
+    pub fn focused_surface_target(&self) -> TerminalSurfaceTarget {
+        match self.focused_terminal() {
+            Some((resource_id, false)) => Some(resource_id),
+            _ => None,
+        }
+    }
+
+    /// The retained screen for one exact terminal, provider slot included.
+    fn screen_for_target(&self, target: TerminalSurfaceTarget) -> Option<&TaskTerminalProjection> {
+        match target {
+            Some(resource_id) => self.terminals.get(&resource_id),
+            None => self
+                .terminals
+                .values()
+                .find(|terminal| !terminal.is_plain_shell()),
+        }
+    }
+
+    fn attachment(&self, target: TerminalSurfaceTarget) -> TerminalAttachment {
+        self.attachments.get(&target).copied().unwrap_or_default()
+    }
+
+    /// Attachment state of one exact terminal.
+    pub fn terminal_attachment_for(
+        &self,
+        target: TerminalSurfaceTarget,
+    ) -> TerminalAttachmentState {
+        self.attachment(target).state
+    }
+
+    /// Attachment state of the visible terminal.
+    pub fn terminal_attachment(&self) -> TerminalAttachmentState {
+        self.terminal_attachment_for(self.focused_surface_target())
+    }
+
+    /// Seed one slot directly. Test-only: production state moves through the
+    /// `note_*` transitions so the query lease and the label cannot diverge.
+    #[cfg(test)]
+    pub(crate) fn set_terminal_attachment_for_test(
+        &mut self,
+        target: TerminalSurfaceTarget,
+        state: TerminalAttachmentState,
+    ) {
+        self.attachments.entry(target).or_default().state = state;
+    }
+
     pub fn center_loading_state(
         &self,
         showing_terminal: bool,
     ) -> Option<CenterSurfaceLoadingState> {
         if showing_terminal {
-            ((self.terminal_query_in_flight
-                || self.terminal_attachment == TerminalAttachmentState::Starting)
-                && self.latest_terminal().is_none())
+            let target = self.focused_surface_target();
+            let attachment = self.attachment(target);
+            ((attachment.query_in_flight || attachment.state == TerminalAttachmentState::Starting)
+                && self.screen_for_target(target).is_none())
             .then_some(CenterSurfaceLoadingState::TerminalInitial)
         } else {
             (self.conversation_in_flight && !self.conversation_has_content())
@@ -386,51 +467,78 @@ impl TaskSurfaceState {
         }
     }
 
-    pub fn note_terminal_query_started(&mut self) {
-        self.terminal_query_in_flight = true;
-        if self.latest_terminal().is_none() {
-            self.terminal_attachment = TerminalAttachmentState::Starting;
+    pub fn note_terminal_query_started_for(&mut self, target: TerminalSurfaceTarget) {
+        let has_screen = self.screen_for_target(target).is_some();
+        let attachment = self.attachments.entry(target).or_default();
+        attachment.query_in_flight = true;
+        if !has_screen {
+            attachment.state = TerminalAttachmentState::Starting;
         }
     }
 
-    pub fn note_terminal_reconnecting(&mut self) {
-        self.terminal_query_in_flight = false;
-        if self.latest_terminal().is_some() {
-            self.terminal_attachment = TerminalAttachmentState::StaleReconnecting;
+    pub fn note_terminal_query_started(&mut self) {
+        self.note_terminal_query_started_for(self.focused_surface_target());
+    }
+
+    pub fn note_terminal_reconnecting_for(&mut self, target: TerminalSurfaceTarget) {
+        let has_screen = self.screen_for_target(target).is_some();
+        let attachment = self.attachments.entry(target).or_default();
+        attachment.query_in_flight = false;
+        attachment.state = if has_screen {
+            TerminalAttachmentState::StaleReconnecting
         } else {
             // Starting is an in-flight promise, not a generic retry label.
             // Once the exact query settles without a projection, stop the
             // spinner and surface a retryable unavailable state. A later
             // query can enter Starting again without losing cached output.
-            self.terminal_attachment = TerminalAttachmentState::Unavailable;
-        }
+            TerminalAttachmentState::Unavailable
+        };
+    }
+
+    pub fn note_terminal_reconnecting(&mut self) {
+        self.note_terminal_reconnecting_for(self.focused_surface_target());
     }
 
     /// A provider-owned restore is still in progress after this exact query
     /// settled. Release the query lease so a bounded retry can be admitted,
     /// but keep the visible startup promise instead of flashing an incorrect
     /// unavailable state between polls.
-    pub fn note_terminal_start_pending(&mut self) {
-        self.terminal_query_in_flight = false;
-        if self.latest_terminal().is_some() {
-            self.terminal_attachment = TerminalAttachmentState::StaleReconnecting;
+    pub fn note_terminal_start_pending_for(&mut self, target: TerminalSurfaceTarget) {
+        let has_screen = self.screen_for_target(target).is_some();
+        let attachment = self.attachments.entry(target).or_default();
+        attachment.query_in_flight = false;
+        attachment.state = if has_screen {
+            TerminalAttachmentState::StaleReconnecting
         } else {
-            self.terminal_attachment = TerminalAttachmentState::Starting;
-        }
+            TerminalAttachmentState::Starting
+        };
+    }
+
+    pub fn note_terminal_start_pending(&mut self) {
+        self.note_terminal_start_pending_for(self.focused_surface_target());
     }
 
     pub fn note_terminal_unavailable(&mut self) {
-        self.terminal_query_in_flight = false;
-        self.terminal_attachment = TerminalAttachmentState::Unavailable;
+        let target = self.focused_surface_target();
+        let attachment = self.attachments.entry(target).or_default();
+        attachment.query_in_flight = false;
+        attachment.state = TerminalAttachmentState::Unavailable;
     }
 
     pub fn note_terminal_exited(&mut self) {
-        self.terminal_query_in_flight = false;
-        self.terminal_attachment = TerminalAttachmentState::Exited;
+        let target = self.focused_surface_target();
+        let attachment = self.attachments.entry(target).or_default();
+        attachment.query_in_flight = false;
+        attachment.state = TerminalAttachmentState::Exited;
+    }
+
+    /// Whether a screen query is outstanding for one exact terminal.
+    pub fn terminal_query_in_flight_for(&self, target: TerminalSurfaceTarget) -> bool {
+        self.attachment(target).query_in_flight
     }
 
     pub fn terminal_query_in_flight(&self) -> bool {
-        self.terminal_query_in_flight
+        self.terminal_query_in_flight_for(self.focused_surface_target())
     }
 
     pub fn conversation_has_content(&self) -> bool {
@@ -438,12 +546,12 @@ impl TaskSurfaceState {
     }
 
     pub fn terminal_is_interactive(&self) -> bool {
-        self.terminal_attachment == TerminalAttachmentState::Live
+        self.terminal_attachment() == TerminalAttachmentState::Live
             && self.latest_terminal().is_some()
     }
 
     pub fn terminal_label(&self) -> &'static str {
-        match self.terminal_attachment {
+        match self.terminal_attachment() {
             TerminalAttachmentState::Live => "Terminal is live",
             TerminalAttachmentState::StaleReconnecting => "Reconnecting — last terminal screen",
             TerminalAttachmentState::Starting => "Terminal starting",
@@ -453,7 +561,7 @@ impl TaskSurfaceState {
     }
 
     pub fn terminal_empty_message(&self) -> &'static str {
-        match self.terminal_attachment {
+        match self.terminal_attachment() {
             TerminalAttachmentState::Live => "Terminal is live; waiting for output.",
             TerminalAttachmentState::StaleReconnecting => "Reconnecting — last terminal screen",
             TerminalAttachmentState::Starting => "Terminal starting…",
@@ -810,8 +918,13 @@ impl<K: Clone + Ord + Eq> TaskSurfaceRegistry<K> {
         state
             .terminals
             .insert(projection.resource_id, projection.clone());
-        state.terminal_attachment = TerminalAttachmentState::Live;
-        state.terminal_query_in_flight = false;
+        // The screen that arrived is THIS terminal's, so only its slot goes
+        // live. Marking the whole Task live would tell the UI a shell is
+        // attached because the provider answered.
+        let target = terminal_surface_target(projection);
+        let attachment = state.attachments.entry(target).or_default();
+        attachment.state = TerminalAttachmentState::Live;
+        attachment.query_in_flight = false;
         Ok(())
     }
 
@@ -880,8 +993,35 @@ impl<K: Clone + Ord + Eq> TaskSurfaceRegistry<K> {
         self.ensure_task(task_id).note_terminal_reconnecting();
     }
 
+    /// Mark ONE terminal reconnecting. The per-Task form addresses whichever
+    /// terminal is visible; this one is for the paths that already know which
+    /// query settled, so a bounded retry for an unfocused terminal cannot
+    /// relabel the one on screen.
+    pub fn note_terminal_reconnecting_for(&mut self, task_id: K, target: TerminalSurfaceTarget) {
+        self.ensure_task(task_id)
+            .note_terminal_reconnecting_for(target);
+    }
+
     pub fn note_terminal_query_started(&mut self, task_id: K) {
         self.ensure_task(task_id).note_terminal_query_started();
+    }
+
+    /// Take the query lease for ONE terminal.
+    pub fn note_terminal_query_started_for(&mut self, task_id: K, target: TerminalSurfaceTarget) {
+        self.ensure_task(task_id)
+            .note_terminal_query_started_for(target);
+    }
+
+    /// Release ONE terminal's lease while keeping its startup promise.
+    pub fn note_terminal_start_pending_for(&mut self, task_id: K, target: TerminalSurfaceTarget) {
+        self.ensure_task(task_id)
+            .note_terminal_start_pending_for(target);
+    }
+
+    /// Whether a screen query is outstanding for ONE terminal.
+    pub fn terminal_query_in_flight_for(&self, task_id: K, target: TerminalSurfaceTarget) -> bool {
+        self.state(task_id)
+            .is_some_and(|state| state.terminal_query_in_flight_for(target))
     }
 
     pub fn terminal_is_interactive(&self, task_id: K) -> bool {
@@ -1079,7 +1219,10 @@ mod tests {
     fn first_terminal_query_projects_starting_without_discarding_a_live_screen() {
         let mut empty = TaskSurfaceState::default();
         empty.note_terminal_query_started();
-        assert_eq!(empty.terminal_attachment, TerminalAttachmentState::Starting);
+        assert_eq!(
+            empty.terminal_attachment(),
+            TerminalAttachmentState::Starting
+        );
         assert!(
             empty.terminal_query_in_flight(),
             "the empty terminal surface must expose its active load"
@@ -1087,7 +1230,7 @@ mod tests {
 
         let mut live = surface_with_terminal_lines(&["ready"]);
         live.note_terminal_query_started();
-        assert_eq!(live.terminal_attachment, TerminalAttachmentState::Live);
+        assert_eq!(live.terminal_attachment(), TerminalAttachmentState::Live);
         assert_eq!(live.terminal_tail(1), vec!["ready".to_string()]);
         assert!(
             live.terminal_query_in_flight(),
@@ -1101,7 +1244,7 @@ mod tests {
 
         empty.note_terminal_reconnecting();
         assert_eq!(
-            empty.terminal_attachment,
+            empty.terminal_attachment(),
             TerminalAttachmentState::Unavailable,
             "a failed first load must stop presenting an unbounded startup state; a later retry may re-enter Starting"
         );
@@ -1118,7 +1261,10 @@ mod tests {
         empty.note_terminal_query_started();
         empty.note_terminal_start_pending();
 
-        assert_eq!(empty.terminal_attachment, TerminalAttachmentState::Starting);
+        assert_eq!(
+            empty.terminal_attachment(),
+            TerminalAttachmentState::Starting
+        );
         assert!(
             !empty.terminal_query_in_flight(),
             "the settled query must release its in-flight lease before a retry"
@@ -1254,6 +1400,97 @@ mod tests {
             created_at_ms: 0,
             last_activity_at_ms: 0,
         }
+    }
+
+    /// Screens are per resource, so attachment has to be too. A bounded retry
+    /// for the provider -- which the client keeps issuing whether or not the
+    /// provider is on screen -- must not relabel the focused shell
+    /// "Reconnecting" and drop `terminal_is_interactive`, which is what stops
+    /// the user typing into a terminal that is working perfectly.
+    #[test]
+    fn a_provider_retry_leaves_the_focused_shells_attachment_alone() {
+        let mut registry = TaskSurfaceRegistry::<TaskId>::default();
+        let task_id = TaskId::new();
+        let provider =
+            terminal_projection_fixture(task_id, crate::domain::id::ResourceId::new(), true);
+        let shell =
+            terminal_projection_fixture(task_id, crate::domain::id::ResourceId::new(), false);
+        let strip = TaskTerminalsProjection {
+            task_id,
+            terminals: vec![
+                terminal_chip_fixture(&provider),
+                terminal_chip_fixture(&shell),
+            ],
+            order: vec![shell.resource_id],
+            focused: Some(shell.resource_id),
+        };
+        registry.admit_terminals(task_id, &strip).unwrap();
+        registry.admit_terminal(task_id, &provider).unwrap();
+        registry.admit_terminal(task_id, &shell).unwrap();
+        assert!(registry.terminal_is_interactive(task_id));
+        assert_eq!(registry.terminal_label(task_id), "Terminal is live");
+
+        // The provider's own retry settles without a projection.
+        registry.note_terminal_reconnecting_for(task_id, None);
+        assert!(
+            registry.terminal_is_interactive(task_id),
+            "the focused shell is still attached; the provider's retry is not about it"
+        );
+        assert_eq!(registry.terminal_label(task_id), "Terminal is live");
+        assert_eq!(
+            registry
+                .state(task_id)
+                .unwrap()
+                .terminal_attachment_for(None),
+            TerminalAttachmentState::StaleReconnecting,
+            "the provider slot alone records the retry"
+        );
+
+        // The shell's own retry does reach it.
+        registry.note_terminal_reconnecting_for(task_id, Some(shell.resource_id));
+        assert_eq!(
+            registry.terminal_label(task_id),
+            "Reconnecting — last terminal screen"
+        );
+        assert!(!registry.terminal_is_interactive(task_id));
+    }
+
+    /// Admitting one terminal's screen marks THAT terminal live. Marking the
+    /// Task live would tell the UI a shell is attached because the provider
+    /// answered, which is the same conflation one step earlier.
+    #[test]
+    fn admitting_a_provider_screen_does_not_mark_the_focused_shell_live() {
+        let mut registry = TaskSurfaceRegistry::<TaskId>::default();
+        let task_id = TaskId::new();
+        let provider =
+            terminal_projection_fixture(task_id, crate::domain::id::ResourceId::new(), true);
+        let shell =
+            terminal_projection_fixture(task_id, crate::domain::id::ResourceId::new(), false);
+        let strip = TaskTerminalsProjection {
+            task_id,
+            terminals: vec![
+                terminal_chip_fixture(&provider),
+                terminal_chip_fixture(&shell),
+            ],
+            order: vec![shell.resource_id],
+            focused: Some(shell.resource_id),
+        };
+        registry.admit_terminals(task_id, &strip).unwrap();
+        registry.admit_terminal(task_id, &provider).unwrap();
+        let state = registry.state(task_id).unwrap();
+        assert_eq!(
+            state.terminal_attachment_for(None),
+            TerminalAttachmentState::Live
+        );
+        assert_eq!(
+            state.terminal_attachment_for(Some(shell.resource_id)),
+            TerminalAttachmentState::Unavailable,
+            "the shell has answered nothing yet, so it is not attached"
+        );
+        assert!(
+            !registry.terminal_is_interactive(task_id),
+            "the focused shell must not read as attached because the provider answered"
+        );
     }
 
     #[test]
@@ -1443,8 +1680,9 @@ mod tests {
             is_provider: true,
             runtime_state: crate::domain::cockpit::TerminalRuntimeStateWire::Running,
         };
+        let target = terminal_surface_target(&projection);
         surface.terminals.insert(projection.resource_id, projection);
-        surface.terminal_attachment = TerminalAttachmentState::Live;
+        surface.set_terminal_attachment_for_test(target, TerminalAttachmentState::Live);
         surface
     }
 

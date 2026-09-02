@@ -2840,6 +2840,17 @@ impl TerminalTarget {
         }
     }
 
+    /// The surface registry's attachment slot for this terminal.
+    ///
+    /// The registry spells the same split as `Option<ResourceId>` because it
+    /// cannot see this private enum; this is the ONE conversion between them.
+    fn surface_target(self) -> crate::ui::task_workspace::surfaces::TerminalSurfaceTarget {
+        match self {
+            Self::Provider => None,
+            Self::Resource(resource_id) => Some(resource_id),
+        }
+    }
+
     /// The bounded screen query that addresses this exact terminal.
     fn screen_query(self) -> TaskCockpitQuery {
         match self {
@@ -13960,8 +13971,10 @@ impl NativeShell {
                         if first_send_terminal_probe_start_pending(&result) {
                             self.schedule_terminal_start_retry(key);
                         } else {
+                            let target = key.1;
                             self.pending_terminal_requeries.remove(&key);
-                            self.task_surfaces.note_terminal_reconnecting(owner);
+                            self.task_surfaces
+                                .note_terminal_reconnecting_for(owner, target.surface_target());
                         }
                         if self.local_slot_mut().interaction.selected_task() == Some(task_id) {
                             self.sync_terminal_from_cockpit();
@@ -14507,9 +14520,11 @@ impl NativeShell {
     }
 
     fn schedule_terminal_start_retry(&mut self, key: TerminalKey) {
+        // The retry is armed for ONE terminal, so only that terminal's
+        // attachment slot keeps its startup promise. Applying it to the Task
+        // relabels whichever terminal happens to be on screen.
         self.task_surfaces
-            .ensure_task(key.0.clone())
-            .note_terminal_start_pending();
+            .note_terminal_start_pending_for(key.0.clone(), key.1.surface_target());
         self.pending_terminal_requeries
             .insert(key, Instant::now() + TERMINAL_START_RETRY_INTERVAL);
     }
@@ -14541,15 +14556,14 @@ impl NativeShell {
                 }
                 let query_in_flight = self
                     .task_surfaces
-                    .state(owner.clone())
-                    .is_some_and(|surface| surface.terminal_query_in_flight());
+                    .terminal_query_in_flight_for(owner.clone(), target.surface_target());
                 if query_in_flight {
                     self.pending_terminal_requeries
                         .insert(key, now + TERMINAL_ECHO_RETRY_INTERVAL);
                     continue;
                 }
                 self.task_surfaces
-                    .note_terminal_query_started(owner.clone());
+                    .note_terminal_query_started_for(owner.clone(), target.surface_target());
                 if self
                     .dispatch_action_recorded_for_owner(
                         &owner.host,
@@ -14563,7 +14577,8 @@ impl NativeShell {
                     dispatched = true;
                 } else {
                     self.pending_terminal_echoes.remove(&key);
-                    self.task_surfaces.note_terminal_reconnecting(owner);
+                    self.task_surfaces
+                        .note_terminal_reconnecting_for(owner, target.surface_target());
                 }
                 continue;
             }
@@ -14579,7 +14594,7 @@ impl NativeShell {
                 continue;
             }
             self.task_surfaces
-                .note_terminal_query_started(owner.clone());
+                .note_terminal_query_started_for(owner.clone(), target.surface_target());
             if self
                 .dispatch_action_recorded_for_owner(
                     &owner.host,
@@ -14592,7 +14607,8 @@ impl NativeShell {
             {
                 dispatched = true;
             } else {
-                self.task_surfaces.note_terminal_reconnecting(owner);
+                self.task_surfaces
+                    .note_terminal_reconnecting_for(owner, target.surface_target());
             }
         }
         dispatched
@@ -15290,7 +15306,12 @@ impl NativeShell {
             Self::task_cockpit_command_parts(&action.command)
         {
             let key = HostTaskKey::new(host_id.clone(), task_id);
-            self.task_surfaces.note_terminal_reconnecting(key.clone());
+            // The guard above matched the legacy provider-only query, so this
+            // is the provider slot and nothing else.
+            self.task_surfaces.note_terminal_reconnecting_for(
+                key.clone(),
+                TerminalTarget::Provider.surface_target(),
+            );
             if self
                 .host_slot(host_id)
                 .is_some_and(|slot| slot.interaction.selected_task() == Some(task_id))
@@ -15741,8 +15762,11 @@ impl NativeShell {
                 query,
                 TaskCockpitQuery::Terminal | TaskCockpitQuery::TerminalReadiness
             ) {
-                self.task_surfaces
-                    .note_terminal_reconnecting(self.local_task_key(task_id));
+                let owner = self.local_task_key(task_id);
+                self.task_surfaces.note_terminal_reconnecting_for(
+                    owner,
+                    TerminalTarget::Provider.surface_target(),
+                );
                 if self.local_slot_mut().interaction.selected_task() == Some(task_id) {
                     self.sync_terminal_from_cockpit();
                 }
@@ -16604,8 +16628,10 @@ impl NativeShell {
                     if first_send_terminal_probe_start_pending(result) {
                         self.schedule_terminal_start_retry(key);
                     } else {
+                        let target = key.1;
                         self.pending_terminal_requeries.remove(&key);
-                        self.task_surfaces.note_terminal_reconnecting(owner);
+                        self.task_surfaces
+                            .note_terminal_reconnecting_for(owner, target.surface_target());
                     }
                 }
             }
@@ -16807,7 +16833,11 @@ impl NativeShell {
         let owner = HostTaskKey::new(host_id.clone(), task_id);
         self.pending_terminal_requeries
             .remove(&(owner.clone(), target));
-        self.task_surfaces.note_terminal_reconnecting(owner);
+        // Only the terminal whose query failed is reconnecting. Marking the
+        // Task would relabel the focused shell because the provider's probe
+        // came back empty, and drop its interactivity with it.
+        self.task_surfaces
+            .note_terminal_reconnecting_for(owner, target.surface_target());
         if host_id == &self.local_host_id()
             && self.local_slot().interaction.selected_task() == Some(task_id)
         {
@@ -16982,7 +17012,7 @@ impl NativeShell {
         // admitted is what it reads.
         let target = self.focused_terminal_target(&owner);
         self.task_surfaces
-            .note_terminal_query_started(owner.clone());
+            .note_terminal_query_started_for(owner.clone(), target.surface_target());
         let _ = self.dispatch_action_recorded_for_owner_inner(
             host_id,
             ActionRequest::TaskCockpit {
@@ -19481,9 +19511,10 @@ impl NativeShell {
             // becomes visible for the first time, and `admit_owner_task_terminals`
             // deliberately issued no screen query for it while it was
             // unselected. Ask for the focused chip's screen, not the provider's.
-            let query = self.focused_terminal_target(&owner).screen_query();
+            let target = self.focused_terminal_target(&owner);
+            let query = target.screen_query();
             self.task_surfaces
-                .note_terminal_query_started(owner.clone());
+                .note_terminal_query_started_for(owner.clone(), target.surface_target());
             self.request_task_terminals_refresh(&owner);
             let _ = self.dispatch_task_cockpit_query(task_id, query);
         }
@@ -21062,8 +21093,10 @@ impl NativeShell {
                 } else if visible {
                     // Same rule as the local path: probe the chip the strip
                     // focuses, and refresh the strip that decides it.
-                    let query = self.focused_terminal_target(&key).readiness_query();
-                    self.task_surfaces.note_terminal_query_started(key.clone());
+                    let target = self.focused_terminal_target(&key);
+                    let query = target.readiness_query();
+                    self.task_surfaces
+                        .note_terminal_query_started_for(key.clone(), target.surface_target());
                     self.request_task_terminals_refresh(&key);
                     let _ = self.dispatch_action_recorded_for_owner(
                         &key.host,
@@ -21115,9 +21148,10 @@ impl NativeShell {
             if visible {
                 if let Some(task_id) = selected_task_id {
                     let owner = self.local_task_key(task_id);
-                    let query = self.focused_terminal_target(&owner).readiness_query();
+                    let target = self.focused_terminal_target(&owner);
+                    let query = target.readiness_query();
                     self.task_surfaces
-                        .note_terminal_query_started(owner.clone());
+                        .note_terminal_query_started_for(owner.clone(), target.surface_target());
                     self.request_task_terminals_refresh(&owner);
                     let _ = self.dispatch_task_cockpit_query(task_id, query);
                 }
@@ -21328,8 +21362,10 @@ impl NativeShell {
                 // belongs to the provider slot by construction.
                 self.note_pending_terminal_echo(&(owner.clone(), TerminalTarget::Provider), &text);
                 self.local_slot_mut().composer_error = None;
-                self.task_surfaces
-                    .note_terminal_query_started(owner.clone());
+                self.task_surfaces.note_terminal_query_started_for(
+                    owner.clone(),
+                    TerminalTarget::Provider.surface_target(),
+                );
                 let _ = self.dispatch_action_recorded_for_owner_inner(
                     &owner.host,
                     ActionRequest::TaskCockpit {
@@ -21476,7 +21512,8 @@ impl NativeShell {
         {
             return false;
         }
-        self.task_surfaces.note_terminal_query_started(owner);
+        self.task_surfaces
+            .note_terminal_query_started_for(owner, TerminalTarget::Provider.surface_target());
         self.dispatch_action_recorded_for_owner_inner(
             host_id,
             ActionRequest::TaskCockpit {
@@ -21524,7 +21561,7 @@ impl NativeShell {
                     slot.composer_error = None;
                 }
                 self.task_surfaces
-                    .note_terminal_query_started(owner.clone());
+                    .note_terminal_query_started_for(owner.clone(), key.1.surface_target());
                 let _ = self.dispatch_action_recorded_for_owner_inner(
                     host_id,
                     ActionRequest::TaskCockpit {
@@ -26214,8 +26251,10 @@ impl NativeShell {
         if is_provider {
             self.set_provider_terminal_visible(true);
         }
-        self.task_surfaces
-            .note_terminal_query_started(owner.clone());
+        self.task_surfaces.note_terminal_query_started_for(
+            owner.clone(),
+            TerminalTarget::Resource(resource_id).surface_target(),
+        );
         let _ = self.dispatch_action_recorded_for_owner(
             &owner.host,
             ActionRequest::TaskCockpit {
