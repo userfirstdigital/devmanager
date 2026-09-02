@@ -301,6 +301,67 @@ fn historical_settled_provider_turn_remains_queryable_after_a_later_turn_settles
 }
 
 #[test]
+fn historical_action_epoch_replays_delivery_between_provider_inputs() {
+    let dir = TempDir::new().expect("tempdir");
+    let mut store = KernelStore::open(&dir.path().join("historical-epoch.sqlite3")).expect("open");
+    let (_first_operation_id, first_permit) = seed_provider_dispatch(&mut store, 0x91);
+    let first_identity = identity_from_effect(first_permit.effect());
+    assert!(matches!(
+        settle_with_accepting_runtime(&mut store, &first_permit),
+        OperationState::Settled { .. }
+    ));
+
+    let (revision, action_epoch): (i64, i64) = store
+        .conn
+        .query_row(
+            "SELECT revision, action_epoch FROM tasks WHERE task_id = ?1",
+            [first_identity.task_id.as_bytes().as_slice()],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .expect("current task fence");
+    let second = store
+        .execute_for_test(CommandEnvelope {
+            command_id: CommandId::from_bytes(fixed_uuid_v7(0x9D)).expect("second command"),
+            client_id: first_identity.client_id,
+            task_id: Some(first_identity.task_id),
+            issued_at_ms: 1_725_003_000_100,
+            expected_task_revision: Some(u64::try_from(revision).expect("revision")),
+            command: Command::SubmitProviderInput(
+                SubmitProviderInputIntent::try_new(
+                    first_identity.agent_session_id,
+                    first_identity.runtime_generation,
+                    TurnId::from_bytes(fixed_uuid_v7(0x9E)).expect("second turn"),
+                    u64::try_from(action_epoch).expect("action epoch"),
+                    None,
+                    None,
+                    ProviderInputAction::SendNow {
+                        text: "second delivered input".into(),
+                        wait: false,
+                        images: Vec::new(),
+                    },
+                )
+                .expect("second provider input"),
+            ),
+        })
+        .expect("accept second provider input");
+    assert!(matches!(second, CommandReceipt::Accepted { .. }));
+    let through_sequence: i64 = store
+        .conn
+        .query_row("SELECT MAX(sequence) FROM events", [], |row| row.get(0))
+        .expect("latest sequence");
+
+    assert_eq!(
+        super::command_bus::historical_action_epoch_through(
+            &store.conn,
+            first_identity.task_id,
+            u64::try_from(through_sequence).expect("sequence"),
+        )
+        .expect("complete task history must replay"),
+        u64::try_from(action_epoch).expect("action epoch")
+    );
+}
+
+#[test]
 fn earlier_provider_write_settles_after_a_later_input_is_accepted() {
     let dir = TempDir::new().expect("tempdir");
     let mut store = KernelStore::open(&dir.path().join("pipelined.sqlite3")).expect("open");

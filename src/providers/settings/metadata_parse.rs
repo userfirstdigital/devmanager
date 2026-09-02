@@ -101,13 +101,21 @@ pub fn parse_claude_initialize_models(body: &str) -> Result<Vec<DiscoveredModel>
         let Ok(slug) = normalize_model_slug(slug_raw) else {
             continue;
         };
-        let display_name = entry
+        let resolved_model = entry
+            .get("resolvedModel")
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty());
+        let provider_display_name = entry
             .get("displayName")
             .and_then(|v| v.as_str())
             .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .map(friendly_claude_display)
-            .unwrap_or_else(|| friendly_claude_display(&slug));
+            .filter(|s| !s.is_empty());
+        let display_name = friendly_claude_display(
+            provider_display_name.unwrap_or(&slug),
+            resolved_model,
+            &slug,
+        );
         let supports_effort = entry
             .get("supportsEffort")
             .and_then(|v| v.as_bool())
@@ -144,21 +152,54 @@ pub fn parse_claude_initialize_models(body: &str) -> Result<Vec<DiscoveredModel>
     Ok(apply_claude_alias_defaults(out))
 }
 
-fn friendly_claude_display(slug: &str) -> String {
-    let lower = slug.to_ascii_lowercase();
-    if lower.contains("fable") {
-        return "Fable".into();
+fn friendly_claude_display(
+    provider_display_name: &str,
+    resolved_model: Option<&str>,
+    selectable_slug: &str,
+) -> String {
+    let mut display = provider_display_name.trim().to_string();
+    let lower = display.to_ascii_lowercase();
+    let family = ["fable", "opus", "sonnet", "haiku"]
+        .into_iter()
+        .find(|family| lower.contains(family))
+        .or_else(|| {
+            let resolved = resolved_model?.to_ascii_lowercase();
+            ["fable", "opus", "sonnet", "haiku"]
+                .into_iter()
+                .find(|family| resolved.contains(family))
+        });
+
+    // Claude's selectable aliases are intentionally stable (for example
+    // `fable[1m]`), while `resolvedModel` carries the provider's current
+    // concrete version. Preserve the alias for launch, but expose the resolved
+    // version so two provider generations never look like the same picker row.
+    if !display.chars().any(|character| character.is_ascii_digit()) {
+        if let (Some(family), Some(resolved)) = (family, resolved_model) {
+            let lower_resolved = resolved.to_ascii_lowercase();
+            if let Some(index) = lower_resolved.find(family) {
+                let version = lower_resolved[index + family.len()..]
+                    .trim_start_matches('-')
+                    .split(['-', '['])
+                    .filter(|segment| {
+                        !segment.is_empty()
+                            && segment.chars().all(|character| character.is_ascii_digit())
+                            && segment.len() < 8
+                    })
+                    .take(2)
+                    .collect::<Vec<_>>();
+                if !version.is_empty() {
+                    display = format!("{display} {}", version.join("."));
+                }
+            }
+        }
     }
-    if lower.contains("opus") {
-        return "Opus".into();
+
+    if selectable_slug.to_ascii_lowercase().contains("[1m]")
+        && !display.to_ascii_lowercase().contains("1m")
+    {
+        display.push_str(" (1M context)");
     }
-    if lower.contains("sonnet") {
-        return "Sonnet".into();
-    }
-    if lower.contains("haiku") {
-        return "Haiku".into();
-    }
-    slug.to_string()
+    display
 }
 
 fn apply_claude_alias_defaults(mut models: Vec<DiscoveredModel>) -> Vec<DiscoveredModel> {

@@ -7343,8 +7343,8 @@ fn effects_from_durable_decision_facts(
     Ok(planned)
 }
 
-/// Replay task mutations through `through_sequence` and return the resulting action_epoch.
-fn historical_action_epoch_through(
+/// Replay every task-scoped fact through `through_sequence` and return the resulting action epoch.
+pub(super) fn historical_action_epoch_through(
     tx: &Connection,
     scope: TaskId,
     through_sequence: u64,
@@ -7388,18 +7388,20 @@ fn historical_action_epoch_through(
         let event_id = id16::<EventId>("events.event_id", &event_id_bytes)?;
         let decoded =
             crate::kernel::store::decode_stored_event(&event_type, schema_version, &payload)?;
-        if !decoded.is_task_mutation() {
-            continue;
-        }
-        let Some(rev_i64) = task_revision else {
-            return Err(StoreError::Corruption);
-        };
-        let revision = u64_from_nonnegative_i64("events.task_revision", rev_i64)?;
+        // Provider delivery and operation-terminal facts are not classified as
+        // task mutations, but they are still required state-machine inputs. In
+        // particular, provider_input.delivered clears the pending input before
+        // a later provider_input.accepted can replay. Skipping those facts makes
+        // a valid multi-turn task look corrupt when reconstructing the action
+        // epoch for a later resource release.
+        let revision = task_revision
+            .map(|value| u64_from_nonnegative_i64("events.task_revision", value))
+            .transpose()?;
         let domain = DomainEvent {
             id: event_id,
             task_id: Some(scope),
             sequence,
-            task_revision: Some(revision),
+            task_revision: revision,
             occurred_at_ms,
             payload: decoded,
         };

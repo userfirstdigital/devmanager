@@ -55,8 +55,8 @@ fn claude_initialize_parses_nested_response_and_fable_effort() {
               "supportedEffortLevels": ["low", "medium", "high", "xhigh", "max"]
             },
             {
-              "value": "claude-fable-5[1m]",
-              "resolvedModel": "claude-fable-5",
+              "value": "fable[1m]",
+              "resolvedModel": "claude-fable-5-1",
               "displayName": "Fable",
               "supportsEffort": true,
               "supportedEffortLevels": ["low", "medium", "high", "xhigh", "max"]
@@ -74,7 +74,8 @@ fn claude_initialize_parses_nested_response_and_fable_effort() {
     let models = parse_claude_initialize_models(body).unwrap();
     assert!(models.iter().any(|m| m.slug.contains("fable")));
     let fable = models.iter().find(|m| m.slug.contains("fable")).unwrap();
-    assert_eq!(fable.display_name, "Fable");
+    assert_eq!(fable.slug, "fable[1m]");
+    assert_eq!(fable.display_name, "Fable 5.1 (1M context)");
     assert!(fable.supports_effort);
     assert!(fable.supported_efforts.contains(&"xhigh".into()));
     let haiku = models.iter().find(|m| m.slug.contains("haiku")).unwrap();

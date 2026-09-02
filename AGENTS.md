@@ -149,6 +149,12 @@
 
 ## Durable orchestration journals
 
+- Historical task replay used to reconstruct a later effect fence must consume
+  the complete task-scoped event stream. Do not filter replay to events marked
+  as task mutations: provider-delivery and operation-terminal facts can clear
+  transient state required by a later valid decision. Prove this path with at
+  least two provider inputs separated by delivery before validating a later
+  resource-release snapshot.
 - Never use a current-state projection row as a resume cursor until it is
   correlated to its exact durable event lineage in the same transaction. Fixed
   multi-step journals must be an exact ordered prefix during normal projection,

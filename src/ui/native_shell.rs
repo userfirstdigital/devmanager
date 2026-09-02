@@ -10156,6 +10156,39 @@ enum ComposerSelectorChoice {
     Access(crate::providers::ProviderAccessMode),
 }
 
+fn provider_default_model_slug(slug: &str) -> bool {
+    matches!(
+        slug.trim().to_ascii_lowercase().as_str(),
+        "default" | "auto"
+    )
+}
+
+fn composer_reasoning_choice_label(
+    effort: crate::providers::ProviderReasoningEffort,
+    default_token: Option<&str>,
+) -> String {
+    use crate::providers::ProviderReasoningEffort as Effort;
+    let base = match effort {
+        Effort::ProviderDefault => return "Default".into(),
+        Effort::Low => "Low",
+        Effort::Medium => "Medium",
+        Effort::High => "High",
+        Effort::ExtraHigh => "Extra high",
+        Effort::Max => "Max",
+        Effort::Ultra => "Ultra",
+    };
+    let is_provider_default = default_token.is_some_and(|token| {
+        crate::ui::provider_metadata::efforts_from_supported(&[token.to_string()])
+            .into_iter()
+            .any(|candidate| candidate == effort)
+    });
+    if is_provider_default {
+        format!("{base} · Default")
+    } else {
+        base.into()
+    }
+}
+
 /// Per-host raw UI ownership. Apply/drain/actions mutate only the captured slot.
 /// Browser and terminal stay on the shell as local-profile authority; remote
 /// hosts leave those surfaces disabled rather than sharing the local adapters.
@@ -10730,6 +10763,7 @@ impl Drop for NativeShell {
 struct NativeGitWindowSnapshot {
     tokens: crate::ui::tokens::ThemeTokens,
     repositories: Vec<crate::domain::cockpit::TaskRepositoryCatalogEntry>,
+    selected_repository: TaskRepositorySelector,
     status: Option<crate::domain::cockpit::TaskGitProjection>,
     file_diff: Option<crate::domain::cockpit::TaskGitFileDiffProjection>,
     history: Option<crate::domain::cockpit::TaskGitHistoryProjection>,
@@ -10745,33 +10779,75 @@ impl NativeGitWindowSnapshot {
     ) -> Self {
         let slot = shell.host_slot(&owner.host);
         let projection = slot.and_then(|slot| slot.cockpit.live_projection());
+        let repositories = projection
+            .and_then(|projection| projection.repositories.clone())
+            .filter(|catalog| catalog.task_id == owner.task_id)
+            .map(|catalog| catalog.repositories)
+            .unwrap_or_default();
+        let selected_repository = native_git_reconciled_selector(
+            selected_repository,
+            shell.selected_repository_for_owner(owner).as_ref(),
+            &repositories,
+        );
+        let host_feedback = slot.and_then(|slot| match &slot.host_state {
+            NativeHostState::Connected { .. } => None,
+            NativeHostState::Connecting => Some("Connecting to the task host…".to_string()),
+            NativeHostState::Disconnected => {
+                Some("Task host disconnected. Git will refresh after reconnection.".to_string())
+            }
+            NativeHostState::Error { message } => Some(format!("Task host error: {message}")),
+        });
         Self {
             tokens: shell.theme_tokens(),
-            repositories: projection
-                .and_then(|projection| projection.repositories.clone())
-                .filter(|catalog| catalog.task_id == owner.task_id)
-                .map(|catalog| catalog.repositories)
-                .unwrap_or_default(),
+            repositories,
+            selected_repository: selected_repository.clone(),
             status: projection
                 .and_then(|projection| projection.git.clone())
                 .filter(|git| {
                     git.task_id == owner.task_id
-                        && git.selector.as_ref() == Some(selected_repository)
+                        && git.selector.as_ref() == Some(&selected_repository)
                 }),
             file_diff: projection.and_then(|projection| projection.git_file_diff.clone()),
             history: projection.and_then(|projection| projection.git_history.clone()),
             commit_diff: projection.and_then(|projection| projection.git_commit_diff.clone()),
-            feedback: slot
-                .and_then(|slot| slot.last_query_detail.clone())
-                .filter(|detail| {
-                    let detail = detail.to_ascii_lowercase();
-                    detail.contains("failed")
-                        || detail.contains("denied")
-                        || detail.contains("unavailable")
-                        || detail.contains("error")
-                }),
+            feedback: host_feedback.or_else(|| {
+                slot.and_then(|slot| slot.last_query_detail.clone())
+                    .filter(|detail| {
+                        let detail = detail.to_ascii_lowercase();
+                        detail.contains("failed")
+                            || detail.contains("denied")
+                            || detail.contains("unavailable")
+                            || detail.contains("error")
+                            || detail.contains("rejected")
+                            || detail.contains("timed out")
+                            || detail.contains("disconnected")
+                    })
+            }),
         }
     }
+}
+
+fn native_git_reconciled_selector(
+    current: &TaskRepositorySelector,
+    preferred: Option<&TaskRepositorySelector>,
+    repositories: &[crate::domain::cockpit::TaskRepositoryCatalogEntry],
+) -> TaskRepositorySelector {
+    let available = |selector: &TaskRepositorySelector| {
+        repositories
+            .iter()
+            .any(|entry| entry.available && &entry.selector == selector)
+    };
+    preferred
+        .filter(|selector| available(selector))
+        .or_else(|| available(current).then_some(current))
+        .cloned()
+        .or_else(|| {
+            repositories
+                .iter()
+                .find(|entry| entry.available)
+                .map(|entry| entry.selector.clone())
+        })
+        .unwrap_or_else(|| current.clone())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -10834,7 +10910,23 @@ impl NativeGitWindow {
                             return;
                         };
                         let _ = this.update(&mut async_cx, |this, cx| {
+                            let selector_changed =
+                                this.selected_repository != snapshot.selected_repository;
+                            if selector_changed {
+                                this.selected_repository = snapshot.selected_repository.clone();
+                                this.selected_file = None;
+                                this.selected_commit = None;
+                            }
+                            let needs_status = selector_changed && snapshot.status.is_none();
+                            let needs_history =
+                                needs_status && this.active_view == NativeGitView::History;
                             this.snapshot = snapshot;
+                            if needs_status {
+                                this.request_status(cx);
+                            }
+                            if needs_history {
+                                this.request_history(cx);
+                            }
                             cx.notify();
                         });
                     }
@@ -15663,6 +15755,35 @@ impl NativeShell {
                             ) {
                                 slot.cockpit.apply_cockpit_result(result);
                             }
+                            let is_git_query = Self::task_cockpit_command_parts(&action.command)
+                                .is_some_and(|(_, _, query)| {
+                                    matches!(
+                                        query,
+                                        TaskCockpitQuery::GitRepositories
+                                            | TaskCockpitQuery::GitStatus
+                                            | TaskCockpitQuery::GitStatusTargeted { .. }
+                                            | TaskCockpitQuery::GitFileDiffTargeted { .. }
+                                            | TaskCockpitQuery::GitHistoryTargeted { .. }
+                                            | TaskCockpitQuery::GitCommitDiffTargeted { .. }
+                                            | TaskCockpitQuery::GitMutateTargeted { .. }
+                                    )
+                                });
+                            if is_git_query {
+                                match result {
+                                    crate::domain::TaskCockpitResult::Denied { reason, .. } => {
+                                        slot.last_query_detail =
+                                            Some(format!("Git query denied: {reason:?}"));
+                                    }
+                                    crate::domain::TaskCockpitResult::Unavailable {
+                                        reason,
+                                        ..
+                                    } => {
+                                        slot.last_query_detail =
+                                            Some(format!("Git query unavailable: {reason:?}"));
+                                    }
+                                    _ => {}
+                                }
+                            }
                             if let crate::domain::TaskCockpitResult::Config(snapshot) = result {
                                 slot.config_sidebar =
                                     ConfigSidebarProjection::from_host_snapshot(snapshot);
@@ -19188,9 +19309,6 @@ impl NativeShell {
         use crate::providers::ProviderReasoningEffort as Effort;
         use crate::ui::provider_metadata::{efforts_from_supported, entry_for_slug};
 
-        let slug = self
-            .selected_model_slug_for_effort(ProviderKind::Codex, options)
-            .ok_or_else(|| "Choose a concrete Codex model for this running session.".to_string())?;
         let instance_id = options.provider_instance_id.as_deref().unwrap_or_else(|| {
             crate::providers::settings::default_instance_id_for_kind(ProviderKind::Codex)
         });
@@ -19219,6 +19337,16 @@ impl NativeShell {
                 .filter(|slug| !slug.starts_with("codex-auto-"))
                 .collect()
             });
+        let slug = self
+            .selected_model_slug_for_effort(ProviderKind::Codex, options)
+            .or_else(|| {
+                (options.model == crate::providers::ProviderModel::ProviderDefault)
+                    .then(|| model_slugs.first().cloned())
+                    .flatten()
+            })
+            .ok_or_else(|| {
+                "Codex did not advertise a default model; refresh Providers.".to_string()
+            })?;
         let model_index = model_slugs
             .iter()
             .position(|candidate| candidate == &slug)
@@ -19296,6 +19424,10 @@ impl NativeShell {
             return Some(slug);
         }
         match (provider, options.model) {
+            (
+                ProviderKind::ClaudeCode | ProviderKind::Cursor,
+                crate::providers::ProviderModel::ProviderDefault,
+            ) => Some("default".into()),
             (ProviderKind::Codex, crate::providers::ProviderModel::CodexSol) => {
                 Some("gpt-5.6-sol".into())
             }
@@ -19505,15 +19637,18 @@ impl NativeShell {
                         .find(|c| c.instance_id == instance_id),
                 );
                 let mut choices = Vec::new();
-                if self.composer_launch_preferences_editable() {
-                    choices.push((
-                        "Provider default".into(),
-                        ComposerSelectorChoice::Model(
-                            crate::providers::ProviderModel::ProviderDefault,
-                        ),
-                    ));
-                }
+                choices.push((
+                    "Default".into(),
+                    ComposerSelectorChoice::Model(crate::providers::ProviderModel::ProviderDefault),
+                ));
                 for slug in ordered {
+                    // Provider catalogs commonly expose their symbolic default
+                    // as a model row as well. The typed ProviderDefault choice
+                    // above is the single source of truth and avoids two rows
+                    // that launch the same provider behavior.
+                    if provider_default_model_slug(&slug) {
+                        continue;
+                    }
                     let choice = match (provider, slug.as_str()) {
                         (ProviderKind::Codex, "gpt-5.6-sol") => {
                             ComposerSelectorChoice::Model(crate::providers::ProviderModel::CodexSol)
@@ -19548,22 +19683,15 @@ impl NativeShell {
             }
             Some(ComposerSelectorKind::Reasoning) => {
                 let options = self.composer_launch_options_for(provider);
-                let (supported, _) = self.supported_efforts_for_current_model(provider, &options);
+                let (supported, default_token) =
+                    self.supported_efforts_for_current_model(provider, &options);
                 supported
                     .into_iter()
                     .map(|effort| {
-                        let label = match effort {
-                            crate::providers::ProviderReasoningEffort::ProviderDefault => {
-                                "Default thinking"
-                            }
-                            crate::providers::ProviderReasoningEffort::Low => "Low",
-                            crate::providers::ProviderReasoningEffort::Medium => "Medium",
-                            crate::providers::ProviderReasoningEffort::High => "High",
-                            crate::providers::ProviderReasoningEffort::ExtraHigh => "Extra high",
-                            crate::providers::ProviderReasoningEffort::Max => "Max",
-                            crate::providers::ProviderReasoningEffort::Ultra => "Ultra",
-                        };
-                        (label.into(), ComposerSelectorChoice::Reasoning(effort))
+                        (
+                            composer_reasoning_choice_label(effort, default_token.as_deref()),
+                            ComposerSelectorChoice::Reasoning(effort),
+                        )
                     })
                     .collect()
             }
@@ -23699,7 +23827,7 @@ impl NativeShell {
                 .unwrap_or_else(|| slug.to_string())
         } else {
             match launch_options.model {
-                crate::providers::ProviderModel::ProviderDefault => "Provider default".into(),
+                crate::providers::ProviderModel::ProviderDefault => "Default".into(),
                 crate::providers::ProviderModel::CodexSol => "GPT-5.6 Sol".into(),
                 crate::providers::ProviderModel::CodexTerra => "GPT-5.6 Terra".into(),
                 crate::providers::ProviderModel::CodexLuna => "GPT-5.6 Luna".into(),
@@ -23709,7 +23837,7 @@ impl NativeShell {
             }
         };
         let reasoning_label = match launch_options.reasoning_effort {
-            crate::providers::ProviderReasoningEffort::ProviderDefault => "Default thinking",
+            crate::providers::ProviderReasoningEffort::ProviderDefault => "Default",
             crate::providers::ProviderReasoningEffort::Low => "Low",
             crate::providers::ProviderReasoningEffort::Medium => "Medium",
             crate::providers::ProviderReasoningEffort::High => "High",
@@ -36766,12 +36894,6 @@ impl NativeShell {
                 Some("Select a task before opening Git.".into());
             return;
         };
-        if owner.host != self.local_host_id() {
-            if let Some(slot) = self.host_slot_mut(&owner.host) {
-                slot.last_query_detail = Some(Self::remote_local_authority_reason().into());
-            }
-            return;
-        }
         let selector = self
             .selected_repository_for_owner(&owner)
             .or_else(|| {
@@ -41505,7 +41627,11 @@ impl Render for NativeGitWindow {
             .as_ref()
             .and_then(|status| status.branch.clone())
             .unwrap_or_else(|| "No branch".into());
-        let loading = status.is_none();
+        let loading_message = status.is_none().then(|| {
+            feedback
+                .clone()
+                .unwrap_or_else(|| "Loading repository status…".into())
+        });
         let entries = status
             .as_ref()
             .map(|status| status.entries.clone())
@@ -41911,7 +42037,7 @@ impl Render for NativeGitWindow {
                             .min_w_0()
                             .min_h(px(0.0))
                             .p(px(24.0))
-                            .children(if loading {
+                            .children(if let Some(loading_message) = loading_message {
                                 Some(
                                     div()
                                         .size_full()
@@ -41919,7 +42045,7 @@ impl Render for NativeGitWindow {
                                         .items_center()
                                         .justify_center()
                                         .text_color(tokens.text.muted.to_gpui())
-                                        .child("Loading repository status…")
+                                        .child(loading_message)
                                         .into_any_element(),
                                 )
                             } else if let Some(file) = active_file {
@@ -42958,6 +43084,7 @@ mod tests {
         composer_caret_visible,
         composer_draft_parts,
         composer_provider_identity,
+        composer_reasoning_choice_label,
         composer_waits_for_provider_identity,
         consume_pending_terminal_echo_prefix,
         cycle_project_choice,
@@ -42973,12 +43100,14 @@ mod tests {
         idle_photo_fetch_matches_current_canvas,
         isolated_dev_profile,
         native_command_id,
+        native_git_reconciled_selector,
         native_reconnect_source_for,
         next_controller_wait,
         overlay_pending_terminal_echo,
         owned_matches_admission,
         prepare_native_composer_image,
         project_creation_affordance,
+        provider_default_model_slug,
         provider_inbox_affordance,
         provider_setup_resolution_expired,
         provider_setup_terminal_input_requests,
@@ -49969,6 +50098,57 @@ mod tests {
             assert!(shell.composer_selector.is_none());
             assert_eq!(shell.layout.composer_launch_options, before);
         });
+    }
+
+    #[test]
+    fn provider_picker_has_one_symbolic_default_and_marks_concrete_default_effort() {
+        use crate::providers::ProviderReasoningEffort as Effort;
+
+        assert!(provider_default_model_slug("default"));
+        assert!(provider_default_model_slug("Auto"));
+        assert!(!provider_default_model_slug("claude-fable-5-1"));
+        assert_eq!(
+            composer_reasoning_choice_label(Effort::ProviderDefault, Some("high")),
+            "Default"
+        );
+        assert_eq!(
+            composer_reasoning_choice_label(Effort::High, Some("high")),
+            "High · Default"
+        );
+        assert_eq!(
+            composer_reasoning_choice_label(Effort::Medium, Some("high")),
+            "Medium"
+        );
+    }
+
+    #[test]
+    fn git_window_rebinds_placeholder_workspace_to_first_available_repository() {
+        use crate::domain::cockpit::{
+            TaskRepositoryCatalogEntry, TaskRepositoryKind, TaskRepositorySelector,
+        };
+
+        let unavailable_workspace = TaskRepositoryCatalogEntry {
+            selector: TaskRepositorySelector::Workspace,
+            label: "Task worktree".into(),
+            kind: TaskRepositoryKind::Workspace,
+            available: false,
+            read_only: false,
+        };
+        let project_root = TaskRepositoryCatalogEntry {
+            selector: TaskRepositorySelector::ProjectRoot,
+            label: "DevManager".into(),
+            kind: TaskRepositoryKind::ProjectRoot,
+            available: true,
+            read_only: false,
+        };
+        assert_eq!(
+            native_git_reconciled_selector(
+                &TaskRepositorySelector::Workspace,
+                None,
+                &[unavailable_workspace, project_root],
+            ),
+            TaskRepositorySelector::ProjectRoot
+        );
     }
 
     #[test]
