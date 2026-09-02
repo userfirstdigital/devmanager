@@ -13829,8 +13829,14 @@ impl NativeShell {
                 }
                 if let crate::domain::TaskCockpitResult::Terminal(projection) = &result {
                     let owner = self.local_task_key(projection.task_id);
-                    self.pending_terminal_requeries
-                        .remove(&(owner.clone(), TerminalTarget::for_projection(projection)));
+                    // Same rule as the fleet lane: the retry was armed under the
+                    // outgoing query's target, so only that key can retire it.
+                    if let Some(query_target) = command_parts
+                        .and_then(|(_, _, query)| TerminalTarget::for_screen_query(&query))
+                    {
+                        self.pending_terminal_requeries
+                            .remove(&(owner.clone(), query_target));
+                    }
                     if command_task_id != Some(projection.task_id)
                         || self
                             .task_surfaces
@@ -16528,15 +16534,20 @@ impl NativeShell {
         else {
             return;
         };
-        if TerminalTarget::for_screen_query(&query).is_none() {
+        let Some(query_target) = TerminalTarget::for_screen_query(&query) else {
             return;
-        }
+        };
         if command_task != projection.task_id {
             return;
         }
         let owner = HostTaskKey::new(host_id.clone(), projection.task_id);
+        // Retire the retry under the key that ARMED it, which is the outgoing
+        // query's target, never the reply's. The two legitimately differ: a
+        // `TerminalFor { resource_id }` aimed at the provider's own resource
+        // keys as `Resource(id)` going out and `Provider` coming back, so
+        // retiring by the projection would leave the armed entry forever.
         self.pending_terminal_requeries
-            .remove(&(owner.clone(), TerminalTarget::for_projection(projection)));
+            .remove(&(owner.clone(), query_target));
         let codex_setup_required = self
             .host_slot(host_id)
             .and_then(|slot| slot.client_model.as_ref())
@@ -63321,6 +63332,97 @@ mod tests {
                     timeline_message_roles_for_test(shell, &remote_host, task_id),
                     before_rows,
                     "stale remote conversation generation must not alter the timeline"
+                );
+            });
+            cx.quit();
+        });
+    }
+
+    /// One provider-shaped terminal projection for the task's provider resource.
+    fn provider_terminal_projection_for_test(
+        model: &crate::client::ClientModel,
+        task_id: TaskId,
+        sequence: u64,
+    ) -> crate::domain::cockpit::TaskTerminalProjection {
+        let snapshot = model.task(task_id).expect("task snapshot");
+        let agent_id = snapshot.primary_agent_id.expect("primary agent");
+        let agent = &snapshot.agents[&agent_id];
+        let resource = crate::domain::agent_resource::provider_terminal_resource(snapshot, agent)
+            .expect("unambiguous provider resource")
+            .expect("provider resource");
+        crate::domain::cockpit::TaskTerminalProjection {
+            task_id,
+            terminal_id: crate::domain::TerminalId::new(),
+            session_id: crate::terminal::protocol::TerminalSessionId::new(),
+            agent_session_id: agent_id,
+            resource_id: resource.id,
+            runtime_generation: agent.runtime_generation,
+            resource_generation: resource.runtime_generation,
+            action_epoch: 1,
+            focus_epoch: crate::terminal::protocol::FocusEpoch::initial(),
+            accepted_input_sequence: 0,
+            accepts_input_without_conversation_id: false,
+            sequence,
+            title: None,
+            text_lines: vec!["provider".into()],
+            screen: Default::default(),
+            is_provider: true,
+            runtime_state: crate::domain::cockpit::TerminalRuntimeStateWire::Running,
+        }
+    }
+
+    /// A retry is armed under the OUTGOING query's target and must be retired
+    /// by that same key. Task 11's chip click addresses the provider terminal
+    /// by its durable resource, so the query keys `Resource(provider_id)` while
+    /// the projection answering it keys `Provider`. Retiring by the reply's key
+    /// leaves the armed entry behind forever, and the client keeps re-querying.
+    #[test]
+    fn a_requery_armed_by_a_resource_addressed_query_is_retired_by_the_provider_reply() {
+        if rerun_headless_shell_test_in_child(
+            "ui::native_shell::tests::a_requery_armed_by_a_resource_addressed_query_is_retired_by_the_provider_reply",
+        ) {
+            return;
+        }
+        let (runtime, _local_shared) = TestRuntime::new(true, NativeHostActionResult::Queued);
+        let remote_host = HostId::Remote([0x5a; 16]);
+        gpui::Application::headless().run(move |cx| {
+            crate::ui::init(cx);
+            with_test_shell_in_app(cx, runtime, |shell| {
+                let (model, task_id) = terminal_bound_client_model();
+                let model = Arc::new(model);
+                let projection = provider_terminal_projection_for_test(&model, task_id, 1);
+                let provider_resource = projection.resource_id;
+                attach_remote_test_host(shell, &remote_host, Arc::clone(&model));
+                let owner = HostTaskKey::new(remote_host.clone(), task_id);
+                shell
+                    .select_fleet_task_key(owner.clone(), FleetSelectMode::Replace)
+                    .expect("select remote task");
+
+                let action = shell
+                    .dispatch_action_recorded_for_owner(
+                        &remote_host,
+                        crate::ui::components::ActionRequest::TaskCockpit {
+                            task_id,
+                            query: TaskCockpitQuery::TerminalFor {
+                                resource_id: provider_resource,
+                            },
+                        },
+                    )
+                    .expect("dispatch resource-addressed terminal query");
+                let armed = (
+                    owner.clone(),
+                    super::TerminalTarget::Resource(provider_resource),
+                );
+                shell.schedule_terminal_start_retry(armed.clone());
+                assert!(
+                    shell.pending_terminal_requeries.contains_key(&armed),
+                    "the retry must be armed under the query's own target"
+                );
+
+                shell.admit_owner_terminal_projection(&remote_host, &action, &projection);
+                assert!(
+                    !shell.pending_terminal_requeries.contains_key(&armed),
+                    "the reply to that exact query must retire the retry it armed"
                 );
             });
             cx.quit();
