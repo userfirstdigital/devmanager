@@ -3264,6 +3264,8 @@ impl HostRequestExecutor {
                     };
                     let accepted_provider_input = accepted_provider_input_task_id(&job.request);
                     let accepted_shell_effect = accepted_shell_terminal_effect(&job.request);
+                    let lane_label = client_request_lane_label(&job.request);
+                    let lane_started = Instant::now();
                     let result = if is_agent_connection_query(&job.request) {
                         self.dispatch_agent_connection(job.negotiated, job.request, job.output_id).await
                     } else if is_task_create_with_primary_provider(&job.request) {
@@ -3284,6 +3286,13 @@ impl HostRequestExecutor {
                         self.apply_shell_terminal_effect(effect);
                     }
                     // If the connection task went away, drop the reply; do not panic.
+                    let lane_elapsed = lane_started.elapsed();
+                    if lane_elapsed >= SLOW_LANE_THRESHOLD {
+                        host_log!(
+                            "devmanager-host: slow request {lane_label} held the executor lane for {} ms",
+                            lane_elapsed.as_millis()
+                        );
+                    }
                     let _ = job.reply.send(result);
                 }
                 control = self.control_rx.recv(), if !self.control_closed => {
@@ -3313,24 +3322,35 @@ impl HostRequestExecutor {
                 }
                 _ = reaper.tick(), if schedule_automatic_maintenance => {
                     let now = Instant::now();
+                    let mut tick = LaneTickTimer::start();
                     self.registry.reap_idle(now);
                     self.replay_registry.reap_idle(now);
                     self.artifact_content_registry.reap(now);
+                    tick.step("reap");
                     self.fan_out_conversation_dirty();
+                    tick.step("conversation_dirty");
                     self.reconcile_configured_services();
+                    tick.step("configured_services");
                     self.queue_one_provider_restore();
+                    tick.step("provider_restore");
                     self.pump_shell_terminal_facts();
+                    tick.step("shell_facts");
                     self.settle_orphaned_shell_releases();
+                    tick.step("orphaned_releases");
                     self.maybe_schedule_provider_health(false);
+                    tick.step("provider_health");
                     // Missed unregister try_send must not leave completed live
                     // metadata forever once the connection has requested shutdown.
                     self.reap_shutdown_outputs();
+                    tick.step("shutdown_outputs");
                     // While Open: at most one process-empty teardown per tick.
                     // While Closing: advance exactly one durable host-cleanup unit.
                     // StoreError fails closed so host supervision sees unexpected exit.
                     if self.run_one_cleanup_or_teardown_unit().is_err() {
                         break;
                     }
+                    tick.step("cleanup_or_teardown");
+                    tick.finish();
                 }
             }
         }
@@ -3353,6 +3373,8 @@ impl HostRequestExecutor {
                     };
                     let accepted_provider_input = accepted_provider_input_task_id(&job.request);
                     let accepted_shell_effect = accepted_shell_terminal_effect(&job.request);
+                    let lane_label = client_request_lane_label(&job.request);
+                    let lane_started = Instant::now();
                     let result = if is_agent_connection_query(&job.request) {
                         self.dispatch_agent_connection(job.negotiated, job.request, job.output_id).await
                     } else if is_task_create_with_primary_provider(&job.request) {
@@ -3371,6 +3393,13 @@ impl HostRequestExecutor {
                         accepted_shell_effect.filter(|_| command_was_accepted(&result))
                     {
                         self.apply_shell_terminal_effect(effect);
+                    }
+                    let lane_elapsed = lane_started.elapsed();
+                    if lane_elapsed >= SLOW_LANE_THRESHOLD {
+                        host_log!(
+                            "devmanager-host: slow request {lane_label} held the executor lane for {} ms",
+                            lane_elapsed.as_millis()
+                        );
                     }
                     let _ = job.reply.send(result);
                 }
@@ -3402,17 +3431,29 @@ impl HostRequestExecutor {
                 }
                 _ = reaper.tick(), if schedule_automatic_maintenance => {
                     let now = Instant::now();
+                    let mut tick = LaneTickTimer::start();
                     self.registry.reap_idle(now);
                     self.replay_registry.reap_idle(now);
                     self.artifact_content_registry.reap(now);
+                    tick.step("reap");
                     self.fan_out_conversation_dirty();
+                    tick.step("conversation_dirty");
                     self.reconcile_configured_services();
+                    tick.step("configured_services");
                     self.queue_one_provider_restore();
+                    tick.step("provider_restore");
                     self.pump_shell_terminal_facts();
+                    tick.step("shell_facts");
                     self.settle_orphaned_shell_releases();
+                    tick.step("orphaned_releases");
                     self.maybe_schedule_provider_health(false);
+                    tick.step("provider_health");
                     self.reap_shutdown_outputs();
-                    if let Some(outcome) = self.drive_supervised_maintenance_unit().await? {
+                    tick.step("shutdown_outputs");
+                    let supervised_outcome = self.drive_supervised_maintenance_unit().await?;
+                    tick.step("supervised_unit");
+                    tick.finish();
+                    if let Some(outcome) = supervised_outcome {
                         return Ok(outcome);
                     }
                 }
@@ -8010,6 +8051,84 @@ fn command_was_accepted(result: &Result<DuplexExecuteCompletion, IpcError>) -> b
         ))
     )
 }
+
+/// Per-step stopwatch for one maintenance tick on the executor lane. A tick
+/// slower than `SLOW_LANE_THRESHOLD` is logged once with every step's share,
+/// so the step that starved the lane is named rather than the tick as a whole.
+struct LaneTickTimer {
+    started: Instant,
+    last: Instant,
+    steps: Vec<(&'static str, Duration)>,
+}
+
+impl LaneTickTimer {
+    fn start() -> Self {
+        let now = Instant::now();
+        Self {
+            started: now,
+            last: now,
+            steps: Vec::with_capacity(12),
+        }
+    }
+
+    fn step(&mut self, name: &'static str) {
+        let now = Instant::now();
+        self.steps
+            .push((name, now.saturating_duration_since(self.last)));
+        self.last = now;
+    }
+
+    fn finish(self) {
+        let total = self.started.elapsed();
+        if total < SLOW_LANE_THRESHOLD {
+            return;
+        }
+        let mut breakdown = String::new();
+        for (name, elapsed) in &self.steps {
+            if elapsed.as_millis() == 0 {
+                continue;
+            }
+            if !breakdown.is_empty() {
+                breakdown.push_str(", ");
+            }
+            breakdown.push_str(&format!("{name}={} ms", elapsed.as_millis()));
+        }
+        host_log!(
+            "devmanager-host: slow maintenance tick held the executor lane for {} ms ({breakdown})",
+            total.as_millis()
+        );
+    }
+}
+
+/// The variant name of a `Debug` rendering: `TaskCockpit(..)` -> `TaskCockpit`.
+fn debug_variant_name(value: &impl std::fmt::Debug) -> String {
+    let rendered = format!("{value:?}");
+    rendered
+        .split(|c: char| c == '(' || c == '{' || c.is_whitespace())
+        .next()
+        .unwrap_or("")
+        .to_string()
+}
+
+/// One word naming a request's kind for lane timing lines. Queries name the
+/// query family so a slow snapshot page and a slow cockpit query read apart.
+fn client_request_lane_label(request: &ClientRequest) -> String {
+    match request {
+        ClientRequest::Command(envelope) => {
+            format!("command:{}", debug_variant_name(&envelope.command))
+        }
+        ClientRequest::TerminalInput(_) => "terminal_input".to_string(),
+        ClientRequest::Query(envelope) => {
+            format!("query:{}", debug_variant_name(&envelope.query))
+        }
+        ClientRequest::Detach(_) => "detach".to_string(),
+    }
+}
+
+/// Requests and maintenance ticks slower than this are logged with their
+/// duration: the executor is one lane, so anything this slow is felt by every
+/// client waiting behind it.
+const SLOW_LANE_THRESHOLD: Duration = Duration::from_millis(100);
 
 fn is_agent_connection_query(request: &ClientRequest) -> bool {
     matches!(

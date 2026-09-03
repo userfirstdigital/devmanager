@@ -6610,6 +6610,7 @@ async fn deferred_bootstrap_projection(
         StartupPhase::SnapshotPages,
         Some(format!("{NATIVE_SNAPSHOT_PAGE_ITEMS} items per page")),
     );
+    let synchronize_started = Instant::now();
     let sync_owned = fleet.synchronize(host_id).await.map_err(|error| {
         let message = preview_error.as_ref().map_or_else(
             || error.to_string(),
@@ -6619,6 +6620,10 @@ async fn deferred_bootstrap_projection(
         NativeShellError::HostConnect { message }
     })?;
     validate_owned_admission(&sync_owned, &admission)?;
+    trace.note(format!(
+        "synchronize returned in {} ms",
+        synchronize_started.elapsed().as_millis()
+    ));
 
     let owned_model = fleet
         .presentation_model(host_id)
@@ -6636,6 +6641,11 @@ async fn deferred_bootstrap_projection(
         .map_err(map_fleet_shell_error)?;
     validate_owned_admission(&replay, &admission)?;
     let replay_events = replay.value;
+    trace.note(format!(
+        "bootstrap model built {} ms after synchronize started; {} replay events",
+        synchronize_started.elapsed().as_millis(),
+        replay_events.len()
+    ));
 
     // Concurrent reconnect/remove must not publish mixed generation.
     fleet
@@ -17996,10 +18006,22 @@ impl NativeShell {
             }
             accepted_projection_kinds.push(projection.kind);
             if !stale_projection {
+                let carries_client_model = projection.client_model.is_some();
                 if let Err(error) = self.apply_validated_host_projection_payloads(&projection) {
+                    self.note_startup_failure(error.clone());
                     self.local_slot_mut().host_state = NativeHostState::Error { message: error };
-                } else if let Some(events) = projection.durable_events.as_ref() {
-                    self.observe_projection_durable_events(events);
+                } else {
+                    if carries_client_model {
+                        // Same rule as the drained-message path: the first
+                        // admitted canonical model ends the startup latency.
+                        self.startup_trace.advance_to(
+                            StartupPhase::FirstProjection,
+                            Some("client model admitted".to_string()),
+                        );
+                    }
+                    if let Some(events) = projection.durable_events.as_ref() {
+                        self.observe_projection_durable_events(events);
+                    }
                 }
                 if let NativeHostProjectionKind::ConversationDirty {
                     task_id,

@@ -207,6 +207,13 @@ impl StartupTrace {
         self.push(Some(detail))
     }
 
+    /// Record a sub-step inside the current phase without changing phase,
+    /// attempt, or the failure detail: the timestamps of the work a phase
+    /// spans are what attribute its duration.
+    pub fn note(&mut self, detail: impl Into<String>) -> StartupTraceEntry {
+        self.push(Some(detail.into()))
+    }
+
     fn push(&mut self, detail: Option<String>) -> StartupTraceEntry {
         let entry = StartupTraceEntry {
             phase: self.current,
@@ -399,6 +406,13 @@ impl SharedStartupTrace {
         state.write(&entry);
     }
 
+    /// See [`StartupTrace::note`].
+    pub fn note(&self, detail: impl Into<String>) {
+        let mut state = self.lock();
+        let entry = state.trace.note(detail);
+        state.write(&entry);
+    }
+
     /// Record an error once per distinct text, so a render path that sees the
     /// same failure every frame writes one line.
     pub fn fail_once(&self, detail: impl Into<String>) {
@@ -518,6 +532,23 @@ fn wall_clock_now() -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_note_records_detail_without_moving_phase_or_attempt() {
+        let mut trace = super::StartupTrace::new();
+        trace.enter(super::StartupPhase::SnapshotPages, None);
+        trace.retry(None);
+        let before = (trace.current(), trace.attempt());
+        let entry = trace.note("synchronize returned in 12 ms");
+        assert_eq!(entry.phase(), super::StartupPhase::SnapshotPages);
+        assert_eq!(entry.attempt(), before.1);
+        assert_eq!(entry.detail(), Some("synchronize returned in 12 ms"));
+        assert_eq!((trace.current(), trace.attempt()), before);
+        assert!(trace
+            .entries()
+            .iter()
+            .any(|e| e.detail() == Some("synchronize returned in 12 ms")));
+    }
+
     use super::*;
 
     #[test]
