@@ -3579,6 +3579,63 @@ fn native_command_id(command: &NativeHostCommand) -> Option<CommandId> {
     }
 }
 
+/// The raw bits of a request id, used as the round-trip log's key.
+///
+/// The log is deliberately free of domain types so it stays unit testable, so
+/// the shell is what turns an id into a key. UUIDs are already unique, so the
+/// whole 128 bits go in rather than a hash that could collide two requests
+/// into one measurement.
+fn request_trace_key(request_id: RequestId) -> u128 {
+    u128::from_be_bytes(*request_id.as_bytes())
+}
+
+/// Which cockpit surface a request is for. A stable, grepped label — the log
+/// exists so "which kind of request is slow" is one grep away.
+fn request_trace_kind(command: &NativeHostCommand) -> &'static str {
+    match command {
+        NativeHostCommand::TaskCockpitQuery { query, .. } => match query {
+            TaskCockpitQuery::Conversation { .. }
+            | TaskCockpitQuery::OpenConversationSubscription { .. } => "conversation",
+            TaskCockpitQuery::Terminal
+            | TaskCockpitQuery::TerminalFor { .. }
+            | TaskCockpitQuery::TerminalScroll { .. }
+            | TaskCockpitQuery::TerminalScrollFor { .. } => "terminal",
+            TaskCockpitQuery::TerminalReadiness | TaskCockpitQuery::TerminalReadinessFor { .. } => {
+                "terminal-readiness"
+            }
+            TaskCockpitQuery::TaskTerminals => "task-terminals",
+            TaskCockpitQuery::FilesList { .. } | TaskCockpitQuery::FilesRead { .. } => "files",
+            TaskCockpitQuery::GitStatus | TaskCockpitQuery::GitStatusTargeted { .. } => {
+                "git-status"
+            }
+            _ => "cockpit",
+        },
+        NativeHostCommand::TaskShowQuery { .. } => "task-show",
+        NativeHostCommand::TaskListQuery { .. } => "task-list",
+        NativeHostCommand::HostStatusQuery { .. } => "host-status",
+        NativeHostCommand::AgentConnectionQuery { .. } => "agent-connection",
+        NativeHostCommand::ProviderSettingsQuery { .. } => "provider-settings",
+        NativeHostCommand::RemoteAccessQuery { .. } => "remote-access",
+        NativeHostCommand::HostActionsQuery { .. } => "host-actions",
+        NativeHostCommand::PromptLibraryQuery { .. } => "prompt-library",
+        NativeHostCommand::OpenShellTerminal { .. } => "open-shell-terminal",
+        NativeHostCommand::Updater { .. } => "updater",
+        _ => "action",
+    }
+}
+
+/// The round-trip log's key and labels for `record`, or `None` for a command
+/// that carries no request id and therefore has no reply to wait for.
+fn request_trace_identity(
+    record: &NativeActionRecord,
+) -> Option<(u128, &'static str, Option<u128>)> {
+    let key = request_trace_key(native_request_id(&record.command)?);
+    let task = record
+        .task_id
+        .map(|task_id| u128::from_be_bytes(*task_id.as_bytes()));
+    Some((key, request_trace_kind(&record.command), task))
+}
+
 fn native_request_id(command: &NativeHostCommand) -> Option<RequestId> {
     match command {
         NativeHostCommand::TaskShowQuery { request_id, .. }
@@ -7834,10 +7891,22 @@ fn resync_or_reconnect_fleet_host(
     Ok((owned.value, owner, generation_changed, replay.value))
 }
 
+/// Publish `projection` for the controller to drain.
+///
+/// This is the moment a reply becomes visible to the client, so it is also
+/// where the round trip's publication stamp goes: everything after it is the
+/// client's own scheduling, and without the stamp "the host was slow" and "the
+/// controller did not wake" would share one number.
 fn publish_projection(
     projections: &Arc<Mutex<VecDeque<NativeHostProjection>>>,
     projection: NativeHostProjection,
 ) -> bool {
+    // Read before the projection moves into the queue.
+    let published_request_key = projection
+        .action_outcome
+        .as_ref()
+        .and_then(|outcome| native_request_id(&outcome.action().command))
+        .map(request_trace_key);
     let Ok(mut queue) = projections.lock() else {
         return false;
     };
@@ -7873,6 +7942,13 @@ fn publish_projection(
     };
     drop(queue);
     if published {
+        // The worker runs on its own thread, and this function already reaches
+        // for the process trace's sibling thread-local wake, so there is
+        // nothing extra to thread through. A shell with a detached trace (the
+        // headless fixtures) simply has no record under this key.
+        if let Some(key) = published_request_key {
+            SharedStartupTrace::process().note_request_published(key);
+        }
         notify_controller_wake_from_worker();
     }
     published
@@ -11385,6 +11461,19 @@ fn center_terminal_interactive(
     task_surface_interactive: bool,
 ) -> bool {
     selected_owner && selected_task_matches && task_surface_interactive
+}
+
+/// Whether the center loading surface must leave the composer's height free at
+/// the bottom of the canvas.
+///
+/// The loading surface has to occupy exactly the box the real surface will
+/// occupy once it attaches, or the pill is centred in a short box and whatever
+/// is underneath shows through as a band below it. Only the conversation body
+/// ends in a composer: a pane showing the provider terminal gives the terminal
+/// grid the whole center canvas, so reserving the composer's height there
+/// leaves the bottom of the terminal surface uncovered.
+fn center_loading_reserves_composer(show_input: bool, showing_provider_terminal: bool) -> bool {
+    show_input && !showing_provider_terminal
 }
 
 fn root_routes_key_to_terminal(
@@ -15540,6 +15629,9 @@ impl NativeShell {
             }
             match self.try_enqueue_host_action_for_owner(host_id, action.clone()) {
                 NativeHostActionResult::Queued => {
+                    if let Some(key) = native_request_id(&action.command).map(request_trace_key) {
+                        self.startup_trace.note_request_handed_off(key);
+                    }
                     if let Some(slot) = self.host_slot_mut(host_id) {
                         if from_overflow {
                             slot.retained_action_overflow = None;
@@ -16434,7 +16526,28 @@ impl NativeShell {
         self.apply_epoch_fenced_action_outcome_for_host(&self.local_host_id(), outcome);
     }
 
+    /// Record the reply's arrival and its application around the real body.
+    ///
+    /// The body has a dozen early returns; a note placed inside it would be
+    /// skipped by whichever branch a given reply takes, and the record would
+    /// sit in flight forever. The applied edge means "the shell is finished
+    /// with this reply", which is true of a rejected reply as well.
     fn apply_epoch_fenced_action_outcome_for_host(
+        &mut self,
+        host_id: &HostId,
+        outcome: NativeHostActionOutcome,
+    ) {
+        let request_key = native_request_id(&outcome.action().command).map(request_trace_key);
+        if let Some(key) = request_key {
+            self.startup_trace.note_request_replied(key);
+        }
+        self.apply_epoch_fenced_action_outcome_body(host_id, outcome);
+        if let Some(key) = request_key {
+            self.startup_trace.note_request_applied(key);
+        }
+    }
+
+    fn apply_epoch_fenced_action_outcome_body(
         &mut self,
         host_id: &HostId,
         outcome: NativeHostActionOutcome,
@@ -26364,6 +26477,11 @@ impl NativeShell {
                 .child(conversation)
                 .into_any_element()
         };
+        // One decision for every loading state painted over this canvas, so
+        // the startup phase line and the surface loading states cannot disagree
+        // about the box they cover.
+        let reserve_composer =
+            center_loading_reserves_composer(show_input, showing_provider_terminal);
         let loading_overlay = startup_status
             .map(|line| {
                 Self::center_surface_loading_overlay(
@@ -26371,7 +26489,7 @@ impl NativeShell {
                     line.primary,
                     line.secondary,
                     true,
-                    show_input,
+                    reserve_composer,
                     tokens,
                 )
             })
@@ -26388,7 +26506,7 @@ impl NativeShell {
                         label.to_string(),
                         None,
                         initial,
-                        show_input,
+                        reserve_composer,
                         tokens,
                     )
                 })
@@ -26412,12 +26530,19 @@ impl NativeShell {
     ///
     /// Both the surface-level loading states and the startup phase line paint
     /// through here, so there is no second loading idiom to drift.
+    ///
+    /// `reserve_composer` is the only thing that shortens the covered box, and
+    /// it must be true exactly when a composer will really occupy that height
+    /// under the finished surface -- see [`center_loading_reserves_composer`].
+    /// Naming it after the composer rather than after the pane's input
+    /// capability is deliberate: a provider-terminal pane has input and no
+    /// composer.
     fn center_surface_loading_overlay(
         owner: &HostTaskKey,
         label: String,
         secondary: Option<String>,
         initial: bool,
-        show_input: bool,
+        reserve_composer: bool,
         tokens: crate::ui::tokens::ThemeTokens,
     ) -> AnyElement {
         let animation_key = stable_host_task_element_key(owner, "center-loading-pulse");
@@ -26482,7 +26607,7 @@ impl NativeShell {
         if initial {
             overlay
                 .top(px(0.0))
-                .bottom(px(if show_input {
+                .bottom(px(if reserve_composer {
                     CONVERSATION_COMPOSER_HEIGHT_RESERVE
                 } else {
                     0.0
@@ -43640,6 +43765,12 @@ impl NativeShell {
         host_id: &HostId,
         record: &mut NativeActionRecord,
     ) -> NativeHostActionResult {
+        // Start this request's round trip before any gate can reject it, so a
+        // request that never reaches the host is a recorded incomplete rather
+        // than an absence.
+        if let Some((key, kind, task)) = request_trace_identity(record) {
+            self.startup_trace.note_request_enqueued(key, kind, task);
+        }
         if let Err(result) = self.ensure_live_action_admission_for_host(host_id, record) {
             if is_native_query_command(&record.command) {
                 self.settle_native_query_admission_failure_for_owner(host_id, record, result);
@@ -43684,6 +43815,9 @@ impl NativeShell {
         };
         match result {
             NativeHostActionResult::Queued => {
+                if let Some(key) = native_request_id(&record.command).map(request_trace_key) {
+                    self.startup_trace.note_request_handed_off(key);
+                }
                 if let Some((_, task_id, TaskCockpitQuery::Conversation { .. })) =
                     Self::task_cockpit_command_parts(&record.command)
                 {
@@ -44831,6 +44965,9 @@ impl Render for NativeGitWindow {
 
 impl Render for NativeShell {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // Completes the round trip of every reply applied since the last paint.
+        // A frame with nothing waiting costs one atomic load and takes no lock.
+        self.startup_trace.note_repaint();
         if self.settings_open && self.settings_page == NativeSettingsPage::RemoteAccess {
             self.sync_remote_settings_fields(window, cx);
         }
@@ -45919,6 +46056,7 @@ mod tests {
         automatic_task_title,
         capture_runtime_projection_owner,
         caret_phase_repaint,
+        center_loading_reserves_composer,
         center_terminal_interactive,
         cockpit_reason_line,
         cockpit_result_detail,
@@ -45940,6 +46078,7 @@ mod tests {
         idle_conversation_photo_url,
         idle_photo_dimensions_allowed,
         idle_photo_fetch_matches_current_canvas,
+        is_conversation_query_command,
         isolated_dev_profile,
         native_command_id,
         native_git_reconciled_selector,
@@ -46883,6 +47022,77 @@ mod tests {
         assert!(first.starts_with("https://picsum.photos/1920/1080?random="));
         assert!(second.starts_with("https://picsum.photos/1920/1080?random="));
         assert_ne!(first, second);
+    }
+
+    #[test]
+    fn the_center_loading_surface_reserves_composer_height_only_where_a_composer_lands() {
+        // Conversation body: the composer really does occupy that height under
+        // the loading surface, so leaving it free is what keeps the pill
+        // centred in the box the timeline will fill.
+        assert!(center_loading_reserves_composer(true, false));
+        // Provider terminal: the grid fills the whole center canvas, so
+        // reserving the composer's height leaves a band of terminal surface
+        // showing below the loading box as a seam.
+        assert!(!center_loading_reserves_composer(true, true));
+        // A background pane withholds the composer either way.
+        assert!(!center_loading_reserves_composer(false, false));
+        assert!(!center_loading_reserves_composer(false, true));
+    }
+
+    /// GPUI does not expose a laid-out element's box to a test, so the contract
+    /// is asserted where it is written: the loading overlay's insets and the
+    /// insets of the surface it stands in for, read out of this file.
+    #[test]
+    fn the_center_loading_surface_covers_the_same_box_as_the_surface_it_stands_in_for() {
+        let source = include_str!("native_shell.rs");
+        let overlay = source
+            .split("    fn center_surface_loading_overlay(")
+            .nth(1)
+            .and_then(|tail| {
+                tail.split("    fn center_provider_terminal_surface_for(")
+                    .next()
+            })
+            .expect("center surface loading overlay");
+        assert!(
+            overlay.contains(".left(px(0.0))")
+                && overlay.contains(".right(px(0.0))")
+                && overlay.contains(".top(px(0.0))")
+                && overlay.contains("if reserve_composer {")
+                && !overlay.contains("show_input"),
+            "the initial loading surface must span the center canvas, shortened only by a \
+             composer that will really be there"
+        );
+
+        let terminal = source
+            .split("    fn center_provider_terminal_surface_for(")
+            .nth(1)
+            .and_then(|tail| tail.split("\n    fn ").next())
+            .expect("center provider terminal surface");
+        assert!(
+            terminal.contains(".w_full()")
+                && terminal.contains(".flex_1()")
+                && terminal.contains(".min_h(px(0.0))")
+                && !terminal.contains("CONVERSATION_COMPOSER_HEIGHT_RESERVE"),
+            "the attached provider terminal fills the whole center canvas, so the loading \
+             surface standing in for it must too"
+        );
+
+        let canvas = source
+            .split("    fn task_conversation_surface_for(")
+            .nth(1)
+            .and_then(|tail| tail.split("    /// The one loading element").next())
+            .expect("center canvas loading overlay construction");
+        assert!(
+            canvas.contains(
+                "center_loading_reserves_composer(show_input, showing_provider_terminal)"
+            ),
+            "the covered box must come from the one predicate, not from the pane's input flag"
+        );
+        assert_eq!(
+            canvas.matches("reserve_composer,").count(),
+            2,
+            "both the startup line and the surface loading states must use it"
+        );
     }
 
     #[test]
@@ -64381,6 +64591,210 @@ mod tests {
             second.is_err(),
             "retry after failure must not observe a leaked installed slot: {second:?}"
         );
+    }
+
+    /// Facts per page, matching the host's own `MAX_CONVERSATION_PAGE_ITEMS`.
+    const MEASURED_CONVERSATION_PAGE_ITEMS: u64 = 128;
+    /// Pages the largest observed transcript (999 events) needs.
+    const MEASURED_CONVERSATION_PAGES: u64 = 8;
+
+    /// One full-size conversation page, shaped like the host's: `items` facts
+    /// on consecutive sequences, an exclusive `after_sequence` cursor, and
+    /// `next_sequence` set on every page but the last.
+    fn measured_conversation_page(
+        page_index: u64,
+        is_last: bool,
+    ) -> crate::domain::SemanticJournalPage {
+        use crate::domain::{
+            EventId, PrivacyClass, SemanticJournalFact, SemanticJournalPage, SemanticJournalPayload,
+        };
+        let after = page_index * MEASURED_CONVERSATION_PAGE_ITEMS;
+        let through = after + MEASURED_CONVERSATION_PAGE_ITEMS;
+        let facts = (after + 1..=through)
+            .map(|sequence| SemanticJournalFact {
+                id: EventId::new(),
+                sequence,
+                occurred_at_ms: Some(sequence as i64),
+                provider: "claude_code".into(),
+                schema_version: 1,
+                kind: if sequence % 2 == 0 {
+                    "assistant_text".into()
+                } else {
+                    "user_message".into()
+                },
+                visibility: "conversation".into(),
+                privacy_class: PrivacyClass::LocalOnly,
+                redacted: false,
+                payload: if sequence % 2 == 0 {
+                    SemanticJournalPayload::AssistantText {
+                        text: format!("assistant turn {sequence}"),
+                    }
+                } else {
+                    SemanticJournalPayload::UserMessage {
+                        text: format!("user turn {sequence}"),
+                    }
+                },
+            })
+            .collect();
+        SemanticJournalPage {
+            oldest_sequence: 0,
+            cursor_rolled_over: false,
+            after_sequence: after,
+            through_sequence: through,
+            high_water: MEASURED_CONVERSATION_PAGES * MEASURED_CONVERSATION_PAGE_ITEMS,
+            encoded_bytes: 4_096,
+            next_sequence: (!is_last).then_some(through),
+            facts,
+        }
+    }
+
+    fn take_pending_conversation_query(
+        shared: &Arc<Mutex<TestRuntimeState>>,
+    ) -> Option<NativeActionRecord> {
+        let mut state = shared.lock().expect("test runtime state");
+        let index = state
+            .accepted
+            .iter()
+            .position(|record| is_conversation_query_command(&record.command))?;
+        Some(state.accepted.remove(index))
+    }
+
+    /// Where the time goes for the conversation pages a task's cockpit needs.
+    ///
+    /// The user waits about fourteen seconds after startup for a task's
+    /// conversation, the host answers every page in under 100 ms, and the
+    /// largest transcript needs eight pages — so roughly 1.75 s per page is
+    /// spent inside this client and nothing measured it. This drives the real
+    /// paging loop against a host that replies instantly, so whatever it costs
+    /// is the client's own cost and nothing else's.
+    ///
+    /// It asserts the STRUCTURE (how many controller passes a page costs, and
+    /// that every stage of the round trip is recorded), not wall time, which no
+    /// CI machine can promise. The wall time is printed for attribution.
+    #[test]
+    fn conversation_paging_round_trip_is_measured_end_to_end() {
+        if rerun_headless_shell_test_in_child(
+            "ui::native_shell::tests::conversation_paging_round_trip_is_measured_end_to_end",
+        ) {
+            return;
+        }
+        let (runtime, shared) = TestRuntime::new(true, NativeHostActionResult::Queued);
+        let workspace = tempfile::tempdir().expect("workspace");
+        let profile = isolated_dev_profile(workspace.path()).expect("profile");
+        gpui::Application::headless().run(move |cx| {
+            crate::ui::init(cx);
+            with_test_shell_profile_in_app_cx(cx, profile, runtime, |shell, _cx| {
+                let (model, task_id) = terminal_bound_client_model();
+                prepare_local_task_shell(shell, std::sync::Arc::new(model), task_id);
+                let epochs = shell.local_slot_mut().interaction.host_runtime_epochs();
+
+                let mut passes_per_page: Vec<usize> = Vec::new();
+                let mut wall_per_page: Vec<Duration> = Vec::new();
+                for page_index in 0..MEASURED_CONVERSATION_PAGES {
+                    let is_last = page_index + 1 == MEASURED_CONVERSATION_PAGES;
+                    let action = take_pending_conversation_query(&shared).unwrap_or_else(|| {
+                        panic!("page {page_index} must have been requested by the shell")
+                    });
+                    assert_eq!(
+                        conversation_query_after_sequence(&action),
+                        Some(page_index * MEASURED_CONVERSATION_PAGE_ITEMS),
+                        "page {page_index} must continue the previous page's cursor"
+                    );
+                    shared
+                        .lock()
+                        .expect("test runtime state")
+                        .projections
+                        .push_back(NativeHostProjection {
+                            kind: NativeHostProjectionKind::Live,
+                            client_model: None,
+                            task_preview: None,
+                            error: None,
+                            epochs: Some(epochs),
+                            action_outcome: Some(NativeHostActionOutcome::Queried {
+                                action,
+                                detail: "conversation".into(),
+                                body: NativeHostQueryBody::TaskCockpit(
+                                    crate::domain::TaskCockpitResult::Conversation(
+                                        measured_conversation_page(page_index, is_last),
+                                    ),
+                                ),
+                            }),
+                            owner: None,
+                            durable_events: None,
+                        });
+
+                    // Drive controller passes until the reply has been applied
+                    // and, unless this was the last page, the next page has
+                    // been asked for. Counting the passes answers whether a
+                    // page costs a controller round trip or not.
+                    let started = Instant::now();
+                    let mut passes = 0usize;
+                    loop {
+                        shell.controller_tick_for_test(MAX_PENDING_HOST_ACTIONS);
+                        passes += 1;
+                        let settled = if is_last {
+                            !shell
+                                .task_surfaces
+                                .conversation_in_flight(shell.local_task_key(task_id))
+                        } else {
+                            shared
+                                .lock()
+                                .expect("test runtime state")
+                                .accepted
+                                .iter()
+                                .any(|record| is_conversation_query_command(&record.command))
+                        };
+                        if settled {
+                            break;
+                        }
+                        assert!(
+                            passes < 8,
+                            "page {page_index} never settled after {passes} controller passes"
+                        );
+                    }
+                    wall_per_page.push(started.elapsed());
+                    passes_per_page.push(passes);
+                    // The real client completes a round trip on its next paint;
+                    // a headless shell never paints, so stand in for it here.
+                    shell.startup_trace().note_repaint();
+                }
+
+                let round_trips = shell.startup_trace().with_round_trips(|log| log.logged());
+                println!(
+                    "conversation paging: pages={MEASURED_CONVERSATION_PAGES} \
+                     items_per_page={MEASURED_CONVERSATION_PAGE_ITEMS} \
+                     passes_per_page={passes_per_page:?} round_trips_logged={round_trips}"
+                );
+                for (index, elapsed) in wall_per_page.iter().enumerate() {
+                    println!("  page {index}: {} us", elapsed.as_micros());
+                }
+                let total: Duration = wall_per_page.iter().sum();
+                println!("  total: {} us", total.as_micros());
+
+                assert!(
+                    passes_per_page.iter().all(|passes| *passes == 1),
+                    "every page must settle in one controller pass with an instant host, \
+                     got {passes_per_page:?}"
+                );
+                assert_eq!(
+                    round_trips, MEASURED_CONVERSATION_PAGES,
+                    "every page's round trip must reach the log"
+                );
+            });
+            // A headless application's run loop does not return on its own.
+            cx.quit();
+        });
+    }
+
+    /// The `after_sequence` a conversation query asked for.
+    fn conversation_query_after_sequence(action: &NativeActionRecord) -> Option<u64> {
+        match &action.command {
+            NativeHostCommand::TaskCockpitQuery {
+                query: TaskCockpitQuery::Conversation { after_sequence },
+                ..
+            } => Some(*after_sequence),
+            _ => None,
+        }
     }
 
     fn test_conversation_user_page(
