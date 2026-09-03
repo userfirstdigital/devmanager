@@ -4770,7 +4770,15 @@ impl HostRequestExecutor {
         let dimensions = SessionDimensions {
             cols,
             rows,
-            cell_width: 8,
+            // FALLBACK, not the truth: there is no window or text system on the
+            // host side. The real pitch is the terminal font's own advance,
+            // measured on the client by
+            // `crate::terminal::view::measure_terminal_cell_advance` (7.617 px
+            // for Cascadia Mono at 13 px) and reported back with the resize.
+            // `cell_height` stays 16 here: it disagrees with the 18 that
+            // `service.rs` and `SessionDimensions::default` use, and correcting
+            // it changes what the PTY is told, which no measurement asks for.
+            cell_width: crate::terminal::view::FALLBACK_TERMINAL_CELL_WIDTH.round() as u16,
             cell_height: 16,
         };
 
