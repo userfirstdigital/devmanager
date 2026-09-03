@@ -33,6 +33,13 @@ use crate::ui::task_cockpit::timeline::PreviewPlanStep;
 use crate::ui::task_cockpit::timeline::{ActivityToggleHandler, Timeline, TimelineViewport};
 use crate::ui::tokens::{theme, Density, Scale, ThemeMode};
 
+/// What the timeline fallback says once a canonical model is admitted for
+/// the task but no messages have arrived yet.
+///
+/// It is a liveness claim, so nothing may paint it while the client is
+/// still loading: see [`TaskCockpitShell::conversation_hold_copy_for`].
+pub const CONVERSATION_LIVE_HOLD_COPY: &str = "Conversation is live; waiting for messages.";
+
 pub struct TaskCockpitShell {
     dock: ContextDock,
     model: Option<ClientModel>,
@@ -708,12 +715,38 @@ impl TaskCockpitShell {
         }
     }
 
+    /// The copy the timeline fallback paints for one task, or `None` once a
+    /// real timeline is admitted.
+    ///
+    /// [`CONVERSATION_LIVE_HOLD_COPY`] is a claim about an admitted canonical
+    /// model, and a client still paging its snapshot has not admitted one --
+    /// which is exactly the thirty-second window the phase line exists for. The
+    /// caller passes that line in, and it wins.
+    pub fn conversation_hold_copy_for(
+        &self,
+        task_id: TaskId,
+        startup_line: Option<&str>,
+    ) -> Option<String> {
+        if self.timeline_for(task_id).is_some() {
+            return None;
+        }
+        Some(
+            startup_line
+                .unwrap_or(CONVERSATION_LIVE_HOLD_COPY)
+                .to_string(),
+        )
+    }
+
     pub fn conversation_timeline_surface_for(
         &self,
         task_id: TaskId,
         tokens: crate::ui::tokens::ThemeTokens,
         activity_toggle: Option<ActivityToggleHandler>,
+        startup_line: Option<String>,
     ) -> AnyElement {
+        let hold_copy = self
+            .conversation_hold_copy_for(task_id, startup_line.as_deref())
+            .unwrap_or_default();
         self.timeline_for(task_id)
             .map(|timeline| {
                 div()
@@ -750,7 +783,7 @@ impl TaskCockpitShell {
                     .child(
                         div()
                             .text_color(tokens.text.muted.to_gpui())
-                            .child("Conversation is live; waiting for messages."),
+                            .child(hold_copy),
                     )
                     .into_any_element()
             })
@@ -873,6 +906,7 @@ impl TaskCockpitShell {
         tokens: crate::ui::tokens::ThemeTokens,
         footer: AnyElement,
         activity_toggle: Option<ActivityToggleHandler>,
+        startup_line: Option<String>,
     ) -> AnyElement {
         div()
             .id(("native-task-conversation-surface", {
@@ -887,7 +921,12 @@ impl TaskCockpitShell {
             .min_h(gpui::px(0.0))
             .flex()
             .flex_col()
-            .child(self.conversation_timeline_surface_for(task_id, tokens, activity_toggle))
+            .child(self.conversation_timeline_surface_for(
+                task_id,
+                tokens,
+                activity_toggle,
+                startup_line,
+            ))
             .child(footer)
             .into_any_element()
     }

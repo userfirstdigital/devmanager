@@ -115,6 +115,7 @@ use crate::ui::shell::{
     PointerOwner, PromptLibraryViewport, ScalePercent, Shell, TerminalPressRejection,
     TerminalRelease,
 };
+use crate::ui::startup_status::{StartupStatusLine, StartupTraceSnapshot};
 use crate::ui::startup_trace::{SharedStartupTrace, StartupPhase};
 use crate::ui::task_cockpit::changes_panel::{
     reconcile_selected_repository, repository_mutation_allowed, repository_status_readable,
@@ -5221,6 +5222,13 @@ fn record_recovery_attempt_result(
         reconnect_backoff_reset(backoff);
     } else {
         reconnect_backoff_note_failure(backoff, now);
+        // The wait the user is looking at is the backoff, not the attempt that
+        // just failed, so the phase line has to be able to name it.
+        SharedStartupTrace::process().fail(format!(
+            "reconnect attempt {} failed; retrying in {}ms",
+            backoff.attempts,
+            reconnect_backoff_delay_after_failures(backoff.attempts).as_millis()
+        ));
     }
 }
 
@@ -7598,16 +7606,28 @@ fn resync_or_reconnect_fleet_host(
     let recovery_deadline = Instant::now() + NATIVE_STARTUP_BUDGET;
     // Recovery re-runs the synchronize unit under the same startup budget, so a
     // client still waiting for its first projection sees the attempts.
+    //
+    // Recorded after Ready too: a reconnect is the same wait as a startup, and
+    // the loading line is driven by this trace alone. `retry_in` continues the
+    // phase's own attempt count, so the strip says "attempt 3", not "attempt 1"
+    // for the third go round.
     let trace = SharedStartupTrace::process();
-    if trace.current() < StartupPhase::FirstProjection {
+    if needs_transport_reconnect {
         trace.retry_in(
-            StartupPhase::Synchronize,
+            StartupPhase::HostConnect,
             Some(format!(
-                "fleet resync (transport reconnect={needs_transport_reconnect}, budget {}ms)",
+                "fleet transport reconnect (budget {}ms)",
                 NATIVE_STARTUP_BUDGET.as_millis()
             )),
         );
     }
+    trace.retry_in(
+        StartupPhase::Synchronize,
+        Some(format!(
+            "fleet resync (transport reconnect={needs_transport_reconnect}, budget {}ms)",
+            NATIVE_STARTUP_BUDGET.as_millis()
+        )),
+    );
 
     let (admission, generation_changed) = runtime.block_on(async {
         tokio::select! {
@@ -7702,9 +7722,7 @@ fn resync_or_reconnect_fleet_host(
         }
     })
     .map_err(|error| {
-        if trace.current() < StartupPhase::FirstProjection {
-            trace.fail(error.clone());
-        }
+        trace.fail(error.clone());
         error
     })?;
 
@@ -9543,6 +9561,8 @@ pub struct NativeAccessibilityNode {
 struct ComposerAccessibilityState {
     value: String,
     focused: bool,
+    /// Startup has not reached Ready, so Send is refused rather than dead.
+    startup_loading: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -10000,9 +10020,14 @@ impl AccessibilityTree {
                     AccessibilityNode::new(
                         AccessibleRole::Button,
                         "Send",
-                        "Send this prompt to the selected AI task.",
+                        if composer.startup_loading {
+                            crate::ui::startup_status::STARTUP_LOADING_TOOLTIP.to_string()
+                        } else {
+                            "Send this prompt to the selected AI task.".to_string()
+                        },
                     )
-                    .gpui("native-task-composer-send", true, true),
+                    .gpui("native-task-composer-send", true, true)
+                    .with_disabled(composer.startup_loading),
                     AccessibilityNode::new(
                         AccessibleRole::Button,
                         "Answer",
@@ -12071,11 +12096,26 @@ impl NativeShell {
             pending_bootstrap,
             retry_host_bootstrap,
             // One trace per client run. Unit/headless shells take a detached
-            // trace so parallel fixtures cannot record into each other.
-            startup_trace: if cfg!(test) {
-                SharedStartupTrace::detached()
-            } else {
-                SharedStartupTrace::process()
+            // trace so parallel fixtures cannot record into each other, and it
+            // starts at Ready: a fixture with an injected runtime never runs
+            // the real bootstrap, so leaving it at HostSpawn would present
+            // every scenario as a client that is still loading and disable the
+            // affordances those scenarios exercise. A startup scenario enters
+            // an earlier phase explicitly.
+            startup_trace: {
+                #[cfg(test)]
+                {
+                    let trace = SharedStartupTrace::detached();
+                    trace.enter(
+                        StartupPhase::Ready,
+                        Some("headless fixture: no real bootstrap".to_string()),
+                    );
+                    trace
+                }
+                #[cfg(not(test))]
+                {
+                    SharedStartupTrace::process()
+                }
             },
             preferences,
             theme_controller,
@@ -13529,6 +13569,7 @@ impl NativeShell {
             .map(|composer| ComposerAccessibilityState {
                 value: composer.draft_text().to_string(),
                 focused: composer_focused,
+                startup_loading: self.startup_gates_actions(),
             });
         let selected_key = self.selected_task_key.clone();
         let local_host = self.local_host_id();
@@ -13571,9 +13612,14 @@ impl NativeShell {
             AccessibilityNode::new(
                 AccessibleRole::Button,
                 "New task",
-                "Open a new task dialog for the selected owner's project (provider start stays deferred).",
+                if self.startup_gates_actions() {
+                    crate::ui::startup_status::STARTUP_LOADING_TOOLTIP.to_string()
+                } else {
+                    "Open a new task dialog for the selected owner's project (provider start stays deferred).".to_string()
+                },
             )
-            .gpui("native-sidebar-new-task", true, true),
+            .gpui("native-sidebar-new-task", true, true)
+            .with_disabled(self.startup_gates_actions()),
         );
         if let Some((owner, approval_state)) = selected_key.as_ref().and_then(|owner| {
             self.host_slot(&owner.host)
@@ -14393,20 +14439,23 @@ impl NativeShell {
                     self.project_actions
                         .apply_command_detail(&row, detail.command.clone());
                 }
-                if let crate::domain::TaskCockpitResult::Denied { reason, .. } = &result {
+                if let crate::domain::TaskCockpitResult::Denied { reason, detail, .. } = &result {
                     self.fail_header_commit_from_action(
                         action,
-                        format!("Commit denied: {reason:?}"),
+                        format!(
+                            "Commit denied: {}",
+                            cockpit_reason_line(reason, detail.as_deref())
+                        ),
                     );
                 }
-                if let crate::domain::TaskCockpitResult::Unavailable { reason, .. } = &result {
-                    self.fail_header_commit_from_action(
-                        action,
-                        format!("Commit failed: {reason:?}"),
-                    );
+                if let crate::domain::TaskCockpitResult::Unavailable { reason, detail, .. } =
+                    &result
+                {
+                    let named = cockpit_reason_line(reason, detail.as_deref());
+                    self.fail_header_commit_from_action(action, format!("Commit failed: {named}"));
                     if !matches!(self.project_actions.mode, ProjectActionMenuMode::Closed) {
                         self.project_actions
-                            .surface_error(format!("Host unavailable: {reason:?}"));
+                            .surface_error(format!("Host unavailable: {named}"));
                     }
                 }
             }
@@ -16678,16 +16727,25 @@ impl NativeShell {
                                 });
                             if is_git_query {
                                 match result {
-                                    crate::domain::TaskCockpitResult::Denied { reason, .. } => {
-                                        slot.last_query_detail =
-                                            Some(format!("Git query denied: {reason:?}"));
+                                    crate::domain::TaskCockpitResult::Denied {
+                                        reason,
+                                        detail,
+                                        ..
+                                    } => {
+                                        slot.last_query_detail = Some(format!(
+                                            "Git query denied: {}",
+                                            cockpit_reason_line(reason, detail.as_deref())
+                                        ));
                                     }
                                     crate::domain::TaskCockpitResult::Unavailable {
                                         reason,
+                                        detail,
                                         ..
                                     } => {
-                                        slot.last_query_detail =
-                                            Some(format!("Git query unavailable: {reason:?}"));
+                                        slot.last_query_detail = Some(format!(
+                                            "Git query unavailable: {}",
+                                            cockpit_reason_line(reason, detail.as_deref())
+                                        ));
                                     }
                                     _ => {}
                                 }
@@ -16801,16 +16859,22 @@ impl NativeShell {
                             );
                         }
                     }
-                    crate::domain::TaskCockpitResult::Denied { reason, .. } => {
+                    crate::domain::TaskCockpitResult::Denied { reason, detail, .. } => {
                         self.fail_header_commit_from_action(
                             &action,
-                            format!("Commit denied: {reason:?}"),
+                            format!(
+                                "Commit denied: {}",
+                                cockpit_reason_line(reason, detail.as_deref())
+                            ),
                         );
                     }
-                    crate::domain::TaskCockpitResult::Unavailable { reason, .. } => {
+                    crate::domain::TaskCockpitResult::Unavailable { reason, detail, .. } => {
                         self.fail_header_commit_from_action(
                             &action,
-                            format!("Commit failed: {reason:?}"),
+                            format!(
+                                "Commit failed: {}",
+                                cockpit_reason_line(reason, detail.as_deref())
+                            ),
                         );
                     }
                     _ => {}
@@ -16845,6 +16909,25 @@ impl NativeShell {
                     } else {
                         let target = key.1;
                         self.pending_terminal_requeries.remove(&key);
+                        // "Terminal unavailable" is the same four words for every
+                        // distinct refusal. Keep the host's sentence with the
+                        // attachment this reply settles so the label can name it.
+                        let refusal = match result {
+                            crate::domain::TaskCockpitResult::Unavailable {
+                                reason,
+                                detail,
+                                ..
+                            } => Some(cockpit_reason_line(reason, detail.as_deref())),
+                            crate::domain::TaskCockpitResult::Denied { reason, detail, .. } => {
+                                Some(cockpit_reason_line(reason, detail.as_deref()))
+                            }
+                            _ => None,
+                        };
+                        self.task_surfaces.note_terminal_refusal_for(
+                            owner.clone(),
+                            target.surface_target(),
+                            refusal,
+                        );
                         self.task_surfaces
                             .note_terminal_reconnecting_for(owner, target.surface_target());
                     }
@@ -18882,6 +18965,39 @@ impl NativeShell {
     /// trace log is written by the recording sites themselves.
     pub fn startup_trace(&self) -> &SharedStartupTrace {
         &self.startup_trace
+    }
+
+    /// The loading line every waiting surface paints, or `None` once the
+    /// client is Ready.
+    ///
+    /// One derivation from the one trace, so the center surface, the sidebar
+    /// and the composer cannot disagree about whether startup is still
+    /// running, and none of them can invent a state the machine never reached.
+    pub(crate) fn startup_status_line(&self) -> Option<StartupStatusLine> {
+        let snapshot = self
+            .startup_trace
+            .with_trace(StartupTraceSnapshot::from_trace);
+        crate::ui::startup_status::startup_status_line(&snapshot, Instant::now())
+    }
+
+    /// The copy the center timeline hold paints for one owner, or `None` once
+    /// that task has an admitted timeline of its own.
+    ///
+    /// The renderer paints exactly this, so a test can read the decision
+    /// without a window -- and the liveness claim has exactly one gate.
+    pub(crate) fn conversation_hold_copy_for_owner(&self, owner: &HostTaskKey) -> Option<String> {
+        let startup = self.startup_status_line().map(|line| line.primary);
+        self.host_slot(&owner.host)?
+            .cockpit
+            .conversation_hold_copy_for(owner.task_id, startup.as_deref())
+    }
+
+    /// Whether startup still owns the actions that create or send a task.
+    ///
+    /// A dead New task button was the original complaint: it looked live and
+    /// did nothing for thirty seconds. It is disabled with a named cause now.
+    pub(crate) fn startup_gates_actions(&self) -> bool {
+        self.startup_trace.current() < StartupPhase::Ready
     }
 
     /// Record a failure only while startup is still in progress. Host errors
@@ -21588,7 +21704,7 @@ impl NativeShell {
             && !self.task_surfaces.terminal_is_interactive(task_key.clone())
         {
             self.local_slot_mut().composer_error =
-                Some(self.task_surfaces.terminal_label(task_key).to_string());
+                Some(self.task_surfaces.terminal_label(task_key));
             return false;
         }
         let Some(snapshot) = model.task(task_id) else {
@@ -25251,7 +25367,8 @@ impl NativeShell {
             .as_ref()
             .is_some_and(|availability| availability.is_available());
         let has_send_content = draft_has_text || !self.current_composer_images().is_empty();
-        let send_enabled = send_available && has_send_content;
+        let startup_loading = self.startup_gates_actions();
+        let send_enabled = send_available && has_send_content && !startup_loading;
         let composer_hold = send_availability
             .as_ref()
             .filter(|availability| !availability.is_available())
@@ -25290,6 +25407,10 @@ impl NativeShell {
             })
             .collect::<Vec<_>>();
         let showing_provider_terminal = self.task_center_terminal_preference(&owner);
+        // One read of the phase machine per paint. Every branch below asks
+        // this value rather than the trace, so the overlay, the hold copy and
+        // the empty state cannot disagree within one frame.
+        let startup_status = self.startup_status_line();
         let center_loading_state = self
             .task_surfaces
             .state(owner.clone())
@@ -25423,7 +25544,11 @@ impl NativeShell {
             send_base
                 .bg(tokens.surfaces.disabled.to_gpui())
                 .text_color(tokens.text.disabled.to_gpui())
-                .child(if send_available { "↑" } else { "…" })
+                .child(if send_available && !startup_loading {
+                    "↑"
+                } else {
+                    "…"
+                })
         };
         let owns_input = show_input && self.selected_task_key.as_ref() == Some(&owner);
         let composer_footer = if !owns_input {
@@ -26017,6 +26142,9 @@ impl NativeShell {
             .children(provider_setup_card)
             .child(composer_footer)
             .into_any_element();
+        // "Conversation is live" is a claim about an admitted canonical model.
+        // While startup is still running the phase line replaces it.
+        let startup_hold_copy = startup_status.as_ref().map(|line| line.primary.clone());
         let conversation = {
             let shell_entity = cx.entity().downgrade();
             let owner_key = owner.clone();
@@ -26033,6 +26161,7 @@ impl NativeShell {
             });
             if self.honest_empty_conversation_for(&owner)
                 && center_loading_state != Some(CenterSurfaceLoadingState::ConversationInitial)
+                && startup_status.is_none()
             {
                 // Keep the canonical conversation-with-footer contract: empty
                 // body replaces only the timeline region, never the composer.
@@ -26059,6 +26188,7 @@ impl NativeShell {
                     tokens,
                     conversation_footer,
                     Some(activity_toggle),
+                    startup_hold_copy.clone(),
                 )
             } else {
                 div()
@@ -26096,8 +26226,35 @@ impl NativeShell {
                 .child(conversation)
                 .into_any_element()
         };
-        let loading_overlay = center_loading_state
-            .map(|state| Self::center_surface_loading_overlay(&owner, state, show_input, tokens));
+        let loading_overlay = startup_status
+            .map(|line| {
+                Self::center_surface_loading_overlay(
+                    &owner,
+                    line.primary,
+                    line.secondary,
+                    true,
+                    show_input,
+                    tokens,
+                )
+            })
+            .or_else(|| {
+                center_loading_state.map(|state| {
+                    let (label, initial) = match state {
+                        CenterSurfaceLoadingState::ConversationInitial => {
+                            ("Loading conversation…", true)
+                        }
+                        CenterSurfaceLoadingState::TerminalInitial => ("Starting terminal…", true),
+                    };
+                    Self::center_surface_loading_overlay(
+                        &owner,
+                        label.to_string(),
+                        None,
+                        initial,
+                        show_input,
+                        tokens,
+                    )
+                })
+            });
         div()
             .id("native-task-center-canvas")
             .relative()
@@ -26112,16 +26269,19 @@ impl NativeShell {
             .into_any_element()
     }
 
+    /// The one loading element: a pulsing pill carrying `label`, and a muted
+    /// second line under it when the caller has a cause to name.
+    ///
+    /// Both the surface-level loading states and the startup phase line paint
+    /// through here, so there is no second loading idiom to drift.
     fn center_surface_loading_overlay(
         owner: &HostTaskKey,
-        state: CenterSurfaceLoadingState,
+        label: String,
+        secondary: Option<String>,
+        initial: bool,
         show_input: bool,
         tokens: crate::ui::tokens::ThemeTokens,
     ) -> AnyElement {
-        let (label, initial) = match state {
-            CenterSurfaceLoadingState::ConversationInitial => ("Loading conversation…", true),
-            CenterSurfaceLoadingState::TerminalInitial => ("Starting terminal…", true),
-        };
         let animation_key = stable_host_task_element_key(owner, "center-loading-pulse");
         let pulse = div()
             .flex_none()
@@ -26157,6 +26317,20 @@ impl NativeShell {
             .text_color(tokens.text.secondary.to_gpui())
             .child(pulse)
             .child(label);
+        let chip = div()
+            .flex()
+            .flex_col()
+            .items_center()
+            .gap(px(tokens.density.spacing.xs))
+            .child(chip)
+            .children(secondary.map(|secondary| {
+                div()
+                    .max_w(px(360.0))
+                    .text_center()
+                    .text_size(px(tokens.density.typography.caption))
+                    .text_color(tokens.text.muted.to_gpui())
+                    .child(secondary)
+            }));
         let overlay = div()
             .id((
                 "native-center-loading-overlay",
@@ -26252,7 +26426,7 @@ impl NativeShell {
         }
         if chrome.summary_caption {
             let summary = if interactive {
-                "Provider terminal · Live · type, use arrows, Enter, or Escape"
+                "Provider terminal · Live · type, use arrows, Enter, or Escape".to_string()
             } else {
                 self.task_surfaces.terminal_label(owner.clone())
             };
@@ -30185,6 +30359,18 @@ impl NativeShell {
                 self.startup_trace
                     .note_ready(Some("cockpit painted with a selected task".to_string()));
             }
+            // A shell with no task to select never paints a Cockpit, and its
+            // user must still be able to create the first one. An admitted
+            // canonical model with nothing to select is a FINISHED startup, not
+            // a stuck one -- without this, a fresh profile would sit below
+            // Ready forever and the New task button that startup disables would
+            // never come back.
+            ShellStage::Welcome | ShellStage::FirstTask
+                if self.startup_trace.current() >= StartupPhase::FirstProjection =>
+            {
+                self.startup_trace
+                    .note_ready(Some("no task to select".to_string()));
+            }
             _ => {}
         }
     }
@@ -32496,6 +32682,13 @@ impl NativeShell {
     }
 
     fn begin_new_task(&mut self) {
+        // Every create path lands here -- the button, the shortcut and the
+        // project row -- so the refusal lives here rather than at each caller.
+        // A silent no-op is what made the original button read as dead.
+        if self.startup_gates_actions() {
+            self.refuse_task_creation_while_loading();
+            return;
+        }
         let project_key = if let Some(selected) = self.selected_task_key.clone() {
             let project_id = self
                 .host_slot(&selected.host)
@@ -32534,7 +32727,24 @@ impl NativeShell {
         self.begin_new_task_for_project_key(HostProjectKey::new(self.local_host_id(), project_id));
     }
 
+    /// Refuse a create-task gesture while the snapshot is still paging, saying
+    /// which check refused it on the same line every other refusal uses.
+    fn refuse_task_creation_while_loading(&mut self) {
+        let message = crate::ui::startup_status::STARTUP_CREATE_REFUSAL.to_string();
+        if let Some(key) = self.selected_task_key.clone() {
+            if self.host_slot(&key.host).is_some() {
+                self.set_composer_error_for_owner(&key, message);
+                return;
+            }
+        }
+        self.local_slot_mut().composer_error = Some(message);
+    }
+
     fn begin_new_task_for_project_key(&mut self, project_key: HostProjectKey) {
+        if self.startup_gates_actions() {
+            self.refuse_task_creation_while_loading();
+            return;
+        }
         if self.host_slot(&project_key.host).is_none() {
             if let Some(slot) = self.host_slot_mut(&self.local_host_id()) {
                 slot.composer_error = Some("New task needs a connected owner host.".into());
@@ -42515,7 +42725,12 @@ impl NativeShell {
                         Button::new("native-sidebar-new-task")
                             .label("New task")
                             .icon(gpui_component::IconName::Plus)
-                            .tooltip("New task")
+                            .tooltip(if self.startup_gates_actions() {
+                                crate::ui::startup_status::STARTUP_LOADING_TOOLTIP
+                            } else {
+                                "New task"
+                            })
+                            .disabled(self.startup_gates_actions())
                             .primary()
                             .small()
                             .rounded(px(8.0))
@@ -44718,6 +44933,20 @@ fn bounded_host_error(message: impl Into<String>) -> String {
     message.into().chars().take(MAX_HOST_ERROR_CHARS).collect()
 }
 
+/// `reason` alone, or `reason: detail` when the host named one.
+///
+/// The closed enum cannot tell two different refusals apart -- `TerminalUnavailable`
+/// covers "no shell is installed" and "the recipe was rejected" alike -- so every
+/// surface that renders an Unavailable/Denied state appends the host's sentence
+/// when one arrived. A trailing colon with nothing after it is worse than the bare
+/// reason, so the absent case is decided here rather than at each call site.
+fn cockpit_reason_line(reason: impl std::fmt::Debug, detail: Option<&str>) -> String {
+    match detail {
+        Some(detail) if !detail.trim().is_empty() => format!("{reason:?}: {detail}"),
+        _ => format!("{reason:?}"),
+    }
+}
+
 /// The one-line status a cockpit query result gets rendered as.
 ///
 /// `Denied`/`Unavailable` carry a closed enum reason plus an optional host
@@ -45553,6 +45782,7 @@ mod tests {
         capture_runtime_projection_owner,
         caret_phase_repaint,
         center_terminal_interactive,
+        cockpit_reason_line,
         cockpit_result_detail,
         composer_caret_visible,
         composer_draft_parts,
@@ -50301,6 +50531,11 @@ mod tests {
         let (model, _task_id) = open_task_without_agent_client_model();
         let (attached, rejection, reached, entries) =
             with_test_shell_in_app(cx, runtime, |shell| {
+                // The headless fixture seeds Ready because it never runs the
+                // real bootstrap. Rewind to where a live client starts and
+                // replay the attach this scenario is actually measuring.
+                shell.startup_trace().enter(StartupPhase::HostSpawn, None);
+                shell.note_runtime_attached("runtime attached");
                 let attached = shell.startup_trace().current();
                 let epochs = shared.lock().expect("test runtime state").epochs;
                 shared
@@ -50583,6 +50818,81 @@ mod tests {
         );
     }
 
+    /// The original complaint in one scenario: while the snapshot is still
+    /// paging, the center must NAME the wait rather than claim the conversation
+    /// is live, and New task must refuse with a named cause rather than doing
+    /// nothing at all.
+    fn startup_phase_line_replaces_liveness_and_gates_task_creation(cx: &mut gpui::App) {
+        use crate::ui::task_cockpit::shell::CONVERSATION_LIVE_HOLD_COPY;
+
+        let (runtime, shared) = TestRuntime::new(true, NativeHostActionResult::Queued);
+        let (model, task_id) = open_task_without_agent_client_model();
+        with_test_shell_in_app(cx, runtime, |shell| {
+            let epochs = shared.lock().expect("test runtime state").epochs;
+            shared
+                .lock()
+                .expect("test runtime state")
+                .projections
+                .push_back(NativeHostProjection::client_model(Arc::new(model)).at_epochs(epochs));
+            let _ = shell.drain_host_projections(MAX_PENDING_HOST_ACTIONS);
+            let owner = shell.local_task_key(task_id);
+            shell.selected_task_key = Some(owner.clone());
+
+            // Still paging: an admitted preview is not an admitted conversation.
+            shell
+                .startup_trace()
+                .enter(StartupPhase::SnapshotPages, None);
+            let line = shell
+                .startup_status_line()
+                .expect("a client below Ready always paints a line");
+            assert!(
+                line.primary.starts_with("Loading tasks"),
+                "the paging phase names itself: {line:?}"
+            );
+            let hold = shell.conversation_hold_copy_for_owner(&owner);
+            assert_eq!(
+                hold.as_deref(),
+                Some(line.primary.as_str()),
+                "the hold repeats the phase line"
+            );
+            assert_ne!(
+                hold.as_deref(),
+                Some(CONVERSATION_LIVE_HOLD_COPY),
+                "nothing may claim liveness before a canonical model is admitted"
+            );
+
+            assert!(
+                shell.startup_gates_actions(),
+                "New task is disabled below Ready"
+            );
+            shell.begin_new_task();
+            assert!(
+                shell.new_task.is_none(),
+                "a create gesture must not open a draft while loading"
+            );
+            let refusal = shell
+                .local_slot_mut()
+                .composer_error
+                .clone()
+                .expect("a refused create names its cause");
+            assert!(
+                refusal.contains("still loading tasks"),
+                "the refusal must name which check refused it: {refusal}"
+            );
+
+            // Ready: the line is gone and both affordances come back.
+            shell.startup_trace().enter(StartupPhase::Ready, None);
+            assert_eq!(shell.startup_status_line(), None);
+            assert!(!shell.startup_gates_actions());
+            assert_eq!(
+                shell.conversation_hold_copy_for_owner(&owner).as_deref(),
+                Some(CONVERSATION_LIVE_HOLD_COPY),
+                "the liveness copy is honest once the model is admitted"
+            );
+            shell.local_slot_mut().composer_error = None;
+        });
+    }
+
     fn action_outcome_retention_pressure_keeps_exact_overflow_record(cx: &mut gpui::App) {
         let (runtime, _shared) = TestRuntime::new(true, NativeHostActionResult::Queued);
         let (pending_len, overflow, failure) = with_test_shell_in_app(cx, runtime, |shell| {
@@ -50776,12 +51086,39 @@ mod tests {
             query_admission_failures_are_discarded_without_durable_retention(cx);
             successful_resync_projection_restores_runtime_connection(cx);
             startup_trace_reaches_first_projection_and_records_synchronize_failures(cx);
+            startup_phase_line_replaces_liveness_and_gates_task_creation(cx);
             action_outcome_retention_pressure_keeps_exact_overflow_record(cx);
             native_shell_drop_retains_pending_overflow_and_deferred_as_uncertain(cx);
             *completed_for_app.borrow_mut() = true;
             cx.quit();
         });
         assert!(*completed.borrow(), "action durability scenarios completed");
+    }
+
+    #[test]
+    fn a_refusal_line_names_the_host_sentence_and_never_trails_a_bare_colon() {
+        use crate::domain::TaskCockpitUnavailableReason;
+
+        assert_eq!(
+            cockpit_reason_line(
+                TaskCockpitUnavailableReason::TerminalUnavailable,
+                Some("Claude Code was updated; the restore recipe no longer matches")
+            ),
+            "TerminalUnavailable: Claude Code was updated; the restore recipe no longer matches"
+        );
+        assert_eq!(
+            cockpit_reason_line(TaskCockpitUnavailableReason::TerminalUnavailable, None),
+            "TerminalUnavailable",
+            "a missing detail must not leave a trailing colon"
+        );
+        assert_eq!(
+            cockpit_reason_line(
+                TaskCockpitUnavailableReason::TerminalUnavailable,
+                Some("   ")
+            ),
+            "TerminalUnavailable",
+            "whitespace is not a named cause"
+        );
     }
 
     #[test]

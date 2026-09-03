@@ -322,10 +322,15 @@ pub fn terminal_surface_target(projection: &TaskTerminalProjection) -> TerminalS
 
 /// One terminal's client-side attachment: what the UI should say about it, and
 /// whether a screen query for it is outstanding.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
 struct TerminalAttachment {
     state: TerminalAttachmentState,
     query_in_flight: bool,
+    /// The host's own sentence behind the refusal that put this terminal in
+    /// `Unavailable`. The closed reason enum cannot tell "no shell is
+    /// installed" from "the recipe was rejected", and the operator reading the
+    /// client has no access to the host's stderr.
+    detail: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -424,7 +429,7 @@ impl TaskSurfaceState {
     }
 
     fn attachment(&self, target: TerminalSurfaceTarget) -> TerminalAttachment {
-        self.attachments.get(&target).copied().unwrap_or_default()
+        self.attachments.get(&target).cloned().unwrap_or_default()
     }
 
     /// Attachment state of one exact terminal.
@@ -471,9 +476,23 @@ impl TaskSurfaceState {
         let has_screen = self.screen_for_target(target).is_some();
         let attachment = self.attachments.entry(target).or_default();
         attachment.query_in_flight = true;
+        // A new query makes the previous refusal history: a stale sentence read
+        // as the reason for the CURRENT state would be worse than none.
+        attachment.detail = None;
         if !has_screen {
             attachment.state = TerminalAttachmentState::Starting;
         }
+    }
+
+    /// Keep the host's sentence for the refusal that is about to settle this
+    /// terminal's query, so the label can name the cause instead of repeating
+    /// the same four words for every distinct failure.
+    pub fn note_terminal_refusal_for(
+        &mut self,
+        target: TerminalSurfaceTarget,
+        detail: Option<String>,
+    ) {
+        self.attachments.entry(target).or_default().detail = detail;
     }
 
     pub fn note_terminal_query_started(&mut self) {
@@ -550,13 +569,28 @@ impl TaskSurfaceState {
             && self.latest_terminal().is_some()
     }
 
-    pub fn terminal_label(&self) -> &'static str {
-        match self.terminal_attachment() {
+    pub fn terminal_label(&self) -> String {
+        let attachment = self.attachment(self.focused_surface_target());
+        let label = match attachment.state {
             TerminalAttachmentState::Live => "Terminal is live",
             TerminalAttachmentState::StaleReconnecting => "Reconnecting — last terminal screen",
             TerminalAttachmentState::Starting => "Terminal starting",
             TerminalAttachmentState::Unavailable => "Terminal unavailable",
             TerminalAttachmentState::Exited => "Terminal exited",
+        };
+        // Only the refused states earn the sentence: a live terminal's label is
+        // not the place for the reason the previous attempt failed.
+        match attachment.detail.as_deref() {
+            Some(detail)
+                if !detail.trim().is_empty()
+                    && matches!(
+                        attachment.state,
+                        TerminalAttachmentState::Unavailable | TerminalAttachmentState::Exited
+                    ) =>
+            {
+                format!("{label}: {detail}")
+            }
+            _ => label.to_string(),
         }
     }
 
@@ -1002,6 +1036,17 @@ impl<K: Clone + Ord + Eq> TaskSurfaceRegistry<K> {
             .note_terminal_reconnecting_for(target);
     }
 
+    /// See [`TaskSurfaceState::note_terminal_refusal_for`].
+    pub fn note_terminal_refusal_for(
+        &mut self,
+        task_id: K,
+        target: TerminalSurfaceTarget,
+        detail: Option<String>,
+    ) {
+        self.ensure_task(task_id)
+            .note_terminal_refusal_for(target, detail);
+    }
+
     pub fn note_terminal_query_started(&mut self, task_id: K) {
         self.ensure_task(task_id).note_terminal_query_started();
     }
@@ -1029,10 +1074,10 @@ impl<K: Clone + Ord + Eq> TaskSurfaceRegistry<K> {
             .is_some_and(TaskSurfaceState::terminal_is_interactive)
     }
 
-    pub fn terminal_label(&self, task_id: K) -> &'static str {
+    pub fn terminal_label(&self, task_id: K) -> String {
         self.state(task_id)
             .map(TaskSurfaceState::terminal_label)
-            .unwrap_or("Terminal unavailable")
+            .unwrap_or_else(|| "Terminal unavailable".to_string())
     }
 
     pub fn terminal_empty_message(&self, task_id: K) -> &'static str {
@@ -1197,6 +1242,34 @@ mod tests {
             "stale partial cannot replace final text"
         );
         assert_eq!(cache.as_page().facts[0], updated.facts[0]);
+    }
+
+    #[test]
+    fn an_unavailable_terminal_names_the_host_sentence_when_one_arrived() {
+        // Without a detail the label must read exactly as it always has: a
+        // trailing colon with nothing after it is worse than the bare reason.
+        let mut bare = TaskSurfaceState::default();
+        bare.note_terminal_query_started();
+        bare.note_terminal_reconnecting();
+        assert_eq!(bare.terminal_label(), "Terminal unavailable");
+
+        let mut named = TaskSurfaceState::default();
+        named.note_terminal_query_started();
+        named.note_terminal_refusal_for(
+            named.focused_surface_target(),
+            Some("TerminalUnavailable: Claude Code was updated".to_string()),
+        );
+        named.note_terminal_reconnecting();
+        assert_eq!(
+            named.terminal_label(),
+            "Terminal unavailable: TerminalUnavailable: Claude Code was updated"
+        );
+
+        // A new query makes the previous refusal history: a stale sentence read
+        // as the reason for the CURRENT state is a lie the label cannot tell.
+        named.note_terminal_query_started();
+        named.note_terminal_reconnecting();
+        assert_eq!(named.terminal_label(), "Terminal unavailable");
     }
 
     #[test]

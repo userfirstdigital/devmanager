@@ -146,6 +146,7 @@ pub struct StartupTrace {
     current: StartupPhase,
     attempt: u32,
     detail: Option<String>,
+    failure_detail: Option<String>,
 }
 
 impl Default for StartupTrace {
@@ -162,6 +163,7 @@ impl StartupTrace {
             current: StartupPhase::HostSpawn,
             attempt: 1,
             detail: None,
+            failure_detail: None,
         }
     }
 
@@ -170,6 +172,10 @@ impl StartupTrace {
         self.current = phase;
         self.attempt = 1;
         self.detail = detail.clone();
+        // Reaching a new phase is progress: whatever the previous one was
+        // retrying is over, and a loading line that kept quoting it would be
+        // naming a failure that no longer applies.
+        self.failure_detail = None;
         self.push(detail)
     }
 
@@ -177,6 +183,7 @@ impl StartupTrace {
     pub fn retry(&mut self, detail: Option<String>) -> StartupTraceEntry {
         self.attempt = self.attempt.saturating_add(1);
         self.detail = detail.clone();
+        self.note_failure(detail.as_deref());
         self.push(detail)
     }
 
@@ -197,6 +204,7 @@ impl StartupTrace {
         self.current = phase;
         self.attempt = attempts_so_far.saturating_add(1);
         self.detail = detail.clone();
+        self.note_failure(detail.as_deref());
         self.push(detail)
     }
 
@@ -204,7 +212,16 @@ impl StartupTrace {
     pub fn fail(&mut self, detail: impl Into<String>) -> StartupTraceEntry {
         let detail = detail.into();
         self.detail = Some(detail.clone());
+        self.failure_detail = Some(detail.clone());
         self.push(Some(detail))
+    }
+
+    /// Remember why a retry happened, so a loading line can say what is being
+    /// retried rather than quoting whichever transition wrote `detail` last.
+    fn note_failure(&mut self, detail: Option<&str>) {
+        if let Some(detail) = detail {
+            self.failure_detail = Some(detail.to_string());
+        }
     }
 
     /// Record a sub-step inside the current phase without changing phase,
@@ -238,8 +255,22 @@ impl StartupTrace {
         self.detail.as_deref()
     }
 
+    /// The last failure this phase recorded, cleared when the next phase is
+    /// entered. Unlike [`Self::detail`] this never carries an ordinary
+    /// transition note, so a loading line built from it cannot claim that a
+    /// successful step is being retried.
+    pub fn failure_detail(&self) -> Option<&str> {
+        self.failure_detail.as_deref()
+    }
+
     pub fn entries(&self) -> &[StartupTraceEntry] {
         &self.entries
+    }
+
+    /// The instant the current phase was entered. Retries stay inside the same
+    /// run, so this is the moment the user started waiting on THIS phase.
+    pub fn phase_started_at(&self) -> Instant {
+        self.started_at + Duration::from_millis(self.current_phase_started_at_ms())
     }
 
     /// Total time since the trace started.
@@ -428,6 +459,15 @@ impl SharedStartupTrace {
         }
         let entry = state.trace.fail(detail);
         state.write(&entry);
+    }
+
+    /// Read several values off the machine under ONE lock.
+    ///
+    /// A loading line renders phase, attempt, elapsed and detail together; four
+    /// separate accessors would let a background thread move the phase between
+    /// two of them and paint a line that never existed.
+    pub fn with_trace<R>(&self, read: impl FnOnce(&StartupTrace) -> R) -> R {
+        read(&self.lock().trace)
     }
 
     pub fn current(&self) -> StartupPhase {
