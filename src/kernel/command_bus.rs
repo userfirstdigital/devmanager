@@ -1979,6 +1979,7 @@ mod terminal_and_provider_restart_tests {
     use crate::domain::command::{CreateTaskIntent, OpenShellTerminalIntent, ProviderStartMode};
     use crate::domain::resource::ResourceRecipe;
     use crate::domain::task::{TaskAssignment, TaskAttention, TaskConnectivity, WorkspaceRef};
+    use crate::kernel::store::{OperationIdentityBackfill, OperationIdentityBackfillRun};
     use crate::providers::ProviderKind;
     use std::collections::BTreeMap;
 
@@ -3033,18 +3034,17 @@ mod terminal_and_provider_restart_tests {
         );
 
         let bus = CommandBus::open(&path).expect("reopen upgrades to v17");
-        let backfill = bus
-            .store
-            .startup_identity_backfill()
-            .copied()
-            .expect("applying V17 must backfill the log");
+        let outcome = bus.store.startup_identity_backfill();
+        let OperationIdentityBackfill::AfterMigration(run) = outcome else {
+            panic!("applying V17 must backfill the log, got {outcome:?}");
+        };
         assert_eq!(
-            backfill.rows_updated,
+            run.rows_updated,
             u64::try_from(expected).expect("count fits u64"),
             "every operation fact must have been written"
         );
         assert_eq!(
-            backfill.rows_scanned, backfill.rows_updated,
+            run.rows_scanned, run.rows_updated,
             "every row read must have been written"
         );
         drop(bus);
@@ -3079,9 +3079,184 @@ mod terminal_and_provider_restart_tests {
         }
 
         let bus = CommandBus::open(&path).expect("second reopen");
+        assert_eq!(
+            bus.store.startup_identity_backfill(),
+            OperationIdentityBackfill::NotNeeded,
+            "a store with no gap must not backfill again"
+        );
+    }
+
+    /// A backfill that never finished leaves V17 recorded with rows still NULL.
+    /// Triggering on the migration alone, that store stayed on the pre-V17 full
+    /// scan for the rest of its life -- correct, far slower, and silent, since
+    /// the fallback is what keeps it correct. The next open must re-arm, and
+    /// must report only the work that remained.
+    #[test]
+    fn an_unfinished_v17_backfill_resumes_on_the_next_open() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let (path, _command_id, _task_id) = store_with_one_operation(directory.path());
+
+        // Revert the identity on the accepted facts only, exactly as an
+        // interrupted backfill that had not reached them would leave the store.
+        // The terminal and host rows stay filled, so a resume that re-read
+        // everything would report the wrong count.
+        let (reverted, already_filled): (i64, i64) = {
+            let conn = Connection::open(&path).expect("raw");
+            conn.execute(
+                "UPDATE events SET operation_id = NULL, command_id = NULL
+                 WHERE event_type = 'operation.accepted'",
+                [],
+            )
+            .expect("interrupt the backfill");
+            let reverted = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM events WHERE event_type = 'operation.accepted'",
+                    [],
+                    |row| row.get(0),
+                )
+                .expect("reverted rows");
+            let already_filled = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM events
+                     WHERE event_type LIKE 'operation.%'
+                       AND event_type != 'operation.accepted'",
+                    [],
+                    |row| row.get(0),
+                )
+                .expect("rows the interrupted run had already written");
+            (reverted, already_filled)
+        };
+        assert!(reverted > 0, "there must be work left to resume");
         assert!(
-            bus.store.startup_identity_backfill().is_none(),
-            "an up-to-date schema must not backfill again"
+            already_filled > 0,
+            "and work already done, or 'only the remaining rows' proves nothing"
+        );
+
+        let bus = CommandBus::open(&path).expect("reopen resumes the backfill");
+        let outcome = bus.store.startup_identity_backfill();
+        let OperationIdentityBackfill::Resumed(run) = outcome else {
+            panic!("an unfinished backfill must resume, got {outcome:?}");
+        };
+        assert_eq!(
+            run.rows_scanned,
+            u64::try_from(reverted).expect("count fits u64"),
+            "a resume reads the remaining rows only, not the whole log"
+        );
+        assert_eq!(run.rows_updated, run.rows_scanned);
+        drop(bus);
+
+        {
+            let conn = Connection::open(&path).expect("raw");
+            assert!(
+                !operation_index_has_gap(&conn, OPERATION_IDENTITY_EVENT_TYPES).expect("gap check"),
+                "the resume must close the gap it was armed by"
+            );
+        }
+
+        // And having closed it, the next open owes nothing: the repair is
+        // self-arming, not self-perpetuating.
+        let bus = CommandBus::open(&path).expect("third open");
+        assert_eq!(
+            bus.store.startup_identity_backfill(),
+            OperationIdentityBackfill::NotNeeded
+        );
+    }
+
+    /// The command half alone can be the gap: host close facts legitimately
+    /// carry no command, so the missing-row predicate the backfill selects with
+    /// and the two seeks the gap check splits it into must agree about which
+    /// rows are missing. If they disagreed, the backfill would either skip
+    /// these rows forever or rewrite every host fact on every open.
+    #[test]
+    fn a_missing_command_half_alone_re_arms_the_backfill_without_touching_host_facts() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let (path, _command_id, _task_id) = store_with_one_operation(directory.path());
+
+        let expected: i64 = {
+            let conn = Connection::open(&path).expect("raw");
+            conn.execute(
+                "UPDATE events SET command_id = NULL WHERE event_type = 'operation.settled'",
+                [],
+            )
+            .expect("drop the command half only");
+            conn.query_row(
+                "SELECT COUNT(*) FROM events WHERE event_type = 'operation.settled'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("rows missing only their command half")
+        };
+        assert!(expected > 0);
+
+        let bus = CommandBus::open(&path).expect("reopen resumes");
+        let outcome = bus.store.startup_identity_backfill();
+        let OperationIdentityBackfill::Resumed(run) = outcome else {
+            panic!("a missing command half is a gap, got {outcome:?}");
+        };
+        assert_eq!(
+            run.rows_scanned,
+            u64::try_from(expected).expect("count fits u64"),
+            "only the rows missing a half are re-read"
+        );
+        drop(bus);
+
+        let conn = Connection::open(&path).expect("raw");
+        let unfilled: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM events
+                 WHERE event_type LIKE 'operation.%' AND command_id IS NULL",
+                [],
+                |row| row.get(0),
+            )
+            .expect("unfilled command halves");
+        assert_eq!(unfilled, 0);
+        assert!(!operation_index_has_gap(&conn, OPERATION_IDENTITY_EVENT_TYPES).expect("gap"));
+    }
+
+    /// The no-work assertion, asserted in BOTH directions in one test: the same
+    /// store reports `NotNeeded` while it is whole and `Resumed` the moment one
+    /// row loses its identity. A `NotNeeded` assertion that cannot be made to
+    /// fail is not evidence that the backfill stayed out of the way.
+    #[test]
+    fn a_store_with_no_gap_opens_without_running_the_backfill() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let (path, _command_id, _task_id) = store_with_one_operation(directory.path());
+
+        for attempt in 0..2 {
+            let bus = CommandBus::open(&path).expect("open a whole store");
+            assert_eq!(
+                bus.store.startup_identity_backfill(),
+                OperationIdentityBackfill::NotNeeded,
+                "open {attempt} of a store with no gap must do no work"
+            );
+        }
+
+        {
+            let conn = Connection::open(&path).expect("raw");
+            conn.execute(
+                "UPDATE events SET operation_id = NULL, command_id = NULL
+                 WHERE sequence = (
+                     SELECT MIN(sequence) FROM events WHERE event_type LIKE 'operation.%'
+                 )",
+                [],
+            )
+            .expect("open one gap");
+        }
+
+        let bus = CommandBus::open(&path).expect("reopen");
+        assert_eq!(
+            bus.store.startup_identity_backfill(),
+            OperationIdentityBackfill::Resumed(OperationIdentityBackfillRun {
+                rows_scanned: 1,
+                rows_updated: 1,
+                elapsed_ms: bus
+                    .store
+                    .startup_identity_backfill()
+                    .run()
+                    .expect("a run happened")
+                    .elapsed_ms,
+            }),
+            "one missing row is one row of work -- so NotNeeded above meant something"
         );
     }
 
@@ -5305,15 +5480,34 @@ const OPERATION_TERMINAL_EVENT_TYPES: &[&str] = &[
     "operation.uncertain",
 ];
 
+/// The rows whose V17 identity is missing, as one SQL predicate.
+///
+/// One rule, one place: [`operation_index_has_gap`] asks whether any row
+/// matches it and the V17 backfill in `store.rs` selects exactly the rows that
+/// do, so the check and the repair cannot disagree about what "missing" means.
+/// Host close facts name an operation and carry no command, so only
+/// `operation.*` rows are required to have one -- without that clause the
+/// backfill would rewrite every host fact on every open and never stop.
+pub(crate) const OPERATION_IDENTITY_MISSING_PREDICATE: &str =
+    "(operation_id IS NULL OR (command_id IS NULL AND event_type LIKE 'operation.%'))";
+
 /// True when a row of one of `event_types` still has a NULL identity column,
 /// i.e. the V17 backfill has not covered it -- an interrupted backfill, or a
 /// row written into the table by hand. An indexed lookup would silently miss
 /// such a row, so every scan below falls back to its pre-V17 full scan while
 /// this reports a gap: a half-backfilled store is slower, never wrong.
+/// `KernelStore::open` asks the same question to decide whether it owes a
+/// backfill, so a store that never finished one repairs itself.
 ///
-/// Both probes are index seeks (`IS NULL` is an equality constraint on the
-/// leading column), so the check costs at most two seeks per event type.
-fn operation_index_has_gap(tx: &Connection, event_types: &[&str]) -> Result<bool, StoreError> {
+/// The two probes below are [`OPERATION_IDENTITY_MISSING_PREDICATE`] split into
+/// its two disjuncts so each is an index seek (`IS NULL` is an equality
+/// constraint on the leading column). Written as one OR the planner would have
+/// to choose between the two indexes; split, the check costs at most two seeks
+/// per event type, which measured free against the lookups it guards.
+pub(crate) fn operation_index_has_gap(
+    tx: &Connection,
+    event_types: &[&str],
+) -> Result<bool, StoreError> {
     for event_type in event_types {
         let missing_operation: bool = tx.query_row(
             "SELECT EXISTS(SELECT 1 FROM events

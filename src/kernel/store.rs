@@ -62,10 +62,11 @@ pub struct KernelStore {
     /// did. `None` means the schema was already current and nothing was
     /// replayed -- which is what a second open of the same store must report.
     startup_rebuild: Option<ProjectionRebuild>,
-    /// The one-time V17 identity backfill this open ran, if it owed one. `None`
-    /// means V17 was already applied -- or that the backfill failed, which is
-    /// logged and leaves the scans on their pre-V17 full scan.
-    startup_identity_backfill: Option<OperationIdentityBackfill>,
+    /// What this open decided about the V17 identity backfill. Every open
+    /// evaluates it, so this is never "unknown": the variants separate "there
+    /// was nothing to do" from "it could not be done", which are the same zero
+    /// rows written for opposite reasons.
+    startup_identity_backfill: OperationIdentityBackfill,
 }
 
 impl fmt::Debug for KernelStore {
@@ -80,15 +81,49 @@ pub struct ProjectionRebuild {
     pub drift_detected: bool,
 }
 
-/// What the one-time V17 identity backfill did: `rows_scanned` operation events
-/// were decoded, and the identity columns of `rows_updated` of them were
-/// written. The two are equal on a healthy store; a caller asserts on this
-/// rather than on the log line, which no test can read.
+/// What one run of the V17 identity backfill did: `rows_scanned` rows were
+/// missing an identity and decoded, and `rows_updated` of them were written.
+/// The two are equal on a healthy store.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct OperationIdentityBackfill {
+pub struct OperationIdentityBackfillRun {
     pub rows_scanned: u64,
     pub rows_updated: u64,
     pub elapsed_ms: u64,
+}
+
+/// What `open` decided about the V17 identity backfill, and what came of it.
+///
+/// The trigger is part of the outcome, not just of the log line, because a
+/// store that keeps reporting `Resumed` is a store whose backfill keeps not
+/// finishing -- and the failure it describes is silent by construction: the
+/// scans stay correct on their pre-V17 fallback, so nothing else ever goes red.
+/// `NotNeeded` and `Failed` both write zero rows for opposite reasons and are
+/// deliberately different values, so no caller can read "could not look" as
+/// "nothing to do".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OperationIdentityBackfill {
+    /// Every operation-naming row already carries its identity; nothing ran.
+    NotNeeded,
+    /// V17 was applied on this open, so the log that already existed was
+    /// filled in.
+    AfterMigration(OperationIdentityBackfillRun),
+    /// V17 was already applied and rows were STILL missing their identity: an
+    /// earlier backfill did not finish, or something wrote rows without one.
+    /// Only the remaining rows were written.
+    Resumed(OperationIdentityBackfillRun),
+    /// The gap probe or the backfill itself failed. Logged; the store still
+    /// opens and every scan stays on its pre-V17 full scan.
+    Failed,
+}
+
+impl OperationIdentityBackfill {
+    /// The run this open performed, when one happened.
+    pub(crate) fn run(self) -> Option<OperationIdentityBackfillRun> {
+        match self {
+            Self::AfterMigration(run) | Self::Resumed(run) => Some(run),
+            Self::NotNeeded | Self::Failed => None,
+        }
+    }
 }
 
 /// Which migrations one `migrate()` call actually applied.
@@ -200,7 +235,7 @@ impl KernelStore {
             path: canonical,
             conn,
             startup_rebuild: None,
-            startup_identity_backfill: None,
+            startup_identity_backfill: OperationIdentityBackfill::NotNeeded,
         };
         let migrated = store.migrate()?;
         // A migration that introduces a projection table creates it EMPTY, and
@@ -228,31 +263,7 @@ impl KernelStore {
                 }
             }
         }
-        // V17 added the indexed operation identity to `events`. The rows that
-        // already exist carry it only inside their msgpack payload, so fill the
-        // columns in once, here. Every scan that reads them falls back to its
-        // pre-V17 full scan for as long as any row is NULL, which is why a
-        // failure is observed and the store still opens: the cost of a failed
-        // backfill is latency, never a wrong answer.
-        if migrated
-            .applied_versions
-            .contains(&schema::OPERATION_IDENTITY_MIGRATION_VERSION)
-        {
-            match store.backfill_operation_identity() {
-                Ok(backfill) => {
-                    eprintln!(
-                        "devmanager-kernel: V17 operation identity backfill wrote {} of {} operation events in {} ms",
-                        backfill.rows_updated, backfill.rows_scanned, backfill.elapsed_ms
-                    );
-                    store.startup_identity_backfill = Some(backfill);
-                }
-                Err(error) => {
-                    eprintln!(
-                        "devmanager-kernel: V17 operation identity backfill failed: {error:?}; receipt correlation stays on the pre-V17 full scan"
-                    );
-                }
-            }
-        }
+        store.startup_identity_backfill = store.settle_operation_identity_backfill(&migrated);
         store.integrity_check()?;
         Ok(store)
     }
@@ -263,24 +274,98 @@ impl KernelStore {
         self.startup_rebuild.as_ref()
     }
 
-    /// The one-time V17 identity backfill `open` ran, or `None` when this open
-    /// did not apply V17. A second open of the same store must report `None`.
-    pub(crate) fn startup_identity_backfill(&self) -> Option<&OperationIdentityBackfill> {
-        self.startup_identity_backfill.as_ref()
+    /// What this open decided about the V17 identity backfill.
+    ///
+    /// A second open of a healthy store reports `NotNeeded`; a store whose
+    /// backfill never finished reports `Resumed` until it does.
+    pub(crate) fn startup_identity_backfill(&self) -> OperationIdentityBackfill {
+        self.startup_identity_backfill
     }
 
-    /// Fill the V17 `operation_id`/`command_id` columns for the log that
-    /// already exists.
+    /// Decide whether this open owes the V17 identity backfill, run it, and say
+    /// which of the two reasons it ran for.
+    ///
+    /// **The gap decides whether to run; the migration only decides what to
+    /// call it.** Triggering on `applied_versions` alone was wrong in a way
+    /// nothing could report: the migration commits in its own transaction and
+    /// the backfill in another, so a crash or a failure between them left V17
+    /// recorded with the columns unfilled, and that store stayed on the
+    /// pre-V17 full scan for the rest of its life -- correct, 20x slower, and
+    /// completely silent, because the fallback is what keeps it correct.
+    /// Asking the same question the scans ask makes the repair self-arming.
+    ///
+    /// The probe costs at most two index seeks per event type and measured
+    /// free (300 receipt lookups moved 169 ms -> 179 ms with it removed
+    /// entirely), so paying it on every open buys the self-repair for nothing.
+    ///
+    /// Never fails the open. A store that cannot be probed or cannot be
+    /// repaired is slow, not wrong.
+    fn settle_operation_identity_backfill(
+        &mut self,
+        migrated: &MigrationOutcome,
+    ) -> OperationIdentityBackfill {
+        let gap = match command_bus::operation_index_has_gap(
+            &self.conn,
+            command_bus::OPERATION_IDENTITY_EVENT_TYPES,
+        ) {
+            Ok(gap) => gap,
+            Err(error) => {
+                eprintln!(
+                    "devmanager-kernel: V17 operation identity gap probe failed: {error:?}; receipt correlation stays on the pre-V17 full scan"
+                );
+                return OperationIdentityBackfill::Failed;
+            }
+        };
+        if !gap {
+            return OperationIdentityBackfill::NotNeeded;
+        }
+        let fresh = migrated
+            .applied_versions
+            .contains(&schema::OPERATION_IDENTITY_MIGRATION_VERSION);
+        let run = match self.backfill_operation_identity() {
+            Ok(run) => run,
+            Err(error) => {
+                eprintln!(
+                    "devmanager-kernel: V17 operation identity backfill failed: {error:?}; receipt correlation stays on the pre-V17 full scan"
+                );
+                return OperationIdentityBackfill::Failed;
+            }
+        };
+        if fresh {
+            eprintln!(
+                "devmanager-kernel: V17 operation identity backfill wrote {} of {} operation events in {} ms (fresh migration)",
+                run.rows_updated, run.rows_scanned, run.elapsed_ms
+            );
+            OperationIdentityBackfill::AfterMigration(run)
+        } else {
+            // Deliberately louder than the fresh-migration line: reaching here
+            // means an earlier backfill did not finish, and a store that keeps
+            // printing this has something failing every time.
+            eprintln!(
+                "devmanager-kernel: V17 operation identity backfill RESUMED after an unfinished backfill: wrote {} of {} remaining operation events in {} ms",
+                run.rows_updated, run.rows_scanned, run.elapsed_ms
+            );
+            OperationIdentityBackfill::Resumed(run)
+        }
+    }
+
+    /// Fill the V17 `operation_id`/`command_id` columns for every row that is
+    /// still missing one.
+    ///
+    /// Only the missing rows, selected with the same predicate the gap check
+    /// asks about, so a resumed backfill reports the work that remained rather
+    /// than re-reading rows that are already correct.
     ///
     /// One IMMEDIATE transaction, for the same reason the projection rebuild
-    /// takes one: it reads every operation event before it writes any of them,
-    /// and a DEFERRED read snapshot that another process invalidates fails
-    /// SQLITE_BUSY_SNAPSHOT outright rather than waiting on the busy timeout.
+    /// takes one: it reads every row it will write before it writes any of
+    /// them, and a DEFERRED read snapshot that another process invalidates
+    /// fails SQLITE_BUSY_SNAPSHOT outright rather than waiting on the busy
+    /// timeout.
     ///
     /// The identity comes from `command_bus::event_operation_identity`, the one
     /// helper the append path also uses, so a row backfilled here and a row
     /// appended afterwards cannot carry different identities.
-    fn backfill_operation_identity(&mut self) -> Result<OperationIdentityBackfill, StoreError> {
+    fn backfill_operation_identity(&mut self) -> Result<OperationIdentityBackfillRun, StoreError> {
         let started = std::time::Instant::now();
         let placeholders = command_bus::OPERATION_IDENTITY_EVENT_TYPES
             .iter()
@@ -296,10 +381,11 @@ impl KernelStore {
         // defined read order.
         let mut pending: Vec<(i64, Vec<u8>, Option<Vec<u8>>)> = Vec::new();
         {
+            let missing = command_bus::OPERATION_IDENTITY_MISSING_PREDICATE;
             let mut stmt = tx.prepare(&format!(
                 "SELECT sequence, event_type, schema_version, payload
                  FROM events
-                 WHERE event_type IN ({placeholders})
+                 WHERE event_type IN ({placeholders}) AND {missing}
                  ORDER BY sequence ASC"
             ))?;
             let mut rows = stmt.query(rusqlite::params_from_iter(
@@ -348,7 +434,7 @@ impl KernelStore {
             }
         }
         tx.commit()?;
-        Ok(OperationIdentityBackfill {
+        Ok(OperationIdentityBackfillRun {
             rows_scanned,
             rows_updated,
             elapsed_ms: u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
