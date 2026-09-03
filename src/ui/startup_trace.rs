@@ -13,6 +13,7 @@
 use std::fs::File;
 use std::io::{BufWriter, Write};
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -354,11 +355,16 @@ fn duration_ms(duration: Duration) -> u64 {
 #[derive(Clone)]
 pub struct SharedStartupTrace {
     state: Arc<Mutex<TraceState>>,
+    /// Set when a reply is applied and cleared when the paint that showed it
+    /// completes its record. `note_repaint` runs on the render path, so the
+    /// common frame must cost one relaxed load rather than the trace mutex.
+    awaiting_repaint: Arc<AtomicBool>,
 }
 
 struct TraceState {
     trace: StartupTrace,
     sink: Option<BufWriter<File>>,
+    round_trips: RequestRoundTripLog,
 }
 
 static PROCESS_STARTUP_TRACE: OnceLock<SharedStartupTrace> = OnceLock::new();
@@ -371,7 +377,9 @@ impl SharedStartupTrace {
             state: Arc::new(Mutex::new(TraceState {
                 trace: StartupTrace::new(),
                 sink: None,
+                round_trips: RequestRoundTripLog::new(),
             })),
+            awaiting_repaint: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -512,6 +520,89 @@ impl SharedStartupTrace {
         self.lock().trace.clone()
     }
 
+    /// Record a cockpit request entering the pending-action lane.
+    ///
+    /// `key` is the request id's raw bits and `task` the task id's; nothing is
+    /// formatted until a line is actually written, so the enqueue path costs a
+    /// lock and a push.
+    pub fn note_request_enqueued(&self, key: u128, kind: &'static str, task: Option<u128>) {
+        let mut state = self.lock();
+        let at_ms = duration_ms(state.trace.elapsed());
+        if let Some(displaced) = state.round_trips.begin(key, kind, task, at_ms) {
+            // A request that never came back is the finding, so say so rather
+            // than dropping it to make room in silence.
+            let line = format!("{} {}", wall_clock_now(), displaced.render_suffix(at_ms));
+            state.write_raw(&line);
+        }
+    }
+
+    /// Record the host runtime accepting the request.
+    pub fn note_request_handed_off(&self, key: u128) {
+        self.note_request_stage(key, RequestStage::HandedOff);
+    }
+
+    /// Record the reply being published into the queue the controller drains.
+    ///
+    /// Called from the host worker thread. Everything after this stamp is the
+    /// client's own scheduling, so this is what separates a slow host from a
+    /// controller that did not wake.
+    pub fn note_request_published(&self, key: u128) {
+        self.note_request_stage(key, RequestStage::Published);
+    }
+
+    /// Record the controller draining the reply into the shell.
+    pub fn note_request_replied(&self, key: u128) {
+        self.note_request_stage(key, RequestStage::Replied);
+    }
+
+    /// Record the shell finishing with the reply. The record now waits only for
+    /// the paint that shows it.
+    pub fn note_request_applied(&self, key: u128) {
+        if self.note_request_stage(key, RequestStage::Applied) {
+            self.awaiting_repaint.store(true, Ordering::Release);
+        }
+    }
+
+    fn note_request_stage(&self, key: u128, stage: RequestStage) -> bool {
+        let mut state = self.lock();
+        let at_ms = duration_ms(state.trace.elapsed());
+        state.round_trips.note(key, stage, at_ms)
+    }
+
+    /// Complete every applied round trip at this paint and write its line.
+    ///
+    /// Called from the render path, so the ordinary frame — nothing applied
+    /// since the last paint — costs one atomic load and never takes the trace
+    /// mutex.
+    pub fn note_repaint(&self) {
+        if !self.awaiting_repaint.load(Ordering::Acquire) {
+            return;
+        }
+        let mut state = self.lock();
+        let at_ms = duration_ms(state.trace.elapsed());
+        let repaint = state.round_trips.note_repaint(at_ms);
+        let still_waiting = state.round_trips.awaiting_repaint();
+        for record in &repaint.completed {
+            let line = format!("{} {}", wall_clock_now(), record.render_suffix(at_ms));
+            state.write_raw(&line);
+        }
+        if repaint.reached_cap {
+            state.write_raw(&format!(
+                "{} request-log capped after {MAX_LOGGED_REQUEST_ROUND_TRIPS} round trips",
+                wall_clock_now()
+            ));
+        }
+        self.awaiting_repaint
+            .store(still_waiting, Ordering::Release);
+    }
+
+    /// Read the round-trip log under ONE lock. A caller that wants several
+    /// values (a measurement harness, say) must not let another thread move a
+    /// record between two accessors.
+    pub fn with_round_trips<R>(&self, read: impl FnOnce(&RequestRoundTripLog) -> R) -> R {
+        read(&self.lock().round_trips)
+    }
+
     /// Reach [`StartupPhase::Ready`] and write the one summary line that names
     /// every phase's duration, so "which phase took the 30 s" is one grep away.
     pub fn note_ready(&self, detail: Option<String>) {
@@ -590,6 +681,381 @@ fn wall_clock_now() -> String {
         .unwrap_or_else(|| "0000-00-00 00:00:00.000".to_string())
 }
 
+/// One cockpit request's round trip through the client, and the bounded log of
+/// them.
+///
+/// The startup trace above answers "which startup phase took the time". It
+/// cannot answer the next question, which is where a REPEATED cockpit request
+/// spends its time once startup is over: a conversation that needs eight pages
+/// pays whatever one page costs eight times, and nothing recorded which of the
+/// four intervals — sitting in the pending-action lane, waiting on the host,
+/// being admitted by the shell, or waiting for the paint that shows it — the
+/// cost is in.
+///
+/// The machine is pure: every call carries the millisecond it happened at, so
+/// tests are deterministic and the shell is the only thing that reads a clock.
+
+/// How far a round trip has got. Ordered: [`RequestRoundTripLog::note`] only
+/// ever moves a record forward, so a duplicate or out-of-order note from a
+/// retry path cannot rewind a stage that already happened.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum RequestStage {
+    /// Captured into the shell's pending-action lane.
+    Enqueued,
+    /// Accepted by the host runtime and on its way to the worker.
+    HandedOff,
+    /// The reply was published into the queue the controller drains. Recorded
+    /// by the worker, so this is the moment the answer became available to the
+    /// client — everything after it is the client's own scheduling.
+    Published,
+    /// The controller drained the reply into the shell.
+    Replied,
+    /// The shell finished applying the reply.
+    Applied,
+}
+
+impl RequestStage {
+    /// Stable log/UI label. Never localized: this string is grepped.
+    pub fn label(self) -> &'static str {
+        match self {
+            RequestStage::Enqueued => "Enqueued",
+            RequestStage::HandedOff => "HandedOff",
+            RequestStage::Published => "Published",
+            RequestStage::Replied => "Replied",
+            RequestStage::Applied => "Applied",
+        }
+    }
+}
+
+impl std::fmt::Display for RequestStage {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.label())
+    }
+}
+
+/// One request's timestamps. `key` is the request id; `task` is the task id the
+/// request was captured against, both carried as their raw 128 bits so nothing
+/// is allocated or formatted until a line is actually written.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RequestRoundTrip {
+    key: u128,
+    kind: &'static str,
+    task: Option<u128>,
+    enqueued_at_ms: u64,
+    handed_off_at_ms: Option<u64>,
+    published_at_ms: Option<u64>,
+    replied_at_ms: Option<u64>,
+    applied_at_ms: Option<u64>,
+    repainted_at_ms: Option<u64>,
+}
+
+impl RequestRoundTrip {
+    pub fn key(&self) -> u128 {
+        self.key
+    }
+
+    pub fn kind(&self) -> &'static str {
+        self.kind
+    }
+
+    pub fn task(&self) -> Option<u128> {
+        self.task
+    }
+
+    /// The furthest stage this record has reached.
+    pub fn stage(&self) -> RequestStage {
+        if self.applied_at_ms.is_some() {
+            RequestStage::Applied
+        } else if self.replied_at_ms.is_some() {
+            RequestStage::Replied
+        } else if self.published_at_ms.is_some() {
+            RequestStage::Published
+        } else if self.handed_off_at_ms.is_some() {
+            RequestStage::HandedOff
+        } else {
+            RequestStage::Enqueued
+        }
+    }
+
+    /// Milliseconds spent in the pending-action lane before the host runtime
+    /// accepted it.
+    pub fn lane_ms(&self) -> Option<u64> {
+        self.handed_off_at_ms
+            .map(|at| at.saturating_sub(self.enqueued_at_ms))
+    }
+
+    /// Milliseconds between hand-off and the reply reaching the shell.
+    ///
+    /// This spans two unrelated things — the worker's round trip to the host,
+    /// and however long the controller took to notice the answer — which is
+    /// why [`Self::worker_ms`] and [`Self::wake_ms`] exist. Reported on its own
+    /// only for a reply that arrived without a publication stamp (the deferred
+    /// and overflow paths, which do not go through the projection queue).
+    pub fn host_ms(&self) -> Option<u64> {
+        match (self.handed_off_at_ms, self.replied_at_ms) {
+            (Some(handed_off), Some(replied)) => Some(replied.saturating_sub(handed_off)),
+            _ => None,
+        }
+    }
+
+    /// Milliseconds the host and its worker took to produce the answer. This is
+    /// the only interval the host can be blamed for.
+    pub fn worker_ms(&self) -> Option<u64> {
+        match (self.handed_off_at_ms, self.published_at_ms) {
+            (Some(handed_off), Some(published)) => Some(published.saturating_sub(handed_off)),
+            _ => None,
+        }
+    }
+
+    /// Milliseconds the answer sat in the projection queue before the client's
+    /// controller drained it. This is pure client scheduling: a large value
+    /// here with a small [`Self::worker_ms`] means the controller waited out a
+    /// deadline instead of being woken by the publication.
+    pub fn wake_ms(&self) -> Option<u64> {
+        match (self.published_at_ms, self.replied_at_ms) {
+            (Some(published), Some(replied)) => Some(replied.saturating_sub(published)),
+            _ => None,
+        }
+    }
+
+    /// Milliseconds the shell spent admitting and projecting the reply.
+    pub fn admit_ms(&self) -> Option<u64> {
+        match (self.replied_at_ms, self.applied_at_ms) {
+            (Some(replied), Some(applied)) => Some(applied.saturating_sub(replied)),
+            _ => None,
+        }
+    }
+
+    /// Milliseconds between the reply being applied and the paint that showed
+    /// it.
+    pub fn paint_ms(&self) -> Option<u64> {
+        match (self.applied_at_ms, self.repainted_at_ms) {
+            (Some(applied), Some(repainted)) => Some(repainted.saturating_sub(applied)),
+            _ => None,
+        }
+    }
+
+    /// Enqueue to paint.
+    pub fn total_ms(&self) -> Option<u64> {
+        self.repainted_at_ms
+            .map(|at| at.saturating_sub(self.enqueued_at_ms))
+    }
+
+    /// How long this record has been alive at `now_ms`. Used by the line that
+    /// reports a request that never came back.
+    pub fn waited_ms(&self, now_ms: u64) -> u64 {
+        now_ms.saturating_sub(self.enqueued_at_ms)
+    }
+
+    /// Render the trailing half of a log line: everything after the wall clock.
+    ///
+    /// A complete record names all four intervals. An incomplete one names the
+    /// stage it died at instead of printing zeros that would read as a fast
+    /// round trip — a request that never returned is a finding, not a nil cost.
+    fn render_suffix(&self, now_ms: u64) -> String {
+        let started = self.enqueued_at_ms;
+        let minutes = started / 60_000;
+        let seconds = (started % 60_000) / 1_000;
+        let millis = started % 1_000;
+        let mut line = format!(
+            "+{minutes:02}:{seconds:02}.{millis:03} request kind={} task={}",
+            self.kind,
+            render_short_id(self.task),
+        );
+        match (
+            self.lane_ms(),
+            self.host_ms(),
+            self.admit_ms(),
+            self.paint_ms(),
+            self.total_ms(),
+        ) {
+            (Some(lane), Some(host), Some(admit), Some(paint), Some(total)) => {
+                // Split the host interval whenever the publication was stamped:
+                // "the host was slow" and "the controller did not wake" are
+                // different findings and must never share one number.
+                match (self.worker_ms(), self.wake_ms()) {
+                    (Some(worker), Some(wake)) => {
+                        line.push_str(&format!(
+                            " lane={lane}ms worker={worker}ms wake={wake}ms"
+                        ));
+                        line.push_str(&format!(
+                            " admit={admit}ms paint={paint}ms total={total}ms"
+                        ));
+                    }
+                    _ => line.push_str(&format!(
+                        " lane={lane}ms host={host}ms admit={admit}ms paint={paint}ms total={total}ms"
+                    )),
+                }
+            }
+            _ => {
+                line.push_str(&format!(
+                    " stage={} waited={}ms incomplete",
+                    self.stage().label(),
+                    self.waited_ms(now_ms)
+                ));
+            }
+        }
+        line
+    }
+}
+
+/// The low 32 bits of an id, or `-` when there is none. Enough to tell one
+/// task's requests from another's in a log without carrying a whole UUID.
+fn render_short_id(id: Option<u128>) -> String {
+    match id {
+        Some(id) => format!("{:08x}", (id & 0xffff_ffff) as u32),
+        None => "-".to_string(),
+    }
+}
+
+/// How many round trips may be in flight before the oldest is reported
+/// unfinished and dropped. The client's own action lane is far smaller than
+/// this, so reaching it means requests are being lost, which the dropped
+/// record's line says out loud.
+pub const MAX_INFLIGHT_REQUEST_ROUND_TRIPS: usize = 64;
+
+/// How many completed round trips are written before the log stops. A session
+/// left open for a day must not grow the file without limit, and the cost being
+/// measured shows up in the first few dozen.
+pub const MAX_LOGGED_REQUEST_ROUND_TRIPS: u64 = 4096;
+
+/// What one repaint completed.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct RequestRepaint {
+    /// Records the repaint completed, in the order they were enqueued. Empty
+    /// once the log has written [`MAX_LOGGED_REQUEST_ROUND_TRIPS`] lines.
+    pub completed: Vec<RequestRoundTrip>,
+    /// True on the single repaint that reached the cap, so the log can say it
+    /// stopped rather than appearing to go quiet.
+    pub reached_cap: bool,
+}
+
+/// The bounded round-trip machine.
+#[derive(Clone, Debug, Default)]
+pub struct RequestRoundTripLog {
+    inflight: std::collections::VecDeque<RequestRoundTrip>,
+    logged: u64,
+    reported_cap: bool,
+}
+
+impl RequestRoundTripLog {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Record a request entering the pending-action lane.
+    ///
+    /// Returns whatever record had to leave to make room — an evicted oldest,
+    /// or a previous record under the same key — so the caller can write its
+    /// unfinished line instead of losing it silently.
+    pub fn begin(
+        &mut self,
+        key: u128,
+        kind: &'static str,
+        task: Option<u128>,
+        at_ms: u64,
+    ) -> Option<RequestRoundTrip> {
+        let displaced = self
+            .inflight
+            .iter()
+            .position(|record| record.key == key)
+            .and_then(|index| self.inflight.remove(index))
+            .or_else(|| {
+                (self.inflight.len() >= MAX_INFLIGHT_REQUEST_ROUND_TRIPS)
+                    .then(|| self.inflight.pop_front())
+                    .flatten()
+            });
+        self.inflight.push_back(RequestRoundTrip {
+            key,
+            kind,
+            task,
+            enqueued_at_ms: at_ms,
+            handed_off_at_ms: None,
+            published_at_ms: None,
+            replied_at_ms: None,
+            applied_at_ms: None,
+            repainted_at_ms: None,
+        });
+        displaced
+    }
+
+    /// Advance `key` to `stage`. Never rewinds and never stamps a stage twice,
+    /// so a retry path that hands the same record off again keeps the first
+    /// hand-off's timestamp — the interval being measured is the wait the user
+    /// actually sat through.
+    pub fn note(&mut self, key: u128, stage: RequestStage, at_ms: u64) -> bool {
+        let Some(record) = self.inflight.iter_mut().find(|record| record.key == key) else {
+            return false;
+        };
+        let slot = match stage {
+            RequestStage::Enqueued => return false,
+            RequestStage::HandedOff => &mut record.handed_off_at_ms,
+            RequestStage::Published => &mut record.published_at_ms,
+            RequestStage::Replied => &mut record.replied_at_ms,
+            RequestStage::Applied => &mut record.applied_at_ms,
+        };
+        if slot.is_some() {
+            return false;
+        }
+        *slot = Some(at_ms);
+        true
+    }
+
+    /// Whether any record is waiting only for the next paint. The shell reads
+    /// this to keep [`Self::note_repaint`] off the per-frame path when there is
+    /// nothing to complete.
+    pub fn awaiting_repaint(&self) -> bool {
+        self.inflight
+            .iter()
+            .any(|record| record.applied_at_ms.is_some())
+    }
+
+    /// Complete every applied record at this paint.
+    pub fn note_repaint(&mut self, at_ms: u64) -> RequestRepaint {
+        let mut completed = Vec::new();
+        let mut remaining = std::collections::VecDeque::with_capacity(self.inflight.len());
+        for mut record in self.inflight.drain(..) {
+            if record.applied_at_ms.is_some() {
+                record.repainted_at_ms = Some(at_ms);
+                completed.push(record);
+            } else {
+                remaining.push_back(record);
+            }
+        }
+        self.inflight = remaining;
+        if completed.is_empty() {
+            return RequestRepaint::default();
+        }
+        let room = MAX_LOGGED_REQUEST_ROUND_TRIPS.saturating_sub(self.logged);
+        let admitted = usize::try_from(room)
+            .unwrap_or(usize::MAX)
+            .min(completed.len());
+        let reached_cap = admitted < completed.len() && !self.reported_cap;
+        self.reported_cap |= admitted < completed.len();
+        completed.truncate(admitted);
+        self.logged = self.logged.saturating_add(admitted as u64);
+        RequestRepaint {
+            completed,
+            reached_cap,
+        }
+    }
+
+    /// How many completed round trips have been handed out for logging.
+    pub fn logged(&self) -> u64 {
+        self.logged
+    }
+
+    pub fn inflight_len(&self) -> usize {
+        self.inflight.len()
+    }
+
+    /// Every in-flight record, oldest first. Read by tests and by a caller that
+    /// wants to name what is still outstanding.
+    pub fn inflight(&self) -> impl Iterator<Item = &RequestRoundTrip> {
+        self.inflight.iter()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     #[test]
@@ -610,6 +1076,221 @@ mod tests {
     }
 
     use super::*;
+
+    fn begun(log: &mut RequestRoundTripLog, key: u128, at_ms: u64) {
+        log.begin(key, "conversation", Some(0xabcd_1234), at_ms);
+    }
+
+    #[test]
+    fn a_round_trip_reports_each_interval_separately() {
+        let mut log = RequestRoundTripLog::new();
+        begun(&mut log, 1, 100);
+        assert!(log.note(1, RequestStage::HandedOff, 103));
+        assert!(log.note(1, RequestStage::Replied, 115));
+        assert!(log.note(1, RequestStage::Applied, 1_855));
+        let repaint = log.note_repaint(1_858);
+
+        let record = repaint.completed.first().expect("one completed round trip");
+        assert_eq!(record.lane_ms(), Some(3));
+        assert_eq!(record.host_ms(), Some(12));
+        assert_eq!(record.admit_ms(), Some(1_740));
+        assert_eq!(record.paint_ms(), Some(3));
+        assert_eq!(record.total_ms(), Some(1_758));
+        assert_eq!(log.inflight_len(), 0);
+        // No publication stamp: the deferred and overflow reply paths never
+        // reach the projection queue, so the two halves cannot be separated
+        // and the line must say `host` rather than invent a zero for one.
+        assert_eq!(record.worker_ms(), None);
+        assert_eq!(record.wake_ms(), None);
+        assert!(record
+            .render_suffix(1_858)
+            .contains("lane=3ms host=12ms admit=1740ms paint=3ms total=1758ms"));
+    }
+
+    #[test]
+    fn a_publication_stamp_separates_the_host_from_the_controller() {
+        let mut log = RequestRoundTripLog::new();
+        begun(&mut log, 1, 100);
+        log.note(1, RequestStage::HandedOff, 103);
+        // The host answered in 40 ms and the answer then sat in the queue for
+        // most of a second: that is a controller that was not woken, and the
+        // line has to be able to say so.
+        log.note(1, RequestStage::Published, 143);
+        log.note(1, RequestStage::Replied, 1_090);
+        log.note(1, RequestStage::Applied, 1_100);
+        let repaint = log.note_repaint(1_103);
+
+        let record = repaint.completed.first().expect("one completed round trip");
+        assert_eq!(record.worker_ms(), Some(40));
+        assert_eq!(record.wake_ms(), Some(947));
+        assert_eq!(record.host_ms(), Some(987), "the two halves must still sum");
+        let line = record.render_suffix(1_103);
+        assert!(
+            line.contains("worker=40ms wake=947ms"),
+            "a split round trip must name both halves: {line}"
+        );
+        assert!(
+            !line.contains("host="),
+            "a split round trip must not also print the conflated interval: {line}"
+        );
+    }
+
+    #[test]
+    fn the_published_stage_sits_between_hand_off_and_the_reply() {
+        assert!(RequestStage::HandedOff < RequestStage::Published);
+        assert!(RequestStage::Published < RequestStage::Replied);
+        let mut log = RequestRoundTripLog::new();
+        begun(&mut log, 1, 0);
+        log.note(1, RequestStage::HandedOff, 1);
+        log.note(1, RequestStage::Published, 2);
+        let published = log.inflight().next().expect("in flight");
+        assert_eq!(published.stage(), RequestStage::Published);
+        assert!(published
+            .render_suffix(500)
+            .contains("stage=Published waited=500ms incomplete"));
+    }
+
+    #[test]
+    fn a_repaint_completes_only_records_that_were_applied() {
+        let mut log = RequestRoundTripLog::new();
+        begun(&mut log, 1, 0);
+        begun(&mut log, 2, 5);
+        log.note(1, RequestStage::HandedOff, 1);
+        log.note(1, RequestStage::Replied, 2);
+        log.note(1, RequestStage::Applied, 3);
+        log.note(2, RequestStage::HandedOff, 6);
+
+        assert!(log.awaiting_repaint());
+        let repaint = log.note_repaint(10);
+        assert_eq!(repaint.completed.len(), 1);
+        assert_eq!(repaint.completed[0].key(), 1);
+        // The unanswered request stays in flight rather than being completed
+        // with a zero host interval it never earned.
+        assert_eq!(log.inflight_len(), 1);
+        assert!(!log.awaiting_repaint());
+    }
+
+    #[test]
+    fn a_repaint_with_nothing_applied_writes_no_line() {
+        let mut log = RequestRoundTripLog::new();
+        begun(&mut log, 1, 0);
+        log.note(1, RequestStage::HandedOff, 1);
+        assert_eq!(log.note_repaint(50), RequestRepaint::default());
+        assert_eq!(log.logged(), 0);
+        assert_eq!(log.inflight_len(), 1);
+    }
+
+    #[test]
+    fn a_stage_never_rewinds_and_never_stamps_twice() {
+        let mut log = RequestRoundTripLog::new();
+        begun(&mut log, 1, 0);
+        assert!(log.note(1, RequestStage::HandedOff, 10));
+        // A retry path handing the same record off again must keep the first
+        // hand-off: the interval being measured is the wait the user sat
+        // through, not the wait since the last internal retry.
+        assert!(!log.note(1, RequestStage::HandedOff, 900));
+        assert!(!log.note(1, RequestStage::Enqueued, 900));
+        log.note(1, RequestStage::Replied, 20);
+        log.note(1, RequestStage::Applied, 30);
+        let repaint = log.note_repaint(40);
+        assert_eq!(repaint.completed[0].lane_ms(), Some(10));
+    }
+
+    #[test]
+    fn a_note_for_an_unknown_request_is_ignored() {
+        let mut log = RequestRoundTripLog::new();
+        assert!(!log.note(7, RequestStage::Replied, 5));
+        assert_eq!(log.inflight_len(), 0);
+    }
+
+    #[test]
+    fn the_inflight_ring_is_bounded_and_reports_what_it_drops() {
+        let mut log = RequestRoundTripLog::new();
+        for index in 0..MAX_INFLIGHT_REQUEST_ROUND_TRIPS {
+            assert!(begun_returns_none(&mut log, index as u128, index as u64));
+        }
+        assert_eq!(log.inflight_len(), MAX_INFLIGHT_REQUEST_ROUND_TRIPS);
+
+        let displaced = log
+            .begin(9_999, "conversation", None, 1_000)
+            .expect("the oldest record leaves to make room");
+        assert_eq!(displaced.key(), 0);
+        assert_eq!(displaced.stage(), RequestStage::Enqueued);
+        assert_eq!(log.inflight_len(), MAX_INFLIGHT_REQUEST_ROUND_TRIPS);
+        assert!(displaced
+            .render_suffix(1_000)
+            .contains("waited=1000ms incomplete"));
+    }
+
+    fn begun_returns_none(log: &mut RequestRoundTripLog, key: u128, at_ms: u64) -> bool {
+        log.begin(key, "conversation", None, at_ms).is_none()
+    }
+
+    #[test]
+    fn re_beginning_a_key_returns_the_record_it_replaced() {
+        let mut log = RequestRoundTripLog::new();
+        begun(&mut log, 1, 0);
+        log.note(1, RequestStage::HandedOff, 5);
+        let displaced = log
+            .begin(1, "conversation", None, 100)
+            .expect("the previous record under this key");
+        assert_eq!(displaced.stage(), RequestStage::HandedOff);
+        assert_eq!(log.inflight_len(), 1);
+    }
+
+    #[test]
+    fn the_completed_log_is_capped_and_says_so_once() {
+        let mut log = RequestRoundTripLog::new();
+        let mut reached_cap_count = 0;
+        for index in 0..(MAX_LOGGED_REQUEST_ROUND_TRIPS + 4) {
+            let key = index as u128;
+            begun(&mut log, key, index);
+            log.note(key, RequestStage::HandedOff, index);
+            log.note(key, RequestStage::Replied, index);
+            log.note(key, RequestStage::Applied, index);
+            let repaint = log.note_repaint(index);
+            if repaint.reached_cap {
+                reached_cap_count += 1;
+            }
+        }
+        assert_eq!(log.logged(), MAX_LOGGED_REQUEST_ROUND_TRIPS);
+        assert_eq!(
+            reached_cap_count, 1,
+            "the cap must be reported once, not on every later repaint"
+        );
+        // Records still complete after the cap; only the writing stops, so a
+        // long session cannot leak in-flight records either.
+        assert_eq!(log.inflight_len(), 0);
+    }
+
+    #[test]
+    fn a_short_id_renders_the_low_bits_or_a_dash() {
+        assert_eq!(render_short_id(Some(0x1122_3344_5566_7788)), "55667788");
+        assert_eq!(render_short_id(None), "-");
+    }
+
+    #[test]
+    fn the_shared_trace_completes_a_round_trip_only_on_the_next_paint() {
+        let trace = SharedStartupTrace::detached();
+        trace.note_request_enqueued(42, "conversation", Some(7));
+        trace.note_request_handed_off(42);
+        trace.note_request_replied(42);
+        trace.with_round_trips(|log| {
+            assert_eq!(log.inflight_len(), 1);
+            assert!(!log.awaiting_repaint());
+        });
+        // A paint before the reply is applied must not complete the record.
+        trace.note_repaint();
+        trace.with_round_trips(|log| assert_eq!(log.inflight_len(), 1));
+
+        trace.note_request_applied(42);
+        trace.with_round_trips(|log| assert!(log.awaiting_repaint()));
+        trace.note_repaint();
+        trace.with_round_trips(|log| {
+            assert_eq!(log.inflight_len(), 0);
+            assert_eq!(log.logged(), 1);
+        });
+    }
 
     #[test]
     fn enter_records_one_entry_per_phase_and_resets_the_attempt() {
