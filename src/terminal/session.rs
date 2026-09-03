@@ -1913,6 +1913,12 @@ pub(crate) struct ResolvedShellLaunch {
 /// rediscovered per shell. `pwsh` and `cmd.exe` both survive the managed path.
 const PLAIN_SHELL_EXCLUDED_PROGRAMS: &[&str] = &["powershell.exe", "powershell"];
 
+/// The candidate programs that take [`pwsh_shell_args`] as a plain shell.
+///
+/// `powershell.exe` is excluded from plain shells outright (see above), so
+/// PowerShell 5.1 never reaches the hook and is not listed here.
+const PLAIN_SHELL_PWSH_PROGRAMS: &[&str] = &["pwsh", "pwsh.exe"];
+
 /// Resolve the first shell candidate whose executable exists for `cwd`.
 ///
 /// This is the plain-shell counterpart of the candidate loop in
@@ -1993,6 +1999,19 @@ fn plain_shell_candidates(
             }
             continue;
         }
+        // The prompt hook is a plain-shell concern only, so it is applied here
+        // rather than in `shell_candidates`, which provider terminals share.
+        let candidate = if PLAIN_SHELL_PWSH_PROGRAMS
+            .iter()
+            .any(|program| candidate.program.eq_ignore_ascii_case(program))
+        {
+            ShellCandidate {
+                program: candidate.program,
+                args: pwsh_shell_args(shell_integration_enabled),
+            }
+        } else {
+            candidate
+        };
         if allowed
             .iter()
             .any(|existing| existing.program == candidate.program)
@@ -2031,6 +2050,49 @@ fn resolve_shell_program(program: &str, cwd: &Path) -> Result<PathBuf, String> {
         .ok_or_else(|| format!("Shell executable `{program}` was not found on PATH"))?
         .canonicalize()
         .map_err(|error| format!("Failed to canonicalize shell executable `{program}`: {error}"))
+}
+
+/// The PowerShell prompt hook one PLAIN SHELL is launched with.
+///
+/// PowerShell does not update its Win32 current directory on `Set-Location`,
+/// so without this neither rung of the live-cwd ladder moves for the default
+/// Windows shell: the PTY stream carries no cwd report, and the root process
+/// PEB still names the launch directory forever. The hook feeds both rungs --
+/// `[Environment]::CurrentDirectory` is the PEB, the OSC 9;9 report is the
+/// parser -- so a machine where either one is unavailable still reports.
+///
+/// It captures the session's existing `prompt` and calls it FIRST, so `$?`
+/// still describes the user's own last command when that prompt reads it, and
+/// returns what the original returned with the report prefixed. The user's
+/// profile is never edited; this lives entirely in the launched session.
+///
+/// Only the `FileSystem` provider reports. `Set-Location HKLM:` moves the
+/// PowerShell location somewhere with no filesystem path, and a registry path
+/// would be refused as a cwd fact anyway for never being absolute.
+///
+/// Written without a single backslash on purpose: the OSC string terminator's
+/// second byte is spelled `[char]92`, so no quoting layer between here and
+/// `CreateProcess` can eat an escape.
+const PWSH_PROMPT_HOOK: &str = "$__dmPrompt = $function:prompt; function global:prompt { $__dmOut = & $__dmPrompt; $__dmLoc = $ExecutionContext.SessionState.Path.CurrentLocation; if ($__dmLoc.Provider.Name -eq 'FileSystem') { [Environment]::CurrentDirectory = $__dmLoc.ProviderPath; $__dmOut = ([char]27 + ']9;9;' + $__dmLoc.ProviderPath + [char]27 + [char]92) + $__dmOut }; $__dmOut }";
+
+/// The arguments one plain shell's `pwsh` is launched with.
+///
+/// The counterpart of [`bash_shell_args`], and applied in exactly one place:
+/// [`plain_shell_candidates`]. Provider terminals keep `-NoLogo` alone -- a
+/// provider owns its own shell contract and does not report cwd through this
+/// ladder. With shell integration off the arguments are unchanged from before,
+/// which is also the escape hatch if a hook ever misbehaves.
+pub fn pwsh_shell_args(shell_integration_enabled: bool) -> Vec<String> {
+    if !shell_integration_enabled {
+        return vec!["-NoLogo".to_string()];
+    }
+    // `-Command` consumes everything after it, so it must come last.
+    vec![
+        "-NoLogo".to_string(),
+        "-NoExit".to_string(),
+        "-Command".to_string(),
+        PWSH_PROMPT_HOOK.to_string(),
+    ]
 }
 
 pub fn bash_shell_args(shell_integration_enabled: bool) -> Vec<String> {
@@ -4067,7 +4129,30 @@ fn parse_shell_sequence(payload: &str) -> Option<ShellSequence> {
     if let Some(rest) = payload.strip_prefix("7;") {
         return parse_ghostty_cwd(rest);
     }
+    if let Some(rest) = payload.strip_prefix("9;9;") {
+        return parse_conemu_cwd(rest);
+    }
     None
+}
+
+/// `ESC ] 9 ; 9 ; <path> ST` -- the ConEmu/Windows Terminal cwd report.
+///
+/// Unlike OSC 7 the payload is a bare native path, not a URL, so nothing is
+/// percent-decoded here: a Windows path is not percent-encoded and decoding
+/// one would corrupt any directory with a literal `%` in its name.
+///
+/// The quotes are optional because both spellings are in the wild -- ConEmu's
+/// own documentation quotes the path, [`PWSH_PROMPT_HOOK`] does not -- and a
+/// reader that accepted only one would silently report nothing for the other.
+fn parse_conemu_cwd(payload: &str) -> Option<ShellSequence> {
+    let path = payload
+        .strip_prefix('"')
+        .and_then(|rest| rest.strip_suffix('"'))
+        .unwrap_or(payload);
+    if path.is_empty() {
+        return None;
+    }
+    Some(ShellSequence::ReportedCwd(PathBuf::from(path)))
 }
 
 fn parse_ghostty_prompt_mark(payload: &str) -> Option<ShellSequence> {
@@ -4306,6 +4391,240 @@ mod tests {
                 "{preferred:?} must name what it refused to consider"
             );
         }
+    }
+
+    /// The hook's argument text is pinned, because nothing downstream can
+    /// check it.
+    ///
+    /// It is one opaque string handed to `CreateProcess`; a typo inside it
+    /// produces a shell that starts perfectly and simply never reports a
+    /// directory, which reads as "PowerShell does not support this" rather
+    /// than as a bug. Writing the expected text out again here is the only
+    /// thing that makes an edit to it visible.
+    #[test]
+    fn the_pwsh_prompt_hook_argument_is_pinned() {
+        let expected_hook = "$__dmPrompt = $function:prompt; function global:prompt { $__dmOut = & $__dmPrompt; $__dmLoc = $ExecutionContext.SessionState.Path.CurrentLocation; if ($__dmLoc.Provider.Name -eq 'FileSystem') { [Environment]::CurrentDirectory = $__dmLoc.ProviderPath; $__dmOut = ([char]27 + ']9;9;' + $__dmLoc.ProviderPath + [char]27 + [char]92) + $__dmOut }; $__dmOut }";
+        assert_eq!(PWSH_PROMPT_HOOK, expected_hook);
+        assert_eq!(
+            pwsh_shell_args(true),
+            vec![
+                "-NoLogo".to_string(),
+                "-NoExit".to_string(),
+                "-Command".to_string(),
+                expected_hook.to_string(),
+            ],
+            "-Command consumes everything after it, so it must come last"
+        );
+        // Shell integration off is the escape hatch, and must be exactly the
+        // arguments a pwsh candidate carried before the hook existed.
+        assert_eq!(pwsh_shell_args(false), vec!["-NoLogo".to_string()]);
+
+        let backslash = char::from_u32(92).expect("backslash");
+        assert!(
+            !PWSH_PROMPT_HOOK.contains(backslash),
+            "the hook must stay backslash-free so no quoting layer can eat an escape"
+        );
+        assert!(
+            !PWSH_PROMPT_HOOK.contains('"'),
+            "a double quote would have to survive Windows command-line quoting intact"
+        );
+    }
+
+    /// The bytes a real `pwsh` emitted under this hook become a cwd sample.
+    ///
+    /// Recorded from a live PowerShell 7.6.5 run of [`PWSH_PROMPT_HOOK`]
+    /// followed by `Set-Location C:` + separator + `Windows`, so the parser is
+    /// tested against what the shell actually writes rather than against what
+    /// this file believes it writes. The trailing prompt text is included
+    /// because the report never arrives alone.
+    #[test]
+    fn a_real_pwsh_prompt_hook_report_becomes_a_cwd_sample() {
+        let emitted: Vec<u8> = vec![
+            27, 93, 57, 59, 57, 59, 67, 58, 92, 87, 105, 110, 100, 111, 119, 115, 27, 92, 80, 83,
+            32, 67, 58, 92, 87, 105, 110, 100, 111, 119, 115, 62, 32,
+        ];
+        let mut parser = ShellSequenceParser::default();
+        let events = parser.push_chunk(&emitted);
+        let separator = char::from_u32(92).expect("backslash");
+        let expected = PathBuf::from(format!("C:{separator}Windows"));
+        match events.as_slice() {
+            [ShellSequence::ReportedCwd(cwd)] => assert_eq!(*cwd, expected),
+            other => panic!("the hook's report must parse as exactly one cwd: {other:?}"),
+        }
+
+        // ConEmu's own documentation quotes the path. Both spellings are in
+        // the wild, so a reader that took only one would report nothing for
+        // the other and look like a shell with no integration.
+        let mut quoted = vec![27u8, 93];
+        quoted.extend_from_slice(b"9;9;");
+        quoted.push(b'"');
+        quoted.extend_from_slice(format!("C:{separator}Windows").as_bytes());
+        quoted.push(b'"');
+        quoted.extend_from_slice(&[27, 92]);
+        let mut parser = ShellSequenceParser::default();
+        match parser.push_chunk(&quoted).as_slice() {
+            [ShellSequence::ReportedCwd(cwd)] => assert_eq!(*cwd, expected),
+            other => panic!("the quoted spelling must parse too: {other:?}"),
+        }
+
+        // A path is not a URL: percent-decoding one would corrupt any
+        // directory with a literal `%` in its name.
+        let mut percent = vec![27u8, 93];
+        percent.extend_from_slice(b"9;9;");
+        percent.extend_from_slice(format!("C:{separator}a%20b").as_bytes());
+        percent.extend_from_slice(&[27, 92]);
+        let mut parser = ShellSequenceParser::default();
+        match parser.push_chunk(&percent).as_slice() {
+            [ShellSequence::ReportedCwd(cwd)] => {
+                assert_eq!(*cwd, PathBuf::from(format!("C:{separator}a%20b")));
+            }
+            other => panic!("a native path must not be percent-decoded: {other:?}"),
+        }
+    }
+
+    /// A real `pwsh` running the real hook produces a real cwd sample.
+    ///
+    /// This is the end-to-end proof for the PowerShell rung, and it is here
+    /// rather than in `tests/task_shell_terminals.rs` because the managed
+    /// launcher cannot start MSIX `pwsh` on every machine (measured
+    /// 2026-09-02: not on this one, by either spelling on PATH, hook or no
+    /// hook) while `pwsh` itself runs fine. Running it as a plain child
+    /// process takes the launcher out of the question and leaves exactly the
+    /// two things the hook is responsible for under test: the bytes PowerShell
+    /// emits, and what this file's parser makes of them.
+    ///
+    /// Both rungs of the ladder are asserted from the one run:
+    /// `[Environment]::CurrentDirectory` is what the PEB rung reads, and the
+    /// OSC report is what the parser rung reads. The unhooked control proves
+    /// the first is the hook's doing -- PowerShell leaves its Win32 directory
+    /// at the launch directory on `Set-Location`, which is the whole reason
+    /// the hook exists.
+    ///
+    /// Skipped with a printed reason only when `pwsh` is not resolvable.
+    #[cfg(windows)]
+    #[test]
+    fn a_live_pwsh_prompt_hook_reports_the_directory_it_moved_to() {
+        let Some(program) = crate::diagnostics::resolve::resolve_all("pwsh")
+            .into_iter()
+            .next()
+        else {
+            println!(
+                "SKIPPED a_live_pwsh_prompt_hook_reports_the_directory_it_moved_to: \
+                 pwsh is not resolvable on PATH"
+            );
+            return;
+        };
+        let separator = char::from_u32(92).expect("backslash");
+        let target = format!("C:{separator}Windows");
+
+        // The hook exactly as a plain shell receives it, then one move and one
+        // prompt render -- which is what an interactive session does after
+        // every command.
+        let run = |hook: &str| -> (String, String) {
+            let script = format!(
+                "{hook}; Set-Location '{target}'; \
+                 [Console]::Out.Write((prompt)); \
+                 [Console]::Error.Write([Environment]::CurrentDirectory)"
+            );
+            let output = std::process::Command::new(&program)
+                .args(["-NoLogo", "-NoProfile", "-Command", script.as_str()])
+                .output()
+                .expect("pwsh must run");
+            assert!(
+                output.status.success(),
+                "pwsh exited {:?}: {}",
+                output.status.code(),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            (
+                String::from_utf8_lossy(&output.stdout).into_owned(),
+                String::from_utf8_lossy(&output.stderr).into_owned(),
+            )
+        };
+
+        let (hooked_stdout, hooked_win32_cwd) = run(PWSH_PROMPT_HOOK);
+        assert_eq!(
+            PathBuf::from(hooked_win32_cwd.trim()),
+            PathBuf::from(&target),
+            "the hook must move the Win32 current directory, which is the PEB rung"
+        );
+
+        let mut parser = ShellSequenceParser::default();
+        let reported = parser
+            .push_chunk(hooked_stdout.as_bytes())
+            .into_iter()
+            .find_map(|sequence| match sequence {
+                ShellSequence::ReportedCwd(cwd) => Some(cwd),
+                _ => None,
+            })
+            .unwrap_or_else(|| {
+                panic!("the hook's prompt reported no cwd; pwsh wrote {hooked_stdout:?}")
+            });
+        assert_eq!(
+            reported,
+            PathBuf::from(&target),
+            "the parser rung must read the directory the shell moved to"
+        );
+
+        // Control: the same shell with no hook. `Set-Location` moves the
+        // PowerShell location and nothing else, so neither rung would ever
+        // move without the hook and neither assertion above can pass by
+        // accident.
+        let (plain_stdout, plain_win32_cwd) = run("$null = $null");
+        assert_ne!(
+            PathBuf::from(plain_win32_cwd.trim()),
+            PathBuf::from(&target),
+            "an unhooked pwsh must not update its Win32 directory, or the hook is unnecessary \
+             and this test proves nothing"
+        );
+        let mut parser = ShellSequenceParser::default();
+        assert!(
+            parser
+                .push_chunk(plain_stdout.as_bytes())
+                .into_iter()
+                .all(|sequence| !matches!(sequence, ShellSequence::ReportedCwd(_))),
+            "an unhooked pwsh must report no cwd at all; it wrote {plain_stdout:?}"
+        );
+    }
+
+    /// The hook is a plain-shell concern only.
+    ///
+    /// `shell_candidates` is shared with the provider terminal launch path,
+    /// which owns its own shell contract and does not report cwd through this
+    /// ladder, so the substitution happens in `plain_shell_candidates` and
+    /// must be observable as a difference between the two.
+    #[cfg(windows)]
+    #[test]
+    fn only_a_plain_shell_pwsh_carries_the_prompt_hook() {
+        let (plain, _excluded) = plain_shell_candidates(Some(&DefaultTerminal::Pwsh), None, true);
+        let plain_pwsh = plain
+            .iter()
+            .find(|candidate| candidate.program == "pwsh")
+            .expect("pwsh is a plain-shell candidate");
+        assert_eq!(plain_pwsh.args, pwsh_shell_args(true));
+
+        let provider = shell_candidates(Some(&DefaultTerminal::Pwsh), None, true);
+        let provider_pwsh = provider
+            .iter()
+            .find(|candidate| candidate.program == "pwsh")
+            .expect("pwsh is a provider candidate too");
+        assert_eq!(
+            provider_pwsh.args,
+            vec!["-NoLogo".to_string()],
+            "a provider terminal's pwsh must be launched exactly as before"
+        );
+
+        // cmd.exe reports through the PEB rung and takes no hook, so the
+        // substitution must not have leaked onto every candidate.
+        let cmd = plain
+            .iter()
+            .find(|candidate| candidate.program == "cmd.exe")
+            .expect("cmd.exe is the last-resort plain shell");
+        assert!(
+            cmd.args.is_empty(),
+            "cmd.exe takes no shell-integration arguments: {:?}",
+            cmd.args
+        );
     }
 
     /// The refusal a client reads must distinguish "not installed" from

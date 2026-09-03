@@ -286,3 +286,124 @@ fn closing_a_shell_retires_the_hosted_view_then_the_manager_session() {
     }
     drop(guard);
 }
+
+/// The PowerShell prompt hook moves `shell_session_cwd` for a real managed shell.
+///
+/// Everything the live-cwd ladder claims about the default Windows shell rests
+/// on this. Neither rung can be trusted from reading: PowerShell moves its own
+/// location on `Set-Location` and leaves its Win32 current directory at the
+/// launch directory (measured on PowerShell 7.6.5, 2026-09-02), so a shell with
+/// no hook reports the directory it started in forever.
+///
+/// The unhooked control is the point of the test. Without it a green here could
+/// be satisfied by the launch directory happening to equal the target, or by a
+/// future pwsh that updates its own PEB, and the hook could then be deleted
+/// without this file noticing.
+///
+/// The gate is whether an UNHOOKED `pwsh` starts under the managed launcher,
+/// not whether `pwsh` exists: on a machine where it cannot start at all there
+/// is nothing here to measure, but a machine where the plain one starts and the
+/// hooked one does not is the hook breaking the launch, which must be red.
+/// Measured 2026-09-02 on this developer machine: MSIX `pwsh` 7.6.5 cannot be
+/// started through the managed launcher by either spelling on PATH, so this
+/// test SKIPS here and the hook is proved instead by
+/// `terminal::session::tests::a_live_pwsh_prompt_hook_reports_the_directory_it_moved_to`,
+/// which runs the same hook in a real `pwsh` without the managed launcher.
+#[test]
+fn a_pwsh_task_shell_reports_its_cwd_only_with_the_prompt_hook() {
+    let Some(program) = devmanager::diagnostics::resolve::resolve_all("pwsh")
+        .into_iter()
+        .next()
+    else {
+        println!(
+            "SKIPPED a_pwsh_task_shell_reports_its_cwd_only_with_the_prompt_hook: \
+             pwsh is not resolvable on PATH"
+        );
+        return;
+    };
+    let _pid_guard = use_isolated_pid_file("pwsh-prompt-hook");
+    let manager = ProcessManager::new();
+    let workdir = tempfile::tempdir().expect("workdir");
+    let sub = workdir.path().join("sub");
+    std::fs::create_dir(&sub).expect("mkdir");
+
+    let spawn = |args: Vec<String>| {
+        let launch = TerminalLaunch {
+            cwd: workdir.path().to_path_buf(),
+            program: program.clone(),
+            args,
+        };
+        manager.spawn_task_shell_session(
+            TaskId::new(),
+            ResourceId::new(),
+            1,
+            1,
+            &launch,
+            dimensions(),
+        )
+    };
+
+    let plain = match spawn(devmanager::terminal::session::pwsh_shell_args(false)) {
+        Ok(session_id) => session_id,
+        Err(error) => {
+            println!(
+                "SKIPPED a_pwsh_task_shell_reports_its_cwd_only_with_the_prompt_hook: \
+                 an unhooked pwsh cannot start under the managed launcher on this machine \
+                 ({}): {error}",
+                program.display()
+            );
+            return;
+        }
+    };
+    let _plain_guard = ShellGuard {
+        manager: &manager,
+        session_id: plain,
+    };
+    // The plain one started, so a refusal here is the hook's argument, not the
+    // machine. That is a failure, never a skip.
+    let hooked = spawn(devmanager::terminal::session::pwsh_shell_args(true))
+        .expect("the prompt hook must not stop pwsh from starting");
+    let _hooked_guard = ShellGuard {
+        manager: &manager,
+        session_id: hooked,
+    };
+
+    for session_id in [hooked, plain] {
+        manager
+            .task_shell_runtime(session_id)
+            .expect("runtime")
+            .write_bytes(b"Set-Location sub\r\n")
+            .expect("Set-Location");
+    }
+
+    let deadline = Instant::now() + Duration::from_secs(60);
+    loop {
+        if manager
+            .shell_session_cwd(hooked)
+            .is_some_and(|observed| same_directory(&observed, &sub))
+        {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the hooked pwsh never reported {sub:?}; observed {:?}",
+            manager.shell_session_cwd(hooked)
+        );
+        std::thread::sleep(Duration::from_millis(200));
+    }
+
+    // The hooked shell has reported, so the unhooked one has had at least as
+    // long to do the same. It cannot, and that is why the hook exists.
+    let unhooked = manager
+        .shell_session_cwd(plain)
+        .expect("a live shell always answers with some directory");
+    assert!(
+        !same_directory(&unhooked, &sub),
+        "an unhooked pwsh reported {unhooked:?} after Set-Location, so this test \
+         would pass with the prompt hook removed"
+    );
+    assert!(
+        same_directory(&unhooked, workdir.path()),
+        "an unhooked pwsh must still report its launch directory, not nothing: {unhooked:?}"
+    );
+}
