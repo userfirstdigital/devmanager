@@ -98,6 +98,16 @@ impl ProviderKind {
             _ => None,
         }
     }
+
+    /// The product name to put in front of a person. `wire_name` is the
+    /// protocol token and must never be shown instead.
+    pub const fn display_name(self) -> &'static str {
+        match self {
+            Self::ClaudeCode => "Claude Code",
+            Self::Codex => "Codex",
+            Self::Cursor => "Cursor",
+        }
+    }
 }
 
 impl fmt::Display for ProviderKind {
@@ -750,9 +760,12 @@ pub enum ProviderExecutableError {
     BackgroundTask,
 }
 
-impl fmt::Debug for ProviderExecutableError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let code = match self {
+impl ProviderExecutableError {
+    /// One stable machine name per refusal. `Debug`, the persisted-state
+    /// refusal marker and every host-side classifier read this single
+    /// definition, so the wire code and the rendered code cannot drift.
+    pub fn code(&self) -> &'static str {
+        match self {
             Self::EmptyPath => "empty_path",
             Self::PathTooLong => "path_too_long",
             Self::Missing(_) => "missing",
@@ -768,10 +781,67 @@ impl fmt::Debug for ProviderExecutableError {
             Self::UnsupportedSchemaVersion(_) => "unsupported_schema_version",
             Self::Io { .. } => "io",
             Self::BackgroundTask => "background_task",
-        };
+        }
+    }
+
+    /// Whether this refusal can only change by user action: the file on disk
+    /// has to be replaced or the path repaired. Anything else (a racing
+    /// writer, a transient IO error, a background-task failure) stays
+    /// retryable, so callers must not treat it as terminal.
+    pub fn is_permanent(&self) -> bool {
+        provider_executable_refusal_is_permanent(self.code())
+    }
+}
+
+/// Marker embedded in the persisted-session decode error so a host that only
+/// ever sees the error text can name the exact refusal instead of re-parsing
+/// prose. Emitter and classifier live together on purpose.
+pub const PROVIDER_EXECUTABLE_REFUSAL_MARKER: &str = "provider-executable-refusal:";
+
+/// Render the marker for one refusal.
+pub fn provider_executable_refusal_marker(error: &ProviderExecutableError) -> String {
+    format!("{PROVIDER_EXECUTABLE_REFUSAL_MARKER}{}", error.code())
+}
+
+/// Read back the refusal code a [`provider_executable_refusal_marker`] put in
+/// a message. Returns `None` when the message carries no marker at all.
+pub fn provider_executable_refusal_code(message: &str) -> Option<&str> {
+    let rest = message.split(PROVIDER_EXECUTABLE_REFUSAL_MARKER).nth(1)?;
+    let end = rest
+        .find(|character: char| !character.is_ascii_lowercase() && character != '_')
+        .unwrap_or(rest.len());
+    let code = &rest[..end];
+    if code.is_empty() {
+        None
+    } else {
+        Some(code)
+    }
+}
+
+/// Whether a code read back by [`provider_executable_refusal_code`] names a
+/// refusal that cannot clear without user action. An unknown code is treated
+/// as retryable: never strand a session on a name this build does not know.
+pub fn provider_executable_refusal_is_permanent(code: &str) -> bool {
+    matches!(
+        code,
+        "empty_path"
+            | "path_too_long"
+            | "missing"
+            | "not_a_file"
+            | "not_native_executable"
+            | "symlink_or_reparse"
+            | "hardlink_ambiguous"
+            | "unsupported_platform"
+            | "not_canonical"
+            | "unsupported_schema_version"
+    )
+}
+
+impl fmt::Debug for ProviderExecutableError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("ProviderExecutableError")
-            .field("code", &code)
+            .field("code", &self.code())
             .finish()
     }
 }
@@ -2257,11 +2327,83 @@ impl Hash for ProviderExecutableHandle {
     }
 }
 
+/// Outcome of re-checking a persisted pin against the file that is on disk
+/// now. `Changed` is not a refusal: the current file already passed every
+/// check a fresh launch applies, and only its content differs from the pin.
+#[derive(Debug)]
+pub enum ProviderExecutableRevalidation {
+    Unchanged(ProviderExecutable),
+    Changed {
+        previous_sha256: [u8; 32],
+        current: ProviderExecutable,
+    },
+}
+
+impl ProviderExecutableRevalidation {
+    pub fn current(&self) -> &ProviderExecutable {
+        match self {
+            Self::Unchanged(current) | Self::Changed { current, .. } => current,
+        }
+    }
+
+    pub fn into_current(self) -> ProviderExecutable {
+        match self {
+            Self::Unchanged(current) | Self::Changed { current, .. } => current,
+        }
+    }
+
+    /// The pin that no longer matches, or `None` when nothing changed.
+    pub fn previous_sha256(&self) -> Option<[u8; 32]> {
+        match self {
+            Self::Unchanged(_) => None,
+            Self::Changed {
+                previous_sha256, ..
+            } => Some(*previous_sha256),
+        }
+    }
+}
+
 impl ProviderExecutable {
     pub fn new(
         canonical_path: impl Into<PathBuf>,
         sha256: [u8; 32],
     ) -> Result<Self, ProviderExecutableError> {
+        match Self::revalidate_pinned(canonical_path, sha256, true)? {
+            ProviderExecutableRevalidation::Unchanged(current) => Ok(current),
+            ProviderExecutableRevalidation::Changed { current, .. } => Err(
+                ProviderExecutableError::HashMismatch(current.canonical_path),
+            ),
+        }
+    }
+
+    /// Re-check a persisted native pin without treating a content change as a
+    /// refusal. Every check a fresh launch applies still runs against the file
+    /// that is on disk now — empty/oversized path, no-follow open, canonical
+    /// path equality, native PE format, stable identity across the read — and
+    /// any of them failing is still an error. Only the pinned digest is
+    /// allowed to differ, and the caller decides what to do about it.
+    pub fn revalidate_persisted(
+        canonical_path: impl Into<PathBuf>,
+        sha256: [u8; 32],
+    ) -> Result<ProviderExecutableRevalidation, ProviderExecutableError> {
+        Self::revalidate_pinned(canonical_path, sha256, true)
+    }
+
+    /// The non-native twin of [`Self::revalidate_persisted`], for a persisted
+    /// runtime dependency (a Node or PowerShell script). Never opens a launch
+    /// handle and never treats the file as a CreateProcess image.
+    pub(crate) fn revalidate_persisted_non_native(
+        canonical_path: impl Into<PathBuf>,
+        sha256: [u8; 32],
+    ) -> Result<ProviderExecutableRevalidation, ProviderExecutableError> {
+        Self::revalidate_pinned(canonical_path, sha256, false)
+    }
+
+    fn revalidate_pinned(
+        canonical_path: impl Into<PathBuf>,
+        sha256: [u8; 32],
+        is_native: bool,
+    ) -> Result<ProviderExecutableRevalidation, ProviderExecutableError> {
         let canonical_path = canonical_path.into();
         if canonical_path.as_os_str().is_empty() {
             return Err(ProviderExecutableError::EmptyPath);
@@ -2269,19 +2411,20 @@ impl ProviderExecutable {
         if path_bytes(&canonical_path) > MAX_PROVIDER_PATH_BYTES {
             return Err(ProviderExecutableError::PathTooLong);
         }
-        let inspected = Self::inspect_blocking(&canonical_path)?;
+        let inspected = Self::inspect_blocking_with_mode(&canonical_path, is_native)?;
         if inspected.canonical_path != canonical_path {
             return Err(ProviderExecutableError::NotCanonical {
                 requested: canonical_path,
                 canonical: inspected.canonical_path,
             });
         }
-        if inspected.sha256 != sha256 {
-            return Err(ProviderExecutableError::HashMismatch(
-                inspected.canonical_path,
-            ));
+        if inspected.sha256 == sha256 {
+            return Ok(ProviderExecutableRevalidation::Unchanged(inspected));
         }
-        Ok(inspected)
+        Ok(ProviderExecutableRevalidation::Changed {
+            previous_sha256: sha256,
+            current: inspected,
+        })
     }
 
     /// Resolve and inspect a native candidate path without trusting its
@@ -2307,35 +2450,6 @@ impl ProviderExecutable {
             executable: self.clone(),
             launch_plan: ProviderLaunchPlan::Direct,
         })
-    }
-
-    /// Re-open a persisted non-native runtime dependency (Node/PowerShell
-    /// script) by path and content hash. Never opens a launch handle and never
-    /// treats the file as a CreateProcess image.
-    pub(crate) fn reopen_non_native(
-        canonical_path: impl Into<PathBuf>,
-        sha256: [u8; 32],
-    ) -> Result<Self, ProviderExecutableError> {
-        let canonical_path = canonical_path.into();
-        if canonical_path.as_os_str().is_empty() {
-            return Err(ProviderExecutableError::EmptyPath);
-        }
-        if path_bytes(&canonical_path) > MAX_PROVIDER_PATH_BYTES {
-            return Err(ProviderExecutableError::PathTooLong);
-        }
-        let inspected = Self::inspect_non_native_blocking(&canonical_path)?;
-        if inspected.canonical_path != canonical_path {
-            return Err(ProviderExecutableError::NotCanonical {
-                requested: canonical_path,
-                canonical: inspected.canonical_path,
-            });
-        }
-        if inspected.sha256 != sha256 {
-            return Err(ProviderExecutableError::HashMismatch(
-                inspected.canonical_path,
-            ));
-        }
-        Ok(inspected)
     }
 
     /// DOS-shaped argv form for a script dependency. Identity attestation still
@@ -5865,6 +5979,172 @@ impl ProviderCapabilities {
             ProviderCapability::CooperativeStop => self.cooperative_stop,
             ProviderCapability::ObserveQuota => self.observe_quota,
         }
+    }
+}
+
+#[cfg(test)]
+mod executable_repin_tests {
+    use super::*;
+
+    /// A real native image, copied so the test can rewrite it in place the way
+    /// an in-place provider update does.
+    fn copy_native_executable(destination: &Path) {
+        let source = std::env::current_exe().expect("test binary path");
+        fs::copy(source, destination).expect("copy the test binary");
+    }
+
+    #[test]
+    fn revalidate_reports_unchanged_for_the_same_file() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("provider-unchanged.exe");
+        copy_native_executable(&path);
+        let pinned = ProviderExecutable::from_path(&path).expect("inspect the copied binary");
+        let canonical = pinned.canonical_path().to_path_buf();
+        let sha256 = *pinned.sha256();
+        drop(pinned);
+        let revalidated = ProviderExecutable::revalidate_persisted(canonical, sha256)
+            .expect("an unchanged file must revalidate");
+        assert!(matches!(
+            revalidated,
+            ProviderExecutableRevalidation::Unchanged(_)
+        ));
+        assert_eq!(revalidated.previous_sha256(), None);
+    }
+
+    #[test]
+    fn revalidate_reports_changed_for_a_rewritten_file_at_the_same_path() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("provider-updated.exe");
+        copy_native_executable(&path);
+        let pinned = ProviderExecutable::from_path(&path).expect("inspect the copied binary");
+        let canonical = pinned.canonical_path().to_path_buf();
+        let previous = *pinned.sha256();
+        drop(pinned);
+        // The shape of an in-place self-update: same path, new bytes.
+        let mut bytes = fs::read(&canonical).expect("read the pinned image");
+        bytes.extend_from_slice(&[0_u8; 4096]);
+        fs::write(&canonical, &bytes).expect("rewrite the pinned image");
+        let revalidated = ProviderExecutable::revalidate_persisted(canonical.clone(), previous)
+            .expect("a replaced native binary must not be a load failure");
+        let ProviderExecutableRevalidation::Changed {
+            previous_sha256,
+            current,
+        } = revalidated
+        else {
+            panic!("a rewritten file must report Changed");
+        };
+        assert_eq!(previous_sha256, previous);
+        assert_ne!(*current.sha256(), previous);
+        assert_eq!(current.canonical_path(), canonical.as_path());
+        assert!(current.is_native());
+    }
+
+    #[test]
+    fn revalidate_refuses_a_non_native_replacement() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("provider-replaced.exe");
+        copy_native_executable(&path);
+        let pinned = ProviderExecutable::from_path(&path).expect("inspect the copied binary");
+        let canonical = pinned.canonical_path().to_path_buf();
+        let previous = *pinned.sha256();
+        drop(pinned);
+        fs::write(
+            &canonical,
+            b"#!/bin/sh
+echo not a portable executable
+",
+        )
+        .expect("replace with a non-image");
+        let error = ProviderExecutable::revalidate_persisted(canonical, previous)
+            .expect_err("a non-native replacement must still be refused");
+        assert_eq!(error.code(), "not_native_executable");
+        assert!(error.is_permanent());
+    }
+
+    #[test]
+    fn revalidate_refuses_a_missing_file() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("provider-gone.exe");
+        copy_native_executable(&path);
+        let pinned = ProviderExecutable::from_path(&path).expect("inspect the copied binary");
+        let canonical = pinned.canonical_path().to_path_buf();
+        let previous = *pinned.sha256();
+        drop(pinned);
+        fs::remove_file(&canonical).expect("remove the pinned image");
+        let error = ProviderExecutable::revalidate_persisted(canonical, previous)
+            .expect_err("a missing pinned file must still be refused");
+        assert!(error.is_permanent(), "{error:?}");
+    }
+
+    #[test]
+    fn new_still_refuses_a_changed_file_with_hash_mismatch() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("provider-strict.exe");
+        copy_native_executable(&path);
+        let pinned = ProviderExecutable::from_path(&path).expect("inspect the copied binary");
+        let canonical = pinned.canonical_path().to_path_buf();
+        let previous = *pinned.sha256();
+        drop(pinned);
+        let mut bytes = fs::read(&canonical).expect("read the pinned image");
+        bytes.extend_from_slice(&[0_u8; 2048]);
+        fs::write(&canonical, &bytes).expect("rewrite the pinned image");
+        let error = ProviderExecutable::new(canonical, previous)
+            .expect_err("the strict constructor keeps its fence");
+        assert_eq!(error.code(), "hash_mismatch");
+        assert!(!error.is_permanent());
+    }
+
+    #[test]
+    fn every_refusal_code_round_trips_through_its_marker() {
+        // Probe the must-match direction against subjects known to match, and
+        // the must-not-match direction against text carrying no marker.
+        let errors = [
+            ProviderExecutableError::EmptyPath,
+            ProviderExecutableError::PathTooLong,
+            ProviderExecutableError::Missing(PathBuf::from("a")),
+            ProviderExecutableError::NotAFile(PathBuf::from("a")),
+            ProviderExecutableError::NotNativeExecutable(PathBuf::from("a")),
+            ProviderExecutableError::SymlinkOrReparse(PathBuf::from("a")),
+            ProviderExecutableError::HardlinkAmbiguous(PathBuf::from("a")),
+            ProviderExecutableError::ChangedDuringValidation(PathBuf::from("a")),
+            ProviderExecutableError::InvalidFileIdentity(PathBuf::from("a")),
+            ProviderExecutableError::UnsupportedPlatform(PathBuf::from("a")),
+            ProviderExecutableError::NotCanonical {
+                requested: PathBuf::from("a"),
+                canonical: PathBuf::from("b"),
+            },
+            ProviderExecutableError::HashMismatch(PathBuf::from("a")),
+            ProviderExecutableError::UnsupportedSchemaVersion(9),
+            ProviderExecutableError::Io {
+                path: PathBuf::from("a"),
+                kind: io::ErrorKind::NotFound,
+            },
+            ProviderExecutableError::BackgroundTask,
+        ];
+        for error in errors {
+            let message = format!(
+                "persisted executable identity invalid: {error:?} ({})",
+                provider_executable_refusal_marker(&error)
+            );
+            assert_eq!(
+                provider_executable_refusal_code(&message),
+                Some(error.code()),
+                "marker must classify back to its own code"
+            );
+            assert_eq!(
+                provider_executable_refusal_is_permanent(error.code()),
+                error.is_permanent()
+            );
+        }
+        assert_eq!(
+            provider_executable_refusal_code("provider runtime book has no task/agent entry"),
+            None,
+            "a message with no marker must not be classified"
+        );
+        assert!(
+            !provider_executable_refusal_is_permanent("a_code_this_build_does_not_know"),
+            "an unknown code must stay retryable"
+        );
     }
 }
 

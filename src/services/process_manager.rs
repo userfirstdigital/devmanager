@@ -2148,6 +2148,21 @@ impl ProcessManager {
         book.failures.drain(..).collect()
     }
 
+    /// Take every automatic provider-executable re-pin the session manager has
+    /// observed. A provider that updated itself in place is re-pinned during
+    /// state load; the host reports the cause to the client from these.
+    pub(crate) fn drain_provider_executable_repins(
+        &self,
+    ) -> Vec<crate::providers::session::ProviderExecutableRepinNotice> {
+        let Ok(mut slot) = self.inner.provider_sessions.lock() else {
+            return Vec::new();
+        };
+        let Some(manager) = slot.as_mut() else {
+            return Vec::new();
+        };
+        manager.drain_executable_repins()
+    }
+
     /// Reconcile provider roots on the host maintenance/query lane as well as
     /// the background sampler. A dead sampler or a just-exited onboarding PTY
     /// must not leave TerminalReadiness reporting StartPending indefinitely.

@@ -78,6 +78,11 @@ pub(crate) struct TaskCockpitDispatch<'a> {
     /// Exact restore queue / in-flight hint for TerminalReadiness. Defaults to
     /// Unknown so compatibility callers never invent absence.
     pub provider_launch_hint: ProviderLaunchReadinessHint,
+    /// The most recent provider restore/re-pin cause the host holds for this
+    /// task, in the words the client should show. A provider terminal that is
+    /// unavailable while a cause is known must never reply with the bare
+    /// reason alone.
+    pub provider_restore_detail: Option<&'a str>,
 }
 
 /// Host-owned launch/restore hint passed into TaskCockpitDispatch. Never
@@ -636,8 +641,8 @@ fn serve_task_terminal(
     max_response_bytes: u32,
 ) -> QueryOutcome {
     let Some(service) = dispatch.terminal_service else {
-        return unavailable(
-            TaskCockpitSurface::Terminal,
+        return provider_terminal_unavailable(
+            dispatch,
             TaskCockpitUnavailableReason::TerminalUnavailable,
         );
     };
@@ -724,8 +729,8 @@ fn serve_task_terminal(
                     provider_identityless_setup_required, CodexIdentitylessStartupReadiness,
                 };
                 if provider_identityless_setup_required(agent.provider_kind, &text_lines) {
-                    return unavailable(
-                        TaskCockpitSurface::Terminal,
+                    return provider_terminal_unavailable(
+                        dispatch,
                         TaskCockpitUnavailableReason::TerminalProviderSetupRequired,
                     );
                 }
@@ -735,8 +740,8 @@ fn serve_task_terminal(
                         CodexIdentitylessStartupReadiness::StartupPending
                     )
                 {
-                    return unavailable(
-                        TaskCockpitSurface::Terminal,
+                    return provider_terminal_unavailable(
+                        dispatch,
                         TaskCockpitUnavailableReason::TerminalStartPending,
                     );
                 }
@@ -775,8 +780,8 @@ fn serve_task_terminal(
                 dispatch.request_id,
                 max_response_bytes,
             ) else {
-                return unavailable(
-                    TaskCockpitSurface::Terminal,
+                return provider_terminal_unavailable(
+                    dispatch,
                     TaskCockpitUnavailableReason::TerminalUnavailable,
                 );
             };
@@ -790,8 +795,8 @@ fn serve_task_terminal(
             // never "the provider has not started".
             if !readiness_query || resource_id.is_some() {
                 // Legacy Terminal callers keep the closed Unavailable reason.
-                return unavailable(
-                    TaskCockpitSurface::Terminal,
+                return provider_terminal_unavailable(
+                    dispatch,
                     TaskCockpitUnavailableReason::TerminalUnavailable,
                 );
             }
@@ -1248,20 +1253,20 @@ fn classify_terminal_readiness_absence(
         dispatch.provider_launch_hint,
         ProviderLaunchReadinessHint::StartPending
     ) {
-        return unavailable(
-            TaskCockpitSurface::Terminal,
+        return provider_terminal_unavailable(
+            dispatch,
             TaskCockpitUnavailableReason::TerminalStartPending,
         );
     }
     let Some(primary_agent_id) = snapshot.primary_agent_id else {
-        return unavailable(
-            TaskCockpitSurface::Terminal,
+        return provider_terminal_unavailable(
+            dispatch,
             TaskCockpitUnavailableReason::TerminalUnavailable,
         );
     };
     let Some(agent) = snapshot.agents.get(&primary_agent_id) else {
-        return unavailable(
-            TaskCockpitSurface::Terminal,
+        return provider_terminal_unavailable(
+            dispatch,
             TaskCockpitUnavailableReason::TerminalUnavailable,
         );
     };
@@ -1271,14 +1276,14 @@ fn classify_terminal_readiness_absence(
     // task with any open shell classified as TerminalUnavailable instead of
     // reaching this classifier at all.
     let Ok(Some(resource)) = provider_terminal_resource(snapshot, agent) else {
-        return unavailable(
-            TaskCockpitSurface::Terminal,
+        return provider_terminal_unavailable(
+            dispatch,
             TaskCockpitUnavailableReason::TerminalUnavailable,
         );
     };
     let Some(manager) = dispatch.service_runtime else {
-        return unavailable(
-            TaskCockpitSurface::Terminal,
+        return provider_terminal_unavailable(
+            dispatch,
             TaskCockpitUnavailableReason::TerminalUnavailable,
         );
     };
@@ -1291,22 +1296,22 @@ fn classify_terminal_readiness_absence(
         agent.runtime_generation,
     ) {
         Some(true) => {
-            return unavailable(
-                TaskCockpitSurface::Terminal,
+            return provider_terminal_unavailable(
+                dispatch,
                 TaskCockpitUnavailableReason::TerminalStartPending,
             );
         }
         None => {
-            return unavailable(
-                TaskCockpitSurface::Terminal,
+            return provider_terminal_unavailable(
+                dispatch,
                 TaskCockpitUnavailableReason::TerminalUnavailable,
             );
         }
         Some(false) => {}
     }
     match manager.try_classify_persisted_provider_launch(primary_agent_id) {
-        Ok(Some(true)) => unavailable(
-            TaskCockpitSurface::Terminal,
+        Ok(Some(true)) => provider_terminal_unavailable(
+            dispatch,
             TaskCockpitUnavailableReason::TerminalStartPending,
         ),
         Ok(Some(false)) => {
@@ -1315,18 +1320,18 @@ fn classify_terminal_readiness_absence(
                 ProviderLaunchReadinessHint::NotPending
             ) || !snapshot.is_unstarted_draft()
             {
-                return unavailable(
-                    TaskCockpitSurface::Terminal,
+                return provider_terminal_unavailable(
+                    dispatch,
                     TaskCockpitUnavailableReason::TerminalUnavailable,
                 );
             }
-            unavailable(
-                TaskCockpitSurface::Terminal,
+            provider_terminal_unavailable(
+                dispatch,
                 TaskCockpitUnavailableReason::TerminalNotStarted,
             )
         }
-        Ok(None) | Err(_) => unavailable(
-            TaskCockpitSurface::Terminal,
+        Ok(None) | Err(_) => provider_terminal_unavailable(
+            dispatch,
             TaskCockpitUnavailableReason::TerminalUnavailable,
         ),
     }
@@ -3183,6 +3188,20 @@ fn denied(surface: TaskCockpitSurface, reason: TaskCockpitDeniedReason) -> Query
     }))
 }
 
+/// A provider-terminal refusal that carries the host's known cause. The bare
+/// reason alone reads as "Terminal unavailable" with nothing to act on, which
+/// is exactly what a stale executable pin used to produce forever.
+fn provider_terminal_unavailable(
+    dispatch: &TaskCockpitDispatch<'_>,
+    reason: TaskCockpitUnavailableReason,
+) -> QueryOutcome {
+    QueryOutcome::Ok(QueryResult::TaskCockpit(TaskCockpitResult::Unavailable {
+        surface: TaskCockpitSurface::Terminal,
+        reason,
+        detail: dispatch.provider_restore_detail.map(str::to_string),
+    }))
+}
+
 fn unavailable(surface: TaskCockpitSurface, reason: TaskCockpitUnavailableReason) -> QueryOutcome {
     QueryOutcome::Ok(QueryResult::TaskCockpit(TaskCockpitResult::Unavailable {
         surface,
@@ -3502,6 +3521,7 @@ mod tests {
             runtime_generation: None,
             config: None,
             provider_launch_hint: ProviderLaunchReadinessHint::Unknown,
+            provider_restore_detail: None,
         });
         let QueryOutcome::Ok(QueryResult::TaskCockpit(TaskCockpitResult::Conversation(page))) =
             outcome
@@ -3618,6 +3638,7 @@ mod tests {
             runtime_generation: None,
             config: None,
             provider_launch_hint: ProviderLaunchReadinessHint::Unknown,
+            provider_restore_detail: None,
         });
         assert!(matches!(
             accepted,
@@ -3649,6 +3670,7 @@ mod tests {
             runtime_generation: Some(1),
             config: None,
             provider_launch_hint: ProviderLaunchReadinessHint::Unknown,
+            provider_restore_detail: None,
         });
         assert!(matches!(
             named,
@@ -3679,6 +3701,7 @@ mod tests {
             runtime_generation: None,
             config: None,
             provider_launch_hint: ProviderLaunchReadinessHint::Unknown,
+            provider_restore_detail: None,
         });
         assert!(matches!(
             foreign,
@@ -3717,6 +3740,7 @@ mod tests {
             runtime_generation: Some(1),
             config: None,
             provider_launch_hint: ProviderLaunchReadinessHint::Unknown,
+            provider_restore_detail: None,
         });
         let QueryOutcome::Ok(QueryResult::TaskCockpit(TaskCockpitResult::FilesRead(text))) = text
         else {
@@ -3746,6 +3770,7 @@ mod tests {
             runtime_generation: Some(1),
             config: None,
             provider_launch_hint: ProviderLaunchReadinessHint::Unknown,
+            provider_restore_detail: None,
         });
         let QueryOutcome::Ok(QueryResult::TaskCockpit(TaskCockpitResult::FilesRead(binary))) =
             binary
@@ -3776,6 +3801,7 @@ mod tests {
             runtime_generation: Some(1),
             config: None,
             provider_launch_hint: ProviderLaunchReadinessHint::Unknown,
+            provider_restore_detail: None,
         });
         assert!(matches!(
             secret,
@@ -3821,6 +3847,7 @@ mod tests {
             runtime_generation: Some(1),
             config: None,
             provider_launch_hint: ProviderLaunchReadinessHint::Unknown,
+            provider_restore_detail: None,
         });
         let QueryOutcome::Ok(QueryResult::TaskCockpit(TaskCockpitResult::FilesList(listed))) =
             listed
@@ -3878,6 +3905,7 @@ mod tests {
             runtime_generation: None,
             config: None,
             provider_launch_hint: ProviderLaunchReadinessHint::Unknown,
+            provider_restore_detail: None,
         });
         let QueryOutcome::Ok(QueryResult::TaskCockpit(TaskCockpitResult::Conversation(page))) =
             outcome
@@ -3941,6 +3969,7 @@ mod tests {
                 runtime_generation: None,
                 config: None,
                 provider_launch_hint: ProviderLaunchReadinessHint::Unknown,
+                provider_restore_detail: None,
             });
             let QueryOutcome::Ok(QueryResult::TaskCockpit(TaskCockpitResult::Conversation(page))) =
                 outcome
@@ -4029,6 +4058,7 @@ mod tests {
             runtime_generation: None,
             config: None,
             provider_launch_hint: ProviderLaunchReadinessHint::Unknown,
+            provider_restore_detail: None,
         });
         let QueryOutcome::Ok(QueryResult::TaskCockpit(TaskCockpitResult::Conversation(page))) =
             outcome
@@ -4076,6 +4106,7 @@ mod tests {
                 runtime_generation: None,
                 config: None,
                 provider_launch_hint: ProviderLaunchReadinessHint::Unknown,
+                provider_restore_detail: None,
             });
             let QueryOutcome::Ok(QueryResult::TaskCockpit(TaskCockpitResult::Conversation(page))) =
                 outcome
@@ -4186,6 +4217,7 @@ mod tests {
                 runtime_generation: None,
                 config: None,
                 provider_launch_hint: ProviderLaunchReadinessHint::Unknown,
+                provider_restore_detail: None,
             });
             if allowed {
                 assert!(matches!(
@@ -4263,6 +4295,7 @@ mod tests {
             runtime_generation: None,
             config: None,
             provider_launch_hint: ProviderLaunchReadinessHint::Unknown,
+            provider_restore_detail: None,
         });
         let QueryOutcome::Ok(QueryResult::TaskCockpit(TaskCockpitResult::Conversation(page))) =
             outcome
@@ -4310,6 +4343,7 @@ mod tests {
             runtime_generation,
             config: None,
             provider_launch_hint: ProviderLaunchReadinessHint::Unknown,
+            provider_restore_detail: None,
         }
     }
 
@@ -5353,6 +5387,7 @@ mod tests {
             runtime_generation: None,
             config: None,
             provider_launch_hint: ProviderLaunchReadinessHint::Unknown,
+            provider_restore_detail: None,
         });
         let QueryOutcome::Ok(QueryResult::TaskCockpit(TaskCockpitResult::TaskTerminals(
             projection,
@@ -5448,6 +5483,7 @@ mod tests {
             runtime_generation: None,
             config: None,
             provider_launch_hint: ProviderLaunchReadinessHint::Unknown,
+            provider_restore_detail: None,
         });
         let QueryOutcome::Ok(QueryResult::TaskCockpit(TaskCockpitResult::TaskTerminals(
             projection,
@@ -5520,6 +5556,7 @@ mod tests {
             runtime_generation: None,
             config: None,
             provider_launch_hint: ProviderLaunchReadinessHint::Unknown,
+            provider_restore_detail: None,
         });
         let QueryOutcome::Ok(QueryResult::TaskCockpit(TaskCockpitResult::TaskTerminals(
             projection,
@@ -5604,6 +5641,7 @@ mod tests {
             runtime_generation: None,
             config: None,
             provider_launch_hint: ProviderLaunchReadinessHint::Unknown,
+            provider_restore_detail: None,
         });
         let QueryOutcome::Ok(QueryResult::TaskCockpit(TaskCockpitResult::TaskTerminals(
             projection,
@@ -5668,6 +5706,7 @@ mod tests {
                 runtime_generation: None,
                 config: None,
                 provider_launch_hint: ProviderLaunchReadinessHint::Unknown,
+                provider_restore_detail: None,
             })
         };
 
@@ -5772,6 +5811,7 @@ mod tests {
                 runtime_generation: None,
                 config: None,
                 provider_launch_hint: ProviderLaunchReadinessHint::Unknown,
+                provider_restore_detail: None,
             })
         };
         let provider_cols = || {
@@ -5998,6 +6038,7 @@ mod tests {
             runtime_generation: None,
             config: None,
             provider_launch_hint: ProviderLaunchReadinessHint::Unknown,
+            provider_restore_detail: None,
         });
         assert!(
             matches!(
@@ -6050,6 +6091,7 @@ mod tests {
             runtime_generation: None,
             config: None,
             provider_launch_hint: ProviderLaunchReadinessHint::Unknown,
+            provider_restore_detail: None,
         });
         let QueryOutcome::Ok(QueryResult::TaskCockpit(TaskCockpitResult::Terminal(projection))) =
             outcome
@@ -6141,6 +6183,7 @@ mod tests {
             runtime_generation: None,
             config: None,
             provider_launch_hint: ProviderLaunchReadinessHint::NotPending,
+            provider_restore_detail: None,
         });
         assert!(
             matches!(
@@ -6153,6 +6196,89 @@ mod tests {
             ),
             "an open shell must not collapse readiness to TerminalUnavailable, got {outcome:?}"
         );
+    }
+
+    #[test]
+    fn a_provider_terminal_refusal_carries_the_host_known_cause() {
+        use crate::services::ProcessManager;
+        use crate::terminal::service::TerminalService;
+
+        let (_repository, bus, client_id, task_id, roots, _agent_id, _resource) =
+            create_unstarted_draft_with_terminal_claim();
+        let granted = CapabilitySet::from_capabilities([Capability::TaskCockpit]);
+        let terminals = TerminalService::new();
+        let store_dir = tempfile::tempdir().expect("provider store");
+        let manager = ProcessManager::new_with_provider_session_store_path(
+            store_dir.path().join("provider-sessions.sqlite"),
+        );
+        let cause = "Claude Code was updated since this session started;                      resuming with the new build...";
+
+        let with_cause = serve_task_cockpit(TaskCockpitDispatch {
+            capabilities: granted,
+            envelope_task_id: Some(task_id),
+            client_id,
+            connection_id: Uuid::now_v7(),
+            request_id: RequestId::new(),
+            query: &TaskCockpitQuery::Terminal,
+            bus: &bus,
+            service_runtime: Some(&manager),
+            semantic_journal: None,
+            terminal_service: Some(&terminals),
+            ssh_endpoints: None,
+            ssh_runtime: None,
+            workspace_projects: Some(&roots),
+            coordinator: None,
+            action_epoch: None,
+            runtime_generation: None,
+            config: None,
+            provider_launch_hint: ProviderLaunchReadinessHint::NotPending,
+            provider_restore_detail: Some(cause),
+        });
+        let QueryOutcome::Ok(QueryResult::TaskCockpit(TaskCockpitResult::Unavailable {
+            surface,
+            reason,
+            detail,
+        })) = with_cause
+        else {
+            panic!("the provider terminal is unavailable here");
+        };
+        assert_eq!(surface, TaskCockpitSurface::Terminal);
+        assert_eq!(reason, TaskCockpitUnavailableReason::TerminalUnavailable);
+        assert_eq!(
+            detail.as_deref(),
+            Some(cause),
+            "a known cause must never be dropped in favour of the bare reason"
+        );
+
+        let without_cause = serve_task_cockpit(TaskCockpitDispatch {
+            capabilities: granted,
+            envelope_task_id: Some(task_id),
+            client_id,
+            connection_id: Uuid::now_v7(),
+            request_id: RequestId::new(),
+            query: &TaskCockpitQuery::Terminal,
+            bus: &bus,
+            service_runtime: Some(&manager),
+            semantic_journal: None,
+            terminal_service: Some(&terminals),
+            ssh_endpoints: None,
+            ssh_runtime: None,
+            workspace_projects: Some(&roots),
+            coordinator: None,
+            action_epoch: None,
+            runtime_generation: None,
+            config: None,
+            provider_launch_hint: ProviderLaunchReadinessHint::NotPending,
+            provider_restore_detail: None,
+        });
+        let QueryOutcome::Ok(QueryResult::TaskCockpit(TaskCockpitResult::Unavailable {
+            detail,
+            ..
+        })) = without_cause
+        else {
+            panic!("the provider terminal is unavailable here");
+        };
+        assert_eq!(detail, None, "no cause known, nothing invented");
     }
 
     #[test]
@@ -6197,6 +6323,7 @@ mod tests {
             runtime_generation: None,
             config: None,
             provider_launch_hint: ProviderLaunchReadinessHint::NotPending,
+            provider_restore_detail: None,
         });
         assert!(matches!(
             no_service,
@@ -6226,6 +6353,7 @@ mod tests {
             runtime_generation: None,
             config: None,
             provider_launch_hint: ProviderLaunchReadinessHint::StartPending,
+            provider_restore_detail: None,
         });
         assert!(matches!(
             pending,
@@ -6255,6 +6383,7 @@ mod tests {
             runtime_generation: None,
             config: None,
             provider_launch_hint: ProviderLaunchReadinessHint::Unknown,
+            provider_restore_detail: None,
         });
         assert!(matches!(
             unknown,
@@ -6284,6 +6413,7 @@ mod tests {
             runtime_generation: None,
             config: None,
             provider_launch_hint: ProviderLaunchReadinessHint::StartPending,
+            provider_restore_detail: None,
         });
         assert!(
             matches!(
@@ -6316,6 +6446,7 @@ mod tests {
             runtime_generation: None,
             config: None,
             provider_launch_hint: ProviderLaunchReadinessHint::NotPending,
+            provider_restore_detail: None,
         });
         assert!(matches!(
             not_started,
@@ -6369,6 +6500,7 @@ mod tests {
             runtime_generation: None,
             config: None,
             provider_launch_hint: ProviderLaunchReadinessHint::NotPending,
+            provider_restore_detail: None,
         });
         assert!(matches!(
             outcome,

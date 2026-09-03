@@ -18,7 +18,7 @@ use crate::process::registry::ProviderPermitOwnership;
 pub use crate::process::registry::{JoinedActiveProcessZeroProof, ProviderManagedProcessPermit};
 use crate::providers::capabilities::{
     CapabilitySupport, ProviderCapabilities, ProviderExecutable, ProviderExecutableHandle,
-    ProviderKind,
+    ProviderExecutableRevalidation, ProviderFileIdentity, ProviderKind,
 };
 use rusqlite::types::ValueRef;
 use rusqlite::{
@@ -1930,7 +1930,26 @@ fn launch_spec_mismatch_fields(
 const RECOVERY_CLAIM_LEASE_MS: u64 = 30_000;
 const RECOVERY_OWNERSHIP_SETTLED: &str = "settled";
 
-#[derive(Clone, PartialEq, Eq)]
+/// The durable record of one automatic re-pin: the session's launch spec was
+/// carrying a digest for a provider executable that has since been replaced in
+/// place, and the file now at the same canonical path passed every check a
+/// fresh launch applies.
+///
+/// The persisted launch spec never stored the OS file identity — only the
+/// canonical path and the digest — so there is no previous file identity to
+/// record here. For a native executable that is not a loss: its `sha256` is a
+/// digest over the file identity and size (see `native_identity_digest`), so
+/// `previous_sha256` *is* the previous identity commitment.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProviderExecutableRepin {
+    pub previous_sha256: [u8; 32],
+    pub current_sha256: [u8; 32],
+    pub current_file_identity: ProviderFileIdentity,
+    pub repinned_at_ms: u64,
+}
+
+#[derive(Clone, Eq)]
 pub struct ProviderSessionState {
     agent_session_id: AgentSessionId,
     task_id: TaskId,
@@ -1942,6 +1961,32 @@ pub struct ProviderSessionState {
     launch_spec: ProviderLaunchSpec,
     provider_session_id: Option<ProviderSessionId>,
     process_root: Option<PersistedProcessRoot>,
+    /// Durable provenance of the last automatic executable re-pin. Round-trips
+    /// through `state_json`.
+    repinned_executable: Option<ProviderExecutableRepin>,
+    /// Set only by `decode` when the file on disk differs from the persisted
+    /// pin and has not yet been written back. Never serialized: it is a
+    /// decode-time observation, not durable state.
+    pending_executable_repin: Option<ProviderExecutableRepin>,
+}
+
+// Both re-pin fields are provenance, not identity: `repinned_executable` is a
+// durable audit record and `pending_executable_repin` is a decode-time
+// observation. Every existing equality check here asks whether two states are
+// the same session at the same revision, so neither field may participate.
+impl PartialEq for ProviderSessionState {
+    fn eq(&self, other: &Self) -> bool {
+        self.agent_session_id == other.agent_session_id
+            && self.task_id == other.task_id
+            && self.generation == other.generation
+            && self.action_epoch == other.action_epoch
+            && self.revision == other.revision
+            && self.lifecycle == other.lifecycle
+            && self.launch_nonce == other.launch_nonce
+            && self.launch_spec == other.launch_spec
+            && self.provider_session_id == other.provider_session_id
+            && self.process_root == other.process_root
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2221,6 +2266,7 @@ fn decode_session_wire(bytes: &[u8]) -> Result<ProviderSessionStateWire, String>
                 launch_nonce: legacy.launch_nonce,
                 launch_spec: legacy.launch_spec,
                 provider_session_id: legacy.provider_session_id,
+                repinned_executable: None,
                 process_root: None,
             })
         }
@@ -3134,6 +3180,9 @@ struct ProviderSessionStateWire {
     launch_spec: PersistedLaunchSpecWire,
     provider_session_id: Option<ProviderSessionId>,
     process_root: Option<PersistedProcessRootWire>,
+    /// Additive, absent on every row written before automatic re-pinning.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    repinned_executable: Option<ProviderExecutableRepin>,
 }
 
 #[derive(Clone, Deserialize)]
@@ -3236,6 +3285,7 @@ impl ProviderSessionState {
                     canonical_executable: root.canonical_executable.clone(),
                     executable_sha256: root.executable_sha256,
                 }),
+            repinned_executable: self.repinned_executable.clone(),
         };
         let encoded = serde_json::to_vec(&wire).map_err(|error| error.to_string())?;
         validate_bounded_state_json(&encoded)?;
@@ -3262,22 +3312,69 @@ impl ProviderSessionState {
         {
             return Err("persisted provider launch identity is inconsistent".to_string());
         }
-        let executable = ProviderExecutable::new(
+        // A provider that updates itself in place rewrites this exact file at
+        // this exact path. Refusing the whole state load then strands every
+        // open session forever, so re-check instead of re-pin-or-die: every
+        // fresh-launch check still runs against the file that is on disk now
+        // (no-follow open, canonical path equality, native PE format, stable
+        // identity across the read) and only the pinned digest may differ.
+        // `load_state` is what writes the change back durably.
+        let revalidated = ProviderExecutable::revalidate_persisted(
             persisted_launch.executable_path.clone(),
             persisted_launch.executable_sha256,
         )
-        .map_err(|error| format!("persisted executable identity invalid: {error:?}"))?;
+        .map_err(|error| {
+            format!(
+                "persisted executable identity invalid: {error:?} ({})",
+                crate::providers::capabilities::provider_executable_refusal_marker(&error)
+            )
+        })?;
+        let mut pending_executable_repin = match &revalidated {
+            ProviderExecutableRevalidation::Unchanged(_) => None,
+            ProviderExecutableRevalidation::Changed {
+                previous_sha256,
+                current,
+            } => Some(ProviderExecutableRepin {
+                previous_sha256: *previous_sha256,
+                current_sha256: *current.sha256(),
+                current_file_identity: *current.file_identity(),
+                repinned_at_ms: repin_now_ms(),
+            }),
+        };
+        let executable = revalidated.into_current();
         let runtime_dependency = match (
             &persisted_launch.runtime_dependency_path,
             &persisted_launch.runtime_dependency_sha256,
         ) {
             (None, None) => None,
             (Some(path), Some(sha256)) => {
-                let dependency = ProviderExecutable::reopen_non_native(path.clone(), *sha256)
-                    .map_err(|error| {
-                        format!("persisted runtime dependency identity invalid: {error:?}")
-                    })?;
-                Some(dependency)
+                // The interpreter/script half of a wrapper graph is rewritten
+                // by the same in-place update, so it re-pins on the same rule.
+                let revalidated =
+                    ProviderExecutable::revalidate_persisted_non_native(path.clone(), *sha256)
+                        .map_err(|error| {
+                            format!(
+                                "persisted runtime dependency identity invalid: {error:?} ({})",
+                                crate::providers::capabilities::provider_executable_refusal_marker(
+                                    &error
+                                )
+                            )
+                        })?;
+                if let ProviderExecutableRevalidation::Changed {
+                    previous_sha256,
+                    current,
+                } = &revalidated
+                {
+                    if pending_executable_repin.is_none() {
+                        pending_executable_repin = Some(ProviderExecutableRepin {
+                            previous_sha256: *previous_sha256,
+                            current_sha256: *current.sha256(),
+                            current_file_identity: *current.file_identity(),
+                            repinned_at_ms: repin_now_ms(),
+                        });
+                    }
+                }
+                Some(revalidated.into_current())
             }
             _ => {
                 return Err("persisted runtime dependency identity is incomplete".to_string());
@@ -3350,8 +3447,40 @@ impl ProviderSessionState {
             launch_spec,
             provider_session_id: wire.provider_session_id,
             process_root,
+            repinned_executable: wire.repinned_executable,
+            pending_executable_repin,
         })
     }
+}
+
+/// One automatic re-pin, reported out of the session manager so the host can
+/// name the cause to the client while the resume is happening.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ProviderExecutableRepinNotice {
+    pub task_id: TaskId,
+    pub agent_session_id: AgentSessionId,
+    pub provider_kind: ProviderKind,
+    pub canonical_path: PathBuf,
+    pub repin: ProviderExecutableRepin,
+}
+
+/// First eight hex digits of a digest, for one log line.
+fn short_sha_hex(sha256: &[u8; 32]) -> String {
+    sha256
+        .iter()
+        .take(4)
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+/// Wall-clock stamp for a re-pin record. A clock that cannot be read yields
+/// zero rather than refusing the load: the record is provenance, and losing a
+/// timestamp must never cost a session its resume.
+fn repin_now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|elapsed| u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX))
+        .unwrap_or(0)
 }
 
 fn persisted_lifecycle_name(lifecycle: PersistedRuntimeLifecycle) -> &'static str {
@@ -5650,6 +5779,7 @@ where
     next_generation: HashMap<AgentSessionId, u64>,
     next_action_epoch: HashMap<AgentSessionId, u64>,
     next_state_revision: HashMap<AgentSessionId, u64>,
+    executable_repins: Vec<ProviderExecutableRepinNotice>,
     recovery_owner_id: Uuid,
     next_view_id: u64,
     _store_contract_marker: std::marker::PhantomData<fn() -> S>,
@@ -5679,6 +5809,7 @@ impl<L: ProviderProcessLauncher, S: ProviderSessionStateStore> ProviderSessionMa
             next_generation: HashMap::new(),
             next_action_epoch: HashMap::new(),
             next_state_revision: HashMap::new(),
+            executable_repins: Vec::new(),
             recovery_owner_id: Uuid::now_v7(),
             next_view_id: 0,
             _store_contract_marker: std::marker::PhantomData,
@@ -6467,21 +6598,59 @@ impl<L: ProviderProcessLauncher, S: ProviderSessionStateStore> ProviderSessionMa
             .state_store
             .load(agent_session_id)
             .map_err(ProviderSessionError::StateStore)?;
-        if let Some(state) = &state {
-            if state.generation == 0 || state.revision == 0 {
-                return Err(ProviderSessionError::StalePersistedState {
-                    generation: state.generation,
-                });
-            }
-            let revision = self
-                .next_state_revision
-                .entry(agent_session_id)
-                .or_insert(0);
-            *revision = (*revision).max(state.revision);
-            let action_epoch = self.next_action_epoch.entry(agent_session_id).or_insert(0);
-            *action_epoch = (*action_epoch).max(state.action_epoch);
+        let Some(mut state) = state else {
+            return Ok(None);
+        };
+        if state.generation == 0 || state.revision == 0 {
+            return Err(ProviderSessionError::StalePersistedState {
+                generation: state.generation,
+            });
         }
-        Ok(state)
+        let revision = self
+            .next_state_revision
+            .entry(agent_session_id)
+            .or_insert(0);
+        *revision = (*revision).max(state.revision);
+        let action_epoch = self.next_action_epoch.entry(agent_session_id).or_insert(0);
+        *action_epoch = (*action_epoch).max(state.action_epoch);
+        // `decode` already proved the current file passes every fresh-launch
+        // check; this is the one caller that owns persistence, so the change
+        // is written back here as a new revision of the same session rather
+        // than re-observed on every load.
+        if let Some(repin) = state.pending_executable_repin.take() {
+            state.repinned_executable = Some(repin.clone());
+            let persisted = state.clone();
+            self.persist_state(persisted)?;
+            let refreshed_revision = self
+                .next_state_revision
+                .get(&agent_session_id)
+                .copied()
+                .unwrap_or(state.revision);
+            state.revision = refreshed_revision;
+            crate::host_log!(
+                "devmanager-host: provider executable re-pinned task={} agent={} kind={:?} path={} from={} to={}",
+                state.task_id,
+                agent_session_id,
+                state.launch_spec.provider_kind,
+                state.launch_spec.executable.canonical_path().display(),
+                short_sha_hex(&repin.previous_sha256),
+                short_sha_hex(&repin.current_sha256),
+            );
+            self.executable_repins.push(ProviderExecutableRepinNotice {
+                task_id: state.task_id,
+                agent_session_id,
+                provider_kind: state.launch_spec.provider_kind,
+                canonical_path: state.launch_spec.executable.canonical_path().to_path_buf(),
+                repin,
+            });
+        }
+        Ok(Some(state))
+    }
+
+    /// Take every automatic executable re-pin observed since the last drain.
+    /// The host reports the cause to the client from these.
+    pub fn drain_executable_repins(&mut self) -> Vec<ProviderExecutableRepinNotice> {
+        std::mem::take(&mut self.executable_repins)
     }
 
     fn persist_state(
@@ -6604,6 +6773,8 @@ impl<L: ProviderProcessLauncher, S: ProviderSessionStateStore> ProviderSessionMa
             launch_spec: request.launch_spec.clone(),
             provider_session_id,
             process_root: None,
+            repinned_executable: None,
+            pending_executable_repin: None,
         }
     }
 
@@ -6626,6 +6797,8 @@ impl<L: ProviderProcessLauncher, S: ProviderSessionStateStore> ProviderSessionMa
                 &runtime.fence(),
                 &runtime.executable(),
             )),
+            repinned_executable: None,
+            pending_executable_repin: None,
         }
     }
 
@@ -8098,6 +8271,8 @@ mod tests {
             launch_spec: runtime.launch_spec(),
             provider_session_id: None,
             process_root: None,
+            repinned_executable: None,
+            pending_executable_repin: None,
         };
         store.persist(state.clone()).unwrap();
         drop(store);
@@ -8215,6 +8390,8 @@ mod tests {
                 launch_spec: runtime.launch_spec(),
                 provider_session_id: None,
                 process_root: None,
+                repinned_executable: None,
+                pending_executable_repin: None,
             };
             let path = tempfile::NamedTempFile::new().unwrap();
             let mut store = SqliteProviderSessionStateStore::open(path.path()).unwrap();
@@ -8233,20 +8410,35 @@ mod tests {
             let unrelated = TaskId::new();
             assert!(store.list_open_for_task(unrelated).unwrap().is_empty());
             assert!(store.list_recovery_for_task(unrelated).unwrap().is_empty());
-            assert!(store
+            // A stale digest at a canonical path whose file still passes every
+            // fresh-launch check is a re-pin candidate, not an unreadable row:
+            // refusing here is what stranded every open session after a
+            // provider updated itself in place. The store reports the change;
+            // only `ProviderSessionManager::load_state` writes it back.
+            let loaded = store
                 .load(state.agent_session_id)
-                .unwrap_err()
-                .contains("hash_mismatch"));
+                .expect("a stale digest must not make the row unreadable")
+                .expect("the row is present");
+            let pending = loaded
+                .pending_executable_repin
+                .as_ref()
+                .expect("the stale digest is reported as a pending re-pin");
+            assert_eq!(pending.previous_sha256, [0_u8; 32]);
+            assert_eq!(
+                pending.current_sha256,
+                *loaded.launch_spec.executable.sha256()
+            );
+            assert!(
+                loaded.repinned_executable.is_none(),
+                "a read path must not invent a durable re-pin record"
+            );
             if lifecycle == PersistedRuntimeLifecycle::Starting {
-                assert!(store
-                    .list_open_for_task(state.task_id)
-                    .unwrap_err()
-                    .contains("hash_mismatch"));
+                assert_eq!(store.list_open_for_task(state.task_id).unwrap().len(), 1);
             } else {
-                assert!(store
-                    .list_recovery_for_task(state.task_id)
-                    .unwrap_err()
-                    .contains("hash_mismatch"));
+                assert_eq!(
+                    store.list_recovery_for_task(state.task_id).unwrap().len(),
+                    1
+                );
             }
             // Foreign records must still have a consistent durable envelope.
             let mut corrupt = stale.clone();
@@ -10595,6 +10787,8 @@ mod tests {
             launch_spec: runtime.launch_spec(),
             provider_session_id: None,
             process_root: None,
+            repinned_executable: None,
+            pending_executable_repin: None,
         };
         let mut arguments: serde_json::Value =
             serde_json::from_slice(&state.encode().unwrap()).unwrap();
@@ -10637,6 +10831,8 @@ mod tests {
             launch_spec: runtime.launch_spec(),
             provider_session_id: None,
             process_root: None,
+            repinned_executable: None,
+            pending_executable_repin: None,
         };
         let mut wire: serde_json::Value = serde_json::from_slice(&state.encode().unwrap()).unwrap();
         wire["launch_spec"]["capabilities"]["auth_state"] =
@@ -10681,12 +10877,155 @@ mod tests {
             launch_spec: runtime.launch_spec(),
             provider_session_id: None,
             process_root: None,
+            repinned_executable: None,
+            pending_executable_repin: None,
         };
         state.launch_spec.provider_kind = ProviderKind::Codex;
         let error = state.encode().unwrap_err();
         assert!(
             error.contains("provider") || error.contains("launch"),
             "{error}"
+        );
+    }
+
+    /// A provider that replaced its own binary at the same canonical path.
+    /// Returns the state to persist and the path that will be rewritten.
+    fn repin_fixture_state(executable: ProviderExecutable) -> ProviderSessionState {
+        let runtime = unit_runtime();
+        let mut launch_spec = runtime.launch_spec();
+        launch_spec.executable = executable;
+        ProviderSessionState {
+            agent_session_id: runtime.agent_session_id(),
+            task_id: runtime.task_id(),
+            generation: runtime.generation(),
+            action_epoch: runtime.correlation().action_epoch(),
+            revision: 1,
+            lifecycle: PersistedRuntimeLifecycle::Running,
+            launch_nonce: runtime.launch_nonce(),
+            launch_spec,
+            provider_session_id: None,
+            process_root: None,
+            repinned_executable: None,
+            pending_executable_repin: None,
+        }
+    }
+
+    fn journal_revisions(path: &Path, agent_id: AgentSessionId) -> Vec<u64> {
+        let store = SqliteProviderSessionStateStore::open(path).unwrap();
+        let mut statement = store
+            .connection
+            .prepare(
+                "SELECT revision FROM provider_session_journal
+                 WHERE agent_session_id = ?1 ORDER BY revision",
+            )
+            .unwrap();
+        let rows = statement
+            .query_map(params![agent_id.to_string()], |row| row.get::<_, i64>(0))
+            .unwrap();
+        rows.map(|value| value.unwrap() as u64).collect()
+    }
+
+    #[test]
+    fn session_load_repins_a_provider_executable_replaced_in_place() {
+        let temp = tempfile::tempdir().unwrap();
+        let exe_path = temp.path().join("provider-repin.exe");
+        std::fs::copy(std::env::current_exe().unwrap(), &exe_path).unwrap();
+        let executable = ProviderExecutable::from_path(&exe_path).unwrap();
+        let canonical = executable.canonical_path().to_path_buf();
+        let previous_sha256 = *executable.sha256();
+        let state = repin_fixture_state(executable);
+        let agent_id = state.agent_session_id;
+        let db = tempfile::NamedTempFile::new().unwrap();
+        {
+            let mut store = SqliteProviderSessionStateStore::open(db.path()).unwrap();
+            store.persist(state.clone()).unwrap();
+        }
+        // Release every attested handle, then replace the image in place the
+        // way an in-place provider self-update does.
+        drop(state);
+        let mut bytes = std::fs::read(&canonical).unwrap();
+        bytes.extend_from_slice(&[0_u8; 4096]);
+        std::fs::write(&canonical, &bytes).unwrap();
+
+        let mut manager = ProviderSessionManager::with_state_store(
+            FixtureProviderProcessLauncher::new(),
+            SqliteProviderSessionStateStore::open(db.path()).unwrap(),
+        );
+        let launch = manager
+            .peek_persisted_launch_spec(agent_id)
+            .expect("a replaced binary at the same path must not fail the state load")
+            .expect("the persisted session is present");
+        assert_ne!(*launch.executable.sha256(), previous_sha256);
+        assert_eq!(launch.executable.canonical_path(), canonical.as_path());
+
+        let repins = manager.drain_executable_repins();
+        assert_eq!(repins.len(), 1, "one re-pin is reported to the host");
+        assert_eq!(repins[0].repin.previous_sha256, previous_sha256);
+        assert_eq!(repins[0].repin.current_sha256, *launch.executable.sha256());
+        assert_eq!(repins[0].agent_session_id, agent_id);
+        drop(manager);
+
+        // The change is durable: a new revision in the journal carrying the
+        // record, not an in-memory patch that is lost on the next load.
+        assert_eq!(
+            journal_revisions(db.path(), agent_id),
+            vec![1, 2],
+            "the re-pin must append a revision to the journal"
+        );
+        let reloaded_store = SqliteProviderSessionStateStore::open(db.path()).unwrap();
+        let reloaded = reloaded_store.load(agent_id).unwrap().unwrap();
+        assert_eq!(reloaded.revision, 2);
+        let record = reloaded
+            .repinned_executable
+            .as_ref()
+            .expect("the durable record survives the reload");
+        assert_eq!(record.previous_sha256, previous_sha256);
+        assert_eq!(record.current_sha256, *launch.executable.sha256());
+        assert!(reloaded.pending_executable_repin.is_none());
+        drop(reloaded);
+        drop(reloaded_store);
+
+        // A second load sees an unchanged file and re-pins nothing.
+        let mut reopened = ProviderSessionManager::with_state_store(
+            FixtureProviderProcessLauncher::new(),
+            SqliteProviderSessionStateStore::open(db.path()).unwrap(),
+        );
+        reopened
+            .peek_persisted_launch_spec(agent_id)
+            .unwrap()
+            .unwrap();
+        assert!(reopened.drain_executable_repins().is_empty());
+        drop(reopened);
+        assert_eq!(journal_revisions(db.path(), agent_id), vec![1, 2]);
+    }
+
+    #[test]
+    fn session_load_still_refuses_a_non_native_replacement() {
+        let temp = tempfile::tempdir().unwrap();
+        let exe_path = temp.path().join("provider-broken.exe");
+        std::fs::copy(std::env::current_exe().unwrap(), &exe_path).unwrap();
+        let executable = ProviderExecutable::from_path(&exe_path).unwrap();
+        let canonical = executable.canonical_path().to_path_buf();
+        let state = repin_fixture_state(executable);
+        let agent_id = state.agent_session_id;
+        let db = tempfile::NamedTempFile::new().unwrap();
+        {
+            let mut store = SqliteProviderSessionStateStore::open(db.path()).unwrap();
+            store.persist(state.clone()).unwrap();
+        }
+        drop(state);
+        std::fs::write(&canonical, b"not a portable executable").unwrap();
+
+        let store = SqliteProviderSessionStateStore::open(db.path()).unwrap();
+        let error = store.load(agent_id).unwrap_err();
+        assert!(
+            error.contains("not_native_executable"),
+            "the fresh-launch checks still refuse a non-image: {error}"
+        );
+        assert_eq!(
+            crate::providers::capabilities::provider_executable_refusal_code(&error),
+            Some("not_native_executable"),
+            "the refusal must classify for the host without re-parsing prose"
         );
     }
 
@@ -10705,6 +11044,8 @@ mod tests {
             launch_spec: runtime.launch_spec(),
             provider_session_id: None,
             process_root: None,
+            repinned_executable: None,
+            pending_executable_repin: None,
         };
         let mut store = SqliteProviderSessionStateStore::open(path.path()).unwrap();
         store.persist(state.clone()).unwrap();
@@ -10740,6 +11081,8 @@ mod tests {
             launch_spec: runtime.launch_spec(),
             provider_session_id: None,
             process_root: None,
+            repinned_executable: None,
+            pending_executable_repin: None,
         };
         let foreign_id = AgentSessionId::new();
         let mut store = SqliteProviderSessionStateStore::open(path.path()).unwrap();
@@ -10773,6 +11116,8 @@ mod tests {
             launch_spec: runtime.launch_spec(),
             provider_session_id: None,
             process_root: None,
+            repinned_executable: None,
+            pending_executable_repin: None,
         };
         let mut store = SqliteProviderSessionStateStore::open(path.path()).unwrap();
         store.persist(state.clone()).unwrap();
@@ -10801,6 +11146,8 @@ mod tests {
             launch_spec: runtime.launch_spec(),
             provider_session_id: None,
             process_root: None,
+            repinned_executable: None,
+            pending_executable_repin: None,
         };
         let mut store = SqliteProviderSessionStateStore::open(path.path()).unwrap();
         store.persist(state.clone()).unwrap();
@@ -10841,6 +11188,8 @@ mod tests {
             launch_spec: runtime.launch_spec(),
             provider_session_id: None,
             process_root: None,
+            repinned_executable: None,
+            pending_executable_repin: None,
         };
         let provider_id = ProviderSessionId::new("legacy-provider-session").unwrap();
         let provenance = ProviderSessionStartProvenance::mint(runtime.correlation(), provider_id);
@@ -10991,6 +11340,8 @@ mod tests {
                 &runtime.fence(),
                 runtime.launch_spec().executable(),
             )),
+            repinned_executable: None,
+            pending_executable_repin: None,
         };
         let mut wire: serde_json::Value = serde_json::from_slice(&state.encode().unwrap()).unwrap();
         wire["schema_version"] = serde_json::json!(1);
@@ -11054,6 +11405,8 @@ mod tests {
             launch_spec: launch_spec.clone(),
             provider_session_id: None,
             process_root: None,
+            repinned_executable: None,
+            pending_executable_repin: None,
         };
         let encoded = state.encode().expect("encode");
         let wire: serde_json::Value = serde_json::from_slice(&encoded).unwrap();
@@ -11113,6 +11466,8 @@ mod tests {
             launch_spec: runtime.launch_spec(),
             provider_session_id: None,
             process_root: None,
+            repinned_executable: None,
+            pending_executable_repin: None,
         };
         let mut store = SqliteProviderSessionStateStore::open(path.path()).unwrap();
         store.persist(state.clone()).unwrap();
@@ -11148,6 +11503,8 @@ mod tests {
                 &runtime.fence(),
                 runtime.launch_spec().executable(),
             )),
+            repinned_executable: None,
+            pending_executable_repin: None,
         };
         settled.launch_spec.mode = ProviderLaunchMode::NewConversation;
         let mut store = SqliteProviderSessionStateStore::open(path.path()).unwrap();
@@ -11190,6 +11547,8 @@ mod tests {
                 &runtime.fence(),
                 runtime.launch_spec().executable(),
             )),
+            repinned_executable: None,
+            pending_executable_repin: None,
         };
         settled.launch_spec.mode = ProviderLaunchMode::NewConversation;
         let mut store = SqliteProviderSessionStateStore::open(path.path()).unwrap();
@@ -11231,6 +11590,8 @@ mod tests {
             launch_spec: runtime.launch_spec(),
             provider_session_id: Some(provider_id.clone()),
             process_root: None,
+            repinned_executable: None,
+            pending_executable_repin: None,
         };
         failed.launch_spec.mode = ProviderLaunchMode::ResumeExact(provider_id.clone());
         let mut store = SqliteProviderSessionStateStore::open(path.path()).unwrap();
@@ -11277,6 +11638,8 @@ mod tests {
                 &runtime.fence(),
                 runtime.launch_spec().executable(),
             )),
+            repinned_executable: None,
+            pending_executable_repin: None,
         };
         let mut store = SqliteProviderSessionStateStore::open(path.path()).unwrap();
         store.persist(state.clone()).unwrap();
@@ -11320,6 +11683,8 @@ mod tests {
             launch_spec: runtime.launch_spec(),
             provider_session_id: None,
             process_root: None,
+            repinned_executable: None,
+            pending_executable_repin: None,
         };
         let mut store = SqliteProviderSessionStateStore::open(path.path()).unwrap();
         store.persist(state.clone()).unwrap();
@@ -11353,6 +11718,8 @@ mod tests {
             launch_spec: runtime.launch_spec(),
             provider_session_id: None,
             process_root: None,
+            repinned_executable: None,
+            pending_executable_repin: None,
         };
         let mut store = SqliteProviderSessionStateStore::open(path.path()).unwrap();
         store.persist(state.clone()).unwrap();
@@ -11382,6 +11749,8 @@ mod tests {
             launch_spec: runtime.launch_spec(),
             provider_session_id: None,
             process_root: None,
+            repinned_executable: None,
+            pending_executable_repin: None,
         };
         let encoded = state.encode().unwrap();
         let mut trailing = encoded.clone();
@@ -11416,6 +11785,8 @@ mod tests {
             launch_spec: runtime.launch_spec(),
             provider_session_id: None,
             process_root: None,
+            repinned_executable: None,
+            pending_executable_repin: None,
         };
         let path = tempfile::NamedTempFile::new().unwrap();
         let mut first = SqliteProviderSessionStateStore::open(path.path()).unwrap();
@@ -11454,6 +11825,8 @@ mod tests {
             launch_spec: runtime.launch_spec(),
             provider_session_id: None,
             process_root: None,
+            repinned_executable: None,
+            pending_executable_repin: None,
         };
         let path = tempfile::NamedTempFile::new().unwrap();
         let mut initializer = SqliteProviderSessionStateStore::open(path.path()).unwrap();
@@ -11772,6 +12145,8 @@ mod tests {
             launch_spec: runtime.launch_spec(),
             provider_session_id: Some(provider_session_id.clone()),
             process_root: None,
+            repinned_executable: None,
+            pending_executable_repin: None,
         };
         let mut first = SqliteProviderSessionStateStore::open(path.path()).unwrap();
         first.persist(state.clone()).unwrap();
@@ -11802,6 +12177,8 @@ mod tests {
             launch_spec,
             provider_session_id: None,
             process_root: None,
+            repinned_executable: None,
+            pending_executable_repin: None,
         };
         let mut store = SqliteProviderSessionStateStore::open(path.path()).unwrap();
         store.persist(state.clone()).unwrap();
@@ -11838,6 +12215,8 @@ mod tests {
             launch_spec: launch_spec.clone(),
             provider_session_id: None,
             process_root: None,
+            repinned_executable: None,
+            pending_executable_repin: None,
         };
         let path = tempfile::NamedTempFile::new().unwrap();
         let mut store = SqliteProviderSessionStateStore::open(path.path()).unwrap();
@@ -11912,6 +12291,8 @@ mod tests {
                 &runtime.fence(),
                 runtime.launch_spec().executable(),
             )),
+            repinned_executable: None,
+            pending_executable_repin: None,
         };
         let mut store = SqliteProviderSessionStateStore::open(path.path()).unwrap();
         store.persist(current.clone()).unwrap();
@@ -12016,6 +12397,8 @@ mod tests {
             launch_spec: runtime.launch_spec(),
             provider_session_id: None,
             process_root: None,
+            repinned_executable: None,
+            pending_executable_repin: None,
         };
         let path = tempfile::NamedTempFile::new().unwrap();
         let mut initializer = SqliteProviderSessionStateStore::open(path.path()).unwrap();

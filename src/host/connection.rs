@@ -55,6 +55,9 @@ use crate::protocol::{
     Capability, CapabilitySet, ClientRequest, DetachAck, DetachRequest, FrameLimits,
     NegotiatedParameters, ServerMessage, StreamFrame, StreamKey, UpdateHandoffReply,
 };
+use crate::providers::capabilities::{
+    provider_executable_refusal_code, provider_executable_refusal_is_permanent,
+};
 use crate::state::SessionDimensions;
 use crate::terminal::protocol::{CloseReason, TerminalSpec};
 use crate::terminal::service::AttachedTerminalRuntime;
@@ -88,6 +91,75 @@ pub const HOST_REQUEST_QUEUE_CAPACITY: usize = 32;
 /// an unrelated provider conversation, while still protecting the host from a
 /// restart stampede.
 const MAX_CONCURRENT_PROVIDER_RESTORES: usize = 2;
+
+/// Classify one restore failure. `Some` names a refusal that cannot clear
+/// without user action; `None` keeps the current retryable behaviour. Pure so
+/// the retry rule can be tested without an executor.
+fn classify_provider_restore_failure(error: &str) -> Option<PermanentProviderRestoreRefusal> {
+    let code = provider_executable_refusal_code(error)
+        .filter(|code| provider_executable_refusal_is_permanent(code))?;
+    Some(PermanentProviderRestoreRefusal {
+        code: code.to_string(),
+        detail: provider_restore_refusal_detail(code),
+    })
+}
+
+/// Record a permanent refusal, returning whether it is new. A refusal already
+/// recorded under the same code is not re-recorded and must not be logged
+/// again: the same refusal arriving on every maintenance tick is the loop.
+fn record_permanent_provider_refusal(
+    refusals: &mut HashMap<TaskId, PermanentProviderRestoreRefusal>,
+    task_id: TaskId,
+    refusal: PermanentProviderRestoreRefusal,
+) -> bool {
+    match refusals.get(&task_id) {
+        Some(existing) if existing.code == refusal.code => false,
+        _ => {
+            refusals.insert(task_id, refusal);
+            true
+        }
+    }
+}
+
+/// Client copy for a provider that updated itself in place. The persisted
+/// capabilities carry the version of the binary that has just been REPLACED,
+/// so naming a version here would name the wrong one; the new build's version
+/// is not known until it is launched and probed.
+fn provider_repin_detail(kind: crate::providers::ProviderKind) -> String {
+    format!(
+        "{} was updated since this session started; resuming with the new build...",
+        kind.display_name()
+    )
+}
+
+/// Client copy for a refusal that only user action can clear. The text is the
+/// `ProviderExecutableError` Display for that code, so the client and the host
+/// log say the same thing.
+fn provider_restore_refusal_detail(code: &str) -> String {
+    let sentence = match code {
+        "missing" => "provider executable is missing",
+        "not_a_file" => "provider executable is not a file",
+        "not_native_executable" => "provider executable is not a runnable native binary",
+        "symlink_or_reparse" => "provider executable must not be a symlink or reparse point",
+        "hardlink_ambiguous" => "provider executable has ambiguous hardlink identity",
+        "not_canonical" => "provider executable path is not canonical",
+        "empty_path" => "provider executable path must be non-empty",
+        "path_too_long" => "provider executable path is too long",
+        "unsupported_platform" => "provider executable identity cannot be proven on this platform",
+        "unsupported_schema_version" => "persisted provider session state is from a newer build",
+        _ => "provider executable cannot be admitted",
+    };
+    format!("{sentence}; the session cannot resume until it is repaired")
+}
+
+/// One recorded permanent refusal to restore a task's provider session.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct PermanentProviderRestoreRefusal {
+    /// `ProviderExecutableError::code` for the refusal.
+    pub code: String,
+    /// The client-facing cause.
+    pub detail: String,
+}
 
 /// One unavailable conversation must not head-of-line block newer provider
 /// input. Every claimed unit is still individually leased and fenced by the
@@ -2725,6 +2797,15 @@ pub struct HostRequestExecutor {
     /// A failed restore fence suppresses only the same durable action epoch.
     /// A later user action advances the epoch and may retry intentionally.
     provider_restore_failed_action_epochs: HashMap<TaskId, u64>,
+    /// The most recent provider restore/re-pin cause per task, in the words the
+    /// client should show. A bare "Terminal unavailable" with a known cause
+    /// sitting in the host log is the failure this exists to prevent.
+    provider_restore_cause: HashMap<TaskId, String>,
+    /// Refusals that cannot clear without user action (the pinned executable is
+    /// gone, is not a native binary, or its path is no longer canonical). The
+    /// task is not re-queued while one is recorded, and it is logged once, not
+    /// once per maintenance tick.
+    provider_restore_permanent_refusals: HashMap<TaskId, PermanentProviderRestoreRefusal>,
     /// Native profile provider settings + health (exact `--config-base` root).
     provider_settings:
         Option<std::sync::Arc<crate::providers::settings::ProviderSettingsAuthority>>,
@@ -3116,6 +3197,8 @@ impl HostRequestExecutor {
             provider_restart_unavailable: HashSet::new(),
             provider_dispatch_maintenance_due: Instant::now(),
             provider_restore_failed_action_epochs: HashMap::new(),
+            provider_restore_cause: HashMap::new(),
+            provider_restore_permanent_refusals: HashMap::new(),
             provider_settings,
             provider_health_jobs: FuturesUnordered::new(),
             terminal_service: TerminalService::new(),
@@ -3214,6 +3297,8 @@ impl HostRequestExecutor {
             provider_restart_unavailable: HashSet::new(),
             provider_dispatch_maintenance_due: Instant::now(),
             provider_restore_failed_action_epochs: HashMap::new(),
+            provider_restore_cause: HashMap::new(),
+            provider_restore_permanent_refusals: HashMap::new(),
             provider_settings: None,
             provider_health_jobs: FuturesUnordered::new(),
             terminal_service: TerminalService::new(),
@@ -3729,6 +3814,9 @@ impl HostRequestExecutor {
     fn drive_provider_input_after_acceptance(&mut self, task_id: TaskId) {
         self.provider_restore_failed_action_epochs.remove(&task_id);
         self.provider_restart_unavailable.remove(&task_id);
+        // An explicit client action is the one thing that re-arms a permanent
+        // refusal: the person may have just repaired or reinstalled the file.
+        self.provider_restore_permanent_refusals.remove(&task_id);
         self.provider_dispatch_maintenance_due =
             Instant::now() + PROVIDER_DISPATCH_MAINTENANCE_PERIOD;
         let held_restarts = if let Some(runtime) = self.configured_service_runtime.as_mut() {
@@ -3769,7 +3857,7 @@ impl HostRequestExecutor {
             self.provider_dispatch_maintenance_due =
                 Instant::now() + PROVIDER_DISPATCH_MAINTENANCE_PERIOD;
         }
-        let (held_restarts, provider_failures) = if let Some(runtime) =
+        let (held_restarts, provider_failures, provider_repins) = if let Some(runtime) =
             self.configured_service_runtime.as_mut()
         {
             let bus = &mut self.bus;
@@ -3792,10 +3880,19 @@ impl HostRequestExecutor {
             }
             let _ = runtime.manager.configured_service_snapshots();
             let failures = runtime.manager.drain_provider_session_failures();
-            (held_restarts, failures)
+            let repins = runtime.manager.drain_provider_executable_repins();
+            (held_restarts, failures, repins)
         } else {
-            (Vec::new(), Vec::new())
+            (Vec::new(), Vec::new(), Vec::new())
         };
+        for notice in provider_repins {
+            // The re-pin already happened and the resume is under way; the
+            // client is told why its terminal is briefly unavailable.
+            self.provider_restore_cause
+                .insert(notice.task_id, provider_repin_detail(notice.provider_kind));
+            self.provider_restore_permanent_refusals
+                .remove(&notice.task_id);
+        }
         for (task_id, reason) in held_restarts {
             self.queue_held_provider_restart(task_id, reason);
         }
@@ -3835,6 +3932,14 @@ impl HostRequestExecutor {
             return;
         }
         if self.provider_restart_unavailable.contains(&task_id) {
+            return;
+        }
+        // A permanent refusal cannot change without user action. Re-queueing it
+        // every tick is the retry loop, not a recovery.
+        if self
+            .provider_restore_permanent_refusals
+            .contains_key(&task_id)
+        {
             return;
         }
         match self.bus.provider_hold_restart_intent(task_id) {
@@ -4120,16 +4225,43 @@ impl HostRequestExecutor {
     fn handle_provider_restore_outcome(&mut self, outcome: ProviderRestoreOutcome) {
         self.provider_restore_in_flight.remove(&outcome.task_id);
         if let Err(error) = outcome.result {
-            host_log!(
-                "devmanager-host: exact provider restore failed task={}: {error}",
-                outcome.task_id
-            );
+            // A refusal that only user action can clear is recorded once per
+            // (task, code) and logged once. Re-logging it every tick is what
+            // turned one broken pin into an unbounded log of identical lines.
+            match classify_provider_restore_failure(&error) {
+                Some(refusal) => {
+                    let detail = refusal.detail.clone();
+                    let code = refusal.code.clone();
+                    if record_permanent_provider_refusal(
+                        &mut self.provider_restore_permanent_refusals,
+                        outcome.task_id,
+                        refusal,
+                    ) {
+                        host_log!(
+                            "devmanager-host: exact provider restore refused task={} code={code}: {error}",
+                            outcome.task_id
+                        );
+                    }
+                    self.provider_restore_cause.insert(outcome.task_id, detail);
+                }
+                None => {
+                    host_log!(
+                        "devmanager-host: exact provider restore failed task={}: {error}",
+                        outcome.task_id
+                    );
+                    self.provider_restore_cause
+                        .insert(outcome.task_id, error.clone());
+                }
+            }
             self.provider_restore_failed_action_epochs
                 .insert(outcome.task_id, outcome.action_epoch);
             self.mark_provider_restore_failed(outcome.task_id);
         } else {
             self.provider_restore_failed_action_epochs
                 .remove(&outcome.task_id);
+            self.provider_restore_permanent_refusals
+                .remove(&outcome.task_id);
+            self.provider_restore_cause.remove(&outcome.task_id);
             if let Err(error) = self.attach_provider_terminal(outcome.task_id) {
                 host_log!(
                     "devmanager-host: provider terminal attachment failed task={}: {error}",
@@ -5856,6 +5988,10 @@ impl HostRequestExecutor {
         &mut self,
         intent: &crate::domain::command::StartProviderSessionIntent,
     ) -> Result<u64, IpcError> {
+        // An explicit start is a client action asking for a retry.
+        self.provider_restore_permanent_refusals
+            .remove(&intent.task_id);
+        self.provider_restore_cause.remove(&intent.task_id);
         let runtime = self.configured_service_runtime.as_ref().ok_or_else(|| {
             host_log!("devmanager-host: provider start has no configured service runtime");
             IpcError::Unavailable
@@ -6978,6 +7114,14 @@ impl HostRequestExecutor {
                         }
                     }
                 }
+                // A permanent refusal outranks a stale transient cause: it is
+                // the state the task is actually stuck in.
+                let provider_restore_detail = envelope.task_id.and_then(|task_id| {
+                    self.provider_restore_permanent_refusals
+                        .get(&task_id)
+                        .map(|refusal| refusal.detail.clone())
+                        .or_else(|| self.provider_restore_cause.get(&task_id).cloned())
+                });
                 let provider_launch_hint = match envelope.task_id {
                     Some(task_id)
                         if self.provider_restore_in_flight.contains(&task_id)
@@ -7024,6 +7168,7 @@ impl HostRequestExecutor {
                             .as_ref()
                             .map(|admission| &admission.store.snapshot().config),
                         provider_launch_hint,
+                        provider_restore_detail: provider_restore_detail.as_deref(),
                     },
                     negotiated.limits.max_page_encoded_bytes,
                 );
@@ -7488,6 +7633,7 @@ impl HostRequestExecutor {
             runtime_generation: None,
             config: None,
             provider_launch_hint: super::cockpit::ProviderLaunchReadinessHint::Unknown,
+            provider_restore_detail: None,
         };
         let page = match super::cockpit::serve_conversation(&dispatch, task_id, after_sequence) {
             QueryOutcome::Ok(QueryResult::TaskCockpit(TaskCockpitResult::Conversation(page))) => {
@@ -8733,6 +8879,7 @@ fn dispatch_authenticated_request_inner(
                             config: None,
                             provider_launch_hint:
                                 super::cockpit::ProviderLaunchReadinessHint::Unknown,
+                            provider_restore_detail: None,
                         });
                     return Ok(ServerMessage::QueryReply(QueryReply {
                         request_id: envelope.request_id,
@@ -9770,16 +9917,19 @@ impl ConnectionOutputPorts {
 
 #[cfg(test)]
 mod output_tests {
+    use std::collections::HashMap;
     use std::path::PathBuf;
     use std::time::Duration;
 
     use super::{
-        accepted_shell_terminal_effect, provider_restore_success_attention,
-        provider_start_requires_existing_binding, AcceptedShellEffect, ConnectionOutputHandle,
-        ConnectionOutputId, DuplexExecuteCompletion, DurableAdmitResult, EphemeralAdmitResult,
-        EphemeralKey, EventReplayRegistry, HostRequestExecutor, HostRequestHandle, LiveStreamState,
-        LiveTail, PhysicalWriteAckStatus, PrioritizedOutbound, ShellSessionLink,
-        StreamMaterializer, MAX_CONCURRENT_PROVIDER_RESTORES,
+        accepted_shell_terminal_effect, classify_provider_restore_failure, provider_repin_detail,
+        provider_restore_refusal_detail, provider_restore_success_attention,
+        provider_start_requires_existing_binding, record_permanent_provider_refusal,
+        AcceptedShellEffect, ConnectionOutputHandle, ConnectionOutputId, DuplexExecuteCompletion,
+        DurableAdmitResult, EphemeralAdmitResult, EphemeralKey, EventReplayRegistry,
+        HostRequestExecutor, HostRequestHandle, LiveStreamState, LiveTail, PhysicalWriteAckStatus,
+        PrioritizedOutbound, ShellSessionLink, StreamMaterializer,
+        MAX_CONCURRENT_PROVIDER_RESTORES,
     };
     use crate::domain::cockpit::{TaskCockpitQuery, TaskCockpitResult};
     use crate::domain::command::{Command, CommandEnvelope, CreateTaskIntent};
@@ -15200,6 +15350,122 @@ mod output_tests {
         assert!(
             body.contains("queue_one_provider_restore"),
             "the exact restore must start without waiting for periodic maintenance"
+        );
+    }
+
+    #[test]
+    fn a_permanent_executable_refusal_is_recorded_once_across_repeated_ticks() {
+        // The exact message a persisted-state decode produces when the pinned
+        // file is no longer a runnable image.
+        let error = concat!(
+            "persisted launch peek failed: provider session state store failed: ",
+            "persisted executable identity invalid: ",
+            "ProviderExecutableError { code: \"not_native_executable\" } ",
+            "(provider-executable-refusal:not_native_executable)"
+        );
+        let refusal = classify_provider_restore_failure(error)
+            .expect("a non-image pin cannot clear without user action");
+        assert_eq!(refusal.code, "not_native_executable");
+        assert!(
+            refusal.detail.contains("not a runnable native binary"),
+            "the client is told the cause, not just the reason: {}",
+            refusal.detail
+        );
+
+        let mut refusals = HashMap::new();
+        let task_id = TaskId::new();
+        let logged: Vec<bool> = (0..3)
+            .map(|_| {
+                record_permanent_provider_refusal(
+                    &mut refusals,
+                    task_id,
+                    classify_provider_restore_failure(error).expect("stable classification"),
+                )
+            })
+            .collect();
+        assert_eq!(
+            logged,
+            vec![true, false, false],
+            "three maintenance ticks must produce exactly one record and one log"
+        );
+        assert_eq!(refusals.len(), 1);
+        assert_eq!(refusals[&task_id].code, "not_native_executable");
+
+        // A different refusal code for the same task is a different fact and
+        // is recorded (and logged) again.
+        assert!(record_permanent_provider_refusal(
+            &mut refusals,
+            task_id,
+            super::PermanentProviderRestoreRefusal {
+                code: "missing".to_string(),
+                detail: provider_restore_refusal_detail("missing"),
+            },
+        ));
+    }
+
+    #[test]
+    fn a_replaced_executable_and_a_transient_failure_stay_retryable() {
+        // hash_mismatch is now handled by re-pinning at state load; if it ever
+        // reaches the host it must not strand the task.
+        let hash_mismatch = concat!(
+            "persisted executable identity invalid: ",
+            "ProviderExecutableError { code: \"hash_mismatch\" } ",
+            "(provider-executable-refusal:hash_mismatch)"
+        );
+        assert!(classify_provider_restore_failure(hash_mismatch).is_none());
+        assert!(classify_provider_restore_failure(
+            "provider runtime did not publish its terminal binding"
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn the_repin_cause_names_the_provider_and_never_a_stale_version() {
+        let detail = provider_repin_detail(crate::providers::ProviderKind::ClaudeCode);
+        assert!(detail.starts_with("Claude Code was updated since this session started"));
+        assert!(detail.contains("resuming"));
+        assert!(
+            !detail.contains(char::is_numeric),
+            "the persisted capabilities carry the REPLACED build's version; never print it: {detail}"
+        );
+        assert!(provider_repin_detail(crate::providers::ProviderKind::Codex).starts_with("Codex"));
+    }
+
+    #[test]
+    fn a_permanent_refusal_is_not_requeued_by_held_provider_input() {
+        let source = include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/src/host/connection.rs"
+        ));
+        let start = source
+            .find("fn queue_held_provider_restart(")
+            .expect("held provider restart scheduler");
+        let body = &source[start..];
+        let end = body
+            .find(
+                "
+    fn queue_one_provider_restore(",
+            )
+            .expect("restore scheduler follows the held restart scheduler");
+        let body = &body[..end];
+        assert!(
+            body.contains("provider_restore_permanent_refusals"),
+            "a refusal that user action alone can clear must not be re-queued every tick"
+        );
+        let rearm = source
+            .find("fn drive_provider_input_after_acceptance(")
+            .expect("immediate provider-input driver");
+        let rearm_body = &source[rearm..];
+        let rearm_end = rearm_body
+            .find(
+                "
+    fn reconcile_configured_services(",
+            )
+            .expect("maintenance reconciler follows immediate driver");
+        assert!(
+            rearm_body[..rearm_end]
+                .contains("provider_restore_permanent_refusals.remove(&task_id)"),
+            "an explicit client action must re-arm a permanent refusal"
         );
     }
 
