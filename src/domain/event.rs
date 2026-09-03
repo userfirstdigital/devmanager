@@ -1195,6 +1195,18 @@ pub enum Event {
         approval_id: Option<ApprovalId>,
     },
     Browser(BrowserDurableFact),
+    /// What a redacted event decodes to after its task was purged.
+    ///
+    /// The purge sweep rewrites the row in place rather than deleting it: the
+    /// `sequence` column is the client's replay cursor, so removing rows would
+    /// punch holes a resuming client reads as `pruned_through_sequence`
+    /// history loss. The row keeps its sequence, its `event_id` and its
+    /// timestamp, and loses everything that named the task -- payload,
+    /// `task_id`, `task_revision`, and the V17 `operation_id`/`command_id`.
+    ///
+    /// It carries no task, so it is not a task mutation, `apply` returns the
+    /// snapshot untouched, and the projector ignores it.
+    Purged,
 }
 
 impl Event {
@@ -1240,13 +1252,15 @@ impl Event {
             Self::ProviderWaitSettled { .. } => "provider_input.wait_settled",
             Self::ProviderInputDelivered { .. } => "provider_input.delivered",
             Self::Browser(_) => "browser.fact",
+            Self::Purged => "event.purged",
         }
     }
 
     pub fn is_task_mutation(&self) -> bool {
         !matches!(
             self,
-            Self::HostCloseBegun { .. }
+            Self::Purged
+                | Self::HostCloseBegun { .. }
                 | Self::HostCleanupBranchCompleted { .. }
                 | Self::OperationAccepted(_)
                 | Self::OperationSettled(_)
@@ -1342,6 +1356,8 @@ enum EventBody {
     ProviderInputDelivered(ProviderInputDeliveredPayload),
     #[serde(rename = "browser.fact")]
     Browser(BrowserDurableFact),
+    #[serde(rename = "event.purged")]
+    Purged(TaskUnitPayload),
 }
 
 #[derive(Serialize, Deserialize)]
@@ -1645,6 +1661,7 @@ impl From<&Event> for EventDocument {
                 approval_id: *approval_id,
             }),
             Event::Browser(fact) => EventBody::Browser(fact.clone()),
+            Event::Purged => EventBody::Purged(TaskUnitPayload {}),
         };
         Self {
             schema_version: EVENT_SCHEMA_VERSION,
@@ -1949,6 +1966,7 @@ impl TryFrom<EventDocument> for Event {
                 }
             }
             EventBody::Browser(fact) => Event::Browser(fact),
+            EventBody::Purged(_) => Event::Purged,
         })
     }
 }
@@ -3279,6 +3297,7 @@ fn apply_into(
             });
         }
         Event::TaskCreated { .. }
+        | Event::Purged
         | Event::HostCloseBegun { .. }
         | Event::HostCleanupBranchCompleted { .. }
         | Event::OperationAccepted(_)

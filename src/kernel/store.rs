@@ -1832,7 +1832,7 @@ fn event_id_from_bytes(bytes: &[u8]) -> Result<EventId, StoreError> {
     EventId::from_bytes(array).map_err(|e| StoreError::EventDecode(e.to_string()))
 }
 
-fn task_id_from_bytes(bytes: &[u8]) -> Result<TaskId, StoreError> {
+pub(crate) fn task_id_from_bytes(bytes: &[u8]) -> Result<TaskId, StoreError> {
     let array: [u8; 16] = bytes
         .try_into()
         .map_err(|_| StoreError::EventDecode("task_id must be 16 bytes".into()))?;
@@ -2113,6 +2113,9 @@ pub(crate) fn encode_event_payload(event: &Event) -> Result<Vec<u8>, StoreError>
             approval_id: *approval_id,
         }),
         Event::Browser(fact) => rmp_serde::to_vec(fact),
+        // The canonical empty body a redacted row carries. Written by
+        // `crate::kernel::purge`, and by nothing else.
+        Event::Purged => rmp_serde::to_vec(&TaskUnitPayload {}),
     }
     .map_err(|e| StoreError::EventDecode(e.to_string()))?;
     if event.event_type().starts_with("provider_input.")
@@ -2442,6 +2445,15 @@ pub(crate) fn decode_stored_event(
         "browser.fact" => {
             let fact: crate::domain::browser::BrowserDurableFact = unpack(payload)?;
             Event::Browser(fact)
+        }
+        // A row `crate::kernel::purge` redacted. It still decodes --
+        // strictly, through the same empty body every other unit
+        // payload uses -- so a replay across the purged range yields
+        // no-ops rather than a decode failure that would poison the
+        // session.
+        "event.purged" => {
+            let _: TaskUnitPayload = unpack(payload)?;
+            Event::Purged
         }
         other => {
             return Err(StoreError::CodecMismatch {

@@ -1703,6 +1703,16 @@ impl ClientModel {
                     artifact_summary: None,
                 })
             }
+            // The purge sweep redacts a deleted task's events in place
+            // rather than deleting the rows, so a client resuming across
+            // the purged range receives these instead of a history gap.
+            // They name no task; the catch-all below would read that
+            // absent task id as ApplyFailed and poison the session.
+            Event::Purged => Ok(StagedEventCommit {
+                task: None,
+                operation: None,
+                artifact_summary: None,
+            }),
             _ => {
                 let task_id = event.task_id.ok_or(ClientModelError::ApplyFailed)?;
                 let current = self.tasks.get(&task_id).cloned();

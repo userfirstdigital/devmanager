@@ -10,6 +10,7 @@ mod lineage;
 mod maintenance;
 mod outbox;
 mod projector;
+pub(crate) mod purge;
 mod replay;
 mod runtime;
 pub(crate) mod schema;
@@ -51,6 +52,7 @@ pub use dispatch::{
 };
 pub(crate) use maintenance::{StoreMaintenanceReport, WalCheckpointOutcome};
 pub use outbox::{DestinationClass, Effect, ReplayPolicy};
+pub use purge::{TaskPurge, TaskPurgeRefusal, TaskPurgeReport};
 pub(crate) use replay::{EventReplaySession, ReplayError};
 pub use runtime::{
     CompletionDisposition, RecoveringResource, RuntimePresence, RuntimeRegistry,

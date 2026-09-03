@@ -209,7 +209,13 @@ pub(crate) fn is_pure_slice_decision_fact(event: &Event) -> bool {
         | Event::TerminalRenamed { .. }
         | Event::TaskTerminalStripSet { .. } => true,
         Event::Browser(fact) => !browser_fact_requires_host_settlement(fact),
-        Event::TaskCloseBegun { .. }
+        // Never a decision fact: the purge sweep writes it directly
+        // over an existing row, so it is never appended by a command
+        // and never planned. `is_side_effect_decision_fact` also
+        // answers false, so a batch that somehow contained one is
+        // rejected rather than planned as a no-op.
+        Event::Purged
+        | Event::TaskCloseBegun { .. }
         | Event::ResourceReleaseBegun { .. }
         | Event::ProviderInputAccepted { .. }
         | Event::OperationAccepted(_)
@@ -521,6 +527,14 @@ pub(crate) fn plan_effects(
             | Event::TerminalActivity { .. } => {
                 return Err(StoreError::Projection(
                     "operation outcome facts are not decision inputs for effect planning".into(),
+                ));
+            }
+            // A redacted row, reachable here only if something fed the
+            // planner a decoded event log. Loud, not silent: the purge
+            // sweep rewrites rows in place and appends nothing.
+            Event::Purged => {
+                return Err(StoreError::Projection(
+                    "event.purged is a redacted row, never a decision fact".into(),
                 ));
             }
         }

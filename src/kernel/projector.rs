@@ -1601,6 +1601,12 @@ pub(crate) fn apply_event(
                 fact.observed_at_ms,
             )?;
         }
+        // A row the purge sweep redacted. It kept its sequence so replay
+        // stays contiguous and lost everything else, so there is nothing
+        // to project and no task to project it onto. A rebuild that
+        // walks the log therefore reproduces exactly the tables the
+        // purge left behind.
+        Event::Purged => {}
         Event::Browser(fact) => {
             let task_id = event.task_id.ok_or_else(|| {
                 StoreError::Projection("browser.fact requires task_id and task_revision".into())

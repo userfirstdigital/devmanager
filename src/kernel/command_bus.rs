@@ -57,6 +57,7 @@ use crate::kernel::outbox::{
     Effect, OperationFence, PlannedEffect, PlannedEffectDocument, ReplayPolicy,
 };
 use crate::kernel::projector;
+use crate::kernel::purge::TaskPurge;
 use crate::kernel::replay::{EventReplaySession, ReplayError};
 use crate::kernel::snapshot::{SnapshotError, SnapshotSession};
 use crate::kernel::store::{
@@ -768,6 +769,32 @@ impl CommandBus {
         &self,
     ) -> Result<Vec<(TaskId, crate::domain::id::ResourceId)>, StoreError> {
         self.store.pending_resource_releases()
+    }
+
+    /// The deleted tasks still awaiting a purge, oldest first, at most `limit`.
+    ///
+    /// The host sweep's worklist. `tasks.lifecycle = 'deleted'` is the durable
+    /// "owes a purge" marker, so this is also what makes the sweep converge
+    /// after a crash and what cleaned up the tasks deleted before the purge
+    /// existed.
+    pub fn deleted_task_ids(&self, limit: u32) -> Result<Vec<TaskId>, StoreError> {
+        let conn = self.store.open_query_connection()?;
+        crate::kernel::purge::deleted_task_ids(&conn, limit)
+    }
+
+    /// Remove one deleted task from the store, entirely.
+    ///
+    /// Refuses anything that is not `lifecycle = 'deleted'`; see
+    /// [`crate::kernel::purge`] for why that one check is the whole guard and
+    /// why the task's events are redacted rather than deleted.
+    ///
+    /// One IMMEDIATE transaction: every table, the event redaction and the
+    /// `tasks` row commit together, so no reader ever sees a half-purged task
+    /// and a crash mid-purge leaves the task Deleted for the next tick.
+    pub fn purge_deleted_task(&mut self, task_id: TaskId) -> Result<TaskPurge, StoreError> {
+        self.store.with_immediate_transaction(|tx| {
+            crate::kernel::purge::purge_deleted_task_in_tx(tx, task_id)
+        })
     }
 
     /// Whether the durable host admission singleton is Closing.
@@ -13261,7 +13288,7 @@ impl_try_from_bytes16!(
     CommandId,
 );
 
-fn parse_lifecycle(value: &str) -> Result<TaskLifecycle, StoreError> {
+pub(crate) fn parse_lifecycle(value: &str) -> Result<TaskLifecycle, StoreError> {
     match value {
         "open" => Ok(TaskLifecycle::Open),
         "settled" => Ok(TaskLifecycle::Settled),
