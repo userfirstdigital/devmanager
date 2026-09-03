@@ -216,8 +216,34 @@ impl KernelStore {
     }
 
     pub fn rebuild_projections(&mut self) -> Result<ProjectionRebuild, StoreError> {
-        let tx = self.conn.transaction()?;
-        let result = rebuild_projections_tx(&tx)?;
+        self.with_rebuild_transaction(rebuild_projections_tx)
+    }
+
+    /// Open the one writer transaction every projection rebuild runs in.
+    ///
+    /// IMMEDIATE, never DEFERRED. A rebuild reads before it writes: its first
+    /// statements copy each projection table's shape into a TEMP shadow, which
+    /// takes a read snapshot of the main database, and only the replay that
+    /// follows writes to it. Under a DEFERRED transaction any other process
+    /// that commits in between -- and the client, the host and `devmanager-ctl`
+    /// all open this store -- leaves that snapshot stale, so the first write
+    /// fails `SQLITE_BUSY_SNAPSHOT` outright; the busy handler cannot rescue a
+    /// snapshot that can never advance, and no caller retries. Taking the
+    /// writer lock at BEGIN instead makes the same contention a wait the busy
+    /// timeout already covers.
+    ///
+    /// The cost of getting this wrong is not a visible error. `open` fails the
+    /// boot rebuild, the store is left schema-current with empty terminal
+    /// projections, the durable pending-rebuild marker is never retried
+    /// (decision 6), and every live shell is then closed as `UnknownTerminal`.
+    fn with_rebuild_transaction<T>(
+        &mut self,
+        body: impl FnOnce(&Transaction<'_>) -> Result<T, StoreError>,
+    ) -> Result<T, StoreError> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let result = body(&tx)?;
         tx.commit()?;
         Ok(result)
     }
@@ -232,10 +258,7 @@ impl KernelStore {
     /// validators still run for every explicit `rebuild_projections` caller, and
     /// the same invariants are enforced per command at use time.
     fn rebuild_projection_tables(&mut self) -> Result<ProjectionRebuild, StoreError> {
-        let tx = self.conn.transaction()?;
-        let result = rebuild_projection_tables_tx(&tx)?;
-        tx.commit()?;
-        Ok(result)
+        self.with_rebuild_transaction(rebuild_projection_tables_tx)
     }
 
     /// Execute a command in one IMMEDIATE writer transaction.
@@ -3844,6 +3867,51 @@ fn build_present_reconciliation_outcome(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A projection rebuild must contend for the writer lock at BEGIN.
+    ///
+    /// This is the whole of decision F7 stated as something that can fail. A
+    /// rebuild reads before it writes -- the TEMP shadow copies take a read
+    /// snapshot of main, the replay writes to it afterwards -- so under a
+    /// DEFERRED transaction another process committing in between leaves the
+    /// snapshot stale and the first write fails `SQLITE_BUSY_SNAPSHOT` with no
+    /// retry possible. The property that rules that out is that the
+    /// transaction takes the writer lock up front, and the way to observe it
+    /// is a second connection already holding one: an IMMEDIATE transaction
+    /// cannot open at all, while a DEFERRED one opens happily even here.
+    ///
+    /// The body is empty on purpose. A body that wrote would take the same
+    /// `Busy` under either behaviour, which is exactly why the review found
+    /// this by reading rather than by a failing test.
+    #[test]
+    fn a_projection_rebuild_takes_the_writer_lock_before_it_reads() {
+        let directory = TempDir::new().expect("tempdir");
+        let path = directory.path().join("rebuild-writer-lock.sqlite");
+        let mut store = KernelStore::open(&path).expect("store");
+
+        let blocker = Connection::open(&path).expect("second connection");
+        blocker
+            .execute_batch("BEGIN IMMEDIATE;")
+            .expect("another process holds the writer lock");
+
+        let contended = store.with_rebuild_transaction(|_tx| Ok(()));
+        assert!(
+            matches!(contended, Err(StoreError::Busy)),
+            "a rebuild transaction must contend for the writer lock at BEGIN, not after its \
+             first read; got {contended:?}"
+        );
+
+        // And it is only the contention: once the other writer is gone the
+        // same call succeeds, so the assertion above cannot be satisfied by a
+        // rebuild that is simply broken.
+        blocker
+            .execute_batch("ROLLBACK;")
+            .expect("release the writer lock");
+        store
+            .with_rebuild_transaction(|_tx| Ok(()))
+            .expect("an uncontended rebuild transaction opens and commits");
+    }
+
     use crate::domain::agent::{
         AgentRole, AgentSessionFacts, AgentSessionLifecycle, ProviderSessionId,
     };
