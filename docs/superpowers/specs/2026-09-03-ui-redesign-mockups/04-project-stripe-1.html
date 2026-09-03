@@ -1,0 +1,122 @@
+<!doctype html>
+<html><head><meta charset="utf-8"><title>04-project-stripe-1</title>
+<style>
+  body { margin:0; padding:28px 32px; background:#0c0c0e; color:#e6e6ea; font: 14px/1.45 "Segoe UI", system-ui, sans-serif; }
+  h2 { margin:0 0 6px; font-size:20px; }
+  h3 { font-size:15px; }
+  .subtitle { color:#9a9aa3; margin:0 0 18px; max-width:1100px; }
+  .options { margin-top:10px; }
+  .option { display:flex; gap:10px; align-items:flex-start; border:1px solid #2c2c33; border-radius:8px; padding:8px 10px; max-width:300px; }
+  .option .letter { font-weight:700; color:#9a9aa3; min-width:16px; }
+  .option h3 { margin:0 0 2px; font-size:13px; }
+  .option p { margin:0; color:#9a9aa3; font-size:12px; }
+  .option[data-choice="1"] { border-color:#f2b441; }
+  .option[data-choice="1"] .letter::after { content:" CHOSEN"; color:#f2b441; font-size:10px; letter-spacing:.06em; }
+  div:has(> .options > .option:not([data-choice="1"])) { opacity:.38; }
+  div:has(> .options > .option[data-choice="1"]) { opacity:1; }
+</style></head><body>
+<h2>A colour per project, without spending any space</h2>
+<p class="subtitle">Four projects, each assigned a muted hue. State colour (amber needs you, red blocked) stays the loud one, so project hues are kept dim and cool. Each variant shows the board row and the matching panel title so you can see the same project across both. Two-line rows are used here; the density choice from the last screen is still open.</p>
+
+<style>
+  .pj { font: 13px/1.4 "Segoe UI", system-ui, sans-serif; color:#e6e6ea; display:grid; grid-template-columns:repeat(3, 1fr); gap:28px; }
+  .pj * { box-sizing:border-box; }
+  .col { width:236px; background:#101013; border:1px solid #26262b; border-radius:9px; overflow:hidden; }
+  .g { display:flex; align-items:center; gap:6px; padding:8px 10px 3px; color:#8a8a94; font-size:10.5px; text-transform:uppercase; letter-spacing:.06em; }
+  .g .n { color:#6b6b74; }
+  .dot { width:7px; height:7px; border-radius:50%; background:#3a3a46; flex:none; }
+  .dot.you { background:#f2b441; box-shadow:0 0 0 3px rgba(242,180,65,.18); }
+  .dot.blocked { background:#e5484d; box-shadow:0 0 0 3px rgba(229,72,77,.18); }
+  .dot.run { background:#6b6b74; }
+  .t { white-space:nowrap; overflow:hidden; text-overflow:ellipsis; min-width:0; }
+  .you .t { color:#fff; }
+  .age { color:#8a8a94; font-size:10.5px; flex:none; }
+  .m { color:#6b6b74; font-size:10.5px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; grid-column:2 / span 2; }
+  .r { display:grid; grid-template-columns:8px 1fr auto; gap:1px 8px; align-items:center; padding:5px 10px 6px; font-size:12.5px; position:relative; }
+  .sel { background:#17171c; }
+  /* palette: muted, cool, all similar brightness */
+  .p-snake { --pc:#5aa3a0; }   /* teal */
+  .p-cmd   { --pc:#7a86c4; }   /* slate blue */
+  .p-dm    { --pc:#a78a5c; }   /* sand */
+  .p-herdr { --pc:#8c6fa8; }   /* mauve */
+  /* variant 1: edge stripe */
+  .v1 .r::before { content:""; position:absolute; left:0; top:4px; bottom:4px; width:3px; border-radius:0 2px 2px 0; background:var(--pc); }
+  /* variant 2: monogram chip after the title */
+  .chip { flex:none; display:inline-block; font-size:9.5px; font-weight:700; letter-spacing:.04em; color:var(--pc); border:1px solid color-mix(in srgb, var(--pc) 55%, transparent); border-radius:4px; padding:0 4px; line-height:14px; margin-left:6px; vertical-align:1px; }
+  /* variant 3: project name coloured in the meta line */
+  .v3 .m b { color:var(--pc); font-weight:500; }
+  /* panel headers */
+  .hdr { width:236px; margin-top:10px; background:#151518; border:1px solid #26262b; border-radius:9px 9px 0 0; border-bottom:0; display:flex; align-items:center; gap:8px; padding:8px 10px 6px; position:relative; overflow:hidden; }
+  .hdr .title { font-weight:600; font-size:13px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; min-width:0; flex:1; }
+  .hdr .inline { color:#9a9aa3; font-weight:400; font-size:11.5px; white-space:nowrap; flex:none; }
+  .hdr .menu { color:#8a8a94; font-size:15px; line-height:1; }
+  .v1 .hdr::before { content:""; position:absolute; left:0; top:0; bottom:0; width:3px; background:var(--pc); }
+  .v3 .hdr .crumb { color:var(--pc); font-weight:400; }
+  .tabs { width:236px; background:#151518; border:1px solid #26262b; border-top:0; border-radius:0 0 9px 9px; display:flex; gap:2px; padding:4px 10px 8px; font-size:11px; color:#8a8a94; }
+  .tabs span { padding:2px 7px; border-radius:5px; }
+  .tabs span.on { background:#1c1c21; color:#e6e6ea; }
+  .cap { color:#9a9aa3; font-size:12px; margin:8px 0 4px; max-width:300px; }
+  .legend { display:flex; gap:14px; margin:0 0 14px; font-size:11.5px; color:#9a9aa3; }
+  .legend i { display:inline-block; width:9px; height:9px; border-radius:50%; background:var(--pc); margin-right:5px; vertical-align:-1px; }
+</style>
+
+<div class="legend"><span class="p-snake"><i></i>Snake Game</span><span class="p-cmd"><i></i>command</span><span class="p-dm"><i></i>devmanager</span><span class="p-herdr"><i></i>herdr</span><span style="margin-left:auto">state colours unchanged: <span style="color:#f2b441">● needs you</span> <span style="color:#e5484d">● blocked</span></span></div>
+
+<div class="pj">
+
+  <!-- 1: edge stripe -->
+  <div class="v1">
+    <div class="col">
+      <div class="g">Needs you <span class="n">2</span></div>
+      <div class="r you p-cmd"><span class="dot you"></span><span class="t">are there any migrations left to run…</span><span class="age">4m</span><span class="m">Asked a question · Claude</span></div>
+      <div class="r you p-snake"><span class="dot blocked"></span><span class="t">Build the Snake backend in snake-game…</span><span class="age">2m</span><span class="m">Provider rejected · Codex</span></div>
+      <div class="g">Working <span class="n">4</span></div>
+      <div class="r sel p-snake"><span class="dot run"></span><span class="t">Snake Frontend</span><span class="age">12s</span><span class="m">cargo test · 5/6 · Claude</span></div>
+      <div class="r p-dm"><span class="dot run"></span><span class="t">Port herdr zoom toggle to the workspace</span><span class="age">8s</span><span class="m">Thinking · 2 subagents · Claude</span></div>
+      <div class="r p-dm"><span class="dot run"></span><span class="t">Startup latency: name the lane cost</span><span class="age">1m</span><span class="m">Reading host-stderr.log · Claude</span></div>
+      <div class="r p-herdr"><span class="dot run"></span><span class="t">Screen history replay</span><span class="age">40s</span><span class="m">Editing pty.rs · 3/5 · Codex</span></div>
+    </div>
+    <div class="hdr p-snake"><span class="title">Snake Frontend</span><span class="inline">▶ cargo test · 12s · 5/6</span><span class="menu">⋯</span></div>
+    <div class="tabs"><span class="on">Conversation</span><span>Terminal</span><span>Files</span></div>
+    <p class="cap">A 3 px stripe on the row's left edge and the panel's left edge. Zero width cost, reads at a glance as "these belong together", and the state dot keeps its meaning.</p>
+    <div class="options" style="margin-top:0"><div class="option" data-choice="1" onclick="toggleSelect(this)"><div class="letter">1</div><div class="content"><h3>Edge stripe</h3><p>Thin project-coloured edge on row and panel.</p></div></div></div>
+  </div>
+
+  <!-- 2: monogram chip -->
+  <div class="v2">
+    <div class="col">
+      <div class="g">Needs you <span class="n">2</span></div>
+      <div class="r you p-cmd"><span class="dot you"></span><span class="t">are there any migrations left to run…<span class="chip">CMD</span></span><span class="age">4m</span><span class="m">Asked a question · Claude</span></div>
+      <div class="r you p-snake"><span class="dot blocked"></span><span class="t">Build the Snake backend in snake-game…<span class="chip">SG</span></span><span class="age">2m</span><span class="m">Provider rejected · Codex</span></div>
+      <div class="g">Working <span class="n">4</span></div>
+      <div class="r sel p-snake"><span class="dot run"></span><span class="t">Snake Frontend<span class="chip">SG</span></span><span class="age">12s</span><span class="m">cargo test · 5/6 · Claude</span></div>
+      <div class="r p-dm"><span class="dot run"></span><span class="t">Port herdr zoom toggle to the workspace<span class="chip">DM</span></span><span class="age">8s</span><span class="m">Thinking · 2 subagents · Claude</span></div>
+      <div class="r p-dm"><span class="dot run"></span><span class="t">Startup latency: name the lane cost<span class="chip">DM</span></span><span class="age">1m</span><span class="m">Reading host-stderr.log · Claude</span></div>
+      <div class="r p-herdr"><span class="dot run"></span><span class="t">Screen history replay<span class="chip">HR</span></span><span class="age">40s</span><span class="m">Editing pty.rs · 3/5 · Codex</span></div>
+    </div>
+    <div class="hdr p-snake"><span class="title">Snake Frontend<span class="chip">SG</span></span><span class="inline">▶ cargo test · 12s · 5/6</span><span class="menu">⋯</span></div>
+    <div class="tabs"><span class="on">Conversation</span><span>Terminal</span><span>Files</span></div>
+    <p class="cap">A two-letter monogram in the project colour after the title. Nameable, not just colour, so it survives colour-blindness and eight projects; costs about 24 px of title width.</p>
+    <div class="options" style="margin-top:0"><div class="option" data-choice="2" onclick="toggleSelect(this)"><div class="letter">2</div><div class="content"><h3>Monogram chip</h3><p>Coloured two-letter tag after the title.</p></div></div></div>
+  </div>
+
+  <!-- 3: coloured project name in meta -->
+  <div class="v3">
+    <div class="col">
+      <div class="g">Needs you <span class="n">2</span></div>
+      <div class="r you p-cmd"><span class="dot you"></span><span class="t">are there any migrations left to run…</span><span class="age">4m</span><span class="m"><b>command</b> · Asked a question · Claude</span></div>
+      <div class="r you p-snake"><span class="dot blocked"></span><span class="t">Build the Snake backend in snake-game…</span><span class="age">2m</span><span class="m"><b>Snake Game</b> · Provider rejected · Codex</span></div>
+      <div class="g">Working <span class="n">4</span></div>
+      <div class="r sel p-snake"><span class="dot run"></span><span class="t">Snake Frontend</span><span class="age">12s</span><span class="m"><b>Snake Game</b> · cargo test · 5/6 · Claude</span></div>
+      <div class="r p-dm"><span class="dot run"></span><span class="t">Port herdr zoom toggle to the workspace</span><span class="age">8s</span><span class="m"><b>devmanager</b> · Thinking · 2 subagents</span></div>
+      <div class="r p-dm"><span class="dot run"></span><span class="t">Startup latency: name the lane cost</span><span class="age">1m</span><span class="m"><b>devmanager</b> · Reading host-stderr.log</span></div>
+      <div class="r p-herdr"><span class="dot run"></span><span class="t">Screen history replay</span><span class="age">40s</span><span class="m"><b>herdr</b> · Editing pty.rs · 3/5 · Codex</span></div>
+    </div>
+    <div class="hdr p-snake"><span class="title">Snake Frontend <span class="crumb">· Snake Game</span></span><span class="inline">▶ 12s · 5/6</span><span class="menu">⋯</span></div>
+    <div class="tabs"><span class="on">Conversation</span><span>Terminal</span><span>Files</span></div>
+    <p class="cap">The project name already sits in the muted second line; just colour it. Free, but it is the smallest text on the row, and it only works with two-line rows.</p>
+    <div class="options" style="margin-top:0"><div class="option" data-choice="3" onclick="toggleSelect(this)"><div class="letter">3</div><div class="content"><h3>Coloured project name</h3><p>The meta line's project word in the project colour.</p></div></div></div>
+  </div>
+</div>
+
+</body></html>

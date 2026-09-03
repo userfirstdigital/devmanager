@@ -1,0 +1,171 @@
+<!doctype html>
+<html><head><meta charset="utf-8"><title>05-provider-mark-1</title>
+<style>
+  body { margin:0; padding:28px 32px; background:#0c0c0e; color:#e6e6ea; font: 14px/1.45 "Segoe UI", system-ui, sans-serif; }
+  h2 { margin:0 0 6px; font-size:20px; }
+  h3 { font-size:15px; }
+  .subtitle { color:#9a9aa3; margin:0 0 18px; max-width:1100px; }
+  .options { margin-top:10px; }
+  .option { display:flex; gap:10px; align-items:flex-start; border:1px solid #2c2c33; border-radius:8px; padding:8px 10px; max-width:300px; }
+  .option .letter { font-weight:700; color:#9a9aa3; min-width:16px; }
+  .option h3 { margin:0 0 2px; font-size:13px; }
+  .option p { margin:0; color:#9a9aa3; font-size:12px; }
+  .option[data-choice="1"] { border-color:#f2b441; }
+  .option[data-choice="1"] .letter::after { content:" CHOSEN"; color:#f2b441; font-size:10px; letter-spacing:.06em; }
+  div:has(> .options > .option:not([data-choice="1"])) { opacity:.38; }
+  div:has(> .options > .option[data-choice="1"]) { opacity:1; }
+</style></head><body>
+<h2>Option A with provider marks instead of the word</h2>
+<p class="subtitle">Full-width boxes, edge stripe, two lines. The provider name is replaced by a small 11 px monochrome mark. The shapes here stand in for the real Claude, Codex and Cursor marks (the app would ship its own glyph set; the existing provider enum already knows the three plus "other"). Two placements, then the same idea on the panel.</p>
+
+<style>
+  .pl { font: 13px/1.4 "Segoe UI", system-ui, sans-serif; color:#e6e6ea; }
+  .pl * { box-sizing:border-box; }
+  .row3 { display:grid; grid-template-columns:repeat(3, 1fr); gap:28px; }
+  .col { width:236px; background:#101013; border:1px solid #26262b; border-radius:9px; overflow:hidden; padding-bottom:4px; }
+  .hd { display:flex; align-items:center; gap:8px; padding:9px 10px 7px; }
+  .hd b { font-size:13px; }
+  .hd .new { margin-left:auto; border:1px solid #3a3a46; border-radius:6px; padding:2px 8px; font-size:11.5px; }
+  .g { display:flex; align-items:center; gap:6px; padding:8px 10px 3px; color:#8a8a94; font-size:10.5px; text-transform:uppercase; letter-spacing:.06em; }
+  .g .n { color:#6b6b74; }
+  .g.done { color:#6b6b74; }
+  .dot { width:7px; height:7px; border-radius:50%; background:#3a3a46; flex:none; }
+  .dot.you { background:#f2b441; box-shadow:0 0 0 3px rgba(242,180,65,.18); }
+  .dot.blocked { background:#e5484d; box-shadow:0 0 0 3px rgba(229,72,77,.18); }
+  .dot.run { background:#6b6b74; }
+  .t { white-space:nowrap; overflow:hidden; text-overflow:ellipsis; min-width:0; }
+  .you .t { color:#fff; }
+  .age { color:#8a8a94; font-size:10.5px; flex:none; }
+  .m { color:#6b6b74; font-size:10.5px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; grid-column:2 / span 2; display:flex; align-items:center; gap:6px; }
+  .m .txt { overflow:hidden; text-overflow:ellipsis; flex:1; min-width:0; }
+  .p-snake { --pc:#5aa3a0; } .p-cmd { --pc:#7a86c4; } .p-dm { --pc:#a78a5c; } .p-herdr { --pc:#8c6fa8; }
+  .seg { display:inline-flex; gap:2px; flex:none; }
+  .seg i { display:block; width:9px; height:4px; border-radius:1.5px; background:#2c2c33; }
+  .seg i.on { background:#8a8a94; }
+  .seg i.now { background:#c9c9d1; }
+  .segn { color:#6b6b74; font-size:10px; flex:none; }
+  .r { display:grid; grid-template-columns:8px 1fr auto; gap:1px 8px; align-items:center; padding:6px 10px 7px; font-size:12.5px; position:relative; margin:0 0 3px; background:#151518; border-top:1px solid #26262b; border-bottom:1px solid #26262b; }
+  .r::before { content:""; position:absolute; left:0; top:0; bottom:0; width:3px; background:var(--pc); }
+  .r.sel { background:#1a1a20; border-color:#34343c; }
+  .r.you { border-color:#5a4a20; }
+  .r.blocked { border-color:#5a2528; }
+  /* marks */
+  .mk { width:11px; height:11px; flex:none; display:inline-block; vertical-align:-1px; }
+  .mk svg { width:11px; height:11px; display:block; }
+  .mk.dim svg { fill:#7a7a84; stroke:#7a7a84; }
+  .mk.lit svg { fill:#a8a8b2; stroke:#a8a8b2; }
+  .mk.claude.tint svg { fill:#d98a5c; stroke:#d98a5c; }
+  .mk.codex.tint svg { fill:#c9c9d1; stroke:#c9c9d1; }
+  .mk.cursor.tint svg { fill:#9ec1e0; stroke:#9ec1e0; }
+  .first { display:flex; align-items:center; gap:6px; min-width:0; grid-column:2; }
+  .first .t { flex:1; }
+  .cap { color:#9a9aa3; font-size:12px; margin:8px 0 4px; max-width:300px; }
+  .key { display:flex; gap:18px; font-size:11.5px; color:#9a9aa3; margin:0 0 14px; align-items:center; }
+  .key span { display:inline-flex; align-items:center; gap:6px; }
+  /* panel */
+  .pane { width:470px; height:150px; background:#151518; border:1px solid #26262b; border-radius:9px; display:flex; flex-direction:column; overflow:hidden; position:relative; margin-top:10px; }
+  .pane::before { content:""; position:absolute; left:0; top:0; bottom:0; width:3px; background:var(--pc); }
+  .hdr { display:flex; align-items:center; gap:8px; padding:8px 10px 0 13px; min-width:0; }
+  .hdr .title { font-weight:600; font-size:13px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; min-width:0; flex:1; display:flex; align-items:center; gap:7px; }
+  .hdr .inline { color:#9a9aa3; font-weight:400; font-size:11.5px; white-space:nowrap; flex:none; display:flex; align-items:center; gap:6px; }
+  .ic { color:#6b6b74; font-size:12px; flex:none; }
+  .act { flex:none; border:1px solid #2c2c33; border-radius:6px; padding:2px 9px; font-size:11.5px; color:#c9c9d1; }
+  .menu { flex:none; color:#8a8a94; font-size:15px; line-height:1; padding:0 3px; }
+  .tabs { display:flex; gap:2px; padding:6px 10px 0 13px; font-size:11.5px; color:#8a8a94; border-bottom:1px solid #1f1f24; }
+  .tabs span { padding:3px 9px 5px; border-radius:6px 6px 0 0; }
+  .tabs span.on { background:#1c1c21; color:#e6e6ea; }
+  .tabs span.sub { display:inline-flex; align-items:center; gap:5px; }
+  .tabs .gap { flex:1; }
+  .stream { flex:1; background:#111114; margin:8px 10px 10px 13px; border-radius:6px; border:1px solid #1f1f24; }
+</style>
+
+<svg width="0" height="0" style="position:absolute">
+  <defs>
+    <!-- stand-in marks -->
+    <symbol id="mk-claude" viewBox="0 0 24 24"><path d="M12 2l2.2 6.3L21 9l-5.4 4.1L17.5 20 12 16.4 6.5 20l1.9-6.9L3 9l6.8-.7z" stroke-width="0"/></symbol>
+    <symbol id="mk-codex" viewBox="0 0 24 24"><path d="M12 3l7.8 4.5v9L12 21l-7.8-4.5v-9z" fill="none" stroke-width="2.4"/><circle cx="12" cy="12" r="2.6" stroke-width="0"/></symbol>
+    <symbol id="mk-cursor" viewBox="0 0 24 24"><path d="M5 3l14 9-6.2 1.6L9.4 20z" stroke-width="0"/></symbol>
+  </defs>
+</svg>
+
+<div class="pl">
+<div class="key">
+  <span><i class="mk lit claude"><svg><use href="#mk-claude"/></svg></i>Claude</span>
+  <span><i class="mk lit codex"><svg><use href="#mk-codex"/></svg></i>Codex</span>
+  <span><i class="mk lit cursor"><svg><use href="#mk-cursor"/></svg></i>Cursor</span>
+  <span style="margin-left:auto">stand-in shapes, not the real marks</span>
+</div>
+
+<div class="row3">
+
+  <!-- 1: mark at end of second line, grey -->
+  <div>
+    <div class="col">
+      <div class="hd"><b>Board</b><span class="new">+ New</span></div>
+      <div class="g">Needs you <span class="n">2</span></div>
+      <div class="r you p-cmd"><span class="dot you"></span><span class="t">are there any migrations left to run…</span><span class="age">4m</span><span class="m"><span class="txt">Asked a question</span><span class="seg"><i class="on"></i><i class="on"></i><i class="now"></i><i></i></span><span class="segn">2/4</span><i class="mk dim claude"><svg><use href="#mk-claude"/></svg></i></span></div>
+      <div class="r blocked p-snake"><span class="dot blocked"></span><span class="t">Build the Snake backend in snake-game…</span><span class="age">2m</span><span class="m"><span class="txt">Provider rejected</span><i class="mk dim codex"><svg><use href="#mk-codex"/></svg></i></span></div>
+      <div class="g">Working <span class="n">4</span></div>
+      <div class="r sel p-snake"><span class="dot run"></span><span class="t">Snake Frontend</span><span class="age">12s</span><span class="m"><span class="txt">cargo test</span><span class="seg"><i class="on"></i><i class="on"></i><i class="on"></i><i class="on"></i><i class="on"></i><i class="now"></i></span><span class="segn">5/6</span><i class="mk dim claude"><svg><use href="#mk-claude"/></svg></i></span></div>
+      <div class="r p-dm"><span class="dot run"></span><span class="t">Port herdr zoom toggle to the workspace</span><span class="age">8s</span><span class="m"><span class="txt">Thinking · 2 subagents</span><i class="mk dim claude"><svg><use href="#mk-claude"/></svg></i></span></div>
+      <div class="r p-dm"><span class="dot run"></span><span class="t">Startup latency: name the lane cost</span><span class="age">1m</span><span class="m"><span class="txt">Reading host-stderr.log</span><i class="mk dim cursor"><svg><use href="#mk-cursor"/></svg></i></span></div>
+      <div class="r p-herdr"><span class="dot run"></span><span class="t">Screen history replay</span><span class="age">40s</span><span class="m"><span class="txt">Editing pty.rs</span><span class="seg"><i class="on"></i><i class="on"></i><i class="on"></i><i class="now"></i><i></i></span><span class="segn">3/5</span><i class="mk dim codex"><svg><use href="#mk-codex"/></svg></i></span></div>
+      <div class="g">Idle <span class="n">2</span></div>
+      <div class="r p-cmd"><span class="dot"></span><span class="t">hi there</span><span class="age">18m</span><span class="m"><span class="txt">Last reply 18m</span><i class="mk dim codex"><svg><use href="#mk-codex"/></svg></i></span></div>
+      <div class="g done">Done <span class="n">3</span> <span style="margin-left:auto">▸</span></div>
+    </div>
+    <p class="cap">Mark at the far right of the second line, in the same grey as the text it replaces. Saves about 30 px on every row, and the word "Claude" stops repeating down the column.</p>
+    <div class="options" style="margin-top:0"><div class="option" data-choice="1" onclick="toggleSelect(this)"><div class="letter">1</div><div class="content"><h3>Grey mark, second line</h3><p>Quiet; where the word was.</p></div></div></div>
+  </div>
+
+  <!-- 2: mark on first line, before age -->
+  <div>
+    <div class="col">
+      <div class="hd"><b>Board</b><span class="new">+ New</span></div>
+      <div class="g">Needs you <span class="n">2</span></div>
+      <div class="r you p-cmd"><span class="dot you"></span><span class="first"><span class="t">are there any migrations left to run…</span><i class="mk dim claude"><svg><use href="#mk-claude"/></svg></i></span><span class="age">4m</span><span class="m"><span class="txt">Asked a question</span><span class="seg"><i class="on"></i><i class="on"></i><i class="now"></i><i></i></span><span class="segn">2/4</span></span></div>
+      <div class="r blocked p-snake"><span class="dot blocked"></span><span class="first"><span class="t">Build the Snake backend in snake-game…</span><i class="mk dim codex"><svg><use href="#mk-codex"/></svg></i></span><span class="age">2m</span><span class="m"><span class="txt">Provider rejected</span></span></div>
+      <div class="g">Working <span class="n">4</span></div>
+      <div class="r sel p-snake"><span class="dot run"></span><span class="first"><span class="t">Snake Frontend</span><i class="mk dim claude"><svg><use href="#mk-claude"/></svg></i></span><span class="age">12s</span><span class="m"><span class="txt">cargo test</span><span class="seg"><i class="on"></i><i class="on"></i><i class="on"></i><i class="on"></i><i class="on"></i><i class="now"></i></span><span class="segn">5/6</span></span></div>
+      <div class="r p-dm"><span class="dot run"></span><span class="first"><span class="t">Port herdr zoom toggle to the workspace</span><i class="mk dim claude"><svg><use href="#mk-claude"/></svg></i></span><span class="age">8s</span><span class="m"><span class="txt">Thinking · 2 subagents</span></span></div>
+      <div class="r p-dm"><span class="dot run"></span><span class="first"><span class="t">Startup latency: name the lane cost</span><i class="mk dim cursor"><svg><use href="#mk-cursor"/></svg></i></span><span class="age">1m</span><span class="m"><span class="txt">Reading host-stderr.log</span></span></div>
+      <div class="r p-herdr"><span class="dot run"></span><span class="first"><span class="t">Screen history replay</span><i class="mk dim codex"><svg><use href="#mk-codex"/></svg></i></span><span class="age">40s</span><span class="m"><span class="txt">Editing pty.rs</span><span class="seg"><i class="on"></i><i class="on"></i><i class="on"></i><i class="now"></i><i></i></span><span class="segn">3/5</span></span></div>
+      <div class="g">Idle <span class="n">2</span></div>
+      <div class="r p-cmd"><span class="dot"></span><span class="first"><span class="t">hi there</span><i class="mk dim codex"><svg><use href="#mk-codex"/></svg></i></span><span class="age">18m</span><span class="m"><span class="txt">Last reply 18m</span></span></div>
+      <div class="g done">Done <span class="n">3</span> <span style="margin-left:auto">▸</span></div>
+    </div>
+    <p class="cap">Mark on the title line, just before the age. The provider becomes part of the task's identity, next to its name, and the second line is pure status. Costs 17 px of title width.</p>
+    <div class="options" style="margin-top:0"><div class="option" data-choice="2" onclick="toggleSelect(this)"><div class="letter">2</div><div class="content"><h3>Mark on the title line</h3><p>Identity with the title; status line stays pure.</p></div></div></div>
+  </div>
+
+  <!-- 3: tinted brand-ish marks, second line -->
+  <div>
+    <div class="col">
+      <div class="hd"><b>Board</b><span class="new">+ New</span></div>
+      <div class="g">Needs you <span class="n">2</span></div>
+      <div class="r you p-cmd"><span class="dot you"></span><span class="t">are there any migrations left to run…</span><span class="age">4m</span><span class="m"><span class="txt">Asked a question</span><span class="seg"><i class="on"></i><i class="on"></i><i class="now"></i><i></i></span><span class="segn">2/4</span><i class="mk tint claude"><svg><use href="#mk-claude"/></svg></i></span></div>
+      <div class="r blocked p-snake"><span class="dot blocked"></span><span class="t">Build the Snake backend in snake-game…</span><span class="age">2m</span><span class="m"><span class="txt">Provider rejected</span><i class="mk tint codex"><svg><use href="#mk-codex"/></svg></i></span></div>
+      <div class="g">Working <span class="n">4</span></div>
+      <div class="r sel p-snake"><span class="dot run"></span><span class="t">Snake Frontend</span><span class="age">12s</span><span class="m"><span class="txt">cargo test</span><span class="seg"><i class="on"></i><i class="on"></i><i class="on"></i><i class="on"></i><i class="on"></i><i class="now"></i></span><span class="segn">5/6</span><i class="mk tint claude"><svg><use href="#mk-claude"/></svg></i></span></div>
+      <div class="r p-dm"><span class="dot run"></span><span class="t">Port herdr zoom toggle to the workspace</span><span class="age">8s</span><span class="m"><span class="txt">Thinking · 2 subagents</span><i class="mk tint claude"><svg><use href="#mk-claude"/></svg></i></span></div>
+      <div class="r p-dm"><span class="dot run"></span><span class="t">Startup latency: name the lane cost</span><span class="age">1m</span><span class="m"><span class="txt">Reading host-stderr.log</span><i class="mk tint cursor"><svg><use href="#mk-cursor"/></svg></i></span></div>
+      <div class="r p-herdr"><span class="dot run"></span><span class="t">Screen history replay</span><span class="age">40s</span><span class="m"><span class="txt">Editing pty.rs</span><span class="seg"><i class="on"></i><i class="on"></i><i class="on"></i><i class="now"></i><i></i></span><span class="segn">3/5</span><i class="mk tint codex"><svg><use href="#mk-codex"/></svg></i></span></div>
+      <div class="g">Idle <span class="n">2</span></div>
+      <div class="r p-cmd"><span class="dot"></span><span class="t">hi there</span><span class="age">18m</span><span class="m"><span class="txt">Last reply 18m</span><i class="mk tint codex"><svg><use href="#mk-codex"/></svg></i></span></div>
+      <div class="g done">Done <span class="n">3</span> <span style="margin-left:auto">▸</span></div>
+    </div>
+    <p class="cap">Same placement as 1, but each mark in its brand tint (Claude's terracotta, Cursor's blue, Codex white). Faster to tell apart, at the cost of one more colour family competing with amber and the project stripes.</p>
+    <div class="options" style="margin-top:0"><div class="option" data-choice="3" onclick="toggleSelect(this)"><div class="letter">3</div><div class="content"><h3>Tinted marks</h3><p>Brand colours; quicker to tell apart, busier.</p></div></div></div>
+  </div>
+</div>
+
+<h3 style="margin-top:28px">The same mark on the panel</h3>
+<p class="subtitle">In the title row, the mark sits before the title, so a glance at the panel grid tells you which agent owns which panel. Subagent tabs carry the mark too, which is how a Codex subagent under a Claude parent would show.</p>
+<div class="pane p-snake">
+  <div class="hdr"><span class="title"><i class="mk lit claude"><svg><use href="#mk-claude"/></svg></i>Snake Frontend</span><span class="inline">▶ cargo test · 12s <span class="seg"><i class="on"></i><i class="on"></i><i class="on"></i><i class="on"></i><i class="on"></i><i class="now"></i></span><span class="segn">5/6</span></span><span class="ic">⤢</span><span class="act">Done</span><span class="menu">⋯</span></div>
+  <div class="tabs"><span class="on">Conversation</span><span>Terminal</span><span>Files</span><span>Git</span><span class="gap"></span><span class="sub"><i class="mk dim claude"><svg><use href="#mk-claude"/></svg></i>code-reviewer</span><span class="sub"><i class="mk dim codex"><svg><use href="#mk-codex"/></svg></i>port-check</span></div>
+  <div class="stream"></div>
+</div>
+</div>
+
+</body></html>
