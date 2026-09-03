@@ -14449,10 +14449,13 @@ impl NativeShell {
                         if first_send_terminal_probe_start_pending(&result) {
                             self.schedule_terminal_start_retry(key);
                         } else {
-                            let target = key.1;
+                            // The requery map keys by the outgoing target it
+                            // was armed under; the attachment slot keys by the
+                            // chip whose reply this is.
+                            let settles = self.settling_terminal_target(&key.0, key.1);
                             self.pending_terminal_requeries.remove(&key);
                             self.task_surfaces
-                                .note_terminal_reconnecting_for(owner, target.surface_target());
+                                .note_terminal_reconnecting_for(owner, settles.surface_target());
                         }
                         if self.local_slot_mut().interaction.selected_task() == Some(task_id) {
                             self.sync_terminal_from_cockpit();
@@ -14921,6 +14924,35 @@ impl NativeShell {
             })
     }
 
+    /// The attachment slot one screen query's REPLY settles for this owner.
+    ///
+    /// [`TerminalTarget::for_screen_query`] reads the query that went OUT, and
+    /// a chip may address the provider by its own durable resource on the way
+    /// out -- `focus_terminal_chip` does exactly that. The provider's screen
+    /// answers as `Provider` however it was asked for (`for_projection`), so
+    /// the lease, the refusal sentence and the startup promise were all taken
+    /// on the provider slot by `TerminalTarget::for_chip`. Keying a settlement
+    /// by the outgoing resource id therefore releases a slot nobody holds and
+    /// leaves the provider's own lease in flight forever, which the bounded
+    /// start retry reads as "a query is still running" and drops itself over.
+    /// This is the ONE conversion from an outgoing target to the slot its
+    /// reply settles; the requery map stays keyed by the outgoing target,
+    /// because that is the key it was armed under.
+    fn settling_terminal_target(
+        &self,
+        owner: &HostTaskKey,
+        target: TerminalTarget,
+    ) -> TerminalTarget {
+        match target {
+            TerminalTarget::Resource(resource_id)
+                if self.terminal_chip_is_provider(owner, resource_id) =>
+            {
+                TerminalTarget::Provider
+            }
+            other => other,
+        }
+    }
+
     /// The screen-readiness request the Terminal tool issues when it becomes
     /// visible, addressed at the chip the strip actually focuses.
     ///
@@ -15003,9 +15035,12 @@ impl NativeShell {
     fn schedule_terminal_start_retry(&mut self, key: TerminalKey) {
         // The retry is armed for ONE terminal, so only that terminal's
         // attachment slot keeps its startup promise. Applying it to the Task
-        // relabels whichever terminal happens to be on screen.
+        // relabels whichever terminal happens to be on screen. The promise
+        // goes to the slot the reply settles, not to the resource id the
+        // outgoing query named -- see `settling_terminal_target`.
+        let settles = self.settling_terminal_target(&key.0, key.1);
         self.task_surfaces
-            .note_terminal_start_pending_for(key.0.clone(), key.1.surface_target());
+            .note_terminal_start_pending_for(key.0.clone(), settles.surface_target());
         self.pending_terminal_requeries
             .insert(key, Instant::now() + TERMINAL_START_RETRY_INTERVAL);
     }
@@ -15024,6 +15059,10 @@ impl NativeShell {
             self.pending_terminal_requeries.remove(&key);
             let owner = key.0.clone();
             let target = key.1;
+            // The query goes out under `target`; every attachment slot below
+            // is the one its reply settles. The two differ for a provider
+            // addressed by its own resource id -- see `settling_terminal_target`.
+            let settles = self.settling_terminal_target(&owner, target);
             let visible = self
                 .layout
                 .task_workspace
@@ -15037,14 +15076,14 @@ impl NativeShell {
                 }
                 let query_in_flight = self
                     .task_surfaces
-                    .terminal_query_in_flight_for(owner.clone(), target.surface_target());
+                    .terminal_query_in_flight_for(owner.clone(), settles.surface_target());
                 if query_in_flight {
                     self.pending_terminal_requeries
                         .insert(key, now + TERMINAL_ECHO_RETRY_INTERVAL);
                     continue;
                 }
                 self.task_surfaces
-                    .note_terminal_query_started_for(owner.clone(), target.surface_target());
+                    .note_terminal_query_started_for(owner.clone(), settles.surface_target());
                 if self
                     .dispatch_action_recorded_for_owner(
                         &owner.host,
@@ -15059,7 +15098,7 @@ impl NativeShell {
                 } else {
                     self.pending_terminal_echoes.remove(&key);
                     self.task_surfaces
-                        .note_terminal_reconnecting_for(owner, target.surface_target());
+                        .note_terminal_reconnecting_for(owner, settles.surface_target());
                 }
                 continue;
             }
@@ -15075,7 +15114,7 @@ impl NativeShell {
                 continue;
             }
             self.task_surfaces
-                .note_terminal_query_started_for(owner.clone(), target.surface_target());
+                .note_terminal_query_started_for(owner.clone(), settles.surface_target());
             if self
                 .dispatch_action_recorded_for_owner(
                     &owner.host,
@@ -15089,7 +15128,7 @@ impl NativeShell {
                 dispatched = true;
             } else {
                 self.task_surfaces
-                    .note_terminal_reconnecting_for(owner, target.surface_target());
+                    .note_terminal_reconnecting_for(owner, settles.surface_target());
             }
         }
         dispatched
@@ -17148,7 +17187,9 @@ impl NativeShell {
                     if first_send_terminal_probe_start_pending(result) {
                         self.schedule_terminal_start_retry(key);
                     } else {
-                        let target = key.1;
+                        // Same split as the local lane: the map keys by the
+                        // outgoing target, the attachment by the settling chip.
+                        let settles = self.settling_terminal_target(&key.0, key.1);
                         self.pending_terminal_requeries.remove(&key);
                         // "Terminal unavailable" is the same four words for every
                         // distinct refusal. Keep the host's sentence with the
@@ -17166,11 +17207,11 @@ impl NativeShell {
                         };
                         self.task_surfaces.note_terminal_refusal_for(
                             owner.clone(),
-                            target.surface_target(),
+                            settles.surface_target(),
                             refusal,
                         );
                         self.task_surfaces
-                            .note_terminal_reconnecting_for(owner, target.surface_target());
+                            .note_terminal_reconnecting_for(owner, settles.surface_target());
                     }
                 }
             }
@@ -17370,13 +17411,14 @@ impl NativeShell {
             return;
         };
         let owner = HostTaskKey::new(host_id.clone(), task_id);
+        let settles = self.settling_terminal_target(&owner, target);
         self.pending_terminal_requeries
             .remove(&(owner.clone(), target));
         // Only the terminal whose query failed is reconnecting. Marking the
         // Task would relabel the focused shell because the provider's probe
         // came back empty, and drop its interactivity with it.
         self.task_surfaces
-            .note_terminal_reconnecting_for(owner, target.surface_target());
+            .note_terminal_reconnecting_for(owner, settles.surface_target());
         if host_id == &self.local_host_id()
             && self.local_slot().interaction.selected_task() == Some(task_id)
         {
@@ -66190,6 +66232,121 @@ mod tests {
                 assert!(
                     !shell.pending_terminal_requeries.contains_key(&armed),
                     "the reply to that exact query must retire the retry it armed"
+                );
+            });
+            cx.quit();
+        });
+    }
+
+    /// The provider chip addresses its terminal by resource id on the way OUT,
+    /// and the provider's screen answers as `Provider` however it was asked for
+    /// -- which is why `TerminalTarget::for_chip` exists and why the attachment
+    /// lease was taken on the provider slot. A settlement keyed by the outgoing
+    /// resource id therefore releases a slot nobody holds and leaves the
+    /// provider's own lease in flight forever: the bounded start retry then
+    /// drops itself (`still_starting` reads exactly that lease) and the Terminal
+    /// tool refuses to re-query, so the provider terminal stays blank with
+    /// nothing scheduled to fill it until a user gesture takes a fresh lease.
+    #[test]
+    fn a_provider_chip_query_settling_start_pending_releases_the_provider_lease() {
+        if rerun_headless_shell_test_in_child(
+            "ui::native_shell::tests::a_provider_chip_query_settling_start_pending_releases_the_provider_lease",
+        ) {
+            return;
+        }
+        let (runtime, _local_shared) = TestRuntime::new(true, NativeHostActionResult::Queued);
+        let remote_host = HostId::Remote([0x5b; 16]);
+        gpui::Application::headless().run(move |cx| {
+            crate::ui::init(cx);
+            with_test_shell_in_app(cx, runtime, |shell| {
+                let (model, task_id) = terminal_bound_client_model();
+                let model = Arc::new(model);
+                let provider_resource =
+                    provider_terminal_projection_for_test(&model, task_id, 1).resource_id;
+                let shared =
+                    attach_remote_test_host_with_shared(shell, &remote_host, Arc::clone(&model));
+                let owner = HostTaskKey::new(remote_host.clone(), task_id);
+                shell
+                    .select_fleet_task_key(owner.clone(), FleetSelectMode::Replace)
+                    .expect("select remote task");
+                let strip = shell_strip_for_test(task_id, provider_resource, &[], None);
+                shell
+                    .task_surfaces
+                    .admit_terminals(owner.clone(), &strip)
+                    .expect("admit strip");
+
+                shared.lock().expect("runtime").accepted.clear();
+                // The real entry point: the user picks the provider chip.
+                shell.focus_terminal_chip(&owner, provider_resource);
+                assert!(
+                    shell
+                        .task_surfaces
+                        .terminal_query_in_flight_for(owner.clone(), None),
+                    "the chip click must take the PROVIDER slot's lease"
+                );
+                let action = shared
+                    .lock()
+                    .expect("runtime")
+                    .accepted
+                    .iter()
+                    .find(|record| {
+                        matches!(
+                            &record.command,
+                            NativeHostCommand::TaskCockpitQuery {
+                                query: TaskCockpitQuery::TerminalFor { resource_id },
+                                ..
+                            } if *resource_id == provider_resource
+                        )
+                    })
+                    .cloned()
+                    .expect("the chip click dispatches a resource-addressed screen query");
+
+                // The host answers that the provider PTY is still starting.
+                shell.apply_epoch_fenced_action_outcome_for_host(
+                    &remote_host,
+                    NativeHostActionOutcome::Queried {
+                        action,
+                        detail: "start pending".into(),
+                        body: NativeHostQueryBody::TaskCockpit(
+                            crate::domain::TaskCockpitResult::Unavailable {
+                                surface: crate::domain::TaskCockpitSurface::Terminal,
+                                reason:
+                                    crate::domain::TaskCockpitUnavailableReason::TerminalStartPending,
+                                detail: None,
+                            },
+                        ),
+                    },
+                );
+
+                assert!(
+                    !shell
+                        .task_surfaces
+                        .terminal_query_in_flight_for(owner.clone(), None),
+                    "the reply must release the PROVIDER slot's lease, not one keyed by the \
+                     resource id the outgoing query happened to name"
+                );
+
+                shared.lock().expect("runtime").accepted.clear();
+                let fired = shell.retry_due_terminal_queries(
+                    Instant::now() + super::TERMINAL_START_RETRY_INTERVAL + Duration::from_secs(1),
+                );
+                assert!(
+                    fired,
+                    "the bounded start retry must dispatch: nothing else will fill the blank \
+                     provider terminal"
+                );
+                assert!(
+                    shared
+                        .lock()
+                        .expect("runtime")
+                        .accepted
+                        .iter()
+                        .any(|record| matches!(
+                            &record.command,
+                            NativeHostCommand::TaskCockpitQuery { query, .. }
+                                if super::TerminalTarget::for_screen_query(query).is_some()
+                        )),
+                    "the retry must re-ask for the provider's screen"
                 );
             });
             cx.quit();
