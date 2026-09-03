@@ -1398,39 +1398,43 @@ impl ThemeTokens {
     }
 }
 
-// T3 Code's dark shell uses a plum-black canvas, a still darker navigation
-// rail, and depth only where interaction calls for it. These values are
-// sampled from the accepted reference rather than approximated from the old
-// neutral zinc cockpit.
-const DARK_SURFACE_CANVAS: Color = Color::from_u32(0x1f1a24);
-const DARK_SURFACE_RAISED: Color = Color::from_u32(0x29232e);
-const DARK_SURFACE_OVERLAY: Color = Color::from_u32(0x2b2431);
-const DARK_SURFACE_SUNKEN: Color = Color::from_u32(0x1a131b);
-const DARK_SURFACE_HOVER: Color = Color::from_u32(0x241c25);
-const DARK_SURFACE_SELECTION: Color = Color::from_u32(0x001062);
+// The redesign's dark shell is a near-black neutral grey stack: the board
+// canvas sits darkest, row boxes lift one step, and colour is reserved for
+// attention (amber) and destruction (red) so nothing else competes for the
+// eye. Values come from the redesign spec rather than the old plum shell.
+const DARK_SURFACE_CANVAS: Color = Color::from_u32(0x101013);
+const DARK_SURFACE_RAISED: Color = Color::from_u32(0x151518);
+const DARK_SURFACE_OVERLAY: Color = Color::from_u32(0x1a1a1f);
+const DARK_SURFACE_SUNKEN: Color = Color::from_u32(0x111114);
+const DARK_SURFACE_HOVER: Color = Color::from_u32(0x17171c);
+const DARK_SURFACE_SELECTION: Color = Color::from_u32(0x1a1a20);
 const DARK_SURFACE_DISABLED: Color = Color::from_u32(0x241e28);
 
-const DARK_TEXT_PRIMARY: Color = Color::from_u32(0xe4e4e7);
-const DARK_TEXT_SECONDARY: Color = Color::from_u32(0xd4d4d8);
-const DARK_TEXT_MUTED: Color = Color::from_u32(0xc4c4cc);
+const DARK_TEXT_PRIMARY: Color = Color::from_u32(0xe6e6ea);
+const DARK_TEXT_SECONDARY: Color = Color::from_u32(0x9a9aa3);
+// The redesign specifies 0x6b6b74 here, but that reads at 3.45:1 on the new
+// raised surface and fails the WCAG AA gate below. 0x808089 is the nearest
+// step on the same grey ramp that keeps muted text AA on raised (4.66:1) and
+// on the legacy panel background (4.53:1).
+const DARK_TEXT_MUTED: Color = Color::from_u32(0x808089);
 const DARK_TEXT_DISABLED: Color = Color::from_u32(0xb8b8c0);
 const DARK_TEXT_INVERSE: Color = Color::from_u32(0xf8fafc);
 const DARK_TEXT_ON_ACCENT: Color = Color::from_u32(0xf8fafc);
-const DARK_TEXT_ON_SELECTION: Color = Color::from_u32(0xf8fafc);
+const DARK_TEXT_ON_SELECTION: Color = Color::from_u32(0xffffff);
 
-const DARK_BORDER_SUBTLE: Color = Color::from_u32(0x362d3d);
-const DARK_BORDER_DEFAULT: Color = Color::from_u32(0x493d50);
-const DARK_BORDER_STRONG: Color = Color::from_u32(0x66566d);
+const DARK_BORDER_SUBTLE: Color = Color::from_u32(0x26262b);
+const DARK_BORDER_DEFAULT: Color = Color::from_u32(0x2c2c33);
+const DARK_BORDER_STRONG: Color = Color::from_u32(0x34343c);
 const DARK_BORDER_FOCUS: Color = Color::from_u32(0xfacc15);
 const DARK_BORDER_SELECTION: Color = Color::from_u32(0xa1a1aa);
 const DARK_BORDER_DISABLED: Color = Color::from_u32(0x52525b);
 
 const DARK_STATUS_EXTERNAL: Color = Color::from_u32(0x60a5fa);
-const DARK_STATUS_ATTENTION: Color = Color::from_u32(0xf59e0b);
-const DARK_STATUS_SUCCESS: Color = Color::from_u32(0x4ade80);
+const DARK_STATUS_ATTENTION: Color = Color::from_u32(0xf2b441);
+const DARK_STATUS_SUCCESS: Color = Color::from_u32(0x7fb07f);
 const DARK_STATUS_WARNING: Color = Color::from_u32(0xfacc15);
-const DARK_STATUS_DESTRUCTIVE: Color = Color::from_u32(0xfb7185);
-const DARK_STATUS_INACTIVE: Color = Color::from_u32(0xa1a1aa);
+const DARK_STATUS_DESTRUCTIVE: Color = Color::from_u32(0xe5484d);
+const DARK_STATUS_INACTIVE: Color = Color::from_u32(0x6b6b74);
 
 const DARK_ACTION_PRIMARY_DEFAULT: Color = Color::from_u32(0xce1a6b);
 const DARK_ACTION_PRIMARY_HOVER: Color = Color::from_u32(0xd4146a);
@@ -1462,6 +1466,7 @@ const DARK_STATUS_DESTRUCTIVE_FOREGROUND: Color = Color::from_u32(0xffe4e6);
 const DARK_STATUS_INACTIVE_SURFACE: Color = Color::from_u32(0x27272a);
 const DARK_STATUS_INACTIVE_FOREGROUND: Color = Color::from_u32(0xd4d4d8);
 
+const DARK_TERMINAL_BACKGROUND: Color = Color::from_u32(0x0b0b0d);
 const DARK_TERMINAL_BLACK: Color = Color::from_u32(0x818894);
 const DARK_TERMINAL_RED: Color = Color::from_u32(0xef4444);
 const DARK_TERMINAL_GREEN: Color = Color::from_u32(0x22c55e);
@@ -1818,7 +1823,7 @@ fn dark_theme(density: Density, scale: Scale) -> ThemeTokens {
             inactive_foreground: DARK_STATUS_INACTIVE_FOREGROUND,
         },
         terminal: TerminalPalette {
-            background: DARK_SURFACE_SUNKEN,
+            background: DARK_TERMINAL_BACKGROUND,
             foreground: DARK_TEXT_PRIMARY,
             cursor: DARK_TEXT_PRIMARY,
             selection: DARK_SURFACE_SELECTION,
@@ -2065,7 +2070,7 @@ pub mod legacy {
     /// Previously `0x52525b` (~2.29:1 against panel). Aligned to the dark
     /// semantic muted token so normal visible dim text meets WCAG AA (≥4.5:1)
     /// without introducing a second palette.
-    pub const TEXT_DIM: u32 = Color::from_u32(0xc4c4cc).to_u32();
+    pub const TEXT_DIM: u32 = Color::from_u32(0x808089).to_u32();
 
     pub const SELECTION_BG: u32 = Color::from_u32(0x22364d).to_u32();
     pub const SELECTION_TEXT: u32 = Color::from_u32(0xf8fafc).to_u32();
@@ -2167,5 +2172,29 @@ mod tests {
                 "semantic muted on raised must stay AA for {mode:?}, got {ratio}"
             );
         }
+    }
+
+    #[test]
+    fn dark_palette_matches_the_redesign_spec() {
+        let t = dark(Density::Comfortable, Scale::Scale100);
+        assert_eq!(t.surfaces.canvas, Color::from_u32(0x101013), "column");
+        assert_eq!(t.surfaces.raised, Color::from_u32(0x151518), "row box");
+        assert_eq!(
+            t.surfaces.selection,
+            Color::from_u32(0x1a1a20),
+            "selected row"
+        );
+        assert_eq!(t.surfaces.sunken, Color::from_u32(0x111114), "stream");
+        assert_eq!(t.terminal.background, Color::from_u32(0x0b0b0d), "terminal");
+        assert_eq!(t.borders.subtle, Color::from_u32(0x26262b));
+        assert_eq!(t.borders.strong, Color::from_u32(0x34343c));
+        assert_eq!(t.text.primary, Color::from_u32(0xe6e6ea));
+        assert_eq!(t.text.secondary, Color::from_u32(0x9a9aa3));
+        // The spec asks for 0x6b6b74; the AA gate on raised surfaces outranks
+        // it, so the nearest passing step on the same ramp is what ships.
+        assert_eq!(t.text.muted, Color::from_u32(0x808089));
+        assert_eq!(t.status.attention, Color::from_u32(0xf2b441));
+        assert_eq!(t.status.destructive, Color::from_u32(0xe5484d));
+        assert_eq!(t.status.success, Color::from_u32(0x7fb07f));
     }
 }
