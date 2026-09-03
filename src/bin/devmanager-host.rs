@@ -107,12 +107,12 @@ fn main() -> ExitCode {
     match run(argv.collect()) {
         Ok(()) => ExitCode::SUCCESS,
         Err(HostRunError::AlreadyRunning(message)) => {
-            let _ = writeln!(io::stderr(), "devmanager-host: {message}");
+            host_log!("devmanager-host: {message}");
             let _ = io::stderr().flush();
             ExitCode::from(HOST_EXIT_ALREADY_RUNNING)
         }
         Err(HostRunError::Message(message)) => {
-            let _ = writeln!(io::stderr(), "devmanager-host: {message}");
+            host_log!("devmanager-host: {message}");
             let _ = io::stderr().flush();
             ExitCode::FAILURE
         }
@@ -928,10 +928,7 @@ fn parent_has_exited(parent: &ParentProcess) -> Result<bool, String> {
     if unsafe { GetExitCodeProcess(parent.handle, &mut exit_code) }.is_ok()
         && exit_code == STILL_ACTIVE
     {
-        let _ = writeln!(
-            io::stderr(),
-            "devmanager-host: parent wait signaled while process is still active; ignoring"
-        );
+        host_log!("devmanager-host: parent wait signaled while process is still active; ignoring");
         let _ = io::stderr().flush();
         return Ok(false);
     }
@@ -1037,10 +1034,7 @@ async fn finish_supervised_host(
 
     match exit {
         HostLoopExit::Parent(Ok(())) => {
-            let _ = writeln!(
-                io::stderr(),
-                "devmanager-host: parent process exited; stopping"
-            );
+            host_log!("devmanager-host: parent process exited; stopping");
             let _ = io::stderr().flush();
         }
         HostLoopExit::Parent(Err(error)) | HostLoopExit::Listener(error) => errors.push(error),
@@ -1126,8 +1120,7 @@ fn spawn_connection_task(
             connection.serve_duplex(requests).await
         };
         if let Err(error) = result {
-            let _ = writeln!(
-                io::stderr(),
+            host_log!(
                 "devmanager-host: client {client_id} duplex connection ended with error: {error}"
             );
             let _ = io::stderr().flush();
@@ -1176,7 +1169,7 @@ async fn serve_foreground_host(
 
     let organization_snapshot = organization_runtime.snapshot();
     if let Some(diagnostic) = organization_snapshot.last_error.as_deref() {
-        let _ = writeln!(io::stderr(), "devmanager-host: {diagnostic}");
+        host_log!("devmanager-host: {diagnostic}");
     }
     let hello_config = AcceptHelloConfig {
         host_boot_id,
@@ -1249,8 +1242,7 @@ async fn serve_foreground_host(
             }
         },
         Err(error) => {
-            let _ = writeln!(
-                io::stderr(),
+            host_log!(
                 "devmanager-host: remote access startup failed closed (local host retained): {error}"
             );
             let _ = io::stderr().flush();
@@ -1340,8 +1332,7 @@ async fn serve_foreground_host(
                 match connection_result {
                     Some(Ok(())) => {}
                     Some(Err(error)) => {
-                        let _ = writeln!(
-                            io::stderr(),
+                        host_log!(
                             "devmanager-host: {}; continuing to accept clients",
                             join_error_message("connection task", error)
                         );
@@ -1388,10 +1379,7 @@ async fn serve_foreground_host(
     // Release desktop detach does not reach this path as a host-stop signal.
     if let Some(controller) = remote_access.take() {
         if let Err(error) = controller.shutdown_async().await {
-            let _ = writeln!(
-                io::stderr(),
-                "devmanager-host: remote access shutdown: {error}"
-            );
+            host_log!("devmanager-host: remote access shutdown: {error}");
             let _ = io::stderr().flush();
         }
     }
