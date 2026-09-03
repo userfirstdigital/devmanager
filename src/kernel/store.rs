@@ -20,7 +20,7 @@ use crate::domain::event::{
     TaskUnitPayload, TerminalActivityPayload, TerminalCwdReportedPayload, TerminalExitedPayload,
     TerminalRenamedPayload, UnstartedPrimaryProviderReboundPayload, EVENT_SCHEMA_VERSION,
 };
-use crate::domain::id::{EventId, OperationId, OutboxId, TaskId};
+use crate::domain::id::{EventId, OperationId, OutboxId, ResourceId, TaskId};
 use crate::domain::operation::{
     OperationOutcome, OperationOutcomeKind, OperationState, OutcomeSource, ResourceFence,
 };
@@ -43,6 +43,13 @@ use crate::kernel::StoreMaintenanceReport;
 use crate::workspace::WorkspaceAuthorization;
 
 const BUSY_TIMEOUT_MS: i64 = 5_000;
+
+/// How many pending `ReleaseResource` rows one maintenance scan examines.
+///
+/// A bound rather than a page: the scan runs on the reaper tick beside every
+/// other maintenance unit, and anything it does not reach this tick it reaches
+/// on the next one.
+const MAX_PENDING_RESOURCE_RELEASES_PER_SCAN: usize = 64;
 const MAX_DISPATCH_LEASE_MS: i64 = 3_600_000;
 pub(crate) const MAX_PROVIDER_EVENT_PAYLOAD_BYTES: usize = 256 * 1024;
 const MAX_CONNECT_IDENTITY_BYTES: usize = 64 * 1024;
@@ -373,6 +380,77 @@ impl KernelStore {
         self.with_immediate_transaction(|tx| {
             claim_next_dispatch_in_tx(tx, now_ms()?, lease_ms, Some(destination))
         })
+    }
+
+    /// Settle the pending `ReleaseResource` row for exactly one resource.
+    ///
+    /// Claim, begin, exact effect validation and `DispatchCompletion::Settled`
+    /// all run in ONE IMMEDIATE transaction, and rows for other resources are
+    /// stepped over without ever being claimed: a claim-then-inspect-then-release
+    /// loop would take and hand back leases on unrelated releases, which is
+    /// visible to every other claimant as contention it cannot explain.
+    ///
+    /// `Ok(None)` means there is no settleable row for this resource, which is
+    /// the ordinary answer when the release has already been settled.
+    pub(crate) fn settle_resource_release_for(
+        &mut self,
+        resource_id: ResourceId,
+        lease: Duration,
+    ) -> Result<Option<(TaskId, OperationId)>, StoreError> {
+        let lease_ms = validate_dispatch_lease_ms(lease)?;
+        self.with_immediate_transaction(|tx| {
+            settle_resource_release_for_in_tx(tx, now_ms()?, lease_ms, resource_id)
+        })
+    }
+
+    /// Every settleable `ReleaseResource` row, as `(task_id, resource_id)`.
+    ///
+    /// Read-only, and used by maintenance to converge after a crash between
+    /// closing a shell and settling its release. The caller decides which of
+    /// these are plain shells it no longer holds; this deliberately does not,
+    /// so "what is a plain shell" keeps one definition
+    /// (`ResourceRecipe::is_plain_shell`).
+    ///
+    /// Bounded: a maintenance tick examines at most
+    /// `MAX_PENDING_RESOURCE_RELEASES_PER_SCAN` rows so one enormous backlog
+    /// cannot stall the tick it runs on.
+    pub(crate) fn pending_resource_releases(
+        &self,
+    ) -> Result<Vec<(TaskId, ResourceId)>, StoreError> {
+        let conn = self.open_query_connection()?;
+        let tx = conn.unchecked_transaction()?;
+        let now = now_ms()?;
+        let mut pending = Vec::new();
+        let mut prior_candidate = None;
+        for _ in 0..MAX_PENDING_RESOURCE_RELEASES_PER_SCAN {
+            let Some(row) = load_next_dispatch_candidate(
+                &tx,
+                now,
+                prior_candidate.as_ref(),
+                Some(DestinationClass::ResourceRelease),
+            )?
+            else {
+                break;
+            };
+            match revalidate_outbox_effect(&tx, &row) {
+                Ok((effect_doc, _fence)) => {
+                    if let Effect::ReleaseResource {
+                        task_id,
+                        resource_fence,
+                        ..
+                    } = &effect_doc.effect
+                    {
+                        pending.push((*task_id, resource_fence.resource_id));
+                    }
+                }
+                // Not settleable now, and not this scan's business to explain.
+                Err(StoreError::StaleFence) => {}
+                Err(error) => return Err(error),
+            }
+            prior_candidate = Some(row);
+        }
+        tx.commit()?;
+        Ok(pending)
     }
 
     /// Settle the next eligible process-empty task teardown under a bounded lease.
@@ -3108,6 +3186,91 @@ pub(crate) fn settle_next_process_empty_task_teardown_in_tx_for_cleanup(
                     return Err(StoreError::Corruption);
                 }
                 return Ok(Some((settled_task, operation_id)));
+            }
+            _ => return Err(StoreError::Corruption),
+        }
+    }
+}
+
+/// Settle the pending `ReleaseResource` row naming exactly `resource_id`.
+///
+/// The resource lives inside the msgpack effect payload, not in a column, so
+/// it cannot be a SQL predicate. Candidates are walked in the same order the
+/// generic claimer uses and each one's effect is decoded BEFORE anything is
+/// claimed; a row for another resource simply advances the cursor.
+///
+/// A stale-fenced candidate is stepped over rather than failing the whole
+/// call. It is not settleable now by definition, and refusing here would mean
+/// one unrelated stale row could stop every shell close on the host. The
+/// maintenance sweep revisits anything left behind, so convergence is kept
+/// without a fail-closed guard on a cross-cutting path.
+fn settle_resource_release_for_in_tx(
+    tx: &Transaction<'_>,
+    now_ms: i64,
+    lease_ms: i64,
+    resource_id: ResourceId,
+) -> Result<Option<(TaskId, OperationId)>, StoreError> {
+    let mut prior_candidate = None;
+    loop {
+        let Some(row) = load_next_dispatch_candidate(
+            tx,
+            now_ms,
+            prior_candidate.as_ref(),
+            Some(DestinationClass::ResourceRelease),
+        )?
+        else {
+            return Ok(None);
+        };
+        let effect_doc = match revalidate_outbox_effect(tx, &row) {
+            Ok((effect_doc, _fence)) => effect_doc,
+            Err(StoreError::StaleFence) => {
+                prior_candidate = Some(row);
+                continue;
+            }
+            Err(error) => return Err(error),
+        };
+        let Effect::ReleaseResource { resource_fence, .. } = &effect_doc.effect else {
+            // The destination class promises this effect; anything else means
+            // the row and its class disagree.
+            return Err(StoreError::Corruption);
+        };
+        if resource_fence.resource_id != resource_id {
+            prior_candidate = Some(row);
+            continue;
+        }
+        match row.state.as_str() {
+            "pending" if !pending_dispatch_is_authorized(&row, effect_doc.replay_policy)? => {
+                prior_candidate = Some(row);
+                continue;
+            }
+            "pending" | "claimed" => {
+                let claim = claim_outbox_row(tx, &row, now_ms, lease_ms, row.state.as_str())?;
+                let permit = begin_dispatch_in_tx(tx, now_ms, &claim)?;
+                let Effect::ReleaseResource {
+                    task_id,
+                    resource_fence,
+                    ..
+                } = permit.effect()
+                else {
+                    return Err(StoreError::Corruption);
+                };
+                // `begin_dispatch_in_tx` re-reads the row, so prove the thing
+                // about to be settled is still the one that was filtered for.
+                if resource_fence.resource_id != resource_id {
+                    return Err(StoreError::Corruption);
+                }
+                let task_id = *task_id;
+                let operation_id = permit.operation_id();
+                let state = command_bus::record_dispatch_completion_in_tx(
+                    tx,
+                    &permit,
+                    DispatchCompletion::Settled,
+                    now_ms,
+                )?;
+                if !matches!(state, OperationState::Settled { .. }) {
+                    return Err(StoreError::Corruption);
+                }
+                return Ok(Some((task_id, operation_id)));
             }
             _ => return Err(StoreError::Corruption),
         }

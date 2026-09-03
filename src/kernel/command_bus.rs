@@ -739,6 +739,37 @@ impl CommandBus {
         Ok(Some((task_id, operation_id)))
     }
 
+    /// Settle the `ReleaseResource` row for exactly one resource, if one is due.
+    ///
+    /// `Command::CloseTerminal` emits only `ResourceReleaseBegun` and enqueues a
+    /// `ReleaseResource` row, and until this existed the sole claimant of that
+    /// destination class was [`Self::settle_next_resource_release`], whose only
+    /// host caller is the task-close/archive loop. So a shell closed any other
+    /// way -- a client close, the orphan sweep -- kept lifecycle `Releasing`,
+    /// its `terminal_facts` row and its strip entry forever, and the client
+    /// rendered a muted "?" chip that never went away.
+    ///
+    /// By resource, not "next", because the host closes one shell at a time and
+    /// must not settle a release it has not performed the teardown for.
+    /// `Ok(None)` is the ordinary answer for an already-settled release.
+    pub(crate) fn settle_resource_release_for(
+        &mut self,
+        resource_id: crate::domain::id::ResourceId,
+        lease: Duration,
+    ) -> Result<Option<(TaskId, OperationId)>, StoreError> {
+        self.store.settle_resource_release_for(resource_id, lease)
+    }
+
+    /// Every settleable `ReleaseResource` row, as `(task_id, resource_id)`.
+    ///
+    /// The convergence half of the above: a host that dies between closing a
+    /// shell and settling its release leaves a row nothing else claims.
+    pub(crate) fn pending_resource_releases(
+        &self,
+    ) -> Result<Vec<(TaskId, crate::domain::id::ResourceId)>, StoreError> {
+        self.store.pending_resource_releases()
+    }
+
     /// Whether the durable host admission singleton is Closing.
     pub(crate) fn host_admission_is_closing(&self) -> Result<bool, StoreError> {
         let conn = self.store.open_query_connection()?;
@@ -2178,6 +2209,135 @@ mod terminal_and_provider_restart_tests {
     /// hand-written rebuild batches, and the four `canonical_table_dump` arms are
     /// wired: without them the rebuild reports drift or drops the rows entirely,
     /// and every reader silently sees a task with no terminals.
+    /// `settle_resource_release_for` settles exactly one resource's release.
+    ///
+    /// The host closes one shell at a time and must never settle a release it
+    /// has not performed the teardown for, so "next" is the wrong selector: two
+    /// shells closed together would let the first close publish `Released` for
+    /// the second, whose PTY is still running. The row for A staying claimable
+    /// afterwards is the half that catches an over-eager filter, and it is
+    /// asserted by actually claiming it.
+    #[test]
+    fn settling_one_shells_release_leaves_every_other_pending() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let path = directory.path().join("per-resource-release.sqlite");
+        let client_id = ClientId::new();
+        let mut bus = CommandBus::open(&path).expect("bus");
+        let (task_id, revision) = create_open_task(&mut bus, client_id);
+
+        let first = plain_shell_facts(task_id, Some("first"));
+        let revision = accepted_revision(
+            host_execute_result(
+                &mut bus,
+                task_envelope(
+                    client_id,
+                    task_id,
+                    revision,
+                    Command::OpenShellTerminal(OpenShellTerminalIntent {
+                        resource: first.clone(),
+                    }),
+                ),
+            )
+            .expect("open first shell"),
+        );
+        let second = plain_shell_facts(task_id, Some("second"));
+        let revision = accepted_revision(
+            host_execute_result(
+                &mut bus,
+                task_envelope(
+                    client_id,
+                    task_id,
+                    revision,
+                    Command::OpenShellTerminal(OpenShellTerminalIntent {
+                        resource: second.clone(),
+                    }),
+                ),
+            )
+            .expect("open second shell"),
+        );
+
+        let revision = accepted_revision(
+            bus.execute(task_envelope(
+                client_id,
+                task_id,
+                revision,
+                Command::CloseTerminal {
+                    resource_id: first.id,
+                },
+            ))
+            .expect("close first"),
+        );
+        let _ = accepted_revision(
+            bus.execute(task_envelope(
+                client_id,
+                task_id,
+                revision,
+                Command::CloseTerminal {
+                    resource_id: second.id,
+                },
+            ))
+            .expect("close second"),
+        );
+
+        // Both releases are pending, and `first` is the older row -- so a
+        // "next"-style claim would take it. Ask for `second` by name.
+        let pending = bus.pending_resource_releases().expect("pending releases");
+        assert!(
+            pending.contains(&(task_id, first.id)) && pending.contains(&(task_id, second.id)),
+            "both closes must leave a settleable row: {pending:?}"
+        );
+
+        let settled = bus
+            .settle_resource_release_for(second.id, Duration::from_secs(30))
+            .expect("settle the second shell's release")
+            .expect("the second shell has a pending release row");
+        assert_eq!(settled.0, task_id);
+
+        let snapshot = bus.task_snapshot(task_id).expect("snapshot").expect("task");
+        assert_eq!(
+            snapshot.resources[&second.id].lifecycle,
+            ResourceLifecycle::Released,
+            "the named resource must reach Released"
+        );
+        assert_eq!(
+            snapshot.resources[&first.id].lifecycle,
+            ResourceLifecycle::Releasing,
+            "the other shell must be untouched: its PTY is still the host's to tear down"
+        );
+        assert!(!snapshot.terminal_facts.contains_key(&second.id));
+        assert!(
+            snapshot.terminal_facts.contains_key(&first.id),
+            "the untouched shell keeps its durable facts"
+        );
+
+        // Settling again is not an error, which is what lets the host call this
+        // unconditionally after a teardown.
+        assert!(bus
+            .settle_resource_release_for(second.id, Duration::from_secs(30))
+            .expect("a settled release settles again as a no-op")
+            .is_none());
+
+        // And the row it stepped over is still there to be claimed -- asserted
+        // by claiming it, not by reading a count.
+        assert_eq!(
+            bus.pending_resource_releases().expect("pending releases"),
+            vec![(task_id, first.id)]
+        );
+        let remaining = bus
+            .settle_next_resource_release(Duration::from_secs(30))
+            .expect("settle the remaining release")
+            .expect("the first shell's row must still be claimable");
+        assert_eq!(remaining.0, task_id);
+        assert_eq!(
+            bus.task_snapshot(task_id)
+                .expect("snapshot")
+                .expect("task")
+                .resources[&first.id]
+                .lifecycle,
+            ResourceLifecycle::Released
+        );
+    }
+
     #[test]
     fn a_projection_rebuild_reproduces_the_terminal_tables() {
         let directory = tempfile::tempdir().expect("tempdir");

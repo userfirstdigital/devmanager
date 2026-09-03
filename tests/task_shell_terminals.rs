@@ -13,7 +13,7 @@ use devmanager::domain::command::{
 };
 use devmanager::domain::id::{CommandId, EnvironmentId, ProjectId, RequestId};
 use devmanager::domain::query::{Query, QueryEnvelope, QueryOutcome, QueryReply, QueryResult};
-use devmanager::domain::resource::TerminalLaunch;
+use devmanager::domain::resource::{ResourceLifecycle, TerminalLaunch};
 use devmanager::domain::task::{
     ReviewReadiness, TaskActivity, TaskAssignment, TaskAttention, TaskConnectivity,
 };
@@ -433,6 +433,7 @@ struct ShellHost {
     _base: tempfile::TempDir,
     paths: ResolvedAppPaths,
     requests: devmanager::host::HostRequestHandle,
+    executor: devmanager::host::SupervisedHostExecutor,
     negotiated: NegotiatedParameters,
     client_id: ClientId,
     task_id: TaskId,
@@ -475,7 +476,7 @@ impl ShellHost {
             .expect("opaque project id");
 
         let bus = CommandBus::open(&paths.database).expect("command store");
-        let (requests, _executor) =
+        let (requests, executor) =
             HostRequestExecutor::start_supervised_with_config_store(bus, store, &paths.root)
                 .expect("configured host executor");
 
@@ -530,10 +531,126 @@ impl ShellHost {
             _base: base,
             paths,
             requests,
+            executor,
             negotiated,
             client_id,
             task_id,
         }
+    }
+
+    /// Kill this host and bring a fresh one up on the same durable store.
+    ///
+    /// This is the crash: the executor task is aborted mid-flight, so anything
+    /// it had begun but not committed is simply gone, and the replacement host
+    /// starts with no `shell_sessions` at all. Any `ReleaseResource` row left
+    /// behind is one nothing in the process can attribute to a live shell.
+    async fn restart(self) -> Self {
+        let ShellHost {
+            _base,
+            paths,
+            requests,
+            executor,
+            negotiated,
+            client_id,
+            task_id,
+        } = self;
+        executor.join.abort();
+        // Wait for the aborted task to be dropped, not merely cancelled: it owns
+        // the previous `ConfigStore`, and the host config refuses a second open
+        // while the first handle is alive.
+        let _ = executor.join.await;
+        drop(requests);
+        tokio::task::yield_now().await;
+
+        let store = ConfigStore::open_host(&paths).expect("reopen host config");
+        let bus = CommandBus::open(&paths.database).expect("reopen command store");
+        let (requests, executor) =
+            HostRequestExecutor::start_supervised_with_config_store(bus, store, &paths.root)
+                .expect("restarted host executor");
+        Self {
+            _base,
+            paths,
+            requests,
+            executor,
+            negotiated,
+            client_id,
+            task_id,
+        }
+    }
+
+    /// The durable facts F10 is about, read through a separate store handle.
+    fn shell_release_state(
+        &self,
+        resource_id: ResourceId,
+    ) -> (Option<ResourceLifecycle>, bool, bool) {
+        let bus = CommandBus::open(&self.paths.database).expect("reopen store");
+        let snapshot = bus
+            .task_snapshot(self.task_id)
+            .expect("snapshot")
+            .expect("task");
+        (
+            snapshot
+                .resources
+                .get(&resource_id)
+                .map(|resource| resource.lifecycle),
+            snapshot.terminal_facts.contains_key(&resource_id),
+            snapshot.terminal_strip.order.contains(&resource_id),
+        )
+    }
+
+    /// Does the Task's own strip still offer a chip for this resource?
+    async fn strip_lists(&self, resource_id: ResourceId) -> bool {
+        let reply = self
+            .requests
+            .execute(
+                self.negotiated.clone(),
+                ClientRequest::Query(QueryEnvelope {
+                    request_id: RequestId::new(),
+                    client_id: self.client_id,
+                    task_id: Some(self.task_id),
+                    query: Query::TaskCockpit(TaskCockpitQuery::TaskTerminals),
+                }),
+            )
+            .await
+            .expect("task terminals query");
+        let ServerMessage::QueryReply(QueryReply { outcome, .. }) = reply else {
+            panic!("expected a query reply; got {reply:?}");
+        };
+        match outcome {
+            QueryOutcome::Ok(QueryResult::TaskCockpit(TaskCockpitResult::TaskTerminals(strip))) => {
+                strip.order.contains(&resource_id)
+                    || strip
+                        .terminals
+                        .iter()
+                        .any(|chip| chip.resource_id == resource_id && !chip.is_provider)
+            }
+            other => panic!("the strip must be readable on an open task; got {other:?}"),
+        }
+    }
+
+    async fn close_terminal(&self, resource_id: ResourceId) {
+        let receipt = self
+            .requests
+            .execute(
+                self.negotiated.clone(),
+                ClientRequest::Command(CommandEnvelope {
+                    command_id: CommandId::new(),
+                    client_id: self.client_id,
+                    task_id: Some(self.task_id),
+                    issued_at_ms: 1_725_000_002_000,
+                    expected_task_revision: Some(self.task_revision()),
+                    command: Command::CloseTerminal { resource_id },
+                }),
+            )
+            .await
+            .expect("close the terminal");
+        assert!(
+            matches!(
+                receipt,
+                ServerMessage::CommandReceipt(CommandReceipt::Accepted { .. })
+            ),
+            "CloseTerminal must be accepted: {receipt:?}"
+        );
     }
 
     fn task_revision(&self) -> u64 {
@@ -735,5 +852,162 @@ fn archiving_a_task_closes_the_plain_shells_it_still_owns() {
             "archiving task {} left shell {resource_id} running as process {shell_pid}",
             host.task_id
         );
+    });
+}
+
+/// Closing a shell must settle its release, not leave a `?` chip forever.
+///
+/// `Command::CloseTerminal` emits only `ResourceReleaseBegun` and enqueues a
+/// `ReleaseResource` outbox row. Until F10 the only claimant of that
+/// destination class was `settle_next_resource_release`, whose only host caller
+/// is the task-close/archive loop -- so a shell closed any other way kept
+/// lifecycle `Releasing`, its `terminal_facts` row and its strip entry
+/// indefinitely, and the client rendered a muted "?" chip that never went away.
+///
+/// All four consequences are asserted, because each one is separately visible
+/// to a user and a fix that moved only the lifecycle would look right in a
+/// debugger and wrong on screen. The pre-close control is what makes them able
+/// to fail.
+#[test]
+fn closing_a_shell_settles_its_release_and_drops_it_from_the_strip() {
+    let _pid_guard = use_isolated_pid_file("close-settles-release");
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("test runtime");
+    runtime.block_on(async {
+        let host = ShellHost::start("closesettle").await;
+        let resource_id = match host.open_shell().await {
+            Ok(resource_id) => resource_id,
+            Err(refusal) => {
+                println!(
+                    "SKIPPED closing_a_shell_settles_its_release_and_drops_it_from_the_strip: \
+                     no shell could be opened on this machine: {refusal}"
+                );
+                return;
+            }
+        };
+
+        // Control: everything the assertions below look at is present first.
+        assert_eq!(
+            host.shell_release_state(resource_id),
+            (Some(ResourceLifecycle::Active), true, true),
+            "an open shell must be Active, carry durable facts and sit in the strip"
+        );
+        assert!(
+            host.strip_lists(resource_id).await,
+            "an open shell must have a chip, or its disappearance proves nothing"
+        );
+
+        host.close_terminal(resource_id).await;
+
+        assert!(
+            wait_until(Duration::from_secs(30), || host
+                .shell_release_state(resource_id)
+                .0
+                == Some(ResourceLifecycle::Released))
+            .await,
+            "closing left the resource at {:?}; nothing else claims a ReleaseResource row \
+             outside the archive loop, so it stays there forever",
+            host.shell_release_state(resource_id).0
+        );
+        let (lifecycle, has_facts, in_order) = host.shell_release_state(resource_id);
+        assert_eq!(lifecycle, Some(ResourceLifecycle::Released));
+        assert!(
+            !has_facts,
+            "a released shell must not keep its terminal facts"
+        );
+        assert!(!in_order, "a released shell must not keep its strip slot");
+        assert!(
+            !host.strip_lists(resource_id).await,
+            "a released shell must not still be offered as a chip"
+        );
+    });
+}
+
+/// A host that dies between the teardown and the settle converges on boot.
+///
+/// The close and the settle are two durable steps and nothing makes them
+/// atomic, so the row has to be recoverable by a host that was not there when
+/// it was written. The replacement host holds no `shell_sessions` at all, which
+/// is exactly the condition that licenses settling: a shell it is still running
+/// is one it has not torn down, and settling that release would publish
+/// `Released` for a live PTY.
+#[test]
+fn a_release_left_by_a_dead_host_is_settled_on_the_next_maintenance_tick() {
+    let _pid_guard = use_isolated_pid_file("converge-orphan-release");
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("test runtime");
+    runtime.block_on(async {
+        let host = ShellHost::start("converge").await;
+        let resource_id = match host.open_shell().await {
+            Ok(resource_id) => resource_id,
+            Err(refusal) => {
+                println!(
+                    "SKIPPED a_release_left_by_a_dead_host_is_settled_on_the_next_maintenance_tick: \
+                     no shell could be opened on this machine: {refusal}"
+                );
+                return;
+            }
+        };
+
+        // Begin the release WITHOUT the host performing its close: a second
+        // store handle writes the same durable step `CloseTerminal` does, which
+        // is the state a crash between the two halves leaves behind.
+        {
+            let mut bus = CommandBus::open(&host.paths.database).expect("second store handle");
+            let revision = bus
+                .task_snapshot(host.task_id)
+                .expect("snapshot")
+                .expect("task")
+                .task
+                .revision;
+            let receipt = bus
+                .execute(CommandEnvelope {
+                    command_id: CommandId::new(),
+                    client_id: host.client_id,
+                    task_id: Some(host.task_id),
+                    issued_at_ms: 1_725_000_003_000,
+                    expected_task_revision: Some(revision),
+                    command: Command::CloseTerminal { resource_id },
+                })
+                .expect("begin the release behind the host's back");
+            assert!(
+                matches!(receipt, CommandReceipt::Accepted { .. }),
+                "the durable close must be accepted: {receipt:?}"
+            );
+        }
+        assert_eq!(
+            host.shell_release_state(resource_id).0,
+            Some(ResourceLifecycle::Releasing),
+            "the fixture must actually leave a pending release, or this proves nothing"
+        );
+
+        // The ORIGINAL host still holds a live session for this shell, so it
+        // must NOT settle: that is the guard that keeps convergence from
+        // publishing Released for a running PTY.
+        for _ in 0..4 {
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        }
+        assert_eq!(
+            host.shell_release_state(resource_id).0,
+            Some(ResourceLifecycle::Releasing),
+            "a host that still holds the shell session must leave its release alone"
+        );
+
+        // Now the crash: the session goes with the host.
+        let host = host.restart().await;
+        assert!(
+            wait_until(Duration::from_secs(30), || host.shell_release_state(resource_id).0
+                == Some(ResourceLifecycle::Released))
+            .await,
+            "a restarted host left the release at {:?}; nothing else ever claims that row",
+            host.shell_release_state(resource_id).0
+        );
+        let (_, has_facts, in_order) = host.shell_release_state(resource_id);
+        assert!(!has_facts, "convergence must retire the terminal facts too");
+        assert!(!in_order, "convergence must free the strip slot too");
     });
 }

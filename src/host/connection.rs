@@ -70,6 +70,12 @@ use super::shutdown::{
     HostCleanupProgress, HostCleanupWorker, ProcessEmptyTeardown, ProcessEmptyTeardownWorker,
 };
 
+/// Lease taken while settling one plain shell's `ReleaseResource` row.
+///
+/// The work under it is a single durable transaction with no process effect,
+/// so this only has to outlast contention on the store, never a teardown.
+const SHELL_RELEASE_SETTLE_LEASE: Duration = Duration::from_secs(30);
+
 /// Fixed capacity for the host request queue.
 ///
 /// When the queue is full, [`HostRequestHandle::execute`] awaits send capacity
@@ -3306,6 +3312,7 @@ impl HostRequestExecutor {
                     self.reconcile_configured_services();
                     self.queue_one_provider_restore();
                     self.pump_shell_terminal_facts();
+                    self.settle_orphaned_shell_releases();
                     self.maybe_schedule_provider_health(false);
                     // Missed unregister try_send must not leave completed live
                     // metadata forever once the connection has requested shutdown.
@@ -3394,6 +3401,7 @@ impl HostRequestExecutor {
                     self.reconcile_configured_services();
                     self.queue_one_provider_restore();
                     self.pump_shell_terminal_facts();
+                    self.settle_orphaned_shell_releases();
                     self.maybe_schedule_provider_health(false);
                     self.reap_shutdown_outputs();
                     if let Some(outcome) = self.drive_supervised_maintenance_unit().await? {
@@ -4221,7 +4229,9 @@ impl HostRequestExecutor {
                 task_id,
                 resource_id,
             } => self.open_shell_terminal_after_accept(task_id, resource_id),
-            AcceptedShellEffect::Close { resource_id } => self.close_shell_terminal(resource_id),
+            AcceptedShellEffect::Close { resource_id } => {
+                self.close_shell_terminal_and_settle_release(resource_id)
+            }
         }
     }
 
@@ -4807,21 +4817,111 @@ impl HostRequestExecutor {
             eprintln!(
                 "devmanager-host: shell terminal {resource_id} closed by reconciliation: {reason}"
             );
-            self.close_shell_terminal(resource_id);
+            self.close_shell_terminal_and_settle_release(resource_id);
+        }
+    }
+
+    /// Tear one plain shell down and settle the durable release behind it.
+    ///
+    /// These are two halves of one gesture on every path that closes a shell
+    /// outside archive. `close_shell_terminal` ends the process and retires the
+    /// hosted view; without the settle the resource stays `Releasing` with its
+    /// `terminal_facts` row and its strip entry intact, because nothing else
+    /// claims a `ReleaseResource` row except the archive loop.
+    ///
+    /// NOT used by that archive loop: it settles each release itself, and a
+    /// second claimant here would leave its own `settle_next_resource_release`
+    /// with no row to find, which it reports as `Unavailable` and refuses the
+    /// archive over.
+    fn close_shell_terminal_and_settle_release(&mut self, resource_id: ResourceId) {
+        self.close_shell_terminal(resource_id);
+        self.settle_shell_release(resource_id);
+    }
+
+    /// Settle one plain shell's `ReleaseResource` row, if one is still due.
+    ///
+    /// No pending row is the ordinary answer for an already-settled release and
+    /// says nothing worth a line. A store error is worth one: the shell is torn
+    /// down either way, so a silent failure here is a resource that renders as
+    /// a muted "?" chip until maintenance happens to reach it.
+    fn settle_shell_release(&mut self, resource_id: ResourceId) {
+        match self
+            .bus
+            .settle_resource_release_for(resource_id, SHELL_RELEASE_SETTLE_LEASE)
+        {
+            Ok(Some(_)) => self.fan_out_live_durable_events(),
+            Ok(None) => {}
+            Err(error) => eprintln!(
+                "devmanager-host: shell terminal {resource_id} release was not settled: {error}"
+            ),
+        }
+    }
+
+    /// Settle `ReleaseResource` rows left behind by a shell that is already gone.
+    ///
+    /// Convergence after a crash between `close_shell_terminal` and its settle,
+    /// and the reason the pairing above does not have to be crash-atomic. A row
+    /// qualifies only when its resource is a plain shell AND this host holds no
+    /// live session for it -- a shell it is still running is one it has not
+    /// torn down, and settling that release would publish `Released` for a live
+    /// PTY.
+    ///
+    /// Runs on the reaper tick rather than inside `pump_shell_terminal_facts`,
+    /// which returns early when there are no live shells: that is exactly the
+    /// state this has to converge from.
+    fn settle_orphaned_shell_releases(&mut self) {
+        let pending = match self.bus.pending_resource_releases() {
+            Ok(pending) => pending,
+            Err(error) => {
+                eprintln!(
+                    "devmanager-host: pending shell releases could not be read, leaving them: {error}"
+                );
+                return;
+            }
+        };
+        for (task_id, resource_id) in pending {
+            if self.shell_sessions.contains_key(&resource_id) {
+                continue;
+            }
+            let snapshot = match self.bus.task_snapshot(task_id) {
+                Ok(Some(snapshot)) => snapshot,
+                // No task, or a read that failed: neither says this row belongs
+                // to a plain shell, and only that would license settling it.
+                Ok(None) => continue,
+                Err(error) => {
+                    eprintln!(
+                        "devmanager-host: shell release {resource_id} could not read task                          {task_id}, leaving it: {error}"
+                    );
+                    continue;
+                }
+            };
+            let is_plain_shell = snapshot
+                .resources
+                .get(&resource_id)
+                .is_some_and(|resource| resource.recipe.is_plain_shell());
+            if !is_plain_shell {
+                continue;
+            }
+            eprintln!("devmanager-host: settling release for {resource_id}: shell already gone");
+            self.settle_shell_release(resource_id);
         }
     }
 
     /// Release one plain shell: hosted view first, then the manager session.
     ///
     /// The durable `ReleaseResource` effect does **not** reach a plain shell.
-    /// `Command::CloseTerminal` emits only `ResourceReleaseBegun`
-    /// (`src/domain/command.rs:1675`), and the sole host caller of
-    /// `settle_next_resource_release` is the task-close/archive loop
-    /// (`src/host/connection.rs:5687`); that settlement records the outbox row
-    /// as **process-empty** and performs no process effect at all
-    /// (`src/kernel/command_bus.rs:712`, whose own doc says it exists for
-    /// "failed launches [that] register a task-owned terminal without creating
-    /// an OS process"). So this method owns the whole teardown.
+    /// `Command::CloseTerminal` emits only `ResourceReleaseBegun`, and settling
+    /// the outbox row it enqueues records it as **process-empty**: no process
+    /// effect at all. So this method owns the whole teardown.
+    ///
+    /// It does NOT own the durable half. Nothing else claims that row outside
+    /// the archive loop, so a caller that only tears the process down leaves
+    /// the resource `Releasing` with its `terminal_facts` row and its strip
+    /// entry forever, which the client renders as a muted "?" chip that never
+    /// goes away. Every path except archive therefore goes through
+    /// [`Self::close_shell_terminal_and_settle_release`], and
+    /// [`Self::settle_orphaned_shell_releases`] converges anything a crash
+    /// leaves between the two.
     ///
     /// Order matters and is safe in exactly this direction.
     /// `TerminalService::close` verifies the runtime's attachment fence and
@@ -14879,6 +14979,14 @@ mod output_tests {
             2,
             "both reaper ticks must sample live shells; an unsampled shell reports \
              no cwd, no activity and never observes its own exit"
+        );
+        let settle = format!("self.settle_orphaned_shell_releases{}", "();");
+        assert_eq!(
+            source.matches(settle.as_str()).count(),
+            2,
+            "both reaper ticks must converge releases left by a shell that is already \
+             gone; on a loop that does not, a crash between the teardown and the \
+             settle leaves a `?` chip nothing ever clears"
         );
     }
 
