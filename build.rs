@@ -896,8 +896,8 @@ fn collect_connect_crypto_source_files(
     let entries = std::fs::read_dir(directory)
         .map_err(|error| format!("cannot scan {}: {error}", directory.display()))?;
     for entry in entries {
-        let entry = entry
-            .map_err(|error| format!("cannot inspect {}: {error}", directory.display()))?;
+        let entry =
+            entry.map_err(|error| format!("cannot inspect {}: {error}", directory.display()))?;
         let path = entry.path();
         if path.is_dir() {
             collect_connect_crypto_source_files(&path, files)?;
@@ -913,7 +913,12 @@ fn connect_crypto_source_fingerprint(repository: &std::path::Path) -> Result<Str
     for path in connect_crypto_source_paths(repository)? {
         let relative = path
             .strip_prefix(repository)
-            .map_err(|_| format!("Connect crypto source escaped repository: {}", path.display()))?
+            .map_err(|_| {
+                format!(
+                    "Connect crypto source escaped repository: {}",
+                    path.display()
+                )
+            })?
             .to_string_lossy()
             .replace('\\', "/");
         update_connect_crypto_fingerprint(&mut hash, relative.as_bytes());
