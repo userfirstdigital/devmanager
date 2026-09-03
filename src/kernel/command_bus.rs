@@ -1682,6 +1682,255 @@ fn operation_state_from_validated_projection(
 
 #[cfg(test)]
 mod workspace_authority_tests {
+    #[test]
+    #[ignore = "timing probe; needs DEVMANAGER_PROBE_STORE"]
+    fn probe_receipt_correlation_steps() {
+        use std::time::{Duration, Instant};
+        let Ok(path) = std::env::var("DEVMANAGER_PROBE_STORE") else {
+            return;
+        };
+        let bus = super::CommandBus::open(std::path::Path::new(&path)).expect("open store copy");
+        let conn = bus.store.open_query_connection().expect("query connection");
+        let rows: Vec<(CommandId, i64)> = {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT o.command_id, r.committed_sequence
+                     FROM operations o JOIN command_receipts r ON r.command_id = o.command_id
+                     WHERE o.task_id IS NOT NULL AND r.committed_sequence IS NOT NULL
+                     ORDER BY o.operation_id ASC LIMIT 300",
+                )
+                .expect("prepare");
+            stmt.query_map([], |row| {
+                Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, i64>(1)?))
+            })
+            .expect("query")
+            .map(|row| {
+                let (c, seq) = row.expect("row");
+                let bytes: [u8; 16] = c.try_into().expect("16 bytes");
+                (CommandId::from_bytes(bytes).expect("cmd"), seq)
+            })
+            .collect()
+        };
+        let mut t_receipt_decode = Duration::ZERO;
+        let mut t_projection = Duration::ZERO;
+        let mut t_decision_batch = Duration::ZERO;
+        let mut t_effects = Duration::ZERO;
+        let mut t_outbox = Duration::ZERO;
+        let mut t_history = Duration::ZERO;
+        let mut t_full = Duration::ZERO;
+        let mut counted = 0usize;
+        let mut skipped = 0usize;
+        for (command_id, committed) in &rows {
+            let started = Instant::now();
+            let payload: Vec<u8> = conn
+                .query_row(
+                    "SELECT receipt FROM command_receipts WHERE command_id = ?1",
+                    [command_id.as_bytes().as_slice()],
+                    |row| row.get(0),
+                )
+                .expect("receipt row");
+            let receipt = crate::kernel::outbox::decode_receipt_document(&payload).expect("decode");
+            t_receipt_decode += started.elapsed();
+            let CommandReceipt::Accepted {
+                operation_id,
+                event_ids,
+                task_revision,
+                ..
+            } = receipt
+            else {
+                continue;
+            };
+            let Some(task_revision) = task_revision else {
+                continue;
+            };
+            let started = Instant::now();
+            let operation =
+                super::load_operation_projection(&conn, *command_id).expect("projection");
+            t_projection += started.elapsed();
+            let Some(task_id) = operation.task_id else {
+                continue;
+            };
+            let committed = u64::try_from(*committed).expect("seq");
+            let first_decision_sequence = committed - event_ids.len() as u64;
+            let started = Instant::now();
+            let decision_facts = super::validate_decision_event_batch(
+                &conn,
+                &event_ids,
+                task_id,
+                task_revision,
+                first_decision_sequence,
+                operation.accepted_at_ms,
+                super::is_side_effect_decision_fact,
+            );
+            t_decision_batch += started.elapsed();
+            let Ok(decision_facts) = decision_facts else {
+                skipped += 1;
+                continue;
+            };
+            let started = Instant::now();
+            let _effects = super::effects_from_durable_decision_facts(
+                &conn,
+                task_id,
+                first_decision_sequence,
+                operation_id,
+                &decision_facts,
+            );
+            t_effects += started.elapsed();
+            let started = Instant::now();
+            let _outbox = super::load_outbox_rows(&conn, operation_id).expect("outbox");
+            t_outbox += started.elapsed();
+            let started = Instant::now();
+            let _history = super::load_operation_outcome_history(
+                &conn,
+                task_id,
+                committed,
+                *command_id,
+                operation_id,
+            );
+            t_history += started.elapsed();
+            let started = Instant::now();
+            super::lookup_receipt(&conn, *command_id).expect("full lookup");
+            t_full += started.elapsed();
+            counted += 1;
+        }
+        // The majority path: pure (no-outbox) accepted receipts.
+        let mut t_pure = Duration::ZERO;
+        let mut t_pure_full = Duration::ZERO;
+        let mut pure_count = 0usize;
+        for (command_id, committed) in &rows {
+            let payload: Vec<u8> = conn
+                .query_row(
+                    "SELECT receipt FROM command_receipts WHERE command_id = ?1",
+                    [command_id.as_bytes().as_slice()],
+                    |row| row.get(0),
+                )
+                .expect("receipt row");
+            let receipt = crate::kernel::outbox::decode_receipt_document(&payload).expect("decode");
+            let CommandReceipt::Accepted {
+                operation_id,
+                event_ids,
+                task_revision,
+                ..
+            } = receipt
+            else {
+                continue;
+            };
+            let Some(task_revision) = task_revision else {
+                continue;
+            };
+            let operation =
+                super::load_operation_projection(&conn, *command_id).expect("projection");
+            let Some(task_id) = operation.task_id else {
+                continue;
+            };
+            if !super::load_outbox_rows(&conn, operation_id)
+                .expect("outbox")
+                .is_empty()
+            {
+                continue;
+            }
+            let committed = u64::try_from(*committed).expect("seq");
+            let started = Instant::now();
+            let result = super::validate_pure_accepted_receipt(
+                &conn,
+                *command_id,
+                operation_id,
+                &event_ids,
+                task_revision,
+                task_id,
+                committed,
+                &operation,
+            );
+            t_pure += started.elapsed();
+            if result.is_err() {
+                continue;
+            }
+            let started = Instant::now();
+            super::lookup_receipt(&conn, *command_id).expect("full lookup");
+            t_pure_full += started.elapsed();
+            pure_count += 1;
+        }
+        eprintln!(
+            "PROBE pure path over {pure_count} ops: validate_pure_accepted_receipt={} ms | full lookup_receipt={} ms",
+            t_pure.as_millis(),
+            t_pure_full.as_millis()
+        );
+        eprintln!(
+            "PROBE steps over {counted} ops ({skipped} not side-effect): receipt_decode={} ms projection={} ms decision_batch={} ms effects={} ms outbox={} ms history={} ms | full lookup_receipt={} ms",
+            t_receipt_decode.as_millis(),
+            t_projection.as_millis(),
+            t_decision_batch.as_millis(),
+            t_effects.as_millis(),
+            t_outbox.as_millis(),
+            t_history.as_millis(),
+            t_full.as_millis()
+        );
+    }
+
+    /// Timing probe for the per-operation snapshot loader against a real store
+    /// copy. Run by hand: `DEVMANAGER_PROBE_STORE=<copy> cargo test --lib
+    /// kernel::command_bus::workspace_authority_tests::probe_operation_facts_costs -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "timing probe; needs DEVMANAGER_PROBE_STORE"]
+    fn probe_operation_facts_costs() {
+        use std::time::Instant;
+        let Ok(path) = std::env::var("DEVMANAGER_PROBE_STORE") else {
+            eprintln!("SKIPPED probe_operation_facts_costs: DEVMANAGER_PROBE_STORE not set");
+            return;
+        };
+        let bus = super::CommandBus::open(std::path::Path::new(&path)).expect("open store copy");
+        let conn = bus.store.open_query_connection().expect("query connection");
+        let ids: Vec<OperationId> = {
+            let mut stmt = conn
+                .prepare("SELECT operation_id FROM operations ORDER BY operation_id ASC LIMIT 300")
+                .expect("prepare");
+            stmt.query_map([], |row| row.get::<_, Vec<u8>>(0))
+                .expect("query")
+                .map(|row| {
+                    let bytes: [u8; 16] = row.expect("row").try_into().expect("16 bytes");
+                    OperationId::from_bytes(bytes).expect("operation id")
+                })
+                .collect()
+        };
+        let started = Instant::now();
+        for id in &ids {
+            super::load_operation_projection_by_id(&conn, *id).expect("projection");
+        }
+        eprintln!(
+            "PROBE projection_by_id x{} = {} ms",
+            ids.len(),
+            started.elapsed().as_millis()
+        );
+        let started = Instant::now();
+        let mut command_ids = Vec::new();
+        for id in &ids {
+            command_ids.push(super::load_operation_command_id(&conn, *id).expect("command id"));
+        }
+        eprintln!(
+            "PROBE command_id x{} = {} ms",
+            ids.len(),
+            started.elapsed().as_millis()
+        );
+        let started = Instant::now();
+        for command_id in &command_ids {
+            super::lookup_receipt(&conn, *command_id).expect("receipt");
+        }
+        eprintln!(
+            "PROBE lookup_receipt x{} = {} ms",
+            ids.len(),
+            started.elapsed().as_millis()
+        );
+        let started = Instant::now();
+        for id in &ids {
+            super::load_operation_facts(&conn, *id).expect("facts");
+        }
+        eprintln!(
+            "PROBE load_operation_facts x{} = {} ms",
+            ids.len(),
+            started.elapsed().as_millis()
+        );
+    }
+
     use super::*;
 
     #[test]

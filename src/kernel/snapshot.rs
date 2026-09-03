@@ -897,6 +897,110 @@ impl Drop for SnapshotSession {
 
 #[cfg(test)]
 mod tests {
+    /// Timing probe against a real store copy. Not a gate: run by hand with
+    /// `DEVMANAGER_PROBE_STORE=<copy of kernel.sqlite3> cargo test --lib
+    /// kernel::snapshot::tests::probe_snapshot_page_costs -- --ignored --nocapture`.
+    /// Prints one PROBE line per page the way the client pages at startup, then
+    /// splits the Tasks section into per-item load time and cumulative
+    /// re-encode time so the two candidate costs are measured, not argued.
+    #[test]
+    #[ignore = "timing probe; needs DEVMANAGER_PROBE_STORE"]
+    fn probe_snapshot_page_costs() {
+        use std::time::Instant;
+        let Ok(path) = std::env::var("DEVMANAGER_PROBE_STORE") else {
+            eprintln!("SKIPPED probe_snapshot_page_costs: DEVMANAGER_PROBE_STORE not set");
+            return;
+        };
+        let bus =
+            command_bus::CommandBus::open(std::path::Path::new(&path)).expect("open store copy");
+        let limits = PageLimits::new(128, 512 * 1024).expect("limits");
+        let scope = crate::kernel::SessionScope {
+            client_id: Some(crate::domain::id::ClientId::new()),
+            task_id: None,
+            connection_id: None,
+            action_epoch: None,
+            runtime_generation: None,
+        };
+        let session = bus.begin_snapshot_scoped(limits, scope).expect("session");
+        let sections = [
+            SnapshotSection::Tasks,
+            SnapshotSection::AgentSessions,
+            SnapshotSection::Artifacts,
+            SnapshotSection::Resources,
+            SnapshotSection::Operations,
+            SnapshotSection::BrowserContexts,
+            SnapshotSection::BrowserTabs,
+        ];
+        let whole = Instant::now();
+        for section in sections {
+            let mut cursor: Option<Vec<u8>> = None;
+            let mut page_no = 0;
+            loop {
+                let started = Instant::now();
+                let page = session.page(section, cursor.as_deref()).expect("page");
+                let ms = started.elapsed().as_millis();
+                page_no += 1;
+                eprintln!(
+                    "PROBE section={section:?} page={page_no} items={} encoded_bytes={} ms={ms}",
+                    page.items.len(),
+                    page.encoded_bytes
+                );
+                cursor = page.next_cursor.clone();
+                if cursor.is_none() {
+                    break;
+                }
+            }
+        }
+        eprintln!("PROBE all sections: {} ms", whole.elapsed().as_millis());
+
+        // Cost split for Tasks.
+        let ids = load_task_ids(&session.conn, None, 1_000).expect("task ids");
+        let started = Instant::now();
+        let mut items = Vec::new();
+        for task_id in &ids {
+            let snapshot = command_bus::load_task_snapshot(&session.conn, *task_id)
+                .expect("load")
+                .expect("present");
+            items.push(SnapshotItem::Task(TaskSnapshotItem {
+                task: snapshot.task,
+                connectivity: snapshot.connectivity,
+                attention: snapshot.attention,
+                activity: snapshot.activity,
+                review_readiness: snapshot.review_readiness,
+                primary_agent_id: snapshot.primary_agent_id,
+            }));
+        }
+        let load_ms = started.elapsed().as_millis();
+        let started = Instant::now();
+        let once = canonical_page_encoded_bytes(
+            session.snapshot_id,
+            session.through_sequence,
+            SnapshotSection::Tasks,
+            None,
+            &items,
+            &None,
+        )
+        .expect("encode");
+        let encode_once_ms = started.elapsed().as_millis();
+        let started = Instant::now();
+        for n in 1..=items.len() {
+            let _ = canonical_page_encoded_bytes(
+                session.snapshot_id,
+                session.through_sequence,
+                SnapshotSection::Tasks,
+                None,
+                &items[..n],
+                &None,
+            )
+            .expect("encode prefix");
+        }
+        let encode_cumulative_ms = started.elapsed().as_millis();
+        eprintln!(
+            "PROBE tasks={} load_all_ms={load_ms} encode_once_ms={encode_once_ms} ({once} bytes) encode_cumulative_ms={encode_cumulative_ms}",
+            items.len()
+        );
+    }
+
     use std::time::Duration;
 
     use sha2::{Digest, Sha256};
