@@ -1408,15 +1408,12 @@ const DARK_SURFACE_OVERLAY: Color = Color::from_u32(0x1a1a1f);
 const DARK_SURFACE_SUNKEN: Color = Color::from_u32(0x111114);
 const DARK_SURFACE_HOVER: Color = Color::from_u32(0x17171c);
 const DARK_SURFACE_SELECTION: Color = Color::from_u32(0x1a1a20);
-const DARK_SURFACE_DISABLED: Color = Color::from_u32(0x241e28);
+const DARK_SURFACE_DISABLED: Color = Color::from_u32(0x1e1e23);
 
 const DARK_TEXT_PRIMARY: Color = Color::from_u32(0xe6e6ea);
 const DARK_TEXT_SECONDARY: Color = Color::from_u32(0x9a9aa3);
-// The redesign specifies 0x6b6b74 here, but that reads at 3.45:1 on the new
-// raised surface and fails the WCAG AA gate below. 0x808089 is the nearest
-// step on the same grey ramp that keeps muted text AA on raised (4.66:1) and
-// on the legacy panel background (4.53:1).
-const DARK_TEXT_MUTED: Color = Color::from_u32(0x808089);
+// Spec asks 0x6b6b74, but that is 3.45:1 on raised and fails the 4.5:1 AA gate; 0x86868f is 5.05:1.
+const DARK_TEXT_MUTED: Color = Color::from_u32(0x86868f);
 const DARK_TEXT_DISABLED: Color = Color::from_u32(0xb8b8c0);
 const DARK_TEXT_INVERSE: Color = Color::from_u32(0xf8fafc);
 const DARK_TEXT_ON_ACCENT: Color = Color::from_u32(0xf8fafc);
@@ -1434,7 +1431,7 @@ const DARK_STATUS_ATTENTION: Color = Color::from_u32(0xf2b441);
 const DARK_STATUS_SUCCESS: Color = Color::from_u32(0x7fb07f);
 const DARK_STATUS_WARNING: Color = Color::from_u32(0xfacc15);
 const DARK_STATUS_DESTRUCTIVE: Color = Color::from_u32(0xe5484d);
-const DARK_STATUS_INACTIVE: Color = Color::from_u32(0x6b6b74);
+const DARK_STATUS_INACTIVE: Color = Color::from_u32(0x86868f);
 
 const DARK_ACTION_PRIMARY_DEFAULT: Color = Color::from_u32(0xce1a6b);
 const DARK_ACTION_PRIMARY_HOVER: Color = Color::from_u32(0xd4146a);
@@ -2070,7 +2067,7 @@ pub mod legacy {
     /// Previously `0x52525b` (~2.29:1 against panel). Aligned to the dark
     /// semantic muted token so normal visible dim text meets WCAG AA (≥4.5:1)
     /// without introducing a second palette.
-    pub const TEXT_DIM: u32 = Color::from_u32(0x808089).to_u32();
+    pub const TEXT_DIM: u32 = Color::from_u32(0x86868f).to_u32();
 
     pub const SELECTION_BG: u32 = Color::from_u32(0x22364d).to_u32();
     pub const SELECTION_TEXT: u32 = Color::from_u32(0xf8fafc).to_u32();
@@ -2192,7 +2189,7 @@ mod tests {
         assert_eq!(t.text.secondary, Color::from_u32(0x9a9aa3));
         // The spec asks for 0x6b6b74; the AA gate on raised surfaces outranks
         // it, so the nearest passing step on the same ramp is what ships.
-        assert_eq!(t.text.muted, Color::from_u32(0x808089));
+        assert_eq!(t.text.muted, Color::from_u32(0x86868f));
         assert_eq!(t.status.attention, Color::from_u32(0xf2b441));
         assert_eq!(t.status.destructive, Color::from_u32(0xe5484d));
         assert_eq!(t.status.success, Color::from_u32(0x7fb07f));
