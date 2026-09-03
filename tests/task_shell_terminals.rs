@@ -5,12 +5,30 @@
 //! from a real Windows shell.
 #![cfg(windows)]
 
+use devmanager::config::paths::{resolve_app_paths, AppProfile, BuildKind, ResolvedAppPaths};
+use devmanager::config::{ConfigCommand, ConfigStore, Project};
+use devmanager::domain::cockpit::TaskCockpitQuery;
+use devmanager::domain::command::{
+    Command, CommandEnvelope, CommandReceipt, CreateTaskRequestIntent,
+};
+use devmanager::domain::id::{CommandId, EnvironmentId, ProjectId, RequestId};
+use devmanager::domain::query::{Query, QueryEnvelope, QueryOutcome, QueryReply, QueryResult};
 use devmanager::domain::resource::TerminalLaunch;
-use devmanager::domain::{ResourceId, TaskId};
+use devmanager::domain::task::{
+    ReviewReadiness, TaskActivity, TaskAssignment, TaskAttention, TaskConnectivity,
+};
+use devmanager::domain::{ClientId, ResourceId, TaskCockpitResult, TaskId};
+use devmanager::host::HostRequestExecutor;
+use devmanager::kernel::CommandBus;
+use devmanager::protocol::{
+    Capability, CapabilitySet, ClientRequest, FrameLimits, NegotiatedParameters, ProtocolVersion,
+    ServerMessage,
+};
 use devmanager::services::{pid_file, ProcessManager};
 use devmanager::state::SessionDimensions;
 use devmanager::terminal::protocol::{CloseReason, TerminalSessionId, TerminalSize, TerminalSpec};
 use devmanager::terminal::service::{AttachedTerminalRuntime, TerminalService};
+use devmanager::workspace::{WorkspaceProjectRoots, WorkspaceRequest};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -406,4 +424,316 @@ fn a_pwsh_task_shell_reports_its_cwd_only_with_the_prompt_hook() {
         same_directory(&unhooked, workdir.path()),
         "an unhooked pwsh must still report its launch directory, not nothing: {unhooked:?}"
     );
+}
+
+/// One host executor with a real configured-service runtime, which is what a
+/// plain shell needs: `open_shell_terminal_after_accept` refuses outright
+/// without one, so a fixture that skipped this would test nothing.
+struct ShellHost {
+    _base: tempfile::TempDir,
+    paths: ResolvedAppPaths,
+    requests: devmanager::host::HostRequestHandle,
+    negotiated: NegotiatedParameters,
+    client_id: ClientId,
+    task_id: TaskId,
+}
+
+impl ShellHost {
+    async fn start(label: &str) -> Self {
+        let base = tempfile::tempdir().expect("fixture base");
+        let profile = format!("shellterm{}{label}", std::process::id());
+        let paths = resolve_app_paths(
+            base.path(),
+            AppProfile::named(&profile).expect("named profile"),
+            BuildKind::Debug,
+        )
+        .expect("isolated debug paths");
+        std::fs::create_dir_all(&paths.root).expect("profile root");
+
+        let configured_id = ProjectId::new().to_string();
+        let mut store = ConfigStore::open_host(&paths).expect("host config");
+        store
+            .execute(
+                store.snapshot().revision,
+                ConfigCommand::CreateProject {
+                    project: Project {
+                        id: configured_id.clone(),
+                        name: "Shell terminal fixture".to_string(),
+                        root_path: paths.root.to_string_lossy().into_owned(),
+                        created_at: "now".to_string(),
+                        updated_at: "now".to_string(),
+                        ..Project::default()
+                    },
+                },
+            )
+            .expect("persist project");
+        let revision = store.snapshot().revision;
+        let roots = WorkspaceProjectRoots::from_host_config_store(&mut store, revision, 1, 1)
+            .expect("issue project roots");
+        let project_id = roots
+            .project_id_for_config_id(&configured_id)
+            .expect("opaque project id");
+
+        let bus = CommandBus::open(&paths.database).expect("command store");
+        let (requests, _executor) =
+            HostRequestExecutor::start_supervised_with_config_store(bus, store, &paths.root)
+                .expect("configured host executor");
+
+        let client_id = ClientId::new();
+        let negotiated = NegotiatedParameters {
+            version: ProtocolVersion::current(),
+            client_id,
+            capabilities: CapabilitySet::from_capabilities([Capability::TaskCockpit]),
+            limits: FrameLimits::v1_default(),
+        };
+        let task_id = TaskId::new();
+        let created = requests
+            .execute(
+                negotiated.clone(),
+                ClientRequest::Command(CommandEnvelope {
+                    command_id: CommandId::new(),
+                    client_id,
+                    task_id: None,
+                    issued_at_ms: 1_725_000_000_000,
+                    expected_task_revision: None,
+                    command: Command::CreateTaskV2(CreateTaskRequestIntent {
+                        id: task_id,
+                        environment_id: EnvironmentId::new(),
+                        title: "Shell terminal fixture".into(),
+                        description: None,
+                        project_id,
+                        workspace: WorkspaceRequest::confirmed_external(&paths.root),
+                        // No provider: a plain shell must not need one, and this
+                        // keeps a provider launch out of the fixture entirely.
+                        primary_provider: None,
+                        defer_primary_provider_start: true,
+                        assignment: TaskAssignment::LocalOwner,
+                        created_at_ms: 1_725_000_000_000,
+                        connectivity: TaskConnectivity::Connected,
+                        attention: TaskAttention::None,
+                        activity: TaskActivity::Idle,
+                        review_readiness: ReviewReadiness::NotReady,
+                    }),
+                }),
+            )
+            .await
+            .expect("create task");
+        assert!(
+            matches!(
+                created,
+                ServerMessage::CommandReceipt(CommandReceipt::Accepted { .. })
+            ),
+            "fixture task must be created: {created:?}"
+        );
+
+        Self {
+            _base: base,
+            paths,
+            requests,
+            negotiated,
+            client_id,
+            task_id,
+        }
+    }
+
+    fn task_revision(&self) -> u64 {
+        let bus = CommandBus::open(&self.paths.database).expect("reopen store");
+        bus.task_snapshot(self.task_id)
+            .expect("snapshot")
+            .expect("task")
+            .task
+            .revision
+    }
+
+    /// Open one plain shell and answer with its durable resource id.
+    ///
+    /// A refusal is returned rather than asserted so the caller can skip on a
+    /// machine with no resolvable shell instead of reporting a red test.
+    async fn open_shell(&self) -> Result<ResourceId, String> {
+        let request_id = RequestId::new();
+        let reply = self
+            .requests
+            .execute(
+                self.negotiated.clone(),
+                ClientRequest::Query(QueryEnvelope {
+                    request_id,
+                    client_id: self.client_id,
+                    task_id: Some(self.task_id),
+                    query: Query::TaskCockpit(TaskCockpitQuery::OpenShellTerminal {
+                        cwd: None,
+                        expected_task_revision: self.task_revision(),
+                    }),
+                }),
+            )
+            .await
+            .expect("open shell query");
+        let ServerMessage::QueryReply(QueryReply { outcome, .. }) = reply else {
+            panic!("expected a query reply; got {reply:?}");
+        };
+        match outcome {
+            QueryOutcome::Ok(QueryResult::TaskCockpit(TaskCockpitResult::TaskTerminals(strip))) => {
+                let resource_id = *strip
+                    .order
+                    .first()
+                    .expect("an opened shell is the strip's first entry");
+                Ok(resource_id)
+            }
+            other => Err(format!("{other:?}")),
+        }
+    }
+}
+
+/// The pids this host has spawned, under the isolated pid file.
+///
+/// Only ever used to FIND the shell, never to decide it has gone: archiving
+/// untracks the session from the ledger, and after that this answers `[]` for
+/// a shell that is still running. Measured 2026-09-02 against a host stripped
+/// of both halves of this fix -- the record vanished within 200 ms while the
+/// process lived on -- which is exactly the "an empty result means it is gone"
+/// conflation. Liveness comes from [`shell_is_running`] instead.
+fn live_shell_pids() -> Vec<u32> {
+    pid_file::active_tracked_processes()
+        .into_iter()
+        .filter(|record| record.session_id.starts_with("shell-"))
+        .map(|record| record.pid)
+        .collect()
+}
+
+/// Is this exact process still alive, according to the operating system?
+fn shell_is_running(pid: u32) -> bool {
+    devmanager::services::platform_service::is_pid_running(pid)
+}
+
+/// Poll until a condition has held on `consecutive` successive reads.
+///
+/// One reading is not evidence when the thing being read can answer wrongly
+/// for a moment, and both oracles here can: the pid ledger is a file that is
+/// briefly empty while it is rewritten, and a pid can in principle be reused.
+/// Requiring the answer to repeat is what keeps a transient from being taken
+/// for a result.
+async fn wait_until_stable(
+    deadline: Duration,
+    consecutive: u32,
+    mut ready: impl FnMut() -> bool,
+) -> bool {
+    let end = Instant::now() + deadline;
+    let mut streak = 0;
+    loop {
+        streak = if ready() { streak + 1 } else { 0 };
+        if streak >= consecutive {
+            return true;
+        }
+        if Instant::now() >= end {
+            return false;
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+}
+
+/// Poll for a condition while YIELDING to the executor.
+///
+/// `std::thread::sleep` here would be silently wrong: these tests run the host
+/// on a current-thread runtime, so a blocking sleep starves the executor task
+/// and the reaper tick that drives reconciliation never happens. The failure
+/// looks exactly like the sweep not working.
+async fn wait_until(deadline: Duration, mut ready: impl FnMut() -> bool) -> bool {
+    let end = Instant::now() + deadline;
+    loop {
+        if ready() {
+            return true;
+        }
+        if Instant::now() >= end {
+            return false;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+/// Archiving a task must leave no plain shell of its running.
+///
+/// `Command::BeginCloseTask` releases every task-owned resource through
+/// `ReleaseResource` + `settle_next_resource_release`, which is process-empty
+/// for a plain shell by construction: nothing in that path touches a PTY. The
+/// release path therefore closes each plain shell itself.
+///
+/// Read this as an end-to-end regression guard, NOT as an attribution. Three
+/// things were measured while writing it, on 2026-09-02, and each one weakens
+/// what a green here can be taken to mean:
+///
+/// 1. A host with neither half of the fix still ends up clean a second or two
+///    later. A real shell prints a prompt, the fact pump offers an activity
+///    fact, the release has already dropped the durable terminal, and the
+///    resulting `UnknownTerminal` outcome closes the shell. That net is real
+///    but conditional: it needs the shell to produce output or settle a cwd.
+/// 2. The pid ledger is not a liveness oracle -- archiving untracks the
+///    session, after which it reports the shell gone whether or not it is --
+///    so liveness is asked of the operating system by pid instead.
+/// 3. `TaskCockpitQuery::TerminalFor` cannot stand in for "the hosted terminal
+///    was retired": on an archived task it answers `Denied(StaleFence)`
+///    whether the entry survives or not. There is no wire-visible observable
+///    for that half, so it is covered by construction and by
+///    `host::connection::tests::only_a_shell_with_no_durable_terminal_left_is_swept`.
+///
+/// The control is what keeps the assertion able to fail at all: the shell is
+/// proved to be a live operating-system process before archiving.
+#[test]
+fn archiving_a_task_closes_the_plain_shells_it_still_owns() {
+    let _pid_guard = use_isolated_pid_file("archive-closes-shells");
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("test runtime");
+    runtime.block_on(async {
+        let host = ShellHost::start("archive").await;
+        let resource_id = match host.open_shell().await {
+            Ok(resource_id) => resource_id,
+            Err(refusal) => {
+                println!(
+                    "SKIPPED archiving_a_task_closes_the_plain_shells_it_still_owns: \
+                     no shell could be opened on this machine: {refusal}"
+                );
+                return;
+            }
+        };
+
+        assert!(
+            wait_until(Duration::from_secs(30), || !live_shell_pids().is_empty()).await,
+            "the fixture shell never started, so nothing here could observe it being closed"
+        );
+        let shell_pid = live_shell_pids()[0];
+        assert!(
+            shell_is_running(shell_pid),
+            "the fixture shell {shell_pid} is not a live process, so the assertion below \
+             could not fail"
+        );
+
+        let receipt = host
+            .requests
+            .execute(
+                host.negotiated.clone(),
+                ClientRequest::Command(CommandEnvelope {
+                    command_id: CommandId::new(),
+                    client_id: host.client_id,
+                    task_id: Some(host.task_id),
+                    issued_at_ms: 1_725_000_001_000,
+                    expected_task_revision: Some(host.task_revision()),
+                    command: Command::BeginCloseTask,
+                }),
+            )
+            .await
+            .expect("archive the task");
+        assert!(
+            matches!(
+                receipt,
+                ServerMessage::CommandReceipt(CommandReceipt::Accepted { .. })
+            ),
+            "archive must be accepted: {receipt:?}"
+        );
+
+        assert!(
+            wait_until_stable(Duration::from_secs(30), 3, || !shell_is_running(shell_pid)).await,
+            "archiving task {} left shell {resource_id} running as process {shell_pid}",
+            host.task_id
+        );
+    });
 }

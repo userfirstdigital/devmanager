@@ -105,13 +105,54 @@ fn task_resource_blocks_archive_after_cleanup_error(
         )
 }
 
+/// Does provider cleanup have to wait for the resource release loop?
+///
+/// Plain shells are deliberately invisible here. They are closed directly by
+/// the release loop rather than through a process-empty durable release, and
+/// counting one would flip an ordinary provider task onto the deferred-cleanup
+/// branch the moment its owner opened a shell -- a timing change to the
+/// provider lane caused by something with no provider in it. Provider cleanup
+/// timing must be exactly what it was before plain shells existed.
+/// Why one live plain-shell link no longer has a durable terminal behind it,
+/// or `None` while it still does.
+///
+/// A durable terminal disappears exactly when its resource is released: the
+/// projector drops the `terminal_facts` row with it. So a `shell_sessions`
+/// entry with no row, or whose resource is gone or `Released`, is a live PTY
+/// that nothing can reach any more.
+///
+/// `Releasing` is deliberately NOT orphaned. It is the ordinary transient a
+/// close passes through -- the client renders it as a muted "?" chip -- and
+/// closing on it would tear down a shell the host is already retiring in
+/// order, or one whose release is still in flight.
+fn orphaned_shell_reason(
+    resource_id: ResourceId,
+    snapshot: Option<&crate::domain::snapshot::TaskSnapshot>,
+) -> Option<&'static str> {
+    // A shell cannot outlive the task that owns it.
+    let Some(snapshot) = snapshot else {
+        return Some("its task is gone");
+    };
+    match snapshot.resources.get(&resource_id) {
+        None => Some("its resource is gone"),
+        Some(resource) if resource.lifecycle == ResourceLifecycle::Released => {
+            Some("its resource was released")
+        }
+        Some(_) if !snapshot.terminal_facts.contains_key(&resource_id) => {
+            Some("its durable terminal is gone")
+        }
+        Some(_) => None,
+    }
+}
+
 fn provider_cleanup_requires_resource_release_first<'a>(
     resources: impl IntoIterator<Item = &'a ResourceFacts>,
     task_id: TaskId,
 ) -> bool {
-    resources
-        .into_iter()
-        .any(|resource| task_resource_blocks_archive_after_cleanup_error(resource, task_id))
+    resources.into_iter().any(|resource| {
+        !resource.recipe.is_plain_shell()
+            && task_resource_blocks_archive_after_cleanup_error(resource, task_id)
+    })
 }
 
 fn run_provider_dispatch_pass(
@@ -4665,6 +4706,10 @@ impl HostRequestExecutor {
         if self.shell_sessions.is_empty() {
             return;
         }
+        self.close_orphaned_shell_terminals();
+        if self.shell_sessions.is_empty() {
+            return;
+        }
         let Some(manager) = self
             .configured_service_runtime
             .as_ref()
@@ -4718,6 +4763,51 @@ impl HostRequestExecutor {
             if offer_activity && !terminal_is_gone {
                 let _ = self.record_shell_fact(task_id, resource_id, HostTerminalFact::Activity);
             }
+        }
+    }
+
+    /// Close every live shell whose durable terminal is gone.
+    ///
+    /// The framework-level guard behind the release path above, and the reason
+    /// a future release path cannot leak a shell by forgetting to close one.
+    /// A durable terminal disappears exactly when its resource is released --
+    /// the projector drops the `terminal_facts` row with it -- so a
+    /// `shell_sessions` entry with no row, or whose resource is `Released`, is
+    /// a live PTY nothing can reach any more.
+    ///
+    /// A task whose snapshot has gone entirely counts too: the shell cannot
+    /// outlive the task that owns it.
+    ///
+    /// A store error is NOT a reason to close anything. It says the sweep could
+    /// not look, and closing a live shell on the strength of a failed read
+    /// would destroy work; the log line is what makes that visible.
+    fn close_orphaned_shell_terminals(&mut self) {
+        let links: Vec<(ResourceId, TaskId)> = self
+            .shell_sessions
+            .iter()
+            .map(|(resource_id, link)| (*resource_id, link.task_id))
+            .collect();
+        let mut orphaned = Vec::new();
+        for (resource_id, task_id) in links {
+            let snapshot = match self.bus.task_snapshot(task_id) {
+                Ok(snapshot) => snapshot,
+                Err(error) => {
+                    eprintln!(
+                        "devmanager-host: shell terminal {resource_id} reconciliation could not \
+                         read task {task_id}, leaving it open: {error}"
+                    );
+                    continue;
+                }
+            };
+            if let Some(reason) = orphaned_shell_reason(resource_id, snapshot.as_ref()) {
+                orphaned.push((resource_id, reason));
+            }
+        }
+        for (resource_id, reason) in orphaned {
+            eprintln!(
+                "devmanager-host: shell terminal {resource_id} closed by reconciliation: {reason}"
+            );
+            self.close_shell_terminal(resource_id);
         }
     }
 
@@ -6019,6 +6109,16 @@ impl HostRequestExecutor {
             }) else {
                 break;
             };
+            // `ReleaseResource` is process-empty for a plain shell by
+            // construction (`settle_next_resource_release` performs no process
+            // effect), so releasing one without this leaves a live PTY, a
+            // `shell_sessions` entry and a `HostedTerminal` unreachable until
+            // the host exits -- and on Windows the shell holds the task's
+            // worktree directory open. `close_shell_terminal` owns the ordered
+            // teardown and is a no-op for a resource this host never spawned.
+            if resource.recipe.is_plain_shell() {
+                self.close_shell_terminal(resource.id);
+            }
             if resource.lifecycle == ResourceLifecycle::Active {
                 let receipt = self
                     .bus
@@ -14997,10 +15097,10 @@ mod output_tests {
 mod tests {
     use super::{
         apply_admitted_notification_sound, next_attention_after_provider_restore_failure,
-        provider_cleanup_requires_resource_release_first, provider_restore_failure_attention,
-        provider_restore_success_attention, provider_terminal_query_may_attach,
-        push_unique_provider_restore_intent, restore_admitted_provider_launch_options,
-        task_resource_blocks_archive_after_cleanup_error,
+        orphaned_shell_reason, provider_cleanup_requires_resource_release_first,
+        provider_restore_failure_attention, provider_restore_success_attention,
+        provider_terminal_query_may_attach, push_unique_provider_restore_intent,
+        restore_admitted_provider_launch_options, task_resource_blocks_archive_after_cleanup_error,
     };
     use crate::domain::agent::{
         AgentRole, AgentSessionFacts, AgentSessionLifecycle, ProviderSessionId,
@@ -15027,6 +15127,176 @@ mod tests {
     };
     use std::collections::{HashMap, HashSet, VecDeque};
     use uuid::Uuid;
+
+    /// Fixtures for the two F1 rules: one task, one provider terminal, one
+    /// plain shell, and every field the rules actually read.
+    fn resource_fixture(
+        task_id: TaskId,
+        launch: Option<crate::domain::resource::TerminalLaunch>,
+        lifecycle: ResourceLifecycle,
+    ) -> ResourceFacts {
+        ResourceFacts {
+            id: ResourceId::new(),
+            task_id: Some(task_id),
+            owner_kind: OwnerKind::Task,
+            resource_kind: ResourceKind::Terminal,
+            recipe: ResourceRecipe::Terminal {
+                cols: 100,
+                rows: 30,
+                launch,
+                title: None,
+            },
+            lifecycle,
+            runtime_generation: 1,
+            updated_at_ms: 1,
+        }
+    }
+
+    fn shell_launch() -> crate::domain::resource::TerminalLaunch {
+        crate::domain::resource::TerminalLaunch {
+            cwd: std::path::PathBuf::from("C:/workspace"),
+            program: std::path::PathBuf::from("C:/Windows/System32/cmd.exe"),
+            args: Vec::new(),
+        }
+    }
+
+    /// Opening a shell must not change when provider cleanup runs.
+    ///
+    /// `provider_cleanup_requires_resource_release_first` decides whether the
+    /// provider is closed before or after the resource release loop. Plain
+    /// shells are released by that loop directly rather than through a
+    /// process-empty durable release, so counting one would move an ordinary
+    /// provider task onto the deferred branch the moment its owner opened a
+    /// shell -- a timing change to the provider lane caused by something with
+    /// no provider in it.
+    #[test]
+    fn a_plain_shell_does_not_change_when_provider_cleanup_runs() {
+        let task_id = TaskId::new();
+        let provider = resource_fixture(task_id, None, ResourceLifecycle::Active);
+        let shell = resource_fixture(task_id, Some(shell_launch()), ResourceLifecycle::Active);
+
+        // The branch a provider alone takes is the branch it must still take
+        // with a shell beside it.
+        let with_provider_alone =
+            provider_cleanup_requires_resource_release_first([&provider], task_id);
+        assert!(
+            with_provider_alone,
+            "a live provider resource defers cleanup; this fixture is the control"
+        );
+        assert_eq!(
+            provider_cleanup_requires_resource_release_first([&provider, &shell], task_id),
+            with_provider_alone,
+            "a shell beside the provider must not move the cleanup branch"
+        );
+
+        // And a task whose only live resources are shells takes the
+        // undeferred branch, exactly as a task with nothing open does.
+        assert!(
+            !provider_cleanup_requires_resource_release_first([&shell], task_id),
+            "shells alone must not defer provider cleanup"
+        );
+        let releasing_shell =
+            resource_fixture(task_id, Some(shell_launch()), ResourceLifecycle::Releasing);
+        assert!(
+            !provider_cleanup_requires_resource_release_first([&releasing_shell], task_id),
+            "a releasing shell must not defer provider cleanup either"
+        );
+        assert!(
+            !provider_cleanup_requires_resource_release_first([], task_id),
+            "the empty case is the branch every shell-only task must share"
+        );
+    }
+
+    /// The reconciliation sweep's rule, in both directions.
+    ///
+    /// This is the framework-level guard behind the release path: a future
+    /// release path that forgets to close a shell leaks a live PTY, and this
+    /// is what catches it one tick later. A rule that answered "orphaned" for
+    /// a healthy shell would be far worse than the leak, so the negative cases
+    /// carry as much weight as the positive ones -- particularly `Releasing`,
+    /// which is the ordinary transient a close passes through and which the
+    /// client renders as a muted "?" chip.
+    #[test]
+    fn only_a_shell_with_no_durable_terminal_left_is_swept() {
+        use crate::domain::terminal_facts::TerminalFacts;
+        use std::collections::BTreeMap;
+
+        let task_id = TaskId::new();
+        let snapshot_with = |lifecycle: Option<ResourceLifecycle>, facts: bool| {
+            let shell = resource_fixture(
+                task_id,
+                Some(shell_launch()),
+                lifecycle.unwrap_or(ResourceLifecycle::Active),
+            );
+            let shell_id = shell.id;
+            let mut snapshot = crate::domain::snapshot::TaskSnapshot {
+                connectivity: TaskConnectivity::Connected,
+                attention: TaskAttention::None,
+                activity: TaskActivity::Idle,
+                review_readiness: ReviewReadiness::NotReady,
+                task: crate::domain::task::TaskFacts::new(
+                    EnvironmentId::new(),
+                    "sweep",
+                    None,
+                    ProjectId::new(),
+                    WorkspaceRef::Main,
+                    TaskAssignment::LocalOwner,
+                    1,
+                )
+                .expect("task facts"),
+                agents: BTreeMap::new(),
+                primary_agent_id: None,
+                artifacts: BTreeMap::new(),
+                resources: BTreeMap::new(),
+                provider_sessions: BTreeMap::new(),
+                browser: crate::domain::browser::BrowserBook::new(),
+                terminal_facts: BTreeMap::new(),
+                terminal_strip: crate::domain::terminal_facts::TaskTerminalStrip::default(),
+            };
+            if lifecycle.is_some() {
+                snapshot.resources.insert(shell_id, shell);
+            }
+            if facts {
+                snapshot
+                    .terminal_facts
+                    .insert(shell_id, TerminalFacts::registered(shell_id, None, 1));
+            }
+            (snapshot, shell_id)
+        };
+
+        // Still live: the sweep must leave every one of these alone.
+        for lifecycle in [ResourceLifecycle::Active, ResourceLifecycle::Releasing] {
+            let (snapshot, shell_id) = snapshot_with(Some(lifecycle), true);
+            assert_eq!(
+                orphaned_shell_reason(shell_id, Some(&snapshot)),
+                None,
+                "a {lifecycle:?} shell with durable facts is still reachable and must not be closed"
+            );
+        }
+
+        // Gone, in each of the three ways it can go.
+        let (snapshot, shell_id) = snapshot_with(Some(ResourceLifecycle::Released), false);
+        assert_eq!(
+            orphaned_shell_reason(shell_id, Some(&snapshot)),
+            Some("its resource was released")
+        );
+        let (snapshot, shell_id) = snapshot_with(None, false);
+        assert_eq!(
+            orphaned_shell_reason(shell_id, Some(&snapshot)),
+            Some("its resource is gone")
+        );
+        // The projection can also lose the terminal without the resource row:
+        // that is what a failed boot rebuild leaves behind.
+        let (snapshot, shell_id) = snapshot_with(Some(ResourceLifecycle::Active), false);
+        assert_eq!(
+            orphaned_shell_reason(shell_id, Some(&snapshot)),
+            Some("its durable terminal is gone")
+        );
+        assert_eq!(
+            orphaned_shell_reason(ResourceId::new(), None),
+            Some("its task is gone")
+        );
+    }
 
     #[test]
     fn stale_provider_cleanup_only_blocks_archive_for_live_task_owned_resources() {
