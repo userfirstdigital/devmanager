@@ -113,7 +113,10 @@ Everything else is a grey ramp:
 | `border.strong` | `#34343c` | selected row, focused panel |
 | `text.primary` | `#e6e6ea` | titles, stream text |
 | `text.secondary` | `#9a9aa3` | status line |
-| `text.muted` | `#6b6b74` | second line, ages, marks |
+| `text.muted` | `#86868f` | second line, ages, marks (spec drafted `#6b6b74`; the repo's 4.5:1 floor on raised forced `#86868f`, landed 2026-09-03) |
+| `text.disabled` | `#85858e` | one step below muted; the disabled-text floor is also 4.5:1, so it cannot sit lower |
+| `surface.disabled` | `#1e1e23` | disabled controls |
+| `status.inactive` | `#86868f` | inactive chips |
 | `status.attention` | `#f2b441` | needs you |
 | `status.blocked` | `#e5484d` | broken |
 | `status.success` | `#7fb07f` | inline only: test passed, subagent live dot |
