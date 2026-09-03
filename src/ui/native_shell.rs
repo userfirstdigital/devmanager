@@ -26432,9 +26432,18 @@ impl NativeShell {
 
     /// Move strip focus one chip along, wrapping at both ends.
     ///
-    /// With nothing focused, forward starts at the first chip and backward at
-    /// the last, so the chord is never a no-op on a Task whose strip focuses
-    /// nothing.
+    /// `focused: None` has two different meanings and the chord has to tell
+    /// them apart. With a provider chip drawn, the durable strip spells "the
+    /// provider is selected" as `focused: None` (`TaskTerminalStrip::validate`
+    /// refuses the provider in `focused`), so no row ever reports `selected`
+    /// and the cycle stands at row 0: forward leaves the provider for the
+    /// first shell, backward for the last. Without a provider chip the same
+    /// `None` really does mean nothing is focused -- the host clears focus when
+    /// the focused shell closes -- so forward starts at the first shell.
+    ///
+    /// On a provider-only strip both directions land back on the provider, and
+    /// that is a true no-op: dispatching `TerminalSetStrip { focused: None }`
+    /// to say so would be a round trip that changes nothing.
     fn cycle_terminal(&mut self, backwards: bool) {
         let Some(owner) = self.selected_task_key.clone() else {
             return;
@@ -26446,9 +26455,16 @@ impl NativeShell {
         if rows.is_empty() {
             return;
         }
+        // `terminal_chip_rows` draws the provider first when there is one.
+        let provider_leads = rows[0].is_provider;
+        if provider_leads && rows.len() == 1 {
+            return;
+        }
         let next = match rows.iter().position(|row| row.selected) {
             Some(current) if backwards => (current + rows.len() - 1) % rows.len(),
             Some(current) => (current + 1) % rows.len(),
+            None if provider_leads && backwards => rows.len() - 1,
+            None if provider_leads => 1,
             None if backwards => rows.len() - 1,
             None => 0,
         };
@@ -67228,6 +67244,71 @@ mod tests {
                 assert_eq!(
                     shell.focused_terminal_target(&owner),
                     super::TerminalTarget::Resource(second)
+                );
+
+                // Forward from the same state. `focused: None` with a provider
+                // chip drawn IS the provider selected -- `validate` refuses the
+                // provider in `focused`, so no row can ever report `selected`
+                // -- and forward must leave it for the first shell rather than
+                // re-selecting row 0, which is the provider itself.
+                admit(shell, None);
+                shell.cycle_terminal(false);
+                assert_eq!(
+                    shell.focused_terminal_target(&owner),
+                    super::TerminalTarget::Resource(first),
+                    "forward from the provider chip must reach the first shell"
+                );
+            });
+            cx.quit();
+        });
+    }
+
+    /// A strip with only the provider chip has nowhere to cycle to.
+    ///
+    /// Every direction lands back on the provider, whose durable spelling is
+    /// `focused: None` -- which is what the strip already says. Dispatching
+    /// `TerminalSetStrip { focused: None }` to say so is a round trip that
+    /// changes nothing, so the chord must dispatch nothing at all.
+    #[test]
+    fn cycling_a_provider_only_strip_dispatches_nothing() {
+        if rerun_headless_shell_test_in_child(
+            "ui::native_shell::tests::cycling_a_provider_only_strip_dispatches_nothing",
+        ) {
+            return;
+        }
+        let (runtime, _local_shared) = TestRuntime::new(true, NativeHostActionResult::Queued);
+        let remote_host = HostId::Remote([0xb2; 16]);
+        gpui::Application::headless().run(move |cx| {
+            crate::ui::init(cx);
+            with_test_shell_in_app(cx, runtime, |shell| {
+                let (model, task_id) = terminal_bound_client_model();
+                let model = Arc::new(model);
+                let provider_resource =
+                    provider_terminal_projection_for_test(&model, task_id, 1).resource_id;
+                let shared =
+                    attach_remote_test_host_with_shared(shell, &remote_host, Arc::clone(&model));
+                let owner = HostTaskKey::new(remote_host.clone(), task_id);
+                shell
+                    .select_fleet_task_key(owner.clone(), FleetSelectMode::Replace)
+                    .expect("select remote task");
+                let strip = crate::domain::cockpit::TaskTerminalsProjection {
+                    task_id,
+                    terminals: vec![terminal_chip_for_test(provider_resource, true)],
+                    order: Vec::new(),
+                    focused: None,
+                };
+                shell
+                    .task_surfaces
+                    .admit_terminals(owner.clone(), &strip)
+                    .expect("admit provider-only strip");
+
+                shared.lock().expect("runtime").accepted.clear();
+                shell.cycle_terminal(false);
+                shell.cycle_terminal(true);
+                assert_eq!(
+                    dispatched_strip_commands_for_test(&shared),
+                    Vec::new(),
+                    "a provider-only strip has nowhere to cycle to, in either direction"
                 );
             });
             cx.quit();
