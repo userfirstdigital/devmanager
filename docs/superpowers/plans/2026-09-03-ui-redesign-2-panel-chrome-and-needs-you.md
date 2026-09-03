@@ -29,6 +29,7 @@
 - Work in your own git worktree off `VisualDevManager`; own `CARGO_TARGET_DIR`; copy `web/src/connect/wasm/` if `build.rs` complains; never write to `<repo>/.devmanager-next/`; never launch the app.
 - LF line endings. Gates: `cargo check --locked --lib --bins --tests -j 2` EXIT 0; `cargo fmt --all -- --check` EXIT 0; no new warnings; targeted tests while iterating, one full `cargo test --lib -- --test-threads=4` at the end.
 - Commit trailer on every commit: `Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>` then `Claude-Session: https://claude.ai/code/session_01BJgrNVntfxuTu79ugvwNHm`.
+- **Visual fidelity rule (user ruling 2026-09-03: the built UI must MATCH the images, not resemble them).** Every task that paints pixels is a design task: before writing any painter code the implementer loads the `frontend-design` skill (`C:/Users/micro/.claude/plugins/cache/claude-plugins-official/frontend-design/unknown/skills/frontend-design/SKILL.md`) and Reads the reference PNG(s) named in the task with the Read tool, then opens the matching mockup HTML beside it and copies sizes, colours, spacing, weights and radii from that CSS verbatim, never approximating from memory. The reviewer of a painter task also Reads the reference PNG and judges the painter code against it element by element (row height, paddings, font sizes, colours, stripe width, segment geometry, mark size), listing every deviation as an Important finding. The final visual acceptance is a side-by-side of a real capture against the PNGs done by the controller with the design skill loaded, and a reviewer independently; a capture that has the same parts in a different arrangement fails.
 - The reference PNGs are the acceptance criterion for appearance (spec 12). Task 10 compares a real capture against them.
 
 ---
@@ -512,6 +513,8 @@ git commit -m "feat(panel): pure panel chrome model"
 
 ### Task 5: Panel chrome painter and the ⋯ menu rows
 
+> **Painter task (Task 5).** Load the `frontend-design` skill and Read `docs/superpowers/specs/2026-09-03-ui-redesign-mockups/02-panel-chrome-2.png` and `docs/superpowers/specs/2026-09-03-ui-redesign-mockups/01-composition-A.png` BEFORE writing code; copy every size and colour from the mockup HTML (same basename, `.html`) beside the PNG. The reviewer reads the same PNG. See the Visual fidelity rule in Global Constraints.
+
 **Files:**
 - Create: `src/ui/panel/render.rs`, `src/ui/panel/menu.rs`
 - Test: `menu.rs` (pure), `render.rs` (headless smoke)
@@ -593,6 +596,8 @@ git commit -m "feat(panel): two-row chrome painter and menu vocabulary"
 ---
 
 ### Task 6: Question card and permission dock
+
+> **Painter task (Task 6).** Load the `frontend-design` skill and Read `docs/superpowers/specs/2026-09-03-ui-redesign-mockups/06-needs-you-question-1-permission.png` BEFORE writing code; copy every size and colour from the mockup HTML (same basename, `.html`) beside the PNG. The reviewer reads the same PNG. See the Visual fidelity rule in Global Constraints.
 
 **Files:**
 - Modify: `src/ui/conversation/render.rs` (`question_element`, `conversation_row_height` for Question)
@@ -701,6 +706,8 @@ Write it against the `open_task_without_agent_client_model`-style fixtures the n
 
 ### Task 9: Wire the panel into the shell
 
+> **Painter task (Task 9).** Load the `frontend-design` skill and Read `docs/superpowers/specs/2026-09-03-ui-redesign-mockups/01-composition-A.png`, `docs/superpowers/specs/2026-09-03-ui-redesign-mockups/02-panel-chrome-2.png` and `docs/superpowers/specs/2026-09-03-ui-redesign-mockups/06-needs-you-question-1-permission.png` BEFORE writing code; copy every size and colour from the mockup HTML (same basename, `.html`) beside the PNG. The reviewer reads the same PNG. See the Visual fidelity rule in Global Constraints.
+
 **Files:**
 - Modify: `src/ui/native_shell.rs`: `render_task_workspace_pane` (24711-24990), `workspace_dock_surface` (28334), the dock render call site (search `workspace_dock_surface(`), `conversation_delete_action` and the whole action strip (34020-34200), `provider_setup_approval_card` (25068), the composer render where `pending_approval_identity` is read (~27884), the chip-menu overlay pattern (27288-27420) for the new pane menu, `render_terminal_chip_menu_overlay`'s caller for overlay placement
 - Test: `native_shell.rs` tests
@@ -784,6 +791,8 @@ git commit -m "feat(shell): two-row panel chrome, tabs, needs-you states, zoom, 
 ---
 
 ### Task 10: Visual acceptance against the reference images
+
+> **Painter task (Task 10).** Load the `frontend-design` skill and Read `docs/superpowers/specs/2026-09-03-ui-redesign-mockups/01-composition-A.png`, `docs/superpowers/specs/2026-09-03-ui-redesign-mockups/02-panel-chrome-2.png` and `docs/superpowers/specs/2026-09-03-ui-redesign-mockups/06-needs-you-question-1-permission.png` BEFORE writing code; copy every size and colour from the mockup HTML (same basename, `.html`) beside the PNG. The reviewer reads the same PNG. See the Visual fidelity rule in Global Constraints.
 
 Same procedure as plan 1 Task 9, against `01-composition-A.png`, `02-panel-chrome-2.png` and `06-needs-you-question-1-permission.png`. Not allowed: a third chrome row, an action strip, a right dock, a compact summary pane, a question docked at the bottom, a permission card in the stream, any amber or red on a panel that does not need you. The user launches and captures; you compare and list every difference with a verdict.
 

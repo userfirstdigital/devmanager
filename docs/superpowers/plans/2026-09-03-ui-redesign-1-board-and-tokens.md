@@ -26,6 +26,7 @@
 - Work in your own git worktree off `VisualDevManager`; `$env:CARGO_TARGET_DIR` is your own `C:\Temp\devmanager-*`; copy `web/src/connect/wasm/` from the main checkout if `build.rs` reports a stale fingerprint. Never write to `<repo>/.devmanager-next/`. Never launch the app; the user launches it.
 - LF line endings. Gates: `cargo check --locked --lib --bins --tests -j 2` EXIT 0; `cargo fmt --all -- --check` EXIT 0; no new warnings; targeted tests while iterating, one full `cargo test --lib -- --test-threads=4` before handing back.
 - Commit trailer on every commit: `Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>` then `Claude-Session: https://claude.ai/code/session_01BJgrNVntfxuTu79ugvwNHm`.
+- **Visual fidelity rule (user ruling 2026-09-03: the built UI must MATCH the images, not resemble them).** Every task that paints pixels is a design task: before writing any painter code the implementer loads the `frontend-design` skill (`C:/Users/micro/.claude/plugins/cache/claude-plugins-official/frontend-design/unknown/skills/frontend-design/SKILL.md`) and Reads the reference PNG(s) named in the task with the Read tool, then opens the matching mockup HTML beside it and copies sizes, colours, spacing, weights and radii from that CSS verbatim, never approximating from memory. The reviewer of a painter task also Reads the reference PNG and judges the painter code against it element by element (row height, paddings, font sizes, colours, stripe width, segment geometry, mark size), listing every deviation as an Important finding. The final visual acceptance is a side-by-side of a real capture against the PNGs done by the controller with the design skill loaded, and a reviewer independently; a capture that has the same parts in a different arrangement fails.
 - The reference PNGs are the acceptance criterion for appearance (spec 12). Task 9 compares a real capture against them.
 
 ---
@@ -1047,6 +1048,8 @@ git commit -m "feat(board): persisted project colour book and rail flag"
 
 ### Task 7: Row layout decisions and the painter
 
+> **Painter task (Task 7).** Load the `frontend-design` skill and Read `docs/superpowers/specs/2026-09-03-ui-redesign-mockups/03-board-rows-boxed-A.png`, `docs/superpowers/specs/2026-09-03-ui-redesign-mockups/04-project-stripe-1.png` and `docs/superpowers/specs/2026-09-03-ui-redesign-mockups/05-provider-mark-1.png` BEFORE writing code; copy every size and colour from the mockup HTML (same basename, `.html`) beside the PNG. The reviewer reads the same PNG. See the Visual fidelity rule in Global Constraints.
+
 **Files:**
 - Create: `src/ui/board/layout.rs`, `src/ui/board/render.rs`
 - Modify: `src/ui/board/mod.rs`
@@ -1348,6 +1351,8 @@ git commit -m "feat(board): row layout rules and gpui painter"
 
 ### Task 8: Wire the board into the shell
 
+> **Painter task (Task 8).** Load the `frontend-design` skill and Read `docs/superpowers/specs/2026-09-03-ui-redesign-mockups/03-board-rows-boxed-A.png` and `docs/superpowers/specs/2026-09-03-ui-redesign-mockups/01-composition-A.png` BEFORE writing code; copy every size and colour from the mockup HTML (same basename, `.html`) beside the PNG. The reviewer reads the same PNG. See the Visual fidelity rule in Global Constraints.
+
 **Files:**
 - Modify: `src/ui/native_shell.rs`: `project_inbox_items` (30425), `row_models` and the `uniform_list` (41904-42520), `inbox_row_height` (34629), `T3_SIDEBAR_ROW_HEIGHT` (360, and the test at 47013), `for_fleet_task_list_with_composer` (accessibility, ~9806), `task_row_status_for_owner` (33755), `status_tone` (33828)
 - Test: `src/ui/native_shell.rs` tests
@@ -1524,6 +1529,8 @@ git commit -m "feat(board): state-grouped board replaces the project rail"
 ---
 
 ### Task 9: Visual acceptance against the reference images
+
+> **Painter task (Task 9).** Load the `frontend-design` skill and Read `docs/superpowers/specs/2026-09-03-ui-redesign-mockups/03-board-rows-boxed-A.png`, `docs/superpowers/specs/2026-09-03-ui-redesign-mockups/04-project-stripe-1.png` and `docs/superpowers/specs/2026-09-03-ui-redesign-mockups/05-provider-mark-1.png` BEFORE writing code; copy every size and colour from the mockup HTML (same basename, `.html`) beside the PNG. The reviewer reads the same PNG. See the Visual fidelity rule in Global Constraints.
 
 **Files:**
 - Create: `.superpowers/sdd/<this plan's workspace>/board-capture.png` (git-ignored) and the report
