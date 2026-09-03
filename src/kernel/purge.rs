@@ -1372,11 +1372,59 @@ mod tests {
         }
         let elapsed = started.elapsed();
 
+        // What the reaper actually pays every tick once the backlog is gone,
+        // and WHERE that cost is -- because the obvious answer is wrong.
+        //
+        // Measured against this store copy: the empty-worklist probe on a
+        // fresh query connection costs ~2.3 ms, of which the connection open
+        // is ~76 us and the worklist query on a REUSED connection is ~37 us.
+        // `SELECT 1` on a fresh connection costs the same ~2.2 ms, so the
+        // whole cost is the FIRST STATEMENT on a new query connection (schema
+        // load and WAL index attach), not the query and not the missing index
+        // on `tasks.lifecycle` that a plan would have tempted you to add.
+        //
+        // The sweep therefore pays what any per-tick read on a fresh query
+        // connection pays here -- the same price `pending_resource_releases`
+        // already pays one step earlier on the same tick. Reducing it means
+        // changing how the store hands out query connections, which is a
+        // separate change with its own snapshot-freshness argument.
+        let idle_started = std::time::Instant::now();
+        for _ in 0..100 {
+            let conn = store.open_query_connection().expect("query connection");
+            assert!(deleted_task_ids(&conn, 8).expect("worklist").is_empty());
+        }
+        let idle_us = idle_started.elapsed().as_micros() / 100;
+        // How much of that is the connection, not the scan.
+        let open_started = std::time::Instant::now();
+        for _ in 0..100 {
+            let _ = store.open_query_connection().expect("query connection");
+        }
+        let open_us = open_started.elapsed().as_micros() / 100;
+        // A trivial statement on a fresh connection: whatever this costs is
+        // the price of asking ANYTHING on a new connection, not of the
+        // worklist query.
+        let trivial_started = std::time::Instant::now();
+        for _ in 0..100 {
+            let conn = store.open_query_connection().expect("query connection");
+            let _: i64 = conn
+                .query_row("SELECT 1", [], |row| row.get(0))
+                .expect("select 1");
+        }
+        let trivial_us = trivial_started.elapsed().as_micros() / 100;
+        // And the worklist query on ONE reused connection.
+        let reused = store.open_query_connection().expect("query connection");
+        let reused_started = std::time::Instant::now();
+        for _ in 0..100 {
+            assert!(deleted_task_ids(&reused, 8).expect("worklist").is_empty());
+        }
+        let reused_us = reused_started.elapsed().as_micros() / 100;
+
         let after = census(&Connection::open(&path).expect("observer"));
         println!(
             "--- after ({purged} tasks in {} ms) ---",
             elapsed.as_millis()
         );
+        println!("steady-state per-tick probe: {idle_us} us (open alone {open_us} us, open + SELECT 1 {trivial_us} us, worklist on a reused connection {reused_us} us)");
         for (label, total) in &after {
             println!("{label:32} {total}");
         }
