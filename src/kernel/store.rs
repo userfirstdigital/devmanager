@@ -364,7 +364,8 @@ impl KernelStore {
     ) -> Result<Option<DispatchClaim>, StoreError> {
         let lease_ms = validate_dispatch_lease_ms(lease)?;
         self.with_immediate_transaction(|tx| {
-            claim_next_dispatch_in_tx(tx, now_ms()?, lease_ms, None)
+            claim_next_dispatch_in_tx(tx, now_ms()?, lease_ms, None, false)
+                .map(|(claim, _retired)| claim)
         })
     }
 
@@ -378,7 +379,34 @@ impl KernelStore {
     ) -> Result<Option<DispatchClaim>, StoreError> {
         let lease_ms = validate_dispatch_lease_ms(lease)?;
         self.with_immediate_transaction(|tx| {
-            claim_next_dispatch_in_tx(tx, now_ms()?, lease_ms, Some(destination))
+            claim_next_dispatch_in_tx(tx, now_ms()?, lease_ms, Some(destination), false)
+                .map(|(claim, _retired)| claim)
+        })
+    }
+
+    /// Claim for the provider-input lane, retiring any candidate it steps over
+    /// whose fence can never pass again.
+    ///
+    /// The provider lane is the one destination with an owning dispatcher that
+    /// can converge: it makes the row's only claim, and nothing else will ever
+    /// come back for a row it leaves behind. Without this, a permanently stale
+    /// row is re-examined once per maintenance tick forever, and the identical
+    /// `StaleFence` it returns each time buries every real error beside it.
+    /// Retirement lands in the same transaction as the scan; the returned rows
+    /// are reported by the caller exactly once.
+    pub(crate) fn claim_next_provider_input_dispatch(
+        &mut self,
+        lease: Duration,
+    ) -> Result<(Option<DispatchClaim>, Vec<RetiredDispatch>), StoreError> {
+        let lease_ms = validate_dispatch_lease_ms(lease)?;
+        self.with_immediate_transaction(|tx| {
+            claim_next_dispatch_in_tx(
+                tx,
+                now_ms()?,
+                lease_ms,
+                Some(DestinationClass::ProviderInput),
+                true,
+            )
         })
     }
 
@@ -3086,28 +3114,49 @@ fn claim_outbox_row(
     Ok(DispatchClaim::new(row.outbox_id, next_generation))
 }
 
+/// One outbox row the dispatch scan retired because its fence can never pass.
+///
+/// The caller logs it exactly once: the retirement is committed with the scan's
+/// own transaction, so the row can never be selected, re-leased, or reported a
+/// second time.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct RetiredDispatch {
+    pub(crate) outbox_id: OutboxId,
+    pub(crate) operation_id: OperationId,
+    pub(crate) task_id: TaskId,
+    pub(crate) check: command_bus::StaleFenceCheck,
+}
+
 fn claim_next_dispatch_in_tx(
     tx: &Transaction<'_>,
     now_ms: i64,
     lease_ms: i64,
     destination: Option<DestinationClass>,
-) -> Result<Option<DispatchClaim>, StoreError> {
+    retire_permanently_stale: bool,
+) -> Result<(Option<DispatchClaim>, Vec<RetiredDispatch>), StoreError> {
     let mut prior_candidate = None;
     let mut saw_stale_fence = false;
+    let mut retired: Vec<RetiredDispatch> = Vec::new();
     loop {
         let Some(row) =
             load_next_dispatch_candidate(tx, now_ms, prior_candidate.as_ref(), destination)?
         else {
-            return if saw_stale_fence {
+            // A transient stale fence is still reported: something is refusing
+            // and the lane must be able to see it. A permanent one has been
+            // retired above, so its row is gone and there is nothing to report.
+            return if saw_stale_fence && retired.is_empty() {
                 Err(StoreError::StaleFence)
             } else {
-                Ok(None)
+                Ok((None, retired))
             };
         };
         let effect_doc = match revalidate_outbox_effect(tx, &row) {
             Ok((effect_doc, _)) => effect_doc,
             Err(StoreError::StaleFence) => {
-                saw_stale_fence = true;
+                match retire_stale_candidate(tx, &row, now_ms, retire_permanently_stale)? {
+                    Some(entry) => retired.push(entry),
+                    None => saw_stale_fence = true,
+                }
                 prior_candidate = Some(row);
                 continue;
             }
@@ -3118,17 +3167,40 @@ fn claim_next_dispatch_in_tx(
                 prior_candidate = Some(row);
             }
             "pending" | "claimed" => {
-                return Ok(Some(claim_outbox_row(
-                    tx,
-                    &row,
-                    now_ms,
-                    lease_ms,
-                    row.state.as_str(),
-                )?));
+                let claim = claim_outbox_row(tx, &row, now_ms, lease_ms, row.state.as_str())?;
+                return Ok((Some(claim), retired));
             }
             _ => return Err(StoreError::Corruption),
         }
     }
+}
+
+/// Retire one stale candidate when, and only when, the check that refused it
+/// can never pass again. `Ok(None)` leaves the row exactly as it was found.
+fn retire_stale_candidate(
+    tx: &Transaction<'_>,
+    row: &OutboxRow,
+    now_ms: i64,
+    retire_permanently_stale: bool,
+) -> Result<Option<RetiredDispatch>, StoreError> {
+    if !retire_permanently_stale {
+        return Ok(None);
+    }
+    let Some(check) =
+        command_bus::classify_stale_dispatch_fence(tx, row.operation_id, row.outbox_id)?
+    else {
+        return Ok(None);
+    };
+    if !check.is_permanent() {
+        return Ok(None);
+    }
+    let task_id = command_bus::retire_stale_fenced_dispatch_in_tx(tx, row, check, now_ms)?;
+    Ok(Some(RetiredDispatch {
+        outbox_id: row.outbox_id,
+        operation_id: row.operation_id,
+        task_id,
+        check,
+    }))
 }
 
 fn settle_next_process_empty_task_teardown_in_tx(

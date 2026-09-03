@@ -4363,13 +4363,110 @@ fn validate_dispatch_lineage(
     Ok((document, fence))
 }
 
+/// Which fence check refused a dispatch candidate, and whether that refusal can
+/// ever change.
+///
+/// `StoreError::StaleFence` is one outward status for a dozen different
+/// refusals, so a lane that sees only the bare error cannot tell "a lease or a
+/// generation bump is still in flight" from "this row can never dispatch
+/// again", and it therefore re-leases the second kind forever. Naming the check
+/// that fired is what separates them; [`StaleFenceCheck::is_permanent`] is
+/// defined in terms of the named check so the two cannot drift apart.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum StaleFenceCheck {
+    /// The operation already carries a durable terminal outcome.
+    OperationTerminal,
+    /// The operation is durably uncertain and belongs to reconciliation.
+    OperationUncertain,
+    /// The owning task row is gone.
+    TaskMissing,
+    /// The task's action epoch has advanced past the planned effect's.
+    TaskActionEpochAdvanced,
+    /// The task's action epoch is behind the planned effect's.
+    TaskActionEpochBehind,
+    /// The task lifecycle no longer admits this effect.
+    TaskLifecycleMoved,
+    /// The durable agent-session row is gone.
+    AgentSessionMissing,
+    /// The agent session belongs to another task.
+    AgentSessionForeign,
+    /// The agent session is no longer open.
+    AgentSessionClosed,
+    /// The live provider identity no longer matches the planned effect.
+    ProviderIdentityMoved,
+    /// The provider runtime generation has advanced past the effect's.
+    ProviderRuntimeGenerationAdvanced,
+    /// The provider runtime generation is behind the effect's.
+    ProviderRuntimeGenerationBehind,
+    /// The released resource is gone, or is owned or generationed elsewhere.
+    ResourceOwnershipMoved,
+}
+
+impl StaleFenceCheck {
+    /// A refusal is permanent when the evidence it rests on only ever moves
+    /// further away: an operation that is already terminal, a task action epoch
+    /// that has advanced, a provider runtime generation that has advanced.
+    /// Every other refusal may be a lease, a restart, or a bump still in
+    /// flight, so its row must be left exactly where it is.
+    pub(crate) fn is_permanent(self) -> bool {
+        matches!(
+            self,
+            Self::OperationTerminal
+                | Self::TaskActionEpochAdvanced
+                | Self::ProviderRuntimeGenerationAdvanced
+        )
+    }
+
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::OperationTerminal => "operation_terminal",
+            Self::OperationUncertain => "operation_uncertain",
+            Self::TaskMissing => "task_missing",
+            Self::TaskActionEpochAdvanced => "task_action_epoch_advanced",
+            Self::TaskActionEpochBehind => "task_action_epoch_behind",
+            Self::TaskLifecycleMoved => "task_lifecycle_moved",
+            Self::AgentSessionMissing => "agent_session_missing",
+            Self::AgentSessionForeign => "agent_session_foreign",
+            Self::AgentSessionClosed => "agent_session_closed",
+            Self::ProviderIdentityMoved => "provider_identity_moved",
+            Self::ProviderRuntimeGenerationAdvanced => "provider_runtime_generation_advanced",
+            Self::ProviderRuntimeGenerationBehind => "provider_runtime_generation_behind",
+            Self::ResourceOwnershipMoved => "resource_ownership_moved",
+        }
+    }
+}
+
+/// The named outbox disposition a retired dispatch row carries, alongside the
+/// `ambiguous_dispatch` / `side_effect_failed` classes already in use.
+pub(crate) const STALE_FENCE_ERROR_CLASS: &str = "stale_fence";
+
+fn task_action_epoch_check(stored: u64, planned: u64) -> StaleFenceCheck {
+    if stored > planned {
+        StaleFenceCheck::TaskActionEpochAdvanced
+    } else {
+        StaleFenceCheck::TaskActionEpochBehind
+    }
+}
+
+fn accepted_dispatch_operation_check(
+    operation: &OperationProjectionRow,
+) -> Result<Option<StaleFenceCheck>, StoreError> {
+    match operation.state.as_str() {
+        "accepted" => Ok(None),
+        "settled" | "failed" | "cancelled" => Ok(Some(StaleFenceCheck::OperationTerminal)),
+        // Uncertain is not terminal: reconciliation still owns it, and its row
+        // must never be retired by the dispatch lane.
+        "uncertain" => Ok(Some(StaleFenceCheck::OperationUncertain)),
+        _ => Err(StoreError::Corruption),
+    }
+}
+
 fn require_accepted_dispatch_operation(
     operation: &OperationProjectionRow,
 ) -> Result<(), StoreError> {
-    match operation.state.as_str() {
-        "accepted" => Ok(()),
-        "settled" | "failed" | "cancelled" | "uncertain" => Err(StoreError::StaleFence),
-        _ => Err(StoreError::Corruption),
+    match accepted_dispatch_operation_check(operation)? {
+        None => Ok(()),
+        Some(_) => Err(StoreError::StaleFence),
     }
 }
 
@@ -5019,43 +5116,66 @@ fn require_current_effect_ownership(
     effect: &Effect,
     fence: OperationFence,
 ) -> Result<(), StoreError> {
+    match current_effect_ownership_check(tx, task_id, effect, fence)? {
+        None => Ok(()),
+        Some(_) => Err(StoreError::StaleFence),
+    }
+}
+
+/// Read the owning task's lifecycle and action epoch, distinguishing "no such
+/// task" from a task that answered. Every caller needs that distinction to name
+/// the check that refused; the projector's own reader errors on a missing row
+/// and is scoped to shadow projection, so it cannot answer this question.
+fn load_task_lifecycle_epoch(
+    tx: &Transaction<'_>,
+    task_id: TaskId,
+) -> Result<Option<(String, u64)>, StoreError> {
+    let row: Option<(String, i64)> = tx
+        .query_row(
+            "SELECT lifecycle, action_epoch FROM tasks WHERE task_id = ?1",
+            [task_id.as_bytes().as_slice()],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?;
+    let Some((lifecycle, epoch)) = row else {
+        return Ok(None);
+    };
+    Ok(Some((
+        lifecycle,
+        u64_from_nonnegative_i64("tasks.action_epoch", epoch)?,
+    )))
+}
+
+/// The single live-ownership rule behind every `StaleFence` a dispatch
+/// candidate can draw. `Ok(None)` grants; `Ok(Some(check))` names the check
+/// that refused, and nothing else in the kernel may decide that question.
+fn current_effect_ownership_check(
+    tx: &Transaction<'_>,
+    task_id: TaskId,
+    effect: &Effect,
+    fence: OperationFence,
+) -> Result<Option<StaleFenceCheck>, StoreError> {
     match effect {
         Effect::BeginTaskTeardown { action_epoch, .. } => {
-            let (lifecycle, stored_epoch): (String, i64) = tx
-                .query_row(
-                    "SELECT lifecycle, action_epoch FROM tasks WHERE task_id = ?1",
-                    [task_id.as_bytes().as_slice()],
-                    |row| Ok((row.get(0)?, row.get(1)?)),
-                )
-                .map_err(|err| match err {
-                    rusqlite::Error::QueryReturnedNoRows => StoreError::StaleFence,
-                    other => other.into(),
-                })?;
-            let stored_epoch = u64_from_nonnegative_i64("tasks.action_epoch", stored_epoch)?;
-            if lifecycle != "closing"
-                || Some(stored_epoch) != fence.action_epoch
-                || stored_epoch != *action_epoch
-            {
-                return Err(StoreError::StaleFence);
+            let Some((lifecycle, stored_epoch)) = load_task_lifecycle_epoch(tx, task_id)? else {
+                return Ok(Some(StaleFenceCheck::TaskMissing));
+            };
+            if lifecycle != "closing" {
+                return Ok(Some(StaleFenceCheck::TaskLifecycleMoved));
+            }
+            if Some(stored_epoch) != fence.action_epoch || stored_epoch != *action_epoch {
+                return Ok(Some(task_action_epoch_check(stored_epoch, *action_epoch)));
             }
         }
         Effect::HoldBrowserHost { action_epoch, .. } => {
-            let (lifecycle, stored_epoch): (String, i64) = tx
-                .query_row(
-                    "SELECT lifecycle, action_epoch FROM tasks WHERE task_id = ?1",
-                    [task_id.as_bytes().as_slice()],
-                    |row| Ok((row.get(0)?, row.get(1)?)),
-                )
-                .map_err(|err| match err {
-                    rusqlite::Error::QueryReturnedNoRows => StoreError::StaleFence,
-                    other => other.into(),
-                })?;
-            let stored_epoch = u64_from_nonnegative_i64("tasks.action_epoch", stored_epoch)?;
-            if lifecycle != "open"
-                || Some(stored_epoch) != fence.action_epoch
-                || stored_epoch != *action_epoch
-            {
-                return Err(StoreError::StaleFence);
+            let Some((lifecycle, stored_epoch)) = load_task_lifecycle_epoch(tx, task_id)? else {
+                return Ok(Some(StaleFenceCheck::TaskMissing));
+            };
+            if lifecycle != "open" {
+                return Ok(Some(StaleFenceCheck::TaskLifecycleMoved));
+            }
+            if Some(stored_epoch) != fence.action_epoch || stored_epoch != *action_epoch {
+                return Ok(Some(task_action_epoch_check(stored_epoch, *action_epoch)));
             }
         }
         Effect::ReleaseResource {
@@ -5063,19 +5183,11 @@ fn require_current_effect_ownership(
             action_epoch,
             ..
         } => {
-            let (_lifecycle, epoch): (String, i64) = tx
-                .query_row(
-                    "SELECT lifecycle, action_epoch FROM tasks WHERE task_id = ?1",
-                    [task_id.as_bytes().as_slice()],
-                    |row| Ok((row.get(0)?, row.get(1)?)),
-                )
-                .map_err(|err| match err {
-                    rusqlite::Error::QueryReturnedNoRows => StoreError::StaleFence,
-                    other => other.into(),
-                })?;
-            let epoch = u64_from_nonnegative_i64("tasks.action_epoch", epoch)?;
+            let Some((_lifecycle, epoch)) = load_task_lifecycle_epoch(tx, task_id)? else {
+                return Ok(Some(StaleFenceCheck::TaskMissing));
+            };
             if Some(epoch) != fence.action_epoch || epoch != *action_epoch {
-                return Err(StoreError::StaleFence);
+                return Ok(Some(task_action_epoch_check(epoch, *action_epoch)));
             }
             let row: Option<(Option<Vec<u8>>, String, String, i64)> = tx
                 .query_row(
@@ -5086,7 +5198,7 @@ fn require_current_effect_ownership(
                 )
                 .optional()?;
             let Some((owned_task, owner_kind, lifecycle, generation)) = row else {
-                return Err(StoreError::StaleFence);
+                return Ok(Some(StaleFenceCheck::ResourceOwnershipMoved));
             };
             let generation = u64_from_nonnegative_i64("resources.runtime_generation", generation)?;
             let owned_ok = matches!(
@@ -5098,7 +5210,7 @@ fn require_current_effect_ownership(
                 || lifecycle != "releasing"
                 || generation != resource_fence.runtime_generation
             {
-                return Err(StoreError::StaleFence);
+                return Ok(Some(StaleFenceCheck::ResourceOwnershipMoved));
             }
         }
         Effect::DeliverProviderInput {
@@ -5128,7 +5240,7 @@ fn require_current_effect_ownership(
                 .optional()?;
             let Some((owned_task, current_kind, current_session, lifecycle, generation)) = row
             else {
-                return Err(StoreError::StaleFence);
+                return Ok(Some(StaleFenceCheck::AgentSessionMissing));
             };
             let generation =
                 u64_from_nonnegative_i64("agent_sessions.runtime_generation", generation)?;
@@ -5136,32 +5248,120 @@ fn require_current_effect_ownership(
                 .map(crate::domain::agent::ProviderSessionId::new)
                 .transpose()
                 .map_err(|_| StoreError::Corruption)?;
-            let owned_ok = owned_task == task_id.as_bytes().to_vec();
-            if !owned_ok
-                || lifecycle != "open"
-                || current_kind != provider_kind.wire_name()
-                || expected_session != *provider_session_id
-                || generation != *runtime_generation
-            {
-                return Err(StoreError::StaleFence);
+            if owned_task != task_id.as_bytes().to_vec() {
+                return Ok(Some(StaleFenceCheck::AgentSessionForeign));
             }
-            let (_task_lifecycle, epoch): (String, i64) = tx
-                .query_row(
-                    "SELECT lifecycle, action_epoch FROM tasks WHERE task_id = ?1",
-                    [task_id.as_bytes().as_slice()],
-                    |row| Ok((row.get(0)?, row.get(1)?)),
-                )
-                .map_err(|err| match err {
-                    rusqlite::Error::QueryReturnedNoRows => StoreError::StaleFence,
-                    other => other.into(),
-                })?;
-            let epoch = u64_from_nonnegative_i64("tasks.action_epoch", epoch)?;
+            if lifecycle != "open" {
+                return Ok(Some(StaleFenceCheck::AgentSessionClosed));
+            }
+            if current_kind != provider_kind.wire_name() || expected_session != *provider_session_id
+            {
+                return Ok(Some(StaleFenceCheck::ProviderIdentityMoved));
+            }
+            if generation != *runtime_generation {
+                return Ok(Some(if generation > *runtime_generation {
+                    StaleFenceCheck::ProviderRuntimeGenerationAdvanced
+                } else {
+                    StaleFenceCheck::ProviderRuntimeGenerationBehind
+                }));
+            }
+            let Some((_task_lifecycle, epoch)) = load_task_lifecycle_epoch(tx, task_id)? else {
+                return Ok(Some(StaleFenceCheck::TaskMissing));
+            };
             if Some(epoch) != fence.action_epoch || epoch != *action_epoch {
-                return Err(StoreError::StaleFence);
+                return Ok(Some(task_action_epoch_check(epoch, *action_epoch)));
             }
         }
     }
-    Ok(())
+    Ok(None)
+}
+
+/// Explain the `StaleFence` one dispatch candidate has already drawn.
+///
+/// This never grants anything: the real validator has refused before it is
+/// called, and it re-runs the same named checks purely to attribute that
+/// refusal. `Ok(None)` means the refusal could not be attributed to a named
+/// check, and the caller must then leave the row exactly as it found it.
+pub(crate) fn classify_stale_dispatch_fence(
+    tx: &Transaction<'_>,
+    operation_id: OperationId,
+    outbox_id: OutboxId,
+) -> Result<Option<StaleFenceCheck>, StoreError> {
+    let Some(operation) = load_operation_projection_by_id(tx, operation_id)? else {
+        return Ok(None);
+    };
+    if let Some(check) = accepted_dispatch_operation_check(&operation)? {
+        return Ok(Some(check));
+    }
+    let Some(task_id) = operation.task_id else {
+        return Ok(None);
+    };
+    let rows = load_outbox_rows(tx, operation_id)?;
+    if rows.len() != 1 || rows[0].outbox_id != outbox_id {
+        return Ok(None);
+    }
+    let fence = operation_fence_from_projection(&operation)?;
+    let document = decode_full_outbox_payload(&rows[0])?;
+    if validate_effect_matches_fence(&document.effect, task_id, fence).is_err() {
+        return Ok(None);
+    }
+    current_effect_ownership_check(tx, task_id, &document.effect, fence)
+}
+
+/// Retire one unclaimed outbox row whose fence can never pass again.
+///
+/// The whole retirement lands in the caller's transaction: the operation
+/// reaches `failed` through the ordinary outcome projection, and the row
+/// reaches the terminal `failed` state carrying [`STALE_FENCE_ERROR_CLASS`] as
+/// its named disposition. Refusing to converge here is what re-leases a dead
+/// row once per maintenance tick for the life of the store.
+pub(crate) fn retire_stale_fenced_dispatch_in_tx(
+    tx: &Transaction<'_>,
+    row: &OutboxRow,
+    check: StaleFenceCheck,
+    observed_at_ms: i64,
+) -> Result<TaskId, StoreError> {
+    if !check.is_permanent() || !matches!(row.state.as_str(), "pending" | "claimed") {
+        return Err(StoreError::InvalidDispatchTransition);
+    }
+    let operation =
+        load_operation_projection_by_id(tx, row.operation_id)?.ok_or(StoreError::Corruption)?;
+    let task_id = operation.task_id.ok_or(StoreError::Corruption)?;
+    if operation.state == "accepted" {
+        let command_id = load_operation_command_id(tx, row.operation_id)?;
+        let fence = operation_fence_from_projection(&operation)?;
+        let settled_at_ms = observed_at_ms
+            .max(operation.accepted_at_ms)
+            .max(row.available_at_ms);
+        let failed = OperationFailedFact::with_source(
+            command_id,
+            row.operation_id,
+            settled_at_ms,
+            OperationErrorCode::SideEffectFailed,
+            fence.action_epoch,
+            fence.resource_id,
+            fence.runtime_generation,
+            OutcomeSource::Dispatch,
+        )
+        .map_err(|_| StoreError::ConstraintViolation)?;
+        append_and_project(
+            tx,
+            EventId::new(),
+            Some(task_id),
+            None,
+            settled_at_ms,
+            Event::OperationFailed(failed),
+        )?;
+    }
+    let expected_state = row.state.clone();
+    transition_outbox(
+        tx,
+        row,
+        &expected_state,
+        "failed",
+        Some(STALE_FENCE_ERROR_CLASS),
+    )?;
+    Ok(task_id)
 }
 
 pub(crate) fn refuse_archive_with_live_resources(
@@ -7504,13 +7704,6 @@ fn validate_side_effect_terminal_receipt(
     fence: OperationFence,
 ) -> Result<(), StoreError> {
     let expected_outbox_state = operation.state.as_str();
-    let expected_error = match expected_outbox_state {
-        "settled" => None,
-        "failed" => Some("side_effect_failed"),
-        "cancelled" => Some("superseded"),
-        "uncertain" => Some("ambiguous_dispatch"),
-        _ => return Err(StoreError::Corruption),
-    };
     let outcome_at = operation.outcome_at_ms.ok_or(StoreError::Corruption)?;
     if outbox_rows.len() != expected_effects.len() {
         return Err(StoreError::Corruption);
@@ -7536,6 +7729,7 @@ fn validate_side_effect_terminal_receipt(
         outbox_rows.iter().zip(expected_effects.iter()).enumerate()
     {
         let expected_index = i64::try_from(expected_index).map_err(|_| StoreError::Corruption)?;
+        let expected_error = terminal_outbox_error_class(expected_outbox_state, row)?;
         if row.effect_index != expected_index
             || row.operation_id != expected_operation_id
             || row.event_sequence != committed_sequence
@@ -7569,6 +7763,28 @@ fn validate_side_effect_terminal_receipt(
         &history,
     )?;
     Ok(())
+}
+
+/// The `last_error_class` a terminal side-effect outbox row must carry.
+///
+/// `failed` has exactly two legitimate dispositions, and the row itself tells
+/// them apart: a row retired because its fence can never pass again was never
+/// dispatched, so its attempt count is still zero, while a destination failure
+/// is only reachable through `begin_dispatch`, which has already incremented
+/// it. Keeping both in one function is what stops the retirement disposition
+/// and the terminal-receipt rule from drifting apart.
+fn terminal_outbox_error_class(
+    operation_state: &str,
+    row: &OutboxRow,
+) -> Result<Option<&'static str>, StoreError> {
+    Ok(match operation_state {
+        "settled" => None,
+        "failed" if row.attempts == 0 => Some(STALE_FENCE_ERROR_CLASS),
+        "failed" => Some("side_effect_failed"),
+        "cancelled" => Some("superseded"),
+        "uncertain" => Some("ambiguous_dispatch"),
+        _ => return Err(StoreError::Corruption),
+    })
 }
 
 fn validate_nonterminal_outbox_dispatch_metadata(

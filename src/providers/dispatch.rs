@@ -11,7 +11,7 @@ use std::time::Duration;
 use crate::domain::id::TaskId;
 use crate::domain::operation::OperationState;
 use crate::domain::provider_input::ProviderInputAction;
-use crate::kernel::{AmbiguityDisposition, DestinationClass, Effect, KernelStore, StoreError};
+use crate::kernel::{AmbiguityDisposition, Effect, KernelStore, StoreError};
 use crate::providers::input::{
     sequence_provider_action, ProviderInputDeliveryError, ProviderInputDeliveryIdentity,
     ProviderInputWriteReceipt,
@@ -127,7 +127,34 @@ impl std::fmt::Debug for ProviderDispatchRuntime {
     }
 }
 
+#[cfg(test)]
+struct AlwaysUnboundDispatchAuthority;
+
+#[cfg(test)]
+impl ProviderDispatchWriteAuthority for AlwaysUnboundDispatchAuthority {
+    fn write(
+        &self,
+        _identity: &ProviderInputDeliveryIdentity,
+        _action: &ProviderInputAction,
+    ) -> Result<ProviderInputWriteReceipt, ProviderWriteFailure> {
+        Err(ProviderWriteFailure {
+            error: ProviderInputDeliveryError::SessionNotBound,
+            disposition: hold_disposition(ProviderInputDeliveryError::SessionNotBound),
+        })
+    }
+}
+
 impl ProviderDispatchRuntime {
+    /// A pass whose write authority always refuses before the external
+    /// boundary. Kernel tests use it to exercise claim, retirement and
+    /// convergence without a process manager or a live provider.
+    #[cfg(test)]
+    pub(crate) fn unbound_for_test() -> Self {
+        Self {
+            authority: Box::new(AlwaysUnboundDispatchAuthority),
+        }
+    }
+
     pub(crate) fn from_process_manager(manager: ProcessManager) -> Self {
         Self {
             authority: Box::new(ProcessManagerDispatchAuthority {
@@ -143,9 +170,21 @@ impl ProviderDispatchRuntime {
         if let Some(disposition) = store.recover_next_expired_dispatch(HOLD_RETRY)? {
             return Ok(ProviderDispatchOutcome::Recovered { disposition });
         }
-        let Some(claim) = store
-            .claim_next_dispatch_for_destination(DestinationClass::ProviderInput, DISPATCH_LEASE)?
-        else {
+        let (claim, retired) = store.claim_next_provider_input_dispatch(DISPATCH_LEASE)?;
+        for row in &retired {
+            // Once per retired row, never once per tick: the row reached a
+            // terminal state in the scan's own transaction, so it can never be
+            // selected, re-leased, or reported again.
+            eprintln!(
+                "provider dispatch retired a permanently stale effect: \
+                 task_id={} operation_id={} outbox_id={} check={}",
+                row.task_id,
+                row.operation_id,
+                row.outbox_id,
+                row.check.as_str()
+            );
+        }
+        let Some(claim) = claim else {
             return Ok(ProviderDispatchOutcome::Idle);
         };
         let permit = store.begin_dispatch(&claim)?;

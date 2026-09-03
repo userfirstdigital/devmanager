@@ -24,7 +24,24 @@ fn fixed_uuid_v7(tail: u8) -> [u8; 16] {
     ]
 }
 
+/// One accepted, still unclaimed provider-input effect.
+struct AcceptedProviderDispatch {
+    client_id: ClientId,
+    task_id: TaskId,
+    operation_id: OperationId,
+}
+
 fn seed_provider_dispatch(store: &mut KernelStore, tail: u8) -> (OperationId, DispatchPermit) {
+    let seeded = seed_accepted_provider_dispatch(store, tail);
+    let claim = store
+        .claim_next_dispatch(Duration::from_secs(30))
+        .expect("claim")
+        .expect("ready");
+    let permit = store.begin_dispatch(&claim).expect("begin");
+    (seeded.operation_id, permit)
+}
+
+fn seed_accepted_provider_dispatch(store: &mut KernelStore, tail: u8) -> AcceptedProviderDispatch {
     let client_id = ClientId::from_bytes(fixed_uuid_v7(tail)).expect("client");
     let task_id = TaskId::from_bytes(fixed_uuid_v7(tail + 1)).expect("task");
     let agent_session_id = AgentSessionId::from_bytes(fixed_uuid_v7(tail + 2)).expect("agent");
@@ -128,12 +145,11 @@ fn seed_provider_dispatch(store: &mut KernelStore, tail: u8) -> (OperationId, Di
     let CommandReceipt::Accepted { operation_id, .. } = accepted else {
         panic!("provider input must be accepted: {accepted:?}");
     };
-    let claim = store
-        .claim_next_dispatch(Duration::from_secs(30))
-        .expect("claim")
-        .expect("ready");
-    let permit = store.begin_dispatch(&claim).expect("begin");
-    (operation_id, permit)
+    AcceptedProviderDispatch {
+        client_id,
+        task_id,
+        operation_id,
+    }
 }
 
 fn identity_from_effect(effect: &Effect) -> ProviderInputDeliveryIdentity {
@@ -641,4 +657,187 @@ fn expired_provider_dispatch_is_recovered_as_uncertain_without_replay() {
         )
         .expect("no retry")
         .is_none());
+}
+
+fn task_revision(store: &KernelStore, task_id: TaskId) -> u64 {
+    let revision: i64 = store
+        .conn
+        .query_row(
+            "SELECT revision FROM tasks WHERE task_id = ?1",
+            [task_id.as_bytes().as_slice()],
+            |row| row.get(0),
+        )
+        .expect("task revision");
+    u64::try_from(revision).expect("non-negative revision")
+}
+
+/// Advance the task's action epoch exactly as closing it does in the live
+/// store; the accepted provider effect keeps the epoch it was planned with.
+fn begin_close_task(store: &mut KernelStore, seeded: &AcceptedProviderDispatch, tail: u8) {
+    let revision = task_revision(store, seeded.task_id);
+    store
+        .execute_for_test(CommandEnvelope {
+            command_id: CommandId::from_bytes(fixed_uuid_v7(tail)).expect("close cmd"),
+            client_id: seeded.client_id,
+            task_id: Some(seeded.task_id),
+            issued_at_ms: 1_725_004_000_000,
+            expected_task_revision: Some(revision),
+            command: Command::BeginCloseTask,
+        })
+        .expect("begin close task");
+}
+
+fn provider_outbox_id(store: &KernelStore, operation_id: OperationId) -> OutboxId {
+    let bytes: Vec<u8> = store
+        .conn
+        .query_row(
+            "SELECT outbox_id FROM outbox WHERE operation_id = ?1",
+            [operation_id.as_bytes().as_slice()],
+            |row| row.get(0),
+        )
+        .expect("outbox id");
+    let bytes: [u8; 16] = bytes.as_slice().try_into().expect("outbox id length");
+    OutboxId::from_bytes(bytes).expect("outbox id")
+}
+
+fn outbox_row_facts(
+    store: &KernelStore,
+    operation_id: OperationId,
+) -> (String, Option<String>, i64, i64) {
+    store
+        .conn
+        .query_row(
+            "SELECT state, last_error_class, attempts, lease_generation
+             FROM outbox WHERE operation_id = ?1",
+            [operation_id.as_bytes().as_slice()],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .expect("outbox row")
+}
+
+/// The live-store shape: an accepted provider effect whose task action epoch
+/// moved on. Before this converged, every maintenance tick re-examined the row,
+/// drew the same `StaleFence`, and logged one identical line for the life of
+/// the store (28,154 lease generations and 8,278 log lines on one dev profile).
+#[test]
+fn a_permanently_stale_provider_row_is_retired_and_the_next_pass_is_idle() {
+    let dir = TempDir::new().expect("tempdir");
+    let mut store = KernelStore::open(&dir.path().join("kernel.sqlite3")).expect("open");
+    let seeded = seed_accepted_provider_dispatch(&mut store, 0x30);
+    begin_close_task(&mut store, &seeded, 0x3c);
+
+    let runtime = crate::providers::dispatch::ProviderDispatchRuntime::unbound_for_test();
+    assert_eq!(
+        runtime.run_once(&mut store).expect("first pass converges"),
+        crate::providers::dispatch::ProviderDispatchOutcome::Idle
+    );
+
+    let (state, error_class, attempts, lease_generation) =
+        outbox_row_facts(&store, seeded.operation_id);
+    assert_eq!(state, "failed");
+    assert_eq!(error_class.as_deref(), Some("stale_fence"));
+    assert_eq!(attempts, 0, "a retired row is never dispatched");
+    assert_eq!(lease_generation, 0, "a retired row is never leased");
+    assert!(matches!(
+        store
+            .operation_status(seeded.operation_id)
+            .expect("operation status"),
+        Some(OperationState::Failed { .. })
+    ));
+
+    assert_eq!(
+        runtime.run_once(&mut store).expect("second pass is idle"),
+        crate::providers::dispatch::ProviderDispatchOutcome::Idle
+    );
+    let (state, _, _, lease_generation_after) = outbox_row_facts(&store, seeded.operation_id);
+    assert_eq!(state, "failed");
+    assert_eq!(
+        lease_generation_after, lease_generation,
+        "a retired row is never re-leased"
+    );
+}
+
+/// Only a refusal whose evidence can never move back retires a row. Everything
+/// else - a session that may reopen, a generation still catching up, an
+/// operation reconciliation still owns - keeps its pending row and its ordinary
+/// claim, attempt and defer behaviour.
+#[test]
+fn a_row_whose_fence_can_still_pass_is_never_retired() {
+    use crate::kernel::command_bus::StaleFenceCheck;
+
+    for check in [
+        StaleFenceCheck::OperationTerminal,
+        StaleFenceCheck::TaskActionEpochAdvanced,
+        StaleFenceCheck::ProviderRuntimeGenerationAdvanced,
+    ] {
+        assert!(check.is_permanent(), "{} must be permanent", check.as_str());
+    }
+    let transient = [
+        StaleFenceCheck::OperationUncertain,
+        StaleFenceCheck::TaskMissing,
+        StaleFenceCheck::TaskActionEpochBehind,
+        StaleFenceCheck::TaskLifecycleMoved,
+        StaleFenceCheck::AgentSessionMissing,
+        StaleFenceCheck::AgentSessionForeign,
+        StaleFenceCheck::AgentSessionClosed,
+        StaleFenceCheck::ProviderIdentityMoved,
+        StaleFenceCheck::ProviderRuntimeGenerationBehind,
+        StaleFenceCheck::ResourceOwnershipMoved,
+    ];
+    for check in transient {
+        assert!(
+            !check.is_permanent(),
+            "{} must not retire a row",
+            check.as_str()
+        );
+    }
+
+    let dir = TempDir::new().expect("tempdir");
+    let mut store = KernelStore::open(&dir.path().join("kernel.sqlite3")).expect("open");
+    let seeded = seed_accepted_provider_dispatch(&mut store, 0x50);
+    let outbox_id = provider_outbox_id(&store, seeded.operation_id);
+
+    for check in transient {
+        let refused = store.with_immediate_transaction(|tx| {
+            let row = load_outbox_row_by_id(tx, outbox_id)?.ok_or(StoreError::Corruption)?;
+            crate::kernel::command_bus::retire_stale_fenced_dispatch_in_tx(
+                tx,
+                &row,
+                check,
+                1_800_000_000_000,
+            )
+        });
+        assert!(
+            matches!(refused, Err(StoreError::InvalidDispatchTransition)),
+            "{} retired a row: {refused:?}",
+            check.as_str()
+        );
+    }
+
+    let (state, error_class, attempts, lease_generation) =
+        outbox_row_facts(&store, seeded.operation_id);
+    assert_eq!(state, "pending");
+    assert_eq!(error_class, None);
+    assert_eq!(attempts, 0);
+    assert_eq!(lease_generation, 0);
+
+    // The ordinary lane still claims, attempts and defers this row rather than
+    // retiring it: attempts return to zero and only the lease generation moves.
+    let runtime = crate::providers::dispatch::ProviderDispatchRuntime::unbound_for_test();
+    assert!(matches!(
+        runtime.run_once(&mut store).expect("held pass"),
+        crate::providers::dispatch::ProviderDispatchOutcome::Held { .. }
+    ));
+    let (state, error_class, attempts, lease_generation) =
+        outbox_row_facts(&store, seeded.operation_id);
+    assert_eq!(state, "pending");
+    assert_eq!(error_class, None);
+    assert_eq!(attempts, 0);
+    assert_eq!(lease_generation, 1);
+    assert!(matches!(
+        store
+            .operation_status(seeded.operation_id)
+            .expect("operation status"),
+        Some(OperationState::Accepted)
+    ));
 }
