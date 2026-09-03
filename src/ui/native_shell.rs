@@ -115,6 +115,7 @@ use crate::ui::shell::{
     PointerOwner, PromptLibraryViewport, ScalePercent, Shell, TerminalPressRejection,
     TerminalRelease,
 };
+use crate::ui::startup_trace::{SharedStartupTrace, StartupPhase};
 use crate::ui::task_cockpit::changes_panel::{
     reconcile_selected_repository, repository_mutation_allowed, repository_status_readable,
 };
@@ -2041,6 +2042,11 @@ impl NativeHostBootstrap for ProcessNativeHostBootstrap {
         // Missing pipe (Unavailable) falls through to a single spawn.
         // Pipe Busy gets bounded attach retries and must not be treated as absence.
         // Timeout means a present-but-slow host: retry attach, never spawn.
+        let trace = SharedStartupTrace::process();
+        trace.advance_to(
+            StartupPhase::HostConnect,
+            Some("attaching to a live host".to_string()),
+        );
         loop {
             if deadline.expired() {
                 return Err(NativeShellError::HostConnect {
@@ -2049,32 +2055,41 @@ impl NativeHostBootstrap for ProcessNativeHostBootstrap {
             }
             match try_attach_existing_host(profile, deadline) {
                 Ok(runtime) => {
+                    trace.advance_to(
+                        StartupPhase::Hello,
+                        Some("attached to a live host".to_string()),
+                    );
                     return Ok(NativeHostRuntimeAttachment::Client(runtime));
                 }
                 Err(IpcError::Unavailable) => break,
                 Err(IpcError::Busy) => {
                     let remaining = deadline.remaining();
                     if remaining.is_zero() {
+                        trace.fail("native host startup deadline expired while pipe was busy");
                         return Err(NativeShellError::HostConnect {
                             message: "native host startup deadline expired while pipe was busy"
                                 .to_string(),
                         });
                     }
+                    trace.retry(Some(IpcError::Busy.to_string()));
                     std::thread::sleep(remaining.min(Duration::from_millis(25)));
                     continue;
                 }
                 Err(IpcError::Timeout) => {
                     let remaining = deadline.remaining();
                     if remaining.is_zero() {
+                        trace.fail("native host attach timed out waiting for a present host");
                         return Err(NativeShellError::HostConnect {
                             message: "native host attach timed out waiting for a present host"
                                 .to_string(),
                         });
                     }
+                    trace.retry(Some(IpcError::Timeout.to_string()));
                     std::thread::sleep(remaining.min(Duration::from_millis(25)));
                     continue;
                 }
                 Err(error) => {
+                    trace.fail(error.to_string());
                     return Err(NativeShellError::HostConnect {
                         message: error.to_string(),
                     });
@@ -2115,7 +2130,22 @@ impl NativeHostBootstrap for ProcessNativeHostBootstrap {
         } else {
             command.stderr(Stdio::from(isolated_host_stderr_log(profile)?));
         }
-        let child = spawn_durable_host_process(&mut command)?;
+        let child = match spawn_durable_host_process(&mut command) {
+            Ok(child) => child,
+            Err(error) => {
+                trace.fail(error.to_string());
+                return Err(error);
+            }
+        };
+        // A spawned host restarts the connect run against a brand new pipe, so
+        // this re-enters HostConnect rather than counting as another attach.
+        trace.enter(
+            StartupPhase::HostConnect,
+            Some(format!(
+                "no live host; spawned devmanager-host pid={}",
+                child.id()
+            )),
+        );
         let process = NativeHostProcess::owned_child(
             OwnedChild {
                 child,
@@ -2139,9 +2169,9 @@ fn native_startup_budget(profile: &IsolatedDevProfile) -> Duration {
     }
 }
 
-fn isolated_host_stderr_log(
-    profile: &IsolatedDevProfile,
-) -> Result<std::fs::File, NativeShellError> {
+/// The one profile logs directory both the host stderr log and the client
+/// startup trace write into. Created if absent.
+fn isolated_host_logs_dir(profile: &IsolatedDevProfile) -> Result<PathBuf, NativeShellError> {
     let named = AppProfile::named(profile.named_profile()).map_err(|error| {
         NativeShellError::HostConnect {
             message: format!("isolated host log profile is invalid: {error}"),
@@ -2158,13 +2188,40 @@ fn isolated_host_stderr_log(
             paths.logs.display()
         ),
     })?;
+    Ok(paths.logs)
+}
+
+fn isolated_host_stderr_log(
+    profile: &IsolatedDevProfile,
+) -> Result<std::fs::File, NativeShellError> {
+    let logs = isolated_host_logs_dir(profile)?;
     std::fs::OpenOptions::new()
         .create(true)
         .append(true)
-        .open(paths.logs.join("host-stderr.log"))
+        .open(logs.join("host-stderr.log"))
         .map_err(|error| NativeShellError::HostConnect {
             message: format!("isolated host stderr log cannot be opened: {error}"),
         })
+}
+
+/// Point this run's startup trace at `<profile logs>/client-startup.log`.
+///
+/// Observed, never fail-closed: a client that cannot write its trace still
+/// starts, and says once why the trace is missing. Production profiles resolve
+/// their app paths elsewhere and, like the host stderr log, are not traced to
+/// disk; their phases stay in memory for the shell to read.
+fn open_startup_trace_log(profile: &IsolatedDevProfile) {
+    if profile.is_production() {
+        return;
+    }
+    match isolated_host_logs_dir(profile) {
+        Ok(logs) => {
+            SharedStartupTrace::process().attach_log_file(&logs.join("client-startup.log"));
+        }
+        Err(error) => {
+            eprintln!("devmanager: startup trace log directory unavailable: {error}");
+        }
+    }
 }
 
 /// Strip parent DevManager identity overrides so the sibling host resolves only
@@ -6435,10 +6492,30 @@ async fn connect_with_startup_retry(
     deadline: NativeShutdownDeadline,
 ) -> Result<HostClient, IpcError> {
     let config = profile.host_client_config();
-    retry_until_startup_deadline(deadline, Duration::from_millis(25), || {
-        HostClient::connect(config.clone())
+    // Every connect attempt against the freshly spawned host is one retry line,
+    // so a slow first launch names the transport rather than the whole startup.
+    let trace = SharedStartupTrace::process();
+    let attempt_trace = trace.clone();
+    let result = retry_until_startup_deadline(deadline, Duration::from_millis(25), || {
+        let config = config.clone();
+        let attempt_trace = attempt_trace.clone();
+        async move {
+            let attempt = HostClient::connect(config).await;
+            if let Err(error) = attempt.as_ref() {
+                attempt_trace.retry(Some(error.to_string()));
+            }
+            attempt
+        }
     })
-    .await
+    .await;
+    match result.as_ref() {
+        Ok(_) => trace.advance_to(
+            StartupPhase::Hello,
+            Some("host client connected".to_string()),
+        ),
+        Err(error) => trace.fail(error.to_string()),
+    }
+    result
 }
 
 async fn retry_until_startup_deadline<T, Attempt, AttemptFuture>(
@@ -6486,7 +6563,15 @@ async fn deferred_bootstrap_projection(
     projections: &Arc<Mutex<VecDeque<NativeHostProjection>>>,
 ) -> Result<Vec<NativeHostProjectionKind>, NativeShellError> {
     let mut kinds = Vec::new();
-    let admission = fleet.admit_host(host_id).map_err(map_fleet_shell_error)?;
+    let trace = SharedStartupTrace::process();
+    trace.advance_to(
+        StartupPhase::Synchronize,
+        Some("fleet admission".to_string()),
+    );
+    let admission = fleet.admit_host(host_id).map_err(|error| {
+        trace.fail(error.to_string());
+        map_fleet_shell_error(error)
+    })?;
     let port = FleetClientPort::new(Arc::clone(fleet), admission.clone())
         .map_err(map_fleet_shell_error)?;
 
@@ -6506,6 +6591,7 @@ async fn deferred_bootstrap_projection(
         }
         Err(error) => {
             let error = error.to_string();
+            trace.fail(format!("task preview unavailable: {error}"));
             publish_runtime_host_error_projection(
                 fleet,
                 host_id,
@@ -6518,18 +6604,20 @@ async fn deferred_bootstrap_projection(
     };
 
     // Preview never enables writes; bootstrapped stays false until canonical model.
-    let sync_owned =
-        fleet
-            .synchronize(host_id)
-            .await
-            .map_err(|error| NativeShellError::HostConnect {
-                message: preview_error.as_ref().map_or_else(
-                    || error.to_string(),
-                    |preview| {
-                        format!("task preview failed: {preview}; canonical sync failed: {error}")
-                    },
-                ),
-            })?;
+    // synchronize is what pages the snapshot NATIVE_SNAPSHOT_PAGE_ITEMS at a
+    // time, so its whole span is the SnapshotPages phase.
+    trace.advance_to(
+        StartupPhase::SnapshotPages,
+        Some(format!("{NATIVE_SNAPSHOT_PAGE_ITEMS} items per page")),
+    );
+    let sync_owned = fleet.synchronize(host_id).await.map_err(|error| {
+        let message = preview_error.as_ref().map_or_else(
+            || error.to_string(),
+            |preview| format!("task preview failed: {preview}; canonical sync failed: {error}"),
+        );
+        trace.fail(message.clone());
+        NativeShellError::HostConnect { message }
+    })?;
     validate_owned_admission(&sync_owned, &admission)?;
 
     let owned_model = fleet
@@ -6648,6 +6736,10 @@ fn native_host_worker_loop(
             ));
             if let Err(error) = bootstrap {
                 eprintln!("devmanager native host projection bootstrap failed: {error}");
+                // Back to the synchronize phase: the whole bootstrap unit is
+                // retried after the backoff, and the trace must say so.
+                SharedStartupTrace::process()
+                    .retry_in(StartupPhase::Synchronize, Some(error.to_string()));
                 // Retain preview/cache; force exact trusted/local reconnect once.
                 match recover_deferred_bootstrap_projection(
                     &fleet,
@@ -6691,6 +6783,11 @@ fn native_host_worker_loop(
                             Instant::now(),
                             false,
                         );
+                        SharedStartupTrace::process().fail(format!(
+                            "reconnect failed: {recovery_error}; backing off {}ms",
+                            reconnect_backoff_delay_after_failures(reconnect_backoff.attempts)
+                                .as_millis()
+                        ));
                         publish_runtime_host_error_projection(
                             &fleet,
                             &host_id,
@@ -7489,6 +7586,18 @@ fn resync_or_reconnect_fleet_host(
         fleet_resync_needs_transport_reconnect(force_transport_reconnect, was_connected);
     let probe_owned = probe.cloned();
     let recovery_deadline = Instant::now() + NATIVE_STARTUP_BUDGET;
+    // Recovery re-runs the synchronize unit under the same startup budget, so a
+    // client still waiting for its first projection sees the attempts.
+    let trace = SharedStartupTrace::process();
+    if trace.current() < StartupPhase::FirstProjection {
+        trace.retry_in(
+            StartupPhase::Synchronize,
+            Some(format!(
+                "fleet resync (transport reconnect={needs_transport_reconnect}, budget {}ms)",
+                NATIVE_STARTUP_BUDGET.as_millis()
+            )),
+        );
+    }
 
     let (admission, generation_changed) = runtime.block_on(async {
         tokio::select! {
@@ -7581,6 +7690,12 @@ fn resync_or_reconnect_fleet_host(
                 }
             } => result,
         }
+    })
+    .map_err(|error| {
+        if trace.current() < StartupPhase::FirstProjection {
+            trace.fail(error.clone());
+        }
+        error
     })?;
 
     if cancellation.load(Ordering::Acquire) {
@@ -10836,6 +10951,9 @@ pub struct NativeShell {
     /// True only for the real shell-first launch path. Test/injected shells do
     /// not create process-backed bootstrap retries behind their fixtures.
     retry_host_bootstrap: bool,
+    /// Startup phase machine. The same handle the bootstrap thread and the
+    /// controller worker record through, so one client run is one trace.
+    startup_trace: SharedStartupTrace,
     preferences: RuntimePreferencesSnapshot,
     theme_controller: ThemeController,
     theme_error: Option<String>,
@@ -11942,6 +12060,13 @@ impl NativeShell {
             hosts,
             pending_bootstrap,
             retry_host_bootstrap,
+            // One trace per client run. Unit/headless shells take a detached
+            // trace so parallel fixtures cannot record into each other.
+            startup_trace: if cfg!(test) {
+                SharedStartupTrace::detached()
+            } else {
+                SharedStartupTrace::process()
+            },
             preferences,
             theme_controller,
             theme_error,
@@ -12104,6 +12229,11 @@ impl NativeShell {
         }
         if start_controller {
             shell.start_controller(cx);
+        }
+        if shell.local_slot().host_runtime.is_some() {
+            // Constructed around an already-attached runtime: the same state
+            // attach_host_runtime_attachment leaves behind.
+            shell.note_runtime_attached("runtime attached at construction");
         }
         // First paint is owned by the shell itself. A slow or failed host
         // bootstrap must never leave the hidden GPUI window transparent while
@@ -18541,16 +18671,29 @@ impl NativeShell {
                 continue;
             }
             kinds.push(projection.kind);
+            let carries_client_model = projection.client_model.is_some();
             if !stale_projection {
                 if let Err(error) = self.apply_validated_host_projection_payloads(&projection) {
+                    self.note_startup_failure(error.clone());
                     self.local_slot_mut().host_state = NativeHostState::Error { message: error };
-                } else if let Some(events) = projection.durable_events.as_ref() {
-                    self.observe_projection_durable_events(events);
+                } else {
+                    if carries_client_model {
+                        // The canonical model is admitted: whatever came before
+                        // this line is the startup latency being hunted.
+                        self.startup_trace.advance_to(
+                            StartupPhase::FirstProjection,
+                            Some("client model admitted".to_string()),
+                        );
+                    }
+                    if let Some(events) = projection.durable_events.as_ref() {
+                        self.observe_projection_durable_events(events);
+                    }
                 }
             }
             if let Some(outcome) = projection.action_outcome {
                 self.apply_epoch_fenced_action_outcome(outcome);
             } else if let Some(error) = projection.error {
+                self.note_startup_failure(error.clone());
                 self.local_slot_mut().host_state = NativeHostState::Error { message: error };
             }
         }
@@ -18670,6 +18813,7 @@ impl NativeShell {
         match &attachment {
             NativeHostRuntimeAttachment::Client(runtime) => {
                 if let Err(error) = runtime.validate_attachment(&self.profile) {
+                    self.note_startup_failure(format!("attachment rejected: {error}"));
                     self.local_slot_mut().host_state = NativeHostState::Error {
                         message: bounded_host_error(error.to_string()),
                     };
@@ -18695,7 +18839,35 @@ impl NativeShell {
         };
         self.local_slot_mut().host_runtime = Some(attachment);
         self.local_slot_mut().host_state = host_state;
+        self.note_runtime_attached("runtime attached");
         Ok(())
+    }
+
+    /// The shell now holds a hello'd runtime; everything after this point is
+    /// the fleet synchronize the controller worker drives.
+    fn note_runtime_attached(&self, detail: &str) {
+        self.startup_trace
+            .advance_to(StartupPhase::Hello, Some(detail.to_string()));
+        self.startup_trace.advance_to(
+            StartupPhase::Synchronize,
+            Some("awaiting the first projection".to_string()),
+        );
+    }
+
+    /// The startup phase machine for this client run.
+    ///
+    /// Read-only for callers: the loading UI renders these phases, and the
+    /// trace log is written by the recording sites themselves.
+    pub fn startup_trace(&self) -> &SharedStartupTrace {
+        &self.startup_trace
+    }
+
+    /// Record a failure only while startup is still in progress. Host errors
+    /// after Ready belong to the running session, not to the startup trace.
+    fn note_startup_failure(&self, detail: impl Into<String>) {
+        if self.startup_trace.current() < StartupPhase::Ready {
+            self.startup_trace.fail_once(detail);
+        }
     }
 
     fn poll_pending_host_bootstrap(&mut self) -> bool {
@@ -18737,6 +18909,7 @@ impl NativeShell {
             }
             Err(error) => {
                 eprintln!("devmanager native host bootstrap failed: {error}");
+                self.note_startup_failure(error.to_string());
                 self.local_slot_mut().host_state = NativeHostState::Error {
                     message: bounded_host_error(error.to_string()),
                 };
@@ -29966,6 +30139,35 @@ impl NativeShell {
     }
 
     fn shell_stage(&self) -> ShellStage {
+        let stage = self.resolve_shell_stage();
+        self.note_startup_shell_stage(stage);
+        stage
+    }
+
+    /// Record what the painted stage says about startup. Called from the render
+    /// path, so every write here is guarded against repeating: `advance_to` and
+    /// `fail_once` are no-ops once the phase or the text has been recorded.
+    fn note_startup_shell_stage(&self, stage: ShellStage) {
+        match stage {
+            ShellStage::Recovery => {
+                self.note_startup_failure("shell stage entered Recovery: store recovery required");
+            }
+            // Ready is the first painted cockpit that has a selected task, which
+            // is the frame whose surfaces are actually requested. The shell-first
+            // launch paints a stage long before any projection lands, so the
+            // admitted client model is part of the condition.
+            ShellStage::Cockpit
+                if self.selected_task_key.is_some()
+                    && self.startup_trace.current() >= StartupPhase::FirstProjection =>
+            {
+                self.startup_trace
+                    .note_ready(Some("cockpit painted with a selected task".to_string()));
+            }
+            _ => {}
+        }
+    }
+
+    fn resolve_shell_stage(&self) -> ShellStage {
         match self.local_slot().config_sidebar.unavailable_reason {
             Some(ConfigSidebarUnavailableReason::StoreRecoveryRequired) => ShellStage::Recovery,
             Some(ConfigSidebarUnavailableReason::SnapshotMissing)
@@ -44328,6 +44530,14 @@ pub(crate) fn run_native_shell_with_bootstrap(
 ) -> Result<(), NativeShellError> {
     // Shell-first: open the stable Cockpit workspace immediately and connect on
     // one owned background worker. controller_tick attaches exactly once.
+    open_startup_trace_log(&profile);
+    SharedStartupTrace::process().enter(
+        StartupPhase::HostSpawn,
+        Some(format!(
+            "client run for profile {}",
+            profile.named_profile()
+        )),
+    );
     let pending = spawn_pending_host_bootstrap(profile.clone(), bootstrap)?;
     launch_native_shell(profile, None, NativeHostState::Connecting, Some(pending))
 }
@@ -45458,6 +45668,7 @@ mod tests {
         ProviderSetupInputCompletion,
         ReaperKind,
         ShellStage,
+        StartupPhase,
         TaskComposer,
         TaskId,
         TrustedReconnectFactoryProbe,
@@ -50060,6 +50271,76 @@ mod tests {
         );
     }
 
+    /// The startup trace must name the phase a stuck client is sitting in: a
+    /// rejecting host is a Synchronize failure carrying the host's own text,
+    /// and the admitted client model is the moment FirstProjection is reached.
+    fn startup_trace_reaches_first_projection_and_records_synchronize_failures(cx: &mut gpui::App) {
+        let (runtime, shared) = TestRuntime::new(true, NativeHostActionResult::Queued);
+        let (model, _task_id) = open_task_without_agent_client_model();
+        let (attached, rejection, reached, entries) =
+            with_test_shell_in_app(cx, runtime, |shell| {
+                let attached = shell.startup_trace().current();
+                let epochs = shared.lock().expect("test runtime state").epochs;
+                shared
+                    .lock()
+                    .expect("test runtime state")
+                    .projections
+                    .push_back(NativeHostProjection {
+                        kind: NativeHostProjectionKind::Error,
+                        client_model: None,
+                        task_preview: None,
+                        error: Some("kernel store is temporarily unavailable".to_string()),
+                        epochs: Some(epochs),
+                        action_outcome: None,
+                        owner: None,
+                        durable_events: None,
+                    });
+                let _ = shell.drain_host_projections(MAX_PENDING_HOST_ACTIONS);
+                let rejection = shell.startup_trace().entries().last().cloned();
+                shared
+                    .lock()
+                    .expect("test runtime state")
+                    .projections
+                    .push_back(
+                        NativeHostProjection::client_model(Arc::new(model)).at_epochs(epochs),
+                    );
+                let _ = shell.drain_host_projections(MAX_PENDING_HOST_ACTIONS);
+                (
+                    attached,
+                    rejection,
+                    shell.startup_trace().current(),
+                    shell.startup_trace().entries(),
+                )
+            });
+        assert_eq!(
+            attached,
+            StartupPhase::Synchronize,
+            "an attached runtime is waiting on the fleet synchronize"
+        );
+        let rejection = rejection.expect("a rejected projection records a failure");
+        assert_eq!(
+            rejection.phase(),
+            StartupPhase::Synchronize,
+            "a host rejection before the first projection is a Synchronize failure"
+        );
+        assert_eq!(
+            rejection.detail(),
+            Some("kernel store is temporarily unavailable"),
+            "the failure must carry the host's own error text"
+        );
+        assert_eq!(
+            reached,
+            StartupPhase::FirstProjection,
+            "an admitted client model reaches FirstProjection"
+        );
+        assert!(
+            entries
+                .iter()
+                .any(|entry| entry.phase() == StartupPhase::FirstProjection),
+            "FirstProjection must be recorded, not merely current"
+        );
+    }
+
     fn uncertain_queries_are_discarded_without_transport_failure(cx: &mut gpui::App) {
         let (runtime, shared) = TestRuntime::new(true, NativeHostActionResult::Queued);
         let (failure, retained, detail, connected) = with_test_shell_in_app(cx, runtime, |shell| {
@@ -50472,6 +50753,7 @@ mod tests {
             uncertain_queries_are_discarded_without_transport_failure(cx);
             query_admission_failures_are_discarded_without_durable_retention(cx);
             successful_resync_projection_restores_runtime_connection(cx);
+            startup_trace_reaches_first_projection_and_records_synchronize_failures(cx);
             action_outcome_retention_pressure_keeps_exact_overflow_record(cx);
             native_shell_drop_retains_pending_overflow_and_deferred_as_uncertain(cx);
             *completed_for_app.borrow_mut() = true;

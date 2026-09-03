@@ -31,6 +31,7 @@ pub mod provider_metadata;
 pub mod provider_settings;
 pub mod renderers;
 pub mod shell;
+pub mod startup_trace;
 pub mod task_cockpit;
 pub mod task_search;
 pub mod task_workspace;
