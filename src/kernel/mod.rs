@@ -12,7 +12,7 @@ mod outbox;
 mod projector;
 mod replay;
 mod runtime;
-mod schema;
+pub(crate) mod schema;
 pub(crate) mod semantic_journal;
 mod snapshot;
 mod store;

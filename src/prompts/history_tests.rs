@@ -1177,7 +1177,13 @@ fn phase07_v1_cannot_absorb_history_after_v8_v9_lineage() {
             |row| Ok((row.get(0)?, row.get(1)?)),
         )
         .expect("latest");
-    assert_eq!(latest, (15, "v15_agent_provider_resource_binding".into()));
+    // Reference the manifest rather than restating its tail: this assertion
+    // pinned v15 by name and had been silently red since V16 landed, so it was
+    // guarding nothing. Reading the manifest keeps it honest across migrations.
+    let newest = crate::kernel::schema::migration_manifest()
+        .last()
+        .expect("the migration manifest is never empty");
+    assert_eq!(latest, (newest.version, newest.name.to_string()));
 }
 
 #[test]
