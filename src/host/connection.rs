@@ -46,6 +46,7 @@ use crate::domain::terminal_facts::{
 };
 use crate::domain::ClientId;
 use crate::domain::{AgentSessionId, PresentProviderQuestionIntent};
+use crate::host_log;
 use crate::kernel::{
     ArtifactContentError, ArtifactContentRegistry, CommandBus, EventReplaySession, ReplayError,
     SessionScope, SnapshotError, SnapshotSession, StoreError, TerminalFactOutcome,
@@ -2233,7 +2234,7 @@ impl ConfiguredServiceRuntime {
             Some(path) => match crate::remote::presentation::SemanticJournalStore::open(&path) {
                 Ok(store) => Arc::new(Mutex::new(store)),
                 Err(error) => {
-                    eprintln!(
+                    host_log!(
                         "devmanager-host: conversation history unavailable ({error}); refusing configured service runtime at {}",
                         path.display()
                     );
@@ -2276,7 +2277,7 @@ impl ConfiguredServiceRuntime {
                     let recorded = journal.record(draft);
                     dirty_board.mark(recorded.stable_session_key.clone(), recorded.sequence);
                     if let Err(error) = journal.flush_if_dirty() {
-                        eprintln!(
+                        host_log!(
                             "devmanager-host: conversation history prompt flush failed: {error}"
                         );
                     }
@@ -3092,7 +3093,7 @@ impl HostRequestExecutor {
                     crate::providers::settings::ProviderSettingsAuthority::from_profile(profile),
                 )),
                 Err(error) => {
-                    eprintln!(
+                    host_log!(
                         "devmanager-host: provider settings unavailable under {}: {error}",
                         root.display()
                     );
@@ -3295,7 +3296,7 @@ impl HostRequestExecutor {
                 }
                 Some(ingress) = self.semantic_ingress_rx.recv() => {
                     if let Err(error) = self.handle_provider_semantic_ingress(ingress) {
-                        eprintln!("devmanager-host: provider semantic ingress rejected: {error}");
+                        host_log!("devmanager-host: provider semantic ingress rejected: {error}");
                     }
                 }
                 Ok(()) = self.semantic_dirty_rx.changed() => {
@@ -3384,7 +3385,7 @@ impl HostRequestExecutor {
                 }
                 Some(ingress) = self.semantic_ingress_rx.recv() => {
                     if let Err(error) = self.handle_provider_semantic_ingress(ingress) {
-                        eprintln!("devmanager-host: provider semantic ingress rejected: {error}");
+                        host_log!("devmanager-host: provider semantic ingress rejected: {error}");
                     }
                 }
                 Ok(()) = self.semantic_dirty_rx.changed() => {
@@ -3693,7 +3694,7 @@ impl HostRequestExecutor {
             match run_provider_dispatch_pass(&mut self.bus, &runtime.provider_dispatch) {
                 Ok(held) => held,
                 Err(error) => {
-                    eprintln!("devmanager-host: immediate provider dispatch failed: {error}");
+                    host_log!("devmanager-host: immediate provider dispatch failed: {error}");
                     Vec::new()
                 }
             }
@@ -3736,7 +3737,7 @@ impl HostRequestExecutor {
                 match run_provider_dispatch_pass(bus, &runtime.provider_dispatch) {
                     Ok(held) => held,
                     Err(error) => {
-                        eprintln!("devmanager-host: provider dispatch maintenance failed: {error}");
+                        host_log!("devmanager-host: provider dispatch maintenance failed: {error}");
                         Vec::new()
                     }
                 }
@@ -3745,7 +3746,7 @@ impl HostRequestExecutor {
             };
             if let Ok(mut journal) = runtime.semantic_journal.lock() {
                 if let Err(error) = journal.flush_if_dirty() {
-                    eprintln!("devmanager-host: conversation history flush failed: {error}");
+                    host_log!("devmanager-host: conversation history flush failed: {error}");
                 }
             }
             let _ = runtime.manager.configured_service_snapshots();
@@ -3758,9 +3759,12 @@ impl HostRequestExecutor {
             self.queue_held_provider_restart(task_id, reason);
         }
         for failure in provider_failures {
-            eprintln!(
+            host_log!(
                 "devmanager-host: provider session failed task={} agent={} provider={:?}: {:?}",
-                failure.task_id, failure.agent_session_id, failure.provider_kind, failure.failure,
+                failure.task_id,
+                failure.agent_session_id,
+                failure.provider_kind,
+                failure.failure,
             );
             if let Ok(Some(snapshot)) = self.bus.task_snapshot(failure.task_id) {
                 self.provider_restore_failed_action_epochs
@@ -3772,7 +3776,7 @@ impl HostRequestExecutor {
             self.mark_provider_restore_failed(failure.task_id);
         }
         if let Err(error) = self.sync_provider_session_identities() {
-            eprintln!("devmanager-host: provider session identity sync failed: {error}");
+            host_log!("devmanager-host: provider session identity sync failed: {error}");
         }
     }
 
@@ -3806,7 +3810,7 @@ impl HostRequestExecutor {
                     &mut intent,
                     &self.provider_launch_options,
                 );
-                eprintln!(
+                host_log!(
                     "devmanager-host: provider input held task={} reason={reason:?}; scheduling {:?}",
                     task_id, intent.mode
                 );
@@ -3818,13 +3822,13 @@ impl HostRequestExecutor {
             }
             Ok(None) => {
                 if self.provider_restart_unavailable.insert(task_id) {
-                    eprintln!(
+                    host_log!(
                         "devmanager-host: provider input held task={task_id} reason={reason:?}; no restart facts"
                     );
                 }
             }
             Err(error) => {
-                eprintln!(
+                host_log!(
                     "devmanager-host: provider hold restart selection failed task={task_id}: {error}"
                 );
             }
@@ -3847,7 +3851,7 @@ impl HostRequestExecutor {
                     }
                 }
                 Err(error) => {
-                    eprintln!("devmanager-host: provider restore enumeration failed: {error}");
+                    host_log!("devmanager-host: provider restore enumeration failed: {error}");
                     return;
                 }
             }
@@ -4005,7 +4009,7 @@ impl HostRequestExecutor {
                     return;
                 }
             }
-            eprintln!("devmanager-host: provider health refresh failed: {error}");
+            host_log!("devmanager-host: provider health refresh failed: {error}");
         }
     }
 
@@ -4075,7 +4079,7 @@ impl HostRequestExecutor {
     fn handle_provider_restore_outcome(&mut self, outcome: ProviderRestoreOutcome) {
         self.provider_restore_in_flight.remove(&outcome.task_id);
         if let Err(error) = outcome.result {
-            eprintln!(
+            host_log!(
                 "devmanager-host: exact provider restore failed task={}: {error}",
                 outcome.task_id
             );
@@ -4086,7 +4090,7 @@ impl HostRequestExecutor {
             self.provider_restore_failed_action_epochs
                 .remove(&outcome.task_id);
             if let Err(error) = self.attach_provider_terminal(outcome.task_id) {
-                eprintln!(
+                host_log!(
                     "devmanager-host: provider terminal attachment failed task={}: {error}",
                     outcome.task_id
                 );
@@ -4279,7 +4283,7 @@ impl HostRequestExecutor {
                 ))
             }
             Err(error) => {
-                eprintln!("devmanager-host: open shell snapshot failed task={task_id}: {error}");
+                host_log!("devmanager-host: open shell snapshot failed task={task_id}: {error}");
                 return Err(QueryOutcome::Err(QueryError::Unavailable {
                     reason: "task_lookup",
                 }));
@@ -4334,7 +4338,7 @@ impl HostRequestExecutor {
         ) {
             Ok(resource) => resource,
             Err(error) => {
-                eprintln!(
+                host_log!(
                     "devmanager-host: open shell recipe rejected task={task_id} program={} cwd={}: {error}",
                     launch.program.display(),
                     cwd.display()
@@ -4362,7 +4366,7 @@ impl HostRequestExecutor {
         {
             Ok(CommandReceipt::Accepted { .. }) => {}
             Ok(CommandReceipt::Rejected { code, .. }) => {
-                eprintln!(
+                host_log!(
                     "devmanager-host: open shell rejected task={task_id} revision={expected_task_revision}: {code:?}"
                 );
                 return Err(shell_open_denied(match code {
@@ -4376,7 +4380,7 @@ impl HostRequestExecutor {
                 }));
             }
             Err(error) => {
-                eprintln!("devmanager-host: open shell execute failed task={task_id}: {error}");
+                host_log!("devmanager-host: open shell execute failed task={task_id}: {error}");
                 return Err(QueryOutcome::Err(QueryError::Unavailable {
                     reason: "open_shell_execute",
                 }));
@@ -4437,7 +4441,7 @@ impl HostRequestExecutor {
                 ))
             }
             Err(error) => {
-                eprintln!(
+                host_log!(
                     "devmanager-host: open shell workspace unavailable task={task_id}: {error}"
                 );
                 return Err(shell_open_unavailable(
@@ -4453,7 +4457,7 @@ impl HostRequestExecutor {
                 format!("cwd is not a directory: {}", path.display()),
             )),
             Err(error) => {
-                eprintln!(
+                host_log!(
                     "devmanager-host: open shell working directory unavailable task={task_id}: {error}"
                 );
                 Err(shell_open_unavailable(
@@ -4528,7 +4532,7 @@ impl HostRequestExecutor {
         // absent resource means it was released again underneath us. There is
         // no terminal left to carry a fact, hence log-only.
         let Some(resource) = snapshot.resources.get(&resource_id) else {
-            eprintln!(
+            host_log!(
                 "devmanager-host: shell terminal {resource_id} was released before it could spawn"
             );
             return;
@@ -4645,7 +4649,7 @@ impl HostRequestExecutor {
     /// exit fact is what a client can see, and the log line is what survives a
     /// store that is itself refusing writes.
     fn refuse_shell_terminal(&mut self, task_id: TaskId, resource_id: ResourceId, reason: String) {
-        eprintln!("devmanager-host: shell terminal {resource_id} refused: {reason}");
+        host_log!("devmanager-host: shell terminal {resource_id} refused: {reason}");
         self.record_shell_exit(
             task_id,
             resource_id,
@@ -4695,7 +4699,7 @@ impl HostRequestExecutor {
             }
             Ok(TerminalFactOutcome::Suppressed) => {
                 if let Some(cwd) = refused_cwd {
-                    eprintln!(
+                    host_log!(
                         "devmanager-host: terminal {resource_id} cwd sample `{}` is not absolute and can never become a fact",
                         cwd.display()
                     );
@@ -4707,7 +4711,7 @@ impl HostRequestExecutor {
                 Some(TerminalFactOutcome::UnknownTerminal)
             }
             Err(error) => {
-                eprintln!("devmanager-host: terminal {resource_id} fact was not written: {error}");
+                host_log!("devmanager-host: terminal {resource_id} fact was not written: {error}");
                 None
             }
         }
@@ -4809,7 +4813,7 @@ impl HostRequestExecutor {
             let snapshot = match self.bus.task_snapshot(task_id) {
                 Ok(snapshot) => snapshot,
                 Err(error) => {
-                    eprintln!(
+                    host_log!(
                         "devmanager-host: shell terminal {resource_id} reconciliation could not \
                          read task {task_id}, leaving it open: {error}"
                     );
@@ -4821,7 +4825,7 @@ impl HostRequestExecutor {
             }
         }
         for (resource_id, reason) in orphaned {
-            eprintln!(
+            host_log!(
                 "devmanager-host: shell terminal {resource_id} closed by reconciliation: {reason}"
             );
             self.close_shell_terminal_and_settle_release(resource_id);
@@ -4858,7 +4862,7 @@ impl HostRequestExecutor {
         {
             Ok(Some(_)) => self.fan_out_live_durable_events(),
             Ok(None) => {}
-            Err(error) => eprintln!(
+            Err(error) => host_log!(
                 "devmanager-host: shell terminal {resource_id} release was not settled: {error}"
             ),
         }
@@ -4880,7 +4884,7 @@ impl HostRequestExecutor {
         let pending = match self.bus.pending_resource_releases() {
             Ok(pending) => pending,
             Err(error) => {
-                eprintln!(
+                host_log!(
                     "devmanager-host: pending shell releases could not be read, leaving them: {error}"
                 );
                 return;
@@ -4896,7 +4900,7 @@ impl HostRequestExecutor {
                 // to a plain shell, and only that would license settling it.
                 Ok(None) => continue,
                 Err(error) => {
-                    eprintln!(
+                    host_log!(
                         "devmanager-host: shell release {resource_id} could not read task {task_id}, leaving it: {error}"
                     );
                     continue;
@@ -4909,7 +4913,7 @@ impl HostRequestExecutor {
             if !is_plain_shell {
                 continue;
             }
-            eprintln!("devmanager-host: settling release for {resource_id}: shell already gone");
+            host_log!("devmanager-host: settling release for {resource_id}: shell already gone");
             self.settle_shell_release(resource_id);
         }
     }
@@ -4951,13 +4955,13 @@ impl HostRequestExecutor {
                     .terminal_service
                     .close(terminal_id, CloseReason::ExplicitServiceClose)
                 {
-                    eprintln!(
+                    host_log!(
                         "devmanager-host: shell terminal {resource_id} view close failed: {error:?}"
                     );
                 }
             }
             Ok(None) => {}
-            Err(error) => eprintln!(
+            Err(error) => host_log!(
                 "devmanager-host: shell terminal {resource_id} view lookup failed: {error:?}"
             ),
         }
@@ -4966,11 +4970,11 @@ impl HostRequestExecutor {
         // Afterwards a query for this resource answers `None`, which is the
         // correct end state: the durable strip still renders it from facts.
         if let Err(error) = self.terminal_service.remove_closed(resource_id) {
-            eprintln!("devmanager-host: shell terminal {resource_id} retire failed: {error:?}");
+            host_log!("devmanager-host: shell terminal {resource_id} retire failed: {error:?}");
         }
         if let Some(runtime) = self.configured_service_runtime.as_ref() {
             if let Err(error) = runtime.manager.close_task_shell_session(link.session_id) {
-                eprintln!("devmanager-host: shell terminal {resource_id} close failed: {error}");
+                host_log!("devmanager-host: shell terminal {resource_id} close failed: {error}");
             }
         }
     }
@@ -5601,7 +5605,7 @@ impl HostRequestExecutor {
         }
         validate_authenticated_command_capability(negotiated.capabilities, &envelope.command)?;
         if command_starts_new_launch(&envelope.command) && self.update_gate.stops_new_launches() {
-            eprintln!("devmanager-host: provider start blocked by update gate");
+            host_log!("devmanager-host: provider start blocked by update gate");
             return Err(IpcError::Unavailable);
         }
         let connection_id = output_id
@@ -5660,11 +5664,11 @@ impl HostRequestExecutor {
             ) {
                 Ok(crate::domain::command::CommandReceipt::Accepted { .. }) => true,
                 Ok(rejected) => {
-                    eprintln!("devmanager-host: provider start {label} rejected: {rejected:?}");
+                    host_log!("devmanager-host: provider start {label} rejected: {rejected:?}");
                     false
                 }
                 Err(error) => {
-                    eprintln!("devmanager-host: provider start {label} failed: {error}");
+                    host_log!("devmanager-host: provider start {label} failed: {error}");
                     false
                 }
             }
@@ -5729,7 +5733,7 @@ impl HostRequestExecutor {
         // onto the cancellation-owned FuturesUnordered lane and return the create
         // receipt immediately so task-list queries stay responsive.
         if let Err(error) = self.start_provider_session_intent(&start_intent) {
-            eprintln!("devmanager-host: provider start schedule failed after create: {error}");
+            host_log!("devmanager-host: provider start schedule failed after create: {error}");
             if let Some(revision) = self
                 .bus
                 .task_snapshot(task_id)
@@ -5781,7 +5785,7 @@ impl HostRequestExecutor {
         if let Err(error) =
             validate_authenticated_command_capability(negotiated.capabilities, &envelope.command)
         {
-            eprintln!("devmanager-host: provider start capability rejected: {error}");
+            host_log!("devmanager-host: provider start capability rejected: {error}");
             return Err(error);
         }
         let Command::StartProviderSession(intent) = envelope.command else {
@@ -5790,7 +5794,7 @@ impl HostRequestExecutor {
         if envelope.task_id != Some(intent.task_id)
             || envelope.expected_task_revision != Some(intent.expected_task_revision)
         {
-            eprintln!("devmanager-host: provider start envelope fence mismatch");
+            host_log!("devmanager-host: provider start envelope fence mismatch");
             return Err(IpcError::Security(
                 "provider start envelope fence mismatch".into(),
             ));
@@ -5812,7 +5816,7 @@ impl HostRequestExecutor {
         intent: &crate::domain::command::StartProviderSessionIntent,
     ) -> Result<u64, IpcError> {
         let runtime = self.configured_service_runtime.as_ref().ok_or_else(|| {
-            eprintln!("devmanager-host: provider start has no configured service runtime");
+            host_log!("devmanager-host: provider start has no configured service runtime");
             IpcError::Unavailable
         })?;
         let manager = runtime.manager.clone();
@@ -5830,18 +5834,18 @@ impl HostRequestExecutor {
                 .bus
                 .task_snapshot(intent.task_id)
                 .map_err(|error| {
-                    eprintln!("devmanager-host: provider start snapshot failed: {error}");
+                    host_log!("devmanager-host: provider start snapshot failed: {error}");
                     map_store_error(error)
                 })?
                 .ok_or_else(|| {
-                    eprintln!("devmanager-host: provider start task missing");
+                    host_log!("devmanager-host: provider start task missing");
                     IpcError::Unavailable
                 })?;
             let agent = snapshot
                 .agents
                 .get(&intent.agent_session_id)
                 .ok_or_else(|| {
-                    eprintln!("devmanager-host: provider start agent missing");
+                    host_log!("devmanager-host: provider start agent missing");
                     IpcError::Unavailable
                 })?;
             // Validate the caller's original task/agent/resource fences before
@@ -5862,13 +5866,13 @@ impl HostRequestExecutor {
                     agent.runtime_generation,
                 ) {
                     Some(true) => {
-                        eprintln!(
+                        host_log!(
                             "devmanager-host: NewConversation refused; live provider generation present"
                         );
                         return Err(IpcError::Unavailable);
                     }
                     None => {
-                        eprintln!(
+                        host_log!(
                             "devmanager-host: NewConversation refused; live provider book busy/unknown"
                         );
                         return Err(IpcError::Unavailable);
@@ -5877,14 +5881,14 @@ impl HostRequestExecutor {
                 }
                 match manager.try_classify_persisted_provider_launch(intent.agent_session_id) {
                     Ok(Some(true)) => {
-                        eprintln!(
+                        host_log!(
                             "devmanager-host: NewConversation refused; persisted launch graph present"
                         );
                         return Err(IpcError::Unavailable);
                     }
                     Ok(Some(false)) => {}
                     Ok(None) | Err(()) => {
-                        eprintln!(
+                        host_log!(
                             "devmanager-host: NewConversation refused; persisted launch classification unknown"
                         );
                         return Err(IpcError::Unavailable);
@@ -5893,13 +5897,13 @@ impl HostRequestExecutor {
             }
             if agent.provider_kind != intent.provider_kind {
                 if intent.mode != crate::domain::command::ProviderStartMode::NewConversation {
-                    eprintln!(
+                    host_log!(
                         "devmanager-host: provider rebind refused for non-NewConversation start"
                     );
                     return Err(IpcError::Unavailable);
                 }
                 if !snapshot.is_unstarted_draft() {
-                    eprintln!("devmanager-host: provider start kind mismatch on non-draft task");
+                    host_log!("devmanager-host: provider start kind mismatch on non-draft task");
                     return Err(IpcError::Unavailable);
                 }
                 // Running/launching without SessionStart must not rebind once a
@@ -5911,13 +5915,13 @@ impl HostRequestExecutor {
                     agent.runtime_generation,
                 ) {
                     Some(true) => {
-                        eprintln!(
+                        host_log!(
                             "devmanager-host: provider rebind refused; live provider generation present"
                         );
                         return Err(IpcError::Unavailable);
                     }
                     None => {
-                        eprintln!(
+                        host_log!(
                             "devmanager-host: provider rebind refused; live provider book busy/unknown"
                         );
                         return Err(IpcError::Unavailable);
@@ -5926,14 +5930,14 @@ impl HostRequestExecutor {
                 }
                 match manager.try_classify_persisted_provider_launch(intent.agent_session_id) {
                     Ok(Some(true)) => {
-                        eprintln!(
+                        host_log!(
                             "devmanager-host: provider rebind refused; persisted launch graph present"
                         );
                         return Err(IpcError::Unavailable);
                     }
                     Ok(Some(false)) => {}
                     Ok(None) | Err(()) => {
-                        eprintln!(
+                        host_log!(
                             "devmanager-host: provider rebind refused; persisted launch classification unknown"
                         );
                         return Err(IpcError::Unavailable);
@@ -5958,11 +5962,11 @@ impl HostRequestExecutor {
                         Uuid::nil(),
                     )
                     .map_err(|error| {
-                        eprintln!("devmanager-host: draft provider rebind failed: {error}");
+                        host_log!("devmanager-host: draft provider rebind failed: {error}");
                         map_store_error(error)
                     })?;
                 if !matches!(receipt, CommandReceipt::Accepted { .. }) {
-                    eprintln!("devmanager-host: draft provider rebind rejected: {receipt:?}");
+                    host_log!("devmanager-host: draft provider rebind rejected: {receipt:?}");
                     return Err(IpcError::Unavailable);
                 }
                 self.fan_out_live_durable_events();
@@ -5977,25 +5981,25 @@ impl HostRequestExecutor {
         }
         let (binding, agent, snapshot) =
             self.bus.prepare_provider_start(&intent).map_err(|error| {
-                eprintln!("devmanager-host: provider start prepare failed: {error}");
+                host_log!("devmanager-host: provider start prepare failed: {error}");
                 map_store_error(error)
             })?;
         let loaded = self
             .bus
             .load_task_runtime(intent.task_id, &self.workspace_projects)
             .map_err(|error| {
-                eprintln!("devmanager-host: provider start load runtime failed: {error}");
+                host_log!("devmanager-host: provider start load runtime failed: {error}");
                 IpcError::Unavailable
             })?
             .ok_or_else(|| {
-                eprintln!("devmanager-host: provider start task runtime missing");
+                host_log!("devmanager-host: provider start task runtime missing");
                 IpcError::Unavailable
             })?;
         let cwd = loaded
             .workspace
             .runtime_working_directory()
             .map_err(|error| {
-                eprintln!("devmanager-host: provider start cwd failed: {error}");
+                host_log!("devmanager-host: provider start cwd failed: {error}");
                 IpcError::Unavailable
             })?;
         let mode = match intent.mode {
@@ -6116,7 +6120,7 @@ impl HostRequestExecutor {
             return Ok(None);
         };
         if let Err(error) = runtime.manager.close_provider_task(task_id) {
-            eprintln!("devmanager-host: task close provider session stop failed: {error}");
+            host_log!("devmanager-host: task close provider session stop failed: {error}");
             // The domain resource ledger is the authority for live process
             // custody. A stale provider-state row (for example after a CLI
             // upgrade changes its executable hash) must not strand a task
@@ -6139,7 +6143,7 @@ impl HostRequestExecutor {
                     resolution: None,
                 }));
             }
-            eprintln!(
+            host_log!(
                 "devmanager-host: task close continuing after stale provider cleanup failure; all task-owned resources are released"
             );
         }
@@ -6169,9 +6173,10 @@ impl HostRequestExecutor {
             .map_err(map_store_error)?
             .ok_or(IpcError::Unavailable)?;
         if envelope.expected_task_revision != Some(snapshot.task.revision) {
-            eprintln!(
+            host_log!(
                 "devmanager-host: task close stale fence task={task_id} expected={:?} actual={}",
-                envelope.expected_task_revision, snapshot.task.revision
+                envelope.expected_task_revision,
+                snapshot.task.revision
             );
             return Err(IpcError::Unavailable);
         }
@@ -6198,7 +6203,7 @@ impl HostRequestExecutor {
         let mut released = 0usize;
         loop {
             if released >= 32 {
-                eprintln!("devmanager-host: task close exceeded resource release bound");
+                host_log!("devmanager-host: task close exceeded resource release bound");
                 return Err(IpcError::Unavailable);
             }
             let snapshot = self
@@ -6245,11 +6250,11 @@ impl HostRequestExecutor {
                         connection_id,
                     )
                     .map_err(|error| {
-                        eprintln!("devmanager-host: task close release resource failed: {error}");
+                        host_log!("devmanager-host: task close release resource failed: {error}");
                         map_store_error(error)
                     })?;
                 if !matches!(receipt, CommandReceipt::Accepted { .. }) {
-                    eprintln!("devmanager-host: task close release resource rejected: {receipt:?}");
+                    host_log!("devmanager-host: task close release resource rejected: {receipt:?}");
                     return Ok(ServerMessage::CommandReceipt(receipt));
                 }
                 self.fan_out_live_durable_events();
@@ -6258,12 +6263,12 @@ impl HostRequestExecutor {
                 .bus
                 .settle_next_resource_release(Duration::from_secs(30))
                 .map_err(|error| {
-                    eprintln!("devmanager-host: task close settle release failed: {error}");
+                    host_log!("devmanager-host: task close settle release failed: {error}");
                     map_store_error(error)
                 })?
                 .is_none()
             {
-                eprintln!("devmanager-host: task close settle release found no outbox row");
+                host_log!("devmanager-host: task close settle release found no outbox row");
                 return Err(IpcError::Unavailable);
             }
             self.fan_out_live_durable_events();
@@ -6308,7 +6313,7 @@ impl HostRequestExecutor {
                 connection_id,
             )
             .map_err(|error| {
-                eprintln!("devmanager-host: task close begin failed: {error}");
+                host_log!("devmanager-host: task close begin failed: {error}");
                 map_store_error(error)
             })?;
         self.fan_out_live_durable_events();
@@ -6317,7 +6322,7 @@ impl HostRequestExecutor {
                 .bus
                 .settle_next_process_empty_task_teardown(Duration::from_secs(30))
             {
-                eprintln!("devmanager-host: task close teardown settle failed: {error}");
+                host_log!("devmanager-host: task close teardown settle failed: {error}");
                 return Err(map_store_error(error));
             }
             self.fan_out_live_durable_events();
@@ -6912,7 +6917,7 @@ impl HostRequestExecutor {
                                             .iter()
                                             .any(|queued| queued.task_id == task_id);
                                 if !restore_already_pending {
-                                    eprintln!(
+                                    host_log!(
                                         "devmanager-host: provider terminal attachment deferred task={task_id}: {error}"
                                     );
                                 }
@@ -7883,7 +7888,7 @@ fn shell_open_denied_named(
     reason: crate::domain::TaskCockpitDeniedReason,
     detail: String,
 ) -> QueryOutcome {
-    eprintln!("devmanager-host: open shell refused task={task_id}: {detail}");
+    host_log!("devmanager-host: open shell refused task={task_id}: {detail}");
     QueryOutcome::Ok(QueryResult::TaskCockpit(TaskCockpitResult::Denied {
         surface: crate::domain::TaskCockpitSurface::Terminal,
         reason,
@@ -7897,7 +7902,7 @@ fn shell_open_unavailable_named(
     reason: crate::domain::TaskCockpitUnavailableReason,
     detail: String,
 ) -> QueryOutcome {
-    eprintln!("devmanager-host: open shell refused task={task_id}: {detail}");
+    host_log!("devmanager-host: open shell refused task={task_id}: {detail}");
     QueryOutcome::Ok(QueryResult::TaskCockpit(TaskCockpitResult::Unavailable {
         surface: crate::domain::TaskCockpitSurface::Terminal,
         reason,
@@ -8363,7 +8368,7 @@ fn normalize_task_create_at_host(
 }
 
 fn map_snapshot_error_transport(error: SnapshotError) -> IpcError {
-    eprintln!("devmanager-host: snapshot open failed: {error:?}");
+    host_log!("devmanager-host: snapshot open failed: {error:?}");
     match error {
         SnapshotError::Store(StoreError::Busy) => IpcError::Busy,
         SnapshotError::InvalidCursor | SnapshotError::CursorContextMismatch => {
@@ -8378,7 +8383,7 @@ fn map_snapshot_section_error(
     section: SnapshotSection,
     error: SnapshotError,
 ) -> Result<QueryOutcome, IpcError> {
-    eprintln!("devmanager-host: snapshot section {section:?} page failed: {error:?}");
+    host_log!("devmanager-host: snapshot section {section:?} page failed: {error:?}");
     match error {
         SnapshotError::InvalidCursor | SnapshotError::CursorContextMismatch => {
             Ok(QueryOutcome::Err(QueryError::InvalidRequest))

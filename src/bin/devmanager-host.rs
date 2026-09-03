@@ -23,6 +23,7 @@ use devmanager::host::{
     OrganizationRuntime, OrganizationRuntimeConfig, PhysicalExitArmRequest, SupervisedHostExecutor,
     HOST_EXIT_ALREADY_RUNNING, NATIVE_HOST_BASE_CAPABILITIES,
 };
+use devmanager::host_log;
 use devmanager::kernel::CommandBus;
 use devmanager::protocol::{
     Capability, CapabilitySet, FrameLimits, PROTOCOL_MAJOR, PROTOCOL_MINOR,
@@ -118,6 +119,27 @@ fn main() -> ExitCode {
     }
 }
 
+/// First line of every host launch, so a slow start has a fixed origin to
+/// measure from. `build` is the crate version; this binary carries no git sha.
+#[cfg(windows)]
+fn log_startup_banner(profile: &str) {
+    host_log!(
+        "devmanager-host: startup profile={profile} pid={} build={}",
+        std::process::id(),
+        env!("CARGO_PKG_VERSION")
+    );
+}
+
+/// Kernel open runs migrations, so it is the first plausible multi-second
+/// stall on a cold launch and needs its own measured span.
+#[cfg(windows)]
+fn log_kernel_opened(started: std::time::Instant) {
+    host_log!(
+        "devmanager-host: kernel opened in {} ms",
+        started.elapsed().as_millis()
+    );
+}
+
 fn run(raw_args: Vec<String>) -> Result<(), HostRunError> {
     #[cfg(not(windows))]
     {
@@ -130,6 +152,7 @@ fn run(raw_args: Vec<String>) -> Result<(), HostRunError> {
     #[cfg(all(windows, debug_assertions))]
     {
         let args = parse_args(raw_args)?;
+        log_startup_banner(&args.profile);
         let paths = prepare_debug_paths(&args)?;
         let parent = match args.parent_pid {
             Some(parent_pid) => Some(open_and_validate_parent(parent_pid)?),
@@ -139,8 +162,10 @@ fn run(raw_args: Vec<String>) -> Result<(), HostRunError> {
         devmanager::persistence::bind_durable_host_storage(&args.profile, &paths.profile_root)
             .map_err(|error| format!("failed to bind host storage: {error}"))?;
         let host_boot_id = host_lock.identity().boot_id;
+        let kernel_open_started = std::time::Instant::now();
         let bus = CommandBus::open(&paths.database)
             .map_err(|error| format!("failed to open host command bus: {error}"))?;
+        log_kernel_opened(kernel_open_started);
         let Some(bus) = prepare_host_bus_before_bind(bus)? else {
             // Ready settle or Closed: exclusive bus consumed; never construct the
             // runtime or reach HelloListener::bind.
@@ -170,6 +195,7 @@ fn run(raw_args: Vec<String>) -> Result<(), HostRunError> {
     #[cfg(all(windows, not(debug_assertions)))]
     {
         parse_production_args(raw_args)?;
+        log_startup_banner(PRODUCTION_HOST_PROFILE);
         let paths = prepare_production_paths()?;
         let host_lock = acquire_lock(&paths.profile_root, PRODUCTION_HOST_PROFILE)?;
         devmanager::persistence::bind_durable_host_storage(
@@ -178,8 +204,10 @@ fn run(raw_args: Vec<String>) -> Result<(), HostRunError> {
         )
         .map_err(|error| format!("failed to bind host storage: {error}"))?;
         let host_boot_id = host_lock.identity().boot_id;
+        let kernel_open_started = std::time::Instant::now();
         let bus = CommandBus::open(&paths.database)
             .map_err(|error| format!("failed to open host command bus: {error}"))?;
+        log_kernel_opened(kernel_open_started);
         let Some(bus) = prepare_host_bus_before_bind(bus)? else {
             return Ok(());
         };
@@ -1214,7 +1242,7 @@ async fn serve_foreground_host(
             Ok(()) => Some(controller),
             Err(_) => {
                 let _ = controller.shutdown_async().await;
-                eprintln!(
+                host_log!(
                     "devmanager-host: remote setup already bound; duplicate controller stopped"
                 );
                 None
@@ -1250,7 +1278,7 @@ async fn serve_foreground_host(
     let mut quota_host = match quota_start {
         Ok(owner) => Some(owner),
         Err(error) => {
-            eprintln!("devmanager-host quota refresh unavailable: {error}");
+            host_log!("devmanager-host quota refresh unavailable: {error}");
             None
         }
     };
@@ -1261,7 +1289,7 @@ async fn serve_foreground_host(
     // cancels and drops the sole pending listener. On arm, take/drop before ack.
     let mut accept_task = Some(Box::pin(listener.accept_with_successor()));
     let mut armed: Option<(devmanager::domain::id::OperationId, u64)> = None;
-    let _ = writeln!(io::stderr(), "devmanager-host: listening for clients");
+    host_log!("devmanager-host: listening for clients");
     let _ = io::stderr().flush();
 
     let exit = loop {

@@ -30,6 +30,7 @@ use crate::git::command::{
     GitConfirmation, GitError, GitRepository,
 };
 use crate::git::model::{MutationPlan, RepoPath, StatusKind};
+use crate::host_log;
 use crate::kernel::CommandBus;
 use crate::protocol::Capability;
 use crate::protocol::CapabilitySet;
@@ -1974,7 +1975,7 @@ fn serve_git_file_diff_targeted(
             },
         ))),
         Err(error) => {
-            eprintln!("devmanager-host: cockpit Git file diff failed: {error}");
+            host_log!("devmanager-host: cockpit Git file diff failed: {error}");
             unavailable(
                 TaskCockpitSurface::Git,
                 TaskCockpitUnavailableReason::GitAuthorityNotIssued,
@@ -2009,7 +2010,7 @@ fn serve_git_history_targeted(
             },
         ))),
         Err(error) => {
-            eprintln!("devmanager-host: cockpit Git history failed: {error}");
+            host_log!("devmanager-host: cockpit Git history failed: {error}");
             unavailable(
                 TaskCockpitSurface::Git,
                 TaskCockpitUnavailableReason::GitAuthorityNotIssued,
@@ -2040,7 +2041,7 @@ fn serve_git_commit_diff_targeted(
             },
         ))),
         Err(error) => {
-            eprintln!("devmanager-host: cockpit Git commit diff failed: {error}");
+            host_log!("devmanager-host: cockpit Git commit diff failed: {error}");
             unavailable(
                 TaskCockpitSurface::Git,
                 TaskCockpitUnavailableReason::GitAuthorityNotIssued,
@@ -2105,7 +2106,7 @@ fn serve_git_mutate_targeted(
             match repository.plan_stage(&paths) {
                 Ok(plan) => GitPlannedMutation::Stage(plan),
                 Err(error) => {
-                    eprintln!("devmanager-host: cockpit Git stage planning failed: {error}");
+                    host_log!("devmanager-host: cockpit Git stage planning failed: {error}");
                     return map_git_error(error);
                 }
             }
@@ -2284,7 +2285,7 @@ fn git_status_outcome(
             },
         ))),
         Err(error) => {
-            eprintln!(
+            host_log!(
                 "devmanager-host: cockpit Git status failed after {:?}: {error:?}",
                 started.elapsed()
             );
@@ -2365,7 +2366,7 @@ fn open_git_repository_targeted(
             runtime_generation,
         )
         .map_err(|error| {
-            eprintln!("devmanager-host: cockpit Git lease acquisition failed: {error:?}");
+            host_log!("devmanager-host: cockpit Git lease acquisition failed: {error:?}");
             unavailable(
                 TaskCockpitSurface::Git,
                 TaskCockpitUnavailableReason::GitAuthorityNotIssued,
@@ -2384,7 +2385,7 @@ fn open_git_repository_targeted(
         TaskCockpitSurface::Git,
     )
     .map_err(|outcome| {
-        eprintln!("devmanager-host: cockpit Git fence revalidation failed: {outcome:?}");
+        host_log!("devmanager-host: cockpit Git fence revalidation failed: {outcome:?}");
         outcome
     })?;
     let binding = match &resolved.selector {
@@ -2422,9 +2423,9 @@ fn open_git_repository_targeted(
     .map_err(|error| {
         match &error {
             GitError::InvalidRepositoryRoot { reason, .. } => {
-                eprintln!("devmanager-host: cockpit Git binding failed: {reason}");
+                host_log!("devmanager-host: cockpit Git binding failed: {reason}");
             }
-            _ => eprintln!("devmanager-host: cockpit Git binding failed: {error}"),
+            _ => host_log!("devmanager-host: cockpit Git binding failed: {error}"),
         }
         unavailable(
             TaskCockpitSurface::Git,
@@ -2433,7 +2434,7 @@ fn open_git_repository_targeted(
     })?;
     let repository =
         GitRepository::from_host_binding(binding, GitCancellation::new()).map_err(|error| {
-            eprintln!("devmanager-host: cockpit Git repository open failed: {error:?}");
+            host_log!("devmanager-host: cockpit Git repository open failed: {error:?}");
             unavailable(
                 TaskCockpitSurface::Git,
                 TaskCockpitUnavailableReason::GitAuthorityNotIssued,
@@ -2884,7 +2885,7 @@ fn live_mutation_authority(
         coordinator.clone(),
     )
     .map_err(|error| {
-        eprintln!(
+        host_log!(
             "devmanager-host: cockpit workspace service reconstruction failed for {surface:?}: {error:?}"
         );
         unavailable(
@@ -2904,7 +2905,7 @@ fn live_mutation_authority(
             runtime_generation,
         )
         .map_err(|error| {
-            eprintln!(
+            host_log!(
                 "devmanager-host: cockpit workspace authorization rejected for {surface:?}: {error:?}"
             );
             denied(surface, TaskCockpitDeniedReason::StaleFence)

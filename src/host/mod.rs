@@ -8,6 +8,7 @@ mod cockpit;
 mod connect;
 mod connection;
 mod conversation_wake;
+pub mod diag;
 mod ipc;
 mod lock;
 mod organization_runtime;

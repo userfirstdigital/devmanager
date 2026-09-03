@@ -34,6 +34,7 @@ use crate::domain::cockpit::TaskCockpitQuery;
 use crate::domain::command::Command;
 use crate::domain::id::{ClientId, OperationId, RequestId};
 use crate::domain::query::Query;
+use crate::host_log;
 use crate::protocol::{
     Capability, CapabilitySet, ClientRequest, NegotiatedParameters, SealedFrame, ServerMessage,
     StreamPayloadKind, MAX_SEALED_FRAME_BYTES, SEALED_NONCE_BYTES,
@@ -66,18 +67,18 @@ pub(crate) async fn serve_host_connect_duplex(
 ) -> Result<(), IpcError> {
     let (sink, stream) = socket.split();
     if !peer.is_authorized() {
-        eprintln!("devmanager-host: Connect duplex peer authorization expired before handoff");
+        host_log!("devmanager-host: Connect duplex peer authorization expired before handoff");
         return Err(IpcError::Unauthorized);
     }
     if peer.client_id() != duplex.client_id {
-        eprintln!("devmanager-host: Connect duplex peer identity changed before handoff");
+        host_log!("devmanager-host: Connect duplex peer identity changed before handoff");
         return Err(IpcError::Unauthorized);
     }
     let authorization = Some(Arc::new(peer.clone()));
     tokio::select! {
         biased;
         _ = peer.revoked() => {
-            eprintln!("devmanager-host: Connect duplex peer authorization revoked after handoff");
+            host_log!("devmanager-host: Connect duplex peer authorization revoked after handoff");
             Err(IpcError::Unauthorized)
         },
         result = serve_connect_io(sink, stream, channel, dispatch, duplex, authorization) => result,
@@ -151,39 +152,39 @@ pub(crate) fn enforce_connect_duplex_preconditions(
     duplex_client_id: ClientId,
 ) -> Result<(ChannelBinding, ConnectLimits, CapabilitySet), IpcError> {
     if !channel.is_production_grade() {
-        eprintln!("devmanager-host: Connect duplex rejected non-production Noise channel");
+        host_log!("devmanager-host: Connect duplex rejected non-production Noise channel");
         return Err(IpcError::Unauthorized);
     }
     if !dispatch.paired_identity_bound() {
-        eprintln!("devmanager-host: Connect duplex rejected missing paired identity");
+        host_log!("devmanager-host: Connect duplex rejected missing paired identity");
         return Err(IpcError::Unauthorized);
     }
     let Some(bound_client_id) = dispatch.bound_client_id() else {
-        eprintln!("devmanager-host: Connect duplex rejected missing Hello client identity");
+        host_log!("devmanager-host: Connect duplex rejected missing Hello client identity");
         return Err(IpcError::Unauthorized);
     };
     if bound_client_id != duplex_client_id {
-        eprintln!("devmanager-host: Connect duplex rejected host/Hello client identity mismatch");
+        host_log!("devmanager-host: Connect duplex rejected host/Hello client identity mismatch");
         return Err(IpcError::Unauthorized);
     }
     let Some(binding) = dispatch.channel_binding() else {
-        eprintln!("devmanager-host: Connect duplex rejected missing channel binding");
+        host_log!("devmanager-host: Connect duplex rejected missing channel binding");
         return Err(IpcError::Unauthorized);
     };
     if binding.connection_id.as_bytes() != channel.prologue().route_id() {
-        eprintln!("devmanager-host: Connect duplex rejected Noise route binding");
+        host_log!("devmanager-host: Connect duplex rejected Noise route binding");
         return Err(IpcError::Unauthorized);
     }
     let Some(limits) = dispatch.negotiated_limits() else {
-        eprintln!("devmanager-host: Connect duplex rejected missing negotiated limits");
+        host_log!("devmanager-host: Connect duplex rejected missing negotiated limits");
         return Err(IpcError::Unauthorized);
     };
     let Some(capabilities) = dispatch.negotiated_capabilities() else {
-        eprintln!("devmanager-host: Connect duplex rejected missing negotiated capabilities");
+        host_log!("devmanager-host: Connect duplex rejected missing negotiated capabilities");
         return Err(IpcError::Unauthorized);
     };
     channel.bind_session(binding).map_err(|_| {
-        eprintln!("devmanager-host: Connect duplex rejected Hello session binding");
+        host_log!("devmanager-host: Connect duplex rejected Hello session binding");
         IpcError::Unauthorized
     })?;
     Ok((binding, limits, capabilities))
@@ -284,29 +285,29 @@ pub(crate) fn open_connect_envelope(
 ) -> Result<ConnectEnvelope, IpcError> {
     let mut channel = lock_channel(channel)?;
     let plaintext = channel.open_bytes(frame, now_unix).map_err(|_| {
-        eprintln!("devmanager-host: Connect duplex rejected sealed frame");
+        host_log!("devmanager-host: Connect duplex rejected sealed frame");
         IpcError::Unauthorized
     })?;
     let envelope =
         ConnectEnvelope::decode_with_limits(&plaintext, negotiated_limits).map_err(|_| {
-            eprintln!("devmanager-host: Connect duplex rejected decoded envelope limits");
+            host_log!("devmanager-host: Connect duplex rejected decoded envelope limits");
             IpcError::Unauthorized
         })?;
     if envelope.sequence != frame.sequence() {
-        eprintln!("devmanager-host: Connect duplex rejected envelope sequence");
+        host_log!("devmanager-host: Connect duplex rejected envelope sequence");
         return Err(IpcError::Unauthorized);
     }
     let binding = envelope.binding().map_err(|_| IpcError::Unauthorized)?;
     if binding != expected_binding {
-        eprintln!("devmanager-host: Connect duplex rejected channel binding");
+        host_log!("devmanager-host: Connect duplex rejected channel binding");
         return Err(IpcError::Unauthorized);
     }
     if envelope.limits != negotiated_limits {
-        eprintln!("devmanager-host: Connect duplex rejected negotiated limits");
+        host_log!("devmanager-host: Connect duplex rejected negotiated limits");
         return Err(IpcError::Unauthorized);
     }
     channel.bind_session(binding).map_err(|_| {
-        eprintln!("devmanager-host: Connect duplex rejected session binding");
+        host_log!("devmanager-host: Connect duplex rejected session binding");
         IpcError::Unauthorized
     })?;
     Ok(envelope)
@@ -337,12 +338,12 @@ where
             WsMessage::Ping(_) | WsMessage::Pong(_) => continue,
             WsMessage::Close(_) => return Ok(()),
             WsMessage::Text(_) => {
-                eprintln!("devmanager-host: Connect duplex rejected text frame");
+                host_log!("devmanager-host: Connect duplex rejected text frame");
                 return Err(IpcError::Unauthorized);
             }
             WsMessage::Binary(bytes) => {
                 if bytes.is_empty() || bytes.len() > max_bytes {
-                    eprintln!(
+                    host_log!(
                         "devmanager-host: Connect duplex rejected physical frame length {} (max {})",
                         bytes.len(),
                         max_bytes
@@ -350,11 +351,11 @@ where
                     return Err(IpcError::Unauthorized);
                 }
                 let frame = SealedFrame::decode(&bytes).map_err(|_| {
-                    eprintln!("devmanager-host: Connect duplex rejected sealed frame encoding");
+                    host_log!("devmanager-host: Connect duplex rejected sealed frame encoding");
                     IpcError::Unauthorized
                 })?;
                 if std::env::var_os("DEVMANAGER_CONNECT_TRACE").is_some() {
-                    eprintln!(
+                    host_log!(
                         "devmanager-host: Connect trace duplex frame sequence={}",
                         frame.sequence()
                     );
@@ -369,7 +370,7 @@ where
                 let payload = envelope
                     .decode_payload()
                     .map_err(|error| {
-                        eprintln!(
+                        host_log!(
                             "devmanager-host: Connect duplex rejected typed payload kind={:?} sequence={}: {error:?}",
                             envelope.payload_kind,
                             envelope.sequence
@@ -381,7 +382,7 @@ where
                                 crate::domain::query::QueryEnvelope,
                             >(&envelope.payload)
                             {
-                                eprintln!(
+                                host_log!(
                                     "devmanager-host: Connect trace query schema detail: {detail}"
                                 );
                             }
@@ -401,7 +402,7 @@ where
                 };
                 let trace_started = std::time::Instant::now();
                 if let Some(label) = trace_request.as_deref() {
-                    eprintln!(
+                    host_log!(
                         "devmanager-host: Connect trace dispatch start sequence={} {label}",
                         envelope.sequence
                     );
@@ -416,7 +417,7 @@ where
                         }
                         _ => String::new(),
                     };
-                    eprintln!(
+                    host_log!(
                         "devmanager-host: Connect trace dispatch complete sequence={} elapsed_ms={} {label}{outcome}",
                         envelope.sequence,
                         trace_started.elapsed().as_millis()
@@ -531,7 +532,7 @@ where
     let payload = match connect_payload_from_host_outbound(&outbound, capabilities, limits) {
         Ok(payload) => payload,
         Err(reason) => {
-            eprintln!("devmanager-host: Connect duplex rejected host outbound: {reason}");
+            host_log!("devmanager-host: Connect duplex rejected host outbound: {reason}");
             drop(outbound);
             return Err(IpcError::Unauthorized);
         }
@@ -571,7 +572,7 @@ where
             payload,
         )
         .map_err(|_| {
-            eprintln!("devmanager-host: Connect duplex failed to encode outbound envelope");
+            host_log!("devmanager-host: Connect duplex failed to encode outbound envelope");
             IpcError::Unauthorized
         })?;
         let plaintext = envelope.encode().map_err(|_| IpcError::Unauthorized)?;
@@ -579,7 +580,7 @@ where
         channel
             .seal_bytes(&plaintext, nonce, now_unix)
             .map_err(|error| {
-                eprintln!(
+                host_log!(
                     "devmanager-host: Connect duplex failed to seal outbound envelope kind={} payload_bytes={} envelope_bytes={plaintext_len}: {error}",
                     envelope.payload_kind.get(),
                     envelope.payload.len(),
