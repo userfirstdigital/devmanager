@@ -11376,6 +11376,19 @@ fn center_terminal_interactive(
     selected_owner && selected_task_matches && task_surface_interactive
 }
 
+/// Whether the center loading surface must leave the composer's height free at
+/// the bottom of the canvas.
+///
+/// The loading surface has to occupy exactly the box the real surface will
+/// occupy once it attaches, or the pill is centred in a short box and whatever
+/// is underneath shows through as a band below it. Only the conversation body
+/// ends in a composer: a pane showing the provider terminal gives the terminal
+/// grid the whole center canvas, so reserving the composer's height there
+/// leaves the bottom of the terminal surface uncovered.
+fn center_loading_reserves_composer(show_input: bool, showing_provider_terminal: bool) -> bool {
+    show_input && !showing_provider_terminal
+}
+
 fn root_routes_key_to_terminal(
     key: &str,
     terminal_focused: bool,
@@ -26332,6 +26345,11 @@ impl NativeShell {
                 .child(conversation)
                 .into_any_element()
         };
+        // One decision for every loading state painted over this canvas, so
+        // the startup phase line and the surface loading states cannot disagree
+        // about the box they cover.
+        let reserve_composer =
+            center_loading_reserves_composer(show_input, showing_provider_terminal);
         let loading_overlay = startup_status
             .map(|line| {
                 Self::center_surface_loading_overlay(
@@ -26339,7 +26357,7 @@ impl NativeShell {
                     line.primary,
                     line.secondary,
                     true,
-                    show_input,
+                    reserve_composer,
                     tokens,
                 )
             })
@@ -26356,7 +26374,7 @@ impl NativeShell {
                         label.to_string(),
                         None,
                         initial,
-                        show_input,
+                        reserve_composer,
                         tokens,
                     )
                 })
@@ -26380,12 +26398,19 @@ impl NativeShell {
     ///
     /// Both the surface-level loading states and the startup phase line paint
     /// through here, so there is no second loading idiom to drift.
+    ///
+    /// `reserve_composer` is the only thing that shortens the covered box, and
+    /// it must be true exactly when a composer will really occupy that height
+    /// under the finished surface -- see [`center_loading_reserves_composer`].
+    /// Naming it after the composer rather than after the pane's input
+    /// capability is deliberate: a provider-terminal pane has input and no
+    /// composer.
     fn center_surface_loading_overlay(
         owner: &HostTaskKey,
         label: String,
         secondary: Option<String>,
         initial: bool,
-        show_input: bool,
+        reserve_composer: bool,
         tokens: crate::ui::tokens::ThemeTokens,
     ) -> AnyElement {
         let animation_key = stable_host_task_element_key(owner, "center-loading-pulse");
@@ -26450,7 +26475,7 @@ impl NativeShell {
         if initial {
             overlay
                 .top(px(0.0))
-                .bottom(px(if show_input {
+                .bottom(px(if reserve_composer {
                     CONVERSATION_COMPOSER_HEIGHT_RESERVE
                 } else {
                     0.0
@@ -45899,6 +45924,7 @@ mod tests {
         automatic_task_title,
         capture_runtime_projection_owner,
         caret_phase_repaint,
+        center_loading_reserves_composer,
         center_terminal_interactive,
         cockpit_reason_line,
         cockpit_result_detail,
@@ -46864,6 +46890,77 @@ mod tests {
         assert!(first.starts_with("https://picsum.photos/1920/1080?random="));
         assert!(second.starts_with("https://picsum.photos/1920/1080?random="));
         assert_ne!(first, second);
+    }
+
+    #[test]
+    fn the_center_loading_surface_reserves_composer_height_only_where_a_composer_lands() {
+        // Conversation body: the composer really does occupy that height under
+        // the loading surface, so leaving it free is what keeps the pill
+        // centred in the box the timeline will fill.
+        assert!(center_loading_reserves_composer(true, false));
+        // Provider terminal: the grid fills the whole center canvas, so
+        // reserving the composer's height leaves a band of terminal surface
+        // showing below the loading box as a seam.
+        assert!(!center_loading_reserves_composer(true, true));
+        // A background pane withholds the composer either way.
+        assert!(!center_loading_reserves_composer(false, false));
+        assert!(!center_loading_reserves_composer(false, true));
+    }
+
+    /// GPUI does not expose a laid-out element's box to a test, so the contract
+    /// is asserted where it is written: the loading overlay's insets and the
+    /// insets of the surface it stands in for, read out of this file.
+    #[test]
+    fn the_center_loading_surface_covers_the_same_box_as_the_surface_it_stands_in_for() {
+        let source = include_str!("native_shell.rs");
+        let overlay = source
+            .split("    fn center_surface_loading_overlay(")
+            .nth(1)
+            .and_then(|tail| {
+                tail.split("    fn center_provider_terminal_surface_for(")
+                    .next()
+            })
+            .expect("center surface loading overlay");
+        assert!(
+            overlay.contains(".left(px(0.0))")
+                && overlay.contains(".right(px(0.0))")
+                && overlay.contains(".top(px(0.0))")
+                && overlay.contains("if reserve_composer {")
+                && !overlay.contains("show_input"),
+            "the initial loading surface must span the center canvas, shortened only by a \
+             composer that will really be there"
+        );
+
+        let terminal = source
+            .split("    fn center_provider_terminal_surface_for(")
+            .nth(1)
+            .and_then(|tail| tail.split("\n    fn ").next())
+            .expect("center provider terminal surface");
+        assert!(
+            terminal.contains(".w_full()")
+                && terminal.contains(".flex_1()")
+                && terminal.contains(".min_h(px(0.0))")
+                && !terminal.contains("CONVERSATION_COMPOSER_HEIGHT_RESERVE"),
+            "the attached provider terminal fills the whole center canvas, so the loading \
+             surface standing in for it must too"
+        );
+
+        let canvas = source
+            .split("    fn task_conversation_surface_for(")
+            .nth(1)
+            .and_then(|tail| tail.split("    /// The one loading element").next())
+            .expect("center canvas loading overlay construction");
+        assert!(
+            canvas.contains(
+                "center_loading_reserves_composer(show_input, showing_provider_terminal)"
+            ),
+            "the covered box must come from the one predicate, not from the pane's input flag"
+        );
+        assert_eq!(
+            canvas.matches("reserve_composer,").count(),
+            2,
+            "both the startup line and the surface loading states must use it"
+        );
     }
 
     #[test]
