@@ -162,7 +162,47 @@ impl KernelStore {
     }
 }
 
+/// Which rows one pinned snapshot session admits.
+///
+/// The unscoped session is the STARTUP projection, not "everything": the shell
+/// renders a Settled or Archived task's operations, agents, resources,
+/// artifacts and browser rows only after the user clicks that task, so paging
+/// them for the whole store at startup was pure cost. The task-scoped session
+/// is what that click issues.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SnapshotProjection {
+    /// Every live task's list row, plus detail for the tasks the shell renders
+    /// without a click (`open`/`closing`) and every non-terminal operation.
+    Startup,
+    /// One task's rows for every section, whatever its lifecycle.
+    Task(TaskId),
+}
+
+/// Lifecycles whose detail rows the startup projection ships.
+///
+/// `settled` and `archived` are excluded because nothing renders them until
+/// the task is selected; `deleted` is excluded because the task is gone.
+const STARTUP_DETAIL_LIFECYCLES: &str = "('open','closing')";
+/// Operation states that are still reconcilable, hence still shipped unscoped.
+const NON_TERMINAL_OPERATION_STATES: &str = "('accepted','uncertain')";
+
+impl SnapshotProjection {
+    fn task_id_param(self) -> Vec<u8> {
+        match self {
+            Self::Startup => Vec::new(),
+            Self::Task(task_id) => task_id.as_bytes().to_vec(),
+        }
+    }
+}
+
 impl SnapshotSession {
+    fn projection(&self) -> SnapshotProjection {
+        match self.scope.task_id {
+            Some(task_id) => SnapshotProjection::Task(task_id),
+            None => SnapshotProjection::Startup,
+        }
+    }
+
     pub(crate) fn snapshot_id(&self) -> SnapshotId {
         self.snapshot_id
     }
@@ -202,7 +242,7 @@ impl SnapshotSession {
             None => None,
         };
         let fetch_limit = i64::from(self.limits.max_items) + 1;
-        let task_ids = load_task_ids(&self.conn, after_task, fetch_limit)?;
+        let task_ids = load_task_ids(&self.conn, self.projection(), after_task, fetch_limit)?;
         self.assemble_page(
             SnapshotSection::Tasks,
             after_item,
@@ -240,7 +280,8 @@ impl SnapshotSession {
             None => None,
         };
         let fetch_limit = i64::from(self.limits.max_items) + 1;
-        let agent_session_ids = load_agent_session_ids(&self.conn, after_agent, fetch_limit)?;
+        let agent_session_ids =
+            load_agent_session_ids(&self.conn, self.projection(), after_agent, fetch_limit)?;
         self.assemble_page(
             SnapshotSection::AgentSessions,
             after_item,
@@ -268,7 +309,8 @@ impl SnapshotSession {
             None => None,
         };
         let fetch_limit = i64::from(self.limits.max_items) + 1;
-        let artifact_ids = load_artifact_ids(&self.conn, after_artifact, fetch_limit)?;
+        let artifact_ids =
+            load_artifact_ids(&self.conn, self.projection(), after_artifact, fetch_limit)?;
         self.assemble_page(
             SnapshotSection::Artifacts,
             after_item,
@@ -296,7 +338,8 @@ impl SnapshotSession {
             None => None,
         };
         let fetch_limit = i64::from(self.limits.max_items) + 1;
-        let resource_ids = load_resource_ids(&self.conn, after_resource, fetch_limit)?;
+        let resource_ids =
+            load_resource_ids(&self.conn, self.projection(), after_resource, fetch_limit)?;
         self.assemble_page(
             SnapshotSection::Resources,
             after_item,
@@ -322,7 +365,8 @@ impl SnapshotSession {
             None => None,
         };
         let fetch_limit = i64::from(self.limits.max_items) + 1;
-        let operation_ids = load_operation_ids(&self.conn, after_operation, fetch_limit)?;
+        let operation_ids =
+            load_operation_ids(&self.conn, self.projection(), after_operation, fetch_limit)?;
         self.assemble_page(
             SnapshotSection::Operations,
             after_item,
@@ -352,7 +396,7 @@ impl SnapshotSession {
             Some(_) => return Err(SnapshotError::CursorContextMismatch),
             None => None,
         };
-        let (contexts, _) = load_browser_views(&self.conn)?;
+        let (contexts, _) = load_browser_views(&self.conn, self.projection())?;
         let fetch_limit = usize::try_from(i64::from(self.limits.max_items) + 1)
             .expect("validated snapshot item limit fits usize");
         let ids = contexts
@@ -390,7 +434,7 @@ impl SnapshotSession {
             Some(_) => return Err(SnapshotError::CursorContextMismatch),
             None => None,
         };
-        let (_, tabs) = load_browser_views(&self.conn)?;
+        let (_, tabs) = load_browser_views(&self.conn, self.projection())?;
         let fetch_limit = usize::try_from(i64::from(self.limits.max_items) + 1)
             .expect("validated snapshot item limit fits usize");
         let ids = tabs
@@ -568,6 +612,7 @@ impl SnapshotSession {
 
 fn load_browser_views(
     conn: &Connection,
+    projection: SnapshotProjection,
 ) -> Result<
     (
         BTreeMap<BrowserContextId, crate::domain::browser::BrowserContextView>,
@@ -575,7 +620,10 @@ fn load_browser_views(
     ),
     SnapshotError,
 > {
-    let task_ids = load_task_ids(conn, None, i64::MAX)?;
+    // Browser rows follow the same admission as every other detail section:
+    // walking every settled task's snapshot to project rows nothing renders
+    // was the most expensive way to produce nothing.
+    let task_ids = load_browser_owner_task_ids(conn, projection)?;
     let mut contexts = BTreeMap::new();
     let mut tabs = BTreeMap::new();
     for task_id in task_ids {
@@ -635,166 +683,205 @@ fn load_browser_views(
     Ok((contexts, tabs))
 }
 
+/// Ids for one section, ordered by identity so the snapshot cursor is stable.
+///
+/// `after` is bound as a blob and empty means "from the start": an empty blob
+/// sorts below every 16-byte id, so one statement serves both the first page
+/// and every continuation, and the primary-key index still drives the scan.
+fn load_scoped_ids(
+    conn: &Connection,
+    sql: &str,
+    projection: SnapshotProjection,
+    after: Option<&[u8]>,
+    fetch_limit: i64,
+) -> Result<Vec<Vec<u8>>, SnapshotError> {
+    let after: &[u8] = after.unwrap_or(&[]);
+    let scoped_task = projection.task_id_param();
+    let mut params: Vec<&dyn rusqlite::ToSql> = vec![&after, &fetch_limit];
+    if matches!(projection, SnapshotProjection::Task(_)) {
+        params.push(&scoped_task);
+    }
+    let mut stmt = conn.prepare(sql)?;
+    let rows = stmt.query_map(rusqlite::params_from_iter(params), |row| {
+        row.get::<_, Vec<u8>>(0)
+    })?;
+    let mut ids = Vec::new();
+    for row in rows {
+        ids.push(row?);
+    }
+    Ok(ids)
+}
+
 fn load_task_ids(
     conn: &Connection,
+    projection: SnapshotProjection,
     after_task: Option<TaskId>,
     fetch_limit: i64,
 ) -> Result<Vec<TaskId>, SnapshotError> {
-    let mut task_ids = Vec::new();
-    match after_task {
-        Some(after_task) => {
-            let mut stmt = conn.prepare(
-                "SELECT task_id FROM tasks WHERE task_id > ?1 ORDER BY task_id ASC LIMIT ?2",
-            )?;
-            let rows = stmt.query_map(
-                rusqlite::params![after_task.as_bytes().as_slice(), fetch_limit],
-                |row| row.get::<_, Vec<u8>>(0),
-            )?;
-            for row in rows {
-                task_ids.push(decode_task_id(&row?)?);
-            }
+    // A task deleted between two purge sweeps still has its row; nothing
+    // selectable may be in that state, so the list never ships it.
+    let sql = match projection {
+        SnapshotProjection::Startup => {
+            "SELECT task_id FROM tasks
+             WHERE task_id > ?1 AND lifecycle <> 'deleted'
+             ORDER BY task_id ASC LIMIT ?2"
         }
-        None => {
-            let mut stmt =
-                conn.prepare("SELECT task_id FROM tasks ORDER BY task_id ASC LIMIT ?1")?;
-            let rows = stmt.query_map([fetch_limit], |row| row.get::<_, Vec<u8>>(0))?;
-            for row in rows {
-                task_ids.push(decode_task_id(&row?)?);
-            }
+        SnapshotProjection::Task(_) => {
+            "SELECT task_id FROM tasks
+             WHERE task_id > ?1 AND task_id = ?3
+             ORDER BY task_id ASC LIMIT ?2"
         }
-    }
-    Ok(task_ids)
+    };
+    let after = after_task.map(|id| id.as_bytes().to_vec());
+    let rows = load_scoped_ids(conn, sql, projection, after.as_deref(), fetch_limit)?;
+    rows.iter().map(|bytes| decode_task_id(bytes)).collect()
+}
+
+/// Tasks whose browser rows this projection admits.
+///
+/// Unscoped this is every task the startup projection ships detail for; scoped
+/// it is the one selected task, whatever its lifecycle.
+fn load_browser_owner_task_ids(
+    conn: &Connection,
+    projection: SnapshotProjection,
+) -> Result<Vec<TaskId>, SnapshotError> {
+    let sql = match projection {
+        SnapshotProjection::Startup => startup_browser_owner_task_sql(),
+        SnapshotProjection::Task(_) => "SELECT task_id FROM tasks
+             WHERE task_id > ?1 AND task_id = ?3
+             ORDER BY task_id ASC LIMIT ?2"
+            .to_string(),
+    };
+    let rows = load_scoped_ids(conn, &sql, projection, None, i64::MAX)?;
+    rows.iter().map(|bytes| decode_task_id(bytes)).collect()
+}
+
+fn startup_browser_owner_task_sql() -> String {
+    format!(
+        "SELECT task_id FROM tasks
+         WHERE task_id > ?1 AND lifecycle IN {STARTUP_DETAIL_LIFECYCLES}
+         ORDER BY task_id ASC LIMIT ?2"
+    )
 }
 
 fn load_agent_session_ids(
     conn: &Connection,
+    projection: SnapshotProjection,
     after_agent: Option<AgentSessionId>,
     fetch_limit: i64,
 ) -> Result<Vec<AgentSessionId>, SnapshotError> {
-    let mut agent_session_ids = Vec::new();
-    match after_agent {
-        Some(after_agent) => {
-            let mut stmt = conn.prepare(
-                "SELECT agent_session_id FROM agent_sessions
-                 WHERE agent_session_id > ?1 ORDER BY agent_session_id ASC LIMIT ?2",
-            )?;
-            let rows = stmt.query_map(
-                rusqlite::params![after_agent.as_bytes().as_slice(), fetch_limit],
-                |row| row.get::<_, Vec<u8>>(0),
-            )?;
-            for row in rows {
-                agent_session_ids.push(decode_agent_session_id(&row?)?);
-            }
-        }
-        None => {
-            let mut stmt = conn.prepare(
-                "SELECT agent_session_id FROM agent_sessions
-                 ORDER BY agent_session_id ASC LIMIT ?1",
-            )?;
-            let rows = stmt.query_map([fetch_limit], |row| row.get::<_, Vec<u8>>(0))?;
-            for row in rows {
-                agent_session_ids.push(decode_agent_session_id(&row?)?);
-            }
-        }
-    }
-    Ok(agent_session_ids)
+    // The lifecycle join is LEFT, not INNER, throughout this module: a row
+    // naming a task that does not exist is a corrupt projection, and an inner
+    // join would delete it from the page instead, turning corruption into
+    // absence. Admitting it keeps the item loader's fail-closed check reachable.
+    let sql = match projection {
+        SnapshotProjection::Startup => format!(
+            "SELECT a.agent_session_id FROM agent_sessions a
+             LEFT JOIN tasks t ON t.task_id = a.task_id
+             WHERE a.agent_session_id > ?1
+               AND (t.task_id IS NULL OR t.lifecycle IN {STARTUP_DETAIL_LIFECYCLES})
+             ORDER BY a.agent_session_id ASC LIMIT ?2"
+        ),
+        SnapshotProjection::Task(_) => "SELECT agent_session_id FROM agent_sessions
+             WHERE agent_session_id > ?1 AND task_id = ?3
+             ORDER BY agent_session_id ASC LIMIT ?2"
+            .to_string(),
+    };
+    let after = after_agent.map(|id| id.as_bytes().to_vec());
+    let rows = load_scoped_ids(conn, &sql, projection, after.as_deref(), fetch_limit)?;
+    rows.iter()
+        .map(|bytes| decode_agent_session_id(bytes))
+        .collect()
 }
 
 fn load_artifact_ids(
     conn: &Connection,
+    projection: SnapshotProjection,
     after_artifact: Option<ArtifactId>,
     fetch_limit: i64,
 ) -> Result<Vec<ArtifactId>, SnapshotError> {
-    let mut artifact_ids = Vec::new();
-    match after_artifact {
-        Some(after_artifact) => {
-            let mut stmt = conn.prepare(
-                "SELECT artifact_id FROM artifacts
-                 WHERE artifact_id > ?1 ORDER BY artifact_id ASC LIMIT ?2",
-            )?;
-            let rows = stmt.query_map(
-                rusqlite::params![after_artifact.as_bytes().as_slice(), fetch_limit],
-                |row| row.get::<_, Vec<u8>>(0),
-            )?;
-            for row in rows {
-                artifact_ids.push(decode_artifact_id(&row?)?);
-            }
-        }
-        None => {
-            let mut stmt = conn
-                .prepare("SELECT artifact_id FROM artifacts ORDER BY artifact_id ASC LIMIT ?1")?;
-            let rows = stmt.query_map([fetch_limit], |row| row.get::<_, Vec<u8>>(0))?;
-            for row in rows {
-                artifact_ids.push(decode_artifact_id(&row?)?);
-            }
-        }
-    }
-    Ok(artifact_ids)
+    let sql = match projection {
+        SnapshotProjection::Startup => format!(
+            "SELECT a.artifact_id FROM artifacts a
+             LEFT JOIN tasks t ON t.task_id = a.task_id
+             WHERE a.artifact_id > ?1
+               AND (t.task_id IS NULL OR t.lifecycle IN {STARTUP_DETAIL_LIFECYCLES})
+             ORDER BY a.artifact_id ASC LIMIT ?2"
+        ),
+        SnapshotProjection::Task(_) => "SELECT artifact_id FROM artifacts
+             WHERE artifact_id > ?1 AND task_id = ?3
+             ORDER BY artifact_id ASC LIMIT ?2"
+            .to_string(),
+    };
+    let after = after_artifact.map(|id| id.as_bytes().to_vec());
+    let rows = load_scoped_ids(conn, &sql, projection, after.as_deref(), fetch_limit)?;
+    rows.iter().map(|bytes| decode_artifact_id(bytes)).collect()
 }
 
 fn load_resource_ids(
     conn: &Connection,
+    projection: SnapshotProjection,
     after_resource: Option<ResourceId>,
     fetch_limit: i64,
 ) -> Result<Vec<ResourceId>, SnapshotError> {
-    let mut resource_ids = Vec::new();
-    match after_resource {
-        Some(after_resource) => {
-            let mut stmt = conn.prepare(
-                "SELECT resource_id FROM resources
-                 WHERE resource_id > ?1 ORDER BY resource_id ASC LIMIT ?2",
-            )?;
-            let rows = stmt.query_map(
-                rusqlite::params![after_resource.as_bytes().as_slice(), fetch_limit],
-                |row| row.get::<_, Vec<u8>>(0),
-            )?;
-            for row in rows {
-                resource_ids.push(decode_resource_id(&row?)?);
-            }
-        }
-        None => {
-            let mut stmt = conn
-                .prepare("SELECT resource_id FROM resources ORDER BY resource_id ASC LIMIT ?1")?;
-            let rows = stmt.query_map([fetch_limit], |row| row.get::<_, Vec<u8>>(0))?;
-            for row in rows {
-                resource_ids.push(decode_resource_id(&row?)?);
-            }
-        }
-    }
-    Ok(resource_ids)
+    // A host-owned resource has no task and is never withheld: the shell shows
+    // it with no task selected at all.
+    let sql = match projection {
+        SnapshotProjection::Startup => format!(
+            "SELECT r.resource_id FROM resources r
+             LEFT JOIN tasks t ON t.task_id = r.task_id
+             WHERE r.resource_id > ?1
+               AND (r.task_id IS NULL
+                    OR t.task_id IS NULL
+                    OR t.lifecycle IN {STARTUP_DETAIL_LIFECYCLES})
+             ORDER BY r.resource_id ASC LIMIT ?2"
+        ),
+        SnapshotProjection::Task(_) => "SELECT resource_id FROM resources
+             WHERE resource_id > ?1 AND task_id = ?3
+             ORDER BY resource_id ASC LIMIT ?2"
+            .to_string(),
+    };
+    let after = after_resource.map(|id| id.as_bytes().to_vec());
+    let rows = load_scoped_ids(conn, &sql, projection, after.as_deref(), fetch_limit)?;
+    rows.iter().map(|bytes| decode_resource_id(bytes)).collect()
 }
 
 fn load_operation_ids(
     conn: &Connection,
+    projection: SnapshotProjection,
     after_operation: Option<OperationId>,
     fetch_limit: i64,
 ) -> Result<Vec<OperationId>, SnapshotError> {
-    let mut operation_ids = Vec::new();
-    match after_operation {
-        Some(after_operation) => {
-            let mut stmt = conn.prepare(
-                "SELECT operation_id FROM operations
-                 WHERE operation_id > ?1 ORDER BY operation_id ASC LIMIT ?2",
-            )?;
-            let rows = stmt.query_map(
-                rusqlite::params![after_operation.as_bytes().as_slice(), fetch_limit],
-                |row| row.get::<_, Vec<u8>>(0),
-            )?;
-            for row in rows {
-                operation_ids.push(decode_operation_id(&row?)?);
-            }
-        }
-        None => {
-            let mut stmt = conn.prepare(
-                "SELECT operation_id FROM operations ORDER BY operation_id ASC LIMIT ?1",
-            )?;
-            let rows = stmt.query_map([fetch_limit], |row| row.get::<_, Vec<u8>>(0))?;
-            for row in rows {
-                operation_ids.push(decode_operation_id(&row?)?);
-            }
-        }
-    }
-    Ok(operation_ids)
+    // Unscoped: only operations that can still change, for any task, so
+    // pending-action reconciliation keeps working. A settled operation is
+    // history no surface reads.
+    //
+    // The task join is required in BOTH directions, and unlike every other
+    // section it is not fail-open: the client refuses an operation whose parent
+    // task it was not given, so shipping one would reject the whole startup
+    // snapshot rather than surface one bad row. `purge` removes a task's
+    // operations with the task, so a surviving orphan is already a purge fault;
+    // and a task deleted between two sweeps still owns rows nothing may render.
+    let sql = match projection {
+        SnapshotProjection::Startup => format!(
+            "SELECT o.operation_id FROM operations o
+             LEFT JOIN tasks t ON t.task_id = o.task_id
+             WHERE o.operation_id > ?1
+               AND o.state IN {NON_TERMINAL_OPERATION_STATES}
+               AND (o.task_id IS NULL
+                    OR (t.task_id IS NOT NULL AND t.lifecycle <> 'deleted'))
+             ORDER BY o.operation_id ASC LIMIT ?2"
+        ),
+        SnapshotProjection::Task(_) => "SELECT operation_id FROM operations
+             WHERE operation_id > ?1 AND task_id = ?3
+             ORDER BY operation_id ASC LIMIT ?2"
+            .to_string(),
+    };
+    let after = after_operation.map(|id| id.as_bytes().to_vec());
+    let rows = load_scoped_ids(conn, &sql, projection, after.as_deref(), fetch_limit)?;
+    rows.iter()
+        .map(|bytes| decode_operation_id(bytes))
+        .collect()
 }
 
 fn decode_task_id(bytes: &[u8]) -> Result<TaskId, SnapshotError> {
@@ -954,7 +1041,8 @@ mod tests {
         eprintln!("PROBE all sections: {} ms", whole.elapsed().as_millis());
 
         // Cost split for Tasks.
-        let ids = load_task_ids(&session.conn, None, 1_000).expect("task ids");
+        let ids = load_task_ids(&session.conn, SnapshotProjection::Startup, None, 1_000)
+            .expect("task ids");
         let started = Instant::now();
         let mut items = Vec::new();
         for task_id in &ids {
@@ -1256,6 +1344,318 @@ mod tests {
             .expect("register resource");
     }
 
+    /// Session scope naming one task, which is what a click on a Done or
+    /// Archived task opens.
+    fn task_scope(task: TaskId) -> SessionScope {
+        SessionScope {
+            client_id: Some(client_id(0x21)),
+            task_id: Some(task),
+            connection_id: None,
+            action_epoch: None,
+            runtime_generation: None,
+        }
+    }
+
+    fn begin_close(store: &mut KernelStore, task: TaskId, command: CommandId) -> OperationId {
+        let revision = task_revision(store.path(), task);
+        match store
+            .execute(envelope(
+                command,
+                Some(task),
+                Some(revision),
+                Command::BeginCloseTask,
+            ))
+            .expect("begin close")
+        {
+            CommandReceipt::Accepted { operation_id, .. } => operation_id,
+            other => panic!("expected accepted close, got {other:?}"),
+        }
+    }
+
+    fn task_revision(path: &std::path::Path, task: TaskId) -> u64 {
+        let conn = Connection::open(path).expect("open revision reader");
+        let revision: i64 = conn
+            .query_row(
+                "SELECT revision FROM tasks WHERE task_id = ?1",
+                [task.as_bytes().as_slice()],
+                |row| row.get(0),
+            )
+            .expect("task revision");
+        u64::try_from(revision).expect("nonnegative revision")
+    }
+
+    fn set_task_lifecycle(path: &std::path::Path, task: TaskId, lifecycle: &str) {
+        let conn = Connection::open(path).expect("open lifecycle writer");
+        let changed = conn
+            .execute(
+                "UPDATE tasks SET lifecycle = ?2 WHERE task_id = ?1",
+                rusqlite::params![task.as_bytes().as_slice(), lifecycle],
+            )
+            .expect("update lifecycle");
+        assert_eq!(changed, 1, "lifecycle fixture must name a live task");
+    }
+
+    /// Remove a task row while leaving its operations behind.
+    fn delete_task_row(path: &std::path::Path, task: TaskId) {
+        let conn = Connection::open(path).expect("open task writer");
+        conn.execute_batch("PRAGMA foreign_keys = OFF;")
+            .expect("allow orphan fixture");
+        let changed = conn
+            .execute(
+                "DELETE FROM tasks WHERE task_id = ?1",
+                [task.as_bytes().as_slice()],
+            )
+            .expect("delete task row");
+        assert_eq!(changed, 1, "the fixture must name a live task");
+    }
+
+    fn release_task_resources(path: &std::path::Path, task: TaskId) {
+        let conn = Connection::open(path).expect("open resource writer");
+        conn.execute(
+            "UPDATE resources SET lifecycle = 'released' WHERE task_id = ?1",
+            [task.as_bytes().as_slice()],
+        )
+        .expect("release resources");
+    }
+
+    fn section_item_count(session: &SnapshotSession, section: SnapshotSection) -> usize {
+        let mut cursor: Option<Vec<u8>> = None;
+        let mut count = 0;
+        loop {
+            let page = session.page(section, cursor.as_deref()).expect("page");
+            count += page.items.len();
+            cursor = page.next_cursor.clone();
+            if cursor.is_none() {
+                return count;
+            }
+        }
+    }
+
+    fn section_items(session: &SnapshotSession, section: SnapshotSection) -> Vec<SnapshotItem> {
+        let mut cursor: Option<Vec<u8>> = None;
+        let mut items = Vec::new();
+        loop {
+            let page = session.page(section, cursor.as_deref()).expect("page");
+            items.extend(page.items.clone());
+            cursor = page.next_cursor.clone();
+            if cursor.is_none() {
+                return items;
+            }
+        }
+    }
+
+    /// One store covering every task lifecycle twice over.
+    ///
+    /// The first four tasks carry an agent and a resource and run
+    /// open / settled / archived / deleted; they are the subject of the DETAIL
+    /// sections, and every operation they own has settled.
+    ///
+    /// The last two carry no children and are closed, so each owns one
+    /// still-`accepted` operation; they are the subject of the OPERATIONS
+    /// section. Their lifecycle is NOT rewritten: a live side-effect operation
+    /// is validated against the durable task mutation chain, so a projection
+    /// poke would make the operation itself unreadable. The second one's task
+    /// row is deleted outright, which is what a purge leaves behind if it ever
+    /// removed a task without its operations.
+    fn lifecycle_fixture_store(path: &std::path::Path) -> (KernelStore, [TaskId; 4], [TaskId; 2]) {
+        let mut store = KernelStore::open(path).expect("open");
+        let detail_tasks = [task_id(0x41), task_id(0x42), task_id(0x43), task_id(0x44)];
+        let operation_tasks = [task_id(0x45), task_id(0x46)];
+        for (index, task) in detail_tasks.iter().copied().enumerate() {
+            let index = u8::try_from(index).expect("fixture index fits");
+            create_task(&mut store, task, command_id(0x50 + index));
+            let revision = task_revision(path, task);
+            register_agent(
+                &mut store,
+                task,
+                agent_id(0x60 + index),
+                command_id(0x70 + index),
+                revision,
+            );
+            let revision = task_revision(path, task);
+            register_resource(
+                &mut store,
+                task,
+                resource_id(0x80 + index),
+                command_id(0x90 + index),
+                revision,
+            );
+        }
+        for (index, task) in operation_tasks.iter().copied().enumerate() {
+            let index = u8::try_from(index).expect("fixture index fits");
+            create_task(&mut store, task, command_id(0x54 + index));
+            begin_close(&mut store, task, command_id(0xA0 + index));
+        }
+
+        // An archived or deleted task may not own a live resource, so release
+        // the fixture's before flipping the lifecycle.
+        for task in [detail_tasks[2], detail_tasks[3]] {
+            release_task_resources(path, task);
+        }
+        set_task_lifecycle(path, detail_tasks[0], "open");
+        set_task_lifecycle(path, detail_tasks[1], "settled");
+        set_task_lifecycle(path, detail_tasks[2], "archived");
+        set_task_lifecycle(path, detail_tasks[3], "deleted");
+        delete_task_row(path, operation_tasks[1]);
+        (store, detail_tasks, operation_tasks)
+    }
+
+    #[test]
+    fn startup_projection_ships_open_task_detail_only() {
+        let dir = TempDir::new().expect("tempdir");
+        let path = dir.path().join("kernel.sqlite3");
+        let (store, detail_tasks, operation_tasks) = lifecycle_fixture_store(&path);
+        let [open_task, settled_task, archived_task, deleted_task] = detail_tasks;
+
+        let session = store
+            .begin_snapshot(PageLimits::new(1_000, 512 * 1024).expect("limits"))
+            .expect("begin startup snapshot");
+
+        // The list still shows settled and archived; the deleted rows are gone.
+        let listed: Vec<TaskId> = section_items(&session, SnapshotSection::Tasks)
+            .into_iter()
+            .map(|item| match item {
+                SnapshotItem::Task(task) => task.task.id,
+                other => panic!("expected task item, got {other:?}"),
+            })
+            .collect();
+        assert!(listed.contains(&open_task));
+        assert!(listed.contains(&settled_task));
+        assert!(listed.contains(&archived_task));
+        assert!(!listed.contains(&deleted_task));
+        assert!(!listed.contains(&operation_tasks[1]));
+        assert!(listed.contains(&operation_tasks[0]));
+        assert_eq!(
+            listed.len(),
+            4,
+            "one of six fixture tasks is deleted and one is purged: {listed:?}"
+        );
+
+        // Detail sections carry only the open task's rows.
+        let agents: Vec<TaskId> = section_items(&session, SnapshotSection::AgentSessions)
+            .into_iter()
+            .map(|item| match item {
+                SnapshotItem::AgentSession(agent) => agent.task_id,
+                other => panic!("expected agent item, got {other:?}"),
+            })
+            .collect();
+        assert_eq!(agents, vec![open_task]);
+
+        let resources: Vec<Option<TaskId>> = section_items(&session, SnapshotSection::Resources)
+            .into_iter()
+            .map(|item| match item {
+                SnapshotItem::Resource(resource) => resource.task_id,
+                other => panic!("expected resource item, got {other:?}"),
+            })
+            .collect();
+        assert_eq!(resources, vec![Some(open_task)]);
+
+        // Operations: every non-terminal one, for every live task, and no
+        // settled history at all.
+        let operations: Vec<(Option<TaskId>, bool)> =
+            section_items(&session, SnapshotSection::Operations)
+                .into_iter()
+                .map(|item| match item {
+                    SnapshotItem::Operation(operation) => (
+                        operation.task_id,
+                        matches!(
+                            operation.state,
+                            OperationState::Accepted | OperationState::Uncertain { .. }
+                        ),
+                    ),
+                    other => panic!("expected operation item, got {other:?}"),
+                })
+                .collect();
+        assert!(
+            operations.iter().all(|(_, non_terminal)| *non_terminal),
+            "startup must never page a terminal operation: {operations:?}"
+        );
+        let operation_owners: Vec<Option<TaskId>> =
+            operations.iter().map(|(task, _)| *task).collect();
+        assert!(
+            operation_owners.contains(&Some(operation_tasks[0])),
+            "a live operation is still paged at startup: {operations:?}"
+        );
+        assert!(
+            !operation_owners.contains(&Some(operation_tasks[1])),
+            "an operation whose task row is gone has no parent to admit it"
+        );
+        for task in detail_tasks {
+            assert!(
+                !operation_owners.contains(&Some(task)),
+                "every operation those tasks own has settled"
+            );
+        }
+    }
+
+    #[test]
+    fn task_scoped_snapshot_ships_an_archived_task_detail() {
+        let dir = TempDir::new().expect("tempdir");
+        let path = dir.path().join("kernel.sqlite3");
+        let (store, detail_tasks, _operation_tasks) = lifecycle_fixture_store(&path);
+
+        let [open_task, _settled_task, archived_task, _deleted_task] = detail_tasks;
+
+        let session = store
+            .begin_snapshot_scoped(
+                PageLimits::new(1_000, 512 * 1024).expect("limits"),
+                task_scope(archived_task),
+            )
+            .expect("begin task-scoped snapshot");
+
+        let listed: Vec<TaskId> = section_items(&session, SnapshotSection::Tasks)
+            .into_iter()
+            .map(|item| match item {
+                SnapshotItem::Task(task) => task.task.id,
+                other => panic!("expected task item, got {other:?}"),
+            })
+            .collect();
+        assert_eq!(listed, vec![archived_task]);
+
+        let agents: Vec<TaskId> = section_items(&session, SnapshotSection::AgentSessions)
+            .into_iter()
+            .map(|item| match item {
+                SnapshotItem::AgentSession(agent) => agent.task_id,
+                other => panic!("expected agent item, got {other:?}"),
+            })
+            .collect();
+        assert_eq!(agents, vec![archived_task]);
+
+        let resources: Vec<Option<TaskId>> = section_items(&session, SnapshotSection::Resources)
+            .into_iter()
+            .map(|item| match item {
+                SnapshotItem::Resource(resource) => resource.task_id,
+                other => panic!("expected resource item, got {other:?}"),
+            })
+            .collect();
+        assert_eq!(resources, vec![Some(archived_task)]);
+
+        // The scope is the whole filter: no other task's rows leak in, and the
+        // scoped view does carry that task's settled operations, which the
+        // startup projection withholds.
+        let operations = section_items(&session, SnapshotSection::Operations);
+        assert!(!operations.is_empty());
+        assert!(operations.iter().any(|item| matches!(
+            item,
+            SnapshotItem::Operation(operation)
+                if matches!(operation.state, OperationState::Settled { .. })
+        )));
+        for item in &operations {
+            match item {
+                SnapshotItem::Operation(operation) => {
+                    assert_eq!(operation.task_id, Some(archived_task));
+                }
+                other => panic!("expected operation item, got {other:?}"),
+            }
+        }
+        assert_ne!(archived_task, open_task);
+        assert_eq!(
+            section_item_count(&session, SnapshotSection::Artifacts),
+            0,
+            "the fixture registers no artifact"
+        );
+    }
+
     #[test]
     fn snapshot_has_global_cursor() {
         let dir = TempDir::new().expect("tempdir");
@@ -1423,13 +1823,30 @@ mod tests {
         let dir = TempDir::new().expect("tempdir");
         let path = dir.path().join("kernel.sqlite3");
         let mut store = KernelStore::open(&path).expect("open");
-        create_task(&mut store, task_id(0xE1), command_id(0xE2));
+        let scoped_task = task_id(0xE1);
+        create_task(&mut store, scoped_task, command_id(0xE2));
         create_task(&mut store, task_id(0xE3), command_id(0xE4));
+        // The scope is now a row filter, so the cursor's section must hold at
+        // least two rows FOR THAT TASK or there is no continuation to fence.
+        register_resource(
+            &mut store,
+            scoped_task,
+            resource_id(0xE7),
+            command_id(0xE8),
+            task_revision(&path, scoped_task),
+        );
+        register_resource(
+            &mut store,
+            scoped_task,
+            resource_id(0xE9),
+            command_id(0xEA),
+            task_revision(&path, scoped_task),
+        );
 
         let limits = PageLimits::new(1, 512 * 1024).expect("limits");
         let scope = SessionScope {
             client_id: Some(client_id(0xE5)),
-            task_id: Some(task_id(0xE6)),
+            task_id: Some(scoped_task),
             connection_id: Some(Uuid::now_v7()),
             action_epoch: Some(7),
             runtime_generation: Some(11),
@@ -1438,7 +1855,7 @@ mod tests {
             .begin_snapshot_scoped(limits, scope)
             .expect("scoped snapshot");
         let cursor = first
-            .page(SnapshotSection::Tasks, None)
+            .page(SnapshotSection::Resources, None)
             .expect("first page")
             .next_cursor
             .expect("resume cursor");
@@ -1477,7 +1894,7 @@ mod tests {
             other.through_sequence = first.through_sequence;
             other.cursor_hmac_key = first.cursor_hmac_key.clone();
             assert_eq!(
-                other.page(SnapshotSection::Tasks, Some(&cursor)),
+                other.page(SnapshotSection::Resources, Some(&cursor)),
                 Err(SnapshotError::CursorContextMismatch)
             );
         }
@@ -2061,26 +2478,22 @@ mod tests {
         let dir = TempDir::new().expect("tempdir");
         let path = dir.path().join("kernel.sqlite3");
         let mut store = KernelStore::open(&path).expect("open");
+        // Three tasks, each with one still-accepted close operation. Create
+        // operations settle inside the test fixture, and the startup projection
+        // never pages a terminal operation, so the closes are the subjects.
         let first_task = task_id(0xD0);
         let second_task = task_id(0xD1);
-        let create_first_command = command_id(0xD2);
-        let create_second_command = command_id(0xD3);
-        let close_command = command_id(0xD4);
-        let create_first = create_task(&mut store, first_task, create_first_command);
-        let create_second = create_task(&mut store, second_task, create_second_command);
-        let close = match store
-            .execute(envelope(
-                close_command,
-                Some(first_task),
-                Some(1),
-                Command::BeginCloseTask,
-            ))
-            .expect("begin close")
-        {
-            CommandReceipt::Accepted { operation_id, .. } => operation_id,
-            other => panic!("expected accepted close, got {other:?}"),
-        };
-        let mut expected_ids = vec![create_first, create_second, close];
+        let third_task = task_id(0xD8);
+        create_task(&mut store, first_task, command_id(0xD2));
+        create_task(&mut store, second_task, command_id(0xD3));
+        create_task(&mut store, third_task, command_id(0xD9));
+        let close_first_command = command_id(0xD4);
+        let close_second_command = command_id(0xDC);
+        let close_third_command = command_id(0xDD);
+        let close_first = begin_close(&mut store, first_task, close_first_command);
+        let close_second = begin_close(&mut store, second_task, close_second_command);
+        let close_third = begin_close(&mut store, third_task, close_third_command);
+        let mut expected_ids = vec![close_first, close_second, close_third];
         expected_ids.sort();
 
         let snapshot = store
@@ -2098,7 +2511,8 @@ mod tests {
                 .expect("settle close"),
             OperationState::Settled { .. }
         ));
-        let post_snapshot = create_task(&mut store, task_id(0xD5), command_id(0xD6));
+        create_task(&mut store, task_id(0xD5), command_id(0xD6));
+        let post_snapshot = begin_close(&mut store, task_id(0xD5), command_id(0xDE));
 
         let first = snapshot
             .page(SnapshotSection::Operations, None)
@@ -2146,24 +2560,20 @@ mod tests {
             .iter()
             .any(|operation| operation.id == post_snapshot));
 
-        let close_facts = operations
-            .iter()
-            .find(|operation| operation.id == close)
-            .expect("close operation");
-        assert_eq!(close_facts.command_id, close_command);
-        assert_eq!(close_facts.task_id, Some(first_task));
-        assert_eq!(close_facts.state, OperationState::Accepted);
         for (id, command_id, task_id) in [
-            (create_first, create_first_command, first_task),
-            (create_second, create_second_command, second_task),
+            (close_first, close_first_command, first_task),
+            (close_second, close_second_command, second_task),
+            (close_third, close_third_command, third_task),
         ] {
             let facts = operations
                 .iter()
                 .find(|operation| operation.id == id)
-                .expect("create operation");
+                .expect("close operation");
             assert_eq!(facts.command_id, command_id);
             assert_eq!(facts.task_id, Some(task_id));
-            assert!(matches!(facts.state, OperationState::Settled { .. }));
+            // Pinned before the dispatch settle below, so the frozen view still
+            // reports the state it had when the session opened.
+            assert_eq!(facts.state, OperationState::Accepted);
         }
     }
 
@@ -2183,8 +2593,13 @@ mod tests {
         .expect("tamper receipt lineage");
         drop(conn);
 
+        // The subject is a settled create operation, which only the
+        // task-scoped projection pages.
         let snapshot = store
-            .begin_snapshot(PageLimits::new(10, 512 * 1024).expect("limits"))
+            .begin_snapshot_scoped(
+                PageLimits::new(10, 512 * 1024).expect("limits"),
+                task_scope(task_id(0xD7)),
+            )
             .expect("begin snapshot");
         assert!(matches!(
             snapshot
@@ -2201,8 +2616,13 @@ mod tests {
         let mut store = KernelStore::open(&path).expect("open");
         let operation = create_task(&mut store, task_id(0xDA), command_id(0xDB));
 
+        // The subject is a settled create operation, which only the task-scoped
+        // projection pages.
         let snapshot = store
-            .begin_snapshot(PageLimits::new(10, 1).expect("limits"))
+            .begin_snapshot_scoped(
+                PageLimits::new(10, 1).expect("limits"),
+                task_scope(task_id(0xDA)),
+            )
             .expect("begin snapshot");
         assert!(matches!(
             snapshot.page(SnapshotSection::Operations, None),

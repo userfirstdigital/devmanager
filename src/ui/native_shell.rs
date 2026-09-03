@@ -5047,6 +5047,8 @@ pub(crate) struct NativeHostClientRuntime {
     host_process: Option<NativeHostProcess>,
     deferred_action_outcome: Arc<Mutex<Option<NativeHostActionOutcome>>>,
     worker_overflow: Arc<Mutex<VecDeque<NativeHostActionOutcome>>>,
+    /// Tasks whose withheld detail the shell has asked the worker to fetch.
+    detail_requests: Arc<Mutex<VecDeque<TaskId>>>,
     /// Ordinary close/detach never arms host quit; full-quit uses inspect/confirm.
     lifecycle: NativeClientLifecycle,
     controller_wake: ControllerWakeBridge,
@@ -5880,6 +5882,8 @@ impl NativeHostClientRuntime {
         let deferred_action_outcome_for_worker = Arc::clone(&deferred_action_outcome);
         let worker_overflow = Arc::new(Mutex::new(VecDeque::new()));
         let worker_overflow_for_worker = Arc::clone(&worker_overflow);
+        let detail_requests: Arc<Mutex<VecDeque<TaskId>>> = Arc::new(Mutex::new(VecDeque::new()));
+        let detail_requests_for_worker = Arc::clone(&detail_requests);
         let channel_depth_for_worker = Arc::clone(&channel_depth);
         let owns_local_for_worker = owns_local_authority;
         let controller_wake = ControllerWakeBridge::unbound();
@@ -5923,6 +5927,7 @@ impl NativeHostClientRuntime {
                         updater_for_worker,
                         deferred_action_outcome_for_worker,
                         worker_overflow_for_worker,
+                        detail_requests_for_worker,
                         controller_wake_for_worker,
                     )
                 }) {
@@ -5963,9 +5968,26 @@ impl NativeHostClientRuntime {
             host_process,
             deferred_action_outcome,
             worker_overflow,
+            detail_requests,
             lifecycle: NativeClientLifecycle::Connected,
             controller_wake,
         })
+    }
+
+    /// Queue one task's withheld detail for the worker thread.
+    ///
+    /// Bounded and de-duplicated: a repeat request for a task already queued is
+    /// dropped, so a re-render cannot multiply host round trips.
+    pub(crate) fn request_task_detail(&self, task_id: TaskId) {
+        if let Ok(mut queue) = self.detail_requests.lock() {
+            if queue.contains(&task_id) {
+                return;
+            }
+            if queue.len() >= MAX_ACTION_LANE_RECORDS {
+                return;
+            }
+            queue.push_back(task_id);
+        }
     }
 
     pub(crate) fn is_connected(&self) -> bool {
@@ -6688,6 +6710,55 @@ async fn deferred_bootstrap_projection(
     Ok(kinds)
 }
 
+/// Load whatever detail the shell asked for since the last tick.
+///
+/// A Settled or Archived task's agents, resources and artifacts are not in the
+/// startup snapshot, so a click on one has to fetch them. This runs on the same
+/// worker thread as every other host request, and republishes the canonical
+/// model so the cockpit renders the rows it just gained.
+fn drain_task_detail_requests(
+    fleet: &Arc<HostFleet>,
+    host_id: &HostId,
+    runtime: &tokio::runtime::Runtime,
+    detail_requests: &Arc<Mutex<VecDeque<TaskId>>>,
+    client_model: &Arc<Mutex<Option<Arc<ClientModel>>>>,
+    epochs: &Arc<Mutex<NativeHostRuntimeEpochs>>,
+    projections: &Arc<Mutex<VecDeque<NativeHostProjection>>>,
+) {
+    let wanted: Vec<TaskId> = match detail_requests.lock() {
+        Ok(mut queue) => queue.drain(..).collect(),
+        Err(_) => Vec::new(),
+    };
+    for task_id in wanted {
+        let Ok(admission) = fleet.admit_host(host_id) else {
+            continue;
+        };
+        if let Err(error) = runtime.block_on(fleet.load_task_detail(&admission, task_id)) {
+            // Observed, never fail-closed: the list row is still correct and the
+            // next selection retries. Silence here would read as an empty task.
+            eprintln!("devmanager native host task detail load failed: {error}");
+            continue;
+        }
+        let Ok(Some(owned)) = fleet.presentation_model(host_id) else {
+            continue;
+        };
+        let owner = NativeProjectionOwner::from_owned(&owned);
+        let model = owned.value;
+        if let Ok(mut current) = client_model.lock() {
+            *current = Some(Arc::clone(&model));
+        }
+        let epochs_now = current_runtime_epochs(epochs);
+        // Live, not Snapshot: the model did not restart, it gained the rows the
+        // startup projection withheld.
+        publish_projection(
+            projections,
+            NativeHostProjection::model(NativeHostProjectionKind::Live, model)
+                .at_epochs(epochs_now)
+                .with_owner(owner),
+        );
+    }
+}
+
 fn native_host_worker_loop(
     fleet: Arc<HostFleet>,
     host_id: HostId,
@@ -6705,6 +6776,7 @@ fn native_host_worker_loop(
     updater: UpdaterService,
     deferred_action_outcome: Arc<Mutex<Option<NativeHostActionOutcome>>>,
     worker_overflow: Arc<Mutex<VecDeque<NativeHostActionOutcome>>>,
+    detail_requests: Arc<Mutex<VecDeque<TaskId>>>,
     controller_wake: ControllerWakeBridge,
 ) {
     install_worker_controller_wake(controller_wake);
@@ -7036,6 +7108,17 @@ fn native_host_worker_loop(
                 );
                 break;
             }
+        }
+        if !cancellation.load(Ordering::Acquire) && bootstrapped.load(Ordering::Acquire) {
+            drain_task_detail_requests(
+                &fleet,
+                &host_id,
+                &runtime,
+                &detail_requests,
+                &client_model,
+                &epochs,
+                &projections,
+            );
         }
         if cancellation.load(Ordering::Acquire) {
             drain_cancelled_worker_commands(
@@ -10921,6 +11004,9 @@ pub(crate) struct HostUiState {
     pub(super) pending_settled_send: Option<PendingSettledSend>,
     pub(super) pending_draft_first_send: Option<PendingDraftFirstSend>,
     pub(super) first_send_readiness_requests: HashSet<RequestId>,
+    /// The task whose withheld detail is already in flight, so a re-render
+    /// cannot re-ask for it every frame.
+    pub(super) requested_task_detail: Option<TaskId>,
     provider_setup_approvals: BTreeMap<TaskId, ProviderSetupApproval>,
     provider_setup_input_completions: BTreeMap<TaskId, ProviderSetupInputCompletion>,
 }
@@ -10952,6 +11038,7 @@ impl HostUiState {
             pending_settled_send: None,
             pending_draft_first_send: None,
             first_send_readiness_requests: HashSet::new(),
+            requested_task_detail: None,
             provider_setup_approvals: BTreeMap::new(),
             provider_setup_input_completions: BTreeMap::new(),
         }
@@ -13511,6 +13598,47 @@ impl NativeShell {
                     None => &mut editor.name,
                 }
             }
+        }
+    }
+
+    /// Ask the host for the selected task's withheld detail, at most once per
+    /// selection.
+    ///
+    /// The startup snapshot ships a Settled or Archived task's list row only,
+    /// so its cockpit is empty until this lands. An Open or Closing task never
+    /// reaches the request because its detail always ships.
+    fn request_selected_task_detail(&mut self) {
+        let Some(task_id) = self.local_slot().interaction.selected_task() else {
+            return;
+        };
+        let admitted = self
+            .local_slot()
+            .client_model
+            .as_ref()
+            .map(|model| model.task_detail_admitted(task_id));
+        match admitted {
+            // No canonical model yet: startup owns the wait, not this path.
+            None => return,
+            Some(true) => {
+                if self.local_slot().requested_task_detail == Some(task_id) {
+                    self.local_slot_mut().requested_task_detail = None;
+                }
+                return;
+            }
+            Some(false) => {}
+        }
+        if self.local_slot().requested_task_detail == Some(task_id) {
+            return;
+        }
+        let requested = match self.local_slot().host_runtime.as_ref() {
+            Some(NativeHostRuntimeAttachment::Client(runtime)) => {
+                runtime.request_task_detail(task_id);
+                true
+            }
+            _ => false,
+        };
+        if requested {
+            self.local_slot_mut().requested_task_detail = Some(task_id);
         }
     }
 
@@ -18802,6 +18930,10 @@ impl NativeShell {
                 self.local_slot_mut().host_state = NativeHostState::Error { message: error };
             }
         }
+        // Every drain is also the moment the selection and the model are both
+        // current, which is the only place that can tell a withheld detail from
+        // a task that genuinely has none.
+        self.request_selected_task_detail();
         kinds
     }
 

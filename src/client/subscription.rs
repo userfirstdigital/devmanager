@@ -19,6 +19,19 @@ const SNAPSHOT_SECTIONS: [SnapshotSection; 5] = [
     SnapshotSection::Resources,
     SnapshotSection::Operations,
 ];
+
+/// Detail sections one task-scoped fetch admits when the user selects a
+/// Settled or Archived task.
+///
+/// Operations are deliberately absent: nothing in the shell reads a settled
+/// operation, the client keeps `operations` only for pending-action
+/// reconciliation, and the startup projection already ships every operation
+/// that can still change.
+const TASK_DETAIL_SECTIONS: [SnapshotSection; 3] = [
+    SnapshotSection::AgentSessions,
+    SnapshotSection::Artifacts,
+    SnapshotSection::Resources,
+];
 const MAX_SEEN_EVENT_IDS: usize = 8_192;
 const MAX_PENDING_REPLAY_EVENTS: usize = 8_192;
 
@@ -664,6 +677,99 @@ impl ClientSubscription {
             Ok(Err(error)) => Err(SubscriptionError::Query(error)),
             Err(error) => Err(SubscriptionError::Transport(error)),
         }
+    }
+
+    /// Fetch and admit one Settled/Archived task's withheld detail rows.
+    ///
+    /// Idempotent by design: a task whose detail is already admitted returns
+    /// without any host round trip, which is what makes a second click free.
+    /// The task-scoped snapshot is released before the rows are admitted, so a
+    /// failure cannot strand a pinned host session.
+    pub async fn load_task_detail(
+        &mut self,
+        client: &mut HostClient,
+        task_id: crate::domain::TaskId,
+    ) -> Result<(), SubscriptionError> {
+        if self.state == ClientSubscriptionState::Released {
+            return Err(SubscriptionError::Released);
+        }
+        let model = self.model.as_ref().ok_or(SubscriptionError::NotReady)?;
+        if model.task_detail_admitted(task_id) {
+            return Ok(());
+        }
+        if !client
+            .granted_capabilities()
+            .contains(Capability::PagedSnapshots)
+        {
+            return Err(SubscriptionError::MissingCapabilities);
+        }
+
+        let mut pages = Vec::new();
+        let mut snapshot_id: Option<SnapshotId> = None;
+        let mut failure = None;
+        'sections: for section in TASK_DETAIL_SECTIONS {
+            let mut resume_cursor: Option<Vec<u8>> = None;
+            loop {
+                let page = match client
+                    .snapshot_page_scoped(
+                        section,
+                        Some(task_id),
+                        snapshot_id,
+                        resume_cursor.clone(),
+                    )
+                    .await
+                {
+                    Ok(Ok(page)) => page,
+                    Ok(Err(error)) => {
+                        failure = Some(SubscriptionError::Query(error));
+                        break 'sections;
+                    }
+                    Err(error) => {
+                        failure = Some(SubscriptionError::TransportAt {
+                            operation: format!("task detail snapshot {section:?}"),
+                            error,
+                        });
+                        break 'sections;
+                    }
+                };
+                if let Some(expected) = snapshot_id {
+                    if expected != page.snapshot_id {
+                        failure = Some(SubscriptionError::IncompleteSnapshot);
+                        break 'sections;
+                    }
+                } else {
+                    snapshot_id = Some(page.snapshot_id);
+                }
+                let next = page.next_cursor.clone();
+                pages.push(page);
+                match next {
+                    Some(cursor) => resume_cursor = Some(cursor),
+                    None => break,
+                }
+            }
+        }
+
+        if let Some(snapshot_id) = snapshot_id {
+            match client
+                .release_snapshot_scoped(snapshot_id, Some(task_id))
+                .await
+            {
+                Ok(Ok(())) | Ok(Err(QueryError::NotFound)) => {}
+                Ok(Err(error)) => {
+                    return Err(failure.unwrap_or(SubscriptionError::Query(error)));
+                }
+                Err(error) => {
+                    return Err(failure.unwrap_or(SubscriptionError::Transport(error)));
+                }
+            }
+        }
+        if let Some(failure) = failure {
+            return Err(failure);
+        }
+
+        let model = self.model.as_mut().ok_or(SubscriptionError::NotReady)?;
+        model.admit_task_detail_pages(task_id, &pages)?;
+        Ok(())
     }
 
     async fn release_snapshot_if_owned(

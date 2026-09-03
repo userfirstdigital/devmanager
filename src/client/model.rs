@@ -1215,6 +1215,43 @@ fn attention_rank(status: VisibleTaskStatus) -> u8 {
     }
 }
 
+/// A task's primary agent must be a Primary agent WHEN THE SNAPSHOT SHIPPED IT.
+///
+/// The startup projection withholds a Settled or Archived task's agent rows
+/// until the user selects it, so a missing primary there is the expected state
+/// rather than a corrupt one. For an Open or Closing task the row is always
+/// shipped, so a missing primary is still a projection fault.
+fn validate_primary_agent(task: &TaskSnapshot) -> Result<(), ClientModelError> {
+    let Some(primary) = task.primary_agent_id else {
+        return Ok(());
+    };
+    match task.agents.get(&primary) {
+        Some(agent) => {
+            if matches!(agent.role, crate::domain::agent::AgentRole::Primary) {
+                Ok(())
+            } else {
+                Err(ClientModelError::InvalidPrimaryAgent)
+            }
+        }
+        None => {
+            if task_detail_ships_at_startup(task.task.lifecycle) {
+                Err(ClientModelError::InvalidPrimaryAgent)
+            } else {
+                Ok(())
+            }
+        }
+    }
+}
+
+/// The client half of the kernel's startup projection predicate.
+///
+/// Kept as one named predicate so the two halves cannot drift: the kernel
+/// withholds exactly the lifecycles this returns false for.
+pub fn task_detail_ships_at_startup(lifecycle: crate::domain::task::TaskLifecycle) -> bool {
+    use crate::domain::task::TaskLifecycle;
+    matches!(lifecycle, TaskLifecycle::Open | TaskLifecycle::Closing)
+}
+
 /// Validated presentation-independent client projection.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ClientModel {
@@ -1230,6 +1267,10 @@ pub struct ClientModel {
     replay_page_count: usize,
     replay_cursors: HashSet<Vec<u8>>,
     task_projection_index: TaskProjectionIndex,
+    /// Tasks whose withheld detail sections have been admitted this session.
+    /// Empty at startup: an Open/Closing task never needs an entry because its
+    /// detail always ships.
+    admitted_task_detail: BTreeSet<TaskId>,
 }
 
 /// Bounded Tasks-only inbox preview. Never a substitute for [`ClientModel`]:
@@ -1472,6 +1513,127 @@ impl ClientModel {
         self.apply_one_event(event)
     }
 
+    /// Whether this task's detail sections are present in the model.
+    ///
+    /// An Open or Closing task is always complete because startup ships it. A
+    /// Settled or Archived task is complete only once a task-scoped snapshot
+    /// has been admitted for it.
+    pub fn task_detail_admitted(&self, task_id: TaskId) -> bool {
+        self.tasks.get(&task_id).is_some_and(|task| {
+            task_detail_ships_at_startup(task.task.lifecycle)
+                || self.admitted_task_detail.contains(&task_id)
+        })
+    }
+
+    /// Admit one task-scoped snapshot's detail rows for `task_id`.
+    ///
+    /// Every page must name the task's own rows; a row for another task is a
+    /// scope violation and rejects the whole admission, so a partly applied
+    /// detail can never be observed. Re-admitting an already-admitted task
+    /// replaces its detail rather than colliding with it, which is what a
+    /// durable event on that task makes necessary.
+    pub fn admit_task_detail_pages(
+        &mut self,
+        task_id: TaskId,
+        pages: &[SnapshotPage],
+    ) -> Result<(), ClientModelError> {
+        let mut candidate = self.clone();
+        candidate.admit_task_detail_pages_inner(task_id, pages)?;
+        *self = candidate;
+        Ok(())
+    }
+
+    fn admit_task_detail_pages_inner(
+        &mut self,
+        task_id: TaskId,
+        pages: &[SnapshotPage],
+    ) -> Result<(), ClientModelError> {
+        if !self.tasks.contains_key(&task_id) {
+            return Err(ClientModelError::MissingParentTask);
+        }
+        {
+            let task = self
+                .tasks
+                .get_mut(&task_id)
+                .ok_or(ClientModelError::MissingParentTask)?;
+            task.agents.clear();
+            task.resources.clear();
+        }
+        self.artifact_summaries
+            .retain(|_, summary| summary.task_id != task_id);
+
+        for page in pages {
+            for item in &page.items {
+                match (page.section, item) {
+                    (SnapshotSection::AgentSessions, SnapshotItem::AgentSession(agent)) => {
+                        if agent.task_id != task_id {
+                            return Err(ClientModelError::InvalidOwnership);
+                        }
+                        let task = self
+                            .tasks
+                            .get_mut(&task_id)
+                            .ok_or(ClientModelError::MissingParentTask)?;
+                        if task.agents.insert(agent.id, agent.clone()).is_some() {
+                            return Err(ClientModelError::DuplicateItem);
+                        }
+                    }
+                    (SnapshotSection::Resources, SnapshotItem::Resource(resource)) => {
+                        resource
+                            .validate()
+                            .map_err(|_| ClientModelError::InvalidOwnership)?;
+                        if resource.task_id != Some(task_id) {
+                            return Err(ClientModelError::InvalidOwnership);
+                        }
+                        let task = self
+                            .tasks
+                            .get_mut(&task_id)
+                            .ok_or(ClientModelError::MissingParentTask)?;
+                        if task
+                            .resources
+                            .insert(resource.id, resource.clone())
+                            .is_some()
+                        {
+                            return Err(ClientModelError::DuplicateItem);
+                        }
+                    }
+                    (SnapshotSection::Artifacts, SnapshotItem::Artifact(summary)) => {
+                        if summary.task_id != task_id {
+                            return Err(ClientModelError::InvalidOwnership);
+                        }
+                        if self
+                            .artifact_summaries
+                            .insert(summary.id, summary.clone())
+                            .is_some()
+                        {
+                            return Err(ClientModelError::DuplicateItem);
+                        }
+                    }
+                    _ => return Err(ClientModelError::SectionItemMismatch),
+                }
+            }
+        }
+
+        let task = self
+            .tasks
+            .get(&task_id)
+            .ok_or(ClientModelError::MissingParentTask)?
+            .clone();
+        validate_primary_agent(&task)?;
+        let occurred_at_ms = self.task_last_occurred_at_ms(task_id).unwrap_or_default();
+        self.task_projection_index
+            .update_task(&task, occurred_at_ms);
+        self.admitted_task_detail.insert(task_id);
+        Ok(())
+    }
+
+    /// Forget one task's admitted detail so the next selection refetches it.
+    ///
+    /// A durable event for the task can change its agents or resources, and the
+    /// event stream alone cannot reconstruct rows the snapshot never shipped.
+    pub fn invalidate_task_detail(&mut self, task_id: TaskId) {
+        self.admitted_task_detail.remove(&task_id);
+    }
+
     /// Apply every event on a frozen/live replay page, then advance the applied
     /// cursor to `through_sequence` when the page completes the frozen range.
     ///
@@ -1550,6 +1712,10 @@ impl ClientModel {
             self.tasks.insert(task_id, snapshot.clone());
             self.task_projection_index
                 .update_task(&snapshot, event.occurred_at_ms);
+            // The event stream cannot reconstruct rows the startup snapshot
+            // never shipped, so a task whose detail was fetched on selection
+            // must be refetched rather than left half-current.
+            self.admitted_task_detail.remove(&task_id);
         }
         if let Some((operation_id, facts)) = staged.operation {
             self.operations.insert(operation_id, facts);
@@ -2102,14 +2268,7 @@ impl ClientModelBuilder {
         }
 
         for task in tasks.values() {
-            if let Some(primary) = task.primary_agent_id {
-                let Some(agent) = task.agents.get(&primary) else {
-                    return Err(ClientModelError::InvalidPrimaryAgent);
-                };
-                if !matches!(agent.role, crate::domain::agent::AgentRole::Primary) {
-                    return Err(ClientModelError::InvalidPrimaryAgent);
-                }
-            }
+            validate_primary_agent(task)?;
         }
 
         for operation in self.operations.values() {
@@ -2132,6 +2291,7 @@ impl ClientModelBuilder {
             replay_page_count: 0,
             replay_cursors: HashSet::new(),
             task_projection_index,
+            admitted_task_detail: BTreeSet::new(),
         })
     }
 
@@ -2552,6 +2712,195 @@ mod tests {
             builder.ingest_page(page).expect("ingest empty section");
         }
         builder.finish().expect("finish model")
+    }
+
+    fn settled_task_item(
+        id: TaskId,
+        title: &str,
+        primary: Option<AgentSessionId>,
+    ) -> TaskSnapshotItem {
+        let mut item = task_item(id, title, primary);
+        item.task.lifecycle = TaskLifecycle::Settled;
+        item
+    }
+
+    fn detail_agent(task: TaskId, agent: AgentSessionId) -> AgentSessionFacts {
+        AgentSessionFacts {
+            id: agent,
+            task_id: task,
+            role: AgentRole::Primary,
+            provider_kind: ProviderKind::Codex,
+            provider_session_id: None,
+            lifecycle: AgentSessionLifecycle::Open,
+            runtime_generation: 0,
+            revision: 1,
+        }
+    }
+
+    fn detail_resource(task: TaskId, resource: ResourceId) -> ResourceFacts {
+        ResourceFacts {
+            id: resource,
+            task_id: Some(task),
+            owner_kind: OwnerKind::Task,
+            resource_kind: ResourceKind::Terminal,
+            recipe: ResourceRecipe::terminal(120, 40),
+            lifecycle: ResourceLifecycle::Active,
+            runtime_generation: 0,
+            updated_at_ms: 1,
+        }
+    }
+
+    #[test]
+    fn startup_model_admits_a_settled_task_with_no_children() {
+        // Catches: the startup projection withholding a settled task's agent
+        // row being read as a corrupt primary-agent binding.
+        let snap = snapshot_id(0xE0);
+        let task = task_id(0xE1);
+        let agent = agent_id(0xE2);
+        let model = assemble_all_sections(
+            snap,
+            1,
+            vec![page(
+                snap,
+                1,
+                SnapshotSection::Tasks,
+                None,
+                vec![SnapshotItem::Task(settled_task_item(
+                    task,
+                    "Settled",
+                    Some(agent),
+                ))],
+                None,
+            )],
+            Vec::new(),
+        );
+        let projected = model.task(task).expect("settled task is listed");
+        assert!(projected.agents.is_empty());
+        assert!(projected.resources.is_empty());
+        assert!(!model.task_detail_admitted(task));
+    }
+
+    #[test]
+    fn open_task_still_requires_its_primary_agent_row() {
+        // Catches: relaxing the primary-agent check for every lifecycle rather
+        // than only the ones whose detail the startup projection withholds.
+        let snap = snapshot_id(0xE3);
+        let task = task_id(0xE4);
+        let agent = agent_id(0xE5);
+        let mut builder = ClientModelBuilder::new();
+        builder
+            .ingest_page(page(
+                snap,
+                1,
+                SnapshotSection::Tasks,
+                None,
+                vec![SnapshotItem::Task(task_item(task, "Open", Some(agent)))],
+                None,
+            ))
+            .expect("ingest task page");
+        for section_page in empty_section_pages(snap, 1) {
+            builder.ingest_page(section_page).expect("ingest empty");
+        }
+        assert_eq!(
+            builder.finish().err(),
+            Some(ClientModelError::InvalidPrimaryAgent)
+        );
+    }
+
+    #[test]
+    fn task_detail_admission_is_idempotent_and_event_invalidated() {
+        // Catches: a second selection refetching, and a durable event leaving
+        // detail that the event stream cannot itself reconstruct marked fresh.
+        let snap = snapshot_id(0xE6);
+        let task = task_id(0xE7);
+        let agent = agent_id(0xE8);
+        let resource = resource_id(0xE9);
+        let mut model = assemble_all_sections(
+            snap,
+            1,
+            vec![page(
+                snap,
+                1,
+                SnapshotSection::Tasks,
+                None,
+                vec![SnapshotItem::Task(settled_task_item(
+                    task,
+                    "Settled",
+                    Some(agent),
+                ))],
+                None,
+            )],
+            Vec::new(),
+        );
+        assert!(!model.task_detail_admitted(task));
+
+        let detail = vec![
+            page(
+                snap,
+                1,
+                SnapshotSection::AgentSessions,
+                None,
+                vec![SnapshotItem::AgentSession(detail_agent(task, agent))],
+                None,
+            ),
+            page(
+                snap,
+                1,
+                SnapshotSection::Resources,
+                None,
+                vec![SnapshotItem::Resource(detail_resource(task, resource))],
+                None,
+            ),
+        ];
+        model
+            .admit_task_detail_pages(task, &detail)
+            .expect("admit task detail");
+        assert!(model.task_detail_admitted(task));
+        let projected = model.task(task).expect("task");
+        assert_eq!(projected.agents.len(), 1);
+        assert_eq!(projected.resources.len(), 1);
+
+        // Re-admitting the same rows replaces rather than collides, which is
+        // what a post-invalidation refetch does.
+        model
+            .admit_task_detail_pages(task, &detail)
+            .expect("re-admit task detail");
+        assert_eq!(model.task(task).expect("task").agents.len(), 1);
+
+        // A row belonging to another task is a scope violation.
+        let other = task_id(0xEA);
+        let foreign = vec![page(
+            snap,
+            1,
+            SnapshotSection::AgentSessions,
+            None,
+            vec![SnapshotItem::AgentSession(detail_agent(
+                other,
+                agent_id(0xEB),
+            ))],
+            None,
+        )];
+        assert_eq!(
+            model.admit_task_detail_pages(task, &foreign).err(),
+            Some(ClientModelError::InvalidOwnership)
+        );
+        // Refused wholesale: the earlier detail is untouched.
+        assert_eq!(model.task(task).expect("task").agents.len(), 1);
+
+        // A durable event for the task retires the admission.
+        model
+            .apply_event(&DomainEvent {
+                id: event_id(0xEC),
+                task_id: Some(task),
+                sequence: 2,
+                task_revision: Some(2),
+                occurred_at_ms: 2,
+                payload: Event::TaskRenamed {
+                    title: "Renamed".into(),
+                },
+            })
+            .expect("apply rename");
+        assert!(!model.task_detail_admitted(task));
     }
 
     #[test]

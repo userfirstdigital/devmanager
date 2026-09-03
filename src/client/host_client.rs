@@ -627,6 +627,20 @@ impl HostClient {
         snapshot_id: Option<SnapshotId>,
         resume_cursor: Option<Vec<u8>>,
     ) -> Result<Result<SnapshotPage, QueryError>, IpcError> {
+        self.snapshot_page_scoped(section, None, snapshot_id, resume_cursor)
+            .await
+    }
+
+    /// One page of a task-scoped snapshot: that task's rows for the section,
+    /// whatever its lifecycle. The unscoped form above is the startup
+    /// projection and deliberately withholds a settled task's detail.
+    pub async fn snapshot_page_scoped(
+        &mut self,
+        section: SnapshotSection,
+        task_id: Option<TaskId>,
+        snapshot_id: Option<SnapshotId>,
+        resume_cursor: Option<Vec<u8>>,
+    ) -> Result<Result<SnapshotPage, QueryError>, IpcError> {
         if !self
             .metadata
             .granted_capabilities()
@@ -644,7 +658,7 @@ impl HostClient {
                 .query(QueryEnvelope {
                     request_id,
                     client_id,
-                    task_id: None,
+                    task_id,
                     query: Query::SnapshotPage {
                         section,
                         snapshot_id,
@@ -688,6 +702,17 @@ impl HostClient {
         &mut self,
         snapshot_id: SnapshotId,
     ) -> Result<Result<(), QueryError>, IpcError> {
+        self.release_snapshot_scoped(snapshot_id, None).await
+    }
+
+    /// Release a snapshot opened under a task scope. The host compares the
+    /// whole session scope, so a task-scoped session can only be released by
+    /// naming the same task.
+    pub async fn release_snapshot_scoped(
+        &mut self,
+        snapshot_id: SnapshotId,
+        task_id: Option<TaskId>,
+    ) -> Result<Result<(), QueryError>, IpcError> {
         if !self
             .metadata
             .granted_capabilities()
@@ -704,7 +729,7 @@ impl HostClient {
                 .query(QueryEnvelope {
                     request_id,
                     client_id,
-                    task_id: None,
+                    task_id,
                     query: Query::ReleaseSnapshot { snapshot_id },
                 })
                 .await

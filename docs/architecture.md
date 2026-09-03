@@ -11,6 +11,30 @@ Installers place both binaries as siblings so the client can attach to the exact
 
 The host owns durable state and local work: tasks, operations, process/Job trees, PTYs, provider runtimes, browser automation surfaces, workspace/Git/services, and Connect/device secrets held in the OS vault. Desktop, CLI, automation, and optional Connect clients are clients of the same typed command/event contract. UI code does not reach around the host to mutate process, task, Git, browser, or provider state.
 
+## Startup projection and lazy task detail
+
+The unscoped kernel snapshot (`SessionScope.task_id == None`, `src/kernel/snapshot.rs`) is the
+STARTUP projection, not the whole store. Startup is what a client pays before it can show
+anything, and the shell renders a Done or Archived task's detail only after the user clicks it,
+so those rows are withheld until then:
+
+- `Tasks` — every task whose `lifecycle` is not `deleted`. Settled and Archived tasks are listed.
+- `Operations` — only `accepted` and `uncertain` operations, for any listed task, so pending-action
+  reconciliation still works. Terminal operations (`settled`/`failed`/`cancelled`) are history and
+  are never paged unscoped. An operation whose task is deleted is excluded too: the client refuses
+  a row whose parent task it was not given, and a task deleted between two purge sweeps
+  (`src/kernel/purge.rs`) still owns its rows.
+- `AgentSessions`, `Artifacts`, `Resources`, `BrowserContexts`, `BrowserTabs` — only rows whose task
+  is `open` or `closing`, plus host-owned resources, which have no task at all.
+
+The task-scoped snapshot (`SessionScope.task_id == Some(t)`) returns that task's rows for every
+section whatever its lifecycle, and is what a click on a Done or Archived task issues. The page
+shapes are unchanged; only which rows appear. The client mirrors the lifecycle half of the
+predicate in exactly one place, `client::model::task_detail_ships_at_startup`, so a task whose
+detail was withheld is not read as a corrupt projection, and admits the fetched rows once per task
+through `ClientModel::admit_task_detail_pages`. A durable event for that task retires the admission,
+because the event stream alone cannot reconstruct rows the snapshot never shipped.
+
 ## Host lifetime and terminal survivability
 
 Terminals live exactly as long as the host process, so the host is built to outlive everything except an explicit full quit:

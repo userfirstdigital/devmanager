@@ -596,6 +596,12 @@ enum DriverRequest {
         allow_explicit_confirm_with_active: bool,
         reply: oneshot::Sender<Result<FleetOwned<UpdateHandoffToken>, FleetError>>,
     },
+    /// Fetch and admit one task's detail rows into the canonical model.
+    LoadTaskDetail {
+        admission: FleetAdmission,
+        task_id: TaskId,
+        reply: oneshot::Sender<Result<FleetOwned<()>, FleetError>>,
+    },
     Synchronize {
         reply: oneshot::Sender<Result<FleetOwned<()>, FleetError>>,
     },
@@ -1533,6 +1539,31 @@ impl HostFleet {
                 client_build: client_build.to_string(),
                 host_build: host_build.to_string(),
                 allow_explicit_confirm_with_active,
+                reply,
+            })
+            .await
+    }
+
+    /// Admit one Settled/Archived task's withheld detail into the canonical
+    /// model, then republish it.
+    ///
+    /// The startup snapshot ships list rows for these tasks and nothing else,
+    /// so this is what a click on one costs. It is a no-op for a task whose
+    /// detail is already present, which is what makes the second click free.
+    pub async fn load_task_detail(
+        &self,
+        admission: &FleetAdmission,
+        task_id: TaskId,
+    ) -> Result<FleetOwned<()>, FleetError> {
+        let driver = self.live(&admission.host)?;
+        driver
+            .shared
+            .with_state(|state| state.admission_matches(admission))??;
+        let admission = admission.clone();
+        driver
+            .request(move |reply| DriverRequest::LoadTaskDetail {
+                admission,
+                task_id,
                 reply,
             })
             .await
@@ -2507,6 +2538,68 @@ async fn handle_request(
                 }
             }
         }
+        DriverRequest::LoadTaskDetail {
+            admission,
+            task_id,
+            reply,
+        } => {
+            match shared.with_state(|state| state.admission_matches(&admission)) {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) | Err(error) => {
+                    let _ = reply.send(Err(error));
+                    return;
+                }
+            }
+            let connected = shared
+                .with_state(|state| state.token.connected)
+                .unwrap_or(false);
+            if !connected || !client.is_connected() {
+                let _ = reply.send(Err(FleetError::DisconnectedReadOnly));
+                return;
+            }
+            let token = match shared.snapshot_token() {
+                Ok(token) => token,
+                Err(error) => {
+                    let _ = reply.send(Err(error));
+                    return;
+                }
+            };
+            let outcome = tokio::select! {
+                _ = wait_stop(stop) => {
+                    client.disconnect();
+                    Err(SubscriptionError::Transport(IpcError::Unavailable))
+                }
+                _ = wait_disconnect(shared) => {
+                    client.disconnect();
+                    Err(SubscriptionError::Transport(IpcError::Unavailable))
+                }
+                result = subscription.load_task_detail(client, task_id) => result,
+            };
+            if shared.fence_is_disconnect() {
+                apply_disconnect_now(client, subscription, shared);
+            }
+            match outcome {
+                Ok(()) => {
+                    if let Some(model) = subscription.model().cloned() {
+                        let _ = shared.with_state(|state| {
+                            state.cached_model = Some(Arc::new(model));
+                        });
+                    }
+                    shared.events_notify.notify_waiters();
+                    let _ = reply.send(Ok(FleetOwned {
+                        host: token.host,
+                        generation: token.generation,
+                        client_id: token.client_id,
+                        task_id: Some(task_id),
+                        value: (),
+                    }));
+                }
+                Err(error) => {
+                    observe_client_connection(shared, client);
+                    let _ = reply.send(Err(FleetError::from(error)));
+                }
+            }
+        }
         DriverRequest::Synchronize { reply } => {
             let connected = shared
                 .with_state(|state| state.token.connected)
@@ -2676,6 +2769,9 @@ fn reject_request(request: DriverRequest, shared: &HostDriverShared, wire_starte
             let _ = reply.send(Err(FleetError::HostFenced));
         }
         DriverRequest::PrepareUpdate { reply, .. } => {
+            let _ = reply.send(Err(FleetError::HostFenced));
+        }
+        DriverRequest::LoadTaskDetail { reply, .. } => {
             let _ = reply.send(Err(FleetError::HostFenced));
         }
         DriverRequest::Synchronize { reply } => {

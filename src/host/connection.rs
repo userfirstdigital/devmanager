@@ -6817,15 +6817,10 @@ impl HostRequestExecutor {
                 snapshot_id,
                 resume_cursor,
             } => {
-                // The kernel snapshot is global. A task-scoped envelope must
-                // not be allowed to borrow that view until a task-filtered
-                // snapshot implementation exists.
-                if task_id.is_some() {
-                    return Ok(QueryReply {
-                        request_id: envelope.request_id,
-                        outcome: QueryOutcome::Err(QueryError::InvalidRequest),
-                    });
-                }
+                // A task-scoped envelope now names the task whose detail the
+                // shell wants: the kernel serves that task's rows for every
+                // section, and the retained session carries the same scope, so
+                // a continuation cannot cross into another task's view.
                 if !negotiated.capabilities.contains(Capability::PagedSnapshots) {
                     return Ok(QueryReply {
                         request_id: envelope.request_id,
