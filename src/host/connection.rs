@@ -3424,8 +3424,7 @@ impl HostRequestExecutor {
                     tick.step("reap");
                     self.fan_out_conversation_dirty();
                     tick.step("conversation_dirty");
-                    self.reconcile_configured_services();
-                    tick.step("configured_services");
+                    self.reconcile_configured_services(&mut tick);
                     self.queue_one_provider_restore();
                     tick.step("provider_restore");
                     self.pump_shell_terminal_facts();
@@ -3535,8 +3534,7 @@ impl HostRequestExecutor {
                     tick.step("reap");
                     self.fan_out_conversation_dirty();
                     tick.step("conversation_dirty");
-                    self.reconcile_configured_services();
-                    tick.step("configured_services");
+                    self.reconcile_configured_services(&mut tick);
                     self.queue_one_provider_restore();
                     tick.step("provider_restore");
                     self.pump_shell_terminal_facts();
@@ -3862,7 +3860,12 @@ impl HostRequestExecutor {
     /// Pump the host-owned configured supervisor on the maintenance lane. The
     /// service panel and action path therefore observe reconciled process/port
     /// evidence without doing probes or process work in request dispatch.
-    fn reconcile_configured_services(&mut self) {
+    ///
+    /// This is the most expensive region of a maintenance tick, so it stamps
+    /// the caller's [`LaneTickTimer`] per sub-step (`cs.*`) rather than being
+    /// timed as one opaque `configured_services` block: a slow tick has to name
+    /// the step that starved the lane, not the function that contains it.
+    fn reconcile_configured_services(&mut self, tick: &mut LaneTickTimer) {
         // Capture dispatch/flush/failure results under the runtime borrow, then
         // release it before mutating restore queues owned by `self`. Disjoint
         // field borrows (`bus` + `configured_service_runtime`) keep this compiling.
@@ -3876,6 +3879,7 @@ impl HostRequestExecutor {
         {
             let bus = &mut self.bus;
             runtime.manager.reconcile_provider_terminal_exits_now();
+            tick.step("cs.terminal_exits");
             let held_restarts = if dispatch_due {
                 match run_provider_dispatch_pass(bus, &runtime.provider_dispatch) {
                     Ok(held) => held,
@@ -3887,14 +3891,23 @@ impl HostRequestExecutor {
             } else {
                 Vec::new()
             };
+            tick.step("cs.dispatch_pass");
             if let Ok(mut journal) = runtime.semantic_journal.lock() {
                 if let Err(error) = journal.flush_if_dirty() {
                     host_log!("devmanager-host: conversation history flush failed: {error}");
                 }
             }
+            tick.step("cs.journal_flush");
+            // The snapshot vector is discarded on purpose: the call's reason
+            // to exist on this lane is the `pump_io()` inside it, which drains
+            // every configured service's reader output into its bounded log.
+            // Nothing here reads the projection -- the cockpit builds its own
+            // through `configured_service_snapshots_for_task`.
             let _ = runtime.manager.configured_service_snapshots();
+            tick.step("cs.snapshots");
             let failures = runtime.manager.drain_provider_session_failures();
             let repins = runtime.manager.drain_provider_executable_repins();
+            tick.step("cs.drain_failures");
             (held_restarts, failures, repins)
         } else {
             (Vec::new(), Vec::new(), Vec::new())
@@ -3927,9 +3940,11 @@ impl HostRequestExecutor {
             }
             self.mark_provider_restore_failed(failure.task_id);
         }
+        tick.step("cs.queue_restarts");
         if let Err(error) = self.sync_provider_session_identities() {
             host_log!("devmanager-host: provider session identity sync failed: {error}");
         }
+        tick.step("cs.identity_sync");
     }
 
     fn queue_held_provider_restart(
