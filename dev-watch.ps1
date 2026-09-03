@@ -84,6 +84,7 @@ function Stop-ManagedApp {
 }
 
 function Stop-StaleLiveCopies {
+    $script:StaleKillErrors = @()
     $liveProcesses = @(
         @{ Name = "devmanager.exe"; Path = $LiveExe },
         @{ Name = "devmanager-host.exe"; Path = $LiveHostExe }
@@ -100,13 +101,22 @@ function Stop-StaleLiveCopies {
             }
 
             Write-Status ("Stopping stale live {0} (pid {1})." -f $liveProcess.Name, $copy.ProcessId) "warn"
-            Stop-Process -Id $copy.ProcessId -Force -ErrorAction SilentlyContinue
+            # A silenced kill plus a bare timeout below cannot say WHY a copy
+            # survived, and the two failures need opposite remedies: an access
+            # error means another launcher owns it, a still-running process
+            # means it is shutting down slowly. Record the reason for the wait.
+            try {
+                Stop-Process -Id $copy.ProcessId -Force -ErrorAction Stop
+            } catch {
+                $script:StaleKillErrors += ("{0} (pid {1}): {2}" -f $liveProcess.Name, $copy.ProcessId, $_.Exception.Message)
+                Write-Status ("Could not stop {0} (pid {1}): {2}" -f $liveProcess.Name, $copy.ProcessId, $_.Exception.Message) "error"
+            }
         }
     }
 }
 
 function Wait-ForStaleLiveCopiesToExit {
-    param([int]$TimeoutMs = 10000)
+    param([int]$TimeoutMs = 20000)
 
     $targets = @(
         @{ Name = "devmanager.exe"; Path = $LiveExe.ToLowerInvariant() },
@@ -127,7 +137,12 @@ function Wait-ForStaleLiveCopiesToExit {
     } while ((Get-Date) -lt $deadline)
 
     $remaining = $running | ForEach-Object { "{0} (pid {1})" -f $_.Name, $_.ProcessId }
-    throw ("Timed out waiting for stale live processes to exit: {0}." -f ($remaining -join ", "))
+    $reason = if ($script:StaleKillErrors -and $script:StaleKillErrors.Count -gt 0) {
+        " Stop-Process refused: " + ($script:StaleKillErrors -join "; ") + "."
+    } else {
+        " The kill was accepted but they are still running; another dev-watch/launch-dev instance may have just started them. Close the DevManager window, or stop them with: Stop-Process -Id <pid> -Force."
+    }
+    throw ("Timed out after {0}s waiting for stale live processes to exit: {1}.{2}" -f [int]($TimeoutMs / 1000), ($remaining -join ", "), $reason)
 }
 
 function Wait-ForFileUnlock {
