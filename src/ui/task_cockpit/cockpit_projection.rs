@@ -34,6 +34,10 @@ pub enum CockpitSurfaceLoad {
     },
     Unavailable {
         reason: TaskCockpitUnavailableReason,
+        /// The host's own sentence for this refusal, when it sent one. The
+        /// wire reason is a closed enum, so "no shell found; tried: ..." and
+        /// "git authority was never issued" are indistinguishable without it.
+        detail: Option<String>,
     },
 }
 
@@ -45,7 +49,11 @@ impl CockpitSurfaceLoad {
             Self::Ready => "ready".into(),
             Self::Error { message } => message.clone(),
             Self::Denied { reason } => format!("denied:{reason:?}"),
-            Self::Unavailable { reason } => format!("unavailable:{reason:?}"),
+            Self::Unavailable {
+                reason,
+                detail: Some(detail),
+            } => format!("unavailable:{reason:?}: {detail}"),
+            Self::Unavailable { reason, .. } => format!("unavailable:{reason:?}"),
         }
     }
 
@@ -158,8 +166,11 @@ impl TaskCockpitLiveProjection {
             TaskCockpitResult::Denied { reason, .. } => {
                 self.load = CockpitSurfaceLoad::Denied { reason: *reason };
             }
-            TaskCockpitResult::Unavailable { reason, .. } => {
-                self.load = CockpitSurfaceLoad::Unavailable { reason: *reason };
+            TaskCockpitResult::Unavailable { reason, detail, .. } => {
+                self.load = CockpitSurfaceLoad::Unavailable {
+                    reason: *reason,
+                    detail: detail.clone(),
+                };
             }
             TaskCockpitResult::GitRepositories(_) => {
                 self.repositories = None;
@@ -285,7 +296,14 @@ pub fn summary_line(projection: &TaskCockpitLiveProjection, kind: CockpitSurface
         (CockpitSurfaceLoad::Loading { action_id }, _) => format!("Loading {action_id}"),
         (CockpitSurfaceLoad::Error { message }, _) => message.clone(),
         (CockpitSurfaceLoad::Denied { reason }, _) => format!("Denied ({reason:?})"),
-        (CockpitSurfaceLoad::Unavailable { reason }, _) => format!("Unavailable ({reason:?})"),
+        (
+            CockpitSurfaceLoad::Unavailable {
+                reason,
+                detail: Some(detail),
+            },
+            _,
+        ) => format!("Unavailable ({reason:?}): {detail}"),
+        (CockpitSurfaceLoad::Unavailable { reason, .. }, _) => format!("Unavailable ({reason:?})"),
         (CockpitSurfaceLoad::Empty, CockpitSurfaceKind::Git) => "No git changes".into(),
         (CockpitSurfaceLoad::Empty, CockpitSurfaceKind::Files) => "No files in this folder".into(),
         (CockpitSurfaceLoad::Empty, CockpitSurfaceKind::Ssh) => "No SSH endpoints".into(),
@@ -528,11 +546,53 @@ mod tests {
             projection.load,
             CockpitSurfaceLoad::Unavailable {
                 reason: TaskCockpitUnavailableReason::GitAuthorityNotIssued,
+                detail: None,
             }
         );
         assert_eq!(
             surface_query_action_id(TaskCockpitSurface::Git),
             Some(ACTION_GIT_STATUS)
+        );
+    }
+
+    /// An `Unavailable` reply's `detail` reaches the surface panel.
+    ///
+    /// The wire `reason` is a closed enum, so "no shell found; tried: pwsh,
+    /// cmd.exe" and every other named cause collapse to one word without it.
+    /// The action line already shows the host's sentence; the panel dropped it
+    /// on the floor and rendered `Unavailable (TerminalUnavailable)`.
+    #[test]
+    fn an_unavailable_reply_keeps_the_detail_that_names_its_cause() {
+        let task_id = task_id();
+        let mut projection = TaskCockpitLiveProjection::empty(task_id);
+        projection.apply_result(&TaskCockpitResult::Unavailable {
+            surface: TaskCockpitSurface::Terminal,
+            reason: TaskCockpitUnavailableReason::TerminalUnavailable,
+            detail: Some("no shell found; tried: pwsh, cmd.exe".into()),
+        });
+        assert_eq!(
+            projection.load,
+            CockpitSurfaceLoad::Unavailable {
+                reason: TaskCockpitUnavailableReason::TerminalUnavailable,
+                detail: Some("no shell found; tried: pwsh, cmd.exe".into()),
+            }
+        );
+        let summary = summary_line(&projection, CockpitSurfaceKind::Services);
+        assert!(
+            summary.contains("no shell found; tried: pwsh, cmd.exe"),
+            "the panel must name the cause it was given: {summary}"
+        );
+
+        // A refusal the host did not name still reads as before, so the detail
+        // is carried rather than invented.
+        projection.apply_result(&TaskCockpitResult::Unavailable {
+            surface: TaskCockpitSurface::Git,
+            reason: TaskCockpitUnavailableReason::GitAuthorityNotIssued,
+            detail: None,
+        });
+        assert_eq!(
+            summary_line(&projection, CockpitSurfaceKind::Git),
+            "Unavailable (GitAuthorityNotIssued)"
         );
     }
 

@@ -2801,6 +2801,15 @@ impl ShellSessionLink {
 /// One accepted terminal-lifecycle command that owes a host process effect.
 #[derive(Clone, Copy)]
 enum AcceptedShellEffect {
+    /// Retained deliberately, and unreachable today.
+    ///
+    /// `Command::OpenShellTerminal` is host-authority-only and refused on both
+    /// wire lanes, so no accepted client request can carry one. The mapping
+    /// stays total anyway: `Close` shares this function and IS client-sendable,
+    /// and if the open gate is ever relaxed the process effect must fire with
+    /// it rather than leaving a registered resource with no shell behind it.
+    /// `only_shell_lifecycle_commands_owe_a_host_process_effect` pins the
+    /// mapping either way.
     Open {
         task_id: TaskId,
         resource_id: ResourceId,
@@ -4319,9 +4328,10 @@ impl HostRequestExecutor {
         // else publishes its events; every other host-authorized write in this
         // executor fans out for the same reason.
         self.fan_out_live_durable_events();
-        // Registration and the real process are two steps. The accepted-request
-        // path fires this for a client-sent command; this one is host-issued,
-        // so it has to start the effect itself.
+        // Registration and the real process are two steps, and this is the only
+        // path that takes the second one. `Command::OpenShellTerminal` is
+        // refused on both wire lanes, so the accepted-request effect lane never
+        // sees an open; a host-issued command has to start the process itself.
         self.open_shell_terminal_after_accept(task_id, resource_id);
         Ok(())
     }

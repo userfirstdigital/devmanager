@@ -1686,8 +1686,15 @@ mod workspace_authority_tests {
     }
 }
 
+/// Plain-shell terminal commands and provider restart identity.
+///
+/// Named for both, because it holds both: the shell open/rename/strip/close
+/// suite, the per-task shell cap, the projection rebuild, and the three
+/// provider-restart-identity tests it started as. A module named only for the
+/// latter made `cargo test terminal`-shaped filtered runs match zero tests and
+/// exit 0, which reads as a green run of the shell suite.
 #[cfg(test)]
-mod provider_restart_identity_tests {
+mod terminal_and_provider_restart_tests {
     use super::*;
     use crate::domain::command::{CreateTaskIntent, OpenShellTerminalIntent, ProviderStartMode};
     use crate::domain::resource::ResourceRecipe;
