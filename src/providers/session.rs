@@ -1765,6 +1765,24 @@ impl PersistedProcessRoot {
             && self.executable_sha256 == *executable.sha256()
     }
 
+    /// Adopt a re-pinned executable digest for a root that names the SAME
+    /// canonical file as the launch spec.
+    ///
+    /// The digest is the only field that may move, and only because the file
+    /// it commits to is literally the file `revalidate_persisted` has just put
+    /// through every check a fresh launch applies. A root naming a DIFFERENT
+    /// path is left untouched so [`Self::validate`] still refuses it with its
+    /// named code. Returns whether the digest actually moved.
+    fn adopt_repinned_executable(&mut self, executable: &ProviderExecutable) -> bool {
+        if self.canonical_executable != executable.canonical_path()
+            || self.executable_sha256 == *executable.sha256()
+        {
+            return false;
+        }
+        self.executable_sha256 = *executable.sha256();
+        true
+    }
+
     fn validate(&self, executable: &ProviderExecutable) -> Result<(), String> {
         if self.pid == 0 || self.creation_time_100ns == 0 {
             return Err("persisted managed process root identity is zero".to_string());
@@ -1947,6 +1965,10 @@ pub struct ProviderExecutableRepin {
     pub current_sha256: [u8; 32],
     pub current_file_identity: ProviderFileIdentity,
     pub repinned_at_ms: u64,
+    /// Whether the managed process root's pin to the same file moved with it.
+    /// Absent on rows written before the root was covered.
+    #[serde(default)]
+    pub process_root_repinned: bool,
 }
 
 #[derive(Clone, Eq)]
@@ -3339,6 +3361,7 @@ impl ProviderSessionState {
                 current_sha256: *current.sha256(),
                 current_file_identity: *current.file_identity(),
                 repinned_at_ms: repin_now_ms(),
+                process_root_repinned: false,
             }),
         };
         let executable = revalidated.into_current();
@@ -3371,6 +3394,7 @@ impl ProviderSessionState {
                             current_sha256: *current.sha256(),
                             current_file_identity: *current.file_identity(),
                             repinned_at_ms: repin_now_ms(),
+                            process_root_repinned: false,
                         });
                     }
                 }
@@ -3427,12 +3451,23 @@ impl ProviderSessionState {
             generation: persisted_launch.generation,
             launch_nonce: LaunchNonce::from_raw(persisted_launch.launch_nonce),
         };
-        let process_root = wire.process_root.map(|root| PersistedProcessRoot {
+        let mut process_root = wire.process_root.map(|root| PersistedProcessRoot {
             pid: root.pid,
             creation_time_100ns: root.creation_time_100ns,
             canonical_executable: root.canonical_executable,
             executable_sha256: root.executable_sha256,
         });
+        // The launch spec is not the only place the old digest was pinned: the
+        // managed process root commits to the same file, and re-pinning one
+        // without the other just moves the refusal to the consistency check
+        // below. Same canonical path plus the checks already run on that exact
+        // file is the whole admission rule; a root naming a different path is
+        // left alone and still refused.
+        if let (Some(root), Some(repin)) = (&mut process_root, &mut pending_executable_repin) {
+            if root.adopt_repinned_executable(&launch_spec.executable) {
+                repin.process_root_repinned = true;
+            }
+        }
         if let Some(root) = &process_root {
             root.validate(&launch_spec.executable)?;
         }
@@ -10890,7 +10925,10 @@ mod tests {
 
     /// A provider that replaced its own binary at the same canonical path.
     /// Returns the state to persist and the path that will be rewritten.
-    fn repin_fixture_state(executable: ProviderExecutable) -> ProviderSessionState {
+    fn repin_fixture_state(
+        executable: ProviderExecutable,
+        process_root: Option<PersistedProcessRoot>,
+    ) -> ProviderSessionState {
         let runtime = unit_runtime();
         let mut launch_spec = runtime.launch_spec();
         launch_spec.executable = executable;
@@ -10904,9 +10942,20 @@ mod tests {
             launch_nonce: runtime.launch_nonce(),
             launch_spec,
             provider_session_id: None,
-            process_root: None,
+            process_root,
             repinned_executable: None,
             pending_executable_repin: None,
+        }
+    }
+
+    /// A live managed root pinned to the same file as the launch spec, which
+    /// is what every actually-running session persists.
+    fn repin_fixture_root(executable: &ProviderExecutable) -> PersistedProcessRoot {
+        PersistedProcessRoot {
+            pid: 4242,
+            creation_time_100ns: 133_000_000_000_000_000,
+            canonical_executable: executable.canonical_path().to_path_buf(),
+            executable_sha256: *executable.sha256(),
         }
     }
 
@@ -10933,7 +10982,11 @@ mod tests {
         let executable = ProviderExecutable::from_path(&exe_path).unwrap();
         let canonical = executable.canonical_path().to_path_buf();
         let previous_sha256 = *executable.sha256();
-        let state = repin_fixture_state(executable);
+        // A running session persists a managed process root pinned to the same
+        // file. Re-pinning only the launch spec moves the refusal one check
+        // later instead of fixing it, so the fixture must carry the root.
+        let root = repin_fixture_root(&executable);
+        let state = repin_fixture_state(executable, Some(root));
         let agent_id = state.agent_session_id;
         let db = tempfile::NamedTempFile::new().unwrap();
         {
@@ -10981,7 +11034,28 @@ mod tests {
             .expect("the durable record survives the reload");
         assert_eq!(record.previous_sha256, previous_sha256);
         assert_eq!(record.current_sha256, *launch.executable.sha256());
+        assert!(
+            record.process_root_repinned,
+            "the managed process root pins the same file and must move with it"
+        );
         assert!(reloaded.pending_executable_repin.is_none());
+        let reloaded_root = reloaded
+            .process_root
+            .as_ref()
+            .expect("the process root survives the re-pin");
+        assert_eq!(reloaded_root.canonical_executable, canonical);
+        assert_eq!(reloaded_root.executable_sha256, *launch.executable.sha256());
+        assert_eq!(reloaded_root.pid, 4242);
+        // The written row must also satisfy the wire-level root/launch-spec
+        // consistency check that task enumeration applies, or the very row the
+        // re-pin wrote becomes unreadable to `list_open_for_task`.
+        assert_eq!(
+            reloaded_store
+                .list_open_for_task(reloaded.task_id)
+                .unwrap()
+                .len(),
+            1
+        );
         drop(reloaded);
         drop(reloaded_store);
 
@@ -11000,13 +11074,56 @@ mod tests {
     }
 
     #[test]
+    fn a_process_root_naming_a_different_path_is_still_refused_after_a_repin() {
+        let temp = tempfile::tempdir().unwrap();
+        let exe_path = temp.path().join("provider-root-mismatch.exe");
+        let other_path = temp.path().join("provider-root-elsewhere.exe");
+        std::fs::copy(std::env::current_exe().unwrap(), &exe_path).unwrap();
+        std::fs::copy(std::env::current_exe().unwrap(), &other_path).unwrap();
+        let executable = ProviderExecutable::from_path(&exe_path).unwrap();
+        let other = ProviderExecutable::from_path(&other_path).unwrap();
+        let canonical = executable.canonical_path().to_path_buf();
+        let other_canonical = other.canonical_path().to_path_buf();
+        drop(other);
+        let root = repin_fixture_root(&executable);
+        let state = repin_fixture_state(executable, Some(root));
+        let agent_id = state.agent_session_id;
+        let db = tempfile::NamedTempFile::new().unwrap();
+        let mut store = SqliteProviderSessionStateStore::open(db.path()).unwrap();
+        store.persist(state.clone()).unwrap();
+        // Rewrite the row so the root names a different file. `encode` would
+        // refuse to produce this, which is exactly why it is written directly.
+        let mut wire: serde_json::Value = serde_json::from_slice(&state.encode().unwrap()).unwrap();
+        wire["process_root"]["canonical_executable"] =
+            serde_json::to_value(&other_canonical).unwrap();
+        store
+            .connection
+            .execute(
+                "UPDATE provider_session_states SET state_json = ?1 WHERE agent_session_id = ?2",
+                params![serde_json::to_vec(&wire).unwrap(), agent_id.to_string()],
+            )
+            .unwrap();
+        drop(state);
+        // The provider updates itself in place, so a re-pin is in play.
+        let mut bytes = std::fs::read(&canonical).unwrap();
+        bytes.extend_from_slice(&[0_u8; 4096]);
+        std::fs::write(&canonical, &bytes).unwrap();
+
+        let error = store.load(agent_id).unwrap_err();
+        assert!(
+            error.contains("persisted managed process root executable identity is inconsistent"),
+            "a root pinned to a DIFFERENT file must never be adopted by a re-pin: {error}"
+        );
+    }
+
+    #[test]
     fn session_load_still_refuses_a_non_native_replacement() {
         let temp = tempfile::tempdir().unwrap();
         let exe_path = temp.path().join("provider-broken.exe");
         std::fs::copy(std::env::current_exe().unwrap(), &exe_path).unwrap();
         let executable = ProviderExecutable::from_path(&exe_path).unwrap();
         let canonical = executable.canonical_path().to_path_buf();
-        let state = repin_fixture_state(executable);
+        let state = repin_fixture_state(executable, None);
         let agent_id = state.agent_session_id;
         let db = tempfile::NamedTempFile::new().unwrap();
         {
