@@ -147,6 +147,7 @@ pub struct StartupTrace {
     attempt: u32,
     detail: Option<String>,
     failure_detail: Option<String>,
+    reached_ready: bool,
 }
 
 impl Default for StartupTrace {
@@ -164,12 +165,17 @@ impl StartupTrace {
             attempt: 1,
             detail: None,
             failure_detail: None,
+            reached_ready: false,
         }
     }
 
     /// Enter `phase`, resetting the attempt counter. Records one entry.
     pub fn enter(&mut self, phase: StartupPhase, detail: Option<String>) -> StartupTraceEntry {
         self.current = phase;
+        // Sticky: a later reconnect rewinds `current` so the same loading line
+        // can name the wait, but the session has still been Ready once and the
+        // actions that startup disabled must not be taken away again.
+        self.reached_ready |= phase == StartupPhase::Ready;
         self.attempt = 1;
         self.detail = detail.clone();
         // Reaching a new phase is progress: whatever the previous one was
@@ -253,6 +259,15 @@ impl StartupTrace {
     /// The most recent detail text, whichever call recorded it.
     pub fn detail(&self) -> Option<&str> {
         self.detail.as_deref()
+    }
+
+    /// Whether this session has EVER reached [`StartupPhase::Ready`].
+    ///
+    /// Not the same question as `current() >= Ready`: a reconnect rewinds the
+    /// phase to name its wait, and that must not re-disable New task on a
+    /// client whose tasks are already loaded.
+    pub fn reached_ready(&self) -> bool {
+        self.reached_ready
     }
 
     /// The last failure this phase recorded, cleared when the next phase is
@@ -472,6 +487,11 @@ impl SharedStartupTrace {
 
     pub fn current(&self) -> StartupPhase {
         self.lock().trace.current()
+    }
+
+    /// See [`StartupTrace::reached_ready`].
+    pub fn reached_ready(&self) -> bool {
+        self.lock().trace.reached_ready()
     }
 
     pub fn attempt(&self) -> u32 {
@@ -801,6 +821,24 @@ mod tests {
         assert_eq!(trace.current(), StartupPhase::HostConnect);
         assert_eq!(trace.entries().len(), 2);
         assert_eq!(trace.entries()[1].detail(), Some("connect refused"));
+    }
+
+    #[test]
+    fn reaching_ready_is_sticky_across_a_reconnect_that_rewinds_the_phase() {
+        let trace = SharedStartupTrace::detached();
+        trace.enter(StartupPhase::SnapshotPages, None);
+        assert!(!trace.reached_ready());
+
+        trace.note_ready(None);
+        assert!(trace.reached_ready());
+
+        // A post-Ready resync goes round the synchronize unit again.
+        trace.retry_in(StartupPhase::Synchronize, Some("fleet resync".to_string()));
+        assert_eq!(trace.current(), StartupPhase::Synchronize);
+        assert!(
+            trace.reached_ready(),
+            "a reconnect names its wait; it does not un-load the session"
+        );
     }
 
     #[test]

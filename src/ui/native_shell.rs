@@ -18996,8 +18996,14 @@ impl NativeShell {
     ///
     /// A dead New task button was the original complaint: it looked live and
     /// did nothing for thirty seconds. It is disabled with a named cause now.
+    ///
+    /// Only until the FIRST Ready of the session. A later reconnect rewinds the
+    /// phase so the same line can name that wait (the phase line still paints),
+    /// but a client whose tasks are already loaded must not have its buttons
+    /// taken away every time a resync goes round -- most of which settle in
+    /// milliseconds, and would read as a flicker rather than as a state.
     pub(crate) fn startup_gates_actions(&self) -> bool {
-        self.startup_trace.current() < StartupPhase::Ready
+        !self.startup_trace.reached_ready()
     }
 
     /// Record a failure only while startup is still in progress. Host errors
@@ -45919,6 +45925,7 @@ mod tests {
         ProviderSetupApprovalState,
         ProviderSetupInputCompletion,
         ReaperKind,
+        SharedStartupTrace,
         ShellStage,
         StartupPhase,
         TaskComposer,
@@ -50828,6 +50835,10 @@ mod tests {
         let (runtime, shared) = TestRuntime::new(true, NativeHostActionResult::Queued);
         let (model, task_id) = open_task_without_agent_client_model();
         with_test_shell_in_app(cx, runtime, |shell| {
+            // The fixture seeds Ready, and reaching Ready is sticky. This
+            // scenario is about a client that has NEVER been Ready, so it takes
+            // a fresh trace rather than trying to rewind a sticky flag.
+            shell.startup_trace = SharedStartupTrace::detached();
             let epochs = shared.lock().expect("test runtime state").epochs;
             shared
                 .lock()
@@ -50890,6 +50901,49 @@ mod tests {
                 "the liveness copy is honest once the model is admitted"
             );
             shell.local_slot_mut().composer_error = None;
+        });
+    }
+
+    /// A reconnect after the session has loaded is a wait worth NAMING and not
+    /// a reason to take the buttons away: most resyncs settle in milliseconds,
+    /// and a disabled New task that flickers reads as a broken control rather
+    /// than as a state.
+    fn a_post_ready_resync_paints_the_phase_line_without_disabling_actions(cx: &mut gpui::App) {
+        let (runtime, _shared) = TestRuntime::new(true, NativeHostActionResult::Queued);
+        with_test_shell_in_app(cx, runtime, |shell| {
+            // A client that has never been Ready: gated, and saying why.
+            shell.startup_trace = SharedStartupTrace::detached();
+            shell
+                .startup_trace()
+                .enter(StartupPhase::SnapshotPages, None);
+            assert!(shell.startup_gates_actions());
+
+            shell.startup_trace().enter(StartupPhase::Ready, None);
+            assert!(!shell.startup_gates_actions());
+            assert_eq!(
+                shell.startup_status_line(),
+                None,
+                "a Ready client paints no loading line"
+            );
+
+            // A post-Ready NeedsResync re-enters Synchronize.
+            shell.startup_trace().retry_in(
+                StartupPhase::Synchronize,
+                Some("fleet resync (transport reconnect=false)".to_string()),
+            );
+            assert_eq!(
+                shell.startup_trace().current(),
+                StartupPhase::Synchronize,
+                "a resync rewinds the phase so the wait can be named"
+            );
+            let line = shell
+                .startup_status_line()
+                .expect("a reconnect paints the same phase line");
+            assert_eq!(line.primary, "Synchronizing\u{2026}");
+            assert!(
+                !shell.startup_gates_actions(),
+                "a reconnect must never disable New task on a loaded session"
+            );
         });
     }
 
@@ -51087,6 +51141,7 @@ mod tests {
             successful_resync_projection_restores_runtime_connection(cx);
             startup_trace_reaches_first_projection_and_records_synchronize_failures(cx);
             startup_phase_line_replaces_liveness_and_gates_task_creation(cx);
+            a_post_ready_resync_paints_the_phase_line_without_disabling_actions(cx);
             action_outcome_retention_pressure_keeps_exact_overflow_record(cx);
             native_shell_drop_retains_pending_overflow_and_deferred_as_uncertain(cx);
             *completed_for_app.borrow_mut() = true;
