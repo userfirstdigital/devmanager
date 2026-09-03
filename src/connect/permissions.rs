@@ -427,7 +427,10 @@ mod tests {
 
         for query in [
             TaskCockpitQuery::TerminalScroll { delta_lines: 3 },
-            TaskCockpitQuery::TerminalResize { cols: 100, rows: 30 },
+            TaskCockpitQuery::TerminalResize {
+                cols: 100,
+                rows: 30,
+            },
             TaskCockpitQuery::TerminalScrollFor {
                 resource_id,
                 delta_lines: -3,
