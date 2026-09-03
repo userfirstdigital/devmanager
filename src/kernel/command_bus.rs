@@ -2802,13 +2802,19 @@ mod terminal_and_provider_restart_tests {
         };
 
         // Rewind the schema to V15 exactly as a store written before this task
-        // would look: the log is untouched, the two projection tables are gone.
+        // would look: the log is untouched, the two projection tables are gone,
+        // and the V17 identity columns and indexes are gone with them (the
+        // indexes first, or SQLite refuses to drop the columns they name).
         {
             let conn = Connection::open(&path).expect("raw reopen");
             conn.execute_batch(
-                "DELETE FROM schema_migrations WHERE version = 16;\n\
+                "DELETE FROM schema_migrations WHERE version IN (16, 17);\n\
                  DROP TABLE task_terminal_strip;\n\
-                 DROP TABLE terminal_facts;",
+                 DROP TABLE terminal_facts;\n\
+                 DROP INDEX idx_events_operation;\n\
+                 DROP INDEX idx_events_command;\n\
+                 ALTER TABLE events DROP COLUMN operation_id;\n\
+                 ALTER TABLE events DROP COLUMN command_id;",
             )
             .expect("rewind to v15");
         }
@@ -2911,6 +2917,462 @@ mod terminal_and_provider_restart_tests {
             1_725_000_000_100,
         )
         .expect("provider terminal facts")
+    }
+
+    /// One task plus one pure task command, so the store holds an
+    /// `operation.accepted` and its `operation.settled`. Returns the store path
+    /// and the command id that owns them.
+    fn store_with_one_operation(
+        directory: &std::path::Path,
+    ) -> (std::path::PathBuf, CommandId, TaskId) {
+        let path = directory.join("tasks.sqlite");
+        let client_id = ClientId::new();
+        let mut bus = CommandBus::open(&path).expect("bus");
+        let (task_id, revision) = create_open_task(&mut bus, client_id);
+        let provider = provider_terminal_facts(task_id);
+        let envelope = task_envelope(
+            client_id,
+            task_id,
+            revision,
+            Command::RegisterResource { resource: provider },
+        );
+        let command_id = envelope.command_id;
+        let _ = accepted_revision(bus.execute(envelope).expect("register provider terminal"));
+        (path, command_id, task_id)
+    }
+
+    /// The V17 identity columns are written by the append path itself, and only
+    /// for facts that name an operation. Asserting they are non-NULL is not
+    /// enough -- the column has to carry the id the payload carries, which is
+    /// what the join against the operations projection checks.
+    #[test]
+    fn appending_operation_facts_writes_the_v17_identity_columns() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let (path, _command_id, _task_id) = store_with_one_operation(directory.path());
+        let conn = Connection::open(&path).expect("raw");
+
+        let operations: i64 = conn
+            .query_row("SELECT COUNT(*) FROM operations", [], |row| row.get(0))
+            .expect("operations");
+        assert!(
+            operations > 0,
+            "the commands above must have made operations"
+        );
+        let correlated: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM operations o
+                 JOIN events e
+                   ON e.operation_id = o.operation_id AND e.command_id = o.command_id
+                 WHERE e.event_type = 'operation.accepted'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("correlated accepted facts");
+        assert_eq!(
+            correlated, operations,
+            "every operation must be reachable from its accepted fact by column"
+        );
+
+        let missing: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM events
+                 WHERE event_type LIKE 'operation.%'
+                   AND (operation_id IS NULL OR command_id IS NULL)",
+                [],
+                |row| row.get(0),
+            )
+            .expect("missing identities");
+        assert_eq!(missing, 0, "every operation fact carries both halves");
+
+        let stray: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM events
+                 WHERE event_type NOT LIKE 'operation.%'
+                   AND event_type NOT LIKE 'host.%'
+                   AND (operation_id IS NOT NULL OR command_id IS NOT NULL)",
+                [],
+                |row| row.get(0),
+            )
+            .expect("stray identities");
+        assert_eq!(stray, 0, "an event that names no operation stores NULL");
+    }
+
+    /// A store written before V17 has the identity only inside its payloads.
+    /// The open that applies V17 fills the columns once, reports what it did,
+    /// and the next open owes nothing.
+    #[test]
+    fn upgrading_a_pre_v17_store_backfills_the_operation_identity_once() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let (path, _command_id, _task_id) = store_with_one_operation(directory.path());
+
+        // Rewind to V16 exactly as a store written before this task would look:
+        // the log is untouched, the identity columns and their indexes are gone.
+        // The indexes must go first, or SQLite refuses to drop the columns.
+        let expected: i64 = {
+            let conn = Connection::open(&path).expect("raw reopen");
+            let expected = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM events WHERE operation_id IS NOT NULL",
+                    [],
+                    |row| row.get(0),
+                )
+                .expect("rows carrying an identity");
+            conn.execute_batch(
+                "DELETE FROM schema_migrations WHERE version = 17;
+                 DROP INDEX idx_events_operation;
+                 DROP INDEX idx_events_command;
+                 ALTER TABLE events DROP COLUMN operation_id;
+                 ALTER TABLE events DROP COLUMN command_id;",
+            )
+            .expect("rewind to v16");
+            expected
+        };
+        assert!(
+            expected > 0,
+            "the store must hold operation facts to backfill"
+        );
+
+        let bus = CommandBus::open(&path).expect("reopen upgrades to v17");
+        let backfill = bus
+            .store
+            .startup_identity_backfill()
+            .copied()
+            .expect("applying V17 must backfill the log");
+        assert_eq!(
+            backfill.rows_updated,
+            u64::try_from(expected).expect("count fits u64"),
+            "every operation fact must have been written"
+        );
+        assert_eq!(
+            backfill.rows_scanned, backfill.rows_updated,
+            "every row read must have been written"
+        );
+        drop(bus);
+
+        {
+            let conn = Connection::open(&path).expect("raw");
+            let missing: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM events
+                     WHERE event_type LIKE 'operation.%'
+                       AND (operation_id IS NULL OR command_id IS NULL)",
+                    [],
+                    |row| row.get(0),
+                )
+                .expect("missing identities");
+            assert_eq!(missing, 0);
+            let stray: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM events
+                     WHERE event_type NOT LIKE 'operation.%'
+                       AND event_type NOT LIKE 'host.%'
+                       AND (operation_id IS NOT NULL OR command_id IS NOT NULL)",
+                    [],
+                    |row| row.get(0),
+                )
+                .expect("stray identities");
+            assert_eq!(stray, 0, "the backfill must not touch other facts");
+            assert!(
+                !operation_index_has_gap(&conn, OPERATION_IDENTITY_EVENT_TYPES).expect("gap check"),
+                "a backfilled store must leave no gap for the scans to fall back on"
+            );
+        }
+
+        let bus = CommandBus::open(&path).expect("second reopen");
+        assert!(
+            bus.store.startup_identity_backfill().is_none(),
+            "an up-to-date schema must not backfill again"
+        );
+    }
+
+    /// The uniqueness check the index rewrite had to preserve: a second
+    /// `operation.accepted` for this operation under ANOTHER task is
+    /// Corruption. The V17 index is keyed by identity rather than by task, so
+    /// the cross-scope reach survives -- and it must fire on both the indexed
+    /// path and the un-backfilled fallback.
+    fn duplicate_accepted_under_another_task(populate_identity: bool) -> StoreError {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let (path, command_id, _task_id) = store_with_one_operation(directory.path());
+        let conn = Connection::open(&path).expect("raw");
+        lookup_receipt(&conn, command_id)
+            .expect("a clean store correlates")
+            .expect("accepted receipt");
+
+        let (payload, schema_version, occurred_at_ms, operation_bytes, command_bytes): (
+            Vec<u8>,
+            i64,
+            i64,
+            Vec<u8>,
+            Vec<u8>,
+        ) = conn
+            .query_row(
+                "SELECT payload, schema_version, occurred_at_ms, operation_id, command_id
+                 FROM events
+                 WHERE event_type = 'operation.accepted' AND command_id = ?1",
+                [command_id.as_bytes().as_slice()],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ))
+                },
+            )
+            .expect("the accepted fact for this command");
+        conn.execute(
+            "INSERT INTO events(
+                event_id, task_id, task_revision, event_type, schema_version,
+                occurred_at_ms, payload, operation_id, command_id
+             ) VALUES (?1, ?2, NULL, 'operation.accepted', ?3, ?4, ?5, ?6, ?7)",
+            rusqlite::params![
+                EventId::new().as_bytes().as_slice(),
+                TaskId::new().as_bytes().as_slice(),
+                schema_version,
+                occurred_at_ms,
+                payload,
+                populate_identity.then_some(operation_bytes),
+                populate_identity.then_some(command_bytes),
+            ],
+        )
+        .expect("craft a duplicate accepted fact under another task");
+        assert_eq!(
+            operation_index_has_gap(&conn, ACCEPTED_EVENT_TYPE).expect("gap check"),
+            !populate_identity,
+            "the crafted row decides which path the scan takes"
+        );
+        lookup_receipt(&conn, command_id).expect_err("duplicate accepted fact")
+    }
+
+    /// The half-match branch: another `operation.accepted` carrying THIS
+    /// command under a DIFFERENT operation is Corruption. It is the reason V17
+    /// indexes `command_id` as well -- an operation-only predicate cannot
+    /// select this row at all, so the branch would still be in the source and
+    /// unreachable from the query, which is a weakened guard wearing the
+    /// clothes of a faster one. Both paths must fire.
+    fn half_matched_accepted_under_another_operation(populate_identity: bool) -> StoreError {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let (path, command_id, _task_id) = store_with_one_operation(directory.path());
+        let conn = Connection::open(&path).expect("raw");
+        lookup_receipt(&conn, command_id)
+            .expect("a clean store correlates")
+            .expect("accepted receipt");
+
+        let (payload, schema_version, occurred_at_ms, task_bytes, command_bytes): (
+            Vec<u8>,
+            i64,
+            i64,
+            Vec<u8>,
+            Vec<u8>,
+        ) = conn
+            .query_row(
+                "SELECT payload, schema_version, occurred_at_ms, task_id, command_id
+                 FROM events
+                 WHERE event_type = 'operation.accepted' AND command_id = ?1",
+                [command_id.as_bytes().as_slice()],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ))
+                },
+            )
+            .expect("the accepted fact for this command");
+        let mut fact: crate::domain::event::OperationAcceptedFact =
+            rmp_serde::from_slice(&payload).expect("accepted fact");
+        let foreign_operation = OperationId::new();
+        fact.operation_id = foreign_operation;
+        conn.execute(
+            "INSERT INTO events(
+                event_id, task_id, task_revision, event_type, schema_version,
+                occurred_at_ms, payload, operation_id, command_id
+             ) VALUES (?1, ?2, NULL, 'operation.accepted', ?3, ?4, ?5, ?6, ?7)",
+            rusqlite::params![
+                EventId::new().as_bytes().as_slice(),
+                task_bytes,
+                schema_version,
+                occurred_at_ms,
+                rmp_serde::to_vec(&fact).expect("re-encode"),
+                populate_identity.then(|| foreign_operation.as_bytes().to_vec()),
+                populate_identity.then_some(command_bytes),
+            ],
+        )
+        .expect("craft a half-matched accepted fact");
+        assert_eq!(
+            operation_index_has_gap(&conn, ACCEPTED_EVENT_TYPE).expect("gap check"),
+            !populate_identity,
+            "the crafted row decides which path the scan takes"
+        );
+        lookup_receipt(&conn, command_id).expect_err("half-matched accepted fact")
+    }
+
+    #[test]
+    fn a_half_matched_accepted_fact_is_corruption_on_both_paths() {
+        assert_eq!(
+            half_matched_accepted_under_another_operation(true),
+            StoreError::Corruption,
+            "indexed path"
+        );
+        assert_eq!(
+            half_matched_accepted_under_another_operation(false),
+            StoreError::Corruption,
+            "un-backfilled fallback path"
+        );
+    }
+
+    #[test]
+    fn a_duplicate_accepted_fact_under_another_task_is_corruption_on_both_paths() {
+        assert_eq!(
+            duplicate_accepted_under_another_task(true),
+            StoreError::Corruption,
+            "indexed path"
+        );
+        assert_eq!(
+            duplicate_accepted_under_another_task(false),
+            StoreError::Corruption,
+            "un-backfilled fallback path"
+        );
+    }
+
+    /// The same invariant one scan along: a duplicate terminal fact for this
+    /// operation under another task is Corruption in the outcome history, on
+    /// both paths.
+    fn duplicate_settled_under_another_task(populate_identity: bool) -> StoreError {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let (path, command_id, task_id) = store_with_one_operation(directory.path());
+        let conn = Connection::open(&path).expect("raw");
+
+        let (accepted_sequence, operation_bytes): (i64, Vec<u8>) = conn
+            .query_row(
+                "SELECT sequence, operation_id FROM events
+                 WHERE event_type = 'operation.accepted' AND command_id = ?1",
+                [command_id.as_bytes().as_slice()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("the accepted fact for this command");
+        let operation_id = id16::<OperationId>("events.operation_id", &operation_bytes)
+            .expect("operation id bytes");
+        let after_sequence =
+            u64_from_nonnegative_i64("events.sequence", accepted_sequence).expect("sequence");
+        let history = load_operation_outcome_history(
+            &conn,
+            task_id,
+            after_sequence,
+            command_id,
+            operation_id,
+        )
+        .expect("a clean store reads its outcome history");
+        assert_eq!(history.len(), 1, "the pure command settled exactly once");
+
+        let (payload, schema_version, occurred_at_ms, command_bytes): (Vec<u8>, i64, i64, Vec<u8>) =
+            conn.query_row(
+                "SELECT payload, schema_version, occurred_at_ms, command_id FROM events
+                 WHERE event_type = 'operation.settled' AND operation_id = ?1",
+                [operation_bytes.as_slice()],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .expect("the settled fact for this operation");
+        conn.execute(
+            "INSERT INTO events(
+                event_id, task_id, task_revision, event_type, schema_version,
+                occurred_at_ms, payload, operation_id, command_id
+             ) VALUES (?1, ?2, NULL, 'operation.settled', ?3, ?4, ?5, ?6, ?7)",
+            rusqlite::params![
+                EventId::new().as_bytes().as_slice(),
+                TaskId::new().as_bytes().as_slice(),
+                schema_version,
+                occurred_at_ms,
+                payload,
+                populate_identity.then_some(operation_bytes),
+                populate_identity.then_some(command_bytes),
+            ],
+        )
+        .expect("craft a duplicate settled fact under another task");
+        assert_eq!(
+            operation_index_has_gap(&conn, OPERATION_TERMINAL_EVENT_TYPES).expect("gap check"),
+            !populate_identity,
+            "the crafted row decides which path the scan takes"
+        );
+        load_operation_outcome_history(&conn, task_id, after_sequence, command_id, operation_id)
+            .expect_err("duplicate settled fact under another task")
+    }
+
+    #[test]
+    fn a_duplicate_settled_fact_under_another_task_is_corruption_on_both_paths() {
+        assert_eq!(
+            duplicate_settled_under_another_task(true),
+            StoreError::Corruption,
+            "indexed path"
+        );
+        assert_eq!(
+            duplicate_settled_under_another_task(false),
+            StoreError::Corruption,
+            "un-backfilled fallback path"
+        );
+    }
+
+    /// A store whose identity columns are NULL is slower, never wrong. The gap
+    /// check is asserted in BOTH directions, so a fallback that never runs
+    /// cannot pass as one that does, and the planner is asked directly whether
+    /// the indexed form is actually served by a V17 index.
+    #[test]
+    fn a_null_identity_falls_back_to_the_full_scan_and_still_correlates() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let (path, command_id, _task_id) = store_with_one_operation(directory.path());
+        let conn = Connection::open(&path).expect("raw");
+
+        assert!(
+            !operation_index_has_gap(&conn, OPERATION_IDENTITY_EVENT_TYPES).expect("gap check"),
+            "a freshly written store has no gap"
+        );
+        lookup_receipt(&conn, command_id)
+            .expect("indexed correlation")
+            .expect("accepted receipt");
+
+        let plan: String = {
+            let mut stmt = conn
+                .prepare(
+                    "EXPLAIN QUERY PLAN
+                     SELECT sequence FROM events
+                     WHERE event_type = 'operation.accepted'
+                       AND (operation_id = ?1 OR command_id = ?2)
+                     ORDER BY sequence ASC",
+                )
+                .expect("prepare plan");
+            stmt.query_map(
+                rusqlite::params![
+                    command_id.as_bytes().as_slice(),
+                    command_id.as_bytes().as_slice()
+                ],
+                |row| row.get::<_, String>(3),
+            )
+            .expect("plan rows")
+            .map(|row| row.expect("plan row"))
+            .collect::<Vec<_>>()
+            .join(" | ")
+        };
+        assert!(
+            plan.contains("idx_events_operation") && plan.contains("idx_events_command"),
+            "the indexed scan must be served by both V17 indexes, plan was: {plan}"
+        );
+
+        conn.execute(
+            "UPDATE events SET operation_id = NULL, command_id = NULL
+             WHERE event_type LIKE 'operation.%'",
+            [],
+        )
+        .expect("null the identity");
+        assert!(
+            operation_index_has_gap(&conn, OPERATION_IDENTITY_EVENT_TYPES).expect("gap check"),
+            "a NULL identity must be seen as a gap, or the fallback never runs"
+        );
+        lookup_receipt(&conn, command_id)
+            .expect("fallback correlation")
+            .expect("accepted receipt");
     }
 
     fn rejection_code(receipt: &CommandReceipt) -> RejectionCode {
@@ -4734,16 +5196,30 @@ fn durable_operation_lineage_exists(
         return Ok(true);
     }
 
-    let mut event_stmt = tx.prepare(
+    // V17: the indexed operation id turns this into a seek. Only the operation
+    // half is bound -- this asks whether ANY durable fact still names the
+    // operation, and `event_references_operation` below is the same rule.
+    let indexed = !operation_index_has_gap(tx, OPERATION_IDENTITY_EVENT_TYPES)?;
+    let mut event_stmt = tx.prepare(&format!(
         "SELECT event_type, schema_version, payload
          FROM events
          WHERE event_type IN (
              'operation.accepted', 'operation.settled', 'operation.failed',
              'operation.cancelled', 'operation.uncertain',
              'host.close_begun', 'host.cleanup_branch_completed'
-         )",
-    )?;
-    let mut event_rows = event_stmt.query([])?;
+         ){}",
+        if indexed {
+            " AND operation_id = ?1"
+        } else {
+            ""
+        }
+    ))?;
+    let lineage_params: Vec<Vec<u8>> = if indexed {
+        vec![operation_id.as_bytes().to_vec()]
+    } else {
+        Vec::new()
+    };
+    let mut event_rows = event_stmt.query(rusqlite::params_from_iter(lineage_params.iter()))?;
     while let Some(row) = event_rows.next()? {
         let event_type: String = row.get(0)?;
         let schema_version: i64 = row.get(1)?;
@@ -4772,13 +5248,21 @@ fn durable_operation_lineage_exists(
     Ok(false)
 }
 
-fn event_references_operation(event: &Event, operation_id: OperationId) -> bool {
+/// The durable (command, operation) identity V17 stores beside every fact that
+/// names an operation. `None` for every other event, whose identity columns
+/// stay NULL. Host close facts name an operation and carry no command.
+///
+/// One rule, one place: the append path writes the columns from here, the V17
+/// backfill fills older rows from here, and `event_references_operation` is
+/// defined in terms of it, so the indexed columns and the decoded payload
+/// cannot drift apart.
+pub(crate) fn event_operation_identity(event: &Event) -> Option<(Option<CommandId>, OperationId)> {
     match event {
-        Event::OperationAccepted(fact) => fact.operation_id == operation_id,
-        Event::OperationSettled(fact) => fact.operation_id == operation_id,
-        Event::OperationFailed(fact) => fact.operation_id == operation_id,
-        Event::OperationCancelled(fact) => fact.operation_id == operation_id,
-        Event::OperationUncertain(fact) => fact.operation_id == operation_id,
+        Event::OperationAccepted(fact) => Some((Some(fact.command_id), fact.operation_id)),
+        Event::OperationSettled(fact) => Some((Some(fact.command_id), fact.operation_id)),
+        Event::OperationFailed(fact) => Some((Some(fact.command_id), fact.operation_id)),
+        Event::OperationCancelled(fact) => Some((Some(fact.command_id), fact.operation_id)),
+        Event::OperationUncertain(fact) => Some((Some(fact.command_id), fact.operation_id)),
         Event::HostCloseBegun {
             operation_id: begun_op,
             ..
@@ -4786,8 +5270,106 @@ fn event_references_operation(event: &Event, operation_id: OperationId) -> bool 
         | Event::HostCleanupBranchCompleted {
             operation_id: begun_op,
             ..
-        } => *begun_op == operation_id,
-        _ => false,
+        } => Some((None, *begun_op)),
+        _ => None,
+    }
+}
+
+fn event_references_operation(event: &Event, operation_id: OperationId) -> bool {
+    event_operation_identity(event).map(|(_, id)| id) == Some(operation_id)
+}
+
+/// Every `event_type` whose row carries a V17 operation identity. The backfill,
+/// the NULL-gap check and the indexed scans all read this one list, so a new
+/// operation-naming fact cannot be indexed in one place and missed in another.
+pub(crate) const OPERATION_IDENTITY_EVENT_TYPES: &[&str] = &[
+    "operation.accepted",
+    "operation.settled",
+    "operation.failed",
+    "operation.cancelled",
+    "operation.uncertain",
+    "host.close_begun",
+    "host.cleanup_branch_completed",
+];
+
+/// The single accepted fact type; a subset of
+/// [`OPERATION_IDENTITY_EVENT_TYPES`].
+const ACCEPTED_EVENT_TYPE: &[&str] = &["operation.accepted"];
+
+/// The four terminal operation facts; a subset of
+/// [`OPERATION_IDENTITY_EVENT_TYPES`].
+const OPERATION_TERMINAL_EVENT_TYPES: &[&str] = &[
+    "operation.settled",
+    "operation.failed",
+    "operation.cancelled",
+    "operation.uncertain",
+];
+
+/// True when a row of one of `event_types` still has a NULL identity column,
+/// i.e. the V17 backfill has not covered it -- an interrupted backfill, or a
+/// row written into the table by hand. An indexed lookup would silently miss
+/// such a row, so every scan below falls back to its pre-V17 full scan while
+/// this reports a gap: a half-backfilled store is slower, never wrong.
+///
+/// Both probes are index seeks (`IS NULL` is an equality constraint on the
+/// leading column), so the check costs at most two seeks per event type.
+fn operation_index_has_gap(tx: &Connection, event_types: &[&str]) -> Result<bool, StoreError> {
+    for event_type in event_types {
+        let missing_operation: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM events
+             WHERE operation_id IS NULL AND event_type = ?1)",
+            [*event_type],
+            |row| row.get(0),
+        )?;
+        if missing_operation {
+            return Ok(true);
+        }
+        // Host close facts name no command, so only `operation.*` rows are
+        // expected to carry one.
+        if event_type.starts_with("operation.") {
+            let missing_command: bool = tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM events
+                 WHERE command_id IS NULL AND event_type = ?1)",
+                [*event_type],
+                |row| row.get(0),
+            )?;
+            if missing_command {
+                return Ok(true);
+            }
+        }
+    }
+    Ok(false)
+}
+
+/// The V17 predicate for a scan that matches on BOTH halves of the identity,
+/// or an empty string when the caller must fall back to reading every row.
+///
+/// Both halves are in the predicate because the scans treat a fact that matches
+/// one and not the other as Corruption; filtering on the operation alone would
+/// make that branch unreachable from an indexed query -- a weakened guard
+/// rather than a faster one.
+fn operation_identity_predicate(indexed: bool) -> &'static str {
+    if indexed {
+        " AND (operation_id = ?1 OR command_id = ?2)"
+    } else {
+        ""
+    }
+}
+
+/// The `?1`/`?2` bindings for [`operation_identity_predicate`]; empty for the
+/// fallback scan, which takes no parameters.
+fn operation_identity_params(
+    indexed: bool,
+    operation_id: OperationId,
+    command_id: CommandId,
+) -> Vec<Vec<u8>> {
+    if indexed {
+        vec![
+            operation_id.as_bytes().to_vec(),
+            command_id.as_bytes().to_vec(),
+        ]
+    } else {
+        Vec::new()
     }
 }
 
@@ -5139,9 +5721,13 @@ fn load_operation_outcome_history(
     command_id: CommandId,
     operation_id: OperationId,
 ) -> Result<Vec<HistoricalOutcome>, StoreError> {
-    // V1 stores operation_id only inside the payload, so matching rows must be decoded.
-    // Bounded tradeoff: scan terminal operation.* rows rather than an indexed operation_id column.
-    let mut stmt = tx.prepare(
+    // V17 indexes the (command, operation) identity, so only the rows that can
+    // match are read instead of decoding every terminal payload. Every check in
+    // the loop below is unchanged, including the half-match Corruption branch,
+    // which is why both halves are bound. A store whose terminal rows are not
+    // fully backfilled falls back to the pre-V17 full scan.
+    let indexed = !operation_index_has_gap(tx, OPERATION_TERMINAL_EVENT_TYPES)?;
+    let mut stmt = tx.prepare(&format!(
         "SELECT sequence, event_id, task_id, task_revision, event_type, schema_version,
                 payload, occurred_at_ms
          FROM events
@@ -5150,10 +5736,12 @@ fn load_operation_outcome_history(
              'operation.failed',
              'operation.cancelled',
              'operation.uncertain'
-         )
+         ){}
          ORDER BY sequence ASC",
-    )?;
-    let rows = stmt.query_map([], |row| {
+        operation_identity_predicate(indexed)
+    ))?;
+    let history_params = operation_identity_params(indexed, operation_id, command_id);
+    let rows = stmt.query_map(rusqlite::params_from_iter(history_params.iter()), |row| {
         Ok((
             row.get::<_, i64>(0)?,
             row.get::<_, Vec<u8>>(1)?,
@@ -7160,7 +7748,11 @@ fn scan_host_operation_terminals(
     expected_command_id: CommandId,
     expected_operation_id: OperationId,
 ) -> Result<Vec<HostOperationTerminalMatch>, StoreError> {
-    let mut stmt = tx.prepare(
+    // V17 indexed identity; both halves are bound because a one-sided match is
+    // still Corruption below. Falls back to the pre-V17 full scan when any
+    // terminal row is un-backfilled.
+    let indexed = !operation_index_has_gap(tx, OPERATION_TERMINAL_EVENT_TYPES)?;
+    let mut stmt = tx.prepare(&format!(
         "SELECT sequence, event_id, task_id, task_revision, event_type, schema_version, payload, occurred_at_ms
          FROM events
          WHERE event_type IN (
@@ -7168,10 +7760,13 @@ fn scan_host_operation_terminals(
              'operation.failed',
              'operation.cancelled',
              'operation.uncertain'
-         )
+         ){}
          ORDER BY sequence ASC",
-    )?;
-    let rows = stmt.query_map([], |row| {
+        operation_identity_predicate(indexed)
+    ))?;
+    let terminal_params =
+        operation_identity_params(indexed, expected_operation_id, expected_command_id);
+    let rows = stmt.query_map(rusqlite::params_from_iter(terminal_params.iter()), |row| {
         Ok((
             row.get::<_, i64>(0)?,
             row.get::<_, Vec<u8>>(1)?,
@@ -9328,10 +9923,17 @@ fn validate_accepted_fact_row(
     Ok(())
 }
 
-/// V1 stores `operation_id` only in the accepted payload. Scan every
-/// `operation.accepted` row and require exactly one matching fact for this
-/// operation; extras in any task scope/sequence are Corruption.
+/// Require exactly one `operation.accepted` fact for this operation; extras in
+/// any task scope/sequence are Corruption.
 /// `scope` is `Some(task)` for task operations and `None` for global host admission.
+///
+/// V17 stores the (command, operation) identity in indexed columns, so only the
+/// rows that can match are read; before it, this decoded every accepted payload
+/// in the store on every receipt lookup (8.3 ms per call on a 7,575-event
+/// store). The cross-scope intent is unchanged: the index is keyed by identity,
+/// not by task, so an extra accepted fact under ANY task scope is still found.
+/// Both halves are bound because a one-sided match is Corruption. While any
+/// accepted row is still un-backfilled the pre-V17 full scan runs instead.
 fn ensure_unique_operation_accepted_fact(
     tx: &Connection,
     command_id: CommandId,
@@ -9342,13 +9944,16 @@ fn ensure_unique_operation_accepted_fact(
     expected_row: &EventRow,
     fence: OperationFence,
 ) -> Result<(), StoreError> {
-    let mut stmt = tx.prepare(
+    let indexed = !operation_index_has_gap(tx, ACCEPTED_EVENT_TYPE)?;
+    let mut stmt = tx.prepare(&format!(
         "SELECT sequence, event_id, task_id, task_revision, schema_version, payload, occurred_at_ms
          FROM events
-         WHERE event_type = 'operation.accepted'
+         WHERE event_type = 'operation.accepted'{}
          ORDER BY sequence ASC",
-    )?;
-    let rows = stmt.query_map([], |row| {
+        operation_identity_predicate(indexed)
+    ))?;
+    let accepted_params = operation_identity_params(indexed, expected_operation_id, command_id);
+    let rows = stmt.query_map(rusqlite::params_from_iter(accepted_params.iter()), |row| {
         Ok((
             row.get::<_, i64>(0)?,
             row.get::<_, Vec<u8>>(1)?,
@@ -10593,10 +11198,15 @@ fn append_and_project(
 ) -> Result<u64, StoreError> {
     let event_type = payload.event_type();
     let packed = encode_event_payload(&payload)?;
+    // V17 identity columns, from the one helper the backfill also uses, so a row
+    // appended now and a row backfilled later carry the same identity. Events
+    // that name no operation store NULL in both.
+    let identity = event_operation_identity(&payload);
     tx.execute(
         "INSERT INTO events(
-            event_id, task_id, task_revision, event_type, schema_version, occurred_at_ms, payload
-         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            event_id, task_id, task_revision, event_type, schema_version, occurred_at_ms,
+            payload, operation_id, command_id
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
         rusqlite::params![
             event_id.as_bytes().as_slice(),
             task_id.map(|id| id.as_bytes().as_slice().to_vec()),
@@ -10608,6 +11218,10 @@ fn append_and_project(
             i64::from(EVENT_SCHEMA_VERSION),
             occurred_at_ms,
             packed,
+            identity.map(|(_, operation_id)| operation_id.as_bytes().to_vec()),
+            identity
+                .and_then(|(command_id, _)| command_id)
+                .map(|command_id| command_id.as_bytes().to_vec()),
         ],
     )?;
     let sequence_i64: i64 = tx.query_row("SELECT last_insert_rowid()", [], |row| row.get(0))?;

@@ -1406,6 +1406,30 @@ CREATE TABLE task_terminal_strip (\n\
 );\n\
 ";
 
+/// The migration that added the `events` identity columns. `KernelStore::open`
+/// reads this to decide whether this open owes the one-time backfill, so the
+/// version number cannot drift away from the manifest entry below.
+pub(crate) const OPERATION_IDENTITY_MIGRATION_VERSION: i64 = 17;
+
+/// The operation identity every operation-naming fact carried only inside its
+/// msgpack payload. Nothing could be indexed, so every receipt-correlation
+/// check decoded the whole `events` table: 8.5 ms per lookup, and a client
+/// startup that paged 2,427 operations sat blank for 33 s.
+///
+/// BOTH halves of the identity are stored because the checks compare both. A
+/// durable fact whose command matches while its operation does not is
+/// Corruption; indexing only `operation_id` would make that branch
+/// unreachable from an indexed query, which is a weakened guard rather than
+/// a faster one.
+const V17_SQL: &str = "\
+ALTER TABLE events ADD COLUMN operation_id BLOB\n\
+  CHECK(operation_id IS NULL OR length(operation_id) = 16);\n\
+ALTER TABLE events ADD COLUMN command_id BLOB\n\
+  CHECK(command_id IS NULL OR length(command_id) = 16);\n\
+CREATE INDEX idx_events_operation ON events(operation_id, event_type, sequence);\n\
+CREATE INDEX idx_events_command ON events(command_id, event_type, sequence);\n\
+";
+
 /// Provider input authority and durable fenced state are additive to the
 /// scoped receipt ledger. The payload digest lets typed provider retries reject
 /// a reused command id without weakening connection/session scope checks.
@@ -1690,6 +1714,12 @@ pub(crate) fn migration_manifest() -> &'static [Migration] {
                     name: "v16_terminal_facts_and_strip",
                     sql: V16_SQL,
                     sha256: sha256_bytes(V16_SQL),
+                },
+                Migration {
+                    version: 17,
+                    name: "v17_events_operation_identity_index",
+                    sql: V17_SQL,
+                    sha256: sha256_bytes(V17_SQL),
                 },
             ];
             verify_manifest(&migrations);
@@ -2009,7 +2039,7 @@ mod tests {
                 .map(|row| row.unwrap())
                 .collect()
         };
-        assert_eq!(history.len(), 16);
+        assert_eq!(history.len(), 17);
         assert_eq!(history[0], (1, "v1_initial".into(), V1_SHA256.to_vec()));
         assert_eq!(
             history[1],
@@ -2057,6 +2087,9 @@ mod tests {
         assert_eq!(history[15].0, 16);
         assert_eq!(history[15].1, "v16_terminal_facts_and_strip");
         assert_eq!(history[15].2, sha256_bytes(V16_SQL).to_vec());
+        assert_eq!(history[16].0, 17);
+        assert_eq!(history[16].1, "v17_events_operation_identity_index");
+        assert_eq!(history[16].2, sha256_bytes(V17_SQL).to_vec());
 
         let compacted_column: (String, i64) = conn
             .query_row(
@@ -2599,7 +2632,7 @@ mod tests {
                     row.get(0)
                 })
                 .expect("migration count");
-            assert_eq!(migration_count, 16, "prior schema V{prior_version}");
+            assert_eq!(migration_count, 17, "prior schema V{prior_version}");
             let missing_prompt_command_payloads: i64 = conn
                 .query_row(
                     "SELECT COUNT(*) FROM prompt_command_receipts
@@ -2639,6 +2672,14 @@ mod tests {
                 )
                 .expect("terminal migration record");
             assert_eq!(terminal_name, "v16_terminal_facts_and_strip");
+            let identity_name: String = conn
+                .query_row(
+                    "SELECT name FROM schema_migrations WHERE version = 17",
+                    [],
+                    |row| row.get(0),
+                )
+                .expect("operation identity migration record");
+            assert_eq!(identity_name, "v17_events_operation_identity_index");
             let lineage_name: String = conn
                 .query_row(
                     "SELECT name FROM schema_migrations WHERE version = 12",
@@ -2760,8 +2801,8 @@ mod tests {
     #[test]
     fn provider_resource_v15_is_contiguous_and_hash_locked() {
         let migrations = migration_manifest();
-        assert_eq!(latest_migration_version(), 16);
-        assert_eq!(migrations.len(), 16);
+        assert_eq!(latest_migration_version(), 17);
+        assert_eq!(migrations.len(), 17);
         assert_eq!(migrations[13].version, 14);
         assert_eq!(migrations[13].name, "connect-identity-v1");
         assert_eq!(migrations[13].sha256, V14_SHA256);
@@ -2773,18 +2814,98 @@ mod tests {
         assert_eq!(migrations[15].version, 16);
         assert_eq!(migrations[15].name, "v16_terminal_facts_and_strip");
         assert_eq!(migrations[15].sha256, sha256_bytes(V16_SQL));
+        assert_eq!(migrations[16].version, 17);
+        assert_eq!(migrations[16].name, "v17_events_operation_identity_index");
+        assert_eq!(migrations[16].sha256, sha256_bytes(V17_SQL));
     }
 
     #[test]
     fn v16_adds_terminal_facts_and_strip_tables() {
         let migrations = migration_manifest();
-        assert_eq!(migrations.len(), 16);
+        assert_eq!(migrations.len(), 17);
         assert_eq!(migrations[15].version, 16);
         assert_eq!(migrations[15].name, "v16_terminal_facts_and_strip");
         assert!(V16_SQL.contains("CREATE TABLE terminal_facts"));
         assert!(V16_SQL.contains("CREATE TABLE task_terminal_strip"));
         assert!(PROJECTION_TABLES.contains(&"terminal_facts"));
         assert!(PROJECTION_TABLES.contains(&"task_terminal_strip"));
+    }
+
+    /// A migrated store must carry BOTH identity columns and BOTH indexes, and
+    /// the planner must actually choose the operation index for the lookup the
+    /// receipt-correlation scans depend on. Asserting only that the index
+    /// exists would pass while every scan still walked the table.
+    #[test]
+    fn v17_indexes_the_operation_identity_on_events() {
+        let migrations = migration_manifest();
+        assert_eq!(migrations.len(), 17);
+        assert_eq!(migrations[16].version, 17);
+        assert_eq!(
+            migrations[16].version, OPERATION_IDENTITY_MIGRATION_VERSION,
+            "the backfill trigger must name this migration"
+        );
+        assert_eq!(migrations[16].name, "v17_events_operation_identity_index");
+        assert_eq!(migrations[16].sha256, sha256_bytes(V17_SQL));
+        assert!(V17_SQL.contains("ADD COLUMN operation_id BLOB"));
+        assert!(V17_SQL.contains("ADD COLUMN command_id BLOB"));
+        assert!(V17_SQL.contains("CREATE INDEX idx_events_operation"));
+        assert!(V17_SQL.contains("CREATE INDEX idx_events_command"));
+
+        let dir = TempDir::new().expect("tempdir");
+        let path = dir.path().join("v17-schema.sqlite3");
+        let conn = Connection::open(&path).expect("raw");
+        for migration in migration_manifest() {
+            conn.execute_batch(migration.sql).expect("migration sql");
+        }
+
+        let columns: Vec<String> = {
+            let mut stmt = conn.prepare("PRAGMA table_info(events)").expect("pragma");
+            stmt.query_map([], |row| row.get::<_, String>(1))
+                .expect("columns")
+                .map(|row| row.expect("column"))
+                .collect()
+        };
+        assert!(columns.iter().any(|column| column == "operation_id"));
+        assert!(columns.iter().any(|column| column == "command_id"));
+
+        let indexes: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_schema WHERE type = 'index'
+                 AND name IN ('idx_events_operation', 'idx_events_command')",
+                [],
+                |row| row.get(0),
+            )
+            .expect("indexes");
+        assert_eq!(indexes, 2);
+
+        let plan: String = conn
+            .query_row(
+                "EXPLAIN QUERY PLAN
+                 SELECT sequence FROM events
+                 WHERE operation_id = x'000102030405060708090a0b0c0d0e0f'
+                   AND event_type = 'operation.accepted'",
+                [],
+                |row| row.get(3),
+            )
+            .expect("plan");
+        assert!(
+            plan.contains("idx_events_operation"),
+            "operation lookup must use the V17 index, plan was: {plan}"
+        );
+        let command_plan: String = conn
+            .query_row(
+                "EXPLAIN QUERY PLAN
+                 SELECT sequence FROM events
+                 WHERE command_id = x'000102030405060708090a0b0c0d0e0f'
+                   AND event_type = 'operation.accepted'",
+                [],
+                |row| row.get(3),
+            )
+            .expect("command plan");
+        assert!(
+            command_plan.contains("idx_events_command"),
+            "command lookup must use the V17 index, plan was: {command_plan}"
+        );
     }
 
     #[test]

@@ -62,6 +62,10 @@ pub struct KernelStore {
     /// did. `None` means the schema was already current and nothing was
     /// replayed -- which is what a second open of the same store must report.
     startup_rebuild: Option<ProjectionRebuild>,
+    /// The one-time V17 identity backfill this open ran, if it owed one. `None`
+    /// means V17 was already applied -- or that the backfill failed, which is
+    /// logged and leaves the scans on their pre-V17 full scan.
+    startup_identity_backfill: Option<OperationIdentityBackfill>,
 }
 
 impl fmt::Debug for KernelStore {
@@ -74,6 +78,17 @@ impl fmt::Debug for KernelStore {
 pub struct ProjectionRebuild {
     pub events_replayed: u64,
     pub drift_detected: bool,
+}
+
+/// What the one-time V17 identity backfill did: `rows_scanned` operation events
+/// were decoded, and the identity columns of `rows_updated` of them were
+/// written. The two are equal on a healthy store; a caller asserts on this
+/// rather than on the log line, which no test can read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OperationIdentityBackfill {
+    pub rows_scanned: u64,
+    pub rows_updated: u64,
+    pub elapsed_ms: u64,
 }
 
 /// Which migrations one `migrate()` call actually applied.
@@ -185,6 +200,7 @@ impl KernelStore {
             path: canonical,
             conn,
             startup_rebuild: None,
+            startup_identity_backfill: None,
         };
         let migrated = store.migrate()?;
         // A migration that introduces a projection table creates it EMPTY, and
@@ -212,6 +228,31 @@ impl KernelStore {
                 }
             }
         }
+        // V17 added the indexed operation identity to `events`. The rows that
+        // already exist carry it only inside their msgpack payload, so fill the
+        // columns in once, here. Every scan that reads them falls back to its
+        // pre-V17 full scan for as long as any row is NULL, which is why a
+        // failure is observed and the store still opens: the cost of a failed
+        // backfill is latency, never a wrong answer.
+        if migrated
+            .applied_versions
+            .contains(&schema::OPERATION_IDENTITY_MIGRATION_VERSION)
+        {
+            match store.backfill_operation_identity() {
+                Ok(backfill) => {
+                    eprintln!(
+                        "devmanager-kernel: V17 operation identity backfill wrote {} of {} operation events in {} ms",
+                        backfill.rows_updated, backfill.rows_scanned, backfill.elapsed_ms
+                    );
+                    store.startup_identity_backfill = Some(backfill);
+                }
+                Err(error) => {
+                    eprintln!(
+                        "devmanager-kernel: V17 operation identity backfill failed: {error:?}; receipt correlation stays on the pre-V17 full scan"
+                    );
+                }
+            }
+        }
         store.integrity_check()?;
         Ok(store)
     }
@@ -220,6 +261,98 @@ impl KernelStore {
     /// schema was already current. Opening an up-to-date store must not replay.
     pub(crate) fn startup_rebuild(&self) -> Option<&ProjectionRebuild> {
         self.startup_rebuild.as_ref()
+    }
+
+    /// The one-time V17 identity backfill `open` ran, or `None` when this open
+    /// did not apply V17. A second open of the same store must report `None`.
+    pub(crate) fn startup_identity_backfill(&self) -> Option<&OperationIdentityBackfill> {
+        self.startup_identity_backfill.as_ref()
+    }
+
+    /// Fill the V17 `operation_id`/`command_id` columns for the log that
+    /// already exists.
+    ///
+    /// One IMMEDIATE transaction, for the same reason the projection rebuild
+    /// takes one: it reads every operation event before it writes any of them,
+    /// and a DEFERRED read snapshot that another process invalidates fails
+    /// SQLITE_BUSY_SNAPSHOT outright rather than waiting on the busy timeout.
+    ///
+    /// The identity comes from `command_bus::event_operation_identity`, the one
+    /// helper the append path also uses, so a row backfilled here and a row
+    /// appended afterwards cannot carry different identities.
+    fn backfill_operation_identity(&mut self) -> Result<OperationIdentityBackfill, StoreError> {
+        let started = std::time::Instant::now();
+        let placeholders = command_bus::OPERATION_IDENTITY_EVENT_TYPES
+            .iter()
+            .enumerate()
+            .map(|(index, _)| format!("?{}", index + 1))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        // Buffer the identities before writing any of them: stepping a SELECT
+        // while UPDATEing the same table on the same connection is not a
+        // defined read order.
+        let mut pending: Vec<(i64, Vec<u8>, Option<Vec<u8>>)> = Vec::new();
+        {
+            let mut stmt = tx.prepare(&format!(
+                "SELECT sequence, event_type, schema_version, payload
+                 FROM events
+                 WHERE event_type IN ({placeholders})
+                 ORDER BY sequence ASC"
+            ))?;
+            let mut rows = stmt.query(rusqlite::params_from_iter(
+                command_bus::OPERATION_IDENTITY_EVENT_TYPES.iter(),
+            ))?;
+            while let Some(row) = rows.next()? {
+                let sequence: i64 = row.get(0)?;
+                let event_type: String = row.get(1)?;
+                let schema_version: i64 = row.get(2)?;
+                let payload: Vec<u8> = row.get(3)?;
+                let event = decode_stored_event(&event_type, schema_version, &payload)?;
+                // The event type list and the identity helper are one rule, so
+                // a row of one of those types that names no operation is a
+                // disagreement between them, not a row to skip.
+                let Some((command_id, operation_id)) =
+                    command_bus::event_operation_identity(&event)
+                else {
+                    return Err(StoreError::Corruption);
+                };
+                pending.push((
+                    sequence,
+                    operation_id.as_bytes().to_vec(),
+                    command_id.map(|command_id| command_id.as_bytes().to_vec()),
+                ));
+            }
+        }
+        let rows_scanned =
+            u64::try_from(pending.len()).map_err(|_| StoreError::IntegerOutOfRange {
+                field: "events.operation_identity_rows",
+                value: u64::MAX,
+            })?;
+        let mut rows_updated: u64 = 0;
+        {
+            let mut update = tx.prepare(
+                "UPDATE events SET operation_id = ?1, command_id = ?2 WHERE sequence = ?3",
+            )?;
+            for (sequence, operation_id, command_id) in pending {
+                let changed =
+                    update.execute(rusqlite::params![operation_id, command_id, sequence])?;
+                rows_updated = rows_updated
+                    .checked_add(u64::try_from(changed).unwrap_or(0))
+                    .ok_or(StoreError::IntegerOutOfRange {
+                        field: "events.operation_identity_rows",
+                        value: u64::MAX,
+                    })?;
+            }
+        }
+        tx.commit()?;
+        Ok(OperationIdentityBackfill {
+            rows_scanned,
+            rows_updated,
+            elapsed_ms: u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+        })
     }
 
     pub fn rebuild_projections(&mut self) -> Result<ProjectionRebuild, StoreError> {
