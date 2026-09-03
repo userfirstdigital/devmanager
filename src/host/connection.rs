@@ -80,6 +80,16 @@ use super::shutdown::{
 /// so this only has to outlast contention on the store, never a teardown.
 const SHELL_RELEASE_SETTLE_LEASE: Duration = Duration::from_secs(30);
 
+/// How many deleted tasks one reaper tick purges.
+///
+/// A bound, not a batch size: steady state is at most one deleted task
+/// per tick, and the number only matters for the one-time backlog of
+/// tasks deleted before the purge existed -- 48 of them on the dev
+/// profile this was measured against, which drains in six ticks. Each
+/// purge is its own write transaction, so this bounds how long the
+/// reaper holds the writer, not how much work is done in one lock.
+const PURGE_TASKS_PER_TICK: u32 = 8;
+
 /// Fixed capacity for the host request queue.
 ///
 /// When the queue is full, [`HostRequestHandle::execute`] awaits send capacity
@@ -3422,6 +3432,8 @@ impl HostRequestExecutor {
                     tick.step("shell_facts");
                     self.settle_orphaned_shell_releases();
                     tick.step("orphaned_releases");
+                    self.purge_deleted_tasks_sweep();
+                    tick.step("purge_deleted_tasks");
                     self.maybe_schedule_provider_health(false);
                     tick.step("provider_health");
                     // Missed unregister try_send must not leave completed live
@@ -3531,6 +3543,8 @@ impl HostRequestExecutor {
                     tick.step("shell_facts");
                     self.settle_orphaned_shell_releases();
                     tick.step("orphaned_releases");
+                    self.purge_deleted_tasks_sweep();
+                    tick.step("purge_deleted_tasks");
                     self.maybe_schedule_provider_health(false);
                     tick.step("provider_health");
                     self.reap_shutdown_outputs();
@@ -5038,6 +5052,123 @@ impl HostRequestExecutor {
             Err(error) => host_log!(
                 "devmanager-host: shell terminal {resource_id} release was not settled: {error}"
             ),
+        }
+    }
+
+    /// Remove the tasks the kernel has recorded as deleted, at most
+    /// [`PURGE_TASKS_PER_TICK`] per tick.
+    ///
+    /// **Ordering, and why it is this way round.** The host-owned state --
+    /// provider sessions in `provider-sessions.sqlite3`, the transcript in
+    /// `conversation-history.json` -- is removed FIRST, and the kernel purge
+    /// commits LAST. Both host removals are idempotent, and the kernel row is
+    /// the only durable marker that a purge is owed, so a crash anywhere in
+    /// this method leaves the task `deleted` and the next tick redoes the lot.
+    /// Purging the kernel first would delete that marker and orphan whatever
+    /// had not been cleaned yet, permanently and invisibly.
+    ///
+    /// **The guard is the lifecycle, and there is deliberately no other one.**
+    /// `tasks.lifecycle = 'deleted'` is written by the projector only after
+    /// the whole close/archive chain has settled, so a client close or archive
+    /// still in flight has not reached Deleted and cannot be swept out from
+    /// under itself. `purge_deleted_task` re-checks it inside its own writer
+    /// transaction, so the check and the delete cannot be separated by a race.
+    ///
+    /// Bounded per tick because the one-time cleanup of tasks deleted before
+    /// this existed is a backlog (48 of them on the dev profile this was
+    /// measured against), and a reaper tick must not turn into a long write.
+    fn purge_deleted_tasks_sweep(&mut self) {
+        let doomed = match self.bus.deleted_task_ids(PURGE_TASKS_PER_TICK) {
+            Ok(doomed) => doomed,
+            Err(error) => {
+                host_log!(
+                    "devmanager-host: deleted tasks could not be read, leaving them: {error}"
+                );
+                return;
+            }
+        };
+        for task_id in doomed {
+            self.forget_purged_task_host_state(task_id);
+            match self.bus.purge_deleted_task(task_id) {
+                Ok(crate::kernel::TaskPurge::Purged(report)) => {
+                    host_log!(
+                        "devmanager-host: purged deleted task {task_id}: {}",
+                        report.summary()
+                    );
+                }
+                Ok(crate::kernel::TaskPurge::Refused(refusal)) => {
+                    // The worklist selected on `lifecycle = 'deleted'` and the
+                    // purge re-checked it, so a refusal here means the two
+                    // disagreed -- another writer reopened the task, or the
+                    // worklist is reading something the purge does not.
+                    host_log!(
+                        "devmanager-host: purge of {task_id} was refused after the worklist \
+                         offered it: {refusal:?}"
+                    );
+                }
+                Err(error) => {
+                    host_log!(
+                        "devmanager-host: purge of deleted task {task_id} failed, retrying next \
+                         tick: {error}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Drop the host-owned state for a task about to be purged.
+    ///
+    /// Runs before the kernel purge commits; see
+    /// [`Self::purge_deleted_tasks_sweep`]. Failures are logged and the purge
+    /// proceeds: the kernel row is what tells the next tick to try again, and
+    /// refusing to purge because a sidecar would not clean up would leave the
+    /// far larger kernel rows in place forever.
+    fn forget_purged_task_host_state(&mut self, task_id: TaskId) {
+        let Some(runtime) = self.configured_service_runtime.as_ref() else {
+            return;
+        };
+        match runtime.manager.forget_provider_task(task_id) {
+            Ok(0) => {}
+            Ok(removed) => {
+                host_log!(
+                    "devmanager-host: purge dropped {removed} provider session rows for {task_id}"
+                );
+            }
+            Err(error) => {
+                host_log!(
+                    "devmanager-host: provider sessions for purged task {task_id} could not be \
+                     dropped: {error}"
+                );
+            }
+        }
+        // The journal is keyed by `StableSessionKey`, which carries no
+        // TaskId. `StableSessionKey::for_task` is the ONE constructor a
+        // sealed provider launch also uses, so the transcript this
+        // removes is the transcript that launch wrote.
+        //
+        // Not covered, and deliberately not guessed at: a Codex hook
+        // registration keys its journal by AGENT SESSION id
+        // (`ai::codex_hooks::CodexHookRegistry::issue_launch_permit`),
+        // which this cannot reach from a task alone once the kernel's
+        // agent_sessions rows are the thing being purged.
+        let key = crate::remote::presentation::StableSessionKey::for_task(task_id.to_string());
+        match runtime.semantic_journal.lock() {
+            Ok(mut journal) => {
+                if journal.remove_session(&key) {
+                    if let Err(error) = journal.flush_if_dirty() {
+                        host_log!(
+                            "devmanager-host: conversation history flush after purging \
+                             {task_id} failed: {error}"
+                        );
+                    }
+                }
+            }
+            Err(_) => {
+                host_log!(
+                    "devmanager-host: conversation history lock poisoned; transcript for purged \
+                     task {task_id} was left behind"
+                );
+            }
         }
     }
 

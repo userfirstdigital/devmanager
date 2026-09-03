@@ -37,6 +37,21 @@ impl StableSessionKey {
         Self(format!("tab:{}", tab_id.as_ref()))
     }
 
+    /// The journal key for a sealed provider launch, which is keyed by
+    /// the kernel task rather than by a UI tab.
+    ///
+    /// This layer holds no `TaskId` on purpose, so the caller passes the
+    /// rendered id. It exists so the launch that WRITES a task's
+    /// transcript (`ProcessManager::prepare_sealed_provider_adapter`)
+    /// and the purge sweep that REMOVES it
+    /// (`HostRequestExecutor::forget_purged_task_host_state`) cannot
+    /// build different keys: a drift between the two would silently
+    /// leave a purged task's transcript in `conversation-history.json`
+    /// forever, with nothing to report it.
+    pub fn for_task(task_id: impl AsRef<str>) -> Self {
+        Self::from_tab(task_id)
+    }
+
     pub fn resolve(runtime: &SessionRuntimeState, tabs: &[SessionTab]) -> Option<Self> {
         match runtime.session_kind {
             SessionKind::Server | SessionKind::Shell => runtime
@@ -1164,6 +1179,41 @@ impl SemanticJournalStore {
         }
         self.enforce_store_limits();
         Some(key)
+    }
+
+    /// Drop one journal session and every binding that pointed at it.
+    ///
+    /// `remove_session_binding` above unbinds a session that WENT AWAY and
+    /// deliberately keeps the transcript. This is the purge's counterpart: the
+    /// task the transcript belongs to no longer exists, so the transcript must
+    /// not outlive it in `conversation-history.json`.
+    ///
+    /// Unconditional, unlike the eviction path `enforce_store_limits` uses,
+    /// which keeps an ACTIVE session's bindings alive and only advances their
+    /// evicted watermark. Nothing is active for a purged task, and leaving a
+    /// binding behind would leave a projector keyed to a task that is gone.
+    ///
+    /// Returns whether anything was removed, so a caller can log a real
+    /// removal separately from a no-op; the sweep re-runs after a crash and
+    /// the second run legitimately removes nothing.
+    pub fn remove_session(&mut self, key: &StableSessionKey) -> bool {
+        let had_session = self.sessions.contains_key(key);
+        let doomed_bindings = self
+            .session_bindings
+            .iter()
+            .filter(|(_, binding)| &binding.key == key)
+            .map(|(session_id, _)| session_id.clone())
+            .collect::<Vec<_>>();
+        for session_id in &doomed_bindings {
+            self.session_bindings.remove(session_id);
+            self.projectors.remove(session_id);
+        }
+        self.sessions.remove(key);
+        let removed = had_session || !doomed_bindings.is_empty();
+        if removed {
+            self.dirty = true;
+        }
+        removed
     }
 
     pub fn retained_session_count(&self) -> usize {
@@ -2717,6 +2767,41 @@ mod tests {
         assert!(title.ends_with('…'));
         assert_eq!(title.chars().take(95).count(), 95);
         assert!(!title.contains('\u{fffd}'));
+    }
+
+    /// The purge sweep's transcript removal drops one task's session and
+    /// leaves every other one alone.
+    #[test]
+    fn remove_session_drops_one_transcript_and_keeps_the_rest() {
+        let mut store = SemanticJournalStore::default();
+        let purged = StableSessionKey::for_task("018f60b0-9c1a-7001-8000-000000000040");
+        let survivor = StableSessionKey::for_task("018f60b0-9c1a-7001-8000-000000000041");
+        for key in [&purged, &survivor] {
+            store.record(SemanticEventDraft {
+                stable_session_key: key.clone(),
+                occurred_at_epoch_ms: 1,
+                source: SemanticSource::Claude,
+                kind: SemanticEventKind::UserMessage {
+                    text: "transcript".into(),
+                },
+                retention: SemanticRetention::Canonical,
+                deduplication_key: None,
+            });
+        }
+        assert_eq!(store.retained_session_count(), 2);
+
+        assert!(store.remove_session(&purged));
+        assert_eq!(store.retained_session_count(), 1);
+        assert!(store.metadata(&purged).is_none());
+        assert!(
+            store.metadata(&survivor).is_some(),
+            "another task's transcript must survive"
+        );
+
+        // Idempotent, and it says so: the sweep re-runs after a crash and the
+        // second run legitimately removes nothing.
+        assert!(!store.remove_session(&purged));
+        assert_eq!(store.retained_session_count(), 1);
     }
 
     #[test]

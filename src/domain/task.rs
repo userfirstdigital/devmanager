@@ -827,8 +827,19 @@ pub enum TaskLifecycle {
     Settled,
     Closing,
     Archived,
-    /// Permanent user deletion. The durable task journal remains as an
-    /// auditable tombstone, but the task is never selectable or reopenable.
+    /// Permanent user deletion, and a TRANSIENT state.
+    ///
+    /// This used to say the durable task journal remained as an auditable
+    /// tombstone. It no longer does: the user's ruling is that deleting a
+    /// task removes it entirely, `tasks` row included. A task reaches
+    /// Deleted and the host's purge sweep removes it on the next reaper
+    /// tick (`crate::kernel::purge`), so a row in this state is a task
+    /// that owes a purge rather than one that will keep this state.
+    ///
+    /// It stays in the vocabulary because the projector still writes it
+    /// and a rebuild still reproduces it from `task.deleted` -- that is
+    /// exactly what makes the sweep crash-safe -- and because nothing
+    /// selectable or reopenable may be in it while it lasts.
     Deleted,
 }
 

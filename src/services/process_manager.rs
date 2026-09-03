@@ -2236,6 +2236,26 @@ impl ProcessManager {
         }
     }
 
+    /// Forget every provider session bound to one purged task.
+    ///
+    /// The destructive sibling of [`Self::close_provider_task`], called only
+    /// by the host's purge sweep. No manager means nothing was ever launched,
+    /// which is zero rows removed rather than an error.
+    pub fn forget_provider_task(
+        &self,
+        task_id: crate::domain::id::TaskId,
+    ) -> Result<u64, crate::providers::session::ProviderSessionError> {
+        let mut slot = self.inner.provider_sessions.lock().map_err(|_| {
+            crate::providers::session::ProviderSessionError::StateStore(
+                "provider session manager lock poisoned".to_string(),
+            )
+        })?;
+        match slot.as_mut() {
+            Some(manager) => manager.forget_task(task_id),
+            None => Ok(0),
+        }
+    }
+
     pub fn admit_stock_provider_launch(
         &self,
         kind: ProviderKind,
@@ -2786,7 +2806,7 @@ impl ProcessManager {
             .map(|token| quote_shell_argument(token, ClaudeShellKind::Cmd))
             .collect::<Vec<_>>()
             .join(" ");
-        let stable_session_key = StableSessionKey::from_tab(&task_key);
+        let stable_session_key = StableSessionKey::for_task(&task_key);
 
         match request.provider_kind() {
             ProviderKind::ClaudeCode => {

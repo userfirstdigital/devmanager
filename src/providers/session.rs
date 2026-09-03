@@ -2657,6 +2657,24 @@ pub trait ProviderSessionStateStore: sealed::ProviderSessionStateStore {
         Err("provider session store does not implement durable hook-token consumption".to_string())
     }
 
+    /// Forget everything this store holds for one task, permanently.
+    ///
+    /// Called only by the host's purge sweep, after the kernel has already
+    /// recorded the task as deleted. Every other removal path in this store is
+    /// a lifecycle transition -- `close_task` leaves the durable row behind
+    /// with `lifecycle = Closed`, deliberately, so recovery can still find a
+    /// leaked root. This is the one path that says the task itself is gone and
+    /// nothing will ever look for those roots again.
+    ///
+    /// Idempotent: a second call for the same task removes nothing and reports
+    /// zero. The sweep relies on that, because it runs this BEFORE the kernel
+    /// purge commits and a crash in between replays it.
+    ///
+    /// Returns the number of `provider_session_states` rows removed.
+    fn forget_task(&mut self, _task_id: TaskId) -> Result<u64, String> {
+        Err("provider session store does not implement durable per-task removal".to_string())
+    }
+
     /// Atomically consume a provider SessionStart token and commit the first
     /// accepted provider ID with its state/journal receipt.
     fn consume_session_start_and_persist(
@@ -2818,6 +2836,25 @@ impl ProviderSessionStateStore for InMemoryProviderSessionStateStore {
         }
         self.states.insert(state.agent_session_id, state.clone());
         Ok(())
+    }
+
+    fn forget_task(&mut self, task_id: TaskId) -> Result<u64, String> {
+        let doomed: Vec<AgentSessionId> = self
+            .states
+            .values()
+            .filter(|state| state.task_id == task_id)
+            .map(|state| state.agent_session_id)
+            .collect();
+        for agent_session_id in &doomed {
+            self.states.remove(agent_session_id);
+            self.recovery_claims
+                .retain(|key, _| key.agent_session_id != *agent_session_id);
+            self.settled_recoveries
+                .retain(|key| key.agent_session_id != *agent_session_id);
+            self.recovery_releases
+                .retain(|_, receipt| receipt.state.agent_session_id != *agent_session_id);
+        }
+        Ok(u64::try_from(doomed.len()).unwrap_or(u64::MAX))
     }
 
     fn list_open_for_task(&self, task_id: TaskId) -> Result<Vec<ProviderSessionState>, String> {
@@ -4976,6 +5013,93 @@ impl ProviderSessionStateStore for SqliteProviderSessionStateStore {
         transaction.commit().map_err(|error| error.to_string())
     }
 
+    fn forget_task(&mut self, task_id: TaskId) -> Result<u64, String> {
+        // Which rows belong to this task can only be answered by decoding
+        // `state_json`: `provider_session_states` is keyed by agent session
+        // and carries no task column. A row that will not decode names no
+        // task this method can trust, so it is LEFT rather than guessed at --
+        // deleting it would be deleting somebody else's session on the
+        // strength of a failed parse.
+        let doomed: Vec<String> = {
+            let mut statement = self
+                .connection
+                .prepare(
+                    "SELECT agent_session_id, revision, lifecycle, state_json
+                     FROM provider_session_states",
+                )
+                .map_err(|error| error.to_string())?;
+            let rows = statement
+                .query_map([], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, String>(2)?,
+                        bounded_state_blob(row, 3)?,
+                    ))
+                })
+                .map_err(|error| error.to_string())?;
+            let mut doomed = Vec::new();
+            for row in rows {
+                let (row_id, row_revision, row_lifecycle, bytes) =
+                    row.map_err(|error| error.to_string())?;
+                match persisted_row_belongs_to_task(
+                    &bytes,
+                    &row_id,
+                    row_revision,
+                    &row_lifecycle,
+                    task_id,
+                ) {
+                    Ok(true) => doomed.push(row_id),
+                    Ok(false) => {}
+                    Err(error) => {
+                        // Named, not swallowed: an undecodable row survives
+                        // every purge of every task, and silence would make
+                        // that indistinguishable from having nothing to do.
+                        eprintln!(
+                            "devmanager-providers: provider session row {row_id} could not be \
+                             attributed to a task, leaving it: {error}"
+                        );
+                    }
+                }
+            }
+            doomed
+        };
+
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|error| error.to_string())?;
+        let mut removed = 0_u64;
+        for agent_session_id in &doomed {
+            for sql in [
+                "DELETE FROM provider_session_recovery_release_pending WHERE agent_session_id = ?1",
+                "DELETE FROM provider_session_recovery_ownership WHERE agent_session_id = ?1",
+                "DELETE FROM provider_session_journal WHERE agent_session_id = ?1",
+            ] {
+                transaction
+                    .execute(sql, params![agent_session_id])
+                    .map_err(|error| error.to_string())?;
+            }
+            let changed = transaction
+                .execute(
+                    "DELETE FROM provider_session_states WHERE agent_session_id = ?1",
+                    params![agent_session_id],
+                )
+                .map_err(|error| error.to_string())?;
+            removed = removed.saturating_add(u64::try_from(changed).unwrap_or(0));
+        }
+        // Start tokens carry the task directly, so they are reachable even for
+        // a task whose state rows never decoded.
+        transaction
+            .execute(
+                "DELETE FROM provider_session_start_tokens WHERE task_id = ?1",
+                params![task_id.to_string()],
+            )
+            .map_err(|error| error.to_string())?;
+        transaction.commit().map_err(|error| error.to_string())?;
+        Ok(removed)
+    }
+
     fn clear_recovery_release(&mut self, receipt: &RecoveryReleaseReceipt) -> Result<(), String> {
         let state_json = receipt.state.encode()?;
         let transaction = self
@@ -6595,6 +6719,28 @@ impl<L: ProviderProcessLauncher, S: ProviderSessionStateStore> ProviderSessionMa
             }
         }
         Ok(())
+    }
+
+    /// Drop every trace of one task, in memory and durably.
+    ///
+    /// [`Self::close_task`] is a lifecycle gesture: it stops the runtimes and
+    /// leaves the durable rows at `lifecycle = Closed` so recovery can still
+    /// find a leaked root. This is what the host's purge sweep calls once the
+    /// task itself is gone and there is nothing left to recover FOR.
+    ///
+    /// Closes first, so a still-running provider is torn down rather than
+    /// orphaned by having its bookkeeping deleted out from under it.
+    pub fn forget_task(&mut self, task_id: TaskId) -> Result<u64, ProviderSessionError> {
+        self.close_task(task_id)?;
+        let removed = self
+            .state_store
+            .forget_task(task_id)
+            .map_err(ProviderSessionError::StateStore)?;
+        self.leases
+            .retain(|_, lease| lease.state.task_id != task_id);
+        self.current
+            .retain(|_, runtime| runtime.task_id() != task_id);
+        Ok(removed)
     }
 
     fn ensure_request_admissible(
@@ -8495,6 +8641,78 @@ mod tests {
                 .unwrap();
             assert!(store.list_recovery_for_task(unrelated).is_err());
         }
+    }
+
+    /// `forget_task` removes one task's durable rows and touches nobody
+    /// else's.
+    ///
+    /// The "nobody else's" half is the point: the table is keyed by agent
+    /// session and carries no task column, so the removal has to decode every
+    /// row to decide, and a predicate that decided wrong would delete a live
+    /// task's sessions with no way to notice.
+    #[test]
+    fn forget_task_removes_only_that_tasks_durable_rows() {
+        let path = tempfile::tempdir().expect("forget_task fixture dir");
+        let db = path.path().join("provider-sessions.sqlite3");
+        let doomed = unit_runtime();
+        let survivor = unit_runtime();
+        assert_ne!(doomed.task_id(), survivor.task_id());
+
+        let persisted = |runtime: &ProviderRuntime| ProviderSessionState {
+            agent_session_id: runtime.agent_session_id(),
+            task_id: runtime.task_id(),
+            generation: runtime.generation(),
+            action_epoch: runtime.correlation().action_epoch(),
+            revision: 1,
+            lifecycle: PersistedRuntimeLifecycle::Running,
+            launch_nonce: runtime.launch_nonce(),
+            launch_spec: runtime.launch_spec(),
+            provider_session_id: None,
+            process_root: None,
+            repinned_executable: None,
+            pending_executable_repin: None,
+        };
+
+        let mut store = SqliteProviderSessionStateStore::open(&db).unwrap();
+        store.persist(persisted(&doomed)).unwrap();
+        store.persist(persisted(&survivor)).unwrap();
+        assert!(store.load(doomed.agent_session_id()).unwrap().is_some());
+        assert!(store.load(survivor.agent_session_id()).unwrap().is_some());
+
+        assert_eq!(store.forget_task(doomed.task_id()).unwrap(), 1);
+        assert!(
+            store.load(doomed.agent_session_id()).unwrap().is_none(),
+            "the purged task's durable row must be gone"
+        );
+        assert!(
+            store.load(survivor.agent_session_id()).unwrap().is_some(),
+            "another task's row must survive"
+        );
+
+        // Idempotent: the sweep runs this before the kernel purge commits, so
+        // a crash in between replays it.
+        assert_eq!(store.forget_task(doomed.task_id()).unwrap(), 0);
+
+        // Durable, not just in this connection's cache.
+        drop(store);
+        let reopened = SqliteProviderSessionStateStore::open(&db).unwrap();
+        assert!(reopened.load(doomed.agent_session_id()).unwrap().is_none());
+        assert!(reopened
+            .load(survivor.agent_session_id())
+            .unwrap()
+            .is_some());
+        let orphan_journal_rows: i64 = Connection::open(&db)
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM provider_session_journal WHERE agent_session_id = ?1",
+                params![doomed.agent_session_id().to_string()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            orphan_journal_rows, 0,
+            "the append-only journal must not outlive the state it journals"
+        );
     }
 
     fn unit_runtime() -> ProviderRuntime {

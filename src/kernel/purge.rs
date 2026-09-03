@@ -165,6 +165,11 @@ pub(crate) const PURGE_TABLES: &[PurgeTable] = &[
 /// Tables that carry a `task_id` column and are deliberately NOT in
 /// [`PURGE_TABLES`], with the reason. The census test reads this beside the
 /// purge list, so exempting a table is a decision someone had to write down.
+///
+/// Test-only because the census is its only consumer: it exists to make an
+/// exemption a written decision rather than a silent omission, not to be read
+/// at runtime.
+#[cfg(test)]
 pub(crate) const PURGE_EXEMPT_TASK_SCOPED_TABLES: &[(&str, &str)] = &[
     (
         "events",
@@ -892,6 +897,110 @@ mod tests {
             reopened.startup_identity_backfill(),
             crate::kernel::store::OperationIdentityBackfill::NotNeeded
         );
+    }
+
+    /// The sweep's worklist offers deleted tasks and nothing else.
+    ///
+    /// The selection IS the guard: `tasks.lifecycle = 'deleted'` is written by
+    /// the projector only after the whole close/archive chain has settled, so
+    /// an open task -- or one still closing -- is never a candidate, and
+    /// `purge_deleted_task` re-checks the same column inside its own writer
+    /// transaction.
+    #[test]
+    fn the_worklist_offers_deleted_tasks_and_nothing_else() {
+        let dir = TempDir::new().expect("tempdir");
+        let path = dir.path().join("kernel.sqlite3");
+        let mut store = KernelStore::open(&path).expect("open");
+        let deleted = seed_deleted_task(&mut store);
+
+        let open = task_id(0xA0);
+        accepted(
+            store
+                .execute_for_test(envelope(
+                    command_id(0xA1),
+                    None,
+                    None,
+                    Command::CreateTask(CreateTaskIntent {
+                        id: open,
+                        environment_id: environment_id(0x02),
+                        title: "still open".into(),
+                        description: None,
+                        project_id: project_id(0x03),
+                        workspace: WorkspaceRef::Main,
+                        assignment: TaskAssignment::LocalOwner,
+                        created_at_ms: 1_725_000_000_000,
+                        connectivity: TaskConnectivity::Connected,
+                        attention: TaskAttention::None,
+                        activity: TaskActivity::Idle,
+                        review_readiness: ReviewReadiness::NotReady,
+                    }),
+                ))
+                .expect("create open task"),
+            "create open task",
+        );
+        let closing = task_id(0xB0);
+        accepted(
+            store
+                .execute_for_test(envelope(
+                    command_id(0xB1),
+                    None,
+                    None,
+                    Command::CreateTask(CreateTaskIntent {
+                        id: closing,
+                        environment_id: environment_id(0x02),
+                        title: "closing".into(),
+                        description: None,
+                        project_id: project_id(0x03),
+                        workspace: WorkspaceRef::Main,
+                        assignment: TaskAssignment::LocalOwner,
+                        created_at_ms: 1_725_000_000_000,
+                        connectivity: TaskConnectivity::Connected,
+                        attention: TaskAttention::None,
+                        activity: TaskActivity::Idle,
+                        review_readiness: ReviewReadiness::NotReady,
+                    }),
+                ))
+                .expect("create closing task"),
+            "create closing task",
+        );
+        accepted(
+            store
+                .execute(envelope(
+                    command_id(0xB2),
+                    Some(closing),
+                    Some(1),
+                    Command::BeginCloseTask,
+                ))
+                .expect("begin close"),
+            "begin close",
+        );
+        store
+            .settle_next_process_empty_task_teardown(Duration::from_secs(30))
+            .expect("archive the closing task");
+
+        let observer = Connection::open(&path).expect("observer");
+        assert_eq!(
+            deleted_task_ids(&observer, 8).expect("worklist"),
+            vec![deleted],
+            "only the deleted task may be swept"
+        );
+
+        // And the purge refuses each of the others by name, so the guard holds
+        // even if something else ever hands it a task id.
+        drop(observer);
+        for (task, expected) in [
+            (open, TaskLifecycle::Open),
+            (closing, TaskLifecycle::Archived),
+        ] {
+            assert_eq!(
+                store
+                    .with_immediate_transaction(|tx| purge_deleted_task_in_tx(tx, task))
+                    .expect("purge call"),
+                TaskPurge::Refused(TaskPurgeRefusal::NotDeleted {
+                    lifecycle: expected
+                })
+            );
+        }
     }
 
     /// A client resuming from a cursor BEFORE the purged range must get a
