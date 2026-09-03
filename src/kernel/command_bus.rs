@@ -2204,11 +2204,6 @@ mod terminal_and_provider_restart_tests {
         assert_eq!(rejection_code(&close_released), RejectionCode::NotFound);
     }
 
-    /// The V16 tables are projections, so a full rebuild from the event log must
-    /// reproduce them byte-for-byte. This is what proves the shadow twins, both
-    /// hand-written rebuild batches, and the four `canonical_table_dump` arms are
-    /// wired: without them the rebuild reports drift or drops the rows entirely,
-    /// and every reader silently sees a task with no terminals.
     /// `settle_resource_release_for` settles exactly one resource's release.
     ///
     /// The host closes one shell at a time and must never settle a release it
@@ -2338,6 +2333,11 @@ mod terminal_and_provider_restart_tests {
         );
     }
 
+    /// The V16 tables are projections, so a full rebuild from the event log must
+    /// reproduce them byte-for-byte. This is what proves the shadow twins, both
+    /// hand-written rebuild batches, and the four `canonical_table_dump` arms are
+    /// wired: without them the rebuild reports drift or drops the rows entirely,
+    /// and every reader silently sees a task with no terminals.
     #[test]
     fn a_projection_rebuild_reproduces_the_terminal_tables() {
         let directory = tempfile::tempdir().expect("tempdir");

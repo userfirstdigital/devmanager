@@ -111,14 +111,6 @@ fn task_resource_blocks_archive_after_cleanup_error(
         )
 }
 
-/// Does provider cleanup have to wait for the resource release loop?
-///
-/// Plain shells are deliberately invisible here. They are closed directly by
-/// the release loop rather than through a process-empty durable release, and
-/// counting one would flip an ordinary provider task onto the deferred-cleanup
-/// branch the moment its owner opened a shell -- a timing change to the
-/// provider lane caused by something with no provider in it. Provider cleanup
-/// timing must be exactly what it was before plain shells existed.
 /// Why one live plain-shell link no longer has a durable terminal behind it,
 /// or `None` while it still does.
 ///
@@ -127,10 +119,14 @@ fn task_resource_blocks_archive_after_cleanup_error(
 /// entry with no row, or whose resource is gone or `Released`, is a live PTY
 /// that nothing can reach any more.
 ///
-/// `Releasing` is deliberately NOT orphaned. It is the ordinary transient a
-/// close passes through -- the client renders it as a muted "?" chip -- and
-/// closing on it would tear down a shell the host is already retiring in
-/// order, or one whose release is still in flight.
+/// `Releasing` with a live link is orphaned too. The two paths that begin a
+/// shell's release in order -- the client `CloseTerminal` effect and the
+/// task-close loop -- both tear the process down and settle the release
+/// synchronously inside one executor step, so no reaper tick can observe
+/// them mid-flight. A `Releasing` shell whose link is still alive at a tick
+/// was therefore released by a bare `Command::ReleaseResource`, which emits
+/// `ResourceReleaseBegun` with no close effect and would otherwise leave the
+/// PTY running behind a "?" chip until the task is archived.
 fn orphaned_shell_reason(
     resource_id: ResourceId,
     snapshot: Option<&crate::domain::snapshot::TaskSnapshot>,
@@ -144,6 +140,9 @@ fn orphaned_shell_reason(
         Some(resource) if resource.lifecycle == ResourceLifecycle::Released => {
             Some("its resource was released")
         }
+        Some(resource) if resource.lifecycle == ResourceLifecycle::Releasing => {
+            Some("its release was begun without a close")
+        }
         Some(_) if !snapshot.terminal_facts.contains_key(&resource_id) => {
             Some("its durable terminal is gone")
         }
@@ -151,6 +150,14 @@ fn orphaned_shell_reason(
     }
 }
 
+/// Does provider cleanup have to wait for the resource release loop?
+///
+/// Plain shells are deliberately invisible here. They are closed directly by
+/// the release loop rather than through a process-empty durable release, and
+/// counting one would flip an ordinary provider task onto the deferred-cleanup
+/// branch the moment its owner opened a shell -- a timing change to the
+/// provider lane caused by something with no provider in it. Provider cleanup
+/// timing must be exactly what it was before plain shells existed.
 fn provider_cleanup_requires_resource_release_first<'a>(
     resources: impl IntoIterator<Item = &'a ResourceFacts>,
     task_id: TaskId,
@@ -4890,7 +4897,7 @@ impl HostRequestExecutor {
                 Ok(None) => continue,
                 Err(error) => {
                     eprintln!(
-                        "devmanager-host: shell release {resource_id} could not read task                          {task_id}, leaving it: {error}"
+                        "devmanager-host: shell release {resource_id} could not read task {task_id}, leaving it: {error}"
                     );
                     continue;
                 }
@@ -15372,15 +15379,23 @@ mod tests {
             (snapshot, shell_id)
         };
 
-        // Still live: the sweep must leave every one of these alone.
-        for lifecycle in [ResourceLifecycle::Active, ResourceLifecycle::Releasing] {
-            let (snapshot, shell_id) = snapshot_with(Some(lifecycle), true);
-            assert_eq!(
-                orphaned_shell_reason(shell_id, Some(&snapshot)),
-                None,
-                "a {lifecycle:?} shell with durable facts is still reachable and must not be closed"
-            );
-        }
+        // Still live: the sweep must leave it alone.
+        let (snapshot, shell_id) = snapshot_with(Some(ResourceLifecycle::Active), true);
+        assert_eq!(
+            orphaned_shell_reason(shell_id, Some(&snapshot)),
+            None,
+            "an Active shell with durable facts is still reachable and must not be closed"
+        );
+
+        // Releasing with a live link: nobody is retiring it in order (both
+        // ordered paths close and settle inside one executor step), so it was
+        // begun by a bare ReleaseResource and the sweep must finish it.
+        let (snapshot, shell_id) = snapshot_with(Some(ResourceLifecycle::Releasing), true);
+        assert_eq!(
+            orphaned_shell_reason(shell_id, Some(&snapshot)),
+            Some("its release was begun without a close"),
+            "a Releasing shell whose PTY is still linked was released without a close"
+        );
 
         // Gone, in each of the three ways it can go.
         let (snapshot, shell_id) = snapshot_with(Some(ResourceLifecycle::Released), false);

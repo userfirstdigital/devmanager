@@ -439,6 +439,77 @@ struct ShellHost {
     task_id: TaskId,
 }
 
+/// A host between a crash and its replacement: the store is on disk, no
+/// executor holds it, and no `shell_sessions` exist anywhere.
+struct StoppedShellHost {
+    _base: tempfile::TempDir,
+    paths: ResolvedAppPaths,
+    negotiated: NegotiatedParameters,
+    client_id: ClientId,
+    task_id: TaskId,
+}
+
+impl StoppedShellHost {
+    async fn start_again(self) -> ShellHost {
+        let StoppedShellHost {
+            _base,
+            paths,
+            negotiated,
+            client_id,
+            task_id,
+        } = self;
+        let store = ConfigStore::open_host(&paths).expect("reopen host config");
+        let bus = CommandBus::open(&paths.database).expect("reopen command store");
+        let (requests, executor) =
+            HostRequestExecutor::start_supervised_with_config_store(bus, store, &paths.root)
+                .expect("restarted host executor");
+        ShellHost {
+            _base,
+            paths,
+            requests,
+            executor,
+            negotiated,
+            client_id,
+            task_id,
+        }
+    }
+
+    /// Write the durable step `CloseTerminal` takes, with no host to perform
+    /// the close: the state a crash between the two halves leaves behind.
+    fn begin_release_behind_the_hosts_back(&self, resource_id: ResourceId) {
+        begin_release_with_second_handle(&self.paths, self.client_id, self.task_id, resource_id);
+    }
+}
+
+fn begin_release_with_second_handle(
+    paths: &ResolvedAppPaths,
+    client_id: ClientId,
+    task_id: TaskId,
+    resource_id: ResourceId,
+) {
+    let mut bus = CommandBus::open(&paths.database).expect("second store handle");
+    let revision = bus
+        .task_snapshot(task_id)
+        .expect("snapshot")
+        .expect("task")
+        .task
+        .revision;
+    let receipt = bus
+        .execute(CommandEnvelope {
+            command_id: CommandId::new(),
+            client_id,
+            task_id: Some(task_id),
+            issued_at_ms: 1_725_000_003_000,
+            expected_task_revision: Some(revision),
+            command: Command::CloseTerminal { resource_id },
+        })
+        .expect("begin the release behind the host's back");
+    assert!(
+        matches!(receipt, CommandReceipt::Accepted { .. }),
+        "the durable close must be accepted: {receipt:?}"
+    );
+}
+
 impl ShellHost {
     async fn start(label: &str) -> Self {
         let base = tempfile::tempdir().expect("fixture base");
@@ -545,6 +616,11 @@ impl ShellHost {
     /// starts with no `shell_sessions` at all. Any `ReleaseResource` row left
     /// behind is one nothing in the process can attribute to a live shell.
     async fn restart(self) -> Self {
+        self.stop().await.start_again().await
+    }
+
+    /// Stop the executor the way a crash does: nothing is closed or settled.
+    async fn stop(self) -> StoppedShellHost {
         let ShellHost {
             _base,
             paths,
@@ -561,17 +637,9 @@ impl ShellHost {
         let _ = executor.join.await;
         drop(requests);
         tokio::task::yield_now().await;
-
-        let store = ConfigStore::open_host(&paths).expect("reopen host config");
-        let bus = CommandBus::open(&paths.database).expect("reopen command store");
-        let (requests, executor) =
-            HostRequestExecutor::start_supervised_with_config_store(bus, store, &paths.root)
-                .expect("restarted host executor");
-        Self {
+        StoppedShellHost {
             _base,
             paths,
-            requests,
-            executor,
             negotiated,
             client_id,
             task_id,
@@ -925,14 +993,78 @@ fn closing_a_shell_settles_its_release_and_drops_it_from_the_strip() {
     });
 }
 
+/// A release begun behind the host's back is finished by the host's own sweep.
+///
+/// `Command::ReleaseResource` (and a `CloseTerminal` written by another store
+/// handle) emits `ResourceReleaseBegun` with no close effect, so the PTY keeps
+/// running behind a "?" chip. Both ordered release paths close and settle
+/// inside one executor step, so a `Releasing` shell whose link is still alive
+/// at a reaper tick can only have come from such a bare release; the sweep
+/// must tear the process down first and settle the row after.
+#[test]
+fn a_release_begun_behind_the_hosts_back_is_closed_and_settled_by_the_sweep() {
+    let _pid_guard = use_isolated_pid_file("sweep-bare-release");
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("test runtime");
+    runtime.block_on(async {
+        let host = ShellHost::start("bare-release").await;
+        let resource_id = match host.open_shell().await {
+            Ok(resource_id) => resource_id,
+            Err(refusal) => {
+                println!(
+                    "SKIPPED a_release_begun_behind_the_hosts_back_is_closed_and_settled_by_the_sweep: \
+                     no shell could be opened on this machine: {refusal}"
+                );
+                return;
+            }
+        };
+        assert!(
+            wait_until(Duration::from_secs(30), || !live_shell_pids().is_empty()).await,
+            "the shell never appeared in the pid ledger"
+        );
+        let shell_pid = live_shell_pids()[0];
+        assert!(
+            shell_is_running(shell_pid),
+            "the fixture shell {shell_pid} is not a live process, so this proves nothing"
+        );
+
+        begin_release_with_second_handle(&host.paths, host.client_id, host.task_id, resource_id);
+        assert_eq!(
+            host.shell_release_state(resource_id).0,
+            Some(ResourceLifecycle::Releasing),
+            "the fixture must actually leave a pending release, or this proves nothing"
+        );
+
+        assert!(
+            wait_until(Duration::from_secs(30), || host
+                .shell_release_state(resource_id)
+                .0
+                == Some(ResourceLifecycle::Released))
+            .await,
+            "the sweep left a Releasing shell with a live link at {:?}; a bare release \
+             would keep its PTY running behind a \"?\" chip until archive",
+            host.shell_release_state(resource_id).0
+        );
+        assert!(
+            wait_until_stable(Duration::from_secs(10), 3, || !shell_is_running(shell_pid)).await,
+            "the sweep settled the release while the shell {shell_pid} was still running"
+        );
+        let (_, has_facts, in_order) = host.shell_release_state(resource_id);
+        assert!(!has_facts, "the sweep must retire the terminal facts too");
+        assert!(!in_order, "the sweep must free the strip slot too");
+    });
+}
+
 /// A host that dies between the teardown and the settle converges on boot.
 ///
 /// The close and the settle are two durable steps and nothing makes them
 /// atomic, so the row has to be recoverable by a host that was not there when
 /// it was written. The replacement host holds no `shell_sessions` at all, which
-/// is exactly the condition that licenses settling: a shell it is still running
-/// is one it has not torn down, and settling that release would publish
-/// `Released` for a live PTY.
+/// is exactly the condition that licenses the maintenance settle: a shell it is
+/// still running is one it has not torn down, and settling that release would
+/// publish `Released` for a live PTY.
 #[test]
 fn a_release_left_by_a_dead_host_is_settled_on_the_next_maintenance_tick() {
     let _pid_guard = use_isolated_pid_file("converge-orphan-release");
@@ -953,52 +1085,12 @@ fn a_release_left_by_a_dead_host_is_settled_on_the_next_maintenance_tick() {
             }
         };
 
-        // Begin the release WITHOUT the host performing its close: a second
-        // store handle writes the same durable step `CloseTerminal` does, which
-        // is the state a crash between the two halves leaves behind.
-        {
-            let mut bus = CommandBus::open(&host.paths.database).expect("second store handle");
-            let revision = bus
-                .task_snapshot(host.task_id)
-                .expect("snapshot")
-                .expect("task")
-                .task
-                .revision;
-            let receipt = bus
-                .execute(CommandEnvelope {
-                    command_id: CommandId::new(),
-                    client_id: host.client_id,
-                    task_id: Some(host.task_id),
-                    issued_at_ms: 1_725_000_003_000,
-                    expected_task_revision: Some(revision),
-                    command: Command::CloseTerminal { resource_id },
-                })
-                .expect("begin the release behind the host's back");
-            assert!(
-                matches!(receipt, CommandReceipt::Accepted { .. }),
-                "the durable close must be accepted: {receipt:?}"
-            );
-        }
-        assert_eq!(
-            host.shell_release_state(resource_id).0,
-            Some(ResourceLifecycle::Releasing),
-            "the fixture must actually leave a pending release, or this proves nothing"
-        );
-
-        // The ORIGINAL host still holds a live session for this shell, so it
-        // must NOT settle: that is the guard that keeps convergence from
-        // publishing Released for a running PTY.
-        for _ in 0..4 {
-            tokio::time::sleep(Duration::from_millis(500)).await;
-        }
-        assert_eq!(
-            host.shell_release_state(resource_id).0,
-            Some(ResourceLifecycle::Releasing),
-            "a host that still holds the shell session must leave its release alone"
-        );
-
-        // Now the crash: the session goes with the host.
-        let host = host.restart().await;
+        // The crash first, so no executor can observe the release being begun:
+        // the row is written while nothing holds the store, which is the
+        // state a host that died between the two halves leaves behind.
+        let stopped = host.stop().await;
+        stopped.begin_release_behind_the_hosts_back(resource_id);
+        let host = stopped.start_again().await;
         assert!(
             wait_until(Duration::from_secs(30), || host.shell_release_state(resource_id).0
                 == Some(ResourceLifecycle::Released))
