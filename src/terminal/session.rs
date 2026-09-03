@@ -324,11 +324,12 @@ impl SessionEventProxy {
             .dimensions
             .lock()
             .unwrap_or_else(|err| err.into_inner());
+        let (cell_width, cell_height) = reported_cell_size(*dimensions);
         WindowSize {
             num_lines: dimensions.rows,
             num_cols: dimensions.cols,
-            cell_width: dimensions.cell_width,
-            cell_height: dimensions.cell_height,
+            cell_width,
+            cell_height,
         }
     }
 
@@ -2407,12 +2408,31 @@ fn write_system_clipboard_text(text: &str) -> Result<(), String> {
         .map_err(|error| format!("Failed to write clipboard: {error}"))
 }
 
+/// Cell size reported downstream (to the PTY and to the emulator's own window
+/// queries). It must be the pitch the client actually paints on, or the host's
+/// column arithmetic and the painted grid describe different grids.
+///
+/// `dimensions` only carries a rounded `u16`, which cannot express a fractional
+/// advance, so the measured advance from
+/// [`crate::terminal::view::measured_terminal_cell_advance`] is the authority
+/// and the stored value stands in only where nothing has measured (headless
+/// hosts and tests).
+fn reported_cell_size(dimensions: SessionDimensions) -> (u16, u16) {
+    let cell_width = crate::terminal::view::measured_terminal_cell_advance(
+        crate::terminal::view::TERMINAL_FONT_SIZE,
+    )
+    .map(|advance| advance.round().max(1.0) as u16)
+    .unwrap_or(dimensions.cell_width);
+    (cell_width, dimensions.cell_height)
+}
+
 fn pty_size(dimensions: SessionDimensions) -> PtySize {
+    let (cell_width, cell_height) = reported_cell_size(dimensions);
     PtySize {
         rows: dimensions.rows,
         cols: dimensions.cols,
-        pixel_width: dimensions.cell_width,
-        pixel_height: dimensions.cell_height,
+        pixel_width: cell_width,
+        pixel_height: cell_height,
     }
 }
 

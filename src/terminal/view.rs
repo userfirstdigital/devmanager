@@ -16,7 +16,8 @@ use gpui::{
     ObjectFit, ParentElement, Pixels, Point, SharedString, StrikethroughStyle, Styled, StyledImage,
     TextRun, UnderlineStyle, Window,
 };
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex, OnceLock};
 
 pub const TERMINAL_FONT_SIZE: f32 = 13.0;
 pub const TERMINAL_LINE_HEIGHT: f32 = 18.0;
@@ -28,6 +29,97 @@ pub const TERMINAL_SCROLLBAR_MIN_THUMB_HEIGHT_PX: f32 = 18.0;
 
 pub fn terminal_line_height(font_size: f32) -> f32 {
     (font_size + 5.0).max(TERMINAL_LINE_HEIGHT)
+}
+
+/// Cell pitch used only where there is no window or text system to ask:
+/// headless hosts, unit tests, and the rounded `u16` grid dimensions the host
+/// carries in [`crate::state::SessionDimensions`].
+///
+/// This is the FALLBACK, not the truth. The truth is the terminal font's own
+/// horizontal advance, measured through GPUI's text system by
+/// [`measure_terminal_cell_advance`]. Cascadia Mono at 13 px advances
+/// 7.617 px, so painting on this constant places every glyph in a run
+/// 0.383 px per column further right than the shaped run actually is.
+pub const FALLBACK_TERMINAL_CELL_WIDTH: f32 = 8.0;
+
+/// One source of truth for the terminal grid's horizontal pitch.
+///
+/// `measured_advance` is what GPUI's text system reports for the exact `Font`
+/// the runs are shaped with (so a fallback substitution is measured rather
+/// than assumed); `None` means nothing could be measured. The pitch MUST equal
+/// that advance: background quads, the cursor quad and the shaped glyphs are
+/// all positioned from it, and any other value makes the three disagree about
+/// where a column starts, accumulating across a run and resetting at every run
+/// boundary.
+pub fn terminal_cell_pitch(measured_advance: Option<f32>) -> f32 {
+    measured_advance
+        .filter(|advance| advance.is_finite() && *advance > 0.0)
+        .unwrap_or(FALLBACK_TERMINAL_CELL_WIDTH)
+}
+
+/// Window-space horizontal offset of a grid column, at the given pitch.
+///
+/// Every painted x in the grid goes through here so the quads and the glyphs
+/// cannot drift apart.
+pub fn terminal_column_offset(column: usize, cell_pitch: f32) -> f32 {
+    column as f32 * cell_pitch
+}
+
+/// Measured advances, keyed by font size bits. Shaping metrics are constant
+/// for a (font, size) pair, so the text system is asked once and never per
+/// frame.
+fn measured_cell_advances() -> &'static Mutex<HashMap<u32, f32>> {
+    static CACHE: OnceLock<Mutex<HashMap<u32, f32>>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Record one measurement so window-free callers (the replica pane model, the
+/// PTY cell-size report) can read the same number the painter uses.
+pub(crate) fn record_measured_terminal_cell_advance(font_size: f32, advance: f32) {
+    if !advance.is_finite() || advance <= 0.0 {
+        return;
+    }
+    if let Ok(mut cache) = measured_cell_advances().lock() {
+        cache.insert(font_size.to_bits(), advance);
+    }
+}
+
+/// The advance last measured for `font_size`, or `None` when no window has
+/// measured yet (headless hosts and tests).
+pub fn measured_terminal_cell_advance(font_size: f32) -> Option<f32> {
+    measured_cell_advances()
+        .lock()
+        .ok()
+        .and_then(|cache| cache.get(&font_size.to_bits()).copied())
+}
+
+/// The pitch every window-free caller should use: the measured advance when
+/// one exists, otherwise [`FALLBACK_TERMINAL_CELL_WIDTH`].
+pub fn last_measured_terminal_cell_pitch(font_size: f32) -> f32 {
+    terminal_cell_pitch(measured_terminal_cell_advance(font_size))
+}
+
+/// Measure the terminal font's advance through GPUI's text system, resolving
+/// the same [`crate::terminal::terminal_font`] value the runs are shaped with
+/// so a font substitution is measured rather than assumed. Cached per font
+/// size; safe to call every frame. `None` only when the text system cannot
+/// answer for this font.
+pub fn measure_terminal_cell_advance(window: &Window, font_size: f32) -> Option<f32> {
+    if let Some(cached) = measured_terminal_cell_advance(font_size) {
+        return Some(cached);
+    }
+    let text_system = window.text_system();
+    let font_id = text_system.resolve_font(&crate::terminal::terminal_font());
+    let measured = text_system
+        .ch_advance(font_id, px(font_size))
+        .or_else(|_| text_system.ch_width(font_id, px(font_size)))
+        .ok()
+        .map(f32::from)
+        .filter(|advance| advance.is_finite() && *advance > 0.0);
+    if let Some(advance) = measured {
+        record_measured_terminal_cell_advance(font_size, advance);
+    }
+    measured
 }
 
 /// Explicit Copy palette for terminal chrome and default cell named colors.
@@ -457,11 +549,11 @@ pub fn terminal_pane_from_replica(request: ReplicaPaneRequest<'_>) -> TerminalPa
         TerminalReplicaOverlay::Exited { summary } => Some(bound_overlay_summary(summary)),
         TerminalReplicaOverlay::None => None,
     };
-    let cell_width = session
-        .as_ref()
-        .map(|view| f32::from(view.runtime.dimensions.cell_width))
-        .filter(|width| *width > 0.0)
-        .unwrap_or(8.0);
+    // `runtime.dimensions.cell_width` is the host's rounded `u16`, which has
+    // always been the hardcoded fallback and cannot express a fractional
+    // advance at all. Take the pitch from the one measured source instead, so
+    // the model agrees with what the painter shapes.
+    let cell_width = last_measured_terminal_cell_pitch(TERMINAL_FONT_SIZE);
     let line_height = session
         .as_ref()
         .map(|view| f32::from(view.runtime.dimensions.cell_height))
@@ -1285,10 +1377,16 @@ fn render_grid_canvas(
     canvas(
         move |bounds, window, cx| {
             if let Some(interaction) = grid_selection.as_ref() {
+                // Column arithmetic must use the same pitch the paint pass
+                // below positions glyphs on, or the grid the PTY is told about
+                // and the grid that is drawn are different grids.
+                let cell_pitch = terminal_cell_pitch(
+                    measure_terminal_cell_advance(window, font_size).or(Some(cell_width)),
+                );
                 let size = terminal_grid_size_for_bounds(
                     f32::from(bounds.size.width),
                     f32::from(bounds.size.height),
-                    cell_width,
+                    cell_pitch,
                     line_height,
                 );
                 (interaction.on_layout)(size, window, cx);
@@ -1305,21 +1403,36 @@ fn render_grid_canvas(
               (background_runs, search_highlight, text_runs, cursor_overlay, grid_selection),
               window,
               cx| {
+            // The pitch is the advance of the font this very window shapes the
+            // runs with — measured once per font size, never per frame. Any
+            // other value (notably the historical hardcoded 8) drifts the
+            // glyphs away from their own background quads by
+            // (pitch - advance) per column.
+            let cell_pitch = terminal_cell_pitch(
+                measure_terminal_cell_advance(window, font_size).or(Some(cell_width)),
+            );
+
             for run in &background_runs {
                 let position = point(
-                    bounds.origin.x + px(run.start_column as f32 * cell_width),
+                    bounds.origin.x + px(terminal_column_offset(run.start_column, cell_pitch)),
                     bounds.origin.y + px(run.row as f32 * line_height),
                 );
-                let run_size = size(px(cell_width * run.cell_count as f32), px(line_height));
+                let run_size = size(
+                    px(terminal_column_offset(run.cell_count, cell_pitch)),
+                    px(line_height),
+                );
                 window.paint_quad(fill(Bounds::new(position, run_size), rgb(run.color)));
             }
 
             if let Some(run) = search_highlight {
                 let position = point(
-                    bounds.origin.x + px(run.start_column as f32 * cell_width),
+                    bounds.origin.x + px(terminal_column_offset(run.start_column, cell_pitch)),
                     bounds.origin.y + px(run.row as f32 * line_height),
                 );
-                let run_size = size(px(cell_width * run.cell_count as f32), px(line_height));
+                let run_size = size(
+                    px(terminal_column_offset(run.cell_count, cell_pitch)),
+                    px(line_height),
+                );
                 window.paint_quad(fill(Bounds::new(position, run_size), rgb(run.color)));
             }
 
@@ -1331,7 +1444,7 @@ fn render_grid_canvas(
                     None,
                 );
                 let position = point(
-                    bounds.origin.x + px(run.start_column as f32 * cell_width),
+                    bounds.origin.x + px(terminal_column_offset(run.start_column, cell_pitch)),
                     bounds.origin.y + px(run.row as f32 * line_height),
                 );
                 let _ = shaped_line.paint(position, px(line_height), window, cx);
@@ -1339,18 +1452,18 @@ fn render_grid_canvas(
 
             if let Some(cursor) = cursor_overlay {
                 let position = point(
-                    bounds.origin.x + px(cursor.column as f32 * cell_width),
+                    bounds.origin.x + px(terminal_column_offset(cursor.column, cell_pitch)),
                     bounds.origin.y + px(cursor.row as f32 * line_height),
                 );
                 let cursor_bounds = match cursor.shape {
                     CursorShape::Underline => Bounds::new(
                         point(position.x, position.y + px((line_height - 2.0).max(0.0))),
-                        size(px(cell_width.max(1.0)), px(2.0)),
+                        size(px(cell_pitch.max(1.0)), px(2.0)),
                     ),
                     CursorShape::Beam => {
                         Bounds::new(position, size(px(2.0), px(line_height.max(1.0))))
                     }
-                    _ => Bounds::new(position, size(px(cell_width), px(line_height))),
+                    _ => Bounds::new(position, size(px(cell_pitch), px(line_height))),
                 };
                 window.paint_quad(fill(cursor_bounds, rgb(cursor.color)));
             }
@@ -1360,13 +1473,13 @@ fn render_grid_canvas(
                 let text_bounds = TerminalTextBounds {
                     left: f32::from(bounds.origin.x),
                     top: f32::from(bounds.origin.y),
-                    width: (grid_cols as f32 * cell_width)
+                    width: terminal_column_offset(grid_cols, cell_pitch)
                         .min(f32::from(bounds.size.width))
-                        .max(cell_width),
+                        .max(cell_pitch),
                     height: (grid_rows as f32 * line_height)
                         .min(f32::from(bounds.size.height))
                         .max(line_height),
-                    cell_width,
+                    cell_width: cell_pitch,
                     row_height: line_height,
                     rows: grid_rows,
                     cols: grid_cols,
@@ -2848,6 +2961,124 @@ mod theme_palette_tests {
         let style = effective_cell_style(&ansi, false, None, palette);
         assert_eq!(style.foreground, 0xfacc15);
         assert_eq!(style.background, 0x1d4ed8);
+    }
+}
+
+#[cfg(test)]
+mod cell_pitch_tests {
+    use super::{
+        last_measured_terminal_cell_pitch, measured_terminal_cell_advance,
+        record_measured_terminal_cell_advance, terminal_cell_pitch, terminal_column_offset,
+        terminal_grid_size_for_bounds, terminal_pane_from_replica, ReplicaPaneRequest,
+        TerminalReplicaOverlay, FALLBACK_TERMINAL_CELL_WIDTH, TERMINAL_FONT_SIZE,
+    };
+    use crate::state::{SessionDimensions, SessionRuntimeState};
+    use crate::terminal::session::{TerminalBackend, TerminalScreenSnapshot, TerminalSessionView};
+    use std::path::PathBuf;
+
+    /// The advance GPUI's text system reports for Cascadia Mono at 13 px.
+    /// Injected, not measured, so this test does not depend on any font being
+    /// installed on the machine running it.
+    const MEASURED_CASCADIA_MONO_13PX: f32 = 7.6172;
+    /// Consolas is the first fallback. A substitution must be followed, never
+    /// rounded back to the constant.
+    const MEASURED_CONSOLAS_13PX: f32 = 7.1475;
+
+    fn replica_view(host_reported_cell_width: u16) -> TerminalSessionView {
+        let mut dimensions = SessionDimensions::default();
+        dimensions.cell_width = host_reported_cell_width;
+        TerminalSessionView {
+            runtime: SessionRuntimeState::new(
+                "pitch-session",
+                PathBuf::from("."),
+                dimensions,
+                TerminalBackend::PortablePtyFeedingAlacritty,
+            ),
+            screen: TerminalScreenSnapshot::default(),
+        }
+    }
+
+    #[test]
+    fn paint_pitch_is_the_measured_advance_not_the_fallback_constant() {
+        let pitch = terminal_cell_pitch(Some(MEASURED_CASCADIA_MONO_13PX));
+        assert_eq!(pitch, MEASURED_CASCADIA_MONO_13PX);
+        assert_eq!(
+            terminal_cell_pitch(Some(MEASURED_CONSOLAS_13PX)),
+            MEASURED_CONSOLAS_13PX
+        );
+
+        // Every painted x in the grid — background quads, glyph runs and the
+        // cursor — is `terminal_column_offset(column, pitch)`, so this is the
+        // pitch the paint pass actually uses.
+        assert_eq!(
+            terminal_column_offset(80, pitch),
+            MEASURED_CASCADIA_MONO_13PX * 80.0
+        );
+
+        // The defect being guarded: on the constant, column 80 was painted
+        // 30.6 px right of the glyph the shaping had put there.
+        let drift = terminal_column_offset(80, FALLBACK_TERMINAL_CELL_WIDTH)
+            - terminal_column_offset(80, pitch);
+        assert!(
+            drift > 30.0,
+            "the fallback constant must not be the paint pitch; drift was {drift}"
+        );
+    }
+
+    #[test]
+    fn the_constant_is_used_only_when_nothing_could_be_measured() {
+        assert_eq!(terminal_cell_pitch(None), FALLBACK_TERMINAL_CELL_WIDTH);
+        assert_eq!(terminal_cell_pitch(Some(0.0)), FALLBACK_TERMINAL_CELL_WIDTH);
+        assert_eq!(
+            terminal_cell_pitch(Some(-1.0)),
+            FALLBACK_TERMINAL_CELL_WIDTH
+        );
+        assert_eq!(
+            terminal_cell_pitch(Some(f32::NAN)),
+            FALLBACK_TERMINAL_CELL_WIDTH
+        );
+        assert_eq!(
+            terminal_cell_pitch(Some(f32::INFINITY)),
+            FALLBACK_TERMINAL_CELL_WIDTH
+        );
+    }
+
+    #[test]
+    fn every_window_free_reader_takes_the_injected_advance() {
+        record_measured_terminal_cell_advance(TERMINAL_FONT_SIZE, MEASURED_CASCADIA_MONO_13PX);
+        assert_eq!(
+            measured_terminal_cell_advance(TERMINAL_FONT_SIZE),
+            Some(MEASURED_CASCADIA_MONO_13PX)
+        );
+        let pitch = last_measured_terminal_cell_pitch(TERMINAL_FONT_SIZE);
+        assert_eq!(pitch, MEASURED_CASCADIA_MONO_13PX);
+
+        // Column arithmetic follows the font: 800 px holds 105 columns at the
+        // real advance and only 100 at the constant.
+        assert_eq!(
+            terminal_grid_size_for_bounds(800.0, 180.0, pitch, 18.0).0,
+            105
+        );
+        assert_eq!(
+            terminal_grid_size_for_bounds(800.0, 180.0, FALLBACK_TERMINAL_CELL_WIDTH, 18.0).0,
+            100
+        );
+
+        // The replica pane model must ignore the host's rounded u16 — that
+        // field is the fallback the host had no way to measure.
+        let view = replica_view(99);
+        let model = terminal_pane_from_replica(ReplicaPaneRequest {
+            active_project: "",
+            session_label: "pitch",
+            replica_view: Some(&view),
+            last_valid_view: None,
+            overlay: TerminalReplicaOverlay::None,
+            selection: None,
+            search: None,
+            search_highlight: None,
+            scrollbar: None,
+        });
+        assert_eq!(model.cell_width, MEASURED_CASCADIA_MONO_13PX);
     }
 }
 

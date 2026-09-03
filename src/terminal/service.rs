@@ -1888,12 +1888,21 @@ impl TerminalService {
     }
 }
 
+/// Grid dimensions for a host-side session. There is no window or text system
+/// here, so the cell size is the FALLBACK, not the truth: the real pitch is the
+/// terminal font's own advance, measured by
+/// [`crate::terminal::view::measure_terminal_cell_advance`] on the client and
+/// reported back through
+/// [`crate::terminal::view::measured_terminal_cell_advance`].
 fn session_dimensions(size: TerminalSize) -> SessionDimensions {
     SessionDimensions {
         cols: size.cols,
         rows: size.rows,
-        cell_width: 8,
-        cell_height: 18,
+        cell_width: crate::terminal::view::FALLBACK_TERMINAL_CELL_WIDTH.round() as u16,
+        cell_height: crate::terminal::view::terminal_line_height(
+            crate::terminal::view::TERMINAL_FONT_SIZE,
+        )
+        .round() as u16,
     }
 }
 
