@@ -83,6 +83,21 @@ pub fn action_for_client_request(request: &ClientRequest) -> Option<(ActionId, O
                     // host under host-chosen authority, which is not a read.
                     return None;
                 }
+                Query::TaskCockpit(
+                    crate::domain::cockpit::TaskCockpitQuery::TerminalScroll { .. }
+                    | crate::domain::cockpit::TaskCockpitQuery::TerminalResize { .. }
+                    | crate::domain::cockpit::TaskCockpitQuery::TerminalScrollFor { .. }
+                    | crate::domain::cockpit::TaskCockpitQuery::TerminalResizeFor { .. },
+                ) => {
+                    // Scroll and resize move the host-owned PTY viewport and
+                    // resize the pty itself, which a terminal application can
+                    // observe and react to. They are spelled as queries only
+                    // because they answer with the resulting screen; a
+                    // read-only principal must not be able to reflow another
+                    // person's shell. The screen, readiness and strip queries
+                    // beside them stay READ_TASK.
+                    ActionId::MUTATE_TASK
+                }
                 // GitRepositories / targeted Git status+mutate remain Task
                 // cockpit reads/mutations over READ_TASK; host fence owns paths.
                 Query::TaskCockpit(_) => ActionId::READ_TASK,
@@ -372,6 +387,92 @@ mod tests {
             authorizer.authorize_request_with_grant(&request, &grant, context),
             PermissionDecision::Denied(PermissionDenyReason::WatcherReadOnly)
         );
+    }
+
+    /// Scroll and resize move a host-owned PTY, so they are mutations on
+    /// Connect however they are spelled on the wire.
+    ///
+    /// All four are `Query::TaskCockpit`, and mapping every cockpit query to
+    /// `READ_TASK` let a principal holding only a read grant reflow and scroll
+    /// another person's shell. The screen, readiness and chip-list queries
+    /// beside them really are reads and must stay reads, or a viewer loses the
+    /// terminal entirely.
+    #[test]
+    fn connect_terminal_viewport_operations_require_mutate_and_the_reads_beside_them_do_not() {
+        use crate::domain::id::ResourceId;
+
+        let task_id = TaskId::new();
+        let resource_id = ResourceId::new();
+        let context = AuthoritativePermissionContext::live(1, 2, 3).expect("live context");
+        let authorizer = SessionAuthorizer::collaborator(task_id);
+        let request_for = |query: TaskCockpitQuery| {
+            ClientRequest::Query(QueryEnvelope {
+                request_id: RequestId::new(),
+                client_id: ClientId::new(),
+                task_id: Some(task_id),
+                query: Query::TaskCockpit(query),
+            })
+        };
+        let grant_for = |action| {
+            ScopedPermissionGrant::issue(
+                ConnectRole::Collaborator { task_id },
+                task_id,
+                action,
+                context,
+            )
+            .expect("scoped grant")
+        };
+        let read_only = grant_for(ActionId::READ_TASK);
+        let mutating = grant_for(ActionId::MUTATE_TASK);
+
+        for query in [
+            TaskCockpitQuery::TerminalScroll { delta_lines: 3 },
+            TaskCockpitQuery::TerminalResize { cols: 100, rows: 30 },
+            TaskCockpitQuery::TerminalScrollFor {
+                resource_id,
+                delta_lines: -3,
+            },
+            TaskCockpitQuery::TerminalResizeFor {
+                resource_id,
+                cols: 100,
+                rows: 30,
+            },
+        ] {
+            let request = request_for(query.clone());
+            assert_eq!(
+                action_for_client_request(&request).map(|(action, _)| action),
+                Some(ActionId::MUTATE_TASK),
+                "{query:?} mutates the PTY and must not map to a read"
+            );
+            assert_eq!(
+                authorizer.authorize_request_with_grant(&request, &read_only, context),
+                PermissionDecision::Denied(PermissionDenyReason::ScopedGrantRequired),
+                "a read-only Connect principal must not be able to run {query:?}"
+            );
+            assert_eq!(
+                authorizer.authorize_request_with_grant(&request, &mutating, context),
+                PermissionDecision::Allow,
+                "a principal holding mutate must still be able to run {query:?}"
+            );
+        }
+
+        for query in [
+            TaskCockpitQuery::TerminalFor { resource_id },
+            TaskCockpitQuery::TerminalReadinessFor { resource_id },
+            TaskCockpitQuery::TaskTerminals,
+        ] {
+            let request = request_for(query.clone());
+            assert_eq!(
+                action_for_client_request(&request).map(|(action, _)| action),
+                Some(ActionId::READ_TASK),
+                "{query:?} only reads and must stay a read"
+            );
+            assert_eq!(
+                authorizer.authorize_request_with_grant(&request, &read_only, context),
+                PermissionDecision::Allow,
+                "a read grant must still see {query:?}"
+            );
+        }
     }
 
     #[test]
