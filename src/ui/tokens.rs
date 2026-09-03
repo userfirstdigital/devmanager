@@ -1414,7 +1414,9 @@ const DARK_TEXT_PRIMARY: Color = Color::from_u32(0xe6e6ea);
 const DARK_TEXT_SECONDARY: Color = Color::from_u32(0x9a9aa3);
 // Spec asks 0x6b6b74, but that is 3.45:1 on raised and fails the 4.5:1 AA gate; 0x86868f is 5.05:1.
 const DARK_TEXT_MUTED: Color = Color::from_u32(0x86868f);
-const DARK_TEXT_DISABLED: Color = Color::from_u32(0xb8b8c0);
+// Dimmest step of the ramp. Darker reads better but 0x85858e is the floor: below it disabled
+// text drops under 4.5:1 on surfaces.disabled (0x1e1e23).
+const DARK_TEXT_DISABLED: Color = Color::from_u32(0x85858e);
 const DARK_TEXT_INVERSE: Color = Color::from_u32(0xf8fafc);
 const DARK_TEXT_ON_ACCENT: Color = Color::from_u32(0xf8fafc);
 const DARK_TEXT_ON_SELECTION: Color = Color::from_u32(0xffffff);
@@ -2172,7 +2174,7 @@ mod tests {
     }
 
     #[test]
-    fn dark_palette_matches_the_redesign_spec() {
+    fn dark_palette_matches_the_redesign_spec_or_its_ruled_gate_values() {
         let t = dark(Density::Comfortable, Scale::Scale100);
         assert_eq!(t.surfaces.canvas, Color::from_u32(0x101013), "column");
         assert_eq!(t.surfaces.raised, Color::from_u32(0x151518), "row box");
@@ -2182,6 +2184,11 @@ mod tests {
             "selected row"
         );
         assert_eq!(t.surfaces.sunken, Color::from_u32(0x111114), "stream");
+        assert_eq!(
+            t.surfaces.disabled,
+            Color::from_u32(0x1e1e23),
+            "disabled row"
+        );
         assert_eq!(t.terminal.background, Color::from_u32(0x0b0b0d), "terminal");
         assert_eq!(t.borders.subtle, Color::from_u32(0x26262b));
         assert_eq!(t.borders.strong, Color::from_u32(0x34343c));
@@ -2193,5 +2200,9 @@ mod tests {
         assert_eq!(t.status.attention, Color::from_u32(0xf2b441));
         assert_eq!(t.status.destructive, Color::from_u32(0xe5484d));
         assert_eq!(t.status.success, Color::from_u32(0x7fb07f));
+        assert_eq!(t.status.inactive, Color::from_u32(0x86868f));
+        // The ramp must descend: primary > secondary > muted > disabled. 0x85858e is the
+        // darkest disabled step that still clears 4.5:1 on surfaces.disabled.
+        assert_eq!(t.text.disabled, Color::from_u32(0x85858e));
     }
 }
