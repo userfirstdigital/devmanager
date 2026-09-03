@@ -2065,6 +2065,41 @@ mod provider_restart_identity_tests {
             TerminalFactOutcome::UnknownTerminal
         );
 
+        // Activity is coalesced: two observations one second apart are one
+        // durable fact, because the second lands inside
+        // `TERMINAL_ACTIVITY_COALESCE_MS`. The window is read from the
+        // projected `last_activity_at_ms` rather than a literal, because the
+        // registration event carried a wall-clock time. Sabotaging the
+        // constant to 0 turns the second call into `Recorded` and fails here.
+        let activity_at_ms = bus
+            .task_snapshot(task_id)
+            .expect("snapshot")
+            .expect("task")
+            .terminal_facts[&shell.id]
+            .last_activity_at_ms
+            + crate::domain::terminal_facts::TERMINAL_ACTIVITY_COALESCE_MS;
+        assert_eq!(
+            bus.record_terminal_fact(
+                task_id,
+                shell.id,
+                HostTerminalFact::Activity,
+                activity_at_ms,
+            )
+            .expect("record activity"),
+            TerminalFactOutcome::Recorded
+        );
+        assert_eq!(
+            bus.record_terminal_fact(
+                task_id,
+                shell.id,
+                HostTerminalFact::Activity,
+                activity_at_ms + 1_000,
+            )
+            .expect("record activity again"),
+            TerminalFactOutcome::Suppressed,
+            "a second activity observation one second later must be coalesced"
+        );
+
         let receipt = bus
             .execute(task_envelope(
                 client_id,

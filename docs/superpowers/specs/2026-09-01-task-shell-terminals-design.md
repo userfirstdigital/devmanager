@@ -164,3 +164,26 @@ All deterministic; no wall-clock gates.
 - Order and focus, exit state and timestamps are persisted.
 - Provider terminal keeps its single-owner fences; the default of `resource_id: None` preserves every existing call site.
 - Server-computed labels and shared process snapshots follow t3code and herdr; PowerShell prompt injection follows herdr.
+
+Implementation decisions recorded on completion (2026-09-02):
+
+- Host terminal facts (`terminal.cwd_reported`, `terminal.exited`, `terminal.activity`) are appended by `CommandBus::record_terminal_fact` with a NULL task revision, never as commands; `Command::OpenShellTerminal` is host-authority-only, so the client sends `NativeHostCommand::OpenShellTerminal { task_id, cwd }` and the host resolves cwd and shell and registers the resource.
+- A provider terminal never carries a title, because the positional durable codec cannot represent `{ launch: None, title: Some }`; only plain shells are renamable.
+- Closing the focused chip clears focus, and the terminal area then shows the random splash image (picsum) as in 0.4.1.
+- Slice 1 reorders via the chip menu (Move left / Move right); drag reorder waits for an `on_drop` idiom in the GPUI shell.
+- `MAX_PLAIN_SHELLS_PER_TASK` is enforced in `decide` (a clean rejection) and again in `apply_into` (a replay backstop); the strip is always a permutation of the task's non-`Released` plain shells.
+- The kernel rebuilds the projection tables once when `open()` applied any migration (the V16 upgrade path); a transiently failed rebuild is not retried on the next open (deferred).
+- Activity means real terminal output (the hosted sequence advanced), throttled to `TERMINAL_ACTIVITY_COALESCE_MS` (30 s); cwd is debounced by `TERMINAL_CWD_DEBOUNCE_MS` (2 s) and keeps the last sample when one is lost.
+- Closing a shell is one owner: the host's `close_shell_terminal` retires the hosted view first, then the manager session, then removes the closed entry; the resource-release effect does not reach plain shells.
+- Provider-resource selection has one rule, `domain::agent_resource::provider_terminal_resource`; `AgentResourceBinding::from_facts` refuses plain shells.
+- The new resource-addressed terminal queries map to the read-only `terminal.view` action (`TaskCockpit`), and viewport operations are fenced before mutation.
+- `TaskTerminals.live_cwd` is redacted (workspace-relative, else the final component) because it crosses Connect.
+- Environment facts measured on 2026-09-02: `powershell.exe` exits with `0xFFFF0000` about 3 s after a managed launch (pre-existing); `pwsh` 7 is an MSIX package resolved via PATH; Git Bash reports no cwd; `cmd.exe` reports cwd through the PEB rung only.
+- Host-authority-only commands must be refused on both lanes: `CommandBus::execute` (defence in depth) and the wire-reachable `validate_authenticated_command_capability` journal-ingress group in `src/host/connection.rs`, because the live executor serves client envelopes through `execute_host_authorized`. `Command::OpenShellTerminal` is in both, and `connect/permissions.rs` denies its command form outright. This is the rule for any future host-only command.
+- Cockpit `Denied` / `Unavailable` replies carry an additive optional `detail` string so a refusal names the offending path or the shells tried; the host still logs the same text.
+- The client keys pending terminal state by `(HostTaskKey, TerminalTarget)` with `TerminalTarget { Provider, Resource(ResourceId) }` rather than a bare `ResourceId`: a start-pending retry armed by a legacy provider query has no resource id to key on, and a reserved nil id would conflate "the provider" with "this exact resource". Screens in the surface registry stay keyed by bare `ResourceId`, and the provider slot is resolved by searching for the non-shell projection, never by a fixed slot.
+- A plain-shell projection from a host predating plain shells keys as the provider, so `TaskTerminalProjection::is_plain_shell` requires the nil session id AND a zero runtime generation, never `is_provider` alone.
+- User ruling 2026-09-02: `focused: None` on the strip renders the splash photo whenever no shell chip is focused, including untouched tasks; the provider terminal is reached through its own chip. The strip's `order` holds plain shells only, so the wire cannot say "provider focused" and the client treats the provider chip as a local selection that clears strip focus.
+- Focusing a chip also switches the center canvas to the Terminal view (user ruling 2026-09-02); the strip lives in the dock, the grid on the center canvas.
+- A shell whose resource is `Releasing` renders as a muted "?" chip rather than as exited: the host's `TaskTerminals` synthesises `Unknown` for every id in `order` that has no hosted entry, so the spec's "in order, absent from terminals" state cannot arise from this host.
+- The client disables the "+" at `MAX_PLAIN_SHELLS_PER_TASK` (the imported constant) and shows refused renames inline using `validate_terminal_title`; the host remains the authority for both rules.
