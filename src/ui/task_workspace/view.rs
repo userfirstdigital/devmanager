@@ -139,7 +139,11 @@ fn build_node<K: Clone + Ord + Eq>(
                 minimised,
                 zoomed: zoomed == Some(pane.id),
                 focused,
-                build_composer: focused && !minimised,
+                // The renderer already gives a Terminal pane the terminal
+                // surface rather than a conversation with a composer under
+                // it. Say so in the model so the reorder is a stated rule
+                // rather than something only the painter knows.
+                build_composer: focused && !minimised && pane.view != PaneView::Terminal,
             }))
         }
         WorkspaceNode::Split { id, axis, children } => Ok(TaskWorkspaceViewNode::Split {
@@ -271,6 +275,34 @@ mod task_pane_view_model_tests {
     }
 
     #[test]
+    fn a_focused_terminal_pane_paints_the_terminal_not_the_composer() {
+        let task_id = TaskId::new();
+        let mut workspace = TaskWorkspace::single(task_id);
+        workspace
+            .set_view(task_id, PaneView::Terminal)
+            .expect("terminal view");
+        let projections = BTreeMap::from([(task_id, projection(task_id))]);
+
+        let model = TaskWorkspaceViewModel::build(&workspace, &projections).expect("workspace");
+        let panes = model.panes();
+        assert!(panes[0].focused);
+        assert_eq!(panes[0].view, PaneView::Terminal);
+        assert!(
+            !panes[0].build_composer,
+            "a Terminal pane paints the terminal; the composer is a Conversation control"
+        );
+
+        workspace
+            .set_view(task_id, PaneView::Conversation)
+            .expect("conversation view");
+        let model = TaskWorkspaceViewModel::build(&workspace, &projections).expect("workspace");
+        assert!(
+            model.panes()[0].build_composer,
+            "the composer comes back with the conversation"
+        );
+    }
+
+    #[test]
     fn only_the_focused_full_pane_builds_interactive_controls() {
         let first = TaskId::new();
         let second = TaskId::new();
@@ -337,7 +369,10 @@ mod task_pane_view_model_tests {
             PaneView::Terminal,
             "each pane carries its own view, not the focused pane's"
         );
-        assert!(second_pane.build_composer);
+        assert!(
+            !second_pane.build_composer,
+            "the focused pane is on Terminal, so it paints the terminal, not the composer"
+        );
         assert!(third_pane.minimised);
         assert!(!third_pane.build_composer);
     }
