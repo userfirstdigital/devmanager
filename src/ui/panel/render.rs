@@ -55,11 +55,10 @@ const TITLE_FONT_SIZE: f32 = 13.0;
 const INLINE_STATUS_FONT_SIZE: f32 = 11.5;
 /// `.st .s { gap: 5px }`.
 const STATUS_GAP: f32 = 5.0;
-/// The inline status must not be able to squeeze the title out of the row. The
-/// mockup's status at the 470 px design width ("▶ cargo test · 12s · 5/6")
-/// measures a little under this, so a longer doing-now line truncates instead
-/// of eating the title.
-const STATUS_TEXT_MAX_WIDTH: f32 = 170.0;
+/// The title never shrinks below this. A title row whose title has been
+/// squeezed to nothing is not a narrower panel, it is an anonymous one, and the
+/// board's stripe and mark cannot say which task it is.
+const TITLE_MIN_WIDTH: f32 = 72.0;
 /// `.act { padding: 2px 9px; border-radius: 6px; font-size: 11.5px }`.
 const ACTION_FONT_SIZE: f32 = 11.5;
 const ACTION_PADDING_X: f32 = 9.0;
@@ -88,9 +87,69 @@ const PANEL_STRIPE_WIDTH: f32 = ROW_STRIPE_WIDTH;
 /// A panel that wants a person is bordered in its state colour rather than in
 /// the neutral frame, with a fainter ring outside it so the panel reads as lit
 /// rather than merely outlined.
-const NEEDS_YOU_BORDER_ALPHA: f32 = 0.7;
+///
+/// The mockup's needs-you pane rule over the pane fill solves to roughly this
+/// per channel. Named `PANEL_` rather than sharing the board's
+/// `NEEDS_YOU_BORDER_ALPHA`: the board's row rule sits at a different alpha over
+/// a different ground, and two constants of the same name in one crate is how a
+/// painter ends up importing the wrong one.
+const PANEL_NEEDS_YOU_BORDER_ALPHA: f32 = 0.45;
 const NEEDS_YOU_GLOW_ALPHA: f32 = 0.25;
 const NEEDS_YOU_GLOW_WIDTH: f32 = 1.0;
+
+/// The zoom affordance's glyph box at [`ZOOM_ICON_FONT_SIZE`]. Zoomed it reads
+/// "⤡ Esc" and is wider, but a zoomed panel owns the whole window, so the
+/// budget below is written for the crowded case.
+const ZOOM_AFFORDANCE_WIDTH: f32 = 12.0;
+/// The primary button at its widest label ("Reopen", six characters at
+/// [`ACTION_FONT_SIZE`]) plus its padding and its two border pixels.
+const PRIMARY_BUTTON_MAX_WIDTH: f32 = 58.0;
+/// The ⋯ glyph plus its padding: [`MENU_FONT_SIZE`] + 2 x [`MENU_PADDING_X`].
+const MENU_GLYPH_WIDTH: f32 = MENU_FONT_SIZE + 2.0 * MENU_PADDING_X;
+/// Everything in the title row whose width does not depend on the panel's:
+///
+/// ```text
+///   13  ROW_PADDING_LEFT          (10 px padding + the 3 px stripe)
+///   10  ROW_PADDING_X             (right padding)
+///   11  PROVIDER_MARK_SIZE
+///   12  ZOOM_AFFORDANCE_WIDTH
+///   58  PRIMARY_BUTTON_MAX_WIDTH
+///   21  MENU_GLYPH_WIDTH          (15 + 2 x 3)
+///   40  5 x TITLE_ROW_GAP         (six children, five gaps)
+///  ---
+///  165
+/// ```
+///
+/// This is what the status must yield to. Before this budget existed the status
+/// was `flex_none` behind a fixed cap, so on a panel of roughly 260-370 px a
+/// long doing-now string pushed Done and ⋯ off the right edge -- silently, with
+/// no panic and nothing in any test to see it.
+const CONTROLS_RESERVE: f32 = ROW_PADDING_LEFT
+    + ROW_PADDING_X
+    + PROVIDER_MARK_SIZE
+    + ZOOM_AFFORDANCE_WIDTH
+    + PRIMARY_BUTTON_MAX_WIDTH
+    + MENU_GLYPH_WIDTH
+    + 5.0 * TITLE_ROW_GAP;
+
+/// The ceiling on the status text: everything the fixed controls do not claim.
+/// The title's [`TITLE_MIN_WIDTH`] floor and the status's own `flex_shrink` do
+/// the rest -- this only stops a very long doing-now line from asking for more
+/// than the row physically has. Same shape as the board's `row_content_width`:
+/// a rule about the content, not about the panel.
+fn status_text_max_width(width_px: f32) -> f32 {
+    (width_px - CONTROLS_RESERVE).max(0.0)
+}
+
+/// The width the status is actually left with once the controls and the title's
+/// floor have been paid, and the hard cap on the status container.
+///
+/// Capping here rather than relying on `flex_shrink` alone makes the guarantee
+/// structural: the status cannot ask for the title's floor or the controls'
+/// reserve even if the layout pass were to resolve differently than expected.
+fn status_content_width(width_px: f32) -> f32 {
+    (width_px - CONTROLS_RESERVE - TITLE_MIN_WIDTH).max(0.0)
+}
 
 /// What the shell does when the chrome is clicked or typed into. The painter
 /// owns no state: it hands the panel's key back and the shell decides.
@@ -151,7 +210,8 @@ fn needs_you_colour(needs_you: Option<&NeedsYou>, tokens: ThemeTokens) -> Option
 
 fn status_colour(tone: StatusTone, tokens: ThemeTokens) -> Color {
     match tone {
-        StatusTone::Neutral => tokens.text.muted,
+        // `.hdr .inline` in the mockup, one step above the tab row's grey.
+        StatusTone::Neutral => tokens.text.secondary,
         StatusTone::Attention => tokens.status.attention,
         StatusTone::Blocked => tokens.status.destructive,
     }
@@ -169,17 +229,25 @@ fn status_separator(tokens: ThemeTokens) -> AnyElement {
 /// The status folded into the title row: the state icon, the doing-now text,
 /// the age and the plan strip, each dropping out at the width where it stops
 /// fitting (spec 6.3, [`status_layout`]).
+///
+/// The container shrinks and clips rather than pushing: it is the one part of
+/// the title row that may lose width, because the title carries the identity
+/// and the three controls on the right are how the panel is operated at all.
 fn inline_status_element(
     chrome: &PanelChrome,
     tokens: ThemeTokens,
     layout: StatusLayout,
+    width_px: f32,
     element_key: u64,
     handlers: &PanelHandlers,
 ) -> AnyElement {
     let tone = status_colour(chrome.status.tone, tokens);
     let mut row = div()
         .flex()
-        .flex_none()
+        .flex_shrink()
+        .min_w(px(0.0))
+        .max_w(px(status_content_width(width_px)))
+        .overflow_hidden()
         .items_center()
         .gap(px(STATUS_GAP))
         .text_size(px(INLINE_STATUS_FONT_SIZE))
@@ -189,8 +257,9 @@ fn inline_status_element(
     if layout.show_text {
         row = row.child(
             div()
-                .flex_none()
-                .max_w(px(STATUS_TEXT_MAX_WIDTH))
+                .flex_shrink()
+                .min_w(px(0.0))
+                .max_w(px(status_text_max_width(width_px)))
                 .truncate()
                 .child(chrome.status.text.clone()),
         );
@@ -246,6 +315,7 @@ fn title_row_element(
     chrome: &PanelChrome,
     tokens: ThemeTokens,
     layout: StatusLayout,
+    width_px: f32,
     element_key: u64,
     handlers: &PanelHandlers,
 ) -> AnyElement {
@@ -291,7 +361,9 @@ fn title_row_element(
             div()
                 .id(("devmanager-panel-title", element_key))
                 .flex_1()
-                .min_w(px(0.0))
+                // The floor, not zero: the status yields first, and a title
+                // squeezed to nothing leaves an anonymous panel.
+                .min_w(px(TITLE_MIN_WIDTH))
                 .truncate()
                 .text_size(px(TITLE_FONT_SIZE))
                 .font_weight(FontWeight::SEMIBOLD)
@@ -319,6 +391,7 @@ fn title_row_element(
         chrome,
         tokens,
         layout,
+        width_px,
         element_key,
         handlers,
     ));
@@ -354,7 +427,7 @@ fn title_row_element(
                     .py(px(ACTION_PADDING_Y))
                     .rounded(px(ACTION_RADIUS))
                     .border(px(PANEL_BORDER_WIDTH))
-                    .border_color(tokens.borders.strong.to_gpui())
+                    .border_color(tokens.borders.default.to_gpui())
                     .text_size(px(ACTION_FONT_SIZE))
                     .text_color(tokens.text.primary.to_gpui())
                     .cursor_pointer()
@@ -435,7 +508,7 @@ fn tab_row_element(
                         .text_color(tokens.text.primary.to_gpui())
                 })
                 .when(!active, |tab| {
-                    tab.text_color(tokens.text.secondary.to_gpui())
+                    tab.text_color(tokens.text.muted.to_gpui())
                         .hover(|style| style.bg(tokens.surfaces.hover.to_gpui()))
                 })
                 .on_mouse_down(
@@ -491,6 +564,7 @@ pub fn panel_chrome_element(
             chrome,
             tokens,
             layout,
+            width_px,
             element_key,
             handlers,
         ));
@@ -521,7 +595,7 @@ pub fn panel_frame(
     // current pane frame already draws it that way, and two panels drawing the
     // same state in two greys is the drift this painter exists to remove.
     let border = match attention {
-        Some(colour) => colour.with_alpha(NEEDS_YOU_BORDER_ALPHA),
+        Some(colour) => colour.with_alpha(PANEL_NEEDS_YOU_BORDER_ALPHA),
         None if chrome.focused => tokens.text.primary,
         None => tokens.borders.subtle,
     };
@@ -731,6 +805,8 @@ mod tests {
                 // the zoomed form, which is the only one carrying a crumb.
                 for (width, focused, zoomed, minimised) in [
                     (470.0_f32, true, false, false),
+                    (370.0_f32, false, false, false),
+                    (300.0_f32, false, false, false),
                     (250.0_f32, false, false, false),
                     (470.0_f32, false, false, true),
                     (1_200.0_f32, true, true, false),
@@ -789,5 +865,40 @@ mod tests {
         // and the chrome's left padding clears it.
         assert_eq!(PANEL_STRIPE_WIDTH, ROW_STRIPE_WIDTH);
         assert!(ROW_PADDING_LEFT > PANEL_STRIPE_WIDTH);
+    }
+
+    /// The status is the only part of the title row allowed to lose width, so
+    /// at every width a panel can be given the fixed controls plus the title's
+    /// floor still fit inside the panel. Pure arithmetic over the constants: no
+    /// window, so a layout pass cannot quietly satisfy it.
+    ///
+    /// The regression it exists for: with the status `flex_none` behind a fixed
+    /// 170 px cap, a long doing-now string on a 260-370 px panel pushed Done
+    /// and the ⋯ menu off the right edge, silently and without panicking.
+    #[test]
+    fn the_status_yields_before_the_controls_and_before_the_title() {
+        assert_eq!(
+            CONTROLS_RESERVE, 165.0,
+            "the documented budget and the summed constants disagree"
+        );
+        for width in [250.0_f32, 300.0, 370.0, 470.0] {
+            assert!(
+                CONTROLS_RESERVE + TITLE_MIN_WIDTH <= width,
+                "at {width} px the controls and the title floor do not fit,                  so something other than the status has to yield"
+            );
+            assert!(status_content_width(width) > 0.0);
+            // The cap the status text may ask for is exactly the row less the
+            // controls, and the remainder after the title's floor is what the
+            // status is really left with.
+            assert_eq!(status_text_max_width(width), width - CONTROLS_RESERVE);
+            assert_eq!(
+                status_text_max_width(width) - TITLE_MIN_WIDTH,
+                status_content_width(width)
+            );
+        }
+        // Narrower than the controls themselves, both floor at zero rather than
+        // handing a negative width to the layout.
+        assert_eq!(status_text_max_width(100.0), 0.0);
+        assert_eq!(status_content_width(100.0), 0.0);
     }
 }

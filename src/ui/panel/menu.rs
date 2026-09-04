@@ -86,7 +86,7 @@ pub fn panel_menu_rows(zoomed: bool) -> Vec<PanelMenuRow> {
         PanelMenuRow {
             item: PanelMenuItem::Move,
             label: "Move ← ↑ ↓ →",
-            key: "⇧⌘arrows",
+            key: "Shift+Ctrl+arrows",
             danger: false,
             separator_before: false,
         },
@@ -99,7 +99,7 @@ pub fn panel_menu_rows(zoomed: bool) -> Vec<PanelMenuRow> {
         },
         PanelMenuRow {
             item: PanelMenuItem::MoreViews,
-            label: "More views…",
+            label: "More views ▸",
             key: "",
             danger: false,
             separator_before: true,
@@ -178,6 +178,11 @@ pub fn panel_key_action(
 mod tests {
     use super::*;
 
+    /// The three modifier glyphs that would give a macOS shortcut away.
+    const MAC_COMMAND: char = '⌘';
+    const MAC_OPTION: char = '⌥';
+    const MAC_CONTROL: char = '⌃';
+
     #[test]
     fn menu_rows_follow_the_spec_order_with_two_separators() {
         let rows = panel_menu_rows(false);
@@ -211,6 +216,17 @@ mod tests {
         );
         assert_eq!(rows[2].label, "Zoom");
         assert_eq!(panel_menu_rows(true)[2].label, "Unzoom");
+        // This is a Windows application: no shortcut may be spelled with a
+        // Command or Option glyph, in either state of the Zoom row.
+        for row in rows.iter().chain(panel_menu_rows(true).iter()) {
+            for glyph in [MAC_COMMAND, MAC_OPTION, MAC_CONTROL] {
+                assert!(
+                    !row.key.contains(glyph) && !row.label.contains(glyph),
+                    "{} carries a macOS modifier glyph",
+                    row.label
+                );
+            }
+        }
     }
 
     #[test]
