@@ -149,12 +149,28 @@ impl Color {
         )
     }
 
-    /// Convert a semantic token to GPUI's opaque native color without exposing
-    /// palette literals to UI consumers.
+    /// Convert a semantic token to GPUI's native color without exposing palette
+    /// literals to UI consumers. Every token constructor is opaque, so this is
+    /// `rgb()` for a token; only a colour narrowed by [`Color::with_alpha`]
+    /// carries transparency through to the compositor.
     pub fn to_gpui(self) -> gpui::Rgba {
-        gpui::rgb(
-            (u32::from(self.red()) << 16) | (u32::from(self.green()) << 8) | u32::from(self.blue()),
+        gpui::rgba(
+            (u32::from(self.red()) << 24)
+                | (u32::from(self.green()) << 16)
+                | (u32::from(self.blue()) << 8)
+                | u32::from(self.alpha()),
         )
+    }
+
+    /// The same hue at a fraction of its opacity, for a halo or a tinted
+    /// border that must read as the state colour without becoming a second
+    /// saturated colour on screen. Deliberately not a token: the token
+    /// contract stays opaque and the caller owns the compositing decision.
+    pub fn with_alpha(self, alpha: f32) -> Self {
+        let alpha = (alpha.clamp(0.0, 1.0) * 255.0).round() as u8;
+        Self {
+            rgba: [self.red(), self.green(), self.blue(), alpha],
+        }
     }
 
     pub const fn red(self) -> u8 {

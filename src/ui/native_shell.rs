@@ -1259,7 +1259,7 @@ fn wait_for_child_exit_with_deadline(mut child: OwnedChild, deadline: NativeShut
     retain_child(child);
 }
 
-fn host_identity_digest_bytes(host: &HostId) -> Vec<u8> {
+pub(crate) fn host_identity_digest_bytes(host: &HostId) -> Vec<u8> {
     match host {
         HostId::LocalProfile(name) => {
             let mut bytes = Vec::with_capacity(1 + name.len());
@@ -1282,19 +1282,17 @@ fn stable_task_element_id(task_id: TaskId) -> ElementId {
     ElementId::Uuid(Uuid::from_bytes(*task_id.as_bytes()))
 }
 
+/// The board painter owns this identity now; the shell keeps the old name so
+/// the accessibility tree and its tests keep publishing the same node ids.
+/// One definition only: see [`crate::ui::board::render::board_row_element_id`].
 fn stable_host_task_element_id(key: &HostTaskKey) -> ElementId {
-    // Hash host + task into a UUID element identity so same raw TaskId on two
-    // hosts never shares a GPUI/accesskit node.
-    let mut digest = Sha256::new();
-    digest.update(b"native-host-task-element");
-    digest.update([0]);
-    digest.update(host_identity_digest_bytes(&key.host));
-    digest.update([0]);
-    digest.update(key.task_id.as_bytes());
-    let hash = digest.finalize();
-    let mut uuid_bytes = [0_u8; 16];
-    uuid_bytes.copy_from_slice(&hash[..16]);
-    ElementId::Uuid(Uuid::from_bytes(uuid_bytes))
+    crate::ui::board::render::board_row_element_id(key)
+}
+
+/// Test-only alias so the painter can assert the two names agree.
+#[cfg(test)]
+pub(crate) fn stable_host_task_element_id_for_test(key: &HostTaskKey) -> ElementId {
+    stable_host_task_element_id(key)
 }
 
 fn stable_host_task_row_element_id(key: &HostTaskKey) -> String {
@@ -46086,7 +46084,7 @@ mod terminal_target_tests {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::{
         // Fleet attach/selection regression helpers
         // (HostFleet / FleetSelectMode / TaskList also used below)
@@ -47324,6 +47322,16 @@ mod tests {
     static HEADLESS_SHELL_TEST_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
     const HEADLESS_SHELL_CHILD_ENV: &str = "DEVMANAGER_HEADLESS_SHELL_TEST_CHILD";
 
+    /// Serialise every headless GPUI test in this process, wherever it lives.
+    /// GPUI's Windows headless message loop is process-global, so two of them
+    /// in one process is undefined behaviour rather than a slow test.
+    pub(crate) fn headless_shell_test_lock() -> std::sync::MutexGuard<'static, ()> {
+        HEADLESS_SHELL_TEST_LOCK
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .expect("headless shell test lock")
+    }
+
     #[test]
     fn worker_client_loan_remains_connected_until_cancelled_or_stopped() {
         assert!(runtime_connection_visible(Some(true), false, false));
@@ -47735,7 +47743,7 @@ mod tests {
     /// returns. Run each independently named scenario in a fresh copy of this
     /// test harness so the ordinary full-suite process never constructs two
     /// headless applications.
-    fn rerun_headless_shell_test_in_child(test_name: &'static str) -> bool {
+    pub(crate) fn rerun_headless_shell_test_in_child(test_name: &'static str) -> bool {
         if std::env::var(HEADLESS_SHELL_CHILD_ENV).as_deref() == Ok(test_name) {
             return false;
         }
