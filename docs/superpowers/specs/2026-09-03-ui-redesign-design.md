@@ -63,7 +63,7 @@ Within a group, rows sort by state age ascending for Needs you (oldest ask first
 
 ### 4.2 Row anatomy
 
-Each row is a full-width box: a 1 px line above and below, no side margins, 3 px gap between rows. The box background is one step lighter than the column. The selected row is two steps lighter with a lighter border.
+Each row is a full-width box: a 1 px line above and below, no side margins, 3 px gap between rows. The box background is one step lighter than the column. The active row is two steps lighter with a lighter border.
 
 ```
 | 3px stripe | ● | title …………………………………………………………… | age |
@@ -77,6 +77,15 @@ Each row is a full-width box: a 1 px line above and below, no side margins, 3 px
 - **Second line**: 10.5 px muted. Left: the *why* on Needs you rows ("Asked a question", "Permission: Bash", "Provider rejected", "Failed: exit 1"), or the *doing now* on Working rows (the current tool or command, bounded to 40 chars: "cargo test", "Editing purge.rs", "Thinking", "Reading host-stderr.log", "2 subagents"), or "Last reply 18m" on Idle rows. Right: progress segments and count when a plan exists (4.3), then the provider mark (4.4).
 
 The project name is not written on the row; the stripe carries it, and the panel title carries it in full. Hovering a row shows a tooltip with project, branch, provider and the full title.
+
+**Open and active.** Two axes, independent of the state colour, so a board with three panels open reads as three.
+
+- **Open** — the task has a panel in the workspace. The project stripe widens from 3 px to 5 px, the row's rules step up to `borders.strong`, and the row takes an **ordinal chip** at the right end of the title line, before the age: a 1 px-bordered, 4 px-radius box holding the panel's number in 10 px muted text. The background stays the ordinary row surface, and the title stays primary: openness is a fact about the workspace, not a selection.
+- **Active** — the row owns the FOCUSED panel. Everything Open has, plus the `surface.row_selected` fill, a white (`text.emphasis`) title, and the ordinal chip inverted to a solid light tag (`text.primary` fill, `surface.column` text). Exactly one row is ever active, and an active row is always open.
+
+The ordinal is the panel's position in the workspace's reading order — top to bottom, then left to right — numbered from 1. It is read off the workspace allocation, so it is the same number on the row and in the panel's own title row, which is what ties the two together: the active panel's header carries the solid chip, every other open panel's header carries the outlined one. Closing a panel renumbers the survivors; moving focus does not renumber anything. The panel frame follows the same split: the focused pane is a 2 px `text.primary` frame (the same bright neutral its chip is filled with), every other pane a 1 px `borders.subtle` one.
+
+Accessible names carry both axes: an open row is announced as "... (open, panel 2)" and the active one as "... (active, panel 2)".
 
 ### 4.3 Progress segments
 
@@ -106,7 +115,7 @@ Everything else is a grey ramp:
 |---|---|---|
 | `surface.column` | `#101013` | board column |
 | `surface.row` | `#151518` | row box, panel body |
-| `surface.row_selected` | `#1e1e23` | selected row, focused panel title row — selected row: filled slab, 5 px stripe, strong rules, white title (ruled `#26262b`; that drops `text_disabled_on_selection` to 4.118:1, so the fill sits at the 4.5:1 ceiling `#1e1e23` and `surface.disabled` moved down to keep the two distinct) |
+| `surface.row_selected` | `#1e1e23` | active row, focused panel title row — active row: filled slab, 5 px stripe, strong rules, white title (ruled `#26262b`; that drops `text_disabled_on_selection` to 4.118:1, so the fill sits at the 4.5:1 ceiling `#1e1e23` and `surface.disabled` moved down to keep the two distinct) |
 | `surface.stream` | `#111114` | conversation stream background |
 | `surface.terminal` | `#0b0b0d` | terminal background |
 | `border.subtle` | `#26262b` | row lines, panel border |

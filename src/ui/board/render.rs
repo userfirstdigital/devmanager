@@ -33,13 +33,13 @@ use crate::ui::board::layout::{
     GROUP_LABEL_FONT_SIZE, GROUP_LABEL_GAP, GROUP_LABEL_PADDING_BOTTOM, GROUP_LABEL_PADDING_TOP,
     HEADER_BUTTON_FONT_SIZE, HEADER_BUTTON_PADDING_X, HEADER_BUTTON_PADDING_Y,
     HEADER_BUTTON_RADIUS, HEADER_GAP, HEADER_PADDING_BOTTOM, HEADER_PADDING_TOP,
-    HEADER_TITLE_FONT_SIZE, LINE_GAP, META_FONT_SIZE, META_GAP, META_LINE_HEIGHT,
-    NEEDS_YOU_BORDER_ALPHA, PROVIDER_MARK_SIZE, RAIL_COUNT_FONT_SIZE, RAIL_DOT_COUNT_GAP,
+    HEADER_TITLE_FONT_SIZE, LINE_GAP, LINE_HEIGHT_RATIO, META_FONT_SIZE, META_GAP,
+    META_LINE_HEIGHT, NEEDS_YOU_BORDER_ALPHA, ORDINAL_CHIP_FONT_SIZE, ORDINAL_CHIP_PADDING_X,
+    ORDINAL_CHIP_RADIUS, PROVIDER_MARK_SIZE, RAIL_COUNT_FONT_SIZE, RAIL_DOT_COUNT_GAP,
     RAIL_DOT_SIZE, RAIL_GROUP_GAP, RAIL_PADDING_TOP, ROW_BORDER_WIDTH, ROW_COMPACT_PADDING_DELTA,
-    ROW_PADDING_BOTTOM, ROW_PADDING_TOP, ROW_PADDING_X, ROW_STRIPE_WIDTH,
-    ROW_STRIPE_WIDTH_SELECTED, SECOND_LINE_INDENT, SEGMENT_GAP, SEGMENT_HEIGHT, SEGMENT_RADIUS,
-    SEGMENT_WIDTH, STATE_DOT_HALO_ALPHA, STATE_DOT_HALO_SIZE, STATE_DOT_SIZE, TITLE_FONT_SIZE,
-    TITLE_LINE_HEIGHT,
+    ROW_PADDING_BOTTOM, ROW_PADDING_TOP, ROW_PADDING_X, ROW_STRIPE_WIDTH, ROW_STRIPE_WIDTH_OPEN,
+    SECOND_LINE_INDENT, SEGMENT_GAP, SEGMENT_HEIGHT, SEGMENT_RADIUS, SEGMENT_WIDTH,
+    STATE_DOT_HALO_ALPHA, STATE_DOT_HALO_SIZE, STATE_DOT_SIZE, TITLE_FONT_SIZE, TITLE_LINE_HEIGHT,
 };
 use crate::ui::board::model::{BoardGroup, BoardModel, BoardProgress, BoardRow, BoardState};
 use crate::ui::board::project_colour::ProjectColourBook;
@@ -243,21 +243,30 @@ pub fn board_row_element(
     };
 
     let stripe = colours.colour(row.project_colour);
-    // A selected row is a filled slab: the fill lifts, the rules step up to
-    // `borders.strong` at full strength, and the stripe widens. One of those
-    // alone is a hairline nobody sees at a glance.
-    let (background, base_border, stripe_width) = if row.selected {
-        (
+    // Two axes, deliberately separate. OPEN says "this task has a panel on
+    // screen": the stripe widens, the rules step up to `borders.strong`, and
+    // the row takes an ordinal chip -- but the fill stays `raised`, so three
+    // open tasks read as three, not as three selections. ACTIVE is the one
+    // focused panel on top of that: the fill lifts to `surfaces.selection`,
+    // the title goes white and the chip inverts to a solid tag. Marking only
+    // the focused row is what made three visible panels read as one.
+    let open = row.open.is_some();
+    let (background, base_border, stripe_width) = match (open, row.active) {
+        (_, true) => (
             tokens.surfaces.selection,
             tokens.borders.strong,
-            ROW_STRIPE_WIDTH_SELECTED,
-        )
-    } else {
-        (
+            ROW_STRIPE_WIDTH_OPEN,
+        ),
+        (true, false) => (
+            tokens.surfaces.raised,
+            tokens.borders.strong,
+            ROW_STRIPE_WIDTH_OPEN,
+        ),
+        (false, false) => (
             tokens.surfaces.raised,
             tokens.borders.subtle,
             ROW_STRIPE_WIDTH,
-        )
+        ),
     };
     // The needs-you tint outranks the selection border: a row that wants a
     // person must not look calmer for being the one you happen to have open.
@@ -271,10 +280,12 @@ pub fn board_row_element(
     // The reference PNG measures pure white on a row that asked a question and
     // the ordinary title colour on Working and on Blocked, so of the STATES only
     // the two waiting on an answer take `text.emphasis`. Blocked is loud in the
-    // dot and the border, not in the title. Selection is a different axis: the
-    // row you have open takes the same white so the slab reads at a glance.
+    // dot and the border, not in the title. Active is a different axis: the
+    // row whose panel has focus takes the same white so the slab reads at a
+    // glance. Merely open does NOT -- three white titles would say nothing
+    // about which panel you are typing into.
     let title_colour =
-        if row.selected || matches!(row.state, BoardState::Question | BoardState::Permission) {
+        if row.active || matches!(row.state, BoardState::Question | BoardState::Permission) {
             tokens.text.emphasis
         } else {
             tokens.text.primary
@@ -309,6 +320,13 @@ pub fn board_row_element(
                 .line_height(px(TITLE_LINE_HEIGHT))
                 .text_color(title_colour.to_gpui())
                 .child(row.title.clone()),
+        )
+        // The open marker sits at the right end of the title line, before the
+        // age: the same number the panel's own header carries, so the row and
+        // the panel are one glance apart.
+        .children(
+            row.open
+                .map(|ordinal| ordinal_chip(ordinal, row.active, tokens)),
         )
         .child(
             div()
@@ -361,9 +379,9 @@ pub fn board_row_element(
         .border_b(px(ROW_BORDER_WIDTH))
         .border_color(border.to_gpui())
         .cursor_pointer()
-        // A selected row keeps its selection fill under the pointer; hovering
+        // The active row keeps its selection fill under the pointer; hovering
         // it must not repaint it as an ordinary hovered row.
-        .when(!row.selected, |row| {
+        .when(!row.active, |row| {
             row.hover(|style| style.bg(tokens.surfaces.hover.to_gpui()))
         })
         .tooltip(move |window, app| {
@@ -411,6 +429,37 @@ pub fn board_row_element(
                 .child(title_line)
                 .children(meta_line),
         )
+        .into_any_element()
+}
+
+/// The "open" marker shared by a board row and its workspace pane header: a
+/// small chip carrying the panel's ordinal.
+///
+/// `solid` is the ACTIVE treatment -- a light filled tag, the strongest mark
+/// either surface carries -- and the outlined form is merely open. Both are the
+/// same box, so the number does not move when focus does, and one function
+/// paints both so the row and the pane can never drift apart.
+pub fn ordinal_chip(ordinal: u8, solid: bool, tokens: ThemeTokens) -> AnyElement {
+    let (background, border, text) = if solid {
+        (
+            Some(tokens.text.primary),
+            tokens.text.primary,
+            tokens.surfaces.canvas,
+        )
+    } else {
+        (None, tokens.borders.strong, tokens.text.muted)
+    };
+    div()
+        .flex_none()
+        .px(px(ORDINAL_CHIP_PADDING_X))
+        .rounded(px(ORDINAL_CHIP_RADIUS))
+        .border(px(ROW_BORDER_WIDTH))
+        .border_color(border.to_gpui())
+        .when_some(background, |chip, fill| chip.bg(fill.to_gpui()))
+        .text_size(px(ORDINAL_CHIP_FONT_SIZE))
+        .line_height(px(ORDINAL_CHIP_FONT_SIZE * LINE_HEIGHT_RATIO))
+        .text_color(text.to_gpui())
+        .child(ordinal.to_string())
         .into_any_element()
 }
 
@@ -680,7 +729,14 @@ mod tests {
             project_label: "p".into(),
             branch: "main".into(),
             last_activity_ms: 0,
-            selected: index == 3,
+            // Two open rows, one of them active: the exact shape the finding
+            // was about, so the smoke test paints both treatments.
+            open: match index {
+                3 => Some(1),
+                4 => Some(2),
+                _ => None,
+            },
+            active: index == 3,
         })
         .collect()
     }
@@ -729,6 +785,10 @@ mod tests {
                 noop_row_handlers(),
                 noop_header_handlers(),
             );
+            // Both chip treatments on their own, so a change to the marker is
+            // exercised even if the sample rows stop carrying one.
+            let _ = ordinal_chip(3, true, tokens);
+            let _ = ordinal_chip(3, false, tokens);
             // Narrow enough to drop the count and then the strip, and compact.
             let _ = render_board(
                 &model,

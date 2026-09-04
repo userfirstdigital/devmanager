@@ -21,6 +21,6 @@ pub use model::{
 };
 pub use project_colour::{ProjectColourBook, PROJECT_PALETTE};
 pub use render::{
-    board_group_element_id, board_row_element, board_row_element_id, render_board,
+    board_group_element_id, board_row_element, board_row_element_id, ordinal_chip, render_board,
     segments_element, BoardHeaderHandlers, BoardRowHandlers,
 };

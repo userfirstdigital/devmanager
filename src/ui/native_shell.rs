@@ -156,7 +156,7 @@ use crate::terminal::protocol::{
 };
 use crate::ui::board::layout::BOARD_RAIL_WIDTH;
 use crate::ui::board::render::{
-    board_row_element_id, render_board, BoardHeaderHandlers, BoardRowHandlers,
+    board_row_element_id, ordinal_chip, render_board, BoardHeaderHandlers, BoardRowHandlers,
 };
 use crate::ui::board::{
     board_activity, board_state_of, build_board_model, BoardActivity, BoardGroup, BoardModel,
@@ -278,6 +278,12 @@ const CLIENT_BUILD_PREFIX: &str = "devmanager";
 const NATIVE_SNAPSHOT_PAGE_ITEMS: u32 = 128;
 const NATIVE_POINTER_ID: u64 = 1;
 /// Dedicated inbox scrollbar gutter width (gpui-component Scrollbar WIDTH = 16px).
+/// The nominal square the workspace is allocated into when panel ORDINALS are
+/// read off it. Wide enough that the pane minimums never force an overflow at
+/// the scale the spec caps supervision at, and deliberately not the live window
+/// size: the ordinals must not renumber when the window is resized.
+const WORKSPACE_ORDINAL_PROBE_EXTENT: f32 = 8_192.0;
+
 const TASK_INBOX_SCROLLBAR_GUTTER_WIDTH_PX: f32 = 16.0;
 /// Row padding matches the left inset; the scrollbar owns its own gutter sibling.
 const TASK_RAIL_ROW_HORIZONTAL_PADDING_PX: f32 = 10.0;
@@ -4521,6 +4527,12 @@ enum ProjectInboxItem {
         task_key: HostTaskKey,
         settled: bool,
         archived: bool,
+        /// The panel ordinal when this task is open in the workspace. Carried
+        /// so the accessible name says what the stripe and the chip say: a
+        /// screen reader hears "open, panel 2" where sighted eyes see the 2.
+        open: Option<u8>,
+        /// The row owns the focused panel.
+        active: bool,
     },
     ArchivedHeader {
         task_count: usize,
@@ -9970,11 +9982,22 @@ impl AccessibilityTree {
         let mut rows = Vec::new();
         let push_task_row = |rows: &mut Vec<AccessibilityNode>,
                              task_element_ids: &mut BTreeMap<String, HostTaskKey>,
-                             task_key: HostTaskKey| {
+                             task_key: HostTaskKey,
+                             open: Option<u8>,
+                             active: bool| {
             let element_id = stable_host_task_row_element_id(&task_key);
+            // The name carries both axes the row paints: which tasks have a
+            // panel, and which of those panels has focus. Without the first
+            // half, three open panels are one announced selection -- the same
+            // finding the stripe and the chip fix visually.
+            let openness = match (open, active) {
+                (Some(ordinal), true) => format!(" (active, panel {ordinal})"),
+                (Some(ordinal), false) => format!(" (open, panel {ordinal})"),
+                (None, _) => String::new(),
+            };
             let mut row = AccessibilityNode::new(
                 AccessibleRole::Button,
-                format!("Task {}", task_key.task_id),
+                format!("Task {}{openness}", task_key.task_id),
                 "Select this task and open its native task cockpit.",
             )
             .gpui(element_id.clone(), true, true);
@@ -9989,6 +10012,8 @@ impl AccessibilityTree {
                     &mut rows,
                     &mut task_element_ids,
                     HostTaskKey::new(default_host.clone(), task_id),
+                    None,
+                    false,
                 );
             }
         } else {
@@ -10046,18 +10071,28 @@ impl AccessibilityTree {
                             ProjectAccessibilityAction::NewTask(project_key.clone()),
                         );
                     }
-                    ProjectInboxItem::Task { task_key, .. }
-                        if rendered_task_set.contains(&task_key.task_id)
-                            || !matches!(task_key.host, HostId::LocalProfile(_))
-                            || project_items.iter().any(|candidate| {
-                                matches!(
-                                    candidate,
-                                    ProjectInboxItem::Task { task_key: other, .. }
-                                        if other == task_key
-                                )
-                            }) =>
+                    ProjectInboxItem::Task {
+                        task_key,
+                        open,
+                        active,
+                        ..
+                    } if rendered_task_set.contains(&task_key.task_id)
+                        || !matches!(task_key.host, HostId::LocalProfile(_))
+                        || project_items.iter().any(|candidate| {
+                            matches!(
+                                candidate,
+                                ProjectInboxItem::Task { task_key: other, .. }
+                                    if other == task_key
+                            )
+                        }) =>
                     {
-                        push_task_row(&mut rows, &mut task_element_ids, task_key.clone());
+                        push_task_row(
+                            &mut rows,
+                            &mut task_element_ids,
+                            task_key.clone(),
+                            *open,
+                            *active,
+                        );
                     }
                     ProjectInboxItem::Task { .. } | ProjectInboxItem::ArchivedHeader { .. } => {}
                 }
@@ -24561,13 +24596,7 @@ impl NativeShell {
                     f32::from(workspace_size.width),
                     f32::from(workspace_size.height),
                 ),
-                AllocationMetrics {
-                    full_min_width: 360.0,
-                    full_min_height: 300.0,
-                    compact_min_width: 210.0,
-                    compact_min_height: 116.0,
-                    divider: 4.0,
-                },
+                Self::workspace_allocation_metrics(),
             );
             (allocated, *workspace != before)
         };
@@ -24586,8 +24615,18 @@ impl NativeShell {
             };
             return self.task_conversation_surface_for(owner, true, tokens, workspace_size, cx);
         };
-        let workspace =
-            self.render_task_workspace_node(root, &allocated, tokens, workspace_size, cx);
+        // One map per frame, shared by every pane header and identical to the
+        // one the board rows read: the row's number and the panel's number are
+        // the same number by construction, not by two call sites agreeing.
+        let ordinals = self.workspace_pane_ordinals();
+        let workspace = self.render_task_workspace_node(
+            root,
+            &allocated,
+            &ordinals,
+            tokens,
+            workspace_size,
+            cx,
+        );
         div().size_full().child(workspace).into_any_element()
     }
 
@@ -24595,6 +24634,7 @@ impl NativeShell {
         &mut self,
         node: &TaskWorkspaceViewNode<HostTaskKey>,
         allocated: &crate::ui::task_workspace::AllocatedWorkspace<HostTaskKey>,
+        ordinals: &HashMap<HostTaskKey, u8>,
         tokens: crate::ui::tokens::ThemeTokens,
         workspace_size: Size<Pixels>,
         cx: &mut Context<Self>,
@@ -24605,7 +24645,8 @@ impl NativeShell {
                     .rect(pane.task_id.clone())
                     .map(|rect| size(px(rect.width), px(rect.height)))
                     .unwrap_or(workspace_size);
-                self.render_task_workspace_pane(pane, tokens, pane_size, cx)
+                let ordinal = ordinals.get(&pane.task_id).copied();
+                self.render_task_workspace_pane(pane, ordinal, tokens, pane_size, cx)
             }
             TaskWorkspaceViewNode::Split {
                 split_id,
@@ -24617,6 +24658,7 @@ impl NativeShell {
                     let content = self.render_task_workspace_node(
                         &child.node,
                         allocated,
+                        ordinals,
                         tokens,
                         workspace_size,
                         cx,
@@ -24823,6 +24865,7 @@ impl NativeShell {
     fn render_task_workspace_pane(
         &mut self,
         pane: &TaskPaneViewModel<HostTaskKey>,
+        ordinal: Option<u8>,
         tokens: crate::ui::tokens::ThemeTokens,
         pane_size: Size<Pixels>,
         cx: &mut Context<Self>,
@@ -24857,11 +24900,17 @@ impl NativeShell {
             shell.drop_ephemeral_task(&close_key);
             cx.notify();
         });
+        // `borders.focus` is a hairline against `surfaces.canvas` at 2 px --
+        // the finding was that the active pane's frame does not read at all.
+        // `text.primary` is the brightest neutral the palette has, and it is
+        // the same colour the active row's chip is filled with, so the frame
+        // and the marker are one visual family.
         let focus_border = if pane.focused {
-            tokens.borders.focus
+            tokens.text.primary
         } else {
             tokens.borders.subtle
         };
+
         let task_element_key = stable_host_task_element_key(&task_key, "pane");
         let dragged_pane = DraggedTaskPane {
             pane_id,
@@ -24897,11 +24946,26 @@ impl NativeShell {
                     .flex_col()
                     .child(
                         div()
-                            .truncate()
-                            .text_size(px(tokens.density.typography.body))
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .text_color(tokens.text.primary.to_gpui())
-                            .child(pane.title.clone()),
+                            .flex()
+                            .items_center()
+                            .gap(px(6.0))
+                            .min_w(px(0.0))
+                            .child(
+                                div()
+                                    .min_w(px(0.0))
+                                    .flex_shrink()
+                                    .truncate()
+                                    .text_size(px(tokens.density.typography.body))
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .text_color(tokens.text.primary.to_gpui())
+                                    .child(pane.title.clone()),
+                            )
+                            // The same chip the board row carries, solid on the
+                            // focused pane: the number is what ties a row to
+                            // its panel, so it must be the same mark on both.
+                            .children(
+                                ordinal.map(|ordinal| ordinal_chip(ordinal, pane.focused, tokens)),
+                            ),
                     )
                     .child(
                         div()
@@ -30782,6 +30846,85 @@ impl NativeShell {
         true
     }
 
+    /// The pane minimums the workspace is allocated with. Shared by the paint
+    /// and by [`Self::workspace_pane_ordinals`] so the ordinals are read off
+    /// the same geometry the panes are laid out with, rather than off a second
+    /// copy of the numbers that can drift from it.
+    fn workspace_allocation_metrics() -> AllocationMetrics {
+        AllocationMetrics {
+            full_min_width: 360.0,
+            full_min_height: 300.0,
+            compact_min_width: 210.0,
+            compact_min_height: 116.0,
+            divider: 4.0,
+        }
+    }
+
+    /// The panel number each open task carries: 1-based, in the workspace's
+    /// reading order -- top to bottom, then left to right.
+    ///
+    /// This is the one map the board row and the pane header both read, so a
+    /// row's chip and its panel's chip can never disagree. It is computed
+    /// against a nominal viewport rather than the live window: `allocate` lays
+    /// each split's children out in tree order along its axis, so a child's
+    /// origin is never behind its predecessor's at ANY viewport, and the
+    /// (y, x) order is therefore the same at every window size. Reading it off
+    /// the live geometry instead would renumber every panel when the window
+    /// was resized past a minimum.
+    ///
+    /// A pane the allocation has no rect for -- there is none today, but a
+    /// future minimised presentation would be one -- is still open, and keeps
+    /// its tree position at the end of the order rather than dropping out.
+    fn workspace_pane_ordinals(&self) -> HashMap<HostTaskKey, u8> {
+        let Some(workspace) = self.layout.task_workspace.as_ref() else {
+            return HashMap::new();
+        };
+        // `allocate` restores automatic-compact panes to full, so it needs
+        // `&mut`. The probe must not do that to the live workspace: this is a
+        // measurement, and the paint owns that restoration.
+        let mut probe = workspace.clone();
+        let allocated = probe.allocate(
+            Viewport::new(
+                WORKSPACE_ORDINAL_PROBE_EXTENT,
+                WORKSPACE_ORDINAL_PROBE_EXTENT,
+            ),
+            Self::workspace_allocation_metrics(),
+        );
+        // `task_ids` walks the tree, so its index is a stable tiebreak for two
+        // panes an allocation has collapsed onto the same origin.
+        let mut ordered: Vec<(usize, HostTaskKey, Option<PaneRect>)> = workspace
+            .task_ids()
+            .into_iter()
+            .enumerate()
+            .map(|(index, key)| {
+                let rect = allocated.rect(key.clone());
+                (index, key, rect)
+            })
+            .collect();
+        ordered.sort_by(|left, right| {
+            let key_of = |entry: &(usize, HostTaskKey, Option<PaneRect>)| {
+                entry
+                    .2
+                    .map(|rect| (0_u8, rect.y, rect.x, entry.0))
+                    .unwrap_or((1, 0.0, 0.0, entry.0))
+            };
+            let (left, right) = (key_of(left), key_of(right));
+            left.0
+                .cmp(&right.0)
+                .then_with(|| left.1.total_cmp(&right.1))
+                .then_with(|| left.2.total_cmp(&right.2))
+                .then_with(|| left.3.cmp(&right.3))
+        });
+        ordered
+            .into_iter()
+            .enumerate()
+            // A workspace of more than 255 panes cannot be supervised and is
+            // not reachable through any gesture; the tail simply carries no
+            // marker rather than wrapping round to 1.
+            .filter_map(|(index, (_, key, _))| u8::try_from(index + 1).ok().map(|n| (key, n)))
+            .collect()
+    }
+
     /// One board row per live fleet task, with the transient state age and the
     /// journal-derived plan progress and doing-now text folded in.
     ///
@@ -30791,6 +30934,9 @@ impl NativeShell {
     fn board_rows(&mut self, now_ms: i64) -> Vec<BoardRow> {
         let fleet = self.fleet_inbox_projection();
         let selected = self.selected_task_key.clone();
+        // Open is every task with a panel, not just the focused one: with
+        // three panels on screen the board marks three rows.
+        let ordinals = self.workspace_pane_ordinals();
         let local_host = self.local_host_id();
         let mut rows = Vec::new();
         let mut live: HashSet<HostTaskKey> = HashSet::new();
@@ -30866,7 +31012,13 @@ impl NativeShell {
                 project_label: fleet_row.project_label.clone(),
                 branch,
                 last_activity_ms: fleet_row.occurred_at_ms,
-                selected: selected.as_ref() == Some(&fleet_row.key),
+                open: ordinals.get(&fleet_row.key).copied(),
+                // Active is the focused panel, so a selection with no panel --
+                // there is none today, but a selection made before the
+                // workspace catches up would be one -- marks nothing rather
+                // than painting the active treatment with no ordinal to show.
+                active: selected.as_ref() == Some(&fleet_row.key)
+                    && ordinals.contains_key(&fleet_row.key),
             });
         }
         let stale: Vec<HostTaskKey> = self
@@ -31063,6 +31215,10 @@ impl NativeShell {
                     task_key: row.key,
                     settled: false,
                     archived: true,
+                    // The archived browser replaces the board; nothing in it
+                    // is a panel on screen.
+                    open: None,
+                    active: false,
                 }));
             }
             return items;
@@ -31088,6 +31244,8 @@ impl NativeShell {
                 task_key: row.key.clone(),
                 settled: row.state == BoardState::Done,
                 archived: false,
+                open: row.open,
+                active: row.active,
             }));
         }
         items.extend(
@@ -42419,6 +42577,10 @@ impl NativeShell {
                             task_key,
                             settled,
                             archived,
+                            // The archived browser paints its own rows; the
+                            // panel marker belongs to the board.
+                            open: _,
+                            active: _,
                         } => {
                         let shell_for_mouse = shell_entity.clone();
                         let shell_for_mouse_up = shell_entity.clone();
@@ -47954,6 +48116,8 @@ pub(crate) mod tests {
                 task_key: HostTaskKey::new(host.clone(), task_id),
                 settled: false,
                 archived: false,
+                open: None,
+                active: false,
             },
         ];
         // Same task, a different section: the tree must observe the move.
@@ -47968,6 +48132,8 @@ pub(crate) mod tests {
                 task_key: HostTaskKey::new(host.clone(), task_id),
                 settled: false,
                 archived: false,
+                open: None,
+                active: false,
             },
         ];
         let tree_alpha = AccessibilityTree::for_task_list_with_projects(
@@ -50082,6 +50248,8 @@ pub(crate) mod tests {
                 task_key: HostTaskKey::new(HostId::local_profile("dev").expect("host"), task_id),
                 settled: false,
                 archived: false,
+                open: None,
+                active: false,
             },
             ProjectInboxItem::NewTaskTarget {
                 project_key: HostProjectKey::new(
@@ -50164,6 +50332,8 @@ pub(crate) mod tests {
                 task_key: HostTaskKey::new(HostId::local_profile("dev").expect("host"), task_id),
                 settled: true,
                 archived: false,
+                open: None,
+                active: false,
             },
         ];
         let settled_tree = AccessibilityTree::for_task_list_with_projects(
@@ -53467,6 +53637,153 @@ pub(crate) mod tests {
             next_sequence: None,
             facts,
         }
+    }
+
+    /// Three tasks open as panels must produce three marked rows, numbered in
+    /// the workspace's reading order, with exactly one of them active. The
+    /// finding this fixes was the opposite: three panels on screen, one barely
+    /// visible mark on the board.
+    #[test]
+    fn open_panels_number_their_board_rows_and_exactly_one_is_active() {
+        if rerun_headless_shell_test_in_child(
+            "ui::native_shell::tests::open_panels_number_their_board_rows_and_exactly_one_is_active",
+        ) {
+            return;
+        }
+        let _guard = HEADLESS_SHELL_TEST_LOCK
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .expect("headless shell test lock");
+        gpui::Application::headless().run(move |cx| {
+            crate::ui::init(cx);
+            let (runtime, _shared) = TestRuntime::new(true, NativeHostActionResult::Queued);
+            let (model, task_ids) = open_tasks_client_model(3);
+            let project_id = model.task(task_ids[0]).expect("task").task.project_id;
+            with_test_shell_in_app(cx, runtime, |shell| {
+                shell.install_project_for_test("DevManager", project_id);
+                shell
+                    .apply_client_model(Arc::new(model))
+                    .expect("apply model");
+                let keys: Vec<HostTaskKey> = task_ids
+                    .iter()
+                    .map(|task_id| shell.local_task_key(*task_id))
+                    .collect();
+                // A left/right split whose right half is split top/bottom:
+                // reading order is left, right-top, right-bottom, which a
+                // plain tree walk would report as left, right-top,
+                // right-bottom too -- so the ordering rule is exercised by the
+                // y-before-x comparison, not by the tree order alone.
+                let mut workspace =
+                    crate::ui::task_workspace::Workspace::<HostTaskKey>::single(keys[0].clone());
+                workspace
+                    .insert_after_focused(
+                        keys[1].clone(),
+                        crate::ui::task_workspace::Axis::Horizontal,
+                    )
+                    .expect("second pane");
+                workspace
+                    .insert_after_focused(
+                        keys[2].clone(),
+                        crate::ui::task_workspace::Axis::Vertical,
+                    )
+                    .expect("third pane");
+                shell.layout.task_workspace = Some(workspace);
+                shell.selected_task_key = Some(keys[0].clone());
+
+                let ordinal_of = |rows: &[crate::ui::board::BoardRow], key: &HostTaskKey| {
+                    rows.iter()
+                        .find(|row| &row.key == key)
+                        .unwrap_or_else(|| panic!("row for {key:?}"))
+                        .open
+                };
+                let rows = shell.board_rows(1_000);
+                assert_eq!(rows.len(), 3, "every open task reaches the board");
+                assert_eq!(
+                    rows.iter().filter_map(|row| row.open).count(),
+                    3,
+                    "all three panels are marked open, not just the focused one"
+                );
+                let mut ordinals: Vec<u8> = rows.iter().filter_map(|row| row.open).collect();
+                ordinals.sort_unstable();
+                assert_eq!(ordinals, vec![1, 2, 3], "the ordinals are 1..3, no gaps");
+                assert_eq!(
+                    ordinal_of(&rows, &keys[0]),
+                    Some(1),
+                    "the left pane reads first"
+                );
+                assert_eq!(
+                    ordinal_of(&rows, &keys[1]),
+                    Some(2),
+                    "the upper of the right column reads second"
+                );
+                assert_eq!(
+                    ordinal_of(&rows, &keys[2]),
+                    Some(3),
+                    "the lower of the right column reads last"
+                );
+                let active: Vec<&crate::ui::board::BoardRow> =
+                    rows.iter().filter(|row| row.active).collect();
+                assert_eq!(active.len(), 1, "exactly one row is active");
+                assert_eq!(
+                    active[0].key, keys[0],
+                    "the selected task is the active one"
+                );
+
+                // Selecting another open task moves the ACTIVE mark without
+                // renumbering: the ordinal names the panel's place on screen,
+                // not the order they were focused in.
+                shell.selected_task_key = Some(keys[2].clone());
+                let moved = shell.board_rows(2_000);
+                let active: Vec<&crate::ui::board::BoardRow> =
+                    moved.iter().filter(|row| row.active).collect();
+                assert_eq!(active.len(), 1, "still exactly one active row");
+                assert_eq!(active[0].key, keys[2], "focus moved");
+                assert_eq!(
+                    moved
+                        .iter()
+                        .map(|row| (row.key.clone(), row.open))
+                        .collect::<BTreeMap<_, _>>(),
+                    rows.iter()
+                        .map(|row| (row.key.clone(), row.open))
+                        .collect::<BTreeMap<_, _>>(),
+                    "the ordinals did not move with the focus"
+                );
+
+                // Closing the first panel renumbers what is left, and the row
+                // that lost its panel loses its marker entirely.
+                let first_pane = shell
+                    .layout
+                    .task_workspace
+                    .as_ref()
+                    .expect("workspace")
+                    .pane_for_task(keys[0].clone())
+                    .expect("first pane")
+                    .id;
+                shell
+                    .layout
+                    .task_workspace
+                    .as_mut()
+                    .expect("workspace")
+                    .remove_pane(first_pane)
+                    .expect("remove first pane");
+                let after = shell.board_rows(3_000);
+                assert_eq!(
+                    ordinal_of(&after, &keys[0]),
+                    None,
+                    "a closed panel leaves its row unmarked"
+                );
+                assert_eq!(
+                    (ordinal_of(&after, &keys[1]), ordinal_of(&after, &keys[2])),
+                    (Some(1), Some(2)),
+                    "the survivors renumber from 1"
+                );
+                assert!(
+                    after.iter().filter(|row| row.active).count() <= 1,
+                    "never more than one active row"
+                );
+            });
+            cx.quit();
+        });
     }
 
     /// Cost probe for the board's per-paint work, at the scale the spec caps

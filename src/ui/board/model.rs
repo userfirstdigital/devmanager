@@ -87,7 +87,19 @@ pub struct BoardRow {
     /// Shown only in the hover tooltip.
     pub branch: String,
     pub last_activity_ms: i64,
-    pub selected: bool,
+    /// The row's task has a panel in the workspace, and this is that panel's
+    /// ordinal (1-based, in the workspace's reading order). `None` means the
+    /// task is not open at all.
+    ///
+    /// Openness is a different axis from focus: with three panels on screen all
+    /// three rows are open, and exactly one of them is [`Self::active`]. The
+    /// board marking only the focused one is what made three visible panels
+    /// read as one selection.
+    pub open: Option<u8>,
+    /// The row owns the focused panel. Implies [`Self::open`] is `Some`: a task
+    /// cannot be the active panel without having one. Asserted in
+    /// [`build_board_model`].
+    pub active: bool,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -142,6 +154,15 @@ pub fn group_of(state: BoardState) -> BoardGroup {
 pub fn build_board_model(rows: Vec<BoardRow>, done_expanded: bool) -> BoardModel {
     let mut buckets: [Vec<BoardRow>; 4] = Default::default();
     for row in rows {
+        // The two axes are not independent in one direction: the active panel
+        // is one of the open ones. A row that claims otherwise would paint the
+        // active treatment with no ordinal to show, so it fails here rather
+        // than rendering a chip with nothing in it.
+        debug_assert!(
+            !row.active || row.open.is_some(),
+            "an active row must be open: {} has active=true with open=None",
+            row.title
+        );
         let index = BoardGroup::ORDER
             .iter()
             .position(|g| *g == group_of(row.state))
@@ -187,8 +208,52 @@ mod tests {
             project_label: "p".into(),
             branch: "main".into(),
             last_activity_ms,
-            selected: false,
+            open: None,
+            active: false,
         }
+    }
+
+    /// The two axes survive grouping and sorting. They are carried per row, so
+    /// a projection that drops one would show three open panels as one marked
+    /// row -- exactly the finding this pair of fields exists to fix.
+    #[test]
+    fn build_board_model_preserves_open_and_active() {
+        let mut first = row(BoardState::Working, 1, 300);
+        first.open = Some(1);
+        let mut second = row(BoardState::Working, 1, 200);
+        second.open = Some(2);
+        second.active = true;
+        let third = row(BoardState::Working, 1, 100);
+        let model = build_board_model(vec![first, second, third], false);
+        let working = &model
+            .groups
+            .iter()
+            .find(|group| group.group == BoardGroup::Working)
+            .expect("working group")
+            .rows;
+        assert_eq!(
+            working.iter().map(|r| r.open).collect::<Vec<_>>(),
+            vec![Some(1), Some(2), None],
+            "the ordinals ride the rows through the sort"
+        );
+        assert_eq!(
+            working.iter().filter(|r| r.active).count(),
+            1,
+            "exactly one row is active"
+        );
+        assert!(
+            working.iter().find(|r| r.active).expect("active").open == Some(2),
+            "the active row keeps its own ordinal"
+        );
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    #[should_panic(expected = "an active row must be open")]
+    fn an_active_row_without_a_panel_is_a_bug() {
+        let mut orphan = row(BoardState::Working, 1, 1);
+        orphan.active = true;
+        let _ = build_board_model(vec![orphan], false);
     }
 
     #[test]
