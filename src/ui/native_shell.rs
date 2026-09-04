@@ -1289,12 +1289,6 @@ fn stable_host_task_element_id(key: &HostTaskKey) -> ElementId {
     crate::ui::board::render::board_row_element_id(key)
 }
 
-/// Test-only alias so the painter can assert the two names agree.
-#[cfg(test)]
-pub(crate) fn stable_host_task_element_id_for_test(key: &HostTaskKey) -> ElementId {
-    stable_host_task_element_id(key)
-}
-
 fn stable_host_task_row_element_id(key: &HostTaskKey) -> String {
     let mut digest = Sha256::new();
     digest.update(b"native-host-task-row");

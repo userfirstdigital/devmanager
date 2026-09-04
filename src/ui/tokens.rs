@@ -253,6 +253,10 @@ pub fn contrast_ratio(first: Color, second: Color) -> f64 {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct TextTokens {
     pub primary: Color,
+    /// One step above `primary`, for the few places a title must read as
+    /// louder than every other title around it -- the board's needs-you rows.
+    /// Pure white on dark, pure black on light: there is nowhere above it to go.
+    pub emphasis: Color,
     pub secondary: Color,
     pub muted: Color,
     pub disabled: Color,
@@ -721,6 +725,10 @@ impl ThemeTokens {
             SemanticColorToken {
                 name: "text_primary",
                 color: self.text.primary,
+            },
+            SemanticColorToken {
+                name: "text_emphasis",
+                color: self.text.emphasis,
             },
             SemanticColorToken {
                 name: "text_secondary",
@@ -1427,6 +1435,7 @@ const DARK_SURFACE_SELECTION: Color = Color::from_u32(0x1a1a20);
 const DARK_SURFACE_DISABLED: Color = Color::from_u32(0x1e1e23);
 
 const DARK_TEXT_PRIMARY: Color = Color::from_u32(0xe6e6ea);
+const DARK_TEXT_EMPHASIS: Color = Color::from_u32(0xffffff);
 const DARK_TEXT_SECONDARY: Color = Color::from_u32(0x9a9aa3);
 // Spec asks 0x6b6b74, but that is 3.45:1 on raised and fails the 4.5:1 AA gate; 0x86868f is 5.05:1.
 const DARK_TEXT_MUTED: Color = Color::from_u32(0x86868f);
@@ -1508,6 +1517,7 @@ const LIGHT_SURFACE_SELECTION: Color = Color::from_u32(0xcbd5e1);
 const LIGHT_SURFACE_DISABLED: Color = Color::from_u32(0xf1f5f9);
 
 const LIGHT_TEXT_PRIMARY: Color = Color::from_u32(0x0f172a);
+const LIGHT_TEXT_EMPHASIS: Color = Color::from_u32(0x000000);
 const LIGHT_TEXT_SECONDARY: Color = Color::from_u32(0x1e293b);
 const LIGHT_TEXT_MUTED: Color = Color::from_u32(0x334155);
 const LIGHT_TEXT_DISABLED: Color = Color::from_u32(0x475569);
@@ -1737,6 +1747,7 @@ fn dark_theme(density: Density, scale: Scale) -> ThemeTokens {
         mode: ThemeMode::Dark,
         text: TextTokens {
             primary: DARK_TEXT_PRIMARY,
+            emphasis: DARK_TEXT_EMPHASIS,
             secondary: DARK_TEXT_SECONDARY,
             muted: DARK_TEXT_MUTED,
             disabled: DARK_TEXT_DISABLED,
@@ -1868,6 +1879,7 @@ fn light_theme(density: Density, scale: Scale) -> ThemeTokens {
         mode: ThemeMode::Light,
         text: TextTokens {
             primary: LIGHT_TEXT_PRIMARY,
+            emphasis: LIGHT_TEXT_EMPHASIS,
             secondary: LIGHT_TEXT_SECONDARY,
             muted: LIGHT_TEXT_MUTED,
             disabled: LIGHT_TEXT_DISABLED,
@@ -1998,6 +2010,8 @@ fn high_contrast_theme(density: Density, scale: Scale) -> ThemeTokens {
     let mut tokens = dark_theme(density, scale);
     tokens.mode = ThemeMode::HighContrast;
     tokens.text.primary = HC_TEXT_PRIMARY;
+    // High contrast keeps white as its loudest text; there is no step above it.
+    tokens.text.emphasis = DARK_TEXT_EMPHASIS;
     tokens.text.secondary = HC_TEXT_SECONDARY;
     tokens.text.muted = HC_TEXT_MUTED;
     tokens.text.disabled = HC_TEXT_DISABLED;
@@ -2209,6 +2223,10 @@ mod tests {
         assert_eq!(t.borders.subtle, Color::from_u32(0x26262b));
         assert_eq!(t.borders.strong, Color::from_u32(0x34343c));
         assert_eq!(t.text.primary, Color::from_u32(0xe6e6ea));
+        // The reference PNG measures pure white on a needs-you row title and
+        // 0xe6e6ea on Working and Blocked, so emphasis sits one step above
+        // primary rather than replacing it.
+        assert_eq!(t.text.emphasis, Color::from_u32(0xffffff));
         assert_eq!(t.text.secondary, Color::from_u32(0x9a9aa3));
         // The spec asks for 0x6b6b74; the AA gate on raised surfaces outranks
         // it, so the nearest passing step on the same ramp is what ships.

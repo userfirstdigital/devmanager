@@ -16,6 +16,7 @@
 
 use std::rc::Rc;
 
+use gpui::prelude::FluentBuilder;
 use gpui::{
     div, px, AnyElement, App, ElementId, FontWeight, InteractiveElement, IntoElement, KeyDownEvent,
     MouseButton, MouseDownEvent, ParentElement, StatefulInteractiveElement, Styled, Window,
@@ -32,8 +33,8 @@ use crate::ui::board::layout::{
     HEADER_BUTTON_FONT_SIZE, HEADER_BUTTON_PADDING_X, HEADER_BUTTON_PADDING_Y,
     HEADER_BUTTON_RADIUS, HEADER_GAP, HEADER_PADDING_BOTTOM, HEADER_PADDING_TOP,
     HEADER_TITLE_FONT_SIZE, LINE_GAP, META_FONT_SIZE, META_GAP, META_LINE_HEIGHT,
-    NEEDS_YOU_BORDER_ALPHA, PROVIDER_MARK_SIZE, RAIL_COUNT_FONT_SIZE, RAIL_DOT_SIZE,
-    RAIL_GROUP_GAP, RAIL_PADDING_TOP, ROW_BORDER_WIDTH, ROW_COMPACT_PADDING_DELTA,
+    NEEDS_YOU_BORDER_ALPHA, PROVIDER_MARK_SIZE, RAIL_COUNT_FONT_SIZE, RAIL_DOT_COUNT_GAP,
+    RAIL_DOT_SIZE, RAIL_GROUP_GAP, RAIL_PADDING_TOP, ROW_BORDER_WIDTH, ROW_COMPACT_PADDING_DELTA,
     ROW_PADDING_BOTTOM, ROW_PADDING_TOP, ROW_PADDING_X, ROW_STRIPE_WIDTH, SECOND_LINE_INDENT,
     SEGMENT_GAP, SEGMENT_HEIGHT, SEGMENT_RADIUS, SEGMENT_WIDTH, STATE_DOT_HALO_ALPHA,
     STATE_DOT_HALO_SIZE, STATE_DOT_SIZE, TITLE_FONT_SIZE, TITLE_LINE_HEIGHT,
@@ -230,11 +231,15 @@ pub fn board_row_element(
         BoardState::Blocked => tokens.status.destructive.with_alpha(NEEDS_YOU_BORDER_ALPHA),
         _ => base_border,
     };
-    // Every row title is `text.primary`: that is what the spec's token table
-    // says the colour is for, and what the mockup paints. The mockup lifts a
-    // needs-you title one step further to pure white, which no token provides
-    // and which the halo, the dot and the tinted border already say louder.
-    let title_colour = tokens.text.primary;
+    // The reference PNG measures pure white on a row that asked a question and
+    // the ordinary title colour on Working and on Blocked, so only the two
+    // states waiting on an answer take `text.emphasis`. Blocked is loud in the
+    // dot and the border, not in the title.
+    let title_colour = if matches!(row.state, BoardState::Question | BoardState::Permission) {
+        tokens.text.emphasis
+    } else {
+        tokens.text.primary
+    };
 
     let tooltip_text = row_tooltip_text(row);
     let (select_key, menu_key, key_key) = (row.key.clone(), row.key.clone(), row.key.clone());
@@ -302,6 +307,7 @@ pub fn board_row_element(
         .id(board_row_element_id(&row.key))
         .tab_stop(true)
         .relative()
+        .flex_none()
         .w_full()
         .h(px(height))
         .mb(px(BOARD_ROW_GAP))
@@ -310,7 +316,11 @@ pub fn board_row_element(
         .border_b(px(ROW_BORDER_WIDTH))
         .border_color(border.to_gpui())
         .cursor_pointer()
-        .hover(|style| style.bg(tokens.surfaces.hover.to_gpui()))
+        // A selected row keeps its selection fill under the pointer; hovering
+        // it must not repaint it as an ordinary hovered row.
+        .when(!row.selected, |row| {
+            row.hover(|style| style.bg(tokens.surfaces.hover.to_gpui()))
+        })
         .tooltip(move |window, app| {
             gpui_component::tooltip::Tooltip::new(tooltip_text.clone()).build(window, app)
         })
@@ -361,8 +371,11 @@ fn group_colour(group: BoardGroup, tokens: ThemeTokens) -> Color {
     match group {
         BoardGroup::NeedsYou => tokens.status.attention,
         BoardGroup::Working => tokens.text.muted,
+        // Idle and Done share the row's own quiet dot colour; `status.inactive`
+        // is the same grey as `text.muted`, which would make Working and Done
+        // indistinguishable on the rail.
         BoardGroup::Idle => tokens.borders.strong,
-        BoardGroup::Done => tokens.status.inactive,
+        BoardGroup::Done => tokens.borders.strong,
     }
 }
 
@@ -512,7 +525,7 @@ fn rail_element(model: &BoardModel, tokens: ThemeTokens) -> AnyElement {
                 .flex()
                 .flex_col()
                 .items_center()
-                .gap(px(LINE_GAP + 1.0))
+                .gap(px(RAIL_DOT_COUNT_GAP))
                 .child(
                     div()
                         .w(px(RAIL_DOT_SIZE))
@@ -687,18 +700,40 @@ mod tests {
         });
     }
 
-    /// The board's row identity is the shell's row identity. A second hash here
-    /// would silently split the accessibility tree in two.
+    /// A fixed UUIDv7, so the golden below is reproducible rather than a fresh
+    /// random id each run. Same shape as `client::fleet`'s test helper.
+    fn fixed_uuid_v7(tail: u8) -> [u8; 16] {
+        [
+            0x01, 0x8f, 0x60, 0xb0, 0x9c, 0x1a, 0x70, 0x01, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, tail,
+        ]
+    }
+
+    fn golden_key() -> HostTaskKey {
+        HostTaskKey::new(
+            HostId::LocalProfile("profile".into()),
+            TaskId::from_bytes(fixed_uuid_v7(0x2a)).expect("fixed task id"),
+        )
+    }
+
+    /// A golden, not a round trip. Asserting the painter against the shell would
+    /// be `f(x) == f(x)` now that the shell forwards here, so this pins the
+    /// literal id the pre-redesign `stable_host_task_element_id` produced. If it
+    /// ever changes, every accessibility node on the board has been renamed and
+    /// the tooling that addresses them by id has silently broken.
     #[test]
-    fn row_element_id_is_the_shell_identity() {
-        let key = HostTaskKey::new(HostId::LocalProfile("profile".into()), TaskId::new());
+    fn row_element_id_is_the_pre_redesign_accessibility_identity() {
         assert_eq!(
-            board_row_element_id(&key),
-            crate::ui::native_shell::stable_host_task_element_id_for_test(&key)
+            board_row_element_id(&golden_key()),
+            ElementId::Uuid(Uuid::from_bytes([
+                0x55, 0x24, 0x9a, 0x5f, 0x4f, 0xe5, 0x5a, 0x67, 0x85, 0x30, 0x9b, 0x90, 0xe6, 0xf3,
+                0x83, 0xa2,
+            ])),
+            "board row element ids are a published contract, not an implementation detail"
         );
-        let other = HostTaskKey::new(HostId::LocalProfile("other".into()), key.task_id);
+        let other = HostTaskKey::new(HostId::LocalProfile("other".into()), golden_key().task_id);
         assert_ne!(
-            board_row_element_id(&key),
+            board_row_element_id(&golden_key()),
             board_row_element_id(&other),
             "the same task id on two hosts must not share a node"
         );

@@ -49,8 +49,9 @@ pub const LINE_GAP: f32 = 1.0;
 pub const STATE_DOT_SIZE: f32 = 7.0;
 pub const STATE_DOT_HALO_SIZE: f32 = 13.0;
 pub const STATE_DOT_HALO_ALPHA: f32 = 0.18;
-/// `.r.you` / `.r.blocked` border colours (#5a4a20 / #5a2528) are the state
-/// colour at roughly a third opacity over `surfaces.raised`.
+/// The mockup's needs-you and blocked row rules are the state colour at roughly
+/// a third opacity over `surfaces.raised`; solving its two border colours per
+/// channel gives 0.31/0.33/0.20 and 0.33/0.31/0.30.
 pub const NEEDS_YOU_BORDER_ALPHA: f32 = 0.32;
 
 /// `.t` / `.r` font-size, `.age` and `.m` font-size, `.segn` font-size.
@@ -94,6 +95,8 @@ pub const GROUP_LABEL_FONT_SIZE: f32 = 10.5;
 pub const RAIL_DOT_SIZE: f32 = 13.0;
 pub const RAIL_COUNT_FONT_SIZE: f32 = 10.0;
 pub const RAIL_GROUP_GAP: f32 = 10.0;
+/// Between a rail group's dot and the count beneath it.
+pub const RAIL_DOT_COUNT_GAP: f32 = 2.0;
 pub const RAIL_PADDING_TOP: f32 = 10.0;
 
 /// Below this the "3/5" count is dropped; below [`SEGMENTS_MIN_WIDTH`] the

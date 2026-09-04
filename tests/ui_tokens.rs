@@ -12,6 +12,8 @@ use serde_json::Value;
 
 const EXPECTED_COLOR_KEYS: &[&str] = &[
     "text_primary",
+    // One step above primary, for a board row that is waiting on an answer.
+    "text_emphasis",
     "text_secondary",
     "text_muted",
     "text_disabled",
