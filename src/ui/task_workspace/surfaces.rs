@@ -2088,7 +2088,7 @@ mod tests {
         workspace
             .as_mut()
             .unwrap()
-            .set_manual_compact(second, true)
+            .set_presentation(second, PanePresentation::Minimised)
             .unwrap();
         let split_id = match workspace.as_ref().unwrap().root().unwrap() {
             crate::ui::task_workspace::WorkspaceNode::Split { id, .. } => *id,
@@ -2115,7 +2115,7 @@ mod tests {
         assert!(!workspace.contains_task(second));
         assert_eq!(
             workspace.presentation(third),
-            Some(PanePresentation::CompactManual)
+            Some(PanePresentation::Minimised)
         );
         assert_eq!(
             workspace.split_child_allocation(split_id, 1),
@@ -2155,7 +2155,9 @@ mod tests {
                 .unwrap();
         }
         workspace.focus_task(second).unwrap();
-        workspace.set_manual_compact(third, true).unwrap();
+        workspace
+            .set_presentation(third, PanePresentation::Minimised)
+            .unwrap();
         let mut registry = TaskSurfaceRegistry::default();
         registry.begin_conversation(fourth, 4);
 
@@ -2190,7 +2192,9 @@ mod tests {
                 .unwrap();
         }
         workspace.focus_task(focused).unwrap();
-        workspace.set_manual_compact(compact, true).unwrap();
+        workspace
+            .set_presentation(compact, PanePresentation::Minimised)
+            .unwrap();
         let mut registry = TaskSurfaceRegistry::default();
 
         let first_wave = registry.conversation_query_schedule(&workspace, 2);
@@ -2250,25 +2254,49 @@ mod tests {
     }
 
     #[test]
-    fn focused_compact_pane_is_scheduled_on_background_cadence() {
-        let task = TaskId::new();
-        let mut workspace = TaskWorkspace::single(task);
-        workspace.set_manual_compact(task, true).unwrap();
+    fn a_minimised_pane_is_scheduled_on_background_cadence() {
+        // The focused pane is never minimised, so the pane this rule is about
+        // is an unfocused strip beside the pane the user is looking at.
+        let strip = TaskId::new();
+        let focused = TaskId::new();
+        let mut workspace = TaskWorkspace::single(strip);
+        workspace
+            .insert_after_focused(focused, Axis::Horizontal)
+            .unwrap();
+        workspace.focus_task(focused).unwrap();
+        workspace
+            .set_presentation(strip, PanePresentation::Minimised)
+            .unwrap();
         let mut registry = TaskSurfaceRegistry::default();
 
         let interactive_only = registry.conversation_query_schedule(&workspace, 0);
-        assert!(
-            interactive_only.is_empty(),
-            "focused compact is not interactive Full"
+        assert_eq!(
+            interactive_only,
+            vec![ConversationQueryPlan {
+                task_id: focused,
+                priority: ConversationQueryPriority::Interactive,
+            }],
+            "a strip is never the interactive pane"
         );
 
-        let with_background = registry.conversation_query_schedule(&workspace, 2);
-        assert_eq!(
-            with_background,
-            vec![ConversationQueryPlan {
-                task_id: task,
+        let mut with_background = registry.conversation_query_schedule(&workspace, 2);
+        let mut expected = vec![
+            ConversationQueryPlan {
+                task_id: focused,
+                priority: ConversationQueryPriority::Interactive,
+            },
+            ConversationQueryPlan {
+                task_id: strip,
                 priority: ConversationQueryPriority::Background,
-            }]
+            },
+        ];
+        // Sorted by task so the comparison is exact rather than a containment
+        // check that would pass on a wave carrying anything else as well.
+        with_background.sort_by_key(|plan| plan.task_id);
+        expected.sort_by_key(|plan| plan.task_id);
+        assert_eq!(
+            with_background, expected,
+            "the wave is exactly the focused pane interactively plus the strip in the background"
         );
     }
 
@@ -2285,7 +2313,9 @@ mod tests {
             others.push(task);
         }
         workspace.focus_task(focused).unwrap();
-        workspace.set_manual_compact(others[0], true).unwrap();
+        workspace
+            .set_presentation(others[0], PanePresentation::Minimised)
+            .unwrap();
         let mut registry = TaskSurfaceRegistry::default();
 
         let mut seen = BTreeSet::new();

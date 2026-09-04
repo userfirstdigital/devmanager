@@ -190,8 +190,8 @@ use crate::ui::task_search::{TaskSearchCandidate, TaskSearchState};
 use crate::ui::task_workspace::{
     conversation_poll_priorities_due, working_conversation_poll_due, Allocation, AllocationMetrics,
     Axis, CenterSurfaceLoadingState, ConversationQueryPriority, DropTarget, Edge, PaneId, PaneRect,
-    SplitId, TaskPaneBody, TaskPaneProjection, TaskPaneViewModel, TaskSurfaceRegistry,
-    TaskWorkspace, TaskWorkspaceViewChild, TaskWorkspaceViewModel, TaskWorkspaceViewNode, Viewport,
+    PaneView, SplitId, TaskPaneProjection, TaskPaneViewModel, TaskSurfaceRegistry, TaskWorkspace,
+    TaskWorkspaceViewChild, TaskWorkspaceViewModel, TaskWorkspaceViewNode, Viewport,
     WorkspaceError, WorkspaceSelectionGesture, CONVERSATION_RECOVERY_HEARTBEAT,
 };
 use crate::ui::terminal_adapter::TerminalDockAdapter;
@@ -5073,11 +5073,6 @@ impl Default for NativeHeaderAttachment {
 fn bounded_header_text(value: String) -> String {
     const MAX_HEADER_TEXT_SCALARS: usize = 256;
     value.chars().take(MAX_HEADER_TEXT_SCALARS).collect()
-}
-
-fn bounded_workspace_snippet(value: &str) -> String {
-    const MAX_WORKSPACE_SNIPPET_SCALARS: usize = 512;
-    value.chars().take(MAX_WORKSPACE_SNIPPET_SCALARS).collect()
 }
 
 impl NativeHostProjection {
@@ -15263,7 +15258,7 @@ impl NativeShell {
                 .task_workspace
                 .as_ref()
                 .is_some_and(|workspace| workspace.contains_task(owner.clone()))
-                && self.task_center_terminal_preference(&owner);
+                && self.pane_view(&owner) == PaneView::Terminal;
             if self.pending_terminal_echoes.contains_key(&key) {
                 if !visible {
                     self.pending_terminal_echoes.remove(&key);
@@ -20359,8 +20354,13 @@ impl NativeShell {
         task_follow_changed: bool,
     ) {
         let owner = self.local_task_key(task_id);
-        let show_terminal = self.task_center_terminal_preference(&owner);
+        // The pane is the single source for its view, so the ContextDock's own
+        // per-task memory is never consulted here: a second remembered surface
+        // is a second answer, and the two would drift. A pane does not outlive
+        // the workspace, so a task reselected after a return to the idle canvas
+        // opens on Conversation; one keypress puts it back on the terminal.
         let was_showing_terminal = self.local_slot_mut().cockpit.dock().showing_raw_terminal();
+        let show_terminal = self.pane_view(&owner) == PaneView::Terminal;
         let result = if show_terminal {
             self.local_slot_mut()
                 .cockpit
@@ -20391,43 +20391,45 @@ impl NativeShell {
         }
     }
 
-    /// Read the center Conversation/Terminal preference for an owner key.
-    /// Local profiles may still carry a legacy raw-TaskId map entry; migrate it
-    /// in place. Remote owners never fall back across hosts.
-    fn task_center_terminal_preference(&mut self, owner: &HostTaskKey) -> bool {
-        let preference_key = owner.center_preference_key();
-        if let Some(value) = self
-            .layout
-            .task_center_terminal
-            .get(&preference_key)
-            .copied()
-        {
-            return value;
+    /// Carry a raw/semantic terminal flip onto the pane that owns it. Going raw
+    /// names Terminal. Going semantic only demotes a pane that is actually
+    /// showing the terminal: a pane parked on Files stays on Files, because the
+    /// dock's terminal presentation says nothing about a surface it does not own.
+    fn note_terminal_presentation_on_pane(&mut self, owner: &HostTaskKey, raw: bool) {
+        if raw {
+            self.set_pane_view(owner, PaneView::Terminal);
+        } else if self.pane_view(owner) == PaneView::Terminal {
+            self.set_pane_view(owner, PaneView::Conversation);
         }
-        if owner.host != self.local_host_id() {
-            return false;
-        }
-        let legacy = owner.task_id.to_string();
-        let Some(value) = self.layout.task_center_terminal.remove(&legacy) else {
-            return false;
-        };
-        self.layout
-            .task_center_terminal
-            .insert(preference_key, value);
-        self.mark_layout_dirty();
-        value
     }
 
-    fn set_task_center_terminal_preference(&mut self, owner: &HostTaskKey, visible: bool) {
-        let preference_key = owner.center_preference_key();
-        if owner.host == self.local_host_id() {
-            let legacy = owner.task_id.to_string();
-            let _ = self.layout.task_center_terminal.remove(&legacy);
-        }
+    /// Which surface this owner's pane shows. The pane owns the choice, so an
+    /// owner with no pane reads as the default rather than as a stored `false`.
+    fn pane_view(&self, owner: &HostTaskKey) -> PaneView {
         self.layout
-            .task_center_terminal
-            .insert(preference_key, visible);
-        self.mark_layout_dirty();
+            .task_workspace
+            .as_ref()
+            .and_then(|workspace| workspace.view_of(owner.clone()))
+            .unwrap_or_default()
+    }
+
+    fn set_pane_view(&mut self, owner: &HostTaskKey, view: PaneView) {
+        let Some(workspace) = self.layout.task_workspace.as_mut() else {
+            // No tree at all is the ordinary idle canvas, not a defect.
+            return;
+        };
+        if workspace.view_of(owner.clone()) == Some(view) {
+            return;
+        }
+        match workspace.set_view(owner.clone(), view) {
+            Ok(()) => self.mark_layout_dirty(),
+            // A tree that has no pane for this owner means the caller and the
+            // workspace disagree about who is open. Say which owner, rather
+            // than dropping the view change on the floor.
+            Err(error) => {
+                eprintln!("devmanager: pane view {view:?} not applied for {owner:?}: {error:?}")
+            }
+        }
     }
 
     /// Local-only: rewrite bare TaskId preference keys to owner-qualified keys
@@ -21932,7 +21934,7 @@ impl NativeShell {
                     if let Some(slot) = self.host_slot_mut(&key.host) {
                         slot.cockpit.dock_mut().show_semantic();
                     }
-                    self.set_task_center_terminal_preference(&key, false);
+                    self.note_terminal_presentation_on_pane(&key, false);
                     self.pending_terminal_focus = false;
                     self.reconcile_browser_dock_lifecycle(None);
                     return;
@@ -21956,7 +21958,7 @@ impl NativeShell {
                 } else {
                     return;
                 };
-                self.set_task_center_terminal_preference(&key, visible);
+                self.note_terminal_presentation_on_pane(&key, visible);
                 if let Err(error) = result {
                     if let Some(slot) = self.host_slot_mut(&key.host) {
                         slot.composer_error = Some(format!("{error:?}"));
@@ -21986,7 +21988,7 @@ impl NativeShell {
             self.local_slot_mut().cockpit.dock_mut().show_semantic();
             if let Some(task_id) = selected_task_id {
                 let owner = self.local_task_key(task_id);
-                self.set_task_center_terminal_preference(&owner, false);
+                self.note_terminal_presentation_on_pane(&owner, false);
             }
             self.pending_terminal_focus = false;
             self.sync_terminal_from_cockpit();
@@ -22010,7 +22012,7 @@ impl NativeShell {
         };
         if let Some(task_id) = selected_task_id {
             let owner = self.local_task_key(task_id);
-            self.set_task_center_terminal_preference(&owner, visible);
+            self.note_terminal_presentation_on_pane(&owner, visible);
         }
         if let Err(error) = result {
             self.local_slot_mut().composer_error = Some(format!("{error:?}"));
@@ -24473,25 +24475,15 @@ impl NativeShell {
 
     fn task_workspace_view_model(&self) -> Option<TaskWorkspaceViewModel<HostTaskKey>> {
         let workspace = self.layout.task_workspace.as_ref()?;
+        // Shell-wide, but it decides what a pane paints, so it goes in as a
+        // projection input and the model owns the whole predicate.
+        let preview_conversation_installed = self.preview_conversation_installed();
         let projections = workspace
             .task_ids()
             .into_iter()
             .map(|key| {
                 let (title, project_name, provider_label, status_label) =
                     self.owner_pane_projection_labels(&key);
-                let show_terminal = key.host == self.local_host_id()
-                    && self
-                        .layout
-                        .task_center_terminal
-                        .get(&key.center_preference_key())
-                        .copied()
-                        .or_else(|| {
-                            self.layout
-                                .task_center_terminal
-                                .get(&key.task_id.to_string())
-                                .copied()
-                        })
-                        .unwrap_or(false);
                 (
                     key.clone(),
                     TaskPaneProjection {
@@ -24500,11 +24492,7 @@ impl NativeShell {
                         project_name,
                         provider_label,
                         status_label,
-                        latest_snippet: self
-                            .task_surfaces
-                            .latest_snippet(key.clone())
-                            .map(str::to_string),
-                        show_terminal,
+                        preview_conversation_installed,
                     },
                 )
             })
@@ -24926,13 +24914,6 @@ impl NativeShell {
                 cx.notify();
             }
         });
-        let compact = pane.body == TaskPaneBody::Compact;
-        let toggle_key = task_key.clone();
-        let toggle = cx.listener(move |shell, _event: &ClickEvent, _window, cx| {
-            cx.stop_propagation();
-            shell.set_workspace_task_compact(toggle_key.clone(), !compact);
-            cx.notify();
-        });
         let close_key = task_key.clone();
         let close = cx.listener(move |shell, _event: &ClickEvent, _window, cx| {
             cx.stop_propagation();
@@ -25020,32 +25001,6 @@ impl NativeShell {
             )
             .child(
                 div()
-                    .id(("native-task-pane-compact", task_element_key))
-                    .tab_stop(true)
-                    .px(px(7.0))
-                    .py(px(4.0))
-                    .rounded(px(5.0))
-                    .cursor_pointer()
-                    .flex()
-                    .items_center()
-                    .gap(px(4.0))
-                    .text_size(px(tokens.density.typography.caption))
-                    .text_color(tokens.text.secondary.to_gpui())
-                    .hover(|style| style.bg(tokens.surfaces.hover.to_gpui()))
-                    .on_click(toggle)
-                    .child(crate::icons::app_icon(
-                        if compact {
-                            crate::icons::PANEL_RIGHT
-                        } else {
-                            crate::icons::SQUARE
-                        },
-                        11.0,
-                        tokens.text.secondary.to_u32(),
-                    ))
-                    .child(if compact { "Full" } else { "Compact" }),
-            )
-            .child(
-                div()
                     .id(("native-task-pane-close", task_element_key))
                     .tab_stop(true)
                     .size(px(24.0))
@@ -25064,29 +25019,17 @@ impl NativeShell {
                     )),
             );
 
-        let body = if pane.body == TaskPaneBody::Compact {
+        let body = if pane.minimised {
+            // Nothing but the title row fits, and the header above already is
+            // that row, so the body is an empty spacer rather than a summary.
             div()
                 .w_full()
                 .flex_1()
                 .min_h(px(0.0))
-                .flex()
-                .items_center()
-                .p(px(12.0))
                 .bg(tokens.surfaces.sunken.to_gpui())
-                .child(
-                    div()
-                        .w_full()
-                        .text_size(px(tokens.density.typography.body))
-                        .line_height(px(tokens.density.typography.body_line_height))
-                        .text_color(tokens.text.secondary.to_gpui())
-                        .child(
-                            pane.latest_snippet
-                                .as_deref()
-                                .map(bounded_workspace_snippet)
-                                .unwrap_or_else(|| "Waiting for activity…".to_string()),
-                        ),
-                )
                 .into_any_element()
+        } else if pane.paint_terminal {
+            self.task_terminal_surface_for(&task_key, tokens, cx)
         } else if pane.build_composer {
             // Focused Full pane owns the interactive composer. Pane chrome
             // already reserved the 42px header; pass only body height.
@@ -25098,8 +25041,6 @@ impl NativeShell {
                 size(pane_size.width, px(body_height)),
                 cx,
             )
-        } else if pane.paint_terminal && !self.preview_conversation_installed() {
-            self.task_terminal_surface_for(&task_key, tokens, cx)
         } else {
             // Background Full panes render the same owner semantic history;
             // only the interactive composer/input is withheld.
@@ -25218,25 +25159,6 @@ impl NativeShell {
                 .right(px(22.0))
                 .h(px(22.0))
                 .into_any_element(),
-        }
-    }
-
-    fn set_workspace_task_compact(&mut self, task_key: HostTaskKey, compact: bool) {
-        let changed = self
-            .layout
-            .task_workspace
-            .as_mut()
-            .is_some_and(|workspace| {
-                workspace.presentation(task_key.clone())
-                    != Some(if compact {
-                        crate::ui::task_workspace::PanePresentation::CompactManual
-                    } else {
-                        crate::ui::task_workspace::PanePresentation::Full
-                    })
-                    && workspace.set_manual_compact(task_key, compact).is_ok()
-            });
-        if changed {
-            self.mark_layout_dirty();
         }
     }
 
@@ -25918,7 +25840,7 @@ impl NativeShell {
                     .into_any_element()
             })
             .collect::<Vec<_>>();
-        let showing_provider_terminal = self.task_center_terminal_preference(&owner);
+        let showing_provider_terminal = self.pane_view(&owner) == PaneView::Terminal;
         // One read of the phase machine per paint. Every branch below asks
         // this value rather than the trace, so the overlay, the hold copy and
         // the empty state cannot disagree within one frame.
@@ -28309,23 +28231,14 @@ impl NativeShell {
             // so the two views it covers are routed and the rest wait rather
             // than half-selecting something.
             KeyboardAction::SelectView(view) => {
-                if matches!(
-                    view,
-                    crate::ui::task_workspace::PaneView::Conversation
-                        | crate::ui::task_workspace::PaneView::Terminal
-                ) {
-                    let owner = self.selected_task_key.clone().or_else(|| {
-                        self.local_slot()
-                            .interaction
-                            .selected_task()
-                            .map(|task_id| self.local_task_key(task_id))
-                    });
-                    if let Some(owner) = owner {
-                        self.set_task_center_terminal_preference(
-                            &owner,
-                            view == crate::ui::task_workspace::PaneView::Terminal,
-                        );
-                    }
+                let owner = self.selected_task_key.clone().or_else(|| {
+                    self.local_slot()
+                        .interaction
+                        .selected_task()
+                        .map(|task_id| self.local_task_key(task_id))
+                });
+                if let Some(owner) = owner {
+                    self.set_pane_view(&owner, view);
                 }
             }
             KeyboardAction::SettleTask => self.settle_selected_task(),
@@ -30924,13 +30837,7 @@ impl NativeShell {
     /// the same geometry the panes are laid out with, rather than off a second
     /// copy of the numbers that can drift from it.
     fn workspace_allocation_metrics() -> AllocationMetrics {
-        AllocationMetrics {
-            full_min_width: 360.0,
-            full_min_height: 300.0,
-            compact_min_width: 210.0,
-            compact_min_height: 116.0,
-            divider: 4.0,
-        }
+        AllocationMetrics::production()
     }
 
     /// The panel number each open task carries: 1-based, in the workspace's
@@ -42783,7 +42690,7 @@ impl NativeShell {
                                             .selected_task_key
                                             .clone()
                                             .is_some_and(|owner| {
-                                                shell.task_center_terminal_preference(&owner)
+                                                shell.pane_view(&owner) == PaneView::Terminal
                                             });
                                         if stale_task_row_routes_key_to_terminal(
                                             event.keystroke.key.as_str(),
@@ -43168,7 +43075,7 @@ impl NativeShell {
                             let _ = shell.update(app, |shell, cx| {
                                 let center_terminal_visible =
                                     shell.selected_task_key.clone().is_some_and(|owner| {
-                                        shell.task_center_terminal_preference(&owner)
+                                        shell.pane_view(&owner) == PaneView::Terminal
                                     });
                                 if stale_task_row_routes_key_to_terminal(
                                     event.keystroke.key.as_str(),
@@ -43936,7 +43843,7 @@ impl NativeShell {
                 let center_terminal_visible = shell
                     .selected_task_key
                     .clone()
-                    .is_some_and(|owner| shell.task_center_terminal_preference(&owner));
+                    .is_some_and(|owner| shell.pane_view(&owner) == PaneView::Terminal);
                 if root_routes_key_to_terminal(
                     event.keystroke.key.as_str(),
                     shell.terminal_focus_handle.is_focused(window),
@@ -46834,6 +46741,7 @@ pub(crate) mod tests {
         OwnedChild,
         OwnedWorker,
         PaletteItem,
+        PaneView,
         PendingComposerSubmission,
         PendingHostBootstrap,
         PendingTerminalEcho,
@@ -55393,7 +55301,11 @@ pub(crate) mod tests {
         with_test_shell_in_app(cx, runtime, |shell| {
             assert!(!shell.terminal_state().is_live());
             let owner = shell.local_task_key(task_id);
-            shell.set_task_center_terminal_preference(&owner, true);
+            // A previous session persists the terminal choice as the owning
+            // pane's view, so the restored layout is what carries it in.
+            shell.layout.task_workspace =
+                Some(crate::ui::task_workspace::Workspace::single(owner.clone()));
+            shell.set_pane_view(&owner, PaneView::Terminal);
             shell
                 .apply_client_model(Arc::new(model))
                 .expect("apply model");
@@ -55821,10 +55733,22 @@ pub(crate) mod tests {
                 "accessible Attach must queue the production image picker"
             );
 
+            // A selection through the production owner route owns a pane; this
+            // scenario reaches the canvas through navigation_mouse_down, which
+            // does not, so seed the tree the select path would have built.
+            let owner = shell.local_task_key(task_id);
+            shell.layout.task_workspace =
+                Some(crate::ui::task_workspace::Workspace::single(owner.clone()));
+
             shell.dispatch_named_accessibility_action("native-task-center-terminal");
             assert_eq!(
                 shell.main_conversation_canvas(),
                 MainConversationCanvas::TaskTerminal
+            );
+            assert_eq!(
+                shell.pane_view(&owner),
+                PaneView::Terminal,
+                "going raw names Terminal on the owning pane"
             );
             assert_eq!(
                 shell.cockpit().active_tool(),
@@ -55840,6 +55764,22 @@ pub(crate) mod tests {
                 "switching to Terminal before a turn exists must not emit a red turn-not-ready error"
             );
 
+            // Leaving the terminal only demotes a pane that is actually showing
+            // it. A pane parked on another surface keeps that surface.
+            shell.set_pane_view(&owner, PaneView::Files);
+            shell.dispatch_named_accessibility_action("native-task-center-conversation");
+            assert_eq!(
+                shell.pane_view(&owner),
+                PaneView::Files,
+                "going semantic must not knock a pane off Files"
+            );
+            shell.dispatch_named_accessibility_action("native-task-center-terminal");
+            assert_eq!(shell.pane_view(&owner), PaneView::Terminal);
+            assert_eq!(
+                shell.main_conversation_canvas(),
+                MainConversationCanvas::TaskTerminal
+            );
+
             shell.clear_selected_task();
             assert!(
                 !shell.splash_fetch_attempted,
@@ -55853,8 +55793,12 @@ pub(crate) mod tests {
             assert!(restored.consumed);
             assert_eq!(
                 shell.main_conversation_canvas(),
-                MainConversationCanvas::TaskTerminal,
-                "ContextDock TerminalPresentation memory must restore Terminal for the task"
+                MainConversationCanvas::TaskConversation,
+                concat!(
+                    "the pane is the only source for its view, and deselection ",
+                    "dropped the tree, so a reselected task opens on Conversation ",
+                    "rather than on the surviving ContextDock terminal memory"
+                )
             );
 
             shell.dispatch_named_accessibility_action("native-task-center-conversation");
@@ -70622,9 +70566,9 @@ pub(crate) mod tests {
                     .task_surfaces
                     .admit_terminals(owner.clone(), &strip)
                     .expect("admit strip");
-                shell.set_task_center_terminal_preference(&owner, false);
+                shell.set_pane_view(&owner, PaneView::Conversation);
                 assert!(
-                    !shell.task_center_terminal_preference(&owner),
+                    shell.pane_view(&owner) != PaneView::Terminal,
                     "the center canvas starts on Conversation"
                 );
 
@@ -70632,7 +70576,7 @@ pub(crate) mod tests {
                 shell.focus_terminal_chip(&owner, shell_resource);
 
                 assert!(
-                    shell.task_center_terminal_preference(&owner),
+                    shell.pane_view(&owner) == PaneView::Terminal,
                     "focusing a chip must bring the terminal view with it"
                 );
                 assert!(

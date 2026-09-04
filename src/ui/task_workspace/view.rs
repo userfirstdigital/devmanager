@@ -2,13 +2,9 @@ use std::collections::BTreeMap;
 
 use crate::domain::TaskId;
 
-use super::{Allocation, Axis, PaneId, PanePresentation, SplitId, Workspace, WorkspaceNode};
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum TaskPaneBody {
-    Full,
-    Compact,
-}
+use super::{
+    Allocation, Axis, PaneId, PanePresentation, PaneView, SplitId, Workspace, WorkspaceNode,
+};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TaskPaneProjection<K = TaskId> {
@@ -17,8 +13,11 @@ pub struct TaskPaneProjection<K = TaskId> {
     pub project_name: String,
     pub provider_label: String,
     pub status_label: String,
-    pub latest_snippet: Option<String>,
-    pub show_terminal: bool,
+    /// A debug preview conversation is installed, which replaces whatever
+    /// surface the pane would otherwise paint. It is an input to the model so
+    /// that the terminal arm and the composer are decided together, in one
+    /// place, rather than the painter carrying half of the rule.
+    pub preview_conversation_installed: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -29,11 +28,19 @@ pub struct TaskPaneViewModel<K = TaskId> {
     pub project_name: String,
     pub provider_label: String,
     pub status_label: String,
-    pub latest_snippet: Option<String>,
-    pub body: TaskPaneBody,
+    /// Which surface this pane paints. There is no separate compact body any
+    /// more, so the view is the only thing that decides what is drawn.
+    pub view: PaneView,
+    /// Paint the raw terminal rather than a conversation. This is the one
+    /// terminal predicate: `view == Terminal` unless a preview conversation
+    /// has displaced it.
+    pub paint_terminal: bool,
+    /// Too little room for content: paint the title strip alone.
+    pub minimised: bool,
+    /// This pane is filling the canvas.
+    pub zoomed: bool,
     pub focused: bool,
     pub build_composer: bool,
-    pub paint_terminal: bool,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -89,10 +96,22 @@ impl<K: Clone + Ord + Eq> TaskWorkspaceViewModel<K> {
         projections: &BTreeMap<K, TaskPaneProjection<K>>,
     ) -> Result<Self, TaskWorkspaceViewError<K>> {
         let focused_task = workspace.focused_task();
-        let root = workspace
-            .root()
-            .map(|root| build_node(root, projections, focused_task.as_ref()))
-            .transpose()?;
+        let zoomed = workspace.zoomed();
+        // A zoomed pane is the whole canvas, so the root the shell renders is
+        // that pane alone. The tree underneath is untouched and comes straight
+        // back when zoom is released.
+        let root = match zoomed.and_then(|pane_id| workspace.pane(pane_id)) {
+            Some(pane) => Some(build_node(
+                &WorkspaceNode::Pane(pane.clone()),
+                projections,
+                focused_task.as_ref(),
+                zoomed,
+            )?),
+            None => workspace
+                .root()
+                .map(|root| build_node(root, projections, focused_task.as_ref(), zoomed))
+                .transpose()?,
+        };
         Ok(Self { root, focused_task })
     }
 
@@ -109,19 +128,17 @@ fn build_node<K: Clone + Ord + Eq>(
     node: &WorkspaceNode<K>,
     projections: &BTreeMap<K, TaskPaneProjection<K>>,
     focused_task: Option<&K>,
+    zoomed: Option<PaneId>,
 ) -> Result<TaskWorkspaceViewNode<K>, TaskWorkspaceViewError<K>> {
     match node {
         WorkspaceNode::Pane(pane) => {
             let projection = projections
                 .get(&pane.task_id)
                 .ok_or_else(|| TaskWorkspaceViewError::MissingProjection(pane.task_id.clone()))?;
-            let body = match pane.presentation {
-                PanePresentation::Full => TaskPaneBody::Full,
-                PanePresentation::CompactManual | PanePresentation::CompactAutomatic => {
-                    TaskPaneBody::Compact
-                }
-            };
+            let minimised = pane.presentation == PanePresentation::Minimised;
             let focused = focused_task == Some(&pane.task_id);
+            let paint_terminal =
+                pane.view == PaneView::Terminal && !projection.preview_conversation_installed;
             Ok(TaskWorkspaceViewNode::Pane(TaskPaneViewModel {
                 pane_id: pane.id,
                 task_id: pane.task_id.clone(),
@@ -129,11 +146,15 @@ fn build_node<K: Clone + Ord + Eq>(
                 project_name: projection.project_name.clone(),
                 provider_label: projection.provider_label.clone(),
                 status_label: projection.status_label.clone(),
-                latest_snippet: projection.latest_snippet.clone(),
-                body,
+                view: pane.view,
+                paint_terminal,
+                minimised,
+                zoomed: zoomed == Some(pane.id),
                 focused,
-                build_composer: focused && body == TaskPaneBody::Full,
-                paint_terminal: body == TaskPaneBody::Full && projection.show_terminal,
+                // A pane painting the terminal has no conversation to put a
+                // composer under, so the two are one decision: whatever turns
+                // the terminal arm off gives the composer back.
+                build_composer: focused && !minimised && !paint_terminal,
             }))
         }
         WorkspaceNode::Split { id, axis, children } => Ok(TaskWorkspaceViewNode::Split {
@@ -144,7 +165,7 @@ fn build_node<K: Clone + Ord + Eq>(
                 .map(|child| {
                     Ok(TaskWorkspaceViewChild {
                         allocation: child.allocation,
-                        node: build_node(&child.node, projections, focused_task)?,
+                        node: build_node(&child.node, projections, focused_task, zoomed)?,
                     })
                 })
                 .collect::<Result<_, TaskWorkspaceViewError<K>>>()?,
@@ -171,29 +192,131 @@ mod task_pane_view_model_tests {
     use super::*;
     use crate::ui::task_workspace::TaskWorkspace;
 
-    fn projection(task_id: TaskId, snippet: Option<&str>, terminal: bool) -> TaskPaneProjection {
+    fn projection(task_id: TaskId) -> TaskPaneProjection {
         TaskPaneProjection {
             task_id,
             title: format!("Task {task_id}"),
             project_name: "DevManager".into(),
             provider_label: "Codex".into(),
             status_label: "Working".into(),
-            latest_snippet: snippet.map(str::to_string),
-            show_terminal: terminal,
+            preview_conversation_installed: false,
         }
     }
 
     #[test]
-    fn compact_view_model_contains_status_and_snippet_but_no_heavy_surface() {
+    fn view_model_carries_view_minimised_and_zoomed_flags() {
+        let task_id = TaskId::new();
+        let other = TaskId::new();
+        let mut workspace = TaskWorkspace::single(task_id);
+        workspace
+            .insert_after_focused(other, Axis::Horizontal)
+            .expect("second pane");
+        workspace.set_view(task_id, PaneView::Files).expect("view");
+        let pane = workspace.pane_for_task(task_id).expect("pane").id;
+        workspace.zoom(pane).expect("zoom");
+        let projections = [task_id, other]
+            .into_iter()
+            .map(|id| (id, projection(id)))
+            .collect();
+
+        let model = TaskWorkspaceViewModel::build(&workspace, &projections).expect("workspace");
+        let panes = model.panes();
+
+        assert_eq!(panes.len(), 1, "zoom shows only the zoomed pane");
+        assert_eq!(panes[0].task_id, task_id);
+        assert_eq!(panes[0].view, PaneView::Files);
+        assert!(panes[0].zoomed);
+        assert!(!panes[0].minimised);
+        assert!(panes[0].build_composer, "the zoomed pane owns the composer");
+    }
+
+    #[test]
+    fn a_previewed_conversation_turns_off_the_terminal_arm_in_one_place() {
         let task_id = TaskId::new();
         let mut workspace = TaskWorkspace::single(task_id);
         workspace
-            .set_manual_compact(task_id, true)
-            .expect("compact task");
-        let projections = BTreeMap::from([(
+            .set_view(task_id, PaneView::Terminal)
+            .expect("terminal view");
+
+        // Preview off: the pane paints the terminal, so it owns no composer.
+        let live = BTreeMap::from([(task_id, projection(task_id))]);
+        let pane = TaskWorkspaceViewModel::build(&workspace, &live)
+            .expect("workspace")
+            .panes()[0]
+            .clone();
+        assert!(pane.paint_terminal);
+        assert!(!pane.build_composer);
+
+        // Preview on: the same pane paints the previewed conversation instead,
+        // so the terminal arm is off and the focused pane owns the composer
+        // again. Both facts are decided here, not in the painter.
+        let previewed = BTreeMap::from([(
             task_id,
-            projection(task_id, Some("Editing layout.rs"), true),
+            TaskPaneProjection {
+                preview_conversation_installed: true,
+                ..projection(task_id)
+            },
         )]);
+        let pane = TaskWorkspaceViewModel::build(&workspace, &previewed)
+            .expect("workspace")
+            .panes()[0]
+            .clone();
+        assert!(
+            !pane.paint_terminal,
+            "a previewed conversation is not the terminal"
+        );
+        assert!(
+            pane.build_composer,
+            "a focused pane painting a conversation owns the composer"
+        );
+        assert_eq!(
+            pane.view,
+            PaneView::Terminal,
+            "the pane's own view is untouched; only what it paints changed"
+        );
+    }
+
+    #[test]
+    fn zooming_a_strip_gives_it_its_content_back() {
+        let strip = TaskId::new();
+        let other = TaskId::new();
+        let mut workspace = TaskWorkspace::single(strip);
+        workspace
+            .insert_after_focused(other, Axis::Horizontal)
+            .expect("second pane");
+        workspace
+            .set_presentation(strip, PanePresentation::Minimised)
+            .expect("minimise");
+        let pane = workspace.pane_for_task(strip).expect("pane").id;
+        let projections = [strip, other]
+            .into_iter()
+            .map(|id| (id, projection(id)))
+            .collect();
+
+        workspace.zoom(pane).expect("zoom");
+
+        let model = TaskWorkspaceViewModel::build(&workspace, &projections).expect("workspace");
+        let panes = model.panes();
+        assert_eq!(panes.len(), 1);
+        assert!(
+            !panes[0].minimised,
+            "a pane filling the canvas is never a title strip"
+        );
+        assert!(panes[0].zoomed);
+        assert!(
+            panes[0].build_composer,
+            "and it owns the composer, which a strip never does"
+        );
+    }
+
+    #[test]
+    fn a_minimised_pane_reports_itself_and_owns_no_composer() {
+        let task_id = TaskId::new();
+        let mut workspace = TaskWorkspace::single(task_id);
+        workspace
+            .set_presentation(task_id, PanePresentation::Minimised)
+            .expect("minimise task");
+        let projections = BTreeMap::from([(task_id, projection(task_id))]);
 
         let model = TaskWorkspaceViewModel::build(&workspace, &projections)
             .expect("workspace model")
@@ -204,10 +327,37 @@ mod task_pane_view_model_tests {
             .clone();
         assert_eq!(model.project_name, "DevManager");
         assert_eq!(model.status_label, "Working");
-        assert_eq!(model.latest_snippet.as_deref(), Some("Editing layout.rs"));
-        assert_eq!(model.body, TaskPaneBody::Compact);
+        assert!(model.minimised);
+        assert!(!model.zoomed);
         assert!(!model.build_composer);
-        assert!(!model.paint_terminal);
+    }
+
+    #[test]
+    fn a_focused_terminal_pane_paints_the_terminal_not_the_composer() {
+        let task_id = TaskId::new();
+        let mut workspace = TaskWorkspace::single(task_id);
+        workspace
+            .set_view(task_id, PaneView::Terminal)
+            .expect("terminal view");
+        let projections = BTreeMap::from([(task_id, projection(task_id))]);
+
+        let model = TaskWorkspaceViewModel::build(&workspace, &projections).expect("workspace");
+        let panes = model.panes();
+        assert!(panes[0].focused);
+        assert_eq!(panes[0].view, PaneView::Terminal);
+        assert!(
+            !panes[0].build_composer,
+            "a Terminal pane paints the terminal; the composer is a Conversation control"
+        );
+
+        workspace
+            .set_view(task_id, PaneView::Conversation)
+            .expect("conversation view");
+        let model = TaskWorkspaceViewModel::build(&workspace, &projections).expect("workspace");
+        assert!(
+            model.panes()[0].build_composer,
+            "the composer comes back with the conversation"
+        );
     }
 
     #[test]
@@ -225,7 +375,7 @@ mod task_pane_view_model_tests {
         workspace.focus_task(second).expect("focus second");
         let projections = [first, second, third]
             .into_iter()
-            .map(|task_id| (task_id, projection(task_id, None, false)))
+            .map(|task_id| (task_id, projection(task_id)))
             .collect();
 
         let model = TaskWorkspaceViewModel::build(&workspace, &projections).expect("workspace");
@@ -239,7 +389,7 @@ mod task_pane_view_model_tests {
     }
 
     #[test]
-    fn background_full_panes_keep_full_body_while_only_focus_owns_composer() {
+    fn background_full_panes_keep_their_view_while_only_focus_owns_composer() {
         let first = TaskId::new();
         let second = TaskId::new();
         let third = TaskId::new();
@@ -252,12 +402,31 @@ mod task_pane_view_model_tests {
             .expect("third pane");
         workspace.focus_task(second).expect("focus second");
         workspace
-            .set_manual_compact(third, true)
-            .expect("compact third");
-        let projections = [first, second, third]
+            .set_presentation(third, PanePresentation::Minimised)
+            .expect("minimise third");
+        let projections: BTreeMap<_, _> = [first, second, third]
             .into_iter()
-            .map(|task_id| (task_id, projection(task_id, Some("live"), false)))
+            .map(|task_id| (task_id, projection(task_id)))
             .collect();
+
+        // On Conversation, the focused Full pane owns the composer. Asserted
+        // before the view is flipped so the negative below is a measured
+        // change rather than a property this test never saw hold.
+        let before = TaskWorkspaceViewModel::build(&workspace, &projections).expect("workspace");
+        let before_panes = before.panes();
+        let second_before = before_panes
+            .iter()
+            .find(|pane| pane.task_id == second)
+            .unwrap();
+        assert_eq!(second_before.view, PaneView::Conversation);
+        assert!(
+            second_before.build_composer,
+            "the focused Full pane on Conversation owns the composer"
+        );
+
+        workspace
+            .set_view(second, PaneView::Terminal)
+            .expect("terminal view");
 
         let model = TaskWorkspaceViewModel::build(&workspace, &projections).expect("workspace");
         let panes = model.panes();
@@ -265,11 +434,20 @@ mod task_pane_view_model_tests {
         let second_pane = panes.iter().find(|pane| pane.task_id == second).unwrap();
         let third_pane = panes.iter().find(|pane| pane.task_id == third).unwrap();
 
-        assert_eq!(first_pane.body, TaskPaneBody::Full);
+        assert!(!first_pane.minimised);
+        assert_eq!(first_pane.view, PaneView::Conversation);
         assert!(!first_pane.build_composer);
-        assert_eq!(second_pane.body, TaskPaneBody::Full);
-        assert!(second_pane.build_composer);
-        assert_eq!(third_pane.body, TaskPaneBody::Compact);
+        assert!(!second_pane.minimised);
+        assert_eq!(
+            second_pane.view,
+            PaneView::Terminal,
+            "each pane carries its own view, not the focused pane's"
+        );
+        assert!(
+            !second_pane.build_composer,
+            "the focused pane is on Terminal, so it paints the terminal, not the composer"
+        );
+        assert!(third_pane.minimised);
         assert!(!third_pane.build_composer);
     }
 
@@ -293,8 +471,7 @@ mod task_pane_view_model_tests {
                     project_name: "DevManager".into(),
                     provider_label: "Codex".into(),
                     status_label: "Idle".into(),
-                    latest_snippet: Some("local cache".into()),
-                    show_terminal: false,
+                    preview_conversation_installed: false,
                 },
             ),
             (
@@ -305,8 +482,7 @@ mod task_pane_view_model_tests {
                     project_name: "DevManager".into(),
                     provider_label: "Codex".into(),
                     status_label: "Working".into(),
-                    latest_snippet: Some("remote cache".into()),
-                    show_terminal: true,
+                    preview_conversation_installed: false,
                 },
             ),
         ]);
@@ -316,10 +492,9 @@ mod task_pane_view_model_tests {
         assert_eq!(panes.len(), 2);
         let local_pane = panes.iter().find(|pane| pane.task_id == local).unwrap();
         let remote_pane = panes.iter().find(|pane| pane.task_id == remote).unwrap();
-        assert_eq!(local_pane.latest_snippet.as_deref(), Some("local cache"));
+        assert_eq!(local_pane.status_label, "Idle");
         assert!(!local_pane.build_composer);
-        assert_eq!(remote_pane.latest_snippet.as_deref(), Some("remote cache"));
+        assert_eq!(remote_pane.status_label, "Working");
         assert!(remote_pane.build_composer);
-        assert!(remote_pane.paint_terminal);
     }
 }

@@ -17,6 +17,7 @@ use crate::domain::TaskId;
 #[cfg(test)]
 use crate::ui::task_workspace::TaskWorkspace;
 use crate::ui::task_workspace::Workspace;
+use crate::ui::task_workspace::{PanePresentation, PaneView};
 
 const LAYOUT_SCHEMA_V1: &str = "devmanager.workspace-layout/v1";
 const LAYOUT_SCHEMA_V2: &str = "devmanager.workspace-layout/v2";
@@ -257,7 +258,10 @@ impl<K: Clone + Ord + Eq> KeyedWorkspaceLayout<K> {
     /// Reject non-finite and out-of-range values from storage. A corrupt or
     /// hand-edited file must degrade to a usable window, never to a pane that
     /// swallows the workspace.
-    pub fn sanitized(mut self) -> Self {
+    pub fn sanitized(mut self) -> Self
+    where
+        K: TerminalCenterKey,
+    {
         for edge in [
             PaneEdge::Sidebar,
             PaneEdge::Inbox,
@@ -286,7 +290,46 @@ impl<K: Clone + Ord + Eq> KeyedWorkspaceLayout<K> {
             }
         }
         self.sanitize_task_workspace();
+        self.adopt_legacy_terminal_preferences();
+        self.restore_minimised_panes();
         self
+    }
+
+    /// Minimisation is a fact about the current viewport, not a stored user
+    /// choice, so a restored file opens every pane Full and lets allocation
+    /// re-derive the strips. This is also what maps a retired `CompactManual`
+    /// pane — which aliases in as `Minimised` — back to a full pane.
+    fn restore_minimised_panes(&mut self) {
+        let Some(workspace) = self.task_workspace.as_mut() else {
+            return;
+        };
+        for task_id in workspace.task_ids() {
+            if workspace.presentation(task_id.clone()) == Some(PanePresentation::Minimised) {
+                let _ = workspace.set_presentation(task_id, PanePresentation::Full);
+            }
+        }
+    }
+
+    /// Fold the retired `task_center_terminal` map into the pane that owns the
+    /// view. The map is consumed rather than kept: a pane's `view` is now the
+    /// only place the Conversation/Terminal choice lives, and two sources would
+    /// drift the moment one of them is written.
+    fn adopt_legacy_terminal_preferences(&mut self)
+    where
+        K: TerminalCenterKey,
+    {
+        if self.task_center_terminal.is_empty() {
+            return;
+        }
+        if let Some(workspace) = self.task_workspace.as_mut() {
+            for task_id in workspace.task_ids() {
+                let key = task_id.center_preference_key();
+                if self.task_center_terminal.get(&key).copied() == Some(true) {
+                    let _ = workspace.set_view(task_id, PaneView::Terminal);
+                }
+            }
+        }
+        self.task_center_terminal.clear();
     }
 
     /// Reconcile local pane membership against the canonical task projection.
@@ -377,7 +420,10 @@ impl<K: Clone + Ord + Eq> KeyedWorkspaceLayout<K> {
     /// Shrink the rails so the conversation keeps its floor in this window.
     /// Stored sizes are preserved; only the rendered widths give way, so
     /// widening the window restores what the user chose.
-    pub fn fitted(self, available_width: f32, available_height: f32) -> Self {
+    pub fn fitted(self, available_width: f32, available_height: f32) -> Self
+    where
+        K: TerminalCenterKey,
+    {
         let mut fitted = self.sanitized();
         if fitted.terminal_collapsed {
             fitted.terminal_height = 0.0;
@@ -643,7 +689,7 @@ impl WorkspaceLayoutStore {
     /// Persist a host-qualified layout as schema `v6`.
     pub fn save_keyed<K>(&self, layout: KeyedWorkspaceLayout<K>) -> io::Result<()>
     where
-        K: Clone + Ord + Eq + Serialize + DeserializeOwned,
+        K: Clone + Ord + Eq + Serialize + DeserializeOwned + TerminalCenterKey,
     {
         let file = LayoutFile {
             schema: LAYOUT_SCHEMA_V6.to_string(),
@@ -939,12 +985,14 @@ mod tests {
     fn v5_persists_dock_scope_center_surface_and_composer_defaults() {
         let directory = tempfile::tempdir().expect("temp dir");
         let store = WorkspaceLayoutStore::at_profile_root(directory.path());
+        let task = TaskId::new();
         let layout = WorkspaceLayout {
             active_dock_tab: Some("Browser".into()),
             project_scope_workspace_id: Some("project-1".into()),
+            task_workspace: Some(TaskWorkspace::single(task)),
             task_center_terminal: {
                 let mut map = BTreeMap::new();
-                map.insert("task-a".into(), true);
+                map.insert(task.center_preference_key(), true);
                 map
             },
             ..WorkspaceLayout::default()
@@ -956,7 +1004,15 @@ mod tests {
             loaded.project_scope_workspace_id.as_deref(),
             Some("project-1")
         );
-        assert_eq!(loaded.task_center_terminal.get("task-a"), Some(&true));
+        assert_eq!(
+            loaded
+                .task_workspace
+                .as_ref()
+                .and_then(|workspace| workspace.view_of(task)),
+            Some(PaneView::Terminal),
+            "the retired center-surface map lands on the pane that owns the view"
+        );
+        assert!(loaded.task_center_terminal.is_empty());
         assert_eq!(
             loaded.composer_launch_options,
             WorkspaceLayout::default().composer_launch_options
@@ -1181,10 +1237,9 @@ mod tests {
             Some(crate::ui::task_workspace::Allocation::Pinned { logical_px: 260.0 })
         );
         assert_eq!(
-            loaded
-                .task_center_terminal
-                .get(&local.center_preference_key()),
-            Some(&true)
+            workspace.view_of(local.clone()),
+            Some(PaneView::Terminal),
+            "the full owner key still separates two hosts' views"
         );
         assert_eq!(
             loaded
@@ -1201,10 +1256,9 @@ mod tests {
             Some(crate::providers::ProviderModel::ClaudeOpus)
         );
         assert_eq!(
-            loaded
-                .task_center_terminal
-                .get(&remote.center_preference_key()),
-            Some(&false)
+            workspace.view_of(remote.clone()),
+            Some(PaneView::Conversation),
+            "the other owner keeps its own view rather than inheriting one"
         );
         let bytes = fs::read(store.path()).expect("read");
         let saved: serde_json::Value = serde_json::from_slice(&bytes).expect("parse");
@@ -1212,6 +1266,37 @@ mod tests {
         // load_keyed is read-only: disk unchanged by a second load.
         let _ = store.load_keyed(local_owner);
         assert_eq!(fs::read(store.path()).expect("reread"), bytes);
+    }
+
+    #[test]
+    fn legacy_task_center_terminal_true_seeds_the_terminal_view_once() {
+        let terminal = TaskId::new();
+        let conversation = TaskId::new();
+        let mut workspace = TaskWorkspace::single(terminal);
+        workspace
+            .insert_after_focused(conversation, crate::ui::task_workspace::Axis::Horizontal)
+            .expect("second pane");
+        let mut layout = KeyedWorkspaceLayout::<TaskId>::default();
+        layout.task_workspace = Some(workspace);
+        layout
+            .task_center_terminal
+            .insert(terminal.center_preference_key(), true);
+        layout
+            .task_center_terminal
+            .insert(conversation.center_preference_key(), false);
+
+        let sanitized = layout.sanitized();
+
+        let workspace = sanitized.task_workspace.as_ref().expect("workspace");
+        assert_eq!(workspace.view_of(terminal), Some(PaneView::Terminal));
+        assert_eq!(
+            workspace.view_of(conversation),
+            Some(PaneView::Conversation)
+        );
+        assert!(
+            sanitized.task_center_terminal.is_empty(),
+            "the map is consumed, not kept"
+        );
     }
 
     #[test]
@@ -1231,7 +1316,9 @@ mod tests {
             _ => panic!("expected split"),
         };
         workspace.pin_task_axis_size(first, 300.0).unwrap();
-        workspace.set_manual_compact(second, true).unwrap();
+        workspace
+            .set_presentation(second, PanePresentation::Minimised)
+            .unwrap();
         let layout = WorkspaceLayout {
             selected_task: Some(second),
             task_workspace: Some(workspace),
@@ -1251,17 +1338,17 @@ mod tests {
         assert_eq!(workspace.previous_focus(), previous);
         assert_eq!(
             workspace.presentation(local_owner(second)),
-            Some(PanePresentation::CompactManual)
+            Some(PanePresentation::Full),
+            "minimisation belongs to the viewport, so it never restores from disk"
         );
         assert_eq!(
             workspace.split_child_allocation(split_id, 0),
             Some(Allocation::Pinned { logical_px: 300.0 })
         );
         assert_eq!(
-            migrated
-                .task_center_terminal
-                .get(&local_owner(first).center_preference_key()),
-            Some(&true)
+            workspace.view_of(local_owner(first)),
+            Some(PaneView::Terminal),
+            "the legacy raw-TaskId preference migrates onto the owning pane"
         );
         let bytes = fs::read(store.path()).expect("read");
         let saved: serde_json::Value = serde_json::from_slice(&bytes).expect("parse");
@@ -1359,10 +1446,7 @@ mod tests {
         store.save(WorkspaceLayout::default()).unwrap();
         let before = fs::read(store.path()).unwrap();
         let layout: KeyedWorkspaceLayout<TestOwnerKey> = KeyedWorkspaceLayout {
-            task_center_terminal: BTreeMap::from([(
-                "x".repeat(MAX_LAYOUT_FILE_BYTES as usize),
-                true,
-            )]),
+            active_dock_tab: Some("x".repeat(MAX_LAYOUT_FILE_BYTES as usize)),
             ..KeyedWorkspaceLayout::default()
         };
         assert_eq!(

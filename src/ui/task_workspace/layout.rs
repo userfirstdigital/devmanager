@@ -118,8 +118,13 @@ impl PaneView {
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum PanePresentation {
     Full,
-    CompactManual,
-    CompactAutomatic,
+    /// Too little room: the pane renders as its title row alone (28 px) until
+    /// allocation gives it space again. Never chosen by the user — the retired
+    /// `CompactManual` aliases in only so an older file still loads, and
+    /// [`KeyedWorkspaceLayout::sanitized`] puts every restored pane back to
+    /// `Full` because allocation re-derives this every frame anyway.
+    #[serde(alias = "CompactAutomatic", alias = "CompactManual")]
+    Minimised,
 }
 
 /// Recursive pane workspace keyed by task identity `K`.
@@ -134,6 +139,10 @@ pub struct TaskPane<K = TaskId> {
     pub task_id: K,
     pub presentation: PanePresentation,
     pub last_focused_at: u64,
+    /// Which surface this pane shows. Absent in files written before the pane
+    /// owned its own view, so it defaults rather than failing the load.
+    #[serde(default)]
+    pub view: PaneView,
 }
 
 impl<K> TaskPane<K> {
@@ -143,6 +152,7 @@ impl<K> TaskPane<K> {
             task_id,
             presentation: PanePresentation::Full,
             last_focused_at,
+            view: PaneView::default(),
         }
     }
 }
@@ -216,6 +226,11 @@ pub struct Workspace<K = TaskId> {
     focused: Option<PaneId>,
     previous_focus: Option<PaneId>,
     focus_clock: u64,
+    /// The one pane filling the canvas right now. Zoom is a look, not a
+    /// layout: it never touches the tree and is deliberately not persisted,
+    /// so a restart returns to the arrangement the user actually built.
+    #[serde(skip)]
+    zoomed: Option<PaneId>,
 }
 
 /// Local TaskId-keyed workspace (existing public API).
@@ -228,6 +243,7 @@ impl<K> Default for Workspace<K> {
             focused: None,
             previous_focus: None,
             focus_clock: 0,
+            zoomed: None,
         }
     }
 }
@@ -241,6 +257,7 @@ impl<K: Clone + Ord + Eq> Workspace<K> {
             root: Some(WorkspaceNode::Pane(pane)),
             previous_focus: None,
             focus_clock,
+            zoomed: None,
         }
     }
 
@@ -296,6 +313,24 @@ impl<K: Clone + Ord + Eq> Workspace<K> {
         self.pane_for_task(task_id).map(|pane| pane.presentation)
     }
 
+    pub fn view_of(&self, task_id: K) -> Option<PaneView> {
+        self.pane_for_task(task_id).map(|pane| pane.view)
+    }
+
+    pub fn set_view(&mut self, task_id: K, view: PaneView) -> Result<(), WorkspaceError> {
+        let pane = self
+            .pane_for_task_mut(task_id)
+            .ok_or(WorkspaceError::MissingPane)?;
+        pane.view = view;
+        Ok(())
+    }
+
+    pub(crate) fn pane_for_task_mut(&mut self, task_id: K) -> Option<&mut TaskPane<K>> {
+        self.root
+            .as_mut()
+            .and_then(|root| find_pane_for_task_mut(root, &task_id))
+    }
+
     pub fn insert_after_focused(
         &mut self,
         task_id: K,
@@ -343,6 +378,40 @@ impl<K: Clone + Ord + Eq> Workspace<K> {
         Ok(())
     }
 
+    pub fn zoomed(&self) -> Option<PaneId> {
+        self.zoomed
+    }
+
+    /// Fill the canvas with one pane. Zooming also focuses it: the zoomed pane
+    /// is the only one on screen, so leaving focus elsewhere would strand the
+    /// composer and every keyboard route on a pane nobody can see.
+    pub fn zoom(&mut self, pane: PaneId) -> Result<(), WorkspaceError> {
+        self.focus_pane(pane)?;
+        // A pane filling the canvas cannot be a title strip: minimisation is a
+        // verdict about sharing a viewport, and a zoomed pane shares nothing.
+        self.pane_mut(pane)
+            .ok_or(WorkspaceError::MissingPane)?
+            .presentation = PanePresentation::Full;
+        self.zoomed = Some(pane);
+        Ok(())
+    }
+
+    pub fn unzoom(&mut self) {
+        self.zoomed = None;
+    }
+
+    pub fn toggle_zoom_focused(&mut self) {
+        match (self.zoomed, self.focused) {
+            (Some(_), _) => self.zoomed = None,
+            // Through `zoom` rather than the field, so the toggle restores a
+            // strip's content exactly as the explicit call does.
+            (None, Some(focused)) => {
+                let _ = self.zoom(focused);
+            }
+            (None, None) => {}
+        }
+    }
+
     pub fn focus_task(&mut self, task_id: K) -> Result<(), WorkspaceError> {
         let pane_id = self
             .pane_for_task(task_id)
@@ -367,20 +436,6 @@ impl<K: Clone + Ord + Eq> Workspace<K> {
         Ok(())
     }
 
-    pub fn set_manual_compact(&mut self, task_id: K, compact: bool) -> Result<(), WorkspaceError> {
-        let pane_id = self
-            .pane_for_task(task_id)
-            .map(|pane| pane.id)
-            .ok_or(WorkspaceError::MissingPane)?;
-        let pane = self.pane_mut(pane_id).ok_or(WorkspaceError::MissingPane)?;
-        pane.presentation = if compact {
-            PanePresentation::CompactManual
-        } else {
-            PanePresentation::Full
-        };
-        Ok(())
-    }
-
     pub fn remove_pane(&mut self, pane_id: PaneId) -> Result<(), WorkspaceError> {
         if self.pane(pane_id).is_none() {
             return Err(WorkspaceError::MissingPane);
@@ -392,6 +447,9 @@ impl<K: Clone + Ord + Eq> Workspace<K> {
             return Err(WorkspaceError::MissingPane);
         }
         candidate.root = next_root;
+        if candidate.zoomed == Some(pane_id) {
+            candidate.zoomed = None;
+        }
         candidate.repair_focus_after_removal(pane_id);
         candidate.validate()?;
         *self = candidate;
@@ -498,6 +556,7 @@ impl<K: Clone + Ord + Eq> Workspace<K> {
             focused: self.focused,
             previous_focus: self.previous_focus,
             focus_clock: self.focus_clock,
+            zoomed: self.zoomed,
         };
         mapped.validate()?;
         Ok(mapped)
@@ -505,7 +564,10 @@ impl<K: Clone + Ord + Eq> Workspace<K> {
 
     pub fn validate(&self) -> Result<(), WorkspaceError> {
         let Some(root) = &self.root else {
-            return if self.focused.is_none() && self.previous_focus.is_none() {
+            return if self.focused.is_none()
+                && self.previous_focus.is_none()
+                && self.zoomed.is_none()
+            {
                 Ok(())
             } else {
                 Err(WorkspaceError::InvalidTree)
@@ -522,6 +584,12 @@ impl<K: Clone + Ord + Eq> Workspace<K> {
         if self
             .previous_focus
             .is_some_and(|previous| previous == focused || !pane_ids.contains(&previous))
+        {
+            return Err(WorkspaceError::InvalidTree);
+        }
+        if self
+            .zoomed
+            .is_some_and(|zoomed| !pane_ids.contains(&zoomed))
         {
             return Err(WorkspaceError::InvalidTree);
         }
@@ -683,6 +751,7 @@ where
                 task_id: mapped,
                 presentation: pane.presentation,
                 last_focused_at: pane.last_focused_at,
+                view: pane.view,
             }))
         }
         WorkspaceNode::Split { id, axis, children } => {
@@ -748,6 +817,18 @@ fn find_pane_for_task<'a, K: PartialEq>(
         WorkspaceNode::Split { children, .. } => children
             .iter()
             .find_map(|child| find_pane_for_task(&child.node, task_id)),
+    }
+}
+
+fn find_pane_for_task_mut<'a, K: PartialEq>(
+    node: &'a mut WorkspaceNode<K>,
+    task_id: &K,
+) -> Option<&'a mut TaskPane<K>> {
+    match node {
+        WorkspaceNode::Pane(pane) => (pane.task_id == *task_id).then_some(pane),
+        WorkspaceNode::Split { children, .. } => children
+            .iter_mut()
+            .find_map(|child| find_pane_for_task_mut(&mut child.node, task_id)),
     }
 }
 
@@ -1017,6 +1098,130 @@ mod tests {
     use crate::domain::TaskId;
 
     #[test]
+    fn a_pane_defaults_to_the_conversation_view_and_remembers_a_set_view() {
+        let mut workspace = Workspace::single(1u32);
+        assert_eq!(workspace.view_of(1), Some(PaneView::Conversation));
+        workspace.set_view(1, PaneView::Terminal).expect("set");
+        assert_eq!(workspace.view_of(1), Some(PaneView::Terminal));
+        assert_eq!(
+            workspace.set_view(9, PaneView::Files),
+            Err(WorkspaceError::MissingPane)
+        );
+    }
+
+    #[test]
+    fn a_serialized_pane_without_a_view_field_loads_as_conversation() {
+        let workspace = Workspace::single(1u32);
+        let mut json = serde_json::to_value(&workspace).expect("json");
+        fn strip(value: &mut serde_json::Value) {
+            match value {
+                serde_json::Value::Object(map) => {
+                    map.remove("view");
+                    for nested in map.values_mut() {
+                        strip(nested);
+                    }
+                }
+                serde_json::Value::Array(items) => items.iter_mut().for_each(strip),
+                _ => {}
+            }
+        }
+        strip(&mut json);
+        let restored: Workspace<u32> = serde_json::from_value(json).expect("old file loads");
+        assert_eq!(restored.view_of(1), Some(PaneView::Conversation));
+    }
+
+    #[test]
+    fn compact_manual_from_an_older_file_loads_and_normalises_to_full() {
+        let workspace = Workspace::single(1u32);
+        let json = serde_json::to_string(&workspace)
+            .expect("json")
+            .replace("\"Full\"", "\"CompactManual\"");
+        assert!(
+            json.contains("CompactManual"),
+            "the fixture must actually carry the retired value"
+        );
+        let restored: Workspace<u32> = serde_json::from_str(&json).expect("older file loads");
+        assert_eq!(
+            restored.presentation(1),
+            Some(PanePresentation::Minimised),
+            "the alias maps the retired value"
+        );
+
+        let automatic = serde_json::to_string(&workspace)
+            .expect("json")
+            .replace("\"Full\"", "\"CompactAutomatic\"");
+        let restored: Workspace<u32> = serde_json::from_str(&automatic).expect("older file loads");
+        assert_eq!(restored.presentation(1), Some(PanePresentation::Minimised));
+    }
+
+    #[test]
+    fn zoom_is_transient_but_restoring_the_pane_to_full_is_not() {
+        let mut workspace = Workspace::single(1u32);
+        workspace
+            .insert_after_focused(2u32, Axis::Horizontal)
+            .expect("pane");
+        let before = serde_json::to_string(&workspace).expect("json");
+        let pane = workspace.pane_for_task(2).expect("pane").id;
+
+        workspace.zoom(pane).expect("zoom");
+        assert_eq!(workspace.zoomed(), Some(pane));
+        assert_eq!(workspace.focused_task(), Some(2), "zoom focuses the pane");
+        assert_eq!(
+            serde_json::to_string(&workspace).expect("json"),
+            before,
+            "zoom itself is not serialised, and pane 2 was already Full"
+        );
+
+        // The whole truth: `zoomed` is skipped, but `presentation` is durable
+        // and zooming a strip WRITES Full onto it. Zoom is transient; the
+        // restoration it performs on the way in is not.
+        workspace.unzoom();
+        workspace
+            .set_presentation(1u32, PanePresentation::Minimised)
+            .expect("minimise 1");
+        let strip = workspace.pane_for_task(1).expect("pane").id;
+
+        workspace.zoom(strip).expect("zoom the strip");
+
+        let json = serde_json::to_string(&workspace).expect("json");
+        assert!(
+            !json.contains("zoomed"),
+            "the zoom itself never reaches the file: {json}"
+        );
+        assert!(
+            !json.contains("Minimised"),
+            "and the strip it restored is persisted as Full, not as a strip: {json}"
+        );
+        assert_eq!(
+            workspace.presentation(1u32),
+            Some(PanePresentation::Full),
+            "zooming a strip restores it, and that survives the round trip"
+        );
+        let restored: Workspace<u32> = serde_json::from_str(&json).expect("reload");
+        assert_eq!(restored.zoomed(), None, "no zoom is loaded back");
+        assert_eq!(restored.presentation(1u32), Some(PanePresentation::Full));
+
+        workspace.unzoom();
+        workspace.focus_task(2u32).expect("focus 2");
+
+        workspace.unzoom();
+        assert_eq!(workspace.zoomed(), None);
+        workspace.toggle_zoom_focused();
+        assert_eq!(workspace.zoomed(), Some(pane));
+        workspace.toggle_zoom_focused();
+        assert_eq!(workspace.zoomed(), None, "the toggle turns it off again");
+
+        workspace.zoom(pane).expect("zoom");
+        workspace.remove_pane(pane).expect("remove");
+        assert_eq!(
+            workspace.zoomed(),
+            None,
+            "removing the zoomed pane clears zoom"
+        );
+        assert!(workspace.validate().is_ok());
+    }
+
+    #[test]
     fn inserting_tasks_preserves_unique_identity_and_focus_history() {
         let first = TaskId::new();
         let second = TaskId::new();
@@ -1149,7 +1354,9 @@ mod tests {
             .insert_after_focused(second, Axis::Horizontal)
             .unwrap();
         let focused_slot = workspace.focused_pane_id().unwrap();
-        workspace.set_manual_compact(second, true).unwrap();
+        workspace
+            .set_presentation(second, PanePresentation::Minimised)
+            .unwrap();
         let split_id = match workspace.root().unwrap() {
             WorkspaceNode::Split { id, .. } => *id,
             _ => panic!("expected split"),
@@ -1170,7 +1377,7 @@ mod tests {
         assert!(!workspace.contains_task(second));
         assert_eq!(
             workspace.presentation(next),
-            Some(PanePresentation::CompactManual)
+            Some(PanePresentation::Minimised)
         );
         assert_eq!(
             workspace.split_child_allocation(split_id, 0),
@@ -1281,7 +1488,9 @@ mod tests {
             .insert_after_focused(remote.clone(), Axis::Horizontal)
             .unwrap();
         let focused_slot = workspace.focused_pane_id().unwrap();
-        workspace.set_manual_compact(remote.clone(), true).unwrap();
+        workspace
+            .set_presentation(remote.clone(), PanePresentation::Minimised)
+            .unwrap();
         workspace.pin_task_axis_size(remote.clone(), 280.0).unwrap();
         let split_id = match workspace.root().unwrap() {
             WorkspaceNode::Split { id, .. } => *id,
@@ -1297,7 +1506,7 @@ mod tests {
         assert!(!workspace.contains_task(remote));
         assert_eq!(
             workspace.presentation(replacement.clone()),
-            Some(PanePresentation::CompactManual)
+            Some(PanePresentation::Minimised)
         );
         assert_eq!(workspace.split_child_allocation(split_id, 1), pinned_before);
         workspace.focus_task(replacement).unwrap();
@@ -1363,7 +1572,9 @@ mod tests {
             _ => panic!("expected split"),
         };
         workspace.pin_task_axis_size(first, 240.0).unwrap();
-        workspace.set_manual_compact(second, true).unwrap();
+        workspace
+            .set_presentation(second, PanePresentation::Minimised)
+            .unwrap();
         let first_pane = workspace.pane_for_task(first).unwrap().id;
         let second_pane = workspace.pane_for_task(second).unwrap().id;
 
@@ -1376,7 +1587,7 @@ mod tests {
         assert_eq!(mapped.pane(second_pane).unwrap().id, second_pane);
         assert_eq!(
             mapped.presentation(("local".into(), second)),
-            Some(PanePresentation::CompactManual)
+            Some(PanePresentation::Minimised)
         );
         assert_eq!(
             mapped.split_child_allocation(split_id, 0),
