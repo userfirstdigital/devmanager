@@ -517,7 +517,8 @@ mod tests {
         let elapsed = started.elapsed();
         let per_notch_us = elapsed.as_secs_f64() * 1_000_000.0 / f64::from(iterations);
         println!(
-            "local wheel notch: {per_notch_us:.3} us over {iterations} notches              (retained window {} rows, {} cols)",
+            "local wheel notch: {per_notch_us:.3} us over {iterations} notches \
+             (retained window {} rows, {} cols)",
             window.rows.len(),
             admitted.screen.cols
         );

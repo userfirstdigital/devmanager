@@ -2500,9 +2500,6 @@ mod tests {
         assert_eq!(t.text.disabled, Color::from_u32(0x85858e));
     }
 
-    /// The board's project stripe reads its hue from here. Pinned so a
-    /// reordered palette is a failing test rather than every project on the
-    /// board silently changing colour.
     /// Every background a scrollbar can land on, in one place, so the
     /// contrast assertion below cannot quietly stop looking at one of them.
     fn scrollbar_backgrounds(tokens: ThemeTokens) -> Vec<(&'static str, Color)> {
@@ -2834,8 +2831,27 @@ mod tests {
         let bar = dark(Density::Comfortable, Scale::Scale100).scrollbar;
         assert_eq!(bar.idle_thumb_width, 4.0);
         assert_eq!(bar.active_thumb_width, 10.0);
+
+        // A pointer target does not change size with the palette, so the whole
+        // spec -- geometry AND both colour triples -- is mode-independent. This
+        // is what lets `terminal_scrollbar_spec()` read the dark theme without
+        // that being a theme choice.
+        let light = light(Density::Comfortable, Scale::Scale100);
+        assert_eq!(
+            dark(Density::Comfortable, Scale::Scale100).scrollbar,
+            light.scrollbar
+        );
+        assert_eq!(
+            high_contrast(Density::Comfortable, Scale::Scale100)
+                .scrollbar
+                .gutter_width,
+            light.scrollbar.gutter_width
+        );
     }
 
+    /// The board's project stripe reads its hue from here. Pinned so a
+    /// reordered palette is a failing test rather than every project on the
+    /// board silently changing colour.
     #[test]
     fn project_palette_is_the_spec_in_assignment_order() {
         assert_eq!(PROJECT_PALETTE.len(), 8);

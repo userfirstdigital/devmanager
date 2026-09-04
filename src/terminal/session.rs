@@ -4571,7 +4571,8 @@ mod tests {
         assert!(!margin.margin_above.is_empty());
         assert!(none.margin_above.is_empty() && none.margin_below.is_empty());
         println!(
-            "host snapshot: {with_margin:.3} ms with a {}-row margin, {without_margin:.3} ms with              none, delta {:.3} ms (viewport {}x{})",
+            "host snapshot: {with_margin:.3} ms with a {}-row margin, \
+             {without_margin:.3} ms with none, delta {:.3} ms (viewport {}x{})",
             margin.margin_above.len() + margin.margin_below.len(),
             with_margin - without_margin,
             margin.rows,

@@ -2887,8 +2887,11 @@ mod theme_palette_tests {
         assert_eq!(palette.selection_bg, 0x141414);
         // The scrollbar's colours are resolved against the TERMINAL plane, not
         // the shell, so they do not follow the sentinel surfaces this fixture
-        // pins. Their identity is asserted in
-        // `themed_palette_scrollbar_matches_the_shared_spec` instead.
+        // pins. Their identity is asserted by
+        // `hovering_the_terminal_gutter_changes_both_width_and_colour` and
+        // `the_light_theme_terminal_gutter_takes_the_dark_ground_colours`
+        // instead, and its geometry by
+        // `terminal_scrollbar_geometry_equals_the_shared_spec`.
     }
 
     #[test]

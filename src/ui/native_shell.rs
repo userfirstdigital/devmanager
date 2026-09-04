@@ -277,8 +277,6 @@ const CLIENT_BUILD_PREFIX: &str = "devmanager";
 // physical output admitted by one request.
 const NATIVE_SNAPSHOT_PAGE_ITEMS: u32 = 128;
 const NATIVE_POINTER_ID: u64 = 1;
-/// Dedicated inbox scrollbar gutter width (gpui-component Scrollbar WIDTH = 16px).
-const TASK_INBOX_SCROLLBAR_GUTTER_WIDTH_PX: f32 = 16.0;
 /// Row padding matches the left inset; the scrollbar owns its own gutter sibling.
 const TASK_RAIL_ROW_HORIZONTAL_PADDING_PX: f32 = 10.0;
 
@@ -364,9 +362,11 @@ fn task_row_capture(button: MouseButton) -> TaskRowCapture {
     TaskRowCapture::Consume
 }
 
-fn task_inbox_scroll_geometry() -> (f32, f32) {
+/// The inbox's gutter width and its row padding. The gutter is the scrollbar
+/// spec's own, so the sibling column the bar sits in cannot drift from the bar.
+fn task_inbox_scroll_geometry(tokens: crate::ui::tokens::ThemeTokens) -> (f32, f32) {
     (
-        TASK_INBOX_SCROLLBAR_GUTTER_WIDTH_PX,
+        tokens.scrollbar.gutter_width,
         TASK_RAIL_ROW_HORIZONTAL_PADDING_PX,
     )
 }
@@ -27052,12 +27052,6 @@ impl NativeShell {
         }
     }
 
-    /// Scroll the terminal the owner's surface is actually showing.
-    ///
-    /// The wheel gesture lands on whichever chip is focused, so the scrollback
-    /// query has to follow the same derivation the resize and screen queries
-    /// use. Hardcoding the legacy provider query here scrolls the provider PTY
-    /// while the user is looking at a shell.
     /// Paint one wheel notch from the client's retained rows, if it lands
     /// inside them.
     ///
@@ -27087,6 +27081,12 @@ impl NativeShell {
             .is_some()
     }
 
+    /// Scroll the terminal the owner's surface is actually showing.
+    ///
+    /// The wheel gesture lands on whichever chip is focused, so the scrollback
+    /// query has to follow the same derivation the resize and screen queries
+    /// use. Hardcoding the legacy provider query here scrolls the provider PTY
+    /// while the user is looking at a shell.
     fn dispatch_terminal_scroll_for_owner(
         &mut self,
         owner: &HostTaskKey,
@@ -42889,7 +42889,7 @@ impl NativeShell {
                     .child(
                         div()
                             .id("native-shell-task-inbox-scrollbar-gutter")
-                            .w(px(TASK_INBOX_SCROLLBAR_GUTTER_WIDTH_PX))
+                            .w(px(task_inbox_scroll_geometry(tokens).0))
                             .flex_none()
                             .h_full()
                             .child(crate::ui::scrollbar::AppScrollbar::vertical(
@@ -49343,8 +49343,16 @@ pub(crate) mod tests {
 
     #[test]
     fn task_inbox_scroll_geometry_uses_gutter_sibling_not_row_overlay_padding() {
-        let (gutter_width, row_padding) = super::task_inbox_scroll_geometry();
-        assert_eq!(gutter_width, 16.0);
+        let tokens = crate::ui::tokens::dark(
+            crate::ui::tokens::Density::Comfortable,
+            crate::ui::tokens::Scale::Scale100,
+        );
+        let (gutter_width, row_padding) = super::task_inbox_scroll_geometry(tokens);
+        // The gutter is the scrollbar spec's, not a number copied from
+        // gpui-component's private 16 px constant -- that component no longer
+        // paints this bar.
+        assert_eq!(gutter_width, tokens.scrollbar.gutter_width);
+        assert_ne!(gutter_width, 16.0);
         assert_eq!(row_padding, 10.0);
         assert_ne!(
             row_padding, 18.0,

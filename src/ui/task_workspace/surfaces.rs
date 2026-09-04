@@ -1594,6 +1594,55 @@ mod tests {
     /// for the provider -- which the client keeps issuing whether or not the
     /// provider is on screen -- must not relabel the focused shell
     /// "Reconnecting" and drop `terminal_is_interactive`, which is what stops
+    /// the user typing into a terminal that is working perfectly.
+    #[test]
+    fn a_provider_retry_leaves_the_focused_shells_attachment_alone() {
+        let mut registry = TaskSurfaceRegistry::<TaskId>::default();
+        let task_id = TaskId::new();
+        let provider =
+            terminal_projection_fixture(task_id, crate::domain::id::ResourceId::new(), true);
+        let shell =
+            terminal_projection_fixture(task_id, crate::domain::id::ResourceId::new(), false);
+        let strip = TaskTerminalsProjection {
+            task_id,
+            terminals: vec![
+                terminal_chip_fixture(&provider),
+                terminal_chip_fixture(&shell),
+            ],
+            order: vec![shell.resource_id],
+            focused: Some(shell.resource_id),
+        };
+        registry.admit_terminals(task_id, &strip).unwrap();
+        registry.admit_terminal(task_id, &provider).unwrap();
+        registry.admit_terminal(task_id, &shell).unwrap();
+        assert!(registry.terminal_is_interactive(task_id));
+        assert_eq!(registry.terminal_label(task_id), "Terminal is live");
+
+        // The provider's own retry settles without a projection.
+        registry.note_terminal_reconnecting_for(task_id, None);
+        assert!(
+            registry.terminal_is_interactive(task_id),
+            "the focused shell is still attached; the provider's retry is not about it"
+        );
+        assert_eq!(registry.terminal_label(task_id), "Terminal is live");
+        assert_eq!(
+            registry
+                .state(task_id)
+                .unwrap()
+                .terminal_attachment_for(None),
+            TerminalAttachmentState::StaleReconnecting,
+            "the provider slot alone records the retry"
+        );
+
+        // The shell's own retry does reach it.
+        registry.note_terminal_reconnecting_for(task_id, Some(shell.resource_id));
+        assert_eq!(
+            registry.terminal_label(task_id),
+            "Reconnecting — last terminal screen"
+        );
+        assert!(!registry.terminal_is_interactive(task_id));
+    }
+
     /// One admitted screen carrying a margin, so the retained-window tests
     /// have something to scroll inside.
     fn terminal_with_margin(
@@ -1751,55 +1800,6 @@ mod tests {
             registry.scroll_terminal_locally(task_id, resource_id, 3),
             None
         );
-    }
-
-    /// the user typing into a terminal that is working perfectly.
-    #[test]
-    fn a_provider_retry_leaves_the_focused_shells_attachment_alone() {
-        let mut registry = TaskSurfaceRegistry::<TaskId>::default();
-        let task_id = TaskId::new();
-        let provider =
-            terminal_projection_fixture(task_id, crate::domain::id::ResourceId::new(), true);
-        let shell =
-            terminal_projection_fixture(task_id, crate::domain::id::ResourceId::new(), false);
-        let strip = TaskTerminalsProjection {
-            task_id,
-            terminals: vec![
-                terminal_chip_fixture(&provider),
-                terminal_chip_fixture(&shell),
-            ],
-            order: vec![shell.resource_id],
-            focused: Some(shell.resource_id),
-        };
-        registry.admit_terminals(task_id, &strip).unwrap();
-        registry.admit_terminal(task_id, &provider).unwrap();
-        registry.admit_terminal(task_id, &shell).unwrap();
-        assert!(registry.terminal_is_interactive(task_id));
-        assert_eq!(registry.terminal_label(task_id), "Terminal is live");
-
-        // The provider's own retry settles without a projection.
-        registry.note_terminal_reconnecting_for(task_id, None);
-        assert!(
-            registry.terminal_is_interactive(task_id),
-            "the focused shell is still attached; the provider's retry is not about it"
-        );
-        assert_eq!(registry.terminal_label(task_id), "Terminal is live");
-        assert_eq!(
-            registry
-                .state(task_id)
-                .unwrap()
-                .terminal_attachment_for(None),
-            TerminalAttachmentState::StaleReconnecting,
-            "the provider slot alone records the retry"
-        );
-
-        // The shell's own retry does reach it.
-        registry.note_terminal_reconnecting_for(task_id, Some(shell.resource_id));
-        assert_eq!(
-            registry.terminal_label(task_id),
-            "Reconnecting — last terminal screen"
-        );
-        assert!(!registry.terminal_is_interactive(task_id));
     }
 
     /// Admitting one terminal's screen marks THAT terminal live. Marking the
