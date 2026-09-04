@@ -13995,18 +13995,9 @@ impl NativeShell {
             composer.as_ref(),
         );
         let mut overlay_nodes = Vec::new();
-        overlay_nodes.push(
-            AccessibilityNode::new(
-                AccessibleRole::Button,
-                if self.show_archived_tasks {
-                    "Show active tasks"
-                } else {
-                    "Show archived tasks"
-                },
-                "Toggle the sidebar between active tasks and the archived-task browser.",
-            )
-            .gpui("native-sidebar-archived", true, true),
-        );
+        // The archived toggle is the board menu's `Archived...` row and nothing
+        // else. It published a node for a footer icon composition A deleted, so
+        // the tree named a control that is not on screen and cannot be reached.
         // The board header's own `+ New`. The per-project "+Claude"/"+Codex"
         // buttons went with the project rail; this one control opens the menu
         // that lists every project instead.
@@ -34402,10 +34393,6 @@ impl NativeShell {
             "native-composer-model" => self.open_composer_model_selector(),
             "native-composer-reasoning" => self.open_composer_reasoning_selector(),
             "native-composer-access" => self.open_composer_access_selector(),
-            "native-sidebar-archived" => {
-                self.show_archived_tasks = !self.show_archived_tasks;
-                self.refresh_accessibility_tree();
-            }
             "native-task-composer-attach" => {
                 if let Some(reason) = self.remote_image_attach_blocked_reason() {
                     if let Some(owner) = self.composer_draft_owner() {
@@ -49448,6 +49435,7 @@ pub(crate) mod tests {
             "native-sidebar-new-project",
             "native-sidebar-changes",
             "native-sidebar-services",
+            "native-sidebar-archived",
         ] {
             assert!(
                 !production_source.contains(gone),
