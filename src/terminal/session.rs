@@ -4427,7 +4427,9 @@ mod tests {
             "margin-test".to_string(),
             std::path::PathBuf::from("."),
             SessionDimensions {
-                cols: 20,
+                // A realistic width: the margin's cost is per CHARACTER, so a
+                // 20-column fixture would understate it tenfold.
+                cols: 200,
                 rows,
                 ..SessionDimensions::default()
             },
@@ -4533,43 +4535,47 @@ mod tests {
     /// `worker=`, the host's cost to produce one screen (measured median 52 ms
     /// on the real launch this lane started from).
     ///
+    /// The A/B is two replicas with the SAME 48-row viewport, one with deep
+    /// scrollback (so the margin collects 48 rows) and one with none (so it
+    /// collects nothing). The viewport iteration is identical in both, which
+    /// is what makes the difference attributable to the margin rather than to
+    /// the grid being bigger.
+    ///
     /// Ignored by default -- a wall-clock number on a shared machine is not a
     /// gate. Run it with `cargo test -- --ignored margin_cost`.
     #[test]
     #[ignore = "measurement, not a gate: prints the margin's snapshot cost"]
     fn margin_cost_measurement() {
-        let replica = replica_with_scrollback(48, 4_000);
         let iterations = 200;
+        let time = |replica: &TerminalReplica| {
+            for _ in 0..20 {
+                std::hint::black_box(replica.snapshot());
+            }
+            let started = std::time::Instant::now();
+            for _ in 0..iterations {
+                std::hint::black_box(replica.snapshot());
+            }
+            started.elapsed().as_secs_f64() * 1000.0 / f64::from(iterations)
+        };
 
-        // Warm.
-        for _ in 0..20 {
-            std::hint::black_box(replica.snapshot());
-        }
+        let with_scrollback = replica_with_scrollback(48, 4_000);
+        // 20 lines into a 48-row terminal never scrolls, so there is no
+        // history and therefore no margin, on an identically sized viewport.
+        let without_scrollback = replica_with_scrollback(48, 20);
 
-        let started = std::time::Instant::now();
-        for _ in 0..iterations {
-            std::hint::black_box(replica.snapshot());
-        }
-        let with_margin = started.elapsed().as_secs_f64() * 1000.0 / f64::from(iterations);
+        let with_margin = time(&with_scrollback);
+        let without_margin = time(&without_scrollback);
 
-        // The same snapshot with the margin stripped afterwards isolates the
-        // COLLECTION cost, which is the only part this lane added.
-        let started = std::time::Instant::now();
-        for _ in 0..iterations {
-            let mut screen = replica.snapshot();
-            screen.margin_above.clear();
-            screen.margin_below.clear();
-            std::hint::black_box(screen);
-        }
-        let baseline = started.elapsed().as_secs_f64() * 1000.0 / f64::from(iterations);
-
-        let screen = replica.snapshot();
+        let margin = with_scrollback.snapshot();
+        let none = without_scrollback.snapshot();
+        assert!(!margin.margin_above.is_empty());
+        assert!(none.margin_above.is_empty() && none.margin_below.is_empty());
         println!(
-            "host snapshot: {with_margin:.3} ms with margin, {baseline:.3} ms measured again              (margin rows above={} below={}, viewport {}x{})",
-            screen.margin_above.len(),
-            screen.margin_below.len(),
-            screen.rows,
-            screen.cols
+            "host snapshot: {with_margin:.3} ms with a {}-row margin, {without_margin:.3} ms with              none, delta {:.3} ms (viewport {}x{})",
+            margin.margin_above.len() + margin.margin_below.len(),
+            with_margin - without_margin,
+            margin.rows,
+            margin.cols
         );
     }
 

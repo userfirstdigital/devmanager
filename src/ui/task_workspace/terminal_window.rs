@@ -265,21 +265,38 @@ mod tests {
         above: usize,
         below: usize,
     ) -> TaskTerminalProjection {
-        let rows = 4;
+        sized_projection(history_size, display_offset, above, below, 4, 20)
+    }
+
+    fn sized_projection(
+        history_size: usize,
+        display_offset: usize,
+        above: usize,
+        below: usize,
+        rows: usize,
+        cols: usize,
+    ) -> TaskTerminalProjection {
         let viewport_top = history_size - display_offset;
         let mut screen = TerminalScreenSnapshot {
             rows,
-            cols: 20,
+            cols,
             display_offset,
             history_size,
             total_lines: history_size + rows,
             ..TerminalScreenSnapshot::default()
         };
-        screen.margin_above = (viewport_top - above..viewport_top)
-            .map(|line| format!("line-{line}"))
-            .collect();
+        // Rows are padded to the real width: a wheel notch copies whole rows,
+        // so a 20-column fixture would make the measurement meaningless.
+        let row_text = move |line: usize| {
+            let mut text = format!("line-{line}");
+            while text.len() < cols {
+                text.push('.');
+            }
+            text
+        };
+        screen.margin_above = (viewport_top - above..viewport_top).map(row_text).collect();
         screen.margin_below = (viewport_top + rows..viewport_top + rows + below)
-            .map(|line| format!("line-{line}"))
+            .map(row_text)
             .collect();
         TaskTerminalProjection {
             task_id: crate::domain::TaskId::new(),
@@ -295,9 +312,7 @@ mod tests {
             accepts_input_without_conversation_id: false,
             sequence: 1,
             title: None,
-            text_lines: (viewport_top..viewport_top + rows)
-                .map(|line| format!("line-{line}"))
-                .collect(),
+            text_lines: (viewport_top..viewport_top + rows).map(row_text).collect(),
             screen,
             is_provider: false,
             runtime_state: crate::domain::cockpit::TerminalRuntimeStateWire::Running,
@@ -313,7 +328,7 @@ mod tests {
         let target = window.scrolled(3).expect("inside the window");
         assert_eq!(target, 13);
         let rows = window.rows_at(target).expect("rows");
-        assert_eq!(rows[0], "line-87");
+        assert!(rows[0].starts_with("line-87"), "{}", rows[0]);
         assert_eq!(rows.len(), 4);
     }
 
@@ -356,7 +371,7 @@ mod tests {
         let mut window = RetainedTerminalWindow::capture(&projection(100, 10, 8, 8));
         assert!(!window.is_locally_scrolled());
         let rows = window.seek(14).expect("rows").to_vec();
-        assert_eq!(rows[0], "line-86");
+        assert!(rows[0].starts_with("line-86"), "{}", rows[0]);
         assert!(window.is_locally_scrolled());
         assert_eq!(window.admitted_display_offset(), 10);
         assert_eq!(window.display_offset(), 14);
@@ -425,7 +440,11 @@ mod tests {
         let mut scrolled = admitted.clone();
         apply_local_scroll_to_projection(&mut scrolled, &window);
         assert_eq!(scrolled.screen.display_offset, 13);
-        assert_eq!(scrolled.text_lines[0], "line-87");
+        assert!(
+            scrolled.text_lines[0].starts_with("line-87"),
+            "{}",
+            scrolled.text_lines[0]
+        );
         assert!(
             scrolled.screen.cells.is_empty(),
             "styled cells are indexed against the admitted viewport"
@@ -467,7 +486,9 @@ mod tests {
     #[test]
     #[ignore = "measurement, not a gate: prints the local notch cost"]
     fn notch_cost_measurement() {
-        let admitted = projection(10_000, 5_000, 48, 48);
+        // A realistic terminal, not the 4x20 the correctness fixtures use: a
+        // notch copies whole rows, so the row width is most of the cost.
+        let admitted = sized_projection(10_000, 5_000, 48, 48, 48, 200);
         let mut window = RetainedTerminalWindow::capture(&admitted);
         let mut projection_copy = admitted.clone();
 
