@@ -12,6 +12,8 @@ use serde_json::Value;
 
 const EXPECTED_COLOR_KEYS: &[&str] = &[
     "text_primary",
+    // One step above primary, for a board row that is waiting on an answer.
+    "text_emphasis",
     "text_secondary",
     "text_muted",
     "text_disabled",
@@ -807,7 +809,7 @@ fn legacy_theme_aliases_preserve_byte_values_with_aa_safe_text_dim() {
     assert_eq!(theme::TEXT_MUTED, 0xa1a1aa);
     assert_eq!(theme::TEXT_SUBTLE, 0x71717a);
     // TEXT_DIM was intentionally raised to the dark muted semantic (WCAG AA on PANEL_BG).
-    assert_eq!(theme::TEXT_DIM, 0xc4c4cc);
+    assert_eq!(theme::TEXT_DIM, 0x86868f);
     assert_eq!(theme::SELECTION_BG, 0x22364d);
     assert_eq!(theme::SELECTION_TEXT, 0xf8fafc);
     assert_eq!(theme::PROJECT_DOT, 0x6366f1);

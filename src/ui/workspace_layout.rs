@@ -131,6 +131,14 @@ pub struct KeyedWorkspaceLayout<K = TaskId> {
     pub composer_provider: Option<crate::providers::ProviderKind>,
     #[serde(default)]
     pub composer_launch_options: Option<crate::providers::ProviderLaunchOptions>,
+    /// Project palette slot per project id, assigned at first sight (spec 5.3).
+    /// Keys are `ProjectId` rendered with its `Display`; slots outside the
+    /// palette are clamped by [`Self::sanitized`].
+    #[serde(default)]
+    pub project_colours: BTreeMap<String, u8>,
+    /// Board column collapsed to the 36 px rail.
+    #[serde(default)]
+    pub board_rail: bool,
 }
 
 /// Local raw-`TaskId` layout (existing public API).
@@ -180,7 +188,10 @@ impl<K> Default for KeyedWorkspaceLayout<K> {
     fn default() -> Self {
         Self {
             sidebar_width: 260.0,
-            inbox_width: 320.0,
+            // The board column's own width. `01-composition-A.html` pins the
+            // chosen composition at 236 px and the option card states the
+            // cost in those terms, so that is what a fresh profile opens at.
+            inbox_width: crate::ui::board::layout::BOARD_COLUMN_WIDTH,
             dock_width: 360.0,
             // The conversation is the primary surface; an idle terminal that
             // opens taller than a third of the window inverts that on the
@@ -203,6 +214,8 @@ impl<K> Default for KeyedWorkspaceLayout<K> {
                 access: crate::providers::ProviderAccessMode::FullAccess,
                 ..crate::providers::ProviderLaunchOptions::default()
             }),
+            project_colours: BTreeMap::new(),
+            board_rail: false,
         }
     }
 }
@@ -262,6 +275,15 @@ impl<K: Clone + Ord + Eq> KeyedWorkspaceLayout<K> {
         }
         if self.composer_launch_options.is_none() {
             self.composer_launch_options = defaults.composer_launch_options;
+        }
+        // A hand-edited or forward-version file can name a palette slot this
+        // build does not have; fail it closed to the first hue rather than
+        // letting a render-time lookup decide.
+        let slots = crate::ui::board::PROJECT_PALETTE.len() as u8;
+        for index in self.project_colours.values_mut() {
+            if *index >= slots {
+                *index = 0;
+            }
         }
         self.sanitize_task_workspace();
         self
@@ -476,6 +498,8 @@ impl KeyedWorkspaceLayout<TaskId> {
             task_composer_preferences,
             composer_provider: self.composer_provider,
             composer_launch_options: self.composer_launch_options,
+            project_colours: self.project_colours,
+            board_rail: self.board_rail,
         })
     }
 }
@@ -1346,5 +1370,31 @@ mod tests {
             io::ErrorKind::InvalidData
         );
         assert_eq!(fs::read(store.path()).unwrap(), before);
+    }
+
+    #[test]
+    fn layout_without_project_colours_or_rail_still_loads() {
+        let json = serde_json::to_value(KeyedWorkspaceLayout::<TaskId>::default()).expect("json");
+        let mut stripped = json.as_object().cloned().expect("object");
+        stripped.remove("project_colours");
+        stripped.remove("board_rail");
+        let layout: KeyedWorkspaceLayout<TaskId> =
+            serde_json::from_value(serde_json::Value::Object(stripped)).expect("older file loads");
+        assert!(layout.project_colours.is_empty());
+        assert!(!layout.board_rail);
+    }
+
+    #[test]
+    fn sanitized_clamps_out_of_range_project_colour_slots() {
+        let layout = KeyedWorkspaceLayout::<TaskId> {
+            project_colours: BTreeMap::from([
+                ("project-a".to_owned(), 3u8),
+                ("project-b".to_owned(), 200u8),
+            ]),
+            ..KeyedWorkspaceLayout::default()
+        }
+        .sanitized();
+        assert_eq!(layout.project_colours.get("project-a").copied(), Some(3));
+        assert_eq!(layout.project_colours.get("project-b").copied(), Some(0));
     }
 }

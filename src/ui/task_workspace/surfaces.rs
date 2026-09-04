@@ -154,6 +154,18 @@ impl TaskConversationCache {
         self.facts.len()
     }
 
+    /// The durable facts, borrowed. [`Self::as_page`] deep-clones the whole
+    /// vector, which is the right shape for a caller that owns a page and the
+    /// wrong one for a caller that only reads it -- the board recomputes its
+    /// row facts on every paint, and a clone per task per frame is pure waste.
+    pub fn facts(&self) -> &[SemanticJournalFact] {
+        &self.facts
+    }
+
+    pub fn through_sequence(&self) -> u64 {
+        self.through_sequence
+    }
+
     fn latest_message_is_assistant(&self) -> bool {
         self.facts
             .iter()
@@ -813,6 +825,34 @@ impl<K: Clone + Ord + Eq> TaskSurfaceRegistry<K> {
 
     pub fn conversation_page(&self, task_id: K) -> Option<SemanticJournalPage> {
         self.state(task_id).map(|state| state.presentation_page())
+    }
+
+    /// The durable conversation facts, borrowed, with the marker a caller
+    /// memoizes on: `(through_sequence, high_water, len)`. Three parts because
+    /// no one of them is sufficient -- a cursor rollover can replace history
+    /// without advancing `through_sequence`, and a page can advance the
+    /// sequences without changing the retained length.
+    ///
+    /// Deliberately excludes the optimistic pending user messages
+    /// [`TaskSurfaceState::presentation_page`] appends: they are all
+    /// `UserMessage` payloads, which carry no plan step and no tool call, so a
+    /// reader of plan progress or doing-now sees exactly the same answer
+    /// without paying for the clone that materialises them.
+    pub fn conversation_facts(
+        &self,
+        task_id: K,
+    ) -> Option<(&[SemanticJournalFact], (u64, u64, usize))> {
+        self.state(task_id).map(|state| {
+            let facts = state.conversation.facts();
+            (
+                facts,
+                (
+                    state.conversation.through_sequence(),
+                    state.conversation.high_water(),
+                    facts.len(),
+                ),
+            )
+        })
     }
 
     pub fn admit_conversation(

@@ -127,8 +127,14 @@ impl RuntimePreferencesSnapshot {
     }
 }
 
-/// An opaque sRGB color. Transparency is intentionally not part of the UI
-/// token contract: compositing belongs to the surface that owns a token.
+/// An sRGB color, opaque by construction: every token constructor
+/// ([`Color::rgb`], [`Color::from_u32`]) yields a fully opaque colour, so no
+/// token carries transparency of its own.
+///
+/// The one route to a translucent colour is [`Color::with_alpha`], which a
+/// painter calls on a token it already holds -- the state-dot halo and the
+/// needs-you / blocked row borders. Compositing therefore stays a decision of
+/// the surface that owns the token rather than a property of the palette.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Color {
     rgba: [u8; 4],
@@ -149,12 +155,28 @@ impl Color {
         )
     }
 
-    /// Convert a semantic token to GPUI's opaque native color without exposing
-    /// palette literals to UI consumers.
+    /// Convert a semantic token to GPUI's native color without exposing palette
+    /// literals to UI consumers. Every token constructor is opaque, so this is
+    /// `rgb()` for a token; only a colour narrowed by [`Color::with_alpha`]
+    /// carries transparency through to the compositor.
     pub fn to_gpui(self) -> gpui::Rgba {
-        gpui::rgb(
-            (u32::from(self.red()) << 16) | (u32::from(self.green()) << 8) | u32::from(self.blue()),
+        gpui::rgba(
+            (u32::from(self.red()) << 24)
+                | (u32::from(self.green()) << 16)
+                | (u32::from(self.blue()) << 8)
+                | u32::from(self.alpha()),
         )
+    }
+
+    /// The same hue at a fraction of its opacity, for a halo or a tinted
+    /// border that must read as the state colour without becoming a second
+    /// saturated colour on screen. Deliberately not a token: the token
+    /// contract stays opaque and the caller owns the compositing decision.
+    pub fn with_alpha(self, alpha: f32) -> Self {
+        let alpha = (alpha.clamp(0.0, 1.0) * 255.0).round() as u8;
+        Self {
+            rgba: [self.red(), self.green(), self.blue(), alpha],
+        }
     }
 
     pub const fn red(self) -> u8 {
@@ -237,6 +259,10 @@ pub fn contrast_ratio(first: Color, second: Color) -> f64 {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct TextTokens {
     pub primary: Color,
+    /// One step above `primary`, for the few places a title must read as
+    /// louder than every other title around it -- the board's needs-you rows.
+    /// Pure white on dark, pure black on light: there is nowhere above it to go.
+    pub emphasis: Color,
     pub secondary: Color,
     pub muted: Color,
     pub disabled: Color,
@@ -705,6 +731,10 @@ impl ThemeTokens {
             SemanticColorToken {
                 name: "text_primary",
                 color: self.text.primary,
+            },
+            SemanticColorToken {
+                name: "text_emphasis",
+                color: self.text.emphasis,
             },
             SemanticColorToken {
                 name: "text_secondary",
@@ -1398,39 +1428,43 @@ impl ThemeTokens {
     }
 }
 
-// T3 Code's dark shell uses a plum-black canvas, a still darker navigation
-// rail, and depth only where interaction calls for it. These values are
-// sampled from the accepted reference rather than approximated from the old
-// neutral zinc cockpit.
-const DARK_SURFACE_CANVAS: Color = Color::from_u32(0x1f1a24);
-const DARK_SURFACE_RAISED: Color = Color::from_u32(0x29232e);
-const DARK_SURFACE_OVERLAY: Color = Color::from_u32(0x2b2431);
-const DARK_SURFACE_SUNKEN: Color = Color::from_u32(0x1a131b);
-const DARK_SURFACE_HOVER: Color = Color::from_u32(0x241c25);
-const DARK_SURFACE_SELECTION: Color = Color::from_u32(0x001062);
-const DARK_SURFACE_DISABLED: Color = Color::from_u32(0x241e28);
+// The redesign's dark shell is a near-black neutral grey stack: the board
+// canvas sits darkest, row boxes lift one step, and colour is reserved for
+// attention (amber) and destruction (red) so nothing else competes for the
+// eye. Values come from the redesign spec rather than the old plum shell.
+const DARK_SURFACE_CANVAS: Color = Color::from_u32(0x101013);
+const DARK_SURFACE_RAISED: Color = Color::from_u32(0x151518);
+const DARK_SURFACE_OVERLAY: Color = Color::from_u32(0x1a1a1f);
+const DARK_SURFACE_SUNKEN: Color = Color::from_u32(0x111114);
+const DARK_SURFACE_HOVER: Color = Color::from_u32(0x17171c);
+const DARK_SURFACE_SELECTION: Color = Color::from_u32(0x1a1a20);
+const DARK_SURFACE_DISABLED: Color = Color::from_u32(0x1e1e23);
 
-const DARK_TEXT_PRIMARY: Color = Color::from_u32(0xe4e4e7);
-const DARK_TEXT_SECONDARY: Color = Color::from_u32(0xd4d4d8);
-const DARK_TEXT_MUTED: Color = Color::from_u32(0xc4c4cc);
-const DARK_TEXT_DISABLED: Color = Color::from_u32(0xb8b8c0);
+const DARK_TEXT_PRIMARY: Color = Color::from_u32(0xe6e6ea);
+const DARK_TEXT_EMPHASIS: Color = Color::from_u32(0xffffff);
+const DARK_TEXT_SECONDARY: Color = Color::from_u32(0x9a9aa3);
+// Spec asks 0x6b6b74, but that is 3.45:1 on raised and fails the 4.5:1 AA gate; 0x86868f is 5.05:1.
+const DARK_TEXT_MUTED: Color = Color::from_u32(0x86868f);
+// Dimmest step of the ramp. Darker reads better but 0x85858e is the floor: below it disabled
+// text drops under 4.5:1 on surfaces.disabled (0x1e1e23).
+const DARK_TEXT_DISABLED: Color = Color::from_u32(0x85858e);
 const DARK_TEXT_INVERSE: Color = Color::from_u32(0xf8fafc);
 const DARK_TEXT_ON_ACCENT: Color = Color::from_u32(0xf8fafc);
-const DARK_TEXT_ON_SELECTION: Color = Color::from_u32(0xf8fafc);
+const DARK_TEXT_ON_SELECTION: Color = Color::from_u32(0xffffff);
 
-const DARK_BORDER_SUBTLE: Color = Color::from_u32(0x362d3d);
-const DARK_BORDER_DEFAULT: Color = Color::from_u32(0x493d50);
-const DARK_BORDER_STRONG: Color = Color::from_u32(0x66566d);
+const DARK_BORDER_SUBTLE: Color = Color::from_u32(0x26262b);
+const DARK_BORDER_DEFAULT: Color = Color::from_u32(0x2c2c33);
+const DARK_BORDER_STRONG: Color = Color::from_u32(0x34343c);
 const DARK_BORDER_FOCUS: Color = Color::from_u32(0xfacc15);
 const DARK_BORDER_SELECTION: Color = Color::from_u32(0xa1a1aa);
 const DARK_BORDER_DISABLED: Color = Color::from_u32(0x52525b);
 
 const DARK_STATUS_EXTERNAL: Color = Color::from_u32(0x60a5fa);
-const DARK_STATUS_ATTENTION: Color = Color::from_u32(0xf59e0b);
-const DARK_STATUS_SUCCESS: Color = Color::from_u32(0x4ade80);
+const DARK_STATUS_ATTENTION: Color = Color::from_u32(0xf2b441);
+const DARK_STATUS_SUCCESS: Color = Color::from_u32(0x7fb07f);
 const DARK_STATUS_WARNING: Color = Color::from_u32(0xfacc15);
-const DARK_STATUS_DESTRUCTIVE: Color = Color::from_u32(0xfb7185);
-const DARK_STATUS_INACTIVE: Color = Color::from_u32(0xa1a1aa);
+const DARK_STATUS_DESTRUCTIVE: Color = Color::from_u32(0xe5484d);
+const DARK_STATUS_INACTIVE: Color = Color::from_u32(0x86868f);
 
 const DARK_ACTION_PRIMARY_DEFAULT: Color = Color::from_u32(0xce1a6b);
 const DARK_ACTION_PRIMARY_HOVER: Color = Color::from_u32(0xd4146a);
@@ -1449,6 +1483,22 @@ const DARK_ACTION_DESTRUCTIVE_FOREGROUND: Color = Color::from_u32(0xffffff);
 /// token module so native views never own ad-hoc RGB(A) literals.
 pub const MODAL_BACKDROP_RGBA: u32 = 0x00000059;
 
+/// One muted hue per project, in the order the board's colour book hands them
+/// out. Dim and cool by construction so amber and red stay the only saturated
+/// colours on screen (spec 5.3). Defined here rather than beside the colour
+/// book because this module is the only place a colour literal may be written;
+/// `crate::ui::board::project_colour` re-exports it.
+pub const PROJECT_PALETTE: [Color; 8] = [
+    Color::from_u32(0x5aa3a0), // teal
+    Color::from_u32(0x7a86c4), // slate
+    Color::from_u32(0xa78a5c), // sand
+    Color::from_u32(0x8c6fa8), // mauve
+    Color::from_u32(0x7a9a6a), // moss
+    Color::from_u32(0x9a7a8a), // dusk
+    Color::from_u32(0x6f8fa8), // steel
+    Color::from_u32(0xa8806f), // clay
+];
+
 const DARK_STATUS_EXTERNAL_SURFACE: Color = Color::from_u32(0x172554);
 const DARK_STATUS_EXTERNAL_FOREGROUND: Color = Color::from_u32(0xdbeafe);
 const DARK_STATUS_ATTENTION_SURFACE: Color = Color::from_u32(0x451a03);
@@ -1462,6 +1512,7 @@ const DARK_STATUS_DESTRUCTIVE_FOREGROUND: Color = Color::from_u32(0xffe4e6);
 const DARK_STATUS_INACTIVE_SURFACE: Color = Color::from_u32(0x27272a);
 const DARK_STATUS_INACTIVE_FOREGROUND: Color = Color::from_u32(0xd4d4d8);
 
+const DARK_TERMINAL_BACKGROUND: Color = Color::from_u32(0x0b0b0d);
 const DARK_TERMINAL_BLACK: Color = Color::from_u32(0x818894);
 const DARK_TERMINAL_RED: Color = Color::from_u32(0xef4444);
 const DARK_TERMINAL_GREEN: Color = Color::from_u32(0x22c55e);
@@ -1488,6 +1539,7 @@ const LIGHT_SURFACE_SELECTION: Color = Color::from_u32(0xcbd5e1);
 const LIGHT_SURFACE_DISABLED: Color = Color::from_u32(0xf1f5f9);
 
 const LIGHT_TEXT_PRIMARY: Color = Color::from_u32(0x0f172a);
+const LIGHT_TEXT_EMPHASIS: Color = Color::from_u32(0x000000);
 const LIGHT_TEXT_SECONDARY: Color = Color::from_u32(0x1e293b);
 const LIGHT_TEXT_MUTED: Color = Color::from_u32(0x334155);
 const LIGHT_TEXT_DISABLED: Color = Color::from_u32(0x475569);
@@ -1717,6 +1769,7 @@ fn dark_theme(density: Density, scale: Scale) -> ThemeTokens {
         mode: ThemeMode::Dark,
         text: TextTokens {
             primary: DARK_TEXT_PRIMARY,
+            emphasis: DARK_TEXT_EMPHASIS,
             secondary: DARK_TEXT_SECONDARY,
             muted: DARK_TEXT_MUTED,
             disabled: DARK_TEXT_DISABLED,
@@ -1818,7 +1871,7 @@ fn dark_theme(density: Density, scale: Scale) -> ThemeTokens {
             inactive_foreground: DARK_STATUS_INACTIVE_FOREGROUND,
         },
         terminal: TerminalPalette {
-            background: DARK_SURFACE_SUNKEN,
+            background: DARK_TERMINAL_BACKGROUND,
             foreground: DARK_TEXT_PRIMARY,
             cursor: DARK_TEXT_PRIMARY,
             selection: DARK_SURFACE_SELECTION,
@@ -1848,6 +1901,7 @@ fn light_theme(density: Density, scale: Scale) -> ThemeTokens {
         mode: ThemeMode::Light,
         text: TextTokens {
             primary: LIGHT_TEXT_PRIMARY,
+            emphasis: LIGHT_TEXT_EMPHASIS,
             secondary: LIGHT_TEXT_SECONDARY,
             muted: LIGHT_TEXT_MUTED,
             disabled: LIGHT_TEXT_DISABLED,
@@ -1978,6 +2032,8 @@ fn high_contrast_theme(density: Density, scale: Scale) -> ThemeTokens {
     let mut tokens = dark_theme(density, scale);
     tokens.mode = ThemeMode::HighContrast;
     tokens.text.primary = HC_TEXT_PRIMARY;
+    // High contrast keeps white as its loudest text; there is no step above it.
+    tokens.text.emphasis = DARK_TEXT_EMPHASIS;
     tokens.text.secondary = HC_TEXT_SECONDARY;
     tokens.text.muted = HC_TEXT_MUTED;
     tokens.text.disabled = HC_TEXT_DISABLED;
@@ -2065,7 +2121,7 @@ pub mod legacy {
     /// Previously `0x52525b` (~2.29:1 against panel). Aligned to the dark
     /// semantic muted token so normal visible dim text meets WCAG AA (≥4.5:1)
     /// without introducing a second palette.
-    pub const TEXT_DIM: u32 = Color::from_u32(0xc4c4cc).to_u32();
+    pub const TEXT_DIM: u32 = Color::from_u32(0x86868f).to_u32();
 
     pub const SELECTION_BG: u32 = Color::from_u32(0x22364d).to_u32();
     pub const SELECTION_TEXT: u32 = Color::from_u32(0xf8fafc).to_u32();
@@ -2167,5 +2223,53 @@ mod tests {
                 "semantic muted on raised must stay AA for {mode:?}, got {ratio}"
             );
         }
+    }
+
+    #[test]
+    fn dark_palette_matches_the_redesign_spec_or_its_ruled_gate_values() {
+        let t = dark(Density::Comfortable, Scale::Scale100);
+        assert_eq!(t.surfaces.canvas, Color::from_u32(0x101013), "column");
+        assert_eq!(t.surfaces.raised, Color::from_u32(0x151518), "row box");
+        assert_eq!(
+            t.surfaces.selection,
+            Color::from_u32(0x1a1a20),
+            "selected row"
+        );
+        assert_eq!(t.surfaces.sunken, Color::from_u32(0x111114), "stream");
+        assert_eq!(
+            t.surfaces.disabled,
+            Color::from_u32(0x1e1e23),
+            "disabled row"
+        );
+        assert_eq!(t.terminal.background, Color::from_u32(0x0b0b0d), "terminal");
+        assert_eq!(t.borders.subtle, Color::from_u32(0x26262b));
+        assert_eq!(t.borders.strong, Color::from_u32(0x34343c));
+        assert_eq!(t.text.primary, Color::from_u32(0xe6e6ea));
+        // The reference PNG measures pure white on a needs-you row title and
+        // 0xe6e6ea on Working and Blocked, so emphasis sits one step above
+        // primary rather than replacing it.
+        assert_eq!(t.text.emphasis, Color::from_u32(0xffffff));
+        assert_eq!(t.text.secondary, Color::from_u32(0x9a9aa3));
+        // The spec asks for 0x6b6b74; the AA gate on raised surfaces outranks
+        // it, so the nearest passing step on the same ramp is what ships.
+        assert_eq!(t.text.muted, Color::from_u32(0x86868f));
+        assert_eq!(t.status.attention, Color::from_u32(0xf2b441));
+        assert_eq!(t.status.destructive, Color::from_u32(0xe5484d));
+        assert_eq!(t.status.success, Color::from_u32(0x7fb07f));
+        assert_eq!(t.status.inactive, Color::from_u32(0x86868f));
+        // The ramp must descend: primary > secondary > muted > disabled. 0x85858e is the
+        // darkest disabled step that still clears 4.5:1 on surfaces.disabled.
+        assert_eq!(t.text.disabled, Color::from_u32(0x85858e));
+    }
+
+    /// The board's project stripe reads its hue from here. Pinned so a
+    /// reordered palette is a failing test rather than every project on the
+    /// board silently changing colour.
+    #[test]
+    fn project_palette_is_the_spec_in_assignment_order() {
+        assert_eq!(PROJECT_PALETTE.len(), 8);
+        assert_eq!(PROJECT_PALETTE[0], Color::from_u32(0x5aa3a0));
+        assert_eq!(PROJECT_PALETTE[1], Color::from_u32(0x7a86c4));
+        assert_eq!(PROJECT_PALETTE[7], Color::from_u32(0xa8806f));
     }
 }

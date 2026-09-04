@@ -14,7 +14,7 @@ mod trusted_hosts_view;
 use trusted_hosts_view::NativeTrustedHostsState;
 
 use std::cell::RefCell;
-use std::collections::{BTreeMap, BTreeSet, HashSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::env;
 use std::error::Error;
 use std::fmt::{Display, Formatter};
@@ -129,6 +129,7 @@ use crate::ui::task_cockpit::dock::{DockEdge, DockTool as CockpitDockTool};
 use crate::ui::task_cockpit::draft_store::{
     ComposerDraftKey, ComposerDraftStore, KeyedComposerDraftKey,
 };
+use crate::ui::task_cockpit::inbox::PrimaryProviderIcon;
 use crate::ui::task_cockpit::shell::TaskCockpitShell;
 use crate::ui::task_cockpit::timeline::{ActivityToggleHandler, CONVERSATION_CONTENT_MAX_WIDTH};
 #[cfg(debug_assertions)]
@@ -153,6 +154,14 @@ use crate::browser::{
 use crate::terminal::protocol::{
     InputAck, InputId, TerminalGeneration, TerminalInputContext, TerminalInputRequest,
 };
+use crate::ui::board::layout::BOARD_RAIL_WIDTH;
+use crate::ui::board::render::{
+    board_row_element_id, render_board, BoardHeaderHandlers, BoardRowHandlers,
+};
+use crate::ui::board::{
+    board_activity, board_state_of, build_board_model, BoardActivity, BoardGroup, BoardModel,
+    BoardRow, BoardState, ProjectColourBook, StateClock,
+};
 use crate::ui::browser_dock_lifecycle::{
     plan_browser_dock, BrowserDockIdentity, BrowserDockLifecycleError, BrowserDockPlan,
     BrowserDockSurfaceState,
@@ -169,7 +178,7 @@ use crate::ui::native_fleet::{
     overlay_owner_config_project_labels, remote_raw_terminal_allowed, FleetSelectMode,
 };
 use crate::ui::native_host_state::{
-    local_host_task_key, FleetInboxProjection, FleetTaskRow, HostDrainCursor, HostProjectKey,
+    local_host_task_key, FleetInboxProjection, HostDrainCursor, HostProjectKey,
     FLEET_DRAIN_PER_HOST,
 };
 use crate::ui::project_actions::{
@@ -194,7 +203,7 @@ use crate::ui::theme_system::{
 use crate::ui::tokens::{mix_color, RuntimePreferencesSnapshot, StatusMeaning};
 use crate::ui::workspace_layout::{
     KeyedWorkspaceLayout, PaneEdge, TaskComposerPreferences, TerminalCenterKey, WindowFrame,
-    WorkspaceLayout, WorkspaceLayoutStore,
+    WorkspaceLayout, WorkspaceLayoutStore, INBOX_MAX, INBOX_MIN,
 };
 
 use crate::updater::{UpdaterService, UpdaterSnapshot, UpdaterStage};
@@ -296,15 +305,63 @@ fn task_row_left_click_should_reopen(_settled: bool) -> bool {
     false
 }
 
-fn task_row_right_click_should_rename(_archived: bool) -> bool {
+/// Right-click renames on a live row and on an archived one alike: the gesture
+/// is about the row's title, and an archived task's title is still editable.
+fn task_row_right_click_should_rename() -> bool {
     true
 }
+
+/// What an empty task list tells the reader to do next. One constant because
+/// the painted empty state and its accessible description are the same
+/// sentence said twice: they had already drifted, the painted copy still
+/// naming the "+Claude" / "+Codex" buttons the board deleted, and nothing
+/// could go red over it -- a screen reader heard the right advice while the
+/// screen showed instructions for controls that are gone.
+const INBOX_EMPTY_STATE_HINT: &str =
+    "Add or choose a project, then start one from the board's + New menu.";
+
+/// What a failed agent start tells the reader to do next. One constant for the
+/// same reason as [`INBOX_EMPTY_STATE_HINT`]: six call sites across the shell
+/// and the cockpit had each spelled out the deleted "+Claude" / "+Codex"
+/// buttons, and copy repeated six times is copy that goes stale six times.
+pub(crate) const AGENT_NOT_STARTED_HINT: &str =
+    "The agent didn't start. Check Settings, then start it again from the board's + New menu.";
 
 /// Task-rail row capture must shield right/middle from the terminal behind the
 /// list, but must not consume left so the archived Delete child can receive the
 /// nested mouse sequence (capture runs before child handlers).
 fn task_rail_row_capture_consumes_button(button: MouseButton) -> bool {
     !matches!(button, MouseButton::Left)
+}
+
+/// What a captured pointer-down on a task row does, as a value rather than as
+/// a shape buried in a closure.
+///
+/// The distinction that matters is the middle button: it must be *consumed*
+/// without doing anything, because a button the row does not consume falls
+/// through to the terminal dock underneath and middle-click there pastes the
+/// selection. A boolean cannot say "consumed but inert", so it kept reading as
+/// if middle and right behaved alike.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum TaskRowCapture {
+    /// Left: not consumed, so a nested affordance inside the row still gets
+    /// its own mouse sequence.
+    Bubble,
+    /// Consumed and otherwise inert -- the middle button, which exists here
+    /// only to be swallowed.
+    Consume,
+    /// Consumed, and opens the inline rename.
+    ConsumeAndRename,
+}
+
+fn task_row_capture(button: MouseButton) -> TaskRowCapture {
+    if !task_rail_row_capture_consumes_button(button) {
+        return TaskRowCapture::Bubble;
+    }
+    if button == MouseButton::Right && task_row_right_click_should_rename() {
+        return TaskRowCapture::ConsumeAndRename;
+    }
+    TaskRowCapture::Consume
 }
 
 fn task_inbox_scroll_geometry() -> (f32, f32) {
@@ -356,9 +413,15 @@ const CONVERSATION_COMPOSER_INNER_RADIUS: f32 = 20.0;
 const CONVERSATION_COMPOSER_CONTEXT_INSET: f32 = 22.0;
 const CONVERSATION_COMPOSER_SEND_DIAMETER: f32 = 28.0;
 const CONVERSATION_COMPOSER_INPUT_MIN_HEIGHT: f32 = 88.0;
-const T3_SIDEBAR_WIDTH: f32 = 256.0;
-const T3_SIDEBAR_ROW_HEIGHT: f32 = 78.0;
+/// The archived browser's row: title, project and branch on three lines.
+const ARCHIVED_ROW_HEIGHT: f32 = 78.0;
 const T3_WORKSPACE_TOPBAR_HEIGHT: f32 = 32.0;
+/// The board header's menus drop from under the header, inset from the window
+/// edge the board is docked against. Row heights are the board's own, in
+/// `ui::board::layout`; these place the panel, nothing more.
+const BOARD_MENU_WIDTH: f32 = 220.0;
+const BOARD_MENU_LEFT_INSET: f32 = 8.0;
+const BOARD_MENU_TOP_INSET: f32 = 30.0;
 const T3_SIDEBAR_NAV_TOP_INSET: f32 = 12.0;
 const CONVERSATION_COMPOSER_PLACEHOLDER: &str =
     crate::ui::native_composer::NATIVE_COMPOSER_PLACEHOLDER;
@@ -1259,7 +1322,7 @@ fn wait_for_child_exit_with_deadline(mut child: OwnedChild, deadline: NativeShut
     retain_child(child);
 }
 
-fn host_identity_digest_bytes(host: &HostId) -> Vec<u8> {
+pub(crate) fn host_identity_digest_bytes(host: &HostId) -> Vec<u8> {
     match host {
         HostId::LocalProfile(name) => {
             let mut bytes = Vec::with_capacity(1 + name.len());
@@ -1282,19 +1345,30 @@ fn stable_task_element_id(task_id: TaskId) -> ElementId {
     ElementId::Uuid(Uuid::from_bytes(*task_id.as_bytes()))
 }
 
+/// The board painter owns this identity now; the shell keeps the old name so
+/// the accessibility tree and its tests keep publishing the same node ids.
+/// One definition only: see [`crate::ui::board::render::board_row_element_id`].
 fn stable_host_task_element_id(key: &HostTaskKey) -> ElementId {
-    // Hash host + task into a UUID element identity so same raw TaskId on two
-    // hosts never shares a GPUI/accesskit node.
-    let mut digest = Sha256::new();
-    digest.update(b"native-host-task-element");
-    digest.update([0]);
-    digest.update(host_identity_digest_bytes(&key.host));
-    digest.update([0]);
-    digest.update(key.task_id.as_bytes());
-    let hash = digest.finalize();
-    let mut uuid_bytes = [0_u8; 16];
-    uuid_bytes.copy_from_slice(&hash[..16]);
-    ElementId::Uuid(Uuid::from_bytes(uuid_bytes))
+    board_row_element_id(key)
+}
+
+/// The board column's width: the narrow rail when it is collapsed, otherwise
+/// the user's chosen inbox width held inside the pane's own bounds. A free
+/// function because the static geometry helpers have a layout but no shell.
+fn board_column_width_for(layout: &KeyedWorkspaceLayout<HostTaskKey>, archived: bool) -> f32 {
+    if layout.board_rail && !archived {
+        BOARD_RAIL_WIDTH
+    } else {
+        layout.inbox_width.clamp(INBOX_MIN, INBOX_MAX)
+    }
+}
+
+/// The accessibility id of a board section. Forwards to the painter's own
+/// mapping rather than restating it: two copies would let an id the tree
+/// publishes drift from the id the element actually carries, and nothing would
+/// go red -- automation would just address a section that is not there.
+fn board_group_element_id(group: BoardGroup) -> &'static str {
+    crate::ui::board::render::board_group_element_id(group)
 }
 
 fn stable_host_task_row_element_id(key: &HostTaskKey) -> String {
@@ -1368,23 +1442,6 @@ fn stable_host_project_element_key(key: &HostProjectKey, suffix: &str) -> u64 {
         .try_into()
         .expect("sha256 prefix is eight bytes");
     u64::from_be_bytes(bytes)
-}
-
-fn stable_host_project_row_element_id(key: &HostProjectKey) -> String {
-    let mut digest = Sha256::new();
-    digest.update(b"native-host-project-row");
-    digest.update([0]);
-    digest.update(host_identity_digest_bytes(&key.host));
-    digest.update([0]);
-    digest.update(key.project_id.as_bytes());
-    let hash = digest.finalize();
-    format!(
-        "native-project-row-{}",
-        hash[..16]
-            .iter()
-            .map(|byte| format!("{byte:02x}"))
-            .collect::<String>()
-    )
 }
 
 /// Return a deterministic numeric suffix for a service element identity.
@@ -4444,34 +4501,97 @@ fn theme_role_display_label(role: ThemeColorRole) -> &'static str {
     }
 }
 
+/// The board's list, flattened for the accessibility tree. The painter reads
+/// [`BoardModel`] directly; this is the same content in the shape the tree
+/// already walks, so task node ids and their ordering do not move.
+///
+/// The project-folder row this enum used to carry is gone with the project
+/// rail: the board groups by state and puts the project on a coloured stripe.
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum ProjectInboxItem {
-    Project {
-        project_id: ProjectId,
-        label: String,
-        expanded: bool,
+    Group {
+        group: BoardGroup,
         task_count: usize,
-        /// Host that owns this project folder row (local multi-folder or remote).
-        host: HostId,
+        collapsed: bool,
     },
     Task {
-        project_id: ProjectId,
+        /// `None` when the projection has no project for this task, rather
+        /// than a freshly minted id that names no project at all.
+        project_id: Option<ProjectId>,
         task_key: HostTaskKey,
         settled: bool,
         archived: bool,
     },
-    DoneHeader {
-        task_count: usize,
-    },
     ArchivedHeader {
         task_count: usize,
     },
+    /// One project the board header's `+ New` menu can start a task in.
+    /// Published as its own accessible button because the board has no project
+    /// rows: without it a project with no tasks yet would be unreachable.
+    NewTaskTarget {
+        project_key: HostProjectKey,
+        label: String,
+    },
+}
+
+/// What a board menu row does when it is chosen. Named rather than boxed so
+/// the row builder stays a plain data list and the overlay owns no closures
+/// beyond the one that applies them.
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum BoardMenuAction {
+    NewTaskIn(HostProjectKey),
+    /// Start a local task straight onto a provider -- what the project rail's
+    /// "+Claude" / "+Codex" buttons did, moved into the one board menu.
+    StartAgentIn(ProjectId, ProviderKind),
+    ToggleArchived,
+    ToggleRail,
+    ToggleDensity,
+}
+
+/// What the board paints under its header.
+///
+/// A value rather than an `if` chain inside the render path, because the
+/// interesting case is invisible from the accessibility tree: the tree said
+/// "No tasks yet" for the whole time an empty active board was painting a bare
+/// `DONE 0` on screen, which reads as a list that failed to load. Naming the
+/// three bodies makes that branch something a test can hold.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum BoardBody {
+    /// The task sections.
+    Sections,
+    /// Nothing is live: the shell's empty state, under the header.
+    EmptyState,
+    /// The archived browser, which keeps the header above it so the `⋯` menu
+    /// that leads back to the active board stays reachable.
+    ArchivedList,
+}
+
+fn board_body_kind(archived: bool, has_rows: bool) -> BoardBody {
+    if archived {
+        BoardBody::ArchivedList
+    } else if has_rows {
+        BoardBody::Sections
+    } else {
+        BoardBody::EmptyState
+    }
+}
+
+/// Which board menu is open. One field holds both, so opening either closes
+/// the other by construction rather than by remembering to.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum BoardMenu {
+    /// The header's `+ New`: every project a task can be started in.
+    NewTask,
+    /// The header's `⋯`: archived view, rail, density.
+    Options,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum ProjectAccessibilityAction {
-    Toggle(HostProjectKey),
-    StartAgent(HostProjectKey, ProviderKind),
+    /// The only project action the board publishes: open the new-task dialog
+    /// for this owner's project. The board has no project headers to expand
+    /// and no per-provider start buttons, so Toggle and StartAgent went with
+    /// them.
     NewTask(HostProjectKey),
 }
 
@@ -9808,20 +9928,17 @@ impl AccessibilityTree {
         selected_key: Option<&HostTaskKey>,
         default_host: &HostId,
         header: &NativeHeaderAttachment,
-        snapshot: Option<&AgentConnectionSnapshot>,
+        // The board's accessibility no longer varies with which providers are
+        // signed in: the per-project "+Claude"/"+Codex" buttons are gone and
+        // one "New task" menu replaced them. Kept so the wrapper chain and the
+        // tests that call it keep their shape.
+        _snapshot: Option<&AgentConnectionSnapshot>,
         project_items: &[ProjectInboxItem],
         composer: Option<&ComposerAccessibilityState>,
         show_project_plus: bool,
     ) -> Self {
         let rendered_task_ids = task_list.rendered_task_ids();
         let rendered_task_set = rendered_task_ids.iter().copied().collect::<HashSet<_>>();
-        let available_agents = snapshot.map(inbox_agent_actions).unwrap_or_default();
-        let claude_available = available_agents
-            .iter()
-            .any(|action| action.provider == ProviderKind::ClaudeCode);
-        let codex_available = available_agents
-            .iter()
-            .any(|action| action.provider == ProviderKind::Codex);
         let selected_is_settled = selected_key.is_some_and(|selected| {
             project_items.iter().any(|item| {
                 matches!(
@@ -9877,98 +9994,57 @@ impl AccessibilityTree {
         } else {
             for item in project_items {
                 match item {
-                    ProjectInboxItem::Project {
-                        project_id,
-                        label,
-                        expanded,
+                    ProjectInboxItem::Group {
+                        group,
                         task_count,
-                        host,
+                        collapsed,
                     } => {
-                        let project_key = HostProjectKey::new(host.clone(), *project_id);
-                        let state = if *expanded { "expanded" } else { "collapsed" };
+                        // The board's sections replace the project headers. A
+                        // live section is a label; Done is the one section that
+                        // discloses, so only it is a button.
                         let task_word = if *task_count == 1 { "task" } else { "tasks" };
-                        let element_id = stable_host_project_row_element_id(&project_key);
+                        if *group == BoardGroup::Done {
+                            let state = if *collapsed { "collapsed" } else { "expanded" };
+                            rows.push(
+                                AccessibilityNode::new(
+                                    AccessibleRole::Button,
+                                    format!("Done, {task_count} {task_word}, {state}"),
+                                    "Show or hide the tasks that are finished but still reversible.",
+                                )
+                                .gpui(board_group_element_id(*group), true, true),
+                            );
+                        } else {
+                            rows.push(
+                                AccessibilityNode::new(
+                                    AccessibleRole::Status,
+                                    format!("{} {task_count}", group.label()),
+                                    "Board section.",
+                                )
+                                .gpui(
+                                    board_group_element_id(*group),
+                                    false,
+                                    false,
+                                ),
+                            );
+                        }
+                    }
+                    ProjectInboxItem::NewTaskTarget { project_key, label } => {
+                        let element_id = format!(
+                            "native-project-new-task-{}",
+                            stable_host_project_element_key(project_key, "new-task")
+                        );
                         rows.push(
                             AccessibilityNode::new(
                                 AccessibleRole::Button,
-                                format!("Project {label}, {task_count} {task_word}, {state}"),
-                                "Expand or collapse this project's tasks.",
+                                format!("New task in {label}"),
+                                "Open a new-task dialog for this owner's project. Provider start stays deferred.",
                             )
                             .gpui(element_id.clone(), true, true),
                         );
                         project_action_elements.insert(
                             element_id,
-                            ProjectAccessibilityAction::Toggle(project_key.clone()),
+                            ProjectAccessibilityAction::NewTask(project_key.clone()),
                         );
-                        let local_project = matches!(host, HostId::LocalProfile(_));
-                        if local_project && claude_available {
-                            let element_id = format!(
-                                "native-project-claude-{}",
-                                stable_host_project_element_key(&project_key, "claude")
-                            );
-                            rows.push(
-                                AccessibilityNode::new(
-                                    AccessibleRole::Button,
-                                    format!("Start Claude task in {label}"),
-                                    "Create a new task in this project and connect Claude Code.",
-                                )
-                                .gpui(
-                                    element_id.clone(),
-                                    true,
-                                    true,
-                                ),
-                            );
-                            project_action_elements.insert(
-                                element_id,
-                                ProjectAccessibilityAction::StartAgent(
-                                    project_key.clone(),
-                                    ProviderKind::ClaudeCode,
-                                ),
-                            );
-                        }
-                        if local_project && codex_available {
-                            let element_id = format!(
-                                "native-project-codex-{}",
-                                stable_host_project_element_key(&project_key, "codex")
-                            );
-                            rows.push(
-                                AccessibilityNode::new(
-                                    AccessibleRole::Button,
-                                    format!("Start Codex task in {label}"),
-                                    "Create a new task in this project and connect Codex.",
-                                )
-                                .gpui(
-                                    element_id.clone(),
-                                    true,
-                                    true,
-                                ),
-                            );
-                            project_action_elements.insert(
-                                element_id,
-                                ProjectAccessibilityAction::StartAgent(
-                                    project_key.clone(),
-                                    ProviderKind::Codex,
-                                ),
-                            );
-                        }
-                        if !local_project {
-                            let element_id = format!(
-                                "native-project-new-task-{}",
-                                stable_host_project_element_key(&project_key, "new-task")
-                            );
-                            rows.push(
-                                AccessibilityNode::new(
-                                    AccessibleRole::Button,
-                                    format!("New task in {label}"),
-                                    "Open a new-task dialog for this remote owner's project. Provider start stays deferred.",
-                                )
-                                .gpui(element_id.clone(), true, true),
-                            );
-                            project_action_elements.insert(
-                                element_id,
-                                ProjectAccessibilityAction::NewTask(project_key),
-                            );
-                        }
                     }
                     ProjectInboxItem::Task { task_key, .. }
                         if rendered_task_set.contains(&task_key.task_id)
@@ -9983,9 +10059,7 @@ impl AccessibilityTree {
                     {
                         push_task_row(&mut rows, &mut task_element_ids, task_key.clone());
                     }
-                    ProjectInboxItem::Task { .. }
-                    | ProjectInboxItem::DoneHeader { .. }
-                    | ProjectInboxItem::ArchivedHeader { .. } => {}
+                    ProjectInboxItem::Task { .. } | ProjectInboxItem::ArchivedHeader { .. } => {}
                 }
             }
         }
@@ -9993,7 +10067,7 @@ impl AccessibilityTree {
             AccessibilityNode::new(
                 AccessibleRole::Status,
                 "No tasks yet",
-                "Add or choose a project, then start with +Claude or +Codex.",
+                INBOX_EMPTY_STATE_HINT,
             )
             .gpui("native-task-inbox-status", false, false)
         } else {
@@ -11358,7 +11432,25 @@ pub struct NativeShell {
     /// Host that owns [`Self::selected_project_id`] / project-scope filter.
     /// Raw ProjectId alone must not filter another host's same UUID.
     project_scope_host: Option<HostId>,
-    collapsed_projects: HashSet<HostProjectKey>,
+    /// How long each task has held its current board state. Transient by
+    /// design -- the kernel records when events occurred, not when a task
+    /// entered a visible state -- so it is never persisted, and a task that
+    /// leaves the fleet projection is forgotten rather than left to leak.
+    board_state_clock: StateClock<HostTaskKey>,
+    /// Whether the board's Done section is disclosed.
+    board_done_expanded: bool,
+    /// One palette slot per project, restored from and written back to
+    /// `layout.project_colours`.
+    project_colours: ProjectColourBook,
+    /// Which board header menu is open, if either.
+    board_menu: Option<BoardMenu>,
+    /// Plan progress and doing-now per task, keyed by the marker
+    /// `TaskSurfaceRegistry::conversation_facts` returns. Recomputed only when
+    /// that marker moves: the board repaints on every frame and on every
+    /// accessibility refresh, and scanning a two-thousand-fact conversation
+    /// each time -- for every open task -- is work nothing asked for. Pruned
+    /// on the same pass as the state clock, so a departed task leaves nothing.
+    board_activity_cache: HashMap<HostTaskKey, ((u64, u64, usize), BoardActivity)>,
     palette_index: usize,
     /// Owner-qualified create result selection; never admit by raw TaskId alone.
     pending_select_task: Option<HostTaskKey>,
@@ -12248,6 +12340,8 @@ impl NativeShell {
                     })
             })
             .collect();
+        // Read before `layout` is moved into the shell below.
+        let project_colours = ProjectColourBook::from_persisted(&layout.project_colours);
         let browser_profile_root = profile.root().to_path_buf();
         let browser_bridge_init = browser_command_channel(64);
         let (theme_controller, theme_error) = match ThemeController::load_at(profile.root()) {
@@ -12418,7 +12512,13 @@ impl NativeShell {
             known_deleted_task_keys: BTreeSet::new(),
             selected_project_id: None,
             project_scope_host: None,
-            collapsed_projects: HashSet::new(),
+            // `StateClock::new` rather than `Default`: the derive needs
+            // `K: Default` and `HostTaskKey` has no default identity.
+            board_state_clock: StateClock::new(),
+            board_done_expanded: false,
+            project_colours,
+            board_menu: None,
+            board_activity_cache: HashMap::new(),
             task_search: TaskSearchState::default(),
             project_scope_menu: ProjectScopeMenuState::default(),
             project_actions: ProjectActionWorkflow::default(),
@@ -13759,9 +13859,9 @@ impl NativeShell {
     fn note_selected_task_restore_unavailable(&mut self, task_id: TaskId) {
         self.task_surfaces
             .note_terminal_reconnecting(self.local_task_key(task_id));
-        self.local_slot_mut().cockpit.set_attachment_unavailable(
-            "The agent didn't start. Check Settings, then use +Claude or +Codex again.",
-        );
+        self.local_slot_mut()
+            .cockpit
+            .set_attachment_unavailable(AGENT_NOT_STARTED_HINT);
     }
 
     pub fn header_attachment(&self) -> &NativeHeaderAttachment {
@@ -13777,7 +13877,7 @@ impl NativeShell {
 
     fn refresh_accessibility_tree(&mut self) {
         self.accessibility_tree_builds = self.accessibility_tree_builds.saturating_add(1);
-        let project_items = self.project_inbox_items();
+        let project_items = self.board_inbox_items(unix_time_ms());
         let shows_add_project = self.shows_add_project_plus();
         let composer_focused = self.composer_accessibility_focused;
         let composer = self
@@ -13837,6 +13937,26 @@ impl NativeShell {
             )
             .gpui("native-sidebar-new-task", true, true)
             .with_disabled(self.startup_gates_actions()),
+        );
+        // The board header's own `+ New`. The per-project "+Claude"/"+Codex"
+        // buttons went with the project rail; this one control opens the menu
+        // that lists every project instead.
+        overlay_nodes.push(
+            AccessibilityNode::new(
+                AccessibleRole::Button,
+                "New task",
+                "Open the board's new-task menu and choose the project to start in.",
+            )
+            .gpui("board-header-new", true, true)
+            .with_disabled(self.startup_gates_actions()),
+        );
+        overlay_nodes.push(
+            AccessibilityNode::new(
+                AccessibleRole::Button,
+                "Board options",
+                "Archived tasks, collapse the board to a rail, and row density.",
+            )
+            .gpui("board-header-menu", true, true),
         );
         if let Some((owner, approval_state)) = selected_key.as_ref().and_then(|owner| {
             self.host_slot(&owner.host)
@@ -18764,14 +18884,6 @@ impl NativeShell {
                     .project_action_for_platform_node(request.target_node)
                 {
                     match action {
-                        ProjectAccessibilityAction::Toggle(project_key) => {
-                            self.toggle_project(project_key);
-                        }
-                        ProjectAccessibilityAction::StartAgent(project_key, _) => {
-                            if project_key.host == self.local_host_id() {
-                                self.begin_new_task_for_project(project_key.project_id);
-                            }
-                        }
                         ProjectAccessibilityAction::NewTask(project_key) => {
                             self.begin_new_task_for_project_key(project_key);
                         }
@@ -27836,10 +27948,7 @@ impl NativeShell {
             if self.task_surfaces.conversation_page(key.clone()).is_none() {
                 self.clear_composer_binding();
                 if let Some(slot) = self.host_slot_mut(&key.host) {
-                    slot.composer_error = Some(
-                        "The agent didn't start. Check Settings, then use +Claude or +Codex again."
-                            .to_string(),
-                    );
+                    slot.composer_error = Some(AGENT_NOT_STARTED_HINT.to_string());
                 }
                 return;
             }
@@ -27847,10 +27956,7 @@ impl NativeShell {
         if snapshot.attention == crate::domain::task::TaskAttention::Failed {
             self.clear_composer_binding();
             if let Some(slot) = self.host_slot_mut(&key.host) {
-                slot.composer_error = Some(
-                    "The agent didn't start. Check Settings, then use +Claude or +Codex again."
-                        .to_string(),
-                );
+                slot.composer_error = Some(AGENT_NOT_STARTED_HINT.to_string());
             }
             return;
         }
@@ -28142,6 +28248,7 @@ impl NativeShell {
                 self.project_scope_menu.close_menu();
                 self.project_actions.close();
                 self.close_terminal_chip_menu();
+                self.close_board_menu();
                 self.refresh_accessibility_tree();
             }
             _ => {}
@@ -30422,37 +30529,421 @@ impl NativeShell {
             .collect()
     }
 
-    fn project_inbox_items(&self) -> Vec<ProjectInboxItem> {
-        let projection = self.fleet_inbox_projection();
-        let mut items = Vec::new();
-        if self.show_archived_tasks {
-            let archived: Vec<_> = projection
-                .archived
-                .iter()
-                .filter(|row| {
-                    row.project_id.map_or(true, |project_id| {
-                        self.fleet_project_scope_includes(&row.key.host, project_id)
-                    })
-                })
-                .cloned()
-                .collect();
-            if !archived.is_empty() {
-                items.push(ProjectInboxItem::ArchivedHeader {
-                    task_count: archived.len(),
-                });
-                items.extend(archived.into_iter().map(|row| ProjectInboxItem::Task {
-                    project_id: row.project_id.unwrap_or_else(ProjectId::new),
-                    task_key: row.key,
-                    settled: false,
-                    archived: true,
-                }));
-            }
-            return items;
-        }
+    /// Open one of the board header's menus. One field holds both, so opening
+    /// either closes the other rather than stacking two overlays.
+    fn open_board_menu(&mut self, menu: BoardMenu) {
+        self.board_menu = Some(menu);
+    }
 
-        // Local multi-folder projects stay authoritative for the local host.
+    fn close_board_menu(&mut self) {
+        self.board_menu = None;
+    }
+
+    /// Keys the open board menu owns. Escape is the only one: the rows are
+    /// pointer targets and their accessible twins live in the tree, so there is
+    /// no selection cursor to move.
+    fn handle_board_menu_key(&mut self, event: &KeyDownEvent) {
+        if event.keystroke.key.as_str() == "escape" {
+            self.close_board_menu();
+        }
+    }
+
+    /// Flip the board between the full column and the narrow rail, and persist
+    /// the choice: a collapsed board that reopens wide on the next launch would
+    /// read as the setting not having taken.
+    fn toggle_board_rail(&mut self) {
+        self.layout.board_rail = !self.layout.board_rail;
+        self.mark_layout_dirty();
+    }
+
+    /// Swap the runtime density preference. The board reads the same one every
+    /// other surface reads, so this changes the whole shell, not just the rows.
+    fn toggle_board_density(&mut self) {
+        let next = if self.board_density_compact() {
+            crate::ui::tokens::Density::Comfortable
+        } else {
+            crate::ui::tokens::Density::Compact
+        };
+        let preferences = RuntimePreferencesSnapshot::new(
+            self.preferences.mode(),
+            next,
+            self.preferences.scale(),
+        );
+        self.queue_preferences(preferences);
+    }
+
+    /// Both board menus, built the same way the terminal chip menu is: a
+    /// full-window occluding backdrop that dismisses on an outside click or
+    /// Escape, with the panel anchored under the header.
+    fn render_board_menu_overlay(
+        &self,
+        tokens: crate::ui::tokens::ThemeTokens,
+        viewport: Size<Pixels>,
+        cx: &Context<Self>,
+    ) -> AnyElement {
+        let menu = self.board_menu.expect("board menu is open");
+        let (title, entries): (&str, Vec<(String, String, BoardMenuAction)>) = match menu {
+            BoardMenu::NewTask => ("New task in", self.board_new_task_menu_entries()),
+            BoardMenu::Options => (
+                "Board",
+                vec![
+                    (
+                        "board-menu-archived".to_string(),
+                        if self.show_archived_tasks {
+                            "Active tasks".to_string()
+                        } else {
+                            "Archived…".to_string()
+                        },
+                        BoardMenuAction::ToggleArchived,
+                    ),
+                    (
+                        "board-menu-rail".to_string(),
+                        if self.layout.board_rail {
+                            "Expand board".to_string()
+                        } else {
+                            "Collapse to rail".to_string()
+                        },
+                        BoardMenuAction::ToggleRail,
+                    ),
+                    (
+                        "board-menu-density".to_string(),
+                        if self.board_density_compact() {
+                            "Density: Compact".to_string()
+                        } else {
+                            "Density: Comfortable".to_string()
+                        },
+                        BoardMenuAction::ToggleDensity,
+                    ),
+                ],
+            ),
+        };
+        let mut rows: Vec<AnyElement> = Vec::new();
+        if entries.is_empty() {
+            rows.push(
+                div()
+                    .id("board-menu-empty")
+                    .w_full()
+                    .px(px(tokens.density.spacing.md))
+                    .py(px(tokens.density.spacing.xs))
+                    .text_size(px(tokens.density.typography.caption))
+                    .text_color(tokens.text.muted.to_gpui())
+                    .child("No projects yet. Add one in Settings.")
+                    .into_any_element(),
+            );
+        }
+        for (element_id, label, action) in entries {
+            rows.push(
+                div()
+                    .id(SharedString::from(element_id))
+                    .w_full()
+                    .px(px(tokens.density.spacing.md))
+                    .py(px(tokens.density.spacing.xs))
+                    .text_size(px(tokens.density.typography.body))
+                    .text_color(tokens.text.primary.to_gpui())
+                    .cursor_pointer()
+                    .hover(|style| style.bg(tokens.surfaces.hover.to_gpui()))
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |shell, _event: &MouseDownEvent, _window, cx| {
+                            cx.stop_propagation();
+                            shell.apply_board_menu_action(action.clone());
+                            shell.close_board_menu();
+                            shell.refresh_accessibility_tree();
+                            cx.notify();
+                        }),
+                    )
+                    .child(label)
+                    .into_any_element(),
+            );
+        }
+        deferred(
+            anchored()
+                .position(point(px(0.0), px(0.0)))
+                .snap_to_window()
+                .child(
+                    div()
+                        .id("board-menu-backdrop")
+                        .occlude()
+                        .w(viewport.width)
+                        .h(viewport.height)
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(|shell, _event: &MouseDownEvent, _window, cx| {
+                                cx.stop_propagation();
+                                shell.close_board_menu();
+                                cx.notify();
+                            }),
+                        )
+                        .on_key_down(cx.listener(
+                            move |shell, event: &KeyDownEvent, _window, cx| {
+                                cx.stop_propagation();
+                                shell.handle_board_menu_key(event);
+                                cx.notify();
+                            },
+                        ))
+                        .child(
+                            div()
+                                .id("board-menu")
+                                .absolute()
+                                .left(px(BOARD_MENU_LEFT_INSET))
+                                .top(px(Self::HEADER_HEIGHT + BOARD_MENU_TOP_INSET))
+                                .w(px(BOARD_MENU_WIDTH))
+                                .flex()
+                                .flex_col()
+                                .py(px(tokens.density.spacing.xs))
+                                .rounded(px(tokens.density.radii.md))
+                                .bg(tokens.surfaces.overlay.to_gpui())
+                                .border(px(1.0))
+                                .border_color(tokens.borders.subtle.to_gpui())
+                                .shadow_sm()
+                                .child(
+                                    div()
+                                        .w_full()
+                                        .px(px(tokens.density.spacing.md))
+                                        .pb(px(tokens.density.spacing.xs))
+                                        .text_size(px(tokens.density.typography.caption))
+                                        .text_color(tokens.text.muted.to_gpui())
+                                        .child(title),
+                                )
+                                .children(rows),
+                        ),
+                ),
+        )
+        .with_priority(2)
+        .into_any_element()
+    }
+
+    fn apply_board_menu_action(&mut self, action: BoardMenuAction) {
+        match action {
+            BoardMenuAction::NewTaskIn(project_key) => {
+                self.begin_new_task_for_project_key(project_key);
+            }
+            BoardMenuAction::StartAgentIn(project_id, provider) => {
+                self.start_task_with_agent_for_project(project_id, provider);
+            }
+            BoardMenuAction::ToggleArchived => {
+                self.show_archived_tasks = !self.show_archived_tasks;
+            }
+            BoardMenuAction::ToggleRail => self.toggle_board_rail(),
+            BoardMenuAction::ToggleDensity => self.toggle_board_density(),
+        }
+    }
+
+    /// A captured pointer-down on a task row. Returns whether the event was
+    /// consumed -- the caller stops propagation on `true`, and on `false` lets
+    /// it bubble so a nested affordance inside the row still gets its sequence.
+    ///
+    /// A method rather than a closure body because a closure is not reachable
+    /// from a test: the previous round asserted the policy helper and would
+    /// have stayed green with the whole handler unwired. This is the side
+    /// effect itself, and both the board row and the archived row call it, so
+    /// the two cannot drift.
+    ///
+    /// The buttons this consumes must not reach the terminal dock behind the
+    /// column: middle-click on a terminal pastes the selection.
+    fn handle_board_row_capture_down(&mut self, key: &HostTaskKey, button: MouseButton) -> bool {
+        // The button alone decides, so nothing here builds the fleet
+        // projection: Left bubbles and middle is swallowed without a lookup,
+        // and the one branch that needs a row looks it up exactly once.
+        match task_row_capture(button) {
+            TaskRowCapture::Bubble => false,
+            TaskRowCapture::Consume => true,
+            TaskRowCapture::ConsumeAndRename => {
+                // Never mint a local selected_project_id from a remote host's
+                // raw ProjectId. This is the one branch that needs the row, so
+                // it is the only one that builds the fleet projection.
+                if key.host == self.local_host_id() {
+                    if let Some(project_id) = self
+                        .fleet_inbox_projection()
+                        .find(key)
+                        .and_then(|row| row.project_id)
+                    {
+                        self.selected_project_id = Some(project_id);
+                    }
+                }
+                self.begin_task_rename_key(key.clone());
+                true
+            }
+        }
+    }
+
+    /// The matching pointer-up: release the grab the row took. Same return
+    /// contract as [`Self::handle_board_row_capture_down`].
+    fn handle_board_row_capture_up(&mut self, button: MouseButton) -> bool {
+        if !task_rail_row_capture_consumes_button(button) {
+            return false;
+        }
+        self.local_slot_mut()
+            .interaction
+            .release_pointer(NATIVE_POINTER_ID);
+        true
+    }
+
+    /// One board row per live fleet task, with the transient state age and the
+    /// journal-derived plan progress and doing-now text folded in.
+    ///
+    /// Also the only place the state clock is pruned: whatever it still holds
+    /// that this pass did not observe has left the projection, and forgetting
+    /// it here is what stops the map growing for the life of the process.
+    fn board_rows(&mut self, now_ms: i64) -> Vec<BoardRow> {
+        let fleet = self.fleet_inbox_projection();
+        let selected = self.selected_task_key.clone();
+        let local_host = self.local_host_id();
+        let mut rows = Vec::new();
+        let mut live: HashSet<HostTaskKey> = HashSet::new();
+        for fleet_row in fleet.rail_rows() {
+            if fleet_row.archived {
+                continue;
+            }
+            if !fleet_row.project_id.map_or(true, |project_id| {
+                self.fleet_project_scope_includes(&fleet_row.key.host, project_id)
+            }) {
+                continue;
+            }
+            let status = self.task_row_status_for_owner(&fleet_row.key);
+            let state = board_state_of(status.unwrap_or(VisibleTaskStatus::Idle), fleet_row.done);
+            // The clock is observed for every state, including Idle, so a
+            // later state change measures from that change rather than from
+            // whenever this process first saw the row. Its answer is only
+            // *used* for the states the clock can actually date: it is
+            // transient, so on the first paint after a launch it says 0, and
+            // an Idle row would then read "Last reply 0s" for a task nobody
+            // has touched in days. Idle has a durable timestamp of its own --
+            // the last event -- so it uses that instead.
+            let clock_age_ms = self
+                .board_state_clock
+                .observe(fleet_row.key.clone(), state, now_ms);
+            let state_age_ms = if state == BoardState::Idle {
+                (now_ms - fleet_row.occurred_at_ms).max(0)
+            } else {
+                clock_age_ms
+            };
+            live.insert(fleet_row.key.clone());
+            let activity = self.board_activity_for(&fleet_row.key);
+            // Only a Working row narrates what the provider is doing. An open
+            // tool call outlives the state it started in, so letting it speak
+            // for an Idle or Done row would report work that has stopped.
+            let why = match state {
+                BoardState::Working => activity
+                    .doing_now
+                    .clone()
+                    .unwrap_or_else(|| BoardState::Working.why_label().to_string()),
+                other => other.why_label().to_string(),
+            };
+            let provider = match self.task_provider_kind_for_owner(&fleet_row.key) {
+                Some(ProviderKind::ClaudeCode) => PrimaryProviderIcon::Claude,
+                Some(ProviderKind::Codex) => PrimaryProviderIcon::Codex,
+                Some(ProviderKind::Cursor) => PrimaryProviderIcon::Cursor,
+                None => PrimaryProviderIcon::Other,
+            };
+            let branch = self
+                .host_slot(&fleet_row.key.host)
+                .and_then(|slot| slot.inbox.row(fleet_row.key.task_id))
+                .map(|inbox_row| inbox_row.display.worktree.clone())
+                .filter(|branch| !branch.trim().is_empty())
+                .unwrap_or_else(|| "main".to_string());
+            let project_colour = fleet_row
+                .project_id
+                .map(|project_id| self.project_colours.colour_index(project_id))
+                .unwrap_or(0);
+            rows.push(BoardRow {
+                key: fleet_row.key.clone(),
+                title: if fleet_row.key.host == local_host {
+                    fleet_row.title.clone()
+                } else {
+                    format!("{} · {}", fleet_row.host_label, fleet_row.title)
+                },
+                state,
+                why,
+                state_age_ms,
+                progress: activity.progress,
+                provider,
+                project_colour,
+                project_id: fleet_row.project_id,
+                project_label: fleet_row.project_label.clone(),
+                branch,
+                last_activity_ms: fleet_row.occurred_at_ms,
+                selected: selected.as_ref() == Some(&fleet_row.key),
+            });
+        }
+        let stale: Vec<HostTaskKey> = self
+            .board_state_clock
+            .keys()
+            .filter(|key| !live.contains(*key))
+            .cloned()
+            .collect();
+        for key in stale {
+            self.board_state_clock.forget(&key);
+            self.board_activity_cache.remove(&key);
+        }
+        // A slot handed out on first sight is only durable once it is written
+        // back, or every restart repaints the same projects a different colour.
+        // The compare runs on every paint and almost always says "no change",
+        // so it must not clone the map to find that out.
+        if !self
+            .project_colours
+            .matches_persisted(&self.layout.project_colours)
+        {
+            self.layout.project_colours = self.project_colours.to_persisted();
+            self.mark_layout_dirty();
+        }
+        rows
+    }
+
+    /// This task's plan progress and doing-now, recomputed only when its
+    /// conversation actually moved.
+    ///
+    /// Reads the facts by reference. The obvious call --
+    /// `conversation_page(key).map(|page| board_activity(&page.facts))` --
+    /// deep-clones every fact of every task on every paint, which is the whole
+    /// conversation history duplicated per frame for nothing: `board_activity`
+    /// only reads. The cache above it then removes even the scan.
+    fn board_activity_for(&mut self, key: &HostTaskKey) -> BoardActivity {
+        // `task_surfaces` and `board_activity_cache` are disjoint fields, so
+        // the borrow of the facts can stay live across the cache read and ends
+        // at the scan below, before the cache is written.
+        let Some((facts, marker)) = self.task_surfaces.conversation_facts(key.clone()) else {
+            self.board_activity_cache.remove(key);
+            return BoardActivity::default();
+        };
+        if let Some((cached_marker, activity)) = self.board_activity_cache.get(key) {
+            if *cached_marker == marker {
+                return activity.clone();
+            }
+        }
+        let activity = board_activity(facts);
+        self.board_activity_cache
+            .insert(key.clone(), (marker, activity.clone()));
+        activity
+    }
+
+    pub fn board_model(&mut self, now_ms: i64) -> BoardModel {
+        let rows = self.board_rows(now_ms);
+        build_board_model(rows, self.board_done_expanded)
+    }
+
+    /// Compact when the runtime density preference is Compact. The board's own
+    /// row heights come from `ui::board::layout`; this only says which of them
+    /// applies, and it reads the one preference the rest of the shell reads.
+    fn board_density_compact(&self) -> bool {
+        self.preferences.density() == crate::ui::tokens::Density::Compact
+    }
+
+    /// How wide the board column paints. Delegates so every caller -- the
+    /// column, the rows inside it and the centre canvas measuring what is left
+    /// -- reads the same rule.
+    fn board_column_width(&self) -> f32 {
+        board_column_width_for(&self.layout, self.show_archived_tasks)
+    }
+
+    /// Every project a new task can be started in, owner-qualified and in a
+    /// stable order: local folders first, then each attached host's configured
+    /// projects. The `+ New` menu and the accessibility tree read the same
+    /// list, so a project reachable by one is reachable by the other.
+    fn board_new_task_targets(&self) -> Vec<(HostProjectKey, String)> {
         let local = self.local_host_id();
-        let mut represented: HashSet<(HostId, ProjectId)> = HashSet::new();
+        let mut targets = Vec::new();
+        let mut seen: HashSet<HostProjectKey> = HashSet::new();
         for project in &self.local_slot().config_sidebar.projects {
             let Ok(project_id) = ProjectId::parse(&project.workspace_id) else {
                 continue;
@@ -30460,36 +30951,11 @@ impl NativeShell {
             if !self.fleet_project_scope_includes(&local, project_id) {
                 continue;
             }
-            represented.insert((local.clone(), project_id));
-            let tasks: Vec<_> = projection
-                .active
-                .iter()
-                .filter(|row| {
-                    row.key.host == local && row.project_id == Some(project_id) && !row.done
-                })
-                .cloned()
-                .collect();
-            let expanded = !self
-                .collapsed_projects
-                .contains(&HostProjectKey::new(local.clone(), project_id));
-            items.push(ProjectInboxItem::Project {
-                project_id,
-                label: project.label.clone(),
-                expanded,
-                task_count: tasks.len(),
-                host: local.clone(),
-            });
-            if expanded {
-                items.extend(tasks.into_iter().map(|row| ProjectInboxItem::Task {
-                    project_id,
-                    task_key: row.key,
-                    settled: false,
-                    archived: false,
-                }));
+            let key = HostProjectKey::new(local.clone(), project_id);
+            if seen.insert(key.clone()) {
+                targets.push((key, project.label.clone()));
             }
         }
-
-        // Remote owner-configured projects (including empty ones with no tasks yet).
         let remote_hosts: Vec<HostId> = self
             .hosts
             .keys()
@@ -30515,128 +30981,118 @@ impl NativeShell {
                 if !self.fleet_project_scope_includes(&host, project_id) {
                     continue;
                 }
-                if !represented.insert((host.clone(), project_id)) {
+                let key = HostProjectKey::new(host.clone(), project_id);
+                if !seen.insert(key.clone()) {
                     continue;
                 }
-                let tasks: Vec<_> = projection
-                    .active
-                    .iter()
-                    .filter(|row| {
-                        row.key.host == host && row.project_id == Some(project_id) && !row.done
-                    })
-                    .cloned()
-                    .collect();
-                let expanded = !self
-                    .collapsed_projects
-                    .contains(&HostProjectKey::new(host.clone(), project_id));
                 let label = if label.trim().is_empty() {
                     format!("{} · project", self.owner_host_label(&host))
                 } else {
                     format!("{} · {}", self.owner_host_label(&host), label)
                 };
-                items.push(ProjectInboxItem::Project {
-                    project_id,
-                    label,
-                    expanded,
-                    task_count: tasks.len(),
-                    host: host.clone(),
-                });
-                if expanded {
-                    items.extend(tasks.into_iter().map(|row| ProjectInboxItem::Task {
-                        project_id,
-                        task_key: row.key,
-                        settled: false,
-                        archived: false,
-                    }));
-                }
+                targets.push((key, label));
             }
         }
+        targets
+    }
 
-        // Host-qualified residual projects (remote hosts + unknown local folders).
-        let mut residual: BTreeMap<(HostId, ProjectId), Vec<FleetTaskRow>> = BTreeMap::new();
-        for row in projection.active.iter().filter(|row| !row.done) {
-            let Some(project_id) = row.project_id else {
-                continue;
-            };
-            if !self.fleet_project_scope_includes(&row.key.host, project_id) {
-                continue;
-            }
-            if represented.contains(&(row.key.host.clone(), project_id)) {
-                continue;
-            }
-            residual
-                .entry((row.key.host.clone(), project_id))
-                .or_default()
-                .push(row.clone());
-        }
-        for ((host, project_id), tasks) in residual {
-            let expanded = !self
-                .collapsed_projects
-                .contains(&HostProjectKey::new(host.clone(), project_id));
-            let label = if host == local {
-                self.project_label_for_id(project_id)
+    /// The `+ New` menu's rows. A local project gets one row per provider the
+    /// connection snapshot reports signed in -- the "+Claude" / "+Codex" pair
+    /// the project rail carried, now in one place instead of on every header.
+    /// A remote project, and a local one with no provider signed in, gets the
+    /// new-task dialog instead: provider start there stays deferred.
+    fn board_new_task_menu_entries(&self) -> Vec<(String, String, BoardMenuAction)> {
+        let local = self.local_host_id();
+        let providers: Vec<ProviderKind> = self
+            .local_slot()
+            .agent_connection
+            .as_ref()
+            .map(inbox_agent_actions)
+            .unwrap_or_default()
+            .into_iter()
+            .map(|action| action.provider)
+            .collect();
+        let mut entries = Vec::new();
+        for (index, (project_key, label)) in self.board_new_task_targets().into_iter().enumerate() {
+            if project_key.host == local && !providers.is_empty() {
+                for (slot, provider) in providers.iter().copied().enumerate() {
+                    entries.push((
+                        format!("board-menu-new-{index}-{slot}"),
+                        format!("{label} · {}", provider.display_name()),
+                        BoardMenuAction::StartAgentIn(project_key.project_id, provider),
+                    ));
+                }
             } else {
-                tasks
-                    .first()
-                    .map(|row| {
-                        if row.project_label.trim().is_empty() {
-                            format!("{} · project", self.owner_host_label(&host))
-                        } else {
-                            format!("{} · {}", self.owner_host_label(&host), row.project_label)
-                        }
+                entries.push((
+                    format!("board-menu-new-{index}"),
+                    format!("{label} · New task…"),
+                    BoardMenuAction::NewTaskIn(project_key),
+                ));
+            }
+        }
+        entries
+    }
+
+    /// The board flattened for the accessibility tree: one node per section,
+    /// the rows in the order they paint, and one reachable "New task" per
+    /// project. The board has no project rows, so without that last part a
+    /// project with no tasks yet would be unreachable to a screen reader.
+    fn board_inbox_items(&mut self, now_ms: i64) -> Vec<ProjectInboxItem> {
+        if self.show_archived_tasks {
+            let archived: Vec<_> = self
+                .fleet_inbox_projection()
+                .archived
+                .iter()
+                .filter(|row| {
+                    row.project_id.map_or(true, |project_id| {
+                        self.fleet_project_scope_includes(&row.key.host, project_id)
                     })
-                    .unwrap_or_else(|| self.owner_host_label(&host))
-            };
-            items.push(ProjectInboxItem::Project {
-                project_id,
-                label,
-                expanded,
-                task_count: tasks.len(),
-                host: host.clone(),
-            });
-            if expanded {
-                items.extend(tasks.into_iter().map(|row| ProjectInboxItem::Task {
-                    project_id,
+                })
+                .cloned()
+                .collect();
+            let mut items = Vec::new();
+            if !archived.is_empty() {
+                items.push(ProjectInboxItem::ArchivedHeader {
+                    task_count: archived.len(),
+                });
+                items.extend(archived.into_iter().map(|row| ProjectInboxItem::Task {
+                    project_id: row.project_id,
                     task_key: row.key,
                     settled: false,
-                    archived: false,
+                    archived: true,
                 }));
             }
+            return items;
         }
-
-        let done: Vec<_> = projection
-            .done
-            .iter()
-            .filter(|row| {
-                row.project_id.map_or(true, |project_id| {
-                    self.fleet_project_scope_includes(&row.key.host, project_id)
-                })
-            })
-            .cloned()
-            .collect();
-        if !done.is_empty() {
-            items.push(ProjectInboxItem::DoneHeader {
-                task_count: done.len(),
+        let board = self.board_model(now_ms);
+        let mut items = Vec::new();
+        for group in &board.groups {
+            items.push(ProjectInboxItem::Group {
+                group: group.group,
+                task_count: group.rows.len(),
+                collapsed: group.collapsed,
             });
-            items.extend(done.into_iter().map(|row| ProjectInboxItem::Task {
-                project_id: row.project_id.unwrap_or_else(ProjectId::new),
-                task_key: row.key,
-                settled: true,
+            if group.collapsed {
+                continue;
+            }
+            items.extend(group.rows.iter().map(|row| ProjectInboxItem::Task {
+                // The row carries the projection's own ProjectId. Minting a
+                // fresh one here made every board row claim a different,
+                // nonexistent project -- invisible today because nothing reads
+                // this field, and a silent mis-attribution the moment anything
+                // does.
+                project_id: row.project_id,
+                task_key: row.key.clone(),
+                settled: row.state == BoardState::Done,
                 archived: false,
             }));
         }
+        items.extend(
+            self.board_new_task_targets()
+                .into_iter()
+                .map(|(project_key, label)| ProjectInboxItem::NewTaskTarget { project_key, label }),
+        );
         items
-    }
-
-    fn toggle_project(&mut self, project_key: HostProjectKey) {
-        // Never mint a local selected_project_id from a remote collapse gesture.
-        if project_key.host == self.local_host_id() {
-            self.selected_project_id = Some(project_key.project_id);
-            self.project_scope_host = Some(project_key.host.clone());
-        }
-        if !self.collapsed_projects.insert(project_key.clone()) {
-            self.collapsed_projects.remove(&project_key);
-        }
     }
 
     fn shell_stage(&self) -> ShellStage {
@@ -33535,6 +33991,12 @@ impl NativeShell {
             "native-sidebar-new-task" => {
                 self.begin_new_task();
             }
+            "board-header-new" => self.open_board_menu(BoardMenu::NewTask),
+            "board-header-menu" => self.open_board_menu(BoardMenu::Options),
+            "board-group-done" => {
+                self.board_done_expanded = !self.board_done_expanded;
+                self.refresh_accessibility_tree();
+            }
             "native-inbox-plus-claude" => self.start_task_with_agent(ProviderKind::ClaudeCode),
             "native-inbox-plus-codex" => self.start_task_with_agent(ProviderKind::Codex),
             "native-task-settle" => self.settle_selected_task(),
@@ -33823,28 +34285,6 @@ impl NativeShell {
         parts.join(" · ")
     }
 
-    /// Status colors are always paired with their textual label, so no state
-    /// in this shell is carried by color alone.
-    fn status_tone(
-        status: Option<VisibleTaskStatus>,
-        tokens: crate::ui::tokens::ThemeTokens,
-    ) -> crate::ui::tokens::Color {
-        match status {
-            Some(VisibleTaskStatus::Failed) => tokens.status.destructive,
-            Some(VisibleTaskStatus::UncertainOutcome) | Some(VisibleTaskStatus::Settling) => {
-                tokens.status.warning
-            }
-            Some(VisibleTaskStatus::NeedsApproval) | Some(VisibleTaskStatus::NeedsAnswer) => {
-                tokens.status.attention
-            }
-            Some(VisibleTaskStatus::Working) => tokens.status.external,
-            Some(VisibleTaskStatus::ReadyForReview) => tokens.status.success,
-            Some(VisibleTaskStatus::Idle) | Some(VisibleTaskStatus::Disconnected) | None => {
-                tokens.status.inactive
-            }
-        }
-    }
-
     fn tone_dot(color: crate::ui::tokens::Color, diameter: f32) -> AnyElement {
         div()
             .flex_none()
@@ -33946,79 +34386,6 @@ impl NativeShell {
                     .child(label.into().to_uppercase()),
             )
             .children(trailing)
-    }
-
-    /// Count badge for a panel header, so a list states its size without
-    /// spending a row on it.
-    fn panel_count_badge(count: usize, tokens: crate::ui::tokens::ThemeTokens) -> AnyElement {
-        div()
-            .flex_none()
-            .px(px(tokens.density.spacing.sm))
-            .py(px(tokens.density.spacing.xxs))
-            .rounded(px(tokens.density.radii.pill))
-            .bg(tokens.surfaces.sunken.to_gpui())
-            .text_size(px(tokens.density.typography.caption))
-            .line_height(px(tokens.density.typography.caption_line_height))
-            .font_weight(FontWeight::MEDIUM)
-            .text_color(tokens.text.muted.to_gpui())
-            .child(count.to_string())
-            .into_any_element()
-    }
-
-    fn inbox_agent_action_id(provider: ProviderKind) -> &'static str {
-        match provider {
-            ProviderKind::ClaudeCode => "native-inbox-plus-claude",
-            ProviderKind::Codex => "native-inbox-plus-codex",
-            ProviderKind::Cursor => unreachable!("Cursor is not an inbox agent action"),
-        }
-    }
-
-    fn inbox_agent_header_actions_static(&self) -> Option<AnyElement> {
-        if self.first_workspace_project_id().is_none() {
-            return None;
-        }
-        let actions = inbox_agent_actions(self.local_slot().agent_connection.as_ref()?);
-        (!actions.is_empty()).then(|| {
-            div()
-                .flex()
-                .flex_none()
-                .items_center()
-                .gap(px(self.theme_tokens().density.spacing.xs))
-                .children(actions.into_iter().map(|action| {
-                    Button::new(Self::inbox_agent_action_id(action.provider))
-                        .label(action.label)
-                        .ghost()
-                        .into_any_element()
-                }))
-                .into_any_element()
-        })
-    }
-
-    fn inbox_agent_header_actions(&self, cx: &Context<Self>) -> Option<AnyElement> {
-        if self.first_workspace_project_id().is_none() {
-            return None;
-        }
-        let actions = inbox_agent_actions(self.local_slot().agent_connection.as_ref()?);
-        (!actions.is_empty()).then(|| {
-            div()
-                .flex()
-                .flex_none()
-                .items_center()
-                .gap(px(self.theme_tokens().density.spacing.xs))
-                .children(actions.into_iter().map(|action| {
-                    let provider = action.provider;
-                    Button::new(Self::inbox_agent_action_id(provider))
-                        .label(action.label)
-                        .ghost()
-                        .on_click(cx.listener(move |shell, _event: &ClickEvent, _window, cx| {
-                            cx.stop_propagation();
-                            shell.start_task_with_agent(provider);
-                            cx.notify();
-                        }))
-                        .into_any_element()
-                }))
-                .into_any_element()
-        })
     }
 
     fn conversation_delete_action(&self, cx: &Context<Self>) -> Option<AnyElement> {
@@ -34471,7 +34838,7 @@ impl NativeShell {
             "native-shell-task-inbox-empty",
             "+",
             "No tasks yet",
-            "Use +Claude or +Codex to start.",
+            INBOX_EMPTY_STATE_HINT,
             tokens,
             action,
         )
@@ -34623,11 +34990,12 @@ impl NativeShell {
         }
     }
 
-    /// Fixed row height for the virtualized inbox. `uniform_list` requires a
-    /// stable height, so the two text lines and their padding are summed from
-    /// the same tokens that render them.
+    /// Fixed row height for the archived browser's virtualized list. Only that
+    /// list is a `uniform_list` now -- the board is a plain column and takes
+    /// its heights from `ui::board::layout` -- but `uniform_list` still needs
+    /// one stable height for the three lines an archived row carries.
     fn inbox_row_height(_tokens: crate::ui::tokens::ThemeTokens) -> f32 {
-        T3_SIDEBAR_ROW_HEIGHT
+        ARCHIVED_ROW_HEIGHT
     }
 
     fn element_without_handlers(&self) -> impl IntoElement {
@@ -34673,6 +35041,9 @@ impl NativeShell {
         }
         if self.terminal_chip_menu.is_some() {
             return Some(self.render_terminal_chip_menu_overlay(tokens, viewport, cx));
+        }
+        if self.board_menu.is_some() {
+            return Some(self.render_board_menu_overlay(tokens, viewport, cx));
         }
         if self.task_search.open()
             || self
@@ -41018,13 +41389,15 @@ impl NativeShell {
         tokens: crate::ui::tokens::ThemeTokens,
         viewport: Size<Pixels>,
         layout: KeyedWorkspaceLayout<HostTaskKey>,
+        archived: bool,
     ) -> Size<Pixels> {
         let dock = if layout.dock_collapsed {
             0.0
         } else {
             Self::RAIL_THICKNESS + layout.dock_width
         };
-        let width = f32::from(viewport.width) - T3_SIDEBAR_WIDTH - dock - 2.0;
+        let width =
+            f32::from(viewport.width) - board_column_width_for(&layout, archived) - dock - 2.0;
         let height = f32::from(viewport.height) - Self::HEADER_HEIGHT - 2.0;
         size(px(width.max(1.0)), px(height.max(1.0)))
     }
@@ -41243,11 +41616,19 @@ impl NativeShell {
         let selected_task = self.layout.selected_task.clone();
         let task_workspace = self.layout.task_workspace.clone();
         let task_composer_preferences = self.layout.task_composer_preferences.clone();
+        // Pane geometry is what "reset layout" means. A project's colour and a
+        // collapsed board are identity and mode, not geometry, so they survive
+        // exactly as the composer preferences do -- resetting the panes must
+        // not repaint every project stripe.
+        let project_colours = self.layout.project_colours.clone();
+        let board_rail = self.layout.board_rail;
         self.layout = KeyedWorkspaceLayout {
             window,
             selected_task,
             task_workspace,
             task_composer_preferences,
+            project_colours,
+            board_rail,
             ..KeyedWorkspaceLayout::<HostTaskKey>::default()
         };
         self.mark_layout_dirty();
@@ -41550,24 +41931,39 @@ impl NativeShell {
             .into_any_element()
     }
 
+    /// The board column. Docked flush to the window edge, no radius, a one
+    /// pixel subtle right border and the canvas ground -- the placement
+    /// `01-composition-A.html` specifies for the column that holds the board.
+    /// Its width is the board's, so the column and the rows it contains cannot
+    /// disagree about how much room the segments strip has.
     fn reference_sidebar(
         tokens: crate::ui::tokens::ThemeTokens,
+        width: f32,
+        rail: bool,
         navigation: AnyElement,
         inbox: AnyElement,
         footer: AnyElement,
     ) -> AnyElement {
-        div()
+        let column = div()
             .id("native-shell-sidebar-column")
             .flex()
             .flex_col()
             .flex_none()
-            .w(px(T3_SIDEBAR_WIDTH))
+            .w(px(width))
             .h_full()
             .min_h(px(0.0))
             .overflow_hidden()
-            .bg(tokens.surfaces.sunken.to_gpui())
+            .bg(tokens.surfaces.canvas.to_gpui())
             .border_r(px(1.0))
-            .border_color(tokens.borders.subtle.to_gpui())
+            .border_color(tokens.borders.subtle.to_gpui());
+        // Collapsed, the column is 36 px of dots. The brand, the project
+        // scope control and the footer buttons do not fit in that and would
+        // be silently clipped, so the rail carries the board alone -- which
+        // is what "collapse to rail" asks for.
+        if rail {
+            return column.child(inbox).into_any_element();
+        }
+        column
             .child(Self::sidebar_brand(tokens))
             .child(navigation)
             .child(inbox)
@@ -41756,7 +42152,14 @@ impl NativeShell {
                     )),
             )
             .into_any_element();
-        let sidebar = Self::reference_sidebar(tokens, navigation, inbox, footer);
+        let sidebar = Self::reference_sidebar(
+            tokens,
+            self.board_column_width(),
+            self.layout.board_rail,
+            navigation,
+            inbox,
+            footer,
+        );
         let dock = Self::stacked_panel_grow(
             "native-shell-context-dock",
             self.local_slot().cockpit.active_tool().label(),
@@ -41887,24 +42290,27 @@ impl NativeShell {
             component.radius = px(tokens.density.radii.md);
             component.radius_lg = px(tokens.density.radii.lg);
         }
-        let inbox_items = Arc::new(
-            self.project_inbox_items()
-                .into_iter()
-                .filter(|item| {
-                    matches!(
-                        item,
-                        ProjectInboxItem::Task { .. }
-                            | ProjectInboxItem::DoneHeader { .. }
-                            | ProjectInboxItem::ArchivedHeader { .. }
-                    )
-                })
-                .collect::<Vec<_>>(),
-        );
+        // The board owns the active list. The archived browser is a different
+        // question -- "what did I finish with" -- and keeps the older row shape
+        // with its Delete affordance, so it is still a uniform list and still
+        // needs its per-row labels. Neither is built when the other is showing.
+        let archived_view = self.show_archived_tasks;
+        let board_now_ms = unix_time_ms();
+        // The rail is a board affordance. Railing the archived view would hide
+        // the header that carries the only pointer route back to the board.
+        let board_rail = self.layout.board_rail && !archived_view;
+        let board_width = self.board_column_width();
+        let board = self.board_model(board_now_ms);
+        let inbox_items = Arc::new(if archived_view {
+            self.board_inbox_items(board_now_ms)
+        } else {
+            Vec::new()
+        });
         let fleet_rows = self.fleet_inbox_projection();
-        let row_models = Arc::new(
+        let row_models = Arc::new(if archived_view {
             fleet_rows
-                .rail_rows()
-                .chain(fleet_rows.archived.iter())
+                .archived
+                .iter()
                 .map(|row| {
                     let host_prefix = if row.key.host == self.local_host_id() {
                         String::new()
@@ -41912,20 +42318,6 @@ impl NativeShell {
                         format!("{} · ", row.host_label)
                     };
                     let title = format!("{host_prefix}{}", row.title);
-                    let (status, tone) = if row.archived {
-                        ("Archived".to_string(), tokens.status.inactive)
-                    } else if row.done {
-                        ("Done".to_string(), tokens.status.inactive)
-                    } else {
-                        let status = self.task_row_status_for_owner(&row.key);
-                        (
-                            status
-                                .map(visible_status_label)
-                                .unwrap_or("Open")
-                                .to_string(),
-                            Self::status_tone(status, tokens),
-                        )
-                    };
                     let provider = self.task_provider_label_for_owner(&row.key).to_string();
                     let branch = self
                         .host_slot(&row.key.host)
@@ -41939,14 +42331,16 @@ impl NativeShell {
                             title,
                             row.project_label.clone(),
                             branch,
-                            status,
-                            tone,
+                            "Archived".to_string(),
+                            tokens.status.inactive,
                             provider,
                         ),
                     )
                 })
-                .collect::<std::collections::HashMap<_, _>>(),
-        );
+                .collect::<std::collections::HashMap<_, _>>()
+        } else {
+            std::collections::HashMap::new()
+        });
         let selected_task_key = self.selected_task_key.clone();
         let selected_task_key_for_list = selected_task_key.clone();
         let local_host_for_list = self.local_host_id();
@@ -41973,21 +42367,12 @@ impl NativeShell {
         let provider_affordance = provider_inbox_affordance(agents_connected, agents_checking);
         let project_creation_affordance =
             project_creation_affordance(self.shows_add_project_plus(), provider_affordance);
-        let available_agents = self
-            .local_slot_mut()
-            .agent_connection
-            .as_ref()
-            .map(inbox_agent_actions)
-            .unwrap_or_default();
-        let claude_available = available_agents
-            .iter()
-            .any(|action| action.provider == ProviderKind::ClaudeCode);
-        let codex_available = available_agents
-            .iter()
-            .any(|action| action.provider == ProviderKind::Codex);
         let shell_entity = cx.entity().downgrade();
         let services_shell_entity = shell_entity.clone();
-        let archived_view = self.show_archived_tasks;
+        // The board painter. Every gesture the project rail carried moves here
+        // unchanged: left click selects (shift toggles), right click renames a
+        // live task, Enter/Space select, and every other key still forwards to
+        // the exact visible interactive terminal.
         let task_list_generation = selected_task_key
             .as_ref()
             .map(|key| stable_host_task_element_key(key, "uniform-list"))
@@ -41999,273 +42384,12 @@ impl NativeShell {
                 range
                     .filter_map(|index| inbox_items.get(index).cloned())
                     .map(|item| match item {
-                        ProjectInboxItem::Project {
-                            project_id,
-                            label,
-                            expanded,
-                            task_count,
-                            host,
-                        } => {
-                            let shell_for_toggle = shell_entity.clone();
-                            let shell_for_toggle_key = shell_entity.clone();
-                            let shell_for_claude = shell_entity.clone();
-                            let shell_for_claude_key = shell_entity.clone();
-                            let shell_for_codex = shell_entity.clone();
-                            let shell_for_codex_key = shell_entity.clone();
-                            let project_key = HostProjectKey::new(host.clone(), project_id);
-                            let project_key_for_toggle = project_key.clone();
-                            let project_key_for_key = project_key.clone();
-                            let remote_project = host.as_remote().is_some();
-                            let header = div()
-                                .id((
-                                    "native-project-row",
-                                    stable_host_project_element_key(&project_key, "row"),
-                                ))
-                                .tab_stop(true)
-                                .w_full()
-                                .h(px(row_height))
-                                .flex()
-                                .items_center()
-                                .gap(px(tokens.density.spacing.sm))
-                                .px(px(tokens.density.spacing.md))
-                                .bg(tokens.surfaces.overlay.to_gpui())
-                                .border_b(px(1.0))
-                                .border_color(tokens.borders.subtle.to_gpui())
-                                .cursor_pointer()
-                                .on_mouse_down(
-                                    MouseButton::Left,
-                                    move |_event: &MouseDownEvent,
-                                          _window: &mut Window,
-                                          app: &mut gpui::App| {
-                                        let _ = shell_for_toggle.update(app, |shell, cx| {
-                                            cx.stop_propagation();
-                                            shell.toggle_project(project_key_for_toggle.clone());
-                                            shell.refresh_accessibility_tree();
-                                            cx.notify();
-                                        });
-                                    },
-                                )
-                                .on_key_down(
-                                    move |event: &KeyDownEvent,
-                                          _window: &mut Window,
-                                          app: &mut gpui::App| {
-                                        if matches!(event.keystroke.key.as_str(), "enter" | "space") {
-                                            let _ = shell_for_toggle_key.update(app, |shell, cx| {
-                                                cx.stop_propagation();
-                                                shell.toggle_project(project_key_for_key.clone());
-                                                shell.refresh_accessibility_tree();
-                                                cx.notify();
-                                            });
-                                        }
-                                    },
-                                )
-                                .child(if expanded { "▾" } else { "▸" })
-                                .child(
-                                    div()
-                                        .flex_1()
-                                        .min_w(px(0.0))
-                                        .truncate()
-                                        .font_weight(FontWeight::SEMIBOLD)
-                                        .child(label),
-                                )
-                                .child(Self::panel_count_badge(task_count, tokens));
-                            let header = if agents_connected && !remote_project {
-                                let claude = if claude_available {
-                                    div()
-                                        .id((
-                                            "native-project-claude",
-                                            stable_host_project_element_key(
-                                                &project_key,
-                                                "claude",
-                                            ),
-                                        ))
-                                        .tab_stop(true)
-                                        .px(px(tokens.density.spacing.sm))
-                                        .py(px(tokens.density.spacing.xxs))
-                                        .rounded(px(tokens.density.radii.sm))
-                                        .hover(|style| style.bg(tokens.surfaces.hover.to_gpui()))
-                                        .on_mouse_down(
-                                            MouseButton::Left,
-                                            move |_event: &MouseDownEvent,
-                                                  _window: &mut Window,
-                                                  app: &mut gpui::App| {
-                                                let _ = shell_for_claude.update(app, |shell, cx| {
-                                                    cx.stop_propagation();
-                                                    shell.start_task_with_agent_for_project(
-                                                        project_id,
-                                                        ProviderKind::ClaudeCode,
-                                                    );
-                                                    cx.notify();
-                                                });
-                                            },
-                                        )
-                                        .on_key_down(
-                                            move |event: &KeyDownEvent,
-                                                  _window: &mut Window,
-                                                  app: &mut gpui::App| {
-                                                if matches!(event.keystroke.key.as_str(), "enter" | "space") {
-                                                    let _ = shell_for_claude_key.update(app, |shell, cx| {
-                                                        cx.stop_propagation();
-                                                        shell.start_task_with_agent_for_project(
-                                                            project_id,
-                                                            ProviderKind::ClaudeCode,
-                                                        );
-                                                        cx.notify();
-                                                    });
-                                                }
-                                            },
-                                        )
-                                        .child("+Claude")
-                                        .into_any_element()
-                                } else {
-                                    div()
-                                        .px(px(tokens.density.spacing.sm))
-                                        .text_color(tokens.text.disabled.to_gpui())
-                                        .child("Claude")
-                                        .into_any_element()
-                                };
-                                let codex = if codex_available {
-                                    div()
-                                        .id((
-                                            "native-project-codex",
-                                            stable_host_project_element_key(
-                                                &project_key,
-                                                "codex",
-                                            ),
-                                        ))
-                                        .tab_stop(true)
-                                        .px(px(tokens.density.spacing.sm))
-                                        .py(px(tokens.density.spacing.xxs))
-                                        .rounded(px(tokens.density.radii.sm))
-                                        .hover(|style| style.bg(tokens.surfaces.hover.to_gpui()))
-                                        .on_mouse_down(
-                                            MouseButton::Left,
-                                            move |_event: &MouseDownEvent,
-                                                  _window: &mut Window,
-                                                  app: &mut gpui::App| {
-                                                let _ = shell_for_codex.update(app, |shell, cx| {
-                                                    cx.stop_propagation();
-                                                    shell.start_task_with_agent_for_project(
-                                                        project_id,
-                                                        ProviderKind::Codex,
-                                                    );
-                                                    cx.notify();
-                                                });
-                                            },
-                                        )
-                                        .on_key_down(
-                                            move |event: &KeyDownEvent,
-                                                  _window: &mut Window,
-                                                  app: &mut gpui::App| {
-                                                if matches!(event.keystroke.key.as_str(), "enter" | "space") {
-                                                    let _ = shell_for_codex_key.update(app, |shell, cx| {
-                                                        cx.stop_propagation();
-                                                        shell.start_task_with_agent_for_project(
-                                                            project_id,
-                                                            ProviderKind::Codex,
-                                                        );
-                                                        cx.notify();
-                                                    });
-                                                }
-                                            },
-                                        )
-                                        .child("+Codex")
-                                        .into_any_element()
-                                } else {
-                                    div()
-                                        .px(px(tokens.density.spacing.sm))
-                                        .text_color(tokens.text.disabled.to_gpui())
-                                        .child("Codex")
-                                        .into_any_element()
-                                };
-                                header.child(claude).child(codex)
-                            } else if remote_project {
-                                let shell_for_remote_new = shell_entity.clone();
-                                let shell_for_remote_new_key = shell_entity.clone();
-                                let remote_project_key = project_key.clone();
-                                let remote_project_key_for_key = project_key.clone();
-                                header.child(
-                                    div()
-                                        .id((
-                                            "native-project-new-task",
-                                            stable_host_project_element_key(
-                                                &project_key,
-                                                "new-task",
-                                            ),
-                                        ))
-                                        .tab_stop(true)
-                                        .px(px(tokens.density.spacing.sm))
-                                        .py(px(tokens.density.spacing.xxs))
-                                        .rounded(px(tokens.density.radii.sm))
-                                        .hover(|style| style.bg(tokens.surfaces.hover.to_gpui()))
-                                        .on_mouse_down(
-                                            MouseButton::Left,
-                                            move |_event: &MouseDownEvent,
-                                                  _window: &mut Window,
-                                                  app: &mut gpui::App| {
-                                                let _ = shell_for_remote_new.update(app, |shell, cx| {
-                                                    cx.stop_propagation();
-                                                    shell.begin_new_task_for_project_key(
-                                                        remote_project_key.clone(),
-                                                    );
-                                                    cx.notify();
-                                                });
-                                            },
-                                        )
-                                        .on_key_down(
-                                            move |event: &KeyDownEvent,
-                                                  _window: &mut Window,
-                                                  app: &mut gpui::App| {
-                                                if matches!(
-                                                    event.keystroke.key.as_str(),
-                                                    "enter" | "space"
-                                                ) {
-                                                    let _ = shell_for_remote_new_key.update(
-                                                        app,
-                                                        |shell, cx| {
-                                                            cx.stop_propagation();
-                                                            shell.begin_new_task_for_project_key(
-                                                                remote_project_key_for_key.clone(),
-                                                            );
-                                                            cx.notify();
-                                                        },
-                                                    );
-                                                }
-                                            },
-                                        )
-                                        .child("+Task"),
-                                )
-                            } else {
-                                let checking_label = match provider_affordance {
-                                    ProviderInboxAffordance::Checking => "Checking…",
-                                    _ => "Connect in Settings",
-                                };
-                                header.child(
-                                    div()
-                                        .px(px(tokens.density.spacing.sm))
-                                        .text_color(tokens.text.muted.to_gpui())
-                                        .child(checking_label),
-                                )
-                            };
-                            header.into_any_element()
+                        // Never reached: only the archived view builds this
+                        // list, and it holds nothing but its header and rows.
+                        ProjectInboxItem::Group { .. }
+                        | ProjectInboxItem::NewTaskTarget { .. } => {
+                            div().into_any_element()
                         }
-                        ProjectInboxItem::DoneHeader { task_count } => div()
-                            .id("native-done-section")
-                            .w_full()
-                            .h(px(row_height))
-                            .flex()
-                            .items_center()
-                            .justify_between()
-                            .px(px(10.0))
-                            .mt(px(8.0))
-                            .border_t(px(1.0))
-                            .border_color(tokens.borders.subtle.to_gpui())
-                            .text_size(px(tokens.density.typography.caption))
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .text_color(tokens.text.muted.to_gpui())
-                            .child("DONE")
-                            .child(task_count.to_string())
-                            .into_any_element(),
                         ProjectInboxItem::ArchivedHeader { task_count } => div()
                             .id("native-archived-section")
                             .w_full()
@@ -42284,7 +42408,11 @@ impl NativeShell {
                             .child(task_count.to_string())
                             .into_any_element(),
                         ProjectInboxItem::Task {
-                            project_id,
+                            // The project and the local-owner check now come
+                            // from `handle_board_row_capture_down`, which reads
+                            // both off the projection so the board row and the
+                            // archived row cannot answer differently.
+                            project_id: _,
                             task_key,
                             settled,
                             archived,
@@ -42303,7 +42431,6 @@ impl NativeShell {
                         let task_key_delete = task_key.clone();
                         let task_key_delete_click = task_key.clone();
                         let task_key_delete_key = task_key.clone();
-                        let task_is_local = task_key.host == local_host_for_list;
                         let (
                             row_title,
                             project_label,
@@ -42324,27 +42451,19 @@ impl NativeShell {
                             });
                         let row_selected = selected_task_key_for_list.as_ref() == Some(&task_key);
                         let row_open = open_task_ids.contains(&task_key);
+                        // The archived row and the board row share one capture
+                        // policy: right/middle are consumed so they cannot fall
+                        // through to the terminal dock, and left is left alone
+                        // so the archived Delete hitbox still receives it.
                         let mouse_handler =
                             move |event: &MouseDownEvent,
                                   window: &mut Window,
                                   app: &mut gpui::App| {
-                                // Right/middle must be captured so they cannot fall
-                                // through to the terminal dock. Left must reach the
-                                // archived Delete hitbox (child on_click / key).
-                                if !task_rail_row_capture_consumes_button(event.button) {
-                                    return;
-                                }
+                                let _ = window;
+                                let key = task_key_mouse.clone();
                                 let _ = shell_for_mouse.update(app, |shell, cx| {
-                                    cx.stop_propagation();
-                                    if event.button == MouseButton::Right {
-                                        // Owner-captured rename; never mint local selected_project_id
-                                        // from a remote raw ProjectId.
-                                        if task_is_local {
-                                            shell.selected_project_id = Some(project_id);
-                                        }
-                                        if task_row_right_click_should_rename(archived) {
-                                            shell.begin_task_rename_key(task_key_mouse.clone());
-                                        }
+                                    if shell.handle_board_row_capture_down(&key, event.button) {
+                                        cx.stop_propagation();
                                         cx.notify();
                                     }
                                 });
@@ -42353,12 +42472,10 @@ impl NativeShell {
                             move |event: &MouseUpEvent,
                                   _window: &mut Window,
                                   app: &mut gpui::App| {
-                                if !task_rail_row_capture_consumes_button(event.button) {
-                                    return;
-                                }
                                 let _ = shell_for_mouse_up.update(app, |shell, cx| {
-                                    cx.stop_propagation();
-                                    shell.local_slot_mut().interaction.release_pointer(NATIVE_POINTER_ID);
+                                    if shell.handle_board_row_capture_up(event.button) {
+                                        cx.stop_propagation();
+                                    }
                                 });
                             };
                         let left_select_handler =
@@ -42658,6 +42775,7 @@ impl NativeShell {
         .h_full()
         .track_scroll(self.task_scroll_handle.clone());
 
+        let board_scroll_handle = self.task_scroll_handle.0.borrow().base_handle.clone();
         let scroll_handle = self.task_scroll_handle.clone();
         let inbox_scroll = cx.listener(move |_shell, event: &ScrollWheelEvent, _window, cx| {
             // Own the wheel here so the virtual list does not also apply a
@@ -42673,6 +42791,193 @@ impl NativeShell {
             cx.notify();
         });
 
+        // What goes under the board header. The header itself is always
+        // painted -- it carries the `⋯` menu, which is the only pointer route
+        // out of the archived view and out of the rail -- so the archived
+        // browser and the empty state become its body rather than replacing
+        // the whole column.
+        let board_body: Option<AnyElement> = match board_body_kind(archived_view, board.has_rows())
+        {
+            BoardBody::Sections => None,
+            BoardBody::EmptyState => Some(Self::inbox_empty_state(tokens, None)),
+            BoardBody::ArchivedList if inbox_is_empty => {
+                Some(Self::inbox_empty_state(tokens, None))
+            }
+            BoardBody::ArchivedList => Some(
+                div()
+                    .id("native-shell-task-inbox-rows")
+                    .w_full()
+                    .flex()
+                    .flex_row()
+                    .flex_1()
+                    .min_h(px(0.0))
+                    .child(
+                        div()
+                            .id("native-shell-task-inbox-viewport")
+                            .flex_1()
+                            .min_w(px(0.0))
+                            .min_h(px(0.0))
+                            .overflow_hidden()
+                            .on_scroll_wheel(inbox_scroll)
+                            .child(task_list_element),
+                    )
+                    .child(
+                        div()
+                            .id("native-shell-task-inbox-scrollbar-gutter")
+                            .w(px(TASK_INBOX_SCROLLBAR_GUTTER_WIDTH_PX))
+                            .flex_none()
+                            .h_full()
+                            .child(Scrollbar::vertical(&self.task_scroll_handle)),
+                    )
+                    .into_any_element(),
+            ),
+        };
+        let board_element = {
+            let board_shell = cx.entity().downgrade();
+            let row_handlers = BoardRowHandlers {
+                on_left_select: Rc::new({
+                    let shell = board_shell.clone();
+                    move |key: &HostTaskKey,
+                          shift: bool,
+                          window: &mut Window,
+                          app: &mut gpui::App| {
+                        let key = key.clone();
+                        let _ = shell.update(app, |shell, cx| {
+                            cx.stop_propagation();
+                            shell.focus_handle.focus(window);
+                            let mode = if shift {
+                                FleetSelectMode::Toggle
+                            } else {
+                                FleetSelectMode::Replace
+                            };
+                            let _ = shell.select_fleet_task_key(key, mode);
+                            shell.refresh_accessibility_tree();
+                            cx.notify();
+                        });
+                    }
+                }),
+                on_capture_mouse_down: Rc::new({
+                    let shell = board_shell.clone();
+                    move |key: &HostTaskKey,
+                          event: &MouseDownEvent,
+                          _window: &mut Window,
+                          app: &mut gpui::App| {
+                        let key = key.clone();
+                        let _ = shell.update(app, |shell, cx| {
+                            if shell.handle_board_row_capture_down(&key, event.button) {
+                                cx.stop_propagation();
+                                cx.notify();
+                            }
+                        });
+                    }
+                }),
+                on_capture_mouse_up: Rc::new({
+                    let shell = board_shell.clone();
+                    move |_key: &HostTaskKey,
+                          event: &MouseUpEvent,
+                          _window: &mut Window,
+                          app: &mut gpui::App| {
+                        let _ = shell.update(app, |shell, cx| {
+                            if shell.handle_board_row_capture_up(event.button) {
+                                cx.stop_propagation();
+                            }
+                        });
+                    }
+                }),
+                on_key_down: Rc::new({
+                    let shell = board_shell.clone();
+                    move |key: &HostTaskKey,
+                          event: &KeyDownEvent,
+                          window: &mut Window,
+                          app: &mut gpui::App| {
+                        let key = key.clone();
+                        if matches!(event.keystroke.key.as_str(), "enter" | "space") {
+                            let shift = event.keystroke.modifiers.shift;
+                            let _ = shell.update(app, |shell, cx| {
+                                cx.stop_propagation();
+                                let mode = if shift {
+                                    FleetSelectMode::Toggle
+                                } else {
+                                    FleetSelectMode::Replace
+                                };
+                                let _ = shell.select_fleet_task_key(key, mode);
+                                shell.refresh_accessibility_tree();
+                                cx.notify();
+                            });
+                        } else {
+                            // Windows UI Automation and some pointer paths can
+                            // leave GPUI focus on the selected row even after
+                            // the user clicks the terminal canvas. Preserve the
+                            // row's Enter/Space semantics above, but forward
+                            // every other key to the exact visible interactive
+                            // terminal.
+                            let _ = shell.update(app, |shell, cx| {
+                                let center_terminal_visible =
+                                    shell.selected_task_key.clone().is_some_and(|owner| {
+                                        shell.task_center_terminal_preference(&owner)
+                                    });
+                                if stale_task_row_routes_key_to_terminal(
+                                    event.keystroke.key.as_str(),
+                                    shell.terminal_input_is_armed(),
+                                    center_terminal_visible,
+                                    shell.selected_center_terminal_is_interactive(),
+                                ) {
+                                    cx.stop_propagation();
+                                    shell.handle_provider_terminal_key(event, window, cx);
+                                    cx.notify();
+                                }
+                            });
+                        }
+                    }
+                }),
+            };
+            let header_handlers = BoardHeaderHandlers {
+                on_new: Rc::new({
+                    let shell = board_shell.clone();
+                    move |_window: &mut Window, app: &mut gpui::App| {
+                        let _ = shell.update(app, |shell, cx| {
+                            cx.stop_propagation();
+                            shell.open_board_menu(BoardMenu::NewTask);
+                            shell.refresh_accessibility_tree();
+                            cx.notify();
+                        });
+                    }
+                }),
+                on_menu: Rc::new({
+                    let shell = board_shell.clone();
+                    move |_window: &mut Window, app: &mut gpui::App| {
+                        let _ = shell.update(app, |shell, cx| {
+                            cx.stop_propagation();
+                            shell.open_board_menu(BoardMenu::Options);
+                            shell.refresh_accessibility_tree();
+                            cx.notify();
+                        });
+                    }
+                }),
+                on_toggle_done: Rc::new({
+                    let shell = board_shell.clone();
+                    move |_window: &mut Window, app: &mut gpui::App| {
+                        let _ = shell.update(app, |shell, cx| {
+                            cx.stop_propagation();
+                            shell.board_done_expanded = !shell.board_done_expanded;
+                            shell.refresh_accessibility_tree();
+                            cx.notify();
+                        });
+                    }
+                }),
+            };
+            render_board(
+                &board,
+                &self.project_colours,
+                tokens,
+                board_width,
+                board_rail,
+                self.board_density_compact(),
+                board_body,
+                row_handlers,
+                header_handlers,
+            )
+        };
         let host_actions = cx.listener(|shell, _action: &HostActions, _window, cx| {
             cx.stop_propagation();
             shell.dispatch_action(ActionRequest::HostActions);
@@ -43055,35 +43360,46 @@ impl NativeShell {
             .flex_1()
             .min_h(px(0.0))
             .overflow_hidden()
-            .child(if inbox_is_empty {
-                Self::inbox_empty_state(tokens, None)
-            } else {
-                div()
-                    .id("native-shell-task-inbox-rows")
+            // One child: the board. The archived browser and the empty state
+            // are painted by the board itself, under its header.
+            .child({
+                // The board is a plain column, not a uniform list, so it needs
+                // a real scroll container of its own: without one a board
+                // taller than the viewport simply cannot be reached. It tracks
+                // the same handle the archived list does, so there is still one
+                // owner of the inbox's scroll position.
+                let viewport = div()
+                    .id("native-shell-board-viewport")
                     .w_full()
                     .flex()
-                    .flex_row()
+                    .flex_col()
                     .flex_1()
                     .min_h(px(0.0))
-                    .child(
-                        div()
-                            .id("native-shell-task-inbox-viewport")
-                            .flex_1()
-                            .min_w(px(0.0))
-                            .min_h(px(0.0))
-                            .overflow_hidden()
-                            .on_scroll_wheel(inbox_scroll)
-                            .child(task_list_element),
-                    )
-                    .child(
-                        div()
-                            .id("native-shell-task-inbox-scrollbar-gutter")
-                            .w(px(TASK_INBOX_SCROLLBAR_GUTTER_WIDTH_PX))
-                            .flex_none()
-                            .h_full()
-                            .child(Scrollbar::vertical(&self.task_scroll_handle)),
-                    )
-                    .into_any_element()
+                    .overflow_y_scroll()
+                    .track_scroll(&board_scroll_handle)
+                    .child(board_element);
+                // Collapsed, the rail paints no header, so the `⋯` menu that
+                // collapsed it is not on screen to undo it. The rail itself is
+                // the way back: one click expands, and the tooltip says so.
+                if board_rail {
+                    viewport
+                        .cursor_pointer()
+                        .tooltip(|window, app| {
+                            gpui_component::tooltip::Tooltip::new("Expand board").build(window, app)
+                        })
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(|shell, _event: &MouseDownEvent, _window, cx| {
+                                cx.stop_propagation();
+                                shell.toggle_board_rail();
+                                shell.refresh_accessibility_tree();
+                                cx.notify();
+                            }),
+                        )
+                        .into_any_element()
+                } else {
+                    viewport.into_any_element()
+                }
             })
             .into_any_element();
         let sidebar_footer = div()
@@ -43269,7 +43585,14 @@ impl NativeShell {
                 }
             })
             .into_any_element();
-        let sidebar = Self::reference_sidebar(tokens, navigation, inbox_panel, sidebar_footer);
+        let sidebar = Self::reference_sidebar(
+            tokens,
+            board_width,
+            self.layout.board_rail,
+            navigation,
+            inbox_panel,
+            sidebar_footer,
+        );
 
         let layout = self
             .layout
@@ -43289,7 +43612,12 @@ impl NativeShell {
         );
         let conversation = self.task_workspace_surface(
             tokens,
-            Self::idle_conversation_photo_size(tokens, viewport, layout.clone()),
+            Self::idle_conversation_photo_size(
+                tokens,
+                viewport,
+                layout.clone(),
+                self.show_archived_tasks,
+            ),
             cx,
         );
 
@@ -46086,7 +46414,7 @@ mod terminal_target_tests {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::{
         // Fleet attach/selection regression helpers
         // (HostFleet / FleetSelectMode / TaskList also used below)
@@ -46096,6 +46424,8 @@ mod tests {
         agent_connection_snapshot,
         authorize_full_host_quit,
         automatic_task_title,
+        board_column_width_for,
+        board_group_element_id,
         capture_runtime_projection_owner,
         caret_phase_repaint,
         center_loading_reserves_composer,
@@ -46155,7 +46485,6 @@ mod tests {
         should_attempt_recovery,
         should_schedule_host_bootstrap_retry,
         stable_host_project_element_key,
-        stable_host_project_row_element_id,
         stable_host_task_element_key,
         stable_host_task_row_element_id,
         stale_task_row_routes_key_to_terminal,
@@ -46177,6 +46506,10 @@ mod tests {
         ActivationSource,
         AgentPresence,
         AgentSessionId,
+        BoardGroup,
+        BoardMenu,
+        BoardMenuAction,
+        BoardState,
         ClientId,
         CockpitDockTool,
         CommandId,
@@ -46194,7 +46527,9 @@ mod tests {
         HostUiState,
         IsolatedDevProfile,
         IsolatedHostLifetime,
+        KeyedWorkspaceLayout,
         MainConversationCanvas,
+        MouseButton,
         NativeAccessibilityAction,
         NativeActionRecord,
         NativeComposerImage,
@@ -46229,6 +46564,7 @@ mod tests {
         PendingComposerSubmission,
         PendingHostBootstrap,
         PendingTerminalEcho,
+        PrimaryProviderIcon,
         ProjectActionMenuMode,
         ProjectId,
         ProjectInboxItem,
@@ -46246,6 +46582,7 @@ mod tests {
         TrustedReconnectFactoryProbe,
         UpdateState,
         UpdaterStage,
+        ARCHIVED_ROW_HEIGHT,
         COMPOSER_CARET_BLINK_INTERVAL,
         COMPOSER_CARET_BLINK_TICKS,
         CONTROLLER_IDLE_RECOVERY_INTERVAL,
@@ -46276,8 +46613,6 @@ mod tests {
         REMOTE_RECONNECT_BACKOFF_MAX,
         REMOTE_RECONNECT_BACKOFF_MIN,
         T3_SIDEBAR_NAV_TOP_INSET,
-        T3_SIDEBAR_ROW_HEIGHT,
-        T3_SIDEBAR_WIDTH,
         T3_WORKSPACE_TOPBAR_HEIGHT,
     };
     use super::{
@@ -47009,11 +47344,85 @@ mod tests {
 
     #[test]
     fn target_shell_geometry_matches_the_t3_reference_composition() {
-        assert_eq!(T3_SIDEBAR_WIDTH, 256.0);
-        assert_eq!(T3_SIDEBAR_ROW_HEIGHT, 78.0);
+        // The left column is no longer a fixed 256 px rail: it is the board,
+        // and `01-composition-A.html` pins it at 236 px.
+        assert_eq!(
+            board_column_width_for(&KeyedWorkspaceLayout::<HostTaskKey>::default(), false),
+            crate::ui::board::layout::BOARD_COLUMN_WIDTH
+        );
+        assert_eq!(
+            board_column_width_for(
+                &KeyedWorkspaceLayout::<HostTaskKey> {
+                    board_rail: true,
+                    ..KeyedWorkspaceLayout::default()
+                },
+                false
+            ),
+            crate::ui::board::layout::BOARD_RAIL_WIDTH,
+            "a collapsed board takes the rail's width, not the column's"
+        );
+        assert_eq!(
+            board_column_width_for(
+                &KeyedWorkspaceLayout::<HostTaskKey> {
+                    board_rail: true,
+                    ..KeyedWorkspaceLayout::default()
+                },
+                true
+            ),
+            crate::ui::board::layout::BOARD_COLUMN_WIDTH,
+            "the archived view is never railed: its header is the only way back"
+        );
+        // The project rail's 78 px row belongs to the archived browser now;
+        // the board's own row heights live in `ui::board::layout` and are
+        // asserted there against the mockup.
+        assert_eq!(ARCHIVED_ROW_HEIGHT, 78.0);
         assert_eq!(T3_WORKSPACE_TOPBAR_HEIGHT, 32.0);
         assert_eq!(T3_SIDEBAR_NAV_TOP_INSET, 12.0);
         assert_eq!(CONVERSATION_CONTENT_MAX_WIDTH, 768.0);
+    }
+
+    /// `reset_layout` restores pane geometry. A project's colour and a
+    /// collapsed board are neither, and losing them would repaint every stripe
+    /// and reopen a rail the user had closed.
+    #[test]
+    fn reset_layout_keeps_project_colours_and_the_board_rail() {
+        if rerun_headless_shell_test_in_child(
+            "ui::native_shell::tests::reset_layout_keeps_project_colours_and_the_board_rail",
+        ) {
+            return;
+        }
+        let _test_guard = HEADLESS_SHELL_TEST_LOCK
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .expect("headless shell test lock");
+        gpui::Application::headless().run(move |cx| {
+            crate::ui::init(cx);
+            let (runtime, _shared) = TestRuntime::new(true, NativeHostActionResult::Queued);
+            with_test_shell_in_app(cx, runtime, |shell| {
+                shell
+                    .layout
+                    .project_colours
+                    .insert("project-a".to_string(), 5);
+                shell.layout.board_rail = true;
+                shell.layout.inbox_width = 480.0;
+                shell.reset_layout();
+                assert_eq!(
+                    shell.layout.project_colours.get("project-a").copied(),
+                    Some(5),
+                    "a project keeps its palette slot across a layout reset"
+                );
+                assert!(
+                    shell.layout.board_rail,
+                    "a collapsed board stays collapsed across a layout reset"
+                );
+                assert_eq!(
+                    shell.layout.inbox_width,
+                    KeyedWorkspaceLayout::<HostTaskKey>::default().inbox_width,
+                    "pane geometry is what reset restores"
+                );
+            });
+            cx.quit();
+        });
     }
 
     #[test]
@@ -47324,6 +47733,16 @@ mod tests {
     static HEADLESS_SHELL_TEST_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
     const HEADLESS_SHELL_CHILD_ENV: &str = "DEVMANAGER_HEADLESS_SHELL_TEST_CHILD";
 
+    /// Serialise every headless GPUI test in this process, wherever it lives.
+    /// GPUI's Windows headless message loop is process-global, so two of them
+    /// in one process is undefined behaviour rather than a slow test.
+    pub(crate) fn headless_shell_test_lock() -> std::sync::MutexGuard<'static, ()> {
+        HEADLESS_SHELL_TEST_LOCK
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .expect("headless shell test lock")
+    }
+
     #[test]
     fn worker_client_loan_remains_connected_until_cancelled_or_stopped() {
         assert!(runtime_connection_visible(Some(true), false, false));
@@ -47522,30 +47941,27 @@ mod tests {
         let host = HostId::local_profile("dev").expect("host");
         let snapshot = agent_connection_snapshot(AgentPresence::SignedIn);
         let items_alpha = vec![
-            ProjectInboxItem::Project {
-                project_id,
-                label: "Alpha".to_string(),
-                expanded: true,
+            ProjectInboxItem::Group {
+                group: BoardGroup::Working,
                 task_count: 1,
-                host: host.clone(),
+                collapsed: false,
             },
             ProjectInboxItem::Task {
-                project_id,
+                project_id: Some(project_id),
                 task_key: HostTaskKey::new(host.clone(), task_id),
                 settled: false,
                 archived: false,
             },
         ];
+        // Same task, a different section: the tree must observe the move.
         let items_beta = vec![
-            ProjectInboxItem::Project {
-                project_id,
-                label: "Beta".to_string(),
-                expanded: true,
+            ProjectInboxItem::Group {
+                group: BoardGroup::Idle,
                 task_count: 1,
-                host: host.clone(),
+                collapsed: false,
             },
             ProjectInboxItem::Task {
-                project_id,
+                project_id: Some(project_id),
                 task_key: HostTaskKey::new(host.clone(), task_id),
                 settled: false,
                 archived: false,
@@ -47735,14 +48151,24 @@ mod tests {
     /// returns. Run each independently named scenario in a fresh copy of this
     /// test harness so the ordinary full-suite process never constructs two
     /// headless applications.
-    fn rerun_headless_shell_test_in_child(test_name: &'static str) -> bool {
+    pub(crate) fn rerun_headless_shell_test_in_child(test_name: &'static str) -> bool {
         if std::env::var(HEADLESS_SHELL_CHILD_ENV).as_deref() == Ok(test_name) {
             return false;
         }
         let status = std::process::Command::new(
             std::env::current_exe().expect("current native-shell test harness"),
         )
-        .args(["--exact", test_name, "--nocapture", "--test-threads=1"])
+        // `--include-ignored`: the child is always given one exact test name,
+        // so this only decides whether an `#[ignore]`d one runs when it was
+        // asked for. Without it the child skipped and exited 0, and the parent
+        // reported the probe as passing while it had measured nothing.
+        .args([
+            "--exact",
+            test_name,
+            "--nocapture",
+            "--include-ignored",
+            "--test-threads=1",
+        ])
         .env(HEADLESS_SHELL_CHILD_ENV, test_name)
         .status()
         .expect("start isolated native-shell headless test");
@@ -48824,8 +49250,7 @@ mod tests {
 
     #[test]
     fn right_click_renames_active_and_archived_tasks() {
-        assert!(super::task_row_right_click_should_rename(false));
-        assert!(super::task_row_right_click_should_rename(true));
+        assert!(super::task_row_right_click_should_rename());
     }
 
     #[test]
@@ -49631,7 +50056,8 @@ mod tests {
         assert_eq!(status.name(), "No tasks yet");
         assert_eq!(
             status.description(),
-            "Add or choose a project, then start with +Claude or +Codex."
+            super::INBOX_EMPTY_STATE_HINT,
+            "the painted empty state and its accessible description are one sentence"
         );
     }
 
@@ -49643,18 +50069,23 @@ mod tests {
         let task_id = TaskId::new();
         let task_list = TaskList::from_virtual_task_ids(vec![task_id]).expect("single-task list");
         let items = vec![
-            ProjectInboxItem::Project {
-                project_id,
-                label: "DevManager".to_string(),
-                expanded: true,
+            ProjectInboxItem::Group {
+                group: BoardGroup::Working,
                 task_count: 1,
-                host: HostId::local_profile("dev").expect("host"),
+                collapsed: false,
             },
             ProjectInboxItem::Task {
-                project_id,
+                project_id: Some(project_id),
                 task_key: HostTaskKey::new(HostId::local_profile("dev").expect("host"), task_id),
                 settled: false,
                 archived: false,
+            },
+            ProjectInboxItem::NewTaskTarget {
+                project_key: HostProjectKey::new(
+                    HostId::local_profile("dev").expect("host"),
+                    project_id,
+                ),
+                label: "DevManager".to_string(),
             },
         ];
         let snapshot = agent_connection_snapshot(AgentPresence::SignedIn);
@@ -49669,27 +50100,33 @@ mod tests {
         let task_key = HostTaskKey::new(host.clone(), task_id);
         let project_key = HostProjectKey::new(host.clone(), project_id);
         let nodes = tree.gpui_nodes();
+        // The board's sections replaced the project headers: a live section is
+        // a label carrying its count, not an expandable button.
         assert!(nodes.iter().any(|node| {
-            node.element_id == stable_host_project_row_element_id(&project_key)
-                && node.label == "Project DevManager, 1 task, expanded"
+            node.element_id == board_group_element_id(BoardGroup::Working)
+                && node.label == "Working 1"
+                && !node.focusable
+                && !node.tab_stop
+        }));
+        // The per-project "+Claude"/"+Codex" buttons are gone. One reachable
+        // "New task" per project replaces both, so a project with no tasks yet
+        // is still reachable even though the board has no project rows.
+        assert!(
+            !nodes.iter().any(|node| {
+                node.element_id.starts_with("native-project-claude-")
+                    || node.element_id.starts_with("native-project-codex-")
+            }),
+            "the board publishes no per-provider project buttons"
+        );
+        assert!(nodes.iter().any(|node| {
+            node.element_id
+                == format!(
+                    "native-project-new-task-{}",
+                    stable_host_project_element_key(&project_key, "new-task")
+                )
+                && node.label == "New task in DevManager"
                 && node.focusable
                 && node.tab_stop
-        }));
-        assert!(nodes.iter().any(|node| {
-            node.element_id
-                == format!(
-                    "native-project-claude-{}",
-                    stable_host_project_element_key(&project_key, "claude")
-                )
-                && node.label == "Start Claude task in DevManager"
-        }));
-        assert!(nodes.iter().any(|node| {
-            node.element_id
-                == format!(
-                    "native-project-codex-{}",
-                    stable_host_project_element_key(&project_key, "codex")
-                )
-                && node.label == "Start Codex task in DevManager"
         }));
         assert!(nodes
             .iter()
@@ -49714,9 +50151,13 @@ mod tests {
         );
 
         let settled_items = vec![
-            ProjectInboxItem::DoneHeader { task_count: 1 },
+            ProjectInboxItem::Group {
+                group: BoardGroup::Done,
+                task_count: 1,
+                collapsed: false,
+            },
             ProjectInboxItem::Task {
-                project_id,
+                project_id: Some(project_id),
                 task_key: HostTaskKey::new(HostId::local_profile("dev").expect("host"), task_id),
                 settled: true,
                 archived: false,
@@ -52603,10 +53044,555 @@ mod tests {
         (builder.finish().expect("client model"), task_id)
     }
 
+    /// The row's capture policy, exercised through the shell method the
+    /// handlers actually call rather than through the pure helper beside it.
+    ///
+    /// The previous round asserted `task_row_capture` alone, which stayed
+    /// green with the whole handler deleted -- the helper is a lookup table,
+    /// not the behaviour. This drives `handle_board_row_capture_down` on a
+    /// live shell and reads the rename state back, so a closure that stops
+    /// calling it, or a method that stops renaming, goes red.
+    ///
+    /// What this still cannot see is the `.capture_any_mouse_down` /
+    /// `.capture_any_mouse_up` attach in `board/render.rs`: a GPUI element
+    /// tree is not introspectable headlessly (calling `element_with_handlers`
+    /// from a test aborts the harness). That wiring is covered by the Task 9
+    /// launch check -- right-click renames, middle-click does nothing.
     #[test]
-    fn task_inbox_groups_tasks_under_their_project_and_preserves_project_on_create() {
+    fn board_row_capture_consumes_middle_without_acting_on_it() {
         if rerun_headless_shell_test_in_child(
-            "ui::native_shell::tests::task_inbox_groups_tasks_under_their_project_and_preserves_project_on_create",
+            "ui::native_shell::tests::board_row_capture_consumes_middle_without_acting_on_it",
+        ) {
+            return;
+        }
+        let _test_guard = HEADLESS_SHELL_TEST_LOCK
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .expect("headless shell test lock");
+        gpui::Application::headless().run(move |cx| {
+            crate::ui::init(cx);
+            let (runtime, _shared) = TestRuntime::new(true, NativeHostActionResult::Queued);
+            let (model, task_id) = open_task_without_agent_client_model();
+            let project_id = model.task(task_id).expect("task").task.project_id;
+            with_test_shell_in_app(cx, runtime, |shell| {
+                shell.install_project_for_test("DevManager", project_id);
+                shell
+                    .apply_client_model(Arc::new(model))
+                    .expect("apply model");
+                let key = shell.local_task_key(task_id);
+                assert!(
+                    shell.board_model(1_000).has_rows(),
+                    "the row under test has to be on the board"
+                );
+
+                // (a) Middle is consumed -- it must not reach the terminal dock
+                // behind the column, where it would paste the selection -- and
+                // it does nothing else.
+                assert!(shell.rename_task.is_none());
+                assert!(
+                    shell.handle_board_row_capture_down(&key, MouseButton::Middle),
+                    "middle must be consumed so it cannot fall through to the terminal"
+                );
+                assert!(
+                    shell.rename_task.is_none(),
+                    "middle must not begin a rename: consumed and inert are two claims"
+                );
+
+                // (b) Right on a local live task is consumed and opens the
+                // rename, which is what it did on the project rail.
+                assert!(
+                    shell.handle_board_row_capture_down(&key, MouseButton::Right),
+                    "right stays captured"
+                );
+                assert_eq!(
+                    shell.rename_task.as_ref().map(|draft| draft.owner.clone()),
+                    Some(key.clone()),
+                    "right-click renames the exact row it was pressed on"
+                );
+                assert_eq!(
+                    shell.selected_project_id,
+                    Some(project_id),
+                    "a local right-click carries the row's own project, never a minted one"
+                );
+                shell.rename_task = None;
+
+                // (c) Left bubbles, so a nested affordance inside the row still
+                // receives its own mouse sequence.
+                assert!(
+                    !shell.handle_board_row_capture_down(&key, MouseButton::Left),
+                    "left must not be consumed"
+                );
+                assert!(shell.rename_task.is_none());
+
+                // The pointer grab the row took is released on the same buttons.
+                assert!(shell.handle_board_row_capture_up(MouseButton::Middle));
+                assert!(shell.handle_board_row_capture_up(MouseButton::Right));
+                assert!(
+                    !shell.handle_board_row_capture_up(MouseButton::Left),
+                    "left took no grab, so there is none to release"
+                );
+            });
+            cx.quit();
+        });
+    }
+
+    /// A task that leaves the fleet projection must drop its cached activity,
+    /// not only its state-clock entry. Both maps are pruned from one list in
+    /// `board_rows`, and this is the half the clock's sabotage check does not
+    /// cover.
+    #[test]
+    fn a_departed_task_drops_its_board_activity_cache_entry() {
+        if rerun_headless_shell_test_in_child(
+            "ui::native_shell::tests::a_departed_task_drops_its_board_activity_cache_entry",
+        ) {
+            return;
+        }
+        let _test_guard = HEADLESS_SHELL_TEST_LOCK
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .expect("headless shell test lock");
+        gpui::Application::headless().run(move |cx| {
+            crate::ui::init(cx);
+            let (runtime, _shared) = TestRuntime::new(true, NativeHostActionResult::Queued);
+            let (model, task_id) = open_task_without_agent_client_model();
+            let project_id = model.task(task_id).expect("task").task.project_id;
+            with_test_shell_in_app(cx, runtime, |shell| {
+                shell.install_project_for_test("DevManager", project_id);
+                shell
+                    .apply_client_model(Arc::new(model))
+                    .expect("apply model");
+                let key = shell.local_task_key(task_id);
+                // Give the task a conversation so it earns a cache entry at all:
+                // a task with no surface is never cached.
+                shell.task_surfaces.begin_conversation(key.clone(), 1);
+                shell
+                    .task_surfaces
+                    .admit_conversation(key.clone(), 1, &probe_conversation_page(4))
+                    .expect("seed conversation");
+
+                let _ = shell.board_model(1_000);
+                assert_eq!(
+                    shell.board_activity_cache.len(),
+                    1,
+                    "a listed task with a conversation is cached"
+                );
+                assert_eq!(shell.board_state_clock.keys().count(), 1);
+
+                // The projection the board reads is what a purge or an archive
+                // takes the task out of.
+                shell.local_slot_mut().inbox =
+                    Inbox::from_error(crate::ui::task_cockpit::InboxError::ProjectionUnavailable);
+                shell.local_slot_mut().client_model = None;
+                let _ = shell.board_model(2_000);
+                assert_eq!(
+                    shell.board_activity_cache.len(),
+                    0,
+                    "a departed task must not leave its activity cached for the life of the process"
+                );
+                assert_eq!(
+                    shell.board_state_clock.keys().count(),
+                    0,
+                    "and the two maps are pruned from one list, so they cannot disagree"
+                );
+            });
+            cx.quit();
+        });
+    }
+
+    /// An Idle row's age is the time since its last event, not the time since
+    /// this process started watching it.
+    ///
+    /// The state clock is transient by design, so on the FIRST paint after a
+    /// launch it reports 0 for every row -- and an Idle row's second line then
+    /// reads "Last reply 0s" for a task nobody has touched for days. The clock
+    /// is still observed for Idle, so a state change later in the session
+    /// measures from that change; only its return value is ignored.
+    #[test]
+    fn an_idle_rows_age_counts_from_its_last_event_not_from_this_launch() {
+        if rerun_headless_shell_test_in_child(
+            "ui::native_shell::tests::an_idle_rows_age_counts_from_its_last_event_not_from_this_launch",
+        ) {
+            return;
+        }
+        let _test_guard = HEADLESS_SHELL_TEST_LOCK
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .expect("headless shell test lock");
+        gpui::Application::headless().run(move |cx| {
+            crate::ui::init(cx);
+            let (runtime, _shared) = TestRuntime::new(true, NativeHostActionResult::Queued);
+            let (model, task_id) = open_task_without_agent_client_model();
+            let project_id = model.task(task_id).expect("task").task.project_id;
+            with_test_shell_in_app(cx, runtime, |shell| {
+                shell.install_project_for_test("DevManager", project_id);
+                shell
+                    .apply_client_model(Arc::new(model))
+                    .expect("apply model");
+                // The fixture task's only timestamp is `created_at_ms: 1`, so
+                // "three days later" is three days since anything happened.
+                const THREE_DAYS_MS: i64 = 3 * 24 * 60 * 60 * 1_000;
+                let board = shell.board_model(THREE_DAYS_MS + 1);
+                let row = board
+                    .groups
+                    .iter()
+                    .flat_map(|group| group.rows.iter())
+                    .find(|row| row.key.task_id == task_id)
+                    .expect("the fixture task is on the board")
+                    .clone();
+                assert_eq!(row.state, BoardState::Idle, "the fixture task is idle");
+                assert_eq!(
+                    row.state_age_ms, THREE_DAYS_MS,
+                    "the first paint after a launch must show the real elapsed time, not 0"
+                );
+                assert_eq!(
+                    crate::ui::board::format_age(row.state_age_ms),
+                    "3d",
+                    "so the title age and the `Last reply ...` line both read 3d"
+                );
+                assert_eq!(
+                    shell.board_state_clock.keys().count(),
+                    1,
+                    "Idle is still observed, so a later state change measures from that change"
+                );
+            });
+            cx.quit();
+        });
+    }
+
+    /// What the board puts under its header, asserted on the render path's own
+    /// decision rather than on the accessibility tree -- the tree said "No
+    /// tasks yet" for the whole time an empty active board was painting a bare
+    /// `DONE 0` on screen, so it is the one witness that cannot see this bug.
+    ///
+    /// `board_body_kind` has exactly one caller, the render path, and its three
+    /// results are the three elements that path builds. Painting the shell and
+    /// reading the result back would be better still and is not available: the
+    /// one test that called `element_with_handlers` headlessly is dead code,
+    /// and reinstating it here reproduced a STATUS_ACCESS_VIOLATION in the
+    /// GPUI harness. Task 9's launch is where the pixels get checked.
+    #[test]
+    fn the_board_paints_an_empty_state_rather_than_a_bare_done_section() {
+        if rerun_headless_shell_test_in_child(
+            "ui::native_shell::tests::the_board_paints_an_empty_state_rather_than_a_bare_done_section",
+        ) {
+            return;
+        }
+        let _test_guard = HEADLESS_SHELL_TEST_LOCK
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .expect("headless shell test lock");
+        // The mapping itself, including the case the bug lived in.
+        assert_eq!(
+            super::board_body_kind(false, false),
+            super::BoardBody::EmptyState
+        );
+        assert_eq!(
+            super::board_body_kind(false, true),
+            super::BoardBody::Sections
+        );
+        assert_eq!(
+            super::board_body_kind(true, false),
+            super::BoardBody::ArchivedList,
+            "the archived view keeps its own list, empty or not"
+        );
+        assert_eq!(
+            super::board_body_kind(true, true),
+            super::BoardBody::ArchivedList
+        );
+
+        gpui::Application::headless().run(move |cx| {
+            crate::ui::init(cx);
+            let (runtime, _shared) = TestRuntime::new(true, NativeHostActionResult::Queued);
+            let (model, task_id) = open_task_without_agent_client_model();
+            let project_id = model.task(task_id).expect("task").task.project_id;
+            with_test_shell_in_app(cx, runtime, |shell| {
+                // A fresh shell: Done still renders, which is exactly why
+                // "are there groups" is the wrong question and `has_rows` is
+                // the right one.
+                let empty = shell.board_model(1_000);
+                assert_eq!(empty.groups.len(), 1);
+                assert!(!empty.has_rows());
+                assert_eq!(
+                    super::board_body_kind(shell.show_archived_tasks, empty.has_rows()),
+                    super::BoardBody::EmptyState,
+                    "an empty active board takes the empty state, not a bare DONE 0"
+                );
+
+                shell.install_project_for_test("DevManager", project_id);
+                shell
+                    .apply_client_model(Arc::new(model))
+                    .expect("apply model");
+                let listed = shell.board_model(2_000);
+                assert!(listed.has_rows());
+                assert_eq!(
+                    super::board_body_kind(shell.show_archived_tasks, listed.has_rows()),
+                    super::BoardBody::Sections
+                );
+
+                // Rail + archived must still paint the header: the `⋯` menu on
+                // it is the only pointer route back to the active board.
+                shell.layout.board_rail = true;
+                shell.show_archived_tasks = true;
+                assert_eq!(
+                    super::board_body_kind(shell.show_archived_tasks, listed.has_rows()),
+                    super::BoardBody::ArchivedList
+                );
+                assert_eq!(
+                    shell.board_column_width(),
+                    crate::ui::board::layout::BOARD_COLUMN_WIDTH,
+                    "the archived view is never railed, or its header would not be painted"
+                );
+            });
+            cx.quit();
+        });
+    }
+
+    /// `open_task_without_agent_client_model`, widened to N open tasks in one
+    /// project so a cost probe has something to measure.
+    fn open_tasks_client_model(count: u8) -> (crate::client::ClientModel, Vec<TaskId>) {
+        use crate::client::ClientModelBuilder;
+        use crate::domain::{
+            id::{EnvironmentId, ProjectId, SnapshotId},
+            snapshot::{SnapshotItem, SnapshotPage, SnapshotSection, TaskSnapshotItem},
+            task::{
+                ReviewReadiness, TaskActivity, TaskAssignment, TaskAttention, TaskConnectivity,
+                TaskFacts, TaskLifecycle, WorkspaceRef,
+            },
+        };
+
+        let uuid = |tail: u8| {
+            [
+                0x01, 0x8f, 0x60, 0xb0, 0x9c, 0x1a, 0x70, 0x01, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00,
+                0x00, tail,
+            ]
+        };
+        let snap = SnapshotId::from_bytes(uuid(0x20)).expect("snapshot");
+        let page = |section, items| SnapshotPage {
+            snapshot_id: snap,
+            through_sequence: 1,
+            section,
+            after_item: None,
+            items,
+            encoded_bytes: 1,
+            next_cursor: None,
+        };
+        let mut task_ids = Vec::new();
+        let mut items = Vec::new();
+        for index in 0..count {
+            // 0x00..0x1f are reserved above for the environment, project and
+            // snapshot ids, so tasks start well clear of them.
+            let task_id = TaskId::from_bytes(uuid(0x40 + index)).expect("task");
+            task_ids.push(task_id);
+            items.push(SnapshotItem::Task(TaskSnapshotItem {
+                task: TaskFacts {
+                    id: task_id,
+                    environment_id: EnvironmentId::from_bytes(uuid(0x01)).expect("env"),
+                    title: format!("probe task {index}"),
+                    description: None,
+                    project_id: ProjectId::from_bytes(uuid(0x02)).expect("project"),
+                    workspace: WorkspaceRef::Main,
+                    assignment: TaskAssignment::LocalOwner,
+                    lifecycle: TaskLifecycle::Open,
+                    action_epoch: 0,
+                    revision: 1,
+                    created_at_ms: 1,
+                },
+                connectivity: TaskConnectivity::Connected,
+                attention: TaskAttention::None,
+                activity: TaskActivity::Idle,
+                review_readiness: ReviewReadiness::NotReady,
+                primary_agent_id: None,
+            }));
+        }
+        let mut builder = ClientModelBuilder::new();
+        builder
+            .ingest_page(page(SnapshotSection::Tasks, items))
+            .expect("tasks");
+        for section in [
+            SnapshotSection::AgentSessions,
+            SnapshotSection::Artifacts,
+            SnapshotSection::Resources,
+            SnapshotSection::Operations,
+        ] {
+            builder
+                .ingest_page(page(section, Vec::new()))
+                .expect("empty section");
+        }
+        (builder.finish().expect("client model"), task_ids)
+    }
+
+    /// A conversation page of `count` facts: alternating tool calls and their
+    /// results, so `board_activity` has real work to do rather than skipping
+    /// every payload.
+    fn probe_conversation_page(count: u64) -> crate::domain::snapshot::SemanticJournalPage {
+        use crate::domain::snapshot::{
+            SemanticJournalFact, SemanticJournalPage, SemanticJournalPayload,
+        };
+        use crate::domain::{EventId, PrivacyClass};
+
+        let facts = (0..count)
+            .map(|sequence| SemanticJournalFact {
+                id: EventId::new(),
+                sequence: sequence + 1,
+                occurred_at_ms: Some(sequence as i64),
+                provider: "claude_code".into(),
+                schema_version: 1,
+                kind: "tool_call".into(),
+                visibility: "task".into(),
+                privacy_class: PrivacyClass::LocalOnly,
+                redacted: false,
+                payload: if sequence % 2 == 0 {
+                    SemanticJournalPayload::ToolCall {
+                        tool_name: "Bash".into(),
+                        call_id: format!("call-{sequence}"),
+                    }
+                } else {
+                    SemanticJournalPayload::ToolResult {
+                        call_id: format!("call-{}", sequence - 1),
+                        status: "ok".into(),
+                    }
+                },
+            })
+            .collect::<Vec<_>>();
+        SemanticJournalPage {
+            oldest_sequence: 1,
+            cursor_rolled_over: false,
+            after_sequence: 0,
+            through_sequence: count,
+            high_water: count,
+            encoded_bytes: count as u32,
+            next_sequence: None,
+            facts,
+        }
+    }
+
+    /// Cost probe for the board's per-paint work, at the scale the spec caps
+    /// supervision at: 40 open tasks, 2,000 conversation facts each.
+    ///
+    /// `#[ignore]`d because it is a measurement, not an assertion about
+    /// correctness, and its absolute numbers are machine-specific. Run with
+    /// `cargo test --lib -- board_model_cost_probe --ignored --nocapture`.
+    /// It does assert the one thing that is not machine-specific: a repaint
+    /// that changed nothing must not re-scan the conversations.
+    #[test]
+    #[ignore = "timing probe; run explicitly with --ignored --nocapture"]
+    fn board_model_cost_probe_forty_tasks_two_thousand_facts() {
+        if rerun_headless_shell_test_in_child(
+            "ui::native_shell::tests::board_model_cost_probe_forty_tasks_two_thousand_facts",
+        ) {
+            return;
+        }
+        let _guard = HEADLESS_SHELL_TEST_LOCK
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .expect("headless shell test lock");
+        const TASKS: u8 = 40;
+        const FACTS: u64 = 2_000;
+        gpui::Application::headless().run(move |cx| {
+            crate::ui::init(cx);
+            let (runtime, _shared) = TestRuntime::new(true, NativeHostActionResult::Queued);
+            let (model, task_ids) = open_tasks_client_model(TASKS);
+            let project_id = model.task(task_ids[0]).expect("task").task.project_id;
+            with_test_shell_in_app(cx, runtime, |shell| {
+                shell.install_project_for_test("DevManager", project_id);
+                shell
+                    .apply_client_model(Arc::new(model))
+                    .expect("apply model");
+                let page = probe_conversation_page(FACTS);
+                for task_id in &task_ids {
+                    let key = shell.local_task_key(*task_id);
+                    shell.task_surfaces.begin_conversation(key.clone(), 1);
+                    shell
+                        .task_surfaces
+                        .admit_conversation(key, 1, &page)
+                        .expect("seed conversation");
+                }
+                let rows = shell.board_model(1_000).groups.iter().map(|g| g.rows.len()).sum::<usize>();
+                assert_eq!(rows, TASKS as usize, "every probe task reaches the board");
+
+                // Cold: the cache was just filled by the call above, so clear
+                // it to measure the scan, then measure the steady state.
+                shell.board_activity_cache.clear();
+                let cold = std::time::Instant::now();
+                let _ = shell.board_model(2_000);
+                let cold_ms = cold.elapsed().as_secs_f64() * 1_000.0;
+
+                let mut warm_ms = f64::MAX;
+                for _ in 0..5 {
+                    let warm = std::time::Instant::now();
+                    let _ = shell.board_model(3_000);
+                    warm_ms = warm_ms.min(warm.elapsed().as_secs_f64() * 1_000.0);
+                }
+
+                // And the old shape, for the comparison the number is for: a
+                // page clone plus a full scan, per task, per paint.
+                let cloned = std::time::Instant::now();
+                for task_id in &task_ids {
+                    let key = shell.local_task_key(*task_id);
+                    let _ = shell
+                        .task_surfaces
+                        .conversation_page(key)
+                        .map(|page| crate::ui::board::board_activity(&page.facts));
+                }
+                let cloned_ms = cloned.elapsed().as_secs_f64() * 1_000.0;
+
+                // What is left in the warm path, so the number above is
+                // attributed rather than guessed at.
+                let mut projection_ms = f64::MAX;
+                for _ in 0..5 {
+                    let projection = std::time::Instant::now();
+                    let _ = shell.fleet_inbox_projection();
+                    projection_ms =
+                        projection_ms.min(projection.elapsed().as_secs_f64() * 1_000.0);
+                }
+                println!(
+                    "board_model cost probe: {TASKS} tasks x {FACTS} facts (debug build)"
+                );
+                println!("  clone+scan, the old per-paint shape: {cloned_ms:.3} ms");
+                println!("  borrowed scan, cold cache:           {cold_ms:.3} ms");
+                println!("  cached, nothing changed:             {warm_ms:.3} ms");
+                println!("  of which fleet_inbox_projection:     {projection_ms:.3} ms");
+                let mut activity_ms = f64::MAX;
+                for _ in 0..5 {
+                    let activity = std::time::Instant::now();
+                    for task_id in &task_ids {
+                        let key = shell.local_task_key(*task_id);
+                        let _ = shell.board_activity_for(&key);
+                    }
+                    activity_ms = activity_ms.min(activity.elapsed().as_secs_f64() * 1_000.0);
+                }
+                println!("  of which board_activity_for x{TASKS}:    {activity_ms:.3} ms");
+                // The claim under test is about the SCAN, not about the row
+                // construction beside it: a repaint that changed nothing must
+                // not walk 80,000 facts again. Comparing the cached activity
+                // read against the cold scan is that claim exactly, and it
+                // holds whatever the build profile does to the absolute
+                // numbers -- which an absolute millisecond bound would not.
+                assert!(
+                    warm_ms < cold_ms / 4.0,
+                    "a repaint that changed nothing must not re-scan: cold {cold_ms:.3} ms, warm {warm_ms:.3} ms"
+                );
+                assert!(
+                    activity_ms < cold_ms / 20.0,
+                    "the cached activity read must be a lookup, not a scan: {activity_ms:.3} ms against a {cold_ms:.3} ms scan"
+                );
+                assert_eq!(
+                    shell.board_activity_cache.len(),
+                    TASKS as usize,
+                    "one cache entry per task, and no more"
+                );
+            });
+            cx.quit();
+        });
+    }
+
+    /// The board replaces the project rail: tasks group by what they are
+    /// doing, the project survives as a palette slot on the stripe, and the
+    /// row keeps the accessibility identity the rail published.
+    #[test]
+    fn board_groups_tasks_by_state_and_keeps_project_as_a_stripe() {
+        if rerun_headless_shell_test_in_child(
+            "ui::native_shell::tests::board_groups_tasks_by_state_and_keeps_project_as_a_stripe",
         ) {
             return;
         }
@@ -52622,57 +53608,141 @@ mod tests {
             let (model, task_id) = open_task_without_agent_client_model();
             let project_id = model.task(task_id).expect("task").task.project_id;
             with_test_shell_in_app(cx, runtime, |shell| {
-                shell.local_slot_mut().agent_connection =
-                    Some(agent_connection_snapshot(AgentPresence::SignedIn));
                 shell.install_project_for_test("DevManager", project_id);
                 shell
                     .apply_client_model(Arc::new(model))
                     .expect("apply model");
+                // After the model: applying one re-projects the connection and
+                // would put both providers back to Checking.
+                shell.local_slot_mut().agent_connection =
+                    Some(agent_connection_snapshot(AgentPresence::SignedIn));
+
+                let board = shell.board_model(1_000);
+                let groups: Vec<_> = board.groups.iter().map(|group| group.group).collect();
                 assert_eq!(
-                    shell.project_inbox_items(),
-                    vec![
-                        ProjectInboxItem::Project {
-                            project_id,
-                            label: "DevManager".to_string(),
-                            expanded: true,
-                            task_count: 1,
-                            host: shell.local_host_id(),
-                        },
-                        ProjectInboxItem::Task {
-                            project_id,
-                            task_key: shell.local_task_key(task_id),
-                            settled: false,
-                            archived: false,
-                        },
-                    ]
+                    groups,
+                    vec![BoardGroup::Idle, BoardGroup::Done],
+                    "an unstarted task is Idle; Done is always present"
+                );
+                let row = &board.groups[0].rows[0];
+                assert_eq!(row.key, shell.local_task_key(task_id));
+                assert_eq!(row.project_colour, 0, "first project takes palette slot 0");
+                assert_eq!(
+                    row.provider,
+                    PrimaryProviderIcon::Other,
+                    "no agent yet, so no provider mark"
+                );
+                assert_eq!(
+                    row.why,
+                    BoardState::Idle.why_label(),
+                    "a row that is not Working never narrates a tool call"
                 );
 
-                shell.toggle_project(HostProjectKey::new(shell.local_host_id(), project_id));
+                // The slot has to survive the process, so it is written back to
+                // the layout the moment it is handed out.
                 assert_eq!(
-                    shell.project_inbox_items(),
-                    vec![ProjectInboxItem::Project {
-                        project_id,
-                        label: "DevManager".to_string(),
-                        expanded: false,
-                        task_count: 1,
-                        host: shell.local_host_id(),
-                    }]
+                    shell.layout.project_colours.get(&project_id.to_string()),
+                    Some(&0),
+                    "a first-sight palette slot is persisted, not re-rolled next launch"
                 );
 
-                shell.begin_new_task_for_project(project_id);
+                shell.refresh_accessibility_tree();
+                let nodes = shell.accessibility_tree().gpui_nodes();
+                assert!(
+                    nodes.iter().any(|node| {
+                        node.element_id == stable_host_task_row_element_id(&row.key)
+                    }),
+                    "row keeps the accessibility identity the project rail published: {:?}",
+                    nodes
+                        .iter()
+                        .map(|node| &node.element_id)
+                        .collect::<Vec<_>>()
+                );
+                assert!(
+                    nodes
+                        .iter()
+                        .any(|node| node.element_id == board_group_element_id(BoardGroup::Idle)),
+                    "each board section is its own accessible node"
+                );
+                assert!(
+                    nodes
+                        .iter()
+                        .any(|node| node.element_id == "board-header-new"),
+                    "the board header's New task control replaces the project +Claude/+Codex pair"
+                );
+
+                // The + New menu reaches the project even though the board has
+                // no project rows, and Escape closes it.
                 assert_eq!(
                     shell
-                        .new_task
-                        .as_ref()
-                        .map(|draft| draft.project_key.project_id),
-                    Some(project_id),
-                    "task creation must retain the project whose header launched it"
+                        .board_new_task_targets()
+                        .into_iter()
+                        .map(|(key, label)| (key.project_id, label))
+                        .collect::<Vec<_>>(),
+                    vec![(project_id, "DevManager".to_string())]
+                );
+                // The "+Claude"/"+Codex" pair the project headers carried is
+                // now one row per signed-in provider in this one menu.
+
+                let entries: Vec<_> = shell
+                    .board_new_task_menu_entries()
+                    .into_iter()
+                    .map(|(_, label, action)| (label, action))
+                    .collect();
+                assert!(
+                    entries.iter().any(|(label, action)| label
+                        == "DevManager · Claude Code"
+                        && *action
+                            == BoardMenuAction::StartAgentIn(
+                                project_id,
+                                ProviderKind::ClaudeCode
+                            )),
+                    "the + New menu still starts a local task straight onto a provider: {entries:?}"
+                );
+                shell.open_board_menu(BoardMenu::NewTask);
+                assert_eq!(shell.board_menu, Some(BoardMenu::NewTask));
+                shell.open_board_menu(BoardMenu::Options);
+                assert_eq!(
+                    shell.board_menu,
+                    Some(BoardMenu::Options),
+                    "one field holds both menus, so opening one closes the other"
+                );
+                shell.handle_board_menu_key(&KeyDownEvent {
+                    keystroke: Keystroke {
+                        modifiers: gpui::Modifiers::default(),
+                        key: "escape".into(),
+                        key_char: None,
+                    },
+                    is_held: false,
+                });
+                assert_eq!(shell.board_menu, None, "Escape dismisses the board menu");
+
+                // Done is collapsed until it is disclosed.
+                assert!(board.groups[1].collapsed);
+                shell.board_done_expanded = true;
+                let expanded = shell.board_model(2_000);
+                assert!(!expanded.groups[1].collapsed);
+
+                // A task that leaves the projection must not leave a clock
+                // entry behind. Nothing here can purge the kernel's task, so
+                // the departure is staged by emptying the projection the board
+                // reads -- which is exactly the state a purge produces.
+                assert_eq!(shell.board_state_clock.keys().count(), 1);
+                shell.local_slot_mut().inbox =
+                    Inbox::from_error(crate::ui::task_cockpit::InboxError::ProjectionUnavailable);
+                shell.local_slot_mut().client_model = None;
+                let departed = shell.board_model(3_000);
+                assert!(departed.groups.iter().all(|group| group.rows.is_empty()));
+                assert_eq!(
+                    shell.board_state_clock.keys().count(),
+                    0,
+                    "a task that left the projection is forgotten rather than left to leak"
                 );
             });
             *completed_for_app.borrow_mut() = true;
             cx.quit();
         });
-        assert!(*completed.borrow(), "project inbox scenario completed");
+        assert!(*completed.borrow(), "board scenario completed");
     }
 
     fn created_task_is_listed_without_a_disconnect_or_missing_field(cx: &mut gpui::App) {
