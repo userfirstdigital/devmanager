@@ -8,6 +8,7 @@ use gpui::{App, Global};
 
 pub mod actions;
 pub mod agent_connection;
+pub mod board;
 pub mod browser_dock_lifecycle;
 pub mod browser_gateway_identity;
 pub mod components;
