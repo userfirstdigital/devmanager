@@ -35,6 +35,13 @@ impl ProjectColourBook {
         self.assignments.clone()
     }
 
+    /// Whether the persisted map already matches what this book holds.
+    /// The caller asks on every paint and almost always gets `true`, so it
+    /// must not have to clone the map to find out.
+    pub fn matches_persisted(&self, stored: &BTreeMap<String, u8>) -> bool {
+        self.assignments == *stored
+    }
+
     pub fn colour_index_if_known(&self, project_id: ProjectId) -> Option<u8> {
         self.assignments.get(&project_id.to_string()).copied()
     }
@@ -83,6 +90,22 @@ mod tests {
         let indices: Vec<_> = ids.iter().map(|id| book.colour_index(*id)).collect();
         assert_eq!(indices, vec![0, 1, 2, 3, 4, 5, 6, 7, 0]);
         assert_eq!(book.colour_index(ids[3]), 3, "stable on re-ask");
+    }
+
+    #[test]
+    fn matches_persisted_agrees_with_a_cloned_comparison() {
+        let mut book = ProjectColourBook::default();
+        let id = ProjectId::new();
+        book.colour_index(id);
+        let stored = book.to_persisted();
+        assert!(book.matches_persisted(&stored));
+        book.colour_index(ProjectId::new());
+        assert!(!book.matches_persisted(&stored));
+        assert_eq!(
+            book.matches_persisted(&stored),
+            book.to_persisted() == stored,
+            "the cheap check and the cloning one must never disagree"
+        );
     }
 
     #[test]

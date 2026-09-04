@@ -19,7 +19,8 @@ use std::rc::Rc;
 use gpui::prelude::FluentBuilder;
 use gpui::{
     div, px, AnyElement, App, ElementId, FontWeight, InteractiveElement, IntoElement, KeyDownEvent,
-    MouseButton, MouseDownEvent, ParentElement, StatefulInteractiveElement, Styled, Window,
+    MouseButton, MouseDownEvent, MouseUpEvent, ParentElement, StatefulInteractiveElement, Styled,
+    Window,
 };
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
@@ -45,9 +46,17 @@ use crate::ui::tokens::{Color, ThemeTokens};
 
 /// What the shell does when a row is clicked, right-clicked or typed into.
 /// The painter owns no state: it hands the row's key back and the shell decides.
+///
+/// Four handlers, matching the four the project rail's row carried. The two
+/// capture-phase ones are not an optimisation: a pointer button the row does
+/// not consume falls through to the terminal dock underneath, so a middle
+/// click on a row would paste into the terminal. The painter only wires the
+/// phases; which buttons are consumed is the shell's policy, because it is the
+/// shell that owns the pointer grab being released.
 pub struct BoardRowHandlers {
+    pub on_capture_mouse_down: Rc<dyn Fn(&HostTaskKey, &MouseDownEvent, &mut Window, &mut App)>,
+    pub on_capture_mouse_up: Rc<dyn Fn(&HostTaskKey, &MouseUpEvent, &mut Window, &mut App)>,
     pub on_left_select: Rc<dyn Fn(&HostTaskKey, bool /*shift*/, &mut Window, &mut App)>,
-    pub on_right_click: Rc<dyn Fn(&HostTaskKey, &mut Window, &mut App)>,
     pub on_key_down: Rc<dyn Fn(&HostTaskKey, &KeyDownEvent, &mut Window, &mut App)>,
 }
 
@@ -76,6 +85,18 @@ pub fn board_row_element_id(key: &HostTaskKey) -> ElementId {
     let mut uuid_bytes = [0_u8; 16];
     uuid_bytes.copy_from_slice(&hash[..16]);
     ElementId::Uuid(Uuid::from_bytes(uuid_bytes))
+}
+
+/// One element id per board section. The single definition: the painter puts
+/// it on the element and `native_shell::board_group_element_id` forwards here
+/// for the accessibility tree, so the two cannot name different sections.
+pub fn board_group_element_id(group: BoardGroup) -> &'static str {
+    match group {
+        BoardGroup::NeedsYou => "board-group-needs-you",
+        BoardGroup::Working => "board-group-working",
+        BoardGroup::Idle => "board-group-idle",
+        BoardGroup::Done => "board-group-done",
+    }
 }
 
 /// The state colour and whether it carries a halo. Only the two states that
@@ -242,10 +263,16 @@ pub fn board_row_element(
     };
 
     let tooltip_text = row_tooltip_text(row);
-    let (select_key, menu_key, key_key) = (row.key.clone(), row.key.clone(), row.key.clone());
-    let (on_select, on_menu, on_key) = (
+    let (capture_down_key, capture_up_key, select_key, key_key) = (
+        row.key.clone(),
+        row.key.clone(),
+        row.key.clone(),
+        row.key.clone(),
+    );
+    let (on_capture_down, on_capture_up, on_select, on_key) = (
+        handlers.on_capture_mouse_down.clone(),
+        handlers.on_capture_mouse_up.clone(),
         handlers.on_left_select.clone(),
-        handlers.on_right_click.clone(),
         handlers.on_key_down.clone(),
     );
 
@@ -324,16 +351,20 @@ pub fn board_row_element(
         .tooltip(move |window, app| {
             gpui_component::tooltip::Tooltip::new(tooltip_text.clone()).build(window, app)
         })
+        // Capture first: the shell consumes the buttons that must not fall
+        // through to the terminal dock, and releases the pointer grab it took.
+        // Left is deliberately left to bubble so a nested affordance inside a
+        // row can still receive its own mouse sequence.
+        .capture_any_mouse_down(move |event: &MouseDownEvent, window, app| {
+            (on_capture_down)(&capture_down_key, event, window, app);
+        })
+        .capture_any_mouse_up(move |event: &MouseUpEvent, window, app| {
+            (on_capture_up)(&capture_up_key, event, window, app);
+        })
         .on_mouse_down(
             MouseButton::Left,
             move |event: &MouseDownEvent, window, app| {
                 (on_select)(&select_key, event.modifiers.shift, window, app);
-            },
-        )
-        .on_mouse_down(
-            MouseButton::Right,
-            move |_event: &MouseDownEvent, window, app| {
-                (on_menu)(&menu_key, window, app);
             },
         )
         .on_key_down(move |event: &KeyDownEvent, window, app| {
@@ -458,12 +489,7 @@ fn group_label_element(
     };
     // One id per section: three labels sharing an ElementId would collide in
     // the accessibility tree and in GPUI's own element state.
-    let element_id = match group {
-        BoardGroup::NeedsYou => "board-group-needs-you",
-        BoardGroup::Working => "board-group-working",
-        BoardGroup::Idle => "board-group-idle",
-        BoardGroup::Done => "board-group-done",
-    };
+    let element_id = board_group_element_id(group);
     let mut label = div()
         .id(element_id)
         .flex()
@@ -544,6 +570,11 @@ fn rail_element(model: &BoardModel, tokens: ThemeTokens) -> AnyElement {
     column.into_any_element()
 }
 
+/// `body` replaces the sections under the header when the column has something
+/// other than a task list to show: the shell's empty state when nothing is
+/// live, and the archived browser when that view is open. Both need the header
+/// above them -- it carries the `⋯` menu, which is the only pointer route back
+/// out of the archived view and out of the rail.
 pub fn render_board(
     model: &BoardModel,
     colours: &ProjectColourBook,
@@ -551,6 +582,7 @@ pub fn render_board(
     width_px: f32,
     rail: bool,
     compact: bool,
+    body: Option<AnyElement>,
     row_handlers: BoardRowHandlers,
     header_handlers: BoardHeaderHandlers,
 ) -> AnyElement {
@@ -566,6 +598,9 @@ pub fn render_board(
         .border_r(px(ROW_BORDER_WIDTH))
         .border_color(tokens.borders.subtle.to_gpui())
         .child(header_element(tokens, &header_handlers));
+    if let Some(body) = body {
+        return column.child(body).into_any_element();
+    }
     for group in &model.groups {
         column = column.child(group_label_element(
             group.group,
@@ -623,6 +658,7 @@ mod tests {
             }),
             provider: PrimaryProviderIcon::Claude,
             project_colour: index as u8,
+            project_id: None,
             project_label: "p".into(),
             branch: "main".into(),
             last_activity_ms: 0,
@@ -634,8 +670,9 @@ mod tests {
 
     fn noop_row_handlers() -> BoardRowHandlers {
         BoardRowHandlers {
+            on_capture_mouse_down: Rc::new(|_, _, _, _| {}),
+            on_capture_mouse_up: Rc::new(|_, _, _, _| {}),
             on_left_select: Rc::new(|_, _, _, _| {}),
-            on_right_click: Rc::new(|_, _, _| {}),
             on_key_down: Rc::new(|_, _, _, _| {}),
         }
     }
@@ -671,6 +708,7 @@ mod tests {
                 crate::ui::board::layout::BOARD_COLUMN_WIDTH,
                 false,
                 false,
+                None,
                 noop_row_handlers(),
                 noop_header_handlers(),
             );
@@ -682,6 +720,7 @@ mod tests {
                 150.0,
                 false,
                 true,
+                None,
                 noop_row_handlers(),
                 noop_header_handlers(),
             );
@@ -693,6 +732,28 @@ mod tests {
                 BOARD_RAIL_WIDTH,
                 true,
                 true,
+                None,
+                noop_row_handlers(),
+                noop_header_handlers(),
+            );
+            // A body replaces the sections and keeps the header: the empty
+            // state and the archived browser both arrive this way, and an
+            // empty model is exactly the case the empty state exists for.
+            let empty = build_board_model(Vec::new(), false);
+            assert!(!empty.has_rows());
+            let _ = render_board(
+                &empty,
+                &colours,
+                tokens,
+                crate::ui::board::layout::BOARD_COLUMN_WIDTH,
+                false,
+                false,
+                Some(
+                    div()
+                        .id("board-test-body")
+                        .child("nothing here")
+                        .into_any_element(),
+                ),
                 noop_row_handlers(),
                 noop_header_handlers(),
             );

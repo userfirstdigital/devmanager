@@ -2,6 +2,7 @@
 //! order the board renders (spec 2026-09-03 section 4). No gpui types here.
 
 use crate::client::HostTaskKey;
+use crate::domain::id::ProjectId;
 use crate::domain::task::VisibleTaskStatus;
 use crate::ui::task_cockpit::inbox::PrimaryProviderIcon;
 
@@ -76,6 +77,11 @@ pub struct BoardRow {
     pub provider: PrimaryProviderIcon,
     /// Palette index.
     pub project_colour: u8,
+    /// The row's owning project, when the projection knows one. Carried so a
+    /// consumer that needs the identity -- the accessibility tree, the rename
+    /// gesture -- does not have to re-derive it from the fleet projection or,
+    /// worse, mint a fresh one.
+    pub project_id: Option<ProjectId>,
     /// Shown only in the hover tooltip; the stripe carries the project on the row.
     pub project_label: String,
     /// Shown only in the hover tooltip.
@@ -95,6 +101,16 @@ pub struct BoardGroupModel {
 #[derive(Clone, Debug, PartialEq)]
 pub struct BoardModel {
     pub groups: Vec<BoardGroupModel>,
+}
+
+impl BoardModel {
+    /// Whether the board has any task at all. Distinct from "no groups": Done
+    /// is always present, so an empty board still renders one section, and a
+    /// bare `DONE 0` is not an empty state -- it reads as a list that failed
+    /// to load rather than as a board with nothing on it.
+    pub fn has_rows(&self) -> bool {
+        self.groups.iter().any(|group| !group.rows.is_empty())
+    }
 }
 
 pub fn board_state_of(status: VisibleTaskStatus, done: bool) -> BoardState {
@@ -168,6 +184,7 @@ mod tests {
             progress: None,
             provider: PrimaryProviderIcon::Claude,
             project_colour: 0,
+            project_id: None,
             project_label: "p".into(),
             branch: "main".into(),
             last_activity_ms,
@@ -253,6 +270,22 @@ mod tests {
             .map(|r| r.last_activity_ms)
             .collect();
         assert_eq!(working, vec![300, 100]);
+    }
+
+    #[test]
+    fn an_empty_board_reports_no_rows_even_though_done_always_renders() {
+        let model = build_board_model(Vec::new(), false);
+        assert_eq!(
+            model.groups.len(),
+            1,
+            "Done is always present so its count has a home"
+        );
+        assert!(
+            !model.has_rows(),
+            "a lone empty Done section is not content"
+        );
+        assert!(build_board_model(vec![row(BoardState::Done, 1, 1)], false).has_rows());
+        assert!(build_board_model(vec![row(BoardState::Idle, 1, 1)], false).has_rows());
     }
 
     #[test]
