@@ -129,6 +129,17 @@ pub const HEADER_BUTTON_FONT_SIZE: f32 = 11.5;
 pub const HEADER_BUTTON_PADDING_X: f32 = 8.0;
 pub const HEADER_BUTTON_PADDING_Y: f32 = 2.0;
 pub const HEADER_BUTTON_RADIUS: f32 = 6.0;
+/// The `+ New` button's own text line, its 11.5 px at the mockup's 1.4 ratio
+/// rounded to a whole pixel, and the 1 px box around it.
+pub const HEADER_BUTTON_LINE_HEIGHT: f32 = 16.0;
+pub const HEADER_BUTTON_BORDER: f32 = 1.0;
+/// The board header's whole box: its 9/7 padding around the tallest control in
+/// the row, which is the `+ New` button rather than the 13 px title.
+///
+/// A constant because the board's `...` menu drops from under this header, and
+/// a menu placed off a number only the painter knows drifts the moment the
+/// header changes. Asserted against its parts below.
+pub const HEADER_HEIGHT: f32 = 38.0;
 
 /// `.g { padding: 8px 10px 3px; gap: 6px; font-size: 10.5px }`.
 pub const GROUP_LABEL_PADDING_TOP: f32 = 8.0;
@@ -315,6 +326,29 @@ mod tests {
         assert_eq!(
             TOP_BAR_BRAND_FONT_SIZE, TOP_BAR_SCOPE_FONT_SIZE,
             "the brand inherits the bar's font-size; only its weight differs"
+        );
+    }
+
+    /// The header is border-box like every row, so its padding around its
+    /// tallest control must add up to [`HEADER_HEIGHT`] exactly. The `+ New`
+    /// button is that control, not the title -- a later change that makes the
+    /// title taller fails here rather than silently leaving the board's menu
+    /// hanging over the header it drops from.
+    #[test]
+    fn the_header_height_is_its_padding_around_the_tallest_control() {
+        let button =
+            2.0 * HEADER_BUTTON_BORDER + 2.0 * HEADER_BUTTON_PADDING_Y + HEADER_BUTTON_LINE_HEIGHT;
+        assert_eq!(
+            HEADER_PADDING_TOP + button + HEADER_PADDING_BOTTOM,
+            HEADER_HEIGHT
+        );
+        assert!(
+            button > HEADER_TITLE_FONT_SIZE * LINE_HEIGHT_RATIO,
+            "the + New button sets the header height, not the title"
+        );
+        assert!(
+            (HEADER_BUTTON_LINE_HEIGHT - HEADER_BUTTON_FONT_SIZE * LINE_HEIGHT_RATIO).abs() <= 0.55,
+            "the button's line stays within half a pixel of the mockup ratio"
         );
     }
 

@@ -430,7 +430,10 @@ const T3_WORKSPACE_TOPBAR_HEIGHT: f32 = 32.0;
 /// `ui::board::layout`; these place the panel, nothing more.
 const BOARD_MENU_WIDTH: f32 = 220.0;
 const BOARD_MENU_LEFT_INSET: f32 = 8.0;
-const BOARD_MENU_TOP_INSET: f32 = 30.0;
+/// Every menu in this shell hangs this far under the control it drops from.
+/// One number, so the board menu and the scope menu cannot disagree about what
+/// "just below" means.
+const MENU_DROP_GAP: f32 = 4.0;
 const CONVERSATION_COMPOSER_PLACEHOLDER: &str =
     crate::ui::native_composer::NATIVE_COMPOSER_PLACEHOLDER;
 const COMPOSER_DRAFT_PERSIST_INTERVAL: Duration = Duration::from_millis(250);
@@ -30858,8 +30861,8 @@ impl NativeShell {
                             div()
                                 .id("board-menu")
                                 .absolute()
-                                .left(px(BOARD_MENU_LEFT_INSET))
-                                .top(px(Self::HEADER_HEIGHT + BOARD_MENU_TOP_INSET))
+                                .left(px(Self::board_menu_anchor().1))
+                                .top(px(Self::board_menu_anchor().0))
                                 .w(px(BOARD_MENU_WIDTH))
                                 .flex()
                                 .flex_col()
@@ -39330,13 +39333,30 @@ impl NativeShell {
 
     /// Where the project-scope menu hangs: `(top, left)` in pixels. The menu
     /// drops from the top bar's scope label, so both numbers are the bar's own
-    /// -- its height plus a 4 px gap, and its left padding. A helper rather
-    /// than two literals inside the painter, because the only other way to ask
-    /// where the menu lands is to paint the overlay.
+    /// -- its height plus the shared drop gap, and its left padding. A helper
+    /// rather than two literals inside the painter, because the only other way
+    /// to ask where the menu lands is to paint the overlay.
     fn project_scope_overlay_anchor() -> (f32, f32) {
         (
-            crate::ui::board::layout::TOP_BAR_HEIGHT + 4.0,
+            crate::ui::board::layout::TOP_BAR_HEIGHT + MENU_DROP_GAP,
             crate::ui::board::layout::TOP_BAR_PADDING_X,
+        )
+    }
+
+    /// Where the board's `...` menu hangs: `(top, left)` in pixels.
+    ///
+    /// It drops from the `...` in the board header, so its top is the window
+    /// bar plus the board header plus the same drop gap the scope menu uses --
+    /// all of it the board column's own geometry. It was anchored off
+    /// `HEADER_HEIGHT`, the T3 workspace top bar, which belongs to the other
+    /// column: raising the window bar then moved the trigger and left the menu
+    /// behind.
+    fn board_menu_anchor() -> (f32, f32) {
+        (
+            crate::ui::board::layout::TOP_BAR_HEIGHT
+                + crate::ui::board::layout::HEADER_HEIGHT
+                + MENU_DROP_GAP,
+            BOARD_MENU_LEFT_INSET,
         )
     }
 
@@ -46747,6 +46767,7 @@ pub(crate) mod tests {
         UpdateState,
         UpdaterStage,
         ARCHIVED_ROW_HEIGHT,
+        BOARD_MENU_LEFT_INSET,
         COMPOSER_CARET_BLINK_INTERVAL,
         COMPOSER_CARET_BLINK_TICKS,
         CONTROLLER_IDLE_RECOVERY_INTERVAL,
@@ -46771,6 +46792,7 @@ pub(crate) mod tests {
         MAX_RETAINED_CHILDREN,
         MAX_RETAINED_WORKERS,
         MAX_RETRY_HOST_ACTIONS,
+        MENU_DROP_GAP,
         NATIVE_SNAPSHOT_PAGE_ITEMS,
         NATIVE_STARTUP_BUDGET,
         PROVIDER_SETUP_RESOLUTION_TIMEOUT,
@@ -49620,6 +49642,31 @@ pub(crate) mod tests {
                 "the provider connection has nothing to do with Git on a local owner"
             );
         }
+    }
+
+    /// The board's `...` menu drops from the `...` in the BOARD header, so its
+    /// top is the board column's own geometry: the window bar, the board
+    /// header, and the shared drop gap. It was anchored off the T3 workspace
+    /// top bar instead, which belongs to the other column entirely -- so
+    /// raising the window bar from 28 to 34 moved the trigger and left the menu
+    /// where it was. Pinned to the two layout constants, so the next change to
+    /// either moves the menu with it.
+    #[test]
+    fn the_board_menu_hangs_off_the_board_header_not_the_workspace_bar() {
+        use crate::ui::board::layout::{HEADER_HEIGHT, TOP_BAR_HEIGHT};
+
+        let (top, left) = NativeShell::board_menu_anchor();
+        assert_eq!(top, TOP_BAR_HEIGHT + HEADER_HEIGHT + MENU_DROP_GAP);
+        assert_eq!(left, BOARD_MENU_LEFT_INSET);
+        assert!(
+            top >= TOP_BAR_HEIGHT + HEADER_HEIGHT,
+            "the menu opens below the header it drops from, never over it"
+        );
+        assert_eq!(
+            MENU_DROP_GAP,
+            NativeShell::project_scope_overlay_anchor().0 - TOP_BAR_HEIGHT,
+            "both menus drop by the same gap"
+        );
     }
 
     /// The project-scope menu drops from under the top bar's scope label, so
