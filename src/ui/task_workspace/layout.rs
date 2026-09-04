@@ -74,6 +74,47 @@ impl Default for Allocation {
     }
 }
 
+/// Which view a task pane shows (spec 6.2). `TABS` are the five visible tabs
+/// in order; `MORE` live behind the panel menu. Serialised per pane; an
+/// unknown value fails closed to `Conversation`.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PaneView {
+    #[default]
+    Conversation,
+    Terminal,
+    Files,
+    Changes,
+    Browser,
+    Review,
+    Artifacts,
+    Services,
+}
+
+impl PaneView {
+    pub const TABS: [PaneView; 5] = [
+        PaneView::Conversation,
+        PaneView::Terminal,
+        PaneView::Files,
+        PaneView::Changes,
+        PaneView::Browser,
+    ];
+    pub const MORE: [PaneView; 3] = [PaneView::Review, PaneView::Artifacts, PaneView::Services];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Conversation => "Conversation",
+            Self::Terminal => "Terminal",
+            Self::Files => "Files",
+            Self::Changes => "Changes",
+            Self::Browser => "Browser",
+            Self::Review => "Review",
+            Self::Artifacts => "Artifacts",
+            Self::Services => "Services",
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum PanePresentation {
     Full,
