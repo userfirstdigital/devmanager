@@ -108,25 +108,76 @@ pub fn thumb_geometry(
     })
 }
 
-/// The scroll fraction that puts the thumb's centre under `pointer_y`, given
-/// in gutter-local coordinates. This is the inverse of [`thumb_geometry`] and
-/// is what both click-to-position and drag use, so a drag cannot disagree with
+/// What a pointer is holding while it drags the thumb.
+///
+/// A press on the bare track has nothing to hold, so it centres the thumb on
+/// the pointer; a press INSIDE the thumb holds the exact spot it landed on, so
+/// the thumb does not jump under the hand on the first pixel of the drag.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum ScrollbarGrab {
+    /// Centre the thumb on the pointer.
+    Centre,
+    /// The pointer is holding the thumb this many pixels below its top.
+    Held(f32),
+}
+
+/// The grab a press at `pointer_y` starts, given the thumb it landed on or
+/// missed. Both painters call this, so "grabbed" cannot mean two things.
+///
+/// `thumb_top` and `thumb_height` may be in any one coordinate space as long as
+/// `pointer_y` is in the same one -- the shell passes gutter-local pixels and
+/// the terminal passes window pixels.
+pub fn grab_for_pointer(thumb_top: f32, thumb_height: f32, pointer_y: f32) -> ScrollbarGrab {
+    if pointer_y >= thumb_top && pointer_y <= thumb_top + thumb_height {
+        ScrollbarGrab::Held((pointer_y - thumb_top).clamp(0.0, thumb_height))
+    } else {
+        ScrollbarGrab::Centre
+    }
+}
+
+/// The scroll fraction that keeps `grab` under `pointer_y`, or `None` when the
+/// thumb fills its track and there is nowhere to put it.
+///
+/// This is the one place the drag arithmetic lives. The coordinates are the
+/// caller's own -- gutter-local in the shell, window-space in the terminal --
+/// because every number here is a difference, so only their agreement matters.
+/// `None` rather than a number because the two painters answer a full track
+/// differently and neither should have to guess which convention this function
+/// picked.
+pub fn scroll_fraction_for_grab(
+    track_top: f32,
+    track_height: f32,
+    thumb_height: f32,
+    pointer_y: f32,
+    grab: ScrollbarGrab,
+) -> Option<f32> {
+    let travel = track_height - thumb_height;
+    if travel <= f32::EPSILON {
+        return None;
+    }
+    let grab_offset = match grab {
+        ScrollbarGrab::Centre => thumb_height / 2.0,
+        ScrollbarGrab::Held(offset) => offset.clamp(0.0, thumb_height),
+    };
+    Some((((pointer_y - grab_offset) - track_top) / travel).clamp(0.0, 1.0))
+}
+
+/// The scroll fraction that puts `grab` under `pointer_y`, given in
+/// gutter-local coordinates. This is the inverse of [`thumb_geometry`] and is
+/// what both click-to-position and drag use, so a drag cannot disagree with
 /// the paint about where the thumb belongs.
 pub fn scroll_fraction_for_pointer(
     spec: ScrollbarTokens,
     gutter_height: f32,
     visible_fraction: f32,
     pointer_y: f32,
+    grab: ScrollbarGrab,
 ) -> f32 {
     let Some(thumb) = thumb_geometry(spec, gutter_height, visible_fraction, 0.0, true) else {
         return 0.0;
     };
     let track = track_geometry(spec, gutter_height);
-    let travel = track.height - thumb.height;
-    if travel <= 0.0 {
-        return 0.0;
-    }
-    ((pointer_y - track.top - thumb.height / 2.0) / travel).clamp(0.0, 1.0)
+    scroll_fraction_for_grab(track.top, track.height, thumb.height, pointer_y, grab).unwrap_or(0.0)
 }
 
 /// Whether the gutter should paint anything at all for this content.
@@ -134,13 +185,27 @@ pub fn has_overflow(visible_fraction: f32) -> bool {
     visible_fraction.is_finite() && visible_fraction > 0.0 && visible_fraction < 1.0
 }
 
-#[derive(Debug, Default, Clone, Copy)]
+#[derive(Debug, Clone, Copy)]
 struct ScrollbarInteraction {
     /// Window-space bounds of the gutter, captured during prepaint. Mouse
     /// events arrive in window space and there is no other way to map one back
     /// onto the track.
     gutter: Bounds<Pixels>,
     dragging: bool,
+    /// What the pointer took hold of when the drag started. Recorded once, at
+    /// mouse-down, because it is a property of the grab and not of the pointer:
+    /// re-deriving it on every move would centre the thumb again each frame.
+    grab: ScrollbarGrab,
+}
+
+impl Default for ScrollbarInteraction {
+    fn default() -> Self {
+        Self {
+            gutter: Bounds::default(),
+            dragging: false,
+            grab: ScrollbarGrab::Centre,
+        }
+    }
 }
 
 /// The app's scrollbar. Absolutely positioned over the right edge of whatever
@@ -268,6 +333,7 @@ impl RenderOnce for AppScrollbar {
                             interaction.gutter,
                             event.position,
                             content_height,
+                            interaction.grab,
                         );
                         cx.notify(view);
                     });
@@ -294,9 +360,26 @@ impl RenderOnce for AppScrollbar {
             let handle = self.handle.clone();
             move |event: &MouseDownEvent, _window: &mut Window, cx: &mut App| {
                 let gutter = state.read(cx).gutter;
-                state.update(cx, |interaction, _| interaction.dragging = true);
+                // Where in the thumb the press landed decides the whole drag,
+                // so it is read from the thumb this frame is painting rather
+                // than re-derived later.
+                let local_y: f32 = (event.position.y - gutter.origin.y).into();
+                let grab = match thumb_geometry(
+                    spec,
+                    gutter.size.height.into(),
+                    visible_fraction,
+                    scroll_fraction,
+                    true,
+                ) {
+                    Some(thumb) => grab_for_pointer(thumb.top, thumb.height, local_y),
+                    None => ScrollbarGrab::Centre,
+                };
+                state.update(cx, |interaction, _| {
+                    interaction.dragging = true;
+                    interaction.grab = grab;
+                });
                 handle.start_drag();
-                apply_pointer(&handle, spec, gutter, event.position, content_height);
+                apply_pointer(&handle, spec, gutter, event.position, content_height, grab);
                 cx.notify(view);
             }
         };
@@ -353,13 +436,14 @@ impl RenderOnce for AppScrollbar {
     }
 }
 
-/// Move the handle so the thumb centres on a window-space pointer position.
+/// Move the handle so `grab` lands on a window-space pointer position.
 fn apply_pointer(
     handle: &Rc<dyn ScrollbarHandle>,
     spec: ScrollbarTokens,
     gutter: Bounds<Pixels>,
     position: Point<Pixels>,
     content_height: f32,
+    grab: ScrollbarGrab,
 ) {
     let gutter_height: f32 = gutter.size.height.into();
     let viewport_height = gutter_height;
@@ -368,7 +452,8 @@ fn apply_pointer(
         return;
     }
     let local_y: f32 = (position.y - gutter.origin.y).into();
-    let fraction = scroll_fraction_for_pointer(spec, gutter_height, visible_fraction, local_y);
+    let fraction =
+        scroll_fraction_for_pointer(spec, gutter_height, visible_fraction, local_y, grab);
     let travel = content_height - viewport_height;
     let mut offset = handle.offset();
     offset.y = px(-(fraction * travel));
@@ -444,19 +529,112 @@ mod tests {
             let thumb =
                 thumb_geometry(spec, gutter_height, visible, fraction, true).expect("thumb");
             let centre = thumb.top + thumb.height / 2.0;
-            let recovered = scroll_fraction_for_pointer(spec, gutter_height, visible, centre);
+            let recovered = scroll_fraction_for_pointer(
+                spec,
+                gutter_height,
+                visible,
+                centre,
+                ScrollbarGrab::Centre,
+            );
             assert!(
                 (recovered - fraction).abs() < 1e-4,
                 "pointer at the thumb centre for {fraction} recovered {recovered}"
             );
+
+            // The offset case: a pointer that is holding the thumb 3 px below
+            // its top recovers the same position when it is 3 px below the
+            // thumb's top, NOT when it is at the thumb's centre.
+            let held = ScrollbarGrab::Held(3.0);
+            let recovered =
+                scroll_fraction_for_pointer(spec, gutter_height, visible, thumb.top + 3.0, held);
+            assert!(
+                (recovered - fraction).abs() < 1e-4,
+                "pointer holding 3 px into the thumb for {fraction} recovered {recovered}"
+            );
         }
+    }
+
+    /// I1: grabbing the thumb anywhere but its exact centre used to teleport it
+    /// so its centre sat under the pointer, and everything after that was
+    /// offset by however far off-centre the grab was.
+    #[test]
+    fn a_thumb_grabbed_off_centre_moves_exactly_as_far_as_the_pointer() {
+        let spec = spec();
+        let gutter_height = 500.0;
+        let visible = 0.3;
+        let before = thumb_geometry(spec, gutter_height, visible, 0.4, true).expect("thumb");
+
+        // Press 3 px below the thumb's top, then drag 10 px down.
+        let press_y = before.top + 3.0;
+        let grab = grab_for_pointer(before.top, before.height, press_y);
+        assert_eq!(grab, ScrollbarGrab::Held(3.0));
+
+        let held = scroll_fraction_for_pointer(spec, gutter_height, visible, press_y, grab);
+        let pressed = thumb_geometry(spec, gutter_height, visible, held, true).expect("thumb");
+        assert!(
+            (pressed.top - before.top).abs() < 1e-3,
+            "pressing inside the thumb must not move it: {} -> {}",
+            before.top,
+            pressed.top
+        );
+
+        let dragged =
+            scroll_fraction_for_pointer(spec, gutter_height, visible, press_y + 10.0, grab);
+        let after = thumb_geometry(spec, gutter_height, visible, dragged, true).expect("thumb");
+        assert!(
+            (after.top - before.top - 10.0).abs() < 1e-3,
+            "a 10 px drag must move the thumb 10 px: {} -> {}",
+            before.top,
+            after.top
+        );
+    }
+
+    /// A press on the bare track has nothing to hold, so it keeps the
+    /// centre-on-pointer behaviour -- which is also what every other scrollbar
+    /// does for a track click.
+    #[test]
+    fn a_press_outside_the_thumb_still_centres_it_on_the_pointer() {
+        let spec = spec();
+        let thumb = thumb_geometry(spec, 500.0, 0.3, 0.1, true).expect("thumb");
+        let below = thumb.top + thumb.height + 40.0;
+        assert_eq!(
+            grab_for_pointer(thumb.top, thumb.height, below),
+            ScrollbarGrab::Centre
+        );
+        let fraction = scroll_fraction_for_pointer(spec, 500.0, 0.3, below, ScrollbarGrab::Centre);
+        let after = thumb_geometry(spec, 500.0, 0.3, fraction, true).expect("thumb");
+        assert!(
+            (after.top + after.height / 2.0 - below).abs() < 1e-3,
+            "a track click centres the thumb on the pointer"
+        );
+    }
+
+    /// The shared drag arithmetic answers `None` for a track the thumb fills,
+    /// so each painter keeps its own convention for that case rather than
+    /// inheriting a number this function chose.
+    #[test]
+    fn a_full_track_has_no_drag_fraction_to_report() {
+        assert_eq!(
+            scroll_fraction_for_grab(2.0, 100.0, 100.0, 50.0, ScrollbarGrab::Centre),
+            None
+        );
+        assert_eq!(
+            scroll_fraction_for_grab(2.0, 100.0, 50.0, 27.0, ScrollbarGrab::Held(0.0)),
+            Some(0.5)
+        );
     }
 
     #[test]
     fn pointer_mapping_saturates_rather_than_running_off_the_ends() {
         let spec = spec();
-        assert_eq!(scroll_fraction_for_pointer(spec, 500.0, 0.3, -400.0), 0.0);
-        assert_eq!(scroll_fraction_for_pointer(spec, 500.0, 0.3, 9000.0), 1.0);
+        assert_eq!(
+            scroll_fraction_for_pointer(spec, 500.0, 0.3, -400.0, ScrollbarGrab::Centre),
+            0.0
+        );
+        assert_eq!(
+            scroll_fraction_for_pointer(spec, 500.0, 0.3, 9000.0, ScrollbarGrab::Centre),
+            1.0
+        );
     }
 
     /// Sabotage guard: the geometry must be a function of the tokens, not of

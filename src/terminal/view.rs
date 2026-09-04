@@ -8,7 +8,7 @@ use crate::terminal::session::{
     TerminalCellSnapshot, TerminalCursorSnapshot, TerminalIndexedCellSnapshot, TerminalSessionView,
 };
 use crate::theme;
-use crate::ui::scrollbar::{thumb_geometry, track_geometry};
+use crate::ui::scrollbar::{thumb_geometry, track_geometry, ScrollbarThumb, ScrollbarTrack};
 use crate::ui::tokens::{ScrollbarTokens, ThemeTokens};
 use alacritty_terminal::vte::ansi::CursorShape;
 use gpui::{
@@ -1198,6 +1198,30 @@ fn render_search_bar(
         )
 }
 
+/// What the terminal's gutter paints for one model at one gutter height.
+///
+/// Extracted from the `canvas` closure below so a test can walk the TERMINAL'S
+/// OWN paint path rather than re-deriving what it believes the painter does.
+/// The painter therefore has no arithmetic of its own left: it turns this into
+/// quads and nothing else, and the minimum thumb length is the shared
+/// `thumb_geometry` rule -- there is no second clamp here.
+pub fn terminal_scrollbar_paint(
+    spec: ScrollbarTokens,
+    gutter_height: f32,
+    scrollbar: TerminalScrollbarModel,
+) -> Option<(Option<ScrollbarTrack>, ScrollbarThumb)> {
+    let active = scrollbar.hovered;
+    let thumb = thumb_geometry(
+        spec,
+        gutter_height,
+        scrollbar.thumb_height_ratio,
+        scrollbar.thumb_top_ratio,
+        active,
+    )?;
+    let track = active.then(|| track_geometry(spec, gutter_height));
+    Some((track, thumb))
+}
+
 /// The terminal gutter, painted from the same spec and the same geometry
 /// functions as every other scrollbar in the app.
 ///
@@ -1218,32 +1242,24 @@ fn render_scrollbar(
             let (scrollbar, actions) = state;
             let gutter_height: f32 = bounds.size.height.into();
             let active = scrollbar.hovered;
-            let visible_fraction = scrollbar.thumb_height_ratio.clamp(0.08, 1.0);
 
-            if active {
-                let track = track_geometry(spec, gutter_height);
-                window.paint_quad(
-                    fill(
-                        Bounds::new(
-                            point(
-                                bounds.origin.x + px(track.left),
-                                bounds.origin.y + px(track.top),
+            if let Some((track, thumb)) = terminal_scrollbar_paint(spec, gutter_height, scrollbar) {
+                if let Some(track) = track {
+                    window.paint_quad(
+                        fill(
+                            Bounds::new(
+                                point(
+                                    bounds.origin.x + px(track.left),
+                                    bounds.origin.y + px(track.top),
+                                ),
+                                size(px(track.width), px(track.height)),
                             ),
-                            size(px(track.width), px(track.height)),
-                        ),
-                        rgb(palette.scrollbar_track),
-                    )
-                    .corner_radii(px(track.radius)),
-                );
-            }
+                            rgb(palette.scrollbar_track),
+                        )
+                        .corner_radii(px(track.radius)),
+                    );
+                }
 
-            if let Some(thumb) = thumb_geometry(
-                spec,
-                gutter_height,
-                visible_fraction,
-                scrollbar.thumb_top_ratio,
-                active,
-            ) {
                 window.paint_quad(
                     fill(
                         Bounds::new(
@@ -3461,19 +3477,72 @@ mod selection_helper_tests {
         for gutter_height in [120.0_f32, 480.0, 1440.0] {
             for visible in [0.02_f32, 0.25, 0.75] {
                 for position in [0.0_f32, 0.5, 1.0] {
-                    let idle = thumb_geometry(spec, gutter_height, visible, position, false)
-                        .expect("idle thumb");
-                    let hovered = thumb_geometry(spec, gutter_height, visible, position, true)
-                        .expect("hover thumb");
+                    // Through the terminal's OWN paint path, not a re-derivation
+                    // of what it is believed to do: `render_scrollbar` turns
+                    // exactly this into quads.
+                    let (idle_track, idle) = crate::terminal::view::terminal_scrollbar_paint(
+                        spec,
+                        gutter_height,
+                        crate::terminal::view::TerminalScrollbarModel {
+                            thumb_top_ratio: position,
+                            thumb_height_ratio: visible,
+                            hovered: false,
+                        },
+                    )
+                    .expect("idle thumb");
+                    let (hover_track, hovered) = crate::terminal::view::terminal_scrollbar_paint(
+                        spec,
+                        gutter_height,
+                        crate::terminal::view::TerminalScrollbarModel {
+                            thumb_top_ratio: position,
+                            thumb_height_ratio: visible,
+                            hovered: true,
+                        },
+                    )
+                    .expect("hover thumb");
                     assert_eq!(idle.width, 4.0);
                     assert_eq!(hovered.width, 10.0);
+                    // The one min-thumb rule: `min_thumb_length` from the
+                    // tokens, applied by the shared geometry. The terminal used
+                    // to clamp the RATIO to 0.08 first, which is a second rule
+                    // and a different answer -- 0.08 of a 1440 px gutter is
+                    // 115 px, nearly five times the spec's minimum.
+                    assert_eq!(idle.height, hovered.height);
                     assert!(idle.height >= spec.min_thumb_length);
+                    assert_eq!(
+                        idle,
+                        thumb_geometry(spec, gutter_height, visible, position, false)
+                            .expect("shared idle thumb"),
+                        "the terminal's paint path is the shared geometry, unmodified"
+                    );
+                    // Idle paints the thumb alone; the groove appears with the
+                    // pointer.
+                    assert!(idle_track.is_none());
+                    assert_eq!(
+                        hover_track,
+                        Some(track_geometry(spec, gutter_height)),
+                        "the hovered groove is the shared track"
+                    );
                     let track = track_geometry(spec, gutter_height);
                     assert!(idle.top >= track.top);
                     assert!(idle.top + idle.height <= track.top + track.height + 1e-3);
                 }
             }
         }
+
+        // A tall gutter with a shallow scrollback is where the old ratio clamp
+        // and the shared minimum disagreed most, so it is asserted by number.
+        let (_, thumb) = crate::terminal::view::terminal_scrollbar_paint(
+            spec,
+            1440.0,
+            crate::terminal::view::TerminalScrollbarModel {
+                thumb_top_ratio: 0.0,
+                thumb_height_ratio: 0.002,
+                hovered: false,
+            },
+        )
+        .expect("thumb");
+        assert_eq!(thumb.height, spec.min_thumb_length);
     }
 
     /// Sabotage: change the token and both the shell geometry and the terminal

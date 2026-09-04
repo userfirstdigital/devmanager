@@ -556,7 +556,7 @@ struct TerminalScrollbarGeometry {
 
 #[derive(Debug, Clone, Copy)]
 struct TerminalScrollbarDrag {
-    grab_offset_px: f32,
+    grab: crate::ui::scrollbar::ScrollbarGrab,
     thumb_top_ratio: f32,
     last_display_offset: usize,
 }
@@ -12300,7 +12300,10 @@ impl NativeShell {
         let top = layout.top - 2.0;
         let width = spec.gutter_width;
         let height = layout.available_height + 4.0;
-        let visible_fraction = (visible_lines as f32 / total_lines as f32).clamp(0.08, 1.0);
+        // No local minimum: the one min-thumb rule is `min_thumb_length` inside
+        // `thumb_geometry`, so a second clamp here would be a second rule that
+        // the paint path does not share.
+        let visible_fraction = visible_lines as f32 / total_lines as f32;
         let scroll_fraction =
             scrollbar_thumb_top_ratio(session.screen.display_offset, max_offset).clamp(0.0, 1.0);
         let track = crate::ui::scrollbar::track_geometry(spec, height);
@@ -12342,15 +12345,6 @@ impl NativeShell {
             && y <= geometry.top + geometry.height
     }
 
-    fn scrollbar_thumb_contains(
-        &self,
-        position: Point<Pixels>,
-        geometry: TerminalScrollbarGeometry,
-    ) -> bool {
-        let y: f32 = position.y.into();
-        y >= geometry.thumb_top && y <= geometry.thumb_top + geometry.thumb_height
-    }
-
     fn scroll_terminal_from_scrollbar(
         &mut self,
         position: Point<Pixels>,
@@ -12361,7 +12355,7 @@ impl NativeShell {
             return;
         };
 
-        let thumb_top_ratio = scrollbar_ratio_for_position(position, geometry, drag.grab_offset_px);
+        let thumb_top_ratio = scrollbar_ratio_for_position(position, geometry, drag.grab);
         let display_offset =
             display_offset_for_scrollbar_ratio(thumb_top_ratio, geometry.max_offset);
         let ratio_changed = (drag.thumb_top_ratio - thumb_top_ratio).abs() > 0.0001;
@@ -14341,15 +14335,16 @@ impl NativeShell {
                 if self.scrollbar_hit_test(event.position, geometry) {
                     self.terminal_selection = None;
                     self.is_selecting_terminal = false;
-                    let grab_offset_px = if self.scrollbar_thumb_contains(event.position, geometry)
-                    {
-                        let y: f32 = event.position.y.into();
-                        (y - geometry.thumb_top).clamp(0.0, geometry.thumb_height)
-                    } else {
-                        geometry.thumb_height / 2.0
-                    };
+                    // Same rule as every other scrollbar in the app: inside the
+                    // thumb the pointer keeps its hold, outside it the thumb
+                    // centres on the pointer.
+                    let grab = crate::ui::scrollbar::grab_for_pointer(
+                        geometry.thumb_top,
+                        geometry.thumb_height,
+                        event.position.y.into(),
+                    );
                     self.terminal_scrollbar_drag = Some(TerminalScrollbarDrag {
-                        grab_offset_px,
+                        grab,
                         thumb_top_ratio: scrollbar_thumb_top_ratio(
                             session.screen.display_offset,
                             geometry.max_offset,
@@ -19533,20 +19528,23 @@ fn scrollbar_model_for_screen(
     })
 }
 
+/// The drag arithmetic is `crate::ui::scrollbar`'s, in window coordinates.
+/// A track the thumb fills has no position to report, and for a terminal that
+/// means the live bottom -- the convention the rest of this module's ratios
+/// use, which is why the fallback is here rather than in the shared function.
 fn scrollbar_ratio_for_position(
     position: Point<Pixels>,
     geometry: TerminalScrollbarGeometry,
-    grab_offset_px: f32,
+    grab: crate::ui::scrollbar::ScrollbarGrab,
 ) -> f32 {
-    let thumb_range = (geometry.track_height - geometry.thumb_height).max(0.0);
-    let position_y: f32 = position.y.into();
-    let unclamped_thumb_top = position_y - geometry.track_top - grab_offset_px;
-
-    if thumb_range <= f32::EPSILON {
-        1.0
-    } else {
-        (unclamped_thumb_top / thumb_range).clamp(0.0, 1.0)
-    }
+    crate::ui::scrollbar::scroll_fraction_for_grab(
+        geometry.track_top,
+        geometry.track_height,
+        geometry.thumb_height,
+        position.y.into(),
+        grab,
+    )
+    .unwrap_or(1.0)
 }
 
 fn display_offset_for_scrollbar_ratio(thumb_top_ratio: f32, max_offset: usize) -> usize {
@@ -21508,8 +21506,62 @@ mod tests {
             max_offset: 120,
         };
 
-        let ratio = scrollbar_ratio_for_position(point(px(5.0), px(44.0)), geometry, 10.0);
+        let ratio = scrollbar_ratio_for_position(
+            point(px(5.0), px(44.0)),
+            geometry,
+            crate::ui::scrollbar::ScrollbarGrab::Held(10.0),
+        );
         assert!((ratio - 0.4).abs() < 0.001);
+
+        // A track click has no hold, so the thumb centres on the pointer: the
+        // same pointer, minus half a 20 px thumb, is 24 px into a 60 px travel.
+        let centred = scrollbar_ratio_for_position(
+            point(px(5.0), px(44.0)),
+            geometry,
+            crate::ui::scrollbar::ScrollbarGrab::Centre,
+        );
+        assert!((centred - 0.4).abs() < 0.001, "centred was {centred}");
+    }
+
+    /// I1 at the terminal: a thumb grabbed 3 px below its top and dragged 10 px
+    /// must move exactly 10 px, not jump so its centre lands on the pointer.
+    #[test]
+    fn dragging_the_terminal_thumb_keeps_the_grab_offset() {
+        let geometry = TerminalScrollbarGeometry {
+            left: 0.0,
+            top: 0.0,
+            width: 10.0,
+            height: 100.0,
+            track_top: 10.0,
+            track_height: 80.0,
+            thumb_top: 34.0,
+            thumb_height: 20.0,
+            max_offset: 120,
+        };
+        let travel = geometry.track_height - geometry.thumb_height;
+
+        let press_y = geometry.thumb_top + 3.0;
+        let grab = crate::ui::scrollbar::grab_for_pointer(
+            geometry.thumb_top,
+            geometry.thumb_height,
+            press_y,
+        );
+        assert_eq!(grab, crate::ui::scrollbar::ScrollbarGrab::Held(3.0));
+
+        let pressed = scrollbar_ratio_for_position(point(px(5.0), px(press_y)), geometry, grab);
+        let pressed_top = geometry.track_top + pressed * travel;
+        assert!(
+            (pressed_top - geometry.thumb_top).abs() < 0.001,
+            "pressing inside the thumb must not move it: {pressed_top}"
+        );
+
+        let dragged =
+            scrollbar_ratio_for_position(point(px(5.0), px(press_y + 10.0)), geometry, grab);
+        let dragged_top = geometry.track_top + dragged * travel;
+        assert!(
+            (dragged_top - geometry.thumb_top - 10.0).abs() < 0.001,
+            "a 10 px drag must move the thumb 10 px: {dragged_top}"
+        );
     }
 
     fn snapshot_cell(character: char) -> TerminalCellSnapshot {
