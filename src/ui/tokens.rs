@@ -2732,8 +2732,9 @@ mod tests {
                 }
             }
         }
-        // The denominator, printed as a fact rather than assumed: ten shipped
-        // palettes reach five grounds each, over three density/scale pairs.
+        // The denominator, asserted rather than assumed: seven built-in themes
+        // in two appearances is fourteen palettes, five grounds each, over
+        // three density/scale pairs -- 14 * 5 * 3.
         assert_eq!(
             grounds_measured, 210,
             "the sweep measured {grounds_measured} palette/ground pairs, not the 210 it should"
