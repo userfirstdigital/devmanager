@@ -849,10 +849,12 @@ mod tests {
         // H[ A=V[p, p2], B=V[q, q2, q3] ] at 800x300, and A's panes are the
         // OLDEST, so they are measured first. A is 324 and B is 488, so B
         // governs the height: `p` and `p2` are both skipped, then `q` (488 ->
-        // 352) and `q2` (352 -> 324) are accepted. At that point B is 224 and
-        // A's 324 is the maximum, so `p` -- already skipped -- is the only
-        // candidate left that can help. Without re-trying it the pass stops at
-        // 324 against a 300 px viewport; re-trying it reaches 224 and fits.
+        // 356) is accepted, which clears the skip list; `p` and `p2` are
+        // skipped again (A's 324 is still under B's 356), then `q2` (356 ->
+        // 324) is accepted. At that point B is 224 and A's 324 is the maximum,
+        // so `p` -- skipped twice -- is the only candidate left that can help.
+        // Without re-trying it the pass stops at 324 against a 300 px
+        // viewport; re-trying it reaches 224 and fits.
         let allocated =
             workspace.allocate(Viewport::new(800.0, 300.0), AllocationMetrics::production());
 
