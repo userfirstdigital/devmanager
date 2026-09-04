@@ -2515,10 +2515,141 @@ mod tests {
         ]
     }
 
+    /// Every shipped palette, in both appearances, as the app ACTUALLY projects
+    /// it -- which is not what the token module says.
+    ///
+    /// `ThemePalette::tokens` overwrites `scrollbar.on_dark.thumb_idle` and
+    /// `thumb_hover` from the `TerminalScrollbar` / `TerminalScrollbarHover`
+    /// roles, whose managed fallback is a mix of the palette's own terminal
+    /// background and foreground. So a gate that measures `dark(..)` and
+    /// `light(..)` measures three token triples that no user with a theme
+    /// selected is looking at. This is the same enumeration the tokens lane's
+    /// projected gates use (`tests/ui_tokens.rs`): the built-in library, each
+    /// definition's palette per appearance, projected.
+    fn shipped_palette_projections() -> Vec<(String, ThemeTokens)> {
+        use crate::ui::theme_system::{ThemeAppearance, ThemeLibrary};
+
+        let library = ThemeLibrary::built_in();
+        let mut projections = Vec::new();
+        for definition in library.themes() {
+            for appearance in [ThemeAppearance::Dark, ThemeAppearance::Light] {
+                let Some(palette) = definition.palette(appearance) else {
+                    continue;
+                };
+                for (density, scale) in [
+                    (Density::Comfortable, Scale::Scale100),
+                    (Density::Compact, Scale::Scale200),
+                    (Density::Comfortable, Scale::Scale125),
+                ] {
+                    projections.push((
+                        format!("{}/{appearance:?}", definition.id),
+                        palette.tokens(density, scale),
+                    ));
+                }
+            }
+        }
+        // The denominator, asserted rather than assumed: a library that stopped
+        // yielding palettes would make every assertion below vacuously true.
+        assert!(
+            projections.len() >= 12,
+            "only {} palette projections enumerated -- the library is not answering",
+            projections.len()
+        );
+        projections
+    }
+
+    /// The forty-eight (palette, ground, state) rows the SHIPPED palettes fail
+    /// today, measured on this branch by the sweep below.
+    ///
+    /// Six built-in dark palettes -- `ember`, `grove`, `iris`, `ocean`, `t3-chat`
+    /// and `t3-code` -- overwrite the scrollbar's two thumb colours from their own
+    /// `TerminalScrollbar` / `TerminalScrollbarHover` roles, whose managed fallback
+    /// is `terminal_background.mix(terminal_foreground, 0.2)` (and `0.34` for
+    /// hover). A twenty-percent mix toward the foreground is not a contrast rule,
+    /// so on a dark palette it lands wherever it lands: `t3-chat` idles at
+    /// 1.047:1 on its own raised surface, which is an invisible scrollbar.
+    ///
+    /// This is a pin, not a waiver, and it is not the scrollbar spec's defect:
+    /// `devmanager-classic`, the default, clears both floors on every ground in
+    /// both appearances, and so does every palette's LIGHT half. The fix is a
+    /// contrast rule in `ThemePalette::tokens`' fallback, which belongs to the
+    /// tokens owner -- ledgered in
+    /// `.superpowers/sdd/2026-09-03-ui-redesign-2-panel-chrome-and-needs-you/lane-5-report.md`.
+    /// Repairing it fails this test as loudly as a regression would.
+    ///
+    /// `(theme/appearance, ground, state, ratio)`. The ratio is the value measured
+    /// on this branch and is enforced as a floor, so a pinned defect cannot quietly
+    /// absorb a further regression in the same row.
+    type ScrollbarDrift = (&'static str, &'static str, &'static str, f64);
+
+    const SHIPPED_PALETTE_SCROLLBAR_DRIFT: &[ScrollbarDrift] = &[
+        ("ember/Dark", "surfaces.canvas", "hover", 5.679),
+        ("ember/Dark", "surfaces.overlay", "idle", 2.221),
+        ("ember/Dark", "surfaces.overlay", "hover", 3.247),
+        ("ember/Dark", "surfaces.raised", "idle", 2.710),
+        ("ember/Dark", "surfaces.raised", "hover", 3.963),
+        ("ember/Dark", "surfaces.sunken", "hover", 4.801),
+        ("ember/Dark", "terminal.background", "hover", 5.679),
+        ("grove/Dark", "surfaces.canvas", "hover", 5.464),
+        ("grove/Dark", "surfaces.overlay", "idle", 2.176),
+        ("grove/Dark", "surfaces.overlay", "hover", 3.119),
+        ("grove/Dark", "surfaces.raised", "idle", 2.644),
+        ("grove/Dark", "surfaces.raised", "hover", 3.790),
+        ("grove/Dark", "surfaces.sunken", "hover", 4.625),
+        ("grove/Dark", "terminal.background", "hover", 5.464),
+        ("iris/Dark", "surfaces.canvas", "hover", 5.848),
+        ("iris/Dark", "surfaces.overlay", "idle", 2.268),
+        ("iris/Dark", "surfaces.overlay", "hover", 3.330),
+        ("iris/Dark", "surfaces.raised", "idle", 2.799),
+        ("iris/Dark", "surfaces.raised", "hover", 4.111),
+        ("iris/Dark", "surfaces.sunken", "hover", 4.961),
+        ("iris/Dark", "terminal.background", "hover", 5.848),
+        ("ocean/Dark", "surfaces.canvas", "hover", 5.675),
+        ("ocean/Dark", "surfaces.overlay", "idle", 2.215),
+        ("ocean/Dark", "surfaces.overlay", "hover", 3.222),
+        ("ocean/Dark", "surfaces.raised", "idle", 2.715),
+        ("ocean/Dark", "surfaces.raised", "hover", 3.949),
+        ("ocean/Dark", "surfaces.sunken", "hover", 4.792),
+        ("ocean/Dark", "terminal.background", "hover", 5.675),
+        ("t3-chat/Dark", "surfaces.canvas", "idle", 1.108),
+        ("t3-chat/Dark", "surfaces.canvas", "hover", 1.561),
+        ("t3-chat/Dark", "surfaces.overlay", "idle", 1.273),
+        ("t3-chat/Dark", "surfaces.overlay", "hover", 1.794),
+        ("t3-chat/Dark", "surfaces.raised", "idle", 1.047),
+        ("t3-chat/Dark", "surfaces.raised", "hover", 1.346),
+        ("t3-chat/Dark", "surfaces.sunken", "idle", 1.108),
+        ("t3-chat/Dark", "surfaces.sunken", "hover", 1.561),
+        ("t3-chat/Dark", "terminal.background", "idle", 1.108),
+        ("t3-chat/Dark", "terminal.background", "hover", 1.561),
+        ("t3-code/Dark", "surfaces.canvas", "idle", 1.849),
+        ("t3-code/Dark", "surfaces.canvas", "hover", 3.053),
+        ("t3-code/Dark", "surfaces.overlay", "idle", 1.145),
+        ("t3-code/Dark", "surfaces.overlay", "hover", 1.890),
+        ("t3-code/Dark", "surfaces.raised", "idle", 1.386),
+        ("t3-code/Dark", "surfaces.raised", "hover", 2.289),
+        ("t3-code/Dark", "surfaces.sunken", "idle", 1.855),
+        ("t3-code/Dark", "surfaces.sunken", "hover", 3.062),
+        ("t3-code/Dark", "terminal.background", "idle", 1.855),
+        ("t3-code/Dark", "terminal.background", "hover", 3.062),
+    ];
+
+    /// A pinned ratio may not get worse by more than this. Ratios are pinned to
+    /// three decimals, so the tolerance only absorbs that rounding. Same value the
+    /// tokens lane's projected gates use.
+    const SCROLLBAR_PINNED_RATIO_TOLERANCE: f64 = 0.005;
+
     /// A 4 px bar is a non-text UI component, so the floor is WCAG 1.4.11's
     /// 3:1 rather than 4.5:1 -- but it has to clear it against every surface a
     /// scrollbar can sit on, in every mode, not just the one that was looked
     /// at while picking the colour.
+    ///
+    /// Two sweeps, because the app renders two different things. The token
+    /// module's own three modes are held HARD: that is the spec this lane
+    /// wrote, and nothing may loosen it. Then every SHIPPED palette, projected
+    /// the way the app actually renders it -- which overwrites the two thumb
+    /// colours from palette roles, so the first sweep cannot see it at all.
+    /// The default palette passes that sweep hard as well; six dark palettes do
+    /// not, and are held to exactly their measured drift.
     #[test]
     fn scrollbar_thumbs_clear_the_non_text_contrast_floor() {
         let density = Density::Comfortable;
@@ -2552,6 +2683,90 @@ mod tests {
                     "{mode:?} track and thumb must not be the same colour on {name}"
                 );
             }
+        }
+
+        // Second sweep: the projections a user with a theme selected is
+        // actually looking at.
+        let expected = SHIPPED_PALETTE_SCROLLBAR_DRIFT
+            .iter()
+            .map(|(label, ground, state, _)| (*label, *ground, *state))
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(
+            expected.len(),
+            SHIPPED_PALETTE_SCROLLBAR_DRIFT.len(),
+            "the pinned list repeats a row, so one of its ratios is never checked"
+        );
+
+        let mut measured = std::collections::BTreeMap::new();
+        let mut grounds_measured = 0usize;
+        for (label, tokens) in shipped_palette_projections() {
+            for (name, background) in scrollbar_backgrounds(tokens) {
+                grounds_measured += 1;
+                let colors = tokens.scrollbar.colors_on(background);
+                let idle = contrast_ratio(colors.thumb_idle, background);
+                let hover = contrast_ratio(colors.thumb_hover, background);
+                // These two hold for every shipped palette today and are NOT
+                // pinned: a thumb that reads louder idle than hovered, or a
+                // track the colour of its own thumb, is a broken bar rather
+                // than a dim one.
+                assert!(
+                    hover > idle,
+                    "{label}: hover scrollbar thumb must read louder than idle on {name}"
+                );
+                assert_ne!(
+                    colors.track_active, colors.thumb_idle,
+                    "{label}: track and thumb must not be the same colour on {name}"
+                );
+
+                let is_default = label.starts_with("devmanager-classic");
+                if idle < 3.0 {
+                    assert!(
+                        !is_default,
+                        "the DEFAULT palette's idle scrollbar thumb is {idle:.3}:1 on {name}                          ({label}), under the 3:1 floor -- this one may not be pinned"
+                    );
+                    measured.insert((label.clone(), name, "idle"), idle);
+                }
+                if hover < 6.0 {
+                    assert!(
+                        !is_default,
+                        "the DEFAULT palette's hover scrollbar thumb is {hover:.3}:1 on {name}                          ({label}), under the 6:1 floor -- this one may not be pinned"
+                    );
+                    measured.insert((label.clone(), name, "hover"), hover);
+                }
+            }
+        }
+        // The denominator, printed as a fact rather than assumed: ten shipped
+        // palettes reach five grounds each, over three density/scale pairs.
+        assert_eq!(
+            grounds_measured, 210,
+            "the sweep measured {grounds_measured} palette/ground pairs, not the 210 it should"
+        );
+
+        let measured_rows = measured
+            .keys()
+            .map(|(label, ground, state)| (label.as_str(), *ground, *state))
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(
+            measured_rows,
+            expected,
+            "the shipped-palette scrollbar drift changed -- a repair must shrink the pinned list,              a regression must not be absorbed by it"
+        );
+
+        for (label, ground, state, pinned) in SHIPPED_PALETTE_SCROLLBAR_DRIFT {
+            let live = measured
+                .iter()
+                .find(|((measured_label, measured_ground, measured_state), _)| {
+                    measured_label == label && measured_ground == ground && measured_state == state
+                })
+                .map(|(_, ratio)| *ratio)
+                .unwrap_or_else(|| {
+                    panic!("{label} {ground} {state} missing from the measured set")
+                });
+            assert!(
+                live >= *pinned - SCROLLBAR_PINNED_RATIO_TOLERANCE,
+                "{label} {ground} {state} fell from {pinned:.3}:1 to {live:.3}:1 -- a pinned \
+                 defect got worse"
+            );
         }
     }
 
