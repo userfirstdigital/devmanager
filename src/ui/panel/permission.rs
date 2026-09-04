@@ -300,7 +300,12 @@ pub fn permission_dock_element(
                 .font(font(COMMAND_FONT))
                 .text_size(px(COMMAND_FONT_SIZE))
                 .line_height(px(COMMAND_LINE_HEIGHT))
+                // `.cmdl` is one line in the mockup: a long command or a deep
+                // path is truncated rather than reflowed, so the dock's height
+                // never depends on what is being asked about.
                 .overflow_hidden()
+                .whitespace_nowrap()
+                .text_ellipsis()
                 .child(summary.to_string()),
         )
         .child(buttons)

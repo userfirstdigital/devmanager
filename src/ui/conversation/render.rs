@@ -30,7 +30,7 @@ use crate::ui::panel::permission::{
     FOOTER_FONT_SIZE, FOOTER_GAP, FOOTER_MARGIN_TOP, PROMPT_MARGIN_BOTTOM,
 };
 use crate::ui::renderers::{MarkdownDocument, MessageRole};
-use crate::ui::tokens::{mix_color, ThemeMode, ThemeTokens};
+use crate::ui::tokens::{mix_color, Color, ThemeMode, ThemeTokens};
 
 /// Production assistant markdown backend.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -937,7 +937,39 @@ const RECOMMENDED_NOTE: &str = "recommended";
 pub fn recommended_choice(choices: &[String]) -> Option<usize> {
     choices
         .iter()
-        .position(|choice| choice.to_ascii_lowercase().contains(RECOMMENDED_MARKER))
+        .position(|choice| recommendation_marker(choice).is_some())
+}
+
+/// Where this choice's recommendation marker starts, when the marker is
+/// actually a recommendation. "(not recommended)" and "never recommended" say
+/// the opposite, so a match whose preceding word negates it is not one -- and
+/// the negated row must keep its warning in the label as well as losing the
+/// full-strength rule, which is why both callers ask this one function.
+fn recommendation_marker(choice: &str) -> Option<usize> {
+    let lowered = choice.to_ascii_lowercase();
+    let start = lowered.find(RECOMMENDED_MARKER)?;
+    let not_a_word = |character: char| !character.is_ascii_alphanumeric();
+    let preceding_word = lowered[..start]
+        .trim_end_matches(not_a_word)
+        .rsplit(not_a_word)
+        .next()
+        .unwrap_or_default();
+    if matches!(preceding_word, "not" | "never") {
+        return None;
+    }
+    Some(start)
+}
+
+/// The rule one choice row draws. The recommended row is the only one at full
+/// strength; every other row -- including a row whose text says "(not
+/// recommended)" -- keeps the same hue at [`CHOICE_BORDER_ALPHA`]. A function
+/// rather than an inline branch so the card and its test read the same rule.
+fn choice_border(is_recommended: bool, tokens: ThemeTokens) -> Color {
+    if is_recommended {
+        tokens.status.attention
+    } else {
+        tokens.status.attention.with_alpha(CHOICE_BORDER_ALPHA)
+    }
 }
 
 /// The choice text with its recommendation marker lifted out, so the label
@@ -945,8 +977,7 @@ pub fn recommended_choice(choices: &[String]) -> Option<usize> {
 /// right -- which is how the mockup shows it. A parenthesised marker takes its
 /// brackets with it.
 fn choice_label(choice: &str) -> String {
-    let lowered = choice.to_ascii_lowercase();
-    let Some(start) = lowered.find(RECOMMENDED_MARKER) else {
+    let Some(start) = recommendation_marker(choice) else {
         return choice.trim().to_string();
     };
     // `to_ascii_lowercase` is length-preserving, so these byte offsets are the
@@ -1007,14 +1038,7 @@ fn question_element(
     for (index, choice) in choices.iter().enumerate() {
         let settled = settled_choice == Some(index);
         let is_recommended = recommended == Some(index);
-        // The recommended row is the only one whose rule is the amber at full
-        // strength; the rest keep the same hue at a fraction, so exactly one
-        // row reads as the default without the others reading as disabled.
-        let border = if is_recommended {
-            tokens.status.attention
-        } else {
-            tokens.status.attention.with_alpha(CHOICE_BORDER_ALPHA)
-        };
+        let border = choice_border(is_recommended, tokens);
         // Once a question is settled it is history: the answer stays filled and
         // legible, and the choices nobody took go quiet, so the card reads as
         // answered rather than as still asking.
@@ -1226,6 +1250,47 @@ mod tests {
         );
         // The marker is lifted wherever it sits, brackets and all.
         assert_eq!(choice_label("(recommended) Run now"), "Run now");
+    }
+
+    #[test]
+    fn a_negated_recommendation_is_not_a_recommendation() {
+        let tokens = crate::ui::tokens::dark(
+            crate::ui::tokens::Density::Comfortable,
+            crate::ui::tokens::Scale::Scale100,
+        );
+        let choices = vec![
+            "Defer to next restart".to_string(),
+            "Force reset (not recommended)".to_string(),
+            "Explain the risk first".to_string(),
+        ];
+        assert_eq!(recommended_choice(&choices), None);
+        // The warning stays in the label rather than being lifted into the
+        // right-hand note, where it would read as an endorsement.
+        assert_eq!(choice_label(&choices[1]), "Force reset (not recommended)");
+        // And the negated row draws the same 0.4 rule as every other row, not
+        // the full-strength amber the recommended row gets.
+        let negated_is_recommended = recommended_choice(&choices) == Some(1);
+        assert_eq!(
+            choice_border(negated_is_recommended, tokens),
+            tokens.status.attention.with_alpha(CHOICE_BORDER_ALPHA)
+        );
+        assert_ne!(
+            choice_border(negated_is_recommended, tokens),
+            choice_border(true, tokens)
+        );
+        assert_eq!(choice_border(true, tokens), tokens.status.attention);
+
+        assert_eq!(
+            recommended_choice(&["Never recommended".to_string()]),
+            None,
+            "\"never recommended\" is the same negation one word along"
+        );
+        // A genuine recommendation in the same list still wins its row.
+        let mixed = vec![
+            "Force reset (not recommended)".to_string(),
+            "Run now (Recommended)".to_string(),
+        ];
+        assert_eq!(recommended_choice(&mixed), Some(1));
     }
 
     #[test]

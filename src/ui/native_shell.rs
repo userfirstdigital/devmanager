@@ -9317,16 +9317,17 @@ impl NativeInteraction {
             KeyboardAction::OpenTaskDetails => {
                 self.keyboard_state.task_details_open = true;
             }
+            // 'selected_dock' is the dock's own selection and nothing else
+            // reads it, so only 'SelectDock' writes it. A view tab does not
+            // pretend to be a dock tool here: while the shell routes only two
+            // of the five views, writing this field from 'SelectView' would
+            // publish a selection the shell never made.
             KeyboardAction::SelectDock(tool) => self.keyboard_state.selected_dock = Some(tool),
-            // A view tab that still has a dock tool behind it reports that tool,
-            // so the keyboard state stays the one place "what is showing" is
-            // read from while the dock and the view tabs overlap.
-            KeyboardAction::SelectView(view) => {
-                self.keyboard_state.selected_dock = crate::ui::actions::dock_tool_for_view(view)
-            }
-            // Settling, zoom and pane moves open no transient layer, so the
-            // keyboard state they would report is unchanged by construction.
-            KeyboardAction::SettleTask
+            // Selecting a view, settling, zoom and pane moves open no transient
+            // layer, so the keyboard state they would report is unchanged by
+            // construction.
+            KeyboardAction::SelectView(_)
+            | KeyboardAction::SettleTask
             | KeyboardAction::ToggleZoom
             | KeyboardAction::MovePane(_)
             | KeyboardAction::FocusPane(_) => {}

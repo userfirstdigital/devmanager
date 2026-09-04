@@ -413,22 +413,6 @@ pub enum KeyboardAction {
     DismissTransient,
 }
 
-/// The dock tool a view still shows behind it, for as long as the dock and the
-/// view tabs overlap. `Conversation` has none: it is the panel's own body, not
-/// a tool docked beside it.
-pub const fn dock_tool_for_view(view: PaneView) -> Option<DockTool> {
-    match view {
-        PaneView::Conversation => None,
-        PaneView::Terminal => Some(DockTool::Terminal),
-        PaneView::Files => Some(DockTool::Files),
-        PaneView::Changes => Some(DockTool::Changes),
-        PaneView::Browser => Some(DockTool::Browser),
-        PaneView::Review => Some(DockTool::Review),
-        PaneView::Artifacts => Some(DockTool::Artifacts),
-        PaneView::Services => Some(DockTool::Services),
-    }
-}
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct KeyboardBinding {
     pub shortcut: KeyboardShortcut,
