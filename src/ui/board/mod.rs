@@ -2,9 +2,11 @@
 //! `model`, `age`, `activity`, `project_colour`, `layout`; the only gpui code
 //! is `render`.
 
+pub mod activity;
 pub mod age;
 pub mod model;
 
+pub use activity::{board_activity, BoardActivity, DOING_NOW_MAX_CHARS};
 pub use age::{format_age, StateClock};
 pub use model::{
     board_state_of, build_board_model, group_of, BoardGroup, BoardGroupModel, BoardModel,
