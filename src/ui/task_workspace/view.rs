@@ -2,13 +2,9 @@ use std::collections::BTreeMap;
 
 use crate::domain::TaskId;
 
-use super::{Allocation, Axis, PaneId, PanePresentation, SplitId, Workspace, WorkspaceNode};
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum TaskPaneBody {
-    Full,
-    Compact,
-}
+use super::{
+    Allocation, Axis, PaneId, PanePresentation, PaneView, SplitId, Workspace, WorkspaceNode,
+};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TaskPaneProjection<K = TaskId> {
@@ -17,8 +13,6 @@ pub struct TaskPaneProjection<K = TaskId> {
     pub project_name: String,
     pub provider_label: String,
     pub status_label: String,
-    pub latest_snippet: Option<String>,
-    pub show_terminal: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -29,11 +23,15 @@ pub struct TaskPaneViewModel<K = TaskId> {
     pub project_name: String,
     pub provider_label: String,
     pub status_label: String,
-    pub latest_snippet: Option<String>,
-    pub body: TaskPaneBody,
+    /// Which surface this pane paints. There is no separate compact body any
+    /// more, so the view is the only thing that decides what is drawn.
+    pub view: PaneView,
+    /// Too little room for content: paint the title strip alone.
+    pub minimised: bool,
+    /// This pane is filling the canvas.
+    pub zoomed: bool,
     pub focused: bool,
     pub build_composer: bool,
-    pub paint_terminal: bool,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -89,10 +87,22 @@ impl<K: Clone + Ord + Eq> TaskWorkspaceViewModel<K> {
         projections: &BTreeMap<K, TaskPaneProjection<K>>,
     ) -> Result<Self, TaskWorkspaceViewError<K>> {
         let focused_task = workspace.focused_task();
-        let root = workspace
-            .root()
-            .map(|root| build_node(root, projections, focused_task.as_ref()))
-            .transpose()?;
+        let zoomed = workspace.zoomed();
+        // A zoomed pane is the whole canvas, so the root the shell renders is
+        // that pane alone. The tree underneath is untouched and comes straight
+        // back when zoom is released.
+        let root = match zoomed.and_then(|pane_id| workspace.pane(pane_id)) {
+            Some(pane) => Some(build_node(
+                &WorkspaceNode::Pane(pane.clone()),
+                projections,
+                focused_task.as_ref(),
+                zoomed,
+            )?),
+            None => workspace
+                .root()
+                .map(|root| build_node(root, projections, focused_task.as_ref(), zoomed))
+                .transpose()?,
+        };
         Ok(Self { root, focused_task })
     }
 
@@ -109,16 +119,14 @@ fn build_node<K: Clone + Ord + Eq>(
     node: &WorkspaceNode<K>,
     projections: &BTreeMap<K, TaskPaneProjection<K>>,
     focused_task: Option<&K>,
+    zoomed: Option<PaneId>,
 ) -> Result<TaskWorkspaceViewNode<K>, TaskWorkspaceViewError<K>> {
     match node {
         WorkspaceNode::Pane(pane) => {
             let projection = projections
                 .get(&pane.task_id)
                 .ok_or_else(|| TaskWorkspaceViewError::MissingProjection(pane.task_id.clone()))?;
-            let body = match pane.presentation {
-                PanePresentation::Full => TaskPaneBody::Full,
-                PanePresentation::Minimised => TaskPaneBody::Compact,
-            };
+            let minimised = pane.presentation == PanePresentation::Minimised;
             let focused = focused_task == Some(&pane.task_id);
             Ok(TaskWorkspaceViewNode::Pane(TaskPaneViewModel {
                 pane_id: pane.id,
@@ -127,11 +135,11 @@ fn build_node<K: Clone + Ord + Eq>(
                 project_name: projection.project_name.clone(),
                 provider_label: projection.provider_label.clone(),
                 status_label: projection.status_label.clone(),
-                latest_snippet: projection.latest_snippet.clone(),
-                body,
+                view: pane.view,
+                minimised,
+                zoomed: zoomed == Some(pane.id),
                 focused,
-                build_composer: focused && body == TaskPaneBody::Full,
-                paint_terminal: body == TaskPaneBody::Full && projection.show_terminal,
+                build_composer: focused && !minimised,
             }))
         }
         WorkspaceNode::Split { id, axis, children } => Ok(TaskWorkspaceViewNode::Split {
@@ -142,7 +150,7 @@ fn build_node<K: Clone + Ord + Eq>(
                 .map(|child| {
                     Ok(TaskWorkspaceViewChild {
                         allocation: child.allocation,
-                        node: build_node(&child.node, projections, focused_task)?,
+                        node: build_node(&child.node, projections, focused_task, zoomed)?,
                     })
                 })
                 .collect::<Result<_, TaskWorkspaceViewError<K>>>()?,
@@ -169,29 +177,51 @@ mod task_pane_view_model_tests {
     use super::*;
     use crate::ui::task_workspace::TaskWorkspace;
 
-    fn projection(task_id: TaskId, snippet: Option<&str>, terminal: bool) -> TaskPaneProjection {
+    fn projection(task_id: TaskId) -> TaskPaneProjection {
         TaskPaneProjection {
             task_id,
             title: format!("Task {task_id}"),
             project_name: "DevManager".into(),
             provider_label: "Codex".into(),
             status_label: "Working".into(),
-            latest_snippet: snippet.map(str::to_string),
-            show_terminal: terminal,
         }
     }
 
     #[test]
-    fn compact_view_model_contains_status_and_snippet_but_no_heavy_surface() {
+    fn view_model_carries_view_minimised_and_zoomed_flags() {
+        let task_id = TaskId::new();
+        let other = TaskId::new();
+        let mut workspace = TaskWorkspace::single(task_id);
+        workspace
+            .insert_after_focused(other, Axis::Horizontal)
+            .expect("second pane");
+        workspace.set_view(task_id, PaneView::Files).expect("view");
+        let pane = workspace.pane_for_task(task_id).expect("pane").id;
+        workspace.zoom(pane).expect("zoom");
+        let projections = [task_id, other]
+            .into_iter()
+            .map(|id| (id, projection(id)))
+            .collect();
+
+        let model = TaskWorkspaceViewModel::build(&workspace, &projections).expect("workspace");
+        let panes = model.panes();
+
+        assert_eq!(panes.len(), 1, "zoom shows only the zoomed pane");
+        assert_eq!(panes[0].task_id, task_id);
+        assert_eq!(panes[0].view, PaneView::Files);
+        assert!(panes[0].zoomed);
+        assert!(!panes[0].minimised);
+        assert!(panes[0].build_composer, "the zoomed pane owns the composer");
+    }
+
+    #[test]
+    fn a_minimised_pane_reports_itself_and_owns_no_composer() {
         let task_id = TaskId::new();
         let mut workspace = TaskWorkspace::single(task_id);
         workspace
             .set_presentation(task_id, PanePresentation::Minimised)
-            .expect("compact task");
-        let projections = BTreeMap::from([(
-            task_id,
-            projection(task_id, Some("Editing layout.rs"), true),
-        )]);
+            .expect("minimise task");
+        let projections = BTreeMap::from([(task_id, projection(task_id))]);
 
         let model = TaskWorkspaceViewModel::build(&workspace, &projections)
             .expect("workspace model")
@@ -202,10 +232,9 @@ mod task_pane_view_model_tests {
             .clone();
         assert_eq!(model.project_name, "DevManager");
         assert_eq!(model.status_label, "Working");
-        assert_eq!(model.latest_snippet.as_deref(), Some("Editing layout.rs"));
-        assert_eq!(model.body, TaskPaneBody::Compact);
+        assert!(model.minimised);
+        assert!(!model.zoomed);
         assert!(!model.build_composer);
-        assert!(!model.paint_terminal);
     }
 
     #[test]
@@ -223,7 +252,7 @@ mod task_pane_view_model_tests {
         workspace.focus_task(second).expect("focus second");
         let projections = [first, second, third]
             .into_iter()
-            .map(|task_id| (task_id, projection(task_id, None, false)))
+            .map(|task_id| (task_id, projection(task_id)))
             .collect();
 
         let model = TaskWorkspaceViewModel::build(&workspace, &projections).expect("workspace");
@@ -237,7 +266,7 @@ mod task_pane_view_model_tests {
     }
 
     #[test]
-    fn background_full_panes_keep_full_body_while_only_focus_owns_composer() {
+    fn background_full_panes_keep_their_view_while_only_focus_owns_composer() {
         let first = TaskId::new();
         let second = TaskId::new();
         let third = TaskId::new();
@@ -251,10 +280,13 @@ mod task_pane_view_model_tests {
         workspace.focus_task(second).expect("focus second");
         workspace
             .set_presentation(third, PanePresentation::Minimised)
-            .expect("compact third");
+            .expect("minimise third");
+        workspace
+            .set_view(second, PaneView::Terminal)
+            .expect("terminal view");
         let projections = [first, second, third]
             .into_iter()
-            .map(|task_id| (task_id, projection(task_id, Some("live"), false)))
+            .map(|task_id| (task_id, projection(task_id)))
             .collect();
 
         let model = TaskWorkspaceViewModel::build(&workspace, &projections).expect("workspace");
@@ -263,11 +295,17 @@ mod task_pane_view_model_tests {
         let second_pane = panes.iter().find(|pane| pane.task_id == second).unwrap();
         let third_pane = panes.iter().find(|pane| pane.task_id == third).unwrap();
 
-        assert_eq!(first_pane.body, TaskPaneBody::Full);
+        assert!(!first_pane.minimised);
+        assert_eq!(first_pane.view, PaneView::Conversation);
         assert!(!first_pane.build_composer);
-        assert_eq!(second_pane.body, TaskPaneBody::Full);
+        assert!(!second_pane.minimised);
+        assert_eq!(
+            second_pane.view,
+            PaneView::Terminal,
+            "each pane carries its own view, not the focused pane's"
+        );
         assert!(second_pane.build_composer);
-        assert_eq!(third_pane.body, TaskPaneBody::Compact);
+        assert!(third_pane.minimised);
         assert!(!third_pane.build_composer);
     }
 
@@ -291,8 +329,6 @@ mod task_pane_view_model_tests {
                     project_name: "DevManager".into(),
                     provider_label: "Codex".into(),
                     status_label: "Idle".into(),
-                    latest_snippet: Some("local cache".into()),
-                    show_terminal: false,
                 },
             ),
             (
@@ -303,8 +339,6 @@ mod task_pane_view_model_tests {
                     project_name: "DevManager".into(),
                     provider_label: "Codex".into(),
                     status_label: "Working".into(),
-                    latest_snippet: Some("remote cache".into()),
-                    show_terminal: true,
                 },
             ),
         ]);
@@ -314,10 +348,9 @@ mod task_pane_view_model_tests {
         assert_eq!(panes.len(), 2);
         let local_pane = panes.iter().find(|pane| pane.task_id == local).unwrap();
         let remote_pane = panes.iter().find(|pane| pane.task_id == remote).unwrap();
-        assert_eq!(local_pane.latest_snippet.as_deref(), Some("local cache"));
+        assert_eq!(local_pane.status_label, "Idle");
         assert!(!local_pane.build_composer);
-        assert_eq!(remote_pane.latest_snippet.as_deref(), Some("remote cache"));
+        assert_eq!(remote_pane.status_label, "Working");
         assert!(remote_pane.build_composer);
-        assert!(remote_pane.paint_terminal);
     }
 }

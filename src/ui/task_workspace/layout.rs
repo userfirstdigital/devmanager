@@ -226,6 +226,11 @@ pub struct Workspace<K = TaskId> {
     focused: Option<PaneId>,
     previous_focus: Option<PaneId>,
     focus_clock: u64,
+    /// The one pane filling the canvas right now. Zoom is a look, not a
+    /// layout: it never touches the tree and is deliberately not persisted,
+    /// so a restart returns to the arrangement the user actually built.
+    #[serde(skip)]
+    zoomed: Option<PaneId>,
 }
 
 /// Local TaskId-keyed workspace (existing public API).
@@ -238,6 +243,7 @@ impl<K> Default for Workspace<K> {
             focused: None,
             previous_focus: None,
             focus_clock: 0,
+            zoomed: None,
         }
     }
 }
@@ -251,6 +257,7 @@ impl<K: Clone + Ord + Eq> Workspace<K> {
             root: Some(WorkspaceNode::Pane(pane)),
             previous_focus: None,
             focus_clock,
+            zoomed: None,
         }
     }
 
@@ -371,6 +378,31 @@ impl<K: Clone + Ord + Eq> Workspace<K> {
         Ok(())
     }
 
+    pub fn zoomed(&self) -> Option<PaneId> {
+        self.zoomed
+    }
+
+    /// Fill the canvas with one pane. Zooming also focuses it: the zoomed pane
+    /// is the only one on screen, so leaving focus elsewhere would strand the
+    /// composer and every keyboard route on a pane nobody can see.
+    pub fn zoom(&mut self, pane: PaneId) -> Result<(), WorkspaceError> {
+        self.focus_pane(pane)?;
+        self.zoomed = Some(pane);
+        Ok(())
+    }
+
+    pub fn unzoom(&mut self) {
+        self.zoomed = None;
+    }
+
+    pub fn toggle_zoom_focused(&mut self) {
+        match (self.zoomed, self.focused) {
+            (Some(_), _) => self.zoomed = None,
+            (None, Some(focused)) => self.zoomed = Some(focused),
+            (None, None) => {}
+        }
+    }
+
     pub fn focus_task(&mut self, task_id: K) -> Result<(), WorkspaceError> {
         let pane_id = self
             .pane_for_task(task_id)
@@ -406,6 +438,9 @@ impl<K: Clone + Ord + Eq> Workspace<K> {
             return Err(WorkspaceError::MissingPane);
         }
         candidate.root = next_root;
+        if candidate.zoomed == Some(pane_id) {
+            candidate.zoomed = None;
+        }
         candidate.repair_focus_after_removal(pane_id);
         candidate.validate()?;
         *self = candidate;
@@ -512,6 +547,7 @@ impl<K: Clone + Ord + Eq> Workspace<K> {
             focused: self.focused,
             previous_focus: self.previous_focus,
             focus_clock: self.focus_clock,
+            zoomed: self.zoomed,
         };
         mapped.validate()?;
         Ok(mapped)
@@ -519,7 +555,10 @@ impl<K: Clone + Ord + Eq> Workspace<K> {
 
     pub fn validate(&self) -> Result<(), WorkspaceError> {
         let Some(root) = &self.root else {
-            return if self.focused.is_none() && self.previous_focus.is_none() {
+            return if self.focused.is_none()
+                && self.previous_focus.is_none()
+                && self.zoomed.is_none()
+            {
                 Ok(())
             } else {
                 Err(WorkspaceError::InvalidTree)
@@ -536,6 +575,12 @@ impl<K: Clone + Ord + Eq> Workspace<K> {
         if self
             .previous_focus
             .is_some_and(|previous| previous == focused || !pane_ids.contains(&previous))
+        {
+            return Err(WorkspaceError::InvalidTree);
+        }
+        if self
+            .zoomed
+            .is_some_and(|zoomed| !pane_ids.contains(&zoomed))
         {
             return Err(WorkspaceError::InvalidTree);
         }
@@ -1098,6 +1143,41 @@ mod tests {
             .replace("\"Full\"", "\"CompactAutomatic\"");
         let restored: Workspace<u32> = serde_json::from_str(&automatic).expect("older file loads");
         assert_eq!(restored.presentation(1), Some(PanePresentation::Minimised));
+    }
+
+    #[test]
+    fn zoom_is_transient_and_leaves_the_tree_unchanged() {
+        let mut workspace = Workspace::single(1u32);
+        workspace
+            .insert_after_focused(2u32, Axis::Horizontal)
+            .expect("pane");
+        let before = serde_json::to_string(&workspace).expect("json");
+        let pane = workspace.pane_for_task(2).expect("pane").id;
+
+        workspace.zoom(pane).expect("zoom");
+        assert_eq!(workspace.zoomed(), Some(pane));
+        assert_eq!(workspace.focused_task(), Some(2), "zoom focuses the pane");
+        assert_eq!(
+            serde_json::to_string(&workspace).expect("json"),
+            before,
+            "zoom is not serialised"
+        );
+
+        workspace.unzoom();
+        assert_eq!(workspace.zoomed(), None);
+        workspace.toggle_zoom_focused();
+        assert_eq!(workspace.zoomed(), Some(pane));
+        workspace.toggle_zoom_focused();
+        assert_eq!(workspace.zoomed(), None, "the toggle turns it off again");
+
+        workspace.zoom(pane).expect("zoom");
+        workspace.remove_pane(pane).expect("remove");
+        assert_eq!(
+            workspace.zoomed(),
+            None,
+            "removing the zoomed pane clears zoom"
+        );
+        assert!(workspace.validate().is_ok());
     }
 
     #[test]

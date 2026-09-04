@@ -82,6 +82,23 @@ impl<K: Clone + Ord + Eq> Workspace<K> {
         metrics: AllocationMetrics,
     ) -> AllocatedWorkspace<K> {
         let metrics = metrics.sanitized();
+        // A zoomed pane is the whole canvas, so there is nothing to divide and
+        // nothing to minimise: its peers are not on screen to be measured.
+        if let Some(zoomed) = self.zoomed() {
+            let mut allocated = AllocatedWorkspace::default();
+            if let Some(pane) = self.pane(zoomed) {
+                allocated.panes.insert(
+                    pane.task_id.clone(),
+                    PaneRect {
+                        x: 0.0,
+                        y: 0.0,
+                        width: viewport.width,
+                        height: viewport.height,
+                    },
+                );
+                return allocated;
+            }
+        }
         self.minimise_to_fit(viewport, metrics);
 
         let mut allocated = AllocatedWorkspace::default();
@@ -637,6 +654,37 @@ mod tests {
             compact_min_height: 28.0,
             divider: 0.0,
         }
+    }
+
+    #[test]
+    fn a_zoomed_workspace_allocates_one_full_canvas_rectangle() {
+        let first = TaskId::new();
+        let second = TaskId::new();
+        let mut workspace = TaskWorkspace::single(first);
+        workspace
+            .insert_after_focused(second, Axis::Horizontal)
+            .expect("pane");
+        let pane = workspace.pane_for_task(second).expect("pane").id;
+        workspace.zoom(pane).expect("zoom");
+
+        let allocated = workspace.allocate(Viewport::new(500.0, 400.0), minimised_strip_metrics());
+
+        assert_eq!(
+            allocated.rect(first),
+            None,
+            "only the zoomed pane is placed"
+        );
+        assert_eq!(
+            allocated.rect(second).map(|rect| (rect.width, rect.height)),
+            Some((500.0, 400.0))
+        );
+        assert!(
+            workspace
+                .task_ids()
+                .into_iter()
+                .all(|task| workspace.presentation(task) == Some(PanePresentation::Full)),
+            "zoom never minimises"
+        );
     }
 
     #[test]

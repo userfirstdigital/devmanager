@@ -190,8 +190,8 @@ use crate::ui::task_search::{TaskSearchCandidate, TaskSearchState};
 use crate::ui::task_workspace::{
     conversation_poll_priorities_due, working_conversation_poll_due, Allocation, AllocationMetrics,
     Axis, CenterSurfaceLoadingState, ConversationQueryPriority, DropTarget, Edge, PaneId, PaneRect,
-    PaneView, SplitId, TaskPaneBody, TaskPaneProjection, TaskPaneViewModel, TaskSurfaceRegistry,
-    TaskWorkspace, TaskWorkspaceViewChild, TaskWorkspaceViewModel, TaskWorkspaceViewNode, Viewport,
+    PaneView, SplitId, TaskPaneProjection, TaskPaneViewModel, TaskSurfaceRegistry, TaskWorkspace,
+    TaskWorkspaceViewChild, TaskWorkspaceViewModel, TaskWorkspaceViewNode, Viewport,
     WorkspaceError, WorkspaceSelectionGesture, CONVERSATION_RECOVERY_HEARTBEAT,
 };
 use crate::ui::terminal_adapter::TerminalDockAdapter;
@@ -5058,11 +5058,6 @@ impl Default for NativeHeaderAttachment {
 fn bounded_header_text(value: String) -> String {
     const MAX_HEADER_TEXT_SCALARS: usize = 256;
     value.chars().take(MAX_HEADER_TEXT_SCALARS).collect()
-}
-
-fn bounded_workspace_snippet(value: &str) -> String {
-    const MAX_WORKSPACE_SNIPPET_SCALARS: usize = 512;
-    value.chars().take(MAX_WORKSPACE_SNIPPET_SCALARS).collect()
 }
 
 impl NativeHostProjection {
@@ -24408,7 +24403,6 @@ impl NativeShell {
             .map(|key| {
                 let (title, project_name, provider_label, status_label) =
                     self.owner_pane_projection_labels(&key);
-                let show_terminal = workspace.view_of(key.clone()) == Some(PaneView::Terminal);
                 (
                     key.clone(),
                     TaskPaneProjection {
@@ -24417,11 +24411,6 @@ impl NativeShell {
                         project_name,
                         provider_label,
                         status_label,
-                        latest_snippet: self
-                            .task_surfaces
-                            .latest_snippet(key.clone())
-                            .map(str::to_string),
-                        show_terminal,
                     },
                 )
             })
@@ -24919,29 +24908,17 @@ impl NativeShell {
                     )),
             );
 
-        let body = if pane.body == TaskPaneBody::Compact {
+        let body = if pane.minimised {
+            // Nothing but the title row fits, and the header above already is
+            // that row, so the body is an empty spacer rather than a summary.
             div()
                 .w_full()
                 .flex_1()
                 .min_h(px(0.0))
-                .flex()
-                .items_center()
-                .p(px(12.0))
                 .bg(tokens.surfaces.sunken.to_gpui())
-                .child(
-                    div()
-                        .w_full()
-                        .text_size(px(tokens.density.typography.body))
-                        .line_height(px(tokens.density.typography.body_line_height))
-                        .text_color(tokens.text.secondary.to_gpui())
-                        .child(
-                            pane.latest_snippet
-                                .as_deref()
-                                .map(bounded_workspace_snippet)
-                                .unwrap_or_else(|| "Waiting for activity…".to_string()),
-                        ),
-                )
                 .into_any_element()
+        } else if pane.view == PaneView::Terminal && !self.preview_conversation_installed() {
+            self.task_terminal_surface_for(&task_key, tokens, cx)
         } else if pane.build_composer {
             // Focused Full pane owns the interactive composer. Pane chrome
             // already reserved the 42px header; pass only body height.
@@ -24953,8 +24930,6 @@ impl NativeShell {
                 size(pane_size.width, px(body_height)),
                 cx,
             )
-        } else if pane.paint_terminal && !self.preview_conversation_installed() {
-            self.task_terminal_surface_for(&task_key, tokens, cx)
         } else {
             // Background Full panes render the same owner semantic history;
             // only the interactive composer/input is withheld.
