@@ -703,6 +703,15 @@ impl PrimaryProviderIcon {
             Self::Other => "Provider",
         }
     }
+
+    pub fn glyph_path(self) -> &'static str {
+        match self {
+            Self::Claude => crate::icons::PROVIDER_CLAUDE,
+            Self::Codex => crate::icons::PROVIDER_CODEX,
+            Self::Cursor => crate::icons::PROVIDER_CURSOR,
+            Self::Other => crate::icons::PROVIDER_OTHER,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -2929,6 +2938,19 @@ mod tests {
     };
     use std::collections::BTreeMap;
     use std::time::Duration;
+
+    #[test]
+    fn provider_icon_glyph_paths_are_distinct_asset_paths() {
+        let paths = [
+            PrimaryProviderIcon::Claude.glyph_path(),
+            PrimaryProviderIcon::Codex.glyph_path(),
+            PrimaryProviderIcon::Cursor.glyph_path(),
+            PrimaryProviderIcon::Other.glyph_path(),
+        ];
+        let unique: std::collections::BTreeSet<_> = paths.iter().collect();
+        assert_eq!(unique.len(), 4);
+        assert!(paths.iter().all(|p| p.starts_with("icons/provider-")));
+    }
 
     fn search_model(task_count: u64) -> ClientModel {
         search_model_with_title_prefix(task_count, "Task")
