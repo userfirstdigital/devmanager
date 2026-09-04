@@ -31859,24 +31859,89 @@ impl NativeShell {
         let Some(key) = self.selected_task_key.clone() else {
             return;
         };
-        let _ = self.dispatch_action_recorded_for_owner(
-            &key.host,
-            ActionRequest::TaskArchive {
-                task_id: key.task_id,
-            },
-        );
+        self.archive_task_key(key);
+    }
+
+    /// Archive `key` and close its panel. Keyed rather than selection-driven
+    /// because the panel's own Done/Archive control names the task it belongs
+    /// to, and a panel that is not the focused one must still act on itself.
+    fn archive_task_key(&mut self, key: HostTaskKey) {
+        let dispatched = self
+            .dispatch_action_recorded_for_owner(
+                &key.host,
+                ActionRequest::TaskArchive {
+                    task_id: key.task_id,
+                },
+            )
+            .is_ok();
+        if dispatched {
+            self.close_task_pane(&key);
+        }
     }
 
     fn settle_selected_task(&mut self) {
         let Some(key) = self.selected_task_key.clone() else {
             return;
         };
-        let _ = self.dispatch_action_recorded_for_owner(
-            &key.host,
-            ActionRequest::TaskSettle {
-                task_id: key.task_id,
-            },
-        );
+        self.settle_task_key(key);
+    }
+
+    /// Done closes the panel (spec 2026-09-03 section 10): the task leaves the
+    /// live board on the same beat, so leaving its panel on screen would keep
+    /// a finished task occupying a share of the window nobody asked for.
+    fn settle_task_key(&mut self, key: HostTaskKey) {
+        let dispatched = self
+            .dispatch_action_recorded_for_owner(
+                &key.host,
+                ActionRequest::TaskSettle {
+                    task_id: key.task_id,
+                },
+            )
+            .is_ok();
+        if dispatched {
+            self.close_task_pane(&key);
+        }
+    }
+
+    /// Remove `key`'s pane and let the split collapse, leaving focus on the
+    /// pane that had it before.
+    ///
+    /// Routed through the toggle gesture rather than calling `remove_pane`
+    /// here, because closing a pane is not only a tree edit: the selection, the
+    /// composer owner and its cached draft, the header projection and the
+    /// accessibility tree all follow it, and `select_fleet_task_key` is the one
+    /// place that does all of that. A second copy would drift, and the drift
+    /// would show up as a composer still bound to a closed pane.
+    fn close_task_pane(&mut self, key: &HostTaskKey) {
+        let open = self
+            .layout
+            .task_workspace
+            .as_ref()
+            .is_some_and(|workspace| workspace.contains_task(key.clone()));
+        if !open {
+            return;
+        }
+        let _ = self.select_fleet_task_key(key.clone(), FleetSelectMode::Toggle);
+    }
+
+    /// Give `key` a pane and focus it: focus the one it already has, otherwise
+    /// insert one BESIDE the focused pane rather than replacing it. Reopening a
+    /// Done task, or sending a message to one, must not evict whatever the
+    /// person was already looking at.
+    fn open_task_pane(&mut self, key: HostTaskKey) {
+        let already_open = self
+            .layout
+            .task_workspace
+            .as_ref()
+            .is_some_and(|workspace| workspace.contains_task(key.clone()));
+        let mode = if already_open {
+            FleetSelectMode::Replace
+        } else {
+            // Toggle on a task with no pane is exactly `insert_after_focused`;
+            // Plain would replace the focused pane's task instead.
+            FleetSelectMode::Toggle
+        };
+        let _ = self.select_fleet_task_key(key, mode);
     }
 
     fn reopen_task(&mut self, task_id: TaskId) {
@@ -31889,7 +31954,7 @@ impl NativeShell {
     }
 
     fn reopen_task_key(&mut self, key: HostTaskKey) {
-        let _ = self.select_fleet_task_key(key.clone(), FleetSelectMode::Replace);
+        self.open_task_pane(key.clone());
         let _ = self.dispatch_action_recorded_for_owner(
             &key.host,
             ActionRequest::TaskReopen {
@@ -32734,6 +32799,11 @@ impl NativeShell {
         if let Some(slot) = self.host_slot_mut(host_id) {
             slot.pending_settled_send = None;
         }
+        // The reopen landed, so the task is live again and wants a panel. It
+        // normally still has the one it was sending from; a Done task whose
+        // panel was closed on settle gets one beside the focused pane rather
+        // than in place of it (spec 2026-09-03 section 10).
+        self.open_task_pane(pending.owner.clone());
         // Re-enter normal send admission: an unopened Done draft still needs
         // the exact provider-start receipt and ready projection before input.
         self.activate_composer_control(pending.control);
@@ -49401,6 +49471,101 @@ pub(crate) mod tests {
             "native-top-bar-scope",
             "the id the tree publishes and the id the painter puts on the element are one constant"
         );
+    }
+
+    /// Done closes the task's panel and the split collapses onto the pane that
+    /// had focus before; reopening inserts a panel BESIDE that survivor rather
+    /// than replacing it.
+    #[test]
+    fn done_closes_the_pane_and_reopen_brings_one_back() {
+        if rerun_headless_shell_test_in_child(
+            "ui::native_shell::tests::done_closes_the_pane_and_reopen_brings_one_back",
+        ) {
+            return;
+        }
+        let _test_guard = HEADLESS_SHELL_TEST_LOCK
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .expect("headless shell test lock");
+        gpui::Application::headless().run(move |cx| {
+            crate::ui::init(cx);
+            let (runtime, _shared) = TestRuntime::new(true, NativeHostActionResult::Queued);
+            let (model, task_ids) = open_tasks_client_model(2);
+            let project_id = model.task(task_ids[0]).expect("task").task.project_id;
+            with_test_shell_in_app(cx, runtime, |shell| {
+                shell.install_project_for_test("DevManager", project_id);
+                shell
+                    .apply_client_model(Arc::new(model))
+                    .expect("apply model");
+                let keys: Vec<HostTaskKey> = task_ids
+                    .iter()
+                    .map(|task_id| shell.local_task_key(*task_id))
+                    .collect();
+                let mut workspace =
+                    crate::ui::task_workspace::Workspace::<HostTaskKey>::single(keys[0].clone());
+                workspace
+                    .insert_after_focused(
+                        keys[1].clone(),
+                        crate::ui::task_workspace::Axis::Horizontal,
+                    )
+                    .expect("second pane");
+                shell.layout.task_workspace = Some(workspace);
+                shell
+                    .select_fleet_task_key(keys[1].clone(), FleetSelectMode::Replace)
+                    .expect("focus the second pane");
+                assert_eq!(
+                    shell
+                        .layout
+                        .task_workspace
+                        .as_ref()
+                        .expect("workspace")
+                        .pane_count(),
+                    2,
+                    "the fixture opens two panes"
+                );
+
+                shell.settle_task_key(keys[1].clone());
+
+                let workspace = shell
+                    .layout
+                    .task_workspace
+                    .as_ref()
+                    .expect("the survivor keeps the workspace alive");
+                assert_eq!(
+                    workspace.pane_count(),
+                    1,
+                    "Done removes the settled task's panel and the split collapses"
+                );
+                assert!(
+                    !workspace.contains_task(keys[1].clone()),
+                    "the settled task has no panel"
+                );
+                assert_eq!(
+                    workspace.focused_task(),
+                    Some(keys[0].clone()),
+                    "focus falls back to the pane that had it before"
+                );
+
+                shell.reopen_task_key(keys[1].clone());
+
+                let workspace = shell.layout.task_workspace.as_ref().expect("workspace");
+                assert_eq!(
+                    workspace.pane_count(),
+                    2,
+                    "reopen inserts a panel rather than replacing the survivor's"
+                );
+                assert!(
+                    workspace.contains_task(keys[0].clone()),
+                    "reopen must not evict the pane that was already open"
+                );
+                assert_eq!(
+                    workspace.focused_task(),
+                    Some(keys[1].clone()),
+                    "the reopened task takes focus"
+                );
+            });
+            cx.quit();
+        });
     }
 
     #[test]
