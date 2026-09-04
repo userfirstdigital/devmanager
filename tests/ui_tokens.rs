@@ -3,7 +3,9 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use devmanager::theme;
-use devmanager::ui::theme_system::{ThemeAppearance, ThemeController, ThemeLibrary};
+use devmanager::ui::theme_system::{
+    AppearancePreference, ThemeAppearance, ThemeController, ThemeLibrary,
+};
 use devmanager::ui::tokens::{
     contrast_ratio, srgb_luminance, theme as build_theme, Color, ContrastPair, Density, Scale,
     TerminalSlotRole, ThemeMode, ThemeTokens, MODAL_BACKDROP_RGBA,
@@ -1132,6 +1134,26 @@ fn theme_gallery_preview_fixture_and_token_matrix_cover_phase_5_2() {
 // Projected-token contrast gates.
 // ---------------------------------------------------------------------------
 
+/// The number of pairs one projection is measured over, per family:
+/// 68 normal_text + 1 large_text + 28 ui_indicator + 7 disabled_text
+/// + 10 interaction_text + 6 status_surface + 6 runtime_only.
+///
+/// Asserting only that the count is equal across projections would be `c == c`
+/// -- every family's length is fixed by the token module, not by the palette --
+/// so a family trimmed from 28 pairs to 6 would stay green in all fourteen. The
+/// absolute number is what makes a shrinking gate fail.
+///
+/// It deliberately counts some colour pairs twice: `interaction_text` re-measures
+/// the action-on-surface pairs that `normal_text` also carries, and
+/// `disabled_text` repeats `normal_text`'s `text_disabled_on_*` rows. The family
+/// is the unit a floor attaches to, so the duplication is left as it is rather
+/// than deduplicated into a number that no longer matches any family's length.
+const PROJECTED_PAIR_COUNT: usize = 126;
+
+/// A pinned ratio may not get worse by more than this. Ratios are pinned to
+/// three decimals, so the tolerance only absorbs that rounding.
+const PINNED_RATIO_TOLERANCE: f64 = 0.005;
+
 const NORMAL_TEXT_FLOOR: f64 = 4.5;
 const LARGE_TEXT_FLOOR: f64 = 3.0;
 const UI_INDICATOR_FLOOR: f64 = 3.0;
@@ -1220,7 +1242,7 @@ fn contrast_violations_with_denominator(tokens: &ThemeTokens) -> (Vec<ContrastVi
     measured += runtime_pairs.len();
     for (pair, floor) in runtime_pairs {
         let ratio = contrast_ratio(pair.foreground, pair.background);
-        if ratio < floor {
+        if !pair.foreground.is_opaque() || ratio < floor {
             violations.push(ContrastViolation {
                 family: "runtime_only",
                 pair: pair.name,
@@ -1229,6 +1251,12 @@ fn contrast_violations_with_denominator(tokens: &ThemeTokens) -> (Vec<ContrastVi
             });
         }
     }
+    assert_eq!(
+        measured, PROJECTED_PAIR_COUNT,
+        "measured {measured} pairs, not {PROJECTED_PAIR_COUNT} -- a family shrank, so every \
+         count this gate reports is drawn from a smaller population than the one it was \
+         calibrated on"
+    );
     (violations, measured)
 }
 
@@ -1292,6 +1320,11 @@ fn runtime_only_contrast_pairs(tokens: &ThemeTokens) -> Vec<(ContrastPair, f64)>
 /// What the modal backdrop actually paints over a surface. `MODAL_BACKDROP_RGBA`
 /// is `0xRRGGBBAA`, so the visible background under an overlay caption is the
 /// backdrop colour composited onto the surface behind it at that alpha.
+///
+/// Three surfaces is a model, not the whole truth: the caption can sit over
+/// whatever the dock is covering, including a terminal showing an image or a
+/// user's own wallpaper through a transparent shell, and no token describes
+/// that. These three are the worst cases among surfaces the palette controls.
 fn modal_backdrop_composite(surface: Color) -> Color {
     let alpha = f64::from(MODAL_BACKDROP_RGBA & 0xff) / 255.0;
     let backdrop = Color::from_u32(MODAL_BACKDROP_RGBA >> 8);
@@ -1337,6 +1370,12 @@ fn matrix_density_and_scale() -> Vec<(Density, Scale)> {
             seen.push(entry);
         }
     }
+    assert_eq!(
+        seen.len(),
+        8,
+        "two densities times four scales -- a shorter grid means every projected loop below \
+         ran fewer times than it claims"
+    );
     seen
 }
 
@@ -1484,36 +1523,311 @@ projected_theme_gate!(
 /// loudly as a new drift would, and the fix is to shrink this list and
 /// un-ignore
 /// `default_selection_dark_projection_meets_every_contrast_floor` below.
-const DEFAULT_DARK_PROJECTION_DRIFT: &[(&str, &str)] = &[
-    ("normal_text", "action_destructive_default_on_surface"),
-    ("normal_text", "action_destructive_hover_on_surface"),
-    ("normal_text", "action_destructive_focus_on_surface"),
+/// `(family, pair, ratio)`. The ratio is the value measured on this branch, and
+/// it is enforced as a floor: a pinned pair that gets *worse* fails, so pinning
+/// a known defect cannot quietly absorb a further regression in the same pair.
+type PinnedDrift = (&'static str, &'static str, f64);
+
+const DEFAULT_DARK_PROJECTION_DRIFT: &[PinnedDrift] = &[
+    (
+        "normal_text",
+        "action_destructive_default_on_surface",
+        3.260,
+    ),
+    ("normal_text", "action_destructive_hover_on_surface", 2.917),
+    ("normal_text", "action_destructive_focus_on_surface", 3.260),
     (
         "ui_indicator",
         "action_primary_disabled_background_on_canvas",
+        1.107,
     ),
-    ("ui_indicator", "action_primary_disabled_border_on_canvas"),
+    (
+        "ui_indicator",
+        "action_primary_disabled_border_on_canvas",
+        1.107,
+    ),
     (
         "ui_indicator",
         "action_destructive_selected_background_on_canvas",
+        1.177,
     ),
     (
         "ui_indicator",
         "action_destructive_selected_border_on_canvas",
+        1.177,
     ),
     (
         "ui_indicator",
         "action_destructive_disabled_background_on_canvas",
+        1.107,
     ),
     (
         "ui_indicator",
         "action_destructive_disabled_border_on_canvas",
+        1.107,
     ),
-    ("interaction_text", "action_destructive_default_on_surface"),
-    ("interaction_text", "action_destructive_hover_on_surface"),
-    ("interaction_text", "action_destructive_focus_on_surface"),
-    ("runtime_only", "border_disabled_on_surface_disabled"),
+    (
+        "interaction_text",
+        "action_destructive_default_on_surface",
+        3.260,
+    ),
+    (
+        "interaction_text",
+        "action_destructive_hover_on_surface",
+        2.917,
+    ),
+    (
+        "interaction_text",
+        "action_destructive_focus_on_surface",
+        3.260,
+    ),
+    ("runtime_only", "border_disabled_on_surface_disabled", 1.000),
 ];
+
+/// The sixty-eight pairs the default *light* projection fails, same shape and
+/// same enforcement. Light is not merely worse than dark, it is worse in kind:
+/// alongside the role borrows dark shares, the light terminal palette puts
+/// white ANSI slots on a white background (`terminal_white_on_background`
+/// 1.002:1), which reads as unreviewed rather than drifted. Bounding it here
+/// stops the count growing while it waits for a palette owner.
+const DEFAULT_LIGHT_PROJECTION_DRIFT: &[PinnedDrift] = &[
+    ("normal_text", "text_disabled_on_canvas", 2.455),
+    ("normal_text", "text_disabled_on_raised", 2.563),
+    ("normal_text", "text_muted_on_overlay", 4.397),
+    ("normal_text", "text_disabled_on_overlay", 2.332),
+    ("normal_text", "text_muted_on_sunken", 4.397),
+    ("normal_text", "text_disabled_on_sunken", 2.332),
+    ("normal_text", "text_muted_on_hover", 3.270),
+    ("normal_text", "text_disabled_on_hover", 1.734),
+    ("normal_text", "text_muted_on_selection", 3.240),
+    ("normal_text", "text_disabled_on_selection", 1.718),
+    ("normal_text", "text_muted_on_disabled_surface", 4.397),
+    ("normal_text", "text_disabled_on_disabled_surface", 2.332),
+    ("normal_text", "text_inverse_on_terminal_background", 1.044),
+    (
+        "normal_text",
+        "text_on_accent_on_action_primary_selected",
+        1.178,
+    ),
+    ("normal_text", "terminal_black_on_background", 2.457),
+    ("normal_text", "terminal_red_on_background", 2.416),
+    ("normal_text", "terminal_green_on_background", 1.472),
+    ("normal_text", "terminal_yellow_on_background", 1.544),
+    ("normal_text", "terminal_blue_on_background", 2.019),
+    ("normal_text", "terminal_magenta_on_background", 1.936),
+    ("normal_text", "terminal_cyan_on_background", 1.389),
+    ("normal_text", "terminal_white_on_background", 1.002),
+    ("normal_text", "terminal_bright_black_on_background", 1.181),
+    ("normal_text", "terminal_bright_red_on_background", 1.862),
+    ("normal_text", "terminal_bright_green_on_background", 1.229),
+    ("normal_text", "terminal_bright_yellow_on_background", 1.193),
+    ("normal_text", "terminal_bright_blue_on_background", 1.361),
+    (
+        "normal_text",
+        "terminal_bright_magenta_on_background",
+        1.304,
+    ),
+    ("normal_text", "terminal_bright_cyan_on_background", 1.196),
+    ("normal_text", "terminal_bright_white_on_background", 1.044),
+    ("normal_text", "action_primary_selected_on_surface", 1.178),
+    ("normal_text", "action_primary_disabled_on_surface", 1.099),
+    (
+        "normal_text",
+        "action_destructive_default_on_surface",
+        1.000,
+    ),
+    ("normal_text", "action_destructive_hover_on_surface", 1.198),
+    ("normal_text", "action_destructive_focus_on_surface", 1.000),
+    (
+        "normal_text",
+        "action_destructive_selected_on_surface",
+        4.276,
+    ),
+    (
+        "normal_text",
+        "action_destructive_disabled_on_surface",
+        1.099,
+    ),
+    ("normal_text", "status_destructive_surface", 4.276),
+    (
+        "ui_indicator",
+        "action_primary_selected_background_on_canvas",
+        1.180,
+    ),
+    (
+        "ui_indicator",
+        "action_primary_selected_border_on_canvas",
+        1.180,
+    ),
+    (
+        "ui_indicator",
+        "action_primary_disabled_background_on_canvas",
+        1.053,
+    ),
+    (
+        "ui_indicator",
+        "action_primary_disabled_border_on_canvas",
+        1.053,
+    ),
+    (
+        "ui_indicator",
+        "action_destructive_selected_background_on_canvas",
+        1.052,
+    ),
+    (
+        "ui_indicator",
+        "action_destructive_selected_border_on_canvas",
+        1.052,
+    ),
+    (
+        "ui_indicator",
+        "action_destructive_disabled_background_on_canvas",
+        1.053,
+    ),
+    (
+        "ui_indicator",
+        "action_destructive_disabled_border_on_canvas",
+        1.053,
+    ),
+    ("ui_indicator", "status_warning_indicator_on_surface", 2.840),
+    ("disabled_text", "text_disabled_on_raised", 2.563),
+    ("disabled_text", "text_disabled_on_canvas", 2.455),
+    ("disabled_text", "text_disabled_on_overlay", 2.332),
+    ("disabled_text", "text_disabled_on_sunken", 2.332),
+    ("disabled_text", "text_disabled_on_hover", 1.734),
+    ("disabled_text", "text_disabled_on_selection", 1.718),
+    ("disabled_text", "text_disabled_on_disabled_surface", 2.332),
+    (
+        "interaction_text",
+        "action_primary_selected_on_surface",
+        1.178,
+    ),
+    (
+        "interaction_text",
+        "action_primary_disabled_on_surface",
+        1.099,
+    ),
+    (
+        "interaction_text",
+        "action_destructive_default_on_surface",
+        1.000,
+    ),
+    (
+        "interaction_text",
+        "action_destructive_hover_on_surface",
+        1.198,
+    ),
+    (
+        "interaction_text",
+        "action_destructive_focus_on_surface",
+        1.000,
+    ),
+    (
+        "interaction_text",
+        "action_destructive_selected_on_surface",
+        4.276,
+    ),
+    (
+        "interaction_text",
+        "action_destructive_disabled_on_surface",
+        1.099,
+    ),
+    ("status_surface", "status_destructive_surface", 4.276),
+    ("runtime_only", "border_disabled_on_surface_disabled", 1.000),
+    (
+        "runtime_only",
+        "text_inverse_on_backdrop_over_raised",
+        2.434,
+    ),
+    (
+        "runtime_only",
+        "text_inverse_on_backdrop_over_canvas",
+        2.523,
+    ),
+    (
+        "runtime_only",
+        "text_inverse_on_backdrop_over_terminal_background",
+        2.523,
+    ),
+    ("runtime_only", "action_primary_disabled_label", 1.099),
+    ("runtime_only", "action_destructive_disabled_label", 1.099),
+];
+
+/// A default-selection controller whose resolved appearance is *proved* to be
+/// the one asked for. `ThemeController::active_palette` takes the SYSTEM
+/// appearance, not the wanted one, and the default preference is
+/// `AppearancePreference::Dark` -- so `active_palette(Light)` hands back the
+/// dark palette, and a light gate written the obvious way silently measures
+/// dark twice. The resolution is asserted under both system appearances.
+fn default_selection_controller(
+    root: &tempfile::TempDir,
+    preference: AppearancePreference,
+    expected: ThemeAppearance,
+) -> ThemeController {
+    let mut controller = ThemeController::with_defaults_at(root.path());
+    controller
+        .set_appearance_preference(preference)
+        .expect("set appearance preference");
+    for system in [ThemeAppearance::Dark, ThemeAppearance::Light] {
+        assert_eq!(
+            controller.selection().resolve(system).appearance,
+            expected,
+            "an explicit {preference:?} preference must resolve to {expected:?} whatever the \
+             system reports, or this gate is measuring the other appearance"
+        );
+    }
+    controller
+}
+
+/// Holds one projection to exactly its pinned drift: the same set of pairs, and
+/// no pinned pair worse than it is today. Both halves must fail for the pin to
+/// be doing its job -- a repair changes the set, a regression changes either.
+fn assert_pinned_drift(
+    label: &str,
+    preference: AppearancePreference,
+    appearance: ThemeAppearance,
+    pinned: &[PinnedDrift],
+) {
+    let root = tempfile::tempdir().expect("temp profile root");
+    let controller = default_selection_controller(&root, preference, appearance);
+    let expected = pinned
+        .iter()
+        .map(|(family, pair, _)| (*family, *pair))
+        .collect::<BTreeSet<_>>();
+    assert_eq!(
+        expected.len(),
+        pinned.len(),
+        "{label}: the pinned list repeats a pair, so one of its ratios is never checked"
+    );
+
+    for (density, scale) in matrix_density_and_scale() {
+        let tokens = controller.active_palette(appearance).tokens(density, scale);
+        let violations = contrast_violations(&tokens);
+        let measured = violations
+            .iter()
+            .map(|violation| (violation.family, violation.pair))
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            measured,
+            expected,
+            "{label}/{density:?}/{scale:?} drift changed: {}",
+            render_violations(&violations)
+        );
+
+        for (family, pair, pinned_ratio) in pinned {
+            let live = violations
+                .iter()
+                .find(|violation| violation.family == *family && violation.pair == *pair)
+                .unwrap_or_else(|| panic!("{label}: {family} {pair} missing from the measured set"))
+                .ratio;
+            assert!(
+                live >= pinned_ratio - PINNED_RATIO_TOLERANCE,
+                "{label}/{density:?}/{scale:?}: {family} {pair} fell from {pinned_ratio:.3}:1 to \
+                 {live:.3}:1 -- a pinned defect got worse"
+            );
+        }
+    }
+}
 
 /// The palette a fresh profile actually resolves to, reached the way the app
 /// reaches it. This gate runs -- it is never ignored -- and holds the shipping
@@ -1521,34 +1835,36 @@ const DEFAULT_DARK_PROJECTION_DRIFT: &[(&str, &str)] = &[
 /// default dark projection fails the suite on the next run.
 #[test]
 fn default_selection_dark_projection_drift_is_exactly_the_pinned_set() {
-    let root = tempfile::tempdir().expect("temp profile root");
-    let controller = ThemeController::with_defaults_at(root.path());
-    let expected = DEFAULT_DARK_PROJECTION_DRIFT
-        .iter()
-        .copied()
-        .collect::<BTreeSet<_>>();
-    for (density, scale) in matrix_density_and_scale() {
-        let tokens = controller
-            .active_palette(ThemeAppearance::Dark)
-            .tokens(density, scale);
-        let measured = contrast_violations(&tokens)
-            .into_iter()
-            .map(|violation| (violation.family, violation.pair))
-            .collect::<BTreeSet<_>>();
-        assert_eq!(
-            measured,
-            expected,
-            "default-selection/Dark/{density:?}/{scale:?} drift changed: {}",
-            render_violations(&contrast_violations(&tokens))
-        );
-    }
+    assert_pinned_drift(
+        "default-selection/Dark",
+        AppearancePreference::Dark,
+        ThemeAppearance::Dark,
+        DEFAULT_DARK_PROJECTION_DRIFT,
+    );
+}
+
+/// The light half of the default theme, bounded the same way. It is not ignored
+/// either: sixty-eight pairs is a number that must not grow silently.
+#[test]
+fn default_selection_light_projection_drift_is_exactly_the_pinned_set() {
+    assert_pinned_drift(
+        "default-selection/Light",
+        AppearancePreference::Light,
+        ThemeAppearance::Light,
+        DEFAULT_LIGHT_PROJECTION_DRIFT,
+    );
 }
 
 #[test]
-#[ignore = "devmanager-classic dark: 13 projected pairs below floor, pinned by default_selection_dark_projection_drift_is_exactly_the_pinned_set; tracked in .superpowers/sdd/2026-09-03-ui-redesign-2-panel-chrome-and-needs-you/lane-tokens-report.md"]
+#[ignore = "devmanager-classic dark: border_disabled_on_surface_disabled 1.000:1, \
+            action_primary_disabled_background_on_canvas 1.107:1, \
+            action_destructive_hover_on_surface 2.917:1 (13 pairs), pinned by \
+            default_selection_dark_projection_drift_is_exactly_the_pinned_set; tracked in \
+            .superpowers/sdd/2026-09-03-ui-redesign-2-panel-chrome-and-needs-you/lane-tokens-report.md"]
 fn default_selection_dark_projection_meets_every_contrast_floor() {
     let root = tempfile::tempdir().expect("temp profile root");
-    let controller = ThemeController::with_defaults_at(root.path());
+    let controller =
+        default_selection_controller(&root, AppearancePreference::Dark, ThemeAppearance::Dark);
     for (density, scale) in matrix_density_and_scale() {
         let tokens = controller
             .active_palette(ThemeAppearance::Dark)
@@ -1566,7 +1882,8 @@ fn default_selection_dark_projection_meets_every_contrast_floor() {
             .superpowers/sdd/2026-09-03-ui-redesign-2-panel-chrome-and-needs-you/lane-tokens-report.md"]
 fn default_selection_light_projection_meets_every_contrast_floor() {
     let root = tempfile::tempdir().expect("temp profile root");
-    let controller = ThemeController::with_defaults_at(root.path());
+    let controller =
+        default_selection_controller(&root, AppearancePreference::Light, ThemeAppearance::Light);
     for (density, scale) in matrix_density_and_scale() {
         let tokens = controller
             .active_palette(ThemeAppearance::Light)
@@ -1586,7 +1903,8 @@ fn default_selection_light_projection_meets_every_contrast_floor() {
 #[test]
 fn projected_gate_detects_the_two_regressions_that_shipped_green() {
     let root = tempfile::tempdir().expect("temp profile root");
-    let controller = ThemeController::with_defaults_at(root.path());
+    let controller =
+        default_selection_controller(&root, AppearancePreference::Dark, ThemeAppearance::Dark);
     let healthy = controller
         .active_palette(ThemeAppearance::Dark)
         .tokens(Density::Comfortable, Scale::Scale100);
