@@ -7,16 +7,10 @@ use std::collections::BTreeMap;
 use crate::domain::id::ProjectId;
 use crate::ui::tokens::Color;
 
-pub const PROJECT_PALETTE: [Color; 8] = [
-    Color::from_u32(0x5aa3a0), // teal
-    Color::from_u32(0x7a86c4), // slate
-    Color::from_u32(0xa78a5c), // sand
-    Color::from_u32(0x8c6fa8), // mauve
-    Color::from_u32(0x7a9a6a), // moss
-    Color::from_u32(0x9a7a8a), // dusk
-    Color::from_u32(0x6f8fa8), // steel
-    Color::from_u32(0xa8806f), // clay
-];
+/// The palette itself lives in the canonical token module: it is the only file
+/// allowed to write a colour literal. Re-exported so every existing
+/// `board::PROJECT_PALETTE` import keeps resolving.
+pub use crate::ui::tokens::PROJECT_PALETTE;
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ProjectColourBook {
@@ -81,13 +75,6 @@ fn clamp_slot(index: u8) -> u8 {
 mod tests {
     use super::*;
     use crate::domain::id::ProjectId;
-
-    #[test]
-    fn palette_is_the_spec_in_assignment_order() {
-        assert_eq!(PROJECT_PALETTE[0], Color::from_u32(0x5aa3a0));
-        assert_eq!(PROJECT_PALETTE[1], Color::from_u32(0x7a86c4));
-        assert_eq!(PROJECT_PALETTE[7], Color::from_u32(0xa8806f));
-    }
 
     #[test]
     fn first_sight_assigns_the_next_palette_slot_and_wraps() {
