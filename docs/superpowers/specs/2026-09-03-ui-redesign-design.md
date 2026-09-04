@@ -106,7 +106,7 @@ Everything else is a grey ramp:
 |---|---|---|
 | `surface.column` | `#101013` | board column |
 | `surface.row` | `#151518` | row box, panel body |
-| `surface.row_selected` | `#1a1a20` | selected row, focused panel title row |
+| `surface.row_selected` | `#1d1d22` | selected row, focused panel title row — selected row: filled slab, 5 px stripe, strong rules, white title (ruled `#26262b`; that drops `text_disabled_on_selection` to 4.118:1, and the 4.5:1 ceiling `#1e1e23` is `surface.disabled` itself, so the step below ships) |
 | `surface.stream` | `#111114` | conversation stream background |
 | `surface.terminal` | `#0b0b0d` | terminal background |
 | `border.subtle` | `#26262b` | row lines, panel border |
@@ -120,6 +120,8 @@ Everything else is a grey ramp:
 | `status.attention` | `#f2b441` | needs you |
 | `status.blocked` | `#e5484d` | broken |
 | `status.success` | `#7fb07f` | inline only: test passed, subagent live dot |
+| `action.primary` | `#e6e6ea`, text `#101013` | the one loud control: New task, New project, primary confirm. Loud by inversion, never by hue. Hover `#ffffff`, pressed `#d0d0d6`, disabled `#606876` with `#f8fafc` text |
+| `border.focus` | `#86868f` | focus ring on the workspace pane and every other control — a grey, not the warning yellow it used to borrow |
 
 These map onto the existing `ThemeTokens` groups (`surfaces`, `borders`, `text`, `status`); the redesign changes values and adds `surface.stream`, `surface.terminal`, `border.strong`. Destructive actions are not red buttons; Delete is a menu item that opens a confirmation, and the confirmation's primary button is the only red button in the app.
 

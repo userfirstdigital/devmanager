@@ -38,6 +38,11 @@ pub const DONE_ROW_PADDING_BOTTOM: f32 = 5.0;
 
 /// `.r::before`: the project stripe on the very left edge, full row height.
 pub const ROW_STRIPE_WIDTH: f32 = 3.0;
+/// A selected row widens the same stripe so the selection is legible from the
+/// edge of the eye. The stripe is absolutely positioned over the row, so this
+/// never reaches [`row_content_width`]: the meta-line breakpoints stay a rule
+/// about the column, not about which row happens to be selected.
+pub const ROW_STRIPE_WIDTH_SELECTED: f32 = 5.0;
 /// `.r` grid is `8px 1fr auto` with an 8 px column gap: the dot cell, then the
 /// title. The meta line starts at grid column 2, i.e. 8 + 8 px in.
 pub const DOT_CELL_WIDTH: f32 = 8.0;

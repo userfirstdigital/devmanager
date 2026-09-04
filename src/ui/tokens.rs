@@ -1098,25 +1098,44 @@ impl ThemeTokens {
             self.text.on_accent,
             self.actions.primary.selected.background,
         ));
+        // `text.on_accent` is the foreground `AccentForeground` paints over
+        // `Accent`, which is the PRIMARY action fill; nothing anywhere paints it
+        // on a destructive fill, which carries its own foreground. Holding both
+        // families against one token was only satisfiable while the two fills
+        // had the same polarity -- the redesign's primary is a light slab and
+        // destructive is still a dark red, and no single colour clears 4.5:1 on
+        // both (proved by exhaustion over the grey ramp: the primary side needs
+        // luminance <= 0.172, the destructive side >= 0.791). So the destructive
+        // family is measured against the foreground that is actually painted on
+        // it, at the same count and the same 4.5:1 floor.
         pairs.push(contrast_pair(
-            "text_on_accent_on_action_destructive_default",
-            self.text.on_accent,
+            "text_on_destructive_on_action_destructive_default",
+            self.actions.destructive.default.foreground,
             self.actions.destructive.default.background,
         ));
         pairs.push(contrast_pair(
-            "text_on_accent_on_action_destructive_hover",
-            self.text.on_accent,
+            "text_on_destructive_on_action_destructive_hover",
+            self.actions.destructive.hover.foreground,
             self.actions.destructive.hover.background,
         ));
         pairs.push(contrast_pair(
-            "text_on_accent_on_action_destructive_focus",
-            self.text.on_accent,
+            "text_on_destructive_on_action_destructive_focus",
+            self.actions.destructive.focus.foreground,
             self.actions.destructive.focus.background,
         ));
         pairs.push(contrast_pair(
-            "text_on_accent_on_action_destructive_selected",
-            self.text.on_accent,
+            "text_on_destructive_on_action_destructive_selected",
+            self.actions.destructive.selected.foreground,
             self.actions.destructive.selected.background,
+        ));
+        // The other surface `text.on_accent` really lands on:
+        // `MessageActionForeground` over `MessageAction`, which is
+        // `status.external`. Ungated until now, and the pre-redesign near-white
+        // read 2.43:1 there.
+        pairs.push(contrast_pair(
+            "text_on_accent_on_status_external",
+            self.text.on_accent,
+            self.status.external,
         ));
         pairs.extend(self.terminal_foreground_contrast_pairs());
         pairs.extend(self.interaction_state_contrast_pairs());
@@ -1437,7 +1456,13 @@ const DARK_SURFACE_RAISED: Color = Color::from_u32(0x151518);
 const DARK_SURFACE_OVERLAY: Color = Color::from_u32(0x1a1a1f);
 const DARK_SURFACE_SUNKEN: Color = Color::from_u32(0x111114);
 const DARK_SURFACE_HOVER: Color = Color::from_u32(0x17171c);
-const DARK_SURFACE_SELECTION: Color = Color::from_u32(0x1a1a20);
+// The selected row has to read as a filled slab, not a hairline lift, so this
+// climbs as far above `raised` as the text gates allow. `0x26262b` (the subtle
+// border) was ruled but drops `text_disabled_on_selection` to 4.118:1; the
+// ceiling for the 4.5:1 floor is `0x1e1e23`, which is `surfaces.disabled`
+// itself, so the step below it is what ships and selection stays distinct from
+// disabled.
+const DARK_SURFACE_SELECTION: Color = Color::from_u32(0x1d1d22);
 const DARK_SURFACE_DISABLED: Color = Color::from_u32(0x1e1e23);
 
 const DARK_TEXT_PRIMARY: Color = Color::from_u32(0xe6e6ea);
@@ -1449,13 +1474,21 @@ const DARK_TEXT_MUTED: Color = Color::from_u32(0x86868f);
 // text drops under 4.5:1 on surfaces.disabled (0x1e1e23).
 const DARK_TEXT_DISABLED: Color = Color::from_u32(0x85858e);
 const DARK_TEXT_INVERSE: Color = Color::from_u32(0xf8fafc);
-const DARK_TEXT_ON_ACCENT: Color = Color::from_u32(0xf8fafc);
+// The redesign's loud control is a light neutral slab, so the text that lands
+// on it is the canvas colour rather than a near-white. This is the foreground
+// `ThemeColorRole::AccentForeground` paints over `Accent`
+// (`actions.primary.default.background`), and it also fixes the message-action
+// pair, where the old near-white read 2.43:1 on `status.external`.
+const DARK_TEXT_ON_ACCENT: Color = Color::from_u32(0x101013);
 const DARK_TEXT_ON_SELECTION: Color = Color::from_u32(0xffffff);
 
 const DARK_BORDER_SUBTLE: Color = Color::from_u32(0x26262b);
 const DARK_BORDER_DEFAULT: Color = Color::from_u32(0x2c2c33);
 const DARK_BORDER_STRONG: Color = Color::from_u32(0x34343c);
-const DARK_BORDER_FOCUS: Color = Color::from_u32(0xfacc15);
+// A focus ring is a control, not a status, so it is a grey on the ramp rather
+// than the warning yellow it used to borrow: 5.27:1 on the canvas, which clears
+// the 3:1 UI-indicator floor at 1-2 px without adding a colour to the shell.
+const DARK_BORDER_FOCUS: Color = Color::from_u32(0x86868f);
 const DARK_BORDER_SELECTION: Color = Color::from_u32(0xa1a1aa);
 const DARK_BORDER_DISABLED: Color = Color::from_u32(0x52525b);
 
@@ -1466,12 +1499,19 @@ const DARK_STATUS_WARNING: Color = Color::from_u32(0xfacc15);
 const DARK_STATUS_DESTRUCTIVE: Color = Color::from_u32(0xe5484d);
 const DARK_STATUS_INACTIVE: Color = Color::from_u32(0x86868f);
 
-const DARK_ACTION_PRIMARY_DEFAULT: Color = Color::from_u32(0xce1a6b);
-const DARK_ACTION_PRIMARY_HOVER: Color = Color::from_u32(0xd4146a);
-const DARK_ACTION_PRIMARY_FOCUS: Color = Color::from_u32(0xd81b70);
-const DARK_ACTION_PRIMARY_SELECTED: Color = Color::from_u32(0xce1a6b);
+// The primary action is the one "loud" control on a shell where colour means
+// "this needs you", so it is loud by inversion rather than by hue: a light grey
+// slab carrying the canvas colour as its text. Focus keeps the default fill and
+// says so with `borders.focus`; the pressed state steps down one.
+const DARK_ACTION_PRIMARY_DEFAULT: Color = Color::from_u32(0xe6e6ea);
+const DARK_ACTION_PRIMARY_HOVER: Color = Color::from_u32(0xffffff);
+const DARK_ACTION_PRIMARY_FOCUS: Color = Color::from_u32(0xe6e6ea);
+const DARK_ACTION_PRIMARY_SELECTED: Color = Color::from_u32(0xd0d0d6);
 const DARK_ACTION_PRIMARY_DISABLED: Color = Color::from_u32(0x606876);
-const DARK_ACTION_PRIMARY_FOREGROUND: Color = Color::from_u32(0xf8fafc);
+const DARK_ACTION_PRIMARY_FOREGROUND: Color = Color::from_u32(0x101013);
+// The disabled fill is the one primary state that stays darker than its text:
+// dark-on-`0x606876` is 3.20:1, so the disabled slab keeps a light foreground.
+const DARK_ACTION_PRIMARY_DISABLED_FOREGROUND: Color = Color::from_u32(0xf8fafc);
 const DARK_ACTION_DESTRUCTIVE_DEFAULT: Color = Color::from_u32(0xc62828);
 const DARK_ACTION_DESTRUCTIVE_HOVER: Color = Color::from_u32(0xc92a2a);
 const DARK_ACTION_DESTRUCTIVE_FOCUS: Color = Color::from_u32(0xc62828);
@@ -1817,7 +1857,7 @@ fn dark_theme(density: Density, scale: Scale) -> ThemeTokens {
                     border: DARK_BORDER_SELECTION,
                 },
                 disabled: ActionStateTokens {
-                    foreground: DARK_ACTION_PRIMARY_FOREGROUND,
+                    foreground: DARK_ACTION_PRIMARY_DISABLED_FOREGROUND,
                     background: DARK_ACTION_PRIMARY_DISABLED,
                     border: DARK_BORDER_SELECTION,
                 },
@@ -2230,11 +2270,44 @@ mod tests {
         let t = dark(Density::Comfortable, Scale::Scale100);
         assert_eq!(t.surfaces.canvas, Color::from_u32(0x101013), "column");
         assert_eq!(t.surfaces.raised, Color::from_u32(0x151518), "row box");
+        // Ruled 0x26262b so the selected row reads as a filled slab; that value
+        // drops text_disabled_on_selection to 4.118:1. 0x1e1e23 is the ceiling
+        // for the 4.5:1 floor and collides with surfaces.disabled, so the step
+        // below it ships (text_disabled_on_selection 4.590:1).
         assert_eq!(
             t.surfaces.selection,
-            Color::from_u32(0x1a1a20),
+            Color::from_u32(0x1d1d22),
             "selected row"
         );
+        assert_ne!(
+            t.surfaces.selection, t.surfaces.disabled,
+            "a selected row must not read as a disabled one"
+        );
+        // Colour is reserved for state that needs you, so neither the focus
+        // ring nor the primary action may be a hue.
+        assert_eq!(t.borders.focus, Color::from_u32(0x86868f), "focus ring");
+        assert_eq!(t.borders.selection, Color::from_u32(0xa1a1aa));
+        assert_eq!(
+            t.actions.primary.default.background,
+            Color::from_u32(0xe6e6ea),
+            "primary action fill"
+        );
+        assert_eq!(
+            t.actions.primary.default.foreground,
+            Color::from_u32(0x101013),
+            "primary action text"
+        );
+        assert_eq!(
+            t.actions.primary.hover.background,
+            Color::from_u32(0xffffff)
+        );
+        assert_eq!(
+            t.actions.primary.selected.background,
+            Color::from_u32(0xd0d0d6)
+        );
+        assert_eq!(t.text.on_accent, Color::from_u32(0x101013));
+        // The status yellow is a status, not a control: it keeps its hue.
+        assert_eq!(t.status.warning, Color::from_u32(0xfacc15));
         assert_eq!(t.surfaces.sunken, Color::from_u32(0x111114), "stream");
         assert_eq!(
             t.surfaces.disabled,

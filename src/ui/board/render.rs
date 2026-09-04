@@ -36,9 +36,10 @@ use crate::ui::board::layout::{
     HEADER_TITLE_FONT_SIZE, LINE_GAP, META_FONT_SIZE, META_GAP, META_LINE_HEIGHT,
     NEEDS_YOU_BORDER_ALPHA, PROVIDER_MARK_SIZE, RAIL_COUNT_FONT_SIZE, RAIL_DOT_COUNT_GAP,
     RAIL_DOT_SIZE, RAIL_GROUP_GAP, RAIL_PADDING_TOP, ROW_BORDER_WIDTH, ROW_COMPACT_PADDING_DELTA,
-    ROW_PADDING_BOTTOM, ROW_PADDING_TOP, ROW_PADDING_X, ROW_STRIPE_WIDTH, SECOND_LINE_INDENT,
-    SEGMENT_GAP, SEGMENT_HEIGHT, SEGMENT_RADIUS, SEGMENT_WIDTH, STATE_DOT_HALO_ALPHA,
-    STATE_DOT_HALO_SIZE, STATE_DOT_SIZE, TITLE_FONT_SIZE, TITLE_LINE_HEIGHT,
+    ROW_PADDING_BOTTOM, ROW_PADDING_TOP, ROW_PADDING_X, ROW_STRIPE_WIDTH,
+    ROW_STRIPE_WIDTH_SELECTED, SECOND_LINE_INDENT, SEGMENT_GAP, SEGMENT_HEIGHT, SEGMENT_RADIUS,
+    SEGMENT_WIDTH, STATE_DOT_HALO_ALPHA, STATE_DOT_HALO_SIZE, STATE_DOT_SIZE, TITLE_FONT_SIZE,
+    TITLE_LINE_HEIGHT,
 };
 use crate::ui::board::model::{BoardGroup, BoardModel, BoardProgress, BoardRow, BoardState};
 use crate::ui::board::project_colour::ProjectColourBook;
@@ -242,10 +243,21 @@ pub fn board_row_element(
     };
 
     let stripe = colours.colour(row.project_colour);
-    let (background, base_border) = if row.selected {
-        (tokens.surfaces.selection, tokens.borders.strong)
+    // A selected row is a filled slab: the fill lifts, the rules step up to
+    // `borders.strong` at full strength, and the stripe widens. One of those
+    // alone is a hairline nobody sees at a glance.
+    let (background, base_border, stripe_width) = if row.selected {
+        (
+            tokens.surfaces.selection,
+            tokens.borders.strong,
+            ROW_STRIPE_WIDTH_SELECTED,
+        )
     } else {
-        (tokens.surfaces.raised, tokens.borders.subtle)
+        (
+            tokens.surfaces.raised,
+            tokens.borders.subtle,
+            ROW_STRIPE_WIDTH,
+        )
     };
     // The needs-you tint outranks the selection border: a row that wants a
     // person must not look calmer for being the one you happen to have open.
@@ -257,14 +269,16 @@ pub fn board_row_element(
         _ => base_border,
     };
     // The reference PNG measures pure white on a row that asked a question and
-    // the ordinary title colour on Working and on Blocked, so only the two
-    // states waiting on an answer take `text.emphasis`. Blocked is loud in the
-    // dot and the border, not in the title.
-    let title_colour = if matches!(row.state, BoardState::Question | BoardState::Permission) {
-        tokens.text.emphasis
-    } else {
-        tokens.text.primary
-    };
+    // the ordinary title colour on Working and on Blocked, so of the STATES only
+    // the two waiting on an answer take `text.emphasis`. Blocked is loud in the
+    // dot and the border, not in the title. Selection is a different axis: the
+    // row you have open takes the same white so the slab reads at a glance.
+    let title_colour =
+        if row.selected || matches!(row.state, BoardState::Question | BoardState::Permission) {
+            tokens.text.emphasis
+        } else {
+            tokens.text.primary
+        };
 
     let tooltip_text = row_tooltip_text(row);
     let (capture_down_key, capture_up_key, select_key, key_key) = (
@@ -381,7 +395,7 @@ pub fn board_row_element(
                 .left_0()
                 .top_0()
                 .bottom_0()
-                .w(px(ROW_STRIPE_WIDTH))
+                .w(px(stripe_width))
                 .bg(stripe.to_gpui()),
         )
         .child(

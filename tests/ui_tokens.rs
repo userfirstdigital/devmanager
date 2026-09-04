@@ -685,10 +685,15 @@ fn semantic_action_and_status_surfaces_declare_every_exposed_state() {
             "text_on_accent_on_action_primary_hover",
             "text_on_accent_on_action_primary_focus",
             "text_on_accent_on_action_primary_selected",
-            "text_on_accent_on_action_destructive_default",
-            "text_on_accent_on_action_destructive_hover",
-            "text_on_accent_on_action_destructive_focus",
-            "text_on_accent_on_action_destructive_selected",
+            // Renamed with the redesign: `text.on_accent` is painted on the
+            // primary fill and on `status.external`, never on a destructive
+            // fill, which carries its own foreground. Same four states, same
+            // 4.5:1 floor, measured against the colour actually painted.
+            "text_on_destructive_on_action_destructive_default",
+            "text_on_destructive_on_action_destructive_hover",
+            "text_on_destructive_on_action_destructive_focus",
+            "text_on_destructive_on_action_destructive_selected",
+            "text_on_accent_on_status_external",
         ] {
             assert!(normal_pairs.contains(name), "missing normal pair {name}");
         }
