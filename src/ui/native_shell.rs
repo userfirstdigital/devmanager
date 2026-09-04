@@ -312,6 +312,15 @@ fn task_row_right_click_should_rename(_archived: bool) -> bool {
 /// Task-rail row capture must shield right/middle from the terminal behind the
 /// list, but must not consume left so the archived Delete child can receive the
 /// nested mouse sequence (capture runs before child handlers).
+/// What an empty task list tells the reader to do next. One constant because
+/// the painted empty state and its accessible description are the same
+/// sentence said twice: they had already drifted, the painted copy still
+/// naming the "+Claude" / "+Codex" buttons the board deleted, and nothing
+/// could go red over it -- a screen reader heard the right advice while the
+/// screen showed instructions for controls that are gone.
+const INBOX_EMPTY_STATE_HINT: &str =
+    "Add or choose a project, then start one from the board's + New menu.";
+
 fn task_rail_row_capture_consumes_button(button: MouseButton) -> bool {
     !matches!(button, MouseButton::Left)
 }
@@ -10048,7 +10057,7 @@ impl AccessibilityTree {
             AccessibilityNode::new(
                 AccessibleRole::Status,
                 "No tasks yet",
-                "Add or choose a project, then start one from the board's + New menu.",
+                INBOX_EMPTY_STATE_HINT,
             )
             .gpui("native-task-inbox-status", false, false)
         } else {
@@ -30716,6 +30725,56 @@ impl NativeShell {
         }
     }
 
+    /// A captured pointer-down on a task row. Returns whether the event was
+    /// consumed -- the caller stops propagation on `true`, and on `false` lets
+    /// it bubble so a nested affordance inside the row still gets its sequence.
+    ///
+    /// A method rather than a closure body because a closure is not reachable
+    /// from a test: the previous round asserted the policy helper and would
+    /// have stayed green with the whole handler unwired. This is the side
+    /// effect itself, and both the board row and the archived row call it, so
+    /// the two cannot drift.
+    ///
+    /// The buttons this consumes must not reach the terminal dock behind the
+    /// column: middle-click on a terminal pastes the selection.
+    fn handle_board_row_capture_down(&mut self, key: &HostTaskKey, button: MouseButton) -> bool {
+        let archived = self
+            .fleet_inbox_projection()
+            .find(key)
+            .is_some_and(|row| row.archived);
+        match task_row_capture(button, archived) {
+            TaskRowCapture::Bubble => false,
+            TaskRowCapture::Consume => true,
+            TaskRowCapture::ConsumeAndRename => {
+                // Never mint a local selected_project_id from a remote host's
+                // raw ProjectId.
+                if key.host == self.local_host_id() {
+                    if let Some(project_id) = self
+                        .fleet_inbox_projection()
+                        .find(key)
+                        .and_then(|row| row.project_id)
+                    {
+                        self.selected_project_id = Some(project_id);
+                    }
+                }
+                self.begin_task_rename_key(key.clone());
+                true
+            }
+        }
+    }
+
+    /// The matching pointer-up: release the grab the row took. Same return
+    /// contract as [`Self::handle_board_row_capture_down`].
+    fn handle_board_row_capture_up(&mut self, button: MouseButton) -> bool {
+        if !task_rail_row_capture_consumes_button(button) {
+            return false;
+        }
+        self.local_slot_mut()
+            .interaction
+            .release_pointer(NATIVE_POINTER_ID);
+        true
+    }
+
     /// One board row per live fleet task, with the transient state age and the
     /// journal-derived plan progress and doing-now text folded in.
     ///
@@ -30830,9 +30889,10 @@ impl NativeShell {
     /// conversation history duplicated per frame for nothing: `board_activity`
     /// only reads. The cache above it then removes even the scan.
     fn board_activity_for(&mut self, key: &HostTaskKey) -> BoardActivity {
-        // The marker is `Copy`, so binding it ends the borrow of
-        // `task_surfaces` and leaves the cache free to be written below.
-        let Some((_, marker)) = self.task_surfaces.conversation_facts(key.clone()) else {
+        // `task_surfaces` and `board_activity_cache` are disjoint fields, so
+        // the borrow of the facts can stay live across the cache read and ends
+        // at the scan below, before the cache is written.
+        let Some((facts, marker)) = self.task_surfaces.conversation_facts(key.clone()) else {
             self.board_activity_cache.remove(key);
             return BoardActivity::default();
         };
@@ -30841,11 +30901,7 @@ impl NativeShell {
                 return activity.clone();
             }
         }
-        let activity: BoardActivity = self
-            .task_surfaces
-            .conversation_facts(key.clone())
-            .map(|(facts, _)| board_activity(facts))
-            .unwrap_or_default();
+        let activity = board_activity(facts);
         self.board_activity_cache
             .insert(key.clone(), (marker, activity.clone()));
         activity
@@ -34330,54 +34386,6 @@ impl NativeShell {
         }
     }
 
-    fn inbox_agent_header_actions_static(&self) -> Option<AnyElement> {
-        if self.first_workspace_project_id().is_none() {
-            return None;
-        }
-        let actions = inbox_agent_actions(self.local_slot().agent_connection.as_ref()?);
-        (!actions.is_empty()).then(|| {
-            div()
-                .flex()
-                .flex_none()
-                .items_center()
-                .gap(px(self.theme_tokens().density.spacing.xs))
-                .children(actions.into_iter().map(|action| {
-                    Button::new(Self::inbox_agent_action_id(action.provider))
-                        .label(action.label)
-                        .ghost()
-                        .into_any_element()
-                }))
-                .into_any_element()
-        })
-    }
-
-    fn inbox_agent_header_actions(&self, cx: &Context<Self>) -> Option<AnyElement> {
-        if self.first_workspace_project_id().is_none() {
-            return None;
-        }
-        let actions = inbox_agent_actions(self.local_slot().agent_connection.as_ref()?);
-        (!actions.is_empty()).then(|| {
-            div()
-                .flex()
-                .flex_none()
-                .items_center()
-                .gap(px(self.theme_tokens().density.spacing.xs))
-                .children(actions.into_iter().map(|action| {
-                    let provider = action.provider;
-                    Button::new(Self::inbox_agent_action_id(provider))
-                        .label(action.label)
-                        .ghost()
-                        .on_click(cx.listener(move |shell, _event: &ClickEvent, _window, cx| {
-                            cx.stop_propagation();
-                            shell.start_task_with_agent(provider);
-                            cx.notify();
-                        }))
-                        .into_any_element()
-                }))
-                .into_any_element()
-        })
-    }
-
     fn conversation_delete_action(&self, cx: &Context<Self>) -> Option<AnyElement> {
         let tokens = self.theme_tokens();
         // Add/Commit stay available without a selected task (collapsed-dock chrome).
@@ -34828,7 +34836,7 @@ impl NativeShell {
             "native-shell-task-inbox-empty",
             "+",
             "No tasks yet",
-            "Use +Claude or +Codex to start.",
+            INBOX_EMPTY_STATE_HINT,
             tokens,
             action,
         )
@@ -42398,7 +42406,11 @@ impl NativeShell {
                             .child(task_count.to_string())
                             .into_any_element(),
                         ProjectInboxItem::Task {
-                            project_id,
+                            // The project and the local-owner check now come
+                            // from `handle_board_row_capture_down`, which reads
+                            // both off the projection so the board row and the
+                            // archived row cannot answer differently.
+                            project_id: _,
                             task_key,
                             settled,
                             archived,
@@ -42417,7 +42429,6 @@ impl NativeShell {
                         let task_key_delete = task_key.clone();
                         let task_key_delete_click = task_key.clone();
                         let task_key_delete_key = task_key.clone();
-                        let task_is_local = task_key.host == local_host_for_list;
                         let (
                             row_title,
                             project_label,
@@ -42438,29 +42449,19 @@ impl NativeShell {
                             });
                         let row_selected = selected_task_key_for_list.as_ref() == Some(&task_key);
                         let row_open = open_task_ids.contains(&task_key);
+                        // The archived row and the board row share one capture
+                        // policy: right/middle are consumed so they cannot fall
+                        // through to the terminal dock, and left is left alone
+                        // so the archived Delete hitbox still receives it.
                         let mouse_handler =
                             move |event: &MouseDownEvent,
                                   window: &mut Window,
                                   app: &mut gpui::App| {
-                                // Right/middle must be captured so they cannot fall
-                                // through to the terminal dock. Left must reach the
-                                // archived Delete hitbox (child on_click / key).
-                                if !task_rail_row_capture_consumes_button(event.button) {
-                                    return;
-                                }
+                                let _ = window;
+                                let key = task_key_mouse.clone();
                                 let _ = shell_for_mouse.update(app, |shell, cx| {
-                                    cx.stop_propagation();
-                                    if event.button == MouseButton::Right {
-                                        // Owner-captured rename; never mint local selected_project_id
-                                        // from a remote raw ProjectId.
-                                        if task_is_local {
-                                            if let Some(project_id) = project_id {
-                                                shell.selected_project_id = Some(project_id);
-                                            }
-                                        }
-                                        if task_row_right_click_should_rename(archived) {
-                                            shell.begin_task_rename_key(task_key_mouse.clone());
-                                        }
+                                    if shell.handle_board_row_capture_down(&key, event.button) {
+                                        cx.stop_propagation();
                                         cx.notify();
                                     }
                                 });
@@ -42469,12 +42470,10 @@ impl NativeShell {
                             move |event: &MouseUpEvent,
                                   _window: &mut Window,
                                   app: &mut gpui::App| {
-                                if !task_rail_row_capture_consumes_button(event.button) {
-                                    return;
-                                }
                                 let _ = shell_for_mouse_up.update(app, |shell, cx| {
-                                    cx.stop_propagation();
-                                    shell.local_slot_mut().interaction.release_pointer(NATIVE_POINTER_ID);
+                                    if shell.handle_board_row_capture_up(event.button) {
+                                        cx.stop_propagation();
+                                    }
                                 });
                             };
                         let left_select_handler =
@@ -42861,34 +42860,12 @@ impl NativeShell {
                           event: &MouseDownEvent,
                           _window: &mut Window,
                           app: &mut gpui::App| {
-                        // Right and middle must be captured so they cannot fall
-                        // through to the terminal dock behind the column --
-                        // middle there pastes the selection. Left is left to
-                        // bubble so a nested affordance still gets its sequence.
-                        // The board paints no archived rows, so a right click
-                        // here is always on a live task.
-                        let decision = task_row_capture(event.button, false);
-                        if decision == TaskRowCapture::Bubble {
-                            return;
-                        }
                         let key = key.clone();
                         let _ = shell.update(app, |shell, cx| {
-                            cx.stop_propagation();
-                            if decision == TaskRowCapture::ConsumeAndRename {
-                                // Never mint a local selected_project_id from a
-                                // remote host's raw ProjectId.
-                                if key.host == shell.local_host_id() {
-                                    if let Some(project_id) = shell
-                                        .fleet_inbox_projection()
-                                        .find(&key)
-                                        .and_then(|row| row.project_id)
-                                    {
-                                        shell.selected_project_id = Some(project_id);
-                                    }
-                                }
-                                shell.begin_task_rename_key(key);
+                            if shell.handle_board_row_capture_down(&key, event.button) {
+                                cx.stop_propagation();
+                                cx.notify();
                             }
-                            cx.notify();
                         });
                     }
                 }),
@@ -42898,15 +42875,10 @@ impl NativeShell {
                           event: &MouseUpEvent,
                           _window: &mut Window,
                           app: &mut gpui::App| {
-                        if !task_rail_row_capture_consumes_button(event.button) {
-                            return;
-                        }
                         let _ = shell.update(app, |shell, cx| {
-                            cx.stop_propagation();
-                            shell
-                                .local_slot_mut()
-                                .interaction
-                                .release_pointer(NATIVE_POINTER_ID);
+                            if shell.handle_board_row_capture_up(event.button) {
+                                cx.stop_propagation();
+                            }
                         });
                     }
                 }),
@@ -46555,6 +46527,7 @@ pub(crate) mod tests {
         IsolatedHostLifetime,
         KeyedWorkspaceLayout,
         MainConversationCanvas,
+        MouseButton,
         NativeAccessibilityAction,
         NativeActionRecord,
         NativeComposerImage,
@@ -50082,7 +50055,8 @@ pub(crate) mod tests {
         assert_eq!(status.name(), "No tasks yet");
         assert_eq!(
             status.description(),
-            "Add or choose a project, then start one from the board's + New menu."
+            super::INBOX_EMPTY_STATE_HINT,
+            "the painted empty state and its accessible description are one sentence"
         );
     }
 
@@ -53069,43 +53043,159 @@ pub(crate) mod tests {
         (builder.finish().expect("client model"), task_id)
     }
 
-    /// The board row must consume the same buttons the project rail's row did.
-    /// A button the row does not consume reaches the terminal dock behind the
-    /// column, and middle-click there pastes the selection into whatever is
-    /// running -- so "middle is consumed" and "middle does nothing" are two
-    /// separate claims and both have to hold.
+    /// The row's capture policy, exercised through the shell method the
+    /// handlers actually call rather than through the pure helper beside it.
+    ///
+    /// The previous round asserted `task_row_capture` alone, which stayed
+    /// green with the whole handler deleted -- the helper is a lookup table,
+    /// not the behaviour. This drives `handle_board_row_capture_down` on a
+    /// live shell and reads the rename state back, so a closure that stops
+    /// calling it, or a method that stops renaming, goes red.
+    ///
+    /// What this still cannot see is the `.capture_any_mouse_down` /
+    /// `.capture_any_mouse_up` attach in `board/render.rs`: a GPUI element
+    /// tree is not introspectable headlessly (calling `element_with_handlers`
+    /// from a test aborts the harness). That wiring is covered by the Task 9
+    /// launch check -- right-click renames, middle-click does nothing.
     #[test]
     fn board_row_capture_consumes_middle_without_acting_on_it() {
-        use super::{task_row_capture, TaskRowCapture};
-
-        assert_eq!(
-            task_row_capture(gpui::MouseButton::Middle, false),
-            TaskRowCapture::Consume,
-            "middle must be consumed so it cannot reach the terminal, and must do nothing"
-        );
-        assert_eq!(
-            task_row_capture(gpui::MouseButton::Right, false),
-            TaskRowCapture::ConsumeAndRename,
-            "right stays captured and opens the rename, as it did on the rail"
-        );
-        assert_eq!(
-            task_row_capture(gpui::MouseButton::Left, false),
-            TaskRowCapture::Bubble,
-            "left must bubble so a nested affordance still receives its sequence"
-        );
-        // The policy predicate and the decision cannot disagree about which
-        // buttons are consumed.
-        for button in [
-            gpui::MouseButton::Left,
-            gpui::MouseButton::Right,
-            gpui::MouseButton::Middle,
-        ] {
-            assert_eq!(
-                super::task_rail_row_capture_consumes_button(button),
-                task_row_capture(button, false) != TaskRowCapture::Bubble,
-                "consume policy and capture decision must agree for {button:?}"
-            );
+        if rerun_headless_shell_test_in_child(
+            "ui::native_shell::tests::board_row_capture_consumes_middle_without_acting_on_it",
+        ) {
+            return;
         }
+        let _test_guard = HEADLESS_SHELL_TEST_LOCK
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .expect("headless shell test lock");
+        gpui::Application::headless().run(move |cx| {
+            crate::ui::init(cx);
+            let (runtime, _shared) = TestRuntime::new(true, NativeHostActionResult::Queued);
+            let (model, task_id) = open_task_without_agent_client_model();
+            let project_id = model.task(task_id).expect("task").task.project_id;
+            with_test_shell_in_app(cx, runtime, |shell| {
+                shell.install_project_for_test("DevManager", project_id);
+                shell
+                    .apply_client_model(Arc::new(model))
+                    .expect("apply model");
+                let key = shell.local_task_key(task_id);
+                assert!(
+                    shell.board_model(1_000).has_rows(),
+                    "the row under test has to be on the board"
+                );
+
+                // (a) Middle is consumed -- it must not reach the terminal dock
+                // behind the column, where it would paste the selection -- and
+                // it does nothing else.
+                assert!(shell.rename_task.is_none());
+                assert!(
+                    shell.handle_board_row_capture_down(&key, MouseButton::Middle),
+                    "middle must be consumed so it cannot fall through to the terminal"
+                );
+                assert!(
+                    shell.rename_task.is_none(),
+                    "middle must not begin a rename: consumed and inert are two claims"
+                );
+
+                // (b) Right on a local live task is consumed and opens the
+                // rename, which is what it did on the project rail.
+                assert!(
+                    shell.handle_board_row_capture_down(&key, MouseButton::Right),
+                    "right stays captured"
+                );
+                assert_eq!(
+                    shell.rename_task.as_ref().map(|draft| draft.owner.clone()),
+                    Some(key.clone()),
+                    "right-click renames the exact row it was pressed on"
+                );
+                assert_eq!(
+                    shell.selected_project_id,
+                    Some(project_id),
+                    "a local right-click carries the row's own project, never a minted one"
+                );
+                shell.rename_task = None;
+
+                // (c) Left bubbles, so a nested affordance inside the row still
+                // receives its own mouse sequence.
+                assert!(
+                    !shell.handle_board_row_capture_down(&key, MouseButton::Left),
+                    "left must not be consumed"
+                );
+                assert!(shell.rename_task.is_none());
+
+                // The pointer grab the row took is released on the same buttons.
+                assert!(shell.handle_board_row_capture_up(MouseButton::Middle));
+                assert!(shell.handle_board_row_capture_up(MouseButton::Right));
+                assert!(
+                    !shell.handle_board_row_capture_up(MouseButton::Left),
+                    "left took no grab, so there is none to release"
+                );
+            });
+            cx.quit();
+        });
+    }
+
+    /// A task that leaves the fleet projection must drop its cached activity,
+    /// not only its state-clock entry. Both maps are pruned from one list in
+    /// `board_rows`, and this is the half the clock's sabotage check does not
+    /// cover.
+    #[test]
+    fn a_departed_task_drops_its_board_activity_cache_entry() {
+        if rerun_headless_shell_test_in_child(
+            "ui::native_shell::tests::a_departed_task_drops_its_board_activity_cache_entry",
+        ) {
+            return;
+        }
+        let _test_guard = HEADLESS_SHELL_TEST_LOCK
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .expect("headless shell test lock");
+        gpui::Application::headless().run(move |cx| {
+            crate::ui::init(cx);
+            let (runtime, _shared) = TestRuntime::new(true, NativeHostActionResult::Queued);
+            let (model, task_id) = open_task_without_agent_client_model();
+            let project_id = model.task(task_id).expect("task").task.project_id;
+            with_test_shell_in_app(cx, runtime, |shell| {
+                shell.install_project_for_test("DevManager", project_id);
+                shell
+                    .apply_client_model(Arc::new(model))
+                    .expect("apply model");
+                let key = shell.local_task_key(task_id);
+                // Give the task a conversation so it earns a cache entry at all:
+                // a task with no surface is never cached.
+                shell.task_surfaces.begin_conversation(key.clone(), 1);
+                shell
+                    .task_surfaces
+                    .admit_conversation(key.clone(), 1, &probe_conversation_page(4))
+                    .expect("seed conversation");
+
+                let _ = shell.board_model(1_000);
+                assert_eq!(
+                    shell.board_activity_cache.len(),
+                    1,
+                    "a listed task with a conversation is cached"
+                );
+                assert_eq!(shell.board_state_clock.keys().count(), 1);
+
+                // The projection the board reads is what a purge or an archive
+                // takes the task out of.
+                shell.local_slot_mut().inbox =
+                    Inbox::from_error(crate::ui::task_cockpit::InboxError::ProjectionUnavailable);
+                shell.local_slot_mut().client_model = None;
+                let _ = shell.board_model(2_000);
+                assert_eq!(
+                    shell.board_activity_cache.len(),
+                    0,
+                    "a departed task must not leave its activity cached for the life of the process"
+                );
+                assert_eq!(
+                    shell.board_state_clock.keys().count(),
+                    0,
+                    "and the two maps are pruned from one list, so they cannot disagree"
+                );
+            });
+            cx.quit();
+        });
     }
 
     /// What the board puts under its header, asserted on the render path's own
