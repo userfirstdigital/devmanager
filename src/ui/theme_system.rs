@@ -260,6 +260,14 @@ impl ThemeColor {
         Color::rgb(self.red, self.green, self.blue)
     }
 
+    /// Lift a canonical token colour into a palette role value.
+    ///
+    /// Built-in palettes are projections of `crate::ui::tokens`, so they are
+    /// written against the token constants rather than restated as literals.
+    pub const fn from_token(color: Color) -> Self {
+        Self::rgb(color.red(), color.green(), color.blue())
+    }
+
     pub fn to_hex(self) -> String {
         if self.alpha == 255 {
             format!("#{:02x}{:02x}{:02x}", self.red, self.green, self.blue)
@@ -586,6 +594,182 @@ impl ThemePalette {
             .expect("validated theme palette contains every semantic role")
     }
 
+    /// The redesign's dark shell, projected from the canonical token module.
+    ///
+    /// A fresh profile resolves to built-in Classic, and [`Self::tokens`]
+    /// overwrites most of what `crate::ui::tokens::dark` produced with these
+    /// role values - so anything the palette does not agree with never reaches
+    /// the screen. Deriving the roles from that same function rather than
+    /// restating them as literals means the two cannot drift.
+    ///
+    /// The role set is a lossy projection of `ThemeTokens`: several tokens
+    /// share one role. Where they disagree the role follows the token with the
+    /// most render call sites, and the losers are named in the comments below.
+    pub fn redesign_dark() -> Self {
+        let tokens = crate::ui::tokens::dark(Density::Comfortable, Scale::Scale100);
+        let role = ThemeColor::from_token;
+        let pairs = [
+            (ThemeColorRole::Canvas, role(tokens.surfaces.canvas)),
+            (ThemeColorRole::Chrome, role(tokens.surfaces.raised)),
+            (ThemeColorRole::Toolbar, role(tokens.surfaces.raised)),
+            (ThemeColorRole::ToolbarForeground, role(tokens.text.primary)),
+            (ThemeColorRole::ToolbarBorder, role(tokens.borders.subtle)),
+            (
+                ThemeColorRole::ToolbarControl,
+                role(tokens.surfaces.overlay),
+            ),
+            (
+                ThemeColorRole::ToolbarControlForeground,
+                role(tokens.text.primary),
+            ),
+            // Drives surfaces.hover.
+            (
+                ThemeColorRole::ToolbarControlHover,
+                role(tokens.surfaces.hover),
+            ),
+            (ThemeColorRole::Surface, role(tokens.surfaces.raised)),
+            (ThemeColorRole::SurfaceRaised, role(tokens.surfaces.raised)),
+            (
+                ThemeColorRole::SurfaceOverlay,
+                role(tokens.surfaces.overlay),
+            ),
+            (ThemeColorRole::Text, role(tokens.text.primary)),
+            (ThemeColorRole::TextMuted, role(tokens.text.muted)),
+            (ThemeColorRole::Border, role(tokens.borders.subtle)),
+            (ThemeColorRole::Input, role(tokens.borders.default)),
+            // Drives borders.focus, which has the render call sites;
+            // actions.primary.focus rides along and has none.
+            (ThemeColorRole::Focus, role(tokens.borders.focus)),
+            // Drives actions.primary.default; borders.selection rides along
+            // and becomes the action colour rather than the neutral outline.
+            (
+                ThemeColorRole::Accent,
+                role(tokens.actions.primary.default.background),
+            ),
+            (
+                ThemeColorRole::AccentForeground,
+                role(tokens.text.on_accent),
+            ),
+            (ThemeColorRole::Secondary, role(tokens.surfaces.overlay)),
+            (
+                ThemeColorRole::SecondaryForeground,
+                role(tokens.text.secondary),
+            ),
+            // Drives surfaces.disabled; borders.disabled and the disabled
+            // action backgrounds ride along and flatten onto it.
+            (ThemeColorRole::Muted, role(tokens.surfaces.disabled)),
+            (ThemeColorRole::MutedForeground, role(tokens.text.muted)),
+            (ThemeColorRole::Placeholder, role(tokens.text.disabled)),
+            (ThemeColorRole::SecondaryLabel, role(tokens.text.secondary)),
+            (ThemeColorRole::IconMuted, role(tokens.text.muted)),
+            // Drives status.destructive; actions.destructive.default rides along.
+            (ThemeColorRole::Error, role(tokens.status.destructive)),
+            (
+                ThemeColorRole::ErrorForeground,
+                role(tokens.status.destructive_foreground),
+            ),
+            (
+                ThemeColorRole::ErrorSurface,
+                role(tokens.status.destructive_surface),
+            ),
+            (ThemeColorRole::Warning, role(tokens.status.warning)),
+            (
+                ThemeColorRole::WarningForeground,
+                role(tokens.status.warning_foreground),
+            ),
+            (
+                ThemeColorRole::WarningSurface,
+                role(tokens.status.warning_surface),
+            ),
+            (ThemeColorRole::Update, role(tokens.status.external)),
+            (
+                ThemeColorRole::UpdateForeground,
+                role(tokens.status.external_foreground),
+            ),
+            (
+                ThemeColorRole::UpdateSurface,
+                role(tokens.status.external_surface),
+            ),
+            (
+                ThemeColorRole::AccentSurface,
+                role(tokens.actions.primary.selected.background),
+            ),
+            (
+                ThemeColorRole::AccentSurfaceForeground,
+                role(tokens.actions.primary.default.foreground),
+            ),
+            (
+                ThemeColorRole::MessageSurface,
+                role(tokens.status.external_surface),
+            ),
+            (
+                ThemeColorRole::MessageForeground,
+                role(tokens.status.external_foreground),
+            ),
+            (ThemeColorRole::MessageAction, role(tokens.status.external)),
+            (
+                ThemeColorRole::MessageActionForeground,
+                role(tokens.text.on_accent),
+            ),
+            (
+                ThemeColorRole::MessageActionHover,
+                role(tokens.actions.primary.hover.background),
+            ),
+            // Drives surfaces.sunken, which is the stream well - a step above
+            // the terminal's own background, so the two roles differ here.
+            (ThemeColorRole::CodeBackground, role(tokens.surfaces.sunken)),
+            (ThemeColorRole::CodeForeground, role(tokens.text.primary)),
+            (ThemeColorRole::Sidebar, role(tokens.surfaces.raised)),
+            (
+                ThemeColorRole::SidebarForeground,
+                role(tokens.text.on_selection),
+            ),
+            (
+                ThemeColorRole::SidebarMutedForeground,
+                role(tokens.text.muted),
+            ),
+            (
+                ThemeColorRole::SidebarControlSurface,
+                role(tokens.surfaces.overlay),
+            ),
+            (ThemeColorRole::SidebarRowHover, role(tokens.surfaces.hover)),
+            (
+                ThemeColorRole::SidebarRowActive,
+                role(tokens.surfaces.selection),
+            ),
+            // Drives surfaces.selection. A neutral grey step, never an accent
+            // mix: colour on this shell is reserved for needs-you.
+            (
+                ThemeColorRole::SidebarRowSelected,
+                role(tokens.surfaces.selection),
+            ),
+            (ThemeColorRole::SidebarBorder, role(tokens.borders.strong)),
+            (
+                ThemeColorRole::TerminalBackground,
+                role(tokens.terminal.background),
+            ),
+            (
+                ThemeColorRole::TerminalForeground,
+                role(tokens.terminal.foreground),
+            ),
+            (ThemeColorRole::TerminalCursor, role(tokens.terminal.cursor)),
+            (
+                ThemeColorRole::TerminalSelection,
+                role(tokens.terminal.selection),
+            ),
+            (
+                ThemeColorRole::TerminalScrollbar,
+                role(tokens.borders.default),
+            ),
+            (
+                ThemeColorRole::TerminalScrollbarHover,
+                role(tokens.borders.strong),
+            ),
+        ];
+        Self::advanced(pairs.into_iter().collect())
+            .expect("redesign dark palette must declare every semantic role")
+    }
+
     pub fn managed(appearance: ThemeAppearance, canvas: ThemeColor, accent: ThemeColor) -> Self {
         let white = ThemeColor::rgb(255, 255, 255);
         let black = ThemeColor::rgb(18, 18, 22);
@@ -824,7 +1008,10 @@ impl ThemePalette {
             color(ThemeColorRole::ErrorForeground),
         );
 
-        tokens.status.attention = color(ThemeColorRole::Warning);
+        // status.attention, status.success, text.emphasis and every terminal
+        // ANSI slot have no role of their own, so they stay as the token module
+        // set them. Attention used to be aliased onto Warning, which quietly
+        // replaced the redesign's amber with whatever a palette called warning.
         tokens.status.warning = color(ThemeColorRole::Warning);
         tokens.status.warning_surface = color(ThemeColorRole::WarningSurface);
         tokens.status.warning_foreground = color(ThemeColorRole::WarningForeground);
@@ -977,15 +1164,23 @@ impl ThemeDefinition {
         light_roles: &[(&str, &str)],
         dark_roles: &[(&str, &str)],
     ) -> Self {
+        Self::paired_palettes(
+            id,
+            label,
+            palette_from_oklch_roles(light_roles),
+            palette_from_oklch_roles(dark_roles),
+        )
+    }
+
+    /// Pair two already-built palettes, for a theme whose halves do not both
+    /// come from a role table.
+    fn paired_palettes(id: &str, label: &str, light: ThemePalette, dark: ThemePalette) -> Self {
         Self {
             id: id.to_string(),
             label: label.to_string(),
             palettes: BTreeMap::from([
-                (
-                    ThemeAppearance::Light,
-                    palette_from_oklch_roles(light_roles),
-                ),
-                (ThemeAppearance::Dark, palette_from_oklch_roles(dark_roles)),
+                (ThemeAppearance::Light, light),
+                (ThemeAppearance::Dark, dark),
             ]),
             managed: false,
             metadata: JsonMap::new(),
@@ -1695,67 +1890,6 @@ const IRIS_DARK_ROLES: &[(&str, &str)] = &[
     ("terminalScrollbarHover", "oklch(0.676012 0.015271 305.433)"),
 ];
 
-/// v0.4.1 zinc/indigo dark palette, mapped onto the semantic role set.
-const DEVMANAGER_CLASSIC_DARK_ROLES: &[(&str, &str)] = &[
-    ("canvas", "#18181b"),
-    ("chrome", "#27272a"),
-    ("toolbar", "#27272a"),
-    ("toolbarForeground", "#e4e4e7"),
-    ("toolbarBorder", "#3f3f46"),
-    ("toolbarControl", "#3f3f46"),
-    ("toolbarControlForeground", "#e4e4e7"),
-    ("toolbarControlHover", "#323238"),
-    ("surface", "#18181b"),
-    ("surfaceRaised", "#27272a"),
-    ("surfaceOverlay", "#27272a"),
-    ("text", "#e4e4e7"),
-    ("textMuted", "#a1a1aa"),
-    ("border", "#3f3f46"),
-    ("input", "#3f3f46"),
-    ("focus", "#4f46e5"),
-    ("accent", "#4f46e5"),
-    ("accentForeground", "#f8fafc"),
-    ("secondary", "#27272a"),
-    ("secondaryForeground", "#e4e4e7"),
-    ("muted", "#27272a"),
-    ("mutedForeground", "#a1a1aa"),
-    ("placeholder", "#71717a"),
-    ("secondaryLabel", "#a1a1aa"),
-    ("iconMuted", "#a1a1aa"),
-    ("error", "#fb7185"),
-    ("errorForeground", "#fb7185"),
-    ("errorSurface", "#2a1517"),
-    ("warning", "#facc15"),
-    ("warningForeground", "#facc15"),
-    ("warningSurface", "#1a202a"),
-    ("update", "#4f46e5"),
-    ("updateForeground", "#f8fafc"),
-    ("updateSurface", "#2c266b"),
-    ("accentSurface", "#2c266b"),
-    ("accentSurfaceForeground", "#e4e4e7"),
-    ("messageSurface", "#22364d"),
-    ("messageForeground", "#f8fafc"),
-    ("messageAction", "#4f46e5"),
-    ("messageActionForeground", "#f8fafc"),
-    ("messageActionHover", "#4338ca"),
-    ("codeBackground", "#09090b"),
-    ("codeForeground", "#e4e4e7"),
-    ("sidebar", "#27272a"),
-    ("sidebarForeground", "#e4e4e7"),
-    ("sidebarMutedForeground", "#a1a1aa"),
-    ("sidebarControlSurface", "#3f3f46"),
-    ("sidebarRowHover", "#323238"),
-    ("sidebarRowActive", "#323238"),
-    ("sidebarRowSelected", "#22364d"),
-    ("sidebarBorder", "#3f3f46"),
-    ("terminalBackground", "#09090b"),
-    ("terminalForeground", "#e4e4e7"),
-    ("terminalCursor", "#4f46e5"),
-    ("terminalSelection", "#22364d"),
-    ("terminalScrollbar", "#3f3f46"),
-    ("terminalScrollbarHover", "#52525b"),
-];
-
 /// Light companion for Classic so the built-in library stays paired.
 const DEVMANAGER_CLASSIC_LIGHT_ROLES: &[(&str, &str)] = &[
     ("canvas", "#fafafa"),
@@ -1819,11 +1953,14 @@ const DEVMANAGER_CLASSIC_LIGHT_ROLES: &[(&str, &str)] = &[
 
 fn built_in_themes() -> Vec<ThemeDefinition> {
     vec![
-        ThemeDefinition::paired_semantic(
+        // The dark half is the redesign shell itself, projected straight from
+        // the token module, because this is the theme a fresh profile resolves
+        // to and its roles are what the running app actually renders.
+        ThemeDefinition::paired_palettes(
             "devmanager-classic",
             "DevManager Classic",
-            DEVMANAGER_CLASSIC_LIGHT_ROLES,
-            DEVMANAGER_CLASSIC_DARK_ROLES,
+            palette_from_oklch_roles(DEVMANAGER_CLASSIC_LIGHT_ROLES),
+            ThemePalette::redesign_dark(),
         ),
         ThemeDefinition::paired_managed(
             "t3-code", "T3 Code", "#fbfafc", "#d60057", "#18151d", "#e0005b",
@@ -2837,12 +2974,24 @@ mod tests {
             .get("devmanager-classic")
             .expect("legacy-readable default theme");
         let dark = classic.palette(ThemeAppearance::Dark).unwrap();
-        assert_eq!(dark.color(ThemeColorRole::Canvas).to_hex(), "#18181b");
-        assert_eq!(dark.color(ThemeColorRole::Sidebar).to_hex(), "#27272a");
-        assert_eq!(dark.color(ThemeColorRole::Text).to_hex(), "#e4e4e7");
+        // Classic's dark half is the redesign shell, so it is pinned against
+        // the token module rather than restated as literals.
+        let redesign = crate::ui::tokens::dark(Density::Comfortable, Scale::Scale100);
         assert_eq!(
-            dark.color(ThemeColorRole::TerminalBackground).to_hex(),
-            "#09090b"
+            dark.color(ThemeColorRole::Canvas).opaque(),
+            redesign.surfaces.canvas
+        );
+        assert_eq!(
+            dark.color(ThemeColorRole::Sidebar).opaque(),
+            redesign.surfaces.raised
+        );
+        assert_eq!(
+            dark.color(ThemeColorRole::Text).opaque(),
+            redesign.text.primary
+        );
+        assert_eq!(
+            dark.color(ThemeColorRole::TerminalBackground).opaque(),
+            redesign.terminal.background
         );
         assert_eq!(
             ThemeSelection::default().appearance,
@@ -3015,6 +3164,129 @@ mod tests {
         );
         assert_eq!(tokens.density.density, Density::Compact);
         assert_eq!(tokens.density.scale, Scale::Scale125);
+    }
+
+    /// Drift guard for the redesign shell.
+    ///
+    /// The running app never reads `crate::ui::tokens::dark` directly: it goes
+    /// through `ThemeController::active_palette(..).tokens(..)`, which starts
+    /// from the token module and then overwrites most surface, text and border
+    /// tokens from the active palette's roles. So a fresh profile's dark look
+    /// is the built-in Classic palette, not the token module, and the two can
+    /// drift silently. Everything the redesign pins is asserted equal here.
+    #[test]
+    fn default_dark_palette_tokens_match_the_redesign_token_module() {
+        let root = tempfile::tempdir().unwrap();
+        let controller = ThemeController::with_defaults_at(root.path());
+        let density = Density::Comfortable;
+        let scale = Scale::Scale100;
+
+        let tokens = controller
+            .active_palette(ThemeAppearance::Dark)
+            .tokens(density, scale);
+        let expected = crate::ui::tokens::dark(density, scale);
+
+        let checks: &[(&str, Color, Color)] = &[
+            (
+                "surfaces.canvas",
+                tokens.surfaces.canvas,
+                expected.surfaces.canvas,
+            ),
+            (
+                "surfaces.raised",
+                tokens.surfaces.raised,
+                expected.surfaces.raised,
+            ),
+            (
+                "surfaces.sunken",
+                tokens.surfaces.sunken,
+                expected.surfaces.sunken,
+            ),
+            (
+                "surfaces.selection",
+                tokens.surfaces.selection,
+                expected.surfaces.selection,
+            ),
+            (
+                "surfaces.hover",
+                tokens.surfaces.hover,
+                expected.surfaces.hover,
+            ),
+            (
+                "surfaces.overlay",
+                tokens.surfaces.overlay,
+                expected.surfaces.overlay,
+            ),
+            ("text.primary", tokens.text.primary, expected.text.primary),
+            (
+                "text.secondary",
+                tokens.text.secondary,
+                expected.text.secondary,
+            ),
+            ("text.muted", tokens.text.muted, expected.text.muted),
+            (
+                "text.disabled",
+                tokens.text.disabled,
+                expected.text.disabled,
+            ),
+            (
+                "text.emphasis",
+                tokens.text.emphasis,
+                expected.text.emphasis,
+            ),
+            (
+                "borders.subtle",
+                tokens.borders.subtle,
+                expected.borders.subtle,
+            ),
+            (
+                "borders.default",
+                tokens.borders.default,
+                expected.borders.default,
+            ),
+            (
+                "borders.strong",
+                tokens.borders.strong,
+                expected.borders.strong,
+            ),
+            (
+                "status.attention",
+                tokens.status.attention,
+                expected.status.attention,
+            ),
+            (
+                "status.destructive",
+                tokens.status.destructive,
+                expected.status.destructive,
+            ),
+            (
+                "status.success",
+                tokens.status.success,
+                expected.status.success,
+            ),
+            (
+                "terminal.background",
+                tokens.terminal.background,
+                expected.terminal.background,
+            ),
+        ];
+
+        let drift = checks
+            .iter()
+            .filter(|(_, actual, wanted)| actual != wanted)
+            .map(|(name, actual, wanted)| {
+                format!(
+                    "{name}: palette {} != tokens {}",
+                    actual.to_hex(),
+                    wanted.to_hex()
+                )
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            drift.is_empty(),
+            "default dark palette drifted from the token module:\n  {}",
+            drift.join("\n  ")
+        );
     }
 
     #[test]
