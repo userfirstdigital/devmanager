@@ -305,13 +305,12 @@ fn task_row_left_click_should_reopen(_settled: bool) -> bool {
     false
 }
 
-fn task_row_right_click_should_rename(_archived: bool) -> bool {
+/// Right-click renames on a live row and on an archived one alike: the gesture
+/// is about the row's title, and an archived task's title is still editable.
+fn task_row_right_click_should_rename() -> bool {
     true
 }
 
-/// Task-rail row capture must shield right/middle from the terminal behind the
-/// list, but must not consume left so the archived Delete child can receive the
-/// nested mouse sequence (capture runs before child handlers).
 /// What an empty task list tells the reader to do next. One constant because
 /// the painted empty state and its accessible description are the same
 /// sentence said twice: they had already drifted, the painted copy still
@@ -321,6 +320,16 @@ fn task_row_right_click_should_rename(_archived: bool) -> bool {
 const INBOX_EMPTY_STATE_HINT: &str =
     "Add or choose a project, then start one from the board's + New menu.";
 
+/// What a failed agent start tells the reader to do next. One constant for the
+/// same reason as [`INBOX_EMPTY_STATE_HINT`]: six call sites across the shell
+/// and the cockpit had each spelled out the deleted "+Claude" / "+Codex"
+/// buttons, and copy repeated six times is copy that goes stale six times.
+pub(crate) const AGENT_NOT_STARTED_HINT: &str =
+    "The agent didn't start. Check Settings, then start it again from the board's + New menu.";
+
+/// Task-rail row capture must shield right/middle from the terminal behind the
+/// list, but must not consume left so the archived Delete child can receive the
+/// nested mouse sequence (capture runs before child handlers).
 fn task_rail_row_capture_consumes_button(button: MouseButton) -> bool {
     !matches!(button, MouseButton::Left)
 }
@@ -338,17 +347,18 @@ enum TaskRowCapture {
     /// Left: not consumed, so a nested affordance inside the row still gets
     /// its own mouse sequence.
     Bubble,
-    /// Consumed and otherwise inert -- middle, and right on an archived row.
+    /// Consumed and otherwise inert -- the middle button, which exists here
+    /// only to be swallowed.
     Consume,
     /// Consumed, and opens the inline rename.
     ConsumeAndRename,
 }
 
-fn task_row_capture(button: MouseButton, archived: bool) -> TaskRowCapture {
+fn task_row_capture(button: MouseButton) -> TaskRowCapture {
     if !task_rail_row_capture_consumes_button(button) {
         return TaskRowCapture::Bubble;
     }
-    if button == MouseButton::Right && task_row_right_click_should_rename(archived) {
+    if button == MouseButton::Right && task_row_right_click_should_rename() {
         return TaskRowCapture::ConsumeAndRename;
     }
     TaskRowCapture::Consume
@@ -10001,7 +10011,7 @@ impl AccessibilityTree {
                                     format!("Done, {task_count} {task_word}, {state}"),
                                     "Show or hide the tasks that are finished but still reversible.",
                                 )
-                                .gpui("board-group-done", true, true),
+                                .gpui(board_group_element_id(*group), true, true),
                             );
                         } else {
                             rows.push(
@@ -13849,9 +13859,9 @@ impl NativeShell {
     fn note_selected_task_restore_unavailable(&mut self, task_id: TaskId) {
         self.task_surfaces
             .note_terminal_reconnecting(self.local_task_key(task_id));
-        self.local_slot_mut().cockpit.set_attachment_unavailable(
-            "The agent didn't start. Check Settings, then use +Claude or +Codex again.",
-        );
+        self.local_slot_mut()
+            .cockpit
+            .set_attachment_unavailable(AGENT_NOT_STARTED_HINT);
     }
 
     pub fn header_attachment(&self) -> &NativeHeaderAttachment {
@@ -27938,10 +27948,7 @@ impl NativeShell {
             if self.task_surfaces.conversation_page(key.clone()).is_none() {
                 self.clear_composer_binding();
                 if let Some(slot) = self.host_slot_mut(&key.host) {
-                    slot.composer_error = Some(
-                        "The agent didn't start. Check Settings, then use +Claude or +Codex again."
-                            .to_string(),
-                    );
+                    slot.composer_error = Some(AGENT_NOT_STARTED_HINT.to_string());
                 }
                 return;
             }
@@ -27949,10 +27956,7 @@ impl NativeShell {
         if snapshot.attention == crate::domain::task::TaskAttention::Failed {
             self.clear_composer_binding();
             if let Some(slot) = self.host_slot_mut(&key.host) {
-                slot.composer_error = Some(
-                    "The agent didn't start. Check Settings, then use +Claude or +Codex again."
-                        .to_string(),
-                );
+                slot.composer_error = Some(AGENT_NOT_STARTED_HINT.to_string());
             }
             return;
         }
@@ -30738,16 +30742,16 @@ impl NativeShell {
     /// The buttons this consumes must not reach the terminal dock behind the
     /// column: middle-click on a terminal pastes the selection.
     fn handle_board_row_capture_down(&mut self, key: &HostTaskKey, button: MouseButton) -> bool {
-        let archived = self
-            .fleet_inbox_projection()
-            .find(key)
-            .is_some_and(|row| row.archived);
-        match task_row_capture(button, archived) {
+        // The button alone decides, so nothing here builds the fleet
+        // projection: Left bubbles and middle is swallowed without a lookup,
+        // and the one branch that needs a row looks it up exactly once.
+        match task_row_capture(button) {
             TaskRowCapture::Bubble => false,
             TaskRowCapture::Consume => true,
             TaskRowCapture::ConsumeAndRename => {
                 // Never mint a local selected_project_id from a remote host's
-                // raw ProjectId.
+                // raw ProjectId. This is the one branch that needs the row, so
+                // it is the only one that builds the fleet projection.
                 if key.host == self.local_host_id() {
                     if let Some(project_id) = self
                         .fleet_inbox_projection()
@@ -30785,12 +30789,6 @@ impl NativeShell {
         let fleet = self.fleet_inbox_projection();
         let selected = self.selected_task_key.clone();
         let local_host = self.local_host_id();
-        let open: HashSet<HostTaskKey> = self
-            .layout
-            .task_workspace
-            .as_ref()
-            .map(|workspace| workspace.task_ids().into_iter().collect())
-            .unwrap_or_default();
         let mut rows = Vec::new();
         let mut live: HashSet<HostTaskKey> = HashSet::new();
         for fleet_row in fleet.rail_rows() {
@@ -30804,9 +30802,22 @@ impl NativeShell {
             }
             let status = self.task_row_status_for_owner(&fleet_row.key);
             let state = board_state_of(status.unwrap_or(VisibleTaskStatus::Idle), fleet_row.done);
-            let state_age_ms = self
+            // The clock is observed for every state, including Idle, so a
+            // later state change measures from that change rather than from
+            // whenever this process first saw the row. Its answer is only
+            // *used* for the states the clock can actually date: it is
+            // transient, so on the first paint after a launch it says 0, and
+            // an Idle row would then read "Last reply 0s" for a task nobody
+            // has touched in days. Idle has a durable timestamp of its own --
+            // the last event -- so it uses that instead.
+            let clock_age_ms = self
                 .board_state_clock
                 .observe(fleet_row.key.clone(), state, now_ms);
+            let state_age_ms = if state == BoardState::Idle {
+                (now_ms - fleet_row.occurred_at_ms).max(0)
+            } else {
+                clock_age_ms
+            };
             live.insert(fleet_row.key.clone());
             let activity = self.board_activity_for(&fleet_row.key);
             // Only a Working row narrates what the provider is doing. An open
@@ -30853,7 +30864,6 @@ impl NativeShell {
                 branch,
                 last_activity_ms: fleet_row.occurred_at_ms,
                 selected: selected.as_ref() == Some(&fleet_row.key),
-                open: open.contains(&fleet_row.key),
             });
         }
         let stale: Vec<HostTaskKey> = self
@@ -34376,14 +34386,6 @@ impl NativeShell {
                     .child(label.into().to_uppercase()),
             )
             .children(trailing)
-    }
-
-    fn inbox_agent_action_id(provider: ProviderKind) -> &'static str {
-        match provider {
-            ProviderKind::ClaudeCode => "native-inbox-plus-claude",
-            ProviderKind::Codex => "native-inbox-plus-codex",
-            ProviderKind::Cursor => unreachable!("Cursor is not an inbox agent action"),
-        }
     }
 
     fn conversation_delete_action(&self, cx: &Context<Self>) -> Option<AnyElement> {
@@ -49248,8 +49250,7 @@ pub(crate) mod tests {
 
     #[test]
     fn right_click_renames_active_and_archived_tasks() {
-        assert!(super::task_row_right_click_should_rename(false));
-        assert!(super::task_row_right_click_should_rename(true));
+        assert!(super::task_row_right_click_should_rename());
     }
 
     #[test]
@@ -53192,6 +53193,66 @@ pub(crate) mod tests {
                     shell.board_state_clock.keys().count(),
                     0,
                     "and the two maps are pruned from one list, so they cannot disagree"
+                );
+            });
+            cx.quit();
+        });
+    }
+
+    /// An Idle row's age is the time since its last event, not the time since
+    /// this process started watching it.
+    ///
+    /// The state clock is transient by design, so on the FIRST paint after a
+    /// launch it reports 0 for every row -- and an Idle row's second line then
+    /// reads "Last reply 0s" for a task nobody has touched for days. The clock
+    /// is still observed for Idle, so a state change later in the session
+    /// measures from that change; only its return value is ignored.
+    #[test]
+    fn an_idle_rows_age_counts_from_its_last_event_not_from_this_launch() {
+        if rerun_headless_shell_test_in_child(
+            "ui::native_shell::tests::an_idle_rows_age_counts_from_its_last_event_not_from_this_launch",
+        ) {
+            return;
+        }
+        let _test_guard = HEADLESS_SHELL_TEST_LOCK
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .expect("headless shell test lock");
+        gpui::Application::headless().run(move |cx| {
+            crate::ui::init(cx);
+            let (runtime, _shared) = TestRuntime::new(true, NativeHostActionResult::Queued);
+            let (model, task_id) = open_task_without_agent_client_model();
+            let project_id = model.task(task_id).expect("task").task.project_id;
+            with_test_shell_in_app(cx, runtime, |shell| {
+                shell.install_project_for_test("DevManager", project_id);
+                shell
+                    .apply_client_model(Arc::new(model))
+                    .expect("apply model");
+                // The fixture task's only timestamp is `created_at_ms: 1`, so
+                // "three days later" is three days since anything happened.
+                const THREE_DAYS_MS: i64 = 3 * 24 * 60 * 60 * 1_000;
+                let board = shell.board_model(THREE_DAYS_MS + 1);
+                let row = board
+                    .groups
+                    .iter()
+                    .flat_map(|group| group.rows.iter())
+                    .find(|row| row.key.task_id == task_id)
+                    .expect("the fixture task is on the board")
+                    .clone();
+                assert_eq!(row.state, BoardState::Idle, "the fixture task is idle");
+                assert_eq!(
+                    row.state_age_ms, THREE_DAYS_MS,
+                    "the first paint after a launch must show the real elapsed time, not 0"
+                );
+                assert_eq!(
+                    crate::ui::board::format_age(row.state_age_ms),
+                    "3d",
+                    "so the title age and the `Last reply ...` line both read 3d"
+                );
+                assert_eq!(
+                    shell.board_state_clock.keys().count(),
+                    1,
+                    "Idle is still observed, so a later state change measures from that change"
                 );
             });
             cx.quit();

@@ -21,6 +21,7 @@ use crate::ui::actions::{
     DockSelectArtifacts, DockSelectBrowser, DockSelectChanges, DockSelectFiles, DockSelectReview,
     DockSelectServices, DockSelectTerminal, DockToggleRawTerminal,
 };
+use crate::ui::native_shell::AGENT_NOT_STARTED_HINT;
 use crate::ui::renderers::{live_target, RendererRegistry, SemanticJournalView};
 use crate::ui::task_cockpit::cockpit_projection::TaskCockpitLiveProjection;
 use crate::ui::task_cockpit::composer::{ApprovalProjection, QuestionProjection, TaskComposer};
@@ -470,10 +471,7 @@ impl TaskCockpitShell {
             // surface the diagnostic beside it.
             if self.conversation.is_none() {
                 self.focused_timeline_task = None;
-                self.timeline_error = Some(
-                    "The agent didn't start. Check Settings, then use +Claude or +Codex again."
-                        .to_string(),
-                );
+                self.timeline_error = Some(AGENT_NOT_STARTED_HINT.to_string());
                 return;
             }
         }
@@ -567,8 +565,7 @@ impl TaskCockpitShell {
                     self.focused_timeline_task = None;
                     self.timeline_error = Some(
                         if error.contains("missing field") || error.contains("agent_session_id") {
-                            "The agent didn't start. Check Settings, then use +Claude or +Codex again."
-                                .to_string()
+                            AGENT_NOT_STARTED_HINT.to_string()
                         } else {
                             error
                         },
@@ -817,9 +814,8 @@ impl TaskCockpitShell {
             .or_else(|| {
                 let task_id = self.dock.selected_task()?;
                 let task = self.model.as_ref()?.tasks().get(&task_id)?;
-                (task.attention == crate::domain::task::TaskAttention::Failed).then_some(
-                    "The agent didn't start. Check Settings, then use +Claude or +Codex again.",
-                )
+                (task.attention == crate::domain::task::TaskAttention::Failed)
+                    .then_some(AGENT_NOT_STARTED_HINT)
             })
             .or(self.timeline_error.as_deref())
     }

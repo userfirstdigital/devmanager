@@ -100,9 +100,20 @@ pub const RAIL_DOT_COUNT_GAP: f32 = 2.0;
 pub const RAIL_PADDING_TOP: f32 = 10.0;
 
 /// Below this the "3/5" count is dropped; below [`SEGMENTS_MIN_WIDTH`] the
-/// strip goes too and the meta text keeps the whole line.
+/// strip goes too and the meta text keeps the whole line. Both are measured
+/// against the row's CONTENT width -- see [`row_content_width`] -- not against
+/// the column, or the clamp on the column width puts them out of reach.
 pub const COUNT_MIN_WIDTH: f32 = 200.0;
 pub const SEGMENTS_MIN_WIDTH: f32 = 160.0;
+
+/// The width the meta line actually has to lay out in: the column less the
+/// project stripe on the left edge and the row's horizontal padding on both
+/// sides. [`row_layout`] is a rule about the content, so handing it the column
+/// width overstates the space by 23 px at every width -- enough, at the
+/// narrowest legal column, to keep painting a count that does not fit.
+pub fn row_content_width(column_width_px: f32) -> f32 {
+    (column_width_px - ROW_STRIPE_WIDTH - 2.0 * ROW_PADDING_X).max(0.0)
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct BoardRowLayout {
@@ -113,6 +124,9 @@ pub struct BoardRowLayout {
 /// The count is the first thing to go, then the segments. A row with no plan
 /// shows neither at any width: the strip means "there is a plan", so an empty
 /// strip would be a lie rather than a smaller version of the truth.
+///
+/// `width_px` is the row's content width, i.e. [`row_content_width`] of the
+/// column the row paints in.
 pub fn row_layout(width_px: f32, progress: Option<BoardProgress>) -> BoardRowLayout {
     let Some(_) = progress else {
         return BoardRowLayout {
@@ -164,6 +178,35 @@ mod tests {
         assert!(at_199.show_segments && !at_199.show_count);
         let at_150 = row_layout(150.0, p);
         assert!(!at_150.show_segments && !at_150.show_count);
+    }
+
+    /// The painter is handed the COLUMN width, and the column is clamped to
+    /// [`crate::ui::workspace_layout::INBOX_MIN`]..`INBOX_MAX` (220..560), so a
+    /// breakpoint compared against the column can never fire: 220 is already
+    /// above both thresholds. The rule is about the space the meta line has,
+    /// which is the column less the stripe and the two paddings -- 197 px at
+    /// the narrowest legal column, where the count must go and the strip must
+    /// stay.
+    #[test]
+    fn the_breakpoints_are_reachable_at_the_narrowest_legal_column() {
+        let p = Some(BoardProgress {
+            completed: 1,
+            total: 4,
+        });
+        let narrow = row_layout(row_content_width(crate::ui::workspace_layout::INBOX_MIN), p);
+        assert!(
+            narrow.show_segments,
+            "the strip is the last thing to go and 197 px still has room for it"
+        );
+        assert!(
+            !narrow.show_count,
+            "the count must drop at the narrowest legal column, or the breakpoint is dead code"
+        );
+        let wide = row_layout(row_content_width(BOARD_COLUMN_WIDTH), p);
+        assert!(
+            wide.show_segments && wide.show_count,
+            "the spec column width shows both"
+        );
     }
 
     #[test]

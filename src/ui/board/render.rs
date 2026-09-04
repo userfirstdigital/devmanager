@@ -28,7 +28,7 @@ use uuid::Uuid;
 use crate::client::HostTaskKey;
 use crate::ui::board::age::format_age;
 use crate::ui::board::layout::{
-    row_height, row_layout, BOARD_RAIL_WIDTH, BOARD_ROW_GAP, COUNT_FONT_SIZE,
+    row_content_width, row_height, row_layout, BOARD_RAIL_WIDTH, BOARD_ROW_GAP, COUNT_FONT_SIZE,
     DONE_ROW_PADDING_BOTTOM, DONE_ROW_PADDING_TOP, DOT_CELL_GAP, DOT_CELL_WIDTH,
     GROUP_LABEL_FONT_SIZE, GROUP_LABEL_GAP, GROUP_LABEL_PADDING_BOTTOM, GROUP_LABEL_PADDING_TOP,
     HEADER_BUTTON_FONT_SIZE, HEADER_BUTTON_PADDING_X, HEADER_BUTTON_PADDING_Y,
@@ -220,7 +220,11 @@ pub fn board_row_element(
     compact: bool,
     handlers: &BoardRowHandlers,
 ) -> AnyElement {
-    let layout = row_layout(width_px, row.progress);
+    // `width_px` is the COLUMN width. The breakpoints are a rule about the
+    // space the meta line has, so the stripe and the two paddings come off it
+    // first -- comparing them against the column leaves them unreachable,
+    // because the column is clamped to 220 px at its narrowest.
+    let layout = row_layout(row_content_width(width_px), row.progress);
     let one_line = row.state == BoardState::Done;
     let height = row_height(one_line, compact);
     let compact_delta = if compact && !one_line {
@@ -663,7 +667,6 @@ mod tests {
             branch: "main".into(),
             last_activity_ms: 0,
             selected: index == 3,
-            open: false,
         })
         .collect()
     }

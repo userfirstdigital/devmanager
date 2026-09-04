@@ -127,8 +127,14 @@ impl RuntimePreferencesSnapshot {
     }
 }
 
-/// An opaque sRGB color. Transparency is intentionally not part of the UI
-/// token contract: compositing belongs to the surface that owns a token.
+/// An sRGB color, opaque by construction: every token constructor
+/// ([`Color::rgb`], [`Color::from_u32`]) yields a fully opaque colour, so no
+/// token carries transparency of its own.
+///
+/// The one route to a translucent colour is [`Color::with_alpha`], which a
+/// painter calls on a token it already holds -- the state-dot halo and the
+/// needs-you / blocked row borders. Compositing therefore stays a decision of
+/// the surface that owns the token rather than a property of the palette.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Color {
     rgba: [u8; 4],

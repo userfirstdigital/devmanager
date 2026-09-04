@@ -88,7 +88,6 @@ pub struct BoardRow {
     pub branch: String,
     pub last_activity_ms: i64,
     pub selected: bool,
-    pub open: bool,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -189,7 +188,6 @@ mod tests {
             branch: "main".into(),
             last_activity_ms,
             selected: false,
-            open: false,
         }
     }
 
