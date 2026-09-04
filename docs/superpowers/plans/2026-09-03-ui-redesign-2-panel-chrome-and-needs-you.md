@@ -798,9 +798,80 @@ Same procedure as plan 1 Task 9, against `01-composition-A.png`, `02-panel-chrom
 
 ---
 
+### Task 11: Board column chrome per composition A
+
+> **Painter task (Task 11).** Load the `frontend-design` skill and Read `docs/superpowers/specs/2026-09-03-ui-redesign-mockups/01-composition-A.png` BEFORE writing code; copy sizes and spacing from `01-composition-A.html` (`.dm-top`, `.board`, `.kbd`). The reviewer reads the same PNG.
+
+Found at sub-project 1's visual acceptance (2026-09-04): the board rows match the reference, but the column still carries the old chrome around them: a brand row ("DevManager" + "Visual" badge), a Search row, an "All projects" scope row with an indigo "New task" button, and a footer strip (files / settings / git / activity icons and an indigo "New project" button). Composition A has none of that in the column. The column is the board and nothing else; brand and scope live in a one-line top bar across the whole window.
+
+**Files:**
+- Modify: `src/ui/native_shell.rs` (the column composition in `inbox_panel` ~43380-43420: `brand → navigation → board → footer`; the brand row, search row, project-scope row, footer strip painters; the accessibility tree builder `for_fleet_task_list_with_composer` ~9806 for the removed nodes; `open_board_menu` for the two new rows)
+- Create: `src/ui/board/topbar.rs` (pure model + painter for the top bar)
+- Test: `src/ui/board/topbar.rs`, `src/ui/native_shell.rs` tests
+
+**Interfaces:**
+- Consumes: `BoardModel` (for the needs-you count), `ProjectScope` (`src/ui/project_scope.rs`) for the scope label, `KeyboardModel` bindings for the hint labels.
+- Produces:
+
+```rust
+pub struct TopBarModel { pub brand: &'static str, pub scope_label: String, pub needs_you: usize, pub hints: Vec<(&'static str, &'static str)> /* (keys, verb) */ }
+pub fn top_bar_model(scope_label: String, board: &BoardModel) -> TopBarModel
+pub fn top_bar_element(model: &TopBarModel, tokens: ThemeTokens, handlers: &TopBarHandlers) -> AnyElement
+pub struct TopBarHandlers { pub on_scope: Rc<dyn Fn(&mut Window, &mut App)>, pub on_needs_you: Rc<dyn Fn(&mut Window, &mut App)>, pub on_settings: Rc<dyn Fn(&mut Window, &mut App)> }
+```
+
+Top bar per `01-composition-A.html:105`: 28 px tall, `surfaces.canvas`, 1 px bottom border `borders.subtle`; left: brand "DevManager" 12 px semibold `text.primary`, then the scope label ("All projects" or the project name) 11.5 px `text.secondary`, clickable to open the existing project-scope chooser; spacer; then an amber chip "N need you" (`status.attention` text, `status.attention` at 0.35 alpha border, radius 4, 10.5 px) only when `needs_you > 0`, clicking it focuses the first Needs-you row; then keyboard hints as `kbd` chips (`borders.default` 1 px, radius 4, 10.5 px `text.muted`): "⌘K switch", "Z zoom", "⌘↑↓←→ focus"; then a 14 px settings glyph (`crate::icons::SETTINGS`) opening the existing settings surface. No "Visual" badge.
+
+The column loses: the brand row, the Search row (⌘K already opens the palette; the search field inside the palette stays), the scope row and its "New task" button (the board's `+ New` replaces it), and the footer strip. The footer's four destinations move into the board ⋯ menu as rows: "Files", "Git", "Activity", "Settings", plus "New project…" (calls the existing `begin_choose_folder` flow), placed above "Archived…". The archived toggle stays in the menu as today.
+
+- [ ] **Step 1: Write the failing tests**
+
+`src/ui/board/topbar.rs`:
+
+```rust
+#[test]
+fn needs_you_chip_appears_only_when_a_needs_you_row_exists() {
+    let empty = build_board_model(vec![], false);
+    assert_eq!(top_bar_model("All projects".into(), &empty).needs_you, 0);
+    let one = build_board_model(vec![row(BoardState::Question)], false);
+    assert_eq!(top_bar_model("All projects".into(), &one).needs_you, 1);
+}
+
+#[test]
+fn hints_are_the_three_composition_chips_in_order() {
+    let m = top_bar_model("All projects".into(), &build_board_model(vec![], false));
+    let verbs: Vec<_> = m.hints.iter().map(|(_, v)| *v).collect();
+    assert_eq!(verbs, vec!["switch", "zoom", "focus"]);
+}
+```
+
+(`row(...)` is the same helper shape as `model.rs`'s tests.)
+
+In `native_shell.rs` tests, extend the board accessibility test: the tree has a node whose element id is `"native-top-bar-scope"` and NO node with ids `native-sidebar-search`, `native-sidebar-new-task`, `native-sidebar-new-project` (grep the current ids for the exact strings and pin them by absence); the board ⋯ menu rows include "New project…" and "Settings".
+
+- [ ] **Step 2: Run to see them fail**
+
+Run: `cargo test --lib -- ui::board::topbar ui::native_shell::tests::board --test-threads=4`
+Expected: compile error (module missing), then assertion failures on the ids.
+
+- [ ] **Step 3: Implement**
+
+Create `topbar.rs` with the model and painter above (constants in `layout.rs`: `TOP_BAR_HEIGHT: f32 = 28.0`, `KBD_FONT_SIZE: f32 = 10.5`, `TOP_BAR_BRAND_FONT_SIZE: f32 = 12.0`). In `inbox_panel` delete the brand, search, scope and footer children so the column is `board_element` alone; paint `top_bar_element` at the top of `main_column` above the board-plus-workspace row (the top bar spans the window, not the column). Route the removed footer actions and "New project…" into `render_board_menu_overlay` rows calling the existing handlers (`begin_choose_folder`, the settings/files/git/activity openers the footer icons called). Remove the deleted rows' accessibility nodes and add `native-top-bar-scope`, `native-top-bar-needs-you` (when shown) and `native-top-bar-settings`.
+
+- [ ] **Step 4: Run the tests**, `cargo fmt --all -- --check`, `cargo check --locked --lib --bins --tests -j 2`; expected PASS / EXIT 0 / no new warnings.
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add src/ui/board/topbar.rs src/ui/board/layout.rs src/ui/board/mod.rs src/ui/native_shell.rs
+git commit -m "feat(shell): board column is the board; brand, scope and hints move to a top bar"
+```
+
+---
+
 ## Self-review
 
-**Spec coverage (sections 3, 6, 10):** composition and zoom, Task 3 and 9; chrome rows and truncation, Tasks 4, 5; views as tabs with More views in the menu, Tasks 1, 5, 9; primary action and menu order, Tasks 5, 9; question card, Task 6 and 9; permission dock with Always-for-this-task and D, Tasks 6, 9; blocked with Retry, Tasks 4, 5, 9; minimised strip and its threshold, Task 2; `PaneView` migration, Task 1; Done and lifecycle, Task 8; keyboard, Tasks 5 (panel letters) and 7 (global chords); the composer placeholder appearing once per panel is inherent to one surface per pane, Task 9.
+**Spec coverage (sections 3, 6, 10):** column chrome per composition A, Task 11 (added 2026-09-04 after sub-project 1's capture showed the old brand/search/scope/footer still around the board); composition and zoom, Task 3 and 9; chrome rows and truncation, Tasks 4, 5; views as tabs with More views in the menu, Tasks 1, 5, 9; primary action and menu order, Tasks 5, 9; question card, Task 6 and 9; permission dock with Always-for-this-task and D, Tasks 6, 9; blocked with Retry, Tasks 4, 5, 9; minimised strip and its threshold, Task 2; `PaneView` migration, Task 1; Done and lifecycle, Task 8; keyboard, Tasks 5 (panel letters) and 7 (global chords); the composer placeholder appearing once per panel is inherent to one surface per pane, Task 9.
 
 **Placeholder scan:** the three shell tests in Task 9 are described in prose because they depend on fixture helpers whose exact names live in the 60k-line shell test module; each names the fixture family to copy, the action to send, and the exact assertion, which is what an implementer needs. No "TBD".
 
