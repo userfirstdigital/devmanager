@@ -129,6 +129,7 @@ use crate::ui::task_cockpit::dock::{DockEdge, DockTool as CockpitDockTool};
 use crate::ui::task_cockpit::draft_store::{
     ComposerDraftKey, ComposerDraftStore, KeyedComposerDraftKey,
 };
+use crate::ui::task_cockpit::inbox::PrimaryProviderIcon;
 use crate::ui::task_cockpit::shell::TaskCockpitShell;
 use crate::ui::task_cockpit::timeline::{ActivityToggleHandler, CONVERSATION_CONTENT_MAX_WIDTH};
 #[cfg(debug_assertions)]
@@ -153,6 +154,14 @@ use crate::browser::{
 use crate::terminal::protocol::{
     InputAck, InputId, TerminalGeneration, TerminalInputContext, TerminalInputRequest,
 };
+use crate::ui::board::layout::BOARD_RAIL_WIDTH;
+use crate::ui::board::render::{
+    board_row_element_id, render_board, BoardHeaderHandlers, BoardRowHandlers,
+};
+use crate::ui::board::{
+    board_activity, board_state_of, build_board_model, BoardGroup, BoardModel, BoardRow,
+    BoardState, ProjectColourBook, StateClock,
+};
 use crate::ui::browser_dock_lifecycle::{
     plan_browser_dock, BrowserDockIdentity, BrowserDockLifecycleError, BrowserDockPlan,
     BrowserDockSurfaceState,
@@ -169,7 +178,7 @@ use crate::ui::native_fleet::{
     overlay_owner_config_project_labels, remote_raw_terminal_allowed, FleetSelectMode,
 };
 use crate::ui::native_host_state::{
-    local_host_task_key, FleetInboxProjection, FleetTaskRow, HostDrainCursor, HostProjectKey,
+    local_host_task_key, FleetInboxProjection, HostDrainCursor, HostProjectKey,
     FLEET_DRAIN_PER_HOST,
 };
 use crate::ui::project_actions::{
@@ -194,7 +203,7 @@ use crate::ui::theme_system::{
 use crate::ui::tokens::{mix_color, RuntimePreferencesSnapshot, StatusMeaning};
 use crate::ui::workspace_layout::{
     KeyedWorkspaceLayout, PaneEdge, TaskComposerPreferences, TerminalCenterKey, WindowFrame,
-    WorkspaceLayout, WorkspaceLayoutStore,
+    WorkspaceLayout, WorkspaceLayoutStore, INBOX_MAX, INBOX_MIN,
 };
 
 use crate::updater::{UpdaterService, UpdaterSnapshot, UpdaterStage};
@@ -356,9 +365,15 @@ const CONVERSATION_COMPOSER_INNER_RADIUS: f32 = 20.0;
 const CONVERSATION_COMPOSER_CONTEXT_INSET: f32 = 22.0;
 const CONVERSATION_COMPOSER_SEND_DIAMETER: f32 = 28.0;
 const CONVERSATION_COMPOSER_INPUT_MIN_HEIGHT: f32 = 88.0;
-const T3_SIDEBAR_WIDTH: f32 = 256.0;
-const T3_SIDEBAR_ROW_HEIGHT: f32 = 78.0;
+/// The archived browser's row: title, project and branch on three lines.
+const ARCHIVED_ROW_HEIGHT: f32 = 78.0;
 const T3_WORKSPACE_TOPBAR_HEIGHT: f32 = 32.0;
+/// The board header's menus drop from under the header, inset from the window
+/// edge the board is docked against. Row heights are the board's own, in
+/// `ui::board::layout`; these place the panel, nothing more.
+const BOARD_MENU_WIDTH: f32 = 220.0;
+const BOARD_MENU_LEFT_INSET: f32 = 8.0;
+const BOARD_MENU_TOP_INSET: f32 = 30.0;
 const T3_SIDEBAR_NAV_TOP_INSET: f32 = 12.0;
 const CONVERSATION_COMPOSER_PLACEHOLDER: &str =
     crate::ui::native_composer::NATIVE_COMPOSER_PLACEHOLDER;
@@ -1286,7 +1301,30 @@ fn stable_task_element_id(task_id: TaskId) -> ElementId {
 /// the accessibility tree and its tests keep publishing the same node ids.
 /// One definition only: see [`crate::ui::board::render::board_row_element_id`].
 fn stable_host_task_element_id(key: &HostTaskKey) -> ElementId {
-    crate::ui::board::render::board_row_element_id(key)
+    board_row_element_id(key)
+}
+
+/// The board column's width: the narrow rail when it is collapsed, otherwise
+/// the user's chosen inbox width held inside the pane's own bounds. A free
+/// function because the static geometry helpers have a layout but no shell.
+fn board_column_width_for(layout: &KeyedWorkspaceLayout<HostTaskKey>) -> f32 {
+    if layout.board_rail {
+        BOARD_RAIL_WIDTH
+    } else {
+        layout.inbox_width.clamp(INBOX_MIN, INBOX_MAX)
+    }
+}
+
+/// The accessibility id of a board section. One id per section, matching the
+/// ids the painter gives the same labels in `ui::board::render`, so a section
+/// addressed by automation is the section that paints.
+fn board_group_element_id(group: BoardGroup) -> &'static str {
+    match group {
+        BoardGroup::NeedsYou => "board-group-needs-you",
+        BoardGroup::Working => "board-group-working",
+        BoardGroup::Idle => "board-group-idle",
+        BoardGroup::Done => "board-group-done",
+    }
 }
 
 fn stable_host_task_row_element_id(key: &HostTaskKey) -> String {
@@ -1360,23 +1398,6 @@ fn stable_host_project_element_key(key: &HostProjectKey, suffix: &str) -> u64 {
         .try_into()
         .expect("sha256 prefix is eight bytes");
     u64::from_be_bytes(bytes)
-}
-
-fn stable_host_project_row_element_id(key: &HostProjectKey) -> String {
-    let mut digest = Sha256::new();
-    digest.update(b"native-host-project-row");
-    digest.update([0]);
-    digest.update(host_identity_digest_bytes(&key.host));
-    digest.update([0]);
-    digest.update(key.project_id.as_bytes());
-    let hash = digest.finalize();
-    format!(
-        "native-project-row-{}",
-        hash[..16]
-            .iter()
-            .map(|byte| format!("{byte:02x}"))
-            .collect::<String>()
-    )
 }
 
 /// Return a deterministic numeric suffix for a service element identity.
@@ -4436,15 +4457,18 @@ fn theme_role_display_label(role: ThemeColorRole) -> &'static str {
     }
 }
 
+/// The board's list, flattened for the accessibility tree. The painter reads
+/// [`BoardModel`] directly; this is the same content in the shape the tree
+/// already walks, so task node ids and their ordering do not move.
+///
+/// The project-folder row this enum used to carry is gone with the project
+/// rail: the board groups by state and puts the project on a coloured stripe.
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum ProjectInboxItem {
-    Project {
-        project_id: ProjectId,
-        label: String,
-        expanded: bool,
+    Group {
+        group: BoardGroup,
         task_count: usize,
-        /// Host that owns this project folder row (local multi-folder or remote).
-        host: HostId,
+        collapsed: bool,
     },
     Task {
         project_id: ProjectId,
@@ -4452,18 +4476,45 @@ enum ProjectInboxItem {
         settled: bool,
         archived: bool,
     },
-    DoneHeader {
-        task_count: usize,
-    },
     ArchivedHeader {
         task_count: usize,
     },
+    /// One project the board header's `+ New` menu can start a task in.
+    /// Published as its own accessible button because the board has no project
+    /// rows: without it a project with no tasks yet would be unreachable.
+    NewTaskTarget {
+        project_key: HostProjectKey,
+        label: String,
+    },
+}
+
+/// What a board menu row does when it is chosen. Named rather than boxed so
+/// the row builder stays a plain data list and the overlay owns no closures
+/// beyond the one that applies them.
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum BoardMenuAction {
+    NewTaskIn(HostProjectKey),
+    ToggleArchived,
+    ToggleRail,
+    ToggleDensity,
+}
+
+/// Which board menu is open. One field holds both, so opening either closes
+/// the other by construction rather than by remembering to.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum BoardMenu {
+    /// The header's `+ New`: every project a task can be started in.
+    NewTask,
+    /// The header's `⋯`: archived view, rail, density.
+    Options,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum ProjectAccessibilityAction {
-    Toggle(HostProjectKey),
-    StartAgent(HostProjectKey, ProviderKind),
+    /// The only project action the board publishes: open the new-task dialog
+    /// for this owner's project. The board has no project headers to expand
+    /// and no per-provider start buttons, so Toggle and StartAgent went with
+    /// them.
     NewTask(HostProjectKey),
 }
 
@@ -9800,20 +9851,17 @@ impl AccessibilityTree {
         selected_key: Option<&HostTaskKey>,
         default_host: &HostId,
         header: &NativeHeaderAttachment,
-        snapshot: Option<&AgentConnectionSnapshot>,
+        // The board's accessibility no longer varies with which providers are
+        // signed in: the per-project "+Claude"/"+Codex" buttons are gone and
+        // one "New task" menu replaced them. Kept so the wrapper chain and the
+        // tests that call it keep their shape.
+        _snapshot: Option<&AgentConnectionSnapshot>,
         project_items: &[ProjectInboxItem],
         composer: Option<&ComposerAccessibilityState>,
         show_project_plus: bool,
     ) -> Self {
         let rendered_task_ids = task_list.rendered_task_ids();
         let rendered_task_set = rendered_task_ids.iter().copied().collect::<HashSet<_>>();
-        let available_agents = snapshot.map(inbox_agent_actions).unwrap_or_default();
-        let claude_available = available_agents
-            .iter()
-            .any(|action| action.provider == ProviderKind::ClaudeCode);
-        let codex_available = available_agents
-            .iter()
-            .any(|action| action.provider == ProviderKind::Codex);
         let selected_is_settled = selected_key.is_some_and(|selected| {
             project_items.iter().any(|item| {
                 matches!(
@@ -9869,98 +9917,57 @@ impl AccessibilityTree {
         } else {
             for item in project_items {
                 match item {
-                    ProjectInboxItem::Project {
-                        project_id,
-                        label,
-                        expanded,
+                    ProjectInboxItem::Group {
+                        group,
                         task_count,
-                        host,
+                        collapsed,
                     } => {
-                        let project_key = HostProjectKey::new(host.clone(), *project_id);
-                        let state = if *expanded { "expanded" } else { "collapsed" };
+                        // The board's sections replace the project headers. A
+                        // live section is a label; Done is the one section that
+                        // discloses, so only it is a button.
                         let task_word = if *task_count == 1 { "task" } else { "tasks" };
-                        let element_id = stable_host_project_row_element_id(&project_key);
+                        if *group == BoardGroup::Done {
+                            let state = if *collapsed { "collapsed" } else { "expanded" };
+                            rows.push(
+                                AccessibilityNode::new(
+                                    AccessibleRole::Button,
+                                    format!("Done, {task_count} {task_word}, {state}"),
+                                    "Show or hide the tasks that are finished but still reversible.",
+                                )
+                                .gpui("board-group-done", true, true),
+                            );
+                        } else {
+                            rows.push(
+                                AccessibilityNode::new(
+                                    AccessibleRole::Status,
+                                    format!("{} {task_count}", group.label()),
+                                    "Board section.",
+                                )
+                                .gpui(
+                                    board_group_element_id(*group),
+                                    false,
+                                    false,
+                                ),
+                            );
+                        }
+                    }
+                    ProjectInboxItem::NewTaskTarget { project_key, label } => {
+                        let element_id = format!(
+                            "native-project-new-task-{}",
+                            stable_host_project_element_key(project_key, "new-task")
+                        );
                         rows.push(
                             AccessibilityNode::new(
                                 AccessibleRole::Button,
-                                format!("Project {label}, {task_count} {task_word}, {state}"),
-                                "Expand or collapse this project's tasks.",
+                                format!("New task in {label}"),
+                                "Open a new-task dialog for this owner's project. Provider start stays deferred.",
                             )
                             .gpui(element_id.clone(), true, true),
                         );
                         project_action_elements.insert(
                             element_id,
-                            ProjectAccessibilityAction::Toggle(project_key.clone()),
+                            ProjectAccessibilityAction::NewTask(project_key.clone()),
                         );
-                        let local_project = matches!(host, HostId::LocalProfile(_));
-                        if local_project && claude_available {
-                            let element_id = format!(
-                                "native-project-claude-{}",
-                                stable_host_project_element_key(&project_key, "claude")
-                            );
-                            rows.push(
-                                AccessibilityNode::new(
-                                    AccessibleRole::Button,
-                                    format!("Start Claude task in {label}"),
-                                    "Create a new task in this project and connect Claude Code.",
-                                )
-                                .gpui(
-                                    element_id.clone(),
-                                    true,
-                                    true,
-                                ),
-                            );
-                            project_action_elements.insert(
-                                element_id,
-                                ProjectAccessibilityAction::StartAgent(
-                                    project_key.clone(),
-                                    ProviderKind::ClaudeCode,
-                                ),
-                            );
-                        }
-                        if local_project && codex_available {
-                            let element_id = format!(
-                                "native-project-codex-{}",
-                                stable_host_project_element_key(&project_key, "codex")
-                            );
-                            rows.push(
-                                AccessibilityNode::new(
-                                    AccessibleRole::Button,
-                                    format!("Start Codex task in {label}"),
-                                    "Create a new task in this project and connect Codex.",
-                                )
-                                .gpui(
-                                    element_id.clone(),
-                                    true,
-                                    true,
-                                ),
-                            );
-                            project_action_elements.insert(
-                                element_id,
-                                ProjectAccessibilityAction::StartAgent(
-                                    project_key.clone(),
-                                    ProviderKind::Codex,
-                                ),
-                            );
-                        }
-                        if !local_project {
-                            let element_id = format!(
-                                "native-project-new-task-{}",
-                                stable_host_project_element_key(&project_key, "new-task")
-                            );
-                            rows.push(
-                                AccessibilityNode::new(
-                                    AccessibleRole::Button,
-                                    format!("New task in {label}"),
-                                    "Open a new-task dialog for this remote owner's project. Provider start stays deferred.",
-                                )
-                                .gpui(element_id.clone(), true, true),
-                            );
-                            project_action_elements.insert(
-                                element_id,
-                                ProjectAccessibilityAction::NewTask(project_key),
-                            );
-                        }
                     }
                     ProjectInboxItem::Task { task_key, .. }
                         if rendered_task_set.contains(&task_key.task_id)
@@ -9975,9 +9982,7 @@ impl AccessibilityTree {
                     {
                         push_task_row(&mut rows, &mut task_element_ids, task_key.clone());
                     }
-                    ProjectInboxItem::Task { .. }
-                    | ProjectInboxItem::DoneHeader { .. }
-                    | ProjectInboxItem::ArchivedHeader { .. } => {}
+                    ProjectInboxItem::Task { .. } | ProjectInboxItem::ArchivedHeader { .. } => {}
                 }
             }
         }
@@ -9985,7 +9990,7 @@ impl AccessibilityTree {
             AccessibilityNode::new(
                 AccessibleRole::Status,
                 "No tasks yet",
-                "Add or choose a project, then start with +Claude or +Codex.",
+                "Add or choose a project, then start one from the board's + New menu.",
             )
             .gpui("native-task-inbox-status", false, false)
         } else {
@@ -11350,7 +11355,18 @@ pub struct NativeShell {
     /// Host that owns [`Self::selected_project_id`] / project-scope filter.
     /// Raw ProjectId alone must not filter another host's same UUID.
     project_scope_host: Option<HostId>,
-    collapsed_projects: HashSet<HostProjectKey>,
+    /// How long each task has held its current board state. Transient by
+    /// design -- the kernel records when events occurred, not when a task
+    /// entered a visible state -- so it is never persisted, and a task that
+    /// leaves the fleet projection is forgotten rather than left to leak.
+    board_state_clock: StateClock<HostTaskKey>,
+    /// Whether the board's Done section is disclosed.
+    board_done_expanded: bool,
+    /// One palette slot per project, restored from and written back to
+    /// `layout.project_colours`.
+    project_colours: ProjectColourBook,
+    /// Which board header menu is open, if either.
+    board_menu: Option<BoardMenu>,
     palette_index: usize,
     /// Owner-qualified create result selection; never admit by raw TaskId alone.
     pending_select_task: Option<HostTaskKey>,
@@ -12240,6 +12256,8 @@ impl NativeShell {
                     })
             })
             .collect();
+        // Read before `layout` is moved into the shell below.
+        let project_colours = ProjectColourBook::from_persisted(&layout.project_colours);
         let browser_profile_root = profile.root().to_path_buf();
         let browser_bridge_init = browser_command_channel(64);
         let (theme_controller, theme_error) = match ThemeController::load_at(profile.root()) {
@@ -12410,7 +12428,12 @@ impl NativeShell {
             known_deleted_task_keys: BTreeSet::new(),
             selected_project_id: None,
             project_scope_host: None,
-            collapsed_projects: HashSet::new(),
+            // `StateClock::new` rather than `Default`: the derive needs
+            // `K: Default` and `HostTaskKey` has no default identity.
+            board_state_clock: StateClock::new(),
+            board_done_expanded: false,
+            project_colours,
+            board_menu: None,
             task_search: TaskSearchState::default(),
             project_scope_menu: ProjectScopeMenuState::default(),
             project_actions: ProjectActionWorkflow::default(),
@@ -13769,7 +13792,7 @@ impl NativeShell {
 
     fn refresh_accessibility_tree(&mut self) {
         self.accessibility_tree_builds = self.accessibility_tree_builds.saturating_add(1);
-        let project_items = self.project_inbox_items();
+        let project_items = self.board_inbox_items(unix_time_ms());
         let shows_add_project = self.shows_add_project_plus();
         let composer_focused = self.composer_accessibility_focused;
         let composer = self
@@ -13829,6 +13852,26 @@ impl NativeShell {
             )
             .gpui("native-sidebar-new-task", true, true)
             .with_disabled(self.startup_gates_actions()),
+        );
+        // The board header's own `+ New`. The per-project "+Claude"/"+Codex"
+        // buttons went with the project rail; this one control opens the menu
+        // that lists every project instead.
+        overlay_nodes.push(
+            AccessibilityNode::new(
+                AccessibleRole::Button,
+                "New task",
+                "Open the board's new-task menu and choose the project to start in.",
+            )
+            .gpui("board-header-new", true, true)
+            .with_disabled(self.startup_gates_actions()),
+        );
+        overlay_nodes.push(
+            AccessibilityNode::new(
+                AccessibleRole::Button,
+                "Board options",
+                "Archived tasks, collapse the board to a rail, and row density.",
+            )
+            .gpui("board-header-menu", true, true),
         );
         if let Some((owner, approval_state)) = selected_key.as_ref().and_then(|owner| {
             self.host_slot(&owner.host)
@@ -18756,14 +18799,6 @@ impl NativeShell {
                     .project_action_for_platform_node(request.target_node)
                 {
                     match action {
-                        ProjectAccessibilityAction::Toggle(project_key) => {
-                            self.toggle_project(project_key);
-                        }
-                        ProjectAccessibilityAction::StartAgent(project_key, _) => {
-                            if project_key.host == self.local_host_id() {
-                                self.begin_new_task_for_project(project_key.project_id);
-                            }
-                        }
                         ProjectAccessibilityAction::NewTask(project_key) => {
                             self.begin_new_task_for_project_key(project_key);
                         }
@@ -28134,6 +28169,7 @@ impl NativeShell {
                 self.project_scope_menu.close_menu();
                 self.project_actions.close();
                 self.close_terminal_chip_menu();
+                self.close_board_menu();
                 self.refresh_accessibility_tree();
             }
             _ => {}
@@ -30414,37 +30450,346 @@ impl NativeShell {
             .collect()
     }
 
-    fn project_inbox_items(&self) -> Vec<ProjectInboxItem> {
-        let projection = self.fleet_inbox_projection();
-        let mut items = Vec::new();
-        if self.show_archived_tasks {
-            let archived: Vec<_> = projection
-                .archived
-                .iter()
-                .filter(|row| {
-                    row.project_id.map_or(true, |project_id| {
-                        self.fleet_project_scope_includes(&row.key.host, project_id)
-                    })
-                })
-                .cloned()
-                .collect();
-            if !archived.is_empty() {
-                items.push(ProjectInboxItem::ArchivedHeader {
-                    task_count: archived.len(),
-                });
-                items.extend(archived.into_iter().map(|row| ProjectInboxItem::Task {
-                    project_id: row.project_id.unwrap_or_else(ProjectId::new),
-                    task_key: row.key,
-                    settled: false,
-                    archived: true,
-                }));
-            }
-            return items;
-        }
+    /// Open one of the board header's menus. One field holds both, so opening
+    /// either closes the other rather than stacking two overlays.
+    fn open_board_menu(&mut self, menu: BoardMenu) {
+        self.board_menu = Some(menu);
+    }
 
-        // Local multi-folder projects stay authoritative for the local host.
+    fn close_board_menu(&mut self) {
+        self.board_menu = None;
+    }
+
+    /// Keys the open board menu owns. Escape is the only one: the rows are
+    /// pointer targets and their accessible twins live in the tree, so there is
+    /// no selection cursor to move.
+    fn handle_board_menu_key(&mut self, event: &KeyDownEvent) {
+        if event.keystroke.key.as_str() == "escape" {
+            self.close_board_menu();
+        }
+    }
+
+    /// Flip the board between the full column and the narrow rail, and persist
+    /// the choice: a collapsed board that reopens wide on the next launch would
+    /// read as the setting not having taken.
+    fn toggle_board_rail(&mut self) {
+        self.layout.board_rail = !self.layout.board_rail;
+        self.mark_layout_dirty();
+    }
+
+    /// Swap the runtime density preference. The board reads the same one every
+    /// other surface reads, so this changes the whole shell, not just the rows.
+    fn toggle_board_density(&mut self) {
+        let next = if self.board_density_compact() {
+            crate::ui::tokens::Density::Comfortable
+        } else {
+            crate::ui::tokens::Density::Compact
+        };
+        let preferences = RuntimePreferencesSnapshot::new(
+            self.preferences.mode(),
+            next,
+            self.preferences.scale(),
+        );
+        self.queue_preferences(preferences);
+    }
+
+    /// Both board menus, built the same way the terminal chip menu is: a
+    /// full-window occluding backdrop that dismisses on an outside click or
+    /// Escape, with the panel anchored under the header.
+    fn render_board_menu_overlay(
+        &self,
+        tokens: crate::ui::tokens::ThemeTokens,
+        viewport: Size<Pixels>,
+        cx: &Context<Self>,
+    ) -> AnyElement {
+        let menu = self.board_menu.expect("board menu is open");
+        let (title, entries): (&str, Vec<(String, String, BoardMenuAction)>) = match menu {
+            BoardMenu::NewTask => (
+                "New task in",
+                self.board_new_task_targets()
+                    .into_iter()
+                    .enumerate()
+                    .map(|(index, (project_key, label))| {
+                        (
+                            format!("board-menu-new-{index}"),
+                            label,
+                            BoardMenuAction::NewTaskIn(project_key),
+                        )
+                    })
+                    .collect(),
+            ),
+            BoardMenu::Options => (
+                "Board",
+                vec![
+                    (
+                        "board-menu-archived".to_string(),
+                        if self.show_archived_tasks {
+                            "Active tasks".to_string()
+                        } else {
+                            "Archived…".to_string()
+                        },
+                        BoardMenuAction::ToggleArchived,
+                    ),
+                    (
+                        "board-menu-rail".to_string(),
+                        if self.layout.board_rail {
+                            "Expand board".to_string()
+                        } else {
+                            "Collapse to rail".to_string()
+                        },
+                        BoardMenuAction::ToggleRail,
+                    ),
+                    (
+                        "board-menu-density".to_string(),
+                        if self.board_density_compact() {
+                            "Density: Compact".to_string()
+                        } else {
+                            "Density: Comfortable".to_string()
+                        },
+                        BoardMenuAction::ToggleDensity,
+                    ),
+                ],
+            ),
+        };
+        let mut rows: Vec<AnyElement> = Vec::new();
+        if entries.is_empty() {
+            rows.push(
+                div()
+                    .id("board-menu-empty")
+                    .w_full()
+                    .px(px(tokens.density.spacing.md))
+                    .py(px(tokens.density.spacing.xs))
+                    .text_size(px(tokens.density.typography.caption))
+                    .text_color(tokens.text.muted.to_gpui())
+                    .child("No projects yet. Add one in Settings.")
+                    .into_any_element(),
+            );
+        }
+        for (element_id, label, action) in entries {
+            rows.push(
+                div()
+                    .id(SharedString::from(element_id))
+                    .w_full()
+                    .px(px(tokens.density.spacing.md))
+                    .py(px(tokens.density.spacing.xs))
+                    .text_size(px(tokens.density.typography.body))
+                    .text_color(tokens.text.primary.to_gpui())
+                    .cursor_pointer()
+                    .hover(|style| style.bg(tokens.surfaces.hover.to_gpui()))
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |shell, _event: &MouseDownEvent, _window, cx| {
+                            cx.stop_propagation();
+                            shell.apply_board_menu_action(action.clone());
+                            shell.close_board_menu();
+                            shell.refresh_accessibility_tree();
+                            cx.notify();
+                        }),
+                    )
+                    .child(label)
+                    .into_any_element(),
+            );
+        }
+        deferred(
+            anchored()
+                .position(point(px(0.0), px(0.0)))
+                .snap_to_window()
+                .child(
+                    div()
+                        .id("board-menu-backdrop")
+                        .occlude()
+                        .w(viewport.width)
+                        .h(viewport.height)
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(|shell, _event: &MouseDownEvent, _window, cx| {
+                                cx.stop_propagation();
+                                shell.close_board_menu();
+                                cx.notify();
+                            }),
+                        )
+                        .on_key_down(cx.listener(
+                            move |shell, event: &KeyDownEvent, _window, cx| {
+                                cx.stop_propagation();
+                                shell.handle_board_menu_key(event);
+                                cx.notify();
+                            },
+                        ))
+                        .child(
+                            div()
+                                .id("board-menu")
+                                .absolute()
+                                .left(px(BOARD_MENU_LEFT_INSET))
+                                .top(px(Self::HEADER_HEIGHT + BOARD_MENU_TOP_INSET))
+                                .w(px(BOARD_MENU_WIDTH))
+                                .flex()
+                                .flex_col()
+                                .py(px(tokens.density.spacing.xs))
+                                .rounded(px(tokens.density.radii.md))
+                                .bg(tokens.surfaces.overlay.to_gpui())
+                                .border(px(1.0))
+                                .border_color(tokens.borders.subtle.to_gpui())
+                                .shadow_sm()
+                                .child(
+                                    div()
+                                        .w_full()
+                                        .px(px(tokens.density.spacing.md))
+                                        .pb(px(tokens.density.spacing.xs))
+                                        .text_size(px(tokens.density.typography.caption))
+                                        .text_color(tokens.text.muted.to_gpui())
+                                        .child(title),
+                                )
+                                .children(rows),
+                        ),
+                ),
+        )
+        .with_priority(2)
+        .into_any_element()
+    }
+
+    fn apply_board_menu_action(&mut self, action: BoardMenuAction) {
+        match action {
+            BoardMenuAction::NewTaskIn(project_key) => {
+                self.begin_new_task_for_project_key(project_key);
+            }
+            BoardMenuAction::ToggleArchived => {
+                self.show_archived_tasks = !self.show_archived_tasks;
+            }
+            BoardMenuAction::ToggleRail => self.toggle_board_rail(),
+            BoardMenuAction::ToggleDensity => self.toggle_board_density(),
+        }
+    }
+
+    /// One board row per live fleet task, with the transient state age and the
+    /// journal-derived plan progress and doing-now text folded in.
+    ///
+    /// Also the only place the state clock is pruned: whatever it still holds
+    /// that this pass did not observe has left the projection, and forgetting
+    /// it here is what stops the map growing for the life of the process.
+    fn board_rows(&mut self, now_ms: i64) -> Vec<BoardRow> {
+        let fleet = self.fleet_inbox_projection();
+        let selected = self.selected_task_key.clone();
+        let local_host = self.local_host_id();
+        let open: HashSet<HostTaskKey> = self
+            .layout
+            .task_workspace
+            .as_ref()
+            .map(|workspace| workspace.task_ids().into_iter().collect())
+            .unwrap_or_default();
+        let mut rows = Vec::new();
+        let mut live: HashSet<HostTaskKey> = HashSet::new();
+        for fleet_row in fleet.rail_rows() {
+            if fleet_row.archived {
+                continue;
+            }
+            if !fleet_row.project_id.map_or(true, |project_id| {
+                self.fleet_project_scope_includes(&fleet_row.key.host, project_id)
+            }) {
+                continue;
+            }
+            let status = self.task_row_status_for_owner(&fleet_row.key);
+            let state = board_state_of(status.unwrap_or(VisibleTaskStatus::Idle), fleet_row.done);
+            let state_age_ms = self
+                .board_state_clock
+                .observe(fleet_row.key.clone(), state, now_ms);
+            live.insert(fleet_row.key.clone());
+            let activity = self
+                .task_surfaces
+                .conversation_page(fleet_row.key.clone())
+                .map(|page| board_activity(&page.facts))
+                .unwrap_or_default();
+            // Only a Working row narrates what the provider is doing. An open
+            // tool call outlives the state it started in, so letting it speak
+            // for an Idle or Done row would report work that has stopped.
+            let why = match state {
+                BoardState::Working => activity
+                    .doing_now
+                    .clone()
+                    .unwrap_or_else(|| BoardState::Working.why_label().to_string()),
+                other => other.why_label().to_string(),
+            };
+            let provider = match self.task_provider_kind_for_owner(&fleet_row.key) {
+                Some(ProviderKind::ClaudeCode) => PrimaryProviderIcon::Claude,
+                Some(ProviderKind::Codex) => PrimaryProviderIcon::Codex,
+                Some(ProviderKind::Cursor) => PrimaryProviderIcon::Cursor,
+                None => PrimaryProviderIcon::Other,
+            };
+            let branch = self
+                .host_slot(&fleet_row.key.host)
+                .and_then(|slot| slot.inbox.row(fleet_row.key.task_id))
+                .map(|inbox_row| inbox_row.display.worktree.clone())
+                .filter(|branch| !branch.trim().is_empty())
+                .unwrap_or_else(|| "main".to_string());
+            let project_colour = fleet_row
+                .project_id
+                .map(|project_id| self.project_colours.colour_index(project_id))
+                .unwrap_or(0);
+            rows.push(BoardRow {
+                key: fleet_row.key.clone(),
+                title: if fleet_row.key.host == local_host {
+                    fleet_row.title.clone()
+                } else {
+                    format!("{} · {}", fleet_row.host_label, fleet_row.title)
+                },
+                state,
+                why,
+                state_age_ms,
+                progress: activity.progress,
+                provider,
+                project_colour,
+                project_label: fleet_row.project_label.clone(),
+                branch,
+                last_activity_ms: fleet_row.occurred_at_ms,
+                selected: selected.as_ref() == Some(&fleet_row.key),
+                open: open.contains(&fleet_row.key),
+            });
+        }
+        let stale: Vec<HostTaskKey> = self
+            .board_state_clock
+            .keys()
+            .filter(|key| !live.contains(*key))
+            .cloned()
+            .collect();
+        for key in stale {
+            self.board_state_clock.forget(&key);
+        }
+        // A slot handed out on first sight is only durable once it is written
+        // back, or every restart repaints the same projects a different colour.
+        let assigned = self.project_colours.to_persisted();
+        if assigned != self.layout.project_colours {
+            self.layout.project_colours = assigned;
+            self.mark_layout_dirty();
+        }
+        rows
+    }
+
+    pub fn board_model(&mut self, now_ms: i64) -> BoardModel {
+        let rows = self.board_rows(now_ms);
+        build_board_model(rows, self.board_done_expanded)
+    }
+
+    /// Compact when the runtime density preference is Compact. The board's own
+    /// row heights come from `ui::board::layout`; this only says which of them
+    /// applies, and it reads the one preference the rest of the shell reads.
+    fn board_density_compact(&self) -> bool {
+        self.preferences.density() == crate::ui::tokens::Density::Compact
+    }
+
+    /// How wide the board column paints. Delegates so every caller -- the
+    /// column, the rows inside it and the centre canvas measuring what is left
+    /// -- reads the same rule.
+    fn board_column_width(&self) -> f32 {
+        board_column_width_for(&self.layout)
+    }
+
+    /// Every project a new task can be started in, owner-qualified and in a
+    /// stable order: local folders first, then each attached host's configured
+    /// projects. The `+ New` menu and the accessibility tree read the same
+    /// list, so a project reachable by one is reachable by the other.
+    fn board_new_task_targets(&self) -> Vec<(HostProjectKey, String)> {
         let local = self.local_host_id();
-        let mut represented: HashSet<(HostId, ProjectId)> = HashSet::new();
+        let mut targets = Vec::new();
+        let mut seen: HashSet<HostProjectKey> = HashSet::new();
         for project in &self.local_slot().config_sidebar.projects {
             let Ok(project_id) = ProjectId::parse(&project.workspace_id) else {
                 continue;
@@ -30452,36 +30797,11 @@ impl NativeShell {
             if !self.fleet_project_scope_includes(&local, project_id) {
                 continue;
             }
-            represented.insert((local.clone(), project_id));
-            let tasks: Vec<_> = projection
-                .active
-                .iter()
-                .filter(|row| {
-                    row.key.host == local && row.project_id == Some(project_id) && !row.done
-                })
-                .cloned()
-                .collect();
-            let expanded = !self
-                .collapsed_projects
-                .contains(&HostProjectKey::new(local.clone(), project_id));
-            items.push(ProjectInboxItem::Project {
-                project_id,
-                label: project.label.clone(),
-                expanded,
-                task_count: tasks.len(),
-                host: local.clone(),
-            });
-            if expanded {
-                items.extend(tasks.into_iter().map(|row| ProjectInboxItem::Task {
-                    project_id,
-                    task_key: row.key,
-                    settled: false,
-                    archived: false,
-                }));
+            let key = HostProjectKey::new(local.clone(), project_id);
+            if seen.insert(key.clone()) {
+                targets.push((key, project.label.clone()));
             }
         }
-
-        // Remote owner-configured projects (including empty ones with no tasks yet).
         let remote_hosts: Vec<HostId> = self
             .hosts
             .keys()
@@ -30507,128 +30827,76 @@ impl NativeShell {
                 if !self.fleet_project_scope_includes(&host, project_id) {
                     continue;
                 }
-                if !represented.insert((host.clone(), project_id)) {
+                let key = HostProjectKey::new(host.clone(), project_id);
+                if !seen.insert(key.clone()) {
                     continue;
                 }
-                let tasks: Vec<_> = projection
-                    .active
-                    .iter()
-                    .filter(|row| {
-                        row.key.host == host && row.project_id == Some(project_id) && !row.done
-                    })
-                    .cloned()
-                    .collect();
-                let expanded = !self
-                    .collapsed_projects
-                    .contains(&HostProjectKey::new(host.clone(), project_id));
                 let label = if label.trim().is_empty() {
                     format!("{} · project", self.owner_host_label(&host))
                 } else {
                     format!("{} · {}", self.owner_host_label(&host), label)
                 };
-                items.push(ProjectInboxItem::Project {
-                    project_id,
-                    label,
-                    expanded,
-                    task_count: tasks.len(),
-                    host: host.clone(),
-                });
-                if expanded {
-                    items.extend(tasks.into_iter().map(|row| ProjectInboxItem::Task {
-                        project_id,
-                        task_key: row.key,
-                        settled: false,
-                        archived: false,
-                    }));
-                }
+                targets.push((key, label));
             }
         }
+        targets
+    }
 
-        // Host-qualified residual projects (remote hosts + unknown local folders).
-        let mut residual: BTreeMap<(HostId, ProjectId), Vec<FleetTaskRow>> = BTreeMap::new();
-        for row in projection.active.iter().filter(|row| !row.done) {
-            let Some(project_id) = row.project_id else {
-                continue;
-            };
-            if !self.fleet_project_scope_includes(&row.key.host, project_id) {
-                continue;
-            }
-            if represented.contains(&(row.key.host.clone(), project_id)) {
-                continue;
-            }
-            residual
-                .entry((row.key.host.clone(), project_id))
-                .or_default()
-                .push(row.clone());
-        }
-        for ((host, project_id), tasks) in residual {
-            let expanded = !self
-                .collapsed_projects
-                .contains(&HostProjectKey::new(host.clone(), project_id));
-            let label = if host == local {
-                self.project_label_for_id(project_id)
-            } else {
-                tasks
-                    .first()
-                    .map(|row| {
-                        if row.project_label.trim().is_empty() {
-                            format!("{} · project", self.owner_host_label(&host))
-                        } else {
-                            format!("{} · {}", self.owner_host_label(&host), row.project_label)
-                        }
+    /// The board flattened for the accessibility tree: one node per section,
+    /// the rows in the order they paint, and one reachable "New task" per
+    /// project. The board has no project rows, so without that last part a
+    /// project with no tasks yet would be unreachable to a screen reader.
+    fn board_inbox_items(&mut self, now_ms: i64) -> Vec<ProjectInboxItem> {
+        if self.show_archived_tasks {
+            let archived: Vec<_> = self
+                .fleet_inbox_projection()
+                .archived
+                .iter()
+                .filter(|row| {
+                    row.project_id.map_or(true, |project_id| {
+                        self.fleet_project_scope_includes(&row.key.host, project_id)
                     })
-                    .unwrap_or_else(|| self.owner_host_label(&host))
-            };
-            items.push(ProjectInboxItem::Project {
-                project_id,
-                label,
-                expanded,
-                task_count: tasks.len(),
-                host: host.clone(),
-            });
-            if expanded {
-                items.extend(tasks.into_iter().map(|row| ProjectInboxItem::Task {
-                    project_id,
+                })
+                .cloned()
+                .collect();
+            let mut items = Vec::new();
+            if !archived.is_empty() {
+                items.push(ProjectInboxItem::ArchivedHeader {
+                    task_count: archived.len(),
+                });
+                items.extend(archived.into_iter().map(|row| ProjectInboxItem::Task {
+                    project_id: row.project_id.unwrap_or_else(ProjectId::new),
                     task_key: row.key,
                     settled: false,
-                    archived: false,
+                    archived: true,
                 }));
             }
+            return items;
         }
-
-        let done: Vec<_> = projection
-            .done
-            .iter()
-            .filter(|row| {
-                row.project_id.map_or(true, |project_id| {
-                    self.fleet_project_scope_includes(&row.key.host, project_id)
-                })
-            })
-            .cloned()
-            .collect();
-        if !done.is_empty() {
-            items.push(ProjectInboxItem::DoneHeader {
-                task_count: done.len(),
+        let board = self.board_model(now_ms);
+        let mut items = Vec::new();
+        for group in &board.groups {
+            items.push(ProjectInboxItem::Group {
+                group: group.group,
+                task_count: group.rows.len(),
+                collapsed: group.collapsed,
             });
-            items.extend(done.into_iter().map(|row| ProjectInboxItem::Task {
-                project_id: row.project_id.unwrap_or_else(ProjectId::new),
-                task_key: row.key,
-                settled: true,
+            if group.collapsed {
+                continue;
+            }
+            items.extend(group.rows.iter().map(|row| ProjectInboxItem::Task {
+                project_id: ProjectId::new(),
+                task_key: row.key.clone(),
+                settled: row.state == BoardState::Done,
                 archived: false,
             }));
         }
+        items.extend(
+            self.board_new_task_targets()
+                .into_iter()
+                .map(|(project_key, label)| ProjectInboxItem::NewTaskTarget { project_key, label }),
+        );
         items
-    }
-
-    fn toggle_project(&mut self, project_key: HostProjectKey) {
-        // Never mint a local selected_project_id from a remote collapse gesture.
-        if project_key.host == self.local_host_id() {
-            self.selected_project_id = Some(project_key.project_id);
-            self.project_scope_host = Some(project_key.host.clone());
-        }
-        if !self.collapsed_projects.insert(project_key.clone()) {
-            self.collapsed_projects.remove(&project_key);
-        }
     }
 
     fn shell_stage(&self) -> ShellStage {
@@ -33527,6 +33795,12 @@ impl NativeShell {
             "native-sidebar-new-task" => {
                 self.begin_new_task();
             }
+            "board-header-new" => self.open_board_menu(BoardMenu::NewTask),
+            "board-header-menu" => self.open_board_menu(BoardMenu::Options),
+            "board-group-done" => {
+                self.board_done_expanded = !self.board_done_expanded;
+                self.refresh_accessibility_tree();
+            }
             "native-inbox-plus-claude" => self.start_task_with_agent(ProviderKind::ClaudeCode),
             "native-inbox-plus-codex" => self.start_task_with_agent(ProviderKind::Codex),
             "native-task-settle" => self.settle_selected_task(),
@@ -34615,11 +34889,12 @@ impl NativeShell {
         }
     }
 
-    /// Fixed row height for the virtualized inbox. `uniform_list` requires a
-    /// stable height, so the two text lines and their padding are summed from
-    /// the same tokens that render them.
+    /// Fixed row height for the archived browser's virtualized list. Only that
+    /// list is a `uniform_list` now -- the board is a plain column and takes
+    /// its heights from `ui::board::layout` -- but `uniform_list` still needs
+    /// one stable height for the three lines an archived row carries.
     fn inbox_row_height(_tokens: crate::ui::tokens::ThemeTokens) -> f32 {
-        T3_SIDEBAR_ROW_HEIGHT
+        ARCHIVED_ROW_HEIGHT
     }
 
     fn element_without_handlers(&self) -> impl IntoElement {
@@ -34665,6 +34940,9 @@ impl NativeShell {
         }
         if self.terminal_chip_menu.is_some() {
             return Some(self.render_terminal_chip_menu_overlay(tokens, viewport, cx));
+        }
+        if self.board_menu.is_some() {
+            return Some(self.render_board_menu_overlay(tokens, viewport, cx));
         }
         if self.task_search.open()
             || self
@@ -41016,7 +41294,7 @@ impl NativeShell {
         } else {
             Self::RAIL_THICKNESS + layout.dock_width
         };
-        let width = f32::from(viewport.width) - T3_SIDEBAR_WIDTH - dock - 2.0;
+        let width = f32::from(viewport.width) - board_column_width_for(&layout) - dock - 2.0;
         let height = f32::from(viewport.height) - Self::HEADER_HEIGHT - 2.0;
         size(px(width.max(1.0)), px(height.max(1.0)))
     }
@@ -41235,11 +41513,19 @@ impl NativeShell {
         let selected_task = self.layout.selected_task.clone();
         let task_workspace = self.layout.task_workspace.clone();
         let task_composer_preferences = self.layout.task_composer_preferences.clone();
+        // Pane geometry is what "reset layout" means. A project's colour and a
+        // collapsed board are identity and mode, not geometry, so they survive
+        // exactly as the composer preferences do -- resetting the panes must
+        // not repaint every project stripe.
+        let project_colours = self.layout.project_colours.clone();
+        let board_rail = self.layout.board_rail;
         self.layout = KeyedWorkspaceLayout {
             window,
             selected_task,
             task_workspace,
             task_composer_preferences,
+            project_colours,
+            board_rail,
             ..KeyedWorkspaceLayout::<HostTaskKey>::default()
         };
         self.mark_layout_dirty();
@@ -41542,8 +41828,14 @@ impl NativeShell {
             .into_any_element()
     }
 
+    /// The board column. Docked flush to the window edge, no radius, a one
+    /// pixel subtle right border and the canvas ground -- the placement
+    /// `01-composition-A.html` specifies for the column that holds the board.
+    /// Its width is the board's, so the column and the rows it contains cannot
+    /// disagree about how much room the segments strip has.
     fn reference_sidebar(
         tokens: crate::ui::tokens::ThemeTokens,
+        width: f32,
         navigation: AnyElement,
         inbox: AnyElement,
         footer: AnyElement,
@@ -41553,11 +41845,11 @@ impl NativeShell {
             .flex()
             .flex_col()
             .flex_none()
-            .w(px(T3_SIDEBAR_WIDTH))
+            .w(px(width))
             .h_full()
             .min_h(px(0.0))
             .overflow_hidden()
-            .bg(tokens.surfaces.sunken.to_gpui())
+            .bg(tokens.surfaces.canvas.to_gpui())
             .border_r(px(1.0))
             .border_color(tokens.borders.subtle.to_gpui())
             .child(Self::sidebar_brand(tokens))
@@ -41748,7 +42040,8 @@ impl NativeShell {
                     )),
             )
             .into_any_element();
-        let sidebar = Self::reference_sidebar(tokens, navigation, inbox, footer);
+        let sidebar =
+            Self::reference_sidebar(tokens, self.board_column_width(), navigation, inbox, footer);
         let dock = Self::stacked_panel_grow(
             "native-shell-context-dock",
             self.local_slot().cockpit.active_tool().label(),
@@ -41879,24 +42172,24 @@ impl NativeShell {
             component.radius = px(tokens.density.radii.md);
             component.radius_lg = px(tokens.density.radii.lg);
         }
-        let inbox_items = Arc::new(
-            self.project_inbox_items()
-                .into_iter()
-                .filter(|item| {
-                    matches!(
-                        item,
-                        ProjectInboxItem::Task { .. }
-                            | ProjectInboxItem::DoneHeader { .. }
-                            | ProjectInboxItem::ArchivedHeader { .. }
-                    )
-                })
-                .collect::<Vec<_>>(),
-        );
+        // The board owns the active list. The archived browser is a different
+        // question -- "what did I finish with" -- and keeps the older row shape
+        // with its Delete affordance, so it is still a uniform list and still
+        // needs its per-row labels. Neither is built when the other is showing.
+        let archived_view = self.show_archived_tasks;
+        let board_now_ms = unix_time_ms();
+        let board_width = self.board_column_width();
+        let board = (!archived_view).then(|| self.board_model(board_now_ms));
+        let inbox_items = Arc::new(if archived_view {
+            self.board_inbox_items(board_now_ms)
+        } else {
+            Vec::new()
+        });
         let fleet_rows = self.fleet_inbox_projection();
-        let row_models = Arc::new(
+        let row_models = Arc::new(if archived_view {
             fleet_rows
-                .rail_rows()
-                .chain(fleet_rows.archived.iter())
+                .archived
+                .iter()
                 .map(|row| {
                     let host_prefix = if row.key.host == self.local_host_id() {
                         String::new()
@@ -41904,20 +42197,6 @@ impl NativeShell {
                         format!("{} · ", row.host_label)
                     };
                     let title = format!("{host_prefix}{}", row.title);
-                    let (status, tone) = if row.archived {
-                        ("Archived".to_string(), tokens.status.inactive)
-                    } else if row.done {
-                        ("Done".to_string(), tokens.status.inactive)
-                    } else {
-                        let status = self.task_row_status_for_owner(&row.key);
-                        (
-                            status
-                                .map(visible_status_label)
-                                .unwrap_or("Open")
-                                .to_string(),
-                            Self::status_tone(status, tokens),
-                        )
-                    };
                     let provider = self.task_provider_label_for_owner(&row.key).to_string();
                     let branch = self
                         .host_slot(&row.key.host)
@@ -41931,14 +42210,16 @@ impl NativeShell {
                             title,
                             row.project_label.clone(),
                             branch,
-                            status,
-                            tone,
+                            "Archived".to_string(),
+                            tokens.status.inactive,
                             provider,
                         ),
                     )
                 })
-                .collect::<std::collections::HashMap<_, _>>(),
-        );
+                .collect::<std::collections::HashMap<_, _>>()
+        } else {
+            std::collections::HashMap::new()
+        });
         let selected_task_key = self.selected_task_key.clone();
         let selected_task_key_for_list = selected_task_key.clone();
         let local_host_for_list = self.local_host_id();
@@ -41965,21 +42246,155 @@ impl NativeShell {
         let provider_affordance = provider_inbox_affordance(agents_connected, agents_checking);
         let project_creation_affordance =
             project_creation_affordance(self.shows_add_project_plus(), provider_affordance);
-        let available_agents = self
-            .local_slot_mut()
-            .agent_connection
-            .as_ref()
-            .map(inbox_agent_actions)
-            .unwrap_or_default();
-        let claude_available = available_agents
-            .iter()
-            .any(|action| action.provider == ProviderKind::ClaudeCode);
-        let codex_available = available_agents
-            .iter()
-            .any(|action| action.provider == ProviderKind::Codex);
         let shell_entity = cx.entity().downgrade();
         let services_shell_entity = shell_entity.clone();
-        let archived_view = self.show_archived_tasks;
+        // The board painter. Every gesture the project rail carried moves here
+        // unchanged: left click selects (shift toggles), right click renames a
+        // live task, Enter/Space select, and every other key still forwards to
+        // the exact visible interactive terminal.
+        let board_element = board.as_ref().map(|model| {
+            let board_shell = cx.entity().downgrade();
+            let row_handlers = BoardRowHandlers {
+                on_left_select: Rc::new({
+                    let shell = board_shell.clone();
+                    move |key: &HostTaskKey,
+                          shift: bool,
+                          window: &mut Window,
+                          app: &mut gpui::App| {
+                        let key = key.clone();
+                        let _ = shell.update(app, |shell, cx| {
+                            cx.stop_propagation();
+                            shell.focus_handle.focus(window);
+                            let mode = if shift {
+                                FleetSelectMode::Toggle
+                            } else {
+                                FleetSelectMode::Replace
+                            };
+                            let _ = shell.select_fleet_task_key(key, mode);
+                            shell.refresh_accessibility_tree();
+                            cx.notify();
+                        });
+                    }
+                }),
+                on_right_click: Rc::new({
+                    let shell = board_shell.clone();
+                    move |key: &HostTaskKey, _window: &mut Window, app: &mut gpui::App| {
+                        let key = key.clone();
+                        let _ = shell.update(app, |shell, cx| {
+                            cx.stop_propagation();
+                            // Never mint a local selected_project_id from a
+                            // remote host's raw ProjectId.
+                            if key.host == shell.local_host_id() {
+                                if let Some(project_id) = shell
+                                    .fleet_inbox_projection()
+                                    .find(&key)
+                                    .and_then(|row| row.project_id)
+                                {
+                                    shell.selected_project_id = Some(project_id);
+                                }
+                            }
+                            // The board paints no archived rows, so a right
+                            // click here is always on a live task.
+                            if task_row_right_click_should_rename(false) {
+                                shell.begin_task_rename_key(key);
+                            }
+                            cx.notify();
+                        });
+                    }
+                }),
+                on_key_down: Rc::new({
+                    let shell = board_shell.clone();
+                    move |key: &HostTaskKey,
+                          event: &KeyDownEvent,
+                          window: &mut Window,
+                          app: &mut gpui::App| {
+                        let key = key.clone();
+                        if matches!(event.keystroke.key.as_str(), "enter" | "space") {
+                            let shift = event.keystroke.modifiers.shift;
+                            let _ = shell.update(app, |shell, cx| {
+                                cx.stop_propagation();
+                                let mode = if shift {
+                                    FleetSelectMode::Toggle
+                                } else {
+                                    FleetSelectMode::Replace
+                                };
+                                let _ = shell.select_fleet_task_key(key, mode);
+                                shell.refresh_accessibility_tree();
+                                cx.notify();
+                            });
+                        } else {
+                            // Windows UI Automation and some pointer paths can
+                            // leave GPUI focus on the selected row even after
+                            // the user clicks the terminal canvas. Preserve the
+                            // row's Enter/Space semantics above, but forward
+                            // every other key to the exact visible interactive
+                            // terminal.
+                            let _ = shell.update(app, |shell, cx| {
+                                let center_terminal_visible =
+                                    shell.selected_task_key.clone().is_some_and(|owner| {
+                                        shell.task_center_terminal_preference(&owner)
+                                    });
+                                if stale_task_row_routes_key_to_terminal(
+                                    event.keystroke.key.as_str(),
+                                    shell.terminal_input_is_armed(),
+                                    center_terminal_visible,
+                                    shell.selected_center_terminal_is_interactive(),
+                                ) {
+                                    cx.stop_propagation();
+                                    shell.handle_provider_terminal_key(event, window, cx);
+                                    cx.notify();
+                                }
+                            });
+                        }
+                    }
+                }),
+            };
+            let header_handlers = BoardHeaderHandlers {
+                on_new: Rc::new({
+                    let shell = board_shell.clone();
+                    move |_window: &mut Window, app: &mut gpui::App| {
+                        let _ = shell.update(app, |shell, cx| {
+                            cx.stop_propagation();
+                            shell.open_board_menu(BoardMenu::NewTask);
+                            shell.refresh_accessibility_tree();
+                            cx.notify();
+                        });
+                    }
+                }),
+                on_menu: Rc::new({
+                    let shell = board_shell.clone();
+                    move |_window: &mut Window, app: &mut gpui::App| {
+                        let _ = shell.update(app, |shell, cx| {
+                            cx.stop_propagation();
+                            shell.open_board_menu(BoardMenu::Options);
+                            shell.refresh_accessibility_tree();
+                            cx.notify();
+                        });
+                    }
+                }),
+                on_toggle_done: Rc::new({
+                    let shell = board_shell.clone();
+                    move |_window: &mut Window, app: &mut gpui::App| {
+                        let _ = shell.update(app, |shell, cx| {
+                            cx.stop_propagation();
+                            shell.board_done_expanded = !shell.board_done_expanded;
+                            shell.refresh_accessibility_tree();
+                            cx.notify();
+                        });
+                    }
+                }),
+            };
+            render_board(
+                model,
+                &self.project_colours,
+                tokens,
+                board_width,
+                self.layout.board_rail,
+                self.board_density_compact(),
+                row_handlers,
+                header_handlers,
+            )
+        });
         let task_list_generation = selected_task_key
             .as_ref()
             .map(|key| stable_host_task_element_key(key, "uniform-list"))
@@ -41991,273 +42406,12 @@ impl NativeShell {
                 range
                     .filter_map(|index| inbox_items.get(index).cloned())
                     .map(|item| match item {
-                        ProjectInboxItem::Project {
-                            project_id,
-                            label,
-                            expanded,
-                            task_count,
-                            host,
-                        } => {
-                            let shell_for_toggle = shell_entity.clone();
-                            let shell_for_toggle_key = shell_entity.clone();
-                            let shell_for_claude = shell_entity.clone();
-                            let shell_for_claude_key = shell_entity.clone();
-                            let shell_for_codex = shell_entity.clone();
-                            let shell_for_codex_key = shell_entity.clone();
-                            let project_key = HostProjectKey::new(host.clone(), project_id);
-                            let project_key_for_toggle = project_key.clone();
-                            let project_key_for_key = project_key.clone();
-                            let remote_project = host.as_remote().is_some();
-                            let header = div()
-                                .id((
-                                    "native-project-row",
-                                    stable_host_project_element_key(&project_key, "row"),
-                                ))
-                                .tab_stop(true)
-                                .w_full()
-                                .h(px(row_height))
-                                .flex()
-                                .items_center()
-                                .gap(px(tokens.density.spacing.sm))
-                                .px(px(tokens.density.spacing.md))
-                                .bg(tokens.surfaces.overlay.to_gpui())
-                                .border_b(px(1.0))
-                                .border_color(tokens.borders.subtle.to_gpui())
-                                .cursor_pointer()
-                                .on_mouse_down(
-                                    MouseButton::Left,
-                                    move |_event: &MouseDownEvent,
-                                          _window: &mut Window,
-                                          app: &mut gpui::App| {
-                                        let _ = shell_for_toggle.update(app, |shell, cx| {
-                                            cx.stop_propagation();
-                                            shell.toggle_project(project_key_for_toggle.clone());
-                                            shell.refresh_accessibility_tree();
-                                            cx.notify();
-                                        });
-                                    },
-                                )
-                                .on_key_down(
-                                    move |event: &KeyDownEvent,
-                                          _window: &mut Window,
-                                          app: &mut gpui::App| {
-                                        if matches!(event.keystroke.key.as_str(), "enter" | "space") {
-                                            let _ = shell_for_toggle_key.update(app, |shell, cx| {
-                                                cx.stop_propagation();
-                                                shell.toggle_project(project_key_for_key.clone());
-                                                shell.refresh_accessibility_tree();
-                                                cx.notify();
-                                            });
-                                        }
-                                    },
-                                )
-                                .child(if expanded { "▾" } else { "▸" })
-                                .child(
-                                    div()
-                                        .flex_1()
-                                        .min_w(px(0.0))
-                                        .truncate()
-                                        .font_weight(FontWeight::SEMIBOLD)
-                                        .child(label),
-                                )
-                                .child(Self::panel_count_badge(task_count, tokens));
-                            let header = if agents_connected && !remote_project {
-                                let claude = if claude_available {
-                                    div()
-                                        .id((
-                                            "native-project-claude",
-                                            stable_host_project_element_key(
-                                                &project_key,
-                                                "claude",
-                                            ),
-                                        ))
-                                        .tab_stop(true)
-                                        .px(px(tokens.density.spacing.sm))
-                                        .py(px(tokens.density.spacing.xxs))
-                                        .rounded(px(tokens.density.radii.sm))
-                                        .hover(|style| style.bg(tokens.surfaces.hover.to_gpui()))
-                                        .on_mouse_down(
-                                            MouseButton::Left,
-                                            move |_event: &MouseDownEvent,
-                                                  _window: &mut Window,
-                                                  app: &mut gpui::App| {
-                                                let _ = shell_for_claude.update(app, |shell, cx| {
-                                                    cx.stop_propagation();
-                                                    shell.start_task_with_agent_for_project(
-                                                        project_id,
-                                                        ProviderKind::ClaudeCode,
-                                                    );
-                                                    cx.notify();
-                                                });
-                                            },
-                                        )
-                                        .on_key_down(
-                                            move |event: &KeyDownEvent,
-                                                  _window: &mut Window,
-                                                  app: &mut gpui::App| {
-                                                if matches!(event.keystroke.key.as_str(), "enter" | "space") {
-                                                    let _ = shell_for_claude_key.update(app, |shell, cx| {
-                                                        cx.stop_propagation();
-                                                        shell.start_task_with_agent_for_project(
-                                                            project_id,
-                                                            ProviderKind::ClaudeCode,
-                                                        );
-                                                        cx.notify();
-                                                    });
-                                                }
-                                            },
-                                        )
-                                        .child("+Claude")
-                                        .into_any_element()
-                                } else {
-                                    div()
-                                        .px(px(tokens.density.spacing.sm))
-                                        .text_color(tokens.text.disabled.to_gpui())
-                                        .child("Claude")
-                                        .into_any_element()
-                                };
-                                let codex = if codex_available {
-                                    div()
-                                        .id((
-                                            "native-project-codex",
-                                            stable_host_project_element_key(
-                                                &project_key,
-                                                "codex",
-                                            ),
-                                        ))
-                                        .tab_stop(true)
-                                        .px(px(tokens.density.spacing.sm))
-                                        .py(px(tokens.density.spacing.xxs))
-                                        .rounded(px(tokens.density.radii.sm))
-                                        .hover(|style| style.bg(tokens.surfaces.hover.to_gpui()))
-                                        .on_mouse_down(
-                                            MouseButton::Left,
-                                            move |_event: &MouseDownEvent,
-                                                  _window: &mut Window,
-                                                  app: &mut gpui::App| {
-                                                let _ = shell_for_codex.update(app, |shell, cx| {
-                                                    cx.stop_propagation();
-                                                    shell.start_task_with_agent_for_project(
-                                                        project_id,
-                                                        ProviderKind::Codex,
-                                                    );
-                                                    cx.notify();
-                                                });
-                                            },
-                                        )
-                                        .on_key_down(
-                                            move |event: &KeyDownEvent,
-                                                  _window: &mut Window,
-                                                  app: &mut gpui::App| {
-                                                if matches!(event.keystroke.key.as_str(), "enter" | "space") {
-                                                    let _ = shell_for_codex_key.update(app, |shell, cx| {
-                                                        cx.stop_propagation();
-                                                        shell.start_task_with_agent_for_project(
-                                                            project_id,
-                                                            ProviderKind::Codex,
-                                                        );
-                                                        cx.notify();
-                                                    });
-                                                }
-                                            },
-                                        )
-                                        .child("+Codex")
-                                        .into_any_element()
-                                } else {
-                                    div()
-                                        .px(px(tokens.density.spacing.sm))
-                                        .text_color(tokens.text.disabled.to_gpui())
-                                        .child("Codex")
-                                        .into_any_element()
-                                };
-                                header.child(claude).child(codex)
-                            } else if remote_project {
-                                let shell_for_remote_new = shell_entity.clone();
-                                let shell_for_remote_new_key = shell_entity.clone();
-                                let remote_project_key = project_key.clone();
-                                let remote_project_key_for_key = project_key.clone();
-                                header.child(
-                                    div()
-                                        .id((
-                                            "native-project-new-task",
-                                            stable_host_project_element_key(
-                                                &project_key,
-                                                "new-task",
-                                            ),
-                                        ))
-                                        .tab_stop(true)
-                                        .px(px(tokens.density.spacing.sm))
-                                        .py(px(tokens.density.spacing.xxs))
-                                        .rounded(px(tokens.density.radii.sm))
-                                        .hover(|style| style.bg(tokens.surfaces.hover.to_gpui()))
-                                        .on_mouse_down(
-                                            MouseButton::Left,
-                                            move |_event: &MouseDownEvent,
-                                                  _window: &mut Window,
-                                                  app: &mut gpui::App| {
-                                                let _ = shell_for_remote_new.update(app, |shell, cx| {
-                                                    cx.stop_propagation();
-                                                    shell.begin_new_task_for_project_key(
-                                                        remote_project_key.clone(),
-                                                    );
-                                                    cx.notify();
-                                                });
-                                            },
-                                        )
-                                        .on_key_down(
-                                            move |event: &KeyDownEvent,
-                                                  _window: &mut Window,
-                                                  app: &mut gpui::App| {
-                                                if matches!(
-                                                    event.keystroke.key.as_str(),
-                                                    "enter" | "space"
-                                                ) {
-                                                    let _ = shell_for_remote_new_key.update(
-                                                        app,
-                                                        |shell, cx| {
-                                                            cx.stop_propagation();
-                                                            shell.begin_new_task_for_project_key(
-                                                                remote_project_key_for_key.clone(),
-                                                            );
-                                                            cx.notify();
-                                                        },
-                                                    );
-                                                }
-                                            },
-                                        )
-                                        .child("+Task"),
-                                )
-                            } else {
-                                let checking_label = match provider_affordance {
-                                    ProviderInboxAffordance::Checking => "Checking…",
-                                    _ => "Connect in Settings",
-                                };
-                                header.child(
-                                    div()
-                                        .px(px(tokens.density.spacing.sm))
-                                        .text_color(tokens.text.muted.to_gpui())
-                                        .child(checking_label),
-                                )
-                            };
-                            header.into_any_element()
+                        // Never reached: only the archived view builds this
+                        // list, and it holds nothing but its header and rows.
+                        ProjectInboxItem::Group { .. }
+                        | ProjectInboxItem::NewTaskTarget { .. } => {
+                            div().into_any_element()
                         }
-                        ProjectInboxItem::DoneHeader { task_count } => div()
-                            .id("native-done-section")
-                            .w_full()
-                            .h(px(row_height))
-                            .flex()
-                            .items_center()
-                            .justify_between()
-                            .px(px(10.0))
-                            .mt(px(8.0))
-                            .border_t(px(1.0))
-                            .border_color(tokens.borders.subtle.to_gpui())
-                            .text_size(px(tokens.density.typography.caption))
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .text_color(tokens.text.muted.to_gpui())
-                            .child("DONE")
-                            .child(task_count.to_string())
-                            .into_any_element(),
                         ProjectInboxItem::ArchivedHeader { task_count } => div()
                             .id("native-archived-section")
                             .w_full()
@@ -43047,7 +43201,21 @@ impl NativeShell {
             .flex_1()
             .min_h(px(0.0))
             .overflow_hidden()
-            .child(if inbox_is_empty {
+            // The board is the active list; the archived browser keeps the
+            // virtualized rows and the scrollbar gutter it already had.
+            .child(if let Some(board_element) = board_element {
+                div()
+                    .id("native-shell-board-viewport")
+                    .w_full()
+                    .flex()
+                    .flex_col()
+                    .flex_1()
+                    .min_h(px(0.0))
+                    .overflow_hidden()
+                    .on_scroll_wheel(inbox_scroll)
+                    .child(board_element)
+                    .into_any_element()
+            } else if inbox_is_empty {
                 Self::inbox_empty_state(tokens, None)
             } else {
                 div()
@@ -43261,7 +43429,8 @@ impl NativeShell {
                 }
             })
             .into_any_element();
-        let sidebar = Self::reference_sidebar(tokens, navigation, inbox_panel, sidebar_footer);
+        let sidebar =
+            Self::reference_sidebar(tokens, board_width, navigation, inbox_panel, sidebar_footer);
 
         let layout = self
             .layout
@@ -46088,6 +46257,8 @@ pub(crate) mod tests {
         agent_connection_snapshot,
         authorize_full_host_quit,
         automatic_task_title,
+        board_column_width_for,
+        board_group_element_id,
         capture_runtime_projection_owner,
         caret_phase_repaint,
         center_loading_reserves_composer,
@@ -46147,7 +46318,6 @@ pub(crate) mod tests {
         should_attempt_recovery,
         should_schedule_host_bootstrap_retry,
         stable_host_project_element_key,
-        stable_host_project_row_element_id,
         stable_host_task_element_key,
         stable_host_task_row_element_id,
         stale_task_row_routes_key_to_terminal,
@@ -46169,6 +46339,9 @@ pub(crate) mod tests {
         ActivationSource,
         AgentPresence,
         AgentSessionId,
+        BoardGroup,
+        BoardMenu,
+        BoardState,
         ClientId,
         CockpitDockTool,
         CommandId,
@@ -46186,6 +46359,7 @@ pub(crate) mod tests {
         HostUiState,
         IsolatedDevProfile,
         IsolatedHostLifetime,
+        KeyedWorkspaceLayout,
         MainConversationCanvas,
         NativeAccessibilityAction,
         NativeActionRecord,
@@ -46221,6 +46395,7 @@ pub(crate) mod tests {
         PendingComposerSubmission,
         PendingHostBootstrap,
         PendingTerminalEcho,
+        PrimaryProviderIcon,
         ProjectActionMenuMode,
         ProjectId,
         ProjectInboxItem,
@@ -46238,6 +46413,7 @@ pub(crate) mod tests {
         TrustedReconnectFactoryProbe,
         UpdateState,
         UpdaterStage,
+        ARCHIVED_ROW_HEIGHT,
         COMPOSER_CARET_BLINK_INTERVAL,
         COMPOSER_CARET_BLINK_TICKS,
         CONTROLLER_IDLE_RECOVERY_INTERVAL,
@@ -46268,8 +46444,6 @@ pub(crate) mod tests {
         REMOTE_RECONNECT_BACKOFF_MAX,
         REMOTE_RECONNECT_BACKOFF_MIN,
         T3_SIDEBAR_NAV_TOP_INSET,
-        T3_SIDEBAR_ROW_HEIGHT,
-        T3_SIDEBAR_WIDTH,
         T3_WORKSPACE_TOPBAR_HEIGHT,
     };
     use super::{
@@ -47001,11 +47175,71 @@ pub(crate) mod tests {
 
     #[test]
     fn target_shell_geometry_matches_the_t3_reference_composition() {
-        assert_eq!(T3_SIDEBAR_WIDTH, 256.0);
-        assert_eq!(T3_SIDEBAR_ROW_HEIGHT, 78.0);
+        // The left column is no longer a fixed 256 px rail: it is the board,
+        // and `01-composition-A.html` pins it at 236 px.
+        assert_eq!(
+            board_column_width_for(&KeyedWorkspaceLayout::<HostTaskKey>::default()),
+            crate::ui::board::layout::BOARD_COLUMN_WIDTH
+        );
+        assert_eq!(
+            board_column_width_for(&KeyedWorkspaceLayout::<HostTaskKey> {
+                board_rail: true,
+                ..KeyedWorkspaceLayout::default()
+            }),
+            crate::ui::board::layout::BOARD_RAIL_WIDTH,
+            "a collapsed board takes the rail's width, not the column's"
+        );
+        // The project rail's 78 px row belongs to the archived browser now;
+        // the board's own row heights live in `ui::board::layout` and are
+        // asserted there against the mockup.
+        assert_eq!(ARCHIVED_ROW_HEIGHT, 78.0);
         assert_eq!(T3_WORKSPACE_TOPBAR_HEIGHT, 32.0);
         assert_eq!(T3_SIDEBAR_NAV_TOP_INSET, 12.0);
         assert_eq!(CONVERSATION_CONTENT_MAX_WIDTH, 768.0);
+    }
+
+    /// `reset_layout` restores pane geometry. A project's colour and a
+    /// collapsed board are neither, and losing them would repaint every stripe
+    /// and reopen a rail the user had closed.
+    #[test]
+    fn reset_layout_keeps_project_colours_and_the_board_rail() {
+        if rerun_headless_shell_test_in_child(
+            "ui::native_shell::tests::reset_layout_keeps_project_colours_and_the_board_rail",
+        ) {
+            return;
+        }
+        let _test_guard = HEADLESS_SHELL_TEST_LOCK
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .expect("headless shell test lock");
+        gpui::Application::headless().run(move |cx| {
+            crate::ui::init(cx);
+            let (runtime, _shared) = TestRuntime::new(true, NativeHostActionResult::Queued);
+            with_test_shell_in_app(cx, runtime, |shell| {
+                shell
+                    .layout
+                    .project_colours
+                    .insert("project-a".to_string(), 5);
+                shell.layout.board_rail = true;
+                shell.layout.inbox_width = 480.0;
+                shell.reset_layout();
+                assert_eq!(
+                    shell.layout.project_colours.get("project-a").copied(),
+                    Some(5),
+                    "a project keeps its palette slot across a layout reset"
+                );
+                assert!(
+                    shell.layout.board_rail,
+                    "a collapsed board stays collapsed across a layout reset"
+                );
+                assert_eq!(
+                    shell.layout.inbox_width,
+                    KeyedWorkspaceLayout::<HostTaskKey>::default().inbox_width,
+                    "pane geometry is what reset restores"
+                );
+            });
+            cx.quit();
+        });
     }
 
     #[test]
@@ -47524,12 +47758,10 @@ pub(crate) mod tests {
         let host = HostId::local_profile("dev").expect("host");
         let snapshot = agent_connection_snapshot(AgentPresence::SignedIn);
         let items_alpha = vec![
-            ProjectInboxItem::Project {
-                project_id,
-                label: "Alpha".to_string(),
-                expanded: true,
+            ProjectInboxItem::Group {
+                group: BoardGroup::Working,
                 task_count: 1,
-                host: host.clone(),
+                collapsed: false,
             },
             ProjectInboxItem::Task {
                 project_id,
@@ -47538,13 +47770,12 @@ pub(crate) mod tests {
                 archived: false,
             },
         ];
+        // Same task, a different section: the tree must observe the move.
         let items_beta = vec![
-            ProjectInboxItem::Project {
-                project_id,
-                label: "Beta".to_string(),
-                expanded: true,
+            ProjectInboxItem::Group {
+                group: BoardGroup::Idle,
                 task_count: 1,
-                host: host.clone(),
+                collapsed: false,
             },
             ProjectInboxItem::Task {
                 project_id,
@@ -49633,7 +49864,7 @@ pub(crate) mod tests {
         assert_eq!(status.name(), "No tasks yet");
         assert_eq!(
             status.description(),
-            "Add or choose a project, then start with +Claude or +Codex."
+            "Add or choose a project, then start one from the board's + New menu."
         );
     }
 
@@ -49645,18 +49876,23 @@ pub(crate) mod tests {
         let task_id = TaskId::new();
         let task_list = TaskList::from_virtual_task_ids(vec![task_id]).expect("single-task list");
         let items = vec![
-            ProjectInboxItem::Project {
-                project_id,
-                label: "DevManager".to_string(),
-                expanded: true,
+            ProjectInboxItem::Group {
+                group: BoardGroup::Working,
                 task_count: 1,
-                host: HostId::local_profile("dev").expect("host"),
+                collapsed: false,
             },
             ProjectInboxItem::Task {
                 project_id,
                 task_key: HostTaskKey::new(HostId::local_profile("dev").expect("host"), task_id),
                 settled: false,
                 archived: false,
+            },
+            ProjectInboxItem::NewTaskTarget {
+                project_key: HostProjectKey::new(
+                    HostId::local_profile("dev").expect("host"),
+                    project_id,
+                ),
+                label: "DevManager".to_string(),
             },
         ];
         let snapshot = agent_connection_snapshot(AgentPresence::SignedIn);
@@ -49671,27 +49907,33 @@ pub(crate) mod tests {
         let task_key = HostTaskKey::new(host.clone(), task_id);
         let project_key = HostProjectKey::new(host.clone(), project_id);
         let nodes = tree.gpui_nodes();
+        // The board's sections replaced the project headers: a live section is
+        // a label carrying its count, not an expandable button.
         assert!(nodes.iter().any(|node| {
-            node.element_id == stable_host_project_row_element_id(&project_key)
-                && node.label == "Project DevManager, 1 task, expanded"
+            node.element_id == board_group_element_id(BoardGroup::Working)
+                && node.label == "Working 1"
+                && !node.focusable
+                && !node.tab_stop
+        }));
+        // The per-project "+Claude"/"+Codex" buttons are gone. One reachable
+        // "New task" per project replaces both, so a project with no tasks yet
+        // is still reachable even though the board has no project rows.
+        assert!(
+            !nodes.iter().any(|node| {
+                node.element_id.starts_with("native-project-claude-")
+                    || node.element_id.starts_with("native-project-codex-")
+            }),
+            "the board publishes no per-provider project buttons"
+        );
+        assert!(nodes.iter().any(|node| {
+            node.element_id
+                == format!(
+                    "native-project-new-task-{}",
+                    stable_host_project_element_key(&project_key, "new-task")
+                )
+                && node.label == "New task in DevManager"
                 && node.focusable
                 && node.tab_stop
-        }));
-        assert!(nodes.iter().any(|node| {
-            node.element_id
-                == format!(
-                    "native-project-claude-{}",
-                    stable_host_project_element_key(&project_key, "claude")
-                )
-                && node.label == "Start Claude task in DevManager"
-        }));
-        assert!(nodes.iter().any(|node| {
-            node.element_id
-                == format!(
-                    "native-project-codex-{}",
-                    stable_host_project_element_key(&project_key, "codex")
-                )
-                && node.label == "Start Codex task in DevManager"
         }));
         assert!(nodes
             .iter()
@@ -49716,7 +49958,11 @@ pub(crate) mod tests {
         );
 
         let settled_items = vec![
-            ProjectInboxItem::DoneHeader { task_count: 1 },
+            ProjectInboxItem::Group {
+                group: BoardGroup::Done,
+                task_count: 1,
+                collapsed: false,
+            },
             ProjectInboxItem::Task {
                 project_id,
                 task_key: HostTaskKey::new(HostId::local_profile("dev").expect("host"), task_id),
@@ -52605,10 +52851,13 @@ pub(crate) mod tests {
         (builder.finish().expect("client model"), task_id)
     }
 
+    /// The board replaces the project rail: tasks group by what they are
+    /// doing, the project survives as a palette slot on the stripe, and the
+    /// row keeps the accessibility identity the rail published.
     #[test]
-    fn task_inbox_groups_tasks_under_their_project_and_preserves_project_on_create() {
+    fn board_groups_tasks_by_state_and_keeps_project_as_a_stripe() {
         if rerun_headless_shell_test_in_child(
-            "ui::native_shell::tests::task_inbox_groups_tasks_under_their_project_and_preserves_project_on_create",
+            "ui::native_shell::tests::board_groups_tasks_by_state_and_keeps_project_as_a_stripe",
         ) {
             return;
         }
@@ -52630,51 +52879,115 @@ pub(crate) mod tests {
                 shell
                     .apply_client_model(Arc::new(model))
                     .expect("apply model");
+
+                let board = shell.board_model(1_000);
+                let groups: Vec<_> = board.groups.iter().map(|group| group.group).collect();
                 assert_eq!(
-                    shell.project_inbox_items(),
-                    vec![
-                        ProjectInboxItem::Project {
-                            project_id,
-                            label: "DevManager".to_string(),
-                            expanded: true,
-                            task_count: 1,
-                            host: shell.local_host_id(),
-                        },
-                        ProjectInboxItem::Task {
-                            project_id,
-                            task_key: shell.local_task_key(task_id),
-                            settled: false,
-                            archived: false,
-                        },
-                    ]
+                    groups,
+                    vec![BoardGroup::Idle, BoardGroup::Done],
+                    "an unstarted task is Idle; Done is always present"
+                );
+                let row = &board.groups[0].rows[0];
+                assert_eq!(row.key, shell.local_task_key(task_id));
+                assert_eq!(row.project_colour, 0, "first project takes palette slot 0");
+                assert_eq!(
+                    row.provider,
+                    PrimaryProviderIcon::Other,
+                    "no agent yet, so no provider mark"
+                );
+                assert_eq!(
+                    row.why,
+                    BoardState::Idle.why_label(),
+                    "a row that is not Working never narrates a tool call"
                 );
 
-                shell.toggle_project(HostProjectKey::new(shell.local_host_id(), project_id));
+                // The slot has to survive the process, so it is written back to
+                // the layout the moment it is handed out.
                 assert_eq!(
-                    shell.project_inbox_items(),
-                    vec![ProjectInboxItem::Project {
-                        project_id,
-                        label: "DevManager".to_string(),
-                        expanded: false,
-                        task_count: 1,
-                        host: shell.local_host_id(),
-                    }]
+                    shell.layout.project_colours.get(&project_id.to_string()),
+                    Some(&0),
+                    "a first-sight palette slot is persisted, not re-rolled next launch"
                 );
 
-                shell.begin_new_task_for_project(project_id);
+                shell.refresh_accessibility_tree();
+                let nodes = shell.accessibility_tree().gpui_nodes();
+                assert!(
+                    nodes.iter().any(|node| {
+                        node.element_id == stable_host_task_row_element_id(&row.key)
+                    }),
+                    "row keeps the accessibility identity the project rail published: {:?}",
+                    nodes
+                        .iter()
+                        .map(|node| &node.element_id)
+                        .collect::<Vec<_>>()
+                );
+                assert!(
+                    nodes
+                        .iter()
+                        .any(|node| node.element_id == board_group_element_id(BoardGroup::Idle)),
+                    "each board section is its own accessible node"
+                );
+                assert!(
+                    nodes
+                        .iter()
+                        .any(|node| node.element_id == "board-header-new"),
+                    "the board header's New task control replaces the project +Claude/+Codex pair"
+                );
+
+                // The + New menu reaches the project even though the board has
+                // no project rows, and Escape closes it.
                 assert_eq!(
                     shell
-                        .new_task
-                        .as_ref()
-                        .map(|draft| draft.project_key.project_id),
-                    Some(project_id),
-                    "task creation must retain the project whose header launched it"
+                        .board_new_task_targets()
+                        .into_iter()
+                        .map(|(key, label)| (key.project_id, label))
+                        .collect::<Vec<_>>(),
+                    vec![(project_id, "DevManager".to_string())]
+                );
+                shell.open_board_menu(BoardMenu::NewTask);
+                assert_eq!(shell.board_menu, Some(BoardMenu::NewTask));
+                shell.open_board_menu(BoardMenu::Options);
+                assert_eq!(
+                    shell.board_menu,
+                    Some(BoardMenu::Options),
+                    "one field holds both menus, so opening one closes the other"
+                );
+                shell.handle_board_menu_key(&KeyDownEvent {
+                    keystroke: Keystroke {
+                        modifiers: gpui::Modifiers::default(),
+                        key: "escape".into(),
+                        key_char: None,
+                    },
+                    is_held: false,
+                });
+                assert_eq!(shell.board_menu, None, "Escape dismisses the board menu");
+
+                // Done is collapsed until it is disclosed.
+                assert!(board.groups[1].collapsed);
+                shell.board_done_expanded = true;
+                let expanded = shell.board_model(2_000);
+                assert!(!expanded.groups[1].collapsed);
+
+                // A task that leaves the projection must not leave a clock
+                // entry behind. Nothing here can purge the kernel's task, so
+                // the departure is staged by emptying the projection the board
+                // reads -- which is exactly the state a purge produces.
+                assert_eq!(shell.board_state_clock.keys().count(), 1);
+                shell.local_slot_mut().inbox =
+                    Inbox::from_error(crate::ui::task_cockpit::InboxError::ProjectionUnavailable);
+                shell.local_slot_mut().client_model = None;
+                let departed = shell.board_model(3_000);
+                assert!(departed.groups.iter().all(|group| group.rows.is_empty()));
+                assert_eq!(
+                    shell.board_state_clock.keys().count(),
+                    0,
+                    "a task that left the projection is forgotten rather than left to leak"
                 );
             });
             *completed_for_app.borrow_mut() = true;
             cx.quit();
         });
-        assert!(*completed.borrow(), "project inbox scenario completed");
+        assert!(*completed.borrow(), "board scenario completed");
     }
 
     fn created_task_is_listed_without_a_disconnect_or_missing_field(cx: &mut gpui::App) {

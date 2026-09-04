@@ -188,7 +188,10 @@ impl<K> Default for KeyedWorkspaceLayout<K> {
     fn default() -> Self {
         Self {
             sidebar_width: 260.0,
-            inbox_width: 320.0,
+            // The board column's own width. `01-composition-A.html` pins the
+            // chosen composition at 236 px and the option card states the
+            // cost in those terms, so that is what a fresh profile opens at.
+            inbox_width: crate::ui::board::layout::BOARD_COLUMN_WIDTH,
             dock_width: 360.0,
             // The conversation is the primary surface; an idle terminal that
             // opens taller than a third of the window inverts that on the

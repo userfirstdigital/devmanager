@@ -46,6 +46,15 @@ impl<K: Hash + Eq> StateClock<K> {
     pub fn forget(&mut self, key: &K) {
         self.entered.remove(key);
     }
+
+    /// Every key the clock is still holding. The caller diffs this against the
+    /// keys it just observed and forgets the difference, so a purged or
+    /// archived task cannot leave an entry behind forever. Exposing the keys
+    /// rather than duplicating them in a second set keeps one source of truth
+    /// for "which tasks does the clock know about".
+    pub fn keys(&self) -> impl Iterator<Item = &K> {
+        self.entered.keys()
+    }
 }
 
 #[cfg(test)]
@@ -78,5 +87,19 @@ mod tests {
         assert_eq!(clock.observe("a", BoardState::Question, 9_500), 500);
         clock.forget(&"a");
         assert_eq!(clock.observe("a", BoardState::Question, 20_000), 0);
+    }
+
+    /// The prune the shell runs every frame: whatever is still in the clock but
+    /// was not observed this pass is a task that left the projection.
+    #[test]
+    fn keys_expose_exactly_what_forget_has_to_reach() {
+        let mut clock = StateClock::new();
+        clock.observe("a", BoardState::Working, 0);
+        clock.observe("b", BoardState::Idle, 0);
+        let mut keys: Vec<_> = clock.keys().copied().collect();
+        keys.sort_unstable();
+        assert_eq!(keys, vec!["a", "b"]);
+        clock.forget(&"a");
+        assert_eq!(clock.keys().copied().collect::<Vec<_>>(), vec!["b"]);
     }
 }
