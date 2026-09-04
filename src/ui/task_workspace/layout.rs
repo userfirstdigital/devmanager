@@ -387,6 +387,11 @@ impl<K: Clone + Ord + Eq> Workspace<K> {
     /// composer and every keyboard route on a pane nobody can see.
     pub fn zoom(&mut self, pane: PaneId) -> Result<(), WorkspaceError> {
         self.focus_pane(pane)?;
+        // A pane filling the canvas cannot be a title strip: minimisation is a
+        // verdict about sharing a viewport, and a zoomed pane shares nothing.
+        self.pane_mut(pane)
+            .ok_or(WorkspaceError::MissingPane)?
+            .presentation = PanePresentation::Full;
         self.zoomed = Some(pane);
         Ok(())
     }
@@ -398,7 +403,11 @@ impl<K: Clone + Ord + Eq> Workspace<K> {
     pub fn toggle_zoom_focused(&mut self) {
         match (self.zoomed, self.focused) {
             (Some(_), _) => self.zoomed = None,
-            (None, Some(focused)) => self.zoomed = Some(focused),
+            // Through `zoom` rather than the field, so the toggle restores a
+            // strip's content exactly as the explicit call does.
+            (None, Some(focused)) => {
+                let _ = self.zoom(focused);
+            }
             (None, None) => {}
         }
     }

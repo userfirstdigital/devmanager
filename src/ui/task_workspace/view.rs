@@ -215,6 +215,39 @@ mod task_pane_view_model_tests {
     }
 
     #[test]
+    fn zooming_a_strip_gives_it_its_content_back() {
+        let strip = TaskId::new();
+        let other = TaskId::new();
+        let mut workspace = TaskWorkspace::single(strip);
+        workspace
+            .insert_after_focused(other, Axis::Horizontal)
+            .expect("second pane");
+        workspace
+            .set_presentation(strip, PanePresentation::Minimised)
+            .expect("minimise");
+        let pane = workspace.pane_for_task(strip).expect("pane").id;
+        let projections = [strip, other]
+            .into_iter()
+            .map(|id| (id, projection(id)))
+            .collect();
+
+        workspace.zoom(pane).expect("zoom");
+
+        let model = TaskWorkspaceViewModel::build(&workspace, &projections).expect("workspace");
+        let panes = model.panes();
+        assert_eq!(panes.len(), 1);
+        assert!(
+            !panes[0].minimised,
+            "a pane filling the canvas is never a title strip"
+        );
+        assert!(panes[0].zoomed);
+        assert!(
+            panes[0].build_composer,
+            "and it owns the composer, which a strip never does"
+        );
+    }
+
+    #[test]
     fn a_minimised_pane_reports_itself_and_owns_no_composer() {
         let task_id = TaskId::new();
         let mut workspace = TaskWorkspace::single(task_id);
