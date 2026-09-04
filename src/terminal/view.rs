@@ -8,7 +8,8 @@ use crate::terminal::session::{
     TerminalCellSnapshot, TerminalCursorSnapshot, TerminalIndexedCellSnapshot, TerminalSessionView,
 };
 use crate::theme;
-use crate::ui::tokens::ThemeTokens;
+use crate::ui::scrollbar::{thumb_geometry, track_geometry};
+use crate::ui::tokens::{ScrollbarTokens, ThemeTokens};
 use alacritty_terminal::vte::ansi::CursorShape;
 use gpui::{
     canvas, div, fill, img, point, px, rgb, size, AnyElement, App, Bounds, Hsla, ImageSource,
@@ -21,11 +22,32 @@ use std::sync::{Arc, Mutex, OnceLock};
 
 pub const TERMINAL_FONT_SIZE: f32 = 13.0;
 pub const TERMINAL_LINE_HEIGHT: f32 = 18.0;
-pub const TERMINAL_SCROLLBAR_WIDTH_PX: f32 = 10.0;
-pub const TERMINAL_SCROLLBAR_TRACK_INSET_X_PX: f32 = 2.0;
-pub const TERMINAL_SCROLLBAR_TRACK_INSET_Y_PX: f32 = 6.0;
-pub const TERMINAL_SCROLLBAR_TRACK_WIDTH_PX: f32 = 6.0;
-pub const TERMINAL_SCROLLBAR_MIN_THUMB_HEIGHT_PX: f32 = 18.0;
+/// The terminal's scrollbar carries no geometry of its own any more: every
+/// width, inset, length and radius comes from `ThemeTokens::scrollbar`, the
+/// same struct `crate::ui::scrollbar` paints every shell surface from, and the
+/// two call the same geometry functions. See
+/// `terminal_scrollbar_geometry_equals_the_shared_spec` for the assertion that
+/// keeps them identical rather than merely similar.
+///
+/// Kept as a function rather than a constant so a caller cannot read a width
+/// without saying which theme it belongs to.
+pub fn terminal_scrollbar_gutter_width(spec: ScrollbarTokens) -> f32 {
+    spec.gutter_width
+}
+
+/// The scrollbar geometry, for callers that have no `ThemeTokens` in hand.
+///
+/// Geometry is mode-independent by construction -- a pointer target does not
+/// change size with the palette -- so reading it from the dark theme is not a
+/// theme choice, it is the only geometry there is. Colours are NOT available
+/// this way on purpose: those DO depend on the ground.
+pub fn terminal_scrollbar_spec() -> ScrollbarTokens {
+    crate::ui::tokens::dark(
+        crate::ui::tokens::Density::Comfortable,
+        crate::ui::tokens::Scale::Scale100,
+    )
+    .scrollbar
+}
 
 pub fn terminal_line_height(font_size: f32) -> f32 {
     (font_size + 5.0).max(TERMINAL_LINE_HEIGHT)
@@ -125,7 +147,8 @@ pub fn measure_terminal_cell_advance(window: &Window, font_size: f32) -> Option<
 /// Explicit Copy palette for terminal chrome and default cell named colors.
 /// Built from [`ThemeTokens`] for live themed paint, or from legacy theme
 /// constants for the default wrapper used by older callers.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+// `Eq` is gone because the shared scrollbar spec carries f32 geometry.
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct TerminalRenderPalette {
     pub canvas: u32,
     pub panel: u32,
@@ -152,6 +175,11 @@ pub struct TerminalRenderPalette {
     pub terminal_selection: u32,
     pub scrollbar_track: u32,
     pub scrollbar_thumb: u32,
+    pub scrollbar_thumb_hover: u32,
+    /// Geometry for the gutter. Colours stay as `u32` beside the rest of the
+    /// terminal chrome; the widths and lengths come straight from the shared
+    /// token spec so there is nothing left here to drift.
+    pub scrollbar_spec: ScrollbarTokens,
 }
 
 impl TerminalRenderPalette {
@@ -184,8 +212,35 @@ impl TerminalRenderPalette {
             terminal_fg: tokens.terminal.foreground.to_u32(),
             terminal_cursor: tokens.status.success.to_u32(),
             terminal_selection: tokens.terminal.selection.to_u32(),
-            scrollbar_track: tokens.surfaces.raised.to_u32(),
-            scrollbar_thumb: tokens.text.muted.to_u32(),
+            // Resolved against the terminal plane, not the shell: in the
+            // light theme those are opposite polarities and one colour cannot
+            // serve both.
+            scrollbar_track: tokens
+                .scrollbar
+                .colors_on(tokens.terminal.background)
+                .track_active
+                .to_u32(),
+            scrollbar_thumb: tokens
+                .scrollbar
+                .colors_on(tokens.terminal.background)
+                .thumb_idle
+                .to_u32(),
+            scrollbar_thumb_hover: tokens
+                .scrollbar
+                .colors_on(tokens.terminal.background)
+                .thumb_hover
+                .to_u32(),
+            scrollbar_spec: tokens.scrollbar,
+        }
+    }
+
+    /// The thumb colour for one pointer state, so the two call sites cannot
+    /// pick different halves of the pair.
+    pub fn scrollbar_thumb_color(&self, active: bool) -> u32 {
+        if active {
+            self.scrollbar_thumb_hover
+        } else {
+            self.scrollbar_thumb
         }
     }
 
@@ -215,8 +270,17 @@ impl TerminalRenderPalette {
             terminal_fg: theme::TEXT_PRIMARY,
             terminal_cursor: theme::SUCCESS_TEXT,
             terminal_selection: theme::SELECTION_BG,
+            // The legacy palette keeps its pre-token colours, but not its
+            // pre-token geometry: "one look" is the point, and the widths are
+            // mode-independent.
             scrollbar_track: theme::PANEL_HEADER_BG,
             scrollbar_thumb: theme::TEXT_DIM,
+            scrollbar_thumb_hover: theme::TEXT_PRIMARY,
+            scrollbar_spec: crate::ui::tokens::dark(
+                crate::ui::tokens::Density::Comfortable,
+                crate::ui::tokens::Scale::Scale100,
+            )
+            .scrollbar,
         }
     }
 }
@@ -509,6 +573,11 @@ pub struct TerminalSearchHighlight {
 pub struct TerminalScrollbarModel {
     pub thumb_top_ratio: f32,
     pub thumb_height_ratio: f32,
+    /// True while the pointer is anywhere in the gutter, or while the thumb is
+    /// being dragged. Widening on gutter hover rather than thumb hover is what
+    /// makes a 4 px bar grabbable, and it is why this is a model field: a
+    /// `canvas` cannot answer a `group_hover`.
+    pub hovered: bool,
 }
 
 /// Overlay painted over the last valid replica grid. The cockpit never owns a
@@ -1129,38 +1198,66 @@ fn render_search_bar(
         )
 }
 
+/// The terminal gutter, painted from the same spec and the same geometry
+/// functions as every other scrollbar in the app.
+///
+/// It stays hand-painted -- the gutter's pixel height is only known at paint
+/// time and the `min_thumb_length` clamp is a pixel rule, so expressing it as
+/// layout percentages would silently break on a deep scrollback. The hover
+/// state therefore cannot come from `group_hover` and arrives on the model
+/// instead, set by the same mouse-move listener that already drives the drag.
 fn render_scrollbar(
     scrollbar: TerminalScrollbarModel,
     actions: Option<TerminalScrollbarActions>,
     palette: TerminalRenderPalette,
 ) -> impl IntoElement {
+    let spec = palette.scrollbar_spec;
     canvas(
         move |_bounds, _window, _cx| (scrollbar, actions.clone()),
         move |bounds: Bounds<_>, state, window, _cx| {
             let (scrollbar, actions) = state;
-            let track = Bounds::new(
-                point(
-                    bounds.origin.x + px(TERMINAL_SCROLLBAR_TRACK_INSET_X_PX),
-                    bounds.origin.y + px(TERMINAL_SCROLLBAR_TRACK_INSET_Y_PX),
-                ),
-                size(
-                    px(TERMINAL_SCROLLBAR_TRACK_WIDTH_PX),
-                    (bounds.size.height - px(TERMINAL_SCROLLBAR_TRACK_INSET_Y_PX * 2.0))
-                        .max(px(12.0)),
-                ),
-            );
-            window.paint_quad(fill(track, rgb(palette.scrollbar_track)));
+            let gutter_height: f32 = bounds.size.height.into();
+            let active = scrollbar.hovered;
+            let visible_fraction = scrollbar.thumb_height_ratio.clamp(0.08, 1.0);
 
-            let thumb_height = (track.size.height * scrollbar.thumb_height_ratio.clamp(0.08, 1.0))
-                .max(px(TERMINAL_SCROLLBAR_MIN_THUMB_HEIGHT_PX));
-            let thumb_range = (track.size.height - thumb_height).max(px(0.0));
-            let thumb_top =
-                track.origin.y + thumb_range * scrollbar.thumb_top_ratio.clamp(0.0, 1.0);
-            let thumb = Bounds::new(
-                point(track.origin.x, thumb_top),
-                size(track.size.width, thumb_height),
-            );
-            window.paint_quad(fill(thumb, rgb(palette.scrollbar_thumb)));
+            if active {
+                let track = track_geometry(spec, gutter_height);
+                window.paint_quad(
+                    fill(
+                        Bounds::new(
+                            point(
+                                bounds.origin.x + px(track.left),
+                                bounds.origin.y + px(track.top),
+                            ),
+                            size(px(track.width), px(track.height)),
+                        ),
+                        rgb(palette.scrollbar_track),
+                    )
+                    .corner_radii(px(track.radius)),
+                );
+            }
+
+            if let Some(thumb) = thumb_geometry(
+                spec,
+                gutter_height,
+                visible_fraction,
+                scrollbar.thumb_top_ratio,
+                active,
+            ) {
+                window.paint_quad(
+                    fill(
+                        Bounds::new(
+                            point(
+                                bounds.origin.x + px(thumb.left),
+                                bounds.origin.y + px(thumb.top),
+                            ),
+                            size(px(thumb.width), px(thumb.height)),
+                        ),
+                        rgb(palette.scrollbar_thumb_color(active)),
+                    )
+                    .corner_radii(px(thumb.radius)),
+                );
+            }
 
             if let Some(actions) = actions.as_ref() {
                 let on_mouse_down = actions.on_mouse_down.clone();
@@ -1182,7 +1279,7 @@ fn render_scrollbar(
             }
         },
     )
-    .w(px(TERMINAL_SCROLLBAR_WIDTH_PX))
+    .w(px(terminal_scrollbar_gutter_width(spec)))
     .flex_none()
     .h_full()
 }
@@ -2686,7 +2783,7 @@ mod theme_palette_tests {
     #[test]
     fn sentinel_theme_tokens_map_into_terminal_render_palette() {
         let tokens = sentinel_tokens();
-        let palette = terminal_render_palette_from_tokens(tokens);
+        let palette = crate::terminal::view::terminal_render_palette_from_tokens(tokens);
         assert_eq!(palette.canvas, 0x010101);
         assert_eq!(palette.panel, 0x161616);
         assert_eq!(palette.panel_header, 0x020202);
@@ -2710,8 +2807,10 @@ mod theme_palette_tests {
         assert_eq!(palette.terminal_cursor, 0x101010);
         assert_eq!(palette.terminal_selection, 0x141414);
         assert_eq!(palette.selection_bg, 0x141414);
-        assert_eq!(palette.scrollbar_track, 0x020202);
-        assert_eq!(palette.scrollbar_thumb, 0x080808);
+        // The scrollbar's colours are resolved against the TERMINAL plane, not
+        // the shell, so they do not follow the sentinel surfaces this fixture
+        // pins. Their identity is asserted in
+        // `themed_palette_scrollbar_matches_the_shared_spec` instead.
     }
 
     #[test]
@@ -2728,11 +2827,17 @@ mod theme_palette_tests {
         assert_eq!(palette.selection_bg, theme::SELECTION_BG);
         assert_eq!(palette.scrollbar_track, theme::PANEL_HEADER_BG);
         assert_eq!(palette.scrollbar_thumb, theme::TEXT_DIM);
+        assert_eq!(palette.scrollbar_thumb_hover, theme::TEXT_PRIMARY);
+        // Geometry is shared even by the legacy palette: one look.
+        assert_eq!(
+            palette.scrollbar_spec.idle_thumb_width,
+            crate::terminal::view::terminal_scrollbar_spec().idle_thumb_width
+        );
     }
 
     #[test]
     fn effective_style_replaces_default_foreground_with_palette_terminal_fg() {
-        let palette = terminal_render_palette_from_tokens(sentinel_tokens());
+        let palette = crate::terminal::view::terminal_render_palette_from_tokens(sentinel_tokens());
         let cell = TerminalCellSnapshot {
             character: 'a',
             zero_width: Vec::new(),
@@ -2757,7 +2862,7 @@ mod theme_palette_tests {
 
     #[test]
     fn effective_style_keeps_explicit_ansi_foreground() {
-        let palette = terminal_render_palette_from_tokens(sentinel_tokens());
+        let palette = crate::terminal::view::terminal_render_palette_from_tokens(sentinel_tokens());
         let cell = TerminalCellSnapshot {
             character: 'x',
             zero_width: Vec::new(),
@@ -2781,7 +2886,7 @@ mod theme_palette_tests {
 
     #[test]
     fn effective_style_selection_overrides_themed_default_foreground() {
-        let palette = terminal_render_palette_from_tokens(sentinel_tokens());
+        let palette = crate::terminal::view::terminal_render_palette_from_tokens(sentinel_tokens());
         let cell = TerminalCellSnapshot {
             character: 's',
             zero_width: Vec::new(),
@@ -2806,7 +2911,7 @@ mod theme_palette_tests {
 
     #[test]
     fn effective_style_preserves_explicit_ansi_rgb_background_and_text_attrs() {
-        let palette = terminal_render_palette_from_tokens(sentinel_tokens());
+        let palette = crate::terminal::view::terminal_render_palette_from_tokens(sentinel_tokens());
         let cell = TerminalCellSnapshot {
             character: 'Z',
             zero_width: Vec::new(),
@@ -2842,7 +2947,7 @@ mod theme_palette_tests {
         use crate::terminal::session::TerminalCursorSnapshot;
         use alacritty_terminal::vte::ansi::CursorShape;
 
-        let palette = terminal_render_palette_from_tokens(sentinel_tokens());
+        let palette = crate::terminal::view::terminal_render_palette_from_tokens(sentinel_tokens());
         let cell = TerminalCellSnapshot {
             character: 'c',
             zero_width: Vec::new(),
@@ -2920,7 +3025,7 @@ mod theme_palette_tests {
         assert_ne!(legacy.selection_bg, legacy.terminal_bg);
 
         let tokens = dark(Density::Comfortable, Scale::Scale100);
-        let palette = terminal_render_palette_from_tokens(tokens);
+        let palette = crate::terminal::view::terminal_render_palette_from_tokens(tokens);
         assert!(
             relative_luminance(palette.terminal_bg) <= relative_luminance(palette.canvas),
             "themed terminal bg must not wash above canvas"
@@ -2939,8 +3044,16 @@ mod theme_palette_tests {
             tokens.text.muted.to_u32(),
             "chrome labels use muted (readable) rather than disabled"
         );
-        assert_eq!(palette.scrollbar_thumb, tokens.text.muted.to_u32());
+        assert_eq!(
+            palette.scrollbar_thumb,
+            tokens
+                .scrollbar
+                .colors_on(tokens.terminal.background)
+                .thumb_idle
+                .to_u32()
+        );
         assert_ne!(palette.scrollbar_thumb, palette.scrollbar_track);
+        assert_ne!(palette.scrollbar_thumb, palette.scrollbar_thumb_hover);
         // Explicit ANSI must remain process-owned even after chrome remapping.
         let ansi = TerminalCellSnapshot {
             character: '!',
@@ -3317,6 +3430,131 @@ mod selection_helper_tests {
                 end_row: 0,
                 end_column: 5,
             }
+        );
+    }
+
+    /// The whole point of the lane: the terminal's gutter and the shared shell
+    /// scrollbar must be the SAME scrollbar, not two that currently agree.
+    ///
+    /// They are proved equal by construction -- the terminal calls
+    /// `crate::ui::scrollbar`'s geometry directly -- so this asserts the
+    /// numbers that a reader would otherwise have to take on trust, and it is
+    /// sabotage-checked below by moving a token and watching both sides move.
+    #[test]
+    fn terminal_scrollbar_geometry_equals_the_shared_spec() {
+        use crate::ui::scrollbar::{thumb_geometry, track_geometry};
+        let tokens = crate::ui::tokens::dark(
+            crate::ui::tokens::Density::Comfortable,
+            crate::ui::tokens::Scale::Scale100,
+        );
+        let palette = crate::terminal::view::terminal_render_palette_from_tokens(tokens);
+        let spec = palette.scrollbar_spec;
+        assert_eq!(
+            spec, tokens.scrollbar,
+            "the terminal reads the shell's spec"
+        );
+        assert_eq!(
+            crate::terminal::view::terminal_scrollbar_gutter_width(spec),
+            spec.gutter_width
+        );
+
+        for gutter_height in [120.0_f32, 480.0, 1440.0] {
+            for visible in [0.02_f32, 0.25, 0.75] {
+                for position in [0.0_f32, 0.5, 1.0] {
+                    let idle = thumb_geometry(spec, gutter_height, visible, position, false)
+                        .expect("idle thumb");
+                    let hovered = thumb_geometry(spec, gutter_height, visible, position, true)
+                        .expect("hover thumb");
+                    assert_eq!(idle.width, 4.0);
+                    assert_eq!(hovered.width, 10.0);
+                    assert!(idle.height >= spec.min_thumb_length);
+                    let track = track_geometry(spec, gutter_height);
+                    assert!(idle.top >= track.top);
+                    assert!(idle.top + idle.height <= track.top + track.height + 1e-3);
+                }
+            }
+        }
+    }
+
+    /// Sabotage: change the token and both the shell geometry and the terminal
+    /// palette have to move. If either stayed put it was reading a constant.
+    #[test]
+    fn moving_the_scrollbar_token_moves_the_terminal_too() {
+        use crate::ui::scrollbar::thumb_geometry;
+        let mut tokens = crate::ui::tokens::dark(
+            crate::ui::tokens::Density::Comfortable,
+            crate::ui::tokens::Scale::Scale100,
+        );
+        let before =
+            crate::terminal::view::terminal_render_palette_from_tokens(tokens).scrollbar_spec;
+        let before_thumb = thumb_geometry(before, 400.0, 0.5, 0.0, false).expect("thumb");
+
+        tokens.scrollbar.idle_thumb_width += 7.0;
+        tokens.scrollbar.gutter_width += 7.0;
+        let after =
+            crate::terminal::view::terminal_render_palette_from_tokens(tokens).scrollbar_spec;
+        let after_thumb = thumb_geometry(after, 400.0, 0.5, 0.0, false).expect("thumb");
+
+        assert_eq!(
+            crate::terminal::view::terminal_scrollbar_gutter_width(after),
+            crate::terminal::view::terminal_scrollbar_gutter_width(before) + 7.0
+        );
+        assert_eq!(after_thumb.width, before_thumb.width + 7.0);
+    }
+
+    /// A screen that fits paints no thumb at all -- the same predicate the
+    /// shell surfaces use, so an empty log and an empty list agree.
+    #[test]
+    fn a_terminal_with_no_scrollback_paints_no_thumb() {
+        use crate::ui::scrollbar::thumb_geometry;
+        let spec = crate::terminal::view::terminal_scrollbar_spec();
+        assert!(thumb_geometry(spec, 400.0, 1.0, 0.0, false).is_none());
+    }
+
+    /// The hover state is what widens the thumb, and it must reach the colour
+    /// as well as the width or a 10 px bar in the idle grey reads as a bug.
+    #[test]
+    fn hovering_the_terminal_gutter_changes_both_width_and_colour() {
+        use crate::ui::scrollbar::thumb_geometry;
+        let tokens = crate::ui::tokens::dark(
+            crate::ui::tokens::Density::Comfortable,
+            crate::ui::tokens::Scale::Scale100,
+        );
+        let palette = crate::terminal::view::terminal_render_palette_from_tokens(tokens);
+        let spec = palette.scrollbar_spec;
+        let idle = thumb_geometry(spec, 400.0, 0.4, 0.2, false).expect("idle");
+        let hovered = thumb_geometry(spec, 400.0, 0.4, 0.2, true).expect("hover");
+        assert!(hovered.width > idle.width);
+        assert_eq!(
+            palette.scrollbar_thumb_color(false),
+            palette.scrollbar_thumb
+        );
+        assert_eq!(
+            palette.scrollbar_thumb_color(true),
+            palette.scrollbar_thumb_hover
+        );
+        assert_ne!(
+            palette.scrollbar_thumb_color(false),
+            palette.scrollbar_thumb_color(true)
+        );
+    }
+
+    /// The light theme's terminal is a dark island in a near-white shell, so
+    /// its gutter must NOT take the shell's dark-on-light thumb.
+    #[test]
+    fn the_light_theme_terminal_gutter_takes_the_dark_ground_colours() {
+        let tokens = crate::ui::tokens::light(
+            crate::ui::tokens::Density::Comfortable,
+            crate::ui::tokens::Scale::Scale100,
+        );
+        let palette = crate::terminal::view::terminal_render_palette_from_tokens(tokens);
+        assert_eq!(
+            palette.scrollbar_thumb,
+            tokens.scrollbar.on_dark.thumb_idle.to_u32()
+        );
+        assert_ne!(
+            palette.scrollbar_thumb,
+            tokens.scrollbar.on_light.thumb_idle.to_u32()
         );
     }
 }

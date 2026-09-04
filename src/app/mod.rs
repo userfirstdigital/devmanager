@@ -353,6 +353,12 @@ struct NativeShell {
     last_terminal_mouse_report: Option<(TerminalGridPosition, Option<MouseButton>)>,
     terminal_mouse_press_owner: Option<TerminalMousePressOwner>,
     terminal_scrollbar_drag: Option<TerminalScrollbarDrag>,
+    /// True while the pointer is inside the terminal's scrollbar gutter.
+    ///
+    /// The gutter is painted on a `canvas`, which cannot answer a
+    /// `group_hover`, so the hover that widens the thumb from 4 px to 10 px is
+    /// tracked here from the same global mouse-move listener the drag uses.
+    terminal_scrollbar_hovered: bool,
     pending_terminal_display_offset: Option<usize>,
     terminal_search: TerminalSearchState,
     editor_panel: Option<EditorPanel>,
@@ -1517,6 +1523,7 @@ impl NativeShell {
             last_terminal_mouse_report: None,
             terminal_mouse_press_owner: None,
             terminal_scrollbar_drag: None,
+            terminal_scrollbar_hovered: false,
             pending_terminal_display_offset: None,
             terminal_search: TerminalSearchState::default(),
             editor_panel: None,
@@ -8357,7 +8364,8 @@ impl NativeShell {
         };
         let metrics = self.terminal_render_metrics(window);
         let available_width = if self.state.settings().show_terminal_scrollbar {
-            (layout.available_width - view::TERMINAL_SCROLLBAR_WIDTH_PX).max(metrics.cell_width)
+            (layout.available_width - view::terminal_scrollbar_spec().gutter_width)
+                .max(metrics.cell_width)
         } else {
             layout.available_width
         };
@@ -12266,6 +12274,7 @@ impl NativeShell {
             self.terminal_scrollbar_drag
                 .map(|drag| drag.thumb_top_ratio),
             self.state.settings().show_terminal_scrollbar,
+            self.terminal_scrollbar_hovered,
         )
     }
 
@@ -12283,21 +12292,29 @@ impl NativeShell {
         let visible_lines = session.screen.rows.max(1);
         let max_offset = session.screen.history_size.max(1);
 
-        let left = layout.left + layout.available_width - view::TERMINAL_SCROLLBAR_WIDTH_PX;
+        // The drag side and the paint side must agree exactly or the thumb
+        // jumps under the pointer, so both go through the one geometry in
+        // `crate::ui::scrollbar` rather than each doing the arithmetic.
+        let spec = view::terminal_scrollbar_spec();
+        let left = layout.left + layout.available_width - spec.gutter_width;
         let top = layout.top - 2.0;
-        let width = view::TERMINAL_SCROLLBAR_WIDTH_PX;
+        let width = spec.gutter_width;
         let height = layout.available_height + 4.0;
-        let track_top = top + view::TERMINAL_SCROLLBAR_TRACK_INSET_Y_PX;
-        let track_height = (height - view::TERMINAL_SCROLLBAR_TRACK_INSET_Y_PX * 2.0).max(12.0);
-        let thumb_height = (track_height
-            * (visible_lines as f32 / total_lines as f32).clamp(0.08, 1.0))
-        .max(view::TERMINAL_SCROLLBAR_MIN_THUMB_HEIGHT_PX)
-        .min(track_height);
-        let thumb_range = (track_height - thumb_height).max(0.0);
-        let thumb_top = track_top
-            + thumb_range
-                * scrollbar_thumb_top_ratio(session.screen.display_offset, max_offset)
-                    .clamp(0.0, 1.0);
+        let visible_fraction = (visible_lines as f32 / total_lines as f32).clamp(0.08, 1.0);
+        let scroll_fraction =
+            scrollbar_thumb_top_ratio(session.screen.display_offset, max_offset).clamp(0.0, 1.0);
+        let track = crate::ui::scrollbar::track_geometry(spec, height);
+        let thumb = crate::ui::scrollbar::thumb_geometry(
+            spec,
+            height,
+            visible_fraction,
+            scroll_fraction,
+            true,
+        )?;
+        let track_top = top + track.top;
+        let track_height = track.height;
+        let thumb_height = thumb.height;
+        let thumb_top = top + thumb.top;
 
         Some(TerminalScrollbarGeometry {
             left,
@@ -14355,6 +14372,21 @@ impl NativeShell {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> bool {
+        // This listener is registered globally for the frame, so it is also
+        // the only place that can see the pointer entering and leaving the
+        // gutter. Track that first, and only notify when it actually changed
+        // -- a repaint per mouse move would cost more than the hover is worth.
+        let session = self.current_active_session_view();
+        let geometry = session
+            .as_ref()
+            .and_then(|session| self.terminal_scrollbar_geometry(window, session));
+        let hovered =
+            geometry.is_some_and(|geometry| self.scrollbar_hit_test(event.position, geometry));
+        if hovered != self.terminal_scrollbar_hovered {
+            self.terminal_scrollbar_hovered = hovered;
+            cx.notify();
+        }
+
         let Some(_) = self.terminal_scrollbar_drag else {
             return false;
         };
@@ -14362,12 +14394,10 @@ impl NativeShell {
             return false;
         }
 
-        if let Some(session) = self.current_active_session_view() {
-            if let Some(geometry) = self.terminal_scrollbar_geometry(window, &session) {
-                self.scroll_terminal_from_scrollbar(event.position, geometry, cx);
-                window.prevent_default();
-                return true;
-            }
+        if let Some(geometry) = geometry {
+            self.scroll_terminal_from_scrollbar(event.position, geometry, cx);
+            window.prevent_default();
+            return true;
         }
         self.terminal_scrollbar_drag = None;
         false
@@ -14919,7 +14949,7 @@ impl NativeShell {
         let cell_width = metrics.cell_width;
         let row_height = metrics.line_height;
         let scrollbar_width = if self.state.settings().show_terminal_scrollbar {
-            view::TERMINAL_SCROLLBAR_WIDTH_PX
+            view::terminal_scrollbar_spec().gutter_width
         } else {
             0.0
         };
@@ -19482,6 +19512,7 @@ fn scrollbar_model_for_screen(
     screen: &crate::terminal::session::TerminalScreenSnapshot,
     drag_thumb_top_ratio: Option<f32>,
     enabled: bool,
+    hovered: bool,
 ) -> Option<view::TerminalScrollbarModel> {
     if !enabled {
         return None;
@@ -19497,6 +19528,8 @@ fn scrollbar_model_for_screen(
     Some(view::TerminalScrollbarModel {
         thumb_top_ratio: thumb_top_ratio.clamp(0.0, 1.0),
         thumb_height_ratio,
+        // A drag is a hover that has committed, so both widen the thumb.
+        hovered: hovered || drag_thumb_top_ratio.is_some(),
     })
 }
 
@@ -21263,7 +21296,7 @@ mod tests {
         screen.history_size = 0;
         screen.display_offset = 0;
 
-        let model = scrollbar_model_for_screen(&screen, None, true).expect("model");
+        let model = scrollbar_model_for_screen(&screen, None, true, false).expect("model");
 
         assert_eq!(model.thumb_height_ratio, 1.0);
     }
@@ -21274,7 +21307,7 @@ mod tests {
         screen.total_lines = 20;
         screen.history_size = 18;
 
-        assert!(scrollbar_model_for_screen(&screen, None, false).is_none());
+        assert!(scrollbar_model_for_screen(&screen, None, false, false).is_none());
     }
 
     #[test]
@@ -21284,7 +21317,7 @@ mod tests {
         screen.history_size = 6;
         screen.display_offset = 0;
 
-        let model = scrollbar_model_for_screen(&screen, None, true).expect("model");
+        let model = scrollbar_model_for_screen(&screen, None, true, false).expect("model");
 
         assert_eq!(model.thumb_height_ratio, 0.25);
         assert_eq!(model.thumb_top_ratio, 1.0);

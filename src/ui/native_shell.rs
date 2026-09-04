@@ -28,6 +28,7 @@ use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
+use crate::ui::scrollbar::AppScrollableElement;
 use gpui::prelude::FluentBuilder;
 use gpui::{
     anchored, canvas, deferred, div, fill, img, point, px, size, uniform_list, Animation,
@@ -41,7 +42,6 @@ use gpui::{
 };
 use gpui_component::button::{Button, ButtonVariants};
 use gpui_component::input::{Input, InputState};
-use gpui_component::scroll::{ScrollableElement, Scrollbar};
 use gpui_component::{Disableable, Sizable};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
@@ -11400,6 +11400,11 @@ pub struct NativeShell {
     composer_painted_layout: Option<ComposerPaintedLayout>,
     composer_draft_content_height: f32,
     composer_scroll_handle: gpui::ScrollHandle,
+    /// Scroll position of the theme editor panel, so the panel can carry a
+    /// real scrollbar instead of clipping silently.
+    theme_editor_scroll_handle: gpui::ScrollHandle,
+    /// Scroll position of the composer's provider/model selector popover.
+    composer_selector_scroll_handle: gpui::ScrollHandle,
     composer_reveal_cursor: bool,
     last_window_persist: Option<Instant>,
     add_project: Option<AddProjectDraft>,
@@ -11859,6 +11864,9 @@ struct NativeGitWindow {
     snapshot: NativeGitWindowSnapshot,
     active_view: NativeGitView,
     show_repository_menu: bool,
+    /// Scroll position of the repository popover, so a long repository list
+    /// carries a bar rather than clipping silently.
+    repository_menu_scroll_handle: gpui::ScrollHandle,
     selected_file: Option<String>,
     selected_commit: Option<String>,
     commit_summary: Entity<InputState>,
@@ -11937,6 +11945,7 @@ impl NativeGitWindow {
             snapshot,
             active_view: NativeGitView::Changes,
             show_repository_menu: false,
+            repository_menu_scroll_handle: gpui::ScrollHandle::new(),
             selected_file: None,
             selected_commit: None,
             commit_summary,
@@ -12489,6 +12498,8 @@ impl NativeShell {
             composer_painted_layout: None,
             composer_draft_content_height: CONVERSATION_COMPOSER_INPUT_MIN_HEIGHT - 42.0,
             composer_scroll_handle: gpui::ScrollHandle::new(),
+            theme_editor_scroll_handle: gpui::ScrollHandle::new(),
+            composer_selector_scroll_handle: gpui::ScrollHandle::new(),
             composer_reveal_cursor: false,
             last_window_persist: None,
             add_project: None,
@@ -21505,7 +21516,15 @@ impl NativeShell {
                         .w(px(200.0))
                         .max_w(px(240.0))
                         .max_h(px(220.0))
+                        .relative()
                         .overflow_y_scroll()
+                        .track_scroll(&self.composer_selector_scroll_handle)
+                        .child(crate::ui::scrollbar::AppScrollbar::vertical(
+                            "native-composer-selector-scrollbar",
+                            &self.composer_selector_scroll_handle,
+                            tokens.scrollbar,
+                            tokens.surfaces.overlay,
+                        ))
                         .p(px(4.0))
                         .rounded(px(6.0))
                         .bg(tokens.surfaces.overlay.to_gpui())
@@ -35478,7 +35497,9 @@ impl NativeShell {
             .id("native-theme-editor")
             .w(px(340.0))
             .max_h(px(560.0))
+            .relative()
             .overflow_y_scroll()
+            .track_scroll(&self.theme_editor_scroll_handle)
             .flex_none()
             .rounded(px(tokens.density.radii.lg))
             .border(px(1.0))
@@ -35488,6 +35509,12 @@ impl NativeShell {
             .flex()
             .flex_col()
             .gap(px(tokens.density.spacing.sm))
+            .child(crate::ui::scrollbar::AppScrollbar::vertical(
+                "native-theme-editor-scrollbar",
+                &self.theme_editor_scroll_handle,
+                tokens.scrollbar,
+                tokens.surfaces.overlay,
+            ))
             .child(
                 div()
                     .text_size(px(tokens.density.typography.body))
@@ -38148,7 +38175,7 @@ impl NativeShell {
                                 .child(
                                     div()
                                         .min_h(px(0.0))
-                                        .overflow_y_scrollbar()
+                                        .app_scroll_y(tokens)
                                         .pr(px(tokens.density.spacing.xs))
                                         .child(content),
                                 ),
@@ -38502,7 +38529,7 @@ impl NativeShell {
                             .flex_col()
                             .gap(px(tokens.density.spacing.xs))
                             .max_h(px(180.0))
-                            .overflow_y_scrollbar()
+                            .app_scroll_y(tokens)
                             .children(project_choices.into_iter().map(
                                 |(project_id, label, selected)| {
                                     let row = div()
@@ -42830,7 +42857,12 @@ impl NativeShell {
                             .w(px(TASK_INBOX_SCROLLBAR_GUTTER_WIDTH_PX))
                             .flex_none()
                             .h_full()
-                            .child(Scrollbar::vertical(&self.task_scroll_handle)),
+                            .child(crate::ui::scrollbar::AppScrollbar::vertical(
+                                "native-shell-task-inbox-scrollbar",
+                                &self.task_scroll_handle,
+                                tokens.scrollbar,
+                                tokens.surfaces.canvas,
+                            )),
                     )
                     .into_any_element(),
             ),
@@ -43378,9 +43410,19 @@ impl NativeShell {
                     .flex_col()
                     .flex_1()
                     .min_h(px(0.0))
+                    .relative()
                     .overflow_y_scroll()
                     .track_scroll(&board_scroll_handle)
-                    .child(board_element);
+                    .child(board_element)
+                    // The board scrolled but painted no bar at all, so a task
+                    // below the fold was unreachable-looking. Same handle, so
+                    // there is still one owner of the inbox scroll position.
+                    .child(crate::ui::scrollbar::AppScrollbar::vertical(
+                        "native-shell-board-scrollbar",
+                        &board_scroll_handle,
+                        tokens.scrollbar,
+                        tokens.surfaces.canvas,
+                    ));
                 // Collapsed, the rail paints no header, so the `⋯` menu that
                 // collapsed it is not on screen to undo it. The rail itself is
                 // the way back: one click expands, and the tooltip says so.
@@ -44811,7 +44853,15 @@ impl Render for NativeGitWindow {
                 .left(px(12.0))
                 .w(px(300.0))
                 .max_h(px(320.0))
+                .relative()
                 .overflow_y_scroll()
+                .track_scroll(&self.repository_menu_scroll_handle)
+                .child(crate::ui::scrollbar::AppScrollbar::vertical(
+                    "native-git-repository-menu-scrollbar",
+                    &self.repository_menu_scroll_handle,
+                    tokens.scrollbar,
+                    tokens.surfaces.overlay,
+                ))
                 .p(px(6.0))
                 .rounded(px(tokens.density.radii.md))
                 .border(px(1.0))
@@ -45136,7 +45186,7 @@ impl Render for NativeGitWindow {
                                 div()
                                     .flex_1()
                                     .min_h(px(0.0))
-                                    .overflow_y_scrollbar()
+                                    .app_scroll_y(tokens)
                                     .children(file_rows),
                             ),
                     )
@@ -45187,7 +45237,7 @@ impl Render for NativeGitWindow {
                                             div()
                                                 .flex_1()
                                                 .min_h(px(0.0))
-                                                .overflow_y_scrollbar()
+                                                .app_scroll_y(tokens)
                                                 .when(active_file_diff_rows.is_empty(), |view| {
                                                     view.text_color(tokens.text.muted.to_gpui())
                                                         .child("Loading diff…")
@@ -45247,7 +45297,7 @@ impl Render for NativeGitWindow {
                                 div()
                                     .flex_1()
                                     .min_h(px(0.0))
-                                    .overflow_y_scrollbar()
+                                    .app_scroll_y(tokens)
                                     .children(history_rows),
                             ),
                     )
@@ -45257,7 +45307,7 @@ impl Render for NativeGitWindow {
                             .min_w_0()
                             .min_h(px(0.0))
                             .p(px(18.0))
-                            .overflow_y_scrollbar()
+                            .app_scroll_y(tokens)
                             .when(self.selected_commit.is_none(), |view| {
                                 view.flex()
                                     .items_center()

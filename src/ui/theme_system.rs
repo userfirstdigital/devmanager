@@ -757,13 +757,20 @@ impl ThemePalette {
                 ThemeColorRole::TerminalSelection,
                 role(tokens.terminal.selection),
             ),
+            // These two roles keep their `terminal*` wire names -- ten
+            // shipped palettes and every user-saved theme spell them that way
+            // -- but they are no longer terminal-only: `ui::scrollbar` paints
+            // every scrollable shell surface from the same pair, which is what
+            // makes "one look" survive a managed theme. Their values come from
+            // the scrollbar tokens rather than borrowed border roles, so the
+            // colour contract has exactly one author.
             (
                 ThemeColorRole::TerminalScrollbar,
-                role(tokens.borders.default),
+                role(tokens.scrollbar.on_dark.thumb_idle),
             ),
             (
                 ThemeColorRole::TerminalScrollbarHover,
-                role(tokens.borders.strong),
+                role(tokens.scrollbar.on_dark.thumb_hover),
             ),
         ];
         Self::advanced(pairs.into_iter().collect())
@@ -984,6 +991,18 @@ impl ThemePalette {
         // not a borrow from this one.
         tokens.text.on_accent = color(ThemeColorRole::AccentForeground);
         tokens.text.on_selection = color(ThemeColorRole::SidebarForeground);
+        // A managed or user palette owns the scrollbar's two thumb colours
+        // through the roles above; the track keeps the token module's value
+        // because no palette declares a role for it and borrowing one would
+        // make the track track something it is not.
+        // The two roles keep their `terminal*` wire names but drive the whole
+        // app now. They carry the DARK-ground pair: the terminal plane is dark
+        // in every shipped palette, and a palette that declared a light one
+        // would still resolve through `ScrollbarTokens::colors_on`. The light-
+        // ground pair keeps the token module's value because no palette
+        // declares a role for it.
+        tokens.scrollbar.on_dark.thumb_idle = color(ThemeColorRole::TerminalScrollbar);
+        tokens.scrollbar.on_dark.thumb_hover = color(ThemeColorRole::TerminalScrollbarHover);
         tokens.borders.subtle = color(ThemeColorRole::Border);
         tokens.borders.default = color(ThemeColorRole::Input);
         tokens.borders.strong = color(ThemeColorRole::SidebarBorder);
@@ -3314,6 +3333,34 @@ mod tests {
                 "actions.primary.disabled.foreground",
                 tokens.actions.primary.disabled.foreground,
                 expected.actions.primary.disabled.foreground,
+            ),
+            // The scrollbar's two thumb colours make the round trip through
+            // `terminalScrollbar`/`terminalScrollbarHover`, so they can drift
+            // exactly the way the surface roles can.
+            (
+                "scrollbar.on_dark.thumb_idle",
+                tokens.scrollbar.on_dark.thumb_idle,
+                expected.scrollbar.on_dark.thumb_idle,
+            ),
+            (
+                "scrollbar.on_dark.thumb_hover",
+                tokens.scrollbar.on_dark.thumb_hover,
+                expected.scrollbar.on_dark.thumb_hover,
+            ),
+            (
+                "scrollbar.on_dark.track_active",
+                tokens.scrollbar.on_dark.track_active,
+                expected.scrollbar.on_dark.track_active,
+            ),
+            (
+                "scrollbar.on_light.thumb_idle",
+                tokens.scrollbar.on_light.thumb_idle,
+                expected.scrollbar.on_light.thumb_idle,
+            ),
+            (
+                "scrollbar.on_light.thumb_hover",
+                tokens.scrollbar.on_light.thumb_hover,
+                expected.scrollbar.on_light.thumb_hover,
             ),
             (
                 "status.attention",

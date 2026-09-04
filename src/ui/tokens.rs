@@ -282,6 +282,104 @@ pub struct SurfaceTokens {
     pub disabled: Color,
 }
 
+/// The one visual contract every scrollbar in the app renders from.
+///
+/// There are two painters -- the shared `ui::scrollbar` element used by every
+/// scrollable shell surface, and the terminal's hand-painted gutter, which has
+/// to stay hand-painted because it lives inside a `canvas` element. Neither
+/// carries a width, a length, a radius or a colour of its own: both read this
+/// struct, so "one look" is a property of the type rather than of two lists of
+/// constants that happen to agree today.
+///
+/// Widths are logical pixels and are deliberately NOT density-scaled: a
+/// scrollbar is a pointer target, and the redesign spec pins 4 px idle /
+/// 10 px on hover or drag at every density.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ScrollbarTokens {
+    /// Thumb width at rest. Thin and delicate, but painted at full opacity so
+    /// it stays visible -- it never fades out.
+    pub idle_thumb_width: f32,
+    /// Thumb width while the pointer is anywhere in the gutter, or while the
+    /// thumb is being dragged. Easy to grab.
+    pub active_thumb_width: f32,
+    /// Width reserved for the gutter, in every state. The thumb is centred in
+    /// it, so growing from idle to active widens the thumb symmetrically and
+    /// never reflows the content beside it.
+    pub gutter_width: f32,
+    /// Shortest thumb the track will paint, so a very long document still
+    /// leaves something grabbable.
+    pub min_thumb_length: f32,
+    /// Distance the track is inset from the top and bottom of the gutter.
+    pub track_inset_y: f32,
+    /// Corner radius as a fraction of the current thumb width. `0.5` is a
+    /// pill at both widths, which is why one ratio replaces two radii.
+    pub thumb_radius_ratio: f32,
+    /// Colours for a scrollbar on a dark ground.
+    pub on_dark: ScrollbarColors,
+    /// Colours for a scrollbar on a light ground.
+    ///
+    /// Two triples rather than one because a scrollbar has to be visible on
+    /// whatever it lands on, and the surfaces are not all one polarity: the
+    /// light theme puts the terminal on `0x1e293b`, a dark slate island inside
+    /// a near-white shell, so a single thumb colour is either invisible on the
+    /// shell or invisible on the terminal. Measured, not guessed -- the first
+    /// single-triple attempt failed `scrollbar_thumbs_clear_the_non_text_contrast_floor`
+    /// at 1.413:1 on exactly that surface. The geometry stays single: one look,
+    /// resolved against its ground, which is the same rule `text.inverse`
+    /// already follows.
+    pub on_light: ScrollbarColors,
+}
+
+/// One scrollbar's three colours. Split from the geometry so the polarity
+/// rule has something to return.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ScrollbarColors {
+    /// Thumb at rest.
+    pub thumb_idle: Color,
+    /// Thumb while the gutter is hovered or the thumb is being dragged.
+    pub thumb_hover: Color,
+    /// Track behind the thumb. Painted only in the active state: at rest the
+    /// bar is the thumb alone, which is what makes the idle look delicate.
+    pub track_active: Color,
+}
+
+impl ScrollbarColors {
+    pub fn thumb(self, active: bool) -> Color {
+        if active {
+            self.thumb_hover
+        } else {
+            self.thumb_idle
+        }
+    }
+}
+
+impl ScrollbarTokens {
+    /// The colours for a scrollbar painted over `background`.
+    ///
+    /// The 0.45 luminance split is the same one `ThemePalette::tokens` uses to
+    /// decide a palette's appearance, so a surface cannot be "light" to one and
+    /// "dark" to the other.
+    pub fn colors_on(self, background: Color) -> ScrollbarColors {
+        if srgb_luminance(background) >= 0.45 {
+            self.on_light
+        } else {
+            self.on_dark
+        }
+    }
+
+    pub fn thumb_width(self, active: bool) -> f32 {
+        if active {
+            self.active_thumb_width
+        } else {
+            self.idle_thumb_width
+        }
+    }
+
+    pub fn thumb_radius(self, active: bool) -> f32 {
+        self.thumb_width(active) * self.thumb_radius_ratio
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct BorderTokens {
     pub subtle: Color,
@@ -718,6 +816,7 @@ pub struct ThemeTokens {
     pub mode: ThemeMode,
     pub text: TextTokens,
     pub surfaces: SurfaceTokens,
+    pub scrollbar: ScrollbarTokens,
     pub borders: BorderTokens,
     pub actions: ActionTokens,
     pub status: StatusTokens,
@@ -1433,6 +1532,46 @@ impl ThemeTokens {
 // canvas sits darkest, row boxes lift one step, and colour is reserved for
 // attention (amber) and destruction (red) so nothing else competes for the
 // eye. Values come from the redesign spec rather than the old plum shell.
+// One scrollbar geometry for the whole app, shared by all three modes. The
+// redesign spec pins the two widths; the rest is derived so that the thumb
+// grows symmetrically inside a fixed gutter and never reflows its neighbour:
+// idle leaves (14 - 4) / 2 = 5 px each side, active leaves (14 - 10) / 2 = 2.
+const SCROLLBAR_IDLE_THUMB_WIDTH: f32 = 4.0;
+const SCROLLBAR_ACTIVE_THUMB_WIDTH: f32 = 10.0;
+const SCROLLBAR_GUTTER_WIDTH: f32 = 14.0;
+// 24 px, between the terminal's old 18 (too small to hit reliably) and
+// gpui-component's 48 (which swallows the position signal on a long log).
+const SCROLLBAR_MIN_THUMB_LENGTH: f32 = 24.0;
+const SCROLLBAR_TRACK_INSET_Y: f32 = 2.0;
+const SCROLLBAR_THUMB_RADIUS_RATIO: f32 = 0.5;
+
+// Idle thumbs are measured against every background a scrollbar can land on
+// -- canvas, sunken, raised, overlay and the terminal plane, in all three
+// modes -- and clear the 3:1 WCAG 1.4.11 non-text floor on every one of them;
+// hover clears 6:1. Asserted by
+// `scrollbar_thumbs_clear_the_non_text_contrast_floor`, which is what found
+// the light theme's dark terminal island in the first place.
+//
+// The dark triple is deliberately one step brighter than the redesign's
+// `text.muted` candidate: the binding surface is not the dark shell (where
+// 0x6b6b74 reads 3.60:1) but the LIGHT theme's terminal plane at 0x1e293b,
+// where the same value drops to 2.773:1. 0x76767f clears it at 3.252:1 and
+// stays delicate on the dark shell at 4.222:1.
+const SCROLLBAR_ON_DARK_THUMB_IDLE: Color = Color::from_u32(0x76767f);
+const SCROLLBAR_ON_DARK_THUMB_HOVER: Color = Color::from_u32(0xb0b0b9);
+const SCROLLBAR_ON_DARK_TRACK_ACTIVE: Color = Color::from_u32(0x26262b);
+
+const SCROLLBAR_ON_LIGHT_THUMB_IDLE: Color = Color::from_u32(0x64748b);
+const SCROLLBAR_ON_LIGHT_THUMB_HOVER: Color = Color::from_u32(0x334155);
+const SCROLLBAR_ON_LIGHT_TRACK_ACTIVE: Color = Color::from_u32(0xcbd5e1);
+
+// High contrast has no light surface, so both polarities resolve to its own
+// louder pair rather than to the shared one -- 3.6:1 is a correct scrollbar
+// and a wrong high-contrast scrollbar.
+const HC_SCROLLBAR_THUMB_IDLE: Color = Color::from_u32(0xd6d6d6);
+const HC_SCROLLBAR_THUMB_HOVER: Color = Color::from_u32(0xffffff);
+const HC_SCROLLBAR_TRACK_ACTIVE: Color = Color::from_u32(0x2a2a2a);
+
 const DARK_SURFACE_CANVAS: Color = Color::from_u32(0x101013);
 const DARK_SURFACE_RAISED: Color = Color::from_u32(0x151518);
 const DARK_SURFACE_OVERLAY: Color = Color::from_u32(0x1a1a1f);
@@ -1809,6 +1948,24 @@ fn dark_theme(density: Density, scale: Scale) -> ThemeTokens {
             selection: DARK_SURFACE_SELECTION,
             disabled: DARK_SURFACE_DISABLED,
         },
+        scrollbar: ScrollbarTokens {
+            idle_thumb_width: SCROLLBAR_IDLE_THUMB_WIDTH,
+            active_thumb_width: SCROLLBAR_ACTIVE_THUMB_WIDTH,
+            gutter_width: SCROLLBAR_GUTTER_WIDTH,
+            min_thumb_length: SCROLLBAR_MIN_THUMB_LENGTH,
+            track_inset_y: SCROLLBAR_TRACK_INSET_Y,
+            thumb_radius_ratio: SCROLLBAR_THUMB_RADIUS_RATIO,
+            on_dark: ScrollbarColors {
+                thumb_idle: SCROLLBAR_ON_DARK_THUMB_IDLE,
+                thumb_hover: SCROLLBAR_ON_DARK_THUMB_HOVER,
+                track_active: SCROLLBAR_ON_DARK_TRACK_ACTIVE,
+            },
+            on_light: ScrollbarColors {
+                thumb_idle: SCROLLBAR_ON_LIGHT_THUMB_IDLE,
+                thumb_hover: SCROLLBAR_ON_LIGHT_THUMB_HOVER,
+                track_active: SCROLLBAR_ON_LIGHT_TRACK_ACTIVE,
+            },
+        },
         borders: BorderTokens {
             subtle: DARK_BORDER_SUBTLE,
             default: DARK_BORDER_DEFAULT,
@@ -1941,6 +2098,24 @@ fn light_theme(density: Density, scale: Scale) -> ThemeTokens {
             selection: LIGHT_SURFACE_SELECTION,
             disabled: LIGHT_SURFACE_DISABLED,
         },
+        scrollbar: ScrollbarTokens {
+            idle_thumb_width: SCROLLBAR_IDLE_THUMB_WIDTH,
+            active_thumb_width: SCROLLBAR_ACTIVE_THUMB_WIDTH,
+            gutter_width: SCROLLBAR_GUTTER_WIDTH,
+            min_thumb_length: SCROLLBAR_MIN_THUMB_LENGTH,
+            track_inset_y: SCROLLBAR_TRACK_INSET_Y,
+            thumb_radius_ratio: SCROLLBAR_THUMB_RADIUS_RATIO,
+            on_dark: ScrollbarColors {
+                thumb_idle: SCROLLBAR_ON_DARK_THUMB_IDLE,
+                thumb_hover: SCROLLBAR_ON_DARK_THUMB_HOVER,
+                track_active: SCROLLBAR_ON_DARK_TRACK_ACTIVE,
+            },
+            on_light: ScrollbarColors {
+                thumb_idle: SCROLLBAR_ON_LIGHT_THUMB_IDLE,
+                thumb_hover: SCROLLBAR_ON_LIGHT_THUMB_HOVER,
+                track_active: SCROLLBAR_ON_LIGHT_TRACK_ACTIVE,
+            },
+        },
         borders: BorderTokens {
             subtle: LIGHT_BORDER_SUBTLE,
             default: LIGHT_BORDER_DEFAULT,
@@ -2069,6 +2244,13 @@ fn high_contrast_theme(density: Density, scale: Scale) -> ThemeTokens {
     tokens.surfaces.hover = HC_SURFACE_HOVER;
     tokens.surfaces.selection = HC_SURFACE_SELECTION;
     tokens.surfaces.disabled = HC_SURFACE_DISABLED;
+    let hc_scrollbar = ScrollbarColors {
+        thumb_idle: HC_SCROLLBAR_THUMB_IDLE,
+        thumb_hover: HC_SCROLLBAR_THUMB_HOVER,
+        track_active: HC_SCROLLBAR_TRACK_ACTIVE,
+    };
+    tokens.scrollbar.on_dark = hc_scrollbar;
+    tokens.scrollbar.on_light = hc_scrollbar;
     tokens.borders.subtle = HC_BORDER_SUBTLE;
     tokens.borders.default = HC_BORDER_DEFAULT;
     tokens.borders.strong = HC_BORDER_STRONG;
@@ -2321,6 +2503,124 @@ mod tests {
     /// The board's project stripe reads its hue from here. Pinned so a
     /// reordered palette is a failing test rather than every project on the
     /// board silently changing colour.
+    /// Every background a scrollbar can land on, in one place, so the
+    /// contrast assertion below cannot quietly stop looking at one of them.
+    fn scrollbar_backgrounds(tokens: ThemeTokens) -> Vec<(&'static str, Color)> {
+        vec![
+            ("surfaces.canvas", tokens.surfaces.canvas),
+            ("surfaces.sunken", tokens.surfaces.sunken),
+            ("surfaces.raised", tokens.surfaces.raised),
+            ("surfaces.overlay", tokens.surfaces.overlay),
+            ("terminal.background", tokens.terminal.background),
+        ]
+    }
+
+    /// A 4 px bar is a non-text UI component, so the floor is WCAG 1.4.11's
+    /// 3:1 rather than 4.5:1 -- but it has to clear it against every surface a
+    /// scrollbar can sit on, in every mode, not just the one that was looked
+    /// at while picking the colour.
+    #[test]
+    fn scrollbar_thumbs_clear_the_non_text_contrast_floor() {
+        let density = Density::Comfortable;
+        let scale = Scale::Scale100;
+        for (mode, tokens) in [
+            (ThemeMode::Dark, dark(density, scale)),
+            (ThemeMode::Light, light(density, scale)),
+            (ThemeMode::HighContrast, high_contrast(density, scale)),
+        ] {
+            for (name, background) in scrollbar_backgrounds(tokens) {
+                // Resolve through the polarity rule, so this asserts the RULE
+                // rather than one triple -- picking the wrong side is exactly
+                // the failure it exists to catch.
+                let colors = tokens.scrollbar.colors_on(background);
+                let idle = contrast_ratio(colors.thumb_idle, background);
+                assert!(
+                    idle >= 3.0,
+                    "{mode:?} idle scrollbar thumb is {idle:.3}:1 on {name}, under the 3:1 floor"
+                );
+                let hover = contrast_ratio(colors.thumb_hover, background);
+                assert!(
+                    hover >= 6.0,
+                    "{mode:?} hover scrollbar thumb is {hover:.3}:1 on {name}, under the 6:1 floor"
+                );
+                assert!(
+                    hover > idle,
+                    "{mode:?} hover scrollbar thumb must read louder than idle on {name}"
+                );
+                assert_ne!(
+                    colors.track_active, colors.thumb_idle,
+                    "{mode:?} track and thumb must not be the same colour on {name}"
+                );
+            }
+        }
+    }
+
+    /// The polarity rule has to actually switch, or the two triples are one
+    /// triple with a decoration. The light theme is the case that matters:
+    /// its shell is near-white and its terminal is a dark island.
+    #[test]
+    fn scrollbar_colours_follow_the_ground_they_are_painted_on() {
+        let tokens = light(Density::Comfortable, Scale::Scale100);
+        let shell = tokens.scrollbar.colors_on(tokens.surfaces.canvas);
+        let terminal = tokens.scrollbar.colors_on(tokens.terminal.background);
+        assert_eq!(shell, tokens.scrollbar.on_light);
+        assert_eq!(terminal, tokens.scrollbar.on_dark);
+        assert_ne!(shell, terminal);
+
+        let tokens = dark(Density::Comfortable, Scale::Scale100);
+        assert_eq!(
+            tokens.scrollbar.colors_on(tokens.surfaces.canvas),
+            tokens.scrollbar.on_dark
+        );
+        assert_eq!(
+            tokens.scrollbar.colors_on(tokens.terminal.background),
+            tokens.scrollbar.on_dark
+        );
+
+        // High contrast has one polarity, so both sides answer the same.
+        let tokens = high_contrast(Density::Comfortable, Scale::Scale100);
+        assert_eq!(tokens.scrollbar.on_dark, tokens.scrollbar.on_light);
+    }
+
+    /// The idle and active states must actually differ, and the gutter must be
+    /// wide enough to hold the active thumb -- a spec where they agree paints
+    /// a scrollbar that never responds to the pointer.
+    #[test]
+    fn scrollbar_geometry_expands_on_hover_inside_a_fixed_gutter() {
+        for tokens in [
+            dark(Density::Comfortable, Scale::Scale100),
+            light(Density::Compact, Scale::Scale200),
+            high_contrast(Density::Comfortable, Scale::Scale125),
+        ] {
+            let bar = tokens.scrollbar;
+            assert!(
+                bar.active_thumb_width > bar.idle_thumb_width,
+                "hover must widen the thumb"
+            );
+            assert!(
+                bar.gutter_width >= bar.active_thumb_width,
+                "the gutter must hold the active thumb without reflowing its neighbour"
+            );
+            assert!(bar.min_thumb_length > 0.0);
+            assert_eq!(bar.thumb_width(false), bar.idle_thumb_width);
+            assert_eq!(bar.thumb_width(true), bar.active_thumb_width);
+            assert_eq!(bar.on_dark.thumb(false), bar.on_dark.thumb_idle);
+            assert_eq!(bar.on_dark.thumb(true), bar.on_dark.thumb_hover);
+            // A pill at both widths, from one ratio.
+            assert_eq!(bar.thumb_radius(false), bar.idle_thumb_width / 2.0);
+            assert_eq!(bar.thumb_radius(true), bar.active_thumb_width / 2.0);
+        }
+    }
+
+    /// The redesign spec pins these two numbers by name. Anything else on the
+    /// screen is a divergence from the ruling, not a taste difference.
+    #[test]
+    fn scrollbar_widths_are_the_ruled_four_and_ten() {
+        let bar = dark(Density::Comfortable, Scale::Scale100).scrollbar;
+        assert_eq!(bar.idle_thumb_width, 4.0);
+        assert_eq!(bar.active_thumb_width, 10.0);
+    }
+
     #[test]
     fn project_palette_is_the_spec_in_assignment_order() {
         assert_eq!(PROJECT_PALETTE.len(), 8);
