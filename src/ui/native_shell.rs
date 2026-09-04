@@ -39211,6 +39211,18 @@ impl NativeShell {
         .into_any_element()
     }
 
+    /// Where the project-scope menu hangs: `(top, left)` in pixels. The menu
+    /// drops from the top bar's scope label, so both numbers are the bar's own
+    /// -- its height plus a 4 px gap, and its left padding. A helper rather
+    /// than two literals inside the painter, because the only other way to ask
+    /// where the menu lands is to paint the overlay.
+    fn project_scope_overlay_anchor() -> (f32, f32) {
+        (
+            crate::ui::board::layout::TOP_BAR_HEIGHT + 4.0,
+            crate::ui::board::layout::TOP_BAR_PADDING_X,
+        )
+    }
+
     fn render_project_scope_overlay(
         &self,
         tokens: crate::ui::tokens::ThemeTokens,
@@ -39284,8 +39296,8 @@ impl NativeShell {
                         .flex()
                         .items_start()
                         .justify_start()
-                        .pt(px(84.0))
-                        .pl(px(24.0))
+                        .pt(px(Self::project_scope_overlay_anchor().0))
+                        .pl(px(Self::project_scope_overlay_anchor().1))
                         .bg(Self::modal_backdrop())
                         .on_mouse_down(
                             MouseButton::Left,
@@ -49411,6 +49423,29 @@ pub(crate) mod tests {
             new_project < archived,
             "the moved destinations sit above Archived: {menu_rows:?}"
         );
+    }
+
+    /// The project-scope menu drops from under the top bar's scope label, so
+    /// its anchor is the bar's own height and padding. The shipped pair was a
+    /// literal 84/24 that matched no constant in the bar: raising the bar to
+    /// the composition's 34 px would have left the menu floating a bar and a
+    /// half below the control that opens it, and moving the padding would not
+    /// have moved the menu at all.
+    #[test]
+    fn the_project_scope_overlay_hangs_off_the_top_bar() {
+        use crate::ui::board::layout::{TOP_BAR_HEIGHT, TOP_BAR_PADDING_X};
+
+        let (top, left) = NativeShell::project_scope_overlay_anchor();
+        assert_eq!(
+            left, TOP_BAR_PADDING_X,
+            "the menu lines up with the bar's own left padding"
+        );
+        assert_eq!(
+            top,
+            TOP_BAR_HEIGHT + 4.0,
+            "the menu hangs 4 px under the bar it drops from"
+        );
+        assert_eq!((top, left), (38.0, 12.0));
     }
 
     /// The four ids above are absent from the accessibility tree because the
