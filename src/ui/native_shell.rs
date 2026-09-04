@@ -31966,16 +31966,20 @@ impl NativeShell {
     /// because the panel's own Done/Archive control names the task it belongs
     /// to, and a panel that is not the focused one must still act on itself.
     fn archive_task_key(&mut self, key: HostTaskKey) {
-        let dispatched = self
-            .dispatch_action_recorded_for_owner(
-                &key.host,
-                ActionRequest::TaskArchive {
-                    task_id: key.task_id,
-                },
-            )
-            .is_ok();
-        if dispatched {
-            self.close_task_pane(&key);
+        match self.dispatch_action_recorded_for_owner(
+            &key.host,
+            ActionRequest::TaskArchive {
+                task_id: key.task_id,
+            },
+        ) {
+            Ok(_) => self.close_task_pane(&key),
+            // Observe rather than close: the panel staying open IS the correct
+            // outcome, but a silently kept panel is indistinguishable from a
+            // control that did nothing, so the refusal names the task.
+            Err(failure) => eprintln!(
+                "devmanager: archive was not enqueued for task {}: {}; its panel stays open",
+                key.task_id, failure.message
+            ),
         }
     }
 
@@ -31992,16 +31996,20 @@ impl NativeShell {
     /// screen would keep a finished task occupying a share of the window nobody
     /// asked for.
     fn settle_task_key(&mut self, key: HostTaskKey) {
-        let dispatched = self
-            .dispatch_action_recorded_for_owner(
-                &key.host,
-                ActionRequest::TaskSettle {
-                    task_id: key.task_id,
-                },
-            )
-            .is_ok();
-        if dispatched {
-            self.close_task_pane(&key);
+        match self.dispatch_action_recorded_for_owner(
+            &key.host,
+            ActionRequest::TaskSettle {
+                task_id: key.task_id,
+            },
+        ) {
+            Ok(_) => self.close_task_pane(&key),
+            // Same as archive: the panel is right to stay, and the reason it
+            // stayed is worth saying rather than leaving as a Done that
+            // apparently did nothing.
+            Err(failure) => eprintln!(
+                "devmanager: Done was not enqueued for task {}: {}; its panel stays open",
+                key.task_id, failure.message
+            ),
         }
     }
 
@@ -49447,6 +49455,17 @@ pub(crate) mod tests {
                 shell.local_slot_mut().agent_connection =
                     Some(agent_connection_snapshot(AgentPresence::SignedIn));
                 shell.install_named_folder_for_test("command");
+                // One task that has asked a question, so the bar's amber chip
+                // has something to count and its node has to appear.
+                let (model, task_ids) = open_tasks_client_model_with_attention(
+                    1,
+                    crate::domain::task::TaskAttention::NeedsAnswer,
+                );
+                let project_id = model.task(task_ids[0]).expect("task").task.project_id;
+                shell.install_project_for_test("DevManager", project_id);
+                shell
+                    .apply_client_model(Arc::new(model))
+                    .expect("apply model");
                 let _ = shell.element_without_handlers();
                 shell.refresh_accessibility_tree();
                 let ids = shell
@@ -49474,12 +49493,14 @@ pub(crate) mod tests {
             ids.iter().any(|id| id == "native-top-bar-settings"),
             "the footer's settings glyph moved to the window top bar: {ids:?}"
         );
-        for gone in [
-            "native-sidebar-search",
-            "native-shell-sidebar-search",
-            "native-sidebar-new-task",
-            "native-sidebar-new-project",
-        ] {
+        assert!(
+            ids.iter().any(|id| id == "native-top-bar-needs-you"),
+            "a task waiting on an answer publishes the bar's needs-you chip: {ids:?}"
+        );
+        // Only ids that WERE accessibility nodes. The Search row published
+        // none, so asserting its absence from the tree stayed green with the
+        // row still on screen; the painter scan below is its only guard.
+        for gone in ["native-sidebar-new-task", "native-sidebar-new-project"] {
             assert!(
                 !ids.iter().any(|id| id == gone),
                 "{gone} is column chrome composition A does not have: {ids:?}"
@@ -49624,11 +49645,12 @@ pub(crate) mod tests {
         assert_eq!((top, left), (38.0, 12.0));
     }
 
-    /// The four ids above are absent from the accessibility tree because the
+    /// The ids above are absent from the accessibility tree because the
     /// elements are gone -- not because the tree happened never to publish
-    /// them. Two of the four (`native-sidebar-search`, `native-header-settings`
-    /// in the footer) were painted without a node, so a tree-only assertion is
-    /// vacuous for them and would stay green if the rows came back.
+    /// them, which is why that loop names only ids that WERE nodes. The Search
+    /// row and the footer's settings glyph were painted without a node at all,
+    /// so no tree assertion can speak for them: this scan reads the production
+    /// source instead and is the only guard those two have.
     #[test]
     fn the_removed_column_chrome_is_gone_from_the_painter_too() {
         let source = include_str!("native_shell.rs");
@@ -53874,13 +53896,22 @@ pub(crate) mod tests {
     /// `open_task_without_agent_client_model`, widened to N open tasks in one
     /// project so a cost probe has something to measure.
     fn open_tasks_client_model(count: u8) -> (crate::client::ClientModel, Vec<TaskId>) {
+        open_tasks_client_model_with_attention(count, crate::domain::task::TaskAttention::None)
+    }
+
+    /// The same fixture with every task carrying one attention state, so a test
+    /// can ask for a board row that needs you rather than only idle ones.
+    fn open_tasks_client_model_with_attention(
+        count: u8,
+        attention: crate::domain::task::TaskAttention,
+    ) -> (crate::client::ClientModel, Vec<TaskId>) {
         use crate::client::ClientModelBuilder;
         use crate::domain::{
             id::{EnvironmentId, ProjectId, SnapshotId},
             snapshot::{SnapshotItem, SnapshotPage, SnapshotSection, TaskSnapshotItem},
             task::{
-                ReviewReadiness, TaskActivity, TaskAssignment, TaskAttention, TaskConnectivity,
-                TaskFacts, TaskLifecycle, WorkspaceRef,
+                ReviewReadiness, TaskActivity, TaskAssignment, TaskConnectivity, TaskFacts,
+                TaskLifecycle, WorkspaceRef,
             },
         };
 
@@ -53922,7 +53953,7 @@ pub(crate) mod tests {
                     created_at_ms: 1,
                 },
                 connectivity: TaskConnectivity::Connected,
-                attention: TaskAttention::None,
+                attention,
                 activity: TaskActivity::Idle,
                 review_readiness: ReviewReadiness::NotReady,
                 primary_agent_id: None,

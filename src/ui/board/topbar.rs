@@ -281,11 +281,31 @@ mod tests {
     }
 
     /// A Working row is not a needs-you row, so the chip must not count it.
-    /// Without this the "count the first group" shortcut passes on the empty
-    /// board and lies on every populated one.
+    ///
+    /// The discriminating fixture is the one with NO needs-you rows: empty
+    /// groups are dropped from the model, so there the first group is Working
+    /// and "count the first group" answers 2 while the truth is 0. The mixed
+    /// fixture below cannot catch that shortcut on its own -- with a Blocked
+    /// row present the first group IS Needs-you and both answers are 1 -- so
+    /// it only pins that Blocked counts.
     #[test]
     fn the_count_is_the_needs_you_group_not_the_first_group() {
-        let model = build_board_model(
+        let keyboard = KeyboardModel::default();
+        let none = build_board_model(
+            vec![row(BoardState::Working), row(BoardState::Working)],
+            false,
+        );
+        assert_eq!(
+            none.groups[0].group,
+            BoardGroup::Working,
+            "the fixture's first group must not be Needs-you, or this proves nothing"
+        );
+        assert_eq!(none.groups[0].rows.len(), 2, "the naive answer here is 2");
+        assert_eq!(
+            top_bar_model("All projects".into(), &none, &keyboard).needs_you,
+            0
+        );
+        let mixed = build_board_model(
             vec![
                 row(BoardState::Working),
                 row(BoardState::Working),
@@ -294,8 +314,9 @@ mod tests {
             false,
         );
         assert_eq!(
-            top_bar_model("All projects".into(), &model, &KeyboardModel::default()).needs_you,
-            1
+            top_bar_model("All projects".into(), &mixed, &keyboard).needs_you,
+            1,
+            "Blocked is a needs-you state"
         );
     }
 
