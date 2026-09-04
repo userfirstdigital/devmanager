@@ -23,10 +23,10 @@
 use std::rc::Rc;
 
 use gpui::{
-    canvas, div, prelude::FluentBuilder, px, App, Bounds, Div, Element, ElementId, Entity,
-    InteractiveElement, IntoElement, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent,
-    ParentElement, Pixels, Point, RenderOnce, ScrollHandle, SharedString, Stateful,
-    StatefulInteractiveElement, StyleRefinement, Styled, Window,
+    canvas, div, px, App, Bounds, Div, Element, ElementId, Entity, InteractiveElement, IntoElement,
+    MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, ParentElement, Pixels, Point,
+    RenderOnce, ScrollHandle, SharedString, Stateful, StatefulInteractiveElement, StyleRefinement,
+    Styled, Window,
 };
 use gpui_component::scroll::ScrollbarHandle;
 use gpui_component::StyledExt;
