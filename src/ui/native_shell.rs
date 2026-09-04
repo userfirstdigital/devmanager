@@ -431,7 +431,6 @@ const T3_WORKSPACE_TOPBAR_HEIGHT: f32 = 32.0;
 const BOARD_MENU_WIDTH: f32 = 220.0;
 const BOARD_MENU_LEFT_INSET: f32 = 8.0;
 const BOARD_MENU_TOP_INSET: f32 = 30.0;
-const T3_SIDEBAR_NAV_TOP_INSET: f32 = 12.0;
 const CONVERSATION_COMPOSER_PLACEHOLDER: &str =
     crate::ui::native_composer::NATIVE_COMPOSER_PLACEHOLDER;
 const COMPOSER_DRAFT_PERSIST_INTERVAL: Duration = Duration::from_millis(250);
@@ -1010,6 +1009,20 @@ enum ProviderInboxAffordance {
     ConnectedAdd,
     Checking,
     DisconnectedAdd,
+}
+
+impl ProviderInboxAffordance {
+    /// Why a project-creation control is disabled, or `None` when it is live.
+    /// The words are the headings `connect_canvas_copy` already prints for the
+    /// same two states, so a disabled row and the empty board never explain one
+    /// condition two ways.
+    fn disabled_reason(self) -> Option<&'static str> {
+        match self {
+            Self::ConnectedAdd => None,
+            Self::Checking => Some("Checking agents"),
+            Self::DisconnectedAdd => Some("Connect an agent"),
+        }
+    }
 }
 
 fn action_lane_total(
@@ -4552,6 +4565,30 @@ enum ProjectInboxItem {
 /// What a board menu row does when it is chosen. Named rather than boxed so
 /// the row builder stays a plain data list and the overlay owns no closures
 /// beyond the one that applies them.
+/// One row in a board menu. It carries its own disabled reason, so the painter
+/// never decides whether a destination is reachable and the tests can read the
+/// answer without painting an overlay.
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct BoardMenuEntry {
+    element_id: String,
+    label: String,
+    action: BoardMenuAction,
+    /// `None` when the row is live. `Some(reason)` disables it, and the reason
+    /// is what the person is told instead of being left to guess at a dim row.
+    disabled_reason: Option<&'static str>,
+}
+
+impl BoardMenuEntry {
+    fn live(element_id: String, label: String, action: BoardMenuAction) -> Self {
+        Self {
+            element_id,
+            label,
+            action,
+            disabled_reason: None,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum BoardMenuAction {
     NewTaskIn(HostProjectKey),
@@ -30727,7 +30764,7 @@ impl NativeShell {
         cx: &Context<Self>,
     ) -> AnyElement {
         let menu = self.board_menu.expect("board menu is open");
-        let (title, entries): (&str, Vec<(String, String, BoardMenuAction)>) = match menu {
+        let (title, entries): (&str, Vec<BoardMenuEntry>) = match menu {
             BoardMenu::NewTask => ("New task in", self.board_new_task_menu_entries()),
             BoardMenu::Options => ("Board", self.board_options_menu_entries()),
         };
@@ -30745,14 +30782,36 @@ impl NativeShell {
                     .into_any_element(),
             );
         }
-        for (element_id, label, action) in entries {
-            rows.push(
-                div()
-                    .id(SharedString::from(element_id))
-                    .w_full()
-                    .px(px(tokens.density.spacing.md))
-                    .py(px(tokens.density.spacing.xs))
-                    .text_size(px(tokens.density.typography.body))
+        for entry in entries {
+            let BoardMenuEntry {
+                element_id,
+                label,
+                action,
+                disabled_reason,
+            } = entry;
+            let row = div()
+                .id(SharedString::from(element_id))
+                .w_full()
+                .flex()
+                .flex_col()
+                .px(px(tokens.density.spacing.md))
+                .py(px(tokens.density.spacing.xs))
+                .text_size(px(tokens.density.typography.body));
+            rows.push(match disabled_reason {
+                // A disabled row says why. The footer's `-unavailable` twins
+                // only dimmed their icon, which left the person to guess at a
+                // control that had stopped answering.
+                Some(reason) => row
+                    .text_color(tokens.text.disabled.to_gpui())
+                    .child(label)
+                    .child(
+                        div()
+                            .text_size(px(tokens.density.typography.caption))
+                            .text_color(tokens.text.muted.to_gpui())
+                            .child(reason),
+                    )
+                    .into_any_element(),
+                None => row
                     .text_color(tokens.text.primary.to_gpui())
                     .cursor_pointer()
                     .hover(|style| style.bg(tokens.surfaces.hover.to_gpui()))
@@ -30768,7 +30827,7 @@ impl NativeShell {
                     )
                     .child(label)
                     .into_any_element(),
-            );
+            });
         }
         deferred(
             anchored()
@@ -30835,54 +30894,104 @@ impl NativeShell {
     ///
     /// A method rather than a literal inside the painter, because the only
     /// other way to ask "is Settings still reachable" is to paint the overlay.
-    fn board_options_menu_entries(&self) -> Vec<(String, String, BoardMenuAction)> {
+    fn board_options_menu_entries(&self) -> Vec<BoardMenuEntry> {
+        Self::board_options_menu_rows(
+            self.show_archived_tasks,
+            self.layout.board_rail,
+            self.board_density_compact(),
+            self.selected_owner_is_remote(),
+            self.new_project_affordance(),
+        )
+    }
+
+    /// The affordance the "New project..." row honours: local canonical
+    /// authority first, then the provider connection. The same chain the
+    /// column footer's "New project" button read before that button became
+    /// this row.
+    fn new_project_affordance(&self) -> ProviderInboxAffordance {
+        let snapshot = self.local_slot().agent_connection.as_ref();
+        let checking = snapshot.is_some_and(|snapshot| {
+            snapshot
+                .agents
+                .iter()
+                .any(|row| row.presence == AgentPresence::Checking)
+        });
+        project_creation_affordance(
+            self.shows_add_project_plus(),
+            provider_inbox_affordance(snapshot_connected(snapshot), checking),
+        )
+    }
+
+    /// The rows themselves, as a pure function of what the menu depends on, so
+    /// which destinations are reachable can be asserted without painting an
+    /// overlay or attaching a remote host.
+    fn board_options_menu_rows(
+        show_archived: bool,
+        board_rail: bool,
+        density_compact: bool,
+        owner_is_remote: bool,
+        new_project: ProviderInboxAffordance,
+    ) -> Vec<BoardMenuEntry> {
+        // Git and Activity opened the two footer icons that had
+        // `-unavailable` twins on a remote owner, and the dispatcher answers
+        // for them with this same sentence. Files and Settings had no twin.
+        let remote_reason = owner_is_remote.then(Self::remote_local_authority_reason);
         vec![
-            (
+            BoardMenuEntry::live(
                 "board-menu-files".to_string(),
                 "Files".to_string(),
                 BoardMenuAction::OpenDock(DockTool::Files),
             ),
-            (
-                "board-menu-git".to_string(),
-                "Git".to_string(),
-                BoardMenuAction::OpenGitWindow,
-            ),
-            (
-                "board-menu-activity".to_string(),
-                "Activity".to_string(),
-                BoardMenuAction::OpenDock(DockTool::Services),
-            ),
-            (
+            BoardMenuEntry {
+                disabled_reason: remote_reason,
+                ..BoardMenuEntry::live(
+                    "board-menu-git".to_string(),
+                    "Git".to_string(),
+                    BoardMenuAction::OpenGitWindow,
+                )
+            },
+            BoardMenuEntry {
+                disabled_reason: remote_reason,
+                ..BoardMenuEntry::live(
+                    "board-menu-activity".to_string(),
+                    "Activity".to_string(),
+                    BoardMenuAction::OpenDock(DockTool::Services),
+                )
+            },
+            BoardMenuEntry::live(
                 "board-menu-settings".to_string(),
                 "Settings".to_string(),
                 BoardMenuAction::OpenSettings,
             ),
-            (
-                "board-menu-new-project".to_string(),
-                "New project…".to_string(),
-                BoardMenuAction::NewProject,
-            ),
-            (
+            BoardMenuEntry {
+                disabled_reason: new_project.disabled_reason(),
+                ..BoardMenuEntry::live(
+                    "board-menu-new-project".to_string(),
+                    "New project…".to_string(),
+                    BoardMenuAction::NewProject,
+                )
+            },
+            BoardMenuEntry::live(
                 "board-menu-archived".to_string(),
-                if self.show_archived_tasks {
+                if show_archived {
                     "Active tasks".to_string()
                 } else {
                     "Archived…".to_string()
                 },
                 BoardMenuAction::ToggleArchived,
             ),
-            (
+            BoardMenuEntry::live(
                 "board-menu-rail".to_string(),
-                if self.layout.board_rail {
+                if board_rail {
                     "Expand board".to_string()
                 } else {
                     "Collapse to rail".to_string()
                 },
                 BoardMenuAction::ToggleRail,
             ),
-            (
+            BoardMenuEntry::live(
                 "board-menu-density".to_string(),
-                if self.board_density_compact() {
+                if density_compact {
                     "Density: Compact".to_string()
                 } else {
                     "Density: Comfortable".to_string()
@@ -31296,7 +31405,7 @@ impl NativeShell {
     /// the project rail carried, now in one place instead of on every header.
     /// A remote project, and a local one with no provider signed in, gets the
     /// new-task dialog instead: provider start there stays deferred.
-    fn board_new_task_menu_entries(&self) -> Vec<(String, String, BoardMenuAction)> {
+    fn board_new_task_menu_entries(&self) -> Vec<BoardMenuEntry> {
         let local = self.local_host_id();
         let providers: Vec<ProviderKind> = self
             .local_slot()
@@ -31311,14 +31420,14 @@ impl NativeShell {
         for (index, (project_key, label)) in self.board_new_task_targets().into_iter().enumerate() {
             if project_key.host == local && !providers.is_empty() {
                 for (slot, provider) in providers.iter().copied().enumerate() {
-                    entries.push((
+                    entries.push(BoardMenuEntry::live(
                         format!("board-menu-new-{index}-{slot}"),
                         format!("{label} · {}", provider.display_name()),
                         BoardMenuAction::StartAgentIn(project_key.project_id, provider),
                     ));
                 }
             } else {
-                entries.push((
+                entries.push(BoardMenuEntry::live(
                     format!("board-menu-new-{index}"),
                     format!("{label} · New task…"),
                     BoardMenuAction::NewTaskIn(project_key),
@@ -42676,20 +42785,9 @@ impl NativeShell {
         );
         let row_height = Self::inbox_row_height(tokens);
         let inbox_is_empty = inbox_items.is_empty();
-        let agents_connected = snapshot_connected(self.local_slot_mut().agent_connection.as_ref());
-        let agents_checking =
-            self.local_slot_mut()
-                .agent_connection
-                .as_ref()
-                .is_some_and(|snapshot| {
-                    snapshot
-                        .agents
-                        .iter()
-                        .any(|row| row.presence == AgentPresence::Checking)
-                });
-        let provider_affordance = provider_inbox_affordance(agents_connected, agents_checking);
-        let project_creation_affordance =
-            project_creation_affordance(self.shows_add_project_plus(), provider_affordance);
+        // The provider-connection chain lives on `new_project_affordance`,
+        // which the board menu's "New project..." row reads. The footer strip
+        // that used to read it here is gone.
         let shell_entity = cx.entity().downgrade();
         let services_shell_entity = shell_entity.clone();
         // The board painter. Every gesture the project rail carried moves here
@@ -46566,6 +46664,7 @@ pub(crate) mod tests {
         BoardGroup,
         BoardMenu,
         BoardMenuAction,
+        BoardMenuEntry,
         BoardState,
         ClientId,
         CockpitDockTool,
@@ -46669,7 +46768,6 @@ pub(crate) mod tests {
         PROVIDER_SETUP_RESOLUTION_TIMEOUT,
         REMOTE_RECONNECT_BACKOFF_MAX,
         REMOTE_RECONNECT_BACKOFF_MIN,
-        T3_SIDEBAR_NAV_TOP_INSET,
         T3_WORKSPACE_TOPBAR_HEIGHT,
     };
     use super::{
@@ -47434,7 +47532,6 @@ pub(crate) mod tests {
         // asserted there against the mockup.
         assert_eq!(ARCHIVED_ROW_HEIGHT, 78.0);
         assert_eq!(T3_WORKSPACE_TOPBAR_HEIGHT, 32.0);
-        assert_eq!(T3_SIDEBAR_NAV_TOP_INSET, 12.0);
         assert_eq!(CONVERSATION_CONTENT_MAX_WIDTH, 768.0);
     }
 
@@ -49361,7 +49458,7 @@ pub(crate) mod tests {
                 let menu_rows = shell
                     .board_options_menu_entries()
                     .into_iter()
-                    .map(|(_, label, _)| label)
+                    .map(|entry| entry.label)
                     .collect::<Vec<_>>();
                 (ids, menu_rows)
             });
@@ -49423,6 +49520,85 @@ pub(crate) mod tests {
             new_project < archived,
             "the moved destinations sit above Archived: {menu_rows:?}"
         );
+    }
+
+    /// The destinations the column footer carried kept its disabled states
+    /// when they became menu rows. Git and Activity are local-authority work,
+    /// so a remote owner disables them exactly as the footer's
+    /// `-unavailable` twins did and with the sentence the dispatcher already
+    /// answers with; "New project..." follows `project_creation_affordance`,
+    /// which dimmed the footer's button while agents were being checked and
+    /// while none was connected. Dropping the states with the buttons would
+    /// have shipped rows that look live and do nothing.
+    #[test]
+    fn the_moved_destinations_keep_the_footers_disabled_states() {
+        fn reason(rows: &[BoardMenuEntry], element_id: &str) -> Option<&'static str> {
+            rows.iter()
+                .find(|row| row.element_id == element_id)
+                .unwrap_or_else(|| panic!("{element_id} must be a board menu row"))
+                .disabled_reason
+        }
+
+        let live = NativeShell::board_options_menu_rows(
+            false,
+            false,
+            false,
+            false,
+            ProviderInboxAffordance::ConnectedAdd,
+        );
+        for element_id in [
+            "board-menu-files",
+            "board-menu-git",
+            "board-menu-activity",
+            "board-menu-new-project",
+        ] {
+            assert_eq!(
+                reason(&live, element_id),
+                None,
+                "{element_id} is live for a connected local owner"
+            );
+        }
+
+        let remote = NativeShell::board_options_menu_rows(
+            false,
+            false,
+            false,
+            true,
+            ProviderInboxAffordance::ConnectedAdd,
+        );
+        for element_id in ["board-menu-git", "board-menu-activity"] {
+            assert_eq!(
+                reason(&remote, element_id),
+                Some(NativeShell::remote_local_authority_reason()),
+                "{element_id} replaced a footer icon with an -unavailable twin"
+            );
+        }
+        assert_eq!(
+            reason(&remote, "board-menu-files"),
+            None,
+            "Files had no -unavailable twin; a remote owner must not disable it"
+        );
+        assert_eq!(
+            reason(&remote, "board-menu-settings"),
+            None,
+            "Settings is not local-authority work"
+        );
+
+        for affordance in [
+            ProviderInboxAffordance::Checking,
+            ProviderInboxAffordance::DisconnectedAdd,
+        ] {
+            let rows = NativeShell::board_options_menu_rows(false, false, false, false, affordance);
+            assert!(
+                reason(&rows, "board-menu-new-project").is_some(),
+                "the footer's New project button dimmed for {affordance:?}"
+            );
+            assert_eq!(
+                reason(&rows, "board-menu-git"),
+                None,
+                "the provider connection has nothing to do with Git on a local owner"
+            );
+        }
     }
 
     /// The project-scope menu drops from under the top bar's scope label, so
@@ -54246,7 +54422,7 @@ pub(crate) mod tests {
                 let entries: Vec<_> = shell
                     .board_new_task_menu_entries()
                     .into_iter()
-                    .map(|(_, label, action)| (label, action))
+                    .map(|entry| (entry.label, entry.action))
                     .collect();
                 assert!(
                     entries.iter().any(|(label, action)| label
