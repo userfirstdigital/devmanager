@@ -72,7 +72,7 @@ Each row is a full-width box: a 1 px line above and below, no side margins, 3 px
 
 - **Stripe**: 3 px on the row's left edge, full row height, in the project's colour (section 5.3).
 - **State dot**: 7 px. Amber with a soft halo for Needs you (question or permission); red with a halo for blocked; mid-grey for Working; dark grey for Idle and Done.
-- **Title**: 12.5 px, primary text, single line, ellipsis. White (not grey) on Needs you rows.
+- **Title**: 12.5 px, primary text, single line, ellipsis. White (`text.emphasis`) on question and permission rows; blocked rows keep primary text, as the reference image measures (`05-provider-mark-1.png`).
 - **Age**: 10.5 px muted, right-aligned on the title line. Time in the current state: since the question was asked, since the turn started, since the last message. Formatted `12s`, `4m`, `2h`, `3d`.
 - **Second line**: 10.5 px muted. Left: the *why* on Needs you rows ("Asked a question", "Permission: Bash", "Provider rejected", "Failed: exit 1"), or the *doing now* on Working rows (the current tool or command, bounded to 40 chars: "cargo test", "Editing purge.rs", "Thinking", "Reading host-stderr.log", "2 subagents"), or "Last reply 18m" on Idle rows. Right: progress segments and count when a plan exists (4.3), then the provider mark (4.4).
 
