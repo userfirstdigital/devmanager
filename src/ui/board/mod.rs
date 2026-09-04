@@ -2,8 +2,10 @@
 //! `model`, `age`, `activity`, `project_colour`, `layout`; the only gpui code
 //! is `render`.
 
+pub mod age;
 pub mod model;
 
+pub use age::{format_age, StateClock};
 pub use model::{
     board_state_of, build_board_model, group_of, BoardGroup, BoardGroupModel, BoardModel,
     BoardProgress, BoardRow, BoardState,
