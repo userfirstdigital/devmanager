@@ -2512,8 +2512,24 @@ mod tests {
         ]
     }
 
-    /// Every shipped palette, in both appearances, as the app ACTUALLY projects
-    /// it -- which is not what the token module says.
+    /// The three `(density, scale)` pairs every projected sweep runs over, each
+    /// with a label, so a measurement can say WHICH pair produced it.
+    const SWEEP_PAIRS: [(&str, Density, Scale); 3] = [
+        (
+            "Comfortable/Scale100",
+            Density::Comfortable,
+            Scale::Scale100,
+        ),
+        ("Compact/Scale200", Density::Compact, Scale::Scale200),
+        (
+            "Comfortable/Scale125",
+            Density::Comfortable,
+            Scale::Scale125,
+        ),
+    ];
+
+    /// Every shipped palette, in both appearances, at every sweep pair, as the
+    /// app ACTUALLY projects it -- which is not what the token module says.
     ///
     /// `ThemePalette::tokens` overwrites `scrollbar.on_dark.thumb_idle` and
     /// `thumb_hover` from the `TerminalScrollbar` / `TerminalScrollbarHover`
@@ -2523,7 +2539,10 @@ mod tests {
     /// selected is looking at. This is the same enumeration the tokens lane's
     /// projected gates use (`tests/ui_tokens.rs`): the built-in library, each
     /// definition's palette per appearance, projected.
-    fn shipped_palette_projections() -> Vec<(String, ThemeTokens)> {
+    ///
+    /// Each entry carries the pair's label, so a caller can key a measurement by
+    /// the pair that produced it rather than collapsing three runs into one.
+    fn shipped_palette_projections() -> Vec<(String, &'static str, ThemeTokens)> {
         use crate::ui::theme_system::{ThemeAppearance, ThemeLibrary};
 
         let library = ThemeLibrary::built_in();
@@ -2533,13 +2552,10 @@ mod tests {
                 let Some(palette) = definition.palette(appearance) else {
                     continue;
                 };
-                for (density, scale) in [
-                    (Density::Comfortable, Scale::Scale100),
-                    (Density::Compact, Scale::Scale200),
-                    (Density::Comfortable, Scale::Scale125),
-                ] {
+                for (pair, density, scale) in SWEEP_PAIRS {
                     projections.push((
                         format!("{}/{appearance:?}", definition.id),
+                        pair,
                         palette.tokens(density, scale),
                     ));
                 }
@@ -2694,14 +2710,28 @@ mod tests {
             "the pinned list repeats a row, so one of its ratios is never checked"
         );
 
+        // Keyed by (palette, ground, PAIR): the pair is in the key because
+        // without it the three density/scale runs overwrite one another, and
+        // 210 "measurements" would be 70 subjects counted three times. Today
+        // the three agree -- `SurfaceTokens` and `ScrollbarTokens` are module
+        // constants and the projection only overwrites two thumb colours -- and
+        // that agreement is asserted below rather than assumed, so a colour
+        // that ever does vary with scale fails loudly instead of silently
+        // deciding the pin by whichever pair ran last.
+        let mut samples: std::collections::BTreeMap<(String, &str, &str), (f64, f64)> =
+            std::collections::BTreeMap::new();
         let mut measured = std::collections::BTreeMap::new();
-        let mut grounds_measured = 0usize;
-        for (label, tokens) in shipped_palette_projections() {
+        for (label, pair, tokens) in shipped_palette_projections() {
             for (name, background) in scrollbar_backgrounds(tokens) {
-                grounds_measured += 1;
                 let colors = tokens.scrollbar.colors_on(background);
                 let idle = contrast_ratio(colors.thumb_idle, background);
                 let hover = contrast_ratio(colors.thumb_hover, background);
+                assert!(
+                    samples
+                        .insert((label.clone(), name, pair), (idle, hover))
+                        .is_none(),
+                    "{label} {name} {pair} measured twice -- the key does not identify a measurement"
+                );
                 // These two hold for every shipped palette today and are NOT
                 // pinned: a thumb that reads louder idle than hovered, or a
                 // track the colour of its own thumb, is a broken bar rather
@@ -2719,47 +2749,76 @@ mod tests {
                 if idle < 3.0 {
                     assert!(
                         !is_default,
-                        "the DEFAULT palette's idle scrollbar thumb is {idle:.3}:1 on {name}                          ({label}), under the 3:1 floor -- this one may not be pinned"
+                        "the DEFAULT palette idles at {idle:.3}:1 on {name} ({label}), under the 3:1 floor -- it may not be pinned"
                     );
-                    measured.insert((label.clone(), name, "idle"), idle);
+                    measured.insert((label.clone(), name, "idle", pair), idle);
                 }
                 if hover < 6.0 {
                     assert!(
                         !is_default,
-                        "the DEFAULT palette's hover scrollbar thumb is {hover:.3}:1 on {name}                          ({label}), under the 6:1 floor -- this one may not be pinned"
+                        "the DEFAULT palette hovers at {hover:.3}:1 on {name} ({label}), under the 6:1 floor -- it may not be pinned"
                     );
-                    measured.insert((label.clone(), name, "hover"), hover);
+                    measured.insert((label.clone(), name, "hover", pair), hover);
                 }
             }
         }
-        // The denominator, asserted rather than assumed: seven built-in themes
+        // The denominator, asserted rather than assumed, and asserted as
+        // DISTINCT keys rather than as a running count: seven built-in themes
         // in two appearances is fourteen palettes, five grounds each, over
-        // three density/scale pairs -- 14 * 5 * 3.
+        // three density/scale pairs -- 14 * 5 * 3. A count could reach 210 by
+        // measuring one subject 210 times; a map's length cannot.
         assert_eq!(
-            grounds_measured, 210,
-            "the sweep measured {grounds_measured} palette/ground pairs, not the 210 it should"
+            samples.len(),
+            210,
+            "the sweep holds {} distinct (palette, ground, pair) measurements, not the 210 it should",
+            samples.len()
         );
+
+        // The three pairs agree TODAY, and that is a fact about the token
+        // module, not a licence to keep only one of them. Asserted per subject
+        // so a scale-dependent colour names itself.
+        for ((label, ground, pair), value) in &samples {
+            let (first_pair, _, _) = SWEEP_PAIRS[0];
+            let reference = samples
+                .get(&(label.clone(), *ground, first_pair))
+                .expect("every subject is measured at the first pair");
+            assert_eq!(
+                value, reference,
+                "{label} {ground} differs between {first_pair} and {pair}: {reference:?} vs \
+                 {value:?} -- the pinned ratios below no longer describe one measurement"
+            );
+        }
 
         let measured_rows = measured
             .keys()
-            .map(|(label, ground, state)| (label.as_str(), *ground, *state))
+            .map(|(label, ground, state, _)| (label.as_str(), *ground, *state))
             .collect::<std::collections::BTreeSet<_>>();
         assert_eq!(
             measured_rows,
             expected,
-            "the shipped-palette scrollbar drift changed -- a repair must shrink the pinned list,              a regression must not be absorbed by it"
+            "the shipped-palette scrollbar drift changed -- a repair must shrink the pinned list, and a regression must not be absorbed by it"
         );
 
         for (label, ground, state, pinned) in SHIPPED_PALETTE_SCROLLBAR_DRIFT {
+            // The WORST of the three pairs, not whichever one iterated last.
+            // They agree today -- asserted above -- so this is the same number;
+            // it stays a minimum so that if they ever diverge the pin is held
+            // to the worse reading rather than the luckier one.
             let live = measured
                 .iter()
-                .find(|((measured_label, measured_ground, measured_state), _)| {
-                    measured_label == label && measured_ground == ground && measured_state == state
-                })
+                .filter(
+                    |((measured_label, measured_ground, measured_state, _), _)| {
+                        measured_label == label
+                            && measured_ground == ground
+                            && measured_state == state
+                    },
+                )
                 .map(|(_, ratio)| *ratio)
-                .unwrap_or_else(|| {
-                    panic!("{label} {ground} {state} missing from the measured set")
-                });
+                .fold(f64::INFINITY, f64::min);
+            assert!(
+                live.is_finite(),
+                "{label} {ground} {state} missing from the measured set"
+            );
             assert!(
                 live >= *pinned - SCROLLBAR_PINNED_RATIO_TOLERANCE,
                 "{label} {ground} {state} fell from {pinned:.3}:1 to {live:.3}:1 -- a pinned \

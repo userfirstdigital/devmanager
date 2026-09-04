@@ -21541,14 +21541,36 @@ mod tests {
         );
         assert!((ratio - 0.4).abs() < 0.001);
 
-        // A track click has no hold, so the thumb centres on the pointer: the
-        // same pointer, minus half a 20 px thumb, is 24 px into a 60 px travel.
+        // A track click has no hold, so the thumb centres on the pointer. On a
+        // 20 px thumb that is indistinguishable from `Held(10.0)` -- half the
+        // thumb IS the held offset -- so the two are compared on a 30 px thumb,
+        // where centring uses 15 and the hold uses 10 and they must disagree.
+        let taller = TerminalScrollbarGeometry {
+            thumb_height: 30.0,
+            ..geometry
+        };
+        let travel = taller.track_height - taller.thumb_height;
+        assert_eq!(travel, 50.0);
+
         let centred = scrollbar_ratio_for_position(
-            point(px(5.0), px(44.0)),
-            geometry,
+            point(px(5.0), px(45.0)),
+            taller,
             crate::ui::scrollbar::ScrollbarGrab::Centre,
         );
+        // (45 - 15 - 10) / 50
         assert!((centred - 0.4).abs() < 0.001, "centred was {centred}");
+
+        let held = scrollbar_ratio_for_position(
+            point(px(5.0), px(45.0)),
+            taller,
+            crate::ui::scrollbar::ScrollbarGrab::Held(10.0),
+        );
+        // (45 - 10 - 10) / 50
+        assert!((held - 0.5).abs() < 0.001, "held was {held}");
+        assert_ne!(
+            centred, held,
+            "Centre and Held must be different rules, not one arithmetic dressed twice"
+        );
     }
 
     /// I1 at the terminal: a thumb grabbed 3 px below its top and dragged 10 px
