@@ -119,7 +119,7 @@ Everything else is a grey ramp:
 | `surface.stream` | `#111114` | conversation stream background |
 | `surface.terminal` | `#0b0b0d` | terminal background |
 | `border.subtle` | `#26262b` | row lines, panel border |
-| `border.strong` | `#34343c` | selected row, focused panel |
+| `border.strong` | `#34343c` | open row rules (every task with a panel, active or not), the ordinal chip's outline, and the board rail dots |
 | `text.primary` | `#e6e6ea` | titles, stream text |
 | `text.secondary` | `#9a9aa3` | status line |
 | `text.muted` | `#86868f` | second line, ages, marks (spec drafted `#6b6b74`; the repo's 4.5:1 floor on raised forced `#86868f`, landed 2026-09-03) |
@@ -130,7 +130,7 @@ Everything else is a grey ramp:
 | `status.blocked` | `#e5484d` | broken |
 | `status.success` | `#7fb07f` | inline only: test passed, subagent live dot |
 | `action.primary` | `#e6e6ea`, text `#101013` | the one loud control: New task, New project, primary confirm. Loud by inversion, never by hue. Hover `#ffffff`, pressed `#d0d0d6`, disabled `#606876` with `#f8fafc` text |
-| `border.focus` | `#86868f` | focus ring on the workspace pane and every other control — a grey, not the warning yellow it used to borrow |
+| `border.focus` | `#86868f` | focus ring on controls generally — a grey, not the warning yellow it used to borrow. NOT the workspace pane frame any more: the focused pane takes 2 px `text.primary` (4.2), because at this value the frame was a hairline and the finding was that nobody could see which panel had focus |
 
 These map onto the existing `ThemeTokens` groups (`surfaces`, `borders`, `text`, `status`); the redesign changes values and adds `surface.stream`, `surface.terminal`, `border.strong`. Destructive actions are not red buttons; Delete is a menu item that opens a confirmation, and the confirmation's primary button is the only red button in the app.
 
