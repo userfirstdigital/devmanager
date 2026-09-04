@@ -87,17 +87,20 @@ pub const SEGMENT_GAP: f32 = 2.0;
 pub const SEGMENT_RADIUS: f32 = 1.5;
 pub const META_GAP: f32 = 6.0;
 
-/// The one-line top bar across the window (`.dm-top` in
-/// `01-composition-A.html`). The mockup's own box is 34 px; the spec pins the
-/// shipped bar at 28 so a window that is mostly panels spends less of itself on
-/// chrome, and every other number here is the mockup's.
-pub const TOP_BAR_HEIGHT: f32 = 28.0;
+/// The one-line top bar across the window. `.dm-top { height: 34px }` in
+/// `01-composition-A.html`, which is the only source for this bar: the spec's
+/// section 3 chooses composition A but gives the bar no geometry of its own,
+/// so every number here is the mockup's and none of them is the spec's.
+pub const TOP_BAR_HEIGHT: f32 = 34.0;
 /// `.dm-top { gap: 14px; padding: 0 12px }`.
 pub const TOP_BAR_GAP: f32 = 14.0;
 pub const TOP_BAR_PADDING_X: f32 = 12.0;
-/// `.dm-top .brand` is semibold; the spec sizes it at 12 rather than the bar's
-/// own 11.5 so the product name reads as the name and not as a fourth label.
-pub const TOP_BAR_BRAND_FONT_SIZE: f32 = 12.0;
+/// `.dm-top .brand { color: #e6e6ea; font-weight: 600 }` sets a weight and a
+/// colour and no size, so the brand is the bar's own 11.5 px in semibold. It
+/// reads as the product name by weight, not by being a size nothing else is.
+/// Kept equal to [`TOP_BAR_SCOPE_FONT_SIZE`] by the test beneath, so the two
+/// literals cannot drift apart.
+pub const TOP_BAR_BRAND_FONT_SIZE: f32 = 11.5;
 /// `.dm-top { font-size: 11.5px }` -- the scope label inherits the bar's size.
 pub const TOP_BAR_SCOPE_FONT_SIZE: f32 = 11.5;
 /// `.dm-top .kbd { border: 1px solid; border-radius: 4px; padding: 1px 6px;
@@ -298,6 +301,21 @@ mod tests {
     fn pinned_line_heights_match_the_mockup_ratio() {
         assert!((TITLE_LINE_HEIGHT - TITLE_FONT_SIZE * LINE_HEIGHT_RATIO).abs() <= 0.55);
         assert!((META_LINE_HEIGHT - META_FONT_SIZE * LINE_HEIGHT_RATIO).abs() <= 0.55);
+    }
+
+    /// The bar is the mockup's `.dm-top`, and that CSS is its only source:
+    /// `height: 34px`, `font-size: 11.5px`, and a `.brand` rule that changes the
+    /// weight and the colour but never the size. A bar pinned shorter, or a
+    /// brand sized on its own, is a deviation from the approved composition
+    /// rather than a reading of it.
+    #[test]
+    fn the_top_bar_is_the_composition_bar() {
+        assert_eq!(TOP_BAR_HEIGHT, 34.0);
+        assert_eq!(TOP_BAR_SCOPE_FONT_SIZE, 11.5);
+        assert_eq!(
+            TOP_BAR_BRAND_FONT_SIZE, TOP_BAR_SCOPE_FONT_SIZE,
+            "the brand inherits the bar's font-size; only its weight differs"
+        );
     }
 
     /// The meta line starts under the title, not under the dot.

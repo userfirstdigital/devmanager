@@ -31886,9 +31886,11 @@ impl NativeShell {
         self.settle_task_key(key);
     }
 
-    /// Done closes the panel (spec 2026-09-03 section 10): the task leaves the
-    /// live board on the same beat, so leaving its panel on screen would keep
-    /// a finished task occupying a share of the window nobody asked for.
+    /// Done closes the panel and collapses the split (plan 2 line 27; the
+    /// spec's section 10 is the keyboard model and says nothing about this).
+    /// The task leaves the live board on the same beat, so leaving its panel on
+    /// screen would keep a finished task occupying a share of the window nobody
+    /// asked for.
     fn settle_task_key(&mut self, key: HostTaskKey) {
         let dispatched = self
             .dispatch_action_recorded_for_owner(
