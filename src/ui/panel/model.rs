@@ -82,9 +82,12 @@ pub struct PanelChrome {
     pub minimised: bool,
 }
 
-/// Which parts of the inline status survive at a given panel width. The count
-/// and the strip go first, then the text: the age is the last thing to be
-/// dropped because "12s" answers "is this stuck?" in three characters.
+/// Which parts of the inline status survive at a given panel width. The strip
+/// goes first, then the text.
+///
+/// The icon and the age are not here because they are never dropped: "12s"
+/// answers "is this stuck?" in three characters, and the painter reserves a
+/// floor for them (and for a blocked panel's Retry) so no width can clip them.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct StatusLayout {
     pub show_segments: bool,

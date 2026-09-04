@@ -55,10 +55,26 @@ const TITLE_FONT_SIZE: f32 = 13.0;
 const INLINE_STATUS_FONT_SIZE: f32 = 11.5;
 /// `.st .s { gap: 5px }`.
 const STATUS_GAP: f32 = 5.0;
-/// The title never shrinks below this. A title row whose title has been
-/// squeezed to nothing is not a narrower panel, it is an anonymous one, and the
-/// board's stripe and mark cannot say which task it is.
-const TITLE_MIN_WIDTH: f32 = 72.0;
+/// The title never shrinks below this. A title squeezed to nothing is not a
+/// narrower panel, it is an anonymous one.
+///
+/// It is 12 px, not the 72 px this constant started at, and the number is
+/// forced rather than chosen. The narrowest panel the chrome is built for is
+/// 250 px, and a blocked panel at that width owes:
+///
+/// ```text
+///  165  CONTROLS_RESERVE
+///   73  status_floor(blocked)   (icon + Retry + age + two gaps)
+///  ---
+///  238  leaving 12 px
+/// ```
+///
+/// So at 250 px the row physically cannot give the title more, and the honest
+/// floor is 12. From 300 px up the title has real room by arithmetic
+/// (300 - 165 - 73 = 62), so the floor only binds at the extreme. If a wider
+/// floor is wanted, the number that has to move is one of the three unmeasured
+/// glyph estimates inside [`CONTROLS_RESERVE`], not this one.
+const TITLE_MIN_WIDTH: f32 = 12.0;
 /// `.act { padding: 2px 9px; border-radius: 6px; font-size: 11.5px }`.
 const ACTION_FONT_SIZE: f32 = 11.5;
 const ACTION_PADDING_X: f32 = 9.0;
@@ -132,23 +148,42 @@ const CONTROLS_RESERVE: f32 = ROW_PADDING_LEFT
     + MENU_GLYPH_WIDTH
     + 5.0 * TITLE_ROW_GAP;
 
-/// The ceiling on the status text: everything the fixed controls do not claim.
-/// The title's [`TITLE_MIN_WIDTH`] floor and the status's own `flex_shrink` do
-/// the rest -- this only stops a very long doing-now line from asking for more
-/// than the row physically has. Same shape as the board's `row_content_width`:
-/// a rule about the content, not about the panel.
+/// The ceiling on the status *text*: everything the fixed controls do not
+/// claim. `min_w(0)` plus `flex_shrink` on the status container is what keeps
+/// the controls on screen; this only stops a very long doing-now line or a
+/// 60-character blocked cause from asking for more than the row physically has.
+/// Same shape as the board's `row_content_width`: a rule about the content, not
+/// about the panel.
 fn status_text_max_width(width_px: f32) -> f32 {
     (width_px - CONTROLS_RESERVE).max(0.0)
 }
 
-/// The width the status is actually left with once the controls and the title's
-/// floor have been paid, and the hard cap on the status container.
+/// One status glyph at [`INLINE_STATUS_FONT_SIZE`]. The widest of the five is
+/// the working triangle.
+const STATUS_ICON_WIDTH: f32 = 10.0;
+/// `format_age` is at most four characters ("59s", "23h", and days for a task
+/// nobody has touched in a year), so this is its box at the status font size.
+const STATUS_AGE_MAX_WIDTH: f32 = 25.0;
+/// The five characters of "Retry".
+const STATUS_RETRY_WIDTH: f32 = 28.0;
+
+/// The width the status may never be squeezed below, because these parts are
+/// present at every width and are `flex_none`: the state icon, the age, and on
+/// a blocked panel the Retry link.
 ///
-/// Capping here rather than relying on `flex_shrink` alone makes the guarantee
-/// structural: the status cannot ask for the title's floor or the controls'
-/// reserve even if the layout pass were to resolve differently than expected.
-fn status_content_width(width_px: f32) -> f32 {
-    (width_px - CONTROLS_RESERVE - TITLE_MIN_WIDTH).max(0.0)
+/// This exists because the previous cut capped the status *container* at a
+/// derived maximum. A `max_w` on a container of `flex_none` children does not
+/// make them yield -- it clips them mid-element -- so a blocked panel below
+/// roughly 320 px silently lost the Retry affordance that the comment three
+/// lines above the Retry element promises it keeps at every width. The floor
+/// is the opposite instruction and the one that actually holds.
+fn status_floor(blocked: bool) -> f32 {
+    let base = STATUS_ICON_WIDTH + STATUS_GAP + STATUS_AGE_MAX_WIDTH;
+    if blocked {
+        base + STATUS_RETRY_WIDTH + STATUS_GAP
+    } else {
+        base
+    }
 }
 
 /// What the shell does when the chrome is clicked or typed into. The painter
@@ -242,11 +277,14 @@ fn inline_status_element(
     handlers: &PanelHandlers,
 ) -> AnyElement {
     let tone = status_colour(chrome.status.tone, tokens);
+    let blocked = matches!(chrome.needs_you, Some(NeedsYou::Blocked { .. }));
     let mut row = div()
         .flex()
         .flex_shrink()
-        .min_w(px(0.0))
-        .max_w(px(status_content_width(width_px)))
+        // A floor, and deliberately no ceiling: the container may shrink to
+        // this and no further, so the icon, the age and Retry survive every
+        // width while the text child above is the only part that yields.
+        .min_w(px(status_floor(blocked)))
         .overflow_hidden()
         .items_center()
         .gap(px(STATUS_GAP))
@@ -268,8 +306,10 @@ fn inline_status_element(
     // A blocked panel keeps its Retry at every width: the cause can be dropped
     // and still leave the panel usable, but a blocked panel with no way to
     // retry is a dead panel, and the narrow widths are exactly where a person
-    // would otherwise have to zoom just to find the affordance.
-    if matches!(chrome.needs_you, Some(NeedsYou::Blocked { .. })) {
+    // would otherwise have to zoom just to find the affordance. `status_floor`
+    // is what makes that true rather than merely intended -- Retry is
+    // `flex_none`, so without the floor it is clipped, not moved.
+    if blocked {
         let retry_key = chrome.key.clone();
         let on_retry = handlers.on_retry.clone();
         row = row.child(
@@ -876,29 +916,39 @@ mod tests {
     /// 170 px cap, a long doing-now string on a 260-370 px panel pushed Done
     /// and the ⋯ menu off the right edge, silently and without panicking.
     #[test]
-    fn the_status_yields_before_the_controls_and_before_the_title() {
+    fn the_status_text_yields_before_the_controls_the_title_and_the_status_floor() {
         assert_eq!(
             CONTROLS_RESERVE, 165.0,
             "the documented budget and the summed constants disagree"
         );
+        assert_eq!(status_floor(false), 40.0);
+        assert_eq!(status_floor(true), 73.0);
+        assert!(
+            status_floor(true) > status_floor(false),
+            "a blocked panel owes a Retry the others do not"
+        );
+
         for width in [250.0_f32, 300.0, 370.0, 470.0] {
+            // The binding case: a blocked panel, which owes the widest floor.
+            // Rearranged, this is "the width left after the controls and the
+            // title floor is at least what the status can never give up".
             assert!(
-                CONTROLS_RESERVE + TITLE_MIN_WIDTH <= width,
-                "at {width} px the controls and the title floor do not fit,                  so something other than the status has to yield"
+                CONTROLS_RESERVE + TITLE_MIN_WIDTH + status_floor(true) <= width,
+                "at {width} px a blocked panel cannot pay for its controls, its title floor and its status floor at once"
             );
-            assert!(status_content_width(width) > 0.0);
-            // The cap the status text may ask for is exactly the row less the
-            // controls, and the remainder after the title's floor is what the
-            // status is really left with.
+            assert!(
+                width - CONTROLS_RESERVE - TITLE_MIN_WIDTH >= status_floor(true),
+                "at {width} px the status is left less than the parts it may never drop"
+            );
+            // The text cap is exactly the row less the controls, and it is
+            // never below the floor -- a cap under the floor would mean the
+            // text could be asked to render in negative space.
             assert_eq!(status_text_max_width(width), width - CONTROLS_RESERVE);
-            assert_eq!(
-                status_text_max_width(width) - TITLE_MIN_WIDTH,
-                status_content_width(width)
-            );
+            assert!(status_text_max_width(width) >= status_floor(true));
         }
-        // Narrower than the controls themselves, both floor at zero rather than
-        // handing a negative width to the layout.
+
+        // Narrower than the controls themselves, the cap floors at zero rather
+        // than handing a negative width to the layout.
         assert_eq!(status_text_max_width(100.0), 0.0);
-        assert_eq!(status_content_width(100.0), 0.0);
     }
 }
