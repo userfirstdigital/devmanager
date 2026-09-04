@@ -22,6 +22,13 @@ use crate::ui::conversation::rows::{
     activity_toggle_label, ActivityEntry, ActivityKind, ActivityState, ConversationRow,
     ConversationRowKey,
 };
+use crate::ui::panel::permission::{
+    card_background, card_border, card_label, CARD_BORDER_WIDTH, CARD_CHROME_HEIGHT,
+    CARD_FONT_SIZE, CARD_FOOTER_HEIGHT, CARD_LINE_HEIGHT, CARD_PADDING_X, CARD_PADDING_Y,
+    CARD_RADIUS, CHOICE_BORDER_ALPHA, CHOICE_GAP, CHOICE_MARGIN_BOTTOM, CHOICE_NOTE_FONT_SIZE,
+    CHOICE_NUMBER_WIDTH, CHOICE_PADDING_X, CHOICE_PADDING_Y, CHOICE_RADIUS, CHOICE_ROW_HEIGHT,
+    FOOTER_FONT_SIZE, FOOTER_GAP, FOOTER_MARGIN_TOP, PROMPT_MARGIN_BOTTOM,
+};
 use crate::ui::renderers::{MarkdownDocument, MessageRole};
 use crate::ui::tokens::{mix_color, ThemeMode, ThemeTokens};
 
@@ -220,7 +227,13 @@ pub fn conversation_row_element(
             choices,
             settled_choice,
             ..
-        } => question_element(prompt, choices, *settled_choice, tokens),
+        } => question_element(
+            prompt,
+            choices,
+            *settled_choice,
+            recommended_choice(choices),
+            tokens,
+        ),
         ConversationRow::TurnFold {
             label, expanded, ..
         } => turn_fold_element(label, *expanded, tokens),
@@ -265,9 +278,17 @@ pub fn conversation_row_height(row: &ConversationRow, tokens: ThemeTokens) -> u3
             activity_row_height(entries, caption_line_height)
         }
         ConversationRow::ActivityToggle { .. } => ICON_SLOT + 4.0,
+        // The question card: the amber label, the prompt, one row per choice,
+        // and the footer. Every number is the mockup's, read from the shared
+        // card constants so the estimate and the painter cannot drift.
         ConversationRow::Question {
             prompt, choices, ..
-        } => 28.0 + text_lines(prompt) * line_height + if choices.is_empty() { 0.0 } else { 32.0 },
+        } => {
+            CARD_CHROME_HEIGHT
+                + text_lines(prompt) * line_height
+                + choices.len() as f32 * CHOICE_ROW_HEIGHT
+                + CARD_FOOTER_HEIGHT
+        }
         ConversationRow::TurnFold { .. } => 24.0,
         ConversationRow::Working { .. } => 20.0,
     };
@@ -899,57 +920,170 @@ fn toggle_element(label: String, tokens: ThemeTokens) -> AnyElement {
 }
 
 /// A composer-style pill, reused for the question row's choices.
-fn choice_pill(label: &str, primary: bool, tokens: ThemeTokens) -> AnyElement {
-    let (background, foreground) = if primary {
-        (
-            tokens.actions.primary.default.background,
-            tokens.actions.primary.default.foreground,
-        )
-    } else {
-        (tokens.surfaces.sunken, tokens.text.secondary)
-    };
-    div()
-        .flex()
-        .items_center()
-        .gap(px(4.0))
-        .px(px(10.0))
-        .py(px(5.0))
-        .rounded(px(tokens.density.radii.pill))
-        .bg(background.to_gpui())
-        .text_size(px(tokens.density.typography.caption))
-        .text_color(foreground.to_gpui())
-        .child(label.to_string())
-        .into_any_element()
+/// The label above a question card.
+const QUESTION_LABEL: &str = "QUESTION";
+/// The footer's left half: the card takes numbers, but the compose box below
+/// it still takes prose, and the card is where that has to be said.
+const QUESTION_FOOTER: &str = "Type to answer in your own words";
+/// The word a provider uses to mark its preferred choice.
+const RECOMMENDED_MARKER: &str = "recommended";
+/// The note the marker becomes, on the right of the recommended row.
+const RECOMMENDED_NOTE: &str = "recommended";
+
+/// Which choice the provider marked as recommended, if any: the first whose
+/// text says so, case-insensitively. One rule in one place, so the row that
+/// gets the full-strength amber rule and the row whose marker is lifted into
+/// the trailing note can never be two different rows.
+pub fn recommended_choice(choices: &[String]) -> Option<usize> {
+    choices
+        .iter()
+        .position(|choice| choice.to_ascii_lowercase().contains(RECOMMENDED_MARKER))
 }
 
-/// Question callout. One of the few surfaces allowed to be prominent.
+/// The choice text with its recommendation marker lifted out, so the label
+/// reads as the answer alone and the marker becomes the muted note on the
+/// right -- which is how the mockup shows it. A parenthesised marker takes its
+/// brackets with it.
+fn choice_label(choice: &str) -> String {
+    let lowered = choice.to_ascii_lowercase();
+    let Some(start) = lowered.find(RECOMMENDED_MARKER) else {
+        return choice.trim().to_string();
+    };
+    // `to_ascii_lowercase` is length-preserving, so these byte offsets are the
+    // original string's own char boundaries.
+    let mut begin = start;
+    let mut end = start + RECOMMENDED_MARKER.len();
+    if choice[..begin].ends_with('(') {
+        begin -= 1;
+    }
+    if choice[end..].starts_with(')') {
+        end += 1;
+    }
+    let head = choice[..begin].trim();
+    let tail = choice[end..].trim();
+    if head.is_empty() {
+        return tail.to_string();
+    }
+    if tail.is_empty() {
+        return head.to_string();
+    }
+    format!("{head} {tail}")
+}
+
+/// The question card. One of the few surfaces allowed to be prominent, and the
+/// only one in the stream that is allowed to be amber.
+///
+/// Geometry is the approved mockup's `.qc` rules, held in
+/// [`crate::ui::panel::permission`] so the card here and the permission dock
+/// under the panel are the same card.
 fn question_element(
     prompt: &str,
     choices: &[String],
     settled_choice: Option<usize>,
+    recommended: Option<usize>,
     tokens: ThemeTokens,
 ) -> AnyElement {
-    let mut pills = div().flex().items_center().gap(px(8.0));
-    for (index, choice) in choices.iter().enumerate() {
-        let primary = settled_choice == Some(index);
-        pills = pills.child(choice_pill(choice, primary, tokens));
-    }
-    div()
+    let mut card = div()
         .w_full()
-        .px(px(16.0))
-        .py(px(14.0))
-        .rounded(px(tokens.density.radii.lg))
-        .bg(tokens.surfaces.raised.to_gpui())
         .flex()
         .flex_col()
-        .gap(px(tokens.density.spacing.sm))
+        .px(px(CARD_PADDING_X))
+        .py(px(CARD_PADDING_Y))
+        .rounded(px(CARD_RADIUS))
+        .border(px(CARD_BORDER_WIDTH))
+        .border_color(card_border(tokens))
+        .bg(card_background(tokens))
+        .text_size(px(CARD_FONT_SIZE))
+        .line_height(px(CARD_LINE_HEIGHT))
+        .text_color(tokens.text.primary.to_gpui())
+        .child(card_label(QUESTION_LABEL, tokens))
         .child(
             div()
-                .text_color(tokens.text.primary.to_gpui())
+                .w_full()
+                .mb(px(PROMPT_MARGIN_BOTTOM))
                 .child(prompt.to_string()),
-        )
-        .child(pills)
-        .into_any_element()
+        );
+
+    for (index, choice) in choices.iter().enumerate() {
+        let settled = settled_choice == Some(index);
+        let is_recommended = recommended == Some(index);
+        // The recommended row is the only one whose rule is the amber at full
+        // strength; the rest keep the same hue at a fraction, so exactly one
+        // row reads as the default without the others reading as disabled.
+        let border = if is_recommended {
+            tokens.status.attention
+        } else {
+            tokens.status.attention.with_alpha(CHOICE_BORDER_ALPHA)
+        };
+        // Once a question is settled it is history: the answer stays filled and
+        // legible, and the choices nobody took go quiet, so the card reads as
+        // answered rather than as still asking.
+        let (foreground, number_color) = match (settled, settled_choice.is_some()) {
+            (true, _) => (
+                tokens.status.attention_foreground,
+                tokens.status.attention_foreground,
+            ),
+            (false, true) => (tokens.text.disabled, tokens.text.disabled),
+            (false, false) => (tokens.text.primary, tokens.text.muted),
+        };
+        let mut row = div()
+            .w_full()
+            .flex()
+            .items_center()
+            .gap(px(CHOICE_GAP))
+            .mb(px(CHOICE_MARGIN_BOTTOM))
+            .px(px(CHOICE_PADDING_X))
+            .py(px(CHOICE_PADDING_Y))
+            .rounded(px(CHOICE_RADIUS))
+            .border(px(CARD_BORDER_WIDTH))
+            .border_color(border.to_gpui())
+            .text_color(foreground.to_gpui())
+            .child(
+                div()
+                    .flex_none()
+                    .w(px(CHOICE_NUMBER_WIDTH))
+                    .text_color(number_color.to_gpui())
+                    .child(format!("{}", index + 1)),
+            )
+            .child(div().child(choice_label(choice)));
+        if settled {
+            row = row.bg(tokens.status.attention_surface.to_gpui());
+        }
+        if is_recommended {
+            row = row.child(div().flex_1()).child(
+                div()
+                    .flex_none()
+                    .text_size(px(CHOICE_NOTE_FONT_SIZE))
+                    .text_color(if settled {
+                        tokens.status.attention_foreground.to_gpui()
+                    } else {
+                        tokens.text.muted.to_gpui()
+                    })
+                    .child(RECOMMENDED_NOTE),
+            );
+        }
+        card = card.child(row);
+    }
+
+    let key_hint = if choices.is_empty() {
+        "⏎ send".to_string()
+    } else {
+        format!("1-{} pick · ⏎ send", choices.len())
+    };
+    card.child(
+        div()
+            .w_full()
+            .flex()
+            .items_center()
+            .gap(px(FOOTER_GAP))
+            .mt(px(FOOTER_MARGIN_TOP))
+            .text_size(px(FOOTER_FONT_SIZE))
+            .text_color(tokens.text.muted.to_gpui())
+            .child(QUESTION_FOOTER)
+            .child(div().flex_1())
+            .child(key_hint),
+    )
+    .into_any_element()
 }
 
 /// Working indicator. Three dots plus an elapsed label.
@@ -1052,6 +1186,48 @@ mod tests {
         );
     }
 
+    fn question_row(choices: &[&str]) -> ConversationRow {
+        ConversationRow::Question {
+            id: crate::ui::renderers::TimelineItemId::Event(crate::domain::EventId::new()),
+            prompt: "p".into(),
+            choices: choices.iter().map(|choice| (*choice).to_string()).collect(),
+            settled_choice: None,
+        }
+    }
+
+    #[test]
+    fn question_row_height_grows_by_one_line_per_choice() {
+        let tokens = crate::ui::tokens::dark(
+            crate::ui::tokens::Density::Comfortable,
+            crate::ui::tokens::Scale::Scale100,
+        );
+        let two = question_row(&["a", "b"]);
+        let three = question_row(&["a", "b", "c"]);
+        assert_eq!(
+            conversation_row_height(&three, tokens) - conversation_row_height(&two, tokens),
+            CHOICE_ROW_HEIGHT as u32
+        );
+        assert_eq!(CHOICE_ROW_HEIGHT, 26.0);
+    }
+
+    #[test]
+    fn the_recommended_choice_is_the_one_that_says_so_and_its_marker_leaves_the_label() {
+        let choices = vec![
+            "Run now (Recommended)".to_string(),
+            "Defer to next restart".to_string(),
+        ];
+        assert_eq!(recommended_choice(&choices), Some(0));
+        assert_eq!(choice_label(&choices[0]), "Run now");
+        assert_eq!(choice_label(&choices[1]), "Defer to next restart");
+        assert_eq!(recommended_choice(&[]), None);
+        assert_eq!(
+            recommended_choice(&["Defer".to_string(), "Run now".to_string()]),
+            None
+        );
+        // The marker is lifted wherever it sits, brackets and all.
+        assert_eq!(choice_label("(recommended) Run now"), "Run now");
+    }
+
     #[test]
     fn long_rich_markdown_height_is_not_truncated_at_the_legacy_480px_cap() {
         let tokens = crate::ui::tokens::theme(
@@ -1107,11 +1283,25 @@ mod tests {
             .split("#[cfg(test)]")
             .next()
             .expect("renderer source precedes its tests");
+        // The redesign adds exactly one exception, and it is scoped rather than
+        // relaxed: the amber question card is a card, so the approved mockup
+        // draws a rule around it and around each of its choice rows. Every row
+        // painted before it still separates by whitespace and surface
+        // lightness alone, which is what the split below keeps asserting.
+        let (before_the_card, from_the_card) = renderers
+            .split_once("fn question_element")
+            .expect("the question card painter is the only renderer that rules");
         assert_eq!(
-            renderers.matches(".border(px(").count(),
+            before_the_card.matches(".border(px(").count(),
             0,
             "conversation rows are separated by whitespace and surface \
              lightness, never by borders"
+        );
+        assert_eq!(
+            from_the_card.matches(".border(px(").count(),
+            2,
+            "the only rules in the stream are the question card's own and its \
+             choice rows' -- if this is 0 the anchor above has stopped matching"
         );
         assert_eq!(
             renderers.matches(".border_b(px(").count(),
