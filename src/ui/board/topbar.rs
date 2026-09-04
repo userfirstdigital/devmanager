@@ -12,9 +12,10 @@ use std::rc::Rc;
 
 use gpui::{
     div, px, AnyElement, App, FontWeight, InteractiveElement, IntoElement, MouseButton,
-    MouseDownEvent, ParentElement, StatefulInteractiveElement, Styled, Window,
+    MouseDownEvent, ParentElement, Styled, Window,
 };
 
+use crate::ui::actions::{KeyboardAction, KeyboardModel, KeyboardShortcut};
 use crate::ui::board::layout::{
     KBD_FONT_SIZE, KBD_PADDING_X, KBD_PADDING_Y, KBD_RADIUS, NEEDS_YOU_CHIP_BORDER_ALPHA,
     TOP_BAR_BRAND_FONT_SIZE, TOP_BAR_GAP, TOP_BAR_HEIGHT, TOP_BAR_PADDING_X,
@@ -27,19 +28,6 @@ use crate::ui::tokens::ThemeTokens;
 /// projection of anything: there is one application.
 pub const BRAND: &str = "DevManager";
 
-/// The three hints the mockup prints, in the order it prints them.
-///
-/// The mockup draws the macOS command glyph; every other shortcut label in this
-/// shell reads `Ctrl+`, and the bindings in [`crate::ui::actions::KeyboardModel`]
-/// are Ctrl chords, so the keys named here are the keys that actually work. A
-/// hint that names a key the platform does not honour is worse than a glyph
-/// that differs from a Mac mockup.
-pub const HINTS: [(&str, &str); 3] = [
-    ("Ctrl+K", "switch"),
-    ("Z", "zoom"),
-    ("Ctrl+\u{2191}\u{2193}\u{2190}\u{2192}", "focus"),
-];
-
 pub const SCOPE_ELEMENT_ID: &str = "native-top-bar-scope";
 pub const NEEDS_YOU_ELEMENT_ID: &str = "native-top-bar-needs-you";
 pub const SETTINGS_ELEMENT_ID: &str = "native-top-bar-settings";
@@ -51,8 +39,10 @@ pub struct TopBarModel {
     pub brand: &'static str,
     pub scope_label: String,
     pub needs_you: usize,
-    /// `(keys, verb)` — the chip's key text and the word after it.
-    pub hints: Vec<(&'static str, &'static str)>,
+    /// `(keys, verb)` -- the chip's key text and the word after it. The keys
+    /// are a `String` because they are read out of the keyboard model at build
+    /// time, not written here.
+    pub hints: Vec<(String, &'static str)>,
 }
 
 /// The three controls in the bar. The painter owns no state.
@@ -65,19 +55,59 @@ pub struct TopBarHandlers {
 /// The needs-you count is the Needs-you group's row count -- the same rows the
 /// board paints under that heading, so the chip and the section cannot
 /// disagree about how many things are waiting.
-pub fn top_bar_model(scope_label: String, board: &BoardModel) -> TopBarModel {
-    let needs_you = board
+pub fn top_bar_model(
+    scope_label: String,
+    board: &BoardModel,
+    keyboard: &KeyboardModel,
+) -> TopBarModel {
+    TopBarModel {
+        brand: BRAND,
+        scope_label,
+        needs_you: needs_you_count(board),
+        hints: hints_from(keyboard),
+    }
+}
+
+/// The three chips the composition prints, in its order, each naming the chord
+/// [`KeyboardModel`] binds for it today rather than a key written beside it. A
+/// chip whose action is unbound is dropped: a bar with two chips is better than
+/// one promising a key that does nothing.
+///
+/// The mockup draws the macOS command glyph. The bindings are Ctrl chords and
+/// every other shortcut label in this shell reads `Ctrl+`, so the labels follow
+/// the model; only the modifier's spelling differs from the Mac reference, and
+/// the chip geometry does not.
+fn hints_from(keyboard: &KeyboardModel) -> Vec<(String, &'static str)> {
+    [
+        (
+            keyboard
+                .shortcut_for(KeyboardAction::OpenTaskSwitcher)
+                .map(KeyboardShortcut::display_label),
+            "switch",
+        ),
+        (
+            keyboard
+                .shortcut_for(KeyboardAction::ToggleZoom)
+                .map(KeyboardShortcut::display_label),
+            "zoom",
+        ),
+        (keyboard.focus_pane_label(), "focus"),
+    ]
+    .into_iter()
+    .filter_map(|(keys, verb)| keys.map(|keys| (keys, verb)))
+    .collect()
+}
+
+/// How many rows the amber chip counts: the Needs-you group's size, read off
+/// the board model the board itself paints, so the chip, the section heading
+/// and the accessibility node cannot disagree about how many things wait.
+pub fn needs_you_count(board: &BoardModel) -> usize {
+    board
         .groups
         .iter()
         .find(|group| group.group == BoardGroup::NeedsYou)
         .map(|group| group.rows.len())
-        .unwrap_or(0);
-    TopBarModel {
-        brand: BRAND,
-        scope_label,
-        needs_you,
-        hints: HINTS.to_vec(),
-    }
+        .unwrap_or(0)
 }
 
 /// `.dm-top .kbd`: a 1 px `borders.default` box, radius 4, 10.5 px muted text.
@@ -237,10 +267,17 @@ mod tests {
 
     #[test]
     fn needs_you_chip_appears_only_when_a_needs_you_row_exists() {
+        let keyboard = KeyboardModel::default();
         let empty = build_board_model(vec![], false);
-        assert_eq!(top_bar_model("All projects".into(), &empty).needs_you, 0);
+        assert_eq!(
+            top_bar_model("All projects".into(), &empty, &keyboard).needs_you,
+            0
+        );
         let one = build_board_model(vec![row(BoardState::Question)], false);
-        assert_eq!(top_bar_model("All projects".into(), &one).needs_you, 1);
+        assert_eq!(
+            top_bar_model("All projects".into(), &one, &keyboard).needs_you,
+            1
+        );
     }
 
     /// A Working row is not a needs-you row, so the chip must not count it.
@@ -256,19 +293,67 @@ mod tests {
             ],
             false,
         );
-        assert_eq!(top_bar_model("All projects".into(), &model).needs_you, 1);
+        assert_eq!(
+            top_bar_model("All projects".into(), &model, &KeyboardModel::default()).needs_you,
+            1
+        );
     }
 
     #[test]
     fn hints_are_the_three_composition_chips_in_order() {
-        let m = top_bar_model("All projects".into(), &build_board_model(vec![], false));
+        let m = top_bar_model(
+            "All projects".into(),
+            &build_board_model(vec![], false),
+            &KeyboardModel::default(),
+        );
         let verbs: Vec<_> = m.hints.iter().map(|(_, v)| *v).collect();
         assert_eq!(verbs, vec!["switch", "zoom", "focus"]);
     }
 
+    /// The chips name the chords the model actually binds. Ctrl+K is the
+    /// palette and Ctrl+P the switcher, so a chip table written beside the
+    /// model rather than read out of it prints a key that does not switch
+    /// anything -- and nothing fails when a rebinding moves the chord.
+    #[test]
+    fn the_hint_chips_are_the_models_own_bindings() {
+        let keyboard = KeyboardModel::default();
+        let m = top_bar_model(
+            "All projects".into(),
+            &build_board_model(vec![], false),
+            &keyboard,
+        );
+        let switcher = keyboard
+            .shortcut_for(KeyboardAction::OpenTaskSwitcher)
+            .expect("the model binds the task switcher")
+            .display_label();
+        assert_eq!(m.hints[0].0, switcher.as_str(), "switch chip");
+        let palette = keyboard
+            .shortcut_for(KeyboardAction::OpenPalette)
+            .expect("the model binds the palette")
+            .display_label();
+        assert_ne!(
+            m.hints[0].0,
+            palette.as_str(),
+            "the switch chip must not name the palette's chord"
+        );
+        let zoom = keyboard
+            .shortcut_for(KeyboardAction::ToggleZoom)
+            .expect("the model binds zoom")
+            .display_label();
+        assert_eq!(m.hints[1].0, zoom.as_str(), "zoom chip");
+        let focus = keyboard
+            .focus_pane_label()
+            .expect("the model binds directional focus");
+        assert_eq!(m.hints[2].0, focus.as_str(), "focus chip");
+    }
+
     #[test]
     fn the_scope_label_is_carried_through_verbatim() {
-        let m = top_bar_model("Snake Game".into(), &build_board_model(vec![], false));
+        let m = top_bar_model(
+            "Snake Game".into(),
+            &build_board_model(vec![], false),
+            &KeyboardModel::default(),
+        );
         assert_eq!(m.scope_label, "Snake Game");
         assert_eq!(m.brand, "DevManager");
     }

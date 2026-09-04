@@ -42281,7 +42281,7 @@ impl NativeShell {
                         .then(|| project.label.as_str())
                 })
         });
-        let model = crate::ui::board::top_bar_model(scope_label, board);
+        let model = crate::ui::board::top_bar_model(scope_label, board, &self.keyboard);
         let handlers = match shell {
             Some(shell) => crate::ui::board::TopBarHandlers {
                 on_scope: Rc::new({
@@ -42328,7 +42328,7 @@ impl NativeShell {
     /// size, read from the same board model the chip's painter reads, so the
     /// chip, the section heading and the accessibility node cannot disagree.
     fn top_bar_needs_you_count(&mut self) -> usize {
-        crate::ui::board::top_bar_model(String::new(), &self.board_model(unix_time_ms())).needs_you
+        crate::ui::board::needs_you_count(&self.board_model(unix_time_ms()))
     }
 
     /// Select the row the needs-you chip counts first. Reads the same board

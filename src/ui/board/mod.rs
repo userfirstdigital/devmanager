@@ -25,4 +25,4 @@ pub use render::{
     board_group_element_id, board_row_element, board_row_element_id, ordinal_chip, render_board,
     segments_element, BoardHeaderHandlers, BoardRowHandlers,
 };
-pub use topbar::{top_bar_element, top_bar_model, TopBarHandlers, TopBarModel};
+pub use topbar::{needs_you_count, top_bar_element, top_bar_model, TopBarHandlers, TopBarModel};
