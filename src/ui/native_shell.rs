@@ -4494,6 +4494,9 @@ enum ProjectInboxItem {
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum BoardMenuAction {
     NewTaskIn(HostProjectKey),
+    /// Start a local task straight onto a provider -- what the project rail's
+    /// "+Claude" / "+Codex" buttons did, moved into the one board menu.
+    StartAgentIn(ProjectId, ProviderKind),
     ToggleArchived,
     ToggleRail,
     ToggleDensity,
@@ -30504,20 +30507,7 @@ impl NativeShell {
     ) -> AnyElement {
         let menu = self.board_menu.expect("board menu is open");
         let (title, entries): (&str, Vec<(String, String, BoardMenuAction)>) = match menu {
-            BoardMenu::NewTask => (
-                "New task in",
-                self.board_new_task_targets()
-                    .into_iter()
-                    .enumerate()
-                    .map(|(index, (project_key, label))| {
-                        (
-                            format!("board-menu-new-{index}"),
-                            label,
-                            BoardMenuAction::NewTaskIn(project_key),
-                        )
-                    })
-                    .collect(),
-            ),
+            BoardMenu::NewTask => ("New task in", self.board_new_task_menu_entries()),
             BoardMenu::Options => (
                 "Board",
                 vec![
@@ -30651,6 +30641,9 @@ impl NativeShell {
         match action {
             BoardMenuAction::NewTaskIn(project_key) => {
                 self.begin_new_task_for_project_key(project_key);
+            }
+            BoardMenuAction::StartAgentIn(project_id, provider) => {
+                self.start_task_with_agent_for_project(project_id, provider);
             }
             BoardMenuAction::ToggleArchived => {
                 self.show_archived_tasks = !self.show_archived_tasks;
@@ -30840,6 +30833,43 @@ impl NativeShell {
             }
         }
         targets
+    }
+
+    /// The `+ New` menu's rows. A local project gets one row per provider the
+    /// connection snapshot reports signed in -- the "+Claude" / "+Codex" pair
+    /// the project rail carried, now in one place instead of on every header.
+    /// A remote project, and a local one with no provider signed in, gets the
+    /// new-task dialog instead: provider start there stays deferred.
+    fn board_new_task_menu_entries(&self) -> Vec<(String, String, BoardMenuAction)> {
+        let local = self.local_host_id();
+        let providers: Vec<ProviderKind> = self
+            .local_slot()
+            .agent_connection
+            .as_ref()
+            .map(inbox_agent_actions)
+            .unwrap_or_default()
+            .into_iter()
+            .map(|action| action.provider)
+            .collect();
+        let mut entries = Vec::new();
+        for (index, (project_key, label)) in self.board_new_task_targets().into_iter().enumerate() {
+            if project_key.host == local && !providers.is_empty() {
+                for (slot, provider) in providers.iter().copied().enumerate() {
+                    entries.push((
+                        format!("board-menu-new-{index}-{slot}"),
+                        format!("{label} · {}", provider.display_name()),
+                        BoardMenuAction::StartAgentIn(project_key.project_id, provider),
+                    ));
+                }
+            } else {
+                entries.push((
+                    format!("board-menu-new-{index}"),
+                    format!("{label} · New task…"),
+                    BoardMenuAction::NewTaskIn(project_key),
+                ));
+            }
+        }
+        entries
     }
 
     /// The board flattened for the accessibility tree: one node per section,
@@ -41836,11 +41866,12 @@ impl NativeShell {
     fn reference_sidebar(
         tokens: crate::ui::tokens::ThemeTokens,
         width: f32,
+        rail: bool,
         navigation: AnyElement,
         inbox: AnyElement,
         footer: AnyElement,
     ) -> AnyElement {
-        div()
+        let column = div()
             .id("native-shell-sidebar-column")
             .flex()
             .flex_col()
@@ -41851,7 +41882,15 @@ impl NativeShell {
             .overflow_hidden()
             .bg(tokens.surfaces.canvas.to_gpui())
             .border_r(px(1.0))
-            .border_color(tokens.borders.subtle.to_gpui())
+            .border_color(tokens.borders.subtle.to_gpui());
+        // Collapsed, the column is 36 px of dots. The brand, the project
+        // scope control and the footer buttons do not fit in that and would
+        // be silently clipped, so the rail carries the board alone -- which
+        // is what "collapse to rail" asks for.
+        if rail {
+            return column.child(inbox).into_any_element();
+        }
+        column
             .child(Self::sidebar_brand(tokens))
             .child(navigation)
             .child(inbox)
@@ -42040,8 +42079,14 @@ impl NativeShell {
                     )),
             )
             .into_any_element();
-        let sidebar =
-            Self::reference_sidebar(tokens, self.board_column_width(), navigation, inbox, footer);
+        let sidebar = Self::reference_sidebar(
+            tokens,
+            self.board_column_width(),
+            self.layout.board_rail,
+            navigation,
+            inbox,
+            footer,
+        );
         let dock = Self::stacked_panel_grow(
             "native-shell-context-dock",
             self.local_slot().cockpit.active_tool().label(),
@@ -42804,6 +42849,7 @@ impl NativeShell {
         .h_full()
         .track_scroll(self.task_scroll_handle.clone());
 
+        let board_scroll_handle = self.task_scroll_handle.0.borrow().base_handle.clone();
         let scroll_handle = self.task_scroll_handle.clone();
         let inbox_scroll = cx.listener(move |_shell, event: &ScrollWheelEvent, _window, cx| {
             // Own the wheel here so the virtual list does not also apply a
@@ -43204,17 +43250,43 @@ impl NativeShell {
             // The board is the active list; the archived browser keeps the
             // virtualized rows and the scrollbar gutter it already had.
             .child(if let Some(board_element) = board_element {
-                div()
+                // The board is a plain column, not a uniform list, so it
+                // needs a real scroll container of its own: without one a
+                // board taller than the viewport simply cannot be reached.
+                // It tracks the same handle the archived list does, so there
+                // is still one owner of the inbox's scroll position.
+                let viewport = div()
                     .id("native-shell-board-viewport")
                     .w_full()
                     .flex()
                     .flex_col()
                     .flex_1()
                     .min_h(px(0.0))
-                    .overflow_hidden()
-                    .on_scroll_wheel(inbox_scroll)
-                    .child(board_element)
-                    .into_any_element()
+                    .overflow_y_scroll()
+                    .track_scroll(&board_scroll_handle)
+                    .child(board_element);
+                // Collapsed, the rail paints no header, so the `⋯` menu that
+                // collapsed it is not on screen to undo it. The rail itself is
+                // the way back: one click expands, and the tooltip says so.
+                if archived_view || !self.layout.board_rail {
+                    viewport.into_any_element()
+                } else {
+                    viewport
+                        .cursor_pointer()
+                        .tooltip(|window, app| {
+                            gpui_component::tooltip::Tooltip::new("Expand board").build(window, app)
+                        })
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(|shell, _event: &MouseDownEvent, _window, cx| {
+                                cx.stop_propagation();
+                                shell.toggle_board_rail();
+                                shell.refresh_accessibility_tree();
+                                cx.notify();
+                            }),
+                        )
+                        .into_any_element()
+                }
             } else if inbox_is_empty {
                 Self::inbox_empty_state(tokens, None)
             } else {
@@ -43429,8 +43501,14 @@ impl NativeShell {
                 }
             })
             .into_any_element();
-        let sidebar =
-            Self::reference_sidebar(tokens, board_width, navigation, inbox_panel, sidebar_footer);
+        let sidebar = Self::reference_sidebar(
+            tokens,
+            board_width,
+            self.layout.board_rail,
+            navigation,
+            inbox_panel,
+            sidebar_footer,
+        );
 
         let layout = self
             .layout
@@ -46341,6 +46419,7 @@ pub(crate) mod tests {
         AgentSessionId,
         BoardGroup,
         BoardMenu,
+        BoardMenuAction,
         BoardState,
         ClientId,
         CockpitDockTool,
@@ -52873,12 +52952,14 @@ pub(crate) mod tests {
             let (model, task_id) = open_task_without_agent_client_model();
             let project_id = model.task(task_id).expect("task").task.project_id;
             with_test_shell_in_app(cx, runtime, |shell| {
-                shell.local_slot_mut().agent_connection =
-                    Some(agent_connection_snapshot(AgentPresence::SignedIn));
                 shell.install_project_for_test("DevManager", project_id);
                 shell
                     .apply_client_model(Arc::new(model))
                     .expect("apply model");
+                // After the model: applying one re-projects the connection and
+                // would put both providers back to Checking.
+                shell.local_slot_mut().agent_connection =
+                    Some(agent_connection_snapshot(AgentPresence::SignedIn));
 
                 let board = shell.board_model(1_000);
                 let groups: Vec<_> = board.groups.iter().map(|group| group.group).collect();
@@ -52943,6 +53024,24 @@ pub(crate) mod tests {
                         .map(|(key, label)| (key.project_id, label))
                         .collect::<Vec<_>>(),
                     vec![(project_id, "DevManager".to_string())]
+                );
+                // The "+Claude"/"+Codex" pair the project headers carried is
+                // now one row per signed-in provider in this one menu.
+
+                let entries: Vec<_> = shell
+                    .board_new_task_menu_entries()
+                    .into_iter()
+                    .map(|(_, label, action)| (label, action))
+                    .collect();
+                assert!(
+                    entries.iter().any(|(label, action)| label
+                        == "DevManager · Claude Code"
+                        && *action
+                            == BoardMenuAction::StartAgentIn(
+                                project_id,
+                                ProviderKind::ClaudeCode
+                            )),
+                    "the + New menu still starts a local task straight onto a provider: {entries:?}"
                 );
                 shell.open_board_menu(BoardMenu::NewTask);
                 assert_eq!(shell.board_menu, Some(BoardMenu::NewTask));
