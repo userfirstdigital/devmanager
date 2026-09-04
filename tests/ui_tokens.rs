@@ -3,9 +3,10 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use devmanager::theme;
+use devmanager::ui::theme_system::{ThemeAppearance, ThemeController, ThemeLibrary};
 use devmanager::ui::tokens::{
     contrast_ratio, srgb_luminance, theme as build_theme, Color, ContrastPair, Density, Scale,
-    TerminalSlotRole, ThemeMode, ThemeTokens,
+    TerminalSlotRole, ThemeMode, ThemeTokens, MODAL_BACKDROP_RGBA,
 };
 use serde::Deserialize;
 use serde_json::Value;
@@ -188,22 +189,38 @@ fn load_theme_matrix() -> ThemeMatrixFixture {
     .expect("typed theme matrix fixture")
 }
 
-fn matrix_case_tokens(case: &ThemeMatrixCase) -> ThemeTokens {
-    let mode = match case.theme {
+fn matrix_mode(theme: &MatrixTheme) -> ThemeMode {
+    match theme {
         MatrixTheme::Dark => ThemeMode::Dark,
         MatrixTheme::Light => ThemeMode::Light,
-    };
-    let density = match case.density {
+    }
+}
+
+fn matrix_density(density: &MatrixDensity) -> Density {
+    match density {
         MatrixDensity::Compact => Density::Compact,
         MatrixDensity::Comfortable => Density::Comfortable,
-    };
-    let scale = match case.scale {
+    }
+}
+
+fn matrix_scale(scale: &MatrixScale) -> Scale {
+    match scale {
         MatrixScale::Scale100 => Scale::Scale100,
         MatrixScale::Scale125 => Scale::Scale125,
         MatrixScale::Scale150 => Scale::Scale150,
         MatrixScale::Scale200 => Scale::Scale200,
-    };
-    build_theme(mode, density, scale)
+    }
+}
+
+/// The token module's own tokens for a matrix case. The projection the app
+/// actually renders is measured separately, by the gates at the end of this
+/// file.
+fn matrix_case_tokens(case: &ThemeMatrixCase) -> ThemeTokens {
+    build_theme(
+        matrix_mode(&case.theme),
+        matrix_density(&case.density),
+        matrix_scale(&case.scale),
+    )
 }
 
 fn colors(tokens: &ThemeTokens) -> BTreeSet<&'static str> {
@@ -1108,5 +1125,517 @@ fn theme_gallery_preview_fixture_and_token_matrix_cover_phase_5_2() {
         combinations.len(),
         16,
         "one case per theme, density, and scale"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Projected-token contrast gates.
+// ---------------------------------------------------------------------------
+
+const NORMAL_TEXT_FLOOR: f64 = 4.5;
+const LARGE_TEXT_FLOOR: f64 = 3.0;
+const UI_INDICATOR_FLOOR: f64 = 3.0;
+
+#[derive(Clone, Debug)]
+struct ContrastViolation {
+    family: &'static str,
+    pair: &'static str,
+    ratio: f64,
+    floor: f64,
+}
+
+/// Every contrast gate above measures `devmanager::ui::tokens::theme(..)` --
+/// the token module -- but the running app never renders those tokens directly:
+/// it renders `ThemePalette::tokens(density, scale)`, the active palette's role
+/// projection, which starts from the token module and then overwrites most
+/// surface, text, border, action and status tokens from the palette's roles.
+/// The gates below run the same pair families and the same floors over that
+/// projection, for every built-in theme and both appearances, so a palette
+/// whose roles compose an unreadable pair fails here instead of shipping while
+/// the token-module gates stay green.
+fn contrast_violations(tokens: &ThemeTokens) -> Vec<ContrastViolation> {
+    let families: [(&'static str, Vec<ContrastPair>, f64); 6] = [
+        (
+            "normal_text",
+            tokens.normal_text_contrast_pairs(),
+            NORMAL_TEXT_FLOOR,
+        ),
+        (
+            "large_text",
+            tokens.large_text_contrast_pairs(),
+            LARGE_TEXT_FLOOR,
+        ),
+        (
+            "ui_indicator",
+            tokens.ui_indicator_contrast_pairs(),
+            UI_INDICATOR_FLOOR,
+        ),
+        (
+            "disabled_text",
+            tokens.disabled_text_contrast_pairs(),
+            NORMAL_TEXT_FLOOR,
+        ),
+        (
+            "interaction_text",
+            tokens.interaction_state_contrast_pairs(),
+            NORMAL_TEXT_FLOOR,
+        ),
+        (
+            "status_surface",
+            tokens.status_surface_contrast_pairs(),
+            NORMAL_TEXT_FLOOR,
+        ),
+    ];
+
+    let mut violations = Vec::new();
+    for (family, pairs, floor) in families {
+        for pair in pairs {
+            let ratio = contrast_ratio(pair.foreground, pair.background);
+            if !pair.foreground.is_opaque() || ratio < floor {
+                violations.push(ContrastViolation {
+                    family,
+                    pair: pair.name,
+                    ratio,
+                    floor,
+                });
+            }
+        }
+    }
+    for (pair, floor) in runtime_only_contrast_pairs(tokens) {
+        let ratio = contrast_ratio(pair.foreground, pair.background);
+        if ratio < floor {
+            violations.push(ContrastViolation {
+                family: "runtime_only",
+                pair: pair.name,
+                ratio,
+                floor,
+            });
+        }
+    }
+    violations
+}
+
+/// Pairs the running app composes but no `ThemeTokens` field holds, so no
+/// token-module gate can reach them: the disabled border against the disabled
+/// fill, the terminal dock's inverse caption over the modal backdrop composite,
+/// and each action's disabled label on the fill the projection gives it.
+fn runtime_only_contrast_pairs(tokens: &ThemeTokens) -> Vec<(ContrastPair, f64)> {
+    vec![
+        (
+            ContrastPair {
+                name: "border_disabled_on_surface_disabled",
+                foreground: tokens.borders.disabled,
+                background: tokens.surfaces.disabled,
+            },
+            UI_INDICATOR_FLOOR,
+        ),
+        (
+            ContrastPair {
+                name: "text_inverse_on_backdrop_over_raised",
+                foreground: tokens.text.inverse,
+                background: modal_backdrop_composite(tokens.surfaces.raised),
+            },
+            NORMAL_TEXT_FLOOR,
+        ),
+        (
+            ContrastPair {
+                name: "text_inverse_on_backdrop_over_canvas",
+                foreground: tokens.text.inverse,
+                background: modal_backdrop_composite(tokens.surfaces.canvas),
+            },
+            NORMAL_TEXT_FLOOR,
+        ),
+        (
+            ContrastPair {
+                name: "text_inverse_on_backdrop_over_terminal_background",
+                foreground: tokens.text.inverse,
+                background: modal_backdrop_composite(tokens.terminal.background),
+            },
+            NORMAL_TEXT_FLOOR,
+        ),
+        (
+            ContrastPair {
+                name: "action_primary_disabled_label",
+                foreground: tokens.actions.primary.disabled.foreground,
+                background: tokens.actions.primary.disabled.background,
+            },
+            NORMAL_TEXT_FLOOR,
+        ),
+        (
+            ContrastPair {
+                name: "action_destructive_disabled_label",
+                foreground: tokens.actions.destructive.disabled.foreground,
+                background: tokens.actions.destructive.disabled.background,
+            },
+            NORMAL_TEXT_FLOOR,
+        ),
+    ]
+}
+
+/// What the modal backdrop actually paints over a surface. `MODAL_BACKDROP_RGBA`
+/// is `0xRRGGBBAA`, so the visible background under an overlay caption is the
+/// backdrop colour composited onto the surface behind it at that alpha.
+fn modal_backdrop_composite(surface: Color) -> Color {
+    let alpha = f64::from(MODAL_BACKDROP_RGBA & 0xff) / 255.0;
+    let backdrop = Color::from_u32(MODAL_BACKDROP_RGBA >> 8);
+    let channel = |over: u8, under: u8| {
+        (f64::from(over) * alpha + f64::from(under) * (1.0 - alpha)).round() as u8
+    };
+    Color::rgb(
+        channel(backdrop.red(), surface.red()),
+        channel(backdrop.green(), surface.green()),
+        channel(backdrop.blue(), surface.blue()),
+    )
+}
+
+fn violation_names(tokens: &ThemeTokens) -> BTreeSet<&'static str> {
+    contrast_violations(tokens)
+        .into_iter()
+        .map(|violation| violation.pair)
+        .collect()
+}
+
+fn render_violations(violations: &[ContrastViolation]) -> String {
+    violations
+        .iter()
+        .map(|violation| {
+            format!(
+                "{} {} {:.3}:1 (floor {:.1}:1)",
+                violation.family, violation.pair, violation.ratio, violation.floor
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("; ")
+}
+
+/// The density and scale combinations the typed matrix declares, deduplicated.
+/// Colour tokens do not vary with either, but the projection is re-run over the
+/// same grid the token-module gates use so a future density-dependent colour
+/// cannot slip past this gate.
+fn matrix_density_and_scale() -> Vec<(Density, Scale)> {
+    let mut seen: Vec<(Density, Scale)> = Vec::new();
+    for case in load_theme_matrix().cases {
+        let entry = (matrix_density(&case.density), matrix_scale(&case.scale));
+        if !seen.contains(&entry) {
+            seen.push(entry);
+        }
+    }
+    seen
+}
+
+fn assert_projected_contrast(label: &str, tokens: &ThemeTokens) {
+    let violations = contrast_violations(tokens);
+    assert!(
+        violations.is_empty(),
+        "{label}: {}",
+        render_violations(&violations)
+    );
+}
+
+fn built_in_palette_tokens(
+    theme_id: &str,
+    appearance: ThemeAppearance,
+    density: Density,
+    scale: Scale,
+) -> ThemeTokens {
+    let library = ThemeLibrary::built_in();
+    let definition = library
+        .get(theme_id)
+        .unwrap_or_else(|| panic!("built-in theme {theme_id}"));
+    definition
+        .palette(appearance)
+        .unwrap_or_else(|| panic!("{theme_id} has no {appearance:?} palette"))
+        .tokens(density, scale)
+}
+
+fn assert_built_in_theme_projection(theme_id: &str, appearance: ThemeAppearance) {
+    for (density, scale) in matrix_density_and_scale() {
+        let tokens = built_in_palette_tokens(theme_id, appearance, density, scale);
+        assert_projected_contrast(
+            &format!("{theme_id}/{appearance:?}/{density:?}/{scale:?}"),
+            &tokens,
+        );
+    }
+}
+
+macro_rules! projected_theme_gate {
+    ($(#[$attribute:meta])* $name:ident, $theme:literal, $appearance:expr) => {
+        #[test]
+        $(#[$attribute])*
+        fn $name() {
+            assert_built_in_theme_projection($theme, $appearance);
+        }
+    };
+}
+
+projected_theme_gate!(
+    #[ignore = "devmanager-classic dark: border_disabled_on_surface_disabled 1.000:1, action_primary_disabled_background_on_canvas 1.107:1, action_destructive_default_on_surface 3.260:1 (13 pairs); the same palette is pinned pair-for-pair by default_selection_dark_projection_drift_is_exactly_the_pinned_set; tracked in .superpowers/sdd/2026-09-03-ui-redesign-2-panel-chrome-and-needs-you/lane-tokens-report.md"]
+    projected_devmanager_classic_dark_meets_every_contrast_floor,
+    "devmanager-classic",
+    ThemeAppearance::Dark
+);
+projected_theme_gate!(
+    #[ignore = "devmanager-classic light: action_destructive_default_on_surface 1.000:1, action_primary_disabled_border_on_canvas 1.053:1 (68 pairs); tracked in .superpowers/sdd/2026-09-03-ui-redesign-2-panel-chrome-and-needs-you/lane-tokens-report.md"]
+    projected_devmanager_classic_light_meets_every_contrast_floor,
+    "devmanager-classic",
+    ThemeAppearance::Light
+);
+projected_theme_gate!(
+    #[ignore = "t3-code dark: border_disabled_on_surface_disabled 1.000:1, action_destructive_selected_background_on_canvas 1.185:1 (24 pairs); tracked in .superpowers/sdd/2026-09-03-ui-redesign-2-panel-chrome-and-needs-you/lane-tokens-report.md"]
+    projected_t3_code_dark_meets_every_contrast_floor,
+    "t3-code",
+    ThemeAppearance::Dark
+);
+projected_theme_gate!(
+    #[ignore = "t3-code light: border_disabled_on_surface_disabled 1.000:1, terminal_white_on_background 1.048:1 (64 pairs); tracked in .superpowers/sdd/2026-09-03-ui-redesign-2-panel-chrome-and-needs-you/lane-tokens-report.md"]
+    projected_t3_code_light_meets_every_contrast_floor,
+    "t3-code",
+    ThemeAppearance::Light
+);
+projected_theme_gate!(
+    #[ignore = "t3-chat dark: border_disabled_on_surface_disabled 1.000:1, action_destructive_selected_background_on_canvas 1.075:1 (29 pairs); tracked in .superpowers/sdd/2026-09-03-ui-redesign-2-panel-chrome-and-needs-you/lane-tokens-report.md"]
+    projected_t3_chat_dark_meets_every_contrast_floor,
+    "t3-chat",
+    ThemeAppearance::Dark
+);
+projected_theme_gate!(
+    #[ignore = "t3-chat light: border_disabled_on_surface_disabled 1.000:1, terminal_white_on_background 1.009:1 (52 pairs); tracked in .superpowers/sdd/2026-09-03-ui-redesign-2-panel-chrome-and-needs-you/lane-tokens-report.md"]
+    projected_t3_chat_light_meets_every_contrast_floor,
+    "t3-chat",
+    ThemeAppearance::Light
+);
+projected_theme_gate!(
+    #[ignore = "grove dark: border_disabled_on_surface_disabled 1.000:1, action_destructive_hover_on_surface 1.108:1 (32 pairs); tracked in .superpowers/sdd/2026-09-03-ui-redesign-2-panel-chrome-and-needs-you/lane-tokens-report.md"]
+    projected_grove_dark_meets_every_contrast_floor,
+    "grove",
+    ThemeAppearance::Dark
+);
+projected_theme_gate!(
+    #[ignore = "grove light: border_disabled_on_surface_disabled 1.000:1, terminal_white_on_background 1.033:1 (54 pairs); tracked in .superpowers/sdd/2026-09-03-ui-redesign-2-panel-chrome-and-needs-you/lane-tokens-report.md"]
+    projected_grove_light_meets_every_contrast_floor,
+    "grove",
+    ThemeAppearance::Light
+);
+projected_theme_gate!(
+    #[ignore = "ocean dark: border_disabled_on_surface_disabled 1.000:1, action_destructive_hover_on_surface 1.096:1 (31 pairs); tracked in .superpowers/sdd/2026-09-03-ui-redesign-2-panel-chrome-and-needs-you/lane-tokens-report.md"]
+    projected_ocean_dark_meets_every_contrast_floor,
+    "ocean",
+    ThemeAppearance::Dark
+);
+projected_theme_gate!(
+    #[ignore = "ocean light: border_disabled_on_surface_disabled 1.000:1, terminal_white_on_background 1.027:1 (54 pairs); tracked in .superpowers/sdd/2026-09-03-ui-redesign-2-panel-chrome-and-needs-you/lane-tokens-report.md"]
+    projected_ocean_light_meets_every_contrast_floor,
+    "ocean",
+    ThemeAppearance::Light
+);
+projected_theme_gate!(
+    #[ignore = "ember dark: border_disabled_on_surface_disabled 1.000:1, action_destructive_hover_on_surface 1.096:1 (31 pairs); tracked in .superpowers/sdd/2026-09-03-ui-redesign-2-panel-chrome-and-needs-you/lane-tokens-report.md"]
+    projected_ember_dark_meets_every_contrast_floor,
+    "ember",
+    ThemeAppearance::Dark
+);
+projected_theme_gate!(
+    #[ignore = "ember light: border_disabled_on_surface_disabled 1.000:1, terminal_white_on_background 1.021:1 (54 pairs); tracked in .superpowers/sdd/2026-09-03-ui-redesign-2-panel-chrome-and-needs-you/lane-tokens-report.md"]
+    projected_ember_light_meets_every_contrast_floor,
+    "ember",
+    ThemeAppearance::Light
+);
+projected_theme_gate!(
+    #[ignore = "iris dark: border_disabled_on_surface_disabled 1.000:1, action_destructive_hover_on_surface 1.096:1 (29 pairs); tracked in .superpowers/sdd/2026-09-03-ui-redesign-2-panel-chrome-and-needs-you/lane-tokens-report.md"]
+    projected_iris_dark_meets_every_contrast_floor,
+    "iris",
+    ThemeAppearance::Dark
+);
+projected_theme_gate!(
+    #[ignore = "iris light: border_disabled_on_surface_disabled 1.000:1, terminal_white_on_background 1.021:1 (54 pairs); tracked in .superpowers/sdd/2026-09-03-ui-redesign-2-panel-chrome-and-needs-you/lane-tokens-report.md"]
+    projected_iris_light_meets_every_contrast_floor,
+    "iris",
+    ThemeAppearance::Light
+);
+
+/// The thirteen pairs the default dark projection fails today, measured on
+/// this branch. Every one is a role borrow overwriting a token the
+/// token-module gates measure, which is the class of defect Task 11 fixed for
+/// `text.inverse`, `borders.selection` and the disabled action foreground:
+/// the destructive action's fills come from `Error` / `ErrorSurface` rather
+/// than the token module's button reds, both disabled fills and
+/// `borders.disabled` come from `Muted` (so a disabled border is the disabled
+/// fill, exactly 1.000:1), and none of it was visible to a gate that measures
+/// `ui::tokens::dark(..)`.
+///
+/// This is a pin, not a waiver. Repairing the projection fails this test as
+/// loudly as a new drift would, and the fix is to shrink this list and
+/// un-ignore
+/// `default_selection_dark_projection_meets_every_contrast_floor` below.
+const DEFAULT_DARK_PROJECTION_DRIFT: &[(&str, &str)] = &[
+    ("normal_text", "action_destructive_default_on_surface"),
+    ("normal_text", "action_destructive_hover_on_surface"),
+    ("normal_text", "action_destructive_focus_on_surface"),
+    (
+        "ui_indicator",
+        "action_primary_disabled_background_on_canvas",
+    ),
+    ("ui_indicator", "action_primary_disabled_border_on_canvas"),
+    (
+        "ui_indicator",
+        "action_destructive_selected_background_on_canvas",
+    ),
+    (
+        "ui_indicator",
+        "action_destructive_selected_border_on_canvas",
+    ),
+    (
+        "ui_indicator",
+        "action_destructive_disabled_background_on_canvas",
+    ),
+    (
+        "ui_indicator",
+        "action_destructive_disabled_border_on_canvas",
+    ),
+    ("interaction_text", "action_destructive_default_on_surface"),
+    ("interaction_text", "action_destructive_hover_on_surface"),
+    ("interaction_text", "action_destructive_focus_on_surface"),
+    ("runtime_only", "border_disabled_on_surface_disabled"),
+];
+
+/// The palette a fresh profile actually resolves to, reached the way the app
+/// reaches it. This gate runs -- it is never ignored -- and holds the shipping
+/// shell to exactly the drift listed above: one new unreadable pair in the
+/// default dark projection fails the suite on the next run.
+#[test]
+fn default_selection_dark_projection_drift_is_exactly_the_pinned_set() {
+    let root = tempfile::tempdir().expect("temp profile root");
+    let controller = ThemeController::with_defaults_at(root.path());
+    let expected = DEFAULT_DARK_PROJECTION_DRIFT
+        .iter()
+        .copied()
+        .collect::<BTreeSet<_>>();
+    for (density, scale) in matrix_density_and_scale() {
+        let tokens = controller
+            .active_palette(ThemeAppearance::Dark)
+            .tokens(density, scale);
+        let measured = contrast_violations(&tokens)
+            .into_iter()
+            .map(|violation| (violation.family, violation.pair))
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            measured,
+            expected,
+            "default-selection/Dark/{density:?}/{scale:?} drift changed: {}",
+            render_violations(&contrast_violations(&tokens))
+        );
+    }
+}
+
+#[test]
+#[ignore = "devmanager-classic dark: 13 projected pairs below floor, pinned by default_selection_dark_projection_drift_is_exactly_the_pinned_set; tracked in .superpowers/sdd/2026-09-03-ui-redesign-2-panel-chrome-and-needs-you/lane-tokens-report.md"]
+fn default_selection_dark_projection_meets_every_contrast_floor() {
+    let root = tempfile::tempdir().expect("temp profile root");
+    let controller = ThemeController::with_defaults_at(root.path());
+    for (density, scale) in matrix_density_and_scale() {
+        let tokens = controller
+            .active_palette(ThemeAppearance::Dark)
+            .tokens(density, scale);
+        assert_projected_contrast(
+            &format!("default-selection/Dark/{density:?}/{scale:?}"),
+            &tokens,
+        );
+    }
+}
+
+#[test]
+#[ignore = "devmanager-classic light: action_destructive_default_on_surface 1.000:1, \
+            action_primary_disabled_border_on_canvas 1.053:1 (68 pairs); tracked in \
+            .superpowers/sdd/2026-09-03-ui-redesign-2-panel-chrome-and-needs-you/lane-tokens-report.md"]
+fn default_selection_light_projection_meets_every_contrast_floor() {
+    let root = tempfile::tempdir().expect("temp profile root");
+    let controller = ThemeController::with_defaults_at(root.path());
+    for (density, scale) in matrix_density_and_scale() {
+        let tokens = controller
+            .active_palette(ThemeAppearance::Light)
+            .tokens(density, scale);
+        assert_projected_contrast(
+            &format!("default-selection/Light/{density:?}/{scale:?}"),
+            &tokens,
+        );
+    }
+}
+
+/// Sabotage proof for the gate above. A gate's first green says nothing until
+/// it has been shown to go red, and both regressions replayed here shipped this
+/// week behind green token-module gates: `text.inverse` aliased onto the accent
+/// foreground (a 1.015:1 caption) and one action foreground shared across all
+/// five states (a 1.144:1 disabled label).
+#[test]
+fn projected_gate_detects_the_two_regressions_that_shipped_green() {
+    let root = tempfile::tempdir().expect("temp profile root");
+    let controller = ThemeController::with_defaults_at(root.path());
+    let healthy = controller
+        .active_palette(ThemeAppearance::Dark)
+        .tokens(Density::Comfortable, Scale::Scale100);
+    let healthy_names = violation_names(&healthy);
+    for pair in [
+        "text_inverse_on_backdrop_over_raised",
+        "action_primary_disabled_label",
+    ] {
+        assert!(
+            !healthy_names.contains(pair),
+            "{pair} must be clean before the sabotage, otherwise this proves nothing"
+        );
+    }
+
+    let mut inverse_regression = healthy;
+    inverse_regression.text.inverse = healthy.text.on_accent;
+    let names = violation_names(&inverse_regression);
+    assert!(
+        names.contains("text_inverse_on_backdrop_over_raised"),
+        "aliasing text.inverse onto the accent foreground must fail the backdrop pair, got {names:?}"
+    );
+
+    let mut disabled_regression = healthy;
+    disabled_regression.actions.primary.disabled.foreground =
+        healthy.actions.primary.default.foreground;
+    let names = violation_names(&disabled_regression);
+    assert!(
+        names.contains("action_primary_disabled_label"),
+        "one foreground across all five action states must fail the disabled label pair, got {names:?}"
+    );
+}
+
+/// Non-failing census: every built-in theme, both appearances, every violation
+/// with its ratio. This is the list the ignore attributes above are drawn from,
+/// and it names what the gate can see rather than only what it currently
+/// rejects.
+#[test]
+fn projected_contrast_census_reports_every_built_in_theme() {
+    let library = ThemeLibrary::built_in();
+    let mut inspected = 0usize;
+    for definition in library.themes() {
+        for appearance in [ThemeAppearance::Dark, ThemeAppearance::Light] {
+            let Some(palette) = definition.palette(appearance) else {
+                continue;
+            };
+            let tokens = palette.tokens(Density::Comfortable, Scale::Scale100);
+            inspected += 1;
+            let violations = contrast_violations(&tokens);
+            if violations.is_empty() {
+                println!("{}/{appearance:?}: clean", definition.id);
+            } else {
+                for violation in violations {
+                    println!(
+                        "{}/{appearance:?}: {} {} {:.3}:1 (floor {:.1}:1)",
+                        definition.id,
+                        violation.family,
+                        violation.pair,
+                        violation.ratio,
+                        violation.floor
+                    );
+                }
+            }
+        }
+    }
+    assert_eq!(
+        inspected, 14,
+        "seven built-in themes, both appearances -- a census over fewer is a census that cannot see"
     );
 }
