@@ -1098,36 +1098,18 @@ impl ThemeTokens {
             self.text.on_accent,
             self.actions.primary.selected.background,
         ));
-        // `text.on_accent` is the foreground `AccentForeground` paints over
-        // `Accent`, which is the PRIMARY action fill; nothing anywhere paints it
-        // on a destructive fill, which carries its own foreground. Holding both
-        // families against one token was only satisfiable while the two fills
-        // had the same polarity -- the redesign's primary is a light slab and
-        // destructive is still a dark red, and no single colour clears 4.5:1 on
-        // both (proved by exhaustion over the grey ramp: the primary side needs
-        // luminance <= 0.172, the destructive side >= 0.791). So the destructive
-        // family is measured against the foreground that is actually painted on
-        // it, at the same count and the same 4.5:1 floor.
-        pairs.push(contrast_pair(
-            "text_on_destructive_on_action_destructive_default",
-            self.actions.destructive.default.foreground,
-            self.actions.destructive.default.background,
-        ));
-        pairs.push(contrast_pair(
-            "text_on_destructive_on_action_destructive_hover",
-            self.actions.destructive.hover.foreground,
-            self.actions.destructive.hover.background,
-        ));
-        pairs.push(contrast_pair(
-            "text_on_destructive_on_action_destructive_focus",
-            self.actions.destructive.focus.foreground,
-            self.actions.destructive.focus.background,
-        ));
-        pairs.push(contrast_pair(
-            "text_on_destructive_on_action_destructive_selected",
-            self.actions.destructive.selected.foreground,
-            self.actions.destructive.selected.background,
-        ));
+        // There is deliberately no `text.on_accent` pair against the destructive
+        // fills. `text.on_accent` is the foreground `AccentForeground` paints
+        // over `Accent`, which is the PRIMARY action fill; nothing anywhere
+        // paints it on a destructive fill, which carries its own foreground.
+        // Holding both families against one token was only satisfiable while the
+        // two fills had the same polarity -- the redesign's primary is a light
+        // slab and destructive is still a dark red, and no single colour clears
+        // 4.5:1 on both (proved by exhaustion over the grey ramp: the primary
+        // side needs luminance <= 0.172, the destructive side >= 0.791). The
+        // real destructive pairs are `action_destructive_*_on_surface` in
+        // `interaction_state_contrast_pairs`, at the same 4.5:1 floor.
+        //
         // The other surface `text.on_accent` really lands on:
         // `MessageActionForeground` over `MessageAction`, which is
         // `status.external`. Ungated until now, and the pre-redesign near-white
@@ -1458,12 +1440,12 @@ const DARK_SURFACE_SUNKEN: Color = Color::from_u32(0x111114);
 const DARK_SURFACE_HOVER: Color = Color::from_u32(0x17171c);
 // The selected row has to read as a filled slab, not a hairline lift, so this
 // climbs as far above `raised` as the text gates allow. `0x26262b` (the subtle
-// border) was ruled but drops `text_disabled_on_selection` to 4.118:1; the
-// ceiling for the 4.5:1 floor is `0x1e1e23`, which is `surfaces.disabled`
-// itself, so the step below it is what ships and selection stays distinct from
-// disabled.
-const DARK_SURFACE_SELECTION: Color = Color::from_u32(0x1d1d22);
-const DARK_SURFACE_DISABLED: Color = Color::from_u32(0x1e1e23);
+// border) was ruled but drops `text_disabled_on_selection` to 4.118:1;
+// `0x1e1e23` is the ceiling for that 4.5:1 floor (4.539:1) and is what ships.
+// `surfaces.disabled` stepped down to `0x1b1b20` to keep the two distinct --
+// disabled text reads 4.691:1 there, so the floor is still clear on both.
+const DARK_SURFACE_SELECTION: Color = Color::from_u32(0x1e1e23);
+const DARK_SURFACE_DISABLED: Color = Color::from_u32(0x1b1b20);
 
 const DARK_TEXT_PRIMARY: Color = Color::from_u32(0xe6e6ea);
 const DARK_TEXT_EMPHASIS: Color = Color::from_u32(0xffffff);
@@ -1471,7 +1453,8 @@ const DARK_TEXT_SECONDARY: Color = Color::from_u32(0x9a9aa3);
 // Spec asks 0x6b6b74, but that is 3.45:1 on raised and fails the 4.5:1 AA gate; 0x86868f is 5.05:1.
 const DARK_TEXT_MUTED: Color = Color::from_u32(0x86868f);
 // Dimmest step of the ramp. Darker reads better but 0x85858e is the floor: below it disabled
-// text drops under 4.5:1 on surfaces.disabled (0x1e1e23).
+// text drops under 4.5:1 on the lightest surface it lands on, surfaces.selection (0x1e1e23),
+// where it reads 4.539:1.
 const DARK_TEXT_DISABLED: Color = Color::from_u32(0x85858e);
 const DARK_TEXT_INVERSE: Color = Color::from_u32(0xf8fafc);
 // The redesign's loud control is a light neutral slab, so the text that lands
@@ -2272,11 +2255,11 @@ mod tests {
         assert_eq!(t.surfaces.raised, Color::from_u32(0x151518), "row box");
         // Ruled 0x26262b so the selected row reads as a filled slab; that value
         // drops text_disabled_on_selection to 4.118:1. 0x1e1e23 is the ceiling
-        // for the 4.5:1 floor and collides with surfaces.disabled, so the step
-        // below it ships (text_disabled_on_selection 4.590:1).
+        // for the 4.5:1 floor (4.539:1) and is what ships; surfaces.disabled
+        // moved down to 0x1b1b20 so the two stay distinct.
         assert_eq!(
             t.surfaces.selection,
-            Color::from_u32(0x1d1d22),
+            Color::from_u32(0x1e1e23),
             "selected row"
         );
         assert_ne!(
@@ -2311,7 +2294,7 @@ mod tests {
         assert_eq!(t.surfaces.sunken, Color::from_u32(0x111114), "stream");
         assert_eq!(
             t.surfaces.disabled,
-            Color::from_u32(0x1e1e23),
+            Color::from_u32(0x1b1b20),
             "disabled row"
         );
         assert_eq!(t.terminal.background, Color::from_u32(0x0b0b0d), "terminal");

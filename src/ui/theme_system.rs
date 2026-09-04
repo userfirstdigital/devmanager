@@ -975,14 +975,24 @@ impl ThemePalette {
         tokens.text.secondary = color(ThemeColorRole::SecondaryForeground);
         tokens.text.muted = color(ThemeColorRole::MutedForeground);
         tokens.text.disabled = color(ThemeColorRole::Placeholder);
-        tokens.text.inverse = color(ThemeColorRole::AccentForeground);
+        // `text.inverse` is NOT `AccentForeground`. It is the light-on-dark
+        // caption the terminal dock paints over its modal backdrop, and while
+        // the accent was a mid-saturation fill the two happened to agree. The
+        // redesign's accent foreground is the canvas colour, which would paint
+        // that caption at 1.015:1 on the backdrop -- so this keeps the token
+        // module's value. Retinting it for a managed theme is a role of its own,
+        // not a borrow from this one.
         tokens.text.on_accent = color(ThemeColorRole::AccentForeground);
         tokens.text.on_selection = color(ThemeColorRole::SidebarForeground);
         tokens.borders.subtle = color(ThemeColorRole::Border);
         tokens.borders.default = color(ThemeColorRole::Input);
         tokens.borders.strong = color(ThemeColorRole::SidebarBorder);
         tokens.borders.focus = color(ThemeColorRole::Focus);
-        tokens.borders.selection = color(ThemeColorRole::Accent);
+        // `borders.selection` is a neutral outline, not the accent. Taking it
+        // from `Accent` made every selection outline the action colour, which is
+        // the opposite of the rule that colour is reserved for state that needs
+        // you -- and under the redesign it would draw the outline in the primary
+        // button's near-white fill.
         tokens.borders.disabled = color(ThemeColorRole::Muted);
 
         set_interaction_colors(
@@ -1058,8 +1068,14 @@ fn set_interaction_colors(
         background: selected,
         border: selected,
     };
+    // The disabled state keeps whatever foreground the token module gave it.
+    // One accent foreground for all five states is only sound while every fill
+    // has the same polarity, and the disabled fill never does: it is
+    // `surfaces.disabled`, a near-black on the dark shell, so the redesign's
+    // dark accent foreground would paint disabled labels at 1.144:1. This is
+    // also what makes `action_primary_disabled_on_surface` describe a real pair.
     tokens.disabled = ActionStateTokens {
-        foreground,
+        foreground: tokens.disabled.foreground,
         background: disabled,
         border: disabled,
     };
@@ -3253,6 +3269,51 @@ mod tests {
                 "borders.strong",
                 tokens.borders.strong,
                 expected.borders.strong,
+            ),
+            // The roles are a lossy projection of the tokens, so every token a
+            // role could quietly overwrite is pinned here: these eight are the
+            // ones the redesign's inverted primary action would otherwise drag
+            // with it.
+            (
+                "text.on_accent",
+                tokens.text.on_accent,
+                expected.text.on_accent,
+            ),
+            ("text.inverse", tokens.text.inverse, expected.text.inverse),
+            (
+                "borders.focus",
+                tokens.borders.focus,
+                expected.borders.focus,
+            ),
+            (
+                "borders.selection",
+                tokens.borders.selection,
+                expected.borders.selection,
+            ),
+            (
+                "actions.primary.default.background",
+                tokens.actions.primary.default.background,
+                expected.actions.primary.default.background,
+            ),
+            (
+                "actions.primary.default.foreground",
+                tokens.actions.primary.default.foreground,
+                expected.actions.primary.default.foreground,
+            ),
+            (
+                "actions.primary.hover.background",
+                tokens.actions.primary.hover.background,
+                expected.actions.primary.hover.background,
+            ),
+            (
+                "actions.primary.selected.background",
+                tokens.actions.primary.selected.background,
+                expected.actions.primary.selected.background,
+            ),
+            (
+                "actions.primary.disabled.foreground",
+                tokens.actions.primary.disabled.foreground,
+                expected.actions.primary.disabled.foreground,
             ),
             (
                 "status.attention",

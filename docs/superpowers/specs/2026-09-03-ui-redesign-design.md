@@ -106,7 +106,7 @@ Everything else is a grey ramp:
 |---|---|---|
 | `surface.column` | `#101013` | board column |
 | `surface.row` | `#151518` | row box, panel body |
-| `surface.row_selected` | `#1d1d22` | selected row, focused panel title row — selected row: filled slab, 5 px stripe, strong rules, white title (ruled `#26262b`; that drops `text_disabled_on_selection` to 4.118:1, and the 4.5:1 ceiling `#1e1e23` is `surface.disabled` itself, so the step below ships) |
+| `surface.row_selected` | `#1e1e23` | selected row, focused panel title row — selected row: filled slab, 5 px stripe, strong rules, white title (ruled `#26262b`; that drops `text_disabled_on_selection` to 4.118:1, so the fill sits at the 4.5:1 ceiling `#1e1e23` and `surface.disabled` moved down to keep the two distinct) |
 | `surface.stream` | `#111114` | conversation stream background |
 | `surface.terminal` | `#0b0b0d` | terminal background |
 | `border.subtle` | `#26262b` | row lines, panel border |
@@ -115,7 +115,7 @@ Everything else is a grey ramp:
 | `text.secondary` | `#9a9aa3` | status line |
 | `text.muted` | `#86868f` | second line, ages, marks (spec drafted `#6b6b74`; the repo's 4.5:1 floor on raised forced `#86868f`, landed 2026-09-03) |
 | `text.disabled` | `#85858e` | one step below muted; the disabled-text floor is also 4.5:1, so it cannot sit lower |
-| `surface.disabled` | `#1e1e23` | disabled controls |
+| `surface.disabled` | `#1b1b20` | disabled controls — one step below `surface.row_selected` so a selected row never reads as a disabled one; disabled text is 4.691:1 here |
 | `status.inactive` | `#86868f` | inactive chips |
 | `status.attention` | `#f2b441` | needs you |
 | `status.blocked` | `#e5484d` | broken |

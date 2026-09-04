@@ -25082,7 +25082,10 @@ impl NativeShell {
                 if dragged.pane_id == target_pane {
                     style
                 } else {
-                    style.bg(Hsla::from(tokens.borders.focus.to_gpui()).opacity(0.32))
+                    // A wash, not a ring: `borders.focus` is a hairline colour
+                    // and at 32% it composited to 1.587:1 against the pane.
+                    // `text.primary` is the brightest neutral on the ramp.
+                    style.bg(Hsla::from(tokens.text.primary.to_gpui()).opacity(0.18))
                 }
             })
             .on_drop(drop);
