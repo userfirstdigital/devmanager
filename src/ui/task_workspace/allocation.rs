@@ -157,6 +157,13 @@ impl<K: Clone + Ord + Eq> Workspace<K> {
     /// to Full, is remembered as tried, and the next one is measured. Only when
     /// no untried candidate helps does the pass stop and leave the rest to the
     /// physical floor.
+    ///
+    /// A skip is **provisional**, so `tried` is cleared on every acceptance: a
+    /// pane on the second-highest branch buys nothing while another branch is
+    /// the maximum, and buys the fit itself once that branch has been lowered
+    /// past it. Clearing cannot loop, because an acceptance always turns one
+    /// Full pane into a strip and the candidate set is drawn from the Full
+    /// ones; within a single round `tried` only grows.
     fn minimise_to_fit(&mut self, viewport: Viewport, metrics: AllocationMetrics) {
         for task_id in self.task_ids() {
             if self.presentation(task_id.clone()) == Some(PanePresentation::Minimised) {
@@ -194,7 +201,11 @@ impl<K: Clone + Ord + Eq> Workspace<K> {
             let relieved = minimum_size(root, metrics);
             let recovered = (over_width && relieved.width < minimum.width)
                 || (over_height && relieved.height < minimum.height);
-            if !recovered {
+            if recovered {
+                // The tree changed shape, so an earlier skip may now be the
+                // candidate that fits it. Measure them all again.
+                tried.clear();
+            } else {
                 let _ = self.set_presentation(candidate.clone(), PanePresentation::Full);
                 tried.push(candidate);
             }
@@ -807,6 +818,74 @@ mod tests {
         assert_eq!(allocated.height(a), Some(300.0));
         assert_eq!(
             allocated.height(c).unwrap() + 4.0 + allocated.height(b).unwrap(),
+            300.0
+        );
+    }
+
+    #[test]
+    fn a_skipped_candidate_is_retried_once_the_governing_branch_is_lowered() {
+        let p = TaskId::new();
+        let p2 = TaskId::new();
+        let q = TaskId::new();
+        let q2 = TaskId::new();
+        let q3 = TaskId::new();
+        let mut workspace = TaskWorkspace::single(p);
+        workspace
+            .insert_after_focused(q, Axis::Horizontal)
+            .expect("second branch");
+        workspace.focus_task(p).expect("focus p");
+        workspace
+            .insert_after_focused(p2, Axis::Vertical)
+            .expect("p2 under p");
+        workspace.focus_task(q).expect("focus q");
+        workspace
+            .insert_after_focused(q2, Axis::Vertical)
+            .expect("q2 under q");
+        workspace
+            .insert_after_focused(q3, Axis::Vertical)
+            .expect("q3 under q2");
+        workspace.focus_task(q3).expect("focus q3");
+
+        // H[ A=V[p, p2], B=V[q, q2, q3] ] at 800x300, and A's panes are the
+        // OLDEST, so they are measured first. A is 324 and B is 488, so B
+        // governs the height: `p` and `p2` are both skipped, then `q` (488 ->
+        // 352) and `q2` (352 -> 324) are accepted. At that point B is 224 and
+        // A's 324 is the maximum, so `p` -- already skipped -- is the only
+        // candidate left that can help. Without re-trying it the pass stops at
+        // 324 against a 300 px viewport; re-trying it reaches 224 and fits.
+        let allocated =
+            workspace.allocate(Viewport::new(800.0, 300.0), AllocationMetrics::production());
+
+        assert_eq!(
+            workspace.presentation(p),
+            Some(PanePresentation::Minimised),
+            "a skip is provisional: once B stopped governing, p had to be measured again"
+        );
+        assert_eq!(workspace.presentation(q), Some(PanePresentation::Minimised));
+        assert_eq!(
+            workspace.presentation(q2),
+            Some(PanePresentation::Minimised)
+        );
+        assert_eq!(
+            workspace.presentation(p2),
+            Some(PanePresentation::Full),
+            "and no more than needed: p2 is left alone once the tree fits"
+        );
+        assert_eq!(workspace.presentation(q3), Some(PanePresentation::Full));
+
+        // 224 <= 300, so every pane is at or above its own minimum and nothing
+        // is squeezed under the physical floor.
+        assert_eq!(allocated.height(p), Some(28.0));
+        assert_eq!(allocated.height(p2), Some(268.0));
+        assert_eq!(allocated.height(q), Some(28.0));
+        assert_eq!(allocated.height(q2), Some(28.0));
+        assert_eq!(allocated.height(q3), Some(236.0));
+        assert_eq!(
+            allocated.height(q).unwrap()
+                + 4.0
+                + allocated.height(q2).unwrap()
+                + 4.0
+                + allocated.height(q3).unwrap(),
             300.0
         );
     }
