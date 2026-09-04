@@ -258,7 +258,7 @@ git commit -m "feat(ui): monochrome provider marks"
 - Test: `src/ui/board/model.rs`
 
 **Interfaces:**
-- Consumes: `crate::domain::task::VisibleTaskStatus`, `crate::ui::native_host_state::HostTaskKey`, `crate::ui::task_cockpit::inbox::PrimaryProviderIcon`.
+- Consumes: `crate::domain::task::VisibleTaskStatus`, `crate::client::HostTaskKey`, `crate::ui::task_cockpit::inbox::PrimaryProviderIcon`.
 - Produces:
 
 ```rust
@@ -298,7 +298,7 @@ impl BoardState { pub fn why_label(self) -> &'static str }
 mod tests {
     use super::*;
     use crate::domain::id::TaskId;
-    use crate::ui::native_host_state::{HostId, HostTaskKey};
+    use crate::client::{HostId, HostTaskKey};
 
     fn row(state: BoardState, state_age_ms: i64, last_activity_ms: i64) -> BoardRow {
         BoardRow {
@@ -414,7 +414,7 @@ pub use model::{
 
 ```rust
 use crate::domain::task::VisibleTaskStatus;
-use crate::ui::native_host_state::HostTaskKey;
+use crate::client::HostTaskKey;
 use crate::ui::task_cockpit::inbox::PrimaryProviderIcon;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1184,7 +1184,7 @@ use crate::ui::board::age::format_age;
 use crate::ui::board::layout::{row_layout, BOARD_ROW_GAP, BOARD_ROW_HEIGHT, SEGMENT_GAP, SEGMENT_HEIGHT, SEGMENT_WIDTH};
 use crate::ui::board::model::{BoardGroup, BoardModel, BoardRow, BoardState};
 use crate::ui::board::project_colour::ProjectColourBook;
-use crate::ui::native_host_state::HostTaskKey;
+use crate::client::HostTaskKey;
 use crate::ui::tokens::ThemeTokens;
 
 pub struct BoardRowHandlers { /* as in Interfaces */ }
@@ -1306,7 +1306,7 @@ mod tests {
     use crate::ui::board::model::{build_board_model, BoardProgress, BoardRow, BoardState};
     use crate::ui::task_cockpit::inbox::PrimaryProviderIcon;
     use crate::domain::id::TaskId;
-    use crate::ui::native_host_state::HostId;
+    use crate::client::HostId;
 
     #[test]
     fn board_renders_every_state_without_panicking() {
