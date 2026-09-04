@@ -20279,17 +20279,13 @@ impl NativeShell {
         task_follow_changed: bool,
     ) {
         let owner = self.local_task_key(task_id);
-        // The pane names the view, but a pane does not outlive the workspace:
-        // clearing the selection drops the whole tree, so a task reselected
-        // afterwards gets a fresh Conversation pane while the ContextDock still
-        // remembers the raw terminal that task was left on. Let that surviving
-        // memory decide rather than silently demoting the user's choice, and
-        // write it back so the pane stays the single source of truth from here.
+        // The pane is the single source for its view, so the ContextDock's own
+        // per-task memory is never consulted here: a second remembered surface
+        // is a second answer, and the two would drift. A pane does not outlive
+        // the workspace, so a task reselected after a return to the idle canvas
+        // opens on Conversation; one keypress puts it back on the terminal.
         let was_showing_terminal = self.local_slot_mut().cockpit.dock().showing_raw_terminal();
-        let show_terminal = self.pane_view(&owner) == PaneView::Terminal || was_showing_terminal;
-        if show_terminal {
-            self.set_pane_view(&owner, PaneView::Terminal);
-        }
+        let show_terminal = self.pane_view(&owner) == PaneView::Terminal;
         let result = if show_terminal {
             self.local_slot_mut()
                 .cockpit
@@ -20320,13 +20316,15 @@ impl NativeShell {
         }
     }
 
-    /// The view a legacy "terminal visible" boolean asks for. Only the two
-    /// surfaces that boolean could ever name are reachable from it.
-    fn view_for_terminal_visibility(visible: bool) -> PaneView {
-        if visible {
-            PaneView::Terminal
-        } else {
-            PaneView::Conversation
+    /// Carry a raw/semantic terminal flip onto the pane that owns it. Going raw
+    /// names Terminal. Going semantic only demotes a pane that is actually
+    /// showing the terminal: a pane parked on Files stays on Files, because the
+    /// dock's terminal presentation says nothing about a surface it does not own.
+    fn note_terminal_presentation_on_pane(&mut self, owner: &HostTaskKey, raw: bool) {
+        if raw {
+            self.set_pane_view(owner, PaneView::Terminal);
+        } else if self.pane_view(owner) == PaneView::Terminal {
+            self.set_pane_view(owner, PaneView::Conversation);
         }
     }
 
@@ -20341,16 +20339,21 @@ impl NativeShell {
     }
 
     fn set_pane_view(&mut self, owner: &HostTaskKey, view: PaneView) {
-        let changed = self
-            .layout
-            .task_workspace
-            .as_mut()
-            .is_some_and(|workspace| {
-                workspace.view_of(owner.clone()) != Some(view)
-                    && workspace.set_view(owner.clone(), view).is_ok()
-            });
-        if changed {
-            self.mark_layout_dirty();
+        let Some(workspace) = self.layout.task_workspace.as_mut() else {
+            // No tree at all is the ordinary idle canvas, not a defect.
+            return;
+        };
+        if workspace.view_of(owner.clone()) == Some(view) {
+            return;
+        }
+        match workspace.set_view(owner.clone(), view) {
+            Ok(()) => self.mark_layout_dirty(),
+            // A tree that has no pane for this owner means the caller and the
+            // workspace disagree about who is open. Say which owner, rather
+            // than dropping the view change on the floor.
+            Err(error) => {
+                eprintln!("devmanager: pane view {view:?} not applied for {owner:?}: {error:?}")
+            }
         }
     }
 
@@ -21856,7 +21859,7 @@ impl NativeShell {
                     if let Some(slot) = self.host_slot_mut(&key.host) {
                         slot.cockpit.dock_mut().show_semantic();
                     }
-                    self.set_pane_view(&key, PaneView::Conversation);
+                    self.note_terminal_presentation_on_pane(&key, false);
                     self.pending_terminal_focus = false;
                     self.reconcile_browser_dock_lifecycle(None);
                     return;
@@ -21880,7 +21883,7 @@ impl NativeShell {
                 } else {
                     return;
                 };
-                self.set_pane_view(&key, Self::view_for_terminal_visibility(visible));
+                self.note_terminal_presentation_on_pane(&key, visible);
                 if let Err(error) = result {
                     if let Some(slot) = self.host_slot_mut(&key.host) {
                         slot.composer_error = Some(format!("{error:?}"));
@@ -21910,7 +21913,7 @@ impl NativeShell {
             self.local_slot_mut().cockpit.dock_mut().show_semantic();
             if let Some(task_id) = selected_task_id {
                 let owner = self.local_task_key(task_id);
-                self.set_pane_view(&owner, PaneView::Conversation);
+                self.note_terminal_presentation_on_pane(&owner, false);
             }
             self.pending_terminal_focus = false;
             self.sync_terminal_from_cockpit();
@@ -21934,7 +21937,7 @@ impl NativeShell {
         };
         if let Some(task_id) = selected_task_id {
             let owner = self.local_task_key(task_id);
-            self.set_pane_view(&owner, Self::view_for_terminal_visibility(visible));
+            self.note_terminal_presentation_on_pane(&owner, visible);
         }
         if let Err(error) = result {
             self.local_slot_mut().composer_error = Some(format!("{error:?}"));
@@ -55178,10 +55181,22 @@ pub(crate) mod tests {
                 "accessible Attach must queue the production image picker"
             );
 
+            // A selection through the production owner route owns a pane; this
+            // scenario reaches the canvas through navigation_mouse_down, which
+            // does not, so seed the tree the select path would have built.
+            let owner = shell.local_task_key(task_id);
+            shell.layout.task_workspace =
+                Some(crate::ui::task_workspace::Workspace::single(owner.clone()));
+
             shell.dispatch_named_accessibility_action("native-task-center-terminal");
             assert_eq!(
                 shell.main_conversation_canvas(),
                 MainConversationCanvas::TaskTerminal
+            );
+            assert_eq!(
+                shell.pane_view(&owner),
+                PaneView::Terminal,
+                "going raw names Terminal on the owning pane"
             );
             assert_eq!(
                 shell.cockpit().active_tool(),
@@ -55197,6 +55212,22 @@ pub(crate) mod tests {
                 "switching to Terminal before a turn exists must not emit a red turn-not-ready error"
             );
 
+            // Leaving the terminal only demotes a pane that is actually showing
+            // it. A pane parked on another surface keeps that surface.
+            shell.set_pane_view(&owner, PaneView::Files);
+            shell.dispatch_named_accessibility_action("native-task-center-conversation");
+            assert_eq!(
+                shell.pane_view(&owner),
+                PaneView::Files,
+                "going semantic must not knock a pane off Files"
+            );
+            shell.dispatch_named_accessibility_action("native-task-center-terminal");
+            assert_eq!(shell.pane_view(&owner), PaneView::Terminal);
+            assert_eq!(
+                shell.main_conversation_canvas(),
+                MainConversationCanvas::TaskTerminal
+            );
+
             shell.clear_selected_task();
             assert!(
                 !shell.splash_fetch_attempted,
@@ -55210,8 +55241,12 @@ pub(crate) mod tests {
             assert!(restored.consumed);
             assert_eq!(
                 shell.main_conversation_canvas(),
-                MainConversationCanvas::TaskTerminal,
-                "ContextDock TerminalPresentation memory must restore Terminal for the task"
+                MainConversationCanvas::TaskConversation,
+                concat!(
+                    "the pane is the only source for its view, and deselection ",
+                    "dropped the tree, so a reselected task opens on Conversation ",
+                    "rather than on the surviving ContextDock terminal memory"
+                )
             );
 
             shell.dispatch_named_accessibility_action("native-task-center-conversation");
