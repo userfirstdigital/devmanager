@@ -2947,6 +2947,22 @@ mod tests {
             PrimaryProviderIcon::Cursor.glyph_path(),
             PrimaryProviderIcon::Other.glyph_path(),
         ];
+        assert_eq!(
+            PrimaryProviderIcon::Claude.glyph_path(),
+            crate::icons::PROVIDER_CLAUDE
+        );
+        assert_eq!(
+            PrimaryProviderIcon::Codex.glyph_path(),
+            crate::icons::PROVIDER_CODEX
+        );
+        assert_eq!(
+            PrimaryProviderIcon::Cursor.glyph_path(),
+            crate::icons::PROVIDER_CURSOR
+        );
+        assert_eq!(
+            PrimaryProviderIcon::Other.glyph_path(),
+            crate::icons::PROVIDER_OTHER
+        );
         let unique: std::collections::BTreeSet<_> = paths.iter().collect();
         assert_eq!(unique.len(), 4);
         assert!(paths.iter().all(|p| p.starts_with("icons/provider-")));
