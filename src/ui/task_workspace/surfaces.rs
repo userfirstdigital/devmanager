@@ -2254,27 +2254,38 @@ mod tests {
     }
 
     #[test]
-    fn focused_compact_pane_is_scheduled_on_background_cadence() {
-        let task = TaskId::new();
-        let mut workspace = TaskWorkspace::single(task);
+    fn a_minimised_pane_is_scheduled_on_background_cadence() {
+        // The focused pane is never minimised, so the pane this rule is about
+        // is an unfocused strip beside the pane the user is looking at.
+        let strip = TaskId::new();
+        let focused = TaskId::new();
+        let mut workspace = TaskWorkspace::single(strip);
         workspace
-            .set_presentation(task, PanePresentation::Minimised)
+            .insert_after_focused(focused, Axis::Horizontal)
+            .unwrap();
+        workspace.focus_task(focused).unwrap();
+        workspace
+            .set_presentation(strip, PanePresentation::Minimised)
             .unwrap();
         let mut registry = TaskSurfaceRegistry::default();
 
         let interactive_only = registry.conversation_query_schedule(&workspace, 0);
-        assert!(
-            interactive_only.is_empty(),
-            "focused compact is not interactive Full"
+        assert_eq!(
+            interactive_only,
+            vec![ConversationQueryPlan {
+                task_id: focused,
+                priority: ConversationQueryPriority::Interactive,
+            }],
+            "a strip is never the interactive pane"
         );
 
         let with_background = registry.conversation_query_schedule(&workspace, 2);
-        assert_eq!(
-            with_background,
-            vec![ConversationQueryPlan {
-                task_id: task,
+        assert!(
+            with_background.contains(&ConversationQueryPlan {
+                task_id: strip,
                 priority: ConversationQueryPriority::Background,
-            }]
+            }),
+            "a strip still refreshes on the background cadence: {with_background:?}"
         );
     }
 

@@ -863,27 +863,35 @@ mod tests {
     }
 
     #[test]
-    fn compact_only_vertical_split_fills_parent_without_unowned_gap() {
+    fn a_strip_beside_a_full_pane_fills_the_parent_without_an_unowned_gap() {
         let first = TaskId::new();
         let second = TaskId::new();
         let mut workspace = TaskWorkspace::single(first);
         workspace
             .insert_after_focused(second, Axis::Vertical)
             .unwrap();
-        workspace
-            .set_presentation(first, PanePresentation::Minimised)
-            .unwrap();
-        workspace
-            .set_presentation(second, PanePresentation::Minimised)
-            .unwrap();
 
-        let allocated = workspace.allocate(Viewport::new(700.0, 700.0), legacy_fixture_metrics());
+        // Presentation is re-derived from the viewport on every pass, so a
+        // strip is set up by giving the tree too little room, never by calling
+        // set_presentation: 500 px cannot hold 300+4+300, and 116+4+300 fits.
+        // Two strips is not a state this allocator can reach at all, because
+        // the focused pane is never a candidate.
+        let allocated = workspace.allocate(Viewport::new(700.0, 500.0), legacy_fixture_metrics());
 
-        assert_eq!(allocated.height(first), Some(348.0));
-        assert_eq!(allocated.height(second), Some(348.0));
+        assert_eq!(
+            workspace.presentation(first),
+            Some(PanePresentation::Minimised)
+        );
+        assert_eq!(workspace.presentation(second), Some(PanePresentation::Full));
+        assert_eq!(
+            allocated.height(first),
+            Some(116.0),
+            "the strip keeps its min"
+        );
+        assert_eq!(allocated.height(second), Some(380.0));
         assert_eq!(
             allocated.height(first).unwrap() + 4.0 + allocated.height(second).unwrap(),
-            700.0
+            500.0
         );
     }
 
@@ -900,18 +908,25 @@ mod tests {
         workspace
             .insert_after_focused(third, Axis::Vertical)
             .unwrap();
-        workspace
-            .set_presentation(third, PanePresentation::Minimised)
-            .unwrap();
+        workspace.focus_task(first).unwrap();
 
-        let allocated = workspace.allocate(Viewport::new(1_000.0, 700.0), legacy_fixture_metrics());
+        // 500 px cannot hold the nested branch's two Full panes (300+4+300),
+        // and `second` is the oldest unfocused candidate, so the strip in this
+        // allocation is one the pass actually produced and one that sticks.
+        let allocated = workspace.allocate(Viewport::new(1_000.0, 500.0), legacy_fixture_metrics());
+        assert_eq!(workspace.presentation(first), Some(PanePresentation::Full));
+        assert_eq!(
+            workspace.presentation(second),
+            Some(PanePresentation::Minimised)
+        );
+        assert_eq!(workspace.presentation(third), Some(PanePresentation::Full));
         let first_rect = allocated.rect(first).expect("first");
         let second_rect = allocated.rect(second).expect("second");
         let third_rect = allocated.rect(third).expect("third");
 
         assert_eq!(first_rect.width + 4.0 + second_rect.width, 1_000.0);
-        assert_eq!(first_rect.height, 700.0);
-        assert_eq!(second_rect.height + 4.0 + third_rect.height, 700.0);
+        assert_eq!(first_rect.height, 500.0);
+        assert_eq!(second_rect.height + 4.0 + third_rect.height, 500.0);
         assert_eq!(second_rect.width, third_rect.width);
     }
 
