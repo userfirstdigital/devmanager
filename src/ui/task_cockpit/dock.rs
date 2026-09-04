@@ -1189,6 +1189,13 @@ impl ContextDock {
         projection: &TaskTerminalProjection,
     ) -> TerminalPaneModel {
         let view = Self::terminal_session_view_from_projection(projection);
+        // One derivation, shared with the legacy app view. `hovered` is false
+        // because the cockpit path builds this model from a projection alone
+        // and has no pointer state to consult, so the terminal shows the idle
+        // 4 px bar and does not widen; the legacy view, which does track the
+        // pointer, passes its own hover through.
+        let scrollbar =
+            crate::terminal::view::scrollbar_model_for_screen(&view.screen, None, true, false);
         terminal_pane_from_replica(ReplicaPaneRequest {
             active_project: "",
             session_label: projection.title.as_deref().unwrap_or("task terminal"),
@@ -1198,7 +1205,7 @@ impl ContextDock {
             selection: None,
             search: None,
             search_highlight: None,
-            scrollbar: None,
+            scrollbar,
         })
     }
 
@@ -2294,6 +2301,40 @@ mod process_census_tests {
             is_provider: true,
             runtime_state: crate::domain::cockpit::TerminalRuntimeStateWire::Running,
         }
+    }
+
+    /// I3/I4: the cockpit's terminal used to derive its own scrollbar model,
+    /// and its answer for a screen with no scrollback was the opposite of the
+    /// legacy app view's. There is one derivation now, and this walks the
+    /// cockpit's real entry point to it rather than calling it directly.
+    #[test]
+    fn the_cockpit_terminal_takes_its_scrollbar_from_the_shared_derivation() {
+        let task_id = TaskId::new();
+        let resource_id = ResourceId::new();
+
+        // A screen that fits paints no bar at all -- the same predicate every
+        // shell surface uses.
+        let fits = shell_projection(task_id, resource_id, 1);
+        assert!(ContextDock::terminal_pane_model_for_projection(&fits)
+            .scrollbar
+            .is_none());
+
+        // One row of scrollback is overflow, so the bar appears, and it is the
+        // shared function's answer to the same screen.
+        let mut scrolled = shell_projection(task_id, resource_id, 2);
+        scrolled.screen.rows = 2;
+        scrolled.screen.total_lines = 3;
+        scrolled.screen.history_size = 1;
+        scrolled.screen.display_offset = 0;
+        let model = ContextDock::terminal_pane_model_for_projection(&scrolled)
+            .scrollbar
+            .expect("a screen with scrollback carries a scrollbar");
+        let shared =
+            crate::terminal::view::scrollbar_model_for_screen(&scrolled.screen, None, true, false)
+                .expect("shared model");
+        assert_eq!(model.thumb_top_ratio, shared.thumb_top_ratio);
+        assert_eq!(model.thumb_height_ratio, shared.thumb_height_ratio);
+        assert_eq!(model.hovered, shared.hovered);
     }
 
     #[test]

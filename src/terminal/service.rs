@@ -2165,6 +2165,9 @@ impl AttachedTerminalRuntime for MockAttachedRuntime {
             cells: Vec::new(),
             lines,
             cursor: None,
+            // A synthesized screen has no scrollback, so it has no margin.
+            margin_above: Vec::new(),
+            margin_below: Vec::new(),
             display_offset: 0,
             history_size: 0,
             total_lines: rows.len(),

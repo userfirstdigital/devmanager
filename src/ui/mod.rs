@@ -32,6 +32,7 @@ pub mod provider_catalog_seeds;
 pub mod provider_metadata;
 pub mod provider_settings;
 pub mod renderers;
+pub mod scrollbar;
 pub mod shell;
 pub mod startup_status;
 pub mod startup_trace;

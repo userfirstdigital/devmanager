@@ -609,6 +609,21 @@ fn compact_terminal_screen_for_wire(
         screen.cells.drain(..discard);
     }
     screen.lines.clear();
+    // The retained-window margin is the one part of a screen that is optional.
+    // A Noise transport message has a hard ~64 KiB ceiling and the enclosing
+    // envelope still needs headroom, so a remote client trades local scrolling
+    // for a frame that fits: it simply gets no margin and falls back to the
+    // synchronous scroll, exactly as an older host's client does. The local IPC
+    // transport has no such ceiling and keeps the margin.
+    //
+    // The styled-cell limit is a PROXY for the transport: it is the only signal
+    // this function is given, and only the connect path passes the small one.
+    // Keying on the transport itself is ledgered as a follow-up in the lane
+    // report.
+    if styled_cell_limit <= MAX_TERMINAL_CONNECT_STYLED_CELLS {
+        screen.margin_above.clear();
+        screen.margin_below.clear();
+    }
     (screen, text_lines)
 }
 
@@ -3353,6 +3368,49 @@ mod tests {
                 runtime_state: crate::domain::cockpit::TerminalRuntimeStateWire::Running,
             }))
             .expect("a normal styled provider screen must remain encodable");
+    }
+
+    /// m12: the margin is the one optional part of a screen, and which
+    /// transport is carrying it decides whether it goes. The local limit must
+    /// keep it -- a client with no margin never scrolls locally and the whole
+    /// lane buys nothing -- and the connect limit must drop it, or a remote
+    /// frame can exceed Noise's ~64 KiB ceiling and disconnect the client.
+    ///
+    /// Both directions asserted on the same screen, so a change that clears the
+    /// margin unconditionally, or never, fails here rather than in the field.
+    #[test]
+    fn the_wire_margin_survives_the_local_limit_and_goes_at_the_connect_limit() {
+        use crate::terminal::session::TerminalScreenSnapshot;
+
+        let rows = 4;
+        let margined = TerminalScreenSnapshot {
+            rows,
+            cols: 20,
+            lines: vec![Vec::new(); rows],
+            margin_above: (0..8).map(|line| format!("above-{line}")).collect(),
+            margin_below: (0..8).map(|line| format!("below-{line}")).collect(),
+            ..TerminalScreenSnapshot::default()
+        };
+
+        let (local, _) =
+            compact_terminal_screen_for_wire(margined.clone(), MAX_TERMINAL_STYLED_CELLS_FOR_WIRE);
+        assert_eq!(
+            local.margin_above.len(),
+            8,
+            "the local IPC transport has no frame ceiling, so the margin must survive it"
+        );
+        assert_eq!(local.margin_below.len(), 8);
+        assert_eq!(
+            local.margin_above.first().map(String::as_str),
+            Some("above-0")
+        );
+
+        let (connect, _) =
+            compact_terminal_screen_for_wire(margined, MAX_TERMINAL_CONNECT_STYLED_CELLS);
+        assert!(
+            connect.margin_above.is_empty() && connect.margin_below.is_empty(),
+            "a remote frame must trade the margin for a frame that fits"
+        );
     }
 
     #[test]

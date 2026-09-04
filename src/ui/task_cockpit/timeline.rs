@@ -25,6 +25,7 @@ use crate::ui::renderers::{
     inspect_operation, live_target, CapturedActionTarget, JournalAvailability, RenderModelError,
     RendererRegistry, SemanticJournalView, TimelineActivation, TimelineItemId, TimelineItemModel,
 };
+use crate::ui::scrollbar::AppScrollbar;
 use crate::ui::tokens::ThemeTokens;
 
 #[cfg(debug_assertions)]
@@ -436,6 +437,7 @@ impl Timeline {
         let activity = self.activity_summary.clone();
         let rows = Rc::clone(&self.rows);
         let list_state = self.list_state.clone();
+        let scrollbar_state = self.list_state.clone();
         let activity_toggle_for_rows = activity_toggle.clone();
         let task_key = self.task_element_key();
         div()
@@ -491,20 +493,41 @@ impl Timeline {
                                     .into_any_element()
                             }))
                             .child(
-                                list(list_state, move |ix, window: &mut Window, cx: &mut App| {
-                                    rows.get(ix)
-                                        .map(|row| {
-                                            timeline_row_element(
-                                                row,
-                                                tokens,
-                                                activity_toggle_for_rows.clone(),
-                                                window,
-                                                cx,
-                                            )
-                                        })
-                                        .unwrap_or_else(|| div().into_any_element())
-                                })
-                                .flex_1(),
+                                // The transcript is the app's longest scrolling
+                                // surface and it painted no bar at all. The
+                                // crate implements `ScrollbarHandle` for
+                                // `ListState`, so the same handle that scrolls
+                                // it drives the bar -- there is still one owner
+                                // of the transcript's scroll position.
+                                div()
+                                    .relative()
+                                    .flex_1()
+                                    .min_h(px(0.0))
+                                    .child(
+                                        list(
+                                            list_state,
+                                            move |ix, window: &mut Window, cx: &mut App| {
+                                                rows.get(ix)
+                                                    .map(|row| {
+                                                        timeline_row_element(
+                                                            row,
+                                                            tokens,
+                                                            activity_toggle_for_rows.clone(),
+                                                            window,
+                                                            cx,
+                                                        )
+                                                    })
+                                                    .unwrap_or_else(|| div().into_any_element())
+                                            },
+                                        )
+                                        .size_full(),
+                                    )
+                                    .child(AppScrollbar::vertical(
+                                        ("native-semantic-timeline-scrollbar", task_key),
+                                        &scrollbar_state,
+                                        tokens.scrollbar,
+                                        tokens.surfaces.canvas,
+                                    )),
                             ),
                     ),
             )

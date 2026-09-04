@@ -353,6 +353,12 @@ struct NativeShell {
     last_terminal_mouse_report: Option<(TerminalGridPosition, Option<MouseButton>)>,
     terminal_mouse_press_owner: Option<TerminalMousePressOwner>,
     terminal_scrollbar_drag: Option<TerminalScrollbarDrag>,
+    /// True while the pointer is inside the terminal's scrollbar gutter.
+    ///
+    /// The gutter is painted on a `canvas`, which cannot answer a
+    /// `group_hover`, so the hover that widens the thumb from 4 px to 10 px is
+    /// tracked here from the same global mouse-move listener the drag uses.
+    terminal_scrollbar_hovered: bool,
     pending_terminal_display_offset: Option<usize>,
     terminal_search: TerminalSearchState,
     editor_panel: Option<EditorPanel>,
@@ -550,7 +556,7 @@ struct TerminalScrollbarGeometry {
 
 #[derive(Debug, Clone, Copy)]
 struct TerminalScrollbarDrag {
-    grab_offset_px: f32,
+    grab: crate::ui::scrollbar::ScrollbarGrab,
     thumb_top_ratio: f32,
     last_display_offset: usize,
 }
@@ -1517,6 +1523,7 @@ impl NativeShell {
             last_terminal_mouse_report: None,
             terminal_mouse_press_owner: None,
             terminal_scrollbar_drag: None,
+            terminal_scrollbar_hovered: false,
             pending_terminal_display_offset: None,
             terminal_search: TerminalSearchState::default(),
             editor_panel: None,
@@ -8357,7 +8364,8 @@ impl NativeShell {
         };
         let metrics = self.terminal_render_metrics(window);
         let available_width = if self.state.settings().show_terminal_scrollbar {
-            (layout.available_width - view::TERMINAL_SCROLLBAR_WIDTH_PX).max(metrics.cell_width)
+            (layout.available_width - view::terminal_scrollbar_spec().gutter_width)
+                .max(metrics.cell_width)
         } else {
             layout.available_width
         };
@@ -12261,11 +12269,12 @@ impl NativeShell {
         session: Option<&crate::terminal::session::TerminalSessionView>,
     ) -> Option<view::TerminalScrollbarModel> {
         let session = session?;
-        scrollbar_model_for_screen(
+        view::scrollbar_model_for_screen(
             &session.screen,
             self.terminal_scrollbar_drag
                 .map(|drag| drag.thumb_top_ratio),
             self.state.settings().show_terminal_scrollbar,
+            self.terminal_scrollbar_hovered,
         )
     }
 
@@ -12283,21 +12292,33 @@ impl NativeShell {
         let visible_lines = session.screen.rows.max(1);
         let max_offset = session.screen.history_size.max(1);
 
-        let left = layout.left + layout.available_width - view::TERMINAL_SCROLLBAR_WIDTH_PX;
+        // The drag side and the paint side must agree exactly or the thumb
+        // jumps under the pointer, so both go through the one geometry in
+        // `crate::ui::scrollbar` rather than each doing the arithmetic.
+        let spec = view::terminal_scrollbar_spec();
+        let left = layout.left + layout.available_width - spec.gutter_width;
         let top = layout.top - 2.0;
-        let width = view::TERMINAL_SCROLLBAR_WIDTH_PX;
+        let width = spec.gutter_width;
         let height = layout.available_height + 4.0;
-        let track_top = top + view::TERMINAL_SCROLLBAR_TRACK_INSET_Y_PX;
-        let track_height = (height - view::TERMINAL_SCROLLBAR_TRACK_INSET_Y_PX * 2.0).max(12.0);
-        let thumb_height = (track_height
-            * (visible_lines as f32 / total_lines as f32).clamp(0.08, 1.0))
-        .max(view::TERMINAL_SCROLLBAR_MIN_THUMB_HEIGHT_PX)
-        .min(track_height);
-        let thumb_range = (track_height - thumb_height).max(0.0);
-        let thumb_top = track_top
-            + thumb_range
-                * scrollbar_thumb_top_ratio(session.screen.display_offset, max_offset)
-                    .clamp(0.0, 1.0);
+        // No local minimum: the one min-thumb rule is `min_thumb_length` inside
+        // `thumb_geometry`, so a second clamp here would be a second rule that
+        // the paint path does not share.
+        let visible_fraction = visible_lines as f32 / total_lines as f32;
+        let scroll_fraction =
+            view::scrollbar_thumb_top_ratio(session.screen.display_offset, max_offset)
+                .clamp(0.0, 1.0);
+        let track = crate::ui::scrollbar::track_geometry(spec, height);
+        let thumb = crate::ui::scrollbar::thumb_geometry(
+            spec,
+            height,
+            visible_fraction,
+            scroll_fraction,
+            true,
+        )?;
+        let track_top = top + track.top;
+        let track_height = track.height;
+        let thumb_height = thumb.height;
+        let thumb_top = top + thumb.top;
 
         Some(TerminalScrollbarGeometry {
             left,
@@ -12325,15 +12346,6 @@ impl NativeShell {
             && y <= geometry.top + geometry.height
     }
 
-    fn scrollbar_thumb_contains(
-        &self,
-        position: Point<Pixels>,
-        geometry: TerminalScrollbarGeometry,
-    ) -> bool {
-        let y: f32 = position.y.into();
-        y >= geometry.thumb_top && y <= geometry.thumb_top + geometry.thumb_height
-    }
-
     fn scroll_terminal_from_scrollbar(
         &mut self,
         position: Point<Pixels>,
@@ -12344,9 +12356,9 @@ impl NativeShell {
             return;
         };
 
-        let thumb_top_ratio = scrollbar_ratio_for_position(position, geometry, drag.grab_offset_px);
+        let thumb_top_ratio = scrollbar_ratio_for_position(position, geometry, drag.grab);
         let display_offset =
-            display_offset_for_scrollbar_ratio(thumb_top_ratio, geometry.max_offset);
+            view::display_offset_for_scrollbar_ratio(thumb_top_ratio, geometry.max_offset);
         let ratio_changed = (drag.thumb_top_ratio - thumb_top_ratio).abs() > 0.0001;
         let offset_changed = drag.last_display_offset != display_offset;
 
@@ -14248,11 +14260,15 @@ impl NativeShell {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.handle_terminal_scrollbar_mouse_move(event, window, cx) {
+        // The scrollbar handler takes the screen snapshot only when the pointer
+        // is in the gutter's column or a drag is running; when it does, this
+        // reuses that one clone rather than taking a second.
+        let mut active_session = None;
+        if self.handle_terminal_scrollbar_mouse_move(event, window, cx, &mut active_session) {
             return;
         }
 
-        let active_session = self.current_active_session_view();
+        let active_session = active_session.or_else(|| self.current_active_session_view());
         let session_mode = active_session.as_ref().map(|session| session.screen.mode);
         let terminal_input_blocked = self.terminal_input_block_reason().is_some();
         if session_mode.is_some_and(|mode| self.terminal_mouse_capture_active(mode))
@@ -14324,16 +14340,17 @@ impl NativeShell {
                 if self.scrollbar_hit_test(event.position, geometry) {
                     self.terminal_selection = None;
                     self.is_selecting_terminal = false;
-                    let grab_offset_px = if self.scrollbar_thumb_contains(event.position, geometry)
-                    {
-                        let y: f32 = event.position.y.into();
-                        (y - geometry.thumb_top).clamp(0.0, geometry.thumb_height)
-                    } else {
-                        geometry.thumb_height / 2.0
-                    };
+                    // Same rule as every other scrollbar in the app: inside the
+                    // thumb the pointer keeps its hold, outside it the thumb
+                    // centres on the pointer.
+                    let grab = crate::ui::scrollbar::grab_for_pointer(
+                        geometry.thumb_top,
+                        geometry.thumb_height,
+                        event.position.y.into(),
+                    );
                     self.terminal_scrollbar_drag = Some(TerminalScrollbarDrag {
-                        grab_offset_px,
-                        thumb_top_ratio: scrollbar_thumb_top_ratio(
+                        grab,
+                        thumb_top_ratio: view::scrollbar_thumb_top_ratio(
                             session.screen.display_offset,
                             geometry.max_offset,
                         ),
@@ -14349,25 +14366,61 @@ impl NativeShell {
         false
     }
 
+    /// This listener is registered globally for the frame, so it is also the
+    /// only place that can see the pointer entering and leaving the gutter.
+    ///
+    /// It therefore runs for every pixel the pointer travels ANYWHERE in the
+    /// window, and `current_active_session_view()` clones a whole screen
+    /// snapshot -- now including the retained margin, so three viewports of
+    /// rows. The cheap tests come first: an active drag, or a pointer inside
+    /// the gutter's column, both of which are layout and metrics only. The
+    /// snapshot is taken after that, and handed back through `session` so the
+    /// caller does not clone it a second time.
     fn handle_terminal_scrollbar_mouse_move(
         &mut self,
         event: &MouseMoveEvent,
         window: &mut Window,
         cx: &mut Context<Self>,
+        session: &mut Option<crate::terminal::session::TerminalSessionView>,
     ) -> bool {
-        let Some(_) = self.terminal_scrollbar_drag else {
-            return false;
-        };
-        if !event.dragging() {
+        let dragging = self.terminal_scrollbar_drag.is_some() && event.dragging();
+        let pointer_x: f32 = event.position.x.into();
+        let in_gutter_column = self
+            .terminal_scrollbar_gutter_span(window)
+            .is_some_and(|(left, right)| pointer_x >= left && pointer_x <= right);
+        if !dragging && !in_gutter_column {
+            // Nowhere near the bar. Clearing a hover that is already false
+            // costs nothing and notifies nothing.
+            if self.terminal_scrollbar_hovered {
+                self.terminal_scrollbar_hovered = false;
+                cx.notify();
+            }
             return false;
         }
 
-        if let Some(session) = self.current_active_session_view() {
-            if let Some(geometry) = self.terminal_scrollbar_geometry(window, &session) {
-                self.scroll_terminal_from_scrollbar(event.position, geometry, cx);
-                window.prevent_default();
-                return true;
-            }
+        if session.is_none() {
+            *session = self.current_active_session_view();
+        }
+        let geometry = session
+            .as_ref()
+            .and_then(|session| self.terminal_scrollbar_geometry(window, session));
+        // Only notify when the hover actually changed -- a repaint per mouse
+        // move would cost more than the hover is worth.
+        let hovered =
+            geometry.is_some_and(|geometry| self.scrollbar_hit_test(event.position, geometry));
+        if hovered != self.terminal_scrollbar_hovered {
+            self.terminal_scrollbar_hovered = hovered;
+            cx.notify();
+        }
+
+        if !dragging {
+            return false;
+        }
+
+        if let Some(geometry) = geometry {
+            self.scroll_terminal_from_scrollbar(event.position, geometry, cx);
+            window.prevent_default();
+            return true;
         }
         self.terminal_scrollbar_drag = None;
         false
@@ -14919,7 +14972,7 @@ impl NativeShell {
         let cell_width = metrics.cell_width;
         let row_height = metrics.line_height;
         let scrollbar_width = if self.state.settings().show_terminal_scrollbar {
-            view::TERMINAL_SCROLLBAR_WIDTH_PX
+            view::terminal_scrollbar_spec().gutter_width
         } else {
             0.0
         };
@@ -14942,15 +14995,41 @@ impl NativeShell {
         })
     }
 
+    /// The terminal grid's horizontal span: left edge and usable width.
+    ///
+    /// Split out of [`Self::terminal_viewport_layout`] because it depends on
+    /// the window and the sidebar alone -- never on a session -- which is what
+    /// lets a mouse-move ask whether the pointer is in the scrollbar's column
+    /// before it pays for a screen snapshot.
+    fn terminal_viewport_columns(&self, window: &Window) -> Option<(f32, f32)> {
+        let viewport_width: f32 = window.viewport_size().width.into();
+        let left = self.sidebar_width() + 4.0; // px_1() left padding on grid inner
+        if viewport_width <= left {
+            return None;
+        }
+        let right_padding = 4.0; // px_1() right padding on grid inner
+        Some((left, (viewport_width - left - right_padding).max(320.0)))
+    }
+
+    /// The scrollbar gutter's x range, from layout and metrics only.
+    fn terminal_scrollbar_gutter_span(&self, window: &Window) -> Option<(f32, f32)> {
+        if !self.state.settings().show_terminal_scrollbar {
+            return None;
+        }
+        let (left, available_width) = self.terminal_viewport_columns(window)?;
+        let width = view::terminal_scrollbar_spec().gutter_width;
+        let gutter_left = left + available_width - width;
+        Some((gutter_left, gutter_left + width))
+    }
+
     fn terminal_viewport_layout(
         &self,
         window: &Window,
         include_exit_banner: bool,
     ) -> Option<TerminalViewportLayout> {
         let viewport = window.viewport_size();
-        let viewport_width: f32 = viewport.width.into();
         let viewport_height: f32 = viewport.height.into();
-        let left = self.sidebar_width() + 4.0; // px_1() left padding on grid inner
+        let (left, available_width) = self.terminal_viewport_columns(window)?;
         let mut top = TERMINAL_TOPBAR_HEIGHT_PX;
 
         let active_workspace_key = browser_workspace_key_for_ai_tab(self.state.active_tab());
@@ -14987,11 +15066,10 @@ impl NativeShell {
         }
         top += 2.0; // py(px(2.0)) top on grid inner
 
-        if viewport_width <= left || viewport_height <= top {
+        if viewport_height <= top {
             return None;
         }
 
-        let right_padding = 4.0; // px_1() right padding on grid inner
         let bottom_padding = chrome::STATUS_BAR_HEIGHT_PX
             + 2.0  // py(px(2.0)) bottom on grid inner
             + 2.0  // pb(px(2.0)) on body wrapper
@@ -15005,7 +15083,7 @@ impl NativeShell {
         Some(TerminalViewportLayout {
             left,
             top,
-            available_width: (viewport_width - left - right_padding).max(320.0),
+            available_width,
             available_height: (viewport_height - top - bottom_padding).max(160.0),
         })
     }
@@ -15992,7 +16070,7 @@ impl Render for NativeShell {
                     )),
                     on_mouse_move: Arc::new(cx.listener(
                         |this, event: &MouseMoveEvent, window, cx| {
-                            this.handle_terminal_scrollbar_mouse_move(event, window, cx);
+                            this.handle_terminal_scrollbar_mouse_move(event, window, cx, &mut None);
                         },
                     )),
                     on_mouse_up: Arc::new(cx.listener(|this, event: &MouseUpEvent, window, cx| {
@@ -19466,62 +19544,23 @@ fn collapse_terminal_whitespace(value: &str) -> String {
     value.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
-fn scrollbar_thumb_top_ratio(display_offset: usize, max_offset: usize) -> f32 {
-    if max_offset == 0 {
-        1.0
-    } else {
-        1.0 - (display_offset as f32 / max_offset as f32)
-    }
-}
-
-/// Pure scrollbar math shared by render and tests. With no scrollback
-/// (alt-screen apps, fresh sessions) this intentionally returns a
-/// full-height inert thumb instead of `None`, so the gutter stays visible
-/// whenever the setting is on — matching Windows Terminal.
-fn scrollbar_model_for_screen(
-    screen: &crate::terminal::session::TerminalScreenSnapshot,
-    drag_thumb_top_ratio: Option<f32>,
-    enabled: bool,
-) -> Option<view::TerminalScrollbarModel> {
-    if !enabled {
-        return None;
-    }
-
-    let total_lines = screen.total_lines.max(screen.rows.max(1));
-    let visible_lines = screen.rows.max(1);
-    let max_offset = screen.history_size.max(1);
-    let thumb_height_ratio = visible_lines as f32 / total_lines as f32;
-    let thumb_top_ratio = drag_thumb_top_ratio
-        .unwrap_or_else(|| scrollbar_thumb_top_ratio(screen.display_offset, max_offset));
-
-    Some(view::TerminalScrollbarModel {
-        thumb_top_ratio: thumb_top_ratio.clamp(0.0, 1.0),
-        thumb_height_ratio,
-    })
-}
-
+/// The drag arithmetic is `crate::ui::scrollbar`'s, in window coordinates.
+/// A track the thumb fills has no position to report, and for a terminal that
+/// means the live bottom -- the convention the rest of this module's ratios
+/// use, which is why the fallback is here rather than in the shared function.
 fn scrollbar_ratio_for_position(
     position: Point<Pixels>,
     geometry: TerminalScrollbarGeometry,
-    grab_offset_px: f32,
+    grab: crate::ui::scrollbar::ScrollbarGrab,
 ) -> f32 {
-    let thumb_range = (geometry.track_height - geometry.thumb_height).max(0.0);
-    let position_y: f32 = position.y.into();
-    let unclamped_thumb_top = position_y - geometry.track_top - grab_offset_px;
-
-    if thumb_range <= f32::EPSILON {
-        1.0
-    } else {
-        (unclamped_thumb_top / thumb_range).clamp(0.0, 1.0)
-    }
-}
-
-fn display_offset_for_scrollbar_ratio(thumb_top_ratio: f32, max_offset: usize) -> usize {
-    if max_offset == 0 {
-        0
-    } else {
-        ((1.0 - thumb_top_ratio.clamp(0.0, 1.0)) * max_offset as f32).round() as usize
-    }
+    crate::ui::scrollbar::scroll_fraction_for_grab(
+        geometry.track_top,
+        geometry.track_height,
+        geometry.thumb_height,
+        position.y.into(),
+        grab,
+    )
+    .unwrap_or(1.0)
 }
 
 fn terminal_view_needs_resize(
@@ -21249,23 +21288,43 @@ mod tests {
 
     #[test]
     fn scrollbar_ratio_maps_live_bottom_to_bottom_thumb() {
-        assert_eq!(scrollbar_thumb_top_ratio(0, 120), 1.0);
-        assert_eq!(scrollbar_thumb_top_ratio(120, 120), 0.0);
-        assert_eq!(display_offset_for_scrollbar_ratio(1.0, 120), 0);
-        assert_eq!(display_offset_for_scrollbar_ratio(0.0, 120), 120);
-        assert_eq!(display_offset_for_scrollbar_ratio(0.5, 120), 60);
+        assert_eq!(view::scrollbar_thumb_top_ratio(0, 120), 1.0);
+        assert_eq!(view::scrollbar_thumb_top_ratio(120, 120), 0.0);
+        assert_eq!(view::display_offset_for_scrollbar_ratio(1.0, 120), 0);
+        assert_eq!(view::display_offset_for_scrollbar_ratio(0.0, 120), 120);
+        assert_eq!(view::display_offset_for_scrollbar_ratio(0.5, 120), 60);
     }
 
+    /// I3/I4: this used to assert a full-height inert thumb, on the reasoning
+    /// that Windows Terminal keeps its gutter occupied. The cockpit's own
+    /// derivation answered `None` for the same screen, so the two shells
+    /// disagreed about the commonest case there is. The brief rules that no
+    /// overflow shows no thumb -- the same predicate every other surface in the
+    /// app uses -- and there is now one derivation that says so.
     #[test]
-    fn scrollbar_model_shows_full_height_thumb_without_history() {
+    fn scrollbar_model_is_absent_without_scrollback() {
         let mut screen = screen_from_lines(&["one", "two"]);
         screen.total_lines = 2;
         screen.history_size = 0;
         screen.display_offset = 0;
 
-        let model = scrollbar_model_for_screen(&screen, None, true).expect("model");
+        assert!(view::scrollbar_model_for_screen(&screen, None, true, false).is_none());
+    }
 
-        assert_eq!(model.thumb_height_ratio, 1.0);
+    /// One row of scrollback is overflow, so the bar appears -- the boundary
+    /// the case above sits one row below.
+    #[test]
+    fn scrollbar_model_appears_with_a_single_row_of_scrollback() {
+        let mut screen = screen_from_lines(&["one", "two"]);
+        screen.total_lines = 3;
+        screen.history_size = 1;
+        screen.display_offset = 0;
+
+        let model = view::scrollbar_model_for_screen(&screen, None, true, false).expect("model");
+
+        assert_eq!(model.thumb_height_ratio, 2.0 / 3.0);
+        assert_eq!(model.thumb_top_ratio, 1.0);
+        assert!(!model.hovered);
     }
 
     #[test]
@@ -21274,7 +21333,7 @@ mod tests {
         screen.total_lines = 20;
         screen.history_size = 18;
 
-        assert!(scrollbar_model_for_screen(&screen, None, false).is_none());
+        assert!(view::scrollbar_model_for_screen(&screen, None, false, false).is_none());
     }
 
     #[test]
@@ -21284,7 +21343,7 @@ mod tests {
         screen.history_size = 6;
         screen.display_offset = 0;
 
-        let model = scrollbar_model_for_screen(&screen, None, true).expect("model");
+        let model = view::scrollbar_model_for_screen(&screen, None, true, false).expect("model");
 
         assert_eq!(model.thumb_height_ratio, 0.25);
         assert_eq!(model.thumb_top_ratio, 1.0);
@@ -21475,8 +21534,84 @@ mod tests {
             max_offset: 120,
         };
 
-        let ratio = scrollbar_ratio_for_position(point(px(5.0), px(44.0)), geometry, 10.0);
+        let ratio = scrollbar_ratio_for_position(
+            point(px(5.0), px(44.0)),
+            geometry,
+            crate::ui::scrollbar::ScrollbarGrab::Held(10.0),
+        );
         assert!((ratio - 0.4).abs() < 0.001);
+
+        // A track click has no hold, so the thumb centres on the pointer. On a
+        // 20 px thumb that is indistinguishable from `Held(10.0)` -- half the
+        // thumb IS the held offset -- so the two are compared on a 30 px thumb,
+        // where centring uses 15 and the hold uses 10 and they must disagree.
+        let taller = TerminalScrollbarGeometry {
+            thumb_height: 30.0,
+            ..geometry
+        };
+        let travel = taller.track_height - taller.thumb_height;
+        assert_eq!(travel, 50.0);
+
+        let centred = scrollbar_ratio_for_position(
+            point(px(5.0), px(45.0)),
+            taller,
+            crate::ui::scrollbar::ScrollbarGrab::Centre,
+        );
+        // (45 - 15 - 10) / 50
+        assert!((centred - 0.4).abs() < 0.001, "centred was {centred}");
+
+        let held = scrollbar_ratio_for_position(
+            point(px(5.0), px(45.0)),
+            taller,
+            crate::ui::scrollbar::ScrollbarGrab::Held(10.0),
+        );
+        // (45 - 10 - 10) / 50
+        assert!((held - 0.5).abs() < 0.001, "held was {held}");
+        assert_ne!(
+            centred, held,
+            "Centre and Held must be different rules, not one arithmetic dressed twice"
+        );
+    }
+
+    /// I1 at the terminal: a thumb grabbed 3 px below its top and dragged 10 px
+    /// must move exactly 10 px, not jump so its centre lands on the pointer.
+    #[test]
+    fn dragging_the_terminal_thumb_keeps_the_grab_offset() {
+        let geometry = TerminalScrollbarGeometry {
+            left: 0.0,
+            top: 0.0,
+            width: 10.0,
+            height: 100.0,
+            track_top: 10.0,
+            track_height: 80.0,
+            thumb_top: 34.0,
+            thumb_height: 20.0,
+            max_offset: 120,
+        };
+        let travel = geometry.track_height - geometry.thumb_height;
+
+        let press_y = geometry.thumb_top + 3.0;
+        let grab = crate::ui::scrollbar::grab_for_pointer(
+            geometry.thumb_top,
+            geometry.thumb_height,
+            press_y,
+        );
+        assert_eq!(grab, crate::ui::scrollbar::ScrollbarGrab::Held(3.0));
+
+        let pressed = scrollbar_ratio_for_position(point(px(5.0), px(press_y)), geometry, grab);
+        let pressed_top = geometry.track_top + pressed * travel;
+        assert!(
+            (pressed_top - geometry.thumb_top).abs() < 0.001,
+            "pressing inside the thumb must not move it: {pressed_top}"
+        );
+
+        let dragged =
+            scrollbar_ratio_for_position(point(px(5.0), px(press_y + 10.0)), geometry, grab);
+        let dragged_top = geometry.track_top + dragged * travel;
+        assert!(
+            (dragged_top - geometry.thumb_top - 10.0).abs() < 0.001,
+            "a 10 px drag must move the thumb 10 px: {dragged_top}"
+        );
     }
 
     fn snapshot_cell(character: char) -> TerminalCellSnapshot {

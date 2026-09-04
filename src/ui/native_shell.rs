@@ -28,6 +28,7 @@ use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
+use crate::ui::scrollbar::AppScrollableElement;
 use gpui::prelude::FluentBuilder;
 use gpui::{
     anchored, canvas, deferred, div, fill, img, point, px, size, uniform_list, Animation,
@@ -41,7 +42,6 @@ use gpui::{
 };
 use gpui_component::button::{Button, ButtonVariants};
 use gpui_component::input::{Input, InputState};
-use gpui_component::scroll::{ScrollableElement, Scrollbar};
 use gpui_component::{Disableable, Sizable};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
@@ -280,14 +280,12 @@ const NATIVE_POINTER_ID: u64 = 1;
 /// The nominal square the workspace is allocated into when panel ORDINALS are
 /// read off it, rather than the live window: the ordinals must not renumber
 /// when the window is resized. It is not a claim that nothing ever overflows --
-/// 40 panes at the 360 px full minimum need 14,400 px and would -- but an
+/// 40 panes at the 320 px full minimum need 12,800 px and would -- but an
 /// overflowing axis still lays its children out in order, so the reading order
 /// the ordinals are sorted from survives it. 8,192 is simply wide enough that
 /// an ordinary workspace is laid out unclamped.
 const WORKSPACE_ORDINAL_PROBE_EXTENT: f32 = 8_192.0;
 
-/// Dedicated inbox scrollbar gutter width (gpui-component Scrollbar WIDTH = 16px).
-const TASK_INBOX_SCROLLBAR_GUTTER_WIDTH_PX: f32 = 16.0;
 /// Row padding matches the left inset; the scrollbar owns its own gutter sibling.
 const TASK_RAIL_ROW_HORIZONTAL_PADDING_PX: f32 = 10.0;
 
@@ -373,9 +371,11 @@ fn task_row_capture(button: MouseButton) -> TaskRowCapture {
     TaskRowCapture::Consume
 }
 
-fn task_inbox_scroll_geometry() -> (f32, f32) {
+/// The inbox's gutter width and its row padding. The gutter is the scrollbar
+/// spec's own, so the sibling column the bar sits in cannot drift from the bar.
+fn task_inbox_scroll_geometry(tokens: crate::ui::tokens::ThemeTokens) -> (f32, f32) {
     (
-        TASK_INBOX_SCROLLBAR_GUTTER_WIDTH_PX,
+        tokens.scrollbar.gutter_width,
         TASK_RAIL_ROW_HORIZONTAL_PADDING_PX,
     )
 }
@@ -11470,6 +11470,11 @@ pub struct NativeShell {
     composer_painted_layout: Option<ComposerPaintedLayout>,
     composer_draft_content_height: f32,
     composer_scroll_handle: gpui::ScrollHandle,
+    /// Scroll position of the theme editor panel, so the panel can carry a
+    /// real scrollbar instead of clipping silently.
+    theme_editor_scroll_handle: gpui::ScrollHandle,
+    /// Scroll position of the composer's provider/model selector popover.
+    composer_selector_scroll_handle: gpui::ScrollHandle,
     composer_reveal_cursor: bool,
     last_window_persist: Option<Instant>,
     add_project: Option<AddProjectDraft>,
@@ -11929,6 +11934,9 @@ struct NativeGitWindow {
     snapshot: NativeGitWindowSnapshot,
     active_view: NativeGitView,
     show_repository_menu: bool,
+    /// Scroll position of the repository popover, so a long repository list
+    /// carries a bar rather than clipping silently.
+    repository_menu_scroll_handle: gpui::ScrollHandle,
     selected_file: Option<String>,
     selected_commit: Option<String>,
     commit_summary: Entity<InputState>,
@@ -12007,6 +12015,7 @@ impl NativeGitWindow {
             snapshot,
             active_view: NativeGitView::Changes,
             show_repository_menu: false,
+            repository_menu_scroll_handle: gpui::ScrollHandle::new(),
             selected_file: None,
             selected_commit: None,
             commit_summary,
@@ -12559,6 +12568,8 @@ impl NativeShell {
             composer_painted_layout: None,
             composer_draft_content_height: CONVERSATION_COMPOSER_INPUT_MIN_HEIGHT - 42.0,
             composer_scroll_handle: gpui::ScrollHandle::new(),
+            theme_editor_scroll_handle: gpui::ScrollHandle::new(),
+            composer_selector_scroll_handle: gpui::ScrollHandle::new(),
             composer_reveal_cursor: false,
             last_window_persist: None,
             add_project: None,
@@ -21582,7 +21593,15 @@ impl NativeShell {
                         .w(px(200.0))
                         .max_w(px(240.0))
                         .max_h(px(220.0))
+                        .relative()
                         .overflow_y_scroll()
+                        .track_scroll(&self.composer_selector_scroll_handle)
+                        .child(crate::ui::scrollbar::AppScrollbar::vertical(
+                            "native-composer-selector-scrollbar",
+                            &self.composer_selector_scroll_handle,
+                            tokens.scrollbar,
+                            tokens.surfaces.overlay,
+                        ))
                         .p(px(4.0))
                         .rounded(px(6.0))
                         .bg(tokens.surfaces.overlay.to_gpui())
@@ -26951,6 +26970,12 @@ impl NativeShell {
                         if delta_lines == 0 {
                             return;
                         }
+                        // Repaint from the retained rows FIRST, then tell the
+                        // host. The notify below therefore renders the new
+                        // position on this frame instead of in ~97 ms, and the
+                        // host's reply -- which still arrives -- replaces the
+                        // window and restores the styled cells.
+                        shell.paint_terminal_scroll_locally(&scroll_owner, delta_lines);
                         shell.dispatch_terminal_scroll_for_owner(&scroll_owner, delta_lines);
                         cx.notify();
                     });
@@ -27051,6 +27076,35 @@ impl NativeShell {
                 });
             }),
         }
+    }
+
+    /// Paint one wheel notch from the client's retained rows, if it lands
+    /// inside them.
+    ///
+    /// This is the whole point of the retained window: a notch used to cost a
+    /// host round trip (measured median 97 ms, so about 10 fps and a scroll
+    /// that felt like a remote device). Serving it locally makes the repaint a
+    /// frame, and `dispatch_terminal_scroll_for_owner` still tells the host so
+    /// its viewport follows and its reply re-centres the window. The host stays
+    /// authoritative; only the WAIT is removed.
+    ///
+    /// Returns true when the notch was painted locally. False is not a failure
+    /// -- it means the gesture ran past the retained rows, or the host sends no
+    /// margin, and the synchronous path still answers it correctly.
+    fn paint_terminal_scroll_locally(&mut self, owner: &HostTaskKey, delta_lines: i32) -> bool {
+        // The retained screens are keyed by durable resource, including the
+        // provider's own, so the window is found the same way the paint path
+        // finds the projection.
+        let key: TerminalKey = (owner.clone(), self.focused_terminal_target(owner));
+        let Some(resource_id) = self
+            .terminal_projection_for(&key)
+            .map(|projection| projection.resource_id)
+        else {
+            return false;
+        };
+        self.task_surfaces
+            .scroll_terminal_locally(owner.clone(), resource_id, delta_lines)
+            .is_some()
     }
 
     /// Scroll the terminal the owner's surface is actually showing.
@@ -35634,7 +35688,9 @@ impl NativeShell {
             .id("native-theme-editor")
             .w(px(340.0))
             .max_h(px(560.0))
+            .relative()
             .overflow_y_scroll()
+            .track_scroll(&self.theme_editor_scroll_handle)
             .flex_none()
             .rounded(px(tokens.density.radii.lg))
             .border(px(1.0))
@@ -35644,6 +35700,12 @@ impl NativeShell {
             .flex()
             .flex_col()
             .gap(px(tokens.density.spacing.sm))
+            .child(crate::ui::scrollbar::AppScrollbar::vertical(
+                "native-theme-editor-scrollbar",
+                &self.theme_editor_scroll_handle,
+                tokens.scrollbar,
+                tokens.surfaces.overlay,
+            ))
             .child(
                 div()
                     .text_size(px(tokens.density.typography.body))
@@ -38304,7 +38366,7 @@ impl NativeShell {
                                 .child(
                                     div()
                                         .min_h(px(0.0))
-                                        .overflow_y_scrollbar()
+                                        .app_scroll_y(tokens)
                                         .pr(px(tokens.density.spacing.xs))
                                         .child(content),
                                 ),
@@ -38658,7 +38720,7 @@ impl NativeShell {
                             .flex_col()
                             .gap(px(tokens.density.spacing.xs))
                             .max_h(px(180.0))
-                            .overflow_y_scrollbar()
+                            .app_scroll_y(tokens)
                             .children(project_choices.into_iter().map(
                                 |(project_id, label, selected)| {
                                     let row = div()
@@ -42985,10 +43047,15 @@ impl NativeShell {
                     .child(
                         div()
                             .id("native-shell-task-inbox-scrollbar-gutter")
-                            .w(px(TASK_INBOX_SCROLLBAR_GUTTER_WIDTH_PX))
+                            .w(px(task_inbox_scroll_geometry(tokens).0))
                             .flex_none()
                             .h_full()
-                            .child(Scrollbar::vertical(&self.task_scroll_handle)),
+                            .child(crate::ui::scrollbar::AppScrollbar::vertical(
+                                "native-shell-task-inbox-scrollbar",
+                                &self.task_scroll_handle,
+                                tokens.scrollbar,
+                                tokens.surfaces.canvas,
+                            )),
                     )
                     .into_any_element(),
             ),
@@ -43522,9 +43589,19 @@ impl NativeShell {
                     .flex_col()
                     .flex_1()
                     .min_h(px(0.0))
+                    .relative()
                     .overflow_y_scroll()
                     .track_scroll(&board_scroll_handle)
-                    .child(board_element);
+                    .child(board_element)
+                    // The board scrolled but painted no bar at all, so a task
+                    // below the fold was unreachable-looking. Same handle, so
+                    // there is still one owner of the inbox scroll position.
+                    .child(crate::ui::scrollbar::AppScrollbar::vertical(
+                        "native-shell-board-scrollbar",
+                        &board_scroll_handle,
+                        tokens.scrollbar,
+                        tokens.surfaces.canvas,
+                    ));
                 // Collapsed, the rail paints no header, so the `⋯` menu that
                 // collapsed it is not on screen to undo it. The rail itself is
                 // the way back: one click expands, and the tooltip says so.
@@ -44988,7 +45065,15 @@ impl Render for NativeGitWindow {
                 .left(px(12.0))
                 .w(px(300.0))
                 .max_h(px(320.0))
+                .relative()
                 .overflow_y_scroll()
+                .track_scroll(&self.repository_menu_scroll_handle)
+                .child(crate::ui::scrollbar::AppScrollbar::vertical(
+                    "native-git-repository-menu-scrollbar",
+                    &self.repository_menu_scroll_handle,
+                    tokens.scrollbar,
+                    tokens.surfaces.overlay,
+                ))
                 .p(px(6.0))
                 .rounded(px(tokens.density.radii.md))
                 .border(px(1.0))
@@ -45313,7 +45398,7 @@ impl Render for NativeGitWindow {
                                 div()
                                     .flex_1()
                                     .min_h(px(0.0))
-                                    .overflow_y_scrollbar()
+                                    .app_scroll_y(tokens)
                                     .children(file_rows),
                             ),
                     )
@@ -45364,7 +45449,7 @@ impl Render for NativeGitWindow {
                                             div()
                                                 .flex_1()
                                                 .min_h(px(0.0))
-                                                .overflow_y_scrollbar()
+                                                .app_scroll_y(tokens)
                                                 .when(active_file_diff_rows.is_empty(), |view| {
                                                     view.text_color(tokens.text.muted.to_gpui())
                                                         .child("Loading diff…")
@@ -45424,7 +45509,7 @@ impl Render for NativeGitWindow {
                                 div()
                                     .flex_1()
                                     .min_h(px(0.0))
-                                    .overflow_y_scrollbar()
+                                    .app_scroll_y(tokens)
                                     .children(history_rows),
                             ),
                     )
@@ -45434,7 +45519,7 @@ impl Render for NativeGitWindow {
                             .min_w_0()
                             .min_h(px(0.0))
                             .p(px(18.0))
-                            .overflow_y_scrollbar()
+                            .app_scroll_y(tokens)
                             .when(self.selected_commit.is_none(), |view| {
                                 view.flex()
                                     .items_center()
@@ -49440,8 +49525,16 @@ pub(crate) mod tests {
 
     #[test]
     fn task_inbox_scroll_geometry_uses_gutter_sibling_not_row_overlay_padding() {
-        let (gutter_width, row_padding) = super::task_inbox_scroll_geometry();
-        assert_eq!(gutter_width, 16.0);
+        let tokens = crate::ui::tokens::dark(
+            crate::ui::tokens::Density::Comfortable,
+            crate::ui::tokens::Scale::Scale100,
+        );
+        let (gutter_width, row_padding) = super::task_inbox_scroll_geometry(tokens);
+        // The gutter is the scrollbar spec's, not a number copied from
+        // gpui-component's private 16 px constant -- that component no longer
+        // paints this bar.
+        assert_eq!(gutter_width, tokens.scrollbar.gutter_width);
+        assert_ne!(gutter_width, 16.0);
         assert_eq!(row_padding, 10.0);
         assert_ne!(
             row_padding, 18.0,

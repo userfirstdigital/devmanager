@@ -242,7 +242,37 @@ pub struct TerminalScreenSnapshot {
     pub rows: usize,
     pub cols: usize,
     pub mode: TerminalModeSnapshot,
+    /// Plain-text rows immediately ABOVE the viewport -- older scrollback --
+    /// oldest first, so `margin_above.last()` is the row directly above
+    /// `lines[0]`. Empty when the viewport is already at the top of history.
+    ///
+    /// This is the retained-window margin: it exists so a wheel notch can be
+    /// painted from memory instead of costing a host round trip. It is text
+    /// only, matching `text_lines`, because a styled grid for three viewports
+    /// does not fit the wire's collection caps -- a locally-scrolled row
+    /// therefore paints in the default style until the host's own reply for
+    /// that position lands and replaces it.
+    ///
+    /// ADDITIVE: `#[serde(default)]` and `TerminalScreenSnapshot` carries no
+    /// `deny_unknown_fields`, so an older host simply sends nothing here and a
+    /// newer host's extra rows are ignored by an older client. Neither
+    /// direction changes the meaning of any existing field.
+    #[serde(default)]
+    pub margin_above: Vec<String>,
+    /// Plain-text rows immediately BELOW the viewport -- newer rows, toward
+    /// the live prompt -- oldest first, so `margin_below[0]` is the row
+    /// directly below the last viewport row. Empty at the bottom.
+    #[serde(default)]
+    pub margin_below: Vec<String>,
 }
+
+/// How many rows of scrollback the host attaches above and below the viewport.
+///
+/// One viewport each way, capped: a wheel gesture is three lines a notch, so
+/// this is roughly ten notches of local scrolling in either direction before
+/// the client has to wait for the host again. The cap stops a very tall
+/// terminal from tripling an already-large reply.
+pub const TERMINAL_MARGIN_ROWS: usize = 48;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TerminalSearchMatch {
@@ -2188,6 +2218,27 @@ fn snapshot_term(term: &Term<SessionEventProxy>) -> TerminalScreenSnapshot {
         });
     }
 
+    let margin = TERMINAL_MARGIN_ROWS.min(rows.max(1));
+    let viewport_top = -(display_offset as i32);
+    let grid = term.grid();
+    // `Grid: Index<Line>` spans `-history_size ..= screen_lines - 1`, with the
+    // viewport starting at `-display_offset`. Both margins are clamped to that
+    // range, so an empty vector means "there is nothing there", never "we did
+    // not look".
+    let margin_above = collect_margin_text(
+        grid,
+        (viewport_top - margin as i32).max(-(history_size as i32)),
+        viewport_top,
+        cols,
+    );
+    let viewport_bottom = viewport_top + rows as i32;
+    let margin_below = collect_margin_text(
+        grid,
+        viewport_bottom,
+        (viewport_bottom + margin as i32).min(term.screen_lines() as i32),
+        cols,
+    );
+
     TerminalScreenSnapshot {
         cells: indexed_cells,
         lines: grid_lines,
@@ -2198,7 +2249,42 @@ fn snapshot_term(term: &Term<SessionEventProxy>) -> TerminalScreenSnapshot {
         rows,
         cols,
         mode,
+        margin_above,
+        margin_below,
     }
+}
+
+/// Plain text for grid lines `[start, end)`, oldest first.
+///
+/// Mirrors the text `compact_terminal_screen_for_wire` builds for the viewport
+/// so the client can append these rows to `text_lines` without a second
+/// decoding rule.
+fn collect_margin_text(
+    grid: &alacritty_terminal::grid::Grid<Cell>,
+    start: i32,
+    end: i32,
+    cols: usize,
+) -> Vec<String> {
+    if end <= start {
+        return Vec::new();
+    }
+    (start..end)
+        .map(|line| {
+            let row = &grid[Line(line)];
+            let mut text = String::with_capacity(cols);
+            for column in 0..cols {
+                let cell = &row[alacritty_terminal::index::Column(column)];
+                if cell.flags.contains(Flags::WIDE_CHAR_SPACER)
+                    || cell.flags.contains(Flags::LEADING_WIDE_CHAR_SPACER)
+                {
+                    continue;
+                }
+                text.push(renderable_char(cell));
+                text.extend(cell.zerowidth().unwrap_or(&[]).iter().copied());
+            }
+            text
+        })
+        .collect()
 }
 
 fn configured_term(scrolling_history: usize) -> TermConfig {
@@ -4333,6 +4419,213 @@ fn apply_shell_sequences(
 mod tests {
     use super::*;
     use std::io;
+
+    /// A replica with `rows` rows and `total` lines of numbered output, so the
+    /// margin assertions have real scrollback rather than a synthesized grid.
+    fn replica_with_scrollback(rows: u16, total: usize) -> TerminalReplica {
+        let mut runtime = SessionRuntimeState::new(
+            "margin-test".to_string(),
+            std::path::PathBuf::from("."),
+            SessionDimensions {
+                // A realistic width: the margin's cost is per CHARACTER, so a
+                // 20-column fixture would understate it tenfold.
+                cols: 200,
+                rows,
+                ..SessionDimensions::default()
+            },
+            TerminalBackend::default(),
+        );
+        runtime.status = crate::state::SessionStatus::Running;
+        let replica = TerminalReplica::from_bootstrap("margin-test", runtime, &[]);
+        let mut bytes = Vec::new();
+        for line in 0..total {
+            bytes.extend_from_slice(
+                format!(
+                    "line-{line}
+"
+                )
+                .as_bytes(),
+            );
+        }
+        replica.apply_output_bytes(&bytes);
+        replica
+    }
+
+    fn trimmed(rows: &[String]) -> Vec<String> {
+        rows.iter().map(|row| row.trim_end().to_string()).collect()
+    }
+
+    /// The host has to serve a WINDOW, not just the viewport, or the client
+    /// has nothing to scroll through locally. The rows above the viewport must
+    /// be the real ones immediately above it, in order.
+    #[test]
+    fn a_screen_carries_the_scrollback_rows_immediately_above_the_viewport() {
+        let replica = replica_with_scrollback(6, 60);
+        let screen = replica.snapshot();
+        assert!(
+            screen.history_size > 0,
+            "the fixture must produce scrollback"
+        );
+        assert!(
+            !screen.margin_above.is_empty(),
+            "a scrolled-back terminal must offer rows above the viewport"
+        );
+
+        // The viewport's own first row, and the margin's last row, have to be
+        // adjacent lines of the same output.
+        let viewport_first = screen.lines[0]
+            .iter()
+            .map(|cell| cell.character)
+            .collect::<String>();
+        let viewport_first = viewport_first.trim_end().to_string();
+        let above = trimmed(&screen.margin_above);
+        let last_above = above.last().expect("a row above the viewport");
+        let index = |row: &str| {
+            row.strip_prefix("line-")
+                .and_then(|rest| rest.parse::<usize>().ok())
+        };
+        assert_eq!(
+            index(last_above).map(|line| line + 1),
+            index(&viewport_first),
+            "the margin's last row must be the line directly above the viewport"
+        );
+        // Ordered oldest first, with no gaps.
+        for pair in above.windows(2) {
+            assert_eq!(
+                index(&pair[0]).map(|line| line + 1),
+                index(&pair[1]),
+                "margin rows must be contiguous and oldest first"
+            );
+        }
+    }
+
+    /// At the live prompt there is nothing below, and reporting rows there
+    /// would be inventing them.
+    #[test]
+    fn a_screen_at_the_live_prompt_carries_no_rows_below_the_viewport() {
+        let replica = replica_with_scrollback(6, 60);
+        let screen = replica.snapshot();
+        assert_eq!(screen.display_offset, 0);
+        assert!(screen.margin_below.is_empty());
+    }
+
+    /// A terminal with no history has no margin either way -- an empty vector
+    /// means "there is nothing there", never "we did not look".
+    #[test]
+    fn a_terminal_with_no_scrollback_carries_no_margin() {
+        let replica = replica_with_scrollback(24, 3);
+        let screen = replica.snapshot();
+        assert_eq!(screen.history_size, 0);
+        assert!(screen.margin_above.is_empty());
+        assert!(screen.margin_below.is_empty());
+    }
+
+    /// The margin is bounded: a very tall terminal must not triple an already
+    /// large reply without limit.
+    #[test]
+    fn the_margin_is_bounded_by_the_declared_row_budget() {
+        let replica = replica_with_scrollback(6, 400);
+        let screen = replica.snapshot();
+        assert!(screen.margin_above.len() <= TERMINAL_MARGIN_ROWS);
+        assert!(screen.margin_above.len() <= screen.rows.max(1));
+        assert!(screen.margin_below.len() <= TERMINAL_MARGIN_ROWS);
+    }
+
+    /// Measurement, not an assertion: what the retained-window margin adds to
+    /// `worker=`, the host's cost to produce one screen (measured median 52 ms
+    /// on the real launch this lane started from).
+    ///
+    /// The A/B is two replicas with the SAME 48-row viewport, one with deep
+    /// scrollback (so the margin collects 48 rows) and one with none (so it
+    /// collects nothing). The viewport iteration is identical in both, which
+    /// is what makes the difference attributable to the margin rather than to
+    /// the grid being bigger.
+    ///
+    /// Ignored by default -- a wall-clock number on a shared machine is not a
+    /// gate. Run it with `cargo test -- --ignored margin_cost`.
+    #[test]
+    #[ignore = "measurement, not a gate: prints the margin's snapshot cost"]
+    fn margin_cost_measurement() {
+        let iterations = 200;
+        let time = |replica: &TerminalReplica| {
+            for _ in 0..20 {
+                std::hint::black_box(replica.snapshot());
+            }
+            let started = std::time::Instant::now();
+            for _ in 0..iterations {
+                std::hint::black_box(replica.snapshot());
+            }
+            started.elapsed().as_secs_f64() * 1000.0 / f64::from(iterations)
+        };
+
+        let with_scrollback = replica_with_scrollback(48, 4_000);
+        // 20 lines into a 48-row terminal never scrolls, so there is no
+        // history and therefore no margin, on an identically sized viewport.
+        let without_scrollback = replica_with_scrollback(48, 20);
+
+        let with_margin = time(&with_scrollback);
+        let without_margin = time(&without_scrollback);
+
+        let margin = with_scrollback.snapshot();
+        let none = without_scrollback.snapshot();
+        assert!(!margin.margin_above.is_empty());
+        assert!(none.margin_above.is_empty() && none.margin_below.is_empty());
+        println!(
+            "host snapshot: {with_margin:.3} ms with a {}-row margin, \
+             {without_margin:.3} ms with none, delta {:.3} ms (viewport {}x{})",
+            margin.margin_above.len() + margin.margin_below.len(),
+            with_margin - without_margin,
+            margin.rows,
+            margin.cols
+        );
+    }
+
+    /// ADDITIVE WIRE: an older host sends a screen with no margin keys at all,
+    /// and a newer client must decode it with empty margins rather than fail.
+    /// The inverse -- a newer host's extra keys reaching an older client -- is
+    /// the same property, and it is why `TerminalScreenSnapshot` must never
+    /// gain `deny_unknown_fields`.
+    #[test]
+    fn a_screen_without_margin_keys_still_decodes() {
+        #[derive(serde::Serialize)]
+        struct LegacyScreen {
+            cells: Vec<TerminalIndexedCellSnapshot>,
+            lines: Vec<Vec<TerminalCellSnapshot>>,
+            cursor: Option<TerminalCursorSnapshot>,
+            display_offset: usize,
+            history_size: usize,
+            total_lines: usize,
+            rows: usize,
+            cols: usize,
+            mode: TerminalModeSnapshot,
+        }
+
+        let legacy = LegacyScreen {
+            cells: Vec::new(),
+            lines: Vec::new(),
+            cursor: None,
+            display_offset: 3,
+            history_size: 40,
+            total_lines: 64,
+            rows: 24,
+            cols: 80,
+            mode: TerminalModeSnapshot::default(),
+        };
+        let encoded = serde_json::to_vec(&legacy).expect("encode legacy screen");
+        let decoded: TerminalScreenSnapshot =
+            serde_json::from_slice(&encoded).expect("an older host's screen must still decode");
+        assert_eq!(decoded.display_offset, 3);
+        assert!(decoded.margin_above.is_empty());
+        assert!(decoded.margin_below.is_empty());
+
+        // And an unknown key from a newer peer must not be fatal either.
+        let mut value: serde_json::Value =
+            serde_json::from_slice(&encoded).expect("re-decode as value");
+        value["some_future_field"] = serde_json::json!(7);
+        let decoded: TerminalScreenSnapshot =
+            serde_json::from_value(value).expect("a newer host's screen must still decode");
+        assert_eq!(decoded.rows, 24);
+    }
 
     /// The durable shell recipe has to name one exact executable, so the
     /// resolver must actually find one on this machine — a resolver that
