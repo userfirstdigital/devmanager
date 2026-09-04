@@ -12269,7 +12269,7 @@ impl NativeShell {
         session: Option<&crate::terminal::session::TerminalSessionView>,
     ) -> Option<view::TerminalScrollbarModel> {
         let session = session?;
-        scrollbar_model_for_screen(
+        view::scrollbar_model_for_screen(
             &session.screen,
             self.terminal_scrollbar_drag
                 .map(|drag| drag.thumb_top_ratio),
@@ -12305,7 +12305,8 @@ impl NativeShell {
         // the paint path does not share.
         let visible_fraction = visible_lines as f32 / total_lines as f32;
         let scroll_fraction =
-            scrollbar_thumb_top_ratio(session.screen.display_offset, max_offset).clamp(0.0, 1.0);
+            view::scrollbar_thumb_top_ratio(session.screen.display_offset, max_offset)
+                .clamp(0.0, 1.0);
         let track = crate::ui::scrollbar::track_geometry(spec, height);
         let thumb = crate::ui::scrollbar::thumb_geometry(
             spec,
@@ -12357,7 +12358,7 @@ impl NativeShell {
 
         let thumb_top_ratio = scrollbar_ratio_for_position(position, geometry, drag.grab);
         let display_offset =
-            display_offset_for_scrollbar_ratio(thumb_top_ratio, geometry.max_offset);
+            view::display_offset_for_scrollbar_ratio(thumb_top_ratio, geometry.max_offset);
         let ratio_changed = (drag.thumb_top_ratio - thumb_top_ratio).abs() > 0.0001;
         let offset_changed = drag.last_display_offset != display_offset;
 
@@ -14345,7 +14346,7 @@ impl NativeShell {
                     );
                     self.terminal_scrollbar_drag = Some(TerminalScrollbarDrag {
                         grab,
-                        thumb_top_ratio: scrollbar_thumb_top_ratio(
+                        thumb_top_ratio: view::scrollbar_thumb_top_ratio(
                             session.screen.display_offset,
                             geometry.max_offset,
                         ),
@@ -19491,43 +19492,6 @@ fn collapse_terminal_whitespace(value: &str) -> String {
     value.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
-fn scrollbar_thumb_top_ratio(display_offset: usize, max_offset: usize) -> f32 {
-    if max_offset == 0 {
-        1.0
-    } else {
-        1.0 - (display_offset as f32 / max_offset as f32)
-    }
-}
-
-/// Pure scrollbar math shared by render and tests. With no scrollback
-/// (alt-screen apps, fresh sessions) this intentionally returns a
-/// full-height inert thumb instead of `None`, so the gutter stays visible
-/// whenever the setting is on — matching Windows Terminal.
-fn scrollbar_model_for_screen(
-    screen: &crate::terminal::session::TerminalScreenSnapshot,
-    drag_thumb_top_ratio: Option<f32>,
-    enabled: bool,
-    hovered: bool,
-) -> Option<view::TerminalScrollbarModel> {
-    if !enabled {
-        return None;
-    }
-
-    let total_lines = screen.total_lines.max(screen.rows.max(1));
-    let visible_lines = screen.rows.max(1);
-    let max_offset = screen.history_size.max(1);
-    let thumb_height_ratio = visible_lines as f32 / total_lines as f32;
-    let thumb_top_ratio = drag_thumb_top_ratio
-        .unwrap_or_else(|| scrollbar_thumb_top_ratio(screen.display_offset, max_offset));
-
-    Some(view::TerminalScrollbarModel {
-        thumb_top_ratio: thumb_top_ratio.clamp(0.0, 1.0),
-        thumb_height_ratio,
-        // A drag is a hover that has committed, so both widen the thumb.
-        hovered: hovered || drag_thumb_top_ratio.is_some(),
-    })
-}
-
 /// The drag arithmetic is `crate::ui::scrollbar`'s, in window coordinates.
 /// A track the thumb fills has no position to report, and for a terminal that
 /// means the live bottom -- the convention the rest of this module's ratios
@@ -19545,14 +19509,6 @@ fn scrollbar_ratio_for_position(
         grab,
     )
     .unwrap_or(1.0)
-}
-
-fn display_offset_for_scrollbar_ratio(thumb_top_ratio: f32, max_offset: usize) -> usize {
-    if max_offset == 0 {
-        0
-    } else {
-        ((1.0 - thumb_top_ratio.clamp(0.0, 1.0)) * max_offset as f32).round() as usize
-    }
 }
 
 fn terminal_view_needs_resize(
@@ -21280,23 +21236,43 @@ mod tests {
 
     #[test]
     fn scrollbar_ratio_maps_live_bottom_to_bottom_thumb() {
-        assert_eq!(scrollbar_thumb_top_ratio(0, 120), 1.0);
-        assert_eq!(scrollbar_thumb_top_ratio(120, 120), 0.0);
-        assert_eq!(display_offset_for_scrollbar_ratio(1.0, 120), 0);
-        assert_eq!(display_offset_for_scrollbar_ratio(0.0, 120), 120);
-        assert_eq!(display_offset_for_scrollbar_ratio(0.5, 120), 60);
+        assert_eq!(view::scrollbar_thumb_top_ratio(0, 120), 1.0);
+        assert_eq!(view::scrollbar_thumb_top_ratio(120, 120), 0.0);
+        assert_eq!(view::display_offset_for_scrollbar_ratio(1.0, 120), 0);
+        assert_eq!(view::display_offset_for_scrollbar_ratio(0.0, 120), 120);
+        assert_eq!(view::display_offset_for_scrollbar_ratio(0.5, 120), 60);
     }
 
+    /// I3/I4: this used to assert a full-height inert thumb, on the reasoning
+    /// that Windows Terminal keeps its gutter occupied. The cockpit's own
+    /// derivation answered `None` for the same screen, so the two shells
+    /// disagreed about the commonest case there is. The brief rules that no
+    /// overflow shows no thumb -- the same predicate every other surface in the
+    /// app uses -- and there is now one derivation that says so.
     #[test]
-    fn scrollbar_model_shows_full_height_thumb_without_history() {
+    fn scrollbar_model_is_absent_without_scrollback() {
         let mut screen = screen_from_lines(&["one", "two"]);
         screen.total_lines = 2;
         screen.history_size = 0;
         screen.display_offset = 0;
 
-        let model = scrollbar_model_for_screen(&screen, None, true, false).expect("model");
+        assert!(view::scrollbar_model_for_screen(&screen, None, true, false).is_none());
+    }
 
-        assert_eq!(model.thumb_height_ratio, 1.0);
+    /// One row of scrollback is overflow, so the bar appears -- the boundary
+    /// the case above sits one row below.
+    #[test]
+    fn scrollbar_model_appears_with_a_single_row_of_scrollback() {
+        let mut screen = screen_from_lines(&["one", "two"]);
+        screen.total_lines = 3;
+        screen.history_size = 1;
+        screen.display_offset = 0;
+
+        let model = view::scrollbar_model_for_screen(&screen, None, true, false).expect("model");
+
+        assert_eq!(model.thumb_height_ratio, 2.0 / 3.0);
+        assert_eq!(model.thumb_top_ratio, 1.0);
+        assert!(!model.hovered);
     }
 
     #[test]
@@ -21305,7 +21281,7 @@ mod tests {
         screen.total_lines = 20;
         screen.history_size = 18;
 
-        assert!(scrollbar_model_for_screen(&screen, None, false, false).is_none());
+        assert!(view::scrollbar_model_for_screen(&screen, None, false, false).is_none());
     }
 
     #[test]
@@ -21315,7 +21291,7 @@ mod tests {
         screen.history_size = 6;
         screen.display_offset = 0;
 
-        let model = scrollbar_model_for_screen(&screen, None, true, false).expect("model");
+        let model = view::scrollbar_model_for_screen(&screen, None, true, false).expect("model");
 
         assert_eq!(model.thumb_height_ratio, 0.25);
         assert_eq!(model.thumb_top_ratio, 1.0);

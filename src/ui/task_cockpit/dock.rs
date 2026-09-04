@@ -1189,7 +1189,13 @@ impl ContextDock {
         projection: &TaskTerminalProjection,
     ) -> TerminalPaneModel {
         let view = Self::terminal_session_view_from_projection(projection);
-        let scrollbar = terminal_scrollbar_model_for_screen(&view.screen);
+        // One derivation, shared with the legacy app view. `hovered` is false
+        // because the cockpit path builds this model from a projection alone
+        // and has no pointer state to consult, so the terminal shows the idle
+        // 4 px bar and does not widen; the legacy view, which does track the
+        // pointer, passes its own hover through.
+        let scrollbar =
+            crate::terminal::view::scrollbar_model_for_screen(&view.screen, None, true, false);
         terminal_pane_from_replica(ReplicaPaneRequest {
             active_project: "",
             session_label: projection.title.as_deref().unwrap_or("task terminal"),
@@ -2297,6 +2303,40 @@ mod process_census_tests {
         }
     }
 
+    /// I3/I4: the cockpit's terminal used to derive its own scrollbar model,
+    /// and its answer for a screen with no scrollback was the opposite of the
+    /// legacy app view's. There is one derivation now, and this walks the
+    /// cockpit's real entry point to it rather than calling it directly.
+    #[test]
+    fn the_cockpit_terminal_takes_its_scrollbar_from_the_shared_derivation() {
+        let task_id = TaskId::new();
+        let resource_id = ResourceId::new();
+
+        // A screen that fits paints no bar at all -- the same predicate every
+        // shell surface uses.
+        let fits = shell_projection(task_id, resource_id, 1);
+        assert!(ContextDock::terminal_pane_model_for_projection(&fits)
+            .scrollbar
+            .is_none());
+
+        // One row of scrollback is overflow, so the bar appears, and it is the
+        // shared function's answer to the same screen.
+        let mut scrolled = shell_projection(task_id, resource_id, 2);
+        scrolled.screen.rows = 2;
+        scrolled.screen.total_lines = 3;
+        scrolled.screen.history_size = 1;
+        scrolled.screen.display_offset = 0;
+        let model = ContextDock::terminal_pane_model_for_projection(&scrolled)
+            .scrollbar
+            .expect("a screen with scrollback carries a scrollbar");
+        let shared =
+            crate::terminal::view::scrollbar_model_for_screen(&scrolled.screen, None, true, false)
+                .expect("shared model");
+        assert_eq!(model.thumb_top_ratio, shared.thumb_top_ratio);
+        assert_eq!(model.thumb_height_ratio, shared.thumb_height_ratio);
+        assert_eq!(model.hovered, shared.hovered);
+    }
+
     #[test]
     fn provider_binding_ignores_the_tasks_plain_shells() {
         let built = client_model_with_shells(2);
@@ -2658,35 +2698,4 @@ mod process_census_tests {
         ));
         assert_eq!(dock.live_output(), "live pty output");
     }
-}
-
-/// The scrollbar for one admitted terminal screen, or `None` when the screen
-/// has no scrollback to show a position within.
-///
-/// The cockpit's terminal rendered `scrollbar: None` unconditionally, so the
-/// redesigned shell's terminal had no scrollbar at all -- the one surface the
-/// redesign spec calls out by name. The ratios come from the same three screen
-/// fields the legacy app view uses, so the two agree by construction.
-///
-/// `hovered` is false here: the cockpit path builds this model from a
-/// projection alone and has no pointer state to consult, so the terminal shows
-/// the idle 4 px bar and does not widen. The legacy app view, which does track
-/// the pointer, passes its own hover through.
-pub fn terminal_scrollbar_model_for_screen(
-    screen: &crate::terminal::session::TerminalScreenSnapshot,
-) -> Option<TerminalScrollbarModel> {
-    let rows = screen.rows.max(1);
-    let total_lines = screen.total_lines.max(rows);
-    if total_lines <= rows {
-        return None;
-    }
-    let max_offset = screen.history_size.max(1);
-    // `display_offset` counts lines scrolled UP from the live prompt, so the
-    // thumb is at the bottom when it is zero.
-    let thumb_top_ratio = 1.0 - (screen.display_offset.min(max_offset) as f32 / max_offset as f32);
-    Some(TerminalScrollbarModel {
-        thumb_top_ratio: thumb_top_ratio.clamp(0.0, 1.0),
-        thumb_height_ratio: (rows as f32 / total_lines as f32).clamp(0.0, 1.0),
-        hovered: false,
-    })
 }

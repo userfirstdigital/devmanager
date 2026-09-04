@@ -580,6 +580,68 @@ pub struct TerminalScrollbarModel {
     pub hovered: bool,
 }
 
+/// Where the thumb's top sits for one display offset, 0..=1.
+///
+/// `display_offset` counts lines scrolled UP from the live prompt, so a zero
+/// offset is the BOTTOM of the bar and the ratio runs the other way from the
+/// offset. Its inverse is [`display_offset_for_scrollbar_ratio`].
+pub fn scrollbar_thumb_top_ratio(display_offset: usize, max_offset: usize) -> f32 {
+    if max_offset == 0 {
+        1.0
+    } else {
+        1.0 - (display_offset.min(max_offset) as f32 / max_offset as f32)
+    }
+}
+
+/// The display offset a thumb position means. Inverse of
+/// [`scrollbar_thumb_top_ratio`].
+pub fn display_offset_for_scrollbar_ratio(thumb_top_ratio: f32, max_offset: usize) -> usize {
+    if max_offset == 0 {
+        0
+    } else {
+        ((1.0 - thumb_top_ratio.clamp(0.0, 1.0)) * max_offset as f32).round() as usize
+    }
+}
+
+/// The scrollbar for one admitted terminal screen, for every caller.
+///
+/// There is ONE derivation of this model. It used to be two -- the legacy app
+/// view's and the cockpit's -- which disagreed about the case that matters: the
+/// app's returned a full-height inert thumb when there was no scrollback, and
+/// the cockpit's returned `None`. The brief rules that no overflow shows no
+/// thumb, the same predicate every shell surface uses, so a screen that fits
+/// paints nothing at all here too.
+///
+/// `enabled` is the user's `show_terminal_scrollbar` setting; a caller with no
+/// such setting passes true. `drag_thumb_top_ratio` is the position a drag in
+/// progress is holding, which overrides the screen's own, and a drag is a hover
+/// that has committed, so it also widens the thumb.
+pub fn scrollbar_model_for_screen(
+    screen: &crate::terminal::session::TerminalScreenSnapshot,
+    drag_thumb_top_ratio: Option<f32>,
+    enabled: bool,
+    hovered: bool,
+) -> Option<TerminalScrollbarModel> {
+    if !enabled {
+        return None;
+    }
+
+    let visible_lines = screen.rows.max(1);
+    let total_lines = screen.total_lines.max(visible_lines);
+    if total_lines <= visible_lines {
+        return None;
+    }
+    let max_offset = screen.history_size.max(1);
+    let thumb_top_ratio = drag_thumb_top_ratio
+        .unwrap_or_else(|| scrollbar_thumb_top_ratio(screen.display_offset, max_offset));
+
+    Some(TerminalScrollbarModel {
+        thumb_top_ratio: thumb_top_ratio.clamp(0.0, 1.0),
+        thumb_height_ratio: visible_lines as f32 / total_lines as f32,
+        hovered: hovered || drag_thumb_top_ratio.is_some(),
+    })
+}
+
 /// Overlay painted over the last valid replica grid. The cockpit never owns a
 /// `TerminalSession`; it only projects a `TerminalReplica` snapshot.
 #[derive(Debug, Clone, PartialEq, Eq)]
