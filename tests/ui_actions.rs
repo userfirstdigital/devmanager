@@ -6,6 +6,7 @@ use devmanager::ui::actions::{
 };
 use devmanager::ui::components::interaction::FocusEpochSource;
 use devmanager::ui::components::{AccessibleRole, InteractionStateModel};
+use devmanager::ui::task_workspace::layout::PaneView;
 use serde::Deserialize;
 use std::fs;
 
@@ -129,14 +130,25 @@ fn keyboard_model_contains_only_the_planned_task_cockpit_shortcuts() {
         model.resolve(KeyboardShortcut::ctrl_shift(ShortcutKey::Character('p'))),
         Some(KeyboardAction::OpenCommandPalette)
     );
+    // The digits belong to the view tabs now; the dock keeps its tools but not
+    // a chord, and the shell reaches them through `SelectDock` directly.
+    assert_eq!(
+        model.resolve(KeyboardShortcut::ctrl(ShortcutKey::Digit(1))),
+        Some(KeyboardAction::SelectView(PaneView::Conversation))
+    );
+    assert_eq!(
+        model.resolve(KeyboardShortcut::ctrl(ShortcutKey::Digit(5))),
+        Some(KeyboardAction::SelectView(PaneView::Browser))
+    );
     assert_eq!(
         model.resolve(KeyboardShortcut::alt(ShortcutKey::Digit(1))),
-        Some(KeyboardAction::SelectDock(DockTool::Changes))
+        None
     );
     assert_eq!(
         model.resolve(KeyboardShortcut::alt(ShortcutKey::Digit(7))),
-        Some(KeyboardAction::SelectDock(DockTool::Review))
+        None
     );
+    assert_eq!(DockTool::from_digit(7), Some(DockTool::Review));
     assert_eq!(
         model.resolve(KeyboardShortcut::ctrl(ShortcutKey::Backtick)),
         Some(KeyboardAction::OpenTerminal)

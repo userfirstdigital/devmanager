@@ -9274,6 +9274,30 @@ impl NativeInteraction {
         result
     }
 
+    /// The same capture for an action that no chord resolves to.
+    ///
+    /// The dock's tabs, its tools menu and the header's Open used to reach the
+    /// shell by dispatching the Alt+digit shortcut the tool was bound to. The
+    /// redesign gives the digits to the view tabs, so those affordances would
+    /// otherwise dispatch a shortcut that resolves to nothing. They name the
+    /// action instead, and still pass through the same focus-epoch and
+    /// activation gate a keyboard-originated action does -- the gate is what
+    /// keeps a stale click from mutating shell state, and it is not optional
+    /// just because the pointer, not a key, started this.
+    pub fn keyboard_action(
+        &mut self,
+        action: KeyboardAction,
+    ) -> Option<(FocusEpoch, u64, KeyboardAction)> {
+        let (focus_epoch, request_generation) = self.begin_handler(self.selected_task());
+        let result = self.interaction.state().can_activate().then_some((
+            focus_epoch,
+            request_generation,
+            action,
+        ));
+        self.pending_keyboard = result;
+        result
+    }
+
     /// Commit one resolved keyboard intent only if it is still the current
     /// focus/request capture. A later event invalidates the old tuple, which
     /// prevents stale key callbacks from mutating shell state.
@@ -9308,7 +9332,20 @@ impl NativeInteraction {
             KeyboardAction::OpenTaskDetails => {
                 self.keyboard_state.task_details_open = true;
             }
+            // 'selected_dock' is the dock's own selection and nothing else
+            // reads it, so only 'SelectDock' writes it. A view tab does not
+            // pretend to be a dock tool here: while the shell routes only two
+            // of the five views, writing this field from 'SelectView' would
+            // publish a selection the shell never made.
             KeyboardAction::SelectDock(tool) => self.keyboard_state.selected_dock = Some(tool),
+            // Selecting a view, settling, zoom and pane moves open no transient
+            // layer, so the keyboard state they would report is unchanged by
+            // construction.
+            KeyboardAction::SelectView(_)
+            | KeyboardAction::SettleTask
+            | KeyboardAction::ToggleZoom
+            | KeyboardAction::MovePane(_)
+            | KeyboardAction::FocusPane(_) => {}
             KeyboardAction::OpenTerminal | KeyboardAction::OpenShellTerminal => {
                 self.keyboard_state.terminal_open = true
             }
@@ -28266,6 +28303,39 @@ impl NativeShell {
                     }
                 }
             }
+            // Lane 2a replaces this arm with `set_pane_view(selected, view)`.
+            // Until that accessor lands there is exactly one view switch the
+            // shell can already make -- the task-centre terminal preference --
+            // so the two views it covers are routed and the rest wait rather
+            // than half-selecting something.
+            KeyboardAction::SelectView(view) => {
+                if matches!(
+                    view,
+                    crate::ui::task_workspace::PaneView::Conversation
+                        | crate::ui::task_workspace::PaneView::Terminal
+                ) {
+                    let owner = self.selected_task_key.clone().or_else(|| {
+                        self.local_slot()
+                            .interaction
+                            .selected_task()
+                            .map(|task_id| self.local_task_key(task_id))
+                    });
+                    if let Some(owner) = owner {
+                        self.set_task_center_terminal_preference(
+                            &owner,
+                            view == crate::ui::task_workspace::PaneView::Terminal,
+                        );
+                    }
+                }
+            }
+            KeyboardAction::SettleTask => self.settle_selected_task(),
+            // Zoom is Task 9 and directional pane focus/move belong to the
+            // workspace lane. The chords are decided here so the binding table
+            // stays the single place they are named; the arms stay empty until
+            // that lane wires `toggle_zoom` and `focus_pane_toward`.
+            KeyboardAction::ToggleZoom
+            | KeyboardAction::MovePane(_)
+            | KeyboardAction::FocusPane(_) => {}
             KeyboardAction::OpenTerminal => {
                 self.set_provider_terminal_visible(true);
             }
@@ -34295,13 +34365,12 @@ impl NativeShell {
             _ => {
                 if let Some(selector) = Self::repository_selector_from_element_id(element_id) {
                     self.select_changes_repository(selector);
-                } else if let Some((_, _, digit)) = NATIVE_DOCK_TABS
+                } else if let Some(tool) = NATIVE_DOCK_TABS
                     .iter()
                     .find(|(_, dock_element_id, _)| *dock_element_id == element_id)
+                    .and_then(|(_, _, digit)| DockTool::from_digit(*digit))
                 {
-                    self.dispatch_keyboard(KeyboardShortcut::alt(
-                        crate::ui::actions::ShortcutKey::Digit(*digit),
-                    ));
+                    self.dispatch_dock_tool(tool);
                 }
             }
         }
@@ -40257,9 +40326,7 @@ impl NativeShell {
         self.layout.active_dock_tab = Some("Files".to_string());
         self.layout.dock_collapsed = false;
         self.mark_layout_dirty();
-        self.dispatch_keyboard(KeyboardShortcut::alt(
-            crate::ui::actions::ShortcutKey::Digit(2),
-        ));
+        self.dispatch_dock_tool(DockTool::Files);
         let _ = self.dispatch_task_cockpit_query(
             task_id,
             TaskCockpitQuery::FilesList {
@@ -43277,45 +43344,31 @@ impl NativeShell {
         });
         let dock_changes = cx.listener(|shell, _action: &NativeDockChanges, _window, cx| {
             cx.stop_propagation();
-            shell.dispatch_keyboard(KeyboardShortcut::alt(
-                crate::ui::actions::ShortcutKey::Digit(1),
-            ));
+            shell.dispatch_dock_tool(DockTool::Changes);
         });
         let dock_files = cx.listener(|shell, _action: &NativeDockFiles, _window, cx| {
             cx.stop_propagation();
-            shell.dispatch_keyboard(KeyboardShortcut::alt(
-                crate::ui::actions::ShortcutKey::Digit(2),
-            ));
+            shell.dispatch_dock_tool(DockTool::Files);
         });
         let dock_terminal = cx.listener(|shell, _action: &NativeDockTerminal, _window, cx| {
             cx.stop_propagation();
-            shell.dispatch_keyboard(KeyboardShortcut::alt(
-                crate::ui::actions::ShortcutKey::Digit(3),
-            ));
+            shell.dispatch_dock_tool(DockTool::Terminal);
         });
         let dock_browser = cx.listener(|shell, _action: &NativeDockBrowser, _window, cx| {
             cx.stop_propagation();
-            shell.dispatch_keyboard(KeyboardShortcut::alt(
-                crate::ui::actions::ShortcutKey::Digit(4),
-            ));
+            shell.dispatch_dock_tool(DockTool::Browser);
         });
         let dock_services = cx.listener(|shell, _action: &NativeDockServices, _window, cx| {
             cx.stop_propagation();
-            shell.dispatch_keyboard(KeyboardShortcut::alt(
-                crate::ui::actions::ShortcutKey::Digit(5),
-            ));
+            shell.dispatch_dock_tool(DockTool::Services);
         });
         let dock_artifacts = cx.listener(|shell, _action: &NativeDockArtifacts, _window, cx| {
             cx.stop_propagation();
-            shell.dispatch_keyboard(KeyboardShortcut::alt(
-                crate::ui::actions::ShortcutKey::Digit(6),
-            ));
+            shell.dispatch_dock_tool(DockTool::Artifacts);
         });
         let dock_review = cx.listener(|shell, _action: &NativeDockReview, _window, cx| {
             cx.stop_propagation();
-            shell.dispatch_keyboard(KeyboardShortcut::alt(
-                crate::ui::actions::ShortcutKey::Digit(7),
-            ));
+            shell.dispatch_dock_tool(DockTool::Review);
         });
         let toggle_sidebar = cx.listener(|shell, _action: &NativeToggleSidebar, _window, cx| {
             cx.stop_propagation();
@@ -43409,9 +43462,9 @@ impl NativeShell {
                     MouseButton::Left,
                     cx.listener(move |shell, _event: &MouseDownEvent, _window, cx| {
                         cx.stop_propagation();
-                        shell.dispatch_keyboard(KeyboardShortcut::alt(
-                            crate::ui::actions::ShortcutKey::Digit(digit),
-                        ));
+                        if let Some(tool) = DockTool::from_digit(digit) {
+                            shell.dispatch_dock_tool(tool);
+                        }
                     }),
                 )
             };
@@ -43718,9 +43771,7 @@ impl NativeShell {
                             .hover(|style| style.bg(tokens.surfaces.hover.to_gpui()))
                             .on_click(cx.listener(|shell, _event: &ClickEvent, _window, cx| {
                                 cx.stop_propagation();
-                                shell.dispatch_keyboard(KeyboardShortcut::alt(
-                                    crate::ui::actions::ShortcutKey::Digit(5),
-                                ));
+                                shell.dispatch_dock_tool(DockTool::Services);
                                 cx.notify();
                             }))
                             .child(crate::icons::app_icon(
@@ -44279,6 +44330,41 @@ impl NativeShell {
             NativeHostActionResult::Disconnected
             | NativeHostActionResult::QueueFull
             | NativeHostActionResult::Stale => Some(record),
+        }
+    }
+
+    /// Select a dock tool from something that is not a key.
+    ///
+    /// The dock's tabs, its tools menu, the sidebar's Services button and the
+    /// header's Open all used to dispatch the Alt+digit shortcut the tool was
+    /// bound to. The redesign gives the digits to the view tabs, so that route
+    /// now resolves to nothing; they name the action instead. The focus-epoch
+    /// and activation gate is the same one `dispatch_keyboard` applies, and so
+    /// is `last_keyboard_action`, so nothing downstream can tell the two apart.
+    fn dispatch_dock_tool(&mut self, tool: DockTool) {
+        self.dispatch_keyboard_action(KeyboardAction::SelectDock(tool));
+    }
+
+    fn dispatch_keyboard_action(&mut self, action: KeyboardAction) {
+        let local_id = self.local_host_id();
+        let Some((focus_epoch, request_generation, action)) = self
+            .hosts
+            .get_mut(&local_id)
+            .expect("local HostUiState must remain installed for the shell profile")
+            .interaction
+            .keyboard_action(action)
+        else {
+            return;
+        };
+        if self
+            .hosts
+            .get_mut(&local_id)
+            .expect("local HostUiState must remain installed for the shell profile")
+            .interaction
+            .commit_keyboard_action(focus_epoch, request_generation, action)
+        {
+            self.last_keyboard_action = Some(action);
+            self.apply_keyboard_shell_effects(action);
         }
     }
 
@@ -55714,7 +55800,7 @@ pub(crate) mod tests {
                     "accessible dock tab {element_id} must use the production dock-selection path"
                 );
             }
-            shell.dispatch_keyboard_for_test(KeyboardShortcut::alt(ShortcutKey::Digit(4)));
+            shell.dispatch_dock_tool(crate::ui::actions::DockTool::Browser);
             assert_eq!(shell.cockpit().active_tool(), CockpitDockTool::Browser);
 
             assert!(matches!(
@@ -57250,7 +57336,7 @@ pub(crate) mod tests {
                 .navigation_mouse_down(task_id, &list);
             shell.sync_cockpit_follow();
 
-            shell.dispatch_keyboard_for_test(KeyboardShortcut::alt(ShortcutKey::Digit(4)));
+            shell.dispatch_dock_tool(crate::ui::actions::DockTool::Browser);
             assert_eq!(
                 shell.last_keyboard_action(),
                 Some(crate::ui::actions::KeyboardAction::SelectDock(
