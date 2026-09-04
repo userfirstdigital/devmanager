@@ -4561,6 +4561,13 @@ enum BoardMenuAction {
     ToggleArchived,
     ToggleRail,
     ToggleDensity,
+    /// The four destinations the column's footer strip carried, plus the
+    /// folder picker its "New project" button opened. Composition A has no
+    /// footer, so the one board menu is where they live now.
+    NewProject,
+    OpenDock(DockTool),
+    OpenGitWindow,
+    OpenSettings,
 }
 
 /// What the board paints under its header.
@@ -14000,19 +14007,6 @@ impl NativeShell {
             )
             .gpui("native-sidebar-archived", true, true),
         );
-        overlay_nodes.push(
-            AccessibilityNode::new(
-                AccessibleRole::Button,
-                "New task",
-                if self.startup_gates_actions() {
-                    crate::ui::startup_status::STARTUP_LOADING_TOOLTIP.to_string()
-                } else {
-                    "Open a new task dialog for the selected owner's project (provider start stays deferred).".to_string()
-                },
-            )
-            .gpui("native-sidebar-new-task", true, true)
-            .with_disabled(self.startup_gates_actions()),
-        );
         // The board header's own `+ New`. The per-project "+Claude"/"+Codex"
         // buttons went with the project rail; this one control opens the menu
         // that lists every project instead.
@@ -14029,9 +14023,47 @@ impl NativeShell {
             AccessibilityNode::new(
                 AccessibleRole::Button,
                 "Board options",
-                "Archived tasks, collapse the board to a rail, and row density.",
+                "Files, Git, Activity, Settings, a new project, archived tasks, collapse the board to a rail, and row density.",
             )
             .gpui("board-header-menu", true, true),
+        );
+        let scope_label = self.project_scope().label(|id| {
+            self.local_slot()
+                .config_sidebar
+                .projects
+                .iter()
+                .find_map(|project| {
+                    (ProjectId::parse(&project.workspace_id).ok() == Some(id))
+                        .then(|| project.label.as_str())
+                })
+        });
+        overlay_nodes.push(
+            AccessibilityNode::new(
+                AccessibleRole::Button,
+                format!("Project scope: {scope_label}"),
+                "Choose whether the board shows every project or one of them.",
+            )
+            .gpui(crate::ui::board::topbar::SCOPE_ELEMENT_ID, true, true),
+        );
+        let needs_you = self.top_bar_needs_you_count();
+        if needs_you > 0 {
+            let task_word = if needs_you == 1 { "task" } else { "tasks" };
+            overlay_nodes.push(
+                AccessibilityNode::new(
+                    AccessibleRole::Button,
+                    format!("{needs_you} {task_word} need you"),
+                    "Select the task that has been waiting for you longest.",
+                )
+                .gpui(crate::ui::board::topbar::NEEDS_YOU_ELEMENT_ID, true, true),
+            );
+        }
+        overlay_nodes.push(
+            AccessibilityNode::new(
+                AccessibleRole::Button,
+                "Settings",
+                "Open agent sign-in settings.",
+            )
+            .gpui(crate::ui::board::topbar::SETTINGS_ELEMENT_ID, true, true),
         );
         if let Some((owner, approval_state)) = selected_key.as_ref().and_then(|owner| {
             self.host_slot(&owner.host)
@@ -14073,24 +14105,6 @@ impl NativeShell {
                 .with_children(children),
             );
         }
-        overlay_nodes.push(
-            AccessibilityNode::new(
-                AccessibleRole::Button,
-                "New project",
-                if self.shows_add_project_plus() {
-                    "Add a local project from the sidebar footer. Creates on this machine only."
-                        .to_string()
-                } else {
-                    "Local host is not connected for project creation.".to_string()
-                },
-            )
-            .gpui(
-                "native-sidebar-new-project",
-                self.shows_add_project_plus(),
-                self.shows_add_project_plus(),
-            )
-            .with_disabled(!self.shows_add_project_plus()),
-        );
         overlay_nodes.push(
             AccessibilityNode::new(
                 AccessibleRole::Region,
@@ -30724,38 +30738,7 @@ impl NativeShell {
         let menu = self.board_menu.expect("board menu is open");
         let (title, entries): (&str, Vec<(String, String, BoardMenuAction)>) = match menu {
             BoardMenu::NewTask => ("New task in", self.board_new_task_menu_entries()),
-            BoardMenu::Options => (
-                "Board",
-                vec![
-                    (
-                        "board-menu-archived".to_string(),
-                        if self.show_archived_tasks {
-                            "Active tasks".to_string()
-                        } else {
-                            "Archived…".to_string()
-                        },
-                        BoardMenuAction::ToggleArchived,
-                    ),
-                    (
-                        "board-menu-rail".to_string(),
-                        if self.layout.board_rail {
-                            "Expand board".to_string()
-                        } else {
-                            "Collapse to rail".to_string()
-                        },
-                        BoardMenuAction::ToggleRail,
-                    ),
-                    (
-                        "board-menu-density".to_string(),
-                        if self.board_density_compact() {
-                            "Density: Compact".to_string()
-                        } else {
-                            "Density: Comfortable".to_string()
-                        },
-                        BoardMenuAction::ToggleDensity,
-                    ),
-                ],
-            ),
+            BoardMenu::Options => ("Board", self.board_options_menu_entries()),
         };
         let mut rows: Vec<AnyElement> = Vec::new();
         if entries.is_empty() {
@@ -30784,9 +30767,9 @@ impl NativeShell {
                     .hover(|style| style.bg(tokens.surfaces.hover.to_gpui()))
                     .on_mouse_down(
                         MouseButton::Left,
-                        cx.listener(move |shell, _event: &MouseDownEvent, _window, cx| {
+                        cx.listener(move |shell, _event: &MouseDownEvent, window, cx| {
                             cx.stop_propagation();
-                            shell.apply_board_menu_action(action.clone());
+                            shell.apply_board_menu_action(action.clone(), window, cx);
                             shell.close_board_menu();
                             shell.refresh_accessibility_tree();
                             cx.notify();
@@ -30853,7 +30836,77 @@ impl NativeShell {
         .into_any_element()
     }
 
-    fn apply_board_menu_action(&mut self, action: BoardMenuAction) {
+    /// The board `⋯` menu. Composition A gives the column no footer strip and
+    /// no "New project" button, so the destinations those carried are rows
+    /// here: Files, Git and Activity are the three the footer's icons opened,
+    /// Settings is its glyph, and "New project…" is its plus. They sit above
+    /// "Archived…", which is the footer's fourth icon and was already a row.
+    ///
+    /// A method rather than a literal inside the painter, because the only
+    /// other way to ask "is Settings still reachable" is to paint the overlay.
+    fn board_options_menu_entries(&self) -> Vec<(String, String, BoardMenuAction)> {
+        vec![
+            (
+                "board-menu-files".to_string(),
+                "Files".to_string(),
+                BoardMenuAction::OpenDock(DockTool::Files),
+            ),
+            (
+                "board-menu-git".to_string(),
+                "Git".to_string(),
+                BoardMenuAction::OpenGitWindow,
+            ),
+            (
+                "board-menu-activity".to_string(),
+                "Activity".to_string(),
+                BoardMenuAction::OpenDock(DockTool::Services),
+            ),
+            (
+                "board-menu-settings".to_string(),
+                "Settings".to_string(),
+                BoardMenuAction::OpenSettings,
+            ),
+            (
+                "board-menu-new-project".to_string(),
+                "New project…".to_string(),
+                BoardMenuAction::NewProject,
+            ),
+            (
+                "board-menu-archived".to_string(),
+                if self.show_archived_tasks {
+                    "Active tasks".to_string()
+                } else {
+                    "Archived…".to_string()
+                },
+                BoardMenuAction::ToggleArchived,
+            ),
+            (
+                "board-menu-rail".to_string(),
+                if self.layout.board_rail {
+                    "Expand board".to_string()
+                } else {
+                    "Collapse to rail".to_string()
+                },
+                BoardMenuAction::ToggleRail,
+            ),
+            (
+                "board-menu-density".to_string(),
+                if self.board_density_compact() {
+                    "Density: Compact".to_string()
+                } else {
+                    "Density: Comfortable".to_string()
+                },
+                BoardMenuAction::ToggleDensity,
+            ),
+        ]
+    }
+
+    fn apply_board_menu_action(
+        &mut self,
+        action: BoardMenuAction,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         match action {
             BoardMenuAction::NewTaskIn(project_key) => {
                 self.begin_new_task_for_project_key(project_key);
@@ -30866,6 +30919,10 @@ impl NativeShell {
             }
             BoardMenuAction::ToggleRail => self.toggle_board_rail(),
             BoardMenuAction::ToggleDensity => self.toggle_board_density(),
+            BoardMenuAction::NewProject => self.begin_choose_folder(cx),
+            BoardMenuAction::OpenDock(tool) => self.dispatch_dock_tool(tool),
+            BoardMenuAction::OpenGitWindow => self.open_native_git_window(window, cx),
+            BoardMenuAction::OpenSettings => self.settings_open = true,
         }
     }
 
@@ -34217,8 +34274,6 @@ impl NativeShell {
                     | "native-browser-reload"
                     | "native-browser-address"
                     | "native-browser-go"
-                    | "native-sidebar-changes"
-                    | "native-sidebar-services"
             ) || NATIVE_DOCK_TABS.iter().any(|(tool, dock_element_id, _)| {
                 *dock_element_id == element_id && !Self::remote_dock_tab_supported(*tool)
             });
@@ -34231,7 +34286,7 @@ impl NativeShell {
             return;
         }
         match element_id {
-            "native-projects-add" | "native-sidebar-new-project" => {
+            "native-projects-add" => {
                 self.local_slot_mut().interaction.close_palettes();
                 self.new_task = None;
                 if self.shows_add_project_plus() {
@@ -34241,9 +34296,13 @@ impl NativeShell {
                     self.settings_open = true;
                 }
             }
-            "native-sidebar-new-task" => {
-                self.begin_new_task();
+            crate::ui::board::topbar::SCOPE_ELEMENT_ID => {
+                self.project_scope_menu.toggle_menu();
             }
+            crate::ui::board::topbar::NEEDS_YOU_ELEMENT_ID => {
+                self.focus_first_needs_you_task();
+            }
+            crate::ui::board::topbar::SETTINGS_ELEMENT_ID => self.settings_open = true,
             "board-header-new" => self.open_board_menu(BoardMenu::NewTask),
             "board-header-menu" => self.open_board_menu(BoardMenu::Options),
             "board-group-done" => {
@@ -42034,6 +42093,7 @@ impl NativeShell {
     fn main_column(
         &self,
         tokens: crate::ui::tokens::ThemeTokens,
+        top_bar: AnyElement,
         conversation: AnyElement,
         sidebar: AnyElement,
         workspace_header: AnyElement,
@@ -42062,7 +42122,10 @@ impl NativeShell {
         let show_dock = !layout.dock_collapsed;
         let conversation_panel =
             Self::conversation_canvas_panel(tokens, conversation, conversation_trailing);
-        div()
+        // Composition A's top bar spans the whole window, not the board column:
+        // it is the parent of both the column and the workspace, so this is a
+        // column of [bar, row] rather than the bare row it used to be.
+        let content = div()
             .id("native-shell-main-content")
             .flex()
             .flex_row()
@@ -42109,8 +42172,108 @@ impl NativeShell {
                                     .child(dock)
                             })),
                     ),
-            )
+            );
+        div()
+            .id("native-shell-window-column")
+            .flex()
+            .flex_col()
+            .flex_1()
+            .min_h(px(0.0))
+            .min_w(px(0.0))
+            .child(top_bar)
+            .child(content)
             .into_any_element()
+    }
+
+    /// The window's one-line top bar (composition A). The scope opens the same
+    /// chooser the column's scope row opened; the needs-you chip selects the
+    /// first waiting row; the glyph opens the settings surface the footer's
+    /// glyph opened.
+    ///
+    /// `shell` is `None` on the handler-less smoke path, which paints the bar
+    /// so the accessibility tree and the element tree agree about it but has no
+    /// entity to route a click through.
+    fn top_bar_element(
+        &self,
+        tokens: crate::ui::tokens::ThemeTokens,
+        board: &crate::ui::board::BoardModel,
+        shell: Option<gpui::WeakEntity<Self>>,
+    ) -> AnyElement {
+        let scope_label = self.project_scope().label(|id| {
+            self.local_slot()
+                .config_sidebar
+                .projects
+                .iter()
+                .find_map(|project| {
+                    (ProjectId::parse(&project.workspace_id).ok() == Some(id))
+                        .then(|| project.label.as_str())
+                })
+        });
+        let model = crate::ui::board::top_bar_model(scope_label, board);
+        let handlers = match shell {
+            Some(shell) => crate::ui::board::TopBarHandlers {
+                on_scope: Rc::new({
+                    let shell = shell.clone();
+                    move |_window: &mut Window, app: &mut gpui::App| {
+                        let _ = shell.update(app, |shell, cx| {
+                            cx.stop_propagation();
+                            shell.project_scope_menu.toggle_menu();
+                            cx.notify();
+                        });
+                    }
+                }),
+                on_needs_you: Rc::new({
+                    let shell = shell.clone();
+                    move |_window: &mut Window, app: &mut gpui::App| {
+                        let _ = shell.update(app, |shell, cx| {
+                            cx.stop_propagation();
+                            shell.focus_first_needs_you_task();
+                            cx.notify();
+                        });
+                    }
+                }),
+                on_settings: Rc::new({
+                    let shell = shell.clone();
+                    move |_window: &mut Window, app: &mut gpui::App| {
+                        let _ = shell.update(app, |shell, cx| {
+                            cx.stop_propagation();
+                            shell.settings_open = true;
+                            cx.notify();
+                        });
+                    }
+                }),
+            },
+            None => crate::ui::board::TopBarHandlers {
+                on_scope: Rc::new(|_, _| {}),
+                on_needs_you: Rc::new(|_, _| {}),
+                on_settings: Rc::new(|_, _| {}),
+            },
+        };
+        crate::ui::board::top_bar_element(&model, tokens, &handlers)
+    }
+
+    /// How many rows the top bar's amber chip counts: the Needs-you group's
+    /// size, read from the same board model the chip's painter reads, so the
+    /// chip, the section heading and the accessibility node cannot disagree.
+    fn top_bar_needs_you_count(&mut self) -> usize {
+        crate::ui::board::top_bar_model(String::new(), &self.board_model(unix_time_ms())).needs_you
+    }
+
+    /// Select the row the needs-you chip counts first. Reads the same board
+    /// model the chip's count came from, so the chip can never point at a row
+    /// the board does not show.
+    fn focus_first_needs_you_task(&mut self) {
+        let Some(key) = self
+            .board_model(unix_time_ms())
+            .groups
+            .iter()
+            .find(|group| group.group == BoardGroup::NeedsYou)
+            .and_then(|group| group.rows.first())
+            .map(|row| row.key.clone())
+        else {
+            return;
+        };
+        let _ = self.select_fleet_task_key(key, FleetSelectMode::Replace);
     }
 
     fn sidebar(
@@ -42135,52 +42298,6 @@ impl NativeShell {
             .into_any_element()
     }
 
-    fn sidebar_brand(tokens: crate::ui::tokens::ThemeTokens) -> AnyElement {
-        div()
-            .id("native-shell-sidebar-brand")
-            .w_full()
-            .h(px(T3_WORKSPACE_TOPBAR_HEIGHT))
-            .flex()
-            .flex_none()
-            .items_center()
-            .gap(px(8.0))
-            .px(px(12.0))
-            .child(
-                div()
-                    .size(px(22.0))
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .rounded(px(6.0))
-                    .overflow_hidden()
-                    .child(
-                        img("icons/devmanager-32.png")
-                            .size(px(22.0))
-                            .object_fit(ObjectFit::Cover),
-                    ),
-            )
-            .child(
-                div()
-                    .min_w(px(0.0))
-                    .truncate()
-                    .text_size(px(tokens.density.typography.body))
-                    .font_weight(FontWeight::SEMIBOLD)
-                    .text_color(tokens.text.primary.to_gpui())
-                    .child("DevManager"),
-            )
-            .child(
-                div()
-                    .px(px(6.0))
-                    .py(px(2.0))
-                    .rounded_full()
-                    .bg(tokens.surfaces.raised.to_gpui())
-                    .text_size(px(9.0))
-                    .text_color(tokens.text.muted.to_gpui())
-                    .child("Visual"),
-            )
-            .into_any_element()
-    }
-
     /// The board column. Docked flush to the window edge, no radius, a one
     /// pixel subtle right border and the canvas ground -- the placement
     /// `01-composition-A.html` specifies for the column that holds the board.
@@ -42189,10 +42306,7 @@ impl NativeShell {
     fn reference_sidebar(
         tokens: crate::ui::tokens::ThemeTokens,
         width: f32,
-        rail: bool,
-        navigation: AnyElement,
         inbox: AnyElement,
-        footer: AnyElement,
     ) -> AnyElement {
         let column = div()
             .id("native-shell-sidebar-column")
@@ -42206,19 +42320,13 @@ impl NativeShell {
             .bg(tokens.surfaces.canvas.to_gpui())
             .border_r(px(1.0))
             .border_color(tokens.borders.subtle.to_gpui());
-        // Collapsed, the column is 36 px of dots. The brand, the project
-        // scope control and the footer buttons do not fit in that and would
-        // be silently clipped, so the rail carries the board alone -- which
-        // is what "collapse to rail" asks for.
-        if rail {
-            return column.child(inbox).into_any_element();
-        }
-        column
-            .child(Self::sidebar_brand(tokens))
-            .child(navigation)
-            .child(inbox)
-            .child(footer)
-            .into_any_element()
+        // Composition A: the column is the board and nothing else, at every
+        // width. The brand and the project scope moved to the window's top
+        // bar; Search is the palette that Ctrl+K already opens; the footer's
+        // four destinations and "New project" moved into the board's own menu.
+        // Nothing here varies with the rail any more, because there is nothing
+        // left that a 36 px column would have to clip.
+        column.child(inbox).into_any_element()
     }
 
     fn element_body(&self, task_rows: Vec<AnyElement>) -> impl IntoElement {
@@ -42288,63 +42396,6 @@ impl NativeShell {
                 .children(task_rows)
                 .into_any_element()
         };
-        let navigation = div()
-            .w_full()
-            .flex()
-            .flex_col()
-            .gap(px(2.0))
-            .px(px(8.0))
-            .pb(px(8.0))
-            .child(
-                div()
-                    .id("native-shell-sidebar-search")
-                    .h(px(32.0))
-                    .flex()
-                    .items_center()
-                    .gap(px(8.0))
-                    .px(px(8.0))
-                    .rounded(px(6.0))
-                    .text_color(tokens.text.secondary.to_gpui())
-                    .child(crate::icons::app_icon(
-                        crate::icons::SEARCH,
-                        14.0,
-                        tokens.text.muted.to_u32(),
-                    ))
-                    .child("Search"),
-            )
-            .child(
-                div()
-                    .id("native-shell-sidebar-project-scope")
-                    .h(px(32.0))
-                    .flex()
-                    .items_center()
-                    .gap(px(8.0))
-                    .px(px(8.0))
-                    .rounded(px(6.0))
-                    .text_color(tokens.text.secondary.to_gpui())
-                    .child(crate::icons::app_icon(
-                        crate::icons::FOLDER,
-                        14.0,
-                        tokens.text.muted.to_u32(),
-                    ))
-                    .child(div().flex_1().child(self.project_scope().label(|id| {
-                        self.local_slot()
-                            .config_sidebar
-                            .projects
-                            .iter()
-                            .find_map(|project| {
-                                (ProjectId::parse(&project.workspace_id).ok() == Some(id))
-                                    .then(|| project.label.as_str())
-                            })
-                    })))
-                    .child(crate::icons::app_icon(
-                        crate::icons::CHEVRON_DOWN,
-                        12.0,
-                        tokens.text.muted.to_u32(),
-                    ))
-                    .child("＋"),
-            )
-            .into_any_element();
         let inbox = div()
             .id("native-shell-task-inbox")
             .w_full()
@@ -42355,61 +42406,11 @@ impl NativeShell {
             .overflow_hidden()
             .child(inbox_body)
             .into_any_element();
-        let footer = div()
-            .id("native-shell-sidebar-footer")
-            .w_full()
-            .h(px(44.0))
-            .flex()
-            .flex_none()
-            .items_center()
-            .justify_between()
-            .px(px(10.0))
-            .border_t(px(1.0))
-            .border_color(tokens.borders.subtle.to_gpui())
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .gap(px(14.0))
-                    .child(crate::icons::app_icon(
-                        crate::icons::SETTINGS,
-                        14.0,
-                        tokens.text.muted.to_u32(),
-                    ))
-                    .child(crate::icons::app_icon(
-                        crate::icons::GIT_BRANCH,
-                        14.0,
-                        tokens.text.muted.to_u32(),
-                    ))
-                    .child(crate::icons::app_icon(
-                        crate::icons::ACTIVITY,
-                        14.0,
-                        tokens.text.muted.to_u32(),
-                    )),
-            )
-            .child(
-                div()
-                    .size(px(28.0))
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .rounded_full()
-                    .bg(tokens.actions.primary.default.background.to_gpui())
-                    .child(crate::icons::app_icon(
-                        crate::icons::PLUS,
-                        14.0,
-                        tokens.actions.primary.default.foreground.to_u32(),
-                    )),
-            )
-            .into_any_element();
-        let sidebar = Self::reference_sidebar(
-            tokens,
-            self.board_column_width(),
-            self.layout.board_rail,
-            navigation,
-            inbox,
-            footer,
-        );
+        let sidebar = Self::reference_sidebar(tokens, self.board_column_width(), inbox);
+        // The handler-less smoke path has no fleet projection to group, so the
+        // bar paints with an empty board: its geometry and its three hint chips
+        // are what this path exercises, not the needs-you count.
+        let top_bar = self.top_bar_element(tokens, &build_board_model(Vec::new(), false), None);
         let dock = Self::stacked_panel_grow(
             "native-shell-context-dock",
             self.local_slot().cockpit.active_tool().label(),
@@ -42435,6 +42436,7 @@ impl NativeShell {
             .text_color(tokens.text.primary.to_gpui())
             .child(self.main_column(
                 tokens,
+                top_bar,
                 if self.local_slot().interaction.selected_task().is_none() {
                     self.idle_conversation_photo_surface(tokens, None)
                 } else {
@@ -43489,109 +43491,6 @@ impl NativeShell {
             .child(self.context_dock_surface(tokens, Some(services_shell_entity)))
             .into_any_element();
 
-        let navigation = div()
-            .id("native-shell-sidebar-navigation")
-            .w_full()
-            .flex()
-            .flex_col()
-            .flex_none()
-            .gap(px(3.0))
-            .px(px(8.0))
-            .pt(px(T3_SIDEBAR_NAV_TOP_INSET))
-            .pb(px(8.0))
-            .child(
-                div()
-                    .id("native-shell-sidebar-search")
-                    .tab_stop(true)
-                    .w_full()
-                    .h(px(34.0))
-                    .flex()
-                    .items_center()
-                    .gap(px(8.0))
-                    .px(px(8.0))
-                    .rounded(px(6.0))
-                    .cursor_pointer()
-                    .text_size(px(tokens.density.typography.caption))
-                    .text_color(tokens.text.secondary.to_gpui())
-                    .hover(|style| style.bg(tokens.surfaces.hover.to_gpui()))
-                    .on_click(cx.listener(|shell, _event: &ClickEvent, window, cx| {
-                        cx.stop_propagation();
-                        shell.dispatch_keyboard(KeyboardShortcut::ctrl(
-                            crate::ui::actions::ShortcutKey::Character('p'),
-                        ));
-                        shell.focus_task_search_input(window);
-                        cx.notify();
-                    }))
-                    .child(crate::icons::app_icon(
-                        crate::icons::SEARCH,
-                        14.0,
-                        tokens.text.muted.to_u32(),
-                    ))
-                    .child(div().flex_1().child("Search")),
-            )
-            .child(
-                div()
-                    .id("native-shell-sidebar-project-scope")
-                    .tab_stop(true)
-                    .w_full()
-                    .h(px(34.0))
-                    .flex()
-                    .items_center()
-                    .gap(px(8.0))
-                    .px(px(8.0))
-                    .rounded(px(6.0))
-                    .cursor_pointer()
-                    .text_size(px(tokens.density.typography.caption))
-                    .text_color(tokens.text.secondary.to_gpui())
-                    .hover(|style| style.bg(tokens.surfaces.hover.to_gpui()))
-                    .on_click(cx.listener(|shell, _event: &ClickEvent, _window, cx| {
-                        cx.stop_propagation();
-                        shell.project_scope_menu.toggle_menu();
-                        cx.notify();
-                    }))
-                    .child(crate::icons::app_icon(
-                        crate::icons::FOLDER,
-                        14.0,
-                        tokens.text.muted.to_u32(),
-                    ))
-                    .child(div().flex_1().font_weight(FontWeight::SEMIBOLD).child(
-                        self.project_scope().label(|id| {
-                            self.local_slot_mut()
-                                .config_sidebar
-                                .projects
-                                .iter()
-                                .find_map(|project| {
-                                    (ProjectId::parse(&project.workspace_id).ok() == Some(id))
-                                        .then(|| project.label.as_str())
-                                })
-                        }),
-                    ))
-                    .child(crate::icons::app_icon(
-                        crate::icons::CHEVRON_DOWN,
-                        12.0,
-                        tokens.text.muted.to_u32(),
-                    ))
-                    .child(
-                        Button::new("native-sidebar-new-task")
-                            .label("New task")
-                            .icon(gpui_component::IconName::Plus)
-                            .tooltip(if self.startup_gates_actions() {
-                                crate::ui::startup_status::STARTUP_LOADING_TOOLTIP
-                            } else {
-                                "New task"
-                            })
-                            .disabled(self.startup_gates_actions())
-                            .primary()
-                            .small()
-                            .rounded(px(8.0))
-                            .on_click(cx.listener(|shell, _event: &ClickEvent, _window, cx| {
-                                cx.stop_propagation();
-                                shell.begin_new_task();
-                                cx.notify();
-                            })),
-                    ),
-            )
-            .into_any_element();
         let inbox_panel = div()
             .id("native-shell-task-inbox")
             .w_full()
@@ -43642,195 +43541,8 @@ impl NativeShell {
                 }
             })
             .into_any_element();
-        let sidebar_footer = div()
-            .id("native-shell-sidebar-footer")
-            .w_full()
-            .h(px(44.0))
-            .flex()
-            .flex_none()
-            .items_center()
-            .justify_between()
-            .px(px(10.0))
-            .border_t(px(1.0))
-            .border_color(tokens.borders.subtle.to_gpui())
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .gap(px(4.0))
-                    .child(
-                        div()
-                            .id("native-sidebar-archived")
-                            .tab_stop(true)
-                            .size(px(28.0))
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .rounded(px(6.0))
-                            .cursor_pointer()
-                            .when(archived_view, |button| {
-                                button.bg(tokens.surfaces.selection.to_gpui())
-                            })
-                            .hover(|style| style.bg(tokens.surfaces.hover.to_gpui()))
-                            .on_click(cx.listener(|shell, _event: &ClickEvent, _window, cx| {
-                                cx.stop_propagation();
-                                shell.show_archived_tasks = !shell.show_archived_tasks;
-                                shell.refresh_accessibility_tree();
-                                cx.notify();
-                            }))
-                            .child(crate::icons::app_icon(
-                                crate::icons::FILE_TEXT,
-                                14.0,
-                                if archived_view {
-                                    tokens.text.primary.to_u32()
-                                } else {
-                                    tokens.text.muted.to_u32()
-                                },
-                            )),
-                    )
-                    .child(
-                        div()
-                            .id("native-header-settings")
-                            .tab_stop(true)
-                            .size(px(28.0))
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .rounded(px(6.0))
-                            .cursor_pointer()
-                            .hover(|style| style.bg(tokens.surfaces.hover.to_gpui()))
-                            .on_click(cx.listener(|shell, _event: &ClickEvent, _window, cx| {
-                                cx.stop_propagation();
-                                shell.settings_open = true;
-                                cx.notify();
-                            }))
-                            .child(crate::icons::app_icon(
-                                crate::icons::SETTINGS,
-                                14.0,
-                                tokens.text.muted.to_u32(),
-                            )),
-                    )
-                    .child(if self.selected_owner_is_remote() {
-                        div()
-                            .id("native-sidebar-changes-unavailable")
-                            .size(px(28.0))
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .rounded(px(6.0))
-                            .child(crate::icons::app_icon(
-                                crate::icons::GIT_BRANCH,
-                                14.0,
-                                tokens.text.disabled.to_u32(),
-                            ))
-                    } else {
-                        div()
-                            .id("native-sidebar-changes")
-                            .tab_stop(true)
-                            .size(px(28.0))
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .rounded(px(6.0))
-                            .cursor_pointer()
-                            .hover(|style| style.bg(tokens.surfaces.hover.to_gpui()))
-                            .on_click(cx.listener(|shell, _event: &ClickEvent, window, cx| {
-                                cx.stop_propagation();
-                                shell.open_native_git_window(window, cx);
-                                cx.notify();
-                            }))
-                            .child(crate::icons::app_icon(
-                                crate::icons::GIT_BRANCH,
-                                14.0,
-                                tokens.text.muted.to_u32(),
-                            ))
-                    })
-                    .child(if self.selected_owner_is_remote() {
-                        div()
-                            .id("native-sidebar-services-unavailable")
-                            .size(px(28.0))
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .rounded(px(6.0))
-                            .child(crate::icons::app_icon(
-                                crate::icons::ACTIVITY,
-                                14.0,
-                                tokens.text.disabled.to_u32(),
-                            ))
-                    } else {
-                        div()
-                            .id("native-sidebar-services")
-                            .tab_stop(true)
-                            .size(px(28.0))
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .rounded(px(6.0))
-                            .cursor_pointer()
-                            .hover(|style| style.bg(tokens.surfaces.hover.to_gpui()))
-                            .on_click(cx.listener(|shell, _event: &ClickEvent, _window, cx| {
-                                cx.stop_propagation();
-                                shell.dispatch_dock_tool(DockTool::Services);
-                                cx.notify();
-                            }))
-                            .child(crate::icons::app_icon(
-                                crate::icons::ACTIVITY,
-                                14.0,
-                                tokens.text.muted.to_u32(),
-                            ))
-                    }),
-            )
-            .child({
-                let new_project = div()
-                    .id("native-sidebar-new-project")
-                    .tab_stop(true)
-                    .h(px(28.0))
-                    .px(px(10.0))
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .gap(px(6.0))
-                    .rounded(px(6.0))
-                    .cursor_pointer()
-                    .bg(tokens.actions.primary.default.background.to_gpui())
-                    .hover(|style| style.bg(tokens.actions.primary.hover.background.to_gpui()))
-                    .child(crate::icons::app_icon(
-                        crate::icons::FOLDER,
-                        14.0,
-                        tokens.actions.primary.default.foreground.to_u32(),
-                    ))
-                    .child(
-                        div()
-                            .text_size(px(tokens.density.typography.caption))
-                            .text_color(tokens.actions.primary.default.foreground.to_gpui())
-                            .child("New project"),
-                    );
-                match project_creation_affordance {
-                    ProviderInboxAffordance::ConnectedAdd => new_project
-                        .on_click(cx.listener(|shell, _event: &ClickEvent, _window, cx| {
-                            cx.stop_propagation();
-                            shell.begin_choose_folder(cx);
-                            cx.notify();
-                        }))
-                        .into_any_element(),
-                    ProviderInboxAffordance::Checking => {
-                        new_project.opacity(0.6).into_any_element()
-                    }
-                    ProviderInboxAffordance::DisconnectedAdd => {
-                        new_project.opacity(0.45).into_any_element()
-                    }
-                }
-            })
-            .into_any_element();
-        let sidebar = Self::reference_sidebar(
-            tokens,
-            board_width,
-            self.layout.board_rail,
-            navigation,
-            inbox_panel,
-            sidebar_footer,
-        );
+        let sidebar = Self::reference_sidebar(tokens, board_width, inbox_panel);
+        let top_bar = self.top_bar_element(tokens, &board, Some(cx.entity().downgrade()));
 
         let layout = self
             .layout
@@ -44032,6 +43744,7 @@ impl NativeShell {
             .text_color(tokens.text.primary.to_gpui())
             .child(self.main_column(
                 tokens,
+                top_bar,
                 conversation,
                 sidebar,
                 workspace_header,
@@ -49541,11 +49254,15 @@ pub(crate) mod tests {
         );
     }
 
+    /// Composition A (spec 2026-09-03 section 3): the board column is the board
+    /// and nothing else. The brand row, the Search row, the scope row with its
+    /// "New task" button and the footer strip are gone from the paint AND from
+    /// the accessibility tree; the top bar carries the scope and the settings
+    /// glyph instead, and the board's own `+ New` is the one new-task control.
     #[test]
-    fn connected_shell_exposes_new_task_beside_projects_and_footer_new_project_without_search_plus()
-    {
+    fn the_board_column_sheds_its_chrome_and_the_top_bar_publishes_the_scope() {
         if rerun_headless_shell_test_in_child(
-            "ui::native_shell::tests::connected_shell_exposes_new_task_beside_projects_and_footer_new_project_without_search_plus",
+            "ui::native_shell::tests::the_board_column_sheds_its_chrome_and_the_top_bar_publishes_the_scope",
         ) {
             return;
         }
@@ -49564,33 +49281,125 @@ pub(crate) mod tests {
                 shell.install_named_folder_for_test("command");
                 let _ = shell.element_without_handlers();
                 shell.refresh_accessibility_tree();
-                shell
+                let ids = shell
                     .accessibility_tree()
                     .gpui_nodes()
                     .into_iter()
                     .map(|node| node.element_id)
-                    .collect::<Vec<_>>()
+                    .collect::<Vec<_>>();
+                let menu_rows = shell
+                    .board_options_menu_entries()
+                    .into_iter()
+                    .map(|(_, label, _)| label)
+                    .collect::<Vec<_>>();
+                (ids, menu_rows)
             });
             *completed_for_app.borrow_mut() = Some(snapshot);
             cx.quit();
         });
-        let ids = completed.borrow().clone().expect("rail control ids");
+        let (ids, menu_rows) = completed.borrow().clone().expect("column control ids");
         assert!(
-            ids.iter().any(|id| id == "native-sidebar-new-task"),
-            "New task must sit beside All projects: {ids:?}"
+            ids.iter().any(|id| id == "native-top-bar-scope"),
+            "the project scope moved to the window top bar: {ids:?}"
         );
         assert!(
-            ids.iter().any(|id| id == "native-sidebar-new-project"),
-            "footer must expose exactly one New project action: {ids:?}"
+            ids.iter().any(|id| id == "native-top-bar-settings"),
+            "the footer's settings glyph moved to the window top bar: {ids:?}"
         );
+        for gone in [
+            "native-sidebar-search",
+            "native-shell-sidebar-search",
+            "native-sidebar-new-task",
+            "native-sidebar-new-project",
+        ] {
+            assert!(
+                !ids.iter().any(|id| id == gone),
+                "{gone} is column chrome composition A does not have: {ids:?}"
+            );
+        }
         assert!(
-            !ids.iter().any(|id| id == "native-search-plus"),
-            "Search must not keep a plus control: {ids:?}"
+            ids.iter().any(|id| id == "board-header-new"),
+            "the board's own + New replaces the scope row's New task button: {ids:?}"
         );
         assert!(
             ids.iter()
                 .any(|id| id == "native-shell-task-inbox-scrollbar-gutter"),
             "inbox must project a dedicated scrollbar gutter sibling: {ids:?}"
+        );
+        // The four footer destinations plus the folder picker, above the
+        // archived toggle that was already a row.
+        for row in [
+            "Files",
+            "Git",
+            "Activity",
+            "Settings",
+            "New project\u{2026}",
+        ] {
+            assert!(
+                menu_rows.iter().any(|label| label == row),
+                "the board menu must carry the column footer's {row} destination: {menu_rows:?}"
+            );
+        }
+        let archived = menu_rows
+            .iter()
+            .position(|label| label == "Archived\u{2026}" || label == "Active tasks")
+            .expect("the archived toggle stays in the menu");
+        let new_project = menu_rows
+            .iter()
+            .position(|label| label == "New project\u{2026}")
+            .expect("New project row");
+        assert!(
+            new_project < archived,
+            "the moved destinations sit above Archived: {menu_rows:?}"
+        );
+    }
+
+    /// The four ids above are absent from the accessibility tree because the
+    /// elements are gone -- not because the tree happened never to publish
+    /// them. Two of the four (`native-sidebar-search`, `native-header-settings`
+    /// in the footer) were painted without a node, so a tree-only assertion is
+    /// vacuous for them and would stay green if the rows came back.
+    #[test]
+    fn the_removed_column_chrome_is_gone_from_the_painter_too() {
+        let source = include_str!("native_shell.rs");
+        let production_source = source
+            .split("mod tests {")
+            .next()
+            .expect("production native shell source");
+        for gone in [
+            "native-shell-sidebar-brand",
+            "native-shell-sidebar-search",
+            "native-shell-sidebar-navigation",
+            "native-shell-sidebar-project-scope",
+            "native-shell-sidebar-footer",
+            "native-sidebar-new-task",
+            "native-sidebar-new-project",
+            "native-sidebar-changes",
+            "native-sidebar-services",
+        ] {
+            assert!(
+                !production_source.contains(gone),
+                "{gone} is column chrome composition A removed; it must not be painted"
+            );
+        }
+        // The removal is only meaningful if the scan can see the ids that DID
+        // survive: without this the loop above passes on an empty string. The
+        // top bar's own ids are named through `board::topbar`, so this pins the
+        // reference rather than the literal -- the literal lives in that module.
+        for kept in [
+            "crate::ui::board::topbar::SCOPE_ELEMENT_ID",
+            "board-header-new",
+            "native-shell-task-inbox",
+        ] {
+            assert!(
+                production_source.contains(kept),
+                "{kept} must still be painted, or this scan is reading the wrong source"
+            );
+        }
+        assert_eq!(
+            crate::ui::board::topbar::SCOPE_ELEMENT_ID,
+            "native-top-bar-scope",
+            "the id the tree publishes and the id the painter puts on the element are one constant"
         );
     }
 

@@ -87,6 +87,35 @@ pub const SEGMENT_GAP: f32 = 2.0;
 pub const SEGMENT_RADIUS: f32 = 1.5;
 pub const META_GAP: f32 = 6.0;
 
+/// The one-line top bar across the window (`.dm-top` in
+/// `01-composition-A.html`). The mockup's own box is 34 px; the spec pins the
+/// shipped bar at 28 so a window that is mostly panels spends less of itself on
+/// chrome, and every other number here is the mockup's.
+pub const TOP_BAR_HEIGHT: f32 = 28.0;
+/// `.dm-top { gap: 14px; padding: 0 12px }`.
+pub const TOP_BAR_GAP: f32 = 14.0;
+pub const TOP_BAR_PADDING_X: f32 = 12.0;
+/// `.dm-top .brand` is semibold; the spec sizes it at 12 rather than the bar's
+/// own 11.5 so the product name reads as the name and not as a fourth label.
+pub const TOP_BAR_BRAND_FONT_SIZE: f32 = 12.0;
+/// `.dm-top { font-size: 11.5px }` -- the scope label inherits the bar's size.
+pub const TOP_BAR_SCOPE_FONT_SIZE: f32 = 11.5;
+/// `.dm-top .kbd { border: 1px solid; border-radius: 4px; padding: 1px 6px;
+/// font-size: 10.5px }`.
+pub const KBD_FONT_SIZE: f32 = 10.5;
+pub const KBD_RADIUS: f32 = 4.0;
+pub const KBD_PADDING_X: f32 = 6.0;
+pub const KBD_PADDING_Y: f32 = 1.0;
+/// The needs-you chip is a `kbd` chip repainted amber: composition C gives it
+/// the attention amber for its text and a much darker olive for its border,
+/// which is that same amber at roughly a third alpha over the mockup's ground.
+/// Solving the two colours per channel gives 0.333/0.361/0.327; the spec pins
+/// the shipped value at 0.35, a hair above the solved mean of 0.340.
+pub const NEEDS_YOU_CHIP_BORDER_ALPHA: f32 = 0.35;
+/// The settings glyph at the right end of the bar, the same 14 px the footer
+/// strip's icons were.
+pub const TOP_BAR_SETTINGS_ICON_SIZE: f32 = 14.0;
+
 /// `.hd { padding: 9px 10px 7px; gap: 8px }` with a 13 px title and an
 /// 11.5 px `+ New` button in a 6 px-radius 1 px box.
 pub const HEADER_PADDING_TOP: f32 = 9.0;
