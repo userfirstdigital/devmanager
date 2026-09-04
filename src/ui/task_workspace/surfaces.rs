@@ -8,6 +8,7 @@ use crate::domain::{
     SemanticJournalPayload, TaskId, TaskTerminalProjection,
 };
 
+use super::terminal_window::{apply_local_scroll_to_projection, RetainedTerminalWindow};
 #[cfg(test)]
 use super::TaskWorkspace;
 use super::{Axis, PanePresentation, Workspace, WorkspaceError};
@@ -302,6 +303,15 @@ pub struct TaskSurfaceState {
     /// and every plain shell live here side by side; nothing in this map is
     /// "the" terminal on its own -- `focused_resource` decides that.
     pub terminals: BTreeMap<ResourceId, TaskTerminalProjection>,
+    /// One retained scroll window per terminal: the rows the host sent around
+    /// the viewport, plus where the client is currently looking inside them.
+    ///
+    /// This is what makes a wheel notch a repaint instead of a 97 ms round
+    /// trip. It is a PAINT CACHE -- `admit_terminal` replaces the entry on
+    /// every admitted screen, so new output, a resize, a host-side viewport
+    /// move and a reattach all rebase it. See
+    /// [`crate::ui::task_workspace::terminal_window`] for the full rule.
+    terminal_windows: BTreeMap<ResourceId, RetainedTerminalWindow>,
     /// The Task's terminal strip as the host last answered it, when one has
     /// been queried. `None` means the strip has never been admitted, which is
     /// not the same as an empty strip.
@@ -992,6 +1002,15 @@ impl<K: Clone + Ord + Eq> TaskSurfaceRegistry<K> {
         state
             .terminals
             .insert(projection.resource_id, projection.clone());
+        // Rebase the retained window from the screen that just arrived. This
+        // is the ONE invalidation point: whatever produced this projection --
+        // output past the high-water mark, a resize, the host's own viewport
+        // move, a reattach -- the retained rows are replaced by it rather than
+        // merged into it, so the cache can never outlive its subject.
+        state.terminal_windows.insert(
+            projection.resource_id,
+            RetainedTerminalWindow::capture(projection),
+        );
         // The screen that arrived is THIS terminal's, so only its slot goes
         // live. Marking the whole Task live would tell the UI a shell is
         // attached because the provider answered.
@@ -1000,6 +1019,62 @@ impl<K: Clone + Ord + Eq> TaskSurfaceRegistry<K> {
         attachment.state = TerminalAttachmentState::Live;
         attachment.query_in_flight = false;
         Ok(())
+    }
+
+    /// Serve one wheel notch for a terminal from the retained window.
+    ///
+    /// Returns the display offset now painted when the notch landed inside the
+    /// retained rows, and `None` when it ran past them -- the caller then does
+    /// exactly what it did before and waits for the host, which is slower and
+    /// still correct.
+    ///
+    /// On a hit this rewrites the RETAINED PROJECTION as well, so every
+    /// existing reader -- the paint path, the scrollbar model, the cursor
+    /// mapper -- sees the new position without knowing the window exists. The
+    /// host is still told about the scroll by the caller; this only takes the
+    /// round trip off the critical path.
+    pub fn scroll_terminal_locally(
+        &mut self,
+        task_id: K,
+        resource_id: ResourceId,
+        delta_lines: i32,
+    ) -> Option<usize>
+    where
+        K: SurfaceTaskKey,
+    {
+        let state = self.surfaces.get_mut(&task_id)?;
+        let projection = state.terminals.get_mut(&resource_id)?;
+        let window = state.terminal_windows.get_mut(&resource_id)?;
+        // Belt and braces: the window is rebased on every admission, so this
+        // should always hold. If it ever does not, the rows belong to another
+        // terminal and painting them would be the one failure this design must
+        // not have.
+        if !window.matches_identity(projection) {
+            return None;
+        }
+        let target = window.scrolled(delta_lines)?;
+        window.seek(target)?;
+        apply_local_scroll_to_projection(projection, window);
+        Some(target)
+    }
+
+    /// Mutable surface state, for tests that need to simulate a state the
+    /// ordinary admission path would never produce.
+    #[cfg(test)]
+    pub fn state_for_test(&mut self, task_id: K) -> &mut TaskSurfaceState {
+        self.ensure_task(task_id)
+    }
+
+    /// The retained window for one terminal, for tests and diagnostics.
+    pub fn terminal_window(
+        &self,
+        task_id: K,
+        resource_id: ResourceId,
+    ) -> Option<&RetainedTerminalWindow>
+    where
+        K: SurfaceTaskKey,
+    {
+        self.state(task_id)?.terminal_windows.get(&resource_id)
     }
 
     /// Admit the Task's terminal strip.
@@ -1519,6 +1594,165 @@ mod tests {
     /// for the provider -- which the client keeps issuing whether or not the
     /// provider is on screen -- must not relabel the focused shell
     /// "Reconnecting" and drop `terminal_is_interactive`, which is what stops
+    /// One admitted screen carrying a margin, so the retained-window tests
+    /// have something to scroll inside.
+    fn terminal_with_margin(
+        task_id: TaskId,
+        resource_id: ResourceId,
+        history_size: usize,
+        display_offset: usize,
+        margin: usize,
+    ) -> TaskTerminalProjection {
+        let rows = 4;
+        let top = history_size - display_offset;
+        let mut projection = terminal_projection_fixture(task_id, resource_id, false);
+        projection.screen.rows = rows;
+        projection.screen.cols = 20;
+        projection.screen.history_size = history_size;
+        projection.screen.total_lines = history_size + rows;
+        projection.screen.display_offset = display_offset;
+        projection.screen.margin_above = (top - margin..top)
+            .map(|line| format!("line-{line}"))
+            .collect();
+        projection.screen.margin_below = (top + rows..top + rows + margin)
+            .map(|line| format!("line-{line}"))
+            .collect();
+        projection.text_lines = (top..top + rows)
+            .map(|line| format!("line-{line}"))
+            .collect();
+        projection
+    }
+
+    /// The measured symptom this lane exists for: a wheel notch used to be a
+    /// host round trip. Inside the retained window it is now a repaint, and
+    /// the retained projection every reader paints from moves with it.
+    #[test]
+    fn a_wheel_notch_inside_the_retained_window_needs_no_host_round_trip() {
+        let mut registry = TaskSurfaceRegistry::<TaskId>::default();
+        let task_id = TaskId::new();
+        let resource_id = ResourceId::new();
+        let projection = terminal_with_margin(task_id, resource_id, 100, 10, 8);
+        registry.admit_terminal(task_id, &projection).unwrap();
+
+        assert_eq!(
+            registry.scroll_terminal_locally(task_id, resource_id, 3),
+            Some(13),
+            "three lines up is well inside an eight-row margin"
+        );
+        let painted = registry
+            .state(task_id)
+            .and_then(|state| state.terminals.get(&resource_id))
+            .expect("retained projection");
+        assert_eq!(painted.screen.display_offset, 13);
+        assert_eq!(painted.text_lines[0], "line-87");
+    }
+
+    /// Running past the window is not an error, it is the old behaviour: the
+    /// caller gets `None` and waits for the host, and nothing is repainted
+    /// from rows we do not have.
+    #[test]
+    fn a_wheel_gesture_past_the_retained_window_falls_back_to_the_host() {
+        let mut registry = TaskSurfaceRegistry::<TaskId>::default();
+        let task_id = TaskId::new();
+        let resource_id = ResourceId::new();
+        let projection = terminal_with_margin(task_id, resource_id, 100, 10, 8);
+        registry.admit_terminal(task_id, &projection).unwrap();
+
+        assert_eq!(
+            registry.scroll_terminal_locally(task_id, resource_id, 40),
+            None
+        );
+        let painted = registry
+            .state(task_id)
+            .and_then(|state| state.terminals.get(&resource_id))
+            .expect("retained projection");
+        assert_eq!(
+            painted.screen.display_offset, 10,
+            "a refused notch must leave the painted position exactly where it was"
+        );
+    }
+
+    /// An older host sends no margin. The client must not break, it must
+    /// simply never get a local hit.
+    #[test]
+    fn an_older_host_without_a_margin_still_scrolls_through_the_host() {
+        let mut registry = TaskSurfaceRegistry::<TaskId>::default();
+        let task_id = TaskId::new();
+        let resource_id = ResourceId::new();
+        let mut projection = terminal_with_margin(task_id, resource_id, 100, 10, 8);
+        projection.screen.margin_above.clear();
+        projection.screen.margin_below.clear();
+        registry.admit_terminal(task_id, &projection).unwrap();
+
+        assert_eq!(
+            registry
+                .terminal_window(task_id, resource_id)
+                .map(|window| window.margins()),
+            Some((0, 0))
+        );
+        assert_eq!(
+            registry.scroll_terminal_locally(task_id, resource_id, 3),
+            None
+        );
+    }
+
+    /// The invalidation rule, exercised: every admitted screen replaces the
+    /// window, so a local scroll cannot survive the host's next answer.
+    #[test]
+    fn a_newly_admitted_screen_rebases_the_retained_window() {
+        let mut registry = TaskSurfaceRegistry::<TaskId>::default();
+        let task_id = TaskId::new();
+        let resource_id = ResourceId::new();
+        let first = terminal_with_margin(task_id, resource_id, 100, 10, 8);
+        registry.admit_terminal(task_id, &first).unwrap();
+        registry.scroll_terminal_locally(task_id, resource_id, 5);
+        assert!(registry
+            .terminal_window(task_id, resource_id)
+            .expect("window")
+            .is_locally_scrolled());
+
+        // The host answers with its own new position -- which is what happens
+        // when the scroll we dispatched lands, and equally when new output
+        // arrives.
+        let mut second = terminal_with_margin(task_id, resource_id, 140, 15, 8);
+        second.session_id = first.session_id;
+        registry.admit_terminal(task_id, &second).unwrap();
+        let window = registry
+            .terminal_window(task_id, resource_id)
+            .expect("window");
+        assert!(
+            !window.is_locally_scrolled(),
+            "the host's answer is the position, not an offset from ours"
+        );
+        assert_eq!(window.display_offset(), 15);
+        assert_eq!(window.admitted_display_offset(), 15);
+    }
+
+    /// A resize reshapes the grid, so the retained rows describe a layout that
+    /// no longer exists. The identity check must refuse them.
+    #[test]
+    fn a_resized_terminal_refuses_its_retained_rows() {
+        let mut registry = TaskSurfaceRegistry::<TaskId>::default();
+        let task_id = TaskId::new();
+        let resource_id = ResourceId::new();
+        let projection = terminal_with_margin(task_id, resource_id, 100, 10, 8);
+        registry.admit_terminal(task_id, &projection).unwrap();
+
+        // Simulate the window surviving a reshape that did not go through
+        // `admit_terminal`: the guard, not the ordering, is what protects this.
+        registry
+            .state_for_test(task_id)
+            .terminals
+            .get_mut(&resource_id)
+            .expect("projection")
+            .screen
+            .cols += 1;
+        assert_eq!(
+            registry.scroll_terminal_locally(task_id, resource_id, 3),
+            None
+        );
+    }
+
     /// the user typing into a terminal that is working perfectly.
     #[test]
     fn a_provider_retry_leaves_the_focused_shells_attachment_alone() {

@@ -1189,6 +1189,7 @@ impl ContextDock {
         projection: &TaskTerminalProjection,
     ) -> TerminalPaneModel {
         let view = Self::terminal_session_view_from_projection(projection);
+        let scrollbar = terminal_scrollbar_model_for_screen(&view.screen);
         terminal_pane_from_replica(ReplicaPaneRequest {
             active_project: "",
             session_label: projection.title.as_deref().unwrap_or("task terminal"),
@@ -1198,7 +1199,7 @@ impl ContextDock {
             selection: None,
             search: None,
             search_highlight: None,
-            scrollbar: None,
+            scrollbar,
         })
     }
 
@@ -2657,4 +2658,35 @@ mod process_census_tests {
         ));
         assert_eq!(dock.live_output(), "live pty output");
     }
+}
+
+/// The scrollbar for one admitted terminal screen, or `None` when the screen
+/// has no scrollback to show a position within.
+///
+/// The cockpit's terminal rendered `scrollbar: None` unconditionally, so the
+/// redesigned shell's terminal had no scrollbar at all -- the one surface the
+/// redesign spec calls out by name. The ratios come from the same three screen
+/// fields the legacy app view uses, so the two agree by construction.
+///
+/// `hovered` is false here: the cockpit path builds this model from a
+/// projection alone and has no pointer state to consult, so the terminal shows
+/// the idle 4 px bar and does not widen. The legacy app view, which does track
+/// the pointer, passes its own hover through.
+pub fn terminal_scrollbar_model_for_screen(
+    screen: &crate::terminal::session::TerminalScreenSnapshot,
+) -> Option<TerminalScrollbarModel> {
+    let rows = screen.rows.max(1);
+    let total_lines = screen.total_lines.max(rows);
+    if total_lines <= rows {
+        return None;
+    }
+    let max_offset = screen.history_size.max(1);
+    // `display_offset` counts lines scrolled UP from the live prompt, so the
+    // thumb is at the bottom when it is zero.
+    let thumb_top_ratio = 1.0 - (screen.display_offset.min(max_offset) as f32 / max_offset as f32);
+    Some(TerminalScrollbarModel {
+        thumb_top_ratio: thumb_top_ratio.clamp(0.0, 1.0),
+        thumb_height_ratio: (rows as f32 / total_lines as f32).clamp(0.0, 1.0),
+        hovered: false,
+    })
 }

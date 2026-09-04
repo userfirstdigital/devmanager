@@ -26944,6 +26944,12 @@ impl NativeShell {
                         if delta_lines == 0 {
                             return;
                         }
+                        // Repaint from the retained rows FIRST, then tell the
+                        // host. The notify below therefore renders the new
+                        // position on this frame instead of in ~97 ms, and the
+                        // host's reply -- which still arrives -- replaces the
+                        // window and restores the styled cells.
+                        shell.paint_terminal_scroll_locally(&scroll_owner, delta_lines);
                         shell.dispatch_terminal_scroll_for_owner(&scroll_owner, delta_lines);
                         cx.notify();
                     });
@@ -27052,6 +27058,35 @@ impl NativeShell {
     /// query has to follow the same derivation the resize and screen queries
     /// use. Hardcoding the legacy provider query here scrolls the provider PTY
     /// while the user is looking at a shell.
+    /// Paint one wheel notch from the client's retained rows, if it lands
+    /// inside them.
+    ///
+    /// This is the whole point of the retained window: a notch used to cost a
+    /// host round trip (measured median 97 ms, so about 10 fps and a scroll
+    /// that felt like a remote device). Serving it locally makes the repaint a
+    /// frame, and `dispatch_terminal_scroll_for_owner` still tells the host so
+    /// its viewport follows and its reply re-centres the window. The host stays
+    /// authoritative; only the WAIT is removed.
+    ///
+    /// Returns true when the notch was painted locally. False is not a failure
+    /// -- it means the gesture ran past the retained rows, or the host sends no
+    /// margin, and the synchronous path still answers it correctly.
+    fn paint_terminal_scroll_locally(&mut self, owner: &HostTaskKey, delta_lines: i32) -> bool {
+        // The retained screens are keyed by durable resource, including the
+        // provider's own, so the window is found the same way the paint path
+        // finds the projection.
+        let key: TerminalKey = (owner.clone(), self.focused_terminal_target(owner));
+        let Some(resource_id) = self
+            .terminal_projection_for(&key)
+            .map(|projection| projection.resource_id)
+        else {
+            return false;
+        };
+        self.task_surfaces
+            .scroll_terminal_locally(owner.clone(), resource_id, delta_lines)
+            .is_some()
+    }
+
     fn dispatch_terminal_scroll_for_owner(
         &mut self,
         owner: &HostTaskKey,

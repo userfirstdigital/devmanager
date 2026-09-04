@@ -609,6 +609,16 @@ fn compact_terminal_screen_for_wire(
         screen.cells.drain(..discard);
     }
     screen.lines.clear();
+    // The retained-window margin is the one part of a screen that is optional.
+    // A Noise transport message has a hard ~64 KiB ceiling and the enclosing
+    // envelope still needs headroom, so a remote client trades local scrolling
+    // for a frame that fits: it simply gets no margin and falls back to the
+    // synchronous scroll, exactly as an older host's client does. The local IPC
+    // transport has no such ceiling and keeps the margin.
+    if styled_cell_limit <= MAX_TERMINAL_CONNECT_STYLED_CELLS {
+        screen.margin_above.clear();
+        screen.margin_below.clear();
+    }
     (screen, text_lines)
 }
 
