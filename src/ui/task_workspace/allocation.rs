@@ -29,6 +29,20 @@ pub struct AllocationMetrics {
 }
 
 impl AllocationMetrics {
+    /// Spec 6.4: a pane is Full at 320x160 or it is a 320x28 title strip.
+    /// One source for the live shell and for every test that asserts what the
+    /// shipped minimums actually do — a fixture that invents its own numbers
+    /// cannot see a rule that only bites when the two widths are equal.
+    pub const fn production() -> Self {
+        Self {
+            full_min_width: 320.0,
+            full_min_height: 160.0,
+            compact_min_width: 320.0,
+            compact_min_height: 28.0,
+            divider: 4.0,
+        }
+    }
+
     fn sanitized(self) -> Self {
         Self {
             full_min_width: finite_non_negative(self.full_min_width),
@@ -129,6 +143,13 @@ impl<K: Clone + Ord + Eq> Workspace<K> {
     /// The focused pane is never a candidate — it is the one the user is
     /// looking at, and minimising it would also let a single-pane workspace
     /// collapse to a title row it could never grow out of.
+    ///
+    /// A strip keeps the full *width* minimum at the production tuple (320 for
+    /// both), so on a horizontal split minimisation recovers nothing on the
+    /// axis under pressure. Every minimisation therefore has to pay for itself:
+    /// it must strictly lower the tree minimum on an axis that is over budget,
+    /// or the pass stops and leaves the rest Full for the physical floor to
+    /// squeeze.
     fn minimise_to_fit(&mut self, viewport: Viewport, metrics: AllocationMetrics) {
         for task_id in self.task_ids() {
             if self.presentation(task_id.clone()) == Some(PanePresentation::Minimised) {
@@ -141,7 +162,9 @@ impl<K: Clone + Ord + Eq> Workspace<K> {
                 return;
             };
             let minimum = minimum_size(root, metrics);
-            if minimum.width <= viewport.width && minimum.height <= viewport.height {
+            let over_width = minimum.width > viewport.width;
+            let over_height = minimum.height > viewport.height;
+            if !over_width && !over_height {
                 return;
             }
             let Some(candidate) = self.least_recently_focused_full_unpinned(focused.as_ref())
@@ -149,9 +172,19 @@ impl<K: Clone + Ord + Eq> Workspace<K> {
                 return;
             };
             if self
-                .set_presentation(candidate, PanePresentation::Minimised)
+                .set_presentation(candidate.clone(), PanePresentation::Minimised)
                 .is_err()
             {
+                return;
+            }
+            let Some(root) = self.root() else {
+                return;
+            };
+            let relieved = minimum_size(root, metrics);
+            let recovered = (over_width && relieved.width < minimum.width)
+                || (over_height && relieved.height < minimum.height);
+            if !recovered {
+                let _ = self.set_presentation(candidate, PanePresentation::Full);
                 return;
             }
         }
@@ -562,7 +595,7 @@ mod tests {
         (workspace, [first, second, third])
     }
 
-    fn production_like_metrics() -> AllocationMetrics {
+    fn legacy_fixture_metrics() -> AllocationMetrics {
         AllocationMetrics {
             full_min_width: 360.0,
             full_min_height: 300.0,
@@ -645,15 +678,78 @@ mod tests {
         );
     }
 
-    /// Spec 6.4: a pane is Full at 320 by 160 or it is a 28 px title strip.
-    fn minimised_strip_metrics() -> AllocationMetrics {
-        AllocationMetrics {
-            full_min_width: 320.0,
-            full_min_height: 160.0,
-            compact_min_width: 320.0,
-            compact_min_height: 28.0,
-            divider: 0.0,
-        }
+    #[test]
+    fn a_horizontal_split_stays_full_when_minimising_cannot_recover_width() {
+        let first = TaskId::new();
+        let second = TaskId::new();
+        let mut workspace = TaskWorkspace::single(first);
+        workspace
+            .insert_after_focused(second, Axis::Horizontal)
+            .expect("second pane");
+
+        // Two Full panes need 320+320+4 = 644 of the 600 available, so the
+        // width axis is over budget. A strip keeps the full 320 width by
+        // design, so minimising `first` would leave the tree minimum at 644 —
+        // no width recovered and a pane stripped for nothing. Both stay Full
+        // and the physical floor squeezes them instead.
+        let allocated =
+            workspace.allocate(Viewport::new(600.0, 700.0), AllocationMetrics::production());
+
+        assert_eq!(workspace.presentation(first), Some(PanePresentation::Full));
+        assert_eq!(workspace.presentation(second), Some(PanePresentation::Full));
+        assert_eq!(allocated.width(first), Some(298.0));
+        assert_eq!(allocated.width(second), Some(298.0));
+        assert_eq!(
+            allocated.width(first).unwrap() + 4.0 + allocated.width(second).unwrap(),
+            600.0,
+            "leaving both Full must not leave an unowned gap"
+        );
+    }
+
+    #[test]
+    fn a_vertical_split_minimises_the_oldest_until_the_tree_fits() {
+        let first = TaskId::new();
+        let second = TaskId::new();
+        let third = TaskId::new();
+        let mut workspace = TaskWorkspace::single(first);
+        workspace
+            .insert_after_focused(second, Axis::Vertical)
+            .expect("second pane");
+        workspace
+            .insert_after_focused(third, Axis::Vertical)
+            .expect("third pane");
+
+        // Height is the divided axis here, and a strip is 28 rather than 160,
+        // so each minimisation does recover room. Three Full panes need
+        // 160*3 + 4*2 = 488 of 300: stripping `first` leaves 356, still short,
+        // so `second` follows and the pass stops at 224.
+        let allocated =
+            workspace.allocate(Viewport::new(400.0, 300.0), AllocationMetrics::production());
+
+        assert_eq!(
+            workspace.presentation(first),
+            Some(PanePresentation::Minimised)
+        );
+        assert_eq!(
+            workspace.presentation(second),
+            Some(PanePresentation::Minimised)
+        );
+        assert_eq!(
+            workspace.presentation(third),
+            Some(PanePresentation::Full),
+            "the focused pane keeps its content"
+        );
+        assert_eq!(allocated.height(first), Some(28.0));
+        assert_eq!(allocated.height(second), Some(28.0));
+        assert_eq!(allocated.height(third), Some(236.0));
+        assert_eq!(
+            allocated.height(first).unwrap()
+                + 4.0
+                + allocated.height(second).unwrap()
+                + 4.0
+                + allocated.height(third).unwrap(),
+            300.0
+        );
     }
 
     #[test]
@@ -667,7 +763,8 @@ mod tests {
         let pane = workspace.pane_for_task(second).expect("pane").id;
         workspace.zoom(pane).expect("zoom");
 
-        let allocated = workspace.allocate(Viewport::new(500.0, 400.0), minimised_strip_metrics());
+        let allocated =
+            workspace.allocate(Viewport::new(500.0, 400.0), AllocationMetrics::production());
 
         assert_eq!(
             allocated.rect(first),
@@ -696,8 +793,10 @@ mod tests {
             .insert_after_focused(second, Axis::Vertical)
             .expect("second pane");
 
-        // 250 px tall: two Full panes need 320, so one must become a strip.
-        let allocated = workspace.allocate(Viewport::new(400.0, 250.0), minimised_strip_metrics());
+        // 250 px tall: two Full panes need 160+4+160 = 324, so one must
+        // become a strip; 28+4+160 = 192 then fits.
+        let allocated =
+            workspace.allocate(Viewport::new(400.0, 250.0), AllocationMetrics::production());
 
         let minimised: Vec<_> = workspace
             .task_ids()
@@ -712,11 +811,12 @@ mod tests {
         assert_eq!(allocated.height(first), Some(28.0), "the strip is 28 px");
         assert_eq!(
             allocated.height(second),
-            Some(222.0),
-            "the surviving Full pane takes the rest"
+            Some(218.0),
+            "the surviving Full pane takes the rest of the 246 divided px"
         );
 
-        let restored = workspace.allocate(Viewport::new(400.0, 400.0), minimised_strip_metrics());
+        let restored =
+            workspace.allocate(Viewport::new(400.0, 400.0), AllocationMetrics::production());
 
         assert!(
             workspace
@@ -725,8 +825,8 @@ mod tests {
                 .all(|task| workspace.presentation(task) == Some(PanePresentation::Full)),
             "returning room restores every strip"
         );
-        assert_eq!(restored.height(first), Some(200.0));
-        assert_eq!(restored.height(second), Some(200.0));
+        assert_eq!(restored.height(first), Some(198.0));
+        assert_eq!(restored.height(second), Some(198.0));
     }
 
     #[test]
@@ -777,7 +877,7 @@ mod tests {
             .set_presentation(second, PanePresentation::Minimised)
             .unwrap();
 
-        let allocated = workspace.allocate(Viewport::new(700.0, 700.0), production_like_metrics());
+        let allocated = workspace.allocate(Viewport::new(700.0, 700.0), legacy_fixture_metrics());
 
         assert_eq!(allocated.height(first), Some(348.0));
         assert_eq!(allocated.height(second), Some(348.0));
@@ -804,8 +904,7 @@ mod tests {
             .set_presentation(third, PanePresentation::Minimised)
             .unwrap();
 
-        let allocated =
-            workspace.allocate(Viewport::new(1_000.0, 700.0), production_like_metrics());
+        let allocated = workspace.allocate(Viewport::new(1_000.0, 700.0), legacy_fixture_metrics());
         let first_rect = allocated.rect(first).expect("first");
         let second_rect = allocated.rect(second).expect("second");
         let third_rect = allocated.rect(third).expect("third");
@@ -951,7 +1050,7 @@ mod tests {
         // 1088 needed of 900: minimising `first` leaves 938, still short, so
         // `second` follows and the pass then stops at 788 rather than stripping
         // every pane it is allowed to.
-        let allocated = workspace.allocate(Viewport::new(900.0, 700.0), production_like_metrics());
+        let allocated = workspace.allocate(Viewport::new(900.0, 700.0), legacy_fixture_metrics());
         assert_eq!(
             workspace.presentation(first),
             Some(PanePresentation::Minimised)
@@ -983,7 +1082,7 @@ mod tests {
         };
         workspace.resize_split_child(split_id, 0, 500.0).unwrap();
 
-        let allocated = workspace.allocate(Viewport::new(800.0, 700.0), production_like_metrics());
+        let allocated = workspace.allocate(Viewport::new(800.0, 700.0), legacy_fixture_metrics());
         assert_eq!(
             allocated.width(first),
             Some(500.0),
@@ -1005,7 +1104,7 @@ mod tests {
     fn mixed_full_and_minimised_auto_peers_conserve_extent_under_pin_pressure() {
         let (mut workspace, [pinned, full_auto, focused_auto]) = three_horizontal_tasks();
         workspace.pin_task_axis_size(pinned, 500.0).unwrap();
-        let metrics = production_like_metrics();
+        let metrics = legacy_fixture_metrics();
 
         // Three Full panes need 1088 of 800. The pinned pane is not a
         // candidate and the third is focused, so `full_auto` is the strip.
@@ -1097,8 +1196,7 @@ mod tests {
         workspace
             .resize_split_child(horizontal_id, 0, 460.0)
             .unwrap();
-        let allocated =
-            workspace.allocate(Viewport::new(1_000.0, 700.0), production_like_metrics());
+        let allocated = workspace.allocate(Viewport::new(1_000.0, 700.0), legacy_fixture_metrics());
         let first_rect = allocated.rect(first).expect("first");
         let second_rect = allocated.rect(second).expect("second");
         let third_rect = allocated.rect(third).expect("third");
@@ -1116,7 +1214,7 @@ mod tests {
         // This pin is vertical at the intermediate V split and must not
         // inflate the horizontal floor of the nested branch.
         workspace.pin_task_axis_size(cross_axis, 700.0).unwrap();
-        let metrics = production_like_metrics();
+        let metrics = legacy_fixture_metrics();
         let allocated = workspace.allocate(Viewport::new(800.0, 700.0), metrics);
         let nested_w = allocated.width(nested_a).unwrap()
             + metrics.divider
@@ -1141,7 +1239,7 @@ mod tests {
         set_root_child_allocation(&mut workspace, 1, Allocation::Pinned { logical_px: 500.0 });
         workspace.focus_task(outer).unwrap();
 
-        let metrics = production_like_metrics();
+        let metrics = legacy_fixture_metrics();
         let allocated = workspace.allocate(Viewport::new(800.0, 700.0), metrics);
         assert_eq!(allocated.width(outer), Some(664.0));
         assert_eq!(allocated.width(nested_a), Some(64.0));
@@ -1161,7 +1259,7 @@ mod tests {
         // nested_a is a child of the inner H split, so this is a horizontal pin.
         workspace.pin_task_axis_size(nested_a, 32.0).unwrap();
 
-        let metrics = production_like_metrics();
+        let metrics = legacy_fixture_metrics();
         let allocated = workspace.allocate(Viewport::new(800.0, 700.0), metrics);
         assert_eq!(allocated.width(nested_a), Some(32.0));
         assert_eq!(allocated.width(nested_b), Some(64.0));
@@ -1189,7 +1287,7 @@ mod tests {
         // deliberate LRF fill behavior.
         workspace.focus_task(first).unwrap();
         let pinned_workspace = workspace.clone();
-        let allocated = workspace.allocate(Viewport::new(800.0, 700.0), production_like_metrics());
+        let allocated = workspace.allocate(Viewport::new(800.0, 700.0), legacy_fixture_metrics());
         assert_eq!(
             allocated.width(first),
             Some(32.0),
@@ -1210,7 +1308,7 @@ mod tests {
         workspace
             .insert_after_focused(second, Axis::Horizontal)
             .unwrap();
-        let metrics = production_like_metrics();
+        let metrics = legacy_fixture_metrics();
         let allocated = workspace.allocate(Viewport::new(2.0, 100.0), metrics);
         let last = allocated.rect(second).unwrap();
         let total = last.x + last.width;
@@ -1245,7 +1343,7 @@ mod tests {
             _ => panic!("expected split"),
         };
         workspace.focus_task(first).unwrap();
-        let metrics = production_like_metrics();
+        let metrics = legacy_fixture_metrics();
         let viewport = Viewport::new(800.0, 700.0);
         let parent_extent = 800.0;
         let divider_total = metrics.divider * 2.0;

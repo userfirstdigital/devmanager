@@ -24542,13 +24542,7 @@ impl NativeShell {
                     f32::from(workspace_size.width),
                     f32::from(workspace_size.height),
                 ),
-                AllocationMetrics {
-                    full_min_width: 320.0,
-                    full_min_height: 160.0,
-                    compact_min_width: 320.0,
-                    compact_min_height: 28.0,
-                    divider: 4.0,
-                },
+                AllocationMetrics::production(),
             );
             (allocated, *workspace != before)
         };
