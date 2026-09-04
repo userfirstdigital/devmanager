@@ -404,13 +404,29 @@ mod task_pane_view_model_tests {
         workspace
             .set_presentation(third, PanePresentation::Minimised)
             .expect("minimise third");
-        workspace
-            .set_view(second, PaneView::Terminal)
-            .expect("terminal view");
-        let projections = [first, second, third]
+        let projections: BTreeMap<_, _> = [first, second, third]
             .into_iter()
             .map(|task_id| (task_id, projection(task_id)))
             .collect();
+
+        // On Conversation, the focused Full pane owns the composer. Asserted
+        // before the view is flipped so the negative below is a measured
+        // change rather than a property this test never saw hold.
+        let before = TaskWorkspaceViewModel::build(&workspace, &projections).expect("workspace");
+        let before_panes = before.panes();
+        let second_before = before_panes
+            .iter()
+            .find(|pane| pane.task_id == second)
+            .unwrap();
+        assert_eq!(second_before.view, PaneView::Conversation);
+        assert!(
+            second_before.build_composer,
+            "the focused Full pane on Conversation owns the composer"
+        );
+
+        workspace
+            .set_view(second, PaneView::Terminal)
+            .expect("terminal view");
 
         let model = TaskWorkspaceViewModel::build(&workspace, &projections).expect("workspace");
         let panes = model.panes();

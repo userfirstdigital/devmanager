@@ -2279,13 +2279,24 @@ mod tests {
             "a strip is never the interactive pane"
         );
 
-        let with_background = registry.conversation_query_schedule(&workspace, 2);
-        assert!(
-            with_background.contains(&ConversationQueryPlan {
+        let mut with_background = registry.conversation_query_schedule(&workspace, 2);
+        let mut expected = vec![
+            ConversationQueryPlan {
+                task_id: focused,
+                priority: ConversationQueryPriority::Interactive,
+            },
+            ConversationQueryPlan {
                 task_id: strip,
                 priority: ConversationQueryPriority::Background,
-            }),
-            "a strip still refreshes on the background cadence: {with_background:?}"
+            },
+        ];
+        // Sorted by task so the comparison is exact rather than a containment
+        // check that would pass on a wave carrying anything else as well.
+        with_background.sort_by_key(|plan| plan.task_id);
+        expected.sort_by_key(|plan| plan.task_id);
+        assert_eq!(
+            with_background, expected,
+            "the wave is exactly the focused pane interactively plus the strip in the background"
         );
     }
 

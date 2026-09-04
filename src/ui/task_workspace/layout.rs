@@ -1155,7 +1155,7 @@ mod tests {
     }
 
     #[test]
-    fn zoom_is_transient_and_leaves_the_tree_unchanged() {
+    fn zoom_is_transient_but_restoring_the_pane_to_full_is_not() {
         let mut workspace = Workspace::single(1u32);
         workspace
             .insert_after_focused(2u32, Axis::Horizontal)
@@ -1169,8 +1169,40 @@ mod tests {
         assert_eq!(
             serde_json::to_string(&workspace).expect("json"),
             before,
-            "zoom is not serialised"
+            "zoom itself is not serialised, and pane 2 was already Full"
         );
+
+        // The whole truth: `zoomed` is skipped, but `presentation` is durable
+        // and zooming a strip WRITES Full onto it. Zoom is transient; the
+        // restoration it performs on the way in is not.
+        workspace.unzoom();
+        workspace
+            .set_presentation(1u32, PanePresentation::Minimised)
+            .expect("minimise 1");
+        let strip = workspace.pane_for_task(1).expect("pane").id;
+
+        workspace.zoom(strip).expect("zoom the strip");
+
+        let json = serde_json::to_string(&workspace).expect("json");
+        assert!(
+            !json.contains("zoomed"),
+            "the zoom itself never reaches the file: {json}"
+        );
+        assert!(
+            !json.contains("Minimised"),
+            "and the strip it restored is persisted as Full, not as a strip: {json}"
+        );
+        assert_eq!(
+            workspace.presentation(1u32),
+            Some(PanePresentation::Full),
+            "zooming a strip restores it, and that survives the round trip"
+        );
+        let restored: Workspace<u32> = serde_json::from_str(&json).expect("reload");
+        assert_eq!(restored.zoomed(), None, "no zoom is loaded back");
+        assert_eq!(restored.presentation(1u32), Some(PanePresentation::Full));
+
+        workspace.unzoom();
+        workspace.focus_task(2u32).expect("focus 2");
 
         workspace.unzoom();
         assert_eq!(workspace.zoomed(), None);
