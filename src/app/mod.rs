@@ -14260,11 +14260,15 @@ impl NativeShell {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.handle_terminal_scrollbar_mouse_move(event, window, cx) {
+        // The scrollbar handler takes the screen snapshot only when the pointer
+        // is in the gutter's column or a drag is running; when it does, this
+        // reuses that one clone rather than taking a second.
+        let mut active_session = None;
+        if self.handle_terminal_scrollbar_mouse_move(event, window, cx, &mut active_session) {
             return;
         }
 
-        let active_session = self.current_active_session_view();
+        let active_session = active_session.or_else(|| self.current_active_session_view());
         let session_mode = active_session.as_ref().map(|session| session.screen.mode);
         let terminal_input_blocked = self.terminal_input_block_reason().is_some();
         if session_mode.is_some_and(|mode| self.terminal_mouse_capture_active(mode))
@@ -14362,20 +14366,46 @@ impl NativeShell {
         false
     }
 
+    /// This listener is registered globally for the frame, so it is also the
+    /// only place that can see the pointer entering and leaving the gutter.
+    ///
+    /// It therefore runs for every pixel the pointer travels ANYWHERE in the
+    /// window, and `current_active_session_view()` clones a whole screen
+    /// snapshot -- now including the retained margin, so three viewports of
+    /// rows. The cheap tests come first: an active drag, or a pointer inside
+    /// the gutter's column, both of which are layout and metrics only. The
+    /// snapshot is taken after that, and handed back through `session` so the
+    /// caller does not clone it a second time.
     fn handle_terminal_scrollbar_mouse_move(
         &mut self,
         event: &MouseMoveEvent,
         window: &mut Window,
         cx: &mut Context<Self>,
+        session: &mut Option<crate::terminal::session::TerminalSessionView>,
     ) -> bool {
-        // This listener is registered globally for the frame, so it is also
-        // the only place that can see the pointer entering and leaving the
-        // gutter. Track that first, and only notify when it actually changed
-        // -- a repaint per mouse move would cost more than the hover is worth.
-        let session = self.current_active_session_view();
+        let dragging = self.terminal_scrollbar_drag.is_some() && event.dragging();
+        let pointer_x: f32 = event.position.x.into();
+        let in_gutter_column = self
+            .terminal_scrollbar_gutter_span(window)
+            .is_some_and(|(left, right)| pointer_x >= left && pointer_x <= right);
+        if !dragging && !in_gutter_column {
+            // Nowhere near the bar. Clearing a hover that is already false
+            // costs nothing and notifies nothing.
+            if self.terminal_scrollbar_hovered {
+                self.terminal_scrollbar_hovered = false;
+                cx.notify();
+            }
+            return false;
+        }
+
+        if session.is_none() {
+            *session = self.current_active_session_view();
+        }
         let geometry = session
             .as_ref()
             .and_then(|session| self.terminal_scrollbar_geometry(window, session));
+        // Only notify when the hover actually changed -- a repaint per mouse
+        // move would cost more than the hover is worth.
         let hovered =
             geometry.is_some_and(|geometry| self.scrollbar_hit_test(event.position, geometry));
         if hovered != self.terminal_scrollbar_hovered {
@@ -14383,10 +14413,7 @@ impl NativeShell {
             cx.notify();
         }
 
-        let Some(_) = self.terminal_scrollbar_drag else {
-            return false;
-        };
-        if !event.dragging() {
+        if !dragging {
             return false;
         }
 
@@ -14968,15 +14995,41 @@ impl NativeShell {
         })
     }
 
+    /// The terminal grid's horizontal span: left edge and usable width.
+    ///
+    /// Split out of [`Self::terminal_viewport_layout`] because it depends on
+    /// the window and the sidebar alone -- never on a session -- which is what
+    /// lets a mouse-move ask whether the pointer is in the scrollbar's column
+    /// before it pays for a screen snapshot.
+    fn terminal_viewport_columns(&self, window: &Window) -> Option<(f32, f32)> {
+        let viewport_width: f32 = window.viewport_size().width.into();
+        let left = self.sidebar_width() + 4.0; // px_1() left padding on grid inner
+        if viewport_width <= left {
+            return None;
+        }
+        let right_padding = 4.0; // px_1() right padding on grid inner
+        Some((left, (viewport_width - left - right_padding).max(320.0)))
+    }
+
+    /// The scrollbar gutter's x range, from layout and metrics only.
+    fn terminal_scrollbar_gutter_span(&self, window: &Window) -> Option<(f32, f32)> {
+        if !self.state.settings().show_terminal_scrollbar {
+            return None;
+        }
+        let (left, available_width) = self.terminal_viewport_columns(window)?;
+        let width = view::terminal_scrollbar_spec().gutter_width;
+        let gutter_left = left + available_width - width;
+        Some((gutter_left, gutter_left + width))
+    }
+
     fn terminal_viewport_layout(
         &self,
         window: &Window,
         include_exit_banner: bool,
     ) -> Option<TerminalViewportLayout> {
         let viewport = window.viewport_size();
-        let viewport_width: f32 = viewport.width.into();
         let viewport_height: f32 = viewport.height.into();
-        let left = self.sidebar_width() + 4.0; // px_1() left padding on grid inner
+        let (left, available_width) = self.terminal_viewport_columns(window)?;
         let mut top = TERMINAL_TOPBAR_HEIGHT_PX;
 
         let active_workspace_key = browser_workspace_key_for_ai_tab(self.state.active_tab());
@@ -15013,11 +15066,10 @@ impl NativeShell {
         }
         top += 2.0; // py(px(2.0)) top on grid inner
 
-        if viewport_width <= left || viewport_height <= top {
+        if viewport_height <= top {
             return None;
         }
 
-        let right_padding = 4.0; // px_1() right padding on grid inner
         let bottom_padding = chrome::STATUS_BAR_HEIGHT_PX
             + 2.0  // py(px(2.0)) bottom on grid inner
             + 2.0  // pb(px(2.0)) on body wrapper
@@ -15031,7 +15083,7 @@ impl NativeShell {
         Some(TerminalViewportLayout {
             left,
             top,
-            available_width: (viewport_width - left - right_padding).max(320.0),
+            available_width,
             available_height: (viewport_height - top - bottom_padding).max(160.0),
         })
     }
@@ -16018,7 +16070,7 @@ impl Render for NativeShell {
                     )),
                     on_mouse_move: Arc::new(cx.listener(
                         |this, event: &MouseMoveEvent, window, cx| {
-                            this.handle_terminal_scrollbar_mouse_move(event, window, cx);
+                            this.handle_terminal_scrollbar_mouse_move(event, window, cx, &mut None);
                         },
                     )),
                     on_mouse_up: Arc::new(cx.listener(|this, event: &MouseUpEvent, window, cx| {
