@@ -185,7 +185,7 @@ fn provider_icon_glyph_paths_are_distinct_asset_paths() {
 
 - [ ] **Step 2: Run them to see them fail**
 
-Run: `cargo test --lib icons::tests provider_icon_glyph_paths -- --test-threads=4`
+Run: `cargo test --lib -- icons::tests provider_icon_glyph_paths --test-threads=4`
 Expected: compile error, constants and method missing.
 
 - [ ] **Step 3: Add the SVGs**
@@ -193,7 +193,7 @@ Expected: compile error, constants and method missing.
 Write each file as a 24-unit viewBox using `fill="currentColor"` (or `stroke="currentColor"` with `fill="none"`), with a leading comment naming its origin. Origin rule: if the vendor publishes a mark under a licence that permits redistribution, trace that; otherwise use the neutral stand-in shape named here and say so in the comment. Stand-ins:
 
 ```svg
-<!-- provider-claude.svg: neutral stand-in (eight-point spark); replace with the vendor mark only if its licence permits redistribution. -->
+<!-- provider-claude.svg: neutral stand-in (five-point star); replace with the vendor mark only if its licence permits redistribution. -->
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="currentColor"><path d="M12 2l2.2 6.3L21 9l-5.4 4.1L17.5 20 12 16.4 6.5 20l1.9-6.9L3 9l6.8-.7z"/></svg>
 ```
 
@@ -238,7 +238,7 @@ pub fn glyph_path(self) -> &'static str {
 
 - [ ] **Step 5: Run the tests**
 
-Run: `cargo test --lib icons::tests provider_icon_glyph_paths -- --test-threads=4`
+Run: `cargo test --lib -- icons::tests provider_icon_glyph_paths --test-threads=4`
 Expected: PASS.
 
 - [ ] **Step 6: Commit**
