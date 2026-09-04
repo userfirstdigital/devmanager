@@ -12,6 +12,7 @@ use crate::client::action::{
 use crate::domain::id::TaskId;
 use crate::ui::components::interaction::FocusEpoch;
 use crate::ui::components::{AccessibilityMetadata, AccessibleRole, InteractionStateModel};
+use crate::ui::task_workspace::layout::{Edge, PaneView};
 use gpui::KeyBinding;
 
 // GPUI adapters are the single native dispatch surface for the shared client
@@ -280,10 +281,37 @@ impl ActionPresentation {
     }
 }
 
+/// The four arrow keys, as a shortcut key in their own right. Directional pane
+/// moves and directional pane focus are the two things a person expects to
+/// reach with an arrow, and both need to name a workspace [`Edge`].
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum ArrowKey {
+    Left,
+    Right,
+    Up,
+    Down,
+}
+
+impl ArrowKey {
+    pub const ALL: [ArrowKey; 4] = [Self::Left, Self::Right, Self::Up, Self::Down];
+
+    /// The workspace edge the arrow points at. One definition, so a chord table
+    /// and a pane move can never disagree about which way "up" is.
+    pub const fn edge(self) -> Edge {
+        match self {
+            Self::Left => Edge::Left,
+            Self::Right => Edge::Right,
+            Self::Up => Edge::Top,
+            Self::Down => Edge::Bottom,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum ShortcutKey {
     Character(char),
     Digit(u8),
+    Arrow(ArrowKey),
     Backtick,
     Tab,
     Escape,
@@ -335,13 +363,46 @@ pub enum DockTool {
     Review,
 }
 
+impl DockTool {
+    /// The digit the dock tool used to answer to, kept as a lookup now that the
+    /// digits themselves belong to the view tabs. The dock's own affordances --
+    /// its tabs, the tools menu and the header's Open -- still identify a tool
+    /// by that number, and this is the single place the mapping lives.
+    pub const fn from_digit(digit: u8) -> Option<Self> {
+        match digit {
+            1 => Some(Self::Changes),
+            2 => Some(Self::Files),
+            3 => Some(Self::Terminal),
+            4 => Some(Self::Browser),
+            5 => Some(Self::Services),
+            6 => Some(Self::Artifacts),
+            7 => Some(Self::Review),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum KeyboardAction {
     OpenPalette,
     OpenTaskSwitcher,
     OpenCommandPalette,
     OpenTaskDetails,
+    /// Show one view in the selected task's pane. The redesign's five tabs
+    /// ([`PaneView::TABS`]) are what the digits now mean.
+    SelectView(PaneView),
+    /// Dock-tool selection. No longer has a chord of its own -- the digits went
+    /// to the view tabs -- but the dock's tabs, menu items and the header's
+    /// Open still reach the shell through it.
     SelectDock(DockTool),
+    /// Mark the selected task done from the keyboard.
+    SettleTask,
+    /// Grow the focused pane to the whole workspace, and back.
+    ToggleZoom,
+    /// Move the focused pane to one edge of the workspace.
+    MovePane(Edge),
+    /// Move focus to the nearest pane in one direction.
+    FocusPane(Edge),
     OpenTerminal,
     /// Open one new plain shell terminal on the selected Task.
     OpenShellTerminal,
@@ -350,6 +411,22 @@ pub enum KeyboardAction {
         backwards: bool,
     },
     DismissTransient,
+}
+
+/// The dock tool a view still shows behind it, for as long as the dock and the
+/// view tabs overlap. `Conversation` has none: it is the panel's own body, not
+/// a tool docked beside it.
+pub const fn dock_tool_for_view(view: PaneView) -> Option<DockTool> {
+    match view {
+        PaneView::Conversation => None,
+        PaneView::Terminal => Some(DockTool::Terminal),
+        PaneView::Files => Some(DockTool::Files),
+        PaneView::Changes => Some(DockTool::Changes),
+        PaneView::Browser => Some(DockTool::Browser),
+        PaneView::Review => Some(DockTool::Review),
+        PaneView::Artifacts => Some(DockTool::Artifacts),
+        PaneView::Services => Some(DockTool::Services),
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -439,21 +516,38 @@ impl Default for KeyboardModel {
                 action: KeyboardAction::OpenCommandPalette,
             });
         }
-        for (digit, action) in [
-            (1, DockTool::Changes),
-            (2, DockTool::Files),
-            (3, DockTool::Terminal),
-            (4, DockTool::Browser),
-            (5, DockTool::Services),
-            (6, DockTool::Artifacts),
-            (7, DockTool::Review),
-        ] {
+        // The digits select a view, not a dock tool: Ctrl+1..5 are the five
+        // tabs in `PaneView::TABS`, in the order they are painted. The Alt+digit
+        // dock chords the redesign replaces are gone from the model; the dock's
+        // own affordances now reach `SelectDock` directly.
+        for (index, view) in PaneView::TABS.iter().enumerate() {
+            let digit = u8::try_from(index + 1).expect("five view tabs fit in a digit");
             bindings.push(KeyboardBinding {
-                shortcut: KeyboardShortcut::alt(ShortcutKey::Digit(digit)),
-                action: KeyboardAction::SelectDock(action),
+                shortcut: KeyboardShortcut::ctrl(ShortcutKey::Digit(digit)),
+                action: KeyboardAction::SelectView(*view),
+            });
+        }
+        // Directional pane work: Ctrl+arrow moves focus, Ctrl+Shift+arrow moves
+        // the pane itself. Both name the same edge, so the two tables are one.
+        for arrow in ArrowKey::ALL {
+            bindings.push(KeyboardBinding {
+                shortcut: KeyboardShortcut::ctrl(ShortcutKey::Arrow(arrow)),
+                action: KeyboardAction::FocusPane(arrow.edge()),
+            });
+            bindings.push(KeyboardBinding {
+                shortcut: KeyboardShortcut::ctrl_shift(ShortcutKey::Arrow(arrow)),
+                action: KeyboardAction::MovePane(arrow.edge()),
             });
         }
         bindings.extend([
+            KeyboardBinding {
+                shortcut: KeyboardShortcut::ctrl(ShortcutKey::Character('d')),
+                action: KeyboardAction::SettleTask,
+            },
+            KeyboardBinding {
+                shortcut: KeyboardShortcut::ctrl_shift(ShortcutKey::Character('z')),
+                action: KeyboardAction::ToggleZoom,
+            },
             KeyboardBinding {
                 shortcut: KeyboardShortcut::ctrl(ShortcutKey::Character('m')),
                 action: KeyboardAction::OpenTaskDetails,
@@ -569,6 +663,92 @@ mod tests {
             model.resolve(KeyboardShortcut::ctrl_shift(ShortcutKey::Tab)),
             Some(KeyboardAction::CycleTerminal { backwards: true })
         );
+    }
+
+    #[test]
+    fn view_tabs_are_ctrl_digits_and_the_dock_bindings_are_gone() {
+        let model = KeyboardModel::default();
+        assert_eq!(
+            model.resolve(KeyboardShortcut::ctrl(ShortcutKey::Digit(1))),
+            Some(KeyboardAction::SelectView(PaneView::Conversation))
+        );
+        assert_eq!(
+            model.resolve(KeyboardShortcut::ctrl(ShortcutKey::Digit(5))),
+            Some(KeyboardAction::SelectView(PaneView::Browser))
+        );
+        assert_eq!(
+            model.resolve(KeyboardShortcut::alt(ShortcutKey::Digit(1))),
+            None
+        );
+        assert_eq!(
+            model.resolve(KeyboardShortcut::alt(ShortcutKey::Digit(7))),
+            None
+        );
+        assert_eq!(
+            model.resolve(KeyboardShortcut::ctrl(ShortcutKey::Character('d'))),
+            Some(KeyboardAction::SettleTask)
+        );
+        assert_eq!(
+            model.resolve(KeyboardShortcut::ctrl_shift(ShortcutKey::Character('z'))),
+            Some(KeyboardAction::ToggleZoom)
+        );
+    }
+
+    #[test]
+    fn every_view_tab_has_its_own_digit_in_painted_order() {
+        let model = KeyboardModel::default();
+        for (index, view) in PaneView::TABS.iter().enumerate() {
+            let digit = u8::try_from(index + 1).expect("five tabs fit in a digit");
+            assert_eq!(
+                model.resolve(KeyboardShortcut::ctrl(ShortcutKey::Digit(digit))),
+                Some(KeyboardAction::SelectView(*view)),
+                "Ctrl+{digit} must select the {}th painted tab",
+                index + 1
+            );
+        }
+        // The views behind the panel menu deliberately have no chord: there are
+        // five digits' worth of tabs, and `MORE` is not one of them.
+        assert_eq!(
+            model.resolve(KeyboardShortcut::ctrl(ShortcutKey::Digit(6))),
+            None
+        );
+    }
+
+    #[test]
+    fn arrows_move_focus_and_shift_arrows_move_the_pane_to_the_same_edge() {
+        let model = KeyboardModel::default();
+        for arrow in ArrowKey::ALL {
+            assert_eq!(
+                model.resolve(KeyboardShortcut::ctrl(ShortcutKey::Arrow(arrow))),
+                Some(KeyboardAction::FocusPane(arrow.edge()))
+            );
+            assert_eq!(
+                model.resolve(KeyboardShortcut::ctrl_shift(ShortcutKey::Arrow(arrow))),
+                Some(KeyboardAction::MovePane(arrow.edge()))
+            );
+        }
+        assert_eq!(ArrowKey::Up.edge(), Edge::Top);
+        assert_eq!(ArrowKey::Down.edge(), Edge::Bottom);
+    }
+
+    #[test]
+    fn the_default_binding_table_is_conflict_free_and_the_dock_keeps_its_digit_lookup() {
+        // `KeyboardModel::new` refuses a duplicate shortcut, so building the
+        // default at all is the conflict assertion -- but say so out loud, since
+        // this run adds six chords to a table that already had thirteen.
+        let bindings = KeyboardModel::default().bindings().to_vec();
+        let mut seen = std::collections::HashSet::new();
+        for binding in &bindings {
+            assert!(
+                seen.insert(binding.shortcut),
+                "{:?} is bound twice",
+                binding.shortcut
+            );
+        }
+        assert!(KeyboardModel::new(bindings).is_ok());
+        assert_eq!(DockTool::from_digit(1), Some(DockTool::Changes));
+        assert_eq!(DockTool::from_digit(7), Some(DockTool::Review));
+        assert_eq!(DockTool::from_digit(8), None);
     }
 
     #[test]
