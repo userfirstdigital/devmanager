@@ -55,26 +55,40 @@ const TITLE_FONT_SIZE: f32 = 13.0;
 const INLINE_STATUS_FONT_SIZE: f32 = 11.5;
 /// `.st .s { gap: 5px }`.
 const STATUS_GAP: f32 = 5.0;
-/// The title never shrinks below this. A title squeezed to nothing is not a
-/// narrower panel, it is an anonymous one.
+/// The title floor at [`TIGHT_WIDTH`], where the row has nothing to spare.
 ///
-/// It is 12 px, not the 72 px this constant started at, and the number is
-/// forced rather than chosen. The narrowest panel the chrome is built for is
-/// 250 px, and a blocked panel at that width owes:
+/// A blocked panel at 250 px owes 165 px of controls and a 73 px status floor,
+/// which is 238 of the 250, so 12 px is not chosen, it is what is left. See
+/// [`title_floor`] for what happens above that width -- a fixed 12 px floor is
+/// only honest at the one width that forces it, and would leave the title at
+/// 12 px on a 470 px panel behind a long blocked cause.
+const TITLE_MIN_WIDTH: f32 = 12.0;
+/// The narrowest panel this chrome is built for, and the width at which the
+/// title floor is at its minimum.
+const TIGHT_WIDTH: f32 = 250.0;
+/// The share of every pixel above [`TIGHT_WIDTH`] that the title's floor
+/// claims. Below 0.5 so the status text still gains room as the panel widens;
+/// high enough that the title is legible well before the design width.
+const TITLE_GROWTH: f32 = 0.4;
+
+/// The width below which the title may never be squeezed, as a function of the
+/// panel's own width.
+///
+/// The title is the panel's identity: the stripe says which project and the
+/// mark says which provider, but only the title says which task. A fixed floor
+/// cannot serve both ends of the range -- 12 px is all a 250 px panel has, and
+/// 12 px on a 470 px panel is an anonymous panel:
 ///
 /// ```text
-///  165  CONTROLS_RESERVE
-///   73  status_floor(blocked)   (icon + Retry + age + two gaps)
-///  ---
-///  238  leaving 12 px
+///   width   title_floor   status text cap   controls + title + status floor
+///     250            12                73     165 +  12 + 73 = 250  (exactly)
+///     300            32               103     165 +  32 + 73 = 270
+///     370            60               145     165 +  60 + 73 = 298
+///     470           100               205     165 + 100 + 73 = 338
 /// ```
-///
-/// So at 250 px the row physically cannot give the title more, and the honest
-/// floor is 12. From 300 px up the title has real room by arithmetic
-/// (300 - 165 - 73 = 62), so the floor only binds at the extreme. If a wider
-/// floor is wanted, the number that has to move is one of the three unmeasured
-/// glyph estimates inside [`CONTROLS_RESERVE`], not this one.
-const TITLE_MIN_WIDTH: f32 = 12.0;
+fn title_floor(width_px: f32) -> f32 {
+    TITLE_MIN_WIDTH + TITLE_GROWTH * (width_px - TIGHT_WIDTH).max(0.0)
+}
 /// `.act { padding: 2px 9px; border-radius: 6px; font-size: 11.5px }`.
 const ACTION_FONT_SIZE: f32 = 11.5;
 const ACTION_PADDING_X: f32 = 9.0;
@@ -148,14 +162,16 @@ const CONTROLS_RESERVE: f32 = ROW_PADDING_LEFT
     + MENU_GLYPH_WIDTH
     + 5.0 * TITLE_ROW_GAP;
 
-/// The ceiling on the status *text*: everything the fixed controls do not
-/// claim. `min_w(0)` plus `flex_shrink` on the status container is what keeps
-/// the controls on screen; this only stops a very long doing-now line or a
-/// 60-character blocked cause from asking for more than the row physically has.
-/// Same shape as the board's `row_content_width`: a rule about the content, not
-/// about the panel.
+/// The ceiling on the status *text*: what is left once the fixed controls and
+/// the title's floor at this width have been paid.
+///
+/// `min_w(0)` plus `flex_shrink` on the status container is what keeps the
+/// controls on screen; this is what keeps the *title* on screen, by stopping a
+/// long doing-now line or a 60-character blocked cause from claiming room the
+/// title needs. Same shape as the board's `row_content_width`: a rule about the
+/// content, not about the panel.
 fn status_text_max_width(width_px: f32) -> f32 {
-    (width_px - CONTROLS_RESERVE).max(0.0)
+    (width_px - CONTROLS_RESERVE - title_floor(width_px)).max(0.0)
 }
 
 /// One status glyph at [`INLINE_STATUS_FONT_SIZE`]. The widest of the five is
@@ -401,9 +417,10 @@ fn title_row_element(
             div()
                 .id(("devmanager-panel-title", element_key))
                 .flex_1()
-                // The floor, not zero: the status yields first, and a title
-                // squeezed to nothing leaves an anonymous panel.
-                .min_w(px(TITLE_MIN_WIDTH))
+                // The floor, not zero, and it widens with the panel: the status
+                // text yields first, and a title squeezed to nothing leaves an
+                // anonymous panel at any width.
+                .min_w(px(title_floor(width_px)))
                 .truncate()
                 .text_size(px(TITLE_FONT_SIZE))
                 .font_weight(FontWeight::SEMIBOLD)
@@ -928,27 +945,49 @@ mod tests {
             "a blocked panel owes a Retry the others do not"
         );
 
-        for width in [250.0_f32, 300.0, 370.0, 470.0] {
-            // The binding case: a blocked panel, which owes the widest floor.
-            // Rearranged, this is "the width left after the controls and the
-            // title floor is at least what the status can never give up".
+        // The title floor widens with the panel, so the title is never
+        // anonymous at a width that could afford to name it. These four are the
+        // doc comment's table: if it and the formula ever disagree, this is
+        // where it shows.
+        for (width, expected_floor, expected_cap) in [
+            (250.0_f32, 12.0_f32, 73.0_f32),
+            (300.0, 32.0, 103.0),
+            (370.0, 60.0, 145.0),
+            (470.0, 100.0, 205.0),
+        ] {
+            assert_eq!(
+                title_floor(width),
+                expected_floor,
+                "the title floor at {width} px is not the documented one"
+            );
+            assert_eq!(
+                status_text_max_width(width),
+                expected_cap,
+                "the status text cap at {width} px is not the documented one"
+            );
+
+            // The binding case: a blocked panel, which owes the widest status
+            // floor. Rearranged, this is "the width left after the controls and
+            // the title floor is at least what the status can never give up".
             assert!(
-                CONTROLS_RESERVE + TITLE_MIN_WIDTH + status_floor(true) <= width,
+                CONTROLS_RESERVE + title_floor(width) + status_floor(true) <= width,
                 "at {width} px a blocked panel cannot pay for its controls, its title floor and its status floor at once"
             );
             assert!(
-                width - CONTROLS_RESERVE - TITLE_MIN_WIDTH >= status_floor(true),
-                "at {width} px the status is left less than the parts it may never drop"
+                status_text_max_width(width) >= status_floor(true),
+                "at {width} px the status text cap sits below the parts the status may never drop"
             );
-            // The text cap is exactly the row less the controls, and it is
-            // never below the floor -- a cap under the floor would mean the
-            // text could be asked to render in negative space.
-            assert_eq!(status_text_max_width(width), width - CONTROLS_RESERVE);
-            assert!(status_text_max_width(width) >= status_floor(true));
         }
 
-        // Narrower than the controls themselves, the cap floors at zero rather
-        // than handing a negative width to the layout.
+        // At the tight width the three add up exactly: nothing is spare, and
+        // nothing is over-committed.
+        assert_eq!(
+            CONTROLS_RESERVE + title_floor(TIGHT_WIDTH) + status_floor(true),
+            TIGHT_WIDTH
+        );
+        // Below the tight width the floor stops shrinking and the cap floors at
+        // zero rather than handing a negative width to the layout.
+        assert_eq!(title_floor(100.0), TITLE_MIN_WIDTH);
         assert_eq!(status_text_max_width(100.0), 0.0);
     }
 }
