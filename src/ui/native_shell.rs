@@ -190,7 +190,7 @@ use crate::ui::task_search::{TaskSearchCandidate, TaskSearchState};
 use crate::ui::task_workspace::{
     conversation_poll_priorities_due, working_conversation_poll_due, Allocation, AllocationMetrics,
     Axis, CenterSurfaceLoadingState, ConversationQueryPriority, DropTarget, Edge, PaneId, PaneRect,
-    SplitId, TaskPaneBody, TaskPaneProjection, TaskPaneViewModel, TaskSurfaceRegistry,
+    PaneView, SplitId, TaskPaneBody, TaskPaneProjection, TaskPaneViewModel, TaskSurfaceRegistry,
     TaskWorkspace, TaskWorkspaceViewChild, TaskWorkspaceViewModel, TaskWorkspaceViewNode, Viewport,
     WorkspaceError, WorkspaceSelectionGesture, CONVERSATION_RECOVERY_HEARTBEAT,
 };
@@ -15188,7 +15188,7 @@ impl NativeShell {
                 .task_workspace
                 .as_ref()
                 .is_some_and(|workspace| workspace.contains_task(owner.clone()))
-                && self.task_center_terminal_preference(&owner);
+                && self.pane_view(&owner) == PaneView::Terminal;
             if self.pending_terminal_echoes.contains_key(&key) {
                 if !visible {
                     self.pending_terminal_echoes.remove(&key);
@@ -20284,8 +20284,17 @@ impl NativeShell {
         task_follow_changed: bool,
     ) {
         let owner = self.local_task_key(task_id);
-        let show_terminal = self.task_center_terminal_preference(&owner);
+        // The pane names the view, but a pane does not outlive the workspace:
+        // clearing the selection drops the whole tree, so a task reselected
+        // afterwards gets a fresh Conversation pane while the ContextDock still
+        // remembers the raw terminal that task was left on. Let that surviving
+        // memory decide rather than silently demoting the user's choice, and
+        // write it back so the pane stays the single source of truth from here.
         let was_showing_terminal = self.local_slot_mut().cockpit.dock().showing_raw_terminal();
+        let show_terminal = self.pane_view(&owner) == PaneView::Terminal || was_showing_terminal;
+        if show_terminal {
+            self.set_pane_view(&owner, PaneView::Terminal);
+        }
         let result = if show_terminal {
             self.local_slot_mut()
                 .cockpit
@@ -20316,43 +20325,38 @@ impl NativeShell {
         }
     }
 
-    /// Read the center Conversation/Terminal preference for an owner key.
-    /// Local profiles may still carry a legacy raw-TaskId map entry; migrate it
-    /// in place. Remote owners never fall back across hosts.
-    fn task_center_terminal_preference(&mut self, owner: &HostTaskKey) -> bool {
-        let preference_key = owner.center_preference_key();
-        if let Some(value) = self
-            .layout
-            .task_center_terminal
-            .get(&preference_key)
-            .copied()
-        {
-            return value;
+    /// The view a legacy "terminal visible" boolean asks for. Only the two
+    /// surfaces that boolean could ever name are reachable from it.
+    fn view_for_terminal_visibility(visible: bool) -> PaneView {
+        if visible {
+            PaneView::Terminal
+        } else {
+            PaneView::Conversation
         }
-        if owner.host != self.local_host_id() {
-            return false;
-        }
-        let legacy = owner.task_id.to_string();
-        let Some(value) = self.layout.task_center_terminal.remove(&legacy) else {
-            return false;
-        };
-        self.layout
-            .task_center_terminal
-            .insert(preference_key, value);
-        self.mark_layout_dirty();
-        value
     }
 
-    fn set_task_center_terminal_preference(&mut self, owner: &HostTaskKey, visible: bool) {
-        let preference_key = owner.center_preference_key();
-        if owner.host == self.local_host_id() {
-            let legacy = owner.task_id.to_string();
-            let _ = self.layout.task_center_terminal.remove(&legacy);
-        }
+    /// Which surface this owner's pane shows. The pane owns the choice, so an
+    /// owner with no pane reads as the default rather than as a stored `false`.
+    fn pane_view(&self, owner: &HostTaskKey) -> PaneView {
         self.layout
-            .task_center_terminal
-            .insert(preference_key, visible);
-        self.mark_layout_dirty();
+            .task_workspace
+            .as_ref()
+            .and_then(|workspace| workspace.view_of(owner.clone()))
+            .unwrap_or_default()
+    }
+
+    fn set_pane_view(&mut self, owner: &HostTaskKey, view: PaneView) {
+        let changed = self
+            .layout
+            .task_workspace
+            .as_mut()
+            .is_some_and(|workspace| {
+                workspace.view_of(owner.clone()) != Some(view)
+                    && workspace.set_view(owner.clone(), view).is_ok()
+            });
+        if changed {
+            self.mark_layout_dirty();
+        }
     }
 
     /// Local-only: rewrite bare TaskId preference keys to owner-qualified keys
@@ -21857,7 +21861,7 @@ impl NativeShell {
                     if let Some(slot) = self.host_slot_mut(&key.host) {
                         slot.cockpit.dock_mut().show_semantic();
                     }
-                    self.set_task_center_terminal_preference(&key, false);
+                    self.set_pane_view(&key, PaneView::Conversation);
                     self.pending_terminal_focus = false;
                     self.reconcile_browser_dock_lifecycle(None);
                     return;
@@ -21881,7 +21885,7 @@ impl NativeShell {
                 } else {
                     return;
                 };
-                self.set_task_center_terminal_preference(&key, visible);
+                self.set_pane_view(&key, Self::view_for_terminal_visibility(visible));
                 if let Err(error) = result {
                     if let Some(slot) = self.host_slot_mut(&key.host) {
                         slot.composer_error = Some(format!("{error:?}"));
@@ -21911,7 +21915,7 @@ impl NativeShell {
             self.local_slot_mut().cockpit.dock_mut().show_semantic();
             if let Some(task_id) = selected_task_id {
                 let owner = self.local_task_key(task_id);
-                self.set_task_center_terminal_preference(&owner, false);
+                self.set_pane_view(&owner, PaneView::Conversation);
             }
             self.pending_terminal_focus = false;
             self.sync_terminal_from_cockpit();
@@ -21935,7 +21939,7 @@ impl NativeShell {
         };
         if let Some(task_id) = selected_task_id {
             let owner = self.local_task_key(task_id);
-            self.set_task_center_terminal_preference(&owner, visible);
+            self.set_pane_view(&owner, Self::view_for_terminal_visibility(visible));
         }
         if let Err(error) = result {
             self.local_slot_mut().composer_error = Some(format!("{error:?}"));
@@ -24404,19 +24408,7 @@ impl NativeShell {
             .map(|key| {
                 let (title, project_name, provider_label, status_label) =
                     self.owner_pane_projection_labels(&key);
-                let show_terminal = key.host == self.local_host_id()
-                    && self
-                        .layout
-                        .task_center_terminal
-                        .get(&key.center_preference_key())
-                        .copied()
-                        .or_else(|| {
-                            self.layout
-                                .task_center_terminal
-                                .get(&key.task_id.to_string())
-                                .copied()
-                        })
-                        .unwrap_or(false);
+                let show_terminal = workspace.view_of(key.clone()) == Some(PaneView::Terminal);
                 (
                     key.clone(),
                     TaskPaneProjection {
@@ -25814,7 +25806,7 @@ impl NativeShell {
                     .into_any_element()
             })
             .collect::<Vec<_>>();
-        let showing_provider_terminal = self.task_center_terminal_preference(&owner);
+        let showing_provider_terminal = self.pane_view(&owner) == PaneView::Terminal;
         // One read of the phase machine per paint. Every branch below asks
         // this value rather than the trace, so the overlay, the hold copy and
         // the empty state cannot disagree within one frame.
@@ -42532,7 +42524,7 @@ impl NativeShell {
                                             .selected_task_key
                                             .clone()
                                             .is_some_and(|owner| {
-                                                shell.task_center_terminal_preference(&owner)
+                                                shell.pane_view(&owner) == PaneView::Terminal
                                             });
                                         if stale_task_row_routes_key_to_terminal(
                                             event.keystroke.key.as_str(),
@@ -42917,7 +42909,7 @@ impl NativeShell {
                             let _ = shell.update(app, |shell, cx| {
                                 let center_terminal_visible =
                                     shell.selected_task_key.clone().is_some_and(|owner| {
-                                        shell.task_center_terminal_preference(&owner)
+                                        shell.pane_view(&owner) == PaneView::Terminal
                                     });
                                 if stale_task_row_routes_key_to_terminal(
                                     event.keystroke.key.as_str(),
@@ -43701,7 +43693,7 @@ impl NativeShell {
                 let center_terminal_visible = shell
                     .selected_task_key
                     .clone()
-                    .is_some_and(|owner| shell.task_center_terminal_preference(&owner));
+                    .is_some_and(|owner| shell.pane_view(&owner) == PaneView::Terminal);
                 if root_routes_key_to_terminal(
                     event.keystroke.key.as_str(),
                     shell.terminal_focus_handle.is_focused(window),
@@ -46564,6 +46556,7 @@ pub(crate) mod tests {
         OwnedChild,
         OwnedWorker,
         PaletteItem,
+        PaneView,
         PendingComposerSubmission,
         PendingHostBootstrap,
         PendingTerminalEcho,
@@ -54836,7 +54829,11 @@ pub(crate) mod tests {
         with_test_shell_in_app(cx, runtime, |shell| {
             assert!(!shell.terminal_state().is_live());
             let owner = shell.local_task_key(task_id);
-            shell.set_task_center_terminal_preference(&owner, true);
+            // A previous session persists the terminal choice as the owning
+            // pane's view, so the restored layout is what carries it in.
+            shell.layout.task_workspace =
+                Some(crate::ui::task_workspace::Workspace::single(owner.clone()));
+            shell.set_pane_view(&owner, PaneView::Terminal);
             shell
                 .apply_client_model(Arc::new(model))
                 .expect("apply model");
@@ -70065,9 +70062,9 @@ pub(crate) mod tests {
                     .task_surfaces
                     .admit_terminals(owner.clone(), &strip)
                     .expect("admit strip");
-                shell.set_task_center_terminal_preference(&owner, false);
+                shell.set_pane_view(&owner, PaneView::Conversation);
                 assert!(
-                    !shell.task_center_terminal_preference(&owner),
+                    shell.pane_view(&owner) != PaneView::Terminal,
                     "the center canvas starts on Conversation"
                 );
 
@@ -70075,7 +70072,7 @@ pub(crate) mod tests {
                 shell.focus_terminal_chip(&owner, shell_resource);
 
                 assert!(
-                    shell.task_center_terminal_preference(&owner),
+                    shell.pane_view(&owner) == PaneView::Terminal,
                     "focusing a chip must bring the terminal view with it"
                 );
                 assert!(

@@ -134,6 +134,10 @@ pub struct TaskPane<K = TaskId> {
     pub task_id: K,
     pub presentation: PanePresentation,
     pub last_focused_at: u64,
+    /// Which surface this pane shows. Absent in files written before the pane
+    /// owned its own view, so it defaults rather than failing the load.
+    #[serde(default)]
+    pub view: PaneView,
 }
 
 impl<K> TaskPane<K> {
@@ -143,6 +147,7 @@ impl<K> TaskPane<K> {
             task_id,
             presentation: PanePresentation::Full,
             last_focused_at,
+            view: PaneView::default(),
         }
     }
 }
@@ -294,6 +299,24 @@ impl<K: Clone + Ord + Eq> Workspace<K> {
 
     pub fn presentation(&self, task_id: K) -> Option<PanePresentation> {
         self.pane_for_task(task_id).map(|pane| pane.presentation)
+    }
+
+    pub fn view_of(&self, task_id: K) -> Option<PaneView> {
+        self.pane_for_task(task_id).map(|pane| pane.view)
+    }
+
+    pub fn set_view(&mut self, task_id: K, view: PaneView) -> Result<(), WorkspaceError> {
+        let pane = self
+            .pane_for_task_mut(task_id)
+            .ok_or(WorkspaceError::MissingPane)?;
+        pane.view = view;
+        Ok(())
+    }
+
+    pub(crate) fn pane_for_task_mut(&mut self, task_id: K) -> Option<&mut TaskPane<K>> {
+        self.root
+            .as_mut()
+            .and_then(|root| find_pane_for_task_mut(root, &task_id))
     }
 
     pub fn insert_after_focused(
@@ -683,6 +706,7 @@ where
                 task_id: mapped,
                 presentation: pane.presentation,
                 last_focused_at: pane.last_focused_at,
+                view: pane.view,
             }))
         }
         WorkspaceNode::Split { id, axis, children } => {
@@ -748,6 +772,18 @@ fn find_pane_for_task<'a, K: PartialEq>(
         WorkspaceNode::Split { children, .. } => children
             .iter()
             .find_map(|child| find_pane_for_task(&child.node, task_id)),
+    }
+}
+
+fn find_pane_for_task_mut<'a, K: PartialEq>(
+    node: &'a mut WorkspaceNode<K>,
+    task_id: &K,
+) -> Option<&'a mut TaskPane<K>> {
+    match node {
+        WorkspaceNode::Pane(pane) => (pane.task_id == *task_id).then_some(pane),
+        WorkspaceNode::Split { children, .. } => children
+            .iter_mut()
+            .find_map(|child| find_pane_for_task_mut(&mut child.node, task_id)),
     }
 }
 
@@ -1015,6 +1051,39 @@ fn validate_node<K: Clone + Ord + Eq>(
 mod tests {
     use super::*;
     use crate::domain::TaskId;
+
+    #[test]
+    fn a_pane_defaults_to_the_conversation_view_and_remembers_a_set_view() {
+        let mut workspace = Workspace::single(1u32);
+        assert_eq!(workspace.view_of(1), Some(PaneView::Conversation));
+        workspace.set_view(1, PaneView::Terminal).expect("set");
+        assert_eq!(workspace.view_of(1), Some(PaneView::Terminal));
+        assert_eq!(
+            workspace.set_view(9, PaneView::Files),
+            Err(WorkspaceError::MissingPane)
+        );
+    }
+
+    #[test]
+    fn a_serialized_pane_without_a_view_field_loads_as_conversation() {
+        let workspace = Workspace::single(1u32);
+        let mut json = serde_json::to_value(&workspace).expect("json");
+        fn strip(value: &mut serde_json::Value) {
+            match value {
+                serde_json::Value::Object(map) => {
+                    map.remove("view");
+                    for nested in map.values_mut() {
+                        strip(nested);
+                    }
+                }
+                serde_json::Value::Array(items) => items.iter_mut().for_each(strip),
+                _ => {}
+            }
+        }
+        strip(&mut json);
+        let restored: Workspace<u32> = serde_json::from_value(json).expect("old file loads");
+        assert_eq!(restored.view_of(1), Some(PaneView::Conversation));
+    }
 
     #[test]
     fn inserting_tasks_preserves_unique_identity_and_focus_history() {
