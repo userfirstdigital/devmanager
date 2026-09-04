@@ -3217,6 +3217,11 @@ mod tests {
                 tokens.surfaces.overlay,
                 expected.surfaces.overlay,
             ),
+            (
+                "surfaces.disabled",
+                tokens.surfaces.disabled,
+                expected.surfaces.disabled,
+            ),
             ("text.primary", tokens.text.primary, expected.text.primary),
             (
                 "text.secondary",
