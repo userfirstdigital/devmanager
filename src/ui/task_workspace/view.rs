@@ -13,6 +13,11 @@ pub struct TaskPaneProjection<K = TaskId> {
     pub project_name: String,
     pub provider_label: String,
     pub status_label: String,
+    /// A debug preview conversation is installed, which replaces whatever
+    /// surface the pane would otherwise paint. It is an input to the model so
+    /// that the terminal arm and the composer are decided together, in one
+    /// place, rather than the painter carrying half of the rule.
+    pub preview_conversation_installed: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -26,6 +31,10 @@ pub struct TaskPaneViewModel<K = TaskId> {
     /// Which surface this pane paints. There is no separate compact body any
     /// more, so the view is the only thing that decides what is drawn.
     pub view: PaneView,
+    /// Paint the raw terminal rather than a conversation. This is the one
+    /// terminal predicate: `view == Terminal` unless a preview conversation
+    /// has displaced it.
+    pub paint_terminal: bool,
     /// Too little room for content: paint the title strip alone.
     pub minimised: bool,
     /// This pane is filling the canvas.
@@ -128,6 +137,8 @@ fn build_node<K: Clone + Ord + Eq>(
                 .ok_or_else(|| TaskWorkspaceViewError::MissingProjection(pane.task_id.clone()))?;
             let minimised = pane.presentation == PanePresentation::Minimised;
             let focused = focused_task == Some(&pane.task_id);
+            let paint_terminal =
+                pane.view == PaneView::Terminal && !projection.preview_conversation_installed;
             Ok(TaskWorkspaceViewNode::Pane(TaskPaneViewModel {
                 pane_id: pane.id,
                 task_id: pane.task_id.clone(),
@@ -136,14 +147,14 @@ fn build_node<K: Clone + Ord + Eq>(
                 provider_label: projection.provider_label.clone(),
                 status_label: projection.status_label.clone(),
                 view: pane.view,
+                paint_terminal,
                 minimised,
                 zoomed: zoomed == Some(pane.id),
                 focused,
-                // The renderer already gives a Terminal pane the terminal
-                // surface rather than a conversation with a composer under
-                // it. Say so in the model so the reorder is a stated rule
-                // rather than something only the painter knows.
-                build_composer: focused && !minimised && pane.view != PaneView::Terminal,
+                // A pane painting the terminal has no conversation to put a
+                // composer under, so the two are one decision: whatever turns
+                // the terminal arm off gives the composer back.
+                build_composer: focused && !minimised && !paint_terminal,
             }))
         }
         WorkspaceNode::Split { id, axis, children } => Ok(TaskWorkspaceViewNode::Split {
@@ -188,6 +199,7 @@ mod task_pane_view_model_tests {
             project_name: "DevManager".into(),
             provider_label: "Codex".into(),
             status_label: "Working".into(),
+            preview_conversation_installed: false,
         }
     }
 
@@ -216,6 +228,52 @@ mod task_pane_view_model_tests {
         assert!(panes[0].zoomed);
         assert!(!panes[0].minimised);
         assert!(panes[0].build_composer, "the zoomed pane owns the composer");
+    }
+
+    #[test]
+    fn a_previewed_conversation_turns_off_the_terminal_arm_in_one_place() {
+        let task_id = TaskId::new();
+        let mut workspace = TaskWorkspace::single(task_id);
+        workspace
+            .set_view(task_id, PaneView::Terminal)
+            .expect("terminal view");
+
+        // Preview off: the pane paints the terminal, so it owns no composer.
+        let live = BTreeMap::from([(task_id, projection(task_id))]);
+        let pane = TaskWorkspaceViewModel::build(&workspace, &live)
+            .expect("workspace")
+            .panes()[0]
+            .clone();
+        assert!(pane.paint_terminal);
+        assert!(!pane.build_composer);
+
+        // Preview on: the same pane paints the previewed conversation instead,
+        // so the terminal arm is off and the focused pane owns the composer
+        // again. Both facts are decided here, not in the painter.
+        let previewed = BTreeMap::from([(
+            task_id,
+            TaskPaneProjection {
+                preview_conversation_installed: true,
+                ..projection(task_id)
+            },
+        )]);
+        let pane = TaskWorkspaceViewModel::build(&workspace, &previewed)
+            .expect("workspace")
+            .panes()[0]
+            .clone();
+        assert!(
+            !pane.paint_terminal,
+            "a previewed conversation is not the terminal"
+        );
+        assert!(
+            pane.build_composer,
+            "a focused pane painting a conversation owns the composer"
+        );
+        assert_eq!(
+            pane.view,
+            PaneView::Terminal,
+            "the pane's own view is untouched; only what it paints changed"
+        );
     }
 
     #[test]
@@ -397,6 +455,7 @@ mod task_pane_view_model_tests {
                     project_name: "DevManager".into(),
                     provider_label: "Codex".into(),
                     status_label: "Idle".into(),
+                    preview_conversation_installed: false,
                 },
             ),
             (
@@ -407,6 +466,7 @@ mod task_pane_view_model_tests {
                     project_name: "DevManager".into(),
                     provider_label: "Codex".into(),
                     status_label: "Working".into(),
+                    preview_conversation_installed: false,
                 },
             ),
         ]);

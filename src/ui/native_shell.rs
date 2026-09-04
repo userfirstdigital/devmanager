@@ -24400,6 +24400,9 @@ impl NativeShell {
 
     fn task_workspace_view_model(&self) -> Option<TaskWorkspaceViewModel<HostTaskKey>> {
         let workspace = self.layout.task_workspace.as_ref()?;
+        // Shell-wide, but it decides what a pane paints, so it goes in as a
+        // projection input and the model owns the whole predicate.
+        let preview_conversation_installed = self.preview_conversation_installed();
         let projections = workspace
             .task_ids()
             .into_iter()
@@ -24414,6 +24417,7 @@ impl NativeShell {
                         project_name,
                         provider_label,
                         status_label,
+                        preview_conversation_installed,
                     },
                 )
             })
@@ -24914,7 +24918,7 @@ impl NativeShell {
                 .min_h(px(0.0))
                 .bg(tokens.surfaces.sunken.to_gpui())
                 .into_any_element()
-        } else if pane.view == PaneView::Terminal && !self.preview_conversation_installed() {
+        } else if pane.paint_terminal {
             self.task_terminal_surface_for(&task_key, tokens, cx)
         } else if pane.build_composer {
             // Focused Full pane owns the interactive composer. Pane chrome
