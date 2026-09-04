@@ -118,8 +118,13 @@ impl PaneView {
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum PanePresentation {
     Full,
-    CompactManual,
-    CompactAutomatic,
+    /// Too little room: the pane renders as its title row alone (28 px) until
+    /// allocation gives it space again. Never chosen by the user — the retired
+    /// `CompactManual` aliases in only so an older file still loads, and
+    /// [`KeyedWorkspaceLayout::sanitized`] puts every restored pane back to
+    /// `Full` because allocation re-derives this every frame anyway.
+    #[serde(alias = "CompactAutomatic", alias = "CompactManual")]
+    Minimised,
 }
 
 /// Recursive pane workspace keyed by task identity `K`.
@@ -387,20 +392,6 @@ impl<K: Clone + Ord + Eq> Workspace<K> {
         let pane = self.pane_mut(pane_id).ok_or(WorkspaceError::MissingPane)?;
         pane.task_id = task_id;
         pane.last_focused_at = clock;
-        Ok(())
-    }
-
-    pub fn set_manual_compact(&mut self, task_id: K, compact: bool) -> Result<(), WorkspaceError> {
-        let pane_id = self
-            .pane_for_task(task_id)
-            .map(|pane| pane.id)
-            .ok_or(WorkspaceError::MissingPane)?;
-        let pane = self.pane_mut(pane_id).ok_or(WorkspaceError::MissingPane)?;
-        pane.presentation = if compact {
-            PanePresentation::CompactManual
-        } else {
-            PanePresentation::Full
-        };
         Ok(())
     }
 
@@ -1086,6 +1077,30 @@ mod tests {
     }
 
     #[test]
+    fn compact_manual_from_an_older_file_loads_and_normalises_to_full() {
+        let workspace = Workspace::single(1u32);
+        let json = serde_json::to_string(&workspace)
+            .expect("json")
+            .replace("\"Full\"", "\"CompactManual\"");
+        assert!(
+            json.contains("CompactManual"),
+            "the fixture must actually carry the retired value"
+        );
+        let restored: Workspace<u32> = serde_json::from_str(&json).expect("older file loads");
+        assert_eq!(
+            restored.presentation(1),
+            Some(PanePresentation::Minimised),
+            "the alias maps the retired value"
+        );
+
+        let automatic = serde_json::to_string(&workspace)
+            .expect("json")
+            .replace("\"Full\"", "\"CompactAutomatic\"");
+        let restored: Workspace<u32> = serde_json::from_str(&automatic).expect("older file loads");
+        assert_eq!(restored.presentation(1), Some(PanePresentation::Minimised));
+    }
+
+    #[test]
     fn inserting_tasks_preserves_unique_identity_and_focus_history() {
         let first = TaskId::new();
         let second = TaskId::new();
@@ -1218,7 +1233,9 @@ mod tests {
             .insert_after_focused(second, Axis::Horizontal)
             .unwrap();
         let focused_slot = workspace.focused_pane_id().unwrap();
-        workspace.set_manual_compact(second, true).unwrap();
+        workspace
+            .set_presentation(second, PanePresentation::Minimised)
+            .unwrap();
         let split_id = match workspace.root().unwrap() {
             WorkspaceNode::Split { id, .. } => *id,
             _ => panic!("expected split"),
@@ -1239,7 +1256,7 @@ mod tests {
         assert!(!workspace.contains_task(second));
         assert_eq!(
             workspace.presentation(next),
-            Some(PanePresentation::CompactManual)
+            Some(PanePresentation::Minimised)
         );
         assert_eq!(
             workspace.split_child_allocation(split_id, 0),
@@ -1350,7 +1367,9 @@ mod tests {
             .insert_after_focused(remote.clone(), Axis::Horizontal)
             .unwrap();
         let focused_slot = workspace.focused_pane_id().unwrap();
-        workspace.set_manual_compact(remote.clone(), true).unwrap();
+        workspace
+            .set_presentation(remote.clone(), PanePresentation::Minimised)
+            .unwrap();
         workspace.pin_task_axis_size(remote.clone(), 280.0).unwrap();
         let split_id = match workspace.root().unwrap() {
             WorkspaceNode::Split { id, .. } => *id,
@@ -1366,7 +1385,7 @@ mod tests {
         assert!(!workspace.contains_task(remote));
         assert_eq!(
             workspace.presentation(replacement.clone()),
-            Some(PanePresentation::CompactManual)
+            Some(PanePresentation::Minimised)
         );
         assert_eq!(workspace.split_child_allocation(split_id, 1), pinned_before);
         workspace.focus_task(replacement).unwrap();
@@ -1432,7 +1451,9 @@ mod tests {
             _ => panic!("expected split"),
         };
         workspace.pin_task_axis_size(first, 240.0).unwrap();
-        workspace.set_manual_compact(second, true).unwrap();
+        workspace
+            .set_presentation(second, PanePresentation::Minimised)
+            .unwrap();
         let first_pane = workspace.pane_for_task(first).unwrap().id;
         let second_pane = workspace.pane_for_task(second).unwrap().id;
 
@@ -1445,7 +1466,7 @@ mod tests {
         assert_eq!(mapped.pane(second_pane).unwrap().id, second_pane);
         assert_eq!(
             mapped.presentation(("local".into(), second)),
-            Some(PanePresentation::CompactManual)
+            Some(PanePresentation::Minimised)
         );
         assert_eq!(
             mapped.split_child_allocation(split_id, 0),

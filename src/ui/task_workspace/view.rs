@@ -117,9 +117,7 @@ fn build_node<K: Clone + Ord + Eq>(
                 .ok_or_else(|| TaskWorkspaceViewError::MissingProjection(pane.task_id.clone()))?;
             let body = match pane.presentation {
                 PanePresentation::Full => TaskPaneBody::Full,
-                PanePresentation::CompactManual | PanePresentation::CompactAutomatic => {
-                    TaskPaneBody::Compact
-                }
+                PanePresentation::Minimised => TaskPaneBody::Compact,
             };
             let focused = focused_task == Some(&pane.task_id);
             Ok(TaskWorkspaceViewNode::Pane(TaskPaneViewModel {
@@ -188,7 +186,7 @@ mod task_pane_view_model_tests {
         let task_id = TaskId::new();
         let mut workspace = TaskWorkspace::single(task_id);
         workspace
-            .set_manual_compact(task_id, true)
+            .set_presentation(task_id, PanePresentation::Minimised)
             .expect("compact task");
         let projections = BTreeMap::from([(
             task_id,
@@ -252,7 +250,7 @@ mod task_pane_view_model_tests {
             .expect("third pane");
         workspace.focus_task(second).expect("focus second");
         workspace
-            .set_manual_compact(third, true)
+            .set_presentation(third, PanePresentation::Minimised)
             .expect("compact third");
         let projections = [first, second, third]
             .into_iter()

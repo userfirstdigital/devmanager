@@ -14,10 +14,10 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
 use crate::domain::TaskId;
-use crate::ui::task_workspace::PaneView;
 #[cfg(test)]
 use crate::ui::task_workspace::TaskWorkspace;
 use crate::ui::task_workspace::Workspace;
+use crate::ui::task_workspace::{PanePresentation, PaneView};
 
 const LAYOUT_SCHEMA_V1: &str = "devmanager.workspace-layout/v1";
 const LAYOUT_SCHEMA_V2: &str = "devmanager.workspace-layout/v2";
@@ -291,7 +291,23 @@ impl<K: Clone + Ord + Eq> KeyedWorkspaceLayout<K> {
         }
         self.sanitize_task_workspace();
         self.adopt_legacy_terminal_preferences();
+        self.restore_minimised_panes();
         self
+    }
+
+    /// Minimisation is a fact about the current viewport, not a stored user
+    /// choice, so a restored file opens every pane Full and lets allocation
+    /// re-derive the strips. This is also what maps a retired `CompactManual`
+    /// pane — which aliases in as `Minimised` — back to a full pane.
+    fn restore_minimised_panes(&mut self) {
+        let Some(workspace) = self.task_workspace.as_mut() else {
+            return;
+        };
+        for task_id in workspace.task_ids() {
+            if workspace.presentation(task_id.clone()) == Some(PanePresentation::Minimised) {
+                let _ = workspace.set_presentation(task_id, PanePresentation::Full);
+            }
+        }
     }
 
     /// Fold the retired `task_center_terminal` map into the pane that owns the
@@ -1300,7 +1316,9 @@ mod tests {
             _ => panic!("expected split"),
         };
         workspace.pin_task_axis_size(first, 300.0).unwrap();
-        workspace.set_manual_compact(second, true).unwrap();
+        workspace
+            .set_presentation(second, PanePresentation::Minimised)
+            .unwrap();
         let layout = WorkspaceLayout {
             selected_task: Some(second),
             task_workspace: Some(workspace),
@@ -1320,7 +1338,8 @@ mod tests {
         assert_eq!(workspace.previous_focus(), previous);
         assert_eq!(
             workspace.presentation(local_owner(second)),
-            Some(PanePresentation::CompactManual)
+            Some(PanePresentation::Full),
+            "minimisation belongs to the viewport, so it never restores from disk"
         );
         assert_eq!(
             workspace.split_child_allocation(split_id, 0),

@@ -2088,7 +2088,7 @@ mod tests {
         workspace
             .as_mut()
             .unwrap()
-            .set_manual_compact(second, true)
+            .set_presentation(second, PanePresentation::Minimised)
             .unwrap();
         let split_id = match workspace.as_ref().unwrap().root().unwrap() {
             crate::ui::task_workspace::WorkspaceNode::Split { id, .. } => *id,
@@ -2115,7 +2115,7 @@ mod tests {
         assert!(!workspace.contains_task(second));
         assert_eq!(
             workspace.presentation(third),
-            Some(PanePresentation::CompactManual)
+            Some(PanePresentation::Minimised)
         );
         assert_eq!(
             workspace.split_child_allocation(split_id, 1),
@@ -2155,7 +2155,9 @@ mod tests {
                 .unwrap();
         }
         workspace.focus_task(second).unwrap();
-        workspace.set_manual_compact(third, true).unwrap();
+        workspace
+            .set_presentation(third, PanePresentation::Minimised)
+            .unwrap();
         let mut registry = TaskSurfaceRegistry::default();
         registry.begin_conversation(fourth, 4);
 
@@ -2190,7 +2192,9 @@ mod tests {
                 .unwrap();
         }
         workspace.focus_task(focused).unwrap();
-        workspace.set_manual_compact(compact, true).unwrap();
+        workspace
+            .set_presentation(compact, PanePresentation::Minimised)
+            .unwrap();
         let mut registry = TaskSurfaceRegistry::default();
 
         let first_wave = registry.conversation_query_schedule(&workspace, 2);
@@ -2253,7 +2257,9 @@ mod tests {
     fn focused_compact_pane_is_scheduled_on_background_cadence() {
         let task = TaskId::new();
         let mut workspace = TaskWorkspace::single(task);
-        workspace.set_manual_compact(task, true).unwrap();
+        workspace
+            .set_presentation(task, PanePresentation::Minimised)
+            .unwrap();
         let mut registry = TaskSurfaceRegistry::default();
 
         let interactive_only = registry.conversation_query_schedule(&workspace, 0);
@@ -2285,7 +2291,9 @@ mod tests {
             others.push(task);
         }
         workspace.focus_task(focused).unwrap();
-        workspace.set_manual_compact(others[0], true).unwrap();
+        workspace
+            .set_presentation(others[0], PanePresentation::Minimised)
+            .unwrap();
         let mut registry = TaskSurfaceRegistry::default();
 
         let mut seen = BTreeSet::new();

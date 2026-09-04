@@ -24554,10 +24554,10 @@ impl NativeShell {
                     f32::from(workspace_size.height),
                 ),
                 AllocationMetrics {
-                    full_min_width: 360.0,
-                    full_min_height: 300.0,
-                    compact_min_width: 210.0,
-                    compact_min_height: 116.0,
+                    full_min_width: 320.0,
+                    full_min_height: 160.0,
+                    compact_min_width: 320.0,
+                    compact_min_height: 28.0,
                     divider: 4.0,
                 },
             );
@@ -24835,13 +24835,6 @@ impl NativeShell {
                 cx.notify();
             }
         });
-        let compact = pane.body == TaskPaneBody::Compact;
-        let toggle_key = task_key.clone();
-        let toggle = cx.listener(move |shell, _event: &ClickEvent, _window, cx| {
-            cx.stop_propagation();
-            shell.set_workspace_task_compact(toggle_key.clone(), !compact);
-            cx.notify();
-        });
         let close_key = task_key.clone();
         let close = cx.listener(move |shell, _event: &ClickEvent, _window, cx| {
             cx.stop_propagation();
@@ -24905,32 +24898,6 @@ impl NativeShell {
                                 pane.project_name, pane.provider_label, pane.status_label
                             )),
                     ),
-            )
-            .child(
-                div()
-                    .id(("native-task-pane-compact", task_element_key))
-                    .tab_stop(true)
-                    .px(px(7.0))
-                    .py(px(4.0))
-                    .rounded(px(5.0))
-                    .cursor_pointer()
-                    .flex()
-                    .items_center()
-                    .gap(px(4.0))
-                    .text_size(px(tokens.density.typography.caption))
-                    .text_color(tokens.text.secondary.to_gpui())
-                    .hover(|style| style.bg(tokens.surfaces.hover.to_gpui()))
-                    .on_click(toggle)
-                    .child(crate::icons::app_icon(
-                        if compact {
-                            crate::icons::PANEL_RIGHT
-                        } else {
-                            crate::icons::SQUARE
-                        },
-                        11.0,
-                        tokens.text.secondary.to_u32(),
-                    ))
-                    .child(if compact { "Full" } else { "Compact" }),
             )
             .child(
                 div()
@@ -25106,25 +25073,6 @@ impl NativeShell {
                 .right(px(22.0))
                 .h(px(22.0))
                 .into_any_element(),
-        }
-    }
-
-    fn set_workspace_task_compact(&mut self, task_key: HostTaskKey, compact: bool) {
-        let changed = self
-            .layout
-            .task_workspace
-            .as_mut()
-            .is_some_and(|workspace| {
-                workspace.presentation(task_key.clone())
-                    != Some(if compact {
-                        crate::ui::task_workspace::PanePresentation::CompactManual
-                    } else {
-                        crate::ui::task_workspace::PanePresentation::Full
-                    })
-                    && workspace.set_manual_compact(task_key, compact).is_ok()
-            });
-        if changed {
-            self.mark_layout_dirty();
         }
     }
 
