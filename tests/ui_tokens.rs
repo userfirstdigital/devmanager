@@ -1154,6 +1154,15 @@ struct ContrastViolation {
 /// whose roles compose an unreadable pair fails here instead of shipping while
 /// the token-module gates stay green.
 fn contrast_violations(tokens: &ThemeTokens) -> Vec<ContrastViolation> {
+    let (violations, _) = contrast_violations_with_denominator(tokens);
+    violations
+}
+
+/// The violations and the number of pairs they were drawn from. A gate that
+/// silently measures fewer pairs -- a family returning an empty vector after a
+/// refactor -- reads exactly like a gate that found nothing, so every caller
+/// that reports a result also has the population size to hand.
+fn contrast_violations_with_denominator(tokens: &ThemeTokens) -> (Vec<ContrastViolation>, usize) {
     let families: [(&'static str, Vec<ContrastPair>, f64); 6] = [
         (
             "normal_text",
@@ -1188,7 +1197,13 @@ fn contrast_violations(tokens: &ThemeTokens) -> Vec<ContrastViolation> {
     ];
 
     let mut violations = Vec::new();
+    let mut measured = 0usize;
     for (family, pairs, floor) in families {
+        assert!(
+            !pairs.is_empty(),
+            "{family} contributed no pairs -- an empty family is a gate that cannot fail"
+        );
+        measured += pairs.len();
         for pair in pairs {
             let ratio = contrast_ratio(pair.foreground, pair.background);
             if !pair.foreground.is_opaque() || ratio < floor {
@@ -1201,7 +1216,9 @@ fn contrast_violations(tokens: &ThemeTokens) -> Vec<ContrastViolation> {
             }
         }
     }
-    for (pair, floor) in runtime_only_contrast_pairs(tokens) {
+    let runtime_pairs = runtime_only_contrast_pairs(tokens);
+    measured += runtime_pairs.len();
+    for (pair, floor) in runtime_pairs {
         let ratio = contrast_ratio(pair.foreground, pair.background);
         if ratio < floor {
             violations.push(ContrastViolation {
@@ -1212,7 +1229,7 @@ fn contrast_violations(tokens: &ThemeTokens) -> Vec<ContrastViolation> {
             });
         }
     }
-    violations
+    (violations, measured)
 }
 
 /// Pairs the running app composes but no `ThemeTokens` field holds, so no
@@ -1610,6 +1627,7 @@ fn projected_gate_detects_the_two_regressions_that_shipped_green() {
 fn projected_contrast_census_reports_every_built_in_theme() {
     let library = ThemeLibrary::built_in();
     let mut inspected = 0usize;
+    let mut pairs_per_projection: Option<usize> = None;
     for definition in library.themes() {
         for appearance in [ThemeAppearance::Dark, ThemeAppearance::Light] {
             let Some(palette) = definition.palette(appearance) else {
@@ -1617,7 +1635,20 @@ fn projected_contrast_census_reports_every_built_in_theme() {
             };
             let tokens = palette.tokens(Density::Comfortable, Scale::Scale100);
             inspected += 1;
-            let violations = contrast_violations(&tokens);
+            let (violations, measured) = contrast_violations_with_denominator(&tokens);
+            if let Some(previous) = pairs_per_projection {
+                assert_eq!(
+                    previous, measured,
+                    "{}/{appearance:?} measured {measured} pairs where every other projection                      measured {previous} -- the denominator moved, so the counts are not comparable",
+                    definition.id
+                );
+            }
+            pairs_per_projection = Some(measured);
+            println!(
+                "{}/{appearance:?}: {} of {measured} pairs below floor",
+                definition.id,
+                violations.len()
+            );
             if violations.is_empty() {
                 println!("{}/{appearance:?}: clean", definition.id);
             } else {
