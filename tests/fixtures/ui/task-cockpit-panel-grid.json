@@ -1,0 +1,102 @@
+{
+  "schema": "devmanager.ui.preview/v1",
+  "id": "task-cockpit-panel-grid",
+  "title": "Board and four open panels",
+  "capture": {
+    "cursor": "excluded",
+    "border": "excluded"
+  },
+  "root": {
+    "kind": "task-cockpit",
+    "label": "Task Cockpit",
+    "tasks": [
+      {
+        "title": "are there any migrations left to run against dev or prod db?",
+        "provider": "claude",
+        "state": "idle",
+        "age_ms": 604800000,
+        "project": "command",
+        "open": true,
+        "focused": true,
+        "view": "conversation",
+        "conversation": {
+          "messages": [
+            {
+              "role": "user",
+              "text": "are there any migrations left to run against dev or prod db?"
+            },
+            {
+              "role": "assistant",
+              "text": "PROD -> integration_entity.{last_seen_at, synced_at}\nDEV -> same. Its later siblings are applied on both."
+            },
+            {
+              "role": "user",
+              "text": "and the two that were added last week?"
+            },
+            {
+              "role": "assistant",
+              "text": "Both landed. The ledger and the schema agree: `20261112020000` and `20261112030000` are in `SequelizeMeta` on dev and on prod, and the columns they add are present on both."
+            },
+            {
+              "role": "user",
+              "text": "show me the ones that are pending, if any"
+            },
+            {
+              "role": "assistant",
+              "text": "None are pending. `npx sequelize-cli db:migrate:status` reports `up` for every file in `api/migrations`, on both databases, with no `down` rows after the last applied one."
+            },
+            {
+              "role": "user",
+              "text": "good. anything that only ran on dev?"
+            },
+            {
+              "role": "assistant",
+              "text": "One: `20261101120000-add-device-resolution-run.js`. It is `up` on dev and absent from prod's ledger, because the deploy that carried it was rolled back. The table it creates does not exist on prod either, so the two answers agree."
+            }
+          ]
+        }
+      },
+      {
+        "title": "Build the Snake backend in C:/Code/userfirst/snake-game-backend. You own only that folder and nothing above it.",
+        "provider": "codex",
+        "state": "idle",
+        "age_ms": 345600000,
+        "project": "snake-game",
+        "open": true,
+        "view": "conversation"
+      },
+      {
+        "title": "Reply with exactly OPTIONS_ARGS_LIVE",
+        "provider": "codex",
+        "state": "idle",
+        "age_ms": 259200000,
+        "project": "command",
+        "open": true,
+        "view": "terminal"
+      },
+      {
+        "title": "New task",
+        "provider": "claude",
+        "state": "idle",
+        "age_ms": 345600000,
+        "project": "command",
+        "open": true,
+        "view": "conversation"
+      },
+      {
+        "title": "Snake Frontend",
+        "provider": "claude",
+        "state": "idle",
+        "age_ms": 345600000,
+        "project": "snake-game"
+      },
+      {
+        "title": "hi there",
+        "provider": "codex",
+        "state": "idle",
+        "age_ms": 777600000,
+        "project": "command"
+      }
+    ]
+  }
+}

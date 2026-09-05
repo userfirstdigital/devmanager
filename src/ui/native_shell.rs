@@ -147,7 +147,8 @@ use crate::ui::task_cockpit::composer::{
     COMPOSER_ICON_BUTTON_SIZE, COMPOSER_ICON_GLYPH_SIZE, COMPOSER_INPUT_MAX_HEIGHT,
     COMPOSER_INPUT_MIN_HEIGHT, COMPOSER_KEY_HINTS, COMPOSER_LINE_HEIGHT, COMPOSER_META_ROW_HEIGHT,
     COMPOSER_META_SEPARATOR as META_SEPARATOR, COMPOSER_PADDING_X, COMPOSER_PADDING_Y,
-    COMPOSER_RADIUS, COMPOSER_REGION_PADDING, COMPOSER_ROW_PADDING_Y,
+    COMPOSER_PILL_PADDING_X, COMPOSER_PILL_RADIUS, COMPOSER_RADIUS, COMPOSER_REGION_PADDING,
+    COMPOSER_ROW_PADDING_Y,
 };
 use crate::ui::task_cockpit::dock::{DockEdge, DockTool as CockpitDockTool};
 use crate::ui::task_cockpit::draft_store::{
@@ -1696,6 +1697,38 @@ impl NativeHostState {
             Self::Connecting | Self::Disconnected | Self::Error { .. } => None,
         }
     }
+}
+
+/// What a seeded preview task is doing, in the vocabulary the fixture speaks.
+///
+/// Deliberately NOT `VisibleTaskStatus`: the fixture names the five states the
+/// mockups paint, and the mapping onto connectivity/attention/activity lives in
+/// [`NativeShell::install_preview_tasks`] so the board derives the status the
+/// same way it does for a real host.
+#[cfg(debug_assertions)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PreviewTaskSeedState {
+    Idle,
+    Working,
+    Question,
+    Blocked,
+    Done,
+}
+
+/// One task a preview fixture asks the shell to stand up, with its panel.
+#[cfg(debug_assertions)]
+#[derive(Debug, Clone)]
+pub struct PreviewTaskSeed {
+    pub title: String,
+    pub provider: ProviderKind,
+    pub state: PreviewTaskSeedState,
+    pub age_ms: i64,
+    pub project: Option<String>,
+    pub open: bool,
+    pub focused: bool,
+    pub terminal_view: bool,
+    pub plan_steps: Vec<PreviewPlanStep>,
+    pub messages: Vec<crate::ui::task_cockpit::timeline::PreviewConversationMessage>,
 }
 
 impl Display for NativeShellError {
@@ -12779,6 +12812,292 @@ impl NativeShell {
     ) {
         self.preview_plan_steps = Some(steps);
         self.preview_conversation_messages = Some(messages);
+    }
+
+    /// Stand a whole board and panel grid up from a preview fixture.
+    ///
+    /// The single-conversation seam above short-circuits the grid painter (see
+    /// `task_workspace_grid`), so it can never show the panel chrome that fix
+    /// wave 2 is about. This one seeds a real `ClientModel` instead and then
+    /// opens the panels the fixture asked for, which means the board rows, the
+    /// panel titles, the status line, the ordinal chips and the project stripes
+    /// are all derived by the same code a live host drives — the fixture only
+    /// supplies the facts.
+    ///
+    /// Deliberately does NOT set `preview_plan_steps`/
+    /// `preview_conversation_messages`: those are the fields
+    /// `preview_conversation_installed` reads, and setting them would take the
+    /// grid's short circuit and paint one bare conversation.
+    #[cfg(debug_assertions)]
+    pub(crate) fn install_preview_tasks(
+        &mut self,
+        seeds: &[PreviewTaskSeed],
+        cx: &mut Context<Self>,
+    ) {
+        use crate::client::ClientModelBuilder;
+        use crate::domain::{
+            agent::{AgentRole, AgentSessionFacts, AgentSessionLifecycle},
+            id::{AgentSessionId, EnvironmentId, ProjectId, SnapshotId},
+            snapshot::{SnapshotItem, SnapshotPage, SnapshotSection, TaskSnapshotItem},
+            task::{
+                ReviewReadiness, TaskActivity, TaskAssignment, TaskAttention, TaskConnectivity,
+                TaskFacts, TaskLifecycle, WorkspaceRef,
+            },
+        };
+
+        if seeds.is_empty() {
+            return;
+        }
+        // A UUIDv7-shaped identity per seeded row. `tail` is the only varying
+        // byte, so the same fixture always produces the same ids and a capture
+        // is comparable with the one before it.
+        let uuid = |tail: u8| {
+            [
+                0x01, 0x8f, 0x60, 0xb0, 0x9c, 0x1a, 0x70, 0x01, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00,
+                0x00, tail,
+            ]
+        };
+        let environment_id = EnvironmentId::from_bytes(uuid(0x01)).expect("preview environment id");
+        let snapshot_id = SnapshotId::from_bytes(uuid(0x20)).expect("preview snapshot id");
+        let page = |section, items| SnapshotPage {
+            snapshot_id,
+            through_sequence: 1,
+            section,
+            after_item: None,
+            items,
+            encoded_bytes: 1,
+            next_cursor: None,
+        };
+
+        // One ProjectId per distinct label, in first-seen order, so two tasks
+        // in the same project share a stripe colour and two in different ones
+        // do not.
+        let mut project_labels: Vec<String> = Vec::new();
+        for seed in seeds {
+            let label = seed
+                .project
+                .clone()
+                .unwrap_or_else(|| "Preview".to_string());
+            if !project_labels.contains(&label) {
+                project_labels.push(label);
+            }
+        }
+        let project_ids: Vec<ProjectId> = (0..project_labels.len())
+            .map(|index| {
+                ProjectId::from_bytes(uuid(0x02u8.saturating_add(index as u8)))
+                    .expect("preview project id")
+            })
+            .collect();
+
+        let now_ms = unix_time_ms();
+        let mut task_items = Vec::with_capacity(seeds.len());
+        let mut agent_items = Vec::with_capacity(seeds.len());
+        let mut task_ids = Vec::with_capacity(seeds.len());
+        for (index, seed) in seeds.iter().enumerate() {
+            let tail = 0x40u8.saturating_add(index as u8);
+            let task_id = TaskId::from_bytes(uuid(tail)).expect("preview task id");
+            let agent_id = AgentSessionId::from_bytes(uuid(0xa0u8.saturating_add(index as u8)))
+                .expect("preview agent id");
+            task_ids.push(task_id);
+            let label = seed
+                .project
+                .clone()
+                .unwrap_or_else(|| "Preview".to_string());
+            let project_index = project_labels
+                .iter()
+                .position(|candidate| *candidate == label)
+                .expect("every seed's project label was collected above");
+            let (lifecycle, connectivity, attention, activity, review) = match seed.state {
+                PreviewTaskSeedState::Idle => (
+                    TaskLifecycle::Open,
+                    TaskConnectivity::Connected,
+                    TaskAttention::None,
+                    TaskActivity::Idle,
+                    ReviewReadiness::NotReady,
+                ),
+                PreviewTaskSeedState::Working => (
+                    TaskLifecycle::Open,
+                    TaskConnectivity::Connected,
+                    TaskAttention::None,
+                    TaskActivity::Working,
+                    ReviewReadiness::NotReady,
+                ),
+                PreviewTaskSeedState::Question => (
+                    TaskLifecycle::Open,
+                    TaskConnectivity::Connected,
+                    TaskAttention::NeedsAnswer,
+                    TaskActivity::Working,
+                    ReviewReadiness::NotReady,
+                ),
+                PreviewTaskSeedState::Blocked => (
+                    TaskLifecycle::Open,
+                    TaskConnectivity::Connected,
+                    TaskAttention::Failed,
+                    TaskActivity::Idle,
+                    ReviewReadiness::NotReady,
+                ),
+                PreviewTaskSeedState::Done => (
+                    TaskLifecycle::Settled,
+                    TaskConnectivity::Connected,
+                    TaskAttention::None,
+                    TaskActivity::Idle,
+                    ReviewReadiness::Ready,
+                ),
+            };
+            task_items.push(SnapshotItem::Task(TaskSnapshotItem {
+                task: TaskFacts {
+                    id: task_id,
+                    environment_id,
+                    title: seed.title.clone(),
+                    description: None,
+                    project_id: project_ids[project_index],
+                    workspace: WorkspaceRef::Main,
+                    assignment: TaskAssignment::LocalOwner,
+                    lifecycle,
+                    action_epoch: 0,
+                    revision: 1,
+                    created_at_ms: (now_ms - seed.age_ms).max(1),
+                },
+                connectivity,
+                attention,
+                activity,
+                review_readiness: review,
+                primary_agent_id: Some(agent_id),
+            }));
+            agent_items.push(SnapshotItem::AgentSession(AgentSessionFacts {
+                id: agent_id,
+                task_id,
+                role: AgentRole::Primary,
+                provider_kind: seed.provider,
+                provider_session_id: None,
+                lifecycle: AgentSessionLifecycle::Open,
+                runtime_generation: 1,
+                revision: 0,
+            }));
+        }
+
+        // A seed that cannot be built is a broken fixture, and a preview that
+        // silently paints the empty board instead of saying so costs a whole
+        // render to diagnose. Every refusal names itself on stderr.
+        let mut builder = ClientModelBuilder::new();
+        if let Err(error) = builder.ingest_page(page(SnapshotSection::Tasks, task_items)) {
+            eprintln!("preview task seed: tasks page rejected: {error:?}");
+            return;
+        }
+        if let Err(error) = builder.ingest_page(page(SnapshotSection::AgentSessions, agent_items)) {
+            eprintln!("preview task seed: agent page rejected: {error:?}");
+            return;
+        }
+        for section in [
+            SnapshotSection::Artifacts,
+            SnapshotSection::Resources,
+            SnapshotSection::Operations,
+        ] {
+            if let Err(error) = builder.ingest_page(page(section, Vec::new())) {
+                eprintln!("preview task seed: {section:?} page rejected: {error:?}");
+                return;
+            }
+        }
+        let model = match builder.finish() {
+            Ok(model) => model,
+            Err(error) => {
+                eprintln!("preview task seed: client model rejected: {error:?}");
+                return;
+            }
+        };
+
+        // The project labels the board and the panel subtitle print come from
+        // the config sidebar, exactly as they do for a live host.
+        let snapshot = crate::domain::cockpit::ConfigSidebarSnapshot {
+            revision: 1,
+            projects: project_labels
+                .iter()
+                .zip(project_ids.iter())
+                .enumerate()
+                .map(
+                    |(index, (label, project_id))| crate::domain::cockpit::ConfigSidebarProject {
+                        config_id: format!("preview-project-{index}"),
+                        label: label.clone(),
+                        root_configured: true,
+                        workspace_id: project_id.to_string(),
+                        folders: Vec::new(),
+                    },
+                )
+                .collect(),
+            servers: Vec::new(),
+            ssh_connections: Vec::new(),
+            providers: Vec::new(),
+        };
+        let local = self.local_host_id();
+        if let Some(slot) = self.host_slot_mut(&local) {
+            slot.config_sidebar = ConfigSidebarProjection::from_host_snapshot(&snapshot);
+        }
+        if let Err(error) = self.apply_client_model(Arc::new(model)) {
+            eprintln!("preview task seed: client model not applied: {error}");
+            return;
+        }
+
+        // A seeded shell has nothing left to wait for. Without this the startup
+        // phase line paints its overlay across every panel body, which is the
+        // one thing a chrome capture must not have on top of it.
+        self.startup_trace
+            .advance_to(StartupPhase::Ready, Some("preview fixture seeded".into()));
+        self.local_slot_mut().host_state = NativeHostState::Connected {
+            endpoint: "preview".to_string(),
+        };
+
+        // Panels, in fixture order, then the one focused pane.
+        let open: Vec<(usize, HostTaskKey)> = seeds
+            .iter()
+            .enumerate()
+            .filter(|(_, seed)| seed.open)
+            .map(|(index, _)| (index, self.local_task_key(task_ids[index])))
+            .collect();
+        if let Some(((_, first), rest)) = open.split_first() {
+            let mut workspace =
+                crate::ui::task_workspace::Workspace::<HostTaskKey>::single(first.clone());
+            for (_, key) in rest {
+                if workspace
+                    .insert_after_focused(key.clone(), crate::ui::task_workspace::Axis::Horizontal)
+                    .is_err()
+                {
+                    break;
+                }
+            }
+            self.layout.task_workspace = Some(workspace);
+            self.mark_layout_dirty();
+            for (index, key) in &open {
+                if seeds[*index].terminal_view {
+                    self.set_pane_view(key, PaneView::Terminal);
+                }
+            }
+            if let Some((_, key)) = open
+                .iter()
+                .find(|(index, _)| seeds[*index].focused)
+                .or_else(|| open.first())
+            {
+                self.focus_workspace_pane_for(key);
+                let _ = self.select_fleet_task_key(key.clone(), FleetSelectMode::Replace);
+            }
+        }
+
+        // Timelines last: `apply_client_model` retains only the timelines of
+        // tasks it still knows about, so seeding them before it would drop
+        // every one of them.
+        for (index, seed) in seeds.iter().enumerate() {
+            if seed.plan_steps.is_empty() && seed.messages.is_empty() {
+                continue;
+            }
+            let task_id = task_ids[index];
+            if let Some(slot) = self.host_slot_mut(&local) {
+                slot.cockpit.install_preview_conversation(
+                    task_id,
+                    &seed.plan_steps,
+                    &seed.messages,
+                );
+            }
+        }
+        cx.notify();
     }
 
     pub fn host_connection(&self) -> &DevTestHostConnection {
@@ -25121,7 +25440,13 @@ impl NativeShell {
                 split_key.rotate_left(11) ^ child_index as u64,
             ))
             .flex_none()
-            .bg(tokens.borders.subtle.to_gpui())
+            // Composition A shows the 8 px between two panels as the CANVAS
+            // ground, not as a rule. Painted `borders.subtle` it was the same
+            // grey as the panel hairline beside it, so the two merged into one
+            // 10 px rail and the panels read as cells of a table rather than
+            // as cards on a ground. The resize affordance still lights up
+            // under the pointer, which is the only moment it is a control.
+            .bg(tokens.surfaces.canvas.to_gpui())
             .hover(|style| style.bg(tokens.borders.focus.to_gpui()))
             .on_mouse_down(MouseButton::Left, begin);
         match axis {
@@ -27158,10 +27483,13 @@ impl NativeShell {
                 .child(permission_dock_element(&summary, tokens, &handlers))
                 .into_any_element()
         } else if !owns_input {
-            // Background Full panes keep their complete live conversation but
-            // do not impersonate an editable composer. The selected pane alone
-            // owns GPUI text focus and the input footer.
-            div().id("native-task-composer-hidden").into_any_element()
+            // Background panes keep their complete live conversation but do
+            // not impersonate an editable composer: the selected pane alone
+            // owns GPUI text focus. V6: they still carry the composer SHAPE --
+            // one resting pill, no key hints and no meta line -- because an
+            // empty div here left three of four panels with no bottom edge at
+            // all, and because the pill is where the eye goes to type.
+            Self::composer_resting_pill(placeholder.clone(), tokens)
         } else if self.composer.is_some() {
             div()
                 .id("native-task-composer")
@@ -27194,7 +27522,11 @@ impl NativeShell {
                             // The old shape was a 22 px pill whose "border"
                             // was a one-pixel background ring under a drop
                             // shadow, which rule 1 does not allow.
-                            .rounded(px(COMPOSER_RADIUS))
+                            // V6: the pill, per the reference capture -- fully
+                            // rounded at half its resting height, so the
+                            // focused field and the unfocused placeholder are
+                            // one shape rather than two.
+                            .rounded(px(COMPOSER_PILL_RADIUS))
                             .border(px(COMPOSER_BORDER_WIDTH))
                             .border_color(if self.composer_accessibility_focused {
                                 tokens.borders.focus.to_gpui()
@@ -27784,25 +28116,10 @@ impl NativeShell {
                 )
                 .into_any_element()
         } else {
-            div()
-                .id("native-task-composer-hold")
-                .w_full()
-                .flex_none()
-                .px(px(tokens.density.spacing.md))
-                .pb(px(tokens.density.spacing.md))
-                .child(
-                    div()
-                        .w_full()
-                        .max_w(px(CONVERSATION_CONTENT_MAX_WIDTH))
-                        .mx_auto()
-                        .px(px(tokens.density.spacing.md))
-                        .py(px(tokens.density.spacing.sm))
-                        .rounded(px(tokens.density.radii.lg))
-                        .bg(tokens.surfaces.disabled.to_gpui())
-                        .text_color(tokens.text.disabled.to_gpui())
-                        .child("Select a task with a connected agent to start chatting"),
-                )
-                .into_any_element()
+            // Focused, but no composer controller is bound yet. The same
+            // resting pill rather than a `surfaces.disabled` slab telling you
+            // to select a task, which is untrue -- the task IS open.
+            Self::composer_resting_pill(placeholder.clone(), tokens)
         };
         let provider_setup_card = self.provider_setup_approval_card(&owner, tokens, cx);
         let conversation_footer = div()
@@ -29148,8 +29465,16 @@ impl NativeShell {
             .flex()
             .flex_1()
             .min_h(px(0.0))
-            .flex_col()
-            .bg(tokens.terminal.background.to_gpui());
+            .flex_col();
+        // The terminal ground belongs to a terminal. With no pane attached the
+        // body is a panel like any other and rule 9 applies: one muted
+        // sentence on the panel own surface. Painting the darker terminal
+        // fill under those two words is what read as a raised band across the
+        // top of the body.
+        let surface = match pane {
+            Some(_) => surface.bg(tokens.terminal.background.to_gpui()),
+            None => surface,
+        };
         if let Some(pane) = pane {
             let interactive = self.selected_center_terminal_is_interactive();
             let interaction = self.terminal_grid_interaction_for_shared(
@@ -29212,6 +29537,62 @@ impl NativeShell {
                 .child(label)
                 .into_any_element()
         }
+    }
+
+    /// The composer at rest: one pill, and nothing else.
+    ///
+    /// V6, from the reference capture: fully rounded at half its resting
+    /// height, `surfaces.sunken` behind a 1 px `borders.default` rule, the
+    /// placeholder at the left and the attach glyph at the right. No key
+    /// hints and no meta line -- those belong to the panel you are typing
+    /// into, and repeating them in every background panel is what made the
+    /// composer look like it owned the whole panel.
+    ///
+    /// Not an input: the pane own click handler focuses the panel, and the
+    /// real composer replaces this on the next frame.
+    fn composer_resting_pill(
+        placeholder: String,
+        tokens: crate::ui::tokens::ThemeTokens,
+    ) -> AnyElement {
+        div()
+            .id("native-task-composer-hold")
+            .w_full()
+            .flex_none()
+            .px(px(COMPOSER_REGION_PADDING))
+            .pb(px(COMPOSER_REGION_PADDING))
+            .flex()
+            .justify_center()
+            .child(
+                div()
+                    .id("native-task-composer-pill")
+                    .w(px(CONVERSATION_CONTENT_MAX_WIDTH))
+                    .max_w_full()
+                    .h(px(COMPOSER_INPUT_MIN_HEIGHT))
+                    .flex()
+                    .items_center()
+                    .gap(px(COMPOSER_CONTROL_GAP))
+                    .px(px(COMPOSER_PILL_PADDING_X))
+                    .rounded(px(COMPOSER_PILL_RADIUS))
+                    .border(px(COMPOSER_BORDER_WIDTH))
+                    .border_color(tokens.borders.default.to_gpui())
+                    .bg(tokens.surfaces.sunken.to_gpui())
+                    .text_size(px(COMPOSER_FONT_SIZE))
+                    .text_color(tokens.text.muted.to_gpui())
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w(px(0.0))
+                            .overflow_hidden()
+                            .whitespace_nowrap()
+                            .child(placeholder),
+                    )
+                    .child(div().flex_none().child(crate::icons::app_icon(
+                        crate::icons::PLUS,
+                        COMPOSER_ICON_GLYPH_SIZE,
+                        tokens.text.muted.to_u32(),
+                    ))),
+            )
+            .into_any_element()
     }
 
     fn sync_task_composer(&mut self, model: &ClientModel, task_id: TaskId) {
@@ -48324,6 +48705,152 @@ pub(crate) mod tests {
         for id in &quiet {
             assert!(streaming.contains(id), "streaming dropped the node {id}");
         }
+    }
+
+    /// V6 (fix wave 2): a panel you are not typing into carries the composer
+    /// SHAPE and nothing else -- one pill, no key hints, no meta line.
+    ///
+    /// The two resting branches (a background pane, and a focused pane whose
+    /// composer controller is not bound yet) go through ONE painter, so the
+    /// unfocused composer cannot drift into carrying half the focused one.
+    #[test]
+    fn the_resting_composer_is_one_pill_with_no_meta_line() {
+        let source = include_str!("native_shell.rs");
+        let pill = source
+            .split("    fn composer_resting_pill(")
+            .nth(1)
+            .expect("the resting composer painter")
+            .split("\n    fn ")
+            .next()
+            .expect("everything up to the next function");
+        assert!(
+            pill.contains("native-task-composer-pill"),
+            "the anchor has stopped matching and this test is guarding nothing"
+        );
+        // (a) the pill's shape, per the reference capture
+        for required in [
+            "COMPOSER_PILL_RADIUS",
+            "COMPOSER_BORDER_WIDTH",
+            "tokens.borders.default",
+            "tokens.surfaces.sunken",
+        ] {
+            assert!(
+                pill.contains(required),
+                "the resting pill must carry {required}"
+            );
+        }
+        // (b) and nothing else: no meta line, no key hints, no send control
+        for forbidden in [
+            "COMPOSER_META_ROW_HEIGHT",
+            "COMPOSER_KEY_HINTS",
+            "native-task-composer-meta",
+            "send_control",
+        ] {
+            assert!(
+                !pill.contains(forbidden),
+                "the resting pill must not carry {forbidden}"
+            );
+        }
+        // (c) the focused composer is the one that does carry the meta line
+        let focused = source
+            .split(r#".id("native-task-composer")"#)
+            .nth(1)
+            .expect("the focused composer")
+            .split("Self::composer_resting_pill(")
+            .next()
+            .expect("its own branch, up to the resting one");
+        assert!(
+            focused.contains(r#".id("native-task-composer-meta")"#)
+                && focused.contains("COMPOSER_KEY_HINTS"),
+            "the focused composer keeps its one meta line and its key hints"
+        );
+        // (d) both resting branches use the one painter
+        // Counted over the painter alone: this file's own tests quote the
+        // call, and counting the whole file would make the assertion drift
+        // every time a test mentions it.
+        let painters = source
+            .split(TEST_MODULE_MARKER)
+            .next()
+            .expect("the painters are everything above the first test module");
+        assert_eq!(
+            painters.matches("Self::composer_resting_pill(").count(),
+            2,
+            "both resting branches paint through the same pill"
+        );
+        assert!(
+            !painters.contains("Select a task with a connected agent to start chatting"),
+            "the disabled slab the pill replaced must be gone"
+        );
+    }
+
+    /// Everything above the first test module in this file: the painters.
+    /// Built from two halves so the marker cannot match itself and silently
+    /// slice the file at this very constant.
+    const TEST_MODULE_MARKER: &str = concat!(
+        "
+#[cfg(",
+        "test)]
+mod "
+    );
+
+    /// V3 (fix wave 2): the terminal ground belongs to a terminal. An empty
+    /// terminal body is a panel like any other -- one muted sentence on the
+    /// panel's own surface, not a darker band across the top.
+    #[test]
+    fn an_empty_terminal_body_does_not_paint_the_terminal_ground() {
+        let source = include_str!("native_shell.rs");
+        let surface = source
+            .split("    fn task_terminal_surface_for(")
+            .nth(1)
+            .expect("the workspace terminal surface")
+            .split("\n    fn ")
+            .next()
+            .expect("everything up to the next function");
+        assert!(
+            surface.contains("terminal_label") && surface.contains("tokens.terminal.background"),
+            "the anchor has stopped matching and this test is guarding nothing"
+        );
+        assert!(
+            surface.contains("Some(_) => surface.bg(tokens.terminal.background.to_gpui())"),
+            "the terminal ground must be painted only when a pane is attached"
+        );
+        assert_eq!(
+            surface.matches("tokens.terminal.background").count(),
+            1,
+            "one decision about the terminal ground, not two"
+        );
+    }
+
+    /// V4 (fix wave 2): the 8 px between two panels is the CANVAS ground.
+    /// Painted `borders.subtle` it was the same grey as the panel hairline
+    /// beside it, and the two merged into one rail.
+    #[test]
+    fn the_gap_between_panels_is_the_canvas_ground() {
+        let source = include_str!("native_shell.rs");
+        let divider = source
+            .split("        let divider = div()")
+            .nth(1)
+            .expect("the split divider")
+            .split("\n    fn ")
+            .next()
+            .expect("everything up to the next function");
+        assert!(
+            divider.contains("native-task-workspace-divider"),
+            "the anchor has stopped matching and this test is guarding nothing"
+        );
+        assert!(
+            divider.contains(".bg(tokens.surfaces.canvas.to_gpui())"),
+            "the gap between panels is the canvas, not a rule"
+        );
+        assert!(
+            !divider.contains(".bg(tokens.borders.subtle.to_gpui())"),
+            "a subtle-grey rail merges with the panel hairline beside it"
+        );
+        // The affordance still exists: it lights up under the pointer.
+        assert!(
+            divider.contains(".hover(|style| style.bg(tokens.borders.focus.to_gpui()))"),
+            "the resize affordance must still show itself under the pointer"
+        );
     }
 
     /// Fix wave 1, F4: the composer is ONE sunken field and ONE meta line.

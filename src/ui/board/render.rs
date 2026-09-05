@@ -213,6 +213,50 @@ fn row_tooltip_text(row: &BoardRow) -> String {
     )
 }
 
+/// The definite width a board row's TITLE paints at, and the one its META line
+/// paints at.
+///
+/// GPUI ellipsises only against a definite width
+/// (`overlay_chrome::ellipsised`), so the two lines cannot be flex slots that
+/// truncate -- this arithmetic is what replaces the flex line. Each is the
+/// row's content width less the parts of its line that are `flex_none`, and
+/// each of those parts is measured with the same biased-high estimate the
+/// panel chrome uses, so a long age or a two-digit chip narrows the label
+/// rather than clipping it.
+fn row_title_width(content_width_px: f32, row: &BoardRow) -> f32 {
+    let mut taken = DOT_CELL_WIDTH
+        + DOT_CELL_GAP
+        + DOT_CELL_GAP
+        + crate::ui::overlay_chrome::approx_text_width(
+            &format_age(row.state_age_ms),
+            META_FONT_SIZE,
+        );
+    if row.open.is_some() {
+        taken += ORDINAL_CHIP_MAX_WIDTH + DOT_CELL_GAP;
+    }
+    (content_width_px - taken).max(MIN_LABEL_WIDTH)
+}
+
+fn row_meta_width(
+    content_width_px: f32,
+    row: &BoardRow,
+    layout: crate::ui::board::layout::BoardRowLayout,
+) -> f32 {
+    let mut taken = SECOND_LINE_INDENT + META_GAP + PROVIDER_MARK_SIZE;
+    if row.progress.is_some() && layout.show_segments {
+        taken += SEGMENTS_MAX_WIDTH + META_GAP;
+    }
+    (content_width_px - taken).max(MIN_LABEL_WIDTH)
+}
+
+/// The ordinal chip at two digits, as the panel chrome counts it.
+const ORDINAL_CHIP_MAX_WIDTH: f32 = 22.0;
+/// Six segments, their gaps and the count beside them.
+const SEGMENTS_MAX_WIDTH: f32 = 84.0;
+/// No label is ever squeezed below this: an ellipsis with nothing before it
+/// says less than a clipped word.
+const MIN_LABEL_WIDTH: f32 = 24.0;
+
 pub fn board_row_element(
     row: &BoardRow,
     colours: &ProjectColourBook,
@@ -291,6 +335,10 @@ pub fn board_row_element(
             tokens.text.primary
         };
 
+    let content_width_px = row_content_width(width_px);
+    let title_width_px = row_title_width(content_width_px, row);
+    let meta_width_px = row_meta_width(content_width_px, row, layout);
+
     let tooltip_text = row_tooltip_text(row);
     let (capture_down_key, capture_up_key, select_key, key_key) = (
         row.key.clone(),
@@ -313,21 +361,25 @@ pub fn board_row_element(
         .child(state_dot(row, tokens))
         .child(
             div()
-                .flex_1()
-                .min_w(px(0.0))
+                // `flex_none`, because the label inside carries a definite
+                // width now and the slack goes to the spacer after it. Left as
+                // `flex_1` the two shared the free space and the title got
+                // half of what the budget had given it.
+                .flex_none()
                 .overflow_hidden()
                 .text_size(px(TITLE_FONT_SIZE))
                 .line_height(px(TITLE_LINE_HEIGHT))
                 .text_color(title_colour.to_gpui())
-                // The ellipsis needs a DEFINITE width. `truncate()` on the flex
-                // item itself gave a hard clip -- a `flex-basis: 0` item is
-                // measured with unbounded available space, so the text laid out
-                // at full length inside an overflow-hidden box and ran flush
-                // into the ordinal chip beside it. `w_full` on an inner child
-                // resolves against the item's settled width, which is the one
-                // number GPUI's measure pass will accept.
-                .child(div().w_full().truncate().child(row.title.clone())),
+                // See `overlay_chrome::ellipsised_line`: the text has to be
+                // measured once, at a settled width, or GPUI caches its full
+                // length and the box below just clips it.
+                .child(crate::ui::overlay_chrome::label_within(
+                    title_width_px,
+                    TITLE_FONT_SIZE,
+                    row.title.clone(),
+                )),
         )
+        .child(div().flex_1().min_w(px(0.0)))
         // The open marker sits at the right end of the title line, before the
         // age: the same number the panel's own header carries, so the row and
         // the panel are one glance apart.
@@ -354,15 +406,12 @@ pub fn board_row_element(
             .text_size(px(META_FONT_SIZE))
             .line_height(px(META_LINE_HEIGHT))
             .text_color(tokens.text.muted.to_gpui())
-            .child(
-                div()
-                    .flex_1()
-                    .min_w(px(0.0))
-                    .overflow_hidden()
-                    // Same shape, same reason as the title line above: the meta
-                    // line runs into the plan strip without it.
-                    .child(div().w_full().truncate().child(second_line_text(row))),
-            )
+            .child(crate::ui::overlay_chrome::label_within(
+                meta_width_px,
+                META_FONT_SIZE,
+                second_line_text(row),
+            ))
+            .child(div().flex_1().min_w(px(0.0)))
             .children(
                 row.progress
                     .filter(|_| layout.show_segments)
@@ -930,15 +979,16 @@ mod tests {
         assert!(!state_paint(BoardState::Done, tokens).1);
     }
 
-    /// F10: a board row's two labels truncate against a DEFINITE width, so the
-    /// title ellipses before the ordinal chip instead of running into it, and
-    /// the meta line ellipses before the plan strip.
+    /// V2 (fix wave 2): a board row's two labels are painted at a DEFINITE
+    /// pixel width, which is the only thing GPUI will ellipsise against.
     ///
-    /// A source scan because the failure is a layout one: `truncate()` on a
-    /// `flex-basis: 0` item is measured with unbounded available space, lays
-    /// the text out at full length and is then clipped by `overflow_hidden` --
-    /// which looks exactly like an ellipsis that was never asked for. No pure
-    /// assertion over the constants can see it.
+    /// A source scan because the failure is a layout one and is invisible to
+    /// any assertion over the constants: `truncate()` on a `flex-basis: 0`
+    /// item, and `truncate()` on a `w_full` child of one, are BOTH measured
+    /// with unbounded available space (GPUI caches the first size it measured
+    /// for a nowrap run), so both lay the text out at full length and let
+    /// `overflow_hidden` cut it off mid-word. Both were tried and both were
+    /// rendered and read back before this test was rewritten.
     #[test]
     fn a_board_rows_labels_truncate_against_a_definite_width() {
         let source = include_str!("render.rs");
@@ -953,19 +1003,62 @@ mod tests {
             .split("\n    div()")
             .next()
             .expect("everything up to the row's own outer element");
+        // The anchor really is the row painter, not some other slice.
+        assert!(
+            row.contains("row.title.clone()") && row.contains("second_line_text(row)"),
+            "the anchor has stopped matching and this test is guarding nothing"
+        );
         // Whitespace-stripped so `cargo fmt` breaking the builder chain over
-        // three lines cannot quietly turn either assertion vacuous.
+        // three lines cannot quietly turn an assertion vacuous.
         let compact: String = row.chars().filter(|c| !c.is_whitespace()).collect();
         assert_eq!(
-            compact.matches(".truncate()").count(),
+            compact.matches("label_within(").count(),
             2,
             "a row has exactly two truncating labels: its title and its meta line"
         );
-        assert_eq!(
-            compact.matches(".w_full().truncate()").count(),
-            2,
-            "every truncating label must resolve its width through an inner w_full child"
+        assert!(
+            compact.contains("label_within(title_width_px,"),
+            "the title must be given the width the row budget computed for it"
         );
+        assert!(
+            compact.contains("label_within(meta_width_px,"),
+            "the meta line must be given the width the row budget computed for it"
+        );
+        // The idiom that could not work must not come back.
+        assert!(
+            !compact.contains(".w_full().truncate()"),
+            "a percentage width is not a definite width; it clips instead of ellipsising"
+        );
+
+        // And the budget itself: both labels leave room for everything else on
+        // their line, at every width the column can take.
+        let mut sample = row_for_width_test();
+        for width in [220.0, 300.0, 420.0] {
+            for open in [None, Some(9), Some(12)] {
+                sample.open = open;
+                let content = row_content_width(width);
+                let title = row_title_width(content, &sample);
+                let meta = row_meta_width(content, &sample, row_layout(content, sample.progress));
+                assert!(title >= MIN_LABEL_WIDTH && title <= content);
+                assert!(meta >= MIN_LABEL_WIDTH && meta <= content);
+                assert!(
+                    title + DOT_CELL_WIDTH <= content,
+                    "at {width} px the title has no room for the state dot"
+                );
+            }
+        }
+    }
+
+    /// A board row with a plan and a two-digit chip: the crowded case the two
+    /// width budgets above have to survive.
+    fn row_for_width_test() -> BoardRow {
+        let mut sample = sample_rows()
+            .into_iter()
+            .find(|candidate| candidate.state == BoardState::Working)
+            .expect("the sample board carries a working row");
+        sample.title = "Build the Snake backend in C:/Code/userfirst/snake-game-backend".into();
+        sample.open = Some(12);
+        sample
     }
 
     /// F10/F12: the row's own numbers. The column is the default a fresh

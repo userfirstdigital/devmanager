@@ -464,7 +464,10 @@ impl Timeline {
             .flex_col()
             .flex_1()
             .min_h(px(0.0))
-            .bg(tokens.surfaces.canvas.to_gpui())
+            // No fill: rule 3 puts the panel on `surfaces.raised`, and a
+            // stream repainting `surfaces.canvas` over it drew a second,
+            // darker box inside the panel AND covered the project stripe the
+            // frame paints down the left edge.
             .child(
                 div()
                     .w_full()
