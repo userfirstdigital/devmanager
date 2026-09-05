@@ -21,6 +21,7 @@ pub mod native_host_state;
 pub mod native_shell;
 #[cfg(test)]
 mod native_ux_behavior_tests;
+pub mod overlay_chrome;
 pub mod panel;
 pub mod preview;
 pub mod preview_capture;
