@@ -157,8 +157,8 @@ use crate::ui::task_cockpit::timeline::{ActivityToggleHandler, CONVERSATION_CONT
 #[cfg(debug_assertions)]
 use crate::ui::task_cockpit::timeline::{PreviewConversationMessage, PreviewPlanStep};
 use crate::ui::task_cockpit::{
-    action_is_current, one_fresh_quota_observations, panel_button_shell, panel_empty_state,
-    panel_group_label, panel_list_row, panel_row_shell, project_services_from_task_projection,
+    action_is_current, one_fresh_quota_observations, panel_button_shell, panel_caption,
+    panel_empty_state, panel_list_row, panel_row_shell, project_services_from_task_projection,
     project_services_panel, render_panel_action, render_panel_frame, render_task_browser_dock,
     update_observation_from_snapshot, ArtifactsPanelProjection, ChangesPanelProjection,
     ConfigSidebarActionRequest, ConfigSidebarProjection, ConfigSidebarUnavailableReason,
@@ -29725,8 +29725,10 @@ impl NativeShell {
                     rows.insert(
                         0,
                         // The preview's `Open · path · n byte(s)` line was a
-                        // header row inside the body; rule 2 makes it a group
-                        // label above the content it introduces. The
+                        // header row inside the body; rule 2 makes it a
+                        // caption above the content it introduces -- a
+                        // caption and not a group label, because it names a
+                        // file and a path's case is data. The
                         // `surfaces.raised` card under it goes: the body is
                         // already on the panel's raised ground, so the fill
                         // was a second elevation standing for nothing.
@@ -29734,7 +29736,7 @@ impl NativeShell {
                             .w_full()
                             .flex()
                             .flex_col()
-                            .child(panel_group_label(
+                            .child(panel_caption(
                                 &format!(
                                     "Open · {} · {} byte(s){}",
                                     preview.relative_path,
@@ -73125,10 +73127,18 @@ pub(crate) mod tests {
             1,
             "the body should end in exactly one panel frame"
         );
+        // A caption, not a group label: rule 2's uppercase belongs to a name,
+        // and every summary this body paints carries projection data -- a
+        // relative directory, a repository label, a branch. `to_uppercase()`
+        // on those prints `SRC/UI · MAIN` and renames `Feature/Foo`.
         assert_eq!(
-            body.matches("panel_group_label(").count(),
+            body.matches("panel_caption(").count(),
             1,
-            "the file preview's `Open · …` header should be the body's one group label"
+            "the file preview's `Open · …` header should be the body's one caption"
+        );
+        assert!(
+            !body.contains("panel_group_label("),
+            "a summary carrying a path or a branch is being uppercased"
         );
         assert_eq!(
             body.matches("panel_empty_state(").count(),
