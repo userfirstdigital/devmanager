@@ -14082,7 +14082,13 @@ impl NativeShell {
     fn refresh_accessibility_tree(&mut self) {
         let _section = crate::ui::frame_trace::section("a11y");
         self.accessibility_tree_builds = self.accessibility_tree_builds.saturating_add(1);
-        let project_items = self.board_inbox_items(unix_time_ms());
+        // ONE board model for the whole refresh. The section list below and
+        // the needs-you count further down are two readings of the same board,
+        // and building it twice was most of what an accessibility refresh
+        // cost -- two fleet projections, two ordinal probes, two state-clock
+        // passes -- for two answers that must agree by construction anyway.
+        let board = self.board_model(unix_time_ms());
+        let project_items = self.board_inbox_items_from_model(&board);
         let shows_add_project = self.shows_add_project_plus();
         let composer_focused = self.composer_accessibility_focused;
         let composer = self
@@ -14173,7 +14179,7 @@ impl NativeShell {
                 .gpui(crate::ui::board::topbar::CONNECTION_ELEMENT_ID, false, false),
             );
         }
-        let needs_you = self.top_bar_needs_you_count();
+        let needs_you = crate::ui::board::needs_you_count(&board);
         if needs_you > 0 {
             let task_word = if needs_you == 1 { "task" } else { "tasks" };
             overlay_nodes.push(
@@ -24864,11 +24870,16 @@ impl NativeShell {
         &mut self,
         tokens: crate::ui::tokens::ThemeTokens,
         workspace_size: Size<Pixels>,
+        board: &BoardModel,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let inset = Self::workspace_grid_inset();
-        let grid =
-            self.task_workspace_grid(tokens, Self::workspace_grid_viewport(workspace_size), cx);
+        let grid = self.task_workspace_grid(
+            tokens,
+            Self::workspace_grid_viewport(workspace_size),
+            board,
+            cx,
+        );
         div()
             .id("native-shell-workspace-grid")
             .size_full()
@@ -24886,6 +24897,7 @@ impl NativeShell {
         &mut self,
         tokens: crate::ui::tokens::ThemeTokens,
         workspace_size: Size<Pixels>,
+        board: &BoardModel,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         if self.preview_conversation_installed() {
@@ -24953,10 +24965,18 @@ impl NativeShell {
         // The panels read the board's own rows, so a panel and its row can
         // never say two different things about one task -- including the
         // ordinal chip, which is `row.open` rather than a second lookup.
-        let rows: HashMap<HostTaskKey, BoardRow> = self
-            .board_rows(unix_time_ms())
-            .into_iter()
-            .map(|row| (row.key.clone(), row))
+        //
+        // Read off the model the frame ALREADY built rather than building a
+        // second set. Two builds meant two fleet projections, two workspace
+        // ordinal probes and two state-clock passes per paint, and -- because
+        // the pane allocation between them can restore a compacted pane -- the
+        // board column and the panels could answer differently for one frame
+        // about the very thing this comment says they cannot.
+        let rows: HashMap<HostTaskKey, BoardRow> = board
+            .groups
+            .iter()
+            .flat_map(|group| group.rows.iter())
+            .map(|row| (row.key.clone(), row.clone()))
             .collect();
         // Directional focus and pane moves are questions about what is on
         // screen, so the rects that answered them are the ones this frame
@@ -32753,6 +32773,18 @@ impl NativeShell {
     /// project. The board has no project rows, so without that last part a
     /// project with no tasks yet would be unreachable to a screen reader.
     fn board_inbox_items(&mut self, now_ms: i64) -> Vec<ProjectInboxItem> {
+        // The archived browser reads the archive, never the board, so the
+        // board model is not built for it.
+        let board = if self.show_archived_tasks {
+            build_board_model(Vec::new(), false)
+        } else {
+            self.board_model(now_ms)
+        };
+        self.board_inbox_items_from_model(&board)
+    }
+
+    /// The same flattening over a board model the caller already has.
+    fn board_inbox_items_from_model(&mut self, board: &BoardModel) -> Vec<ProjectInboxItem> {
         if self.show_archived_tasks {
             let archived: Vec<_> = self
                 .fleet_inbox_projection()
@@ -32783,7 +32815,6 @@ impl NativeShell {
             }
             return items;
         }
-        let board = self.board_model(now_ms);
         let mut items = Vec::new();
         for group in &board.groups {
             items.push(ProjectInboxItem::Group {
@@ -43820,9 +43851,8 @@ impl NativeShell {
         } else {
             Vec::new()
         });
-        let fleet_rows = self.fleet_inbox_projection();
         let row_models = Arc::new(if archived_view {
-            fleet_rows
+            self.fleet_inbox_projection()
                 .archived
                 .iter()
                 .map(|row| {
@@ -44904,6 +44934,7 @@ impl NativeShell {
                 layout.clone(),
                 self.show_archived_tasks,
             ),
+            &board,
             cx,
         );
 
@@ -56338,6 +56369,11 @@ pub(crate) mod tests {
                     frame.calls("fleet_projection"),
                     1,
                     "and so is the fleet projection they read: {frame:?}"
+                );
+                assert_eq!(
+                    frame.calls("board_model"),
+                    1,
+                    "and the model built from them: {frame:?}"
                 );
                 assert_eq!(
                     frame.calls("pane_ordinals"),
@@ -69988,7 +70024,8 @@ pub(crate) mod tests {
                 // The window paints before the first controller tick.
                 let tokens = shell.preferences.tokens();
                 let size = gpui::size(gpui::px(1900.0), gpui::px(700.0));
-                let _ = shell.task_workspace_grid(tokens, size, cx);
+                let board = shell.board_model(1_000);
+                let _ = shell.task_workspace_grid(tokens, size, &board, cx);
 
                 shell.controller_tick_for_test(0);
 
@@ -70039,7 +70076,8 @@ pub(crate) mod tests {
                     record,
                     test_conversation_assistant_page(4, 0, 4, "seven days of history"),
                 );
-                let _ = shell.task_workspace_grid(tokens, size, cx);
+                let board = shell.board_model(1_000);
+                let _ = shell.task_workspace_grid(tokens, size, &board, cx);
                 assert_eq!(
                     shell
                         .host_slot(&local)
@@ -70107,7 +70145,8 @@ pub(crate) mod tests {
 
                 let tokens = shell.preferences.tokens();
                 let size = gpui::size(gpui::px(1900.0), gpui::px(700.0));
-                let _ = shell.task_workspace_grid(tokens, size, cx);
+                let board = shell.board_model(1_000);
+                let _ = shell.task_workspace_grid(tokens, size, &board, cx);
                 assert!(
                     shell
                         .host_slot(&local)
@@ -70144,7 +70183,8 @@ pub(crate) mod tests {
                         .conversation_answered(second_key.clone()),
                     "an answer of zero facts is still an answer"
                 );
-                let _ = shell.task_workspace_grid(tokens, size, cx);
+                let board = shell.board_model(1_000);
+                let _ = shell.task_workspace_grid(tokens, size, &board, cx);
                 assert!(
                     shell.honest_empty_conversation_for(&second_key),
                     "an answered, genuinely empty conversation must still say so"
