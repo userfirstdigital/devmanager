@@ -72,12 +72,6 @@ pub const SECONDARY_FONT_SIZE: f32 = 11.0;
 /// Captions (rule 2).
 pub const CAPTION_FONT_SIZE: f32 = 10.5;
 
-/// Default buttons: 11 px, padding 2x8, radius 6, border only (rule 4).
-pub const BUTTON_FONT_SIZE: f32 = 11.0;
-pub const BUTTON_PADDING_X: f32 = 8.0;
-pub const BUTTON_PADDING_Y: f32 = 2.0;
-pub const BUTTON_RADIUS: f32 = 6.0;
-
 /// Inputs: `surfaces.sunken`, 1 px border, radius 4 (rule 3).
 pub const INPUT_RADIUS: f32 = 4.0;
 pub const INPUT_PADDING_X: f32 = 8.0;
@@ -370,53 +364,6 @@ pub fn quiet_toggle(on: bool, tokens: ThemeTokens) -> AnyElement {
             }
         })
         .child(knob)
-        .into_any_element()
-}
-
-/// A default button (rule 4): no fill, one hairline, 11 px `text.primary`.
-pub fn quiet_button_chrome(tokens: ThemeTokens) -> Div {
-    div()
-        .flex_none()
-        .flex()
-        .items_center()
-        .px(px(BUTTON_PADDING_X))
-        .py(px(BUTTON_PADDING_Y))
-        .rounded(px(BUTTON_RADIUS))
-        .border(px(OVERLAY_BORDER_WIDTH))
-        .border_color(tokens.borders.default.to_gpui())
-        .text_size(px(BUTTON_FONT_SIZE))
-        .text_color(tokens.text.primary.to_gpui())
-}
-
-/// A settings row: full width, two lines of copy on the left, one control on
-/// the right, a hairline under it. No card, no fill (rules 3, 5).
-pub fn settings_row(
-    id: impl Into<ElementId>,
-    title: impl Into<String>,
-    detail: Option<String>,
-    control: Option<AnyElement>,
-    tokens: ThemeTokens,
-) -> AnyElement {
-    div()
-        .id(id)
-        .w_full()
-        .px(px(ROW_PADDING_X))
-        .py(px(ROW_PADDING_Y))
-        .flex()
-        .items_center()
-        .gap(px(CONTROL_GAP))
-        .border_b(px(OVERLAY_BORDER_WIDTH))
-        .border_color(tokens.borders.subtle.to_gpui())
-        .child(
-            div()
-                .flex_1()
-                .min_w(px(0.0))
-                .flex()
-                .flex_col()
-                .child(row_title(title, OverlayRowState::Idle, tokens))
-                .children(detail.map(|detail| row_meta(detail, OverlayRowState::Idle, tokens))),
-        )
-        .children(control)
         .into_any_element()
 }
 
