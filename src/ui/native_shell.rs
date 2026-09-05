@@ -73446,20 +73446,29 @@ pub(crate) mod tests {
                 "`fn {body}` still paints the `○` glyph rule 9 has no room for"
             );
         }
-        // The survivors: the shared `empty_state` is still defined and still
-        // has callers outside the two bodies above, so this scan cannot go
-        // green by the whole helper having been deleted.
+        // The survivors, BY NAME rather than by count. This assertion used to
+        // be `callers >= 3`, and fix wave 1 F6 moved one of the three -- the
+        // empty conversation -- onto the left-aligned `stream_hold_element`,
+        // because a stream says it is empty on its own first line rather than
+        // in a centred band. A floor of three would have gone red for a change
+        // it was never written to catch, and lowering it to two would have
+        // been a threshold nobody could read a second time. Naming the two
+        // remaining owners is strictly stronger: it still cannot go green by
+        // the helper having been deleted or emptied, and it now also fails if
+        // either surface quietly stops using it.
         assert!(
             shell.contains(concat!("fn empty", "_state(")),
             "the shared empty-state helper is gone; the surfaces that legitimately \
              use it have lost their copy"
         );
-        let other_callers = shell.matches(concat!("Self::empty", "_state(")).count();
-        assert!(
-            other_callers >= 3,
-            "only {other_callers} callers of the shared empty state survive; this \
-             lane should have moved two dock bodies off it, not emptied it"
-        );
+        for owner in ["inbox_empty_state", "setup_intro"] {
+            let slice = shell_method_body(&shell, owner);
+            assert!(
+                slice.contains(concat!("Self::empty", "_state(")),
+                "`fn {owner}` no longer paints the shared empty state, so this scan \
+                 has nothing left to prove the helper is live"
+            );
+        }
     }
 
     /// The Files, Changes, Artifacts, Review and Browser bodies are lane R2's
