@@ -315,11 +315,18 @@ pub fn board_row_element(
             div()
                 .flex_1()
                 .min_w(px(0.0))
-                .truncate()
+                .overflow_hidden()
                 .text_size(px(TITLE_FONT_SIZE))
                 .line_height(px(TITLE_LINE_HEIGHT))
                 .text_color(title_colour.to_gpui())
-                .child(row.title.clone()),
+                // The ellipsis needs a DEFINITE width. `truncate()` on the flex
+                // item itself gave a hard clip -- a `flex-basis: 0` item is
+                // measured with unbounded available space, so the text laid out
+                // at full length inside an overflow-hidden box and ran flush
+                // into the ordinal chip beside it. `w_full` on an inner child
+                // resolves against the item's settled width, which is the one
+                // number GPUI's measure pass will accept.
+                .child(div().w_full().truncate().child(row.title.clone())),
         )
         // The open marker sits at the right end of the title line, before the
         // age: the same number the panel's own header carries, so the row and
@@ -351,8 +358,10 @@ pub fn board_row_element(
                 div()
                     .flex_1()
                     .min_w(px(0.0))
-                    .truncate()
-                    .child(second_line_text(row)),
+                    .overflow_hidden()
+                    // Same shape, same reason as the title line above: the meta
+                    // line runs into the plan strip without it.
+                    .child(div().w_full().truncate().child(second_line_text(row))),
             )
             .children(
                 row.progress
@@ -919,5 +928,60 @@ mod tests {
         assert!(!state_paint(BoardState::Working, tokens).1);
         assert!(!state_paint(BoardState::Idle, tokens).1);
         assert!(!state_paint(BoardState::Done, tokens).1);
+    }
+
+    /// F10: a board row's two labels truncate against a DEFINITE width, so the
+    /// title ellipses before the ordinal chip instead of running into it, and
+    /// the meta line ellipses before the plan strip.
+    ///
+    /// A source scan because the failure is a layout one: `truncate()` on a
+    /// `flex-basis: 0` item is measured with unbounded available space, lays
+    /// the text out at full length and is then clipped by `overflow_hidden` --
+    /// which looks exactly like an ellipsis that was never asked for. No pure
+    /// assertion over the constants can see it.
+    #[test]
+    fn a_board_rows_labels_truncate_against_a_definite_width() {
+        let source = include_str!("render.rs");
+        let painter = source
+            .split("#[cfg(test)]")
+            .next()
+            .expect("the painter is everything above its tests");
+        let row = painter
+            .split("let title_line = div()")
+            .nth(1)
+            .expect("the row painter builds a title line")
+            .split("\n    div()")
+            .next()
+            .expect("everything up to the row's own outer element");
+        // Whitespace-stripped so `cargo fmt` breaking the builder chain over
+        // three lines cannot quietly turn either assertion vacuous.
+        let compact: String = row.chars().filter(|c| !c.is_whitespace()).collect();
+        assert_eq!(
+            compact.matches(".truncate()").count(),
+            2,
+            "a row has exactly two truncating labels: its title and its meta line"
+        );
+        assert_eq!(
+            compact.matches(".w_full().truncate()").count(),
+            2,
+            "every truncating label must resolve its width through an inner w_full child"
+        );
+    }
+
+    /// F10/F12: the row's own numbers. The column is the default a fresh
+    /// profile opens at -- still resizable, and clamped to the workspace
+    /// layout's own bounds, which this checks it sits inside.
+    #[test]
+    fn the_board_row_keeps_the_specs_column_and_type_scale() {
+        assert_eq!(crate::ui::board::layout::BOARD_COLUMN_WIDTH, 300.0);
+        assert!(
+            crate::ui::board::layout::BOARD_COLUMN_WIDTH >= crate::ui::workspace_layout::INBOX_MIN
+                && crate::ui::board::layout::BOARD_COLUMN_WIDTH
+                    <= crate::ui::workspace_layout::INBOX_MAX,
+            "the default column must survive the clamp it is stored behind"
+        );
+        assert_eq!(TITLE_FONT_SIZE, 12.0, "spec: board title 12");
+        assert_eq!(META_FONT_SIZE, 10.5, "spec: board meta 10.5");
+        assert!(META_FONT_SIZE < TITLE_FONT_SIZE);
     }
 }
