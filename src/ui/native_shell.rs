@@ -43573,13 +43573,6 @@ impl NativeShell {
         crate::ui::board::top_bar_element(&model, tokens, &handlers)
     }
 
-    /// How many rows the top bar's amber chip counts: the Needs-you group's
-    /// size, read from the same board model the chip's painter reads, so the
-    /// chip, the section heading and the accessibility node cannot disagree.
-    fn top_bar_needs_you_count(&mut self) -> usize {
-        crate::ui::board::needs_you_count(&self.board_model(unix_time_ms()))
-    }
-
     /// Select the row the needs-you chip counts first. Reads the same board
     /// model the chip's count came from, so the chip can never point at a row
     /// the board does not show.
