@@ -93,7 +93,11 @@ pub fn stream_hold_element(
 ///
 ///  * no timeline at all -> take the page, whatever it carries. An empty page
 ///    yields the honest "open and ready" empty state, which is a true sentence
-///    about a task with no events.
+///    about a task with no events -- and true ONLY because fix wave 2 made the
+///    paint path offer `admitted_conversation_page`, so a page reaching here at
+///    all is one the host answered. The registry's invented empty page for an
+///    unasked surface used to reach this arm, and this arm published it as a
+///    fact about the task.
 ///  * a timeline with no rows -> take the page only when it carries facts.
 ///    Reprojecting an empty timeline from another empty page would rebuild it
 ///    every frame for nothing.

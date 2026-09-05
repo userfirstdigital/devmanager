@@ -25,6 +25,14 @@ pub const CONVERSATION_RECOVERY_HEARTBEAT: Duration = Duration::from_secs(30);
 /// A task already projected as working gets one bounded completion check each
 /// second while it remains open. Idle tasks remain push-driven and do not poll.
 pub const WORKING_CONVERSATION_POLL_INTERVAL: Duration = Duration::from_secs(1);
+/// How often the unanswered-open-pane sweep may re-ask. It is a bounded retry
+/// cadence, not a poll: a pane leaves the sweep for good on its first answer,
+/// so this only paces the case where the ask could not be enqueued at all.
+pub const UNANSWERED_CONVERSATION_SWEEP_INTERVAL: Duration = Duration::from_millis(500);
+/// Panes asked per sweep. The same bound the background recovery wave uses, so
+/// a restored eight-pane workspace fills over four sweeps instead of putting
+/// eight queries on the action lane at once.
+pub const MAX_UNANSWERED_CONVERSATION_SWEEP: usize = 2;
 
 pub fn working_conversation_poll_due(
     projected_working: bool,
@@ -295,6 +303,13 @@ pub struct TaskSurfaceState {
     pub conversation: TaskConversationCache,
     pub conversation_generation: u64,
     pub conversation_in_flight: bool,
+    /// Whether a host reply has ever landed on this surface's conversation.
+    /// `false` is NOT "this task has no events" -- it is "nobody has answered
+    /// yet", which is the state EVERY open pane is in before its first reply.
+    /// The same distinction `strip: Option<..>` keeps for the terminal strip,
+    /// which the conversation cache cannot express on its own: a fresh cache
+    /// and a genuinely empty conversation are the same bytes.
+    conversation_answered: bool,
     /// Fair-scheduling watermark; lower values are admitted first on the next
     /// bounded background wave.
     pub last_conversation_scheduled_at: u64,
@@ -859,6 +874,33 @@ impl<K: Clone + Ord + Eq> TaskSurfaceRegistry<K> {
         self.state(task_id).map(|state| state.presentation_page())
     }
 
+    /// Whether anything real has landed on this surface's conversation: a host
+    /// reply of any length -- including a genuinely empty one -- or a local
+    /// optimistic user row.
+    ///
+    /// [`Self::conversation_page`] cannot answer this. It hands back an EMPTY
+    /// page for a surface [`Self::ensure_task`] merely registered, which is
+    /// every open pane before its first reply, so at that accessor "nobody has
+    /// asked yet" and "the host says this task has no events" are ONE fact. A
+    /// pane that installs a timeline from the first is claiming the second.
+    pub fn conversation_answered(&self, task_id: K) -> bool {
+        self.state(task_id).is_some_and(|state| {
+            state.conversation_answered || !state.pending_user_messages.is_empty()
+        })
+    }
+
+    /// The conversation page for a surface that has actually been answered.
+    ///
+    /// This is [`Self::conversation_page`] with the invented empty page for an
+    /// unanswered surface removed, so a caller that installs a timeline from it
+    /// cannot publish "this conversation is empty" about a task nobody has
+    /// asked the host about.
+    pub fn admitted_conversation_page(&self, task_id: K) -> Option<SemanticJournalPage> {
+        self.conversation_answered(task_id.clone())
+            .then(|| self.conversation_page(task_id))
+            .flatten()
+    }
+
     /// The durable conversation facts, borrowed, with the marker a caller
     /// memoizes on: `(through_sequence, high_water, len)`. Three parts because
     /// no one of them is sufficient -- a cursor rollover can replace history
@@ -909,6 +951,10 @@ impl<K: Clone + Ord + Eq> TaskSurfaceRegistry<K> {
             state.latest_snippet = state.presentation_latest_snippet().map(ToOwned::to_owned);
         }
         state.conversation_in_flight = false;
+        // An answer of zero facts is still an ANSWER. Recording it here is what
+        // lets a caller tell "the host says this task has no events" from "no
+        // one has asked yet", which `conversation_page` alone cannot.
+        state.conversation_answered = true;
         Ok(ConversationAdmission {
             page: changed.then(|| state.presentation_page()),
             changed,
@@ -2128,6 +2174,67 @@ mod tests {
         assert_eq!(cache.fact_count(), prior_facts);
         assert_eq!(cache.high_water(), 4);
         assert_eq!(cache.request_after_sequence(), 4);
+    }
+
+    /// `conversation_page` cannot tell "nobody has asked" from "the host says
+    /// this task has no events": it invents an empty page for any surface
+    /// `ensure_task` registered, which is every open pane before its first
+    /// reply. A pane that installs a timeline from that page publishes the
+    /// second claim while only the first is true. Both directions asserted --
+    /// an unasked surface is not answered, and an ANSWER of zero facts is.
+    #[test]
+    fn conversation_answered_separates_an_unasked_surface_from_an_empty_answer() {
+        let task = TaskId::new();
+        let mut registry = TaskSurfaceRegistry::default();
+        registry.ensure_task(task);
+
+        assert!(
+            registry.conversation_page(task).is_some(),
+            "the invented empty page is what makes the distinction necessary"
+        );
+        assert!(
+            !registry.conversation_answered(task),
+            "registering a surface is not an answer"
+        );
+        assert!(
+            registry.admitted_conversation_page(task).is_none(),
+            "an unanswered surface must offer no page to install a timeline from"
+        );
+
+        let empty = SemanticJournalPage {
+            oldest_sequence: 0,
+            cursor_rolled_over: false,
+            after_sequence: 0,
+            through_sequence: 0,
+            high_water: 0,
+            encoded_bytes: 0,
+            next_sequence: None,
+            facts: Vec::new(),
+        };
+        registry.begin_conversation(task, 1);
+        registry
+            .admit_conversation(task, 1, &empty)
+            .expect("admit an empty answer");
+        assert!(
+            registry.conversation_answered(task),
+            "an answer of zero facts is still an answer"
+        );
+        assert!(
+            registry
+                .admitted_conversation_page(task)
+                .is_some_and(|page| page.facts.is_empty()),
+            "the answered-but-empty page is what paints the honest empty state"
+        );
+
+        // A local optimistic user row is real content on a surface the host has
+        // never answered, so it must not be withheld from the pane either.
+        let pending_task = TaskId::new();
+        let mut registry = TaskSurfaceRegistry::default();
+        registry.admit_pending_user_message(pending_task, "hello", CommandId::new());
+        assert!(
+            registry.conversation_answered(pending_task),
+            "an optimistic user row is content the pane must paint"
+        );
     }
 
     #[test]
