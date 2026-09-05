@@ -4,6 +4,7 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::domain::TaskId;
+use crate::ui::task_workspace::allocation::AllocatedWorkspace;
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
 pub struct PaneId(Uuid);
@@ -410,6 +411,92 @@ impl<K: Clone + Ord + Eq> Workspace<K> {
             }
             (None, None) => {}
         }
+    }
+
+    /// The pane the eye would land on moving `edge`-ward from the focused one.
+    ///
+    /// Geometry, not tree order: `⌘→` means "the panel to the right of this
+    /// one on screen", and the tree's sibling order answers a different
+    /// question (a pane can be the next sibling and be painted below). The
+    /// rects are the ones the shell last allocated, so the answer is about
+    /// what is actually on screen at this window size rather than about a
+    /// nominal layout nobody is looking at.
+    ///
+    /// Ties -- two panes stacked at the same distance to the right -- go to the
+    /// one whose centre is closest to the focused pane's own axis, which is the
+    /// one a person would say is "across from" it.
+    pub fn pane_toward(&self, edge: Edge, allocated: &AllocatedWorkspace<K>) -> Option<PaneId> {
+        let focused = self.focused?;
+        let origin = allocated.rect(self.pane(focused)?.task_id.clone())?;
+        let (origin_x, origin_y) = (
+            origin.x + origin.width / 2.0,
+            origin.y + origin.height / 2.0,
+        );
+        let mut best: Option<(f32, f32, PaneId)> = None;
+        for task_id in self.task_ids() {
+            let Some(pane) = self.pane_for_task(task_id.clone()) else {
+                continue;
+            };
+            if pane.id == focused {
+                continue;
+            }
+            let Some(rect) = allocated.rect(task_id) else {
+                continue;
+            };
+            let centre_x = rect.x + rect.width / 2.0;
+            let centre_y = rect.y + rect.height / 2.0;
+            // The forward distance must be strictly positive: a pane whose
+            // centre sits on the same axis is beside this one, not toward the
+            // edge, and admitting it would make `⌘←` and `⌘→` both answer with
+            // the same neighbour.
+            let (forward, sideways) = match edge {
+                Edge::Left => (origin_x - centre_x, (centre_y - origin_y).abs()),
+                Edge::Right => (centre_x - origin_x, (centre_y - origin_y).abs()),
+                Edge::Top => (origin_y - centre_y, (centre_x - origin_x).abs()),
+                Edge::Bottom => (centre_y - origin_y, (centre_x - origin_x).abs()),
+            };
+            if forward <= 0.0 {
+                continue;
+            }
+            let better = match best {
+                None => true,
+                Some((best_forward, best_sideways, _)) => {
+                    forward < best_forward || (forward == best_forward && sideways < best_sideways)
+                }
+            };
+            if better {
+                best = Some((forward, sideways, pane.id));
+            }
+        }
+        best.map(|(_, _, pane_id)| pane_id)
+    }
+
+    /// Move focus one pane toward `edge`. Returns whether focus moved.
+    ///
+    /// Nothing that way is an ordinary answer at the edge of the workspace, not
+    /// a fault -- but it is said out loud, because a chord that silently does
+    /// nothing is indistinguishable from a chord that never arrived.
+    pub fn focus_pane_toward(&mut self, edge: Edge, allocated: &AllocatedWorkspace<K>) -> bool {
+        let Some(target) = self.pane_toward(edge, allocated) else {
+            eprintln!("devmanager: no pane lies {edge:?} of the focused pane");
+            return false;
+        };
+        self.focus_pane(target).is_ok()
+    }
+
+    /// Move the focused pane past its `edge`-ward neighbour, landing on that
+    /// neighbour's far side so the pane keeps travelling in the direction the
+    /// arrow named. Returns whether the tree changed.
+    pub fn move_pane_toward(&mut self, edge: Edge, allocated: &AllocatedWorkspace<K>) -> bool {
+        let Some(target) = self.pane_toward(edge, allocated) else {
+            eprintln!("devmanager: no pane lies {edge:?} of the focused pane to move past");
+            return false;
+        };
+        let Some(source) = self.focused else {
+            return false;
+        };
+        self.move_pane(source, DropTarget::Edge { pane: target, edge })
+            .is_ok()
     }
 
     pub fn focus_task(&mut self, task_id: K) -> Result<(), WorkspaceError> {
@@ -1096,6 +1183,91 @@ fn validate_node<K: Clone + Ord + Eq>(
 mod tests {
     use super::*;
     use crate::domain::TaskId;
+    use crate::ui::task_workspace::allocation::{AllocationMetrics, Viewport};
+
+    /// Four panes in a 2x2: 1 top-left, 3 bottom-left, 2 top-right, 4
+    /// bottom-right. Built through the ordinary insert path so the tree is one
+    /// the shell can actually produce, and returned with 1 focused.
+    fn quad() -> Workspace<u32> {
+        let mut workspace = Workspace::single(1u32);
+        workspace
+            .insert_after_focused(2u32, Axis::Horizontal)
+            .expect("second pane");
+        workspace.focus_task(1u32).expect("focus 1");
+        workspace
+            .insert_after_focused(3u32, Axis::Vertical)
+            .expect("third pane");
+        workspace.focus_task(2u32).expect("focus 2");
+        workspace
+            .insert_after_focused(4u32, Axis::Vertical)
+            .expect("fourth pane");
+        workspace.focus_task(1u32).expect("focus 1");
+        workspace
+    }
+
+    fn quad_rects(workspace: &Workspace<u32>) -> AllocatedWorkspace<u32> {
+        workspace.clone().allocate(
+            Viewport::new(1200.0, 800.0),
+            AllocationMetrics::production(),
+        )
+    }
+
+    #[test]
+    fn directional_focus_reads_the_screen_not_the_tree() {
+        let mut workspace = quad();
+        let rects = quad_rects(&workspace);
+        // 1 is top-left: right is 2, down is 3, and there is nothing above or
+        // to the left of it.
+        assert!(workspace.focus_pane_toward(Edge::Right, &rects));
+        assert_eq!(workspace.focused_task(), Some(2));
+        assert!(workspace.focus_pane_toward(Edge::Bottom, &rects));
+        assert_eq!(workspace.focused_task(), Some(4));
+        assert!(workspace.focus_pane_toward(Edge::Left, &rects));
+        assert_eq!(workspace.focused_task(), Some(3));
+        assert!(workspace.focus_pane_toward(Edge::Top, &rects));
+        assert_eq!(workspace.focused_task(), Some(1));
+    }
+
+    #[test]
+    fn directional_focus_at_the_edge_of_the_workspace_is_a_no_op() {
+        let mut workspace = quad();
+        let rects = quad_rects(&workspace);
+        assert!(!workspace.focus_pane_toward(Edge::Left, &rects));
+        assert!(!workspace.focus_pane_toward(Edge::Top, &rects));
+        assert_eq!(workspace.focused_task(), Some(1));
+    }
+
+    #[test]
+    fn moving_a_pane_toward_an_edge_lands_it_past_that_neighbour() {
+        let mut workspace = quad();
+        let rects = quad_rects(&workspace);
+        assert!(workspace.move_pane_toward(Edge::Right, &rects));
+        // The tree still holds every pane and 1 is still the focused one: a
+        // move is a relocation, not a close and not a focus change.
+        let mut ids = workspace.task_ids();
+        ids.sort();
+        assert_eq!(ids, vec![1, 2, 3, 4]);
+        assert_eq!(workspace.focused_task(), Some(1));
+        // 1 now sits to the right of 2, which is what "move right" means.
+        let moved = quad_rects(&workspace);
+        let one = moved.rect(1).expect("pane 1 rect");
+        let two = moved.rect(2).expect("pane 2 rect");
+        assert!(
+            one.x > two.x,
+            "pane 1 at x={} must sit right of pane 2 at x={}",
+            one.x,
+            two.x
+        );
+    }
+
+    #[test]
+    fn moving_a_pane_with_nothing_that_way_leaves_the_tree_alone() {
+        let mut workspace = quad();
+        let rects = quad_rects(&workspace);
+        let before = workspace.clone();
+        assert!(!workspace.move_pane_toward(Edge::Left, &rects));
+        assert_eq!(workspace, before);
+    }
 
     #[test]
     fn a_pane_defaults_to_the_conversation_view_and_remembers_a_set_view() {
