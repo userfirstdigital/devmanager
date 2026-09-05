@@ -121,9 +121,18 @@ use crate::ui::task_cockpit::changes_panel::{
     reconcile_selected_repository, repository_mutation_allowed, repository_status_readable,
 };
 use crate::ui::task_cockpit::composer::{
-    provider_command_catalog, provider_command_opens_terminal, AnswerPayload, ApprovalDecision,
-    ComposerControl, ComposerDraftProjection, ComposerError, ComposerFence, ComposerHostProjection,
-    ComposerIntent, ComposerPayload, ProviderCommandSuggestion, TaskComposer,
+    composer_send_look, composer_send_tints, provider_command_catalog,
+    provider_command_opens_terminal, AnswerPayload, ApprovalDecision, ComposerControl,
+    ComposerDraftProjection, ComposerError, ComposerFence, ComposerHostProjection, ComposerIntent,
+    ComposerPayload, ComposerSendLook, ProviderCommandSuggestion, TaskComposer,
+    COMPOSER_ATTACHMENT_THUMBNAIL, COMPOSER_BORDER_WIDTH, COMPOSER_BUTTON_FONT_SIZE,
+    COMPOSER_BUTTON_PADDING_X, COMPOSER_BUTTON_PADDING_Y, COMPOSER_BUTTON_RADIUS,
+    COMPOSER_CAPTION_FONT_SIZE, COMPOSER_CHIP_FONT_SIZE, COMPOSER_CHIP_GAP,
+    COMPOSER_CHIP_LABEL_MAX_WIDTH, COMPOSER_CHIP_PADDING_X, COMPOSER_CHIP_PADDING_Y,
+    COMPOSER_CHIP_RADIUS, COMPOSER_CONTROL_GAP, COMPOSER_FONT_SIZE, COMPOSER_HEIGHT_RESERVE,
+    COMPOSER_ICON_BUTTON_SIZE, COMPOSER_ICON_GLYPH_SIZE, COMPOSER_INPUT_MIN_HEIGHT,
+    COMPOSER_LINE_HEIGHT, COMPOSER_PADDING_X, COMPOSER_PADDING_Y, COMPOSER_RADIUS,
+    COMPOSER_REGION_PADDING, COMPOSER_ROW_PADDING_Y, COMPOSER_SECONDARY_FONT_SIZE,
 };
 use crate::ui::task_cockpit::dock::{DockEdge, DockTool as CockpitDockTool};
 use crate::ui::task_cockpit::draft_store::{
@@ -416,12 +425,11 @@ const HOST_BOOTSTRAP_REATTACH_TICKS: usize = 60;
 const IDLE_PHOTO_FETCH_TIMEOUT: Duration = Duration::from_secs(8);
 #[cfg_attr(test, allow(dead_code))]
 const IDLE_PHOTO_MAX_BYTES: u64 = 8 * 1024 * 1024;
-const CONVERSATION_COMPOSER_HEIGHT_RESERVE: f32 = 200.0;
-const CONVERSATION_COMPOSER_OUTER_RADIUS: f32 = 22.0;
-const CONVERSATION_COMPOSER_INNER_RADIUS: f32 = 20.0;
-const CONVERSATION_COMPOSER_CONTEXT_INSET: f32 = 22.0;
-const CONVERSATION_COMPOSER_SEND_DIAMETER: f32 = 28.0;
-const CONVERSATION_COMPOSER_INPUT_MIN_HEIGHT: f32 = 88.0;
+// The composer's geometry now lives beside the composer model, in
+// `task_cockpit::composer`, so the shell that paints it and the module that
+// owns it cannot describe two different composers. The 22 px outer/inner pill
+// radii, the 22 px context inset and the 28 px filled send disc are gone with
+// the pill they described.
 /// The archived browser's row: title, project and branch on three lines.
 const ARCHIVED_ROW_HEIGHT: f32 = 78.0;
 const T3_WORKSPACE_TOPBAR_HEIGHT: f32 = 32.0;
@@ -12638,7 +12646,7 @@ impl NativeShell {
             composer_pointer_selecting: false,
             composer_input_bounds: None,
             composer_painted_layout: None,
-            composer_draft_content_height: CONVERSATION_COMPOSER_INPUT_MIN_HEIGHT - 42.0,
+            composer_draft_content_height: COMPOSER_INPUT_MIN_HEIGHT - 42.0,
             composer_scroll_handle: gpui::ScrollHandle::new(),
             theme_editor_scroll_handle: gpui::ScrollHandle::new(),
             composer_selector_scroll_handle: gpui::ScrollHandle::new(),
@@ -21672,13 +21680,16 @@ impl NativeShell {
                             tokens.scrollbar,
                             tokens.surfaces.overlay,
                         ))
+                        // Rule 7: `surfaces.overlay`, 1 px `borders.default`,
+                        // radius 6, rows at 11 px, bounded height with the
+                        // app scrollbar above.
                         .p(px(4.0))
-                        .rounded(px(6.0))
+                        .rounded(px(COMPOSER_RADIUS))
                         .bg(tokens.surfaces.overlay.to_gpui())
-                        .border(px(1.0))
-                        .border_color(tokens.borders.subtle.to_gpui())
+                        .border(px(COMPOSER_BORDER_WIDTH))
+                        .border_color(tokens.borders.default.to_gpui())
                         .shadow_sm()
-                        .text_size(px(11.0))
+                        .text_size(px(COMPOSER_SECONDARY_FONT_SIZE))
                         .on_mouse_down(
                             MouseButton::Left,
                             cx.listener(|_shell, _event: &MouseDownEvent, _window, cx| {
@@ -25481,7 +25492,7 @@ impl NativeShell {
             .flatten();
         let timeline_height = (f32::from(idle_photo_size.height)
             - if show_input {
-                CONVERSATION_COMPOSER_HEIGHT_RESERVE
+                COMPOSER_HEIGHT_RESERVE
             } else {
                 0.0
             })
@@ -25763,9 +25774,13 @@ impl NativeShell {
                 .overflow_hidden()
                 .flex()
                 .flex_col()
-                .rounded(px(tokens.density.radii.lg))
-                .border(px(1.0))
-                .border_color(tokens.borders.subtle.to_gpui())
+                // Rule 7: an overlay is `surfaces.overlay` behind a 1 px
+                // `borders.default` rule at radius 6, with the one elevation
+                // rule 1 allows. Its rows are rule 5's: full width, 5x10, a
+                // `text.primary` title with a `text.muted` note beside it.
+                .rounded(px(COMPOSER_RADIUS))
+                .border(px(COMPOSER_BORDER_WIDTH))
+                .border_color(tokens.borders.default.to_gpui())
                 .bg(tokens.surfaces.overlay.to_gpui())
                 .shadow_sm()
                 .children(
@@ -25785,23 +25800,39 @@ impl NativeShell {
                                 .w_full()
                                 .flex()
                                 .items_center()
-                                .gap(px(tokens.density.spacing.sm))
-                                .px(px(tokens.density.spacing.md))
-                                .py(px(tokens.density.spacing.xs))
+                                .gap(px(COMPOSER_CONTROL_GAP))
+                                .px(px(COMPOSER_PADDING_X))
+                                .py(px(COMPOSER_ROW_PADDING_Y))
+                                .text_size(px(COMPOSER_FONT_SIZE))
                                 .bg(if index == selected {
                                     tokens.surfaces.selection.to_gpui()
                                 } else {
                                     tokens.surfaces.overlay.to_gpui()
                                 })
+                                .hover(move |style| {
+                                    if index == selected {
+                                        style
+                                    } else {
+                                        style.bg(tokens.surfaces.hover.to_gpui())
+                                    }
+                                })
                                 .on_click(choose)
                                 .child(
                                     div()
-                                        .min_w(px(112.0))
-                                        .text_color(tokens.text.primary.to_gpui())
+                                        .min_w(px(COMPOSER_CHIP_LABEL_MAX_WIDTH * 0.7))
+                                        .text_color(if index == selected {
+                                            tokens.text.emphasis.to_gpui()
+                                        } else {
+                                            tokens.text.primary.to_gpui()
+                                        })
                                         .child(suggestion.command),
                                 )
                                 .child(
                                     div()
+                                        .min_w(px(0.0))
+                                        .overflow_hidden()
+                                        .whitespace_nowrap()
+                                        .text_ellipsis()
                                         .text_color(tokens.text.muted.to_gpui())
                                         .child(suggestion.label),
                                 )
@@ -25839,46 +25870,68 @@ impl NativeShell {
                     shell.remove_native_composer_image(image_id);
                     cx.notify();
                 });
+                // Rule 7: an attachment is a chip -- 10.5 px behind a 1 px
+                // `borders.default` rule at radius 4, one line tall, with the
+                // thumbnail inside it rather than a 40 px card under it. Its
+                // remove affordance is rule 4's icon button, not a labelled
+                // one, so the chip reads as a token beside the draft.
                 div()
                     .id(("native-composer-image-chip", image.id))
                     .flex()
                     .items_center()
-                    .gap(px(tokens.density.spacing.xs))
-                    .px(px(tokens.density.spacing.sm))
-                    .py(px(tokens.density.spacing.xxs))
-                    .rounded(px(tokens.density.radii.md))
-                    .border(px(1.0))
-                    .border_color(tokens.borders.subtle.to_gpui())
-                    .bg(tokens.surfaces.sunken.to_gpui())
+                    .gap(px(COMPOSER_CHIP_PADDING_X))
+                    .px(px(COMPOSER_CHIP_PADDING_X))
+                    .py(px(COMPOSER_CHIP_PADDING_Y))
+                    .rounded(px(COMPOSER_CHIP_RADIUS))
+                    .border(px(COMPOSER_BORDER_WIDTH))
+                    .border_color(tokens.borders.default.to_gpui())
                     .child(
                         div()
                             .flex_none()
-                            .w(px(40.0))
-                            .h(px(40.0))
-                            .rounded(px(tokens.density.radii.sm))
+                            .w(px(COMPOSER_ATTACHMENT_THUMBNAIL))
+                            .h(px(COMPOSER_ATTACHMENT_THUMBNAIL))
+                            .rounded(px(COMPOSER_CHIP_RADIUS))
                             .overflow_hidden()
                             .child(
                                 img(ImageSource::Render(preview))
-                                    .w(px(40.0))
-                                    .h(px(40.0))
+                                    .w(px(COMPOSER_ATTACHMENT_THUMBNAIL))
+                                    .h(px(COMPOSER_ATTACHMENT_THUMBNAIL))
                                     .object_fit(ObjectFit::Cover),
                             ),
                     )
                     .child(
                         div()
-                            .max_w(px(220.0))
+                            .max_w(px(COMPOSER_CHIP_LABEL_MAX_WIDTH))
                             .overflow_hidden()
-                            .text_size(px(tokens.density.typography.caption))
-                            .text_color(tokens.text.secondary.to_gpui())
+                            .whitespace_nowrap()
+                            .text_ellipsis()
+                            .text_size(px(COMPOSER_CHIP_FONT_SIZE))
+                            .text_color(tokens.text.muted.to_gpui())
                             .child(image.label.clone()),
                     )
-                    .child(
-                        Button::new(("native-task-composer-remove-image", image.id))
-                            .label("Remove")
-                            .ghost()
-                            .disabled(composer_pending)
-                            .on_click(remove),
-                    )
+                    .child({
+                        let remove_control = div()
+                            .id(("native-task-composer-remove-image", image.id))
+                            .flex_none()
+                            .size(px(COMPOSER_ICON_GLYPH_SIZE))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .child(crate::icons::app_icon(
+                                crate::icons::X,
+                                COMPOSER_CHIP_FONT_SIZE,
+                                if composer_pending {
+                                    tokens.text.disabled.to_u32()
+                                } else {
+                                    tokens.text.muted.to_u32()
+                                },
+                            ));
+                        if composer_pending {
+                            remove_control
+                        } else {
+                            remove_control.cursor_pointer().on_click(remove)
+                        }
+                    })
                     .into_any_element()
             })
             .collect::<Vec<_>>();
@@ -25922,10 +25975,25 @@ impl NativeShell {
                     shell.activate_composer_answer_option(index, selected_label.clone());
                     cx.notify();
                 });
-                Button::new(("native-question-option", index))
-                    .label(label)
-                    .ghost()
+                // Rule 4's default button: 1 px `borders.default`, no fill,
+                // an 11 px `text.primary` label at 2x8 padding and radius 6,
+                // with `surfaces.hover` under the pointer. A ghost button had
+                // no rule at all, so a row of answers read as loose text.
+                div()
+                    .id(("native-question-option", index))
+                    .tab_stop(true)
+                    .flex_none()
+                    .px(px(COMPOSER_BUTTON_PADDING_X))
+                    .py(px(COMPOSER_BUTTON_PADDING_Y))
+                    .rounded(px(COMPOSER_BUTTON_RADIUS))
+                    .border(px(COMPOSER_BORDER_WIDTH))
+                    .border_color(tokens.borders.default.to_gpui())
+                    .text_size(px(COMPOSER_BUTTON_FONT_SIZE))
+                    .text_color(tokens.text.primary.to_gpui())
+                    .cursor_pointer()
+                    .hover(move |style| style.bg(tokens.surfaces.hover.to_gpui()))
                     .on_click(select)
+                    .child(label)
                     .into_any_element()
             })
             .collect::<Vec<_>>();
@@ -25938,16 +26006,14 @@ impl NativeShell {
             .task_surfaces
             .state(owner.clone())
             .and_then(|state| state.center_loading_state(showing_provider_terminal));
-        let composer_hairline = mix_color(tokens.surfaces.canvas, tokens.borders.subtle, 0.65);
         let composer_pill = |label: &str| {
             div()
                 .flex()
                 .items_center()
-                .h(px(24.0))
-                .px(px(6.0))
-                .py(px(2.0))
-                .text_size(px(11.0))
-                .text_color(tokens.text.secondary.to_gpui())
+                .h(px(COMPOSER_ICON_BUTTON_SIZE))
+                .px(px(COMPOSER_CHIP_PADDING_X))
+                .text_size(px(COMPOSER_SECONDARY_FONT_SIZE))
+                .text_color(tokens.text.muted.to_gpui())
                 .child(label.to_string())
                 .into_any_element()
         };
@@ -26046,32 +26112,37 @@ impl NativeShell {
                 .and_then(|ctl| ctl.usage_summary_for(instance_id))
                 .map(|summary| composer_pill(&summary))
         };
+        // Rule 4: the send control is an icon button -- a 24 px hit box, no
+        // border, no fill, `text.muted` at rest and `text.primary` on hover.
+        // It replaces a 28 px accent-filled disc, which rule 1 spends only on
+        // status. DEVIATION: the glyph stays the arrow character rather than a
+        // lucide mark, because `crate::icons` carries no send glyph and an
+        // `svg()` takes its colour at build time, so it cannot brighten on
+        // hover -- text can, which is the half of rule 4 that is behaviour.
+        let send_look = composer_send_look(send_enabled, composer_pending);
+        let (send_rest, send_hover) = composer_send_tints(send_look, tokens);
+        let send_glyph = match send_look {
+            ComposerSendLook::Busy => "…",
+            ComposerSendLook::Ready | ComposerSendLook::Idle => "↑",
+        };
         let send_base = div()
             .id("native-task-composer-send")
             .flex_none()
-            .size(px(CONVERSATION_COMPOSER_SEND_DIAMETER))
-            .rounded_full()
+            .size(px(COMPOSER_ICON_BUTTON_SIZE))
+            .rounded(px(COMPOSER_CHIP_RADIUS))
             .flex()
             .items_center()
             .justify_center()
-            .text_size(px(tokens.density.typography.body))
-            .font_weight(FontWeight::SEMIBOLD);
+            .text_size(px(COMPOSER_ICON_GLYPH_SIZE))
+            .text_color(send_rest.to_gpui())
+            .child(send_glyph);
         let send_control = if send_enabled {
             send_base
                 .cursor_pointer()
-                .bg(tokens.actions.primary.default.background.to_gpui())
-                .text_color(tokens.actions.primary.default.foreground.to_gpui())
+                .hover(move |style| style.text_color(send_hover.to_gpui()))
                 .on_click(send)
-                .child("↑")
         } else {
             send_base
-                .bg(tokens.surfaces.disabled.to_gpui())
-                .text_color(tokens.text.disabled.to_gpui())
-                .child(if send_available && !startup_loading {
-                    "↑"
-                } else {
-                    "…"
-                })
         };
         let owns_input = show_input && self.selected_task_key.as_ref() == Some(&owner);
         let composer_footer = if !owns_input {
@@ -26084,9 +26155,9 @@ impl NativeShell {
                 .id("native-task-composer")
                 .w_full()
                 .flex_none()
-                .px(px(16.0))
-                .pb(px(12.0))
-                .pt(px(8.0))
+                .px(px(COMPOSER_REGION_PADDING))
+                .pb(px(COMPOSER_REGION_PADDING))
+                .pt(px(COMPOSER_CONTROL_GAP))
                 .flex()
                 .flex_col()
                 .gap(px(0.0))
@@ -26105,34 +26176,34 @@ impl NativeShell {
                             .id("native-task-composer-card")
                             .w(px(CONVERSATION_CONTENT_MAX_WIDTH))
                             .max_w_full()
-                            // The one-pixel padding is the ring. This is a
-                            // surface recipe, not another field border.
-                            .p(px(1.0))
-                            .rounded_tl(px(CONVERSATION_COMPOSER_OUTER_RADIUS))
-                            .rounded_tr(px(CONVERSATION_COMPOSER_OUTER_RADIUS))
-                            .bg(if self.composer_accessibility_focused {
+                            // Rule 3: an input is `surfaces.sunken` behind a
+                            // real 1 px `borders.default` rule at radius 6 --
+                            // `borders.focus` while it has focus (rule 11).
+                            // The old shape was a 22 px pill whose "border"
+                            // was a one-pixel background ring under a drop
+                            // shadow, which rule 1 does not allow.
+                            .rounded(px(COMPOSER_RADIUS))
+                            .border(px(COMPOSER_BORDER_WIDTH))
+                            .border_color(if self.composer_accessibility_focused {
                                 tokens.borders.focus.to_gpui()
                             } else {
-                                composer_hairline.to_gpui()
+                                tokens.borders.default.to_gpui()
                             })
-                            .shadow_md()
+                            .bg(tokens.surfaces.sunken.to_gpui())
                             .child(
                                 div()
                                     .w_full()
-                                    .rounded_tl(px(CONVERSATION_COMPOSER_INNER_RADIUS))
-                                    .rounded_tr(px(CONVERSATION_COMPOSER_INNER_RADIUS))
-                                    .bg(tokens.surfaces.raised.to_gpui())
                                     .flex()
                                     .flex_col()
                                     .children((!question_option_buttons.is_empty()).then(|| {
                                         div()
                                             .id("native-question-options")
                                             .w_full()
-                                            .px(px(16.0))
-                                            .pt(px(14.0))
+                                            .px(px(COMPOSER_PADDING_X))
+                                            .pt(px(COMPOSER_CONTROL_GAP))
                                             .flex()
                                             .flex_wrap()
-                                            .gap(px(tokens.density.spacing.xs))
+                                            .gap(px(COMPOSER_CHIP_GAP))
                                             .children(question_option_buttons)
                                             .into_any_element()
                                     }))
@@ -26140,11 +26211,11 @@ impl NativeShell {
                                         div()
                                             .id("native-task-composer-attachments")
                                             .w_full()
-                                            .px(px(16.0))
-                                            .pt(px(14.0))
+                                            .px(px(COMPOSER_PADDING_X))
+                                            .pt(px(COMPOSER_CONTROL_GAP))
                                             .flex()
                                             .flex_wrap()
-                                            .gap(px(tokens.density.spacing.xs))
+                                            .gap(px(COMPOSER_CHIP_GAP))
                                             .children(image_chips)
                                             .into_any_element()
                                     }))
@@ -26153,7 +26224,7 @@ impl NativeShell {
                                             .id("native-task-composer-input")
                                             .relative()
                                             .w_full()
-                                            .min_h(px(CONVERSATION_COMPOSER_INPUT_MIN_HEIGHT))
+                                            .min_h(px(COMPOSER_INPUT_MIN_HEIGHT))
                                             .max_h(px(200.0))
                                             .overflow_y_scroll()
                                             .track_scroll(&self.composer_scroll_handle)
@@ -26162,10 +26233,11 @@ impl NativeShell {
                                             .cursor_text()
                                             .on_mouse_down(MouseButton::Left, focus)
                                             .on_key_down(key)
-                                            .px(px(16.0))
-                                            .pt(px(14.0))
-                                            .pb(px(28.0))
-                                            .text_size(px(tokens.density.typography.body))
+                                            .px(px(COMPOSER_PADDING_X))
+                                            .pt(px(COMPOSER_PADDING_Y))
+                                            .pb(px(COMPOSER_PADDING_Y))
+                                            .text_size(px(COMPOSER_FONT_SIZE))
+                                            .line_height(px(COMPOSER_LINE_HEIGHT))
                                             .text_color(if draft_is_empty {
                                                 tokens.text.muted.to_gpui()
                                             } else {
@@ -26447,7 +26519,7 @@ impl NativeShell {
                                                 .w_full()
                                                 .h(px(self
                                                     .composer_draft_content_height
-                                                    .max(CONVERSATION_COMPOSER_INPUT_MIN_HEIGHT - 42.0)));
+                                                    .max(COMPOSER_INPUT_MIN_HEIGHT - 42.0)));
                                                 div()
                                                     .id("native-task-composer-draft")
                                                     .w_full()
@@ -26462,9 +26534,9 @@ impl NativeShell {
                                             .map(|error| {
                                         div()
                                             .w_full()
-                                            .px(px(16.0))
-                                            .pb(px(8.0))
-                                            .text_size(px(tokens.density.typography.caption))
+                                            .px(px(COMPOSER_PADDING_X))
+                                            .pb(px(COMPOSER_PADDING_Y))
+                                            .text_size(px(COMPOSER_CAPTION_FONT_SIZE))
                                             .text_color(tokens.status.destructive.to_gpui())
                                             .child(error.clone())
                                             .into_any_element()
@@ -26509,11 +26581,11 @@ impl NativeShell {
                                             );
                                             div()
                                                 .w_full()
-                                                .px(px(16.0))
-                                                .pb(px(8.0))
+                                                .px(px(COMPOSER_PADDING_X))
+                                                .pb(px(COMPOSER_PADDING_Y))
                                                 .flex()
                                                 .items_center()
-                                                .gap(px(8.0))
+                                                .gap(px(COMPOSER_CONTROL_GAP))
                                                 .child(
                                                     Button::new(gpui::SharedString::from(retry_id))
                                                         .label("Retry")
@@ -26532,9 +26604,9 @@ impl NativeShell {
                                     .children(composer_hold.map(|hold| {
                                         div()
                                             .w_full()
-                                            .px(px(16.0))
-                                            .pb(px(8.0))
-                                            .text_size(px(tokens.density.typography.caption))
+                                            .px(px(COMPOSER_PADDING_X))
+                                            .pb(px(COMPOSER_PADDING_Y))
+                                            .text_size(px(COMPOSER_CAPTION_FONT_SIZE))
                                             .text_color(tokens.text.muted.to_gpui())
                                             .child(hold)
                                             .into_any_element()
@@ -26542,12 +26614,12 @@ impl NativeShell {
                                     .child(
                                         div()
                                             .w_full()
-                                            .px(px(6.0))
-                                            .pb(px(4.0))
+                                            .px(px(COMPOSER_CHIP_PADDING_X))
+                                            .pb(px(COMPOSER_CHIP_GAP))
                                             .flex()
                                             .items_center()
                                             .justify_between()
-                                            .gap(px(4.0))
+                                            .gap(px(COMPOSER_CONTROL_GAP))
                                             .child(
                                                 div()
                                                     .relative()
@@ -26555,8 +26627,7 @@ impl NativeShell {
                                                     .flex()
                                                     .flex_wrap()
                                                     .items_center()
-                                                    .gap(px(4.0))
-                                                    .text_size(px(11.0))
+                                                    .text_size(px(COMPOSER_SECONDARY_FONT_SIZE))
                                                     .gap(px(2.0))
                                                     .child(provider_control)
                                                     .child(launch_option_controls)
@@ -26568,7 +26639,7 @@ impl NativeShell {
                                                     .flex_none()
                                                     .flex()
                                                     .items_center()
-                                                    .gap(px(6.0))
+                                                    .gap(px(COMPOSER_CHIP_GAP))
                                                     .children(has_question.then(|| {
                                                         Button::new("native-task-composer-answer")
                                                             .label("Answer")
@@ -26612,18 +26683,14 @@ impl NativeShell {
                     div().w_full().flex().justify_center().child(
                         div()
                             .id("native-task-composer-context-strip")
-                            .w(px(CONVERSATION_CONTENT_MAX_WIDTH
-                                - 2.0 * CONVERSATION_COMPOSER_CONTEXT_INSET))
+                            .w(px(CONVERSATION_CONTENT_MAX_WIDTH))
                             .max_w_full()
-                            .px(px(12.0))
-                            .py(px(6.0))
-                            .rounded_bl(px(16.0))
-                            .rounded_br(px(16.0))
-                            .bg(tokens.surfaces.sunken.to_gpui())
+                            .px(px(COMPOSER_PADDING_X))
+                            .pt(px(COMPOSER_PADDING_Y))
                             .flex()
                             .items_center()
-                            .gap(px(8.0))
-                            .text_size(px(tokens.density.typography.caption))
+                            .gap(px(COMPOSER_CONTROL_GAP))
+                            .text_size(px(COMPOSER_CAPTION_FONT_SIZE))
                             .text_color(tokens.text.muted.to_gpui())
                             .child(checkout_label)
                             .child(div().flex_1())
@@ -26880,7 +26947,7 @@ impl NativeShell {
             overlay
                 .top(px(0.0))
                 .bottom(px(if reserve_composer {
-                    CONVERSATION_COMPOSER_HEIGHT_RESERVE
+                    COMPOSER_HEIGHT_RESERVE
                 } else {
                     0.0
                 }))
@@ -46810,15 +46877,11 @@ pub(crate) mod tests {
         BOARD_MENU_LOCAL_ONLY_SUFFIX,
         COMPOSER_CARET_BLINK_INTERVAL,
         COMPOSER_CARET_BLINK_TICKS,
+        COMPOSER_HEIGHT_RESERVE,
+        COMPOSER_INPUT_MIN_HEIGHT,
         CONTROLLER_IDLE_RECOVERY_INTERVAL,
         CONTROLLER_TICK_INTERVAL,
-        CONVERSATION_COMPOSER_CONTEXT_INSET,
-        CONVERSATION_COMPOSER_HEIGHT_RESERVE,
-        CONVERSATION_COMPOSER_INNER_RADIUS,
-        CONVERSATION_COMPOSER_INPUT_MIN_HEIGHT,
-        CONVERSATION_COMPOSER_OUTER_RADIUS,
         CONVERSATION_COMPOSER_PLACEHOLDER,
-        CONVERSATION_COMPOSER_SEND_DIAMETER,
         CONVERSATION_CONTENT_MAX_WIDTH,
         HOST_BOOTSTRAP_REATTACH_INTERVAL,
         HOST_BOOTSTRAP_REATTACH_TICKS,
@@ -47250,15 +47313,90 @@ pub(crate) mod tests {
 
     #[test]
     fn target_composer_geometry_and_affordance_copy_are_pinned() {
-        assert_eq!(CONVERSATION_COMPOSER_OUTER_RADIUS, 22.0);
-        assert_eq!(CONVERSATION_COMPOSER_INNER_RADIUS, 20.0);
-        assert_eq!(CONVERSATION_COMPOSER_CONTEXT_INSET, 22.0);
-        assert_eq!(CONVERSATION_COMPOSER_SEND_DIAMETER, 28.0);
-        assert_eq!(CONVERSATION_COMPOSER_INPUT_MIN_HEIGHT, 88.0);
-        assert_eq!(CONVERSATION_COMPOSER_HEIGHT_RESERVE, 200.0);
+        // The shell paints the composer; the composer module says what it
+        // looks like. These are the two numbers the SHELL still owns -- how
+        // tall the empty field stands and how much room the surfaces above it
+        // reserve for it -- read from their one definition.
+        assert_eq!(COMPOSER_INPUT_MIN_HEIGHT, 88.0);
+        assert_eq!(COMPOSER_HEIGHT_RESERVE, 200.0);
         assert_eq!(
             CONVERSATION_COMPOSER_PLACEHOLDER,
             crate::ui::native_composer::NATIVE_COMPOSER_PLACEHOLDER
+        );
+    }
+
+    #[test]
+    fn the_composer_footer_paints_the_redesign_and_not_the_pill() {
+        // KNOWN LIMITATION: a source assertion. GPUI exposes no painted style
+        // to a unit test, and the composer footer is built inline inside
+        // `task_conversation_surface_for`, so it is anchored on that function
+        // name and on the two element ids the footer is built around -- a
+        // rename fails loudly rather than silently guarding nothing.
+        let source = include_str!("native_shell.rs");
+        let footer = source
+            .split("    fn task_conversation_surface_for(")
+            .nth(1)
+            .and_then(|tail| tail.split("\n    fn ").next())
+            .expect("the composer footer is built in task_conversation_surface_for");
+        assert!(
+            footer.contains(".id(\"native-task-composer-card\")")
+                && footer.contains(".id(\"native-task-composer-send\")"),
+            "the anchor above has stopped matching and this test is guarding nothing"
+        );
+
+        // Rule 3: a real rule around a sunken input, not a background ring.
+        assert!(
+            footer.contains(".border(px(COMPOSER_BORDER_WIDTH))")
+                && footer.contains(".rounded(px(COMPOSER_RADIUS))")
+                && footer.contains(".bg(tokens.surfaces.sunken.to_gpui())"),
+            "the composer input is `surfaces.sunken` inside a 1 px rule at radius 6"
+        );
+        // Rule 11: focus is the focus token, never blue-by-accident.
+        assert!(
+            footer.contains("tokens.borders.focus.to_gpui()")
+                && footer.contains("tokens.borders.default.to_gpui()"),
+            "the rule is `borders.default`, and `borders.focus` while focused"
+        );
+        // Rule 1 allows exactly one elevation, the `raised` overlay, and the
+        // slash-command menu is the composer's only overlay. Counted rather
+        // than forbidden so a shadow put back on the composer itself is red.
+        assert_eq!(
+            footer.matches(".shadow_").count(),
+            1,
+            "the only elevation in the composer footer is the slash menu's"
+        );
+        assert!(
+            footer
+                .split(".id(\"native-task-composer-slash-menu\")")
+                .nth(1)
+                .is_some_and(|tail| tail
+                    .split(".children(")
+                    .next()
+                    .is_some_and(|head| head.contains(".shadow_sm()"))),
+            "that one elevation belongs to the slash menu, not to the input"
+        );
+        // Rule 1: no drop shadow on the composer, and no accent fill anywhere.
+        for gone in [
+            ".shadow_md()",
+            "CONVERSATION_COMPOSER_OUTER_RADIUS",
+            "CONVERSATION_COMPOSER_INNER_RADIUS",
+            "CONVERSATION_COMPOSER_SEND_DIAMETER",
+            "CONVERSATION_COMPOSER_CONTEXT_INSET",
+            "tokens.actions.primary.default.background",
+            ".rounded_full()",
+        ] {
+            assert!(
+                !footer.contains(gone),
+                "the composer keeps no part of the old pill; found {gone}"
+            );
+        }
+        // Rule 4: the send control is a 24 px icon button that brightens on
+        // hover rather than a filled disc.
+        assert!(
+            footer.contains(".size(px(COMPOSER_ICON_BUTTON_SIZE))")
+                && footer.contains("composer_send_look(send_enabled, composer_pending)")
+                && footer.contains("style.text_color(send_hover.to_gpui())"),
+            "the send control reads its look from the composer model"
         );
     }
 

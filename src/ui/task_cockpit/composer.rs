@@ -46,6 +46,117 @@ pub use crate::client::action::{
     ACTION_TASK_STOP_TURN as EXPECTED_ACTION_STOP_TURN,
 };
 
+// ---------------------------------------------------------------------------
+// The composer's visual language (redesign rules 1-12).
+//
+// The composer's *painter* lives in `native_shell.rs`, because the draft is
+// painted with a `canvas` that needs the shell's shaped-text and caret state.
+// Its visual decisions live here, next to the model that owns the composer, so
+// there is exactly one place that says what the composer looks like -- and the
+// pinning test that used to restate these numbers in `native_shell.rs` now
+// reads them from here.
+//
+// The density tokens cannot supply this scale: they top out at 11/12 px
+// captions and 13/14 px body and carry no half-pixel step, while the redesign
+// asks for 10.5 / 11 / 11.5.
+// ---------------------------------------------------------------------------
+
+/// Rule 3: the composer is an input, so it is `surfaces.sunken` behind a 1 px
+/// `borders.default` rule -- `borders.focus` while it holds focus (rule 11) --
+/// at the radius rule 3 gives a control. It replaces a 22 px pill whose
+/// "border" was a one-pixel background ring under a drop shadow.
+pub const COMPOSER_RADIUS: f32 = 6.0;
+/// Rule 3: one pixel, like every other rule in the app.
+pub const COMPOSER_BORDER_WIDTH: f32 = 1.0;
+/// The mockup's `.compose { padding: 6px 10px }`.
+pub const COMPOSER_PADDING_X: f32 = 10.0;
+pub const COMPOSER_PADDING_Y: f32 = 6.0;
+/// Rule 2: the draft is body text, and the placeholder is `text.muted`.
+pub const COMPOSER_FONT_SIZE: f32 = 11.5;
+/// 11.5 px at the mockup stream's 1.5 leading.
+pub const COMPOSER_LINE_HEIGHT: f32 = 17.25;
+/// Rule 2: the composer's captions -- the context strip, the hold line, the
+/// key hints beside the send control.
+pub const COMPOSER_CAPTION_FONT_SIZE: f32 = 10.5;
+/// Rule 2: the composer's secondary rows -- the provider and model pills.
+pub const COMPOSER_SECONDARY_FONT_SIZE: f32 = 11.0;
+/// Rule 4: an icon button is a 24 px hit box around a 14 px lucide glyph, with
+/// no border and no fill. The composer's send and stop are the only two.
+pub const COMPOSER_ICON_BUTTON_SIZE: f32 = 24.0;
+pub const COMPOSER_ICON_GLYPH_SIZE: f32 = 14.0;
+/// Rule 7: a kbd chip -- 10.5 px, `borders.default`, radius 4, padding 1x6.
+/// The attachment chips wear it, so an attachment reads as a token beside the
+/// draft rather than as a card under it.
+pub const COMPOSER_CHIP_FONT_SIZE: f32 = 10.5;
+pub const COMPOSER_CHIP_RADIUS: f32 = 4.0;
+pub const COMPOSER_CHIP_PADDING_X: f32 = 6.0;
+pub const COMPOSER_CHIP_PADDING_Y: f32 = 1.0;
+/// Rule 6: chip gap 6, control gap 8.
+pub const COMPOSER_CHIP_GAP: f32 = 6.0;
+pub const COMPOSER_CONTROL_GAP: f32 = 8.0;
+/// Rule 5: a full-width row is 5 px above and below its line, with no side
+/// margin. The composer's slash-command overlay rows are these.
+pub const COMPOSER_ROW_PADDING_Y: f32 = 5.0;
+/// Rule 6: region padding 10-12. The composer's footer takes 10, matching the
+/// stream column above it so the two share one left edge.
+pub const COMPOSER_REGION_PADDING: f32 = 10.0;
+/// Rule 4: a default button -- 1 px `borders.default`, no fill, 11 px label,
+/// padding 2x8, radius 6. The question card's answer options are these.
+pub const COMPOSER_BUTTON_FONT_SIZE: f32 = 11.0;
+pub const COMPOSER_BUTTON_PADDING_X: f32 = 8.0;
+pub const COMPOSER_BUTTON_PADDING_Y: f32 = 2.0;
+pub const COMPOSER_BUTTON_RADIUS: f32 = 6.0;
+/// The attachment thumbnail. Rule 3's chip radius, small enough that a chip
+/// stays one line tall beside the 24 px icon buttons.
+pub const COMPOSER_ATTACHMENT_THUMBNAIL: f32 = 20.0;
+/// The tallest a chip's label may get before it truncates.
+pub const COMPOSER_CHIP_LABEL_MAX_WIDTH: f32 = 160.0;
+
+/// How tall the empty composer stands, and how much room the surfaces above it
+/// reserve for it. Unchanged by the redesign: they are layout, not look.
+pub const COMPOSER_INPUT_MIN_HEIGHT: f32 = 88.0;
+pub const COMPOSER_HEIGHT_RESERVE: f32 = 200.0;
+
+/// What the send control is saying right now. Rule 4 gives an icon button one
+/// resting tint and one hover tint, and rule 1 allows exactly one colour here:
+/// red, for the destructive act of stopping a turn.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ComposerSendLook {
+    /// There is something to send and the composer may send it.
+    Ready,
+    /// Nothing to send yet, or sending is unavailable.
+    Idle,
+    /// A submission is in flight; the control is not a target.
+    Busy,
+}
+
+/// One decision about how the send control looks, taken from the same three
+/// facts the painter already has. A function rather than an inline chain so
+/// the look and its test read the same rule.
+pub fn composer_send_look(enabled: bool, pending: bool) -> ComposerSendLook {
+    if pending {
+        ComposerSendLook::Busy
+    } else if enabled {
+        ComposerSendLook::Ready
+    } else {
+        ComposerSendLook::Idle
+    }
+}
+
+/// The resting and hover tints for a send control in that state, as token
+/// colours. `Idle` and `Busy` do not brighten, because they are not targets.
+pub fn composer_send_tints(
+    look: ComposerSendLook,
+    tokens: ThemeTokens,
+) -> (crate::ui::tokens::Color, crate::ui::tokens::Color) {
+    match look {
+        ComposerSendLook::Ready => (tokens.text.muted, tokens.text.primary),
+        ComposerSendLook::Idle | ComposerSendLook::Busy => {
+            (tokens.text.disabled, tokens.text.disabled)
+        }
+    }
+}
+
 pub const MAX_QUESTION_OPTIONS: usize = 16;
 pub const MAX_DISABLED_REASONS: usize = 9;
 pub const MAX_COMPOSER_ATTACHMENTS: usize = 8;
@@ -829,13 +940,22 @@ impl TaskComposer {
         } else {
             "turn identity unavailable"
         };
+        // Rules 2, 3 and 9: this seam paints the composer's *state*, not an
+        // input, so it is a quiet 11.5 px `text.muted` block under the same
+        // 1 px `borders.subtle` rule every region gets -- no raised surface
+        // pretending to be a field.
         div()
             .id("native-task-composer")
             .w_full()
             .flex_col()
-            .gap(px(tokens.density.spacing.xs))
-            .p(px(tokens.density.physical().control_padding as f32))
-            .bg(tokens.surfaces.raised.to_gpui())
+            .gap(px(COMPOSER_CHIP_PADDING_Y))
+            .px(px(COMPOSER_REGION_PADDING))
+            .py(px(COMPOSER_PADDING_Y))
+            .border_t(px(COMPOSER_BORDER_WIDTH))
+            .border_color(tokens.borders.subtle.to_gpui())
+            .text_size(px(COMPOSER_FONT_SIZE))
+            .line_height(px(COMPOSER_LINE_HEIGHT))
+            .text_color(tokens.text.muted.to_gpui())
             .child("Task composer")
             .child(format!(
                 "{} character draft · {} · {} · {}",
@@ -2474,6 +2594,115 @@ mod tests {
     use crate::client::action::{ActionArgumentSchema, ActionRisk, ActionScope};
     use crate::protocol::Capability;
     use crate::ui::components::interaction::FocusEpochSource;
+
+    fn redesign_tokens() -> ThemeTokens {
+        crate::ui::tokens::dark(
+            crate::ui::tokens::Density::Comfortable,
+            crate::ui::tokens::Scale::Scale100,
+        )
+    }
+
+    #[test]
+    fn the_composer_type_scale_is_the_redesign_scale() {
+        // Rule 2, and its ceiling: nothing the composer paints is over 13 px.
+        assert_eq!(COMPOSER_CAPTION_FONT_SIZE, 10.5);
+        assert_eq!(COMPOSER_CHIP_FONT_SIZE, 10.5);
+        assert_eq!(COMPOSER_SECONDARY_FONT_SIZE, 11.0);
+        assert_eq!(COMPOSER_BUTTON_FONT_SIZE, 11.0);
+        assert_eq!(COMPOSER_FONT_SIZE, 11.5);
+        for size in [
+            COMPOSER_CAPTION_FONT_SIZE,
+            COMPOSER_CHIP_FONT_SIZE,
+            COMPOSER_SECONDARY_FONT_SIZE,
+            COMPOSER_BUTTON_FONT_SIZE,
+            COMPOSER_FONT_SIZE,
+        ] {
+            assert!(size <= 13.0, "found {size} px in the composer");
+        }
+    }
+
+    #[test]
+    fn the_composer_geometry_is_the_redesign_geometry() {
+        // Rule 3: radius 4 for chips, 6 for controls and the input, one pixel
+        // of rule. Rule 4: a 24 px icon button around a 14 px glyph. Rule 6:
+        // the 4/8/10/12 grid, chip gap 6, control gap 8.
+        assert_eq!(COMPOSER_RADIUS, 6.0);
+        assert_eq!(COMPOSER_BUTTON_RADIUS, 6.0);
+        assert_eq!(COMPOSER_CHIP_RADIUS, 4.0);
+        assert_eq!(COMPOSER_BORDER_WIDTH, 1.0);
+        assert_eq!(COMPOSER_ICON_BUTTON_SIZE, 24.0);
+        assert_eq!(COMPOSER_ICON_GLYPH_SIZE, 14.0);
+        assert_eq!(COMPOSER_CHIP_GAP, 6.0);
+        assert_eq!(COMPOSER_CONTROL_GAP, 8.0);
+        assert_eq!(COMPOSER_REGION_PADDING, 10.0);
+        assert_eq!((COMPOSER_PADDING_X, COMPOSER_PADDING_Y), (10.0, 6.0));
+        assert_eq!(
+            (COMPOSER_BUTTON_PADDING_X, COMPOSER_BUTTON_PADDING_Y),
+            (8.0, 2.0)
+        );
+        assert_eq!(
+            (COMPOSER_CHIP_PADDING_X, COMPOSER_CHIP_PADDING_Y),
+            (6.0, 1.0)
+        );
+    }
+
+    #[test]
+    fn the_send_control_is_quiet_and_only_brightens_when_it_can_send() {
+        // Rule 4: an icon button rests at `text.muted` and reaches
+        // `text.primary` on hover. Rule 1: it never carries an accent fill,
+        // so no state below may equal an action or status colour.
+        let tokens = redesign_tokens();
+        assert_eq!(composer_send_look(true, false), ComposerSendLook::Ready);
+        assert_eq!(composer_send_look(false, false), ComposerSendLook::Idle);
+        assert_eq!(
+            composer_send_look(true, true),
+            ComposerSendLook::Busy,
+            "a submission in flight outranks a sendable draft"
+        );
+
+        let (rest, hover) = composer_send_tints(ComposerSendLook::Ready, tokens);
+        assert_eq!(rest, tokens.text.muted);
+        assert_eq!(hover, tokens.text.primary);
+        assert_ne!(rest, hover, "a target must show that it is one");
+
+        for look in [ComposerSendLook::Idle, ComposerSendLook::Busy] {
+            let (rest, hover) = composer_send_tints(look, tokens);
+            assert_eq!(rest, tokens.text.disabled);
+            assert_eq!(
+                rest, hover,
+                "a control that cannot be used must not brighten under the pointer"
+            );
+        }
+        // Rule 1: every tint the control can wear comes from the `text`
+        // family, never from a status. Asserted as membership rather than as
+        // a list of inequalities, because in this palette the primary action's
+        // background is deliberately `text.primary` itself -- an inequality
+        // against `actions.primary` would be red for the right colour.
+        let text_family = [
+            tokens.text.primary,
+            tokens.text.emphasis,
+            tokens.text.secondary,
+            tokens.text.muted,
+            tokens.text.disabled,
+        ];
+        for look in [
+            ComposerSendLook::Ready,
+            ComposerSendLook::Idle,
+            ComposerSendLook::Busy,
+        ] {
+            let (rest, hover) = composer_send_tints(look, tokens);
+            for tint in [rest, hover] {
+                assert!(
+                    text_family.contains(&tint),
+                    "the send control paints text tokens only, found {tint:?}"
+                );
+                assert_ne!(tint, tokens.status.attention);
+                assert_ne!(tint, tokens.status.success);
+                // Red belongs to Stop alone, and Stop is not one of these.
+                assert_ne!(tint, tokens.status.destructive);
+            }
+        }
+    }
 
     const FIXTURE_CATALOG: &[ActionDescriptor] = &[
         ActionDescriptor {

@@ -8,7 +8,7 @@
 //! in the first place (see `rows.rs`).
 
 use gpui::{
-    div, font, px, rems, AnyElement, App, ClipboardItem, ElementId, Font, FontFeatures, FontWeight,
+    div, font, px, rems, AnyElement, App, ClipboardItem, ElementId, Font, FontFeatures,
     InteractiveElement, IntoElement, ParentElement, StatefulInteractiveElement, Styled, Window,
 };
 use gpui_component::{
@@ -103,29 +103,78 @@ pub fn assistant_message_paint_backend() -> AssistantMarkdownBackend {
     AssistantMarkdownBackend::NativeGfm
 }
 
-/// Target: the user bubble caps at 80 percent of the readable measure.
-const USER_BUBBLE_FRACTION: f32 = 0.80;
-/// Target: 16 px radius on the user bubble.
-const USER_BUBBLE_RADIUS: f32 = 16.0;
-/// Target: work-entry icons occupy a 20 px slot.
-const ICON_SLOT: f32 = 20.0;
+// ---------------------------------------------------------------------------
+// The stream's visual language (redesign rules 1-12).
+//
+// Every size below is the redesign's own type/spacing scale rather than the
+// density tokens, because the density scale tops out at 11/12 px captions and
+// 13/14 px body and carries no half-pixel step. The rules ask for 10.5 / 11 /
+// 11.5 / 12 / 13, so the stream names its steps here, once, and every painter
+// in this module reads them.
+// ---------------------------------------------------------------------------
+
+/// Rule 2: the role label above a message block -- 10.5 px, uppercase,
+/// `text.muted`. It replaces the old right-aligned user bubble and the
+/// assistant's coloured dot: the stream has no avatars and no role tints.
+const ROLE_LABEL_FONT_SIZE: f32 = 10.5;
+/// Rule 6: 4 px between a role label and the body it heads.
+const ROLE_LABEL_GAP: f32 = 4.0;
+/// Rule 2: message body -- 11.5 px `text.primary`.
+const BODY_FONT_SIZE: f32 = 11.5;
+/// 11.5 px at the mockup stream's 1.5 leading (`.stream { font: 11.5px/1.5 }`).
+const BODY_LINE_HEIGHT: f32 = 17.25;
+/// Rule 2: nothing in the stream is larger than 13, so the four heading levels
+/// walk 13 -> 11.5 instead of the old 22 -> 14 chat scale.
+const HEADING_SIZES: [f32; 4] = [13.0, 12.5, 12.0, 11.5];
+/// Block cadence, in rems of GPUI's 16 px root. 10 px of air between blocks is
+/// the spacing grid's step at this type size.
+const PARAGRAPH_GAP_REMS: f32 = 0.625;
+/// Rule 2: captions -- timestamps, code-block affordances, group labels.
+const CAPTION_FONT_SIZE: f32 = 10.5;
+/// Rule 2: secondary rows -- one-line tool/step rows and their details.
+const SECONDARY_FONT_SIZE: f32 = 11.0;
+/// Rule 3: code is monospace 11.5 on `surfaces.sunken` inside a 1 px
+/// `borders.subtle` rule at radius 4 (`.stream`/`.cmdl` in the mockups).
+const CODE_FONT_SIZE: f32 = 11.5;
+/// Rule 3: radius 4 for chips/kbd/inputs, and for code.
+const CODE_RADIUS: f32 = 4.0;
+/// Rule 3: every rule in this module is one pixel.
+const HAIRLINE_WIDTH: f32 = 1.0;
+/// Rule 3: radius 6 for cards.
+const CARD_RADIUS_6: f32 = 6.0;
+/// Rule 2: monospace only in terminals and code. The mockup's stream face.
+const CODE_FONT_FAMILY: &str = "Cascadia Mono";
+/// A 10.5 px label at the mockup's 1.4 leading. Scroll bookkeeping only.
+const ROLE_LABEL_LINE_HEIGHT: f32 = 14.7;
+
+/// The scroll estimate for one single-line stream row -- a tool row, a plan
+/// step, the collapsed-group toggle. Named so the painter's padding and the
+/// estimate cannot drift.
+fn stream_row_height(caption_line_height: f32) -> f32 {
+    2.0 * ROW_PADDING_Y + caption_line_height
+}
+/// Rule 10: 14 px icons, 12 in captions. A tool row is a caption row.
+const ROW_GLYPH_SIZE: f32 = 12.0;
+/// Rule 4: a 24 px hit box around a 12/14 px glyph.
+const ROW_GLYPH_SLOT: f32 = 16.0;
+/// Rule 6: the spacing grid's control gap.
+const CONTROL_GAP: f32 = 8.0;
+/// Rule 6: rows sit on a 4 px vertical rhythm; the stream's rows are one line
+/// tall, so 3 px above and below keeps them on the 4/8 grid at 11 px.
+const ROW_PADDING_Y: f32 = 3.0;
 /// Target: the working indicator uses three 4 px dots.
 const WORKING_DOT: f32 = 4.0;
-/// Target: the floating Tasks card sits slightly inside the shared 768px
-/// conversation/composer measure.
-const PLAN_CARD_HORIZONTAL_INSET: f32 = 22.0;
-/// Keep long implementation reports inside the comfortable 65--80 character
-/// reading band while the shared conversation/composer column remains wide
-/// enough for code, tables, and the composer controls.
-const ASSISTANT_PROSE_MAX_WIDTH: f32 = 640.0;
 const ASSISTANT_TURN_LABEL: &str = "Answer";
+/// The user's own turn is labelled the same way the assistant's is, because
+/// the bubble that used to distinguish it is gone.
+const USER_TURN_LABEL: &str = "You";
+/// Rule 2: a group header. The plan card's own label.
+const PLAN_CARD_LABEL: &str = "Tasks";
 const META_REST_OPACITY: f32 = 0.0;
 const META_REVEALED_OPACITY: f32 = 1.0;
 
-/// T3 keeps chat prose at `text-sm leading-relaxed` even when navigation uses
-/// Compact density. DevManager adds one pixel of type size/leading and a little
-/// more block cadence: long implementation reports are our primary surface,
-/// and the literal T3 values still read as a dense wall on a desktop panel.
+/// The markdown metrics the stream hands `TextView`. One struct so the painted
+/// body and [`markdown_body_height`]'s scroll estimate cannot drift.
 #[derive(Debug, Clone, Copy, PartialEq)]
 struct ConversationMarkdownMetrics {
     body_size: f32,
@@ -138,11 +187,28 @@ fn conversation_markdown_metrics(
     _density: crate::ui::tokens::Density,
 ) -> ConversationMarkdownMetrics {
     ConversationMarkdownMetrics {
-        body_size: 16.0,
-        body_line_height: 25.0,
-        paragraph_gap_rems: 0.90,
-        heading_sizes: [22.0, 18.5, 16.0, 14.0],
+        body_size: BODY_FONT_SIZE,
+        body_line_height: BODY_LINE_HEIGHT,
+        paragraph_gap_rems: PARAGRAPH_GAP_REMS,
+        heading_sizes: HEADING_SIZES,
     }
+}
+
+/// Rule 2: a group label is uppercase. GPUI 0.2.2 exposes no text-transform,
+/// so the label is uppercased in the model and the painter reads this.
+fn role_label(text: &str) -> String {
+    text.to_uppercase()
+}
+
+/// The label element every message block wears. One builder so the user turn
+/// and the assistant turn cannot end up with two different labels.
+fn role_label_element(text: &str, tokens: ThemeTokens) -> AnyElement {
+    div()
+        .w_full()
+        .text_size(px(ROLE_LABEL_FONT_SIZE))
+        .text_color(tokens.text.muted.to_gpui())
+        .child(role_label(text))
+        .into_any_element()
 }
 
 fn tabular_numeral_font() -> Font {
@@ -160,8 +226,6 @@ fn message_meta_opacity(revealed: bool) -> f32 {
         META_REST_OPACITY
     }
 }
-
-use crate::ui::task_cockpit::timeline::CONVERSATION_CONTENT_MAX_WIDTH;
 
 pub fn conversation_row_element(
     row: &ConversationRow,
@@ -261,23 +325,25 @@ pub fn conversation_row_height(row: &ConversationRow, tokens: ThemeTokens) -> u3
             role: MessageRole::Reasoning,
             text,
             ..
-        } => 16.0 + text_lines(text) * caption_line_height,
-        ConversationRow::Message {
-            role: MessageRole::User,
-            text,
-            ..
-        } => 24.0 + markdown_body_height(text, tokens) + 6.0 + caption_line_height + 14.0,
+        } => 2.0 * (ROW_PADDING_Y + 1.0) + text_lines(text) * caption_line_height,
+        // Both turns paint the same block now, so they estimate the same way:
+        // the role label and its gap, the body, then the meta row and the gap
+        // above it.
         ConversationRow::Message { text, .. } => {
-            // Answer scan anchor + its gap, body, and hover metadata.
-            18.0 + 8.0 + markdown_body_height(text, tokens) + 6.0 + caption_line_height + 12.0
+            ROLE_LABEL_LINE_HEIGHT
+                + ROLE_LABEL_GAP
+                + markdown_body_height(text, tokens)
+                + ROLE_LABEL_GAP
+                + caption_line_height
+                + CONTROL_GAP
         }
         ConversationRow::Error { text, .. } => {
-            32.0 + caption_line_height + text_lines(text) * line_height
+            ROLE_LABEL_LINE_HEIGHT + ROLE_LABEL_GAP + text_lines(text) * BODY_LINE_HEIGHT
         }
         ConversationRow::Activity { entries, .. } => {
             activity_row_height(entries, caption_line_height)
         }
-        ConversationRow::ActivityToggle { .. } => ICON_SLOT + 4.0,
+        ConversationRow::ActivityToggle { .. } => stream_row_height(caption_line_height),
         // The question card: the amber label, the prompt, one row per choice,
         // and the footer. Every number is the mockup's, read from the shared
         // card constants so the estimate and the painter cannot drift.
@@ -352,51 +418,53 @@ fn activity_row_height(entries: &[ActivityEntry], caption_line_height: f32) -> f
         .iter()
         .filter(|entry| entry.kind == ActivityKind::PlanStep)
         .count();
-    let work_height = work_count as f32 * (ICON_SLOT + 4.0);
+    let row = stream_row_height(caption_line_height);
+    let work_height = work_count as f32 * row;
     if plan_count == 0 {
-        return work_height.max(ICON_SLOT + 4.0);
+        return work_height.max(row);
     }
 
-    let step_gaps = plan_count.saturating_sub(1) as f32 * 3.0;
-    let plan_card_height = 6.0
-        + 24.0
+    // The card's own chrome: the 4 px it sits below the rows above it, its
+    // 8 px of padding top and bottom, and the 4 px between its label and the
+    // first step. Then the label line, then one row per step.
+    let plan_card_height = ROLE_LABEL_GAP
+        + 2.0 * CONTROL_GAP
+        + ROLE_LABEL_GAP
         + caption_line_height
-        + 8.0
-        + plan_count as f32 * caption_line_height
-        + step_gaps;
-    let section_gap = if work_count > 0 { 2.0 } else { 0.0 };
-    work_height + section_gap + plan_card_height
+        + plan_count as f32 * row;
+    work_height + plan_card_height
 }
 
-/// Turn fold. The only hairline anywhere in the transcript.
+/// Turn fold. Rule 3's 1 px `borders.subtle` rule between regions, under a
+/// 10.5 px muted group label and its chevron (rules 2 and 10).
 fn turn_fold_element(label: &str, expanded: bool, tokens: ThemeTokens) -> AnyElement {
-    let chevron = if expanded { "^" } else { "v" };
+    let chevron = if expanded {
+        crate::icons::CHEVRON_DOWN
+    } else {
+        crate::icons::CHEVRON_RIGHT
+    };
     div()
         .w_full()
-        .pt(px(4.0))
-        .pb(px(8.0))
-        .border_b(px(1.0))
-        .border_color(mix_color(tokens.surfaces.canvas, tokens.borders.subtle, 0.60).to_gpui())
+        .pt(px(ROLE_LABEL_GAP))
+        .pb(px(CONTROL_GAP))
+        .border_b(px(HAIRLINE_WIDTH))
+        .border_color(tokens.borders.subtle.to_gpui())
         .child(
             div()
                 .flex()
                 .items_center()
-                .gap(px(4.0))
-                .px(px(4.0))
-                .rounded(px(tokens.density.radii.sm))
-                .text_size(px(tokens.density.typography.caption))
+                .gap(px(ROLE_LABEL_GAP))
+                .text_size(px(ROLE_LABEL_FONT_SIZE))
                 .text_color(tokens.text.muted.to_gpui())
-                .child(label.to_string())
-                .child(chevron),
+                .child(row_glyph(chevron, tokens.text.muted))
+                .child(role_label(label)),
         )
         .into_any_element()
 }
 
-/// User turn. Right-aligned pill, the only surfaced message in the transcript.
-///
-/// Right alignment uses `justify_end()` on a row. Aligning with `items_end()`
-/// on a column collapses its children to zero width in GPUI and they never
-/// paint -- measured, not assumed, while building the prototype this ports.
+/// User turn. The same full-width, label-headed block the assistant gets:
+/// rule 1 leaves the stream grey, so a role tint or a bubble is the wrong way
+/// to say who spoke. The 10.5 uppercase label says it instead.
 fn user_message_element(
     row_key: &ConversationRowKey,
     text: &str,
@@ -405,20 +473,44 @@ fn user_message_element(
     window: &mut Window,
     cx: &mut App,
 ) -> AnyElement {
+    message_block_element(
+        USER_TURN_LABEL,
+        row_key,
+        text,
+        markdown,
+        true,
+        tokens,
+        window,
+        cx,
+    )
+}
+
+/// One message block: a 10.5 uppercase muted role label over 11.5 px
+/// `text.primary` body, full width, no surface of its own. Both turns paint
+/// through it so they cannot drift apart.
+fn message_block_element(
+    label: &str,
+    row_key: &ConversationRowKey,
+    text: &str,
+    markdown: &MarkdownDocument,
+    user: bool,
+    tokens: ThemeTokens,
+    window: &mut Window,
+    cx: &mut App,
+) -> AnyElement {
     let metrics = conversation_markdown_metrics(tokens.density.density);
-    let view = native_markdown_view(row_key, text, markdown, true, tokens, window, cx);
+    let view = native_markdown_view(row_key, text, markdown, user, tokens, window, cx);
     div()
         .w_full()
+        .min_w(px(0.0))
         .flex()
-        .justify_end()
+        .flex_col()
+        .gap(px(ROLE_LABEL_GAP))
+        .child(role_label_element(label, tokens))
         .child(
             div()
+                .w_full()
                 .min_w(px(0.0))
-                .flex_shrink()
-                .max_w(px(CONVERSATION_CONTENT_MAX_WIDTH * USER_BUBBLE_FRACTION))
-                .p(px(12.0))
-                .rounded(px(USER_BUBBLE_RADIUS))
-                .bg(tokens.surfaces.raised.to_gpui())
                 .text_size(px(metrics.body_size))
                 .line_height(px(metrics.body_line_height))
                 .text_color(tokens.text.primary.to_gpui())
@@ -455,8 +547,9 @@ fn message_row_element(
         .group(group.clone())
         .flex()
         .flex_col()
-        .gap(px(6.0))
-        .pb(px(if user { 14.0 } else { 12.0 }))
+        .min_w(px(0.0))
+        .gap(px(ROLE_LABEL_GAP))
+        .pb(px(CONTROL_GAP))
         .child(body)
         .child(message_meta_element(
             group,
@@ -515,8 +608,8 @@ fn message_meta_element(
         .tab_index(0)
         .focus(|style| style.opacity(message_meta_opacity(true)))
         .font(tabular_numeral_font())
-        .text_size(px(tokens.density.typography.caption))
-        .text_color(mix_color(tokens.surfaces.canvas, tokens.text.muted, 0.55).to_gpui());
+        .text_size(px(CAPTION_FONT_SIZE))
+        .text_color(tokens.text.muted.to_gpui());
 
     if let Some(timestamp) = format_message_timestamp(occurred_at_ms) {
         meta = meta.child(timestamp);
@@ -550,10 +643,9 @@ fn message_meta_element(
     meta.into_any_element()
 }
 
-/// Assistant turn. It stays on the plain transcript canvas, but receives one
-/// quiet scan anchor so the actual answer cannot blend into preceding tool
-/// history. The narrower prose measure keeps long reports readable while code
-/// and tables can still use the wider conversation column.
+/// Assistant turn. The same block as the user's: a 10.5 uppercase muted scan
+/// anchor over 11.5 px body. The old coloured dot was the stream's only
+/// non-status use of the accent, which rule 1 does not allow.
 fn assistant_message_element(
     row_key: &ConversationRowKey,
     text: &str,
@@ -566,45 +658,16 @@ fn assistant_message_element(
         assistant_message_paint_backend(),
         AssistantMarkdownBackend::NativeGfm
     );
-    let metrics = conversation_markdown_metrics(tokens.density.density);
-    let view = native_markdown_view(row_key, text, markdown, false, tokens, window, cx);
-
-    div()
-        .w(px(ASSISTANT_PROSE_MAX_WIDTH))
-        .max_w_full()
-        .flex()
-        .flex_col()
-        .gap(px(8.0))
-        .child(
-            div()
-                .flex()
-                .items_center()
-                .gap(px(7.0))
-                .px(px(4.0))
-                .text_size(px(tokens.density.typography.caption))
-                .font_weight(FontWeight::SEMIBOLD)
-                .text_color(tokens.text.secondary.to_gpui())
-                .child(
-                    div().flex_none().size(px(6.0)).rounded_full().bg(tokens
-                        .actions
-                        .primary
-                        .default
-                        .background
-                        .to_gpui()),
-                )
-                .child(ASSISTANT_TURN_LABEL),
-        )
-        .child(
-            div()
-                .w_full()
-                .px(px(4.0))
-                .pb(px(4.0))
-                .text_size(px(metrics.body_size))
-                .text_color(tokens.text.primary.to_gpui())
-                .line_height(px(metrics.body_line_height))
-                .child(view),
-        )
-        .into_any_element()
+    message_block_element(
+        ASSISTANT_TURN_LABEL,
+        row_key,
+        text,
+        markdown,
+        false,
+        tokens,
+        window,
+        cx,
+    )
 }
 
 fn native_markdown_view(
@@ -638,13 +701,22 @@ fn native_markdown_view(
                 3 => px(metrics.heading_sizes[2]),
                 _ => px(metrics.heading_sizes[3]),
             })
+            // Rule 3: code sits in a sunken well behind a 1 px `borders.subtle`
+            // rule at radius 4, in the mockup's 11.5 px mono face.
             .code_block(
                 gpui::StyleRefinement::default()
-                    .font(font("Cascadia Mono"))
-                    .text_size(px(tokens.density.typography.caption)),
+                    .font(font(CODE_FONT_FAMILY))
+                    .text_size(px(CODE_FONT_SIZE))
+                    .line_height(px(BODY_LINE_HEIGHT))
+                    .bg(tokens.surfaces.sunken.to_gpui())
+                    .border(px(HAIRLINE_WIDTH))
+                    .border_color(tokens.borders.subtle.to_gpui())
+                    .rounded(px(CODE_RADIUS)),
             ),
     )
     .code_block_actions(move |block, _window, _cx| {
+        let muted = tokens.text.muted.to_gpui();
+        let primary = tokens.text.primary.to_gpui();
         let copy_text = block.code().to_string();
         let lang = block
             .lang()
@@ -657,18 +729,23 @@ fn native_markdown_view(
             )
             .into(),
         );
+        // Rule 2/10: the language and the copy affordance are captions on the
+        // code well, not controls -- 10.5 px, `text.muted`, `text.primary` on
+        // hover (rule 4's icon-button behaviour, applied to a text affordance).
         div()
             .flex()
             .items_center()
-            .gap(px(8.0))
+            .gap(px(CONTROL_GAP))
             .px(px(8.0))
-            .py(px(4.0))
-            .text_size(px(11.0))
+            .py(px(ROW_PADDING_Y))
+            .text_size(px(CAPTION_FONT_SIZE))
+            .text_color(muted)
             .child(lang)
             .child(
                 div()
                     .id(code_id)
                     .cursor_pointer()
+                    .hover(move |style| style.text_color(primary))
                     .on_click(move |_event, _window, cx| {
                         cx.stop_propagation();
                         cx.write_to_clipboard(ClipboardItem::new_string(copy_text.clone()));
@@ -685,88 +762,102 @@ fn stable_code_block_hash(text: &str) -> u64 {
     hasher.finish()
 }
 
-/// Reasoning turn. Quiet and visually subordinate to the assistant's answer.
+/// Reasoning turn. Quiet and visually subordinate to the assistant's answer:
+/// a sunken well at radius 4 (rule 3) carrying 11 px `text.muted` (rule 2).
 fn reasoning_element(text: String, tokens: ThemeTokens) -> AnyElement {
     div()
         .w_full()
-        .px(px(tokens.density.spacing.md))
-        .py(px(tokens.density.spacing.sm))
-        .rounded(px(tokens.density.radii.md))
+        .px(px(CONTROL_GAP))
+        .py(px(ROW_PADDING_Y + 1.0))
+        .rounded(px(CODE_RADIUS))
         .bg(tokens.surfaces.sunken.to_gpui())
-        .text_size(px(tokens.density.typography.caption))
-        .text_color(tokens.text.secondary.to_gpui())
+        .text_size(px(SECONDARY_FONT_SIZE))
+        .text_color(tokens.text.muted.to_gpui())
         .child(text)
         .into_any_element()
 }
 
-/// Error turn. The one message-shaped row allowed to be prominent.
+/// Error turn. Rules 1 and 4: red is information, so the label carries it and
+/// nothing is filled or ruled. The body stays `text.primary` at body size, so
+/// the message is legible rather than shouted.
 fn error_element(text: String, tokens: ThemeTokens) -> AnyElement {
     div()
         .w_full()
-        .px(px(tokens.density.spacing.md))
-        .py(px(tokens.density.spacing.md))
-        .rounded(px(tokens.density.radii.md))
-        .bg(tokens.surfaces.raised.to_gpui())
         .flex()
         .flex_col()
-        .gap(px(tokens.density.spacing.xs))
+        .gap(px(ROLE_LABEL_GAP))
+        .text_size(px(BODY_FONT_SIZE))
+        .line_height(px(BODY_LINE_HEIGHT))
         .child(
             div()
-                .font_weight(FontWeight::SEMIBOLD)
+                .text_size(px(ROLE_LABEL_FONT_SIZE))
                 .text_color(tokens.status.destructive.to_gpui())
-                .child("Error"),
+                .child(role_label("Error")),
         )
         .child(div().text_color(tokens.text.primary.to_gpui()).child(text))
         .into_any_element()
 }
 
-/// Tone recolors the heading only. Work rows remain on the conversation
-/// canvas at rest; their status never grows into another card surface.
+/// The glyph and the label colour one work row wears.
+///
+/// Rule 1 keeps the stream grey: only a *failure* earns
+/// `status.destructive`. The old amber on `Active` spent the "needs you" hue
+/// on a tool that is merely busy, which is exactly the confusion the rule
+/// exists to prevent -- an active row is `text.primary` instead, and every
+/// settled row is muted.
 fn entry_tone(state: ActivityState, tokens: ThemeTokens) -> (gpui::Rgba, &'static str) {
     match state {
-        ActivityState::Success => (tokens.text.primary.to_gpui(), "-"),
-        ActivityState::Active => (tokens.status.warning.to_gpui(), "!"),
-        ActivityState::Pending => (tokens.text.muted.to_gpui(), "o"),
-        ActivityState::Failure => (tokens.status.destructive.to_gpui(), "x"),
+        ActivityState::Success => (tokens.text.muted.to_gpui(), crate::icons::CHECK),
+        ActivityState::Active => (tokens.text.primary.to_gpui(), crate::icons::PLAY),
+        ActivityState::Pending => (tokens.text.muted.to_gpui(), crate::icons::SQUARE),
+        ActivityState::Failure => (tokens.status.destructive.to_gpui(), crate::icons::X),
     }
 }
 
-/// One work / tool entry. Quiet by default; failure recolors the heading only.
+/// One work / tool entry: a single 11 px muted line behind a 12 px grey lucide
+/// glyph (rules 2 and 10). The detail rides on the same line and truncates, so
+/// a long command cannot turn one tool call into a paragraph.
 fn work_entry_element(entry: &ActivityEntry, tokens: ThemeTokens) -> AnyElement {
     let (heading_color, icon) = entry_tone(entry.state, tokens);
     div()
         .w_full()
+        .min_w(px(0.0))
         .flex()
         .items_center()
-        .gap(px(6.0))
-        .px(px(2.0))
-        .py(px(2.0))
-        .rounded(px(6.0))
+        .gap(px(CONTROL_GAP))
+        .py(px(ROW_PADDING_Y))
+        .text_size(px(SECONDARY_FONT_SIZE))
+        .whitespace_nowrap()
+        .overflow_hidden()
+        .child(row_glyph(icon, tokens.text.muted))
         .child(
             div()
                 .flex_none()
-                .size(px(ICON_SLOT))
-                .flex()
-                .items_center()
-                .justify_center()
-                .text_size(px(tokens.density.typography.caption))
-                .text_color(tokens.text.muted.to_gpui())
-                .child(icon),
-        )
-        .child(
-            div()
-                .text_size(px(tokens.density.typography.caption))
-                .font_weight(FontWeight::MEDIUM)
                 .text_color(heading_color)
                 .child(entry.label.clone()),
         )
         .children((!entry.detail.trim().is_empty()).then(|| {
             div()
-                .text_size(px(tokens.density.typography.caption))
+                .min_w(px(0.0))
+                .overflow_hidden()
+                .text_ellipsis()
                 .text_color(tokens.text.muted.to_gpui())
-                .child(format!("- {}", entry.detail))
+                .child(entry.detail.clone())
                 .into_any_element()
         }))
+        .into_any_element()
+}
+
+/// Rule 10: a 12 px lucide glyph tinted with a token, centred in a fixed slot
+/// so every row's text starts on the same x whatever glyph it wears.
+fn row_glyph(path: &'static str, color: Color) -> AnyElement {
+    div()
+        .flex_none()
+        .size(px(ROW_GLYPH_SLOT))
+        .flex()
+        .items_center()
+        .justify_center()
+        .child(crate::icons::app_icon(path, ROW_GLYPH_SIZE, color.to_u32()))
         .into_any_element()
 }
 
@@ -805,80 +896,70 @@ fn plan_progress(entries: &[&ActivityEntry]) -> (usize, usize) {
 
 fn plan_card_element(entries: &[&ActivityEntry], tokens: ThemeTokens) -> AnyElement {
     let (completed, total) = plan_progress(entries);
-    let mut steps = div().w_full().flex().flex_col().gap(px(3.0));
+    let mut steps = div().w_full().flex().flex_col();
     for entry in entries {
-        let (symbol, color) = match entry.state {
-            ActivityState::Success => ("✓", tokens.status.success),
-            ActivityState::Active => ("•", tokens.actions.primary.default.background),
-            ActivityState::Pending => ("○", tokens.text.muted),
-            ActivityState::Failure => ("×", tokens.status.destructive),
+        // Rule 1: a plan step is not a status, so only failure is coloured.
+        // The state reads from the glyph, which is what rule 10 is for.
+        let (icon, color) = match entry.state {
+            ActivityState::Success => (crate::icons::CHECK, tokens.text.muted),
+            ActivityState::Active => (crate::icons::PLAY, tokens.text.primary),
+            ActivityState::Pending => (crate::icons::SQUARE, tokens.text.muted),
+            ActivityState::Failure => (crate::icons::X, tokens.status.destructive),
         };
         steps = steps.child(
             div()
                 .w_full()
+                .min_w(px(0.0))
                 .flex()
                 .items_center()
-                .gap(px(8.0))
-                .text_size(px(tokens.density.typography.caption))
-                .line_height(px(tokens.density.typography.caption_line_height))
-                .child(
-                    div()
-                        .flex_none()
-                        .w(px(12.0))
-                        .text_center()
-                        .text_color(color.to_gpui())
-                        .child(symbol),
-                )
+                .gap(px(CONTROL_GAP))
+                .py(px(ROW_PADDING_Y))
+                .text_size(px(SECONDARY_FONT_SIZE))
+                .whitespace_nowrap()
+                .overflow_hidden()
+                .child(row_glyph(icon, color))
                 .child(
                     div()
                         .flex_1()
                         .min_w(px(0.0))
-                        .text_color(
-                            if matches!(
-                                entry.state,
-                                ActivityState::Success | ActivityState::Pending
-                            ) {
-                                tokens.text.muted.to_gpui()
-                            } else {
-                                tokens.text.secondary.to_gpui()
-                            },
-                        )
+                        .overflow_hidden()
+                        .text_ellipsis()
+                        .text_color(if matches!(entry.state, ActivityState::Failure) {
+                            tokens.status.destructive.to_gpui()
+                        } else {
+                            tokens.text.muted.to_gpui()
+                        })
                         .child(entry.detail.clone()),
                 ),
         );
     }
 
+    // Rule 3: a card is `surfaces.raised` at radius 6 on the canvas; rule 1
+    // forbids the drop shadow it used to carry, and rule 5 gives it the full
+    // width of the stream instead of a floating inset.
     div()
-        .w(px(
-            CONVERSATION_CONTENT_MAX_WIDTH - 2.0 * PLAN_CARD_HORIZONTAL_INSET
-        ))
-        .max_w_full()
-        .mx_auto()
-        .mt(px(6.0))
-        .px(px(14.0))
-        .py(px(12.0))
-        .rounded(px(tokens.density.radii.lg))
+        .w_full()
+        .min_w(px(0.0))
+        .mt(px(ROLE_LABEL_GAP))
+        .px(px(10.0))
+        .py(px(CONTROL_GAP))
+        .rounded(px(CARD_RADIUS_6))
         .bg(tokens.surfaces.raised.to_gpui())
-        .shadow_sm()
         .flex()
         .flex_col()
-        .gap(px(8.0))
+        .gap(px(ROLE_LABEL_GAP))
         .child(
             div()
                 .w_full()
                 .flex()
                 .items_center()
-                .gap(px(8.0))
-                .text_size(px(tokens.density.typography.caption))
-                .font_weight(FontWeight::SEMIBOLD)
-                .text_color(tokens.text.primary.to_gpui())
-                .child("☷")
-                .child("Tasks")
+                .gap(px(CONTROL_GAP))
+                .text_size(px(ROLE_LABEL_FONT_SIZE))
+                .text_color(tokens.text.muted.to_gpui())
+                .child(role_label(PLAN_CARD_LABEL))
                 .child(
                     div()
                         .font(tabular_numeral_font())
-                        .font_weight(FontWeight::NORMAL)
-                        .text_color(tokens.text.muted.to_gpui())
                         .child(format!("{completed}/{total}")),
                 ),
         )
@@ -887,33 +968,27 @@ fn plan_card_element(entries: &[&ActivityEntry], tokens: ThemeTokens) -> AnyElem
 }
 
 /// Collapsed work group. Copy is count- and kind-aware, computed by
-/// `activity_toggle_label` in the pure derivation layer.
+/// `activity_toggle_label` in the pure derivation layer. Painted as one more
+/// 11 px tool row (rule 2) behind the chevron that expands it (rule 10).
 fn toggle_element(label: String, tokens: ThemeTokens) -> AnyElement {
     div()
         .w_full()
+        .min_w(px(0.0))
         .flex()
         .items_center()
-        .gap(px(6.0))
-        .px(px(2.0))
-        .py(px(2.0))
-        .rounded(px(6.0))
+        .gap(px(CONTROL_GAP))
+        .py(px(ROW_PADDING_Y))
         .font(tabular_numeral_font())
+        .text_size(px(SECONDARY_FONT_SIZE))
+        .whitespace_nowrap()
+        .overflow_hidden()
+        .child(row_glyph(crate::icons::CHEVRON_RIGHT, tokens.text.muted))
         .child(
             div()
-                .flex_none()
-                .size(px(ICON_SLOT))
-                .flex()
-                .items_center()
-                .justify_center()
-                .text_size(px(tokens.density.typography.caption))
+                .min_w(px(0.0))
+                .overflow_hidden()
+                .text_ellipsis()
                 .text_color(tokens.text.muted.to_gpui())
-                .child("v"),
-        )
-        .child(
-            div()
-                .text_size(px(tokens.density.typography.caption))
-                .font_weight(FontWeight::MEDIUM)
-                .text_color(tokens.text.primary.to_gpui())
                 .child(label),
         )
         .into_any_element()
@@ -1132,30 +1207,39 @@ fn working_element(elapsed_ms: Option<u64>, step: Option<&str>, tokens: ThemeTok
             }
         }
     };
+    // Rule 1/2: the streaming indicator is one more quiet 11 px row. It is the
+    // only animated thing in the stream, so it earns no colour on top.
     div()
         .w_full()
-        .pl(px(6.0))
-        .py(px(2.0))
+        .min_w(px(0.0))
+        .py(px(ROW_PADDING_Y))
         .flex()
         .items_center()
-        .gap(px(8.0))
-        .text_size(px(11.0))
+        .gap(px(CONTROL_GAP))
+        .text_size(px(SECONDARY_FONT_SIZE))
         .font(tabular_numeral_font())
-        .text_color(tokens.text.secondary.to_gpui())
+        .text_color(tokens.text.muted.to_gpui())
+        .whitespace_nowrap()
+        .overflow_hidden()
         .child(
             div()
+                .flex_none()
+                .w(px(ROW_GLYPH_SLOT))
                 .flex()
                 .items_center()
+                .justify_center()
                 .gap(px(3.0))
                 .child(dot())
                 .child(dot())
                 .child(dot()),
         )
-        .child(div().child(elapsed_label))
+        .child(div().flex_none().child(elapsed_label))
         .children(step.map(|step| {
             div()
-                .text_color(mix_color(tokens.surfaces.canvas, tokens.text.muted, 0.55).to_gpui())
-                .child(format!("- {step}"))
+                .min_w(px(0.0))
+                .overflow_hidden()
+                .text_ellipsis()
+                .child(step.to_string())
                 .into_any_element()
         }))
         .into_any_element()
@@ -1164,6 +1248,7 @@ fn working_element(elapsed_ms: Option<u64>, step: Option<&str>, tokens: ThemeTok
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ui::task_cockpit::timeline::CONVERSATION_CONTENT_MAX_WIDTH;
 
     fn sample_assistant_document() -> MarkdownDocument {
         MarkdownDocument {
@@ -1335,6 +1420,127 @@ mod tests {
     }
 
     #[test]
+    fn the_stream_type_scale_is_the_redesign_scale() {
+        // Rule 2. Every step the stream paints, pinned in one place, and the
+        // ceiling asserted so a future edit cannot reintroduce chat-sized type.
+        assert_eq!(ROLE_LABEL_FONT_SIZE, 10.5);
+        assert_eq!(CAPTION_FONT_SIZE, 10.5);
+        assert_eq!(SECONDARY_FONT_SIZE, 11.0);
+        assert_eq!(BODY_FONT_SIZE, 11.5);
+        assert_eq!(CODE_FONT_SIZE, 11.5);
+        assert_eq!(HEADING_SIZES, [13.0, 12.5, 12.0, 11.5]);
+        for size in [
+            ROLE_LABEL_FONT_SIZE,
+            CAPTION_FONT_SIZE,
+            SECONDARY_FONT_SIZE,
+            BODY_FONT_SIZE,
+            CODE_FONT_SIZE,
+        ]
+        .into_iter()
+        .chain(HEADING_SIZES)
+        {
+            assert!(
+                size <= 13.0,
+                "nothing in the stream is larger than 13 px, found {size}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_markdown_metrics_the_body_paints_are_the_scale_above() {
+        // The struct handed to TextView and the scroll estimate read the same
+        // constants, at every density -- the redesign has one stream scale.
+        for density in [
+            crate::ui::tokens::Density::Compact,
+            crate::ui::tokens::Density::Comfortable,
+        ] {
+            let metrics = conversation_markdown_metrics(density);
+            assert_eq!(metrics.body_size, BODY_FONT_SIZE);
+            assert_eq!(metrics.body_line_height, BODY_LINE_HEIGHT);
+            assert_eq!(metrics.paragraph_gap_rems, PARAGRAPH_GAP_REMS);
+            assert_eq!(metrics.heading_sizes, HEADING_SIZES);
+        }
+    }
+
+    #[test]
+    fn both_turns_are_the_same_label_headed_block_with_no_bubble() {
+        // KNOWN LIMITATION: a source assertion, for the same reason the border
+        // invariant below is one -- GPUI exposes no painted style to a unit
+        // test. It is anchored on the two painter names rather than on any
+        // literal, so a rename fails it loudly.
+        let source = include_str!("render.rs");
+        let renderers = source
+            .split("#[cfg(test)]")
+            .next()
+            .expect("renderer source precedes its tests");
+        assert_eq!(
+            renderers.matches("message_block_element(").count(),
+            3,
+            "one definition and exactly two callers -- the user turn and the \
+             assistant turn must paint through the same block"
+        );
+        for gone in [
+            "USER_BUBBLE",
+            "rounded(px(USER",
+            "ASSISTANT_PROSE_MAX_WIDTH",
+            "PLAN_CARD_HORIZONTAL_INSET",
+            "shadow_sm()",
+            "shadow_md()",
+        ] {
+            assert!(
+                !renderers.contains(gone),
+                "the stream has no bubbles, no prose inset and no drop shadow; \
+                 found {gone}"
+            );
+        }
+        assert_eq!(role_label(USER_TURN_LABEL), "YOU");
+        assert_eq!(role_label(ASSISTANT_TURN_LABEL), "ANSWER");
+    }
+
+    #[test]
+    fn only_a_failed_tool_row_is_coloured() {
+        // Rule 1: amber means "needs you" and red means blocked. A tool that
+        // is merely running must not spend either.
+        let tokens = crate::ui::tokens::dark(
+            crate::ui::tokens::Density::Comfortable,
+            crate::ui::tokens::Scale::Scale100,
+        );
+        let colour = |state| entry_tone(state, tokens).0;
+        assert_eq!(
+            colour(ActivityState::Failure),
+            tokens.status.destructive.to_gpui()
+        );
+        assert_eq!(colour(ActivityState::Active), tokens.text.primary.to_gpui());
+        assert_eq!(colour(ActivityState::Success), tokens.text.muted.to_gpui());
+        assert_eq!(colour(ActivityState::Pending), tokens.text.muted.to_gpui());
+        for state in [
+            ActivityState::Active,
+            ActivityState::Success,
+            ActivityState::Pending,
+        ] {
+            assert_ne!(
+                colour(state),
+                tokens.status.attention.to_gpui(),
+                "the attention hue belongs to the question card alone"
+            );
+            assert_ne!(colour(state), tokens.status.warning.to_gpui());
+        }
+        // Rule 10: every row glyph is a lucide mark from `crate::icons`.
+        for state in [
+            ActivityState::Failure,
+            ActivityState::Active,
+            ActivityState::Success,
+            ActivityState::Pending,
+        ] {
+            let path = entry_tone(state, tokens).1;
+            assert!(
+                path.starts_with("icons/") && path.ends_with(".svg"),
+                "expected a lucide asset path, found {path}"
+            );
+        }
+    }
+
+    #[test]
     fn no_conversation_row_renderer_draws_a_border() {
         // KNOWN LIMITATION: this is a source-text assertion, and source-text
         // assertions decay silently. GPUI offers no way to inspect a painted
@@ -1348,25 +1554,30 @@ mod tests {
             .split("#[cfg(test)]")
             .next()
             .expect("renderer source precedes its tests");
-        // The redesign adds exactly one exception, and it is scoped rather than
-        // relaxed: the amber question card is a card, so the approved mockup
-        // draws a rule around it and around each of its choice rows. Every row
-        // painted before it still separates by whitespace and surface
-        // lightness alone, which is what the split below keeps asserting.
+        // The redesign adds exactly two exceptions, and both are scoped rather
+        // than relaxed: rule 3 puts a 1 px `borders.subtle` rule around a code
+        // block, and the amber question card is a card, so the approved mockup
+        // rules it and each of its choice rows. Every *row* the stream paints
+        // still separates by whitespace and surface lightness alone.
         let (before_the_card, from_the_card) = renderers
             .split_once("fn question_element")
             .expect("the question card painter is the only renderer that rules");
         assert_eq!(
             before_the_card.matches(".border(px(").count(),
-            0,
-            "conversation rows are separated by whitespace and surface \
-             lightness, never by borders"
+            1,
+            "the only rule before the card is the code block's well -- \
+             conversation rows themselves are never bordered"
+        );
+        assert!(
+            before_the_card.contains("gpui::StyleRefinement::default()"),
+            "that one rule belongs to the code-block style refinement -- if \
+             this fails the count above is guarding something else"
         );
         assert_eq!(
             from_the_card.matches(".border(px(").count(),
             2,
-            "the only rules in the stream are the question card's own and its \
-             choice rows' -- if this is 0 the anchor above has stopped matching"
+            "the only rules from the card on are its own and its choice rows' \
+             -- if this is 0 the anchor above has stopped matching"
         );
         assert_eq!(
             renderers.matches(".border_b(px(").count(),
@@ -1377,34 +1588,18 @@ mod tests {
     }
 
     #[test]
-    fn the_user_bubble_caps_at_eighty_percent_of_the_measure() {
-        assert!((USER_BUBBLE_FRACTION - 0.80).abs() < f32::EPSILON);
-    }
-
-    #[test]
-    fn the_readable_measure_matches_the_t3_reference() {
+    fn the_readable_measure_is_a_ceiling_the_panel_clamps() {
+        // 768 is the widest the column ever gets; inside a redesign panel
+        // `max_w_full` clamps it to the panel. It is the only measure now --
+        // the narrower prose column and the plan card's inset are gone, so
+        // every row is full width (rule 5).
         assert_eq!(CONVERSATION_CONTENT_MAX_WIDTH, 768.0);
-        assert_eq!(PLAN_CARD_HORIZONTAL_INSET, 22.0);
-        assert_eq!(ASSISTANT_PROSE_MAX_WIDTH, 640.0);
-        assert!(ASSISTANT_PROSE_MAX_WIDTH < CONVERSATION_CONTENT_MAX_WIDTH);
     }
 
     #[test]
-    fn assistant_turn_has_an_explicit_scan_anchor() {
+    fn each_turn_has_an_explicit_scan_anchor() {
         assert_eq!(ASSISTANT_TURN_LABEL, "Answer");
-    }
-
-    #[test]
-    fn chat_typography_keeps_t3_cadence_with_more_readable_prose() {
-        let compact = conversation_markdown_metrics(crate::ui::tokens::Density::Compact);
-        let comfortable = conversation_markdown_metrics(crate::ui::tokens::Density::Comfortable);
-
-        for metrics in [compact, comfortable] {
-            assert_eq!(metrics.body_size, 16.0);
-            assert_eq!(metrics.body_line_height, 25.0);
-            assert_eq!(metrics.paragraph_gap_rems, 0.90);
-            assert_eq!(metrics.heading_sizes, [22.0, 18.5, 16.0, 14.0]);
-        }
+        assert_eq!(USER_TURN_LABEL, "You");
     }
 
     #[test]
@@ -1476,7 +1671,11 @@ mod tests {
         let plan_only = activity_row_height(&[plan("one"), plan("two")], 16.0);
         let mixed = activity_row_height(&[tool, plan("one"), plan("two")], 16.0);
 
-        assert_eq!(plan_only, 89.0);
-        assert_eq!(mixed, 115.0);
+        // One 22 px row per step, plus the card's 4 + 8 + 8 + 4 chrome and its
+        // 16 px label line: 24 + 16 + 44.
+        assert_eq!(stream_row_height(16.0), 22.0);
+        assert_eq!(plan_only, 84.0);
+        // A tool row above the card adds exactly one more row.
+        assert_eq!(mixed - plan_only, stream_row_height(16.0));
     }
 }
