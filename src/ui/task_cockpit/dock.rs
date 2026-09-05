@@ -1805,8 +1805,16 @@ impl ContextDock {
                 )
             },
         );
+        // The body only. The tab strip above and the collapse chrome are the
+        // panel's own furniture and belong to Task 9's retirement of this
+        // surface -- they are deliberately left exactly as they are.
         let body = if let Some(summary) = self.cockpit_surface_summary(chrome.active_tool) {
+            // Rule 5: a full-width region on the row grid, 11.5 px content.
             div()
+                .w_full()
+                .px(gpui::px(super::panel::ROW_PADDING_X))
+                .py(gpui::px(super::panel::ROW_PADDING_Y))
+                .text_size(gpui::px(super::panel::ROW_FONT_SIZE))
                 .text_color(rgb(tokens.text.primary.to_u32()))
                 .child(summary)
                 .into_any_element()
