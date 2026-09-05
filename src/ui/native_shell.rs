@@ -29980,7 +29980,13 @@ impl NativeShell {
                     .map(|affordance| {
                         let label = service_panel_action_label(affordance.action);
                         let action = affordance.action;
-                        let mut control = div()
+                        // Rule 4's default button, the same shell every typed
+                        // `PanelAction` uses. A disabled affordance shows its
+                        // reason INSTEAD of its label -- it used to append the
+                        // reason as a second child, so a blocked control read
+                        // "Start Waiting on dependency" on one line -- and it
+                        // takes `borders.disabled`, not the enabled border.
+                        let mut control = panel_button_shell(tokens, affordance.enabled)
                             .id((
                                 "native-service-control",
                                 stable_service_element_key(
@@ -29988,12 +29994,7 @@ impl NativeShell {
                                     &label.to_ascii_lowercase(),
                                 ),
                             ))
-                            .px(px(tokens.density.spacing.sm))
-                            .py(px(tokens.density.spacing.xs))
-                            .rounded_sm()
-                            .border_1()
-                            .border_color(tokens.borders.subtle.to_gpui())
-                            .child(label);
+                            .child(affordance.disabled_reason.unwrap_or(label));
                         if affordance.enabled {
                             if let Some(task_id) = selected {
                                 if let Some(shell_entity) = shell_entity.clone() {
@@ -30047,56 +30048,61 @@ impl NativeShell {
                                         );
                                 }
                             }
-                        } else {
-                            control = control
-                                .text_color(tokens.text.disabled.to_gpui())
-                                .child(
-                                    affordance
-                                        .disabled_reason
-                                        .unwrap_or("Unavailable"),
-                                );
                         }
                         control.into_any_element()
                     })
                     .collect::<Vec<_>>();
-                div()
+                // Rule 5's row grid, shared with the file tree, the review
+                // list and the config rail. The service's own id is the title
+                // line and its ownership/health/dependency summary is the
+                // 10.5 px meta line under it, where both used to be plain
+                // children inheriting whatever size the body had.
+                panel_row_shell(tokens, false)
                     .id((
                         "native-service-row",
                         stable_service_element_key(row.service_id.as_str(), "row"),
                     ))
-                    .w_full()
-                    .flex()
+                    .items_start()
                     .flex_wrap()
-                    .items_center()
-                    .gap(px(tokens.density.spacing.sm))
-                    .p(px(tokens.density.physical().row_padding as f32))
                     .border_b_1()
                     .border_color(tokens.borders.subtle.to_gpui())
                     .child(status.element(tokens))
                     .child(
                         div()
+                            .flex_1()
+                            .min_w(px(0.0))
+                            .flex()
                             .flex_col()
-                            .flex_grow()
-                            .child(row.service_id.to_string())
-                            .child(description),
+                            .child(div().w_full().truncate().child(row.service_id.to_string()))
+                            .child(
+                                div()
+                                    .w_full()
+                                    .truncate()
+                                    .text_size(px(META_FONT_SIZE))
+                                    .text_color(tokens.text.muted.to_gpui())
+                                    .child(description),
+                            ),
                     )
                     .children(controls)
                     .into_any_element()
             })
             .collect::<Vec<_>>();
         let body = if rows.is_empty() {
-            div()
-                .text_color(tokens.text.secondary.to_gpui())
-                .child("No configured services in the selected task.")
-                .into_any_element()
+            panel_empty_state("No configured services in the selected task.", tokens)
         } else {
-            div().flex_col().children(rows).into_any_element()
+            div()
+                .w_full()
+                .flex()
+                .flex_col()
+                .children(rows)
+                .into_any_element()
         };
+        // Rule 3 reserves the input ground for inputs; a panel body sits on
+        // the panel's own raised ground. The region padding goes with it so
+        // the rows above are full width to the panel's edges.
         div()
             .id("native-shell-services-dock")
             .w_full()
-            .p(px(tokens.density.physical().control_padding as f32))
-            .bg(tokens.surfaces.sunken.to_gpui())
             .child(body)
             .into_any_element()
     }
@@ -73168,6 +73174,74 @@ pub(crate) mod tests {
             !body.contains("density.typography"),
             "the body reads a type size from the density scale (caption 11/12, body \
              13/14), which is not rule 2's scale"
+        );
+    }
+
+    /// The Services body is lane R2's row grid and rule 4's button, and every
+    /// service control keeps its epoch-fenced dispatch.
+    ///
+    /// The denominator here is the survivors rather than a count of painters:
+    /// one row shell, one button shell, one empty state, and the three things
+    /// a restyle of this body would quietly take with it -- the row id, the
+    /// control id, and the `service_action_is_current` guard that refuses a
+    /// dispatch whose action epoch has moved.
+    #[test]
+    fn the_services_body_is_lane_r2s_row_and_keeps_its_epoch_fenced_controls() {
+        let shell = shell_source();
+        let body = shell_method_body(&shell, "services_dock_surface");
+
+        assert_eq!(
+            body.matches("panel_row_shell(").count(),
+            1,
+            "the service row should be rule 5's row grid"
+        );
+        assert_eq!(
+            body.matches("panel_button_shell(").count(),
+            1,
+            "the service control should be rule 4's button, not a second idea of one"
+        );
+        assert_eq!(
+            body.matches("panel_empty_state(").count(),
+            1,
+            "an empty service list should be rule 9's one sentence"
+        );
+
+        for kept in [
+            "\"native-service-row\"",
+            "\"native-service-control\"",
+            "service_action_is_current(",
+            "dispatch_action_recorded_for_owner(",
+            "StatusLight::new(",
+            "status.element(tokens)",
+        ] {
+            assert!(
+                body.contains(kept),
+                "the services body lost `{kept}`; the restyle took a handler, an id \
+                 or an accessibility node with it"
+            );
+        }
+
+        // What rule 3 removed: the body no longer paints itself on the input
+        // ground, and no longer pads its own edges, so rule 5's rows reach the
+        // panel's.
+        //
+        // The needle is the PAINT (`…to_gpui()`), not the token's name. This
+        // assertion first went red on the explanatory comment three lines
+        // above the code it guards -- a comment lives inside the text a
+        // source scan reads, so "a comment is not code" is false here.
+        assert!(
+            !body.contains(concat!("surfaces.sunken", ".to_gpui()")),
+            "the services body still paints itself on the input ground, which rule 3 \
+             reserves for inputs"
+        );
+        assert!(
+            !body.contains("rounded_sm()"),
+            "a service control still uses the old radius instead of rule 3's 6"
+        );
+        assert!(
+            !body.contains("density.physical()"),
+            "the services body still takes its padding from the density scale rather \
+             than rule 5's 5x10 row"
         );
     }
 }
