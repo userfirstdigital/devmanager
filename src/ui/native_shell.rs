@@ -59592,8 +59592,17 @@ pub(crate) mod tests {
             source.contains("let workspace_actions: Option<AnyElement> = None;"),
             "the header must pass no task actions"
         );
+        // Split so the needle exists nowhere in this file as one literal. The
+        // first cut of this assertion searched for the exact call it forbids
+        // and found ITSELF, which made a negative assertion that could never
+        // pass -- the same shape as a guard that can never fail, one sign
+        // flipped.
+        let forbidden = concat!(
+            "let workspace_actions = self.",
+            "conversation_delete_action(cx);"
+        );
         assert!(
-            !source.contains("let workspace_actions = self.conversation_delete_action(cx);"),
+            !source.contains(forbidden),
             "the action strip must not be built for the header any more"
         );
     }

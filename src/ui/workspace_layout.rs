@@ -941,7 +941,12 @@ mod tests {
         let fitted = layout.clone().fitted(1000.0, 900.0);
         let rails = fitted.sidebar_width + fitted.inbox_width + fitted.dock_width;
         assert!(rails <= 1000.0 - CENTER_MIN + f32::EPSILON, "rails {rails}");
-        assert!(fitted.dock_width >= DOCK_MIN);
+        // The dock is retired, so its rail is zero at every window size and the
+        // `>= DOCK_MIN` floor this line used to assert is now unreachable by
+        // construction. Asserting the zero instead of deleting the line: the
+        // fitting order below -- inbox and sidebar keep their floors while the
+        // rails give way -- is what the test is actually for, and it stands.
+        assert_eq!(fitted.dock_width, 0.0);
         assert!(fitted.inbox_width >= INBOX_MIN);
         assert!(fitted.sidebar_width >= SIDEBAR_MIN);
         // Stored preference is untouched: only the rendered geometry gave way.
