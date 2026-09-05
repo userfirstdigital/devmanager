@@ -449,16 +449,28 @@ impl Timeline {
         let scrollbar_state = self.list_state.clone();
         let activity_toggle_for_rows = activity_toggle.clone();
         let task_key = self.task_element_key();
+        // Fix wave 1, F3: the stream is the panel's `flex_1` region, not a
+        // `height: 100%` box. A percentage height resolves against a parent
+        // whose own height is still flex-derived, so it collapsed to the
+        // CONTENT height: measured 70 px inside a 400 px panel body in the
+        // user's `5.png`, with nothing under it but panel background, and the
+        // list left with no room to paint a single row. Every other region in
+        // this shell fills the flex way, opting out of `min-height: auto` as
+        // it goes; so does this one, at every level between body and list.
         div()
             .id(("native-semantic-timeline", task_key))
             .w_full()
-            .h_full()
+            .flex()
+            .flex_col()
+            .flex_1()
+            .min_h(px(0.0))
             .bg(tokens.surfaces.canvas.to_gpui())
             .child(
                 div()
                     .w_full()
-                    .h_full()
                     .flex()
+                    .flex_1()
+                    .min_h(px(0.0))
                     .justify_center()
                     .px(px(STREAM_REGION_PADDING))
                     .child(
@@ -468,10 +480,11 @@ impl Timeline {
                             // `w_full().max_w(..)` form did not clamp in GPUI.
                             .w(px(CONVERSATION_CONTENT_MAX_WIDTH))
                             .max_w_full()
-                            .h_full()
                             .py(px(STREAM_REGION_PADDING))
                             .flex()
                             .flex_col()
+                            .flex_1()
+                            .min_h(px(0.0))
                             .gap(px(STREAM_REGION_GAP))
                             // The activity summary is a caption, not a badge.
                             // Rule 1 spends `status.attention` on "needs you"
@@ -1039,6 +1052,61 @@ mod tests {
     use crate::ui::conversation::fixtures::{generic_item, message_item, tool_item};
     use crate::ui::conversation::rows::{derive_conversation_rows, ConversationVerbosity};
     use crate::ui::renderers::MessageRole;
+
+    /// Fix wave 1, F3: the stream FILLS the panel body.
+    ///
+    /// KNOWN LIMITATION: a source assertion. A GPUI element tree carries no
+    /// resolved geometry a headless test can read, so what this can see is the
+    /// sizing idiom the painter uses. It is anchored on the painter's own
+    /// function and asserts the anchor matched, so a rename fails loudly
+    /// rather than leaving a guard that guards nothing.
+    ///
+    /// The defect it pins: the stream sized itself with `height: 100%` at two
+    /// levels, and a percentage height against a parent whose height is itself
+    /// flex-derived collapses to the CONTENT height -- 70 px inside a 400 px
+    /// panel body in the user`s `5.png`, with panel background under it and no
+    /// room for the list to paint a row.
+    #[test]
+    fn the_stream_fills_the_panel_body_instead_of_sizing_to_its_content() {
+        let source = include_str!("timeline.rs");
+        let painter = source
+            .split("    pub fn surface_with_activity_handler(")
+            .nth(1)
+            .and_then(|tail| {
+                tail.split(
+                    "
+    fn ",
+                )
+                .next()
+            })
+            .expect("the stream painter is surface_with_activity_handler");
+        // The anchor really is the painter, not some other slice of the file.
+        assert!(
+            painter.contains("native-semantic-timeline")
+                && painter.contains("native-conversation-column")
+                && painter.contains("AppScrollbar::vertical"),
+            "the anchor above has stopped matching and this test is guarding nothing"
+        );
+        // The denominator: FOUR nested boxes stand between the panel body and
+        // the list -- the surface root, the centring row, the content column
+        // and the list wrapper -- and every one of them has to pass the height
+        // on. Three of the four are what this fix added.
+        assert_eq!(
+            painter.matches(".flex_1()").count(),
+            4,
+            "every box between the panel body and the list fills"
+        );
+        assert_eq!(
+            painter.matches(".min_h(px(0.0))").count(),
+            4,
+            "and every one of them opts out of `min-height: auto`"
+        );
+        // And the idiom that collapsed is gone from the painter entirely.
+        assert!(
+            !painter.contains(".h_full()"),
+            "a percentage height cannot size the stream; it collapsed to content"
+        );
+    }
 
     #[test]
     fn an_unmapped_kind_produces_no_conversation_row_without_a_denylist() {

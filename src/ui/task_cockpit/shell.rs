@@ -51,6 +51,72 @@ const STREAM_HOLD_PADDING: f32 = 12.0;
 /// A comfortable measure for one sentence at 11.5 px.
 const STREAM_HOLD_MAX_WIDTH: f32 = 340.0;
 
+/// The one sentence an empty or waiting stream shows (rule 9).
+///
+/// Fix wave 1, F6: it reads at the stream's own left edge, on the stream's own
+/// first line, at the size the stream's body text is -- not centred in a band
+/// down the middle of the panel. A centred sentence reads as a placeholder
+/// graphic; a sentence where the first message would be reads as the stream
+/// saying it has nothing yet. The padding is the conversation column's own, so
+/// the sentence and the first real row share one left edge.
+pub fn stream_hold_element(
+    id: impl Into<gpui::ElementId>,
+    copy: impl Into<gpui::SharedString>,
+    tokens: crate::ui::tokens::ThemeTokens,
+) -> AnyElement {
+    div()
+        .id(id)
+        .w_full()
+        .flex_1()
+        .min_h(gpui::px(0.0))
+        .overflow_hidden()
+        .px(gpui::px(STREAM_HOLD_PADDING))
+        .py(gpui::px(STREAM_HOLD_PADDING))
+        .text_size(gpui::px(STREAM_HOLD_FONT_SIZE))
+        .line_height(gpui::px(STREAM_HOLD_LINE_HEIGHT))
+        .text_color(tokens.text.muted.to_gpui())
+        .child(
+            div()
+                .max_w(gpui::px(STREAM_HOLD_MAX_WIDTH))
+                .child(copy.into()),
+        )
+        .into_any_element()
+}
+
+/// Does a pane's stream still want the page its surface is offering?
+///
+/// `painted_rows` is `None` when the pane has no timeline at all, and
+/// `Some(n)` for one that has already been projected. Fix wave 1, F5: the
+/// middle case is the one the shipped code had no answer for -- an open pane
+/// gets an EMPTY page on its first paint, so it acquired an empty timeline
+/// that `contains_key` then defended against every later page.
+///
+///  * no timeline at all -> take the page, whatever it carries. An empty page
+///    yields the honest "open and ready" empty state, which is a true sentence
+///    about a task with no events.
+///  * a timeline with no rows -> take the page only when it carries facts.
+///    Reprojecting an empty timeline from another empty page would rebuild it
+///    every frame for nothing.
+///  * a timeline with rows -> never. It owns itself from here, and admission
+///    (`project_admitted_page_into_timeline`) is what advances it.
+pub fn timeline_wants_page(painted_rows: Option<usize>, page_facts: usize) -> bool {
+    match painted_rows {
+        None => true,
+        Some(0) => page_facts > 0,
+        Some(_) => false,
+    }
+}
+
+/// Whether a pane should ASK its surface for a page at all.
+///
+/// The paint path decides this before it has a page to look at, so it is
+/// [`timeline_wants_page`] with the page's contents unknown -- the most
+/// generous a page could be. Defined in terms of that function rather than
+/// restated, so the offer and the acceptance cannot answer differently.
+pub fn timeline_should_offer_page(painted_rows: Option<usize>) -> bool {
+    timeline_wants_page(painted_rows, usize::MAX)
+}
+
 pub struct TaskCockpitShell {
     dock: ContextDock,
     model: Option<ClientModel>,
@@ -619,10 +685,26 @@ impl TaskCockpitShell {
         }
     }
 
-    /// Hydrate a missing timeline once from an admitted page. Paint paths must
-    /// call this instead of reprojecting every frame.
+    /// Hydrate a missing timeline from the page a pane's surface is offering.
+    /// Paint paths must call this instead of reprojecting every frame.
+    ///
+    /// Fix wave 1, F5. `TaskSurfaceRegistry::conversation_page` answers with an
+    /// EMPTY page for any pane `ensure_task` has registered but no host reply
+    /// has admitted yet -- which is every open pane on its first paint. The
+    /// old guard was `contains_key`, so that first paint installed an empty
+    /// timeline and nothing ever asked again: the pane then waited on a
+    /// background admission slot (two panes, a thirty-second heartbeat, no
+    /// pagination continuation off the selected task) before it could show a
+    /// single line of its conversation. [`timeline_wants_page`] is the rule
+    /// that replaces it, and both this and the shell's paint path read it, so
+    /// the offer and the acceptance cannot disagree.
     pub fn hydrate_timeline_if_absent(&mut self, task_id: TaskId, page: &SemanticJournalPage) {
-        if self.timelines.contains_key(&task_id) {
+        if !timeline_wants_page(
+            self.timelines
+                .get(&task_id)
+                .map(|timeline| timeline.rows().len()),
+            page.facts.len(),
+        ) {
             return;
         }
         self.project_page_into_timeline(task_id, page, conversation_presentation_signature(page));
@@ -765,6 +847,8 @@ impl TaskCockpitShell {
                         )
                     }))
                     .w_full()
+                    .flex()
+                    .flex_col()
                     .flex_1()
                     .min_h(gpui::px(0.0))
                     .overflow_hidden()
@@ -772,33 +856,18 @@ impl TaskCockpitShell {
                     .into_any_element()
             })
             .unwrap_or_else(|| {
-                div()
-                    .id(("native-semantic-timeline-pane-hold", {
+                // Rule 9 and F6: one sentence, at the stream's left edge.
+                stream_hold_element(
+                    ("native-semantic-timeline-pane-hold", {
                         u64::from_be_bytes(
                             task_id.as_bytes()[8..]
                                 .try_into()
                                 .expect("task identity tail is exactly eight bytes"),
                         )
-                    }))
-                    .w_full()
-                    .flex_1()
-                    .min_h(gpui::px(0.0))
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .p(gpui::px(STREAM_HOLD_PADDING))
-                    // Rule 9: an empty state is one 11.5 px `text.muted`
-                    // sentence. No glyph, no heading, no surface of its own.
-                    .child(
-                        div()
-                            .max_w(gpui::px(STREAM_HOLD_MAX_WIDTH))
-                            .text_center()
-                            .text_size(gpui::px(STREAM_HOLD_FONT_SIZE))
-                            .line_height(gpui::px(STREAM_HOLD_LINE_HEIGHT))
-                            .text_color(tokens.text.muted.to_gpui())
-                            .child(hold_copy),
-                    )
-                    .into_any_element()
+                    }),
+                    hold_copy,
+                    tokens,
+                )
             })
     }
 
@@ -960,6 +1029,8 @@ impl TaskCockpitShell {
                 div()
                     .id("native-semantic-timeline")
                     .w_full()
+                    .flex()
+                    .flex_col()
                     .flex_1()
                     .min_h(gpui::px(0.0))
                     .overflow_hidden()
@@ -967,31 +1038,9 @@ impl TaskCockpitShell {
                     .into_any_element()
             })
             .unwrap_or_else(move || {
-                // A hold is an expected state, not an error surface. Centred
-                // secondary copy keeps the panel composed while it waits, so a
-                // bound timeline is what draws the eye once one is admitted.
-                div()
-                    .id("native-semantic-timeline-hold")
-                    .w_full()
-                    .flex_1()
-                    .min_h(gpui::px(0.0))
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .p(gpui::px(STREAM_HOLD_PADDING))
-                    // Rule 9, same sentence shape as the per-task hold above.
-                    .child(
-                        div()
-                            .w_full()
-                            .min_w(gpui::px(0.0))
-                            .max_w(gpui::px(STREAM_HOLD_MAX_WIDTH))
-                            .text_center()
-                            .text_size(gpui::px(STREAM_HOLD_FONT_SIZE))
-                            .line_height(gpui::px(STREAM_HOLD_LINE_HEIGHT))
-                            .text_color(tokens.text.muted.to_gpui())
-                            .child(timeline_error),
-                    )
-                    .into_any_element()
+                // A hold is an expected state, not an error surface: one
+                // sentence where the first message would be (rule 9, F6).
+                stream_hold_element("native-semantic-timeline-hold", timeline_error, tokens)
             })
     }
 
@@ -1186,6 +1235,47 @@ mod tests {
         EventId, PrivacyClass, SemanticJournalFact, SemanticJournalPage, SemanticJournalPayload,
     };
     use crate::ui::task_cockpit::dock::DockEdge;
+
+    /// Fix wave 1, F5: an open pane that is not the selected task must show
+    /// its conversation.
+    ///
+    /// The defect this pins: `TaskSurfaceRegistry::conversation_page` answers
+    /// with an EMPTY page for every pane the workspace has registered but no
+    /// host reply has admitted for, so a pane`s first paint installed an empty
+    /// timeline -- and the old `contains_key` guard then refused every later
+    /// page. In the user`s `4.png` and `5.png` the panels with real history
+    /// (panel 1 is "1/1 tasks, last reply 4d") painted no conversation at all.
+    ///
+    /// The denominator is the whole domain of the rule: three states of the
+    /// pane`s stream crossed with an empty and a non-empty page, six cases,
+    /// all six asserted.
+    #[test]
+    fn an_empty_stream_keeps_asking_for_a_page_and_a_painted_one_stops() {
+        // No timeline yet: take whatever the surface offers. An empty page
+        // becomes the honest "open and ready" empty state.
+        assert!(timeline_wants_page(None, 0));
+        assert!(timeline_wants_page(None, 12));
+        // A timeline that painted nothing is replaceable -- but only by a page
+        // that actually carries something, or it would rebuild every frame.
+        assert!(!timeline_wants_page(Some(0), 0));
+        assert!(timeline_wants_page(Some(0), 1));
+        // A stream with rows owns itself; admission advances it, not paint.
+        assert!(!timeline_wants_page(Some(1), 0));
+        assert!(!timeline_wants_page(Some(1), 400));
+
+        // The paint path asks before it has a page, so it is the same rule at
+        // its most generous, and it must agree on both ends.
+        assert!(timeline_should_offer_page(None));
+        assert!(timeline_should_offer_page(Some(0)));
+        assert!(!timeline_should_offer_page(Some(3)));
+        for painted in [None, Some(0usize), Some(1), Some(99)] {
+            assert_eq!(
+                timeline_should_offer_page(painted),
+                timeline_wants_page(painted, usize::MAX),
+                "the offer must be the rule, not a second opinion about it"
+            );
+        }
+    }
 
     struct ShellProjectionView {
         timeline_text: String,

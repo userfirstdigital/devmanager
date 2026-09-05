@@ -191,6 +191,13 @@ impl ProviderSettingsController {
         usage_for_instance(&self.snapshot.usage, instance_id).map(format_usage_summary)
     }
 
+    /// The one-segment form the composer's meta line carries (F4). Same source
+    /// as [`Self::usage_summary_for`], one formatter along.
+    pub fn usage_compact_for(&self, instance_id: &str) -> Option<String> {
+        usage_for_instance(&self.snapshot.usage, instance_id)
+            .and_then(crate::ui::provider_metadata::format_usage_compact)
+    }
+
     pub fn apply_reply(&mut self, reply: ProviderSettingsReply) {
         match reply {
             ProviderSettingsReply::Snapshot(snapshot) => {

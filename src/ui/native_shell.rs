@@ -144,9 +144,10 @@ use crate::ui::task_cockpit::composer::{
     COMPOSER_CAPTION_FONT_SIZE, COMPOSER_CHIP_FONT_SIZE, COMPOSER_CHIP_GAP,
     COMPOSER_CHIP_LABEL_MAX_WIDTH, COMPOSER_CHIP_PADDING_X, COMPOSER_CHIP_PADDING_Y,
     COMPOSER_CHIP_RADIUS, COMPOSER_CONTROL_GAP, COMPOSER_FONT_SIZE, COMPOSER_HEIGHT_RESERVE,
-    COMPOSER_ICON_BUTTON_SIZE, COMPOSER_ICON_GLYPH_SIZE, COMPOSER_INPUT_MIN_HEIGHT,
-    COMPOSER_LINE_HEIGHT, COMPOSER_PADDING_X, COMPOSER_PADDING_Y, COMPOSER_RADIUS,
-    COMPOSER_REGION_PADDING, COMPOSER_ROW_PADDING_Y, COMPOSER_SECONDARY_FONT_SIZE,
+    COMPOSER_ICON_BUTTON_SIZE, COMPOSER_ICON_GLYPH_SIZE, COMPOSER_INPUT_MAX_HEIGHT,
+    COMPOSER_INPUT_MIN_HEIGHT, COMPOSER_KEY_HINTS, COMPOSER_LINE_HEIGHT, COMPOSER_META_ROW_HEIGHT,
+    COMPOSER_META_SEPARATOR as META_SEPARATOR, COMPOSER_PADDING_X, COMPOSER_PADDING_Y,
+    COMPOSER_RADIUS, COMPOSER_REGION_PADDING, COMPOSER_ROW_PADDING_Y,
 };
 use crate::ui::task_cockpit::dock::{DockEdge, DockTool as CockpitDockTool};
 use crate::ui::task_cockpit::draft_store::{
@@ -468,8 +469,10 @@ const MENU_DROP_GAP: f32 = 4.0;
 /// The panel ⋯ menu is wider than the board's: its rows carry a shortcut
 /// column ("Move ← ↑ ↓ →" plus "Shift+Ctrl+arrows"), which the board's do not.
 const PANE_MENU_WIDTH: f32 = 260.0;
-const CONVERSATION_COMPOSER_PLACEHOLDER: &str =
-    crate::ui::native_composer::NATIVE_COMPOSER_PLACEHOLDER;
+/// Rule 9 and F6: what an open conversation with no messages says. One
+/// sentence, named once so the painter and its test read the same string.
+const CONVERSATION_EMPTY_COPY: &str =
+    "This conversation is open and ready. Send a message to begin.";
 const COMPOSER_DRAFT_PERSIST_INTERVAL: Duration = Duration::from_millis(250);
 const AUTOMATIC_TASK_TITLE_DELAY: Duration = Duration::from_secs(2);
 const LAYOUT_PERSIST_INTERVAL: Duration = Duration::from_millis(250);
@@ -12672,7 +12675,7 @@ impl NativeShell {
             composer_pointer_selecting: false,
             composer_input_bounds: None,
             composer_painted_layout: None,
-            composer_draft_content_height: COMPOSER_INPUT_MIN_HEIGHT - 42.0,
+            composer_draft_content_height: COMPOSER_LINE_HEIGHT,
             composer_scroll_handle: gpui::ScrollHandle::new(),
             theme_editor_scroll_handle: gpui::ScrollHandle::new(),
             composer_selector_scroll_handle: gpui::ScrollHandle::new(),
@@ -26339,6 +26342,30 @@ impl NativeShell {
         )
     }
 
+    /// One clickable segment of the composer's meta line (F4).
+    ///
+    /// It is text, not a control: rule 2's 10.5 px caption in `text.muted`,
+    /// reaching `text.primary` under the pointer so the line still says which
+    /// parts of it can be opened. The `id` is the one the accessibility tree
+    /// publishes and `dispatch_named_accessibility_action` routes, so this is
+    /// the same target the bordered pill was -- one row of chrome lighter.
+    fn composer_meta_action(
+        id: &'static str,
+        label: String,
+        tokens: crate::ui::tokens::ThemeTokens,
+        on_click: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
+    ) -> AnyElement {
+        div()
+            .id(id)
+            .tab_stop(true)
+            .flex_none()
+            .cursor_pointer()
+            .hover(move |style| style.text_color(tokens.text.primary.to_gpui()))
+            .on_click(on_click)
+            .child(label)
+            .into_any_element()
+    }
+
     fn task_conversation_surface_for(
         &mut self,
         owner: HostTaskKey,
@@ -26349,9 +26376,21 @@ impl NativeShell {
     ) -> AnyElement {
         self.ensure_idle_conversation_photo(cx);
         let owner_task_id = owner.task_id;
-        let needs_hydration = self
-            .host_slot(&owner.host)
-            .is_some_and(|slot| slot.cockpit.timeline_for(owner_task_id).is_none());
+        // F5: an open pane whose stream has painted nothing yet keeps asking
+        // its surface for a page. The old test was "has no timeline at all",
+        // and every pane acquires an EMPTY one on its first paint -- the
+        // surface answers with an empty page until the host admits a real one
+        // -- so the question was never asked a second time and the pane sat
+        // blank until a background admission slot came round. The rule lives
+        // in `task_cockpit::shell` so the offer here and the acceptance in
+        // `hydrate_timeline_if_absent` cannot drift apart.
+        let needs_hydration = self.host_slot(&owner.host).is_some_and(|slot| {
+            crate::ui::task_cockpit::shell::timeline_should_offer_page(
+                slot.cockpit
+                    .timeline_for(owner_task_id)
+                    .map(|timeline| timeline.rows().len()),
+            )
+        });
         let page = needs_hydration
             .then(|| self.task_surfaces.conversation_page(owner.clone()))
             .flatten();
@@ -26504,11 +26543,6 @@ impl NativeShell {
         let draft_is_empty = draft.is_empty();
         let draft_has_text = !draft.trim().is_empty();
         let provider_kind = self.composer_provider_for_launch();
-        let placeholder = if draft_is_empty && provider_kind.is_none() {
-            "Enable a provider in Settings"
-        } else {
-            CONVERSATION_COMPOSER_PLACEHOLDER
-        };
         let caret_visible = composer_caret_visible(
             self.composer_accessibility_focused,
             Instant::now().saturating_duration_since(self.composer_caret_epoch),
@@ -26522,6 +26556,14 @@ impl NativeShell {
             Some(ProviderKind::Codex) => "Codex",
             Some(ProviderKind::Cursor) => "Cursor",
             None => "Provider",
+        };
+        // F4: the mockup's "Message Claude...". It names the provider that
+        // would answer, so it is built after the label rather than pinned to
+        // one generic sentence.
+        let placeholder = if draft_is_empty && provider_kind.is_none() {
+            "Enable a provider in Settings".to_string()
+        } else {
+            crate::ui::task_cockpit::composer::composer_placeholder(provider_label)
         };
         let launch_options =
             self.composer_launch_options_for(provider_kind.unwrap_or(ProviderKind::Codex));
@@ -26630,7 +26672,8 @@ impl NativeShell {
                     "branch unavailable".to_string(),
                 )
             });
-        // NOTE: provider_control is built after composer_pill below.
+        // NOTE: the meta line's segments are built below, after the launch
+        // options they name.
         let mut slash_suggestions = self.slash_command_suggestions();
         if !slash_suggestions.is_empty() {
             self.slash_command_selection = self
@@ -26880,99 +26923,89 @@ impl NativeShell {
             .task_surfaces
             .state(owner.clone())
             .and_then(|state| state.center_loading_state(showing_provider_terminal));
-        let composer_pill = |label: &str| {
-            div()
-                .flex()
-                .items_center()
-                .h(px(COMPOSER_ICON_BUTTON_SIZE))
-                .px(px(COMPOSER_CHIP_PADDING_X))
-                .text_size(px(COMPOSER_SECONDARY_FONT_SIZE))
-                .text_color(tokens.text.muted.to_gpui())
-                .child(label.to_string())
-                .into_any_element()
-        };
-        let provider_control: AnyElement = if draft_provider_selectable {
-            Button::new("native-composer-provider")
-                .label(provider_label)
-                .ghost()
-                .xsmall()
-                .dropdown_caret(true)
-                .compact()
-                .on_click(open_provider)
-                .into_any_element()
+        // F4: everything the composer used to stack under its field --
+        // provider, model, reasoning, access, the quota row and the checkout
+        // strip -- is ONE 10.5 px muted line. Each editable segment keeps the
+        // element id and the handler it had as a bordered pill, so the
+        // accessibility tree, the named-action dispatch and the selector
+        // menus reach exactly what they reached before; what changes is that
+        // the composer costs the panel one line instead of four rows.
+        let meta_static = |label: String| div().flex_none().child(label).into_any_element();
+        let mut meta_segments: Vec<AnyElement> = Vec::new();
+        meta_segments.push(if draft_provider_selectable {
+            Self::composer_meta_action(
+                "native-composer-provider",
+                provider_label.to_string(),
+                tokens,
+                open_provider,
+            )
         } else {
-            composer_pill(provider_label)
-        };
-        let launch_option_controls = if self.composer_launch_preferences_editable() {
-            div()
-                .flex()
-                .flex_wrap()
-                .items_center()
-                .gap(px(2.0))
-                .child(
-                    Button::new("native-composer-model")
-                        .label(model_label)
-                        .ghost()
-                        .xsmall()
-                        .dropdown_caret(true)
-                        .max_w(px(160.0))
-                        .overflow_hidden()
-                        .compact()
-                        .on_click(open_model),
-                )
-                .child(
-                    Button::new("native-composer-reasoning")
-                        .label(reasoning_label)
-                        .ghost()
-                        .xsmall()
-                        .dropdown_caret(true)
-                        .compact()
-                        .on_click(open_reasoning),
-                )
-                .child(
-                    Button::new("native-composer-access")
-                        .label(access_label)
-                        .ghost()
-                        .xsmall()
-                        .dropdown_caret(true)
-                        .compact()
-                        .on_click(open_access),
-                )
-                .into_any_element()
+            meta_static(provider_label.to_string())
+        });
+        if self.composer_launch_preferences_editable() {
+            meta_segments.push(Self::composer_meta_action(
+                "native-composer-model",
+                model_label,
+                tokens,
+                open_model,
+            ));
+            meta_segments.push(Self::composer_meta_action(
+                "native-composer-reasoning",
+                reasoning_label,
+                tokens,
+                open_reasoning,
+            ));
+            meta_segments.push(Self::composer_meta_action(
+                "native-composer-access",
+                access_label.to_string(),
+                tokens,
+                open_access,
+            ));
         } else if self.composer_model_reasoning_editable() {
-            div()
-                .flex()
-                .flex_wrap()
-                .items_center()
-                .gap(px(2.0))
-                .child(
-                    Button::new("native-composer-model")
-                        .label(model_label)
-                        .ghost()
-                        .xsmall()
-                        .dropdown_caret(true)
-                        .max_w(px(160.0))
-                        .overflow_hidden()
-                        .compact()
-                        .on_click(open_model),
-                )
-                .child(
-                    Button::new("native-composer-reasoning")
-                        .label(reasoning_label)
-                        .ghost()
-                        .xsmall()
-                        .dropdown_caret(true)
-                        .compact()
-                        .on_click(open_reasoning),
-                )
-                .child(composer_pill(access_label))
-                .into_any_element()
+            meta_segments.push(Self::composer_meta_action(
+                "native-composer-model",
+                model_label,
+                tokens,
+                open_model,
+            ));
+            meta_segments.push(Self::composer_meta_action(
+                "native-composer-reasoning",
+                reasoning_label,
+                tokens,
+                open_reasoning,
+            ));
+            // Access is fixed once a session is running, so it is said, not
+            // offered. Dropping it instead would make the line lie by omission
+            // about what the agent is allowed to do.
+            meta_segments.push(meta_static(access_label.to_string()));
         } else if self.draft_owner_composer_workflow_pending() {
-            composer_pill("Starting provider…")
+            meta_segments.push(meta_static("Starting provider…".to_string()));
         } else {
-            composer_pill("Current session")
-        };
-        let usage_pill = {
+            meta_segments.push(meta_static("Current session".to_string()));
+        }
+        // The checkout strip's two labels were a row of their own; the branch
+        // is the half that changes, and the checkout is its tooltip.
+        if !branch_label.is_empty() {
+            meta_segments.push(
+                div()
+                    .id("native-task-composer-branch")
+                    .flex_none()
+                    .min_w(px(0.0))
+                    .overflow_hidden()
+                    .whitespace_nowrap()
+                    .text_ellipsis()
+                    .tooltip({
+                        let checkout = checkout_label.clone();
+                        move |window, app| {
+                            gpui_component::tooltip::Tooltip::new(checkout.clone())
+                                .build(window, app)
+                        }
+                    })
+                    .child(branch_label.clone())
+                    .into_any_element(),
+            );
+        }
+        {
             let instance_id = launch_options
                 .provider_instance_id
                 .as_deref()
@@ -26981,11 +27014,14 @@ impl NativeShell {
                         .map(crate::providers::settings::default_instance_id_for_kind)
                         .unwrap_or("codex")
                 });
-            self.provider_settings
+            if let Some(quota) = self
+                .provider_settings
                 .as_ref()
-                .and_then(|ctl| ctl.usage_summary_for(instance_id))
-                .map(|summary| composer_pill(&summary))
-        };
+                .and_then(|ctl| ctl.usage_compact_for(instance_id))
+            {
+                meta_segments.push(meta_static(quota));
+            }
+        }
         // Rule 4: the send slot is one icon button -- a 24 px hit box, no
         // border, no fill, `text.muted` at rest and `text.primary` on hover.
         // It replaces a 28 px accent-filled disc, which rule 1 spends only on
@@ -27155,13 +27191,33 @@ impl NativeShell {
                                             .children(image_chips)
                                             .into_any_element()
                                     }))
+                                    // F4: the field, its key hints and the
+                                    // send slot are ONE row inside the sunken
+                                    // rule -- the mockup's `.compose`. The
+                                    // hints sit at the field's right in 10.5
+                                    // muted, and the R1 send/stop slot after
+                                    // them; both stay with the field's last
+                                    // line as the draft grows.
                                     .child(
+                                        div()
+                                            .w_full()
+                                            .flex()
+                                            .items_end()
+                                            .gap(px(COMPOSER_CHIP_GAP))
+                                            .pr(px(COMPOSER_CHIP_PADDING_X))
+                                            .child(
                                         div()
                                             .id("native-task-composer-input")
                                             .relative()
-                                            .w_full()
+                                            // F3: the field grows from one
+                                            // line to six and then scrolls
+                                            // inside itself, so the stream
+                                            // above keeps the rest of the
+                                            // panel.
+                                            .flex_1()
+                                            .min_w(px(0.0))
                                             .min_h(px(COMPOSER_INPUT_MIN_HEIGHT))
-                                            .max_h(px(200.0))
+                                            .max_h(px(COMPOSER_INPUT_MAX_HEIGHT))
                                             .overflow_y_scroll()
                                             .track_scroll(&self.composer_scroll_handle)
                                             .track_focus(&self.composer_focus_handle)
@@ -27182,7 +27238,7 @@ impl NativeShell {
                                             .child({
                                                 let paint_entity = cx.entity();
                                                 let paint_text = draft.clone();
-                                                let paint_placeholder = placeholder.to_string();
+                                                let paint_placeholder = placeholder.clone();
                                                 let paint_empty = draft_is_empty;
                                                 let paint_color =
                                                     Hsla::from(tokens.text.primary.to_gpui());
@@ -27455,7 +27511,7 @@ impl NativeShell {
                                                 .w_full()
                                                 .h(px(self
                                                     .composer_draft_content_height
-                                                    .max(COMPOSER_INPUT_MIN_HEIGHT - 42.0)));
+                                                    .max(COMPOSER_LINE_HEIGHT)));
                                                 div()
                                                     .id("native-task-composer-draft")
                                                     .w_full()
@@ -27463,6 +27519,26 @@ impl NativeShell {
                                                     .into_any_element()
                                             })
                                             .child(composer_input_registration),
+                                            )
+                                            // The mockup's `.compose .k`: the
+                                            // real keys, right-aligned in the
+                                            // field at caption size in
+                                            // `text.muted`, so they read as a
+                                            // note rather than as a control.
+                                            .child(
+                                                div()
+                                                    .flex_none()
+                                                    .pb(px(COMPOSER_PADDING_Y))
+                                                    .text_size(px(COMPOSER_CAPTION_FONT_SIZE))
+                                                    .text_color(tokens.text.muted.to_gpui())
+                                                    .child(COMPOSER_KEY_HINTS),
+                                            )
+                                            .child(
+                                                div()
+                                                    .flex_none()
+                                                    .pb(px(COMPOSER_CHIP_PADDING_Y))
+                                                    .child(send_control),
+                                            ),
                                     )
                                     .children(
                                         self.host_slot(&owner.host)
@@ -27547,91 +27623,124 @@ impl NativeShell {
                                             .child(hold)
                                             .into_any_element()
                                     }))
-                                    .child(
-                                        div()
-                                            .w_full()
-                                            .px(px(COMPOSER_CHIP_PADDING_X))
-                                            .pb(px(COMPOSER_CHIP_GAP))
-                                            .flex()
-                                            .items_center()
-                                            .justify_between()
-                                            .gap(px(COMPOSER_CONTROL_GAP))
-                                            .child(
-                                                div()
-                                                    .relative()
-                                                    .min_w(px(0.0))
-                                                    .flex()
-                                                    .flex_wrap()
-                                                    .items_center()
-                                                    .text_size(px(COMPOSER_SECONDARY_FONT_SIZE))
-                                                    .gap(px(2.0))
-                                                    .child(provider_control)
-                                                    .child(launch_option_controls)
-                                                    .children(usage_pill)
-                                                    .children(self.composer_selector_menu(tokens, cx)),
-                                            )
-                                            .child(
-                                                div()
-                                                    .flex_none()
-                                                    .flex()
-                                                    .items_center()
-                                                    .gap(px(COMPOSER_CHIP_GAP))
-                                                    .children(has_question.then(|| {
-                                                        Button::new("native-task-composer-answer")
-                                                            .label("Answer")
-                                                            .ghost()
-                                                            .on_click(answer)
-                                                            .into_any_element()
-                                                    }))
-                                                    .children(has_approval.then(|| {
-                                                        Button::new("native-task-composer-reject")
-                                                            .label("Reject")
-                                                            .ghost()
-                                                            .on_click(reject)
-                                                            .into_any_element()
-                                                    }))
-                                                    .children(has_approval.then(|| {
-                                                        Button::new("native-task-composer-approve")
-                                                            .label("Approve")
-                                                            .ghost()
-                                                            .on_click(approve)
-                                                            .into_any_element()
-                                                    }))
-                                                    .child(
-                                                        Button::new("native-task-composer-attach")
-                                                            .label("+")
-                                                            .ghost()
-                                                            .disabled(
-                                                                composer_pending
-                                                                    || self
-                                                                        .remote_image_attach_blocked_reason()
-                                                                        .is_some(),
-                                                            )
-                                                            .on_click(attach),
-                                                    )
-                                                    .child(send_control),
-                                            ),
-                                    ),
                             ),
                     ),
                 )
+                // F4: ONE 10.5 px muted line under the field, carrying every
+                // launch fact the four stacked rows carried -- provider,
+                // model, effort, access, branch and quota -- with the attach
+                // affordance at its right end. No other rows.
                 .child(
-                    div().w_full().flex().justify_center().child(
-                        div()
-                            .id("native-task-composer-context-strip")
-                            .w(px(CONVERSATION_CONTENT_MAX_WIDTH))
-                            .max_w_full()
-                            .px(px(COMPOSER_PADDING_X))
-                            .pt(px(COMPOSER_PADDING_Y))
-                            .flex()
-                            .items_center()
-                            .gap(px(COMPOSER_CONTROL_GAP))
-                            .text_size(px(COMPOSER_CAPTION_FONT_SIZE))
-                            .text_color(tokens.text.muted.to_gpui())
-                            .child(checkout_label)
-                            .child(div().flex_1())
-                            .child(branch_label),
-                    ),
+                    div()
+                        .w_full()
+                        .flex()
+                        .justify_center()
+                        .pt(px(COMPOSER_CHIP_GAP))
+                        .child(
+                            div()
+                                .id("native-task-composer-meta")
+                                .w(px(CONVERSATION_CONTENT_MAX_WIDTH))
+                                .max_w_full()
+                                .h(px(COMPOSER_META_ROW_HEIGHT))
+                                .px(px(COMPOSER_PADDING_X))
+                                .flex()
+                                .items_center()
+                                .gap(px(COMPOSER_CONTROL_GAP))
+                                .text_size(px(COMPOSER_CAPTION_FONT_SIZE))
+                                .text_color(tokens.text.muted.to_gpui())
+                                .child(
+                                    div()
+                                        .relative()
+                                        .flex()
+                                        .flex_1()
+                                        .min_w(px(0.0))
+                                        .items_center()
+                                        .overflow_hidden()
+                                        .whitespace_nowrap()
+                                        .gap(px(COMPOSER_CHIP_PADDING_X))
+                                        .children(meta_segments.into_iter().enumerate().flat_map(
+                                            |(index, segment)| {
+                                                // The mockup's separator, and
+                                                // never before the first
+                                                // segment (F8's rule, on the
+                                                // composer's line).
+                                                let separator = (index > 0).then(|| {
+                                                    div()
+                                                        .flex_none()
+                                                        .text_color(
+                                                            tokens.borders.strong.to_gpui(),
+                                                        )
+                                                        .child(META_SEPARATOR)
+                                                        .into_any_element()
+                                                });
+                                                separator.into_iter().chain(Some(segment))
+                                            },
+                                        ))
+                                        .children(self.composer_selector_menu(tokens, cx)),
+                                )
+                                .children(has_question.then(|| {
+                                    Button::new("native-task-composer-answer")
+                                        .label("Answer")
+                                        .ghost()
+                                        .xsmall()
+                                        .compact()
+                                        .on_click(answer)
+                                        .into_any_element()
+                                }))
+                                .children(has_approval.then(|| {
+                                    Button::new("native-task-composer-reject")
+                                        .label("Reject")
+                                        .ghost()
+                                        .xsmall()
+                                        .compact()
+                                        .on_click(reject)
+                                        .into_any_element()
+                                }))
+                                .children(has_approval.then(|| {
+                                    Button::new("native-task-composer-approve")
+                                        .label("Approve")
+                                        .ghost()
+                                        .xsmall()
+                                        .compact()
+                                        .on_click(approve)
+                                        .into_any_element()
+                                }))
+                                // Rule 4's icon button -- a 14 px glyph in a
+                                // 24 px hit box, no border and no fill --
+                                // where a labelled "+" pill used to sit.
+                                .child({
+                                    let attach_blocked = composer_pending
+                                        || self.remote_image_attach_blocked_reason().is_some();
+                                    let attach_control = div()
+                                        .id("native-task-composer-attach")
+                                        .tab_stop(true)
+                                        .flex_none()
+                                        .size(px(COMPOSER_ICON_BUTTON_SIZE))
+                                        .flex()
+                                        .items_center()
+                                        .justify_center()
+                                        .rounded(px(COMPOSER_CHIP_RADIUS))
+                                        .child(crate::icons::app_icon(
+                                            crate::icons::PLUS,
+                                            COMPOSER_ICON_GLYPH_SIZE,
+                                            if attach_blocked {
+                                                tokens.text.disabled.to_u32()
+                                            } else {
+                                                tokens.text.muted.to_u32()
+                                            },
+                                        ));
+                                    if attach_blocked {
+                                        attach_control
+                                    } else {
+                                        attach_control
+                                            .cursor_pointer()
+                                            .hover(move |style| {
+                                                style.bg(tokens.surfaces.hover.to_gpui())
+                                            })
+                                            .on_click(attach)
+                                    }
+                                }),
+                        ),
                 )
                 .into_any_element()
         } else {
@@ -27698,11 +27807,15 @@ impl NativeShell {
                     .min_h(px(0.0))
                     .flex()
                     .flex_col()
-                    .child(Self::empty_state(
+                    // F6: rule 9's one sentence, at the stream's own left
+                    // edge and body size, through the same helper the two
+                    // timeline holds use -- not centred in a band with 72 px
+                    // of dead space under it, which read as a placeholder
+                    // graphic rather than as the stream saying it is empty.
+                    .child(crate::ui::task_cockpit::shell::stream_hold_element(
                         "native-empty-conversation",
-                        "This conversation is open and ready. Send a message to begin.",
+                        CONVERSATION_EMPTY_COPY,
                         tokens,
-                        None,
                     ))
                     .child(conversation_footer)
                     .into_any_element()
@@ -47612,10 +47725,11 @@ pub(crate) mod tests {
         COMPOSER_CARET_BLINK_INTERVAL,
         COMPOSER_CARET_BLINK_TICKS,
         COMPOSER_HEIGHT_RESERVE,
+        COMPOSER_INPUT_MAX_HEIGHT,
         COMPOSER_INPUT_MIN_HEIGHT,
+        COMPOSER_LINE_HEIGHT,
         CONTROLLER_IDLE_RECOVERY_INTERVAL,
         CONTROLLER_TICK_INTERVAL,
-        CONVERSATION_COMPOSER_PLACEHOLDER,
         CONVERSATION_CONTENT_MAX_WIDTH,
         HOST_BOOTSTRAP_REATTACH_INTERVAL,
         HOST_BOOTSTRAP_REATTACH_TICKS,
@@ -48050,11 +48164,19 @@ pub(crate) mod tests {
         // looks like. These are the two numbers the SHELL still owns -- how
         // tall the empty field stands and how much room the surfaces above it
         // reserve for it -- read from their one definition.
-        assert_eq!(COMPOSER_INPUT_MIN_HEIGHT, 88.0);
-        assert_eq!(COMPOSER_HEIGHT_RESERVE, 200.0);
+        // F3: the field is one line tall and grows to six, and the reserve
+        // above it is the sum of the composer's parts. Both are asserted
+        // part-for-part beside their definitions in `task_cockpit::composer`;
+        // here the shell only pins that it reads the same two numbers.
+        assert_eq!(COMPOSER_INPUT_MIN_HEIGHT, COMPOSER_LINE_HEIGHT + 12.0);
+        assert_eq!(COMPOSER_INPUT_MAX_HEIGHT, 6.0 * COMPOSER_LINE_HEIGHT + 12.0);
+        assert!(COMPOSER_HEIGHT_RESERVE < 200.0);
+        // F4: the field invites a message to the provider that would answer
+        // it, so the placeholder is built from the provider label rather than
+        // pinned to one generic sentence. Its rule is asserted where it lives.
         assert_eq!(
-            CONVERSATION_COMPOSER_PLACEHOLDER,
-            crate::ui::native_composer::NATIVE_COMPOSER_PLACEHOLDER
+            crate::ui::task_cockpit::composer::composer_placeholder("Claude Code"),
+            "Message Claude Code\u{2026}"
         );
     }
 
@@ -48123,6 +48245,96 @@ pub(crate) mod tests {
         for id in &quiet {
             assert!(streaming.contains(id), "streaming dropped the node {id}");
         }
+    }
+
+    /// Fix wave 1, F4: the composer is ONE sunken field and ONE meta line.
+    ///
+    /// KNOWN LIMITATION: a source assertion. The footer is built inline in
+    /// `task_conversation_surface_for` and GPUI exposes no painted tree to a
+    /// headless test, so this is anchored on that function and on the element
+    /// ids the footer is built around -- and it asserts the anchor matched, so
+    /// a rename fails loudly rather than leaving a guard that guards nothing.
+    ///
+    /// What it pins: the four rows the user`s `4.png` shows stacked under the
+    /// field -- "Claude Code", the three dropdown pills, the quota line and
+    /// the "Local checkout / main" strip -- are one line, and the parts that
+    /// were controls keep the element ids the accessibility tree publishes.
+    #[test]
+    fn the_composer_is_one_field_and_one_meta_line() {
+        let source = include_str!("native_shell.rs");
+        let footer = source
+            .split("    fn task_conversation_surface_for(")
+            .nth(1)
+            .and_then(|tail| tail.split("\n    fn ").next())
+            .expect("the composer footer is built in task_conversation_surface_for");
+        assert!(
+            footer.contains(".id(\"native-task-composer-card\")")
+                && footer.contains(".id(\"native-task-composer-input\")")
+                && footer.contains(".id(\"native-task-composer-meta\")"),
+            "the anchor above has stopped matching and this test is guarding nothing"
+        );
+
+        // One meta line, and only one.
+        assert_eq!(
+            footer.matches(".id(\"native-task-composer-meta\")").count(),
+            1,
+            "F4 allows exactly one line under the field"
+        );
+        // Every launch fact the four rows carried is still on it, reached
+        // through the ids the accessibility tree publishes and
+        // `dispatch_named_accessibility_action` routes.
+        for segment in [
+            "native-composer-provider",
+            "native-composer-model",
+            "native-composer-reasoning",
+            "native-composer-access",
+        ] {
+            assert!(
+                footer.contains(segment),
+                "the meta line dropped the {segment} segment"
+            );
+        }
+        assert!(
+            footer.contains("branch_label") && footer.contains("usage_compact_for"),
+            "the branch and the quota are segments of the line, not rows of their own"
+        );
+        // And the rows themselves are gone.
+        for gone in [
+            "native-task-composer-context-strip",
+            "composer_pill",
+            "usage_summary_for",
+            ".dropdown_caret(",
+            "launch_option_controls",
+        ] {
+            assert!(
+                !footer.contains(gone),
+                "{gone} belongs to the stacked rows the meta line replaced"
+            );
+        }
+        // The denominator for "no other controls": the only buttons left in
+        // the footer are the five conditional ones -- Answer, Reject, Approve
+        // and the never-enqueued Retry / Edit draft pair. The provider, model,
+        // effort, access and attach pills were five more.
+        assert_eq!(
+            footer.matches("Button::new(").count(),
+            5,
+            "the meta line is text, not a row of buttons"
+        );
+
+        // The hints and the send slot sit inside the field`s own rule, to its
+        // right, as the mockup`s `.compose` does.
+        assert!(
+            footer.contains(".child(COMPOSER_KEY_HINTS)")
+                && footer.contains(".child(send_control)"),
+            "the key hints and the send slot belong to the field row"
+        );
+        // Attach is rule 4`s icon button now, not a labelled `+` pill.
+        assert!(
+            footer.contains("crate::icons::PLUS")
+                && footer.contains(".id(\"native-task-composer-attach\")")
+                && !footer.contains(".label(\"+\")"),
+            "attach is a 14 px glyph in a 24 px hit box at the line`s right"
+        );
     }
 
     #[test]
@@ -73102,20 +73314,29 @@ pub(crate) mod tests {
                 "`fn {body}` still paints the `○` glyph rule 9 has no room for"
             );
         }
-        // The survivors: the shared `empty_state` is still defined and still
-        // has callers outside the two bodies above, so this scan cannot go
-        // green by the whole helper having been deleted.
+        // The survivors, BY NAME rather than by count. This assertion used to
+        // be `callers >= 3`, and fix wave 1 F6 moved one of the three -- the
+        // empty conversation -- onto the left-aligned `stream_hold_element`,
+        // because a stream says it is empty on its own first line rather than
+        // in a centred band. A floor of three would have gone red for a change
+        // it was never written to catch, and lowering it to two would have
+        // been a threshold nobody could read a second time. Naming the two
+        // remaining owners is strictly stronger: it still cannot go green by
+        // the helper having been deleted or emptied, and it now also fails if
+        // either surface quietly stops using it.
         assert!(
             shell.contains(concat!("fn empty", "_state(")),
             "the shared empty-state helper is gone; the surfaces that legitimately \
              use it have lost their copy"
         );
-        let other_callers = shell.matches(concat!("Self::empty", "_state(")).count();
-        assert!(
-            other_callers >= 3,
-            "only {other_callers} callers of the shared empty state survive; this \
-             lane should have moved two dock bodies off it, not emptied it"
-        );
+        for owner in ["inbox_empty_state", "setup_intro"] {
+            let slice = shell_method_body(&shell, owner);
+            assert!(
+                slice.contains(concat!("Self::empty", "_state(")),
+                "`fn {owner}` no longer paints the shared empty state, so this scan \
+                 has nothing left to prove the helper is live"
+            );
+        }
     }
 
     /// The Files, Changes, Artifacts, Review and Browser bodies are lane R2's
