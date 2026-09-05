@@ -35646,7 +35646,7 @@ impl NativeShell {
                     .gap(px(tokens.density.spacing.xxs))
                     .child(
                         div()
-                            .text_size(px(tokens.density.typography.caption))
+                            .text_size(px(overlay_chrome::CAPTION_FONT_SIZE))
                             .text_color(tokens.text.muted.to_gpui())
                             .child("Name"),
                     )
@@ -35821,7 +35821,7 @@ impl NativeShell {
                         .gap(px(tokens.density.spacing.xxs))
                         .child(
                             div()
-                                .text_size(px(tokens.density.typography.caption))
+                                .text_size(px(overlay_chrome::CAPTION_FONT_SIZE))
                                 .text_color(tokens.text.muted.to_gpui())
                                 .child("Background (Canvas)"),
                         )
@@ -35856,7 +35856,7 @@ impl NativeShell {
                         .gap(px(tokens.density.spacing.xxs))
                         .child(
                             div()
-                                .text_size(px(tokens.density.typography.caption))
+                                .text_size(px(overlay_chrome::CAPTION_FONT_SIZE))
                                 .text_color(tokens.text.muted.to_gpui())
                                 .child("Accent"),
                         )
@@ -35886,7 +35886,7 @@ impl NativeShell {
                 )
                 .child(
                     div()
-                        .text_size(px(tokens.density.typography.caption))
+                        .text_size(px(overlay_chrome::CAPTION_FONT_SIZE))
                         .text_color(tokens.text.muted.to_gpui())
                         .child("Swatches"),
                 )
@@ -35908,9 +35908,9 @@ impl NativeShell {
                                     div()
                                         .id(("native-theme-swatch", index))
                                         .size(px(22.0))
-                                        .rounded(px(tokens.density.radii.sm))
-                                        .border(px(1.0))
-                                        .border_color(tokens.borders.subtle.to_gpui())
+                                        .rounded(px(overlay_chrome::INPUT_RADIUS))
+                                        .border(px(overlay_chrome::OVERLAY_BORDER_WIDTH))
+                                        .border_color(tokens.borders.default.to_gpui())
                                         .bg(color.opaque().to_gpui())
                                         .on_mouse_down(
                                             MouseButton::Left,
@@ -35931,7 +35931,7 @@ impl NativeShell {
             for (group_title, roles) in theme_editor_role_groups() {
                 panel = panel.child(
                     div()
-                        .text_size(px(tokens.density.typography.caption))
+                        .text_size(px(overlay_chrome::CAPTION_FONT_SIZE))
                         .font_weight(FontWeight::SEMIBOLD)
                         .text_color(tokens.text.primary.to_gpui())
                         .child(*group_title),
@@ -35951,7 +35951,7 @@ impl NativeShell {
                             .gap(px(2.0))
                             .child(
                                 div()
-                                    .text_size(px(tokens.density.typography.caption))
+                                    .text_size(px(overlay_chrome::CAPTION_FONT_SIZE))
                                     .text_color(tokens.text.muted.to_gpui())
                                     .child(theme_role_display_label(role)),
                             )
@@ -35995,7 +35995,7 @@ impl NativeShell {
             .when_some(editor.error.clone(), |content, error| {
                 content.child(
                     div()
-                        .text_size(px(tokens.density.typography.caption))
+                        .text_size(px(overlay_chrome::CAPTION_FONT_SIZE))
                         .text_color(tokens.status.destructive.to_gpui())
                         .child(error),
                 )
@@ -36312,7 +36312,7 @@ impl NativeShell {
                     .when_some(self.theme_feedback.clone(), |content, message| {
                         content.child(
                             div()
-                                .text_size(px(tokens.density.typography.caption))
+                                .text_size(px(overlay_chrome::CAPTION_FONT_SIZE))
                                 .text_color(tokens.text.secondary.to_gpui())
                                 .child(message),
                         )
@@ -36320,7 +36320,7 @@ impl NativeShell {
                     .when_some(self.theme_error.clone(), |content, error| {
                         content.child(
                             div()
-                                .text_size(px(tokens.density.typography.caption))
+                                .text_size(px(overlay_chrome::CAPTION_FONT_SIZE))
                                 .text_color(tokens.status.destructive.to_gpui())
                                 .child(error),
                         )
@@ -36395,7 +36395,7 @@ impl NativeShell {
                     .gap(px(tokens.density.spacing.sm))
                     .child(
                         div()
-                            .text_size(px(tokens.density.typography.caption))
+                            .text_size(px(overlay_chrome::CAPTION_FONT_SIZE))
                             .text_color(tokens.text.secondary.to_gpui())
                             .child("Health interval (seconds, 0 = manual only)"),
                     )
@@ -36667,7 +36667,7 @@ impl NativeShell {
             .when_some(feedback, |content, message| {
                 content.child(
                     div()
-                        .text_size(px(tokens.density.typography.caption))
+                        .text_size(px(overlay_chrome::CAPTION_FONT_SIZE))
                         .text_color(tokens.text.secondary.to_gpui())
                         .child(message),
                 )
@@ -36675,7 +36675,7 @@ impl NativeShell {
             .when_some(error, |content, message| {
                 content.child(
                     div()
-                        .text_size(px(tokens.density.typography.caption))
+                        .text_size(px(overlay_chrome::CAPTION_FONT_SIZE))
                         .text_color(tokens.status.destructive.to_gpui())
                         .child(message),
                 )
@@ -36831,7 +36831,7 @@ impl NativeShell {
             .gap(px(tokens.density.spacing.xs))
             .child(
                 div()
-                    .text_size(px(tokens.density.typography.caption))
+                    .text_size(px(overlay_chrome::CAPTION_FONT_SIZE))
                     .text_color(tokens.text.secondary.to_gpui())
                     .child(format!(
                         "{} · {}",
@@ -36849,7 +36849,7 @@ impl NativeShell {
                     .gap(px(tokens.density.spacing.sm))
                     .child(
                         div()
-                            .text_size(px(tokens.density.typography.caption))
+                            .text_size(px(overlay_chrome::CAPTION_FONT_SIZE))
                             .text_color(tokens.text.secondary.to_gpui())
                             .child(account),
                     )
@@ -36875,7 +36875,7 @@ impl NativeShell {
         if let Some(subscription) = subscription {
             body = body.child(
                 div()
-                    .text_size(px(tokens.density.typography.caption))
+                    .text_size(px(overlay_chrome::CAPTION_FONT_SIZE))
                     .text_color(tokens.text.muted.to_gpui())
                     .child(subscription),
             );
@@ -36887,7 +36887,7 @@ impl NativeShell {
         {
             body = body.child(
                 div()
-                    .text_size(px(tokens.density.typography.caption))
+                    .text_size(px(overlay_chrome::CAPTION_FONT_SIZE))
                     .text_color(tokens.text.muted.to_gpui())
                     .child(usage),
             );
@@ -36898,7 +36898,7 @@ impl NativeShell {
         {
             body = body.child(
                 div()
-                    .text_size(px(tokens.density.typography.caption))
+                    .text_size(px(overlay_chrome::CAPTION_FONT_SIZE))
                     .text_color(tokens.text.muted.to_gpui())
                     .child("Usage refreshing…"),
             );
@@ -36909,7 +36909,7 @@ impl NativeShell {
         {
             body = body.child(
                 div()
-                    .text_size(px(tokens.density.typography.caption))
+                    .text_size(px(overlay_chrome::CAPTION_FONT_SIZE))
                     .text_color(tokens.status.warning.to_gpui())
                     .child(error),
             );
@@ -36917,7 +36917,7 @@ impl NativeShell {
         if is_stub {
             body = body.child(
                 div()
-                    .text_size(px(tokens.density.typography.caption))
+                    .text_size(px(overlay_chrome::CAPTION_FONT_SIZE))
                     .text_color(tokens.status.warning.to_gpui())
                     .child("Not supported in native DevManager yet. Cannot enable or launch."),
             );
@@ -38590,12 +38590,12 @@ impl NativeShell {
                                         .w_full()
                                         .px(px(tokens.density.spacing.md))
                                         .py(px(tokens.density.spacing.sm))
-                                        .rounded(px(tokens.density.radii.md))
+                                        .rounded(px(overlay_chrome::INPUT_RADIUS))
                                         .border(px(1.0))
                                         .border_color(if selected {
                                             tokens.actions.primary.default.background.to_gpui()
                                         } else {
-                                            tokens.borders.subtle.to_gpui()
+                                            tokens.borders.default.to_gpui()
                                         })
                                         .bg(if selected {
                                             tokens.surfaces.selection.to_gpui()
@@ -42314,7 +42314,11 @@ impl NativeShell {
             component.link_active = tokens.actions.primary.selected.background.to_gpui().into();
             component.muted = tokens.surfaces.sunken.to_gpui().into();
             component.muted_foreground = tokens.text.muted.to_gpui().into();
-            component.popover = tokens.surfaces.raised.to_gpui().into();
+            // A tooltip and a popover are overlays (rule 7), so they take the
+            // overlay surface rather than the raised one a panel sits on. This
+            // is the only route to the tooltip's chrome: its element comes from
+            // gpui-component, which reads this palette rather than our tokens.
+            component.popover = tokens.surfaces.overlay.to_gpui().into();
             component.popover_foreground = tokens.text.primary.to_gpui().into();
             // gpui-component uses `accent` as the background for inline code.
             // A full hover surface turns every identifier in technical prose
@@ -48709,6 +48713,144 @@ pub(crate) mod tests {
         assert!(
             !source.contains(folder_add_err),
             "overlay should not use folder wording for add failure"
+        );
+    }
+
+    /// The overlay and secondary painters this file owns, and the property
+    /// that has to hold for all of them: every one paints through
+    /// `overlay_chrome`, and none of them reaches back for the density type
+    /// scale, whose 11/13/15 px steps are not the redesign's 10.5/11.5/12/13.
+    ///
+    /// The list is the denominator. A painter that is renamed or split leaves
+    /// the list and the slicing panics rather than passing silently, which is
+    /// the failure mode a bare `source.contains("overlay_chrome")` would have.
+    const OVERLAY_PAINTERS: [&str; 21] = [
+        "render_command_palette",
+        "render_task_search_overlay",
+        "render_project_scope_overlay",
+        "render_composer_trigger_overlay",
+        "render_terminal_chip_menu_overlay",
+        "composer_selector_menu",
+        "render_settings_overlay",
+        "render_appearance_settings_content",
+        "render_provider_settings_content",
+        "render_provider_settings_card",
+        "render_remote_settings_content",
+        "render_theme_editor_panel",
+        "render_add_project_overlay",
+        "render_new_task_overlay",
+        "render_rename_task_overlay",
+        "render_delete_task_overlay",
+        "render_commit_overlay",
+        "render_project_action_overlay",
+        "empty_state",
+        "center_surface_loading_overlay",
+        "overlay_text_field",
+    ];
+
+    /// One painter's body: from its `fn` line to the next one at the same
+    /// indent. Panics when the painter is gone, which is the point.
+    fn painter_body<'a>(source: &'a str, name: &str) -> &'a str {
+        let opening = format!("    fn {name}(");
+        let start = source
+            .find(&opening)
+            .unwrap_or_else(|| panic!("{name} is no longer a painter in native_shell.rs"));
+        let end = source[start + 1..]
+            .find("\n    fn ")
+            .map(|offset| start + 1 + offset)
+            .unwrap_or(source.len());
+        &source[start..end]
+    }
+
+    #[test]
+    fn every_overlay_painter_paints_through_the_shared_chrome() {
+        let source = include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/src/ui/native_shell.rs"
+        ));
+        let mut checked = 0usize;
+        for name in OVERLAY_PAINTERS {
+            let body = painter_body(source, name);
+            assert!(
+                body.len() > 200,
+                "{name} sliced to {} bytes -- the slicing is wrong, not the painter",
+                body.len()
+            );
+            assert!(
+                body.contains("overlay_chrome::"),
+                "{name} paints its own chrome instead of the shared vocabulary"
+            );
+            assert!(
+                !body.contains("tokens.density.typography."),
+                "{name} still reads the density type scale, not the redesign's"
+            );
+            checked += 1;
+        }
+        assert_eq!(
+            checked,
+            OVERLAY_PAINTERS.len(),
+            "every named painter must have been inspected"
+        );
+    }
+
+    /// The chrome is only shared if the constants are the mockups' numbers.
+    /// Read them here rather than in `overlay_chrome`'s own tests so a change
+    /// there has to answer to a caller as well as to itself.
+    #[test]
+    fn the_overlay_chrome_constants_are_the_redesign_numbers() {
+        use crate::ui::overlay_chrome as chrome;
+        assert_eq!(chrome::OVERLAY_RADIUS, 6.0);
+        assert_eq!(chrome::OVERLAY_BORDER_WIDTH, 1.0);
+        assert_eq!(chrome::OVERLAY_ANCHOR_DROP, 4.0);
+        assert_eq!(chrome::ROW_PADDING_X, 10.0);
+        assert_eq!(chrome::ROW_PADDING_Y, 5.0);
+        assert_eq!(chrome::ROW_TITLE_FONT_SIZE, 11.5);
+        assert_eq!(chrome::ROW_META_FONT_SIZE, 10.5);
+        assert_eq!(chrome::KBD_FONT_SIZE, 10.5);
+        assert_eq!(chrome::HEADING_FONT_SIZE, 13.0);
+        assert_eq!(chrome::TOGGLE_WIDTH, 28.0);
+        assert_eq!(chrome::TOGGLE_HEIGHT, 16.0);
+    }
+
+    /// A selected overlay row is the selection surface under a white title,
+    /// and an unselected one has no fill of its own -- the property the twelve
+    /// painters used to each decide separately.
+    #[test]
+    fn overlay_rows_resolve_one_selection_look() {
+        use crate::ui::overlay_chrome::{row_fill, row_title_colour, OverlayRowState};
+        let tokens = crate::ui::tokens::RuntimePreferencesSnapshot::default().tokens();
+        assert_eq!(
+            row_fill(OverlayRowState::Selected, tokens),
+            Some(tokens.surfaces.selection)
+        );
+        assert_eq!(row_fill(OverlayRowState::Idle, tokens), None);
+        assert_eq!(
+            row_title_colour(OverlayRowState::Selected, tokens),
+            tokens.text.emphasis
+        );
+    }
+
+    /// Rule 9: an empty state is one sentence. The medallion and the heading
+    /// are gone from the painter, and the accessibility node still carries the
+    /// headline -- that pairing is what makes dropping the heading safe.
+    #[test]
+    fn the_empty_state_paints_one_sentence_and_no_medallion() {
+        let source = include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/src/ui/native_shell.rs"
+        ));
+        let body = painter_body(source, "empty_state");
+        assert!(
+            body.contains("sentence"),
+            "the empty state should take one sentence"
+        );
+        assert!(
+            !body.contains("glyph"),
+            "the empty state must not paint a glyph medallion"
+        );
+        assert!(
+            !body.contains("FontWeight::SEMIBOLD"),
+            "the empty state must not paint a heading"
         );
     }
 
