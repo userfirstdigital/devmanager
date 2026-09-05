@@ -29547,12 +29547,11 @@ impl NativeShell {
         let owner_for_actions = Some(owner_key.clone());
         let captured_focus = Some(slot.interaction.current_focus_epoch());
         let captured_revision = revision;
-        let (title, summary, actions, rows): (
-            &'static str,
-            String,
-            Vec<PanelAction>,
-            Vec<AnyElement>,
-        ) = match tool {
+        // No title. The panel chrome above the tab strip already names this
+        // panel, and a body that repeats it is the panel-header-inside-a-body
+        // rules 2 and 5 forbid. The summary survives as the body's rule-2
+        // group label.
+        let (summary, actions, rows): (String, Vec<PanelAction>, Vec<AnyElement>) = match tool {
             CockpitDockTool::Changes => {
                 let selected = self.selected_repository_for_owner(&owner_key);
                 let changes = ChangesPanelProjection::from_host(
@@ -29574,27 +29573,27 @@ impl NativeShell {
                         let selector = row.selector.clone();
                         let available = row.available;
                         let element_key = stable_changes_repo_element_key(&row.element_id);
-                        let label =
-                            format!("{} · {} · {}", row.label, row.scope_label, row.state_label);
-                        let selected_mark = if row.selected { "● " } else { "○ " };
                         let owner_for_repo = owner_key.clone();
                         let repo_focus = captured_focus;
                         let repo_revision = captured_revision;
-                        let mut row_div = div()
-                            .id(("native-changes-repo", element_key))
-                            .flex()
-                            .items_center()
-                            .gap(px(tokens.density.spacing.sm))
-                            .px(px(tokens.density.spacing.sm))
-                            .py(px(tokens.density.spacing.xs))
-                            .border_1()
-                            .border_color(tokens.borders.subtle.to_gpui())
-                            .text_color(if available {
-                                tokens.text.primary.to_gpui()
-                            } else {
-                                tokens.text.disabled.to_gpui()
-                            })
-                            .child(format!("{selected_mark}{label}"));
+                        // Rule 5: the selection is the row's own fill and its
+                        // `text.emphasis` title, not a `●`/`○` prefix inside
+                        // the label -- a mark that has to be read, in a column
+                        // that is also the text. Scope and state drop to the
+                        // 10.5 px metadata line, so the repository's name is
+                        // the only thing on the title line.
+                        let mut row_div = panel_list_row(
+                            tokens,
+                            Some(crate::icons::GIT_BRANCH),
+                            row.label.clone(),
+                            Some(format!("{} · {}", row.scope_label, row.state_label)),
+                            None,
+                            row.selected,
+                        )
+                        .id(("native-changes-repo", element_key));
+                        if !available {
+                            row_div = row_div.text_color(tokens.text.disabled.to_gpui());
+                        }
                         if available {
                             if let Some(shell_entity) = shell_entity.clone() {
                                 row_div = row_div.cursor_pointer().on_mouse_down(
@@ -29622,15 +29621,12 @@ impl NativeShell {
                     })
                     .collect();
                 if rows.is_empty() {
-                    rows.push(
-                        div()
-                            .text_color(tokens.text.secondary.to_gpui())
-                            .child("No repositories in the Task catalog yet.")
-                            .into_any_element(),
-                    );
+                    rows.push(panel_empty_state(
+                        "No repositories in the Task catalog yet.",
+                        tokens,
+                    ));
                 }
                 (
-                    "Changes",
                     // Repository status must never be presented as the Project branch.
                     format!(
                         "{} · {}",
@@ -29661,81 +29657,107 @@ impl NativeShell {
                 let mut rows: Vec<AnyElement> = Vec::new();
                 if let Some(parent) = panel.navigate_parent.clone() {
                     rows.push(
-                        div()
-                            .flex()
-                            .items_center()
-                            .gap(px(tokens.density.spacing.sm))
-                            .child("..")
-                            .child(Self::panel_action_element_for_owner(
+                        panel_list_row(
+                            tokens,
+                            Some(crate::icons::FOLDER),
+                            "..",
+                            None,
+                            Some(Self::panel_action_element_for_owner(
                                 parent,
                                 "parent",
                                 tokens,
                                 shell_entity.clone(),
                                 owner_for_actions.clone(),
                                 captured_focus,
-                            ))
-                            .into_any_element(),
+                            )),
+                            false,
+                        )
+                        .into_any_element(),
                     );
                 }
                 if let Some(root) = panel.navigate_root.clone() {
                     rows.push(
-                        div()
-                            .flex()
-                            .items_center()
-                            .gap(px(tokens.density.spacing.sm))
-                            .child("/")
-                            .child(Self::panel_action_element_for_owner(
+                        panel_list_row(
+                            tokens,
+                            Some(crate::icons::FOLDER),
+                            "/",
+                            None,
+                            Some(Self::panel_action_element_for_owner(
                                 root,
                                 "root",
                                 tokens,
                                 shell_entity.clone(),
                                 owner_for_actions.clone(),
                                 captured_focus,
-                            ))
-                            .into_any_element(),
+                            )),
+                            false,
+                        )
+                        .into_any_element(),
                     );
                 }
                 rows.extend(panel.rows.iter().map(|row| {
-                    div()
-                        .flex()
-                        .items_center()
-                        .gap(px(tokens.density.spacing.sm))
-                        .child(row.label.clone())
-                        .child(Self::panel_action_element_for_owner(
+                    // Rule 10: the glyph says directory or file and nothing
+                    // more. It is the same 14 px `text.muted` for a `.rs` and
+                    // a `.png`, because the colour budget belongs to status.
+                    let glyph = if row.is_directory {
+                        crate::icons::FOLDER
+                    } else {
+                        crate::icons::FILE_TEXT
+                    };
+                    panel_list_row(
+                        tokens,
+                        Some(glyph),
+                        row.label.clone(),
+                        None,
+                        Some(Self::panel_action_element_for_owner(
                             row.read.clone(),
                             &row.relative_path,
                             tokens,
                             shell_entity.clone(),
                             owner_for_actions.clone(),
                             captured_focus,
-                        ))
-                        .into_any_element()
+                        )),
+                        false,
+                    )
+                    .into_any_element()
                 }));
                 if let Some(preview) = panel.preview.as_ref() {
                     rows.insert(
                         0,
+                        // The preview's `Open · path · n byte(s)` line was a
+                        // header row inside the body; rule 2 makes it a group
+                        // label above the content it introduces. The
+                        // `surfaces.raised` card under it goes: the body is
+                        // already on the panel's raised ground, so the fill
+                        // was a second elevation standing for nothing.
                         div()
+                            .w_full()
                             .flex()
                             .flex_col()
-                            .gap(px(tokens.density.spacing.xs))
-                            .p(px(tokens.density.physical().control_padding as f32))
-                            .bg(tokens.surfaces.raised.to_gpui())
-                            .child(format!(
-                                "Open · {} · {} byte(s){}",
-                                preview.relative_path,
-                                preview.byte_len,
-                                if preview.binary { " · binary" } else { "" }
+                            .child(panel_group_label(
+                                &format!(
+                                    "Open · {} · {} byte(s){}",
+                                    preview.relative_path,
+                                    preview.byte_len,
+                                    if preview.binary { " · binary" } else { "" }
+                                ),
+                                tokens,
                             ))
                             .child(
                                 div()
+                                    .w_full()
+                                    .px(px(ROW_PADDING_X))
+                                    .pb(px(ROW_PADDING_Y))
                                     .max_h(px(200.0))
                                     .overflow_hidden()
+                                    .text_size(px(ROW_FONT_SIZE))
+                                    .text_color(tokens.text.secondary.to_gpui())
                                     .child(preview.content.clone()),
                             )
                             .into_any_element(),
                     );
                 }
-                ("Files", panel.summary(), vec![panel.refresh], rows)
+                (panel.summary(), vec![panel.refresh], rows)
             }
             CockpitDockTool::Artifacts => {
                 let summaries = slot
@@ -29754,12 +29776,21 @@ impl NativeShell {
                     .rows
                     .iter()
                     .map(|row| {
-                        div()
-                            .child(format!("{:?} · {}", row.kind, row.label))
-                            .into_any_element()
+                        // The kind was a `{:?}` prefix on the title line; it
+                        // is metadata, so rule 5 puts it on the 10.5 px line
+                        // under the artifact's own name.
+                        panel_list_row(
+                            tokens,
+                            Some(crate::icons::FILE_TEXT),
+                            row.label.clone(),
+                            Some(format!("{:?}", row.kind)),
+                            None,
+                            false,
+                        )
+                        .into_any_element()
                     })
                     .collect();
-                ("Artifacts", panel.summary(), vec![panel.refresh], rows)
+                (panel.summary(), vec![panel.refresh], rows)
             }
             CockpitDockTool::Review => {
                 let summaries = slot
@@ -29777,12 +29808,21 @@ impl NativeShell {
                 let rows = panel
                     .artifacts
                     .iter()
-                    .map(|row| div().child(row.label.clone()).into_any_element())
+                    .map(|row| {
+                        panel_list_row(
+                            tokens,
+                            Some(crate::icons::FILE_TEXT),
+                            row.label.clone(),
+                            None,
+                            None,
+                            false,
+                        )
+                        .into_any_element()
+                    })
                     .collect();
-                ("Review", panel.summary(), vec![panel.refresh], rows)
+                (panel.summary(), vec![panel.refresh], rows)
             }
             CockpitDockTool::Browser => (
-                "Browser",
                 "No browser session is attached to this task".to_owned(),
                 Vec::new(),
                 Vec::new(),
@@ -29791,28 +29831,31 @@ impl NativeShell {
                 unreachable!("terminal and services use dedicated context-dock surfaces")
             }
         };
-        let controls = actions.into_iter().map(|action| {
-            Self::panel_action_element_for_owner(
-                action,
-                "refresh",
-                tokens,
-                shell_entity.clone(),
-                owner_for_actions.clone(),
-                captured_focus,
-            )
-        });
-        div()
-            .id("native-shell-workspace-dock")
-            .w_full()
-            .flex()
-            .flex_col()
-            .gap(px(tokens.density.spacing.xs))
-            .p(px(tokens.density.physical().control_padding as f32))
-            .bg(tokens.surfaces.sunken.to_gpui())
-            .child(div().child(format!("{title} · {summary}")))
-            .child(div().flex().children(controls))
-            .children(rows)
-            .into_any_element()
+        let controls: Vec<AnyElement> = actions
+            .into_iter()
+            .map(|action| {
+                Self::panel_action_element_for_owner(
+                    action,
+                    "refresh",
+                    tokens,
+                    shell_entity.clone(),
+                    owner_for_actions.clone(),
+                    captured_focus,
+                )
+            })
+            .collect();
+        // The `surfaces.sunken` ground and the region padding go with the
+        // title row. Rule 3 keeps `sunken` for inputs; a panel body sits on
+        // the panel's own `raised` ground, and rule 5's rows are full width
+        // so their hover and selection fills reach the panel's edge -- which
+        // a padded box would have cut short on both sides.
+        render_panel_frame(
+            "native-shell-workspace-dock",
+            summary,
+            controls,
+            div().w_full().flex().flex_col().children(rows),
+            tokens,
+        )
     }
 
     fn service_action_request(
@@ -73046,6 +73089,85 @@ pub(crate) mod tests {
             other_callers >= 3,
             "only {other_callers} callers of the shared empty state survive; this \
              lane should have moved two dock bodies off it, not emptied it"
+        );
+    }
+
+    /// The Files, Changes, Artifacts, Review and Browser bodies are lane R2's
+    /// rows, group label and frame -- and every handler that was wired to them
+    /// is still wired.
+    ///
+    /// The denominators are counted, not implied: six `panel_list_row` sites
+    /// (the Changes repository, the Files `..` and `/` navigators, the Files
+    /// listing, the Artifacts list and the Review list), one frame, and four
+    /// owner-scoped action sites. A scan that only asked "is the painter
+    /// mentioned" would keep passing with five of the six reverted, which is
+    /// exactly the shape a partial revert takes.
+    #[test]
+    fn the_workspace_dock_bodies_are_lane_r2s_rows_and_keep_their_handlers() {
+        let shell = shell_source();
+        let body = shell_method_body(&shell, "workspace_dock_surface_for");
+
+        let list_rows = body.matches("panel_list_row(").count();
+        assert_eq!(
+            list_rows, 6,
+            "expected six rule-5 list rows in the workspace dock body \
+             (Changes repo, Files `..`, Files `/`, Files listing, Artifacts, Review), \
+             found {list_rows}"
+        );
+        assert_eq!(
+            body.matches("render_panel_frame(").count(),
+            1,
+            "the body should end in exactly one panel frame"
+        );
+        assert_eq!(
+            body.matches("panel_group_label(").count(),
+            1,
+            "the file preview's `Open · …` header should be the body's one group label"
+        );
+        assert_eq!(
+            body.matches("panel_empty_state(").count(),
+            1,
+            "the empty repository list should be rule 9's one sentence"
+        );
+
+        // The handlers, ids and accessibility nodes this substitution had to
+        // preserve. Four owner-scoped action sites: the Files `..`, the Files
+        // `/`, every file row's Read, and the frame's refresh controls.
+        assert_eq!(
+            body.matches("panel_action_element_for_owner(").count(),
+            4,
+            "an owner-scoped action site was dropped along with the row that carried it"
+        );
+        for kept in [
+            "\"native-changes-repo\"",
+            "on_mouse_down(",
+            "select_changes_repository_for_owner_gated(",
+        ] {
+            assert!(
+                body.contains(kept),
+                "the Changes repository row lost `{kept}`; its click no longer selects"
+            );
+        }
+
+        // And what rules 2 and 5 removed. The title binding is gone from the
+        // tuple, so a `{title} · {summary}` header cannot come back without
+        // this failing to compile first; these check the two that would still
+        // compile.
+        assert!(
+            !body.contains("{title}"),
+            "the body still paints a title row; the panel chrome above already owns the name"
+        );
+        for banished in ["\"● \"", "\"○ \""] {
+            assert!(
+                !body.contains(banished),
+                "the Changes rows still mark the selection with {banished} text instead \
+                 of rule 5's selection fill"
+            );
+        }
+        assert!(
+            !body.contains("density.typography"),
+            "the body reads a type size from the density scale (caption 11/12, body \
+             13/14), which is not rule 2's scale"
         );
     }
 }
