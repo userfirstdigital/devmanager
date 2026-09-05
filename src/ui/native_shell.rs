@@ -25261,6 +25261,7 @@ impl NativeShell {
         let zoom_entity = entity.clone();
         let menu_entity = entity.clone();
         let retry_entity = entity.clone();
+        let tooltip_entity = entity.clone();
         let key_entity = entity;
         PanelHandlers {
             on_focus: Rc::new(move |key, _window, app| {
@@ -25323,7 +25324,33 @@ impl NativeShell {
                     cx.notify();
                 });
             }),
+            // Read, not update: a tooltip must not notify, or resting a
+            // pointer on a tab would re-render the shell on every frame.
+            on_terminal_tooltip: Rc::new(move |key, app| {
+                let key = key.clone();
+                tooltip_entity
+                    .read_with(app, |shell, _| shell.terminal_tab_diagnostic(&key))
+                    .ok()
+                    .flatten()
+            }),
         }
+    }
+
+    /// The four facts the terminal body's 22 px debug strip used to print
+    /// across its own top, for the panel's Terminal tab tooltip (fix wave 1,
+    /// F7). `None` when this panel has no terminal attached yet.
+    ///
+    /// Called on hover only. Projecting the pane model clones a terminal
+    /// screen, which is why this is behind a handler the painter asks lazily
+    /// rather than a field on `PanelChrome` that every panel would pay for on
+    /// every frame.
+    fn terminal_tab_diagnostic(&self, owner: &HostTaskKey) -> Option<String> {
+        let pane = self
+            .task_surfaces
+            .state(owner.clone())
+            .and_then(|state| state.latest_terminal())
+            .map(crate::ui::task_cockpit::dock::ContextDock::terminal_pane_model_for_projection)?;
+        Some(crate::terminal::view::terminal_surface_diagnostic(&pane))
     }
 
     /// The row a pane keeps when the fleet projection no longer lists its
@@ -28991,10 +29018,16 @@ impl NativeShell {
                 )
                 .into_any_element()
         } else {
+            // Design language rule 9: an empty state is ONE 11.5 px muted
+            // sentence, left-aligned at the surface's own padding -- not a
+            // label floated in the middle of the body, and not the full-width
+            // raised bar this used to read as (fix wave 1, F7).
             surface
-                .items_center()
-                .justify_center()
-                .text_color(tokens.terminal.bright_black.to_gpui())
+                .items_start()
+                .justify_start()
+                .p(px(crate::ui::overlay_chrome::REGION_PADDING))
+                .text_size(px(crate::ui::overlay_chrome::BODY_FONT_SIZE))
+                .text_color(tokens.text.muted.to_gpui())
                 .child(label)
                 .into_any_element()
         }

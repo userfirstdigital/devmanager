@@ -262,6 +262,15 @@ pub struct PanelHandlers {
     pub on_menu: Rc<dyn Fn(&HostTaskKey, Point<Pixels>, &mut Window, &mut App)>,
     pub on_retry: Rc<dyn Fn(&HostTaskKey, &mut Window, &mut App)>,
     pub on_key: Rc<dyn Fn(&HostTaskKey, &KeyDownEvent, &mut Window, &mut App)>,
+    /// The diagnostic the terminal body used to print across its own top --
+    /// session title, backend, status, font size -- for the Terminal tab's
+    /// tooltip (fix wave 1, F7).
+    ///
+    /// Asked lazily, and that is the point: answering it means projecting a
+    /// terminal screen, which is far too expensive to do for every panel on
+    /// every frame just to have a string ready in case a pointer stops on a
+    /// tab. `None` when the panel has no terminal attached yet.
+    pub on_terminal_tooltip: Rc<dyn Fn(&HostTaskKey, &mut App) -> Option<String>>,
 }
 
 /// Hash host + task into the panel's element identity.
@@ -631,6 +640,8 @@ fn tab_row_element(
         let active = view == chrome.view;
         let select_key = chrome.key.clone();
         let on_select = handlers.on_select_view.clone();
+        let tooltip_key = chrome.key.clone();
+        let on_terminal_tooltip = handlers.on_terminal_tooltip.clone();
         row = row.child(
             div()
                 .id((view.label(), element_key))
@@ -653,6 +664,16 @@ fn tab_row_element(
                 .when(!active, |tab| {
                     tab.text_color(tokens.text.secondary.to_gpui())
                         .hover(|style| style.bg(tokens.surfaces.hover.to_gpui()))
+                })
+                // The terminal body's old debug strip lives here now: one hover
+                // on the tab that owns those facts, instead of a full-width
+                // developer line across every terminal (F7).
+                .when(view == PaneView::Terminal, |tab| {
+                    tab.tooltip(move |window, app| {
+                        let text = (on_terminal_tooltip)(&tooltip_key, app)
+                            .unwrap_or_else(|| "No terminal attached yet.".to_string());
+                        gpui_component::tooltip::Tooltip::new(text).build(window, app)
+                    })
                 })
                 .on_mouse_down(
                     MouseButton::Left,
@@ -840,6 +861,7 @@ mod tests {
             on_menu: Rc::new(|_, _, _, _| {}),
             on_retry: Rc::new(|_, _, _| {}),
             on_key: Rc::new(|_, _, _, _| {}),
+            on_terminal_tooltip: Rc::new(|_, _| None),
         }
     }
 
@@ -1318,6 +1340,73 @@ mod tests {
         assert!(
             !painter.contains(".text_size(px(1"),
             "text sizes belong in the constants above, not inline"
+        );
+    }
+
+    /// F7: the terminal body's debug strip is a tooltip on the Terminal tab,
+    /// and on no other tab -- the facts are about the terminal, and four
+    /// developer facts hanging off "Files" would be noise.
+    ///
+    /// A source scan: the tooltip's text is produced by a shell closure that
+    /// projects a live terminal, so there is nothing a headless test can read
+    /// out of the element tree. What CAN be checked is that the painter asks
+    /// for it, asks only under `PaneView::Terminal`, and has a sentence for
+    /// the panel that has no terminal yet.
+    #[test]
+    fn the_terminal_tab_carries_the_bodys_old_debug_strip() {
+        let source = include_str!("render.rs");
+        let painter = source
+            .split("#[cfg(test)]")
+            .next()
+            .expect("the painter is everything above its tests");
+        let tabs = painter
+            .split("fn tab_row_element(")
+            .nth(1)
+            .expect("the tab row painter");
+        let tabs = tabs
+            .split("\n/// ")
+            .next()
+            .expect("everything up to the next item's doc comment");
+        assert!(
+            tabs.contains("on_terminal_tooltip"),
+            "the tab row must ask the shell for the terminal diagnostic"
+        );
+        assert!(
+            tabs.contains("view == PaneView::Terminal"),
+            "only the Terminal tab carries it"
+        );
+        assert!(
+            tabs.contains("No terminal attached yet."),
+            "a panel with no terminal yet still owes the hover a sentence"
+        );
+
+        // And the body it came from no longer paints it. The four facts are
+        // composed in exactly one place, which is the function the tooltip
+        // reaches; if a second copy ever appears in the surface painter this
+        // goes red.
+        let terminal = include_str!("../../terminal/view.rs");
+        let surface = terminal
+            .split("fn render_terminal_surface_with_palette(")
+            .nth(1)
+            .expect("the terminal surface painter")
+            .split("\nfn ")
+            .next()
+            .expect("everything up to the next item");
+        assert!(
+            !surface.contains("font {}"),
+            "the font size belongs in the tooltip, not across the top of the body"
+        );
+        assert!(
+            !surface.contains("surface_header_detail("),
+            "the backend line belongs in the tooltip, not across the top of the body"
+        );
+        assert!(
+            !surface.contains("session_status_label("),
+            "the status word belongs in the tooltip, not across the top of the body"
+        );
+        assert!(
+            terminal.contains("pub fn terminal_surface_diagnostic("),
+            "the four facts must still exist somewhere, or F7 deleted them rather than moving them"
         );
     }
 }
