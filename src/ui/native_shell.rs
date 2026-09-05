@@ -24771,7 +24771,53 @@ impl NativeShell {
         (title, project_name, provider_label, status_label)
     }
 
+    /// F2/F13: composition A insets the panel grid from the canvas on all
+    /// four sides, including the right window edge -- a panel that touches
+    /// the window frame reads as clipped rather than as placed.
+    ///
+    /// The inset is the same 8 px the allocator spends between panels, so
+    /// every gap in the window is one number:
+    /// [`AllocationMetrics::production`]`.divider`.
+    fn workspace_grid_inset() -> f32 {
+        Self::workspace_allocation_metrics().divider
+    }
+
+    /// The viewport the panes are actually allocated inside: the canvas
+    /// less the inset on each side. Pure, so the arithmetic is asserted
+    /// rather than trusted -- handing the allocator the OUTER size would
+    /// lay the grid out 16 px wider than the box that holds it and clip
+    /// the right-hand column against the window.
+    fn workspace_grid_viewport(outer: Size<Pixels>) -> Size<Pixels> {
+        let inset = Self::workspace_grid_inset() * 2.0;
+        size(
+            px((f32::from(outer.width) - inset).max(1.0)),
+            px((f32::from(outer.height) - inset).max(1.0)),
+        )
+    }
+
     fn task_workspace_surface(
+        &mut self,
+        tokens: crate::ui::tokens::ThemeTokens,
+        workspace_size: Size<Pixels>,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let inset = Self::workspace_grid_inset();
+        let grid =
+            self.task_workspace_grid(tokens, Self::workspace_grid_viewport(workspace_size), cx);
+        div()
+            .id("native-shell-workspace-grid")
+            .size_full()
+            .min_w(px(0.0))
+            .min_h(px(0.0))
+            .overflow_hidden()
+            .p(px(inset))
+            .child(grid)
+            .into_any_element()
+    }
+
+    /// The grid itself, laid out inside the inset box rather than against
+    /// the window.
+    fn task_workspace_grid(
         &mut self,
         tokens: crate::ui::tokens::ThemeTokens,
         workspace_size: Size<Pixels>,
@@ -24913,7 +24959,11 @@ impl NativeShell {
                             Axis::Horizontal => parent_rect.width,
                             Axis::Vertical => parent_rect.height,
                         };
-                        let divider_width = 4.0_f32
+                        // The painted rail IS the allocator's gap: a second
+                        // copy of the number would leave a seam or an overlap
+                        // the moment one of the two moved.
+                        let divider_width = Self::workspace_allocation_metrics()
+                            .divider
                             .min(parent_extent / children.len().saturating_sub(1).max(1) as f32);
                         let sibling_floor_total = children
                             .iter()
@@ -24994,7 +25044,8 @@ impl NativeShell {
                         .iter()
                         .map(|child| Self::task_workspace_child_floor(child, axis))
                         .sum::<f32>()
-                        + 4.0 * children.len().saturating_sub(1) as f32
+                        + Self::workspace_allocation_metrics().divider
+                            * children.len().saturating_sub(1) as f32
                 } else {
                     children
                         .iter()
@@ -47609,7 +47660,7 @@ pub(crate) mod tests {
     use crate::ui::task_cockpit::Inbox;
     use crate::ui::task_cockpit::TaskList;
     use crate::ui::workspace_layout::{PaneEdge, WorkspaceLayout};
-    use gpui::{AppContext, KeyDownEvent, Keystroke, WindowOptions};
+    use gpui::{px, size, AppContext, KeyDownEvent, Keystroke, WindowOptions};
     use std::collections::{BTreeMap, VecDeque};
     use std::path::PathBuf;
     use std::process::Command;
@@ -60100,6 +60151,37 @@ pub(crate) mod tests {
             )),
             "the workspace row's height must be the window minus the top bar"
         );
+    }
+
+    /// F2/F13: the panel grid is inset from the canvas on all four sides, and
+    /// the allocator is handed the INSET box rather than the window. Handing it
+    /// the outer size is the bug the right window edge shows: the grid lays
+    /// itself out 16 px wider than the box that holds it, and the right-hand
+    /// column is clipped against the frame (4.png, panel 3).
+    #[test]
+    fn the_panel_grid_is_inset_from_every_canvas_edge_including_the_window() {
+        // One number for the gap between panels and the gap to the window, so a
+        // panel's edge cannot sit closer to the frame than to its neighbour.
+        assert_eq!(NativeShell::workspace_grid_inset(), 8.0);
+        assert_eq!(
+            NativeShell::workspace_grid_inset(),
+            crate::ui::task_workspace::AllocationMetrics::production().divider,
+            "the outer inset and the divider are the same 8 px"
+        );
+
+        let inner = NativeShell::workspace_grid_viewport(size(px(1000.0), px(800.0)));
+        assert_eq!(f32::from(inner.width), 984.0, "8 px off the left AND right");
+        assert_eq!(
+            f32::from(inner.height),
+            784.0,
+            "8 px off the top AND bottom"
+        );
+
+        // A window narrower than its own padding must still hand the allocator
+        // a positive viewport rather than a negative one.
+        let tiny = NativeShell::workspace_grid_viewport(size(px(4.0), px(4.0)));
+        assert_eq!(f32::from(tiny.width), 1.0);
+        assert_eq!(f32::from(tiny.height), 1.0);
     }
 
     #[test]
