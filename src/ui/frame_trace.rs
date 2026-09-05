@@ -98,6 +98,13 @@ struct FrameState {
     started: Option<Instant>,
     sections: Vec<SectionReport>,
     last: Option<FrameReport>,
+    /// When the current rate window opened, and how many frames it has seen.
+    /// The RATE is the number the drag complaint is actually about: a shell
+    /// painting 300 identical frames a second is not slow per frame, it is
+    /// asked 300 times, and only the count says which.
+    rate_window: Option<Instant>,
+    rate_frames: u32,
+    rate_total: Duration,
 }
 
 thread_local! {
@@ -123,17 +130,30 @@ pub fn end_frame() {
     if !enabled() {
         return;
     }
-    let report = FRAME.with(|frame| {
+    let (report, rate) = FRAME.with(|frame| {
         let mut frame = frame.borrow_mut();
         let Some(started) = frame.started.take() else {
-            return None;
+            return (None, None);
         };
         let report = FrameReport {
             total: started.elapsed(),
             sections: std::mem::take(&mut frame.sections),
         };
         frame.last = Some(report.clone());
-        Some(report)
+
+        let window_started = *frame.rate_window.get_or_insert_with(Instant::now);
+        frame.rate_frames = frame.rate_frames.saturating_add(1);
+        frame.rate_total += report.total;
+        let elapsed = window_started.elapsed();
+        let rate = (elapsed >= Duration::from_secs(1)).then(|| {
+            let frames = frame.rate_frames;
+            let total = frame.rate_total;
+            frame.rate_window = Some(Instant::now());
+            frame.rate_frames = 0;
+            frame.rate_total = Duration::ZERO;
+            (frames, elapsed, total)
+        });
+        (Some(report), rate)
     });
     let Some(report) = report else {
         return;
@@ -148,6 +168,17 @@ pub fn end_frame() {
         ));
     }
     eprintln!("{line}");
+    if let Some((frames, elapsed, total)) = rate {
+        // Only the shell's own build time is summed here -- GPUI's layout and
+        // paint sit outside `render` -- so this is a floor on what the frames
+        // cost, never the whole of it.
+        eprintln!(
+            "devmanager: frames={frames} in {:.2}s ({:.1}/sec, {:.1}% of one core building them)",
+            elapsed.as_secs_f64(),
+            f64::from(frames) / elapsed.as_secs_f64().max(0.000_001),
+            total.as_secs_f64() / elapsed.as_secs_f64().max(0.000_001) * 100.0
+        );
+    }
 }
 
 /// The frame that [`end_frame`] most recently closed on this thread.

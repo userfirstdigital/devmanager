@@ -15889,6 +15889,11 @@ impl NativeShell {
         self.local_slot().pending_host_actions.front()
     }
 
+    #[cfg(test)]
+    pub(crate) fn controller_wait_deadline_for_test(&self) -> Duration {
+        self.controller_wait_deadline()
+    }
+
     pub fn controller_tick_count(&self) -> usize {
         self.controller_ticks
     }
@@ -56243,6 +56248,18 @@ pub(crate) mod tests {
         cx: &mut gpui::App,
         action: impl FnOnce(&mut NativeShell, &mut gpui::Window, &mut gpui::Context<NativeShell>),
     ) {
+        with_frame_probe_window(cx, |entity, window, cx| {
+            entity.update(cx, |shell, cx| action(shell, window, cx));
+        });
+    }
+
+    /// The same probe shell, handed over with the raw `App` beside the window
+    /// so a caller can drive `Window::draw` -- the WHOLE frame, layout and
+    /// paint included, rather than only the element tree the shell builds.
+    fn with_frame_probe_window(
+        cx: &mut gpui::App,
+        action: impl FnOnce(&gpui::Entity<NativeShell>, &mut gpui::Window, &mut gpui::App),
+    ) {
         const TASKS: u8 = 6;
         const PANES: usize = 4;
         const MESSAGES: u64 = 40;
@@ -56271,7 +56288,7 @@ pub(crate) mod tests {
         let entity = window.entity(cx).expect("frame probe shell entity");
         let any_window = window.into();
         cx.update_window(any_window, |_root, window, cx| {
-            entity.update(cx, |shell, cx| {
+            entity.update(cx, |shell, _cx| {
                 shell.install_idle_conversation_photo_for_test();
                 let (model, task_ids) = open_tasks_client_model(TASKS);
                 let project_id = model.task(task_ids[0]).expect("task").task.project_id;
@@ -56321,8 +56338,8 @@ pub(crate) mod tests {
                     TASKS as usize,
                     "and a six-row board"
                 );
-                action(shell, window, cx);
             });
+            action(&entity, window, cx);
         })
         .expect("drive the frame probe window");
     }
@@ -56643,6 +56660,209 @@ pub(crate) mod tests {
             cx.quit();
         });
         assert!(completed.get(), "window move scenario completed");
+    }
+
+    /// What ONE WHOLE FRAME costs -- `Window::draw`, which builds the element
+    /// tree, lays it out, prepaints and paints it.
+    ///
+    /// The section probe above measures only the half the shell writes. The
+    /// other half is GPUI's, it is charged on every frame just the same, and
+    /// it is the half an optimised build cannot make disappear if the tree
+    /// handed to it is large. Splitting the two is the whole point: it says
+    /// whether the remaining cost is ours to fix or GPUI's.
+    ///
+    /// `#[ignore]`d: it is a measurement. Run with
+    /// `cargo test --lib -- whole_frame_draw_cost_probe --ignored --nocapture`.
+    #[test]
+    #[ignore = "timing probe; run explicitly with --ignored --nocapture"]
+    fn whole_frame_draw_cost_probe_six_rows_four_panes() {
+        const TEST_NAME: &str =
+            "ui::native_shell::tests::whole_frame_draw_cost_probe_six_rows_four_panes";
+        if rerun_headless_shell_test_in_child(TEST_NAME) {
+            return;
+        }
+        let _guard = HEADLESS_SHELL_TEST_LOCK
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .expect("headless shell test lock");
+        const FRAMES: usize = 100;
+        gpui::Application::new().run(move |cx| {
+            crate::ui::init(cx);
+            crate::ui::frame_trace::set_enabled_for_test(true);
+            with_frame_probe_window(cx, |_entity, window, cx| {
+                for _ in 0..5 {
+                    let _ = window.draw(cx);
+                }
+                let mut draw_ms: Vec<f64> = Vec::with_capacity(FRAMES);
+                let mut build_ms: Vec<f64> = Vec::with_capacity(FRAMES);
+                for _ in 0..FRAMES {
+                    let started = std::time::Instant::now();
+                    let _ = window.draw(cx);
+                    draw_ms.push(started.elapsed().as_secs_f64() * 1_000.0);
+                    build_ms.push(
+                        crate::ui::frame_trace::last_frame()
+                            .map(|frame| frame.millis("render"))
+                            .unwrap_or(0.0),
+                    );
+                }
+                draw_ms.sort_by(f64::total_cmp);
+                build_ms.sort_by(f64::total_cmp);
+                let draw = probe_percentile(&draw_ms, 0.5);
+                let build = probe_percentile(&build_ms, 0.5);
+                println!(
+                    "whole frame draw cost probe: 6 board rows, 4 open panes, \
+                     40-message conversation, {FRAMES} frames (debug build)"
+                );
+                println!(
+                    "  Window::draw (whole frame)   median {:.3} ms  p95 {:.3} ms",
+                    draw,
+                    probe_percentile(&draw_ms, 0.95)
+                );
+                println!(
+                    "  of which the shell builds    median {:.3} ms  p95 {:.3} ms  ({:.0}%)",
+                    build,
+                    probe_percentile(&build_ms, 0.95),
+                    if draw > 0.0 {
+                        build / draw * 100.0
+                    } else {
+                        0.0
+                    }
+                );
+                println!(
+                    "  the rest is GPUI layout+paint       {:.3} ms  ({:.0}%)",
+                    (draw - build).max(0.0),
+                    if draw > 0.0 {
+                        (draw - build).max(0.0) / draw * 100.0
+                    } else {
+                        0.0
+                    }
+                );
+            });
+            crate::ui::frame_trace::set_enabled_for_test(false);
+            cx.quit();
+        });
+    }
+
+    /// How often an IDLE shell asks to be repainted, and how fast it lets
+    /// itself be asked.
+    ///
+    /// Two numbers, because they are two different failures. The controller
+    /// loop sleeps `controller_wait_deadline()` between passes, so that is the
+    /// ceiling on how often an idle shell can wake at all; and each pass
+    /// returns whether it wants a repaint, so that is how many of those wakes
+    /// turn into a frame. A shell that wakes every millisecond and repaints
+    /// every time is burning a core with nothing on screen changing, and it is
+    /// the shape that survives an optimised build unchanged -- which is what
+    /// the release build being no smoother than the debug one points at.
+    ///
+    /// `#[ignore]`d: it is a measurement. Run with
+    /// `cargo test --lib -- idle_repaint_rate_probe --ignored --nocapture`.
+    #[test]
+    #[ignore = "timing probe; run explicitly with --ignored --nocapture"]
+    fn idle_repaint_rate_probe_six_rows_four_panes() {
+        const TEST_NAME: &str =
+            "ui::native_shell::tests::idle_repaint_rate_probe_six_rows_four_panes";
+        if rerun_headless_shell_test_in_child(TEST_NAME) {
+            return;
+        }
+        let _guard = HEADLESS_SHELL_TEST_LOCK
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .expect("headless shell test lock");
+        const TICKS: usize = 500;
+        gpui::Application::new().run(move |cx| {
+            crate::ui::init(cx);
+            with_frame_probe_shell(cx, |shell, window, cx| {
+                let _ = gpui::Render::render(shell, window, cx);
+                for _ in 0..8 {
+                    let _ = shell.controller_tick_for_test(MAX_PENDING_HOST_ACTIONS);
+                }
+                let _ = gpui::Render::render(shell, window, cx);
+
+                let before_trees = shell.accessibility_tree_builds;
+                let mut repaints = 0_usize;
+                let mut tick_ms: Vec<f64> = Vec::with_capacity(TICKS);
+                for _ in 0..TICKS {
+                    let started = std::time::Instant::now();
+                    let repaint = shell.controller_tick_for_test(MAX_PENDING_HOST_ACTIONS);
+                    tick_ms.push(started.elapsed().as_secs_f64() * 1_000.0);
+                    if repaint {
+                        repaints += 1;
+                    }
+                }
+                tick_ms.sort_by(f64::total_cmp);
+                let wait = shell.controller_wait_deadline_for_test();
+                println!("idle repaint rate probe: {TICKS} controller passes (debug build)");
+                println!(
+                    "  wait between passes when idle: {:.1} ms  (ceiling {:.1} wakes/sec)",
+                    wait.as_secs_f64() * 1_000.0,
+                    1.0 / wait.as_secs_f64().max(0.000_001)
+                );
+                println!("  passes that asked for a repaint: {repaints} of {TICKS}");
+                println!(
+                    "  accessibility trees rebuilt:     {}",
+                    shell.accessibility_tree_builds - before_trees
+                );
+                println!(
+                    "  controller pass                  median {:.3} ms  p95 {:.3} ms",
+                    probe_percentile(&tick_ms, 0.5),
+                    probe_percentile(&tick_ms, 0.95)
+                );
+            });
+            cx.quit();
+        });
+    }
+
+    /// An idle shell must not ask to be repainted at all.
+    ///
+    /// The controller pass is the only thing that runs on a shell nobody is
+    /// touching, and every pass that returns `true` is a frame. A pass that
+    /// says `true` unconditionally puts the app at the wake rate forever, and
+    /// no build profile makes that cheaper -- it makes each wasted frame
+    /// cheaper and leaves the count alone.
+    #[test]
+    fn an_idle_shell_asks_for_no_repaints() {
+        const TEST_NAME: &str = "ui::native_shell::tests::an_idle_shell_asks_for_no_repaints";
+        if rerun_headless_shell_test_in_child(TEST_NAME) {
+            return;
+        }
+        let _guard = HEADLESS_SHELL_TEST_LOCK
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .expect("headless shell test lock");
+        let completed = std::rc::Rc::new(std::cell::Cell::new(false));
+        let completed_for_app = std::rc::Rc::clone(&completed);
+        gpui::Application::new().run(move |cx| {
+            crate::ui::init(cx);
+            with_frame_probe_shell(cx, |shell, window, cx| {
+                let _ = gpui::Render::render(shell, window, cx);
+                // Settle whatever the first passes legitimately have to do:
+                // the first preferences snapshot, the first projection drain,
+                // the first conversation sweep.
+                for _ in 0..8 {
+                    let _ = shell.controller_tick_for_test(MAX_PENDING_HOST_ACTIONS);
+                }
+                let before_trees = shell.accessibility_tree_builds;
+                let mut repaints = 0_usize;
+                for _ in 0..50 {
+                    if shell.controller_tick_for_test(MAX_PENDING_HOST_ACTIONS) {
+                        repaints += 1;
+                    }
+                }
+                assert_eq!(
+                    repaints, 0,
+                    "fifty passes over a shell nobody touched asked for {repaints} repaints"
+                );
+                assert_eq!(
+                    shell.accessibility_tree_builds - before_trees,
+                    0,
+                    "and rebuilt the accessibility tree"
+                );
+            });
+            completed_for_app.set(true);
+            cx.quit();
+        });
+        assert!(completed.get(), "idle shell scenario completed");
     }
 
     /// The board replaces the project rail: tasks group by what they are
