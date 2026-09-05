@@ -267,19 +267,25 @@ const STATUS_AGE_MAX_WIDTH: f32 = 25.0;
 /// The box the always-visible recovery label is painted in, at the status font
 /// size. "Retry" measures 27.0 px inside it and "New" 22.5.
 ///
+/// Keeps its original name deliberately. A concurrent branch grew a THIRD use
+/// site for it (`status_floor_for`), and renaming it here auto-merged cleanly
+/// while leaving that site referring to a constant that no longer exists -- a
+/// merge that does not compile, invisible in both diffstats. Measured with
+/// `git merge-tree`.
+///
 /// The floor reserves the SHORT form
 /// (`BlockedRecovery::short_label`), because it is the form that fits at every
 /// width. Reserving the long one would put the floor above its own budget at
 /// 280 px, where the entire status budget is the floor; and a `flex_none`
 /// child under an under-reserved floor is clipped rather than moved, which is
 /// the defect `status_floor` exists for.
-const STATUS_RECOVERY_WIDTH: f32 = 28.0;
+const STATUS_RETRY_WIDTH: f32 = 28.0;
 
 /// How much wider the long label is than the reserved short one, so the
 /// painter can spend genuinely spare pixels on it and nothing else.
 fn recovery_label_extra_width(recovery: crate::ui::panel::model::BlockedRecovery) -> f32 {
     (crate::ui::overlay_chrome::approx_text_width(recovery.label(), INLINE_STATUS_FONT_SIZE)
-        - STATUS_RECOVERY_WIDTH)
+        - STATUS_RETRY_WIDTH)
         .max(0.0)
 }
 
@@ -300,7 +306,7 @@ fn recovery_label_extra_width(recovery: crate::ui::panel::model::BlockedRecovery
 fn status_floor(blocked: bool) -> f32 {
     let base = STATUS_ICON_WIDTH + STATUS_GAP + STATUS_AGE_MAX_WIDTH;
     if blocked {
-        base + STATUS_RECOVERY_WIDTH + STATUS_GAP
+        base + STATUS_RETRY_WIDTH + STATUS_GAP
     } else {
         base
     }
@@ -344,7 +350,7 @@ fn status_fixed_parts(chrome: &PanelChrome, layout: StatusLayout, blocked: bool)
         width += 2.0 * STATUS_GAP + STATUS_SEPARATOR_WIDTH;
     }
     if blocked {
-        width += STATUS_RECOVERY_WIDTH + STATUS_GAP;
+        width += STATUS_RETRY_WIDTH + STATUS_GAP;
     }
     if chrome.status.progress.is_some() && layout.show_segments {
         width += STATUS_SEGMENTS_MAX_WIDTH + STATUS_GAP + STATUS_SEPARATOR_WIDTH + STATUS_GAP;
@@ -1417,7 +1423,7 @@ mod tests {
                 crate::ui::overlay_chrome::approx_text_width(
                     recovery.short_label(),
                     INLINE_STATUS_FONT_SIZE
-                ) <= STATUS_RECOVERY_WIDTH,
+                ) <= STATUS_RETRY_WIDTH,
                 "{recovery:?}'s always-visible label must fit what the floor reserves"
             );
         }
@@ -1427,7 +1433,7 @@ mod tests {
         // the arithmetic that forced a yielding label rather than a wider
         // floor, and it is asserted so a later font or budget change says
         // so instead of leaving the machinery unexplained.
-        let floor_with_long_label = status_floor(true) - STATUS_RECOVERY_WIDTH
+        let floor_with_long_label = status_floor(true) - STATUS_RETRY_WIDTH
             + crate::ui::overlay_chrome::approx_text_width(
                 BlockedRecovery::StartFresh.label(),
                 INLINE_STATUS_FONT_SIZE,
