@@ -430,6 +430,9 @@ const T3_WORKSPACE_TOPBAR_HEIGHT: f32 = 32.0;
 /// `ui::board::layout`; these place the panel, nothing more.
 const BOARD_MENU_WIDTH: f32 = 220.0;
 const BOARD_MENU_LEFT_INSET: f32 = 8.0;
+/// The one short suffix a row disabled by remote ownership carries. The whole
+/// sentence is the row's tooltip; this is what the menu itself prints.
+const BOARD_MENU_LOCAL_ONLY_SUFFIX: &str = "(local only)";
 /// Every menu in this shell hangs this far under the control it drops from.
 /// One number, so the board menu and the scope menu cannot disagree about what
 /// "just below" means.
@@ -1014,18 +1017,30 @@ enum ProviderInboxAffordance {
     DisconnectedAdd,
 }
 
-impl ProviderInboxAffordance {
-    /// Why a project-creation control is disabled, or `None` when it is live.
-    /// The words are the headings `connect_canvas_copy` already prints for the
-    /// same two states, so a disabled row and the empty board never explain one
-    /// condition two ways.
-    fn disabled_reason(self) -> Option<&'static str> {
-        match self {
-            Self::ConnectedAdd => None,
-            Self::Checking => Some("Checking agents"),
-            Self::DisconnectedAdd => Some("Connect an agent"),
-        }
-    }
+/// Why the "New project..." row refuses, or `None` when it is live.
+///
+/// The words are not copied: `connect_canvas_copy` is CALLED for the state the
+/// affordance names, so this row and the empty-board canvas cannot drift apart.
+/// `DisconnectedAdd` asks with `None`, which is that function's own
+/// not-connected branch; `Checking` asks with the real snapshot, which is only
+/// ever in the checking state when the affordance says so.
+///
+/// Ledgered: a `CheckFailed` snapshot reaches here as `DisconnectedAdd`, because
+/// `provider_inbox_affordance` already collapses the two, so the row says
+/// "connect an agent" rather than the canvas's "could not check agents".
+fn new_project_disabled(
+    affordance: ProviderInboxAffordance,
+    snapshot: Option<&AgentConnectionSnapshot>,
+) -> Option<BoardMenuDisabled> {
+    let (heading, detail) = match affordance {
+        ProviderInboxAffordance::ConnectedAdd => return None,
+        ProviderInboxAffordance::Checking => connect_canvas_copy(snapshot),
+        ProviderInboxAffordance::DisconnectedAdd => connect_canvas_copy(None),
+    };
+    Some(BoardMenuDisabled {
+        suffix: format!("({})", heading.to_lowercase()),
+        detail,
+    })
 }
 
 fn action_lane_total(
@@ -4576,9 +4591,19 @@ struct BoardMenuEntry {
     element_id: String,
     label: String,
     action: BoardMenuAction,
-    /// `None` when the row is live. `Some(reason)` disables it, and the reason
-    /// is what the person is told instead of being left to guess at a dim row.
-    disabled_reason: Option<&'static str>,
+    /// `None` when the row is live. `Some(_)` disables it and says why.
+    disabled: Option<BoardMenuDisabled>,
+}
+
+/// Why a board menu row refuses, in the two lengths the menu needs: a short
+/// parenthetical the row can carry on its own line, and the full sentence for
+/// the tooltip. A menu is scanned, so the row gets the short one.
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct BoardMenuDisabled {
+    /// Painted after the greyed label, e.g. `(local only)`.
+    suffix: String,
+    /// The whole explanation, shown on hover and never inline.
+    detail: String,
 }
 
 impl BoardMenuEntry {
@@ -4587,7 +4612,7 @@ impl BoardMenuEntry {
             element_id,
             label,
             action,
-            disabled_reason: None,
+            disabled: None,
         }
     }
 }
@@ -30790,29 +30815,25 @@ impl NativeShell {
                 element_id,
                 label,
                 action,
-                disabled_reason,
+                disabled,
             } = entry;
             let row = div()
                 .id(SharedString::from(element_id))
                 .w_full()
-                .flex()
-                .flex_col()
                 .px(px(tokens.density.spacing.md))
                 .py(px(tokens.density.spacing.xs))
                 .text_size(px(tokens.density.typography.body));
-            rows.push(match disabled_reason {
-                // A disabled row says why. The footer's `-unavailable` twins
-                // only dimmed their icon, which left the person to guess at a
-                // control that had stopped answering.
-                Some(reason) => row
+            rows.push(match disabled {
+                // A disabled row stays one line: the greyed label and one short
+                // parenthetical. The whole sentence goes to the tooltip -- as
+                // wrapped caption text it was several lines of prose per row
+                // inside a 220 px menu that exists to be scanned.
+                Some(BoardMenuDisabled { suffix, detail }) => row
                     .text_color(tokens.text.disabled.to_gpui())
-                    .child(label)
-                    .child(
-                        div()
-                            .text_size(px(tokens.density.typography.caption))
-                            .text_color(tokens.text.muted.to_gpui())
-                            .child(reason),
-                    )
+                    .tooltip(move |window, app| {
+                        gpui_component::tooltip::Tooltip::new(detail.clone()).build(window, app)
+                    })
+                    .child(format!("{label} {suffix}"))
                     .into_any_element(),
                 None => row
                     .text_color(tokens.text.primary.to_gpui())
@@ -30864,6 +30885,15 @@ impl NativeShell {
                                 .left(px(Self::board_menu_anchor().1))
                                 .top(px(Self::board_menu_anchor().0))
                                 .w(px(BOARD_MENU_WIDTH))
+                                // The row count is a projection -- one per
+                                // project on the New-task menu -- so the panel
+                                // is bounded by what is left of the window
+                                // under it and scrolls rather than growing off
+                                // the bottom edge.
+                                .max_h(px((f32::from(viewport.height)
+                                    - Self::board_menu_anchor().0)
+                                    .max(0.0)))
+                                .overflow_y_scroll()
                                 .flex()
                                 .flex_col()
                                 .py(px(tokens.density.spacing.xs))
@@ -30903,7 +30933,10 @@ impl NativeShell {
             self.layout.board_rail,
             self.board_density_compact(),
             self.selected_owner_is_remote(),
-            self.new_project_affordance(),
+            new_project_disabled(
+                self.new_project_affordance(),
+                self.local_slot().agent_connection.as_ref(),
+            ),
         )
     }
 
@@ -30933,12 +30966,15 @@ impl NativeShell {
         board_rail: bool,
         density_compact: bool,
         owner_is_remote: bool,
-        new_project: ProviderInboxAffordance,
+        new_project: Option<BoardMenuDisabled>,
     ) -> Vec<BoardMenuEntry> {
         // Git and Activity opened the two footer icons that had
         // `-unavailable` twins on a remote owner, and the dispatcher answers
         // for them with this same sentence. Files and Settings had no twin.
-        let remote_reason = owner_is_remote.then(Self::remote_local_authority_reason);
+        let remote = owner_is_remote.then(|| BoardMenuDisabled {
+            suffix: BOARD_MENU_LOCAL_ONLY_SUFFIX.to_string(),
+            detail: Self::remote_local_authority_reason().to_string(),
+        });
         vec![
             BoardMenuEntry::live(
                 "board-menu-files".to_string(),
@@ -30946,7 +30982,7 @@ impl NativeShell {
                 BoardMenuAction::OpenDock(DockTool::Files),
             ),
             BoardMenuEntry {
-                disabled_reason: remote_reason,
+                disabled: remote.clone(),
                 ..BoardMenuEntry::live(
                     "board-menu-git".to_string(),
                     "Git".to_string(),
@@ -30954,7 +30990,7 @@ impl NativeShell {
                 )
             },
             BoardMenuEntry {
-                disabled_reason: remote_reason,
+                disabled: remote,
                 ..BoardMenuEntry::live(
                     "board-menu-activity".to_string(),
                     "Activity".to_string(),
@@ -30967,7 +31003,7 @@ impl NativeShell {
                 BoardMenuAction::OpenSettings,
             ),
             BoardMenuEntry {
-                disabled_reason: new_project.disabled_reason(),
+                disabled: new_project,
                 ..BoardMenuEntry::live(
                     "board-menu-new-project".to_string(),
                     "New project…".to_string(),
@@ -46621,6 +46657,7 @@ pub(crate) mod tests {
         composer_reasoning_choice_label,
         composer_waits_for_provider_identity,
         concrete_default_effort_token,
+        connect_canvas_copy,
         consume_pending_terminal_echo_prefix,
         cycle_project_choice,
         decode_idle_conversation_photo_bytes,
@@ -46638,6 +46675,7 @@ pub(crate) mod tests {
         native_command_id,
         native_git_reconciled_selector,
         native_reconnect_source_for,
+        new_project_disabled,
         next_controller_wait,
         overlay_pending_terminal_echo,
         owned_matches_admission,
@@ -46692,6 +46730,7 @@ pub(crate) mod tests {
         BoardGroup,
         BoardMenu,
         BoardMenuAction,
+        BoardMenuDisabled,
         BoardMenuEntry,
         BoardState,
         ClientId,
@@ -46768,6 +46807,7 @@ pub(crate) mod tests {
         UpdaterStage,
         ARCHIVED_ROW_HEIGHT,
         BOARD_MENU_LEFT_INSET,
+        BOARD_MENU_LOCAL_ONLY_SUFFIX,
         COMPOSER_CARET_BLINK_INTERVAL,
         COMPOSER_CARET_BLINK_TICKS,
         CONTROLLER_IDLE_RECOVERY_INTERVAL,
@@ -49573,22 +49613,23 @@ pub(crate) mod tests {
     /// which dimmed the footer's button while agents were being checked and
     /// while none was connected. Dropping the states with the buttons would
     /// have shipped rows that look live and do nothing.
+    /// One row's disabled state, by element id. Panics rather than answering
+    /// `None` for a row that is not there, so a renamed id fails loudly instead
+    /// of reading as "that destination is live".
+    fn board_menu_disabled<'a>(
+        rows: &'a [BoardMenuEntry],
+        element_id: &str,
+    ) -> Option<&'a BoardMenuDisabled> {
+        rows.iter()
+            .find(|row| row.element_id == element_id)
+            .unwrap_or_else(|| panic!("{element_id} must be a board menu row"))
+            .disabled
+            .as_ref()
+    }
+
     #[test]
     fn the_moved_destinations_keep_the_footers_disabled_states() {
-        fn reason(rows: &[BoardMenuEntry], element_id: &str) -> Option<&'static str> {
-            rows.iter()
-                .find(|row| row.element_id == element_id)
-                .unwrap_or_else(|| panic!("{element_id} must be a board menu row"))
-                .disabled_reason
-        }
-
-        let live = NativeShell::board_options_menu_rows(
-            false,
-            false,
-            false,
-            false,
-            ProviderInboxAffordance::ConnectedAdd,
-        );
+        let live = NativeShell::board_options_menu_rows(false, false, false, false, None);
         for element_id in [
             "board-menu-files",
             "board-menu-git",
@@ -49596,33 +49637,29 @@ pub(crate) mod tests {
             "board-menu-new-project",
         ] {
             assert_eq!(
-                reason(&live, element_id),
+                board_menu_disabled(&live, element_id),
                 None,
                 "{element_id} is live for a connected local owner"
             );
         }
 
-        let remote = NativeShell::board_options_menu_rows(
-            false,
-            false,
-            false,
-            true,
-            ProviderInboxAffordance::ConnectedAdd,
-        );
+        let remote = NativeShell::board_options_menu_rows(false, false, false, true, None);
         for element_id in ["board-menu-git", "board-menu-activity"] {
+            let disabled = board_menu_disabled(&remote, element_id)
+                .unwrap_or_else(|| panic!("{element_id} must be disabled on a remote owner"));
             assert_eq!(
-                reason(&remote, element_id),
-                Some(NativeShell::remote_local_authority_reason()),
+                disabled.detail,
+                NativeShell::remote_local_authority_reason(),
                 "{element_id} replaced a footer icon with an -unavailable twin"
             );
         }
         assert_eq!(
-            reason(&remote, "board-menu-files"),
+            board_menu_disabled(&remote, "board-menu-files"),
             None,
             "Files had no -unavailable twin; a remote owner must not disable it"
         );
         assert_eq!(
-            reason(&remote, "board-menu-settings"),
+            board_menu_disabled(&remote, "board-menu-settings"),
             None,
             "Settings is not local-authority work"
         );
@@ -49631,17 +49668,91 @@ pub(crate) mod tests {
             ProviderInboxAffordance::Checking,
             ProviderInboxAffordance::DisconnectedAdd,
         ] {
-            let rows = NativeShell::board_options_menu_rows(false, false, false, false, affordance);
+            let snapshot = agent_connection_snapshot(AgentPresence::Checking);
+            let rows = NativeShell::board_options_menu_rows(
+                false,
+                false,
+                false,
+                false,
+                new_project_disabled(affordance, Some(&snapshot)),
+            );
             assert!(
-                reason(&rows, "board-menu-new-project").is_some(),
+                board_menu_disabled(&rows, "board-menu-new-project").is_some(),
                 "the footer's New project button dimmed for {affordance:?}"
             );
             assert_eq!(
-                reason(&rows, "board-menu-git"),
+                board_menu_disabled(&rows, "board-menu-git"),
                 None,
                 "the provider connection has nothing to do with Git on a local owner"
             );
         }
+    }
+
+    /// A disabled row is a greyed label plus ONE short parenthetical, and the
+    /// full sentence lives in the tooltip. `remote_local_authority_reason()` is
+    /// 176 characters: painted inline it wrapped to several lines under BOTH
+    /// the Git and the Activity row, inside a 220 px panel that exists to be
+    /// scanned. The suffix words are never copied -- they come from the one
+    /// constant, or from calling `connect_canvas_copy` for the matching state.
+    #[test]
+    fn a_disabled_row_shows_one_short_suffix_and_keeps_the_sentence_for_the_tooltip() {
+        let remote = NativeShell::board_options_menu_rows(false, false, false, true, None);
+        for element_id in ["board-menu-git", "board-menu-activity"] {
+            let disabled = board_menu_disabled(&remote, element_id).expect("disabled");
+            assert_eq!(disabled.suffix, BOARD_MENU_LOCAL_ONLY_SUFFIX);
+            assert!(
+                disabled.suffix.chars().count() <= 16,
+                "the row's own text stays scannable: {:?}",
+                disabled.suffix
+            );
+            assert_eq!(
+                disabled.detail,
+                NativeShell::remote_local_authority_reason()
+            );
+            assert!(
+                disabled.detail.chars().count() > 100,
+                "the long sentence is still carried, just not painted inline"
+            );
+            assert_ne!(
+                disabled.suffix, disabled.detail,
+                "the row must not paint the sentence it hides in the tooltip"
+            );
+        }
+
+        let checking = agent_connection_snapshot(AgentPresence::Checking);
+        for (affordance, snapshot, expected) in [
+            (
+                ProviderInboxAffordance::Checking,
+                Some(&checking),
+                "(checking agents)",
+            ),
+            (
+                ProviderInboxAffordance::DisconnectedAdd,
+                None,
+                "(connect an agent)",
+            ),
+        ] {
+            let disabled = new_project_disabled(affordance, snapshot).expect("disabled");
+            assert_eq!(disabled.suffix, expected, "{affordance:?}");
+            // Called, not copied: the same words the empty-board canvas prints
+            // for this state.
+            let canvas = match affordance {
+                ProviderInboxAffordance::Checking => connect_canvas_copy(snapshot),
+                _ => connect_canvas_copy(None),
+            };
+            assert_eq!(disabled.suffix, format!("({})", canvas.0.to_lowercase()));
+            assert_eq!(disabled.detail, canvas.1);
+            assert!(
+                disabled.suffix.chars().count() <= 20,
+                "the row's own text stays scannable: {:?}",
+                disabled.suffix
+            );
+        }
+        assert_eq!(
+            new_project_disabled(ProviderInboxAffordance::ConnectedAdd, None),
+            None,
+            "a live row carries no suffix at all"
+        );
     }
 
     /// The board's `...` menu drops from the `...` in the BOARD header, so its
