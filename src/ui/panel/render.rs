@@ -239,7 +239,14 @@ fn status_room(width_px: f32, chrome: &PanelChrome, layout: StatusLayout, blocke
         estimated_status_width(chrome, layout, blocked),
         blocked,
     );
-    (width_px - controls_reserve(chrome) - title).max(status_floor(blocked))
+    // Bounded by BOTH: what this panel's own controls leave, and the
+    // worst-case budget above. The second is what keeps "the title never runs
+    // under the status" true even when the width estimate is wrong, because
+    // `CONTROLS_RESERVE + title_floor(w) + status_budget(w) == w` holds by
+    // construction at every width and does not depend on an estimate.
+    (width_px - controls_reserve(chrome) - title)
+        .min(status_budget(width_px, blocked))
+        .max(status_floor(blocked))
 }
 
 /// One status glyph at [`INLINE_STATUS_FONT_SIZE`]. The widest of the five is
