@@ -73,6 +73,11 @@ pub struct PanelChrome {
     pub crumb: String,
     pub provider: PrimaryProviderIcon,
     pub project_colour: u8,
+    /// The panel number, 1-based, or `None` for a pane the workspace has no
+    /// ordinal for. Read straight off the row's `open` field rather than from
+    /// a second lookup, so a row's chip and its panel's chip are one number
+    /// (Task 12).
+    pub ordinal: Option<u8>,
     pub status: PanelStatus,
     pub needs_you: Option<NeedsYou>,
     pub primary: PrimaryAction,
@@ -139,6 +144,7 @@ pub fn panel_chrome(
         crumb,
         provider: row.provider,
         project_colour: row.project_colour,
+        ordinal: row.open,
         status: PanelStatus {
             icon,
             text,

@@ -23,7 +23,7 @@ use sha2::{Digest, Sha256};
 
 use crate::client::HostTaskKey;
 use crate::ui::board::layout::{PROVIDER_MARK_SIZE, ROW_STRIPE_WIDTH};
-use crate::ui::board::render::segments_element;
+use crate::ui::board::render::{ordinal_chip, segments_element};
 use crate::ui::board::ProjectColourBook;
 use crate::ui::panel::model::{
     status_layout, NeedsYou, PanelChrome, PrimaryAction, StatusLayout, StatusTone,
@@ -57,15 +57,17 @@ const INLINE_STATUS_FONT_SIZE: f32 = 11.5;
 const STATUS_GAP: f32 = 5.0;
 /// The title floor at [`TIGHT_WIDTH`], where the row has nothing to spare.
 ///
-/// A blocked panel at 250 px owes 165 px of controls and a 73 px status floor,
-/// which is 238 of the 250, so 12 px is not chosen, it is what is left. See
+/// A blocked panel at 280 px owes 195 px of controls and a 73 px status floor,
+/// which is 268 of the 280, so 12 px is not chosen, it is what is left. See
 /// [`title_floor`] for what happens above that width -- a fixed 12 px floor is
 /// only honest at the one width that forces it, and would leave the title at
 /// 12 px on a 470 px panel behind a long blocked cause.
 const TITLE_MIN_WIDTH: f32 = 12.0;
 /// The narrowest panel this chrome is built for, and the width at which the
-/// title floor is at its minimum.
-const TIGHT_WIDTH: f32 = 250.0;
+/// title floor is at its minimum. Below the production pane minimum of 320 px
+/// (`AllocationMetrics::production`), so the budget holds at every width a
+/// panel is ever allocated.
+const TIGHT_WIDTH: f32 = 280.0;
 /// The share of every pixel above [`TIGHT_WIDTH`] that the title's floor
 /// claims. Below 0.5 so the status text still gains room as the panel widens;
 /// high enough that the title is legible well before the design width.
@@ -81,10 +83,10 @@ const TITLE_GROWTH: f32 = 0.4;
 ///
 /// ```text
 ///   width   title_floor   status text cap   controls + title + status floor
-///     250            12                73     165 +  12 + 73 = 250  (exactly)
-///     300            32               103     165 +  32 + 73 = 270
-///     370            60               145     165 +  60 + 73 = 298
-///     470           100               205     165 + 100 + 73 = 338
+///     280            12                73     195 +  12 + 73 = 280  (exactly)
+///     300            20                85     195 +  20 + 73 = 288
+///     370            48               127     195 +  48 + 73 = 316
+///     470            88               187     195 +  88 + 73 = 356
 /// ```
 fn title_floor(width_px: f32) -> f32 {
     TITLE_MIN_WIDTH + TITLE_GROWTH * (width_px - TIGHT_WIDTH).max(0.0)
@@ -134,6 +136,11 @@ const ZOOM_AFFORDANCE_WIDTH: f32 = 12.0;
 /// The primary button at its widest label ("Reopen", six characters at
 /// [`ACTION_FONT_SIZE`]) plus its padding and its two border pixels.
 const PRIMARY_BUTTON_MAX_WIDTH: f32 = 58.0;
+/// The ordinal chip at two digits: the glyph pair at
+/// `ORDINAL_CHIP_FONT_SIZE`, its padding on both sides and its 1 px rule.
+/// A panel numbered above 99 cannot be supervised and does not get a chip at
+/// all, so this is the real maximum rather than an estimate.
+const ORDINAL_CHIP_MAX_WIDTH: f32 = 22.0;
 /// The ⋯ glyph plus its padding: [`MENU_FONT_SIZE`] + 2 x [`MENU_PADDING_X`].
 const MENU_GLYPH_WIDTH: f32 = MENU_FONT_SIZE + 2.0 * MENU_PADDING_X;
 /// Everything in the title row whose width does not depend on the panel's:
@@ -142,12 +149,13 @@ const MENU_GLYPH_WIDTH: f32 = MENU_FONT_SIZE + 2.0 * MENU_PADDING_X;
 ///   13  ROW_PADDING_LEFT          (10 px padding + the 3 px stripe)
 ///   10  ROW_PADDING_X             (right padding)
 ///   11  PROVIDER_MARK_SIZE
+///   22  ORDINAL_CHIP_MAX_WIDTH    (two digits, padding and border)
 ///   12  ZOOM_AFFORDANCE_WIDTH
 ///   58  PRIMARY_BUTTON_MAX_WIDTH
 ///   21  MENU_GLYPH_WIDTH          (15 + 2 x 3)
-///   40  5 x TITLE_ROW_GAP         (six children, five gaps)
+///   48  6 x TITLE_ROW_GAP         (seven children, six gaps)
 ///  ---
-///  165
+///  195
 /// ```
 ///
 /// This is what the status must yield to. Before this budget existed the status
@@ -157,10 +165,11 @@ const MENU_GLYPH_WIDTH: f32 = MENU_FONT_SIZE + 2.0 * MENU_PADDING_X;
 const CONTROLS_RESERVE: f32 = ROW_PADDING_LEFT
     + ROW_PADDING_X
     + PROVIDER_MARK_SIZE
+    + ORDINAL_CHIP_MAX_WIDTH
     + ZOOM_AFFORDANCE_WIDTH
     + PRIMARY_BUTTON_MAX_WIDTH
     + MENU_GLYPH_WIDTH
-    + 5.0 * TITLE_ROW_GAP;
+    + 6.0 * TITLE_ROW_GAP;
 
 /// The ceiling on the status *text*: what is left once the fixed controls and
 /// the title's floor at this width have been paid.
@@ -413,6 +422,15 @@ fn title_row_element(
             PROVIDER_MARK_SIZE,
             tokens.text.muted.to_u32(),
         )))
+        // Spec 4.2: the panel number sits before the title, and it is the same
+        // chip the board row carries -- solid on the focused panel. Task 12's
+        // rule, kept inside the new chrome rather than left on a header that
+        // no longer exists.
+        .children(
+            chrome
+                .ordinal
+                .map(|ordinal| ordinal_chip(ordinal, chrome.focused, tokens)),
+        )
         .child(
             div()
                 .id(("devmanager-panel-title", element_key))
@@ -936,7 +954,7 @@ mod tests {
     #[test]
     fn the_status_text_yields_before_the_controls_the_title_and_the_status_floor() {
         assert_eq!(
-            CONTROLS_RESERVE, 165.0,
+            CONTROLS_RESERVE, 195.0,
             "the documented budget and the summed constants disagree"
         );
         assert_eq!(status_floor(false), 40.0);
@@ -951,10 +969,10 @@ mod tests {
         // doc comment's table: if it and the formula ever disagree, this is
         // where it shows.
         for (width, expected_floor, expected_cap) in [
-            (250.0_f32, 12.0_f32, 73.0_f32),
-            (300.0, 32.0, 103.0),
-            (370.0, 60.0, 145.0),
-            (470.0, 100.0, 205.0),
+            (280.0_f32, 12.0_f32, 73.0_f32),
+            (300.0, 20.0, 85.0),
+            (370.0, 48.0, 127.0),
+            (470.0, 88.0, 187.0),
         ] {
             assert_eq!(
                 title_floor(width),
