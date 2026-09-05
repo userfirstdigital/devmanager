@@ -10,13 +10,15 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use gpui::{
-    div, px, AnyElement, AppContext, ClickEvent, Context, Entity, FontWeight, IntoElement,
-    ParentElement, SharedString, Styled, Window,
+    div, px, AnyElement, AppContext, ClickEvent, Context, Entity, IntoElement, ParentElement,
+    SharedString, Styled, Window,
 };
 use gpui_component::button::{Button, ButtonVariants};
 use gpui_component::input::{Input, InputState};
 use gpui_component::{Disableable, IconName, Sizable};
 use zeroize::Zeroizing;
+
+use crate::ui::overlay_chrome;
 
 use crate::client::{
     hex_encode, ConnectTrustedOptions, FleetError, FleetRemoval, HostFleet, HostId,
@@ -2232,70 +2234,39 @@ impl NativeShell {
         }
     }
 
-    /// The trusted-hosts list, painted in the redesign's body language.
-    ///
-    /// Rule 2's scale and rule 5's row geometry are read from the one place
-    /// that defines them -- `src/ui/task_cockpit/panel.rs` -- so this list and
-    /// a dock panel body cannot drift into two different ideas of a row.
     pub(crate) fn render_trusted_hosts_content(
         &self,
         tokens: crate::ui::tokens::ThemeTokens,
         cx: &Context<Self>,
     ) -> AnyElement {
-        use crate::ui::task_cockpit::panel::{
-            META_FONT_SIZE, ROW_FONT_SIZE as BODY_FONT_SIZE, ROW_GAP as CONTROL_GAP, ROW_PADDING_X,
-            ROW_PADDING_Y,
-        };
-        /// Rule 2: the one heading per surface.
-        const HEADING_FONT_SIZE: f32 = 13.0;
-        /// Rule 6's spacing grid: 10 between the regions of this surface,
-        /// 14 above it.
-        const SECTION_GAP: f32 = 10.0;
-        const SECTION_TOP_MARGIN: f32 = 14.0;
-        /// Rule 5: the two lines of a row sit tight against each other.
-        const ROW_LINE_GAP: f32 = 4.0;
-        /// The form's label column. Unchanged -- it is the width the three
-        /// fields already align on, and rule 6's grid has nothing to say
-        /// about a label column.
-        const FIELD_LABEL_WIDTH: f32 = 140.0;
-
         let busy = self.trusted_hosts.controller.setup_busy()
             || self.trusted_hosts.forget_job.is_some()
             || self.trusted_hosts.controller.recovery().is_some();
         let mut section = div()
             .flex()
             .flex_col()
-            .gap(px(SECTION_GAP))
-            .mt(px(SECTION_TOP_MARGIN))
-            .child(
-                // Rule 2: the one heading a surface gets is 13 px semibold.
-                div()
-                    .text_size(px(HEADING_FONT_SIZE))
-                    .font_weight(FontWeight::SEMIBOLD)
-                    .child("Other PCs"),
-            )
-            .child(
-                // Rule 2: body prose is 11.5 px on `text.secondary`.
-                div()
-                    .text_size(px(BODY_FONT_SIZE))
-                    .text_color(tokens.text.secondary.to_gpui())
-                    .child(
-                        "Pair another DevManager PC over your LAN. Saved PCs restore into this window's fleet; closing this window does not erase durable trust.",
-                    ),
-            );
+            .gap(px(overlay_chrome::REGION_PADDING))
+            .mt(px(16.0))
+            .text_size(px(overlay_chrome::BODY_FONT_SIZE))
+            .child(overlay_chrome::field_label("Other PCs", tokens))
+            .child(overlay_chrome::caption(
+                "Pair another DevManager PC over your LAN. Saved PCs restore into this window's fleet; closing this window does not erase durable trust.",
+                tokens,
+            ));
         if let Some(fields) = &self.trusted_hosts.fields {
             section = section
                 .child(
                     div()
                         .flex()
                         .items_center()
-                        .gap(px(12.0))
+                        .gap(px(overlay_chrome::CONTROL_GAP))
                         .child(
                             div()
-                                .w(px(FIELD_LABEL_WIDTH))
+                                .w(px(140.0))
                                 .flex_shrink_0()
-                                .text_size(px(BODY_FONT_SIZE))
-                                .child("Endpoint"),
+                                .text_size(px(overlay_chrome::SECTION_LABEL_FONT_SIZE))
+                                .text_color(tokens.text.muted.to_gpui())
+                                .child("ENDPOINT"),
                         )
                         .child(
                             div()
@@ -2308,13 +2279,14 @@ impl NativeShell {
                     div()
                         .flex()
                         .items_center()
-                        .gap(px(12.0))
+                        .gap(px(overlay_chrome::CONTROL_GAP))
                         .child(
                             div()
-                                .w(px(FIELD_LABEL_WIDTH))
+                                .w(px(140.0))
                                 .flex_shrink_0()
-                                .text_size(px(BODY_FONT_SIZE))
-                                .child("Pairing code"),
+                                .text_size(px(overlay_chrome::SECTION_LABEL_FONT_SIZE))
+                                .text_color(tokens.text.muted.to_gpui())
+                                .child("PAIRING CODE"),
                         )
                         .child(
                             div()
@@ -2327,13 +2299,14 @@ impl NativeShell {
                     div()
                         .flex()
                         .items_center()
-                        .gap(px(12.0))
+                        .gap(px(overlay_chrome::CONTROL_GAP))
                         .child(
                             div()
-                                .w(px(FIELD_LABEL_WIDTH))
+                                .w(px(140.0))
                                 .flex_shrink_0()
-                                .text_size(px(BODY_FONT_SIZE))
-                                .child("CA PEM path"),
+                                .text_size(px(overlay_chrome::SECTION_LABEL_FONT_SIZE))
+                                .text_color(tokens.text.muted.to_gpui())
+                                .child("CA PEM PATH"),
                         )
                         .child(
                             div()
@@ -2347,7 +2320,7 @@ impl NativeShell {
             .flex()
             .flex_wrap()
             .items_center()
-            .gap(px(CONTROL_GAP))
+            .gap(px(overlay_chrome::CONTROL_GAP))
             .child(
                 Button::new("native-trusted-connect")
                     .label("Connect")
@@ -2377,7 +2350,7 @@ impl NativeShell {
         if let Some(feedback) = self.trusted_hosts.controller.feedback() {
             section = section.child(
                 div()
-                    .text_size(px(BODY_FONT_SIZE))
+                    .text_size(px(overlay_chrome::BODY_FONT_SIZE))
                     .text_color(tokens.status.warning.to_gpui())
                     .child(SharedString::from(feedback.to_string())),
             );
@@ -2391,8 +2364,8 @@ impl NativeShell {
             for (key, retained) in self.trusted_hosts.controller.retained_forget_ledgers() {
                 section = section.child(
                     div()
-                        .text_size(px(META_FONT_SIZE))
-                        .text_color(tokens.text.muted.to_gpui())
+                        .text_size(px(overlay_chrome::ROW_META_FONT_SIZE))
+                        .text_color(tokens.text.secondary.to_gpui())
                         .child(format!(
                             "Retained forget ledger {} gen {}: {:?}",
                             hex_encode(&key.host_public_id).get(..12).unwrap_or("host"),
@@ -2413,41 +2386,37 @@ impl NativeShell {
                 TrustedHostRowPhase::Disconnecting => "Disconnecting…",
                 TrustedHostRowPhase::Forgetting => "Forgetting…",
             };
-            // Rule 5: a two-line list row -- an 11.5 px title over a 10.5 px
-            // `text.muted` meta line -- full width, padded 5x10, with no side
-            // margin, no radius and no fill of its own. The sunken rounded
-            // card this used to be made each host read as a separate object;
-            // rule 3 keeps `surfaces.sunken` for inputs.
             let mut row_el = div()
-                .w_full()
                 .flex()
                 .flex_col()
-                .gap(px(ROW_LINE_GAP))
-                .px(px(ROW_PADDING_X))
-                .py(px(ROW_PADDING_Y))
+                .gap(px(4.0))
+                .px(px(overlay_chrome::ROW_PADDING_X))
+                .py(px(overlay_chrome::ROW_PADDING_Y))
+                .border_b(px(overlay_chrome::OVERLAY_BORDER_WIDTH))
+                .border_color(tokens.borders.subtle.to_gpui())
                 .child(
                     div()
-                        .text_size(px(BODY_FONT_SIZE))
+                        .text_size(px(overlay_chrome::ROW_TITLE_FONT_SIZE))
+                        .line_height(px(overlay_chrome::ROW_TITLE_LINE_HEIGHT))
                         .text_color(tokens.text.primary.to_gpui())
                         .child(safe_host_label(&row.record)),
                 )
                 .child(
                     div()
-                        .text_size(px(META_FONT_SIZE))
+                        .text_size(px(overlay_chrome::ROW_META_FONT_SIZE))
+                        .line_height(px(overlay_chrome::ROW_META_LINE_HEIGHT))
                         .text_color(tokens.text.muted.to_gpui())
                         .child(status),
                 );
             if let Some(error) = &row.last_error {
-                // Rule 1: red is what a blocked host earns, and the only
-                // colour spent on this row.
                 row_el = row_el.child(
                     div()
-                        .text_size(px(META_FONT_SIZE))
+                        .text_size(px(overlay_chrome::ROW_META_FONT_SIZE))
                         .text_color(tokens.status.destructive.to_gpui())
                         .child(error.clone()),
                 );
             }
-            let mut buttons = div().flex().flex_wrap().gap(px(CONTROL_GAP));
+            let mut buttons = div().flex().flex_wrap().gap(px(overlay_chrome::CHIP_GAP));
             if matches!(
                 row.phase,
                 TrustedHostRowPhase::Failed
