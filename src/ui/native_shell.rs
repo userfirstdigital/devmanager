@@ -448,7 +448,11 @@ const IDLE_PHOTO_MAX_BYTES: u64 = 8 * 1024 * 1024;
 // the pill they described.
 /// The archived browser's row: title, project and branch on three lines.
 const ARCHIVED_ROW_HEIGHT: f32 = 78.0;
-const T3_WORKSPACE_TOPBAR_HEIGHT: f32 = 32.0;
+// F1: composition A has no workspace header row. The 32 px strip that carried
+// the breadcrumb and the centre-canvas Conversation|Terminal switch is gone
+// with its height constant: the panel grid starts directly under the window's
+// own 34 px top bar (`ui::board::layout::TOP_BAR_HEIGHT`), the breadcrumb's
+// project is the top bar's scope label, and its task is the panel's own title.
 /// The board header's menus drop from under the header, inset from the window
 /// edge the board is docked against. Row heights are the board's own, in
 /// `ui::board::layout`; these place the panel, nothing more.
@@ -36177,10 +36181,6 @@ impl NativeShell {
 
     /// Column widths and the terminal height are user-owned and persisted;
     /// their bounds live with the layout store that clamps them.
-    ///
-    /// Header height is pinned so the workspace row can be measured against the
-    /// window without reading back layout.
-    const HEADER_HEIGHT: f32 = T3_WORKSPACE_TOPBAR_HEIGHT;
     const MIN_WORKSPACE_ROW_HEIGHT: f32 = 240.0;
     const PANEL_HEADER_HEIGHT: f32 = 34.0;
 
@@ -42548,232 +42548,13 @@ impl NativeShell {
             .unwrap_or(false)
     }
 
-    /// Compact, independent controls for the center canvas and right context
-    /// panel. T3 keeps layout controls in the title bar as quiet icon toggles;
-    /// the center mode remains an explicit two-state choice so the active
-    /// Conversation/Terminal surface is never ambiguous.
-    fn pane_toggles(
-        &self,
-        tokens: crate::ui::tokens::ThemeTokens,
-        cx: &Context<Self>,
-    ) -> AnyElement {
-        let terminal_visible = self.owner_showing_raw_terminal();
-        let conversation_option = div()
-            .id("native-task-center-conversation")
-            .tab_stop(true)
-            .flex()
-            .flex_none()
-            .items_center()
-            .justify_center()
-            .h(px(22.0))
-            .px(px(8.0))
-            .rounded(px(tokens.density.radii.sm))
-            .cursor_pointer()
-            .bg(if terminal_visible {
-                tokens.surfaces.raised.to_gpui()
-            } else {
-                tokens.surfaces.overlay.to_gpui()
-            })
-            .text_size(px(tokens.density.typography.caption))
-            .text_color(if terminal_visible {
-                tokens.text.muted.to_gpui()
-            } else {
-                tokens.text.primary.to_gpui()
-            })
-            .hover(|style| style.bg(tokens.surfaces.overlay.to_gpui()))
-            .on_click(cx.listener(|shell, _event: &ClickEvent, window, cx| {
-                cx.stop_propagation();
-                shell.set_provider_terminal_visible(false);
-                shell.composer_focus_handle.focus(window);
-                shell.pending_composer_focus = false;
-                cx.notify();
-            }))
-            .child("Conversation");
-        let terminal_option = div()
-            .id("native-task-center-terminal")
-            .tab_stop(true)
-            .flex()
-            .flex_none()
-            .items_center()
-            .justify_center()
-            .gap(px(5.0))
-            .h(px(22.0))
-            .px(px(8.0))
-            .rounded(px(tokens.density.radii.sm))
-            .cursor_pointer()
-            .bg(if terminal_visible {
-                tokens.surfaces.overlay.to_gpui()
-            } else {
-                tokens.surfaces.raised.to_gpui()
-            })
-            .text_size(px(tokens.density.typography.caption))
-            .text_color(if terminal_visible {
-                tokens.text.primary.to_gpui()
-            } else {
-                tokens.text.muted.to_gpui()
-            })
-            .hover(|style| style.bg(tokens.surfaces.overlay.to_gpui()))
-            .on_click(cx.listener(|shell, _event: &ClickEvent, window, cx| {
-                cx.stop_propagation();
-                shell.set_provider_terminal_visible(true);
-                if !shell.selected_owner_is_remote() {
-                    shell.arm_selected_provider_terminal_input();
-                    shell.terminal_focus_handle.focus(window);
-                    shell.pending_terminal_focus = false;
-                }
-                cx.notify();
-            }))
-            .child(crate::icons::app_icon(
-                crate::icons::TERMINAL,
-                12.0,
-                if terminal_visible {
-                    tokens.text.primary.to_u32()
-                } else {
-                    tokens.text.muted.to_u32()
-                },
-            ))
-            .child("Terminal");
-        let center_mode_switch = div()
-            .id("native-shell-center-mode-switch")
-            .flex()
-            .flex_none()
-            .items_center()
-            .gap(px(1.0))
-            .p(px(2.0))
-            .rounded(px(tokens.density.radii.md))
-            .bg(tokens.surfaces.raised.to_gpui())
-            .child(conversation_option)
-            .child(terminal_option);
-        // The right dock is retired, so its toggle is gone with it: a button
-        // that opens nothing is worse than no button, and the tools it used to
-        // reveal are the panel's own view tabs now.
-        div()
-            .id("native-shell-pane-toggles")
-            .flex()
-            .flex_none()
-            .items_center()
-            .gap(px(5.0))
-            .child(center_mode_switch)
-            .into_any_element()
-    }
-
-    fn header_settings_control_static() -> AnyElement {
-        Button::new("native-header-settings")
-            .label("Settings")
-            .ghost()
-            .into_any_element()
-    }
-
-    fn header_bar(
-        &self,
-        tokens: crate::ui::tokens::ThemeTokens,
-        host_status_control: Option<AnyElement>,
-        workspace_actions: Option<AnyElement>,
-        pane_toggles: Option<AnyElement>,
-        _settings_control: AnyElement,
-    ) -> AnyElement {
-        let show_attachment = !self.local_slot().header_attachment.label().is_empty()
-            || !self.local_slot().header_attachment.detail().is_empty();
-        let show_connection = !matches!(
-            self.local_slot().host_state,
-            NativeHostState::Connected { .. }
-        );
-        let project_label = self
-            .current_workspace_project_label()
-            .unwrap_or_else(|| "All projects".to_string());
-        let task_label = if self.local_slot().header_attachment.label().is_empty() {
-            "DevManager".to_string()
-        } else {
-            self.local_slot().header_attachment.label()
-        };
-        div()
-            .id("native-shell-workspace-topbar")
-            .w_full()
-            .flex()
-            .flex_none()
-            .h(px(Self::HEADER_HEIGHT))
-            .items_center()
-            .gap(px(tokens.density.spacing.sm))
-            .px(px(16.0))
-            .bg(tokens.surfaces.canvas.to_gpui())
-            .child(
-                div()
-                    .id("native-shell-header-breadcrumb")
-                    .flex()
-                    .flex_1()
-                    .min_w(px(0.0))
-                    .items_center()
-                    .gap(px(8.0))
-                    .child(div().flex_none().child(crate::icons::app_icon(
-                        crate::icons::FOLDER,
-                        14.0,
-                        tokens.text.muted.to_u32(),
-                    )))
-                    .child(
-                        div()
-                            .flex_none()
-                            .text_size(px(tokens.density.typography.caption))
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .text_color(tokens.text.secondary.to_gpui())
-                            .child(project_label),
-                    )
-                    .children(show_attachment.then(|| {
-                        div()
-                            .flex_none()
-                            .text_color(tokens.text.muted.to_gpui())
-                            .child("/")
-                            .into_any_element()
-                    }))
-                    .child(
-                        div()
-                            .min_w(px(0.0))
-                            .truncate()
-                            .text_size(px(tokens.density.typography.caption))
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .text_color(tokens.text.primary.to_gpui())
-                            .child(task_label),
-                    ),
-            )
-            .children(workspace_actions)
-            .children(pane_toggles)
-            .children(show_connection.then(|| self.status_bar(tokens)))
-            .children(host_status_control.map(|control| div().flex_none().child(control)))
-            .into_any_element()
-    }
-
-    /// Connection truth, carried in the header beside the host control it
-    /// describes. The status string is long and low-priority, so it is capped
-    /// and truncated rather than allowed to crowd the task title.
-    fn status_bar(&self, tokens: crate::ui::tokens::ThemeTokens) -> AnyElement {
-        div()
-            .id("native-shell-status-bar")
-            .flex()
-            .flex_none()
-            .items_center()
-            .max_w(px(560.0))
-            .gap(px(tokens.density.spacing.sm))
-            .px(px(tokens.density.spacing.md))
-            .py(px(tokens.density.spacing.xs))
-            .rounded(px(tokens.density.radii.pill))
-            .bg(tokens.surfaces.raised.to_gpui())
-            .text_size(px(tokens.density.typography.caption))
-            .line_height(px(tokens.density.typography.caption_line_height))
-            .text_color(tokens.text.secondary.to_gpui())
-            .child(Self::tone_dot(self.host_tone(tokens), 8.0))
-            .child(div().truncate().child(self.host_status_headline()))
-            .into_any_element()
-    }
-
-    /// Header-sized projection of the status line. The full string carries
-    /// boot, connection, and build identifiers, which truncate mid-identifier
-    /// in a chip; the leading segments already state connection truth.
-    fn host_status_headline(&self) -> String {
-        self.host_status_text()
-            .split(" · ")
-            .take(3)
-            .collect::<Vec<_>>()
-            .join(" · ")
-    }
+    // F1: the centre-canvas Conversation|Terminal switch, the workspace
+    // header row it sat in, and the connection chip beside it are deleted.
+    // The panel's own view tabs are the switch now (one per panel rather
+    // than one for whichever panel happened to be selected), and the
+    // accessibility tree still publishes `native-task-center-conversation`
+    // and `native-task-center-terminal` because it is built from shell
+    // state rather than from these elements.
 
     /// Optional task-details panel, shown only while the keyboard model has it
     /// open.
@@ -42817,7 +42598,10 @@ impl NativeShell {
         };
         let width =
             f32::from(viewport.width) - board_column_width_for(&layout, archived) - dock - 2.0;
-        let height = f32::from(viewport.height) - Self::HEADER_HEIGHT - 2.0;
+        // F1: the panel grid starts directly under the window's own top bar,
+        // so the row it fills is the window minus that bar and the frame's
+        // hairline -- there is no header row between the two any more.
+        let height = f32::from(viewport.height) - crate::ui::board::layout::TOP_BAR_HEIGHT - 2.0;
         size(px(width.max(1.0)), px(height.max(1.0)))
     }
 
@@ -43220,7 +43004,6 @@ impl NativeShell {
         top_bar: AnyElement,
         conversation: AnyElement,
         sidebar: AnyElement,
-        workspace_header: AnyElement,
         dock: AnyElement,
         workspace_height: Option<Pixels>,
         layout: KeyedWorkspaceLayout<HostTaskKey>,
@@ -43269,7 +43052,6 @@ impl NativeShell {
                     .flex_1()
                     .min_h(px(0.0))
                     .min_w(px(0.0))
-                    .child(workspace_header)
                     .child(
                         workspace_row
                             .child(
@@ -43470,13 +43252,6 @@ impl NativeShell {
                 .text_size(px(tokens.density.typography.body))
                 .line_height(px(tokens.density.typography.body_line_height))
                 .text_color(tokens.text.primary.to_gpui())
-                .child(self.header_bar(
-                    tokens,
-                    None,
-                    None,
-                    None,
-                    Self::header_settings_control_static(),
-                ))
                 .child(
                     div()
                         .id("native-shell-content")
@@ -43542,13 +43317,6 @@ impl NativeShell {
             self.context_dock_surface(tokens, None),
             None,
         );
-        let workspace_header = self.header_bar(
-            tokens,
-            None,
-            None,
-            None,
-            Self::header_settings_control_static(),
-        );
         div()
             .id("native-shell-root")
             .size_full()
@@ -43570,7 +43338,6 @@ impl NativeShell {
                         .into_any_element()
                 },
                 sidebar,
-                workspace_header,
                 dock,
                 None,
                 layout,
@@ -44740,18 +44507,6 @@ impl NativeShell {
             .layout
             .clone()
             .fitted(f32::from(viewport.width), f32::from(viewport.height));
-        // Spec 6.3: one primary action per panel and everything else behind
-        // its ⋯ menu. The header's Done/Restore/Archive/Delete strip acted on
-        // "the selected task" no matter which panel you were looking at, which
-        // is exactly the ambiguity the per-panel action removes.
-        let workspace_actions: Option<AnyElement> = None;
-        let workspace_header = self.header_bar(
-            tokens,
-            None,
-            workspace_actions,
-            Some(self.pane_toggles(tokens, cx)),
-            Self::header_settings_control_static(),
-        );
         let workspace_rails = (
             self.pane_rail(PaneEdge::Inbox, tokens, cx),
             self.pane_rail(PaneEdge::Dock, tokens, cx),
@@ -44958,7 +44713,6 @@ impl NativeShell {
                 top_bar,
                 conversation,
                 sidebar,
-                workspace_header,
                 dock_panel,
                 None,
                 layout,
@@ -47830,7 +47584,6 @@ pub(crate) mod tests {
         PROVIDER_SETUP_RESOLUTION_TIMEOUT,
         REMOTE_RECONNECT_BACKOFF_MAX,
         REMOTE_RECONNECT_BACKOFF_MIN,
-        T3_WORKSPACE_TOPBAR_HEIGHT,
     };
     use super::{
         fleet_projection_message_accepted, NativeProjectionOwner, NativeSettingsPage,
@@ -48757,7 +48510,6 @@ pub(crate) mod tests {
         // the board's own row heights live in `ui::board::layout` and are
         // asserted there against the mockup.
         assert_eq!(ARCHIVED_ROW_HEIGHT, 78.0);
-        assert_eq!(T3_WORKSPACE_TOPBAR_HEIGHT, 32.0);
         assert_eq!(CONVERSATION_CONTENT_MAX_WIDTH, 768.0);
     }
 
@@ -60291,28 +60043,62 @@ pub(crate) mod tests {
         );
     }
 
-    /// Spec 6.3: one primary action per panel, everything else behind its ⋯
-    /// menu. The header's task action strip acted on "the selected task" from
-    /// a place that named no panel, which is the ambiguity that removed it.
+    /// F1 (composition A): there is no workspace header row. The 32 px strip
+    /// that carried the breadcrumb and the centre-canvas Conversation|Terminal
+    /// switch is deleted with its constant and every caller, so the panel grid
+    /// starts directly under the 34 px window top bar.
+    ///
+    /// A source scan, because the assertion is about a painter that no longer
+    /// exists: once the element is gone there is nothing to read back out of a
+    /// window, and the accessibility tree is built from shell state rather than
+    /// from these elements, so it cannot witness the deletion either.
+    ///
+    /// Every needle is split across a `concat!` so it exists nowhere in this
+    /// file as one literal -- a negative assertion that finds ITSELF can never
+    /// fail, which is the guard-that-cannot-fail shape one sign flipped.
     #[test]
-    fn the_workspace_header_no_longer_carries_a_task_action_strip() {
+    fn the_header_row_above_the_panel_grid_is_gone() {
         let source = include_str!("native_shell.rs");
+        for (forbidden, what) in [
+            (
+                concat!("T3_WORKSPACE_TOPBAR", "_HEIGHT"),
+                "the 32 px header height constant",
+            ),
+            (concat!("fn header", "_bar("), "the header painter"),
+            (
+                concat!("native-shell-workspace-", "topbar"),
+                "the header row element",
+            ),
+            (
+                concat!("native-shell-header-", "breadcrumb"),
+                "the breadcrumb",
+            ),
+            (
+                concat!("fn pane", "_toggles("),
+                "the centre-canvas view switch painter",
+            ),
+            (
+                concat!("native-shell-center-mode-", "switch"),
+                "the centre-canvas Conversation|Terminal switch",
+            ),
+            (
+                concat!("workspace", "_header"),
+                "the header argument threaded through main_column",
+            ),
+        ] {
+            assert!(
+                !source.contains(forbidden),
+                "{what} must be gone from the shell (found {forbidden:?})"
+            );
+        }
+        // And the row it used to sit above is measured against the window top
+        // bar now, not against a header that no longer exists.
         assert!(
-            source.contains("let workspace_actions: Option<AnyElement> = None;"),
-            "the header must pass no task actions"
-        );
-        // Split so the needle exists nowhere in this file as one literal. The
-        // first cut of this assertion searched for the exact call it forbids
-        // and found ITSELF, which made a negative assertion that could never
-        // pass -- the same shape as a guard that can never fail, one sign
-        // flipped.
-        let forbidden = concat!(
-            "let workspace_actions = self.",
-            "conversation_delete_action(cx);"
-        );
-        assert!(
-            !source.contains(forbidden),
-            "the action strip must not be built for the header any more"
+            source.contains(concat!(
+                "f32::from(viewport.height) - crate::ui::board::layout::TOP",
+                "_BAR_HEIGHT - 2.0"
+            )),
+            "the workspace row's height must be the window minus the top bar"
         );
     }
 
