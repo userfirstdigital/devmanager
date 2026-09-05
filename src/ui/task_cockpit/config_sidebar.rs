@@ -6,10 +6,11 @@
 //! [`ConfigSnapshot`] and the shell dispatches the typed selection requests.
 //! Configuration editing remains behind the existing ConfigStore/app facade.
 
-use gpui::{
-    div, px, rgb, AnyElement, FontWeight, InteractiveElement, IntoElement, ParentElement, Styled,
-};
+use gpui::{div, px, rgb, AnyElement, InteractiveElement, IntoElement, ParentElement, Styled};
 
+use super::panel::{
+    panel_empty_state, panel_row_shell, META_FONT_SIZE, ROW_ICON_SIZE, ROW_PADDING_X, ROW_PADDING_Y,
+};
 use crate::config::{
     AppConfig, ConfigRevision, ConfigSnapshot, Nullable, Project, ProjectFolder, RunCommand,
     SSHConnection, Settings,
@@ -473,6 +474,7 @@ impl ConfigSidebarProjection {
         let mut sections = Vec::new();
         sections.push(section(
             self.project_section_title(),
+            crate::icons::FOLDER,
             self.projects.iter().map(|row| row.label.clone()),
             0,
             tokens,
@@ -481,6 +483,7 @@ impl ConfigSidebarProjection {
         if !self.servers.is_empty() {
             sections.push(section(
                 "Servers",
+                crate::icons::SERVER,
                 self.servers.iter().map(|row| row.label.clone()),
                 1,
                 tokens,
@@ -490,6 +493,7 @@ impl ConfigSidebarProjection {
         if !self.ssh_connections.is_empty() {
             sections.push(section(
                 "Remote connections",
+                crate::icons::GLOBE,
                 self.ssh_connections.iter().map(|row| row.label.clone()),
                 3,
                 tokens,
@@ -508,7 +512,11 @@ impl ConfigSidebarProjection {
             .flex()
             .flex_col()
             .overflow_hidden()
-            .bg(rgb(tokens.surfaces.overlay.to_u32()))
+            // Rule 3: this rail is a panel on the canvas, not a menu -- it is
+            // always present and nothing is anchored to it -- so it is
+            // `surfaces.raised`. `surfaces.overlay` is reserved for rule 7's
+            // menus, palettes and pickers.
+            .bg(rgb(tokens.surfaces.raised.to_u32()))
             .children(self.shows_identity_summary().then(|| {
                 div()
                     .id("native-config-sidebar-summary")
@@ -516,16 +524,17 @@ impl ConfigSidebarProjection {
                     .flex_none()
                     .flex()
                     .flex_col()
-                    .gap(px(tokens.density.spacing.xxs))
-                    .px(px(tokens.density.spacing.lg))
-                    .py(px(tokens.density.spacing.md))
+                    // Rule 5: on the row grid, so the summary's left edge is
+                    // the rows' left edge rather than a wider inset of its own.
+                    .px(px(ROW_PADDING_X))
+                    .py(px(ROW_PADDING_Y))
                     .border_b(px(1.0))
                     .border_color(rgb(tokens.borders.subtle.to_u32()))
                     .child(
+                        // Rule 2: a caption is 10.5 px on `text.muted`.
                         div()
-                            .text_size(px(tokens.density.typography.caption))
-                            .line_height(px(tokens.density.typography.caption_line_height))
-                            .text_color(rgb(tokens.text.secondary.to_u32()))
+                            .text_size(px(META_FONT_SIZE))
+                            .text_color(rgb(tokens.text.muted.to_u32()))
                             .child(self.summary()),
                     )
             }))
@@ -538,9 +547,9 @@ impl ConfigSidebarProjection {
                     .overflow_hidden()
                     .flex()
                     .flex_col()
-                    .gap(px(tokens.density.spacing.lg))
-                    .px(px(tokens.density.spacing.sm))
-                    .py(px(tokens.density.spacing.md))
+                    // Rule 6: row gap 0 -- the rows are bands, and the space
+                    // between two groups is the group label's own padding.
+                    .py(px(ROW_PADDING_Y))
                     .children(sections),
             )
             .into_any_element()
@@ -697,6 +706,7 @@ fn accessibility(role: AccessibleRole, name: &str) -> AccessibilityMetadata {
 
 fn section(
     title: &'static str,
+    glyph: &'static str,
     labels: impl IntoIterator<Item = String>,
     section_id: usize,
     tokens: ThemeTokens,
@@ -706,32 +716,26 @@ fn section(
     let is_empty = labels.is_empty();
     // Row ids are offset by their section so two rails cannot mint the same
     // GPUI element identity for different rows.
-    let rows = labels.into_iter().enumerate().map(|(index, label)| {
-        div()
+    let rows = labels.into_iter().enumerate().map(move |(index, label)| {
+        // Rule 5: full width, padding 5x10, no side margin and no radius, so
+        // the hover fill is a band across the rail. The geometry and the two
+        // interaction fills come from the one body-language helper rather than
+        // from a second copy of the same numbers.
+        panel_row_shell(tokens, false)
             .id((
                 "native-config-sidebar-row",
                 section_id * MAX_CONFIG_SERVERS + index,
             ))
-            .w_full()
-            .flex()
-            .items_center()
-            .gap(px(tokens.density.spacing.sm))
-            .h(px(tokens.density.controls.row_height))
-            .px(px(tokens.density.spacing.sm))
-            .rounded(px(tokens.density.radii.sm))
-            .text_size(px(tokens.density.typography.body))
-            .line_height(px(tokens.density.typography.body_line_height))
-            .text_color(rgb(tokens.text.secondary.to_u32()))
             .cursor_pointer()
-            .hover(|style| style.bg(rgb(tokens.surfaces.hover.to_u32())))
-            .child(
-                div()
-                    .flex_none()
-                    .w(px(5.0))
-                    .h(px(5.0))
-                    .rounded(px(tokens.density.radii.pill))
-                    .bg(rgb(tokens.borders.strong.to_u32())),
-            )
+            // Rule 10: a 14 px lucide glyph tinted `text.muted`. It replaces
+            // the 5 px filled dot this rail used to paint -- rule 3 asks for
+            // borders and glyphs rather than decorative fills, and a dot in
+            // `borders.strong` says nothing about what the row is.
+            .child(crate::icons::app_icon(
+                glyph,
+                ROW_ICON_SIZE,
+                tokens.text.muted.to_u32(),
+            ))
             .child(div().flex_1().min_w(px(0.0)).truncate().child(label))
     });
     div()
@@ -739,37 +743,28 @@ fn section(
         .w_full()
         .flex()
         .flex_col()
-        .gap(px(tokens.density.spacing.xxs))
         .child(
             div()
                 .w_full()
                 .flex()
                 .items_center()
                 .justify_between()
-                .px(px(tokens.density.spacing.sm))
-                .pb(px(tokens.density.spacing.xxs))
+                .px(px(ROW_PADDING_X))
+                .py(px(ROW_PADDING_Y))
                 .child(
+                    // Rule 2: a group label is 10.5 px uppercase on
+                    // `text.muted`, and nothing else. The semibold weight is
+                    // rule 2's 12 px title, which a group label is not.
                     div()
-                        .text_size(px(tokens.density.typography.caption))
-                        .line_height(px(tokens.density.typography.caption_line_height))
-                        .font_weight(FontWeight::SEMIBOLD)
+                        .text_size(px(META_FONT_SIZE))
                         .text_color(rgb(tokens.text.muted.to_u32()))
                         .child(title.to_uppercase()),
                 )
                 .children(heading_action),
         )
         .children(rows)
-        .children(is_empty.then(|| {
-            div()
-                .flex()
-                .items_center()
-                .h(px(tokens.density.controls.row_height))
-                .px(px(tokens.density.spacing.sm))
-                .text_size(px(tokens.density.typography.caption))
-                .line_height(px(tokens.density.typography.caption_line_height))
-                .text_color(rgb(tokens.text.disabled.to_u32()))
-                .child("None configured")
-        }))
+        // Rule 9: one 11.5 px `text.muted` sentence, no heading.
+        .children(is_empty.then(|| panel_empty_state("None configured yet.", tokens)))
         .into_any_element()
 }
 
