@@ -4583,7 +4583,25 @@ enum ProjectInboxItem {
 /// What a board menu row does when it is chosen. Named rather than boxed so
 /// the row builder stays a plain data list and the overlay owns no closures
 /// beyond the one that applies them.
-/// One row in a board menu. It carries its own disabled reason, so the painter
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum BoardMenuAction {
+    NewTaskIn(HostProjectKey),
+    /// Start a local task straight onto a provider -- what the project rail's
+    /// "+Claude" / "+Codex" buttons did, moved into the one board menu.
+    StartAgentIn(ProjectId, ProviderKind),
+    ToggleArchived,
+    ToggleRail,
+    ToggleDensity,
+    /// The four destinations the column's footer strip carried, plus the
+    /// folder picker its "New project" button opened. Composition A has no
+    /// footer, so the one board menu is where they live now.
+    NewProject,
+    OpenDock(DockTool),
+    OpenGitWindow,
+    OpenSettings,
+}
+
+/// One row in a board menu. It carries its own disabled state, so the painter
 /// never decides whether a destination is reachable and the tests can read the
 /// answer without painting an overlay.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -4615,24 +4633,6 @@ impl BoardMenuEntry {
             disabled: None,
         }
     }
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-enum BoardMenuAction {
-    NewTaskIn(HostProjectKey),
-    /// Start a local task straight onto a provider -- what the project rail's
-    /// "+Claude" / "+Codex" buttons did, moved into the one board menu.
-    StartAgentIn(ProjectId, ProviderKind),
-    ToggleArchived,
-    ToggleRail,
-    ToggleDensity,
-    /// The four destinations the column's footer strip carried, plus the
-    /// folder picker its "New project" button opened. Composition A has no
-    /// footer, so the one board menu is where they live now.
-    NewProject,
-    OpenDock(DockTool),
-    OpenGitWindow,
-    OpenSettings,
 }
 
 /// What the board paints under its header.
@@ -49806,9 +49806,9 @@ pub(crate) mod tests {
     /// The ids above are absent from the accessibility tree because the
     /// elements are gone -- not because the tree happened never to publish
     /// them, which is why that loop names only ids that WERE nodes. The Search
-    /// row and the footer's settings glyph were painted without a node at all,
-    /// so no tree assertion can speak for them: this scan reads the production
-    /// source instead and is the only guard those two have.
+    /// row was painted without a node at all, so no tree assertion can speak
+    /// for it: this scan reads the production source instead and is its only
+    /// guard.
     #[test]
     fn the_removed_column_chrome_is_gone_from_the_painter_too() {
         let source = include_str!("native_shell.rs");
