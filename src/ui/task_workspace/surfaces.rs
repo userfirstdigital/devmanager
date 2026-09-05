@@ -616,6 +616,28 @@ impl TaskSurfaceState {
         }
     }
 
+    /// The host's own sentence behind a refused terminal, when there is one.
+    ///
+    /// `terminal_label` folds it into a display string; a caller that wants to
+    /// SAY the cause -- the panel's blocked status -- needs the sentence
+    /// itself, and sniffing it back out of the label would be two spellings of
+    /// one fact.
+    pub fn terminal_refusal_detail(&self) -> Option<String> {
+        let attachment = self.attachment(self.focused_surface_target());
+        if !matches!(
+            attachment.state,
+            TerminalAttachmentState::Unavailable | TerminalAttachmentState::Exited
+        ) {
+            return None;
+        }
+        attachment
+            .detail
+            .as_deref()
+            .map(str::trim)
+            .filter(|detail| !detail.is_empty())
+            .map(str::to_string)
+    }
+
     pub fn terminal_empty_message(&self) -> &'static str {
         match self.terminal_attachment() {
             TerminalAttachmentState::Live => "Terminal is live; waiting for output.",
@@ -1193,6 +1215,12 @@ impl<K: Clone + Ord + Eq> TaskSurfaceRegistry<K> {
         self.state(task_id)
             .map(TaskSurfaceState::terminal_label)
             .unwrap_or_else(|| "Terminal unavailable".to_string())
+    }
+
+    /// See [`TaskSurfaceState::terminal_refusal_detail`].
+    pub fn terminal_refusal_detail(&self, task_id: K) -> Option<String> {
+        self.state(task_id)
+            .and_then(TaskSurfaceState::terminal_refusal_detail)
     }
 
     pub fn terminal_empty_message(&self, task_id: K) -> &'static str {
