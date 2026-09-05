@@ -157,15 +157,17 @@ use crate::ui::task_cockpit::timeline::{ActivityToggleHandler, CONVERSATION_CONT
 #[cfg(debug_assertions)]
 use crate::ui::task_cockpit::timeline::{PreviewConversationMessage, PreviewPlanStep};
 use crate::ui::task_cockpit::{
-    action_is_current, one_fresh_quota_observations, project_services_from_task_projection,
-    project_services_panel, render_panel_action, render_task_browser_dock,
+    action_is_current, one_fresh_quota_observations, panel_button_shell, panel_empty_state,
+    panel_group_label, panel_list_row, panel_row_shell, project_services_from_task_projection,
+    project_services_panel, render_panel_action, render_panel_frame, render_task_browser_dock,
     update_observation_from_snapshot, ArtifactsPanelProjection, ChangesPanelProjection,
     ConfigSidebarActionRequest, ConfigSidebarProjection, ConfigSidebarUnavailableReason,
     FilesPanelProjection, Inbox, InboxPresentationWidth, InboxRenderModel, PanelAction,
     PanelDisabledReason, ReviewPanelProjection, ServicePanelAction, ServicePanelTone,
     ServicesPanelProjection, TaskBrowserDockModel, TaskHeaderModel, TaskList,
     TopBarProjectionController, TopBarProjectionInput, UpdateState, WorkspacePanelProjection,
-    DEFAULT_VISIBLE_ROWS, FIXED_VIRTUAL_OVERSCAN,
+    DEFAULT_VISIBLE_ROWS, FIXED_VIRTUAL_OVERSCAN, META_FONT_SIZE, ROW_FONT_SIZE, ROW_PADDING_X,
+    ROW_PADDING_Y,
 };
 
 use crate::browser::{
@@ -36206,32 +36208,46 @@ impl NativeShell {
         tool: CockpitDockTool,
         tokens: crate::ui::tokens::ThemeTokens,
     ) -> AnyElement {
-        Self::empty_state(
-            "native-shell-workspace-dock",
-            "\u{25cb}",
-            "Select a task first",
-            format!(
-                "{} loads once a task in the inbox is selected.",
-                tool.label()
-            ),
-            tokens,
-            None,
-        )
+        // Rule 9: one sentence, and nothing else. The headline said "Select a
+        // task first" while the sentence under it said the same thing at
+        // greater length, and the `○` in a 44 px pill above both was an
+        // illustration standing in for an icon that means nothing.
+        div()
+            .id("native-shell-workspace-dock")
+            .w_full()
+            .child(panel_empty_state(
+                format!(
+                    "{} loads once a task in the inbox is selected.",
+                    tool.label()
+                ),
+                tokens,
+            ))
+            .into_any_element()
     }
 
+    /// Rule 9's empty state for a view whose authority is local-only.
+    ///
+    /// The tool is still named at the call sites -- it is what decides that
+    /// this surface is reached at all -- but it no longer reaches the copy.
+    /// The shared authority reason IS the sentence, used verbatim rather than
+    /// restated with the tool's name folded in: it is the one string nine
+    /// other call sites already show for this refusal, it already names the
+    /// three local-only capabilities by name, and a tenth wording of it is how
+    /// the ten drift apart. The tab strip directly above the body says which
+    /// view the reader is looking at.
     fn remote_dock_unavailable_surface(
         &self,
-        tool: CockpitDockTool,
+        _tool: CockpitDockTool,
         tokens: crate::ui::tokens::ThemeTokens,
     ) -> AnyElement {
-        Self::empty_state(
-            "native-shell-remote-dock-unavailable",
-            "\u{25cb}",
-            format!("{} unavailable on remote", tool.label()),
-            Self::remote_local_authority_reason(),
-            tokens,
-            None,
-        )
+        div()
+            .id("native-shell-remote-dock-unavailable")
+            .w_full()
+            .child(panel_empty_state(
+                Self::remote_local_authority_reason(),
+                tokens,
+            ))
+            .into_any_element()
     }
 
     /// Empty-state copy for the task list. Without this the inbox renders a
@@ -72985,6 +73001,51 @@ pub(crate) mod tests {
         assert!(
             changes.contains(concat!("pub fn diff", "_rows(")),
             "lane R2's diff painter is gone; the call sites above point at nothing"
+        );
+    }
+
+    /// Both dock empty states are rule 9's one muted sentence, from lane R2's
+    /// `panel_empty_state`, rather than the shared `empty_state` -- which
+    /// centres a `○` in a 44 px pill, a semibold heading and a sentence, i.e.
+    /// an illustration and a heading, both of which rule 9 forbids in a panel
+    /// body.
+    ///
+    /// The denominator is the two bodies AND the survivors: `empty_state`
+    /// itself must still exist and still be used elsewhere, because this scan
+    /// would otherwise pass just as happily if someone deleted the inbox's
+    /// empty state along with these two.
+    #[test]
+    fn both_dock_empty_states_are_rule_nines_one_sentence() {
+        let shell = shell_source();
+        let painter = concat!("panel_empty", "_state(");
+        for body in ["dock_empty_state", "remote_dock_unavailable_surface"] {
+            let slice = shell_method_body(&shell, body);
+            assert!(
+                slice.contains(painter),
+                "`fn {body}` does not call lane R2's empty-state painter"
+            );
+            assert!(
+                !slice.contains(concat!("Self::empty", "_state(")),
+                "`fn {body}` still builds the heading-plus-illustration empty state"
+            );
+            assert!(
+                !slice.contains("\\u{25cb}"),
+                "`fn {body}` still paints the `○` glyph rule 9 has no room for"
+            );
+        }
+        // The survivors: the shared `empty_state` is still defined and still
+        // has callers outside the two bodies above, so this scan cannot go
+        // green by the whole helper having been deleted.
+        assert!(
+            shell.contains(concat!("fn empty", "_state(")),
+            "the shared empty-state helper is gone; the surfaces that legitimately \
+             use it have lost their copy"
+        );
+        let other_callers = shell.matches(concat!("Self::empty", "_state(")).count();
+        assert!(
+            other_callers >= 3,
+            "only {other_callers} callers of the shared empty state survive; this \
+             lane should have moved two dock bodies off it, not emptied it"
         );
     }
 }
