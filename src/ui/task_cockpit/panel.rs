@@ -113,9 +113,63 @@ pub fn task_identity(task_id: TaskId, revision: Option<u64>) -> PanelIdentity {
     PanelIdentity { task_id, revision }
 }
 
+// ---------------------------------------------------------------------------
+// The panel body's visual language.
+//
+// A dock body starts under the panel's tab row and has no chrome of its own:
+// the panel frame in `src/ui/panel/render.rs` already paints the title, the
+// status and the tabs, so a body that repeats them says the same thing twice.
+// The numbers below are the redesign's rules 2/4/5/6/9/10 written once, so a
+// panel is restyled by reading them rather than by a painter's memory. They
+// are measured against the body of the chosen arrangement in
+// `docs/superpowers/specs/2026-09-03-ui-redesign-mockups/02-panel-chrome-2.html`.
+// ---------------------------------------------------------------------------
+
+/// Rule 5: list rows are full width with no side margin, so the hover and
+/// selection fills reach the panel's edge and the row reads as a band rather
+/// than a card. 10 px of horizontal padding matches the `.hdr`/`.tabs` rows
+/// above it, so a row's text is on the same left edge as the panel's title.
+pub const ROW_PADDING_X: f32 = 10.0;
+/// Rule 5: 5 px above and below, which is what makes a two-line row 40 px and
+/// a one-line row 22 px at the 11.5/10.5 type scale.
+pub const ROW_PADDING_Y: f32 = 5.0;
+/// Rule 2: 11.5 px is the body/list size -- the row's own content.
+pub const ROW_FONT_SIZE: f32 = 11.5;
+/// Rule 2: 10.5 px is the caption size -- a row's metadata line, and the only
+/// size at which colour is ever spent on a count.
+pub const META_FONT_SIZE: f32 = 10.5;
+// Rule 2 also asks for .04-.06em of letter-spacing on a group label. GPUI
+// 0.2.2's `Styled` has no letter-spacing or tracking setter -- nothing in this
+// application sets one -- so the label is uppercase at the caption size and
+// the tracking is the one part of rule 2 that cannot be honoured here. Lane
+// 2c's `card_label` in `src/ui/panel/permission.rs` reaches the same place by
+// the same route; if a tracking setter ever lands, both change together.
+/// Rule 10: a lucide glyph inside a list row is 14 px and `text.muted`. The
+/// glyph is never coloured by what it stands for -- a `.rs` file and a `.png`
+/// file get the same grey, because the colour budget belongs to status.
+pub const ROW_ICON_SIZE: f32 = 14.0;
+/// Rule 6: the gap between a row's glyph and its text, and between controls.
+pub const ROW_GAP: f32 = 8.0;
+/// Rule 6: region padding, used where a body needs a margin of its own rather
+/// than a full-width row (an empty state, a group's outer box).
+pub const REGION_PADDING: f32 = 10.0;
+
+/// Rule 4: a default button is 11 px on a 1 px `borders.default`, no fill.
+const ACTION_FONT_SIZE: f32 = 11.0;
+/// Rule 4: padding 2x8.
+const ACTION_PADDING_X: f32 = 8.0;
+const ACTION_PADDING_Y: f32 = 2.0;
+/// Rule 3: radius 6 for buttons.
+const ACTION_RADIUS: f32 = 6.0;
+
 /// Render a small action affordance.  The action request stays on the typed
 /// projection for the owning shell to dispatch; this renderer intentionally
 /// does not invent a click handler or bypass the host action boundary.
+///
+/// Rule 4's default button: a 1 px `borders.default` outline with no fill, an
+/// 11 px `text.primary` label, 2x8 padding and radius 6. Hover fills with
+/// `surfaces.hover` rather than changing the label's colour, so a row of these
+/// stays quiet until the pointer is on one.
 pub fn render_panel_action(action: &PanelAction, target: &str, tokens: ThemeTokens) -> AnyElement {
     let label = action.disabled_reason.map_or_else(
         || action_label(action.action_id),
@@ -123,56 +177,190 @@ pub fn render_panel_action(action: &PanelAction, target: &str, tokens: ThemeToke
     );
     let mut element = div()
         .id(("task-cockpit-panel-action", action.element_key(target)))
-        .px(px(tokens.density.spacing.sm))
-        .py(px(tokens.density.spacing.xs))
+        .flex_none()
+        .px(px(ACTION_PADDING_X))
+        .py(px(ACTION_PADDING_Y))
+        .rounded(px(ACTION_RADIUS))
         .border_1()
-        .border_color(rgb(tokens.borders.subtle.to_u32()))
-        .text_xs()
+        .text_size(px(ACTION_FONT_SIZE))
         .child(label);
     if action.is_enabled() {
         element = element
             .cursor_pointer()
-            .text_color(rgb(tokens.text.primary.to_u32()));
+            .border_color(rgb(tokens.borders.default.to_u32()))
+            .text_color(rgb(tokens.text.primary.to_u32()))
+            .hover(|style| style.bg(rgb(tokens.surfaces.hover.to_u32())));
     } else {
-        element = element.text_color(rgb(tokens.text.disabled.to_u32()));
+        element = element
+            .border_color(rgb(tokens.borders.disabled.to_u32()))
+            .text_color(rgb(tokens.text.disabled.to_u32()));
     }
     element.into_any_element()
 }
 
+/// Rule 2's group header: 10.5 px uppercase on `text.muted`, letter-spaced,
+/// sitting on the row grid rather than in a box of its own.
+///
+/// This is what a panel body uses where it once painted its own title. The
+/// panel already carries its name in the chrome above; a body only ever needs
+/// to say which *group* of rows follows.
+pub fn panel_group_label(title: &str, tokens: ThemeTokens) -> AnyElement {
+    div()
+        .w_full()
+        .px(px(ROW_PADDING_X))
+        .py(px(ROW_PADDING_Y))
+        .text_size(px(META_FONT_SIZE))
+        .text_color(rgb(tokens.text.muted.to_u32()))
+        .child(title.to_uppercase())
+        .into_any_element()
+}
+
+/// Rule 9's empty state: one 11.5 px `text.muted` sentence. No heading, no
+/// illustration, and nothing that looks like an error unless it is one.
+pub fn panel_empty_state(sentence: impl Into<String>, tokens: ThemeTokens) -> AnyElement {
+    div()
+        .w_full()
+        .p(px(REGION_PADDING))
+        .text_size(px(ROW_FONT_SIZE))
+        .text_color(rgb(tokens.text.muted.to_u32()))
+        .child(sentence.into())
+        .into_any_element()
+}
+
+/// Rule 5's list row, as a shell the caller fills and wires.
+///
+/// The click handler, the element id and the accessibility node stay with the
+/// caller -- this only owns the geometry and the two interaction fills, which
+/// are the parts every list in the app was getting slightly differently.
+pub fn panel_row_shell(tokens: ThemeTokens, selected: bool) -> gpui::Div {
+    let row = div()
+        .w_full()
+        .flex()
+        .items_center()
+        .gap(px(ROW_GAP))
+        .px(px(ROW_PADDING_X))
+        .py(px(ROW_PADDING_Y))
+        .text_size(px(ROW_FONT_SIZE));
+    if selected {
+        row.bg(rgb(tokens.surfaces.selection.to_u32()))
+            .text_color(rgb(tokens.text.emphasis.to_u32()))
+    } else {
+        row.text_color(rgb(tokens.text.primary.to_u32()))
+            .hover(|style| style.bg(rgb(tokens.surfaces.hover.to_u32())))
+    }
+}
+
+/// Rule 5's list row, complete: a 14 px grey glyph, an 11.5 px title, an
+/// optional 10.5 px `text.muted` metadata line under it, and an optional
+/// trailing element the caller owns (a count, a button, a status).
+///
+/// One painter serves the file tree, the review list, the artifacts list and
+/// the services list, because rule 5 gives all four the same row -- and four
+/// copies of the same row is how four lists end up with four different ideas
+/// of what a selected row looks like.
+///
+/// The glyph is deliberately not chosen from the row's own type: rule 10 keeps
+/// every list glyph 14 px and `text.muted`, so a `.rs` and a `.png` look the
+/// same and the colour budget stays with status.
+pub fn panel_list_row(
+    tokens: ThemeTokens,
+    glyph: Option<&'static str>,
+    title: impl Into<String>,
+    meta: Option<String>,
+    trailing: Option<AnyElement>,
+    selected: bool,
+) -> gpui::Div {
+    let title = title.into();
+    let lines = div()
+        .flex_1()
+        .min_w(px(0.0))
+        .flex()
+        .flex_col()
+        .child(div().w_full().truncate().child(title))
+        .children(meta.map(|meta| {
+            div()
+                .w_full()
+                .truncate()
+                .text_size(px(META_FONT_SIZE))
+                // A selected row's title goes to `text.emphasis`; its metadata
+                // stays muted, so the two lines keep their hierarchy under the
+                // selection fill instead of both going white.
+                .text_color(rgb(tokens.text.muted.to_u32()))
+                .child(meta)
+        }));
+    panel_row_shell(tokens, selected)
+        // A two-line row is aligned to the top of its glyph, not centred on
+        // the pair, or the glyph floats between the two lines.
+        .items_start()
+        .children(glyph.map(|glyph| {
+            div().flex_none().child(crate::icons::app_icon(
+                glyph,
+                ROW_ICON_SIZE,
+                tokens.text.muted.to_u32(),
+            ))
+        }))
+        .child(lines)
+        .children(trailing)
+}
+
+/// The one place rule 1 lets a list row spend colour: a `+n`/`-n` count.
+///
+/// 10.5 px on `status.success` and `status.destructive`, side by side, and
+/// nothing else in the row is tinted. A zero is not painted at all -- a green
+/// `+0` is a colour spent on the absence of news.
+pub fn panel_change_counts(added: u32, removed: u32, tokens: ThemeTokens) -> AnyElement {
+    div()
+        .flex_none()
+        .flex()
+        .items_center()
+        .gap(px(ROW_GAP / 2.0))
+        .text_size(px(META_FONT_SIZE))
+        .children((added > 0).then(|| {
+            div()
+                .text_color(rgb(tokens.status.success.to_u32()))
+                .child(format!("+{added}"))
+        }))
+        .children((removed > 0).then(|| {
+            div()
+                .text_color(rgb(tokens.status.destructive.to_u32()))
+                .child(format!("-{removed}"))
+        }))
+        .into_any_element()
+}
+
+/// A panel body: the rows, with no title row of its own.
+///
+/// The `summary` the callers used to print beside a title is now a rule-2
+/// group label above the rows, and the panel's name is not repeated at all --
+/// the chrome owns it. Controls sit on their own row under the label so a
+/// narrow panel wraps the buttons instead of the summary.
 pub fn render_panel_frame(
     id: &'static str,
-    title: &'static str,
     summary: impl Into<String>,
     actions: impl IntoIterator<Item = PanelAction>,
     body: impl IntoElement,
     tokens: ThemeTokens,
 ) -> AnyElement {
-    let controls = actions
+    let controls: Vec<AnyElement> = actions
         .into_iter()
-        .map(|action| render_panel_action(&action, "panel", tokens));
+        .map(|action| render_panel_action(&action, "panel", tokens))
+        .collect();
+    let summary = summary.into();
     div()
         .id(id)
         .w_full()
         .flex()
         .flex_col()
-        .gap(px(tokens.density.spacing.xs))
-        .p(px(tokens.density.physical().control_padding as f32))
-        .bg(rgb(tokens.surfaces.sunken.to_u32()))
-        .child(
+        .child(panel_group_label(&summary, tokens))
+        .children((!controls.is_empty()).then(|| {
             div()
                 .flex()
-                .items_center()
-                .gap(px(tokens.density.spacing.sm))
-                .text_color(rgb(tokens.text.primary.to_u32()))
-                .child(title)
-                .child(summary.into()),
-        )
-        .child(
-            div()
-                .flex()
-                .gap(px(tokens.density.spacing.xs))
-                .children(controls),
-        )
+                .flex_wrap()
+                .gap(px(ROW_GAP))
+                .px(px(ROW_PADDING_X))
+                .pb(px(ROW_PADDING_Y))
+                .children(controls)
+        }))
         .child(body)
         .into_any_element()
 }
@@ -288,5 +476,21 @@ mod tests {
         );
         assert!(action_is_current(&unfenced, Some(task_id), None));
         assert!(!action_is_current(&unfenced, Some(task_id), Some(4)));
+    }
+
+    /// Rule 2's scale, read off the constants the painters actually use rather
+    /// than off a painter's memory of the mockup.
+    #[test]
+    fn the_body_type_scale_is_the_redesigns_scale() {
+        assert_eq!(ROW_FONT_SIZE, 11.5, "rule 2: body/list text is 11.5 px");
+        assert_eq!(META_FONT_SIZE, 10.5, "rule 2: captions/meta are 10.5 px");
+        assert_eq!(ACTION_FONT_SIZE, 11.0, "rule 4: button labels are 11 px");
+        assert_eq!(ROW_ICON_SIZE, 14.0, "rule 10: list glyphs are 14 px");
+        assert_eq!(ACTION_RADIUS, 6.0, "rule 3: radius 6 for buttons");
+        assert_eq!(ACTION_PADDING_X, 8.0);
+        assert_eq!(ACTION_PADDING_Y, 2.0);
+        assert_eq!(ROW_PADDING_X, 10.0, "rule 5: rows are padded 5x10");
+        assert_eq!(ROW_PADDING_Y, 5.0, "rule 5: rows are padded 5x10");
+        assert_eq!(ROW_GAP, 8.0, "rule 6: control gap is 8");
     }
 }
