@@ -41,7 +41,16 @@ use crate::ui::renderers::{
 pub const DEFAULT_OVERSCAN: usize = 4;
 pub const MAX_PAINTED_ROWS: usize = 48;
 /// Shared readable measure for the conversation column and floating composer.
+/// A ceiling, not a width: inside a redesign panel `max_w_full` clamps it to
+/// the panel, so the stream fills the panel it is in.
 pub const CONVERSATION_CONTENT_MAX_WIDTH: f32 = 768.0;
+/// Rule 6: region padding is 10-12. The stream's column takes the lower end,
+/// because every row inside it is already full-width with its own rhythm.
+const STREAM_REGION_PADDING: f32 = 10.0;
+/// Rule 6: 8 px between the summary caption and the stream below it.
+const STREAM_REGION_GAP: f32 = 8.0;
+/// Rule 2: 10.5 px captions. The activity summary is one.
+const STREAM_CAPTION_FONT_SIZE: f32 = 10.5;
 /// Follow re-arm band above the true content bottom. Strict on purpose: a
 /// half-viewport "near end" test re-arms live-follow while the user is reading
 /// history and yanks them back down on the next streamed chunk.
@@ -451,7 +460,7 @@ impl Timeline {
                     .h_full()
                     .flex()
                     .justify_center()
-                    .px(px(16.0))
+                    .px(px(STREAM_REGION_PADDING))
                     .child(
                         div()
                             .id(("native-conversation-column", task_key))
@@ -460,36 +469,25 @@ impl Timeline {
                             .w(px(CONVERSATION_CONTENT_MAX_WIDTH))
                             .max_w_full()
                             .h_full()
-                            .py(px(tokens.density.spacing.lg))
+                            .py(px(STREAM_REGION_PADDING))
                             .flex()
                             .flex_col()
-                            .gap(px(tokens.density.spacing.md))
+                            .gap(px(STREAM_REGION_GAP))
+                            // The activity summary is a caption, not a badge.
+                            // Rule 1 spends `status.attention` on "needs you"
+                            // alone, so the amber dot and the pill's surface
+                            // are gone: what is running reads as one quiet
+                            // 10.5 px muted line above the stream (rule 2).
                             .children(activity.map(|summary| {
                                 div()
                                     .w_full()
-                                    .flex()
-                                    .justify_start()
-                                    .child(
-                                        div()
-                                            .flex_none()
-                                            .flex()
-                                            .items_center()
-                                            .gap(px(7.0))
-                                            .px(px(10.0))
-                                            .py(px(6.0))
-                                            .rounded(px(tokens.density.radii.md))
-                                            .bg(tokens.surfaces.sunken.to_gpui())
-                                            .text_size(px(tokens.density.typography.caption))
-                                            .text_color(tokens.text.secondary.to_gpui())
-                                            .child(
-                                                div()
-                                                    .flex_none()
-                                                    .size(px(6.0))
-                                                    .rounded_full()
-                                                    .bg(tokens.status.attention.to_gpui()),
-                                            )
-                                            .child(summary),
-                                    )
+                                    .min_w(px(0.0))
+                                    .overflow_hidden()
+                                    .text_ellipsis()
+                                    .whitespace_nowrap()
+                                    .text_size(px(STREAM_CAPTION_FONT_SIZE))
+                                    .text_color(tokens.text.muted.to_gpui())
+                                    .child(summary)
                                     .into_any_element()
                             }))
                             .child(
