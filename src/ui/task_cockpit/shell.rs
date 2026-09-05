@@ -41,6 +41,16 @@ use crate::ui::tokens::{theme, Density, Scale, ThemeMode};
 /// still loading: see [`TaskCockpitShell::conversation_hold_copy_for`].
 pub const CONVERSATION_LIVE_HOLD_COPY: &str = "Conversation is live; waiting for messages.";
 
+/// Rule 9: an empty or blocked stream is one sentence at body size in
+/// `text.muted` -- no glyph, no heading, no card. Rule 2 fixes the size at
+/// 11.5; rule 6 puts 12 px of region padding around it.
+const STREAM_HOLD_FONT_SIZE: f32 = 11.5;
+/// 11.5 px at the mockup stream's 1.5 leading.
+const STREAM_HOLD_LINE_HEIGHT: f32 = 17.25;
+const STREAM_HOLD_PADDING: f32 = 12.0;
+/// A comfortable measure for one sentence at 11.5 px.
+const STREAM_HOLD_MAX_WIDTH: f32 = 340.0;
+
 pub struct TaskCockpitShell {
     dock: ContextDock,
     model: Option<ClientModel>,
@@ -776,9 +786,15 @@ impl TaskCockpitShell {
                     .flex()
                     .items_center()
                     .justify_center()
-                    .p(gpui::px(tokens.density.spacing.xl))
+                    .p(gpui::px(STREAM_HOLD_PADDING))
+                    // Rule 9: an empty state is one 11.5 px `text.muted`
+                    // sentence. No glyph, no heading, no surface of its own.
                     .child(
                         div()
+                            .max_w(gpui::px(STREAM_HOLD_MAX_WIDTH))
+                            .text_center()
+                            .text_size(gpui::px(STREAM_HOLD_FONT_SIZE))
+                            .line_height(gpui::px(STREAM_HOLD_LINE_HEIGHT))
                             .text_color(tokens.text.muted.to_gpui())
                             .child(hold_copy),
                     )
@@ -962,15 +978,16 @@ impl TaskCockpitShell {
                     .flex()
                     .items_center()
                     .justify_center()
-                    .p(gpui::px(tokens.density.spacing.xl))
+                    .p(gpui::px(STREAM_HOLD_PADDING))
+                    // Rule 9, same sentence shape as the per-task hold above.
                     .child(
                         div()
                             .w_full()
                             .min_w(gpui::px(0.0))
-                            .max_w(gpui::px(340.0))
+                            .max_w(gpui::px(STREAM_HOLD_MAX_WIDTH))
                             .text_center()
-                            .text_size(gpui::px(tokens.density.typography.caption))
-                            .line_height(gpui::px(tokens.density.typography.caption_line_height))
+                            .text_size(gpui::px(STREAM_HOLD_FONT_SIZE))
+                            .line_height(gpui::px(STREAM_HOLD_LINE_HEIGHT))
                             .text_color(tokens.text.muted.to_gpui())
                             .child(timeline_error),
                     )
@@ -983,21 +1000,20 @@ impl TaskCockpitShell {
             .id("native-task-composer-hold")
             .w_full()
             .flex_none()
-            .p(gpui::px(tokens.density.spacing.md))
+            .px(gpui::px(STREAM_HOLD_PADDING))
+            .py(gpui::px(STREAM_HOLD_PADDING))
             .border_t(gpui::px(1.0))
             .border_color(tokens.borders.subtle.to_gpui())
+            // Rule 3 and 9: the blocked composer is a sentence under the same
+            // hairline every region gets, not a disabled-grey box inside a
+            // second box. The rule above it already separates it from the
+            // stream.
             .child(
                 div()
                     .w_full()
-                    .px(gpui::px(tokens.density.spacing.md))
-                    .py(gpui::px(tokens.density.spacing.sm))
-                    .rounded(gpui::px(tokens.density.radii.md))
-                    .bg(tokens.surfaces.disabled.to_gpui())
-                    .border(gpui::px(1.0))
-                    .border_color(tokens.borders.subtle.to_gpui())
-                    .text_size(gpui::px(tokens.density.typography.caption))
-                    .line_height(gpui::px(tokens.density.typography.caption_line_height))
-                    .text_color(tokens.text.disabled.to_gpui())
+                    .text_size(gpui::px(STREAM_HOLD_FONT_SIZE))
+                    .line_height(gpui::px(STREAM_HOLD_LINE_HEIGHT))
+                    .text_color(tokens.text.muted.to_gpui())
                     .child("Task composer unavailable until a primary agent is bound"),
             )
             .into_any_element()
