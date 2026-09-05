@@ -1045,6 +1045,26 @@ mod tests {
                     title + DOT_CELL_WIDTH <= content,
                     "at {width} px the title has no room for the state dot"
                 );
+                // W6 (fix wave 3): the title's ellipsis must land clear of the
+                // ordinal chip, not up against it. The reserve carries the
+                // chip's own box PLUS a gap, so the gap is what is left when
+                // the chip is subtracted -- and it is at least the 6 px the
+                // spacing grid gives two adjacent things.
+                if open.is_some() {
+                    let gap = content
+                        - title
+                        - ORDINAL_CHIP_MAX_WIDTH
+                        - DOT_CELL_WIDTH
+                        - 2.0 * DOT_CELL_GAP
+                        - crate::ui::overlay_chrome::approx_text_width(
+                            &crate::ui::board::format_age(sample.state_age_ms),
+                            META_FONT_SIZE,
+                        );
+                    assert!(
+                        gap >= 6.0 - 0.01,
+                        "at {width} px the title ends {gap} px from the chip"
+                    );
+                }
             }
         }
     }
