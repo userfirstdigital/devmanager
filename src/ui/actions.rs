@@ -124,6 +124,73 @@ pub struct NativeCycleTerminalBack;
 #[action(name = "native.dismiss_transient")]
 pub struct NativeDismissTransient;
 
+// The panel's own chords (spec 10). Each is a unit action bound to exactly one
+// keystroke here and resolved through [`KeyboardModel`] in the shell, so the
+// chord table and the meaning table cannot drift: the binding below names the
+// keystroke, and `KeyboardModel::default` names what it does.
+
+/// Settle the focused panel's task (Ctrl+D).
+#[derive(Clone, Debug, Default, PartialEq, Eq, gpui::Action)]
+#[action(name = "native.panel_settle")]
+pub struct NativePanelSettle;
+
+/// Fill the canvas with the focused panel, and back (Ctrl+Shift+Z).
+#[derive(Clone, Debug, Default, PartialEq, Eq, gpui::Action)]
+#[action(name = "native.panel_zoom")]
+pub struct NativePanelZoom;
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, gpui::Action)]
+#[action(name = "native.panel_view_1")]
+pub struct NativePanelView1;
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, gpui::Action)]
+#[action(name = "native.panel_view_2")]
+pub struct NativePanelView2;
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, gpui::Action)]
+#[action(name = "native.panel_view_3")]
+pub struct NativePanelView3;
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, gpui::Action)]
+#[action(name = "native.panel_view_4")]
+pub struct NativePanelView4;
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, gpui::Action)]
+#[action(name = "native.panel_view_5")]
+pub struct NativePanelView5;
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, gpui::Action)]
+#[action(name = "native.panel_focus_left")]
+pub struct NativePanelFocusLeft;
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, gpui::Action)]
+#[action(name = "native.panel_focus_right")]
+pub struct NativePanelFocusRight;
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, gpui::Action)]
+#[action(name = "native.panel_focus_up")]
+pub struct NativePanelFocusUp;
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, gpui::Action)]
+#[action(name = "native.panel_focus_down")]
+pub struct NativePanelFocusDown;
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, gpui::Action)]
+#[action(name = "native.panel_move_left")]
+pub struct NativePanelMoveLeft;
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, gpui::Action)]
+#[action(name = "native.panel_move_right")]
+pub struct NativePanelMoveRight;
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, gpui::Action)]
+#[action(name = "native.panel_move_up")]
+pub struct NativePanelMoveUp;
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, gpui::Action)]
+#[action(name = "native.panel_move_down")]
+pub struct NativePanelMoveDown;
+
 #[derive(Clone, Debug, Default, PartialEq, Eq, gpui::Action)]
 #[action(name = "dock.tool.changes")]
 pub struct DockSelectChanges;
@@ -182,13 +249,25 @@ pub fn register_native_keyboard_bindings(cx: &mut gpui::App) {
         KeyBinding::new("ctrl-k", NativeOpenPalette, None),
         KeyBinding::new("ctrl-p", NativeOpenTaskSwitcher, None),
         KeyBinding::new("ctrl-shift-p", NativeOpenCommandPalette, None),
-        KeyBinding::new("alt-1", NativeDockChanges, None),
-        KeyBinding::new("alt-2", NativeDockFiles, None),
-        KeyBinding::new("alt-3", NativeDockTerminal, None),
-        KeyBinding::new("alt-4", NativeDockBrowser, None),
-        KeyBinding::new("alt-5", NativeDockServices, None),
-        KeyBinding::new("alt-6", NativeDockArtifacts, None),
-        KeyBinding::new("alt-7", NativeDockReview, None),
+        // The Alt+digit dock chords are gone with the right dock: the digits
+        // belong to the panel's view tabs now, and `KeyboardModel` says None
+        // for Alt+digit. The `NativeDock*` actions survive only because the
+        // dock's own affordances still name them.
+        KeyBinding::new("ctrl-1", NativePanelView1, None),
+        KeyBinding::new("ctrl-2", NativePanelView2, None),
+        KeyBinding::new("ctrl-3", NativePanelView3, None),
+        KeyBinding::new("ctrl-4", NativePanelView4, None),
+        KeyBinding::new("ctrl-5", NativePanelView5, None),
+        KeyBinding::new("ctrl-d", NativePanelSettle, None),
+        KeyBinding::new("ctrl-shift-z", NativePanelZoom, None),
+        KeyBinding::new("ctrl-left", NativePanelFocusLeft, None),
+        KeyBinding::new("ctrl-right", NativePanelFocusRight, None),
+        KeyBinding::new("ctrl-up", NativePanelFocusUp, None),
+        KeyBinding::new("ctrl-down", NativePanelFocusDown, None),
+        KeyBinding::new("ctrl-shift-left", NativePanelMoveLeft, None),
+        KeyBinding::new("ctrl-shift-right", NativePanelMoveRight, None),
+        KeyBinding::new("ctrl-shift-up", NativePanelMoveUp, None),
+        KeyBinding::new("ctrl-shift-down", NativePanelMoveDown, None),
         KeyBinding::new("ctrl-`", NativeOpenTerminal, None),
         KeyBinding::new("ctrl-shift-`", NativeOpenShellTerminal, None),
         // Cycling is scoped to the terminal surface's own key context so it
@@ -413,6 +492,24 @@ pub enum KeyboardAction {
     DismissTransient,
 }
 
+/// Whether an armed provider terminal owns this chord instead of the shell.
+///
+/// Ctrl+D is EOF and the Ctrl+arrows are word motion inside a PTY, so while
+/// terminal input is armed those three keystrokes belong to the program on the
+/// other end. Every other panel chord -- the view digits, zoom, the palette --
+/// has no meaning in a terminal and stays with the shell, so a person does not
+/// lose the panel while typing in it.
+///
+/// This is a rule about the ACTION, not about the keystroke: the binding table
+/// is the only place a chord is named, and this is the only place the terminal
+/// is allowed to take one back.
+pub const fn keyboard_action_yields_to_armed_terminal(action: KeyboardAction) -> bool {
+    matches!(
+        action,
+        KeyboardAction::SettleTask | KeyboardAction::FocusPane(_) | KeyboardAction::MovePane(_)
+    )
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct KeyboardBinding {
     pub shortcut: KeyboardShortcut,
@@ -631,6 +728,82 @@ pub fn catalog(selected_task: Option<TaskId>) -> Vec<ActionPresentation> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_armed_terminal_takes_back_eof_and_word_motion_and_nothing_else() {
+        for action in [
+            KeyboardAction::SettleTask,
+            KeyboardAction::FocusPane(Edge::Left),
+            KeyboardAction::MovePane(Edge::Bottom),
+        ] {
+            assert!(
+                keyboard_action_yields_to_armed_terminal(action),
+                "{action:?} is a PTY key while the terminal is armed"
+            );
+        }
+        for action in [
+            KeyboardAction::ToggleZoom,
+            KeyboardAction::SelectView(PaneView::Terminal),
+            KeyboardAction::OpenPalette,
+            KeyboardAction::DismissTransient,
+        ] {
+            assert!(
+                !keyboard_action_yields_to_armed_terminal(action),
+                "{action:?} has no meaning inside a PTY and stays with the shell"
+            );
+        }
+    }
+
+    #[test]
+    fn every_panel_chord_the_gpui_table_binds_is_one_the_model_resolves() {
+        // The gpui bindings and `KeyboardModel` are two halves of one table.
+        // A chord bound to an action the model has no answer for would arrive
+        // at the shell and do nothing, silently.
+        let model = KeyboardModel::default();
+        let panel_chords = [
+            KeyboardShortcut::ctrl(ShortcutKey::Character('d')),
+            KeyboardShortcut::ctrl_shift(ShortcutKey::Character('z')),
+            KeyboardShortcut::ctrl(ShortcutKey::Digit(1)),
+            KeyboardShortcut::ctrl(ShortcutKey::Digit(5)),
+            KeyboardShortcut::ctrl(ShortcutKey::Arrow(ArrowKey::Left)),
+            KeyboardShortcut::ctrl(ShortcutKey::Arrow(ArrowKey::Right)),
+            KeyboardShortcut::ctrl(ShortcutKey::Arrow(ArrowKey::Up)),
+            KeyboardShortcut::ctrl(ShortcutKey::Arrow(ArrowKey::Down)),
+            KeyboardShortcut::ctrl_shift(ShortcutKey::Arrow(ArrowKey::Left)),
+            KeyboardShortcut::ctrl_shift(ShortcutKey::Arrow(ArrowKey::Right)),
+            KeyboardShortcut::ctrl_shift(ShortcutKey::Arrow(ArrowKey::Up)),
+            KeyboardShortcut::ctrl_shift(ShortcutKey::Arrow(ArrowKey::Down)),
+        ];
+        for shortcut in panel_chords {
+            assert!(
+                model.resolve(shortcut).is_some(),
+                "{shortcut:?} is bound in gpui but means nothing to the model"
+            );
+        }
+    }
+
+    #[test]
+    fn the_gpui_binding_table_no_longer_carries_the_alt_digit_dock_chords() {
+        let source = include_str!("actions.rs");
+        let table = source
+            .split("pub fn register_native_keyboard_bindings(")
+            .nth(1)
+            .expect("native binding table");
+        for chord in ["\"alt-1\"", "\"alt-2\"", "\"alt-7\""] {
+            assert!(
+                !table.contains(chord),
+                "{chord} must not be bound: the digits belong to the view tabs"
+            );
+        }
+        for chord in [
+            "\"ctrl-1\"",
+            "\"ctrl-d\"",
+            "\"ctrl-shift-z\"",
+            "\"ctrl-left\"",
+        ] {
+            assert!(table.contains(chord), "{chord} must reach the shell");
+        }
+    }
 
     #[test]
     fn shell_terminal_chords_resolve() {
