@@ -158,15 +158,17 @@ use crate::ui::task_cockpit::timeline::{ActivityToggleHandler, CONVERSATION_CONT
 #[cfg(debug_assertions)]
 use crate::ui::task_cockpit::timeline::{PreviewConversationMessage, PreviewPlanStep};
 use crate::ui::task_cockpit::{
-    action_is_current, one_fresh_quota_observations, project_services_from_task_projection,
-    project_services_panel, render_panel_action, render_task_browser_dock,
+    action_is_current, one_fresh_quota_observations, panel_button_shell, panel_caption,
+    panel_empty_state, panel_list_row, panel_row_shell, project_services_from_task_projection,
+    project_services_panel, render_panel_action, render_panel_frame, render_task_browser_dock,
     update_observation_from_snapshot, ArtifactsPanelProjection, ChangesPanelProjection,
     ConfigSidebarActionRequest, ConfigSidebarProjection, ConfigSidebarUnavailableReason,
     FilesPanelProjection, Inbox, InboxPresentationWidth, InboxRenderModel, PanelAction,
     PanelDisabledReason, ReviewPanelProjection, ServicePanelAction, ServicePanelTone,
     ServicesPanelProjection, TaskBrowserDockModel, TaskHeaderModel, TaskList,
     TopBarProjectionController, TopBarProjectionInput, UpdateState, WorkspacePanelProjection,
-    DEFAULT_VISIBLE_ROWS, FIXED_VIRTUAL_OVERSCAN,
+    DEFAULT_VISIBLE_ROWS, FIXED_VIRTUAL_OVERSCAN, META_FONT_SIZE, ROW_FONT_SIZE, ROW_PADDING_X,
+    ROW_PADDING_Y,
 };
 
 use crate::browser::{
@@ -12318,115 +12320,6 @@ impl NativeGitWindow {
             );
         });
     }
-}
-
-fn native_git_diff_rows(
-    diff: &crate::git::git_service::GitDiffResult,
-    tokens: &crate::ui::tokens::ThemeTokens,
-) -> Vec<AnyElement> {
-    if diff.is_binary {
-        return vec![div()
-            .p(px(16.0))
-            .text_color(tokens.text.muted.to_gpui())
-            .child("Binary file changed")
-            .into_any_element()];
-    }
-    let mut rows = Vec::new();
-    let mut index = 0usize;
-    for hunk in &diff.hunks {
-        rows.push(
-            div()
-                .id(("native-git-diff-hunk", index))
-                .w_full()
-                .px(px(12.0))
-                .py(px(6.0))
-                .font_family("Consolas")
-                .text_size(px(tokens.density.typography.caption))
-                .bg(tokens.surfaces.selection.to_gpui())
-                .text_color(tokens.text.secondary.to_gpui())
-                .child(hunk.header.clone())
-                .into_any_element(),
-        );
-        index += 1;
-        for line in &hunk.lines {
-            let (prefix, background, foreground) = match line.kind {
-                crate::git::git_service::DiffLineKind::Add => (
-                    "+",
-                    tokens.status.success_surface.to_gpui(),
-                    tokens.status.success_foreground.to_gpui(),
-                ),
-                crate::git::git_service::DiffLineKind::Delete => (
-                    "−",
-                    tokens.status.destructive_surface.to_gpui(),
-                    tokens.status.destructive_foreground.to_gpui(),
-                ),
-                crate::git::git_service::DiffLineKind::HunkHeader => (
-                    " ",
-                    tokens.surfaces.selection.to_gpui(),
-                    tokens.text.secondary.to_gpui(),
-                ),
-                crate::git::git_service::DiffLineKind::Context => (
-                    " ",
-                    tokens.surfaces.canvas.to_gpui(),
-                    tokens.text.primary.to_gpui(),
-                ),
-            };
-            rows.push(
-                div()
-                    .id(("native-git-diff-line", index))
-                    .w_full()
-                    .flex()
-                    .font_family("Consolas")
-                    .text_size(px(tokens.density.typography.caption))
-                    .bg(background)
-                    .text_color(foreground)
-                    .child(
-                        div()
-                            .w(px(44.0))
-                            .flex_none()
-                            .px(px(6.0))
-                            .text_color(tokens.text.muted.to_gpui())
-                            .child(
-                                line.old_lineno
-                                    .map(|line| line.to_string())
-                                    .unwrap_or_default(),
-                            ),
-                    )
-                    .child(
-                        div()
-                            .w(px(44.0))
-                            .flex_none()
-                            .px(px(6.0))
-                            .text_color(tokens.text.muted.to_gpui())
-                            .child(
-                                line.new_lineno
-                                    .map(|line| line.to_string())
-                                    .unwrap_or_default(),
-                            ),
-                    )
-                    .child(div().w(px(20.0)).flex_none().child(prefix))
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w_0()
-                            .whitespace_nowrap()
-                            .child(line.content.clone()),
-                    )
-                    .into_any_element(),
-            );
-            index += 1;
-        }
-    }
-    if rows.is_empty() {
-        rows.push(
-            div()
-                .p(px(16.0))
-                .text_color(tokens.text.muted.to_gpui())
-                .child("No patch content for this selection")
-                .into_any_element(),
-        );
-    }
-    rows
 }
 
 impl NativeShell {
@@ -29719,12 +29612,11 @@ impl NativeShell {
         let owner_for_actions = Some(owner_key.clone());
         let captured_focus = Some(slot.interaction.current_focus_epoch());
         let captured_revision = revision;
-        let (title, summary, actions, rows): (
-            &'static str,
-            String,
-            Vec<PanelAction>,
-            Vec<AnyElement>,
-        ) = match tool {
+        // No title. The panel chrome above the tab strip already names this
+        // panel, and a body that repeats it is the panel-header-inside-a-body
+        // rules 2 and 5 forbid. The summary survives as the body's rule-2
+        // group label.
+        let (summary, actions, rows): (String, Vec<PanelAction>, Vec<AnyElement>) = match tool {
             CockpitDockTool::Changes => {
                 let selected = self.selected_repository_for_owner(&owner_key);
                 let changes = ChangesPanelProjection::from_host(
@@ -29746,27 +29638,27 @@ impl NativeShell {
                         let selector = row.selector.clone();
                         let available = row.available;
                         let element_key = stable_changes_repo_element_key(&row.element_id);
-                        let label =
-                            format!("{} · {} · {}", row.label, row.scope_label, row.state_label);
-                        let selected_mark = if row.selected { "● " } else { "○ " };
                         let owner_for_repo = owner_key.clone();
                         let repo_focus = captured_focus;
                         let repo_revision = captured_revision;
-                        let mut row_div = div()
-                            .id(("native-changes-repo", element_key))
-                            .flex()
-                            .items_center()
-                            .gap(px(tokens.density.spacing.sm))
-                            .px(px(tokens.density.spacing.sm))
-                            .py(px(tokens.density.spacing.xs))
-                            .border_1()
-                            .border_color(tokens.borders.subtle.to_gpui())
-                            .text_color(if available {
-                                tokens.text.primary.to_gpui()
-                            } else {
-                                tokens.text.disabled.to_gpui()
-                            })
-                            .child(format!("{selected_mark}{label}"));
+                        // Rule 5: the selection is the row's own fill and its
+                        // `text.emphasis` title, not a `●`/`○` prefix inside
+                        // the label -- a mark that has to be read, in a column
+                        // that is also the text. Scope and state drop to the
+                        // 10.5 px metadata line, so the repository's name is
+                        // the only thing on the title line.
+                        let mut row_div = panel_list_row(
+                            tokens,
+                            Some(crate::icons::GIT_BRANCH),
+                            row.label.clone(),
+                            Some(format!("{} · {}", row.scope_label, row.state_label)),
+                            None,
+                            row.selected,
+                        )
+                        .id(("native-changes-repo", element_key));
+                        if !available {
+                            row_div = row_div.text_color(tokens.text.disabled.to_gpui());
+                        }
                         if available {
                             if let Some(shell_entity) = shell_entity.clone() {
                                 row_div = row_div.cursor_pointer().on_mouse_down(
@@ -29794,15 +29686,12 @@ impl NativeShell {
                     })
                     .collect();
                 if rows.is_empty() {
-                    rows.push(
-                        div()
-                            .text_color(tokens.text.secondary.to_gpui())
-                            .child("No repositories in the Task catalog yet.")
-                            .into_any_element(),
-                    );
+                    rows.push(panel_empty_state(
+                        "No repositories in the Task catalog yet.",
+                        tokens,
+                    ));
                 }
                 (
-                    "Changes",
                     // Repository status must never be presented as the Project branch.
                     format!(
                         "{} · {}",
@@ -29833,81 +29722,109 @@ impl NativeShell {
                 let mut rows: Vec<AnyElement> = Vec::new();
                 if let Some(parent) = panel.navigate_parent.clone() {
                     rows.push(
-                        div()
-                            .flex()
-                            .items_center()
-                            .gap(px(tokens.density.spacing.sm))
-                            .child("..")
-                            .child(Self::panel_action_element_for_owner(
+                        panel_list_row(
+                            tokens,
+                            Some(crate::icons::FOLDER),
+                            "..",
+                            None,
+                            Some(Self::panel_action_element_for_owner(
                                 parent,
                                 "parent",
                                 tokens,
                                 shell_entity.clone(),
                                 owner_for_actions.clone(),
                                 captured_focus,
-                            ))
-                            .into_any_element(),
+                            )),
+                            false,
+                        )
+                        .into_any_element(),
                     );
                 }
                 if let Some(root) = panel.navigate_root.clone() {
                     rows.push(
-                        div()
-                            .flex()
-                            .items_center()
-                            .gap(px(tokens.density.spacing.sm))
-                            .child("/")
-                            .child(Self::panel_action_element_for_owner(
+                        panel_list_row(
+                            tokens,
+                            Some(crate::icons::FOLDER),
+                            "/",
+                            None,
+                            Some(Self::panel_action_element_for_owner(
                                 root,
                                 "root",
                                 tokens,
                                 shell_entity.clone(),
                                 owner_for_actions.clone(),
                                 captured_focus,
-                            ))
-                            .into_any_element(),
+                            )),
+                            false,
+                        )
+                        .into_any_element(),
                     );
                 }
                 rows.extend(panel.rows.iter().map(|row| {
-                    div()
-                        .flex()
-                        .items_center()
-                        .gap(px(tokens.density.spacing.sm))
-                        .child(row.label.clone())
-                        .child(Self::panel_action_element_for_owner(
+                    // Rule 10: the glyph says directory or file and nothing
+                    // more. It is the same 14 px `text.muted` for a `.rs` and
+                    // a `.png`, because the colour budget belongs to status.
+                    let glyph = if row.is_directory {
+                        crate::icons::FOLDER
+                    } else {
+                        crate::icons::FILE_TEXT
+                    };
+                    panel_list_row(
+                        tokens,
+                        Some(glyph),
+                        row.label.clone(),
+                        None,
+                        Some(Self::panel_action_element_for_owner(
                             row.read.clone(),
                             &row.relative_path,
                             tokens,
                             shell_entity.clone(),
                             owner_for_actions.clone(),
                             captured_focus,
-                        ))
-                        .into_any_element()
+                        )),
+                        false,
+                    )
+                    .into_any_element()
                 }));
                 if let Some(preview) = panel.preview.as_ref() {
                     rows.insert(
                         0,
+                        // The preview's `Open · path · n byte(s)` line was a
+                        // header row inside the body; rule 2 makes it a
+                        // caption above the content it introduces -- a
+                        // caption and not a group label, because it names a
+                        // file and a path's case is data. The
+                        // `surfaces.raised` card under it goes: the body is
+                        // already on the panel's raised ground, so the fill
+                        // was a second elevation standing for nothing.
                         div()
+                            .w_full()
                             .flex()
                             .flex_col()
-                            .gap(px(tokens.density.spacing.xs))
-                            .p(px(tokens.density.physical().control_padding as f32))
-                            .bg(tokens.surfaces.raised.to_gpui())
-                            .child(format!(
-                                "Open · {} · {} byte(s){}",
-                                preview.relative_path,
-                                preview.byte_len,
-                                if preview.binary { " · binary" } else { "" }
+                            .child(panel_caption(
+                                &format!(
+                                    "Open · {} · {} byte(s){}",
+                                    preview.relative_path,
+                                    preview.byte_len,
+                                    if preview.binary { " · binary" } else { "" }
+                                ),
+                                tokens,
                             ))
                             .child(
                                 div()
+                                    .w_full()
+                                    .px(px(ROW_PADDING_X))
+                                    .pb(px(ROW_PADDING_Y))
                                     .max_h(px(200.0))
                                     .overflow_hidden()
+                                    .text_size(px(ROW_FONT_SIZE))
+                                    .text_color(tokens.text.secondary.to_gpui())
                                     .child(preview.content.clone()),
                             )
                             .into_any_element(),
                     );
                 }
-                ("Files", panel.summary(), vec![panel.refresh], rows)
+                (panel.summary(), vec![panel.refresh], rows)
             }
             CockpitDockTool::Artifacts => {
                 let summaries = slot
@@ -29926,12 +29843,21 @@ impl NativeShell {
                     .rows
                     .iter()
                     .map(|row| {
-                        div()
-                            .child(format!("{:?} · {}", row.kind, row.label))
-                            .into_any_element()
+                        // The kind was a `{:?}` prefix on the title line; it
+                        // is metadata, so rule 5 puts it on the 10.5 px line
+                        // under the artifact's own name.
+                        panel_list_row(
+                            tokens,
+                            Some(crate::icons::FILE_TEXT),
+                            row.label.clone(),
+                            Some(format!("{:?}", row.kind)),
+                            None,
+                            false,
+                        )
+                        .into_any_element()
                     })
                     .collect();
-                ("Artifacts", panel.summary(), vec![panel.refresh], rows)
+                (panel.summary(), vec![panel.refresh], rows)
             }
             CockpitDockTool::Review => {
                 let summaries = slot
@@ -29949,12 +29875,21 @@ impl NativeShell {
                 let rows = panel
                     .artifacts
                     .iter()
-                    .map(|row| div().child(row.label.clone()).into_any_element())
+                    .map(|row| {
+                        panel_list_row(
+                            tokens,
+                            Some(crate::icons::FILE_TEXT),
+                            row.label.clone(),
+                            None,
+                            None,
+                            false,
+                        )
+                        .into_any_element()
+                    })
                     .collect();
-                ("Review", panel.summary(), vec![panel.refresh], rows)
+                (panel.summary(), vec![panel.refresh], rows)
             }
             CockpitDockTool::Browser => (
-                "Browser",
                 "No browser session is attached to this task".to_owned(),
                 Vec::new(),
                 Vec::new(),
@@ -29963,28 +29898,31 @@ impl NativeShell {
                 unreachable!("terminal and services use dedicated context-dock surfaces")
             }
         };
-        let controls = actions.into_iter().map(|action| {
-            Self::panel_action_element_for_owner(
-                action,
-                "refresh",
-                tokens,
-                shell_entity.clone(),
-                owner_for_actions.clone(),
-                captured_focus,
-            )
-        });
-        div()
-            .id("native-shell-workspace-dock")
-            .w_full()
-            .flex()
-            .flex_col()
-            .gap(px(tokens.density.spacing.xs))
-            .p(px(tokens.density.physical().control_padding as f32))
-            .bg(tokens.surfaces.sunken.to_gpui())
-            .child(div().child(format!("{title} · {summary}")))
-            .child(div().flex().children(controls))
-            .children(rows)
-            .into_any_element()
+        let controls: Vec<AnyElement> = actions
+            .into_iter()
+            .map(|action| {
+                Self::panel_action_element_for_owner(
+                    action,
+                    "refresh",
+                    tokens,
+                    shell_entity.clone(),
+                    owner_for_actions.clone(),
+                    captured_focus,
+                )
+            })
+            .collect();
+        // The `surfaces.sunken` ground and the region padding go with the
+        // title row. Rule 3 keeps `sunken` for inputs; a panel body sits on
+        // the panel's own `raised` ground, and rule 5's rows are full width
+        // so their hover and selection fills reach the panel's edge -- which
+        // a padded box would have cut short on both sides.
+        render_panel_frame(
+            "native-shell-workspace-dock",
+            summary,
+            controls,
+            div().w_full().flex().flex_col().children(rows),
+            tokens,
+        )
     }
 
     fn service_action_request(
@@ -30109,7 +30047,13 @@ impl NativeShell {
                     .map(|affordance| {
                         let label = service_panel_action_label(affordance.action);
                         let action = affordance.action;
-                        let mut control = div()
+                        // Rule 4's default button, the same shell every typed
+                        // `PanelAction` uses. A disabled affordance shows its
+                        // reason INSTEAD of its label -- it used to append the
+                        // reason as a second child, so a blocked control read
+                        // "Start Waiting on dependency" on one line -- and it
+                        // takes `borders.disabled`, not the enabled border.
+                        let mut control = panel_button_shell(tokens, affordance.enabled)
                             .id((
                                 "native-service-control",
                                 stable_service_element_key(
@@ -30117,12 +30061,7 @@ impl NativeShell {
                                     &label.to_ascii_lowercase(),
                                 ),
                             ))
-                            .px(px(tokens.density.spacing.sm))
-                            .py(px(tokens.density.spacing.xs))
-                            .rounded_sm()
-                            .border_1()
-                            .border_color(tokens.borders.subtle.to_gpui())
-                            .child(label);
+                            .child(affordance.disabled_reason.unwrap_or(label));
                         if affordance.enabled {
                             if let Some(task_id) = selected {
                                 if let Some(shell_entity) = shell_entity.clone() {
@@ -30176,56 +30115,61 @@ impl NativeShell {
                                         );
                                 }
                             }
-                        } else {
-                            control = control
-                                .text_color(tokens.text.disabled.to_gpui())
-                                .child(
-                                    affordance
-                                        .disabled_reason
-                                        .unwrap_or("Unavailable"),
-                                );
                         }
                         control.into_any_element()
                     })
                     .collect::<Vec<_>>();
-                div()
+                // Rule 5's row grid, shared with the file tree, the review
+                // list and the config rail. The service's own id is the title
+                // line and its ownership/health/dependency summary is the
+                // 10.5 px meta line under it, where both used to be plain
+                // children inheriting whatever size the body had.
+                panel_row_shell(tokens, false)
                     .id((
                         "native-service-row",
                         stable_service_element_key(row.service_id.as_str(), "row"),
                     ))
-                    .w_full()
-                    .flex()
+                    .items_start()
                     .flex_wrap()
-                    .items_center()
-                    .gap(px(tokens.density.spacing.sm))
-                    .p(px(tokens.density.physical().row_padding as f32))
                     .border_b_1()
                     .border_color(tokens.borders.subtle.to_gpui())
                     .child(status.element(tokens))
                     .child(
                         div()
+                            .flex_1()
+                            .min_w(px(0.0))
+                            .flex()
                             .flex_col()
-                            .flex_grow()
-                            .child(row.service_id.to_string())
-                            .child(description),
+                            .child(div().w_full().truncate().child(row.service_id.to_string()))
+                            .child(
+                                div()
+                                    .w_full()
+                                    .truncate()
+                                    .text_size(px(META_FONT_SIZE))
+                                    .text_color(tokens.text.muted.to_gpui())
+                                    .child(description),
+                            ),
                     )
                     .children(controls)
                     .into_any_element()
             })
             .collect::<Vec<_>>();
         let body = if rows.is_empty() {
-            div()
-                .text_color(tokens.text.secondary.to_gpui())
-                .child("No configured services in the selected task.")
-                .into_any_element()
+            panel_empty_state("No configured services in the selected task.", tokens)
         } else {
-            div().flex_col().children(rows).into_any_element()
+            div()
+                .w_full()
+                .flex()
+                .flex_col()
+                .children(rows)
+                .into_any_element()
         };
+        // Rule 3 reserves the input ground for inputs; a panel body sits on
+        // the panel's own raised ground. The region padding goes with it so
+        // the rows above are full width to the panel's edges.
         div()
             .id("native-shell-services-dock")
             .w_full()
-            .p(px(tokens.density.physical().control_padding as f32))
-            .bg(tokens.surfaces.sunken.to_gpui())
             .child(body)
             .into_any_element()
     }
@@ -36364,28 +36308,43 @@ impl NativeShell {
         tool: CockpitDockTool,
         tokens: crate::ui::tokens::ThemeTokens,
     ) -> AnyElement {
-        Self::empty_state(
-            "native-shell-workspace-dock",
-            format!(
-                "{} loads once a task in the inbox is selected.",
-                tool.label()
-            ),
-            tokens,
-            None,
-        )
+        // Rule 9: one sentence in the panel body language, nothing else.
+        div()
+            .id("native-shell-workspace-dock")
+            .w_full()
+            .child(panel_empty_state(
+                format!(
+                    "{} loads once a task in the inbox is selected.",
+                    tool.label()
+                ),
+                tokens,
+            ))
+            .into_any_element()
     }
 
+    /// Rule 9's empty state for a view whose authority is local-only.
+    ///
+    /// The tool is still named at the call sites -- it is what decides that
+    /// this surface is reached at all -- but it no longer reaches the copy.
+    /// The shared authority reason IS the sentence, used verbatim rather than
+    /// restated with the tool's name folded in: it is the one string nine
+    /// other call sites already show for this refusal, it already names the
+    /// three local-only capabilities by name, and a tenth wording of it is how
+    /// the ten drift apart. The tab strip directly above the body says which
+    /// view the reader is looking at.
     fn remote_dock_unavailable_surface(
         &self,
         _tool: CockpitDockTool,
         tokens: crate::ui::tokens::ThemeTokens,
     ) -> AnyElement {
-        Self::empty_state(
-            "native-shell-remote-dock-unavailable",
-            Self::remote_local_authority_reason(),
-            tokens,
-            None,
-        )
+        div()
+            .id("native-shell-remote-dock-unavailable")
+            .w_full()
+            .child(panel_empty_state(
+                Self::remote_local_authority_reason(),
+                tokens,
+            ))
+            .into_any_element()
     }
 
     /// Empty-state copy for the task list. Without this the inbox renders a
@@ -46185,7 +46144,9 @@ impl Render for NativeGitWindow {
                 .into_any_element()
         });
         let active_file_diff_rows = active_file_diff
-            .map(|projection| native_git_diff_rows(&projection.diff, &tokens))
+            .map(|projection| {
+                crate::ui::task_cockpit::changes_panel::diff_rows(&projection.diff, &tokens)
+            })
             .unwrap_or_default();
         let history_rows = history_entries.iter().enumerate().map(|(index, entry)| {
             let commit_hash = entry.full_hash.clone();
@@ -46226,7 +46187,9 @@ impl Render for NativeGitWindow {
                 .into_any_element()
         });
         let active_commit_diff_rows = active_commit_diff
-            .map(|projection| native_git_diff_rows(&projection.diff, &tokens))
+            .map(|projection| {
+                crate::ui::task_cockpit::changes_panel::diff_rows(&projection.diff, &tokens)
+            })
             .unwrap_or_default();
 
         let commit = cx.listener(|this, _event: &ClickEvent, window, cx| {
@@ -73146,6 +73109,300 @@ pub(crate) mod tests {
             });
             cx.quit();
         });
+    }
+
+    // -----------------------------------------------------------------------
+    // The dock panel bodies call lane R2's painters
+    //
+    // The six bodies are painted inline in this file, so what these scans
+    // protect is a *call site*: that the shell asks
+    // `src/ui/task_cockpit/panel.rs` and `changes_panel.rs` for its rows,
+    // rather than growing a second body language beside them again. Every one
+    // asserts a denominator -- how many call sites survived -- because a scan
+    // that only asks "does the name appear" keeps passing when one of two
+    // sites reverts, and a scan whose anchor stopped matching reads exactly
+    // like a scan that found nothing wrong.
+    //
+    // Needles that name this file's own contents are split with `concat!`:
+    // the scanned file *is* the file these tests live in, so a needle written
+    // out whole would match its own source and turn every count into a lie.
+    // -----------------------------------------------------------------------
+
+    /// This file's own source, for the call-site scans below.
+    fn shell_source() -> String {
+        std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/ui/native_shell.rs"),
+        )
+        .expect("the shell's own source")
+    }
+
+    /// The body of one of the shell's methods, sliced from its declaration to
+    /// the next declaration at the same indent.
+    ///
+    /// Anchored on the declaration's NAME, required to be unique, rather than
+    /// on a line number or a fragment of the body: a rename or a reformat then
+    /// fails loudly here instead of quietly slicing nothing and leaving every
+    /// assertion over the slice vacuously true.
+    fn shell_method_body<'a>(source: &'a str, name: &str) -> &'a str {
+        let needle = format!("fn {name}(");
+        assert_eq!(
+            source.matches(needle.as_str()).count(),
+            1,
+            "`fn {name}` should be declared exactly once for this slice to mean anything"
+        );
+        let start = source
+            .find(needle.as_str())
+            .unwrap_or_else(|| panic!("the shell no longer declares `fn {name}`"));
+        let rest = &source[start..];
+        let end = rest.find("\n    fn ").unwrap_or(rest.len());
+        let body = &rest[..end];
+        assert!(
+            body.len() > 200,
+            "the slice for `fn {name}` is only {} bytes; the anchor has stopped \
+             finding its subject",
+            body.len()
+        );
+        body
+    }
+
+    /// Both git diff views paint through lane R2's `diff_rows`, and the shell
+    /// no longer carries a diff painter of its own.
+    ///
+    /// Two call sites is the denominator, and they are different views -- the
+    /// working-tree file and the selected commit -- so a revert of either is a
+    /// visible regression that a bare "the name appears" scan would miss.
+    #[test]
+    fn both_git_diff_views_paint_through_lane_r2s_diff_rows() {
+        let shell = shell_source();
+        // The needle stops at the opening parenthesis: `rustfmt` may wrap the
+        // arguments across lines at will, and a needle that spelled them out
+        // would decay into "the formatter has not run" rather than "the
+        // painter is still called".
+        let call = concat!("changes_panel::diff", "_rows(");
+        assert_eq!(
+            shell.matches(call).count(),
+            2,
+            "the shell should ask the shared diff painter for its rows at exactly \
+             two sites (the working-tree file and the selected commit)"
+        );
+        assert!(
+            !shell.contains(concat!("native_git", "_diff_rows")),
+            "the shell still defines or calls its own diff painter, so the four \
+             opaque status fills rule 1 forbids are still on screen"
+        );
+
+        // And the painter it now calls is the one whose colour decision is
+        // asserted directly by
+        // `changes_panel::a_patch_tints_only_the_lines_that_changed`.
+        let changes = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("src/ui/task_cockpit/changes_panel.rs"),
+        )
+        .expect("the changes panel's source");
+        assert!(
+            changes.contains(concat!("pub fn diff", "_rows(")),
+            "lane R2's diff painter is gone; the call sites above point at nothing"
+        );
+    }
+
+    /// Both dock empty states are rule 9's one muted sentence, from lane R2's
+    /// `panel_empty_state`, rather than the shared `empty_state` -- which
+    /// centres a `○` in a 44 px pill, a semibold heading and a sentence, i.e.
+    /// an illustration and a heading, both of which rule 9 forbids in a panel
+    /// body.
+    ///
+    /// The denominator is the two bodies AND the survivors: `empty_state`
+    /// itself must still exist and still be used elsewhere, because this scan
+    /// would otherwise pass just as happily if someone deleted the inbox's
+    /// empty state along with these two.
+    #[test]
+    fn both_dock_empty_states_are_rule_nines_one_sentence() {
+        let shell = shell_source();
+        let painter = concat!("panel_empty", "_state(");
+        for body in ["dock_empty_state", "remote_dock_unavailable_surface"] {
+            let slice = shell_method_body(&shell, body);
+            assert!(
+                slice.contains(painter),
+                "`fn {body}` does not call lane R2's empty-state painter"
+            );
+            assert!(
+                !slice.contains(concat!("Self::empty", "_state(")),
+                "`fn {body}` still builds the heading-plus-illustration empty state"
+            );
+            assert!(
+                !slice.contains("\\u{25cb}"),
+                "`fn {body}` still paints the `○` glyph rule 9 has no room for"
+            );
+        }
+        // The survivors: the shared `empty_state` is still defined and still
+        // has callers outside the two bodies above, so this scan cannot go
+        // green by the whole helper having been deleted.
+        assert!(
+            shell.contains(concat!("fn empty", "_state(")),
+            "the shared empty-state helper is gone; the surfaces that legitimately \
+             use it have lost their copy"
+        );
+        let other_callers = shell.matches(concat!("Self::empty", "_state(")).count();
+        assert!(
+            other_callers >= 3,
+            "only {other_callers} callers of the shared empty state survive; this \
+             lane should have moved two dock bodies off it, not emptied it"
+        );
+    }
+
+    /// The Files, Changes, Artifacts, Review and Browser bodies are lane R2's
+    /// rows, group label and frame -- and every handler that was wired to them
+    /// is still wired.
+    ///
+    /// The denominators are counted, not implied: six `panel_list_row` sites
+    /// (the Changes repository, the Files `..` and `/` navigators, the Files
+    /// listing, the Artifacts list and the Review list), one frame, and four
+    /// owner-scoped action sites. A scan that only asked "is the painter
+    /// mentioned" would keep passing with five of the six reverted, which is
+    /// exactly the shape a partial revert takes.
+    #[test]
+    fn the_workspace_dock_bodies_are_lane_r2s_rows_and_keep_their_handlers() {
+        let shell = shell_source();
+        let body = shell_method_body(&shell, "workspace_dock_surface_for");
+
+        let list_rows = body.matches("panel_list_row(").count();
+        assert_eq!(
+            list_rows, 6,
+            "expected six rule-5 list rows in the workspace dock body \
+             (Changes repo, Files `..`, Files `/`, Files listing, Artifacts, Review), \
+             found {list_rows}"
+        );
+        assert_eq!(
+            body.matches("render_panel_frame(").count(),
+            1,
+            "the body should end in exactly one panel frame"
+        );
+        // A caption, not a group label: rule 2's uppercase belongs to a name,
+        // and every summary this body paints carries projection data -- a
+        // relative directory, a repository label, a branch. `to_uppercase()`
+        // on those prints `SRC/UI · MAIN` and renames `Feature/Foo`.
+        assert_eq!(
+            body.matches("panel_caption(").count(),
+            1,
+            "the file preview's `Open · …` header should be the body's one caption"
+        );
+        assert!(
+            !body.contains("panel_group_label("),
+            "a summary carrying a path or a branch is being uppercased"
+        );
+        assert_eq!(
+            body.matches("panel_empty_state(").count(),
+            1,
+            "the empty repository list should be rule 9's one sentence"
+        );
+
+        // The handlers, ids and accessibility nodes this substitution had to
+        // preserve. Four owner-scoped action sites: the Files `..`, the Files
+        // `/`, every file row's Read, and the frame's refresh controls.
+        assert_eq!(
+            body.matches("panel_action_element_for_owner(").count(),
+            4,
+            "an owner-scoped action site was dropped along with the row that carried it"
+        );
+        for kept in [
+            "\"native-changes-repo\"",
+            "on_mouse_down(",
+            "select_changes_repository_for_owner_gated(",
+        ] {
+            assert!(
+                body.contains(kept),
+                "the Changes repository row lost `{kept}`; its click no longer selects"
+            );
+        }
+
+        // And what rules 2 and 5 removed. The title binding is gone from the
+        // tuple, so a `{title} · {summary}` header cannot come back without
+        // this failing to compile first; these check the two that would still
+        // compile.
+        assert!(
+            !body.contains("{title}"),
+            "the body still paints a title row; the panel chrome above already owns the name"
+        );
+        for banished in ["\"● \"", "\"○ \""] {
+            assert!(
+                !body.contains(banished),
+                "the Changes rows still mark the selection with {banished} text instead \
+                 of rule 5's selection fill"
+            );
+        }
+        assert!(
+            !body.contains("density.typography"),
+            "the body reads a type size from the density scale (caption 11/12, body \
+             13/14), which is not rule 2's scale"
+        );
+    }
+
+    /// The Services body is lane R2's row grid and rule 4's button, and every
+    /// service control keeps its epoch-fenced dispatch.
+    ///
+    /// The denominator here is the survivors rather than a count of painters:
+    /// one row shell, one button shell, one empty state, and the three things
+    /// a restyle of this body would quietly take with it -- the row id, the
+    /// control id, and the `service_action_is_current` guard that refuses a
+    /// dispatch whose action epoch has moved.
+    #[test]
+    fn the_services_body_is_lane_r2s_row_and_keeps_its_epoch_fenced_controls() {
+        let shell = shell_source();
+        let body = shell_method_body(&shell, "services_dock_surface");
+
+        assert_eq!(
+            body.matches("panel_row_shell(").count(),
+            1,
+            "the service row should be rule 5's row grid"
+        );
+        assert_eq!(
+            body.matches("panel_button_shell(").count(),
+            1,
+            "the service control should be rule 4's button, not a second idea of one"
+        );
+        assert_eq!(
+            body.matches("panel_empty_state(").count(),
+            1,
+            "an empty service list should be rule 9's one sentence"
+        );
+
+        for kept in [
+            "\"native-service-row\"",
+            "\"native-service-control\"",
+            "service_action_is_current(",
+            "dispatch_action_recorded_for_owner(",
+            "StatusLight::new(",
+            "status.element(tokens)",
+        ] {
+            assert!(
+                body.contains(kept),
+                "the services body lost `{kept}`; the restyle took a handler, an id \
+                 or an accessibility node with it"
+            );
+        }
+
+        // What rule 3 removed: the body no longer paints itself on the input
+        // ground, and no longer pads its own edges, so rule 5's rows reach the
+        // panel's.
+        //
+        // The needle is the PAINT (`…to_gpui()`), not the token's name. This
+        // assertion first went red on the explanatory comment three lines
+        // above the code it guards -- a comment lives inside the text a
+        // source scan reads, so "a comment is not code" is false here.
+        assert!(
+            !body.contains(concat!("surfaces.sunken", ".to_gpui()")),
+            "the services body still paints itself on the input ground, which rule 3 \
+             reserves for inputs"
+        );
+        assert!(
+            !body.contains("rounded_sm()"),
+            "a service control still uses the old radius instead of rule 3's 6"
+        );
+        assert!(
+            !body.contains("density.physical()"),
+            "the services body still takes its padding from the density scale rather \
+             than rule 5's 5x10 row"
+        );
     }
 }
 

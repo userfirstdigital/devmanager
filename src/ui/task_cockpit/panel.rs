@@ -162,57 +162,95 @@ const ACTION_PADDING_Y: f32 = 2.0;
 /// Rule 3: radius 6 for buttons.
 const ACTION_RADIUS: f32 = 6.0;
 
-/// Render a small action affordance.  The action request stays on the typed
-/// projection for the owning shell to dispatch; this renderer intentionally
-/// does not invent a click handler or bypass the host action boundary.
+/// Rule 4's default button, as a shell the caller gives an id, a label and a
+/// click handler.
 ///
-/// Rule 4's default button: a 1 px `borders.default` outline with no fill, an
-/// 11 px `text.primary` label, 2x8 padding and radius 6. Hover fills with
-/// `surfaces.hover` rather than changing the label's colour, so a row of these
-/// stays quiet until the pointer is on one.
-pub fn render_panel_action(action: &PanelAction, target: &str, tokens: ThemeTokens) -> AnyElement {
-    let label = action.disabled_reason.map_or_else(
-        || action_label(action.action_id),
-        PanelDisabledReason::label,
-    );
-    let mut element = div()
-        .id(("task-cockpit-panel-action", action.element_key(target)))
+/// 1 px `borders.default` with no fill, an 11 px `text.primary` label, 2x8
+/// padding and radius 6; hover fills with `surfaces.hover` rather than
+/// changing the label's colour, so a row of these stays quiet until the
+/// pointer is on one. Disabled swaps the border for `borders.disabled` --
+/// never the enabled border, which is what makes a dead button look live.
+///
+/// `render_panel_action` paints a typed `PanelAction` with it. The services
+/// body's affordances are `ServicePanelAction`s rather than `PanelAction`s and
+/// would otherwise be a second, drifting idea of what a button looks like --
+/// which is exactly how the two ended up 1 px, one radius and one type size
+/// apart before this lane.
+pub fn panel_button_shell(tokens: ThemeTokens, enabled: bool) -> gpui::Div {
+    let button = div()
         .flex_none()
         .px(px(ACTION_PADDING_X))
         .py(px(ACTION_PADDING_Y))
         .rounded(px(ACTION_RADIUS))
         .border_1()
-        .text_size(px(ACTION_FONT_SIZE))
-        .child(label);
-    if action.is_enabled() {
-        element = element
+        .text_size(px(ACTION_FONT_SIZE));
+    if enabled {
+        button
             .cursor_pointer()
             .border_color(rgb(tokens.borders.default.to_u32()))
             .text_color(rgb(tokens.text.primary.to_u32()))
-            .hover(|style| style.bg(rgb(tokens.surfaces.hover.to_u32())));
+            .hover(|style| style.bg(rgb(tokens.surfaces.hover.to_u32())))
     } else {
-        element = element
+        button
             .border_color(rgb(tokens.borders.disabled.to_u32()))
-            .text_color(rgb(tokens.text.disabled.to_u32()));
+            .text_color(rgb(tokens.text.disabled.to_u32()))
     }
-    element.into_any_element()
 }
 
-/// Rule 2's group header: 10.5 px uppercase on `text.muted`, letter-spaced,
-/// sitting on the row grid rather than in a box of its own.
+/// Render a small action affordance.  The action request stays on the typed
+/// projection for the owning shell to dispatch; this renderer intentionally
+/// does not invent a click handler or bypass the host action boundary.
+///
+/// Rule 4's default button, from `panel_button_shell`.
+pub fn render_panel_action(action: &PanelAction, target: &str, tokens: ThemeTokens) -> AnyElement {
+    let label = action.disabled_reason.map_or_else(
+        || action_label(action.action_id),
+        PanelDisabledReason::label,
+    );
+    panel_button_shell(tokens, action.is_enabled())
+        .id(("task-cockpit-panel-action", action.element_key(target)))
+        .child(label)
+        .into_any_element()
+}
+
+/// Rule 2's caption: 10.5 px `text.muted` on the row grid rather than in a
+/// box of its own, with the text exactly as its projection wrote it.
 ///
 /// This is what a panel body uses where it once painted its own title. The
-/// panel already carries its name in the chrome above; a body only ever needs
-/// to say which *group* of rows follows.
-pub fn panel_group_label(title: &str, tokens: ThemeTokens) -> AnyElement {
+/// panel already carries its name in the chrome above, so a body only ever
+/// needs to say what the rows below it are.
+///
+/// Case is data here, and that is the whole reason this is a separate entry
+/// point from `panel_group_label`. Rule 2's uppercase belongs to a label that
+/// NAMES a group; these lines carry a relative directory, a repository label
+/// and a branch straight out of a projection, and `to_uppercase()` on those
+/// prints `SRC/UI · MAIN · 3 CHANGE(S)` and renames a branch called
+/// `Feature/Foo` to one that does not exist.
+pub fn panel_caption(text: &str, tokens: ThemeTokens) -> AnyElement {
     div()
         .w_full()
         .px(px(ROW_PADDING_X))
         .py(px(ROW_PADDING_Y))
         .text_size(px(META_FONT_SIZE))
         .text_color(rgb(tokens.text.muted.to_u32()))
-        .child(title.to_uppercase())
+        .child(text.to_owned())
         .into_any_element()
+}
+
+/// The text a group label paints, split out from the painter so that the one
+/// decision here which can silently change what a line SAYS is assertable
+/// without a renderer.
+pub fn panel_group_label_text(title: &str) -> String {
+    title.to_uppercase()
+}
+
+/// Rule 2's group header: `panel_caption` uppercased.
+///
+/// For a label that names a group of rows -- a constant in the source, never
+/// a value out of a projection. See `panel_caption` for why that distinction
+/// is load-bearing rather than stylistic.
+pub fn panel_group_label(title: &str, tokens: ThemeTokens) -> AnyElement {
+    panel_caption(&panel_group_label_text(title), tokens)
 }
 
 /// Rule 9's empty state: one 11.5 px `text.muted` sentence. No heading, no
@@ -334,24 +372,32 @@ pub fn panel_change_counts(added: u32, removed: u32, tokens: ThemeTokens) -> Any
 /// group label above the rows, and the panel's name is not repeated at all --
 /// the chrome owns it. Controls sit on their own row under the label so a
 /// narrow panel wraps the buttons instead of the summary.
+///
+/// The controls arrive already rendered rather than as bare `PanelAction`s.
+/// The shell's buttons are owner-scoped: each one carries a click handler
+/// fenced on the owning task's revision and focus epoch, and re-rendering them
+/// here from the typed action would paint the same button and silently drop
+/// the handler -- a panel whose Refresh does nothing, which nothing in the
+/// type system would have caught. `render_panel_action` is still the painter
+/// on the other side of that handler.
 pub fn render_panel_frame(
     id: &'static str,
     summary: impl Into<String>,
-    actions: impl IntoIterator<Item = PanelAction>,
+    controls: impl IntoIterator<Item = AnyElement>,
     body: impl IntoElement,
     tokens: ThemeTokens,
 ) -> AnyElement {
-    let controls: Vec<AnyElement> = actions
-        .into_iter()
-        .map(|action| render_panel_action(&action, "panel", tokens))
-        .collect();
+    let controls: Vec<AnyElement> = controls.into_iter().collect();
     let summary = summary.into();
     div()
         .id(id)
         .w_full()
         .flex()
         .flex_col()
-        .child(panel_group_label(&summary, tokens))
+        // `panel_caption`, not `panel_group_label`: every caller's summary
+        // carries projection data -- a relative directory, a repository label,
+        // a branch -- and uppercasing those changes what they say.
+        .child(panel_caption(&summary, tokens))
         .children((!controls.is_empty()).then(|| {
             div()
                 .flex()
@@ -492,6 +538,55 @@ mod tests {
         assert_eq!(ROW_PADDING_X, 10.0, "rule 5: rows are padded 5x10");
         assert_eq!(ROW_PADDING_Y, 5.0, "rule 5: rows are padded 5x10");
         assert_eq!(ROW_GAP, 8.0, "rule 6: control gap is 8");
+    }
+
+    /// A body's summary keeps the case its projection wrote.
+    ///
+    /// `render_panel_frame`'s summary is not a group label: every caller's
+    /// summary carries projection data. `FilesPanelProjection::summary`
+    /// begins with a relative directory and `ChangesPanelProjection::summary`
+    /// carries a repository label and a branch name, so `to_uppercase()`
+    /// prints `SRC/UI · 12 FILE(S)` and turns a branch called `Feature/Foo`
+    /// into one that does not exist.
+    ///
+    /// Asserted on the source because the two painters differ only in the
+    /// text they hand to an identical element tree, and a built `AnyElement`
+    /// cannot be read back. The needle is the call, and its two directions are
+    /// both checked: the caption is used and the uppercasing one is not.
+    #[test]
+    fn a_panel_summary_is_a_caption_and_keeps_its_projections_case() {
+        assert_eq!(
+            panel_group_label_text("changes"),
+            "CHANGES",
+            "a group label is still rule 2's uppercase"
+        );
+        let source = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/ui/task_cockpit/panel.rs"),
+        )
+        .expect("this module's own source");
+        let start = source
+            .find("pub fn render_panel_frame(")
+            .expect("the frame painter is still declared");
+        let frame = &source[start..];
+        let end = frame[1..]
+            .find("\npub fn ")
+            .map(|offset| offset + 1)
+            .unwrap_or(frame.len());
+        let frame = &frame[..end];
+        assert!(
+            frame.len() > 400,
+            "the slice for `render_panel_frame` is only {} bytes; the anchor has \
+             stopped finding its subject",
+            frame.len()
+        );
+        assert!(
+            frame.contains(concat!("panel_", "caption(&summary")),
+            "the frame no longer paints its summary as a caption"
+        );
+        assert!(
+            !frame.contains(concat!("panel_group", "_label(&summary")),
+            "the frame is uppercasing a summary that carries a path and a branch name"
+        );
     }
 
     /// The panel bodies this lane restyled, by path. A file that disappears or
