@@ -258,6 +258,182 @@ fn project_repository_rows(
         .collect()
 }
 
+// ---------------------------------------------------------------------------
+// The diff view.
+//
+// Rule 1: colour is information, and in a patch the information is exactly two
+// things -- this line arrived, that line left. So added and removed lines are
+// `status.success` and `status.destructive` at a low alpha through
+// `Color::with_alpha`, and nothing else in the view is tinted at all: the hunk
+// header, the gutter and the context lines are grey on the one `surfaces.sunken`
+// ground. The previous painting spent four different fills (two opaque status
+// surfaces, `surfaces.selection` for headers, `surfaces.canvas` for context)
+// and two status foregrounds, which made an ordinary patch the most colourful
+// surface in the application.
+// ---------------------------------------------------------------------------
+
+/// How much of the status hue a changed line's band carries.
+///
+/// Low enough that a screen of added lines still reads as text on the sunken
+/// ground rather than as a green block, high enough to find one changed line
+/// in a screen of context. `status.success`/`status.destructive` are the
+/// saturated tokens, so this is the alpha that keeps rule 1's "sparingly".
+pub const DIFF_LINE_TINT_ALPHA: f32 = 0.14;
+/// Rule 2: 11.5 px is the body size, and the monospace exception is code --
+/// which a patch is.
+pub const DIFF_FONT_SIZE: f32 = super::panel::ROW_FONT_SIZE;
+/// Rule 2: the hunk header and the line-number gutter are captions.
+pub const DIFF_CAPTION_FONT_SIZE: f32 = super::panel::META_FONT_SIZE;
+/// The gutter columns, unchanged from the surface this replaces: two line
+/// numbers and the +/- mark.
+const DIFF_GUTTER_WIDTH: f32 = 44.0;
+const DIFF_MARK_WIDTH: f32 = 20.0;
+/// Rule 5's horizontal padding, so a patch line starts on the same left edge
+/// as every other row in a panel body.
+const DIFF_PADDING_X: f32 = super::panel::ROW_PADDING_X;
+const DIFF_PADDING_Y: f32 = 1.0;
+
+/// The rule-1 tint for a diff line, or `None` for a line that is not a change.
+///
+/// Split out from the painter so the colour decision is testable without a
+/// GPUI window: a test can assert that context and header lines carry no tint
+/// at all, which is the half of rule 1 that a painter quietly loses first.
+pub fn diff_line_tint(
+    kind: &crate::git::git_service::DiffLineKind,
+    tokens: crate::ui::tokens::ThemeTokens,
+) -> Option<crate::ui::tokens::Color> {
+    use crate::git::git_service::DiffLineKind;
+    match kind {
+        DiffLineKind::Add => Some(tokens.status.success.with_alpha(DIFF_LINE_TINT_ALPHA)),
+        DiffLineKind::Delete => Some(tokens.status.destructive.with_alpha(DIFF_LINE_TINT_ALPHA)),
+        DiffLineKind::Context | DiffLineKind::HunkHeader => None,
+    }
+}
+
+/// The mark in a diff line's gutter. `+`/`-` and nothing else -- the mark is
+/// what a monochrome reader has instead of the tint.
+pub fn diff_line_mark(kind: &crate::git::git_service::DiffLineKind) -> &'static str {
+    use crate::git::git_service::DiffLineKind;
+    match kind {
+        DiffLineKind::Add => "+",
+        DiffLineKind::Delete => "-",
+        DiffLineKind::Context | DiffLineKind::HunkHeader => " ",
+    }
+}
+
+/// Paint one file's patch as rows on the `surfaces.sunken` ground.
+///
+/// A drop-in replacement for `native_git_diff_rows` in `src/ui/native_shell.rs`
+/// with the same signature and the same element ids, so the two call sites
+/// change by name only.
+pub fn diff_rows(
+    diff: &crate::git::git_service::GitDiffResult,
+    tokens: &crate::ui::tokens::ThemeTokens,
+) -> Vec<gpui::AnyElement> {
+    use gpui::{div, px, InteractiveElement, IntoElement, ParentElement, Styled};
+
+    // Rule 9: one 11.5 px `text.muted` sentence, no heading and no fill.
+    let sentence = |text: &'static str| -> gpui::AnyElement {
+        div()
+            .w_full()
+            .p(px(super::panel::REGION_PADDING))
+            .bg(tokens.surfaces.sunken.to_gpui())
+            .text_size(px(DIFF_FONT_SIZE))
+            .text_color(tokens.text.muted.to_gpui())
+            .child(text)
+            .into_any_element()
+    };
+    if diff.is_binary {
+        return vec![sentence(
+            "This file is binary, so there is no patch to show.",
+        )];
+    }
+    let mut rows = Vec::new();
+    let mut index = 0usize;
+    for hunk in &diff.hunks {
+        rows.push(
+            // Rule 2: a hunk header is a caption on the row grid, not a filled
+            // band. It says where you are; it is not a change.
+            div()
+                .id(("native-git-diff-hunk", index))
+                .w_full()
+                .px(px(DIFF_PADDING_X))
+                .py(px(super::panel::ROW_PADDING_Y))
+                .bg(tokens.surfaces.sunken.to_gpui())
+                .font_family("Consolas")
+                .text_size(px(DIFF_CAPTION_FONT_SIZE))
+                .text_color(tokens.text.muted.to_gpui())
+                .child(hunk.header.clone())
+                .into_any_element(),
+        );
+        index += 1;
+        for line in &hunk.lines {
+            let tint = diff_line_tint(&line.kind, *tokens);
+            let mut row = div()
+                .id(("native-git-diff-line", index))
+                .w_full()
+                .flex()
+                .px(px(DIFF_PADDING_X))
+                .py(px(DIFF_PADDING_Y))
+                .bg(tokens.surfaces.sunken.to_gpui())
+                .font_family("Consolas")
+                .text_size(px(DIFF_FONT_SIZE))
+                // Rule 1: the tint carries the meaning, so the text stays the
+                // one readable foreground rather than a second green.
+                .text_color(tokens.text.primary.to_gpui());
+            if let Some(tint) = tint {
+                row = row.bg(tint.to_gpui());
+            }
+            rows.push(
+                row.child(
+                    div()
+                        .w(px(DIFF_GUTTER_WIDTH))
+                        .flex_none()
+                        .text_size(px(DIFF_CAPTION_FONT_SIZE))
+                        .text_color(tokens.text.muted.to_gpui())
+                        .child(
+                            line.old_lineno
+                                .map(|line| line.to_string())
+                                .unwrap_or_default(),
+                        ),
+                )
+                .child(
+                    div()
+                        .w(px(DIFF_GUTTER_WIDTH))
+                        .flex_none()
+                        .text_size(px(DIFF_CAPTION_FONT_SIZE))
+                        .text_color(tokens.text.muted.to_gpui())
+                        .child(
+                            line.new_lineno
+                                .map(|line| line.to_string())
+                                .unwrap_or_default(),
+                        ),
+                )
+                .child(
+                    div()
+                        .w(px(DIFF_MARK_WIDTH))
+                        .flex_none()
+                        .text_color(tokens.text.muted.to_gpui())
+                        .child(diff_line_mark(&line.kind)),
+                )
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .whitespace_nowrap()
+                        .child(line.content.clone()),
+                )
+                .into_any_element(),
+            );
+            index += 1;
+        }
+    }
+    if rows.is_empty() {
+        rows.push(sentence("Nothing changed in this file."));
+    }
+    rows
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -558,5 +734,45 @@ mod tests {
             ),
             Some(TaskRepositorySelector::ProjectRoot)
         );
+    }
+
+    /// Rule 1, stated as the thing that can actually regress: a patch spends
+    /// colour on added and removed lines and on nothing else, and it spends it
+    /// at low alpha rather than as a saturated fill.
+    #[test]
+    fn a_patch_tints_only_the_lines_that_changed() {
+        use crate::git::git_service::DiffLineKind;
+        let tokens = crate::ui::tokens::dark(
+            crate::ui::tokens::Density::Comfortable,
+            crate::ui::tokens::Scale::Scale100,
+        );
+
+        let added = diff_line_tint(&DiffLineKind::Add, tokens).expect("an added line is tinted");
+        let removed =
+            diff_line_tint(&DiffLineKind::Delete, tokens).expect("a removed line is tinted");
+        assert_eq!(added.to_u32(), tokens.status.success.to_u32());
+        assert_eq!(removed.to_u32(), tokens.status.destructive.to_u32());
+        assert!(!added.is_opaque(), "rule 1: the tint is a low-alpha band");
+        assert!(!removed.is_opaque(), "rule 1: the tint is a low-alpha band");
+        assert_eq!(added.alpha(), (DIFF_LINE_TINT_ALPHA * 255.0).round() as u8);
+        assert_eq!(
+            removed.alpha(),
+            (DIFF_LINE_TINT_ALPHA * 255.0).round() as u8
+        );
+
+        // The half that quietly regresses: context and hunk headers must carry
+        // no tint at all. A painter that gives them `surfaces.selection` looks
+        // fine and has spent the panel's whole colour budget on punctuation.
+        assert_eq!(diff_line_tint(&DiffLineKind::Context, tokens), None);
+        assert_eq!(diff_line_tint(&DiffLineKind::HunkHeader, tokens), None);
+
+        // The monochrome reading of the same fact.
+        assert_eq!(diff_line_mark(&DiffLineKind::Add), "+");
+        assert_eq!(diff_line_mark(&DiffLineKind::Delete), "-");
+        assert_eq!(diff_line_mark(&DiffLineKind::Context), " ");
+
+        // Rule 2's sizes, read off the constants the painter uses.
+        assert_eq!(DIFF_FONT_SIZE, 11.5);
+        assert_eq!(DIFF_CAPTION_FONT_SIZE, 10.5);
     }
 }
