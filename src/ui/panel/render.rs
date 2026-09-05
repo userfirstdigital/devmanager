@@ -651,6 +651,51 @@ pub fn panel_chrome_element(
     column.into_any_element()
 }
 
+/// What the panel box wears, as values rather than as a built element.
+///
+/// The frame is the one part of a panel with no text in it, so a screenshot is
+/// the only other way to check it. Reading the four decisions out here lets the
+/// radius, the hairline, the focused ring and the surface be asserted against
+/// the mockup instead of remembered.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct PanelFrameShape {
+    pub radius: f32,
+    pub border_width: f32,
+    pub border: Color,
+    pub background: Color,
+    /// How far the project stripe is held off the top and the bottom edge.
+    /// See [`panel_frame`] for why it is not zero.
+    pub stripe_inset: f32,
+}
+
+/// F2: `surfaces.raised` on the canvas, radius 8 (`radii.lg`), a 1 px
+/// `borders.subtle` hairline, and a focused frame of 2 px `text.primary` at the
+/// same radius. Needs-you outranks focus, because a panel that wants a person
+/// must not look calmer for being the one you happen to be typing into.
+pub fn panel_frame_shape(chrome: &PanelChrome, tokens: ThemeTokens) -> PanelFrameShape {
+    let attention = needs_you_colour(chrome.needs_you.as_ref(), tokens);
+    let radius = tokens.density.radii.lg;
+    PanelFrameShape {
+        radius,
+        border_width: if chrome.focused {
+            PANEL_FOCUS_BORDER_WIDTH
+        } else {
+            PANEL_BORDER_WIDTH
+        },
+        // The focused frame is `text.primary`, not `borders.focus`: the shell's
+        // current pane frame already draws it that way, and two panels drawing
+        // the same state in two greys is the drift this painter exists to
+        // remove.
+        border: match attention {
+            Some(colour) => colour.with_alpha(PANEL_NEEDS_YOU_BORDER_ALPHA),
+            None if chrome.focused => tokens.text.primary,
+            None => tokens.borders.subtle,
+        },
+        background: tokens.surfaces.raised,
+        stripe_inset: radius,
+    }
+}
+
 /// The panel box: the frame, the project stripe, the chrome and the body.
 pub fn panel_frame(
     chrome: &PanelChrome,
@@ -661,20 +706,8 @@ pub fn panel_frame(
 ) -> AnyElement {
     let stripe = colours.colour(chrome.project_colour);
     let attention = needs_you_colour(chrome.needs_you.as_ref(), tokens);
-    let border_width = if chrome.focused {
-        PANEL_FOCUS_BORDER_WIDTH
-    } else {
-        PANEL_BORDER_WIDTH
-    };
-    // The focused frame is `text.primary`, not `borders.focus`: the shell's
-    // current pane frame already draws it that way, and two panels drawing the
-    // same state in two greys is the drift this painter exists to remove.
-    let border = match attention {
-        Some(colour) => colour.with_alpha(PANEL_NEEDS_YOU_BORDER_ALPHA),
-        None if chrome.focused => tokens.text.primary,
-        None => tokens.borders.subtle,
-    };
-    let radius = tokens.density.radii.md;
+    let shape = panel_frame_shape(chrome, tokens);
+    let radius = shape.radius;
 
     let panel = div()
         .flex()
@@ -683,16 +716,25 @@ pub fn panel_frame(
         .size_full()
         .overflow_hidden()
         .rounded(px(radius))
-        .bg(tokens.surfaces.raised.to_gpui())
-        .border(px(border_width))
-        .border_color(border.to_gpui())
+        .bg(shape.background.to_gpui())
+        .border(px(shape.border_width))
+        .border_color(shape.border.to_gpui())
+        // The mockup clips the stripe with the panel's own radius
+        // (`.pane { border-radius: 9px; overflow: hidden }` plus a
+        // `::before` on the left edge). GPUI's `overflow_hidden` masks to a
+        // RECTANGLE, not to the border radius, so a full-height stripe paints
+        // its square top-left corner outside the frame's arc -- a coloured nub
+        // hanging off the rounded corner. Holding the stripe off both ends by
+        // the radius and rounding its own ends is what the CSS clip leaves at
+        // the stripe's left edge, and it can never paint outside the frame.
         .child(
             div()
                 .absolute()
                 .left_0()
-                .top_0()
-                .bottom_0()
+                .top(px(shape.stripe_inset))
+                .bottom(px(shape.stripe_inset))
                 .w(px(PANEL_STRIPE_WIDTH))
+                .rounded(px(PANEL_STRIPE_WIDTH / 2.0))
                 .bg(stripe.to_gpui()),
         )
         .child(chrome_element)
@@ -927,6 +969,69 @@ mod tests {
             }
             cx.quit();
         });
+    }
+
+    /// F2: the panel box against `02-panel-chrome-2` and `01-composition-A`.
+    /// `.pane { background:#151518; border:1px solid #26262b; border-radius }`
+    /// is `surfaces.raised`, a 1 px `borders.subtle` hairline and radius 8;
+    /// the focused panel is 2 px `text.primary` at the same radius, so the
+    /// frame thickens without the box changing shape under the cursor.
+    ///
+    /// Read out of [`panel_frame_shape`] rather than off a screenshot: a frame
+    /// carries no text, so nothing else in this suite can witness it.
+    #[test]
+    fn the_panel_frame_is_raised_on_canvas_at_radius_eight() {
+        let tokens = crate::ui::tokens::dark(Density::Comfortable, Scale::Scale100);
+        let unfocused = panel_chrome(
+            &row(BoardState::Working),
+            PaneView::Conversation,
+            false,
+            false,
+            false,
+            None,
+            false,
+            String::new(),
+        );
+        let shape = panel_frame_shape(&unfocused, tokens);
+        assert_eq!(shape.radius, 8.0, "composition A rounds a panel at 8");
+        assert_eq!(shape.radius, tokens.density.radii.lg);
+        assert_eq!(shape.border_width, 1.0);
+        assert_eq!(shape.border, tokens.borders.subtle);
+        assert_eq!(shape.background, tokens.surfaces.raised);
+        assert_ne!(
+            shape.background, tokens.surfaces.canvas,
+            "the panel must be a step above the ground it sits on"
+        );
+
+        let focused = panel_chrome(
+            &row(BoardState::Working),
+            PaneView::Conversation,
+            true,
+            false,
+            false,
+            None,
+            false,
+            String::new(),
+        );
+        let focused = panel_frame_shape(&focused, tokens);
+        assert_eq!(
+            focused.border_width, 2.0,
+            "Task 12: the focused frame is 2 px"
+        );
+        assert_eq!(focused.border, tokens.text.primary);
+        assert_eq!(
+            focused.radius, shape.radius,
+            "focus thickens the frame; it must not reshape the box"
+        );
+
+        // The stripe is held off both ends by the radius, because GPUI masks a
+        // panel to a rectangle rather than to its border radius: a full-height
+        // stripe would paint a square corner outside the frame's arc.
+        assert_eq!(shape.stripe_inset, shape.radius);
+        assert!(
+            shape.stripe_inset >= PANEL_STRIPE_WIDTH,
+            "a stripe inset under its own width would still square the corner"
+        );
     }
 
     /// The chrome rows are the numbers the mockup was measured at, and the

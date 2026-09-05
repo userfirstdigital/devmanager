@@ -33,13 +33,17 @@ impl AllocationMetrics {
     /// One source for the live shell and for every test that asserts what the
     /// shipped minimums actually do — a fixture that invents its own numbers
     /// cannot see a rule that only bites when the two widths are equal.
+    ///
+    /// F2: `divider` is composition A's gap between panels, 8 px. It is the
+    /// same number the grid's outer inset uses, so a panel's edge sits the
+    /// same distance from its neighbour as from the window.
     pub const fn production() -> Self {
         Self {
             full_min_width: 320.0,
             full_min_height: 160.0,
             compact_min_width: 320.0,
             compact_min_height: 28.0,
-            divider: 4.0,
+            divider: 8.0,
         }
     }
 
@@ -628,6 +632,33 @@ mod tests {
         }
     }
 
+    /// F2: composition A's grid puts 8 px between panels, not 4. The number is
+    /// asserted here rather than remembered, because the shipped gap is what
+    /// every minimisation threshold in this module is computed from -- a change
+    /// to it moves the width at which a pane becomes a strip.
+    #[test]
+    fn the_shipped_grid_gap_is_eight_pixels() {
+        assert_eq!(AllocationMetrics::production().divider, 8.0);
+
+        // And it is spent: two Full panes in an 800 px row own 800 px between
+        // them with exactly one gap, so the gap is neither dropped nor paid
+        // for twice.
+        let first = TaskId::new();
+        let second = TaskId::new();
+        let mut workspace = TaskWorkspace::single(first);
+        workspace
+            .insert_after_focused(second, Axis::Horizontal)
+            .expect("second pane");
+        let allocated =
+            workspace.allocate(Viewport::new(800.0, 700.0), AllocationMetrics::production());
+        assert_eq!(allocated.width(first), Some(396.0));
+        assert_eq!(allocated.width(second), Some(396.0));
+        assert_eq!(
+            allocated.width(first).unwrap() + 8.0 + allocated.width(second).unwrap(),
+            800.0
+        );
+    }
+
     // Build an H branch below a V branch below the root H split. This lets the
     // tests distinguish floors on the requested axis from pins on the other
     // axis without reaching into production-only tree construction helpers.
@@ -710,9 +741,9 @@ mod tests {
             .insert_after_focused(second, Axis::Horizontal)
             .expect("second pane");
 
-        // Two Full panes need 320+320+4 = 644 of the 600 available, so the
+        // Two Full panes need 320+320+8 = 648 of the 600 available, so the
         // width axis is over budget. A strip keeps the full 320 width by
-        // design, so minimising `first` would leave the tree minimum at 644 —
+        // design, so minimising `first` would leave the tree minimum at 648 —
         // no width recovered and a pane stripped for nothing. Both stay Full
         // and the physical floor squeezes them instead.
         let allocated =
@@ -720,10 +751,10 @@ mod tests {
 
         assert_eq!(workspace.presentation(first), Some(PanePresentation::Full));
         assert_eq!(workspace.presentation(second), Some(PanePresentation::Full));
-        assert_eq!(allocated.width(first), Some(298.0));
-        assert_eq!(allocated.width(second), Some(298.0));
+        assert_eq!(allocated.width(first), Some(296.0));
+        assert_eq!(allocated.width(second), Some(296.0));
         assert_eq!(
-            allocated.width(first).unwrap() + 4.0 + allocated.width(second).unwrap(),
+            allocated.width(first).unwrap() + 8.0 + allocated.width(second).unwrap(),
             600.0,
             "leaving both Full must not leave an unowned gap"
         );
@@ -744,8 +775,8 @@ mod tests {
 
         // Height is the divided axis here, and a strip is 28 rather than 160,
         // so each minimisation does recover room. Three Full panes need
-        // 160*3 + 4*2 = 488 of 300: stripping `first` leaves 356, still short,
-        // so `second` follows and the pass stops at 224.
+        // 160*3 + 8*2 = 496 of 300: stripping `first` leaves 364, still short,
+        // so `second` follows and the pass stops at 232.
         let allocated =
             workspace.allocate(Viewport::new(400.0, 300.0), AllocationMetrics::production());
 
@@ -764,12 +795,12 @@ mod tests {
         );
         assert_eq!(allocated.height(first), Some(28.0));
         assert_eq!(allocated.height(second), Some(28.0));
-        assert_eq!(allocated.height(third), Some(236.0));
+        assert_eq!(allocated.height(third), Some(228.0));
         assert_eq!(
             allocated.height(first).unwrap()
-                + 4.0
+                + 8.0
                 + allocated.height(second).unwrap()
-                + 4.0
+                + 8.0
                 + allocated.height(third).unwrap(),
             300.0
         );
@@ -789,12 +820,12 @@ mod tests {
             .expect("b under c");
         workspace.focus_task(c).expect("focus c");
 
-        // H[a, V[c, b]] at 800x300. Height is over budget: max(160, 160+4+160)
-        // = 324. The globally least-recently-focused candidate is `a`, and `a`
+        // H[a, V[c, b]] at 800x300. Height is over budget: max(160, 160+8+160)
+        // = 328. The globally least-recently-focused candidate is `a`, and `a`
         // is in the branch that is NOT the max, so minimising it leaves the
-        // root at 324 - it buys nothing. `a` must therefore be skipped rather
+        // root at 328 - it buys nothing. `a` must therefore be skipped rather
         // than ending the pass: `b` is next, and it lowers the V branch to
-        // 28+4+160 = 192, so max(160, 192) = 192 and the tree fits.
+        // 28+8+160 = 196, so max(160, 196) = 196 and the tree fits.
         let allocated =
             workspace.allocate(Viewport::new(800.0, 300.0), AllocationMetrics::production());
 
@@ -812,12 +843,12 @@ mod tests {
         assert_eq!(allocated.height(b), Some(28.0));
         assert_eq!(
             allocated.height(c),
-            Some(268.0),
+            Some(264.0),
             "c keeps more than its 160 full minimum, so nothing is squeezed"
         );
         assert_eq!(allocated.height(a), Some(300.0));
         assert_eq!(
-            allocated.height(c).unwrap() + 4.0 + allocated.height(b).unwrap(),
+            allocated.height(c).unwrap() + 8.0 + allocated.height(b).unwrap(),
             300.0
         );
     }
@@ -847,14 +878,14 @@ mod tests {
         workspace.focus_task(q3).expect("focus q3");
 
         // H[ A=V[p, p2], B=V[q, q2, q3] ] at 800x300, and A's panes are the
-        // OLDEST, so they are measured first. A is 324 and B is 488, so B
-        // governs the height: `p` and `p2` are both skipped, then `q` (488 ->
-        // 356) is accepted, which clears the skip list; `p` and `p2` are
-        // skipped again (A's 324 is still under B's 356), then `q2` (356 ->
-        // 324) is accepted. At that point B is 224 and A's 324 is the maximum,
+        // OLDEST, so they are measured first. A is 328 and B is 496, so B
+        // governs the height: `p` and `p2` are both skipped, then `q` (496 ->
+        // 364) is accepted, which clears the skip list; `p` and `p2` are
+        // skipped again (A's 328 is still under B's 364), then `q2` (364 ->
+        // 232) is accepted. At that point B is 232 and A's 328 is the maximum,
         // so `p` -- skipped twice -- is the only candidate left that can help.
-        // Without re-trying it the pass stops at 324 against a 300 px
-        // viewport; re-trying it reaches 224 and fits.
+        // Without re-trying it the pass stops at 328 against a 300 px
+        // viewport; re-trying it lowers A to 196 and the tree fits at 232.
         let allocated =
             workspace.allocate(Viewport::new(800.0, 300.0), AllocationMetrics::production());
 
@@ -875,18 +906,18 @@ mod tests {
         );
         assert_eq!(workspace.presentation(q3), Some(PanePresentation::Full));
 
-        // 224 <= 300, so every pane is at or above its own minimum and nothing
+        // 232 <= 300, so every pane is at or above its own minimum and nothing
         // is squeezed under the physical floor.
         assert_eq!(allocated.height(p), Some(28.0));
-        assert_eq!(allocated.height(p2), Some(268.0));
+        assert_eq!(allocated.height(p2), Some(264.0));
         assert_eq!(allocated.height(q), Some(28.0));
         assert_eq!(allocated.height(q2), Some(28.0));
-        assert_eq!(allocated.height(q3), Some(236.0));
+        assert_eq!(allocated.height(q3), Some(228.0));
         assert_eq!(
             allocated.height(q).unwrap()
-                + 4.0
+                + 8.0
                 + allocated.height(q2).unwrap()
-                + 4.0
+                + 8.0
                 + allocated.height(q3).unwrap(),
             300.0
         );
@@ -897,7 +928,7 @@ mod tests {
         let (mut workspace, [first, second, third]) = three_horizontal_tasks();
         workspace.focus_task(third).expect("focus third");
 
-        // Three Full panes need 320*3 + 4*2 = 968 of 600, and a strip keeps the
+        // Three Full panes need 320*3 + 8*2 = 976 of 600, and a strip keeps the
         // full 320 width, so neither `first` nor `second` lowers the width by a
         // pixel. Both are tried, both are put back, the candidate set is
         // exhausted, and the 64 px physical floor absorbs the pressure instead.
@@ -917,9 +948,9 @@ mod tests {
             );
         }
         let total = allocated.width(first).unwrap()
-            + 4.0
+            + 8.0
             + allocated.width(second).unwrap()
-            + 4.0
+            + 8.0
             + allocated.width(third).unwrap();
         assert!(
             (total - 600.0).abs() < 0.01,
@@ -968,8 +999,8 @@ mod tests {
             .insert_after_focused(second, Axis::Vertical)
             .expect("second pane");
 
-        // 250 px tall: two Full panes need 160+4+160 = 324, so one must
-        // become a strip; 28+4+160 = 192 then fits.
+        // 250 px tall: two Full panes need 160+8+160 = 328, so one must
+        // become a strip; 28+8+160 = 196 then fits.
         let allocated =
             workspace.allocate(Viewport::new(400.0, 250.0), AllocationMetrics::production());
 
@@ -986,8 +1017,8 @@ mod tests {
         assert_eq!(allocated.height(first), Some(28.0), "the strip is 28 px");
         assert_eq!(
             allocated.height(second),
-            Some(218.0),
-            "the surviving Full pane takes the rest of the 246 divided px"
+            Some(214.0),
+            "the surviving Full pane takes the rest of the 242 divided px"
         );
 
         let restored =
@@ -1000,8 +1031,8 @@ mod tests {
                 .all(|task| workspace.presentation(task) == Some(PanePresentation::Full)),
             "returning room restores every strip"
         );
-        assert_eq!(restored.height(first), Some(198.0));
-        assert_eq!(restored.height(second), Some(198.0));
+        assert_eq!(restored.height(first), Some(196.0));
+        assert_eq!(restored.height(second), Some(196.0));
     }
 
     #[test]
