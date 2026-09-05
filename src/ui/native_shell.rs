@@ -26646,8 +26646,6 @@ impl NativeShell {
                     .flex_col()
                     .child(Self::empty_state(
                         "native-empty-conversation",
-                        "◇",
-                        "No messages yet",
                         "This conversation is open and ready. Send a message to begin.",
                         tokens,
                         None,
@@ -26766,12 +26764,15 @@ impl NativeShell {
         reserve_composer: bool,
         tokens: crate::ui::tokens::ThemeTokens,
     ) -> AnyElement {
+        // Rule 9: the status is one quiet line. The pulse stays -- it is the
+        // only thing that says the wait is alive rather than stuck -- but it is
+        // a 5 px text.muted dot beside the sentence, not a badge on a pill.
         let animation_key = stable_host_task_element_key(owner, "center-loading-pulse");
         let pulse = div()
             .flex_none()
-            .size(px(7.0))
+            .size(px(5.0))
             .rounded_full()
-            .bg(tokens.actions.primary.default.background.to_gpui())
+            .bg(tokens.text.muted.to_gpui())
             .with_animation(
                 ("native-center-loading-pulse", animation_key),
                 Animation::new(Duration::from_millis(900))
@@ -26789,29 +26790,24 @@ impl NativeShell {
         let chip = div()
             .flex()
             .items_center()
-            .gap(px(tokens.density.spacing.xs))
-            .px(px(tokens.density.spacing.sm))
-            .py(px(tokens.density.spacing.xs))
-            .rounded_full()
-            .border(px(1.0))
-            .border_color(tokens.borders.subtle.to_gpui())
-            .bg(tokens.surfaces.raised.to_gpui())
-            .shadow_sm()
-            .text_size(px(tokens.density.typography.caption))
-            .text_color(tokens.text.secondary.to_gpui())
+            .gap(px(overlay_chrome::CHIP_GAP))
+            .text_size(px(overlay_chrome::BODY_FONT_SIZE))
+            .line_height(px(overlay_chrome::ROW_TITLE_LINE_HEIGHT))
+            .text_color(tokens.text.muted.to_gpui())
             .child(pulse)
             .child(label);
         let chip = div()
             .flex()
             .flex_col()
             .items_center()
-            .gap(px(tokens.density.spacing.xs))
+            .gap(px(overlay_chrome::CHIP_GAP))
             .child(chip)
             .children(secondary.map(|secondary| {
                 div()
                     .max_w(px(360.0))
                     .text_center()
-                    .text_size(px(tokens.density.typography.caption))
+                    .text_size(px(overlay_chrome::ROW_META_FONT_SIZE))
+                    .line_height(px(overlay_chrome::ROW_META_LINE_HEIGHT))
                     .text_color(tokens.text.muted.to_gpui())
                     .child(secondary)
             }));
@@ -34957,11 +34953,14 @@ impl NativeShell {
     /// shows, so it is composed rather than left as a bare line of text: the
     /// glyph anchors the panel, the headline states the fact, and the caption
     /// says what would fill it.
+    /// Rule 9: an empty state is one 11.5 px `text.muted` sentence and at most
+    /// one default button under it -- no glyph medallion, no heading, no
+    /// illustration. The headline the old signature carried is still spoken:
+    /// the accessibility tree is built from shell state rather than from these
+    /// elements, so dropping the painted heading costs a screen reader nothing.
     fn empty_state(
         id: &'static str,
-        glyph: &'static str,
-        headline: impl Into<String>,
-        detail: impl Into<String>,
+        sentence: impl Into<String>,
         tokens: crate::ui::tokens::ThemeTokens,
         action: Option<AnyElement>,
     ) -> AnyElement {
@@ -34974,39 +34973,17 @@ impl NativeShell {
             .flex_col()
             .items_center()
             .justify_center()
-            .gap(px(tokens.density.spacing.sm))
-            .p(px(tokens.density.spacing.xl))
+            .gap(px(overlay_chrome::CONTROL_GAP))
+            .p(px(overlay_chrome::REGION_PADDING))
             .pb(px(72.0))
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .w(px(44.0))
-                    .h(px(44.0))
-                    .mb(px(tokens.density.spacing.xs))
-                    .rounded(px(tokens.density.radii.pill))
-                    .bg(tokens.surfaces.sunken.to_gpui())
-                    .text_size(px(tokens.density.typography.heading))
-                    .text_color(tokens.text.muted.to_gpui())
-                    .child(glyph),
-            )
-            .child(
-                div()
-                    .text_size(px(tokens.density.typography.heading))
-                    .line_height(px(tokens.density.typography.heading_line_height))
-                    .font_weight(FontWeight::SEMIBOLD)
-                    .text_color(tokens.text.primary.to_gpui())
-                    .child(headline.into()),
-            )
             .child(
                 div()
                     .max_w(px(420.0))
                     .text_center()
-                    .text_size(px(tokens.density.typography.caption))
-                    .line_height(px(tokens.density.typography.caption_line_height))
+                    .text_size(px(overlay_chrome::BODY_FONT_SIZE))
+                    .line_height(px(overlay_chrome::ROW_TITLE_LINE_HEIGHT))
                     .text_color(tokens.text.muted.to_gpui())
-                    .child(detail.into()),
+                    .child(sentence.into()),
             )
             .children(action)
             .into_any_element()
@@ -35020,8 +34997,6 @@ impl NativeShell {
     ) -> AnyElement {
         Self::empty_state(
             "native-shell-workspace-dock",
-            "\u{25cb}",
-            "Select a task first",
             format!(
                 "{} loads once a task in the inbox is selected.",
                 tool.label()
@@ -35033,13 +35008,11 @@ impl NativeShell {
 
     fn remote_dock_unavailable_surface(
         &self,
-        tool: CockpitDockTool,
+        _tool: CockpitDockTool,
         tokens: crate::ui::tokens::ThemeTokens,
     ) -> AnyElement {
         Self::empty_state(
             "native-shell-remote-dock-unavailable",
-            "\u{25cb}",
-            format!("{} unavailable on remote", tool.label()),
             Self::remote_local_authority_reason(),
             tokens,
             None,
@@ -35054,8 +35027,6 @@ impl NativeShell {
     ) -> AnyElement {
         Self::empty_state(
             "native-shell-task-inbox-empty",
-            "+",
-            "No tasks yet",
             INBOX_EMPTY_STATE_HINT,
             tokens,
             action,
@@ -35089,34 +35060,21 @@ impl NativeShell {
         tokens: crate::ui::tokens::ThemeTokens,
         action: Option<AnyElement>,
     ) -> AnyElement {
-        let Some((title, detail)) = self.setup_intro_copy(stage) else {
+        // The headline half of the copy pair belongs to the accessibility
+        // tree (it is that node's name); rule 9 leaves the canvas one sentence.
+        let Some((_title, detail)) = self.setup_intro_copy(stage) else {
             return div().id("native-shell-setup-unused").into_any_element();
         };
-        let (id, glyph) = match stage {
-            ShellStage::Connecting => ("native-shell-setup-connecting", "·"),
-            ShellStage::Recovery => ("native-shell-setup-recovery", "!"),
-            ShellStage::Welcome => ("native-shell-setup-welcome", "+"),
-            ShellStage::FirstTask => ("native-shell-setup-first-task", "1"),
+        let id = match stage {
+            ShellStage::Connecting => "native-shell-setup-connecting",
+            ShellStage::Recovery => "native-shell-setup-recovery",
+            ShellStage::Welcome => "native-shell-setup-welcome",
+            ShellStage::FirstTask => "native-shell-setup-first-task",
             ShellStage::Cockpit => {
                 return div().id("native-shell-setup-unused").into_any_element();
             }
         };
-        let composed_action = if stage == ShellStage::Welcome {
-            Some(
-                div()
-                    .id("native-shell-setup-welcome-action")
-                    .flex()
-                    .flex_col()
-                    .items_center()
-                    .gap(px(tokens.density.spacing.md))
-                    .child(self.setup_welcome_steps(tokens))
-                    .children(action)
-                    .into_any_element(),
-            )
-        } else {
-            action
-        };
-        Self::empty_state(id, glyph, title, detail, tokens, composed_action)
+        Self::empty_state(id, detail, tokens, action)
     }
 
     fn primary_action_button(
@@ -35148,33 +35106,6 @@ impl NativeShell {
                 }),
             )
             .child(label)
-            .into_any_element()
-    }
-
-    fn setup_welcome_steps(&self, tokens: crate::ui::tokens::ThemeTokens) -> AnyElement {
-        let steps = [
-            "Connect an agent",
-            "Add a project",
-            "Start Claude or Codex from the inbox",
-        ];
-        div()
-            .id("native-shell-setup-steps")
-            .w_full()
-            .flex_none()
-            .flex()
-            .flex_col()
-            .items_center()
-            .gap(px(tokens.density.spacing.xxs))
-            .children(steps.into_iter().enumerate().map(|(index, step)| {
-                div()
-                    .id(("native-shell-setup-step", index))
-                    .max_w(px(360.0))
-                    .text_center()
-                    .text_size(px(tokens.density.typography.caption))
-                    .line_height(px(tokens.density.typography.caption_line_height))
-                    .text_color(tokens.text.muted.to_gpui())
-                    .child(format!("{}. {step}", index + 1))
-            }))
             .into_any_element()
     }
 
