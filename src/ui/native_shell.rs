@@ -42329,37 +42329,24 @@ impl NativeShell {
                 .into();
             component.accent_foreground = tokens.text.primary.to_gpui().into();
             component.selection = tokens.surfaces.selection.to_gpui().into();
-            component.primary = tokens.actions.primary.default.background.to_gpui().into();
-            component.primary_hover = tokens.actions.primary.hover.background.to_gpui().into();
-            component.primary_active = tokens.actions.primary.selected.background.to_gpui().into();
-            component.primary_foreground =
-                tokens.actions.primary.default.foreground.to_gpui().into();
-            component.secondary = tokens.surfaces.overlay.to_gpui().into();
-            component.secondary_hover = tokens.surfaces.hover.to_gpui().into();
-            component.secondary_active = tokens.surfaces.selection.to_gpui().into();
-            component.secondary_foreground = tokens.text.primary.to_gpui().into();
-            component.danger = tokens
-                .actions
-                .destructive
-                .default
-                .background
-                .to_gpui()
-                .into();
-            component.danger_hover = tokens.actions.destructive.hover.background.to_gpui().into();
-            component.danger_active = tokens
-                .actions
-                .destructive
-                .selected
-                .background
-                .to_gpui()
-                .into();
-            component.danger_foreground = tokens
-                .actions
-                .destructive
-                .default
-                .foreground
-                .to_gpui()
-                .into();
+            // Rule 4's three button looks. Secondary is gpui-component's
+            // DEFAULT variant, so this is the button the whole app shows unless
+            // a call site says otherwise: unfilled, a text.primary label, a
+            // surfaces.hover hover. Its 1 px hairline is the one property a
+            // palette cannot reach -- see `overlay_chrome::ButtonPalette`.
+            let buttons = overlay_chrome::button_palette(tokens);
+            component.primary = buttons.primary_background.to_gpui().into();
+            component.primary_hover = buttons.primary_hover.to_gpui().into();
+            component.primary_active = buttons.primary_active.to_gpui().into();
+            component.primary_foreground = buttons.primary_foreground.to_gpui().into();
+            component.secondary = buttons.default_background.to_gpui().into();
+            component.secondary_hover = buttons.default_hover.to_gpui().into();
+            component.secondary_active = buttons.default_active.to_gpui().into();
+            component.secondary_foreground = buttons.default_foreground.to_gpui().into();
+            component.danger = buttons.destructive_background.to_gpui().into();
+            component.danger_hover = buttons.destructive_hover.to_gpui().into();
+            component.danger_active = buttons.destructive_active.to_gpui().into();
+            component.danger_foreground = buttons.destructive_foreground.to_gpui().into();
             component.success = tokens.status.success_surface.to_gpui().into();
             component.success_foreground = tokens.status.success_foreground.to_gpui().into();
             component.warning = tokens.status.warning_surface.to_gpui().into();

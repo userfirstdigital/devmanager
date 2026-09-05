@@ -367,6 +367,66 @@ pub fn quiet_toggle(on: bool, tokens: ThemeTokens) -> AnyElement {
         .into_any_element()
 }
 
+/// Rule 4's three button looks, resolved from the tokens.
+///
+/// Every button in the shell is a `gpui_component::Button`, which reads its
+/// colours from that library's own global palette rather than from our tokens;
+/// the shell bridges the two once per paint. This is the one place that states
+/// what the bridge must carry, so the rule is beside the rest of the vocabulary
+/// and readable by a test, instead of inline in a render function no test can
+/// reach.
+///
+/// **One property of rule 4 is not expressible from a palette.** gpui-component
+/// 0.5.1 derives a default (`Secondary`) button's border from its *background*
+/// -- `border_color` returns `bg` -- unless the call site opts into
+/// `.outline()`, which additionally switches on a button shadow that rule 1
+/// forbids. So the default button here is unfilled with a `text.primary` label
+/// and a `surfaces.hover` hover, and its 1 px `borders.default` hairline is the
+/// one thing missing. Getting it needs a per-call-site change or a library that
+/// separates border from fill; ledgered in `lane-r3-report.md`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ButtonPalette {
+    pub default_background: Color,
+    pub default_foreground: Color,
+    pub default_hover: Color,
+    pub default_active: Color,
+    pub primary_background: Color,
+    pub primary_foreground: Color,
+    pub primary_hover: Color,
+    pub primary_active: Color,
+    pub destructive_background: Color,
+    pub destructive_foreground: Color,
+    pub destructive_hover: Color,
+    pub destructive_active: Color,
+}
+
+/// Rule 4, read off the tokens rather than off the action palette.
+///
+/// Primary is deliberately `text.primary` on `canvas` and not
+/// `actions.primary`: the rule says the one primary action is light-on-dark,
+/// and taking it from the action tokens would let a custom theme's accent
+/// reintroduce the brand tint rule 1 removed. In the built-in dark theme the
+/// two already agree, which is what makes this a pin rather than a change.
+pub fn button_palette(tokens: ThemeTokens) -> ButtonPalette {
+    ButtonPalette {
+        // No fill: the ground shows through, which is as close to rule 4's
+        // "1 px border, no fill" as a palette can get here.
+        default_background: tokens.surfaces.canvas,
+        default_foreground: tokens.text.primary,
+        default_hover: tokens.surfaces.hover,
+        default_active: tokens.surfaces.selection,
+        primary_background: tokens.text.primary,
+        primary_foreground: tokens.surfaces.canvas,
+        primary_hover: tokens.actions.primary.hover.background,
+        primary_active: tokens.actions.primary.selected.background,
+        // Destructive is red text on no fill (rule 4), never a red slab.
+        destructive_background: tokens.surfaces.canvas,
+        destructive_foreground: tokens.status.destructive,
+        destructive_hover: tokens.surfaces.hover,
+        destructive_active: tokens.surfaces.selection,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -431,6 +491,63 @@ mod tests {
             OverlayRowState::Selected
         );
         assert_eq!(OverlayRowState::selected_when(false), OverlayRowState::Idle);
+    }
+
+    #[test]
+    fn the_default_button_is_unfilled_with_a_primary_label() {
+        let tokens = tokens();
+        let palette = button_palette(tokens);
+        assert_eq!(palette.default_background, tokens.surfaces.canvas);
+        assert_eq!(palette.default_foreground, tokens.text.primary);
+        assert_eq!(palette.default_hover, tokens.surfaces.hover);
+        assert_ne!(
+            palette.default_background, tokens.surfaces.overlay,
+            "a default button must not be a filled chip"
+        );
+    }
+
+    #[test]
+    fn the_primary_button_is_light_on_dark_and_carries_no_brand_tint() {
+        let tokens = tokens();
+        let palette = button_palette(tokens);
+        assert_eq!(palette.primary_background, tokens.text.primary);
+        assert_eq!(palette.primary_foreground, tokens.surfaces.canvas);
+    }
+
+    #[test]
+    fn the_destructive_button_is_red_text_and_never_a_red_slab() {
+        let tokens = tokens();
+        let palette = button_palette(tokens);
+        assert_eq!(palette.destructive_foreground, tokens.status.destructive);
+        assert_eq!(palette.destructive_background, tokens.surfaces.canvas);
+        assert_ne!(
+            palette.destructive_background, tokens.actions.destructive.default.background,
+            "the red fill is what rule 4 removes"
+        );
+    }
+
+    /// Every theme, not just the built-in dark one: a custom palette must not
+    /// be able to put its accent back on a button.
+    #[test]
+    fn every_theme_resolves_the_same_three_button_looks() {
+        use crate::ui::tokens::{Density, Scale, ThemeMode};
+        for mode in [ThemeMode::Dark, ThemeMode::Light, ThemeMode::HighContrast] {
+            let tokens = crate::ui::tokens::theme(mode, Density::Comfortable, Scale::Scale100);
+            let palette = button_palette(tokens);
+            assert_eq!(palette.primary_background, tokens.text.primary, "{mode:?}");
+            assert_eq!(
+                palette.primary_foreground, tokens.surfaces.canvas,
+                "{mode:?}"
+            );
+            assert_eq!(
+                palette.default_background, tokens.surfaces.canvas,
+                "{mode:?}"
+            );
+            assert_eq!(
+                palette.destructive_foreground, tokens.status.destructive,
+                "{mode:?}"
+            );
+        }
     }
 
     #[test]
