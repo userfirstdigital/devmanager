@@ -121,10 +121,10 @@ use crate::ui::task_cockpit::changes_panel::{
     reconcile_selected_repository, repository_mutation_allowed, repository_status_readable,
 };
 use crate::ui::task_cockpit::composer::{
-    composer_send_look, composer_send_tints, provider_command_catalog,
-    provider_command_opens_terminal, AnswerPayload, ApprovalDecision, ComposerControl,
-    ComposerDraftProjection, ComposerError, ComposerFence, ComposerHostProjection, ComposerIntent,
-    ComposerPayload, ComposerSendLook, ProviderCommandSuggestion, TaskComposer,
+    composer_send_element_id, composer_send_glyph, composer_send_look, composer_send_tints,
+    provider_command_catalog, provider_command_opens_terminal, AnswerPayload, ApprovalDecision,
+    ComposerControl, ComposerDraftProjection, ComposerError, ComposerFence, ComposerHostProjection,
+    ComposerIntent, ComposerPayload, ComposerSendLook, ProviderCommandSuggestion, TaskComposer,
     COMPOSER_ATTACHMENT_THUMBNAIL, COMPOSER_BORDER_WIDTH, COMPOSER_BUTTON_FONT_SIZE,
     COMPOSER_BUTTON_PADDING_X, COMPOSER_BUTTON_PADDING_Y, COMPOSER_BUTTON_RADIUS,
     COMPOSER_CAPTION_FONT_SIZE, COMPOSER_CHIP_FONT_SIZE, COMPOSER_CHIP_GAP,
@@ -9897,6 +9897,11 @@ struct ComposerAccessibilityState {
     focused: bool,
     /// Startup has not reached Ready, so Send is refused rather than dead.
     startup_loading: bool,
+    /// A turn is running and the composer will accept a stop for it, so the
+    /// send slot is painted as Stop. Read from
+    /// `NativeShell::composer_turn_is_streaming`, the same predicate the
+    /// painter reads, so the node and the button cannot disagree.
+    streaming: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -10304,7 +10309,24 @@ impl AccessibilityTree {
         let composer_children = selected_key
             .zip(composer)
             .map(|(_, composer)| {
-                vec![
+                // Stop exists only while a turn is streaming, because that is
+                // the only time the painted slot is a Stop button and the only
+                // time `ComposerControl::StopTurn` is available. Publishing it
+                // otherwise would offer a node whose activation the composer
+                // refuses, which reads to a screen reader as a broken control.
+                let stop = composer.streaming.then(|| {
+                    AccessibilityNode::new(
+                        AccessibleRole::Button,
+                        "Stop",
+                        "Stop the turn the selected AI task is running.",
+                    )
+                    .gpui(
+                        crate::ui::task_cockpit::composer::COMPOSER_STOP_ELEMENT_ID,
+                        true,
+                        true,
+                    )
+                });
+                let mut children = vec![
                     AccessibilityNode::new(
                         AccessibleRole::TextField,
                         "Prompt",
@@ -10357,7 +10379,9 @@ impl AccessibilityTree {
                         "Reject the provider's current request.",
                     )
                     .gpui("native-task-composer-reject", true, true),
-                ]
+                ];
+                children.extend(stop);
+                children
             })
             .unwrap_or_default();
         let prompt_library = AccessibilityNode::new(
@@ -13976,6 +14000,7 @@ impl NativeShell {
                 value: composer.draft_text().to_string(),
                 focused: composer_focused,
                 startup_loading: self.startup_gates_actions(),
+                streaming: self.composer_turn_is_streaming(),
             });
         let selected_key = self.selected_task_key.clone();
         let local_host = self.local_host_id();
@@ -23473,6 +23498,29 @@ impl NativeShell {
         }
     }
 
+    /// A turn is running **and** the composer will accept a stop for it.
+    ///
+    /// One predicate, read by the painter (which turns the send slot red) and
+    /// by the accessibility tree (which publishes `native-composer-stop` only
+    /// while it holds), so the button and the node can never disagree about
+    /// whether a turn is streaming. Both halves matter: a submission in flight
+    /// with no turn id would otherwise paint a red Stop that
+    /// `TaskComposer::availability` refuses the moment it is pressed.
+    fn composer_turn_is_streaming(&self) -> bool {
+        let pending = self
+            .composer
+            .as_ref()
+            .and_then(TaskComposer::pending_intent)
+            .is_some()
+            || self.draft_owner_composer_workflow_pending();
+        pending
+            && self
+                .composer
+                .as_ref()
+                .and_then(|composer| composer.availability(ComposerControl::StopTurn).ok())
+                .is_some_and(|availability| availability.is_available())
+    }
+
     fn activate_composer_control(&mut self, control: ComposerControl) {
         // Capture immutable owner at the gesture — never raw TaskId / later focus.
         let Some(owner_key) = self
@@ -25488,6 +25536,14 @@ impl NativeShell {
             shell.activate_composer_control(ComposerControl::SendNow);
             cx.notify();
         });
+        // Stop takes the same route Send does, so it passes the same owner
+        // capture, ephemeral-task gate and availability check rather than
+        // minting a second path into the composer.
+        let stop = cx.listener(|shell, _event: &ClickEvent, _window, cx| {
+            cx.stop_propagation();
+            shell.activate_composer_control(ComposerControl::StopTurn);
+            cx.notify();
+        });
         let answer = cx.listener(|shell, _event: &ClickEvent, _window, cx| {
             cx.stop_propagation();
             shell.activate_composer_control(ComposerControl::Answer);
@@ -25789,6 +25845,7 @@ impl NativeShell {
             .and_then(TaskComposer::pending_intent)
             .is_some()
             || self.draft_owner_composer_workflow_pending();
+        let composer_streaming = self.composer_turn_is_streaming();
         let image_chips = self
             .current_composer_images()
             .iter()
@@ -26042,21 +26099,22 @@ impl NativeShell {
                 .and_then(|ctl| ctl.usage_summary_for(instance_id))
                 .map(|summary| composer_pill(&summary))
         };
-        // Rule 4: the send control is an icon button -- a 24 px hit box, no
+        // Rule 4: the send slot is one icon button -- a 24 px hit box, no
         // border, no fill, `text.muted` at rest and `text.primary` on hover.
         // It replaces a 28 px accent-filled disc, which rule 1 spends only on
-        // status. DEVIATION: the glyph stays the arrow character rather than a
-        // lucide mark, because `crate::icons` carries no send glyph and an
-        // `svg()` takes its colour at build time, so it cannot brighten on
-        // hover -- text can, which is the half of rule 4 that is behaviour.
-        let send_look = composer_send_look(send_enabled, composer_pending);
+        // status. While a turn is streaming the same slot becomes Stop: the
+        // one red control the composer is allowed, on `surfaces.hover` under
+        // the pointer, carrying its own element id so nothing announces "Send"
+        // over a button that stops the turn.
+        //
+        // DEVIATION: both glyphs are characters rather than lucide marks,
+        // because `crate::icons` carries neither and an `svg()` takes its
+        // colour at build time, so it cannot brighten on hover -- text can,
+        // which is the half of rule 4 that is behaviour.
+        let send_look = composer_send_look(send_enabled, composer_pending, composer_streaming);
         let (send_rest, send_hover) = composer_send_tints(send_look, tokens);
-        let send_glyph = match send_look {
-            ComposerSendLook::Busy => "…",
-            ComposerSendLook::Ready | ComposerSendLook::Idle => "↑",
-        };
         let send_base = div()
-            .id("native-task-composer-send")
+            .id(composer_send_element_id(send_look))
             .flex_none()
             .size(px(COMPOSER_ICON_BUTTON_SIZE))
             .rounded(px(COMPOSER_CHIP_RADIUS))
@@ -26065,14 +26123,21 @@ impl NativeShell {
             .justify_center()
             .text_size(px(COMPOSER_ICON_GLYPH_SIZE))
             .text_color(send_rest.to_gpui())
-            .child(send_glyph);
-        let send_control = if send_enabled {
-            send_base
+            .child(composer_send_glyph(send_look));
+        let send_control = match send_look {
+            ComposerSendLook::Busy => send_base
+                .cursor_pointer()
+                .hover(move |style| {
+                    style
+                        .bg(tokens.surfaces.hover.to_gpui())
+                        .text_color(send_hover.to_gpui())
+                })
+                .on_click(stop),
+            ComposerSendLook::Ready => send_base
                 .cursor_pointer()
                 .hover(move |style| style.text_color(send_hover.to_gpui()))
-                .on_click(send)
-        } else {
-            send_base
+                .on_click(send),
+            ComposerSendLook::Idle => send_base,
         };
         let owns_input = show_input && self.selected_task_key.as_ref() == Some(&owner);
         let composer_footer = if !owns_input {
@@ -34315,6 +34380,9 @@ impl NativeShell {
                 }
             }
             "native-task-composer-send" => self.activate_composer_control(ComposerControl::SendNow),
+            crate::ui::task_cockpit::composer::COMPOSER_STOP_ELEMENT_ID => {
+                self.activate_composer_control(ComposerControl::StopTurn)
+            }
             "native-shell-tools-affordance" => self.open_project_action_menu(),
             "native-task-open" => self.begin_header_open(),
             "native-task-commit" => self.begin_header_commit(),
@@ -46845,6 +46913,7 @@ pub(crate) mod tests {
         ClientId,
         CockpitDockTool,
         CommandId,
+        ComposerAccessibilityState,
         ComposerControl,
         ComposerDraftKey,
         ComposerDraftPart,
@@ -47367,6 +47436,73 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn the_stop_node_exists_only_while_a_turn_is_streaming() {
+        use crate::ui::task_cockpit::composer::{
+            COMPOSER_SEND_ELEMENT_ID, COMPOSER_STOP_ELEMENT_ID,
+        };
+        use crate::ui::task_cockpit::TaskList;
+
+        let task_id = TaskId::new();
+        let task_list =
+            TaskList::from_virtual_task_ids(vec![task_id]).expect("one task fits the inbox");
+        let ids_when = |streaming: bool| {
+            let composer = ComposerAccessibilityState {
+                value: String::new(),
+                focused: false,
+                startup_loading: false,
+                streaming,
+            };
+            AccessibilityTree::for_task_list_with_projects_and_composer(
+                &task_list,
+                Some(task_id),
+                &NativeHeaderAttachment::default(),
+                None,
+                &[],
+                Some(&composer),
+            )
+            .gpui_nodes()
+            .into_iter()
+            .map(|node| node.element_id)
+            .collect::<Vec<_>>()
+        };
+
+        let quiet = ids_when(false);
+        let streaming = ids_when(true);
+
+        // The anchor: if the composer's nodes stop being published at all,
+        // the absence assertion below would pass while guarding nothing.
+        assert!(
+            quiet.iter().any(|id| id == COMPOSER_SEND_ELEMENT_ID),
+            "the composer's own nodes must be in the tree for this test to mean anything"
+        );
+        assert!(
+            !quiet.iter().any(|id| id == COMPOSER_STOP_ELEMENT_ID),
+            "Stop must not be offered when there is no turn to stop"
+        );
+        assert!(
+            streaming.iter().any(|id| id == COMPOSER_STOP_ELEMENT_ID),
+            "a streaming turn publishes exactly one Stop node"
+        );
+        assert_eq!(
+            streaming
+                .iter()
+                .filter(|id| *id == COMPOSER_STOP_ELEMENT_ID)
+                .count(),
+            1
+        );
+        // Streaming adds Stop and takes nothing away, so an assistive client
+        // that had focus on another composer node keeps it.
+        assert_eq!(
+            streaming.len(),
+            quiet.len() + 1,
+            "streaming adds the Stop node and changes nothing else"
+        );
+        for id in &quiet {
+            assert!(streaming.contains(id), "streaming dropped the node {id}");
+        }
+    }
+
+    #[test]
     fn the_composer_footer_paints_the_redesign_and_not_the_pill() {
         // KNOWN LIMITATION: a source assertion. GPUI exposes no painted style
         // to a unit test, and the composer footer is built inline inside
@@ -47381,7 +47517,8 @@ pub(crate) mod tests {
             .expect("the composer footer is built in task_conversation_surface_for");
         assert!(
             footer.contains(".id(\"native-task-composer-card\")")
-                && footer.contains(".id(\"native-task-composer-send\")"),
+                && footer.contains(".id(\"native-task-composer-input\")")
+                && footer.contains("let send_base = div()"),
             "the anchor above has stopped matching and this test is guarding nothing"
         );
 
@@ -47431,13 +47568,34 @@ pub(crate) mod tests {
                 "the composer keeps no part of the old pill; found {gone}"
             );
         }
-        // Rule 4: the send control is a 24 px icon button that brightens on
-        // hover rather than a filled disc.
+        // Rule 4: the send slot is a 24 px icon button that brightens on hover
+        // rather than a filled disc, and every part of its look -- glyph, id
+        // and tints -- is read from the composer model rather than decided in
+        // the painter.
         assert!(
             footer.contains(".size(px(COMPOSER_ICON_BUTTON_SIZE))")
-                && footer.contains("composer_send_look(send_enabled, composer_pending)")
+                && footer.contains(
+                    "composer_send_look(send_enabled, composer_pending, composer_streaming)"
+                )
+                && footer.contains(".id(composer_send_element_id(send_look))")
+                && footer.contains(".child(composer_send_glyph(send_look))")
                 && footer.contains("style.text_color(send_hover.to_gpui())"),
-            "the send control reads its look from the composer model"
+            "the send slot reads its look from the composer model"
+        );
+        // The Stop arm: the same slot, the same intent path Send uses, and the
+        // `surfaces.hover` ground rule 4 gives a destructive icon button.
+        assert!(
+            footer.contains("ComposerControl::StopTurn")
+                && footer.contains("ComposerSendLook::Busy => send_base")
+                && footer.contains(".bg(tokens.surfaces.hover.to_gpui())")
+                && footer.contains("let composer_streaming = self.composer_turn_is_streaming();"),
+            "Stop hangs off the Busy arm and shares the send control's route"
+        );
+        // Idle is the one arm with no click handler, so a submission in flight
+        // cannot be pressed again.
+        assert!(
+            footer.contains("ComposerSendLook::Idle => send_base,"),
+            "a control that cannot act must carry no listener"
         );
     }
 

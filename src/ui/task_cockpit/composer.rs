@@ -117,43 +117,89 @@ pub const COMPOSER_CHIP_LABEL_MAX_WIDTH: f32 = 160.0;
 pub const COMPOSER_INPUT_MIN_HEIGHT: f32 = 88.0;
 pub const COMPOSER_HEIGHT_RESERVE: f32 = 200.0;
 
-/// What the send control is saying right now. Rule 4 gives an icon button one
-/// resting tint and one hover tint, and rule 1 allows exactly one colour here:
-/// red, for the destructive act of stopping a turn.
+/// What the one control in the composer's send slot is saying right now.
+/// Rule 4 gives an icon button one resting tint and one hover tint, and rule 1
+/// allows exactly one colour here: red, for the destructive act of stopping a
+/// running turn.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ComposerSendLook {
     /// There is something to send and the composer may send it.
     Ready,
-    /// Nothing to send yet, or sending is unavailable.
+    /// Nothing to send yet, or sending is unavailable, or a submission is in
+    /// flight that cannot be stopped. Not a target.
     Idle,
-    /// A submission is in flight; the control is not a target.
+    /// A turn is running and the composer may stop it: the slot is Stop.
     Busy,
 }
 
-/// One decision about how the send control looks, taken from the same three
-/// facts the painter already has. A function rather than an inline chain so
-/// the look and its test read the same rule.
-pub fn composer_send_look(enabled: bool, pending: bool) -> ComposerSendLook {
-    if pending {
+/// One decision about what the send slot shows, taken from the three facts the
+/// painter already has, in this precedence:
+///
+/// 1. `streaming` -- a turn is running *and* [`ComposerControl::StopTurn`] is
+///    available for it. The slot becomes Stop, which is a target.
+/// 2. `pending` -- a submission is in flight with nothing to stop. The slot
+///    stays the send glyph but is not a target, so it cannot double-send.
+/// 3. `enabled` -- there is something to send.
+///
+/// A function rather than an inline chain so the look, the painter and the
+/// test read one rule. `streaming` outranks `pending` because a stoppable turn
+/// is always also pending, and Stop is the useful half of that pair.
+pub fn composer_send_look(enabled: bool, pending: bool, streaming: bool) -> ComposerSendLook {
+    if streaming {
         ComposerSendLook::Busy
-    } else if enabled {
-        ComposerSendLook::Ready
-    } else {
+    } else if pending || !enabled {
         ComposerSendLook::Idle
+    } else {
+        ComposerSendLook::Ready
     }
 }
 
-/// The resting and hover tints for a send control in that state, as token
-/// colours. `Idle` and `Busy` do not brighten, because they are not targets.
+/// The resting and hover tints for the slot in that state, as token colours.
+///
+/// `Busy` is Stop, and rule 4's destructive control is red text with no fill:
+/// `status.destructive` at rest, `text.primary` on hover (the painter adds the
+/// `surfaces.hover` ground under it). `Idle` does not brighten, because it is
+/// not a target.
 pub fn composer_send_tints(
     look: ComposerSendLook,
     tokens: ThemeTokens,
 ) -> (crate::ui::tokens::Color, crate::ui::tokens::Color) {
     match look {
         ComposerSendLook::Ready => (tokens.text.muted, tokens.text.primary),
-        ComposerSendLook::Idle | ComposerSendLook::Busy => {
-            (tokens.text.disabled, tokens.text.disabled)
-        }
+        ComposerSendLook::Busy => (tokens.status.destructive, tokens.text.primary),
+        ComposerSendLook::Idle => (tokens.text.disabled, tokens.text.disabled),
+    }
+}
+
+/// Rule 10 asks for a lucide mark. These are characters instead, because
+/// `crate::icons` carries no send or stop glyph and `app_icon` builds an
+/// `svg()` whose colour is fixed at construction -- so it cannot brighten on
+/// hover, which is the half of rule 4 that is behaviour rather than
+/// decoration. Ledgered as deviation 1 in `lane-r1-report.md`.
+pub const COMPOSER_SEND_GLYPH: &str = "↑";
+pub const COMPOSER_STOP_GLYPH: &str = "■";
+
+/// The glyph the slot wears in that state. One mapping, so the painted glyph
+/// and the tint beside it cannot disagree about which control this is.
+pub fn composer_send_glyph(look: ComposerSendLook) -> &'static str {
+    match look {
+        ComposerSendLook::Busy => COMPOSER_STOP_GLYPH,
+        ComposerSendLook::Ready | ComposerSendLook::Idle => COMPOSER_SEND_GLYPH,
+    }
+}
+
+/// The element and accessibility id the slot publishes in that state. Stop is
+/// its own node so a screen reader is never told "Send" while the button under
+/// the pointer stops the turn.
+pub const COMPOSER_SEND_ELEMENT_ID: &str = "native-task-composer-send";
+pub const COMPOSER_STOP_ELEMENT_ID: &str = "native-composer-stop";
+
+/// Which id the slot carries in that state -- read by the painter and by the
+/// accessibility tree, so the node and the button cannot drift apart.
+pub fn composer_send_element_id(look: ComposerSendLook) -> &'static str {
+    match look {
+        ComposerSendLook::Busy => COMPOSER_STOP_ELEMENT_ID,
+        ComposerSendLook::Ready | ComposerSendLook::Idle => COMPOSER_SEND_ELEMENT_ID,
     }
 }
 
@@ -2649,15 +2695,31 @@ mod tests {
     #[test]
     fn the_send_control_is_quiet_and_only_brightens_when_it_can_send() {
         // Rule 4: an icon button rests at `text.muted` and reaches
-        // `text.primary` on hover. Rule 1: it never carries an accent fill,
-        // so no state below may equal an action or status colour.
+        // `text.primary` on hover.
         let tokens = redesign_tokens();
-        assert_eq!(composer_send_look(true, false), ComposerSendLook::Ready);
-        assert_eq!(composer_send_look(false, false), ComposerSendLook::Idle);
+        // (enabled, pending, streaming)
         assert_eq!(
-            composer_send_look(true, true),
+            composer_send_look(true, false, false),
+            ComposerSendLook::Ready
+        );
+        assert_eq!(
+            composer_send_look(false, false, false),
+            ComposerSendLook::Idle
+        );
+        assert_eq!(
+            composer_send_look(true, true, false),
+            ComposerSendLook::Idle,
+            "a submission in flight with nothing to stop must not stay a send target"
+        );
+        assert_eq!(
+            composer_send_look(true, true, true),
             ComposerSendLook::Busy,
-            "a submission in flight outranks a sendable draft"
+            "a stoppable turn outranks everything else in the slot"
+        );
+        assert_eq!(
+            composer_send_look(false, false, true),
+            ComposerSendLook::Busy,
+            "Stop does not need a sendable draft"
         );
 
         let (rest, hover) = composer_send_tints(ComposerSendLook::Ready, tokens);
@@ -2665,19 +2727,18 @@ mod tests {
         assert_eq!(hover, tokens.text.primary);
         assert_ne!(rest, hover, "a target must show that it is one");
 
-        for look in [ComposerSendLook::Idle, ComposerSendLook::Busy] {
-            let (rest, hover) = composer_send_tints(look, tokens);
-            assert_eq!(rest, tokens.text.disabled);
-            assert_eq!(
-                rest, hover,
-                "a control that cannot be used must not brighten under the pointer"
-            );
-        }
-        // Rule 1: every tint the control can wear comes from the `text`
-        // family, never from a status. Asserted as membership rather than as
-        // a list of inequalities, because in this palette the primary action's
-        // background is deliberately `text.primary` itself -- an inequality
-        // against `actions.primary` would be red for the right colour.
+        let (rest, hover) = composer_send_tints(ComposerSendLook::Idle, tokens);
+        assert_eq!(rest, tokens.text.disabled);
+        assert_eq!(
+            rest, hover,
+            "a control that cannot be used must not brighten under the pointer"
+        );
+
+        // Rule 1: the only colour the slot may spend is red, and only on Stop.
+        // Asserted as membership rather than as a list of inequalities,
+        // because in this palette the primary action's background is
+        // deliberately `text.primary` itself -- an inequality against
+        // `actions.primary` would go red for the right colour.
         let text_family = [
             tokens.text.primary,
             tokens.text.emphasis,
@@ -2685,21 +2746,64 @@ mod tests {
             tokens.text.muted,
             tokens.text.disabled,
         ];
-        for look in [
-            ComposerSendLook::Ready,
-            ComposerSendLook::Idle,
-            ComposerSendLook::Busy,
-        ] {
+        for look in [ComposerSendLook::Ready, ComposerSendLook::Idle] {
             let (rest, hover) = composer_send_tints(look, tokens);
             for tint in [rest, hover] {
                 assert!(
                     text_family.contains(&tint),
-                    "the send control paints text tokens only, found {tint:?}"
+                    "only Stop is coloured; {look:?} painted {tint:?}"
                 );
                 assert_ne!(tint, tokens.status.attention);
                 assert_ne!(tint, tokens.status.success);
-                // Red belongs to Stop alone, and Stop is not one of these.
                 assert_ne!(tint, tokens.status.destructive);
+            }
+        }
+    }
+
+    #[test]
+    fn a_streaming_turn_turns_the_send_slot_into_a_red_stop() {
+        // The coordinator's ruling: while a turn is streaming the slot is a
+        // 24 px red icon button that stops the turn, and it is its own
+        // accessibility node so nothing announces "Send" over a Stop.
+        let tokens = redesign_tokens();
+
+        assert_eq!(
+            composer_send_glyph(ComposerSendLook::Busy),
+            COMPOSER_STOP_GLYPH
+        );
+        for look in [ComposerSendLook::Ready, ComposerSendLook::Idle] {
+            assert_eq!(composer_send_glyph(look), COMPOSER_SEND_GLYPH);
+        }
+        assert_ne!(
+            COMPOSER_STOP_GLYPH, COMPOSER_SEND_GLYPH,
+            "Stop and Send must not be the same mark"
+        );
+
+        // Rule 4's destructive control: red text, no fill, `text.primary` on
+        // hover. The ground under the hover is the painter's `surfaces.hover`.
+        let (rest, hover) = composer_send_tints(ComposerSendLook::Busy, tokens);
+        assert_eq!(rest, tokens.status.destructive);
+        assert_eq!(hover, tokens.text.primary);
+        assert_ne!(rest, hover, "Stop is a target and must show that it is one");
+
+        // The node exists only while streaming, and it is the only state that
+        // carries the Stop id.
+        assert_eq!(
+            composer_send_element_id(ComposerSendLook::Busy),
+            COMPOSER_STOP_ELEMENT_ID
+        );
+        assert_eq!(COMPOSER_STOP_ELEMENT_ID, "native-composer-stop");
+        for look in [ComposerSendLook::Ready, ComposerSendLook::Idle] {
+            assert_eq!(composer_send_element_id(look), COMPOSER_SEND_ELEMENT_ID);
+            assert_ne!(composer_send_element_id(look), COMPOSER_STOP_ELEMENT_ID);
+        }
+        // And the only state reached without a streaming turn is never Busy,
+        // so the Stop id is unreachable while nothing is streaming.
+        for enabled in [true, false] {
+            for pending in [true, false] {
+                let look = composer_send_look(enabled, pending, false);
+                assert_ne!(look, ComposerSendLook::Busy);
+                assert_eq!(composer_send_element_id(look), COMPOSER_SEND_ELEMENT_ID);
             }
         }
     }
