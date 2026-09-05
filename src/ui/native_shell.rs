@@ -14080,6 +14080,7 @@ impl NativeShell {
     }
 
     fn refresh_accessibility_tree(&mut self) {
+        let _section = crate::ui::frame_trace::section("a11y");
         self.accessibility_tree_builds = self.accessibility_tree_builds.saturating_add(1);
         let project_items = self.board_inbox_items(unix_time_ms());
         let shows_add_project = self.shows_add_project_plus();
@@ -15891,6 +15892,14 @@ impl NativeShell {
     }
 
     pub fn queue_preferences(&mut self, preferences: RuntimePreferencesSnapshot) {
+        // Nothing to apply, so nothing to wake for. Without this the drag path
+        // notifies the controller on every window-move message, which drops
+        // its wait to zero and spins the tick at the 1 ms floor for as long as
+        // the drag lasts. `controller_tick` refuses the repaint independently;
+        // this only stops the wake.
+        if self.pending_preferences.back().unwrap_or(&self.preferences) == &preferences {
+            return;
+        }
         enqueue_pending_preference(&mut self.pending_preferences, preferences);
         self.controller_wake.notify();
     }
@@ -18607,9 +18616,19 @@ impl NativeShell {
         semantic_repaint |= self.retry_due_terminal_queries(now);
         if let Some(preferences) = self.pending_preferences.pop_back() {
             self.pending_preferences.clear();
+            // Only a preferences snapshot that CHANGED anything is a semantic
+            // repaint. Measured 2026-09-05: a window drag delivers one
+            // `WM_MOVE` per step, GPUI turns each into `bounds_changed`, and
+            // the bounds observer queues the system snapshot every time --
+            // identical every time, because moving a window changes neither
+            // the appearance, the scale factor nor the density. Applying it
+            // unconditionally made every one of those 200 of 200 moves rebuild
+            // the whole accessibility tree and ask for a second full repaint
+            // on top of the one GPUI had already scheduled.
+            let changed = preferences != self.preferences;
             self.preferences = preferences;
             self.terminal.set_preferences(preferences);
-            semantic_repaint = true;
+            semantic_repaint |= changed;
         }
 
         // Poll background connect/attach before draining projections so a late
@@ -19300,18 +19319,36 @@ impl NativeShell {
             ));
         });
         let bounds = cx.observe_window_bounds(window, |shell, window, _cx| {
-            shell.queue_preferences(RuntimePreferencesSnapshot::from_system(
-                window.appearance(),
-                window.scale_factor(),
-                shell.preferences.density(),
-            ));
-            shell.record_window_frame(window);
-            shell.capture_browser_parent_hwnd(window);
-            shell.pump_pending_browser_commands(window);
-            shell.reconcile_browser_dock_lifecycle(Some(window));
+            shell.on_window_bounds_changed(window);
         });
         self.appearance_subscription = Some(appearance);
         self.bounds_subscription = Some(bounds);
+    }
+
+    /// Everything the shell does when GPUI reports the window moved or
+    /// resized.
+    ///
+    /// Named rather than inline because this is the DRAG path: Windows sends
+    /// one `WM_MOVE` per step of a window drag -- hundreds a second -- and
+    /// GPUI turns every one of them into a `bounds_changed`, which already
+    /// costs a full `refresh()` before this runs at all. Anything in here that
+    /// is not free, or that ends up asking for another repaint, is multiplied
+    /// by the message rate rather than by the frame rate.
+    fn on_window_bounds_changed(&mut self, window: &Window) {
+        self.queue_preferences(RuntimePreferencesSnapshot::from_system(
+            window.appearance(),
+            window.scale_factor(),
+            self.preferences.density(),
+        ));
+        self.record_window_frame(window);
+        self.capture_browser_parent_hwnd(window);
+        self.pump_pending_browser_commands(window);
+        self.reconcile_browser_dock_lifecycle(Some(window));
+    }
+
+    #[cfg(test)]
+    pub(crate) fn on_window_bounds_changed_for_test(&mut self, window: &Window) {
+        self.on_window_bounds_changed(window);
     }
 
     /// Explicit acknowledged detach path used by UI action and ordinary close.
@@ -24912,6 +24949,7 @@ impl NativeShell {
             };
             return self.task_conversation_surface_for(owner, true, tokens, workspace_size, cx);
         };
+        let _section = crate::ui::frame_trace::section("workspace");
         // The panels read the board's own rows, so a panel and its row can
         // never say two different things about one task -- including the
         // ordinal chip, which is `row.open` rather than a second lookup.
@@ -25185,6 +25223,7 @@ impl NativeShell {
         pane_size: Size<Pixels>,
         cx: &mut Context<Self>,
     ) -> AnyElement {
+        let _section = crate::ui::frame_trace::section("panes");
         let task_key = pane.task_id.clone();
         let pane_id = pane.pane_id;
         let task_element_key = stable_host_task_element_key(&task_key, "pane");
@@ -25466,6 +25505,7 @@ impl NativeShell {
         pane: &TaskPaneViewModel<HostTaskKey>,
         row: &BoardRow,
     ) -> PanelChrome {
+        let _section = crate::ui::frame_trace::section("panel_chrome");
         let owner = pane.task_id.clone();
         let needs_you = self.panel_needs_you_for(&owner, row);
         let done = row.state == BoardState::Done;
@@ -26426,6 +26466,7 @@ impl NativeShell {
         idle_photo_size: Size<Pixels>,
         cx: &mut Context<Self>,
     ) -> AnyElement {
+        let _section = crate::ui::frame_trace::section("conversation");
         self.ensure_idle_conversation_photo(cx);
         let owner_task_id = owner.task_id;
         // F5: an open pane whose stream has painted nothing yet keeps asking
@@ -31292,6 +31333,7 @@ impl NativeShell {
 
     /// Merge presentation rows across installed hosts. Domain models stay separate.
     pub fn fleet_inbox_projection(&self) -> FleetInboxProjection {
+        let _section = crate::ui::frame_trace::section("fleet_projection");
         let mut parts = Vec::with_capacity(self.hosts.len());
         for (host_id, slot) in &self.hosts {
             let mut projection =
@@ -32381,6 +32423,7 @@ impl NativeShell {
     /// future minimised presentation would be one -- is still open, and keeps
     /// its tree position at the end of the order rather than dropping out.
     fn workspace_pane_ordinals(&self) -> HashMap<HostTaskKey, u8> {
+        let _section = crate::ui::frame_trace::section("pane_ordinals");
         let Some(workspace) = self.layout.task_workspace.as_ref() else {
             return HashMap::new();
         };
@@ -32437,6 +32480,7 @@ impl NativeShell {
     /// that this pass did not observe has left the projection, and forgetting
     /// it here is what stops the map growing for the life of the process.
     fn board_rows(&mut self, now_ms: i64) -> Vec<BoardRow> {
+        let _section = crate::ui::frame_trace::section("board_rows");
         let fleet = self.fleet_inbox_projection();
         // Open is every task with a panel, not just the focused one: with
         // three panels on screen the board marks three rows.
@@ -32588,6 +32632,7 @@ impl NativeShell {
     }
 
     pub fn board_model(&mut self, now_ms: i64) -> BoardModel {
+        let _section = crate::ui::frame_trace::section("board_model");
         let rows = self.board_rows(now_ms);
         build_board_model(rows, self.board_done_expanded)
     }
@@ -36717,6 +36762,7 @@ impl NativeShell {
         viewport: Size<Pixels>,
         cx: &Context<Self>,
     ) -> Option<AnyElement> {
+        let _section = crate::ui::frame_trace::section("overlays");
         if self.add_project.is_some() {
             return Some(self.render_add_project_overlay(tokens, viewport, cx));
         }
@@ -43685,6 +43731,7 @@ impl NativeShell {
         viewport: Size<Pixels>,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
+        let _element_section = crate::ui::frame_trace::section("element");
         let tokens = self.theme_tokens();
         // gpui-component owns a separate global palette. Keep it synchronized
         // with DevManager's semantic theme so Buttons, scrollbars, popovers,
@@ -44297,6 +44344,7 @@ impl NativeShell {
                     .into_any_element(),
             ),
         };
+        let _board_section = crate::ui::frame_trace::section("board_column");
         let board_element = {
             let board_shell = cx.entity().downgrade();
             let row_handlers = BoardRowHandlers {
@@ -44754,6 +44802,7 @@ impl NativeShell {
             };
             dock_tabs = dock_tabs.child(tab);
         }
+        drop(_board_section);
         let dock_panel = div()
             .id("native-shell-context-dock")
             .w_full()
@@ -44834,7 +44883,10 @@ impl NativeShell {
             })
             .into_any_element();
         let sidebar = Self::reference_sidebar(tokens, board_width, inbox_panel);
-        let top_bar = self.top_bar_element(tokens, &board, Some(cx.entity().downgrade()));
+        let top_bar = {
+            let _section = crate::ui::frame_trace::section("top_bar");
+            self.top_bar_element(tokens, &board, Some(cx.entity().downgrade()))
+        };
 
         let layout = self
             .layout
@@ -46635,6 +46687,8 @@ impl Render for NativeGitWindow {
 
 impl Render for NativeShell {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        crate::ui::frame_trace::begin_frame();
+        let _frame = crate::ui::frame_trace::section("render");
         // Completes the round trip of every reply applied since the last paint.
         // A frame with nothing waiting costs one atomic load and takes no lock.
         self.startup_trace.note_repaint();
@@ -46683,7 +46737,10 @@ impl Render for NativeShell {
         // authority. `window_bounds()` is the saved normal-placement rectangle,
         // which can describe a different monitor-sized surface during reveal.
         let viewport = window.bounds().size;
-        self.element_with_handlers(viewport, cx)
+        let element = self.element_with_handlers(viewport, cx);
+        drop(_frame);
+        crate::ui::frame_trace::end_frame();
+        element
     }
 }
 
@@ -56087,6 +56144,469 @@ pub(crate) mod tests {
             });
             cx.quit();
         });
+    }
+
+    /// Forty alternating user/assistant messages: the conversation shape a
+    /// pane actually paints, rather than the tool-call pairs the board's
+    /// activity probe uses.
+    fn probe_message_conversation_page(count: u64) -> crate::domain::snapshot::SemanticJournalPage {
+        use crate::domain::snapshot::{
+            SemanticJournalFact, SemanticJournalPage, SemanticJournalPayload,
+        };
+        use crate::domain::{EventId, PrivacyClass};
+
+        let facts = (0..count)
+            .map(|sequence| SemanticJournalFact {
+                id: EventId::new(),
+                sequence: sequence + 1,
+                occurred_at_ms: Some(sequence as i64),
+                provider: "claude_code".into(),
+                schema_version: 1,
+                kind: if sequence % 2 == 0 {
+                    "user_message".into()
+                } else {
+                    "assistant_text".into()
+                },
+                visibility: "task".into(),
+                privacy_class: PrivacyClass::LocalOnly,
+                redacted: false,
+                payload: if sequence % 2 == 0 {
+                    SemanticJournalPayload::UserMessage {
+                        text: format!("probe question {sequence} about the render path"),
+                    }
+                } else {
+                    SemanticJournalPayload::AssistantText {
+                        text: format!(
+                            "probe answer {sequence}: a paragraph long enough to wrap in a pane, \
+                             so the conversation surface does the work a real reply makes it do."
+                        ),
+                    }
+                },
+            })
+            .collect::<Vec<_>>();
+        SemanticJournalPage {
+            oldest_sequence: 1,
+            cursor_rolled_over: false,
+            after_sequence: 0,
+            through_sequence: count,
+            high_water: count,
+            encoded_bytes: count as u32,
+            next_sequence: None,
+            facts,
+        }
+    }
+
+    /// Percentile of an already-sorted sample, nearest-rank.
+    fn probe_percentile(sorted: &[f64], fraction: f64) -> f64 {
+        if sorted.is_empty() {
+            return 0.0;
+        }
+        let rank = ((sorted.len() as f64) * fraction).ceil() as usize;
+        sorted[rank.saturating_sub(1).min(sorted.len() - 1)]
+    }
+
+    /// Build the six-row, four-pane shell the frame probe and the
+    /// once-per-frame invariant both measure, and hand it to `action` with a
+    /// live window so `Render::render` can be called for real.
+    fn with_frame_probe_shell(
+        cx: &mut gpui::App,
+        action: impl FnOnce(&mut NativeShell, &mut gpui::Window, &mut gpui::Context<NativeShell>),
+    ) {
+        const TASKS: u8 = 6;
+        const PANES: usize = 4;
+        const MESSAGES: u64 = 40;
+
+        let workspace = tempfile::tempdir().expect("workspace tempdir");
+        let profile = isolated_dev_profile(workspace.path()).expect("isolated profile");
+        let (runtime, _shared) = TestRuntime::new(true, NativeHostActionResult::Queued);
+        let window = cx
+            .open_window(
+                WindowOptions {
+                    show: false,
+                    ..WindowOptions::default()
+                },
+                move |_window, cx| {
+                    cx.new(|cx| {
+                        NativeShell::new_with_host_runtime_port(
+                            profile,
+                            Box::new(runtime),
+                            crate::ui::tokens::RuntimePreferencesSnapshot::default(),
+                            cx,
+                        )
+                    })
+                },
+            )
+            .expect("open hidden frame-probe window");
+        let entity = window.entity(cx).expect("frame probe shell entity");
+        let any_window = window.into();
+        cx.update_window(any_window, |_root, window, cx| {
+            entity.update(cx, |shell, cx| {
+                shell.install_idle_conversation_photo_for_test();
+                let (model, task_ids) = open_tasks_client_model(TASKS);
+                let project_id = model.task(task_ids[0]).expect("task").task.project_id;
+                shell.install_project_for_test("DevManager", project_id);
+                shell
+                    .apply_client_model(Arc::new(model))
+                    .expect("apply model");
+                let keys: Vec<HostTaskKey> = task_ids
+                    .iter()
+                    .map(|task_id| shell.local_task_key(*task_id))
+                    .collect();
+                // One pane carries a real conversation; the rest are open and
+                // empty, which is the ordinary screen.
+                let page = probe_message_conversation_page(MESSAGES);
+                shell.task_surfaces.begin_conversation(keys[0].clone(), 1);
+                shell
+                    .task_surfaces
+                    .admit_conversation(keys[0].clone(), 1, &page)
+                    .expect("seed conversation");
+                shell
+                    .select_fleet_task_key(keys[0].clone(), FleetSelectMode::Replace)
+                    .expect("select the first task");
+                for key in keys.iter().take(PANES).skip(1) {
+                    shell
+                        .select_fleet_task_key(key.clone(), FleetSelectMode::Toggle)
+                        .expect("open pane");
+                }
+                shell
+                    .select_fleet_task_key(keys[0].clone(), FleetSelectMode::Replace)
+                    .expect("focus the conversation pane");
+                assert_eq!(
+                    shell
+                        .layout
+                        .task_workspace
+                        .as_ref()
+                        .map(|workspace| workspace.pane_count()),
+                    Some(PANES),
+                    "the probe measures a four-pane workspace"
+                );
+                assert_eq!(
+                    shell
+                        .board_model(1_000)
+                        .groups
+                        .iter()
+                        .map(|group| group.rows.len())
+                        .sum::<usize>(),
+                    TASKS as usize,
+                    "and a six-row board"
+                );
+                action(shell, window, cx);
+            });
+        })
+        .expect("drive the frame probe window");
+    }
+
+    /// One render must build the board rows ONCE.
+    ///
+    /// This is the invariant behind the whole per-frame cost, and it is not a
+    /// timing claim, so it runs in the ordinary suite. A helper called once
+    /// per pane instead of once per frame is invisible in any single sample --
+    /// it is cheap at one pane and quadratic at the four the user has -- so
+    /// the count, not the millisecond, is what is asserted.
+    #[test]
+    fn one_render_builds_the_board_rows_once() {
+        const TEST_NAME: &str = "ui::native_shell::tests::one_render_builds_the_board_rows_once";
+        if rerun_headless_shell_test_in_child(TEST_NAME) {
+            return;
+        }
+        let _guard = HEADLESS_SHELL_TEST_LOCK
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .expect("headless shell test lock");
+        let completed = std::rc::Rc::new(std::cell::Cell::new(false));
+        let completed_for_app = std::rc::Rc::clone(&completed);
+        gpui::Application::new().run(move |cx| {
+            crate::ui::init(cx);
+            crate::ui::frame_trace::set_enabled_for_test(true);
+            with_frame_probe_shell(cx, |shell, window, cx| {
+                // Two frames: the first can legitimately do first-sight work,
+                // and the steady state is what the drag actually pays.
+                let _ = gpui::Render::render(shell, window, cx);
+                let _ = gpui::Render::render(shell, window, cx);
+                let frame = crate::ui::frame_trace::last_frame().expect("a traced frame");
+                assert_eq!(
+                    frame.calls("render"),
+                    1,
+                    "one frame is one render: {frame:?}"
+                );
+                assert_eq!(
+                    frame.calls("board_rows"),
+                    1,
+                    "the board rows are built once per frame and shared: {frame:?}"
+                );
+                assert_eq!(
+                    frame.calls("fleet_projection"),
+                    1,
+                    "and so is the fleet projection they read: {frame:?}"
+                );
+                assert_eq!(
+                    frame.calls("pane_ordinals"),
+                    1,
+                    "and the workspace ordinal probe: {frame:?}"
+                );
+                assert_eq!(
+                    frame.calls("panes"),
+                    4,
+                    "every open pane still paints: {frame:?}"
+                );
+            });
+            crate::ui::frame_trace::set_enabled_for_test(false);
+            completed_for_app.set(true);
+            cx.quit();
+        });
+        assert!(completed.get(), "frame invariant scenario completed");
+    }
+
+    /// The frame cost itself: 200 renders of a six-row board with four open
+    /// panes, one carrying a forty-message conversation.
+    ///
+    /// `#[ignore]`d because the absolute numbers are machine- and
+    /// profile-specific. Run with
+    /// `cargo test --lib -- render_frame_cost_probe --ignored --nocapture`.
+    #[test]
+    #[ignore = "timing probe; run explicitly with --ignored --nocapture"]
+    fn render_frame_cost_probe_six_rows_four_panes() {
+        const TEST_NAME: &str =
+            "ui::native_shell::tests::render_frame_cost_probe_six_rows_four_panes";
+        if rerun_headless_shell_test_in_child(TEST_NAME) {
+            return;
+        }
+        let _guard = HEADLESS_SHELL_TEST_LOCK
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .expect("headless shell test lock");
+        const FRAMES: usize = 200;
+        gpui::Application::new().run(move |cx| {
+            crate::ui::init(cx);
+            crate::ui::frame_trace::set_enabled_for_test(true);
+            with_frame_probe_shell(cx, |shell, window, cx| {
+                let mut samples: Vec<crate::ui::frame_trace::FrameReport> =
+                    Vec::with_capacity(FRAMES);
+                // Warm the caches the steady state has: the first paint fills
+                // the board activity cache and the conversation surfaces, and
+                // a median that included it would report first-sight work as
+                // the per-frame cost.
+                for _ in 0..5 {
+                    let _ = gpui::Render::render(shell, window, cx);
+                }
+                for _ in 0..FRAMES {
+                    let _ = gpui::Render::render(shell, window, cx);
+                    samples
+                        .push(crate::ui::frame_trace::last_frame().expect("every frame is traced"));
+                }
+                let mut names: Vec<&'static str> = Vec::new();
+                for sample in &samples {
+                    for section in &sample.sections {
+                        if !names.contains(&section.name) {
+                            names.push(section.name);
+                        }
+                    }
+                }
+                println!(
+                    "render frame cost probe: 6 board rows, 4 open panes, 40-message \
+                     conversation, {FRAMES} frames (debug build)"
+                );
+                println!(
+                    "  {:<18} {:>9} {:>9} {:>7}",
+                    "section", "median ms", "p95 ms", "calls"
+                );
+                let mut totals: Vec<f64> =
+                    samples.iter().map(|sample| sample.total_millis()).collect();
+                totals.sort_by(f64::total_cmp);
+                println!(
+                    "  {:<18} {:>9.3} {:>9.3} {:>7}",
+                    "FRAME (total)",
+                    probe_percentile(&totals, 0.5),
+                    probe_percentile(&totals, 0.95),
+                    1
+                );
+                for name in names {
+                    let mut values: Vec<f64> =
+                        samples.iter().map(|sample| sample.millis(name)).collect();
+                    values.sort_by(f64::total_cmp);
+                    let calls: u32 = samples
+                        .iter()
+                        .map(|sample| sample.calls(name))
+                        .max()
+                        .unwrap_or(0);
+                    println!(
+                        "  {:<18} {:>9.3} {:>9.3} {:>7}",
+                        name,
+                        probe_percentile(&values, 0.5),
+                        probe_percentile(&values, 0.95),
+                        calls
+                    );
+                }
+            });
+            crate::ui::frame_trace::set_enabled_for_test(false);
+            cx.quit();
+        });
+    }
+
+    /// What ONE window-move message costs the shell, and how many repaints it
+    /// asks for.
+    ///
+    /// The drag complaint is not a claim about the frame rate the shell
+    /// chooses -- during a Windows modal move loop the shell does not choose
+    /// it. GPUI turns every `WM_MOVE` into `Window::bounds_changed`, which
+    /// calls `refresh()` (a full redraw) and then runs the bounds observers;
+    /// Windows sends one of those per step of the drag. So the number that
+    /// governs smoothness is the work per MOVE MESSAGE, and specifically
+    /// whether the observer asks for a repaint of its own on top of the one
+    /// GPUI already scheduled.
+    ///
+    /// `#[ignore]`d: absolute milliseconds are machine-specific. Run with
+    /// `cargo test --lib -- window_move_cost_probe --ignored --nocapture`.
+    #[test]
+    #[ignore = "timing probe; run explicitly with --ignored --nocapture"]
+    fn window_move_cost_probe_six_rows_four_panes() {
+        const TEST_NAME: &str =
+            "ui::native_shell::tests::window_move_cost_probe_six_rows_four_panes";
+        if rerun_headless_shell_test_in_child(TEST_NAME) {
+            return;
+        }
+        let _guard = HEADLESS_SHELL_TEST_LOCK
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .expect("headless shell test lock");
+        const MOVES: usize = 200;
+        gpui::Application::new().run(move |cx| {
+            crate::ui::init(cx);
+            crate::ui::frame_trace::set_enabled_for_test(true);
+            with_frame_probe_shell(cx, |shell, window, cx| {
+                // Settle: one paint and one tick, so the steady state is what
+                // the drag measures rather than first-sight work.
+                let _ = gpui::Render::render(shell, window, cx);
+                let _ = shell.controller_tick_for_test(MAX_PENDING_HOST_ACTIONS);
+                let _ = gpui::Render::render(shell, window, cx);
+
+                let mut observer_ms: Vec<f64> = Vec::with_capacity(MOVES);
+                let mut tick_ms: Vec<f64> = Vec::with_capacity(MOVES);
+                let mut repaints = 0_usize;
+                let before_a11y = shell.accessibility_tree_builds;
+                for _ in 0..MOVES {
+                    let started = std::time::Instant::now();
+                    shell.on_window_bounds_changed_for_test(window);
+                    observer_ms.push(started.elapsed().as_secs_f64() * 1_000.0);
+
+                    // The controller loop is woken by `queue_preferences`, so
+                    // the tick that follows a move is part of the move's cost.
+                    let started = std::time::Instant::now();
+                    let repaint = shell.controller_tick_for_test(MAX_PENDING_HOST_ACTIONS);
+                    tick_ms.push(started.elapsed().as_secs_f64() * 1_000.0);
+                    if repaint {
+                        repaints += 1;
+                    }
+                }
+                let a11y_rebuilds = shell.accessibility_tree_builds - before_a11y;
+                observer_ms.sort_by(f64::total_cmp);
+                tick_ms.sort_by(f64::total_cmp);
+
+                // And what a repaint the move asked for actually costs.
+                let mut render_ms: Vec<f64> = Vec::with_capacity(50);
+                for _ in 0..50 {
+                    let started = std::time::Instant::now();
+                    let _ = gpui::Render::render(shell, window, cx);
+                    render_ms.push(started.elapsed().as_secs_f64() * 1_000.0);
+                }
+                render_ms.sort_by(f64::total_cmp);
+
+                println!("window move cost probe: {MOVES} move messages (debug build)");
+                println!(
+                    "  bounds observer      median {:.3} ms  p95 {:.3} ms",
+                    probe_percentile(&observer_ms, 0.5),
+                    probe_percentile(&observer_ms, 0.95)
+                );
+                println!(
+                    "  controller tick      median {:.3} ms  p95 {:.3} ms",
+                    probe_percentile(&tick_ms, 0.5),
+                    probe_percentile(&tick_ms, 0.95)
+                );
+                println!(
+                    "  element build        median {:.3} ms  p95 {:.3} ms",
+                    probe_percentile(&render_ms, 0.5),
+                    probe_percentile(&render_ms, 0.95)
+                );
+                println!(
+                    "  repaints ASKED FOR by the tick: {repaints} of {MOVES} moves \
+                     (0 is what an unchanged window should cost)"
+                );
+                println!(
+                    "  accessibility trees rebuilt:    {a11y_rebuilds} \
+                     (one per move is the storm)"
+                );
+                let per_move = probe_percentile(&observer_ms, 0.5)
+                    + probe_percentile(&tick_ms, 0.5)
+                    + if repaints > 0 {
+                        probe_percentile(&render_ms, 0.5)
+                    } else {
+                        0.0
+                    };
+                println!("  charged per move message:       {per_move:.3} ms");
+            });
+            crate::ui::frame_trace::set_enabled_for_test(false);
+            cx.quit();
+        });
+    }
+
+    /// A window that MOVED but did not change what the shell shows must not
+    /// ask for a repaint, and must not rebuild the accessibility tree.
+    ///
+    /// This is the drag defect stated as an assertion. Windows delivers one
+    /// `WM_MOVE` per step of a drag and GPUI already schedules a redraw for
+    /// each; a shell that answers each of them with a second repaint plus a
+    /// full accessibility rebuild is doing three frames' work per frame, which
+    /// is why the release build is no smoother than the debug one.
+    #[test]
+    fn a_window_move_that_changed_nothing_asks_for_no_repaint() {
+        const TEST_NAME: &str =
+            "ui::native_shell::tests::a_window_move_that_changed_nothing_asks_for_no_repaint";
+        if rerun_headless_shell_test_in_child(TEST_NAME) {
+            return;
+        }
+        let _guard = HEADLESS_SHELL_TEST_LOCK
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .expect("headless shell test lock");
+        let completed = std::rc::Rc::new(std::cell::Cell::new(false));
+        let completed_for_app = std::rc::Rc::clone(&completed);
+        gpui::Application::new().run(move |cx| {
+            crate::ui::init(cx);
+            with_frame_probe_shell(cx, |shell, window, cx| {
+                // Settle everything the first paint and the first tick do.
+                let _ = gpui::Render::render(shell, window, cx);
+                for _ in 0..4 {
+                    let _ = shell.controller_tick_for_test(MAX_PENDING_HOST_ACTIONS);
+                }
+                // The FIRST move is a real change and must still repaint: the
+                // shell is constructed with the default preferences snapshot
+                // and only learns the window appearance and scale factor when
+                // the window first reports its bounds. What must cost nothing
+                // is every move after that.
+                shell.on_window_bounds_changed_for_test(window);
+                let _ = shell.controller_tick_for_test(MAX_PENDING_HOST_ACTIONS);
+                let before_trees = shell.accessibility_tree_builds;
+                let mut repaints = 0_usize;
+                for _ in 0..20 {
+                    shell.on_window_bounds_changed_for_test(window);
+                    if shell.controller_tick_for_test(MAX_PENDING_HOST_ACTIONS) {
+                        repaints += 1;
+                    }
+                }
+                assert_eq!(
+                    repaints, 0,
+                    "twenty moves that changed nothing asked for {repaints} repaints"
+                );
+                assert_eq!(
+                    shell.accessibility_tree_builds - before_trees,
+                    0,
+                    "and rebuilt the accessibility tree"
+                );
+            });
+            completed_for_app.set(true);
+            cx.quit();
+        });
+        assert!(completed.get(), "window move scenario completed");
     }
 
     /// The board replaces the project rail: tasks group by what they are
