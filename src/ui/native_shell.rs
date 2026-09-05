@@ -26294,9 +26294,21 @@ impl NativeShell {
     ) -> AnyElement {
         self.ensure_idle_conversation_photo(cx);
         let owner_task_id = owner.task_id;
-        let needs_hydration = self
-            .host_slot(&owner.host)
-            .is_some_and(|slot| slot.cockpit.timeline_for(owner_task_id).is_none());
+        // F5: an open pane whose stream has painted nothing yet keeps asking
+        // its surface for a page. The old test was "has no timeline at all",
+        // and every pane acquires an EMPTY one on its first paint -- the
+        // surface answers with an empty page until the host admits a real one
+        // -- so the question was never asked a second time and the pane sat
+        // blank until a background admission slot came round. The rule lives
+        // in `task_cockpit::shell` so the offer here and the acceptance in
+        // `hydrate_timeline_if_absent` cannot drift apart.
+        let needs_hydration = self.host_slot(&owner.host).is_some_and(|slot| {
+            crate::ui::task_cockpit::shell::timeline_should_offer_page(
+                slot.cockpit
+                    .timeline_for(owner_task_id)
+                    .map(|timeline| timeline.rows().len()),
+            )
+        });
         let page = needs_hydration
             .then(|| self.task_surfaces.conversation_page(owner.clone()))
             .flatten();
