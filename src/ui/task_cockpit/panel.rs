@@ -162,40 +162,55 @@ const ACTION_PADDING_Y: f32 = 2.0;
 /// Rule 3: radius 6 for buttons.
 const ACTION_RADIUS: f32 = 6.0;
 
-/// Render a small action affordance.  The action request stays on the typed
-/// projection for the owning shell to dispatch; this renderer intentionally
-/// does not invent a click handler or bypass the host action boundary.
+/// Rule 4's default button, as a shell the caller gives an id, a label and a
+/// click handler.
 ///
-/// Rule 4's default button: a 1 px `borders.default` outline with no fill, an
-/// 11 px `text.primary` label, 2x8 padding and radius 6. Hover fills with
-/// `surfaces.hover` rather than changing the label's colour, so a row of these
-/// stays quiet until the pointer is on one.
-pub fn render_panel_action(action: &PanelAction, target: &str, tokens: ThemeTokens) -> AnyElement {
-    let label = action.disabled_reason.map_or_else(
-        || action_label(action.action_id),
-        PanelDisabledReason::label,
-    );
-    let mut element = div()
-        .id(("task-cockpit-panel-action", action.element_key(target)))
+/// 1 px `borders.default` with no fill, an 11 px `text.primary` label, 2x8
+/// padding and radius 6; hover fills with `surfaces.hover` rather than
+/// changing the label's colour, so a row of these stays quiet until the
+/// pointer is on one. Disabled swaps the border for `borders.disabled` --
+/// never the enabled border, which is what makes a dead button look live.
+///
+/// `render_panel_action` paints a typed `PanelAction` with it. The services
+/// body's affordances are `ServicePanelAction`s rather than `PanelAction`s and
+/// would otherwise be a second, drifting idea of what a button looks like --
+/// which is exactly how the two ended up 1 px, one radius and one type size
+/// apart before this lane.
+pub fn panel_button_shell(tokens: ThemeTokens, enabled: bool) -> gpui::Div {
+    let button = div()
         .flex_none()
         .px(px(ACTION_PADDING_X))
         .py(px(ACTION_PADDING_Y))
         .rounded(px(ACTION_RADIUS))
         .border_1()
-        .text_size(px(ACTION_FONT_SIZE))
-        .child(label);
-    if action.is_enabled() {
-        element = element
+        .text_size(px(ACTION_FONT_SIZE));
+    if enabled {
+        button
             .cursor_pointer()
             .border_color(rgb(tokens.borders.default.to_u32()))
             .text_color(rgb(tokens.text.primary.to_u32()))
-            .hover(|style| style.bg(rgb(tokens.surfaces.hover.to_u32())));
+            .hover(|style| style.bg(rgb(tokens.surfaces.hover.to_u32())))
     } else {
-        element = element
+        button
             .border_color(rgb(tokens.borders.disabled.to_u32()))
-            .text_color(rgb(tokens.text.disabled.to_u32()));
+            .text_color(rgb(tokens.text.disabled.to_u32()))
     }
-    element.into_any_element()
+}
+
+/// Render a small action affordance.  The action request stays on the typed
+/// projection for the owning shell to dispatch; this renderer intentionally
+/// does not invent a click handler or bypass the host action boundary.
+///
+/// Rule 4's default button, from `panel_button_shell`.
+pub fn render_panel_action(action: &PanelAction, target: &str, tokens: ThemeTokens) -> AnyElement {
+    let label = action.disabled_reason.map_or_else(
+        || action_label(action.action_id),
+        PanelDisabledReason::label,
+    );
+    panel_button_shell(tokens, action.is_enabled())
+        .id(("task-cockpit-panel-action", action.element_key(target)))
+        .child(label)
+        .into_any_element()
 }
 
 /// Rule 2's group header: 10.5 px uppercase on `text.muted`, letter-spaced,
@@ -334,17 +349,22 @@ pub fn panel_change_counts(added: u32, removed: u32, tokens: ThemeTokens) -> Any
 /// group label above the rows, and the panel's name is not repeated at all --
 /// the chrome owns it. Controls sit on their own row under the label so a
 /// narrow panel wraps the buttons instead of the summary.
+///
+/// The controls arrive already rendered rather than as bare `PanelAction`s.
+/// The shell's buttons are owner-scoped: each one carries a click handler
+/// fenced on the owning task's revision and focus epoch, and re-rendering them
+/// here from the typed action would paint the same button and silently drop
+/// the handler -- a panel whose Refresh does nothing, which nothing in the
+/// type system would have caught. `render_panel_action` is still the painter
+/// on the other side of that handler.
 pub fn render_panel_frame(
     id: &'static str,
     summary: impl Into<String>,
-    actions: impl IntoIterator<Item = PanelAction>,
+    controls: impl IntoIterator<Item = AnyElement>,
     body: impl IntoElement,
     tokens: ThemeTokens,
 ) -> AnyElement {
-    let controls: Vec<AnyElement> = actions
-        .into_iter()
-        .map(|action| render_panel_action(&action, "panel", tokens))
-        .collect();
+    let controls: Vec<AnyElement> = controls.into_iter().collect();
     let summary = summary.into();
     div()
         .id(id)
