@@ -10,6 +10,10 @@
   Give it at least a 600-second command timeout. If its wrapper times out, track
   the exact Cargo process tree until it exits before rerunning; a wrapper timeout
   is not proof that Cargo or rustc stopped, and duplicate builds are forbidden.
+- A fresh worktree fails `cargo check` until `web/src/connect/wasm/` is copied
+  in from the main working copy: that directory is gitignored but its files are
+  inputs to `build.rs`'s bundle fingerprint, so a checkout holds 183 of the 188
+  files the hash needs. The error's suggested recovery command is not the fix.
 - Give every concurrently active Rust worktree its own `CARGO_TARGET_DIR`.
   Sharing one target directory serializes builds behind Cargo locks, obscures
   which worker owns compiler processes, and can turn a focused task into a false
