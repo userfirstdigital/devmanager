@@ -95,8 +95,8 @@ pub const TOP_BAR_HEIGHT: f32 = 34.0;
 /// `.dm-top { gap: 14px; padding: 0 12px }`.
 pub const TOP_BAR_GAP: f32 = 14.0;
 pub const TOP_BAR_PADDING_X: f32 = 12.0;
-/// `.dm-top .brand { color: #e6e6ea; font-weight: 600 }` sets a weight and a
-/// colour and no size, so the brand is the bar's own 11.5 px in semibold. It
+/// `.dm-top .brand` sets a weight and a colour and no size at all, so the
+/// brand is the bar's own 11.5 px in semibold. It
 /// reads as the product name by weight, not by being a size nothing else is.
 /// Kept equal to [`TOP_BAR_SCOPE_FONT_SIZE`] by the test beneath, so the two
 /// literals cannot drift apart.
