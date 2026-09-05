@@ -36,7 +36,13 @@ use crate::ui::tokens::{Color, ThemeTokens};
 pub const TITLE_ROW_HEIGHT: f32 = 30.0;
 /// `.tabs`: 6 px of top padding over an 11.5 px tab with 3/5 padding, sitting
 /// on its own 1 px bottom rule.
-pub const TAB_ROW_HEIGHT: f32 = 26.0;
+///
+/// Pinned at the spec's 28 rather than the 26 those paddings sum to: the tab is
+/// a POINTER target as well as a label, and 26 px left the selected pill
+/// looking squeezed against the rule under it at the width a panel gets as one
+/// of eight (fix wave 1, F11). The two extra pixels go under the tab, between
+/// its bottom padding and the rule.
+pub const TAB_ROW_HEIGHT: f32 = 28.0;
 /// A minimised panel is the title row alone, two pixels tighter because it has
 /// no tab row beneath it to align to.
 pub const MINIMISED_HEIGHT: f32 = 28.0;
@@ -49,10 +55,19 @@ const ROW_PADDING_X: f32 = 10.0;
 const ROW_PADDING_LEFT: f32 = ROW_PADDING_X + PANEL_STRIPE_WIDTH;
 /// `.hdr { gap: 8px }`.
 const TITLE_ROW_GAP: f32 = 8.0;
-/// `.hdr .title { font-size: 13px; font-weight: 600 }`.
-const TITLE_FONT_SIZE: f32 = 13.0;
-/// `.hdr .inline { font-size: 11.5px }` -- the status folded into the title row.
-const INLINE_STATUS_FONT_SIZE: f32 = 11.5;
+/// `.hdr .title { font-weight: 600 }`, at the redesign's title size.
+///
+/// The mockup CSS says 13 px, and 13 px is what shipped -- against the PNGs
+/// the row then read one to two pixels large everywhere, because the mockup's
+/// browser and GPUI do not measure "13 px" the same way. The spec's type scale
+/// is the authority over the CSS literal (design language rule 2: 12 for
+/// titles, 13 for the ONE heading a surface gets, and the panel title is not
+/// that heading), so the constant is pinned at 12 (fix wave 1, F12).
+const TITLE_FONT_SIZE: f32 = 12.0;
+/// `.hdr .inline` -- the status folded into the title row, at the scale's
+/// "secondary rows" size. 11.5 is the BODY size in rule 2; the status is a
+/// secondary row beside a 12 px title, and at 11.5 it read as a second title.
+const INLINE_STATUS_FONT_SIZE: f32 = 11.0;
 /// `.st .s { gap: 5px }`.
 const STATUS_GAP: f32 = 5.0;
 /// The title floor at [`TIGHT_WIDTH`], where the row has nothing to spare.
@@ -82,12 +97,15 @@ const TITLE_GROWTH: f32 = 0.4;
 /// 12 px on a 470 px panel is an anonymous panel:
 ///
 /// ```text
-///   width   title_floor   status text cap   controls + title + status floor
-///     280            12                73     195 +  12 + 73 = 280  (exactly)
-///     300            20                85     195 +  20 + 73 = 288
-///     370            48               127     195 +  48 + 73 = 316
-///     470            88               187     195 +  88 + 73 = 356
+///   width   title_floor   status_budget   controls + title floor + budget
+///     280            12              73    195 +  12 +  73 = 280
+///     300            20              85    195 +  20 +  85 = 300
+///     370            48             127    195 +  48 + 127 = 370
+///     470            88             187    195 +  88 + 187 = 470
 /// ```
+///
+/// The row is exactly paid for at every width, which is what makes the title's
+/// ellipsis land somewhere rather than being clipped flush against the status.
 fn title_floor(width_px: f32) -> f32 {
     TITLE_MIN_WIDTH + TITLE_GROWTH * (width_px - TIGHT_WIDTH).max(0.0)
 }
@@ -171,16 +189,33 @@ const CONTROLS_RESERVE: f32 = ROW_PADDING_LEFT
     + MENU_GLYPH_WIDTH
     + 6.0 * TITLE_ROW_GAP;
 
-/// The ceiling on the status *text*: what is left once the fixed controls and
-/// the title's floor at this width have been paid.
+/// Every pixel the status GROUP may occupy: what is left once the fixed
+/// controls and the title's floor at this width have been paid, and never less
+/// than the parts the status may not drop.
 ///
-/// `min_w(0)` plus `flex_shrink` on the status container is what keeps the
-/// controls on screen; this is what keeps the *title* on screen, by stopping a
-/// long doing-now line or a 60-character blocked cause from claiming room the
-/// title needs. Same shape as the board's `row_content_width`: a rule about the
-/// content, not about the panel.
-fn status_text_max_width(width_px: f32) -> f32 {
-    (width_px - CONTROLS_RESERVE - title_floor(width_px)).max(0.0)
+/// The group is `flex_none` behind this as a `max_w`, which is what makes "the
+/// title never runs under the status" a fact of the arithmetic rather than a
+/// hope about how the flex line resolves: by construction
+/// `CONTROLS_RESERVE + title_floor(w) + status_budget(w) == w` at every width
+/// down to [`TIGHT_WIDTH`], so the row is exactly paid for and the title's
+/// ellipsis has somewhere to land.
+fn status_budget(width_px: f32, blocked: bool) -> f32 {
+    (width_px - CONTROLS_RESERVE - title_floor(width_px)).max(status_floor(blocked))
+}
+
+/// The ceiling on the status *text*: the group's budget less the parts of the
+/// group that are present at every width.
+///
+/// This is what keeps the *title* on screen, by stopping a long doing-now line
+/// or a 60-character blocked cause from claiming room the title needs. Same
+/// shape as the board's `row_content_width`: a rule about the content, not
+/// about the panel.
+///
+/// It used to be the budget itself, which under-counted the icon, the age and
+/// a blocked panel's Retry -- 187 px of text plus a 40 px floor on a 470 px
+/// panel is 227 px for a group that only has 187 to spend.
+fn status_text_max_width(width_px: f32, blocked: bool) -> f32 {
+    (status_budget(width_px, blocked) - status_floor(blocked)).max(0.0)
 }
 
 /// One status glyph at [`INLINE_STATUS_FONT_SIZE`]. The widest of the five is
@@ -202,6 +237,10 @@ const STATUS_RETRY_WIDTH: f32 = 28.0;
 /// roughly 320 px silently lost the Retry affordance that the comment three
 /// lines above the Retry element promises it keeps at every width. The floor
 /// is the opposite instruction and the one that actually holds.
+/// The icon is counted even for the states that have none (`PanelStatus::icon`
+/// is `None` for idle): a floor that over-reserves by ten pixels only ever
+/// leaves the status a little narrower than it could be, while one that
+/// under-reserves is the bug this function exists for.
 fn status_floor(blocked: bool) -> f32 {
     let base = STATUS_ICON_WIDTH + STATUS_GAP + STATUS_AGE_MAX_WIDTH;
     if blocked {
@@ -223,6 +262,15 @@ pub struct PanelHandlers {
     pub on_menu: Rc<dyn Fn(&HostTaskKey, Point<Pixels>, &mut Window, &mut App)>,
     pub on_retry: Rc<dyn Fn(&HostTaskKey, &mut Window, &mut App)>,
     pub on_key: Rc<dyn Fn(&HostTaskKey, &KeyDownEvent, &mut Window, &mut App)>,
+    /// The diagnostic the terminal body used to print across its own top --
+    /// session title, backend, status, font size -- for the Terminal tab's
+    /// tooltip (fix wave 1, F7).
+    ///
+    /// Asked lazily, and that is the point: answering it means projecting a
+    /// terminal screen, which is far too expensive to do for every panel on
+    /// every frame just to have a string ready in case a pointer stops on a
+    /// tab. `None` when the panel has no terminal attached yet.
+    pub on_terminal_tooltip: Rc<dyn Fn(&HostTaskKey, &mut App) -> Option<String>>,
 }
 
 /// Hash host + task into the panel's element identity.
@@ -305,26 +353,44 @@ fn inline_status_element(
     let blocked = matches!(chrome.needs_you, Some(NeedsYou::Blocked { .. }));
     let mut row = div()
         .flex()
-        .flex_shrink()
-        // A floor, and deliberately no ceiling: the container may shrink to
-        // this and no further, so the icon, the age and Retry survive every
-        // width while the text child above is the only part that yields.
+        // `flex_none` inside a budget, not `flex_shrink`: a shrinking group
+        // still resolves against its CONTENT first, so a long doing-now line
+        // took the width and left the title clipped hard against it with no
+        // gap -- which is what a clipped path title running into "Idle" was in
+        // the capture. Bounded above by `status_budget` and below by
+        // `status_floor`, the group can neither eat the title's floor nor be
+        // squeezed out of its own icon, age and Retry.
+        .flex_none()
         .min_w(px(status_floor(blocked)))
+        .max_w(px(status_budget(width_px, blocked)))
+        // The plan strip is `flex_none` and as wide as the plan is long, so the
+        // group still clips rather than pushing when a plan outgrows the panel.
         .overflow_hidden()
         .items_center()
         .gap(px(STATUS_GAP))
         .text_size(px(INLINE_STATUS_FONT_SIZE))
-        .text_color(tone.to_gpui())
-        .child(div().flex_none().child(chrome.status.icon));
+        .text_color(tone.to_gpui());
+
+    // Idle has no verb and therefore no glyph: its old middle dot was the same
+    // character as the separator below, so the row opened on a separator.
+    if let Some(icon) = chrome.status.icon {
+        row = row.child(div().flex_none().child(icon));
+    }
 
     if layout.show_text {
         row = row.child(
             div()
                 .flex_shrink()
                 .min_w(px(0.0))
-                .max_w(px(status_text_max_width(width_px)))
-                .truncate()
-                .child(chrome.status.text.clone()),
+                .max_w(px(status_text_max_width(width_px, blocked)))
+                .overflow_hidden()
+                // The ellipsis needs a DEFINITE width to be measured against:
+                // GPUI truncates in the text element's measure pass, which only
+                // sees one when `known_dimensions.width` is set. `w_full` on
+                // the inner child resolves against the bounded box above, which
+                // is why the same two-div shape is used for every truncating
+                // label in this app (`task_cockpit::panel::panel_list_row`).
+                .child(div().w_full().truncate().child(chrome.status.text.clone())),
         );
     }
 
@@ -439,14 +505,21 @@ fn title_row_element(
                 // text yields first, and a title squeezed to nothing leaves an
                 // anonymous panel at any width.
                 .min_w(px(title_floor(width_px)))
-                .truncate()
+                .overflow_hidden()
                 .text_size(px(TITLE_FONT_SIZE))
                 .font_weight(FontWeight::SEMIBOLD)
                 .text_color(title_colour.to_gpui())
                 .tooltip(move |window, app| {
                     gpui_component::tooltip::Tooltip::new(tooltip_text.clone()).build(window, app)
                 })
-                .child(chrome.title.clone()),
+                // `truncate()` on the flex item itself gave a HARD clip, not an
+                // ellipsis: a `flex-basis: 0` item is measured with unbounded
+                // available space, so the text element never learns the width
+                // it has to fit and lays out at its full length inside a box
+                // that is `overflow_hidden`. `w_full` on an inner child
+                // resolves against the item's settled width, which is the one
+                // number the measure pass will accept.
+                .child(div().w_full().truncate().child(chrome.title.clone())),
         );
 
     // The crumb only earns its width when the panel is zoomed; at one-of-eight
@@ -567,6 +640,8 @@ fn tab_row_element(
         let active = view == chrome.view;
         let select_key = chrome.key.clone();
         let on_select = handlers.on_select_view.clone();
+        let tooltip_key = chrome.key.clone();
+        let on_terminal_tooltip = handlers.on_terminal_tooltip.clone();
         row = row.child(
             div()
                 .id((view.label(), element_key))
@@ -582,9 +657,23 @@ fn tab_row_element(
                     tab.bg(tokens.surfaces.selection.to_gpui())
                         .text_color(tokens.text.primary.to_gpui())
                 })
+                // The unselected tabs are `text.secondary`, one step above the
+                // muted grey they used to be: at 11.5 px on `surfaces.raised`
+                // the muted token read as disabled rather than as "another
+                // view you can go to", which is what 02's tab row shows.
                 .when(!active, |tab| {
-                    tab.text_color(tokens.text.muted.to_gpui())
+                    tab.text_color(tokens.text.secondary.to_gpui())
                         .hover(|style| style.bg(tokens.surfaces.hover.to_gpui()))
+                })
+                // The terminal body's old debug strip lives here now: one hover
+                // on the tab that owns those facts, instead of a full-width
+                // developer line across every terminal (F7).
+                .when(view == PaneView::Terminal, |tab| {
+                    tab.tooltip(move |window, app| {
+                        let text = (on_terminal_tooltip)(&tooltip_key, app)
+                            .unwrap_or_else(|| "No terminal attached yet.".to_string());
+                        gpui_component::tooltip::Tooltip::new(text).build(window, app)
+                    })
                 })
                 .on_mouse_down(
                     MouseButton::Left,
@@ -814,6 +903,7 @@ mod tests {
             on_menu: Rc::new(|_, _, _, _| {}),
             on_retry: Rc::new(|_, _, _| {}),
             on_key: Rc::new(|_, _, _, _| {}),
+            on_terminal_tooltip: Rc::new(|_, _| None),
         }
     }
 
@@ -1039,7 +1129,7 @@ mod tests {
     #[test]
     fn the_chrome_rows_keep_the_mockups_heights() {
         assert_eq!(TITLE_ROW_HEIGHT, 30.0);
-        assert_eq!(TAB_ROW_HEIGHT, 26.0);
+        assert_eq!(TAB_ROW_HEIGHT, 28.0);
         assert_eq!(MINIMISED_HEIGHT, 28.0);
         assert!(MINIMISED_HEIGHT < TITLE_ROW_HEIGHT + TAB_ROW_HEIGHT);
         // The stripe is the board's, on the same edge and at the same width,
@@ -1048,16 +1138,20 @@ mod tests {
         assert!(ROW_PADDING_LEFT > PANEL_STRIPE_WIDTH);
     }
 
-    /// The status is the only part of the title row allowed to lose width, so
-    /// at every width a panel can be given the fixed controls plus the title's
-    /// floor still fit inside the panel. Pure arithmetic over the constants: no
-    /// window, so a layout pass cannot quietly satisfy it.
+    /// The title row is exactly paid for at every width: the fixed controls,
+    /// the title's floor and the status group's budget sum to the panel, so a
+    /// long doing-now line cannot claim room the title needs and the title's
+    /// ellipsis always has somewhere to land. Pure arithmetic over the
+    /// constants: no window, so a layout pass cannot quietly satisfy it.
     ///
-    /// The regression it exists for: with the status `flex_none` behind a fixed
-    /// 170 px cap, a long doing-now string on a 260-370 px panel pushed Done
-    /// and the ⋯ menu off the right edge, silently and without panicking.
+    /// The regression it exists for, twice over: with the status `flex_none`
+    /// behind a fixed 170 px cap, a long doing-now string on a 260-370 px panel
+    /// pushed Done and the menu off the right edge; with the status shrinking
+    /// behind a cap that counted only the TEXT, the group could still ask for
+    /// its floor on top of that cap -- 227 px of demand on a 470 px panel that
+    /// had budgeted 187 -- and the title was clipped flush against it.
     #[test]
-    fn the_status_text_yields_before_the_controls_the_title_and_the_status_floor() {
+    fn the_status_group_fits_inside_what_the_controls_and_the_title_leave_it() {
         assert_eq!(
             CONTROLS_RESERVE, 195.0,
             "the documented budget and the summed constants disagree"
@@ -1073,7 +1167,7 @@ mod tests {
         // anonymous at a width that could afford to name it. These four are the
         // doc comment's table: if it and the formula ever disagree, this is
         // where it shows.
-        for (width, expected_floor, expected_cap) in [
+        for (width, expected_floor, expected_budget) in [
             (280.0_f32, 12.0_f32, 73.0_f32),
             (300.0, 20.0, 85.0),
             (370.0, 48.0, 127.0),
@@ -1084,34 +1178,340 @@ mod tests {
                 expected_floor,
                 "the title floor at {width} px is not the documented one"
             );
-            assert_eq!(
-                status_text_max_width(width),
-                expected_cap,
-                "the status text cap at {width} px is not the documented one"
-            );
-
-            // The binding case: a blocked panel, which owes the widest status
-            // floor. Rearranged, this is "the width left after the controls and
-            // the title floor is at least what the status can never give up".
-            assert!(
-                CONTROLS_RESERVE + title_floor(width) + status_floor(true) <= width,
-                "at {width} px a blocked panel cannot pay for its controls, its title floor and its status floor at once"
-            );
-            assert!(
-                status_text_max_width(width) >= status_floor(true),
-                "at {width} px the status text cap sits below the parts the status may never drop"
-            );
+            for blocked in [false, true] {
+                assert_eq!(
+                    status_budget(width, blocked),
+                    expected_budget,
+                    "the status budget at {width} px is not the documented one"
+                );
+                // The whole point: the row is exactly paid for. Nothing is
+                // spare and nothing is over-committed, in either state.
+                assert_eq!(
+                    CONTROLS_RESERVE + title_floor(width) + status_budget(width, blocked),
+                    width,
+                    "at {width} px the title row does not add up"
+                );
+                // The parts the status may never drop always fit inside the
+                // budget, so the text is the only thing that yields.
+                assert!(
+                    status_budget(width, blocked) >= status_floor(blocked),
+                    "at {width} px the status budget sits below its own floor"
+                );
+                assert_eq!(
+                    status_text_max_width(width, blocked),
+                    status_budget(width, blocked) - status_floor(blocked),
+                    "the text cap is not the budget less the floor"
+                );
+            }
         }
 
-        // At the tight width the three add up exactly: nothing is spare, and
-        // nothing is over-committed.
-        assert_eq!(
-            CONTROLS_RESERVE + title_floor(TIGHT_WIDTH) + status_floor(true),
-            TIGHT_WIDTH
-        );
-        // Below the tight width the floor stops shrinking and the cap floors at
-        // zero rather than handing a negative width to the layout.
+        // A blocked panel at the tight width has spent everything on its icon,
+        // its age and its Retry: the cause is the part that goes.
+        assert_eq!(status_text_max_width(TIGHT_WIDTH, true), 0.0);
+        assert_eq!(status_text_max_width(TIGHT_WIDTH, false), 33.0);
+        // Below the tight width the floor stops shrinking and the budget floors
+        // at what the status may never give up rather than going negative.
         assert_eq!(title_floor(100.0), TITLE_MIN_WIDTH);
-        assert_eq!(status_text_max_width(100.0), 0.0);
+        assert_eq!(status_budget(100.0, true), status_floor(true));
+        assert_eq!(status_text_max_width(100.0, true), 0.0);
+    }
+
+    /// F8: idle has no verb, so it has no glyph -- otherwise the status opens
+    /// on the same middle dot it uses to separate its own parts and reads as a
+    /// separator with nothing before it ("· Idle · 4d" rather than "Idle · 4d").
+    #[test]
+    fn only_a_state_with_a_verb_carries_a_glyph() {
+        let idle = panel_chrome(
+            &row(BoardState::Idle),
+            PaneView::Conversation,
+            false,
+            false,
+            false,
+            None,
+            false,
+            String::new(),
+        );
+        assert_eq!(idle.status.icon, None);
+
+        let cases: [(BoardState, Option<NeedsYou>); 3] = [
+            (BoardState::Working, None),
+            (
+                BoardState::Question,
+                Some(NeedsYou::Question { choices: 1 }),
+            ),
+            (
+                BoardState::Blocked,
+                Some(NeedsYou::Blocked {
+                    cause: "x".to_string(),
+                }),
+            ),
+        ];
+        for (state, needs_you) in cases {
+            let chrome = panel_chrome(
+                &row(state),
+                PaneView::Conversation,
+                false,
+                false,
+                false,
+                needs_you,
+                false,
+                String::new(),
+            );
+            assert!(
+                chrome.status.icon.is_some(),
+                "{state:?} names a verb and must carry its glyph"
+            );
+        }
+    }
+
+    /// Both truncating labels in the title row hang the text off an inner
+    /// `w_full` child. GPUI measures an ellipsis against a DEFINITE width, and
+    /// a `flex-basis: 0` item is measured with unbounded available space, so
+    /// `truncate()` applied to the flex item itself clips hard instead --
+    /// which is what put "C:/Code/userfir" flush against the status in the
+    /// capture. A source scan because the failure is a layout one: no pure
+    /// assertion over the constants can see it.
+    #[test]
+    fn the_title_and_the_status_text_truncate_against_a_definite_width() {
+        let source = include_str!("render.rs");
+        let painter = source
+            .split("#[cfg(test)]")
+            .next()
+            .expect("the painter is everything above its tests");
+        // Whitespace-stripped so `cargo fmt` breaking the builder chain over
+        // three lines cannot quietly turn either assertion vacuous.
+        let compact: String = painter.chars().filter(|c| !c.is_whitespace()).collect();
+        assert_eq!(
+            compact.matches(".truncate()").count(),
+            2,
+            "the title row has exactly two truncating labels: the title and the status text"
+        );
+        assert_eq!(
+            compact.matches(".w_full().truncate()").count(),
+            2,
+            "every truncating label must resolve its width through an inner w_full child"
+        );
+    }
+
+    /// F9: the mark before the title is the board's own 11 px monochrome
+    /// provider mark, painted in `text.muted` and sitting BEFORE the title, per
+    /// mockup 05 (chosen option 1, "grey mark, second line" -- and the same
+    /// mark on the panel) and design language rule 10, which forbids a brand
+    /// tint outright.
+    ///
+    /// A source scan because there is nothing else to read: the size is a
+    /// constant the board owns and the colour is a token, so the only thing
+    /// that can go wrong is the painter passing different ones. Ordering is
+    /// checked by position, which is what "before the title" means.
+    #[test]
+    fn the_provider_mark_is_the_boards_eleven_pixel_grey_one_before_the_title() {
+        // Shared with the board row's meta line rather than restated, so the
+        // row and the panel cannot draw two different marks.
+        assert_eq!(PROVIDER_MARK_SIZE, 11.0);
+
+        let source = include_str!("render.rs");
+        let painter = source
+            .split("#[cfg(test)]")
+            .next()
+            .expect("the painter is everything above its tests");
+        let title_row = painter
+            .split("fn title_row_element(")
+            .nth(1)
+            .expect("the title row painter");
+
+        let mark = title_row
+            .find("crate::icons::app_icon(")
+            .expect("the title row paints the provider mark through app_icon");
+        let title = title_row
+            .find("devmanager-panel-title")
+            .expect("the title row paints the title");
+        assert!(
+            mark < title,
+            "the provider mark must be painted before the title"
+        );
+
+        let call = &title_row[mark..title];
+        assert!(
+            call.contains("chrome.provider.glyph_path()"),
+            "the mark is the panel's own provider glyph"
+        );
+        assert!(
+            call.contains("PROVIDER_MARK_SIZE"),
+            "the mark is sized by the board's shared constant, not by a literal"
+        );
+        assert!(
+            call.contains("tokens.text.muted.to_u32()"),
+            "the mark is grey: design language rule 10 allows no brand tint"
+        );
+    }
+
+    /// F11: the tab row per mockup 02 -- 28 px, 11.5 px labels, the selected
+    /// tab a pill on `surfaces.selection` in `text.primary` and every other
+    /// tab in `text.secondary`. The five tabs are all that fit at the width a
+    /// panel gets as one of eight, so there is no "More" affordance to build:
+    /// `PaneView::TABS` IS the five, and the three views behind it reach the
+    /// panel through the menu.
+    #[test]
+    fn the_tab_row_is_the_mockups_and_five_tabs_are_all_of_them() {
+        assert_eq!(TAB_ROW_HEIGHT, 28.0);
+        assert_eq!(TAB_FONT_SIZE, 11.5);
+        assert_eq!(
+            PaneView::TABS.len(),
+            5,
+            "more than five tabs and the row would owe a More menu"
+        );
+        assert!(
+            TABS_PADDING_TOP + TAB_PADDING_TOP + TAB_FONT_SIZE + TAB_PADDING_BOTTOM
+                <= TAB_ROW_HEIGHT,
+            "the tab and its paddings must fit inside the row"
+        );
+
+        let source = include_str!("render.rs");
+        let painter = source
+            .split("#[cfg(test)]")
+            .next()
+            .expect("the painter is everything above its tests");
+        let tabs = painter
+            .split("fn tab_row_element(")
+            .nth(1)
+            .expect("the tab row painter");
+        let tabs = tabs
+            .split("\n/// ")
+            .next()
+            .expect("everything up to the next item's doc comment");
+        assert!(
+            tabs.contains("tokens.surfaces.selection.to_gpui()")
+                && tabs.contains("tokens.text.primary.to_gpui()"),
+            "the selected tab is a pill on surfaces.selection in text.primary"
+        );
+        assert!(
+            tabs.contains("tokens.text.secondary.to_gpui()"),
+            "the unselected tabs are text.secondary"
+        );
+        assert!(
+            !tabs.contains("tokens.text.muted.to_gpui()"),
+            "no tab is painted in the muted grey, which reads as disabled"
+        );
+    }
+
+    /// F12: the redesign's type scale, pinned at the density the shell is
+    /// actually running, and shown not to move with it.
+    ///
+    /// Where the density comes from: `NativeShell::theme_tokens` builds its
+    /// tokens from `self.preferences`, and the window is opened with
+    /// `RuntimePreferencesSnapshot::from_system(appearance, scale_factor,
+    /// RuntimePreferencesSnapshot::default().density())` -- so the shipped
+    /// default is `Density::Comfortable` with the display's own `Scale`, and
+    /// only the board's density toggle ever changes it.
+    ///
+    /// Whether it reaches these numbers: it does not. `density_metrics` gives
+    /// Comfortable a 12 px caption and a 14 px body against Compact's 11 and
+    /// 13, but this painter never reads `tokens.density.typography` -- every
+    /// size here is a literal measured off the mockup. So "the redesign
+    /// numbers ARE the comfortable numbers" holds by the painter ignoring the
+    /// density, and the scan below is what keeps it true.
+    #[test]
+    fn the_chrome_type_scale_is_the_specs_and_no_density_moves_it() {
+        assert_eq!(TITLE_FONT_SIZE, 12.0, "spec: panel title 12 semibold");
+        assert_eq!(INLINE_STATUS_FONT_SIZE, 11.0, "spec: status 11");
+        assert_eq!(TAB_FONT_SIZE, 11.5, "spec: tabs 11.5");
+        // Nothing in the chrome is larger than the 12 px title: rule 2 keeps 13
+        // for the one heading a surface gets, and a panel's heading is its
+        // title. The two exceptions are glyph boxes, not text.
+        assert!(ACTION_FONT_SIZE <= TAB_FONT_SIZE);
+        assert!(INLINE_STATUS_FONT_SIZE < TITLE_FONT_SIZE);
+
+        // The four sizes the shell can hand the painter, at both densities.
+        // The metrics differ; the chrome does not.
+        let comfortable = crate::ui::tokens::dark(Density::Comfortable, Scale::Scale100);
+        let compact = crate::ui::tokens::dark(Density::Compact, Scale::Scale100);
+        assert_eq!(comfortable.density.density, Density::Comfortable);
+        assert_ne!(
+            comfortable.density.typography.body, compact.density.typography.body,
+            "the two densities must really differ, or this test proves nothing"
+        );
+
+        let source = include_str!("render.rs");
+        let painter = source
+            .split("#[cfg(test)]")
+            .next()
+            .expect("the painter is everything above its tests");
+        assert!(
+            !painter.contains("density.typography"),
+            "the panel chrome must not take its type scale from the density metrics"
+        );
+        // Every text size in the painter comes from a named constant, so a
+        // literal cannot creep back in beside them.
+        assert!(
+            !painter.contains(".text_size(px(1"),
+            "text sizes belong in the constants above, not inline"
+        );
+    }
+
+    /// F7: the terminal body's debug strip is a tooltip on the Terminal tab,
+    /// and on no other tab -- the facts are about the terminal, and four
+    /// developer facts hanging off "Files" would be noise.
+    ///
+    /// A source scan: the tooltip's text is produced by a shell closure that
+    /// projects a live terminal, so there is nothing a headless test can read
+    /// out of the element tree. What CAN be checked is that the painter asks
+    /// for it, asks only under `PaneView::Terminal`, and has a sentence for
+    /// the panel that has no terminal yet.
+    #[test]
+    fn the_terminal_tab_carries_the_bodys_old_debug_strip() {
+        let source = include_str!("render.rs");
+        let painter = source
+            .split("#[cfg(test)]")
+            .next()
+            .expect("the painter is everything above its tests");
+        let tabs = painter
+            .split("fn tab_row_element(")
+            .nth(1)
+            .expect("the tab row painter");
+        let tabs = tabs
+            .split("\n/// ")
+            .next()
+            .expect("everything up to the next item's doc comment");
+        assert!(
+            tabs.contains("on_terminal_tooltip"),
+            "the tab row must ask the shell for the terminal diagnostic"
+        );
+        assert!(
+            tabs.contains("view == PaneView::Terminal"),
+            "only the Terminal tab carries it"
+        );
+        assert!(
+            tabs.contains("No terminal attached yet."),
+            "a panel with no terminal yet still owes the hover a sentence"
+        );
+
+        // And the body it came from no longer paints it. The four facts are
+        // composed in exactly one place, which is the function the tooltip
+        // reaches; if a second copy ever appears in the surface painter this
+        // goes red.
+        let terminal = include_str!("../../terminal/view.rs");
+        let surface = terminal
+            .split("fn render_terminal_surface_with_palette(")
+            .nth(1)
+            .expect("the terminal surface painter")
+            .split("\nfn ")
+            .next()
+            .expect("everything up to the next item");
+        assert!(
+            !surface.contains("font {}"),
+            "the font size belongs in the tooltip, not across the top of the body"
+        );
+        assert!(
+            !surface.contains("surface_header_detail("),
+            "the backend line belongs in the tooltip, not across the top of the body"
+        );
+        assert!(
+            !surface.contains("session_status_label("),
+            "the status word belongs in the tooltip, not across the top of the body"
+        );
+        assert!(
+            terminal.contains("pub fn terminal_surface_diagnostic("),
+            "the four facts must still exist somewhere, or F7 deleted them rather than moving them"
+        );
     }
 }

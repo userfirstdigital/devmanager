@@ -16,7 +16,17 @@ pub const BOARD_ROW_HEIGHT_COMPACT: f32 = 42.0;
 /// Done rows are one line: title and age only (spec 4.1).
 pub const BOARD_DONE_ROW_HEIGHT: f32 = 28.0;
 pub const BOARD_ROW_GAP: f32 = 3.0;
-pub const BOARD_COLUMN_WIDTH: f32 = 236.0;
+/// The board column a fresh profile opens at, and the width the row's
+/// breakpoints are reasoned about at. Still resizable: it is only the default
+/// `inbox_width`, clamped to
+/// [`crate::ui::workspace_layout::INBOX_MIN`]..`INBOX_MAX` (220..560).
+///
+/// 236 was `01-composition-A.html`'s column and the number its option card
+/// costed. 05 -- the chosen provider-mark composition, and the one that added
+/// a mark to the meta line -- draws the same board 300 px wide, and at 236 the
+/// real titles ("Build the Snake backend in C:/Code/userfirst/snake-game")
+/// were ellipsed to a few words (fix wave 1, F10).
+pub const BOARD_COLUMN_WIDTH: f32 = 300.0;
 pub const BOARD_RAIL_WIDTH: f32 = 36.0;
 
 /// The 1 px rule above and below each row (`border-top` / `border-bottom` on
@@ -68,7 +78,12 @@ pub const STATE_DOT_HALO_ALPHA: f32 = 0.18;
 pub const NEEDS_YOU_BORDER_ALPHA: f32 = 0.32;
 
 /// `.t` / `.r` font-size, `.age` and `.m` font-size, `.segn` font-size.
-pub const TITLE_FONT_SIZE: f32 = 12.5;
+///
+/// The title is pinned at the spec's 12 rather than the mockup CSS's 12.5:
+/// design language rule 2 sets titles at 12, and against the reference PNGs
+/// the rows read a pixel large (fix wave 1, F12). The meta line's 10.5 is both
+/// the CSS's and the spec's, so it is unchanged.
+pub const TITLE_FONT_SIZE: f32 = 12.0;
 pub const META_FONT_SIZE: f32 = 10.5;
 pub const COUNT_FONT_SIZE: f32 = 10.0;
 /// `font: 13px/1.4` — the mockup's single line-height ratio, pinned to whole
@@ -118,6 +133,13 @@ pub const NEEDS_YOU_CHIP_BORDER_ALPHA: f32 = 0.35;
 /// The settings glyph at the right end of the bar, the same 14 px the footer
 /// strip's icons were.
 pub const TOP_BAR_SETTINGS_ICON_SIZE: f32 = 14.0;
+/// The connection chip's ceiling. `host_status_headline` is three " · "
+/// segments of boot and connection truth and can run well past a hundred
+/// characters; unbounded it would push the needs-you chip and the hints off
+/// the right of the bar, which is the one thing the bar must never do. Wide
+/// enough for the leading segment that states the connection, which is the
+/// part a person reads.
+pub const TOP_BAR_CONNECTION_MAX_WIDTH: f32 = 320.0;
 
 /// `.hd { padding: 9px 10px 7px; gap: 8px }` with a 13 px title and an
 /// 11.5 px `+ New` button in a 6 px-radius 1 px box.

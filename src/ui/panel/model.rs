@@ -53,7 +53,14 @@ pub enum StatusTone {
 /// chosen option 2).
 #[derive(Clone, Debug, PartialEq)]
 pub struct PanelStatus {
-    pub icon: &'static str,
+    /// The state glyph, or `None` for a state that has no verb of its own.
+    ///
+    /// Idle is the case the redesign found: its glyph was a middle dot, the
+    /// same character the row already uses as its separator, so the status
+    /// opened "· Idle · 4d" and read as a separator with nothing in front of
+    /// it. Absence is the honest model -- there is no icon for "nothing is
+    /// happening" -- and it is what the painter branches on.
+    pub icon: Option<&'static str>,
     pub text: String,
     pub age: String,
     pub progress: Option<BoardProgress>,
@@ -123,20 +130,25 @@ pub fn panel_chrome(
     crumb: String,
 ) -> PanelChrome {
     let (icon, text, tone) = match (&needs_you, row.state) {
-        (Some(NeedsYou::Question { .. }), _) => {
-            ("?", "Asked a question".to_string(), StatusTone::Attention)
-        }
+        (Some(NeedsYou::Question { .. }), _) => (
+            Some("?"),
+            "Asked a question".to_string(),
+            StatusTone::Attention,
+        ),
         (Some(NeedsYou::Permission { .. }), _) => {
-            ("?", "Permission".to_string(), StatusTone::Attention)
+            (Some("?"), "Permission".to_string(), StatusTone::Attention)
         }
         (Some(NeedsYou::Blocked { cause }), _) => (
-            "!",
+            Some("!"),
             bound(cause, STATUS_CAUSE_MAX_CHARS),
             StatusTone::Blocked,
         ),
-        (None, BoardState::Working) => ("▶", row.why.clone(), StatusTone::Neutral),
-        (None, BoardState::Done) => ("✓", "Done".to_string(), StatusTone::Neutral),
-        (None, _) => ("·", row.why.clone(), StatusTone::Neutral),
+        (None, BoardState::Working) => (Some("▶"), row.why.clone(), StatusTone::Neutral),
+        (None, BoardState::Done) => (Some("✓"), "Done".to_string(), StatusTone::Neutral),
+        // Idle and every other quiet state: no verb, so no glyph. The row then
+        // opens with the word, and the separator only ever sits BETWEEN two
+        // things that are both there.
+        (None, _) => (None, row.why.clone(), StatusTone::Neutral),
     };
     PanelChrome {
         key: row.key.clone(),
@@ -217,7 +229,7 @@ mod tests {
             String::new(),
         );
         assert_eq!(chrome.status.tone, StatusTone::Attention);
-        assert_eq!(chrome.status.icon, "?");
+        assert_eq!(chrome.status.icon, Some("?"));
         assert_eq!(chrome.status.text, "Asked a question");
         assert_eq!(chrome.primary, PrimaryAction::Done);
     }
@@ -236,7 +248,7 @@ mod tests {
             String::new(),
         );
         assert_eq!(chrome.status.tone, StatusTone::Blocked);
-        assert_eq!(chrome.status.icon, "!");
+        assert_eq!(chrome.status.icon, Some("!"));
         assert_eq!(chrome.status.text.chars().count(), STATUS_CAUSE_MAX_CHARS);
     }
 
@@ -255,7 +267,7 @@ mod tests {
             String::new(),
         );
         assert_eq!(chrome.status.text, "cargo test");
-        assert_eq!(chrome.status.icon, "▶");
+        assert_eq!(chrome.status.icon, Some("▶"));
         assert_eq!(chrome.status.tone, StatusTone::Neutral);
         assert_eq!(chrome.view, PaneView::Terminal);
 
@@ -270,7 +282,7 @@ mod tests {
             String::new(),
         );
         assert_eq!(done.primary, PrimaryAction::Reopen);
-        assert_eq!(done.status.icon, "✓");
+        assert_eq!(done.status.icon, Some("✓"));
         assert_eq!(done.status.text, "Done");
     }
 
@@ -343,7 +355,7 @@ mod tests {
             String::new(),
         );
         assert_eq!(chrome.status.tone, StatusTone::Attention);
-        assert_eq!(chrome.status.icon, "?");
+        assert_eq!(chrome.status.icon, Some("?"));
         assert_eq!(chrome.status.text, "Permission");
         assert!(chrome.minimised);
     }

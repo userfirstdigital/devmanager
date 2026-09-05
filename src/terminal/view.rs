@@ -823,32 +823,6 @@ fn render_terminal_surface_with_palette(
             )
     });
 
-    let is_ai_tab = matches!(
-        model.active_tab_type,
-        Some(TabType::Claude) | Some(TabType::Codex)
-    );
-    let status_text = model
-        .session
-        .as_ref()
-        .map(|s| session_status_label(s, is_ai_tab))
-        .unwrap_or(if is_ai_tab { "saved" } else { "" });
-    let status_color = model
-        .session
-        .as_ref()
-        .map(|session| session_status_color(session, palette))
-        .unwrap_or(palette.text_muted);
-    let session_title = model
-        .session
-        .as_ref()
-        .and_then(|session| session.runtime.title.clone())
-        .filter(|title| is_meaningful_title(title))
-        .unwrap_or_else(|| model.session_label.clone());
-    let header_title = if model.active_project.is_empty() || session_title == model.active_project {
-        session_title
-    } else {
-        format!("{} • {}", model.active_project, session_title)
-    };
-    let header_detail = surface_header_detail(model);
     let runtime_controls = model.runtime_controls.clone();
     let metrics = model.session.as_ref().map(|session| {
         let metrics = &session.runtime.metrics;
@@ -897,91 +871,62 @@ fn render_terminal_surface_with_palette(
         .into_any_element()
     };
 
+    // What survives of the terminal's old 22 px header: the two ACTIONS it
+    // carried beside the diagnostic, plus the dev-server port they operate on.
+    // The four debug facts -- session title, backend, status and font size --
+    // are gone from the body (fix wave 1, F7) and reachable as the panel's
+    // Terminal tab tooltip through `terminal_surface_diagnostic`.
+    //
+    // The row exists only when it has an action to carry, so the ordinary
+    // terminal -- every panel and every dock, which pass no actions at all --
+    // now opens straight onto its grid.
+    let browser_action = open_browser_action.map(|on_click| {
+        runtime_action_button("Browser", palette.primary, on_click, palette).into_any_element()
+    });
+    let runtime_actions = actions
+        .zip(runtime_controls.clone())
+        .map(|(actions, controls)| {
+            render_runtime_actions(actions, controls, palette).into_any_element()
+        });
+    let port_label = runtime_controls
+        .as_ref()
+        .and_then(|controls| controls.port_label.clone())
+        .map(|detail| {
+            div()
+                .flex_shrink_0()
+                .text_xs()
+                .text_color(rgb(runtime_controls
+                    .as_ref()
+                    .map(|controls| controls.port_color)
+                    .unwrap_or(palette.text_dim)))
+                .child(SharedString::from(detail))
+                .into_any_element()
+        });
+    let action_row = (browser_action.is_some() || runtime_actions.is_some()).then(|| {
+        div()
+            .h(px(22.0))
+            .flex_none()
+            .flex()
+            .items_center()
+            .justify_end()
+            .gap(px(12.0))
+            .px(px(6.0))
+            .bg(rgb(palette.panel_header))
+            .border_b_1()
+            .border_color(rgb(palette.border))
+            .overflow_hidden()
+            .children(port_label)
+            .children(browser_action)
+            .children(runtime_actions)
+    });
+
     div()
         .flex_1()
         .h_full()
         .flex()
         .flex_col()
         .bg(rgb(palette.canvas))
-        .child(
-            div()
-                .h(px(22.0))
-                .flex_none()
-                .flex()
-                .items_center()
-                .justify_between()
-                .px(px(6.0))
-                .bg(rgb(palette.panel_header))
-                .border_b_1()
-                .border_color(rgb(palette.border))
-                .overflow_hidden()
-                .child(
-                    div()
-                        .flex_shrink_0()
-                        .text_xs()
-                        .font_weight(gpui::FontWeight::SEMIBOLD)
-                        .text_color(rgb(palette.text_primary))
-                        .child(SharedString::from(header_title)),
-                )
-                .child(
-                    div()
-                        .flex()
-                        .items_center()
-                        .gap(px(12.0))
-                        .overflow_hidden()
-                        .min_w(px(0.0))
-                        .children(
-                            runtime_controls
-                                .as_ref()
-                                .and_then(|controls| controls.port_label.as_ref())
-                                .map(|detail| {
-                                    div()
-                                        .text_xs()
-                                        .text_color(rgb(runtime_controls
-                                            .as_ref()
-                                            .map(|controls| controls.port_color)
-                                            .unwrap_or(palette.text_dim)))
-                                        .child(SharedString::from(detail.clone()))
-                                }),
-                        )
-                        .children(header_detail.map(|detail| {
-                            div()
-                                .text_xs()
-                                .text_color(rgb(palette.text_dim))
-                                .overflow_hidden()
-                                .whitespace_nowrap()
-                                .child(SharedString::from(detail))
-                        }))
-                        .child(
-                            div()
-                                .flex_shrink_0()
-                                .text_xs()
-                                .text_color(rgb(status_color))
-                                .child(status_text),
-                        )
-                        .child(
-                            div()
-                                .flex_shrink_0()
-                                .text_xs()
-                                .text_color(rgb(palette.text_dim))
-                                .child(SharedString::from(format!(
-                                    "font {}",
-                                    model.font_size.round() as u32
-                                ))),
-                        ),
-                )
-                .children(open_browser_action.map(|on_click| {
-                    runtime_action_button("Browser", palette.primary, on_click, palette)
-                        .into_any_element()
-                }))
-                .children(
-                    actions
-                        .zip(runtime_controls.clone())
-                        .map(|(actions, controls)| {
-                            render_runtime_actions(actions, controls, palette).into_any_element()
-                        }),
-                ),
-        )
+        .children(action_row)
         .child(
             div().flex_1().pb(px(2.0)).child(
                 div()
@@ -1360,6 +1305,53 @@ fn render_scrollbar(
     .w(px(terminal_scrollbar_gutter_width(spec)))
     .flex_none()
     .h_full()
+}
+
+/// The four facts the terminal body's 22 px debug strip used to print across
+/// the top of every terminal: the session's title, the backend behind it, its
+/// status, and the size the grid is rendering at.
+///
+/// The strip is gone from the body (fix wave 1, F7). Design language rule 1 is
+/// that grey is the interface and colour is information; a developer
+/// diagnostic spanning the full width of a panel is neither, and it cost a
+/// line of stream on every terminal. This is where the text went: the panel
+/// hangs it off its Terminal tab as a tooltip, so it is one hover away rather
+/// than gone.
+///
+/// One caller, deliberately. A second surface wanting these facts should call
+/// this rather than re-composing them, which is how the strip and its
+/// replacement would otherwise start saying different things.
+pub fn terminal_surface_diagnostic(model: &TerminalPaneModel) -> String {
+    let is_ai_tab = matches!(
+        model.active_tab_type,
+        Some(TabType::Claude) | Some(TabType::Codex)
+    );
+    let session_title = model
+        .session
+        .as_ref()
+        .and_then(|session| session.runtime.title.clone())
+        .filter(|title| is_meaningful_title(title))
+        .unwrap_or_else(|| model.session_label.clone());
+    let title = if model.active_project.is_empty() || session_title == model.active_project {
+        session_title
+    } else {
+        format!("{} • {}", model.active_project, session_title)
+    };
+    let status = model
+        .session
+        .as_ref()
+        .map(|session| session_status_label(session, is_ai_tab))
+        .unwrap_or(if is_ai_tab { "saved" } else { "" });
+
+    let mut parts = vec![title];
+    parts.extend(surface_header_detail(model));
+    parts.push(status.to_string());
+    parts.push(format!("font {}", model.font_size.round() as u32));
+    // A part that is empty is a fact the model does not have, and an empty
+    // segment between two separators reads as a missing value rather than as
+    // an absent one.
+    parts.retain(|part| !part.trim().is_empty());
+    parts.join(" · ")
 }
 
 fn surface_header_detail(model: &TerminalPaneModel) -> Option<String> {
@@ -2715,22 +2707,6 @@ fn session_status_label(session: &TerminalSessionView, is_ai_tab: bool) -> &'sta
         SessionStatus::Exited => "exited",
         SessionStatus::Failed => "failed",
         SessionStatus::Stopped => "stopped",
-    }
-}
-
-fn session_status_color(session: &TerminalSessionView, palette: TerminalRenderPalette) -> u32 {
-    if session.runtime.unseen_ready {
-        return palette.success;
-    }
-    if matches!(session.runtime.ai_activity, Some(AiActivity::Thinking)) {
-        return palette.warning;
-    }
-
-    match session.runtime.status {
-        SessionStatus::Running => palette.text_subtle,
-        SessionStatus::Starting | SessionStatus::Stopping => palette.warning,
-        SessionStatus::Crashed | SessionStatus::Failed => palette.danger,
-        _ => palette.text_muted,
     }
 }
 
