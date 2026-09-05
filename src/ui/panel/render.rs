@@ -1146,4 +1146,56 @@ mod tests {
             "every truncating label must resolve its width through an inner w_full child"
         );
     }
+
+    /// F9: the mark before the title is the board's own 11 px monochrome
+    /// provider mark, painted in `text.muted` and sitting BEFORE the title, per
+    /// mockup 05 (chosen option 1, "grey mark, second line" -- and the same
+    /// mark on the panel) and design language rule 10, which forbids a brand
+    /// tint outright.
+    ///
+    /// A source scan because there is nothing else to read: the size is a
+    /// constant the board owns and the colour is a token, so the only thing
+    /// that can go wrong is the painter passing different ones. Ordering is
+    /// checked by position, which is what "before the title" means.
+    #[test]
+    fn the_provider_mark_is_the_boards_eleven_pixel_grey_one_before_the_title() {
+        // Shared with the board row's meta line rather than restated, so the
+        // row and the panel cannot draw two different marks.
+        assert_eq!(PROVIDER_MARK_SIZE, 11.0);
+
+        let source = include_str!("render.rs");
+        let painter = source
+            .split("#[cfg(test)]")
+            .next()
+            .expect("the painter is everything above its tests");
+        let title_row = painter
+            .split("fn title_row_element(")
+            .nth(1)
+            .expect("the title row painter");
+
+        let mark = title_row
+            .find("crate::icons::app_icon(")
+            .expect("the title row paints the provider mark through app_icon");
+        let title = title_row
+            .find("devmanager-panel-title")
+            .expect("the title row paints the title");
+        assert!(
+            mark < title,
+            "the provider mark must be painted before the title"
+        );
+
+        let call = &title_row[mark..title];
+        assert!(
+            call.contains("chrome.provider.glyph_path()"),
+            "the mark is the panel's own provider glyph"
+        );
+        assert!(
+            call.contains("PROVIDER_MARK_SIZE"),
+            "the mark is sized by the board's shared constant, not by a literal"
+        );
+        assert!(
+            call.contains("tokens.text.muted.to_u32()"),
+            "the mark is grey: design language rule 10 allows no brand tint"
+        );
+    }
 }
