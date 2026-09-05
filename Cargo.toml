@@ -23,6 +23,16 @@ path = "tests/fixtures/providers/probe_fixture.rs"
 test = false
 bench = false
 
+# GPUI, taffy, swash and the text stack do the layout and paint of every
+# frame, and an unoptimised copy of them is most of what a debug frame costs:
+# measured 2026-09-05 at six board rows and four open panes, one whole frame
+# through Window::draw was 21.6 ms, of which the shell built 2.6 ms and GPUI
+# spent 19.0 ms (88%). Optimising the DEPENDENCIES only leaves this crate at
+# opt-level 0, so an incremental rebuild of src/ is unchanged; the dependency
+# build is paid once.
+[profile.dev.package."*"]
+opt-level = 2
+
 [dependencies]
 accesskit = "0.24.1"
 alacritty_terminal = "0.25.1"

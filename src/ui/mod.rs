@@ -13,6 +13,7 @@ pub mod browser_dock_lifecycle;
 pub mod browser_gateway_identity;
 pub mod components;
 pub mod conversation;
+pub mod frame_trace;
 pub mod header_actions;
 #[path = "composer/mod.rs"]
 pub mod native_composer;
