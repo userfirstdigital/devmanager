@@ -35460,32 +35460,19 @@ impl NativeShell {
                         cx.notify();
                     }))
                     .child(
-                        div()
-                            .id("native-add-project-dialog")
+                        overlay_chrome::dialog_surface("native-add-project-dialog", tokens)
                             .w(px(440.0))
-                            .rounded(px(tokens.density.radii.lg))
-                            .bg(tokens.surfaces.raised.to_gpui())
-                            .border(px(1.0))
-                            .border_color(tokens.borders.subtle.to_gpui())
-                            .shadow_sm()
-                            .p(px(tokens.density.spacing.xl))
-                            .flex()
-                            .flex_col()
-                            .gap(px(tokens.density.spacing.md))
+                            .child(overlay_chrome::heading(
+                                if has_folder {
+                                    "Add this project?"
+                                } else {
+                                    "Add a project"
+                                },
+                                tokens,
+                            ))
                             .child(
                                 div()
-                                    .text_size(px(tokens.density.typography.heading))
-                                    .font_weight(FontWeight::SEMIBOLD)
-                                    .text_color(tokens.text.primary.to_gpui())
-                                    .child(if has_folder {
-                                        "Add this project?"
-                                    } else {
-                                        "Add a project"
-                                    }),
-                            )
-                            .child(
-                                div()
-                                    .text_size(px(tokens.density.typography.caption))
+                                    .text_size(px(overlay_chrome::CAPTION_FONT_SIZE))
                                     .text_color(tokens.text.muted.to_gpui())
                                     .child(if has_folder {
                                         "You can change the name. Nothing is added until you confirm."
@@ -35499,10 +35486,7 @@ impl NativeShell {
                                     .flex_col()
                                     .gap(px(tokens.density.spacing.xxs))
                                     .child(
-                                        div()
-                                            .text_size(px(tokens.density.typography.caption))
-                                            .text_color(tokens.text.muted.to_gpui())
-                                            .child("Name"),
+                                        overlay_chrome::field_label("Name", tokens),
                                     )
                                     .child(self.overlay_text_field(
                                         "native-add-project-name",
@@ -35517,10 +35501,7 @@ impl NativeShell {
                                     .flex_col()
                                     .gap(px(tokens.density.spacing.xxs))
                                     .child(
-                                        div()
-                                            .text_size(px(tokens.density.typography.caption))
-                                            .text_color(tokens.text.muted.to_gpui())
-                                            .child("Folder"),
+                                        overlay_chrome::field_label("Folder", tokens),
                                     )
                                     .child(
                                         div()
@@ -35532,9 +35513,11 @@ impl NativeShell {
                                                     .id("native-add-project-path")
                                                     .flex_1()
                                                     .min_w(px(0.0))
-                                                    .px(px(tokens.density.spacing.md))
-                                                    .py(px(tokens.density.spacing.sm))
-                                                    .rounded(px(tokens.density.radii.md))
+                                                    .px(px(overlay_chrome::INPUT_PADDING_X))
+                                                    .py(px(overlay_chrome::INPUT_PADDING_Y))
+                                                    .rounded(px(overlay_chrome::INPUT_RADIUS))
+                                                    .border(px(overlay_chrome::OVERLAY_BORDER_WIDTH))
+                                                    .border_color(tokens.borders.default.to_gpui())
                                                     .bg(tokens.surfaces.sunken.to_gpui())
                                                     .truncate()
                                                     .text_color(if has_folder {
@@ -35568,7 +35551,7 @@ impl NativeShell {
                             )
                             .children(error.map(|message| {
                                 div()
-                                    .text_size(px(tokens.density.typography.caption))
+                                    .text_size(px(overlay_chrome::CAPTION_FONT_SIZE))
                                     .text_color(tokens.status.destructive.to_gpui())
                                     .child(message)
                             }))
@@ -38321,18 +38304,8 @@ impl NativeShell {
                             cx.notify();
                         }))
                         .child(
-                            div()
-                                .id("native-rename-task-dialog")
+                            overlay_chrome::dialog_surface("native-rename-task-dialog", tokens)
                                 .w(px(440.0))
-                                .rounded(px(tokens.density.radii.lg))
-                                .bg(tokens.surfaces.raised.to_gpui())
-                                .border(px(1.0))
-                                .border_color(tokens.borders.subtle.to_gpui())
-                                .shadow_sm()
-                                .p(px(tokens.density.spacing.xl))
-                                .flex()
-                                .flex_col()
-                                .gap(px(tokens.density.spacing.md))
                                 .on_mouse_down(
                                     MouseButton::Left,
                                     cx.listener(|shell, _event: &MouseDownEvent, window, cx| {
@@ -38340,13 +38313,7 @@ impl NativeShell {
                                         shell.root_editor_focus_handle.focus(window);
                                     }),
                                 )
-                                .child(
-                                    div()
-                                        .text_size(px(tokens.density.typography.heading))
-                                        .font_weight(FontWeight::SEMIBOLD)
-                                        .text_color(tokens.text.primary.to_gpui())
-                                        .child("Rename task"),
-                                )
+                                .child(overlay_chrome::heading("Rename task", tokens))
                                 .child(self.overlay_text_field(
                                     "native-rename-task-name",
                                     &draft.title,
@@ -38355,7 +38322,7 @@ impl NativeShell {
                                 ))
                                 .children(error.map(|message| {
                                     div()
-                                        .text_size(px(tokens.density.typography.caption))
+                                        .text_size(px(overlay_chrome::CAPTION_FONT_SIZE))
                                         .text_color(tokens.status.destructive.to_gpui())
                                         .child(message)
                                 }))
@@ -38440,28 +38407,18 @@ impl NativeShell {
                             },
                         ))
                         .child(
-                            div()
-                                .id("native-delete-task-dialog")
+                            overlay_chrome::dialog_surface("native-delete-task-dialog", tokens)
                                 .w(px(440.0))
-                                .rounded(px(tokens.density.radii.lg))
-                                .bg(tokens.surfaces.raised.to_gpui())
-                                .border(px(1.0))
-                                .border_color(tokens.borders.subtle.to_gpui())
-                                .shadow_sm()
-                                .p(px(tokens.density.spacing.xl))
-                                .flex()
-                                .flex_col()
-                                .gap(px(tokens.density.spacing.md))
                                 .child(
                                     div()
-                                        .text_size(px(tokens.density.typography.heading))
+                                        .text_size(px(overlay_chrome::HEADING_FONT_SIZE))
                                         .font_weight(FontWeight::SEMIBOLD)
                                         .text_color(tokens.status.destructive.to_gpui())
                                         .child("Delete task permanently?"),
                                 )
                                 .child(
                                     div()
-                                        .text_size(px(tokens.density.typography.body))
+                                        .text_size(px(overlay_chrome::BODY_FONT_SIZE))
                                         .text_color(tokens.text.secondary.to_gpui())
                                         .child(format!(
                                             "“{title}” will disappear from DevManager and cannot be restored."
@@ -38469,13 +38426,13 @@ impl NativeShell {
                                 )
                                 .children(status.map(|message| {
                                     div()
-                                        .text_size(px(tokens.density.typography.caption))
+                                        .text_size(px(overlay_chrome::CAPTION_FONT_SIZE))
                                         .text_color(tokens.text.muted.to_gpui())
                                         .child(message)
                                 }))
                                 .children(error.map(|message| {
                                     div()
-                                        .text_size(px(tokens.density.typography.caption))
+                                        .text_size(px(overlay_chrome::CAPTION_FONT_SIZE))
                                         .text_color(tokens.status.destructive.to_gpui())
                                         .child(message)
                                 }))
@@ -38596,34 +38553,20 @@ impl NativeShell {
                 cx.notify();
             }))
             .child(
-                div()
-                    .id("native-new-task-dialog")
+                overlay_chrome::dialog_surface("native-new-task-dialog", tokens)
                     .w(px(440.0))
-                    .rounded(px(tokens.density.radii.lg))
-                    .bg(tokens.surfaces.raised.to_gpui())
-                    .border(px(1.0))
-                    .border_color(tokens.borders.subtle.to_gpui())
-                    .shadow_sm()
-                    .p(px(tokens.density.spacing.xl))
-                    .flex()
-                    .flex_col()
-                    .gap(px(tokens.density.spacing.md))
                     .child(
-                        div()
-                            .text_size(px(tokens.density.typography.heading))
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .text_color(tokens.text.primary.to_gpui())
-                            .child("Create task"),
+                        overlay_chrome::heading("Create task", tokens),
                     )
                     .child(
                         div()
-                            .text_size(px(tokens.density.typography.caption))
+                            .text_size(px(overlay_chrome::CAPTION_FONT_SIZE))
                             .text_color(tokens.text.muted.to_gpui())
                             .child("Choose the project this task should start in."),
                     )
                     .child(
                         div()
-                            .text_size(px(tokens.density.typography.caption))
+                            .text_size(px(overlay_chrome::CAPTION_FONT_SIZE))
                             .font_weight(FontWeight::SEMIBOLD)
                             .text_color(tokens.text.muted.to_gpui())
                             .child("Project"),
@@ -38685,7 +38628,7 @@ impl NativeShell {
                     )
                     .children(error.map(|message| {
                         div()
-                            .text_size(px(tokens.density.typography.caption))
+                            .text_size(px(overlay_chrome::CAPTION_FONT_SIZE))
                             .text_color(tokens.status.destructive.to_gpui())
                             .child(message)
                     }))
@@ -39087,99 +39030,102 @@ impl NativeShell {
             ProjectActionMenuMode::Closed => div().child("Closed"),
             ProjectActionMenuMode::Menu { selected_index } => {
                 let rows = self.project_action_rows();
-                let mut list = div().flex().flex_col().gap(px(2.0));
+                let mut list = div().flex().flex_col().gap(px(overlay_chrome::ROW_GAP));
                 for (index, row) in rows.iter().enumerate() {
                     let run_command_id = row.command_id.clone();
                     let edit_command_id = row.command_id.clone();
                     let archive_command_id = row.command_id.clone();
+                    let state = OverlayRowState::selected_when(index == *selected_index);
                     list = list.child(
-                        div()
-                            .id(("native-project-action-row", index))
-                            .px(px(10.0))
-                            .py(px(6.0))
-                            .rounded(px(6.0))
-                            .bg(if index == *selected_index {
-                                tokens.surfaces.raised.to_gpui()
-                            } else {
-                                tokens.surfaces.overlay.to_gpui()
-                            })
-                            .flex()
-                            .items_center()
-                            .gap(px(6.0))
-                            .child(div().flex_1().child(row.label.clone()))
-                            .child(
-                                Button::new(("native-project-action-run", index))
-                                    .label("Run")
-                                    .on_click(cx.listener(
-                                        move |shell, _event: &ClickEvent, _window, cx| {
-                                            cx.stop_propagation();
-                                            shell.run_project_action(&run_command_id);
-                                            cx.notify();
-                                        },
-                                    )),
-                            )
-                            .child(
-                                Button::new(("native-project-action-edit", index))
-                                    .label("Edit")
-                                    .ghost()
-                                    .on_click(cx.listener(
-                                        move |shell, _event: &ClickEvent, _window, cx| {
-                                            cx.stop_propagation();
-                                            shell.edit_project_action(&edit_command_id);
-                                            cx.notify();
-                                        },
-                                    )),
-                            )
-                            .child(
-                                Button::new(("native-project-action-archive", index))
-                                    .label("Archive")
-                                    .ghost()
-                                    .on_click(cx.listener(
-                                        move |shell, _event: &ClickEvent, _window, cx| {
-                                            cx.stop_propagation();
-                                            shell.begin_archive_project_action(&archive_command_id);
-                                            cx.notify();
-                                        },
-                                    )),
-                            ),
+                        overlay_chrome::overlay_row(
+                            ("native-project-action-row", index),
+                            state,
+                            tokens,
+                        )
+                        .flex_row()
+                        .items_center()
+                        .gap(px(overlay_chrome::CHIP_GAP))
+                        .child(overlay_chrome::row_title(row.label.clone(), state, tokens))
+                        .child(
+                            Button::new(("native-project-action-run", index))
+                                .label("Run")
+                                .on_click(cx.listener(
+                                    move |shell, _event: &ClickEvent, _window, cx| {
+                                        cx.stop_propagation();
+                                        shell.run_project_action(&run_command_id);
+                                        cx.notify();
+                                    },
+                                )),
+                        )
+                        .child(
+                            Button::new(("native-project-action-edit", index))
+                                .label("Edit")
+                                .ghost()
+                                .on_click(cx.listener(
+                                    move |shell, _event: &ClickEvent, _window, cx| {
+                                        cx.stop_propagation();
+                                        shell.edit_project_action(&edit_command_id);
+                                        cx.notify();
+                                    },
+                                )),
+                        )
+                        .child(
+                            Button::new(("native-project-action-archive", index))
+                                .label("Archive")
+                                .ghost()
+                                .on_click(cx.listener(
+                                    move |shell, _event: &ClickEvent, _window, cx| {
+                                        cx.stop_propagation();
+                                        shell.begin_archive_project_action(&archive_command_id);
+                                        cx.notify();
+                                    },
+                                )),
+                        ),
                     );
                 }
                 list = list
                     .child(
-                        div()
-                            .id("native-project-action-add")
-                            .px(px(10.0))
-                            .py(px(6.0))
-                            .rounded(px(6.0))
-                            .cursor_pointer()
-                            .child("Add action…")
-                            .on_mouse_down(
-                                MouseButton::Left,
-                                cx.listener(|shell, _event: &MouseDownEvent, _window, cx| {
-                                    cx.stop_propagation();
-                                    shell.begin_add_project_action();
-                                    cx.notify();
-                                }),
-                            ),
+                        overlay_chrome::overlay_row(
+                            "native-project-action-add",
+                            OverlayRowState::Idle,
+                            tokens,
+                        )
+                        .child(overlay_chrome::row_title(
+                            "Add action…",
+                            OverlayRowState::Idle,
+                            tokens,
+                        ))
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(|shell, _event: &MouseDownEvent, _window, cx| {
+                                cx.stop_propagation();
+                                shell.begin_add_project_action();
+                                cx.notify();
+                            }),
+                        ),
                     )
                     .child(
-                        div()
-                            .id("native-project-action-layout-palette")
-                            .px(px(10.0))
-                            .py(px(6.0))
-                            .text_color(tokens.text.muted.to_gpui())
-                            .child("Layout commands…")
-                            .on_mouse_down(
-                                MouseButton::Left,
-                                cx.listener(|shell, _event: &MouseDownEvent, _window, cx| {
-                                    cx.stop_propagation();
-                                    shell.project_actions.close();
-                                    shell.dispatch_keyboard(KeyboardShortcut::ctrl(
-                                        crate::ui::actions::ShortcutKey::Character('k'),
-                                    ));
-                                    cx.notify();
-                                }),
-                            ),
+                        overlay_chrome::overlay_row(
+                            "native-project-action-layout-palette",
+                            OverlayRowState::Idle,
+                            tokens,
+                        )
+                        .child(overlay_chrome::row_meta(
+                            "Layout commands…",
+                            OverlayRowState::Idle,
+                            tokens,
+                        ))
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(|shell, _event: &MouseDownEvent, _window, cx| {
+                                cx.stop_propagation();
+                                shell.project_actions.close();
+                                shell.dispatch_keyboard(KeyboardShortcut::ctrl(
+                                    crate::ui::actions::ShortcutKey::Character('k'),
+                                ));
+                                cx.notify();
+                            }),
+                        ),
                     );
                 if let Some(error) = self.project_actions.last_error.clone() {
                     list = list.child(
@@ -39197,14 +39143,31 @@ impl NativeShell {
                             .child(result),
                     );
                 }
-                list.child("Enter runs · E edits · Delete archives · Esc closes")
+                list.child(overlay_chrome::kbd_hint_row(
+                    [
+                        ("Enter".to_string(), "run".to_string()),
+                        ("E".to_string(), "edit".to_string()),
+                        ("Delete".to_string(), "archive".to_string()),
+                        ("Esc".to_string(), "close".to_string()),
+                    ],
+                    tokens,
+                ))
             }
             ProjectActionMenuMode::ArchiveConfirm { row } => div()
                 .flex()
                 .flex_col()
                 .gap(px(8.0))
-                .child(format!("Archive action “{}”?", row.label))
-                .child("Enter confirms · Esc cancels")
+                .child(overlay_chrome::heading(
+                    format!("Archive action “{}”?", row.label),
+                    tokens,
+                ))
+                .child(overlay_chrome::kbd_hint_row(
+                    [
+                        ("Enter".to_string(), "confirm".to_string()),
+                        ("Esc".to_string(), "cancel".to_string()),
+                    ],
+                    tokens,
+                ))
                 .child(
                     div()
                         .flex()
@@ -39242,13 +39205,15 @@ impl NativeShell {
                     .child(
                         div()
                             .id("native-project-action-name")
-                            .px(px(8.0))
-                            .py(px(6.0))
-                            .rounded(px(6.0))
-                            .bg(if name_focused {
-                                tokens.surfaces.raised.to_gpui()
+                            .px(px(overlay_chrome::INPUT_PADDING_X))
+                            .py(px(overlay_chrome::INPUT_PADDING_Y))
+                            .rounded(px(overlay_chrome::INPUT_RADIUS))
+                            .bg(tokens.surfaces.sunken.to_gpui())
+                            .border(px(overlay_chrome::OVERLAY_BORDER_WIDTH))
+                            .border_color(if name_focused {
+                                tokens.borders.focus.to_gpui()
                             } else {
-                                tokens.surfaces.overlay.to_gpui()
+                                tokens.borders.default.to_gpui()
                             })
                             .child(format!(
                                 "Name{}: {}",
@@ -39271,13 +39236,15 @@ impl NativeShell {
                     .child(
                         div()
                             .id("native-project-action-command")
-                            .px(px(8.0))
-                            .py(px(6.0))
-                            .rounded(px(6.0))
-                            .bg(if !name_focused {
-                                tokens.surfaces.raised.to_gpui()
+                            .px(px(overlay_chrome::INPUT_PADDING_X))
+                            .py(px(overlay_chrome::INPUT_PADDING_Y))
+                            .rounded(px(overlay_chrome::INPUT_RADIUS))
+                            .bg(tokens.surfaces.sunken.to_gpui())
+                            .border(px(overlay_chrome::OVERLAY_BORDER_WIDTH))
+                            .border_color(if !name_focused {
+                                tokens.borders.focus.to_gpui()
                             } else {
-                                tokens.surfaces.overlay.to_gpui()
+                                tokens.borders.default.to_gpui()
                             })
                             .child(format!(
                                 "Command{}: {}",
@@ -39309,7 +39276,14 @@ impl NativeShell {
                             .clone()
                             .map(|result| div().id("native-project-action-result").child(result)),
                     )
-                    .child("Tab fields · Enter saves · Esc cancels")
+                    .child(overlay_chrome::kbd_hint_row(
+                        [
+                            ("Tab".to_string(), "next field".to_string()),
+                            ("Enter".to_string(), "save".to_string()),
+                            ("Esc".to_string(), "cancel".to_string()),
+                        ],
+                        tokens,
+                    ))
             }
         };
         deferred(
@@ -39328,14 +39302,8 @@ impl NativeShell {
                         .pt(px(72.0))
                         .bg(Self::modal_backdrop())
                         .child(
-                            div()
-                                .id("native-project-action-panel")
+                            overlay_chrome::dialog_surface("native-project-action-panel", tokens)
                                 .w(px(360.0))
-                                .p(px(12.0))
-                                .rounded(px(10.0))
-                                .bg(tokens.surfaces.overlay.to_gpui())
-                                .border(px(1.0))
-                                .border_color(tokens.borders.subtle.to_gpui())
                                 .child(body),
                         ),
                 ),
@@ -39423,14 +39391,8 @@ impl NativeShell {
                             }),
                         )
                         .child(
-                            div()
-                                .id("native-commit-panel")
+                            overlay_chrome::dialog_surface("native-commit-panel", tokens)
                                 .w(px(420.0))
-                                .p(px(14.0))
-                                .rounded(px(10.0))
-                                .bg(tokens.surfaces.overlay.to_gpui())
-                                .border(px(1.0))
-                                .border_color(tokens.borders.subtle.to_gpui())
                                 .child(body),
                         ),
                 ),
