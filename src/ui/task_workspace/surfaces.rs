@@ -376,6 +376,14 @@ struct TerminalAttachment {
     /// installed" from "the recipe was rejected", and the operator reading the
     /// client has no access to the host's stderr.
     detail: Option<String>,
+    /// The host's TYPED reason for the same refusal, when the reply carried
+    /// one.
+    ///
+    /// `detail` is that reason rendered for a person to read, so branching the
+    /// UI on it would be a guard on one spelling of the sentence. The two are
+    /// set by one call for the same reason: a type and its rendering that can
+    /// be written independently will disagree.
+    refusal_reason: Option<crate::domain::TaskCockpitUnavailableReason>,
     /// Whether the host has ever SETTLED a query for this exact terminal --
     /// with a screen, with a refusal, or with a start-pending classification.
     ///
@@ -546,8 +554,26 @@ impl TaskSurfaceState {
         &mut self,
         target: TerminalSurfaceTarget,
         detail: Option<String>,
+        reason: Option<crate::domain::TaskCockpitUnavailableReason>,
     ) {
-        self.attachments.entry(target).or_default().detail = detail;
+        let attachment = self.attachments.entry(target).or_default();
+        attachment.detail = detail;
+        attachment.refusal_reason = reason;
+    }
+
+    /// Whether the host said this terminal's provider conversation is GONE.
+    ///
+    /// Read off the typed reason, never the sentence: the sentence is what a
+    /// person reads and is free to be reworded, while this decides which
+    /// recovery the panel offers.
+    pub fn terminal_session_not_found_for(&self, target: TerminalSurfaceTarget) -> bool {
+        self.attachment(target).refusal_reason
+            == Some(crate::domain::TaskCockpitUnavailableReason::TerminalProviderSessionNotFound)
+    }
+
+    /// See [`Self::terminal_session_not_found_for`], for the visible terminal.
+    pub fn terminal_session_not_found(&self) -> bool {
+        self.terminal_session_not_found_for(self.focused_surface_target())
     }
 
     pub fn note_terminal_query_started(&mut self) {
@@ -1256,9 +1282,16 @@ impl<K: Clone + Ord + Eq> TaskSurfaceRegistry<K> {
         task_id: K,
         target: TerminalSurfaceTarget,
         detail: Option<String>,
+        reason: Option<crate::domain::TaskCockpitUnavailableReason>,
     ) {
         self.ensure_task(task_id)
-            .note_terminal_refusal_for(target, detail);
+            .note_terminal_refusal_for(target, detail, reason);
+    }
+
+    /// See [`TaskSurfaceState::terminal_session_not_found`].
+    pub fn terminal_session_not_found(&self, task_id: K) -> bool {
+        self.state(task_id)
+            .is_some_and(TaskSurfaceState::terminal_session_not_found)
     }
 
     pub fn note_terminal_query_started(&mut self, task_id: K) {
@@ -1484,6 +1517,7 @@ mod tests {
         named.note_terminal_refusal_for(
             named.focused_surface_target(),
             Some("TerminalUnavailable: Claude Code was updated".to_string()),
+            Some(crate::domain::TaskCockpitUnavailableReason::TerminalUnavailable),
         );
         named.note_terminal_reconnecting();
         assert_eq!(

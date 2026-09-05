@@ -18,8 +18,8 @@ pub use menu::{
     more_views, panel_key_action, panel_menu_rows, PanelKeyAction, PanelMenuItem, PanelMenuRow,
 };
 pub use model::{
-    panel_chrome, status_layout, NeedsYou, PanelChrome, PanelStatus, PrimaryAction, StatusLayout,
-    StatusTone, STATUS_CAUSE_MAX_CHARS,
+    blocked_recovery_for, panel_chrome, status_layout, BlockedRecovery, NeedsYou, PanelChrome,
+    PanelStatus, PrimaryAction, StatusLayout, StatusTone, STATUS_CAUSE_MAX_CHARS,
 };
 pub use render::{
     panel_chrome_element, panel_element_id, panel_frame, PanelHandlers, MINIMISED_HEIGHT,
