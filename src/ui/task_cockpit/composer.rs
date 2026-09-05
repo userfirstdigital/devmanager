@@ -97,9 +97,10 @@ pub const COMPOSER_CONTROL_GAP: f32 = 8.0;
 /// Rule 5: a full-width row is 5 px above and below its line, with no side
 /// margin. The composer's slash-command overlay rows are these.
 pub const COMPOSER_ROW_PADDING_Y: f32 = 5.0;
-/// Rule 6: region padding 10-12. The composer's footer takes 10, matching the
-/// stream column above it so the two share one left edge.
-pub const COMPOSER_REGION_PADDING: f32 = 10.0;
+/// Rule 6: region padding 10-12. The composer's footer takes the same number
+/// as the stream column above it (`timeline::STREAM_REGION_PADDING`, 12 since
+/// fix wave 3) so the two share one left edge inside the panel body.
+pub const COMPOSER_REGION_PADDING: f32 = 12.0;
 /// Rule 4: a default button -- 1 px `borders.default`, no fill, 11 px label,
 /// padding 2x8, radius 6. The question card's answer options are these.
 pub const COMPOSER_BUTTON_FONT_SIZE: f32 = 11.0;
@@ -167,6 +168,133 @@ pub const COMPOSER_HEIGHT_RESERVE: f32 = COMPOSER_CONTROL_GAP
     + COMPOSER_CHIP_GAP
     + COMPOSER_META_ROW_HEIGHT
     + COMPOSER_REGION_PADDING;
+
+/// The narrowest draft field that still earns its key hints.
+///
+/// The hints are a note about two keys, not a control, and in a 296 px panel
+/// they took more of the row than the field they annotate: the placeholder was
+/// squeezed onto a second line and the pill grew to roughly 56 px against the
+/// 32 the design gives it (`fix-wave-2-panel-grid.png`). Above this width the
+/// field is wide enough that the note costs it nothing.
+pub const COMPOSER_HINTS_MIN_FIELD_WIDTH: f32 = 420.0;
+
+/// The width the composer CARD gets on a surface this wide.
+///
+/// The card is centred at [`CONVERSATION_CONTENT_MAX_WIDTH`] and clamped to
+/// the surface, so on any panel narrower than that it is the surface less the
+/// region padding on both sides.
+pub fn composer_card_width(surface_width_px: f32) -> f32 {
+    (surface_width_px - 2.0 * COMPOSER_REGION_PADDING)
+        .min(crate::ui::task_cockpit::timeline::CONVERSATION_CONTENT_MAX_WIDTH)
+        .max(0.0)
+}
+
+/// The width the draft field itself gets: the card, less its two border
+/// pixels, the send slot and the gap before it.
+///
+/// The key hints are deliberately NOT subtracted -- this is the width the
+/// field would have WITHOUT them, which is the question
+/// [`composer_shows_key_hints`] asks. Subtracting them would make the answer
+/// depend on itself.
+pub fn composer_field_width(surface_width_px: f32) -> f32 {
+    (composer_card_width(surface_width_px)
+        - 2.0 * COMPOSER_BORDER_WIDTH
+        - COMPOSER_CHIP_GAP
+        - COMPOSER_ICON_BUTTON_SIZE)
+        .max(0.0)
+}
+
+/// Does the composer on a surface this wide show its key hints?
+pub fn composer_shows_key_hints(surface_width_px: f32) -> bool {
+    composer_field_width(surface_width_px) >= COMPOSER_HINTS_MIN_FIELD_WIDTH
+}
+
+/// The placeholder trimmed to one line of the field it sits in, ellipsised
+/// where it was cut.
+///
+/// The field paints its own text through a `canvas`, so there is no
+/// `text_ellipsis` for it to inherit and no wrap width that would stop at one
+/// line: "Message Codex..." simply folded onto a second line in a 296 px panel
+/// and took the pill's height with it. Trimmed here rather than in the paint
+/// closure so the rule is a pure function of a width and can be read at four
+/// of them without a window.
+///
+/// Bounded by `approx_text_width`, which is biased high, so the trim is a
+/// character or two early rather than a character late -- and a placeholder
+/// running under the key hints is the defect this exists for.
+pub fn composer_placeholder_within(placeholder: &str, width_px: f32) -> String {
+    let fits = |text: &str| {
+        crate::ui::overlay_chrome::approx_text_width(text, COMPOSER_FONT_SIZE) <= width_px
+    };
+    if fits(placeholder) {
+        return placeholder.to_string();
+    }
+    let ellipsis = '\u{2026}';
+    let mut kept: Vec<char> = placeholder.chars().collect();
+    while !kept.is_empty() {
+        kept.pop();
+        let mut candidate: String = kept.iter().collect();
+        candidate.push(ellipsis);
+        if fits(&candidate) {
+            return candidate;
+        }
+    }
+    String::new()
+}
+
+/// The meta line's segments, in paint order.
+///
+/// The order IS the drop order read backwards: the line loses its right-hand
+/// end first, and the provider and the model are the two it may never lose --
+/// they say where the draft is going, which is the whole reason the line is
+/// under the field. Everything it drops stays reachable through the selector
+/// the segment opened and through the panel's own menu.
+pub const COMPOSER_META_KEPT_SEGMENTS: usize = 2;
+
+/// How wide the meta line's segment strip paints, for the first `labels`.
+///
+/// The separator between two segments plus the chip gap on either side of it,
+/// once per pair, is the same arithmetic the painter lays out.
+pub fn composer_meta_line_width(labels: &[String]) -> f32 {
+    let text: f32 = labels
+        .iter()
+        .map(|label| {
+            crate::ui::overlay_chrome::approx_text_width(label, COMPOSER_CAPTION_FONT_SIZE)
+        })
+        .sum();
+    let separators = labels.len().saturating_sub(1) as f32;
+    let separator_width = crate::ui::overlay_chrome::approx_text_width(
+        COMPOSER_META_SEPARATOR,
+        COMPOSER_CAPTION_FONT_SIZE,
+    );
+    text + separators * (separator_width + 2.0 * COMPOSER_CHIP_PADDING_X)
+}
+
+/// The room the segment strip has: the card, less its padding, the attach
+/// affordance and the control gap before it.
+pub fn composer_meta_line_room(surface_width_px: f32) -> f32 {
+    (composer_card_width(surface_width_px)
+        - 2.0 * COMPOSER_PADDING_X
+        - COMPOSER_ICON_BUTTON_SIZE
+        - COMPOSER_CONTROL_GAP)
+        .max(0.0)
+}
+
+/// How many of the meta line's segments survive in `room_px`.
+///
+/// Drops from the RIGHT, one at a time, and never below
+/// [`COMPOSER_META_KEPT_SEGMENTS`]. Same shape as the tab row's rule
+/// (`panel::render::tabs_that_fit`): a segment that does not fit is DROPPED,
+/// not clipped, because "Full acce" is a rendering fault where a missing
+/// segment is a line that says less.
+pub fn composer_meta_segments_within(labels: &[String], room_px: f32) -> usize {
+    let mut kept = labels.len();
+    while kept > COMPOSER_META_KEPT_SEGMENTS && composer_meta_line_width(&labels[..kept]) > room_px
+    {
+        kept -= 1;
+    }
+    kept
+}
 
 /// What the one control in the composer's send slot is saying right now.
 /// Rule 4 gives an icon button one resting tint and one hover tint, and rule 1
@@ -2699,6 +2827,120 @@ mod tests {
         )
     }
 
+    /// W4 (fix wave 3): the pill is ONE line at rest.
+    ///
+    /// Two rules, both of them width rules, and the render that motivated them
+    /// is `fix-wave-2-panel-grid.png`: in the 296 px panel the placeholder wrapped
+    /// onto a second line and the key hints ate the field, leaving a pill of
+    /// roughly 56 px where the design says one line.
+    #[test]
+    fn the_composer_pill_is_one_line_and_its_hints_wait_for_a_field_that_can_afford_them() {
+        assert_eq!(COMPOSER_HINTS_MIN_FIELD_WIDTH, 420.0);
+        // A panel as one of four in the capture, and the mockup's own width:
+        // both leave the field under the threshold, so neither shows a note
+        // about two keys instead of the draft it annotates.
+        assert!(!composer_shows_key_hints(296.0));
+        assert!(!composer_shows_key_hints(470.0));
+        // Two panels across a 1912 px window, and a zoomed one: both are wide
+        // enough that the hints cost the field nothing.
+        assert!(composer_shows_key_hints(940.0));
+        assert!(composer_shows_key_hints(1800.0));
+        // The rule is monotonic in the width, or a panel could gain hints by
+        // getting narrower.
+        let mut previous = false;
+        for width in [200.0_f32, 296.0, 400.0, 470.0, 520.0, 700.0, 940.0, 1800.0] {
+            let shown = composer_shows_key_hints(width);
+            assert!(
+                shown || !previous,
+                "the hints came back at {width} px after being dropped"
+            );
+            previous = shown;
+        }
+
+        // The placeholder is one line at every width: untouched where it fits,
+        // ellipsised where it does not, and never longer than what it was
+        // measured against.
+        let placeholder = composer_placeholder("Codex");
+        assert_eq!(
+            composer_placeholder_within(&placeholder, 400.0),
+            placeholder
+        );
+        for width in [10.0_f32, 24.0, 40.0, 60.0] {
+            let trimmed = composer_placeholder_within(&placeholder, width);
+            assert!(
+                crate::ui::overlay_chrome::approx_text_width(&trimmed, COMPOSER_FONT_SIZE) <= width,
+                "the trimmed placeholder still outgrows {width} px: {trimmed:?}"
+            );
+            if !trimmed.is_empty() {
+                assert!(
+                    trimmed.ends_with('\u{2026}'),
+                    "a trimmed placeholder says it was cut: {trimmed:?}"
+                );
+                assert!(trimmed.chars().count() < placeholder.chars().count());
+            }
+        }
+        // A field with no room at all is empty rather than a bare ellipsis.
+        assert_eq!(composer_placeholder_within(&placeholder, 0.0), "");
+    }
+
+    /// W5 (fix wave 3): the meta line drops its right-hand end rather than
+    /// clipping it, and never loses the pair that says where the draft goes.
+    #[test]
+    fn the_meta_line_drops_from_the_right_and_keeps_the_provider_and_the_model() {
+        assert_eq!(COMPOSER_META_KEPT_SEGMENTS, 2);
+        // The line the capture painted, in paint order.
+        let labels: Vec<String> = ["Codex", "GPT-5.6 Sol", "Extra high", "Full access", "main"]
+            .iter()
+            .map(|label| (*label).to_string())
+            .collect();
+
+        // A wide surface keeps everything.
+        assert_eq!(
+            composer_meta_segments_within(&labels, composer_meta_line_room(1800.0)),
+            labels.len()
+        );
+
+        // Narrowing only ever takes segments away, one end at a time, and
+        // what survives always fits -- except at the floor, which is the one
+        // place the line is allowed to overflow rather than lie.
+        let mut previous = labels.len();
+        for width in [1800.0_f32, 940.0, 700.0, 470.0, 400.0, 350.0, 296.0, 200.0] {
+            let room = composer_meta_line_room(width);
+            let kept = composer_meta_segments_within(&labels, room);
+            assert!(
+                kept <= previous,
+                "at {width} px the line grew a segment back"
+            );
+            assert!(
+                kept >= COMPOSER_META_KEPT_SEGMENTS,
+                "at {width} px the line lost the provider or the model"
+            );
+            assert!(
+                kept == COMPOSER_META_KEPT_SEGMENTS
+                    || composer_meta_line_width(&labels[..kept]) <= room,
+                "at {width} px the {kept} kept segments do not fit in {room} px"
+            );
+            previous = kept;
+        }
+
+        // The capture's own width: "Full access" was the segment clipped to
+        // "Full acces", so it must be one of the ones that go.
+        let narrow = composer_meta_segments_within(&labels, composer_meta_line_room(296.0));
+        assert!(
+            narrow < labels.len(),
+            "a 296 px panel cannot paint the whole line"
+        );
+        assert!(!labels[..narrow].contains(&"main".to_string()));
+
+        // No room at all still leaves the two that may never drop.
+        assert_eq!(
+            composer_meta_segments_within(&labels, 0.0),
+            COMPOSER_META_KEPT_SEGMENTS
+        );
+        // And a line that is already at the floor is left alone.
+        assert_eq!(composer_meta_segments_within(&labels[..2], 0.0), 2);
+    }
+
     #[test]
     fn the_composer_type_scale_is_the_redesign_scale() {
         // Rule 2, and its ceiling: nothing the composer paints is over 13 px.
@@ -2731,7 +2973,15 @@ mod tests {
         assert_eq!(COMPOSER_ICON_GLYPH_SIZE, 14.0);
         assert_eq!(COMPOSER_CHIP_GAP, 6.0);
         assert_eq!(COMPOSER_CONTROL_GAP, 8.0);
-        assert_eq!(COMPOSER_REGION_PADDING, 10.0);
+        // W2 took both region paddings to the upper end of rule 6's 10-12 and
+        // pinned them to each other: the composer and the stream above it
+        // stack inside one panel body and must share a left edge.
+        assert_eq!(COMPOSER_REGION_PADDING, 12.0);
+        assert_eq!(
+            COMPOSER_REGION_PADDING,
+            crate::ui::task_cockpit::timeline::STREAM_REGION_PADDING,
+            "the composer and the stream must share one region padding"
+        );
         assert_eq!((COMPOSER_PADDING_X, COMPOSER_PADDING_Y), (10.0, 6.0));
         assert_eq!(
             (COMPOSER_BUTTON_PADDING_X, COMPOSER_BUTTON_PADDING_Y),

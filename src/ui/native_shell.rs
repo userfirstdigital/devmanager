@@ -135,13 +135,14 @@ use crate::ui::task_cockpit::changes_panel::{
     reconcile_selected_repository, repository_mutation_allowed, repository_status_readable,
 };
 use crate::ui::task_cockpit::composer::{
+    composer_meta_line_room, composer_meta_segments_within, composer_placeholder_within,
     composer_send_element_id, composer_send_glyph, composer_send_look, composer_send_tints,
-    provider_command_catalog, provider_command_opens_terminal, AnswerPayload, ApprovalDecision,
-    ComposerControl, ComposerDraftProjection, ComposerError, ComposerFence, ComposerHostProjection,
-    ComposerIntent, ComposerPayload, ComposerSendLook, ProviderCommandSuggestion, TaskComposer,
-    COMPOSER_ATTACHMENT_THUMBNAIL, COMPOSER_BORDER_WIDTH, COMPOSER_BUTTON_FONT_SIZE,
-    COMPOSER_BUTTON_PADDING_X, COMPOSER_BUTTON_PADDING_Y, COMPOSER_BUTTON_RADIUS,
-    COMPOSER_CAPTION_FONT_SIZE, COMPOSER_CHIP_FONT_SIZE, COMPOSER_CHIP_GAP,
+    composer_shows_key_hints, provider_command_catalog, provider_command_opens_terminal,
+    AnswerPayload, ApprovalDecision, ComposerControl, ComposerDraftProjection, ComposerError,
+    ComposerFence, ComposerHostProjection, ComposerIntent, ComposerPayload, ComposerSendLook,
+    ProviderCommandSuggestion, TaskComposer, COMPOSER_ATTACHMENT_THUMBNAIL, COMPOSER_BORDER_WIDTH,
+    COMPOSER_BUTTON_FONT_SIZE, COMPOSER_BUTTON_PADDING_X, COMPOSER_BUTTON_PADDING_Y,
+    COMPOSER_BUTTON_RADIUS, COMPOSER_CAPTION_FONT_SIZE, COMPOSER_CHIP_FONT_SIZE, COMPOSER_CHIP_GAP,
     COMPOSER_CHIP_LABEL_MAX_WIDTH, COMPOSER_CHIP_PADDING_X, COMPOSER_CHIP_PADDING_Y,
     COMPOSER_CHIP_RADIUS, COMPOSER_CONTROL_GAP, COMPOSER_FONT_SIZE, COMPOSER_HEIGHT_RESERVE,
     COMPOSER_ICON_BUTTON_SIZE, COMPOSER_ICON_GLYPH_SIZE, COMPOSER_INPUT_MAX_HEIGHT,
@@ -26748,10 +26749,14 @@ impl NativeShell {
         owner: HostTaskKey,
         show_input: bool,
         tokens: crate::ui::tokens::ThemeTokens,
-        idle_photo_size: Size<Pixels>,
+        // The panel BODY's size, not just the idle photo's: the composer's key
+        // hints and its meta line are both decisions about how wide this
+        // surface is (W4, W5), and it was already the only width in scope.
+        surface_size: Size<Pixels>,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         self.ensure_idle_conversation_photo(cx);
+        let surface_width_px = f32::from(surface_size.width);
         let owner_task_id = owner.task_id;
         // F5: an open pane whose stream has painted nothing yet keeps asking
         // its surface for a page. The old test was "has no timeline at all",
@@ -26781,7 +26786,7 @@ impl NativeShell {
         let page = needs_hydration
             .then(|| self.task_surfaces.admitted_conversation_page(owner.clone()))
             .flatten();
-        let timeline_height = (f32::from(idle_photo_size.height)
+        let timeline_height = (f32::from(surface_size.height)
             - if show_input {
                 COMPOSER_HEIGHT_RESERVE
             } else {
@@ -26790,7 +26795,7 @@ impl NativeShell {
         .max(1.0) as u32;
         {
             let Some(slot) = self.host_slot_mut(&owner.host) else {
-                return self.idle_conversation_photo_surface(tokens, Some(idle_photo_size));
+                return self.idle_conversation_photo_surface(tokens, Some(surface_size));
             };
             if let Some(page) = page.as_ref() {
                 slot.cockpit.hydrate_timeline_if_absent(owner_task_id, page);
@@ -27318,62 +27323,94 @@ impl NativeShell {
         // menus reach exactly what they reached before; what changes is that
         // the composer costs the panel one line instead of four rows.
         let meta_static = |label: String| div().flex_none().child(label).into_any_element();
-        let mut meta_segments: Vec<AnyElement> = Vec::new();
-        meta_segments.push(if draft_provider_selectable {
-            Self::composer_meta_action(
-                "native-composer-provider",
-                provider_label.to_string(),
-                tokens,
-                open_provider,
-            )
-        } else {
-            meta_static(provider_label.to_string())
-        });
+        // W5: each segment carries the label it paints, because the line has
+        // to be able to MEASURE itself. The previous cut let the strip clip,
+        // and "Full acces" reads as a rendering fault where a dropped segment
+        // reads as a line that says less -- the tab row's rule, one surface
+        // along.
+        let mut meta_segments: Vec<(String, AnyElement)> = Vec::new();
+        let mut push_segment = |label: String, element: AnyElement| {
+            meta_segments.push((label, element));
+        };
+        push_segment(
+            provider_label.to_string(),
+            if draft_provider_selectable {
+                Self::composer_meta_action(
+                    "native-composer-provider",
+                    provider_label.to_string(),
+                    tokens,
+                    open_provider,
+                )
+            } else {
+                meta_static(provider_label.to_string())
+            },
+        );
         if self.composer_launch_preferences_editable() {
-            meta_segments.push(Self::composer_meta_action(
-                "native-composer-model",
-                model_label,
-                tokens,
-                open_model,
-            ));
-            meta_segments.push(Self::composer_meta_action(
-                "native-composer-reasoning",
-                reasoning_label,
-                tokens,
-                open_reasoning,
-            ));
-            meta_segments.push(Self::composer_meta_action(
-                "native-composer-access",
+            push_segment(
+                model_label.clone(),
+                Self::composer_meta_action(
+                    "native-composer-model",
+                    model_label,
+                    tokens,
+                    open_model,
+                ),
+            );
+            push_segment(
+                reasoning_label.clone(),
+                Self::composer_meta_action(
+                    "native-composer-reasoning",
+                    reasoning_label,
+                    tokens,
+                    open_reasoning,
+                ),
+            );
+            push_segment(
                 access_label.to_string(),
-                tokens,
-                open_access,
-            ));
+                Self::composer_meta_action(
+                    "native-composer-access",
+                    access_label.to_string(),
+                    tokens,
+                    open_access,
+                ),
+            );
         } else if self.composer_model_reasoning_editable() {
-            meta_segments.push(Self::composer_meta_action(
-                "native-composer-model",
-                model_label,
-                tokens,
-                open_model,
-            ));
-            meta_segments.push(Self::composer_meta_action(
-                "native-composer-reasoning",
-                reasoning_label,
-                tokens,
-                open_reasoning,
-            ));
+            push_segment(
+                model_label.clone(),
+                Self::composer_meta_action(
+                    "native-composer-model",
+                    model_label,
+                    tokens,
+                    open_model,
+                ),
+            );
+            push_segment(
+                reasoning_label.clone(),
+                Self::composer_meta_action(
+                    "native-composer-reasoning",
+                    reasoning_label,
+                    tokens,
+                    open_reasoning,
+                ),
+            );
             // Access is fixed once a session is running, so it is said, not
             // offered. Dropping it instead would make the line lie by omission
             // about what the agent is allowed to do.
-            meta_segments.push(meta_static(access_label.to_string()));
+            push_segment(
+                access_label.to_string(),
+                meta_static(access_label.to_string()),
+            );
         } else if self.draft_owner_composer_workflow_pending() {
-            meta_segments.push(meta_static("Starting provider…".to_string()));
+            let label = "Starting provider…".to_string();
+            push_segment(label.clone(), meta_static(label));
         } else {
-            meta_segments.push(meta_static("Current session".to_string()));
+            let label = "Current session".to_string();
+            push_segment(label.clone(), meta_static(label));
         }
         // The checkout strip's two labels were a row of their own; the branch
         // is the half that changes, and the checkout is its tooltip.
         if !branch_label.is_empty() {
-            meta_segments.push(
+            push_segment(
+                branch_label.clone(),
                 div()
                     .id("native-task-composer-branch")
                     .flex_none()
@@ -27406,9 +27443,26 @@ impl NativeShell {
                 .as_ref()
                 .and_then(|ctl| ctl.usage_compact_for(instance_id))
             {
-                meta_segments.push(meta_static(quota));
+                push_segment(quota.clone(), meta_static(quota));
             }
         }
+        drop(push_segment);
+        // W5: the line loses its right-hand end rather than clipping it. The
+        // provider and the model never go: they say where the draft is going,
+        // and everything the line drops is still reachable from the selector
+        // that segment opens and from the panel's own menu.
+        let meta_kept = composer_meta_segments_within(
+            &meta_segments
+                .iter()
+                .map(|(label, _)| label.clone())
+                .collect::<Vec<_>>(),
+            composer_meta_line_room(surface_width_px),
+        );
+        meta_segments.truncate(meta_kept);
+        let meta_segments: Vec<AnyElement> = meta_segments
+            .into_iter()
+            .map(|(_, element)| element)
+            .collect();
         // Rule 4: the send slot is one icon button -- a 24 px hit box, no
         // border, no fill, `text.muted` at rest and `text.primary` on hover.
         // It replaces a 28 px accent-filled disc, which rule 1 spends only on
@@ -27665,8 +27719,19 @@ impl NativeShell {
                                                             style.line_height_in_pixels(
                                                                 window.rem_size(),
                                                             );
+                                                        // W4: the placeholder
+                                                        // is ONE line. There is
+                                                        // no `text_ellipsis` to
+                                                        // inherit inside a
+                                                        // canvas, so it is
+                                                        // trimmed against the
+                                                        // width the field
+                                                        // actually got.
                                                         let display = if paint_empty {
-                                                            paint_placeholder.clone()
+                                                            composer_placeholder_within(
+                                                                &paint_placeholder,
+                                                                f32::from(bounds.size.width),
+                                                            )
                                                         } else {
                                                             paint_text.clone()
                                                         };
@@ -27753,7 +27818,20 @@ impl NativeShell {
                                                                 SharedString::from(display),
                                                                 font_size,
                                                                 &runs,
-                                                                Some(bounds.size.width),
+                                                                // W4: a wrap
+                                                                // width for the
+                                                                // DRAFT, which
+                                                                // grows to six
+                                                                // lines, and
+                                                                // none for the
+                                                                // placeholder,
+                                                                // which is one
+                                                                // line and has
+                                                                // already been
+                                                                // trimmed to
+                                                                // fit it.
+                                                                (!paint_empty)
+                                                                    .then_some(bounds.size.width),
                                                                 None,
                                                             )
                                                             .unwrap_or_default();
@@ -27919,14 +27997,24 @@ impl NativeShell {
                                             // field at caption size in
                                             // `text.muted`, so they read as a
                                             // note rather than as a control.
-                                            .child(
-                                                div()
-                                                    .flex_none()
-                                                    .pb(px(COMPOSER_PADDING_Y))
-                                                    .text_size(px(COMPOSER_CAPTION_FONT_SIZE))
-                                                    .text_color(tokens.text.muted.to_gpui())
-                                                    .child(COMPOSER_KEY_HINTS),
-                                            )
+                                            //
+                                            // W4: a note, and only where the
+                                            // field can afford one. In a
+                                            // 296 px panel they took more of
+                                            // the row than the field they
+                                            // annotate and folded the
+                                            // placeholder onto a second line.
+                                            .children(composer_shows_key_hints(surface_width_px).then(
+                                                || {
+                                                    div()
+                                                        .flex_none()
+                                                        .pb(px(COMPOSER_PADDING_Y))
+                                                        .text_size(px(COMPOSER_CAPTION_FONT_SIZE))
+                                                        .text_color(tokens.text.muted.to_gpui())
+                                                        .child(COMPOSER_KEY_HINTS)
+                                                        .into_any_element()
+                                                },
+                                            ))
                                             .child(
                                                 div()
                                                     .flex_none()
