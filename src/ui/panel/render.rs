@@ -36,7 +36,13 @@ use crate::ui::tokens::{Color, ThemeTokens};
 pub const TITLE_ROW_HEIGHT: f32 = 30.0;
 /// `.tabs`: 6 px of top padding over an 11.5 px tab with 3/5 padding, sitting
 /// on its own 1 px bottom rule.
-pub const TAB_ROW_HEIGHT: f32 = 26.0;
+///
+/// Pinned at the spec's 28 rather than the 26 those paddings sum to: the tab is
+/// a POINTER target as well as a label, and 26 px left the selected pill
+/// looking squeezed against the rule under it at the width a panel gets as one
+/// of eight (fix wave 1, F11). The two extra pixels go under the tab, between
+/// its bottom padding and the rule.
+pub const TAB_ROW_HEIGHT: f32 = 28.0;
 /// A minimised panel is the title row alone, two pixels tighter because it has
 /// no tab row beneath it to align to.
 pub const MINIMISED_HEIGHT: f32 = 28.0;
@@ -631,8 +637,12 @@ fn tab_row_element(
                     tab.bg(tokens.surfaces.selection.to_gpui())
                         .text_color(tokens.text.primary.to_gpui())
                 })
+                // The unselected tabs are `text.secondary`, one step above the
+                // muted grey they used to be: at 11.5 px on `surfaces.raised`
+                // the muted token read as disabled rather than as "another
+                // view you can go to", which is what 02's tab row shows.
                 .when(!active, |tab| {
-                    tab.text_color(tokens.text.muted.to_gpui())
+                    tab.text_color(tokens.text.secondary.to_gpui())
                         .hover(|style| style.bg(tokens.surfaces.hover.to_gpui()))
                 })
                 .on_mouse_down(
@@ -983,7 +993,7 @@ mod tests {
     #[test]
     fn the_chrome_rows_keep_the_mockups_heights() {
         assert_eq!(TITLE_ROW_HEIGHT, 30.0);
-        assert_eq!(TAB_ROW_HEIGHT, 26.0);
+        assert_eq!(TAB_ROW_HEIGHT, 28.0);
         assert_eq!(MINIMISED_HEIGHT, 28.0);
         assert!(MINIMISED_HEIGHT < TITLE_ROW_HEIGHT + TAB_ROW_HEIGHT);
         // The stripe is the board's, on the same edge and at the same width,
@@ -1196,6 +1206,55 @@ mod tests {
         assert!(
             call.contains("tokens.text.muted.to_u32()"),
             "the mark is grey: design language rule 10 allows no brand tint"
+        );
+    }
+
+    /// F11: the tab row per mockup 02 -- 28 px, 11.5 px labels, the selected
+    /// tab a pill on `surfaces.selection` in `text.primary` and every other
+    /// tab in `text.secondary`. The five tabs are all that fit at the width a
+    /// panel gets as one of eight, so there is no "More" affordance to build:
+    /// `PaneView::TABS` IS the five, and the three views behind it reach the
+    /// panel through the menu.
+    #[test]
+    fn the_tab_row_is_the_mockups_and_five_tabs_are_all_of_them() {
+        assert_eq!(TAB_ROW_HEIGHT, 28.0);
+        assert_eq!(TAB_FONT_SIZE, 11.5);
+        assert_eq!(
+            PaneView::TABS.len(),
+            5,
+            "more than five tabs and the row would owe a More menu"
+        );
+        assert!(
+            TABS_PADDING_TOP + TAB_PADDING_TOP + TAB_FONT_SIZE + TAB_PADDING_BOTTOM
+                <= TAB_ROW_HEIGHT,
+            "the tab and its paddings must fit inside the row"
+        );
+
+        let source = include_str!("render.rs");
+        let painter = source
+            .split("#[cfg(test)]")
+            .next()
+            .expect("the painter is everything above its tests");
+        let tabs = painter
+            .split("fn tab_row_element(")
+            .nth(1)
+            .expect("the tab row painter");
+        let tabs = tabs
+            .split("\n/// ")
+            .next()
+            .expect("everything up to the next item's doc comment");
+        assert!(
+            tabs.contains("tokens.surfaces.selection.to_gpui()")
+                && tabs.contains("tokens.text.primary.to_gpui()"),
+            "the selected tab is a pill on surfaces.selection in text.primary"
+        );
+        assert!(
+            tabs.contains("tokens.text.secondary.to_gpui()"),
+            "the unselected tabs are text.secondary"
+        );
+        assert!(
+            !tabs.contains("tokens.text.muted.to_gpui()"),
+            "no tab is painted in the muted grey, which reads as disabled"
         );
     }
 }
