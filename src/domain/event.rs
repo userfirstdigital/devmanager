@@ -571,6 +571,21 @@ pub struct AgentProviderSessionBoundPayload {
     pub runtime_generation: u64,
 }
 
+/// The provider itself refused to resume this agent's durable conversation, so
+/// the binding is released and the id it refused is recorded for the record.
+///
+/// The event carries the abandoned id rather than only clearing a column: the
+/// point of a durable provider identity is that it can be audited later, and a
+/// release that erased the id would leave "which conversation did we give up
+/// on" unanswerable forever.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AgentProviderSessionAbandonedPayload {
+    pub agent_session_id: AgentSessionId,
+    pub abandoned_provider_session_id: ProviderSessionId,
+    pub runtime_generation: u64,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PrimaryAgentSetPayload {
@@ -1059,6 +1074,14 @@ pub enum Event {
         provider_session_id: ProviderSessionId,
         runtime_generation: u64,
     },
+    /// Release a durable provider conversation the provider refused to resume.
+    /// Fenced on the exact id, so it can never release a binding that has
+    /// already moved on to a different conversation.
+    AgentProviderSessionAbandoned {
+        agent_session_id: AgentSessionId,
+        abandoned_provider_session_id: ProviderSessionId,
+        runtime_generation: u64,
+    },
     PrimaryAgentSet {
         agent_session_id: AgentSessionId,
     },
@@ -1222,6 +1245,7 @@ impl Event {
             Self::TaskDeleted => "task.deleted",
             Self::AgentSessionRegistered { .. } => "agent_session.registered",
             Self::AgentProviderSessionBound { .. } => "agent_session.provider_bound",
+            Self::AgentProviderSessionAbandoned { .. } => "agent_session.provider_abandoned",
             Self::PrimaryAgentSet { .. } => "primary_agent.set",
             Self::UnstartedPrimaryProviderRebound { .. } => {
                 "agent_session.unstarted_provider_rebound"
@@ -1300,6 +1324,8 @@ enum EventBody {
     AgentSessionRegistered(AgentSessionRegisteredPayload),
     #[serde(rename = "agent_session.provider_bound")]
     AgentProviderSessionBound(AgentProviderSessionBoundPayload),
+    #[serde(rename = "agent_session.provider_abandoned")]
+    AgentProviderSessionAbandoned(AgentProviderSessionAbandonedPayload),
     #[serde(rename = "primary_agent.set")]
     PrimaryAgentSet(PrimaryAgentSetPayload),
     #[serde(rename = "agent_session.unstarted_provider_rebound")]
@@ -1414,6 +1440,15 @@ impl From<&Event> for EventDocument {
                 agent_session_id: *agent_session_id,
                 resource_id: *resource_id,
                 provider_session_id: provider_session_id.clone(),
+                runtime_generation: *runtime_generation,
+            }),
+            Event::AgentProviderSessionAbandoned {
+                agent_session_id,
+                abandoned_provider_session_id,
+                runtime_generation,
+            } => EventBody::AgentProviderSessionAbandoned(AgentProviderSessionAbandonedPayload {
+                agent_session_id: *agent_session_id,
+                abandoned_provider_session_id: abandoned_provider_session_id.clone(),
                 runtime_generation: *runtime_generation,
             }),
             Event::PrimaryAgentSet { agent_session_id } => {
@@ -1719,6 +1754,11 @@ impl TryFrom<EventDocument> for Event {
                 agent_session_id: p.agent_session_id,
                 resource_id: p.resource_id,
                 provider_session_id: p.provider_session_id,
+                runtime_generation: p.runtime_generation,
+            },
+            EventBody::AgentProviderSessionAbandoned(p) => Event::AgentProviderSessionAbandoned {
+                agent_session_id: p.agent_session_id,
+                abandoned_provider_session_id: p.abandoned_provider_session_id,
                 runtime_generation: p.runtime_generation,
             },
             EventBody::PrimaryAgentSet(p) => Event::PrimaryAgentSet {
@@ -2597,6 +2637,34 @@ fn apply_into(
                     agent.provider_session_id = Some(provider_session_id.clone());
                     agent.revision = agent.revision.saturating_add(1);
                 }
+            }
+        }
+        Event::AgentProviderSessionAbandoned {
+            agent_session_id,
+            abandoned_provider_session_id,
+            runtime_generation,
+        } => {
+            let Some(agent) = snap.agents.get_mut(agent_session_id) else {
+                return Err(ApplyError::NotFound);
+            };
+            if agent.lifecycle != AgentSessionLifecycle::Open
+                || agent.runtime_generation != *runtime_generation
+            {
+                return Err(ApplyError::InvalidTransition);
+            }
+            // Fenced on the EXACT id. Releasing whatever happens to be bound
+            // would let a stale abandon undo a conversation that was rebound
+            // in between, which is the one outcome worse than the wedge this
+            // event exists to break.
+            match agent.provider_session_id.as_ref() {
+                Some(bound) if bound == abandoned_provider_session_id => {
+                    agent.provider_session_id = None;
+                    agent.revision = agent.revision.saturating_add(1);
+                }
+                // Already released: replaying the event is a no-op, not a
+                // failure, so a resync cannot wedge on its own history.
+                None => {}
+                Some(_) => return Err(ApplyError::OwnershipConflict),
             }
         }
         Event::PrimaryAgentSet { agent_session_id } => {

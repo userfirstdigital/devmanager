@@ -95,6 +95,12 @@ pub(crate) enum ProviderLaunchReadinessHint {
     StartPending,
     /// Host proved the task is not in the restore queue or in-flight set.
     NotPending,
+    /// Host observed the provider REFUSE to resume this task's durable
+    /// conversation. Nothing the host can retry on its own will change that,
+    /// so this outranks StartPending for the same reason a permanent restore
+    /// refusal outranks a stale transient cause: it is the state the task is
+    /// actually stuck in, not the state of the current attempt.
+    ConversationNotFound,
 }
 
 /// Host-side adapter for the exact kernel provider-resource claim.  The
@@ -1264,6 +1270,18 @@ fn classify_terminal_readiness_absence(
     task_id: TaskId,
     snapshot: &crate::domain::TaskSnapshot,
 ) -> QueryOutcome {
+    // First, because it is the only classification a retry cannot clear. Told
+    // "start pending" instead, a client waits for an attempt that is certain
+    // to fail with the same refusal, forever.
+    if matches!(
+        dispatch.provider_launch_hint,
+        ProviderLaunchReadinessHint::ConversationNotFound
+    ) {
+        return provider_terminal_unavailable(
+            dispatch,
+            TaskCockpitUnavailableReason::TerminalProviderSessionNotFound,
+        );
+    }
     if matches!(
         dispatch.provider_launch_hint,
         ProviderLaunchReadinessHint::StartPending

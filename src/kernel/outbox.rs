@@ -192,6 +192,7 @@ pub(crate) fn is_pure_slice_decision_fact(event: &Event) -> bool {
         | Event::TaskDeleted
         | Event::AgentSessionRegistered { .. }
         | Event::AgentProviderSessionBound { .. }
+        | Event::AgentProviderSessionAbandoned { .. }
         | Event::PrimaryAgentSet { .. }
         | Event::UnstartedPrimaryProviderRebound { .. }
         | Event::SpecialistRequested { .. }
@@ -494,6 +495,7 @@ pub(crate) fn plan_effects(
             | Event::TaskDeleted
             | Event::AgentSessionRegistered { .. }
             | Event::AgentProviderSessionBound { .. }
+            | Event::AgentProviderSessionAbandoned { .. }
             | Event::PrimaryAgentSet { .. }
             | Event::UnstartedPrimaryProviderRebound { .. }
             | Event::SpecialistRequested { .. }

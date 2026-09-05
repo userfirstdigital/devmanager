@@ -1226,6 +1226,19 @@ pub enum Command {
         provider_session_id: crate::domain::ProviderSessionId,
         expected_runtime_generation: u64,
     },
+    /// Release a durable provider conversation the provider itself refused to
+    /// resume, so the next start can be a fresh one.
+    ///
+    /// Host-journal ingress only, and fenced on the EXACT id the provider
+    /// refused: this is the one command that throws away a durable provider
+    /// identity, and it must never be able to throw away a different one than
+    /// the failure named. Without it a task whose conversation the provider has
+    /// forgotten can only be resumed, which fails forever.
+    AbandonProviderSession {
+        agent_session_id: AgentSessionId,
+        abandoned_provider_session_id: crate::domain::ProviderSessionId,
+        expected_runtime_generation: u64,
+    },
     SetPrimaryAgent {
         agent_session_id: AgentSessionId,
     },
@@ -1532,6 +1545,40 @@ pub fn decide(
                     provider_session_id: provider_session_id.clone(),
                     runtime_generation: *expected_runtime_generation,
                 }]),
+            }
+        }
+        Command::AbandonProviderSession {
+            agent_session_id,
+            abandoned_provider_session_id,
+            expected_runtime_generation,
+        } => {
+            let snap = require_runtime_capable_task(snapshot, envelope)?;
+            require_expected_revision(snap, envelope)?;
+            let agent = snap
+                .agents
+                .get(agent_session_id)
+                .ok_or(RejectionCode::NotFound)?;
+            require_open_agent(agent)?;
+            if agent.runtime_generation != *expected_runtime_generation {
+                return Err(RejectionCode::InvalidTransition);
+            }
+            match agent.provider_session_id.as_ref() {
+                Some(bound) if bound == abandoned_provider_session_id => {
+                    Ok(vec![Event::AgentProviderSessionAbandoned {
+                        agent_session_id: *agent_session_id,
+                        abandoned_provider_session_id: abandoned_provider_session_id.clone(),
+                        runtime_generation: *expected_runtime_generation,
+                    }])
+                }
+                // Nothing bound: there is no conversation to abandon, and
+                // emitting the event anyway would claim a release that never
+                // happened. AlreadyResolved is the same answer BindProviderSession
+                // gives for its own already-done case.
+                None => Err(RejectionCode::AlreadyResolved),
+                // A DIFFERENT conversation is bound. The failure this command
+                // carries is about an id that is no longer current, so
+                // honouring it would discard a live binding on stale evidence.
+                Some(_) => Err(RejectionCode::OwnershipConflict),
             }
         }
         Command::SetPrimaryAgent { agent_session_id } => {

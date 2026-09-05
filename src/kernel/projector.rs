@@ -321,6 +321,71 @@ pub(crate) fn apply_event(
             }
             bump_task_revision(tx, shadow, task_id, event)?;
         }
+        Event::AgentProviderSessionAbandoned {
+            agent_session_id,
+            abandoned_provider_session_id,
+            runtime_generation,
+        } => {
+            let task_id = require_task_id(event)?;
+            let table = table_name("agent_sessions", shadow);
+            // Fenced on the EXACT id, which is what makes replay safe: the
+            // UPDATE simply changes nothing once the binding has already been
+            // released or has moved on, and the check below tells those two
+            // apart from a genuine fence mismatch.
+            let changed = tx.execute(
+                &format!(
+                    "UPDATE {table}
+                     SET provider_session_id = NULL, provider_resource_id = NULL,
+                         revision = revision + 1
+                     WHERE agent_session_id = ?1 AND task_id = ?2
+                       AND lifecycle = 'open' AND runtime_generation = ?3
+                       AND provider_session_id = ?4"
+                ),
+                rusqlite::params![
+                    agent_session_id.as_bytes().as_slice(),
+                    task_id.as_bytes().as_slice(),
+                    u64_to_sqlite_i64("agent_sessions.runtime_generation", *runtime_generation)?,
+                    abandoned_provider_session_id.as_str(),
+                ],
+            )?;
+            if changed == 0 {
+                let existing: Option<Option<String>> = tx
+                    .query_row(
+                        &format!(
+                            "SELECT provider_session_id FROM {table}
+                             WHERE agent_session_id = ?1 AND task_id = ?2
+                               AND lifecycle = 'open' AND runtime_generation = ?3"
+                        ),
+                        rusqlite::params![
+                            agent_session_id.as_bytes().as_slice(),
+                            task_id.as_bytes().as_slice(),
+                            u64_to_sqlite_i64(
+                                "agent_sessions.runtime_generation",
+                                *runtime_generation
+                            )?,
+                        ],
+                        |row| row.get(0),
+                    )
+                    .optional()?;
+                // THREE cases, and only one of them is benign.
+                // `Some(None)` is already-released, which is this event
+                // replayed and must be a no-op. `Some(Some(other))` is a
+                // different conversation bound in between. `None` is no
+                // open agent at this
+                // generation at all -- and letting THAT pass is the shape
+                // where an abandon reports success having released nothing,
+                // so it is a mismatch like any other.
+                match existing {
+                    Some(None) => {}
+                    Some(Some(_)) | None => {
+                        return Err(StoreError::Projection(
+                            "provider session abandon fence mismatch".into(),
+                        ))
+                    }
+                }
+            }
+            bump_task_revision(tx, shadow, task_id, event)?;
+        }
         Event::PrimaryAgentSet { agent_session_id } => {
             let task_id = require_task_id(event)?;
             validate_primary_agent(tx, shadow, task_id, *agent_session_id)?;
