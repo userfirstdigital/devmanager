@@ -550,6 +550,7 @@ fn is_pure_decision_fact(event: &Event) -> bool {
             | Event::TaskDeleted
             | Event::AgentSessionRegistered { .. }
             | Event::AgentProviderSessionBound { .. }
+            | Event::AgentProviderSessionAbandoned { .. }
             | Event::PrimaryAgentSet { .. }
             | Event::UnstartedPrimaryProviderRebound { .. }
             | Event::SpecialistRequested { .. }

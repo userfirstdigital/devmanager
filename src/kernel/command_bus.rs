@@ -234,6 +234,10 @@ impl CommandBus {
             Command::CreateTask(_)
                 | Command::CreateTaskV2(_)
                 | Command::BindProviderSession { .. }
+                // Abandon is host-authority for a stronger reason than Bind:
+                // it DISCARDS a durable provider identity, on evidence only
+                // the host can have observed.
+                | Command::AbandonProviderSession { .. }
                 | Command::RebindUnstartedPrimaryProvider { .. }
                 | Command::ServiceControl(_)
                 | Command::StartProviderSession(_)
@@ -4070,7 +4074,7 @@ mod terminal_and_provider_restart_tests {
     }
 
     #[test]
-    fn correlated_provider_binding_is_exact_write_once_and_restorable() {
+    fn correlated_provider_binding_is_exact_write_once_restorable_and_abandonable() {
         let directory = tempfile::tempdir().expect("provider restart directory");
         let mut bus =
             CommandBus::open(&directory.path().join("tasks.sqlite")).expect("command bus");
@@ -4300,6 +4304,153 @@ mod terminal_and_provider_restart_tests {
             resource_id,
             "projection rebuild must preserve the exact restart resource"
         );
+
+        // ---- Abandoning that conversation, which is the ONE way a durable
+        // provider identity is ever thrown away.
+        //
+        // The provider refused to resume `codex-durable-session`, so the task
+        // can only go forward as a fresh conversation. Every fence is proved
+        // here, because this command discards durable state and a wrong answer
+        // is unrecoverable.
+        let abandon = |session_id: ProviderSessionId, generation| Command::AbandonProviderSession {
+            agent_session_id,
+            abandoned_provider_session_id: session_id,
+            expected_runtime_generation: generation,
+        };
+        let bound = ProviderSessionId::new("codex-durable-session").expect("provider session");
+
+        assert_eq!(
+            bus.execute(task_envelope(
+                client_id,
+                task_id,
+                revision,
+                abandon(bound.clone(), 7),
+            )),
+            Err(StoreError::HostAuthorityRequired),
+            "a client cannot discard a durable provider conversation"
+        );
+
+        // A DIFFERENT id is stale evidence about a binding that has moved on.
+        let wrong_id = host_execute(
+            &mut bus,
+            task_envelope(
+                client_id,
+                task_id,
+                revision,
+                abandon(
+                    ProviderSessionId::new("some-other-session").expect("other"),
+                    7,
+                ),
+            ),
+        );
+        assert!(
+            matches!(
+                wrong_id,
+                CommandReceipt::Rejected {
+                    code: RejectionCode::OwnershipConflict,
+                    ..
+                }
+            ),
+            "abandon must be fenced on the exact id; got {wrong_id:?}"
+        );
+        let stale_generation = host_execute(
+            &mut bus,
+            task_envelope(client_id, task_id, revision, abandon(bound.clone(), 8)),
+        );
+        assert!(matches!(
+            stale_generation,
+            CommandReceipt::Rejected {
+                code: RejectionCode::InvalidTransition,
+                ..
+            }
+        ));
+        assert_eq!(
+            bus.durable_provider_binding(agent_session_id)
+                .expect("binding after refused abandons"),
+            Some((bound.clone(), resource_id)),
+            "a refused abandon must not have released anything"
+        );
+
+        // The exact id, host-authorized: the binding is released.
+        revision = accepted_revision(host_execute(
+            &mut bus,
+            task_envelope(client_id, task_id, revision, abandon(bound.clone(), 7)),
+        ));
+        assert_eq!(
+            bus.durable_provider_binding(agent_session_id)
+                .expect("binding after abandon"),
+            None,
+            "abandoning must clear the durable provider_session_id"
+        );
+        // And the task stops being enumerated for exact resume, which is the
+        // whole point: the restore loop can no longer aim at the dead id.
+        assert!(
+            bus.restorable_provider_starts(64)
+                .expect("restore query after abandon")
+                .iter()
+                .all(|start| start.agent_session_id != agent_session_id),
+            "an abandoned conversation must not be re-enumerated for ResumeExact"
+        );
+
+        // Repeating it is AlreadyResolved, not a second release: there is no
+        // conversation left to abandon and the command must not pretend there
+        // is.
+        let repeat = host_execute(
+            &mut bus,
+            task_envelope(client_id, task_id, revision, abandon(bound.clone(), 7)),
+        );
+        assert!(
+            matches!(
+                repeat,
+                CommandReceipt::Rejected {
+                    code: RejectionCode::AlreadyResolved,
+                    ..
+                }
+            ),
+            "abandoning nothing returned {repeat:?}"
+        );
+
+        // A fresh conversation can now be bound, which it could not before:
+        // the durable bind is fenced on `provider_session_id IS NULL`.
+        revision = accepted_revision(host_execute(
+            &mut bus,
+            task_envelope(
+                client_id,
+                task_id,
+                revision,
+                bind_command(
+                    resource_id,
+                    ProviderSessionId::new("codex-fresh-session").expect("fresh"),
+                    7,
+                ),
+            ),
+        ));
+        assert_eq!(
+            bus.durable_provider_binding(agent_session_id)
+                .expect("binding after fresh start"),
+            Some((
+                ProviderSessionId::new("codex-fresh-session").expect("fresh"),
+                resource_id,
+            ))
+        );
+
+        // Replay is the real test of the projector's fence: the abandon and the
+        // rebind have to reconstruct to the same state from the journal alone.
+        let replay = bus
+            .store
+            .rebuild_projections()
+            .expect("rebuild after abandon");
+        assert!(replay.events_replayed > 0);
+        assert_eq!(
+            bus.durable_provider_binding(agent_session_id)
+                .expect("rebuilt binding after abandon"),
+            Some((
+                ProviderSessionId::new("codex-fresh-session").expect("fresh"),
+                resource_id,
+            )),
+            "replaying abandon-then-rebind must land on the fresh conversation"
+        );
+        let _ = revision;
     }
 }
 

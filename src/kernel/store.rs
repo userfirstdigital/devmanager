@@ -8,17 +8,18 @@ use sha2::{Digest, Sha256};
 use crate::domain::agent_resource::AgentResourceBinding;
 use crate::domain::command::{CommandEnvelope, CommandReceipt};
 use crate::domain::event::{
-    AgentProviderSessionBoundPayload, AgentSessionRegisteredPayload, ArtifactRegisteredPayload,
-    DomainEvent, Event, HostCleanupBranchCompletedPayload, HostCloseBegunPayload,
-    OperationAcceptedFact, OperationCancelledFact, OperationFailedFact, OperationSettledFact,
-    OperationUncertainFact, PrimaryAgentSetPayload, PrimaryPromotedPayload,
-    ProviderApprovalPresentedPayload, ProviderInputAcceptedPayload, ProviderInputDeliveredPayload,
-    ProviderQuestionPresentedPayload, ProviderWaitSettledPayload, ResourceRegisteredPayload,
-    ResourceReleaseBegunPayload, ResourceReleasedPayload, SpecialistClosedPayload,
-    SpecialistHandoffRecordedPayload, SpecialistRequestedPayload, TaskAttentionSetPayload,
-    TaskCloseBegunPayload, TaskCreatedPayload, TaskRenamedPayload, TaskTerminalStripSetPayload,
-    TaskUnitPayload, TerminalActivityPayload, TerminalCwdReportedPayload, TerminalExitedPayload,
-    TerminalRenamedPayload, UnstartedPrimaryProviderReboundPayload, EVENT_SCHEMA_VERSION,
+    AgentProviderSessionAbandonedPayload, AgentProviderSessionBoundPayload,
+    AgentSessionRegisteredPayload, ArtifactRegisteredPayload, DomainEvent, Event,
+    HostCleanupBranchCompletedPayload, HostCloseBegunPayload, OperationAcceptedFact,
+    OperationCancelledFact, OperationFailedFact, OperationSettledFact, OperationUncertainFact,
+    PrimaryAgentSetPayload, PrimaryPromotedPayload, ProviderApprovalPresentedPayload,
+    ProviderInputAcceptedPayload, ProviderInputDeliveredPayload, ProviderQuestionPresentedPayload,
+    ProviderWaitSettledPayload, ResourceRegisteredPayload, ResourceReleaseBegunPayload,
+    ResourceReleasedPayload, SpecialistClosedPayload, SpecialistHandoffRecordedPayload,
+    SpecialistRequestedPayload, TaskAttentionSetPayload, TaskCloseBegunPayload, TaskCreatedPayload,
+    TaskRenamedPayload, TaskTerminalStripSetPayload, TaskUnitPayload, TerminalActivityPayload,
+    TerminalCwdReportedPayload, TerminalExitedPayload, TerminalRenamedPayload,
+    UnstartedPrimaryProviderReboundPayload, EVENT_SCHEMA_VERSION,
 };
 use crate::domain::id::{EventId, OperationId, OutboxId, ResourceId, TaskId};
 use crate::domain::operation::{
@@ -1883,6 +1884,15 @@ pub(crate) fn encode_event_payload(event: &Event) -> Result<Vec<u8>, StoreError>
             provider_session_id: provider_session_id.clone(),
             runtime_generation: *runtime_generation,
         }),
+        Event::AgentProviderSessionAbandoned {
+            agent_session_id,
+            abandoned_provider_session_id,
+            runtime_generation,
+        } => rmp_serde::to_vec(&AgentProviderSessionAbandonedPayload {
+            agent_session_id: *agent_session_id,
+            abandoned_provider_session_id: abandoned_provider_session_id.clone(),
+            runtime_generation: *runtime_generation,
+        }),
         Event::PrimaryAgentSet { agent_session_id } => rmp_serde::to_vec(&PrimaryAgentSetPayload {
             agent_session_id: *agent_session_id,
         }),
@@ -2208,6 +2218,14 @@ pub(crate) fn decode_stored_event(
                 agent_session_id: p.agent_session_id,
                 resource_id: p.resource_id,
                 provider_session_id: p.provider_session_id,
+                runtime_generation: p.runtime_generation,
+            }
+        }
+        "agent_session.provider_abandoned" => {
+            let p: AgentProviderSessionAbandonedPayload = unpack(payload)?;
+            Event::AgentProviderSessionAbandoned {
+                agent_session_id: p.agent_session_id,
+                abandoned_provider_session_id: p.abandoned_provider_session_id,
                 runtime_generation: p.runtime_generation,
             }
         }

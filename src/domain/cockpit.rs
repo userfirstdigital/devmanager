@@ -104,6 +104,11 @@ pub enum TaskCockpitUnavailableReason {
     /// Host-attested: live identityless Codex PTY shows a blocking trust/setup
     /// screen that requires user action on that host before composer input.
     TerminalProviderSetupRequired,
+    /// Host-attested: the provider itself refused to resume this task's durable
+    /// conversation, so no amount of retrying the same start can work. The one
+    /// way forward is a FRESH conversation, which discards the durable provider
+    /// identity and therefore needs a person to ask for it.
+    TerminalProviderSessionNotFound,
     GitAuthorityNotIssued,
     FileAuthorityNotIssued,
     SshOperationUnsupported,

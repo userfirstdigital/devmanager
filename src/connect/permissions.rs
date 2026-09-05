@@ -149,6 +149,12 @@ pub fn action_for_client_request(request: &ClientRequest) -> Option<(ActionId, O
                 // cwd, so a remote principal holding MUTATE_TASK must not be
                 // able to send one; the host issues it itself.
                 Command::BindProviderSession { .. }
+                // Abandon joins Bind for a stronger version of the same
+                // reason: it is the only command that DISCARDS a durable
+                // provider identity, and its whole justification is a launch
+                // failure only the host can have observed. A remote principal
+                // holding MUTATE_TASK must not be able to send one.
+                | Command::AbandonProviderSession { .. }
                 | Command::RebindUnstartedPrimaryProvider { .. }
                 | Command::PresentProviderQuestion(_)
                 | Command::PresentProviderApproval(_)

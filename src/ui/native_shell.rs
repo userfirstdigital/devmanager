@@ -117,9 +117,9 @@ use crate::ui::panel::permission::{
     permission_dock_element, permission_names_a_file, PermissionHandlers,
 };
 use crate::ui::panel::{
-    more_views, panel_chrome, panel_chrome_element, panel_frame, panel_key_action, panel_menu_rows,
-    NeedsYou, PanelChrome, PanelHandlers, PanelKeyAction, PanelMenuItem, PrimaryAction,
-    TAB_ROW_HEIGHT, TITLE_ROW_HEIGHT,
+    blocked_recovery_for, more_views, panel_chrome, panel_chrome_element, panel_frame,
+    panel_key_action, panel_menu_rows, BlockedRecovery, NeedsYou, PanelChrome, PanelHandlers,
+    PanelKeyAction, PanelMenuItem, PrimaryAction, TAB_ROW_HEIGHT, TITLE_ROW_HEIGHT,
 };
 use crate::ui::prompts::mutation::apply_host_reply_to_session;
 use crate::ui::prompts::{PromptLibraryKey, PromptLibrarySession};
@@ -865,6 +865,35 @@ fn first_send_terminal_probe_start_pending(result: &crate::domain::TaskCockpitRe
             ..
         }
     )
+}
+
+/// What a panel and a board row both say when the provider has forgotten a
+/// task's conversation.
+///
+/// One definition for the two surfaces, because "the row and the panel
+/// disagree about why this task is stuck" is a bug report nobody can act on.
+const SESSION_NOT_FOUND_CAUSE: &str = "Session not found";
+
+/// The host's refusal for a terminal query, as BOTH the typed reason and the
+/// sentence a person reads.
+///
+/// One decoder, because the two must be recorded together: the sentence is
+/// what the panel shows and the type is what decides which recovery it offers,
+/// and a UI that branched on the sentence would be a guard on one spelling of
+/// it.
+fn terminal_query_refusal(
+    result: &crate::domain::TaskCockpitResult,
+) -> Option<(String, Option<crate::domain::TaskCockpitUnavailableReason>)> {
+    match result {
+        crate::domain::TaskCockpitResult::Unavailable { reason, detail, .. } => Some((
+            cockpit_reason_line(*reason, detail.as_deref()),
+            Some(*reason),
+        )),
+        crate::domain::TaskCockpitResult::Denied { reason, detail, .. } => {
+            Some((cockpit_reason_line(*reason, detail.as_deref()), None))
+        }
+        _ => None,
+    }
 }
 
 /// Live Codex PTY is on a blocking trust/setup screen for this host.
@@ -15206,6 +15235,19 @@ impl NativeShell {
                             // chip whose reply this is.
                             let settles = self.settling_terminal_target(&key.0, key.1);
                             self.pending_terminal_requeries.remove(&key);
+                            // The local lane used to drop the host's reason on
+                            // the floor -- both the sentence and the type --
+                            // so a local panel could only ever say the same
+                            // four words for every distinct refusal. The fleet
+                            // lane has kept it since fix wave 1; this is the
+                            // same hop, one host over.
+                            let refusal = terminal_query_refusal(&result);
+                            self.task_surfaces.note_terminal_refusal_for(
+                                owner.clone(),
+                                settles.surface_target(),
+                                refusal.as_ref().map(|(detail, _)| detail.clone()),
+                                refusal.and_then(|(_, reason)| reason),
+                            );
                             self.task_surfaces
                                 .note_terminal_reconnecting_for(owner, settles.surface_target());
                         }
@@ -17982,21 +18024,12 @@ impl NativeShell {
                         // "Terminal unavailable" is the same four words for every
                         // distinct refusal. Keep the host's sentence with the
                         // attachment this reply settles so the label can name it.
-                        let refusal = match result {
-                            crate::domain::TaskCockpitResult::Unavailable {
-                                reason,
-                                detail,
-                                ..
-                            } => Some(cockpit_reason_line(reason, detail.as_deref())),
-                            crate::domain::TaskCockpitResult::Denied { reason, detail, .. } => {
-                                Some(cockpit_reason_line(reason, detail.as_deref()))
-                            }
-                            _ => None,
-                        };
+                        let refusal = terminal_query_refusal(result);
                         self.task_surfaces.note_terminal_refusal_for(
                             owner.clone(),
                             settles.surface_target(),
-                            refusal,
+                            refusal.as_ref().map(|(detail, _)| detail.clone()),
+                            refusal.and_then(|(_, reason)| reason),
                         );
                         self.task_surfaces
                             .note_terminal_reconnecting_for(owner, settles.surface_target());
@@ -25873,7 +25906,7 @@ impl NativeShell {
             on_retry: Rc::new(move |key, _window, app| {
                 let key = key.clone();
                 let _ = retry_entity.update(app, |shell, cx| {
-                    shell.retry_provider_for(&key);
+                    shell.recover_blocked_panel_for(&key);
                     cx.notify();
                 });
             }),
@@ -25980,21 +26013,36 @@ impl NativeShell {
                 names_a_file: permission_names_a_file(&summary),
             });
         }
-        let blocked = matches!(
-            self.task_row_status_for_owner(owner),
-            Some(
-                VisibleTaskStatus::Failed
-                    | VisibleTaskStatus::Disconnected
-                    | VisibleTaskStatus::UncertainOutcome
-            )
-        );
-        blocked.then(|| NeedsYou::Blocked {
-            // The provider's own sentence when there is one; the board's word
-            // for the state when there is not. Never a fabricated cause.
-            cause: self
-                .task_surfaces
-                .terminal_refusal_detail(owner.clone())
-                .unwrap_or_else(|| row.why.clone()),
+        let session_not_found = self.task_surfaces.terminal_session_not_found(owner.clone());
+        let blocked = session_not_found
+            || matches!(
+                self.task_row_status_for_owner(owner),
+                Some(
+                    VisibleTaskStatus::Failed
+                        | VisibleTaskStatus::Disconnected
+                        | VisibleTaskStatus::UncertainOutcome
+                )
+            );
+        blocked.then(|| {
+            NeedsYou::Blocked {
+                // A conversation the provider has FORGOTTEN gets the short
+                // sentence, because the host's own rendering of that reason is
+                // a mouthful and the panel has one line. Otherwise the
+                // provider's own sentence when there is one, and the board's
+                // word for the state when there is not. Never a fabricated
+                // cause.
+                cause: if session_not_found {
+                    SESSION_NOT_FOUND_CAUSE.to_string()
+                } else {
+                    self.task_surfaces
+                        .terminal_refusal_detail(owner.clone())
+                        .unwrap_or_else(|| row.why.clone())
+                },
+                // One mapping, so the panel, the handler and the tests read
+                // the same rule. Discarding a durable conversation is a
+                // person's decision, which is exactly what this affordance is.
+                recovery: blocked_recovery_for(session_not_found),
+            }
         })
     }
 
@@ -26294,6 +26342,90 @@ impl NativeShell {
             }
         } else {
             self.refresh_cockpit_surfaces_for_owner(owner);
+        }
+    }
+
+    /// Act on a blocked panel's one recovery affordance.
+    ///
+    /// Reads the SAME `BlockedRecovery` the painter took its label from, so
+    /// the button cannot say one thing and do another. A panel labelled
+    /// "Start fresh" starts a fresh conversation; every other blocked panel
+    /// retries.
+    fn recover_blocked_panel_for(&mut self, owner: &HostTaskKey) {
+        match blocked_recovery_for(self.task_surfaces.terminal_session_not_found(owner.clone())) {
+            BlockedRecovery::StartFresh => self.start_fresh_provider_conversation_for(owner),
+            BlockedRecovery::Retry => self.retry_provider_for(owner),
+        }
+    }
+
+    /// Abandon the conversation the provider has forgotten and start a new one.
+    ///
+    /// The host refuses a `NewConversation` start for a task with a persisted
+    /// launch graph, EXCEPT one whose exact resume the provider has refused --
+    /// which is precisely the state this panel is in. Accepting it is what
+    /// releases the durable provider identity, so this is deliberately a
+    /// person's gesture and never automatic.
+    fn start_fresh_provider_conversation_for(&mut self, owner: &HostTaskKey) {
+        let Some(model) = self
+            .host_slot(&owner.host)
+            .and_then(|slot| slot.client_model.clone())
+        else {
+            return;
+        };
+        let Some(snapshot) = model.task(owner.task_id) else {
+            return;
+        };
+        let Some(agent_session_id) = snapshot.primary_agent_id else {
+            self.set_owner_composer_error(owner, "This task has no agent session to restart.");
+            return;
+        };
+        let Some(agent) = snapshot.agents.get(&agent_session_id) else {
+            self.set_owner_composer_error(owner, "This task's agent facts are unavailable.");
+            return;
+        };
+        // The one shared provider rule, not a bare resource search: a task's
+        // plain shells are Active Terminal resources at the same generation.
+        let Ok(Some(resource)) =
+            crate::domain::agent_resource::provider_terminal_resource(snapshot, agent)
+        else {
+            self.set_owner_composer_error(
+                owner,
+                "Couldn't find this task's provider terminal resource.",
+            );
+            return;
+        };
+        let arguments = crate::client::action::ProviderStartArguments {
+            task_id: owner.task_id,
+            agent_session_id,
+            resource_id: resource.id,
+            provider_kind: agent.provider_kind,
+            mode: crate::domain::command::ProviderStartMode::NewConversation,
+            launch_options: crate::providers::adapter::ProviderLaunchOptions::default(),
+            action_epoch: snapshot.task.action_epoch,
+        };
+        match self.dispatch_action_recorded_for_owner(
+            &owner.host,
+            ActionRequest::StartProviderSession(arguments),
+        ) {
+            Ok(_) => {
+                // The panel's blocked state is settled by the host's next
+                // answer, not by optimism here. What IS said now is that the
+                // gesture was accepted, because the alternative is a button
+                // that appears to do nothing for a second or two.
+                self.set_owner_composer_error(
+                    owner,
+                    "Starting a fresh conversation for this task.",
+                );
+            }
+            Err(failure) => self.set_owner_composer_error(owner, &failure.message),
+        }
+    }
+
+    /// Say something on one owner's panel. A recovery that refuses silently is
+    /// indistinguishable from a button that does not work.
+    fn set_owner_composer_error(&mut self, owner: &HostTaskKey, message: &str) {
+        if let Some(slot) = self.host_slot_mut(&owner.host) {
+            slot.composer_error = Some(message.to_string());
         }
     }
 
@@ -33093,7 +33225,22 @@ impl NativeShell {
                 continue;
             }
             let status = self.task_row_status_for_owner(&fleet_row.key);
-            let state = board_state_of(status.unwrap_or(VisibleTaskStatus::Idle), fleet_row.done);
+            // A task whose provider conversation the provider has FORGOTTEN
+            // cannot start, so it needs a person -- whatever its activity
+            // says. Without this the wedged task reads as Idle, which is the
+            // state a healthy task with nothing to do is in, and the row is
+            // filed away from the group whose whole job is "these want you".
+            // Measured in the capture: the panel for such a task showed
+            // "Idle".
+            let state = if !fleet_row.done
+                && self
+                    .task_surfaces
+                    .terminal_session_not_found(fleet_row.key.clone())
+            {
+                BoardState::Blocked
+            } else {
+                board_state_of(status.unwrap_or(VisibleTaskStatus::Idle), fleet_row.done)
+            };
             // The clock is observed for every state, including Idle, so a
             // later state change measures from that change rather than from
             // whenever this process first saw the row. Its answer is only
@@ -33120,6 +33267,18 @@ impl NativeShell {
                     .doing_now
                     .clone()
                     .unwrap_or_else(|| BoardState::Working.why_label().to_string()),
+                // The row names the cause it can name. "Blocked" is true of
+                // every blocked row and tells a person nothing about which one
+                // to open; a conversation the provider has forgotten is the
+                // one blocked cause with a specific answer, and the panel
+                // already says exactly this.
+                BoardState::Blocked
+                    if self
+                        .task_surfaces
+                        .terminal_session_not_found(fleet_row.key.clone()) =>
+                {
+                    SESSION_NOT_FOUND_CAUSE.to_string()
+                }
                 other => other.why_label().to_string(),
             };
             let provider = match self.task_provider_kind_for_owner(&fleet_row.key) {
@@ -71141,6 +71300,67 @@ mod "
         });
     }
 
+    fn apply_terminal_unavailable_outcome_for_test(
+        shell: &mut NativeShell,
+        host_id: &HostId,
+        action: NativeActionRecord,
+        reason: crate::domain::TaskCockpitUnavailableReason,
+    ) {
+        shell.apply_epoch_fenced_action_outcome_for_host(
+            host_id,
+            NativeHostActionOutcome::Queried {
+                action,
+                detail: "terminal".into(),
+                body: NativeHostQueryBody::TaskCockpit(
+                    crate::domain::TaskCockpitResult::Unavailable {
+                        surface: crate::domain::TaskCockpitSurface::Terminal,
+                        reason,
+                        detail: None,
+                    },
+                ),
+            },
+        );
+    }
+
+    /// The recovery the PANEL MODEL would paint for this owner, read through
+    /// the same `panel_needs_you_for` the chrome builder uses -- never rebuilt
+    /// here, or the test would be asserting its own copy of the rule.
+    fn blocked_recovery_for_test(
+        shell: &NativeShell,
+        owner: &HostTaskKey,
+    ) -> Option<super::BlockedRecovery> {
+        match shell.panel_needs_you_for(owner, &blocked_row_for_test(owner)) {
+            Some(super::NeedsYou::Blocked { recovery, .. }) => Some(recovery),
+            _ => None,
+        }
+    }
+
+    fn blocked_cause_for_test(shell: &NativeShell, owner: &HostTaskKey) -> Option<String> {
+        match shell.panel_needs_you_for(owner, &blocked_row_for_test(owner)) {
+            Some(super::NeedsYou::Blocked { cause, .. }) => Some(cause),
+            _ => None,
+        }
+    }
+
+    fn blocked_row_for_test(owner: &HostTaskKey) -> crate::ui::board::BoardRow {
+        crate::ui::board::BoardRow {
+            key: owner.clone(),
+            title: "blocked".into(),
+            state: crate::ui::board::BoardState::Blocked,
+            why: "Blocked".into(),
+            state_age_ms: 0,
+            progress: None,
+            provider: crate::ui::task_cockpit::PrimaryProviderIcon::Claude,
+            project_colour: 0,
+            project_id: None,
+            project_label: "p".into(),
+            branch: "main".into(),
+            last_activity_ms: 0,
+            open: Some(1),
+            active: true,
+        }
+    }
+
     fn apply_terminal_query_outcome_for_test(
         shell: &mut NativeShell,
         host_id: &HostId,
@@ -71315,6 +71535,160 @@ mod "
                     !after.iter().any(|(task_id, query)| *task_id == second
                         && super::TerminalTarget::for_screen_query(query).is_some()),
                     "an answered pane must not be re-swept; asked {after:?}"
+                );
+            });
+            cx.quit();
+        });
+    }
+
+    /// The host's typed refusal becomes the panel's cause AND its action.
+    ///
+    /// Before this, the shell threw the reason away twice over: the LOCAL
+    /// reply lane recorded neither the sentence nor the type, so a local panel
+    /// could only ever say the same four words; and a blocked panel's one
+    /// affordance was hard-coded to "Retry", which for a conversation the
+    /// provider has forgotten re-runs the exact launch that just failed.
+    ///
+    /// Both directions are asserted, because a recovery offered on the wrong
+    /// panel discards a live conversation: an ordinary refusal must still say
+    /// Retry.
+    #[test]
+    fn a_forgotten_provider_conversation_offers_start_fresh_and_nothing_else_does() {
+        if rerun_headless_shell_test_in_child(
+            "ui::native_shell::tests::a_forgotten_provider_conversation_offers_start_fresh_and_nothing_else_does",
+        ) {
+            return;
+        }
+        gpui::Application::headless().run(move |cx| {
+            crate::ui::init(cx);
+            let (runtime, shared) = TestRuntime::new(true, NativeHostActionResult::Queued);
+            with_test_shell_in_app(cx, runtime, |shell| {
+                shell.install_idle_conversation_photo_for_test();
+                let (model, task_id) = terminal_bound_client_model();
+                let model = Arc::new(model);
+                let local = shell.local_host_id();
+                let owner = HostTaskKey::new(local.clone(), task_id);
+                shell.layout.task_workspace =
+                    Some(crate::ui::task_workspace::Workspace::single(owner.clone()));
+                shell
+                    .apply_client_model(Arc::clone(&model))
+                    .expect("client model");
+                shell
+                    .select_fleet_task_key(owner.clone(), FleetSelectMode::Replace)
+                    .expect("select the task");
+                shell.set_pane_view(&owner, PaneView::Terminal);
+
+                // Precondition: nothing has been refused, so no panel may be
+                // offering to throw a conversation away.
+                assert!(
+                    !shell
+                        .task_surfaces
+                        .terminal_session_not_found(owner.clone()),
+                    "the surface must start with no recorded refusal"
+                );
+
+                // An ORDINARY refusal keeps Retry. This half is what stops the
+                // fix from offering to discard a conversation on every failure.
+                let ordinary = shell
+                    .host_slot_mut(&local)
+                    .and_then(|slot| {
+                        slot.interaction
+                            .action_on_current_handler(ActionRequest::TaskCockpit {
+                                task_id,
+                                query: TaskCockpitQuery::TerminalReadiness,
+                            })
+                    })
+                    .expect("an ordinary readiness query for the selected task");
+                apply_terminal_unavailable_outcome_for_test(
+                    shell,
+                    &local,
+                    ordinary,
+                    crate::domain::TaskCockpitUnavailableReason::TerminalUnavailable,
+                );
+                assert!(
+                    !shell
+                        .task_surfaces
+                        .terminal_session_not_found(owner.clone()),
+                    "an ordinary refusal is not a forgotten conversation"
+                );
+                // And it must not invent a blocked panel at all, let alone one
+                // offering to discard the conversation. This is the direction
+                // that matters: a spurious Start fresh throws away real work.
+                assert_eq!(
+                    blocked_recovery_for_test(shell, &owner),
+                    None,
+                    "an ordinary refusal on an idle task must not produce a blocked panel"
+                );
+                // The Retry direction of the mapping itself, which this
+                // fixture cannot reach through a blocked status.
+                assert_eq!(
+                    crate::ui::panel::blocked_recovery_for(false),
+                    super::BlockedRecovery::Retry,
+                    "every blocked panel but this one keeps Retry"
+                );
+                assert_eq!(
+                    crate::ui::panel::blocked_recovery_for(true),
+                    super::BlockedRecovery::StartFresh
+                );
+                assert_eq!(super::BlockedRecovery::Retry.label(), "Retry");
+
+                // Now the one refusal a retry cannot clear.
+                let refused = shell
+                    .host_slot_mut(&local)
+                    .and_then(|slot| {
+                        slot.interaction
+                            .action_on_current_handler(ActionRequest::TaskCockpit {
+                                task_id,
+                                query: TaskCockpitQuery::TerminalReadiness,
+                            })
+                    })
+                    .expect("a second readiness query");
+                apply_terminal_unavailable_outcome_for_test(
+                    shell,
+                    &local,
+                    refused,
+                    crate::domain::TaskCockpitUnavailableReason::TerminalProviderSessionNotFound,
+                );
+                assert!(
+                    shell
+                        .task_surfaces
+                        .terminal_session_not_found(owner.clone()),
+                    "the LOCAL lane must keep the host's typed reason, not just its sentence"
+                );
+                assert_eq!(
+                    blocked_recovery_for_test(shell, &owner),
+                    Some(super::BlockedRecovery::StartFresh),
+                    "a forgotten conversation must offer Start fresh"
+                );
+                assert_eq!(
+                    blocked_cause_for_test(shell, &owner).as_deref(),
+                    Some("Session not found"),
+                    "the panel says the cause in the words the board row uses"
+                );
+                assert_eq!(
+                    super::BlockedRecovery::StartFresh.label(),
+                    "Start fresh",
+                    "the painter takes its label from this same value"
+                );
+
+                // And the affordance DOES what its label says: the recovery
+                // dispatches a NewConversation start, not another retry.
+                shared.lock().expect("runtime").accepted.clear();
+                shell.recover_blocked_panel_for(&owner);
+                let started: Vec<crate::domain::command::ProviderStartMode> = shared
+                    .lock()
+                    .expect("runtime")
+                    .accepted
+                    .iter()
+                    .filter_map(|record| match &record.command {
+                        NativeHostCommand::ProviderStart { arguments, .. } => Some(arguments.mode),
+                        _ => None,
+                    })
+                    .collect();
+                assert_eq!(
+                    started,
+                    vec![crate::domain::command::ProviderStartMode::NewConversation],
+                    "Start fresh must dispatch exactly one NewConversation start; got {started:?}"
                 );
             });
             cx.quit();

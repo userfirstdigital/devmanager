@@ -26,9 +26,103 @@ pub const STATUS_CAUSE_MAX_CHARS: usize = 60;
 /// with room to say which one and how to answer it.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum NeedsYou {
-    Question { choices: usize },
-    Permission { names_a_file: bool },
-    Blocked { cause: String },
+    Question {
+        choices: usize,
+    },
+    Permission {
+        names_a_file: bool,
+    },
+    Blocked {
+        cause: String,
+        recovery: BlockedRecovery,
+    },
+}
+
+/// What a blocked panel's one recovery affordance actually DOES.
+///
+/// The label and the action are one decision, not two: a panel that says
+/// "Retry" and starts a fresh conversation, or says "Start fresh" and retries,
+/// is worse than either. So the painter reads its label from here and the
+/// handler reads its action from the same value.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum BlockedRecovery {
+    /// Re-select the task, which re-runs its cockpit refresh and re-attempts
+    /// the provider restore. Right for every cause a retry can clear.
+    Retry,
+    /// Abandon the durable conversation the provider has forgotten and start a
+    /// new one. The only way forward when the provider refuses to resume, and
+    /// deliberately a person's decision -- it discards the conversation's
+    /// durable identity.
+    StartFresh,
+}
+
+/// Which recovery a blocked panel owes, from the one fact that decides it.
+///
+/// Pure and separate from the shell so BOTH directions can be exercised: a
+/// mapping tested only where it answers `StartFresh` would not catch a version
+/// that answers `StartFresh` always, and offering to discard a conversation on
+/// an ordinary refusal is the expensive mistake here.
+pub fn blocked_recovery_for(provider_conversation_missing: bool) -> BlockedRecovery {
+    if provider_conversation_missing {
+        // No retry can clear this: every attempt runs the same
+        // `--resume <id>` against a conversation the provider does not have.
+        BlockedRecovery::StartFresh
+    } else {
+        BlockedRecovery::Retry
+    }
+}
+
+impl BlockedRecovery {
+    /// The affordance's text where the row has room for it.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Retry => "Retry",
+            Self::StartFresh => "Start fresh",
+        }
+    }
+
+    /// The form that fits at EVERY width, and therefore the one the status
+    /// floor reserves.
+    ///
+    /// The floor cannot simply grow to the longest label: the title row is
+    /// exactly paid for at every width
+    /// (`CONTROLS_RESERVE + title_floor(w) + status_budget(w) == w`), and at
+    /// 280 px the whole status budget is 73 px -- which is the floor itself.
+    /// A floor sized to "Start fresh" would sit ABOVE its own budget there,
+    /// and a `flex_none` child under an under-reserved floor is CLIPPED rather
+    /// than moved. So the label yields instead, exactly as the status text
+    /// does, and both forms are five characters wide at the floor.
+    /// Measured, not guessed: at the 11 px status size "Fresh" is 29.5 px
+    /// against the 28 px the floor reserves, so it does NOT fit and "New"
+    /// (22.5 px) does. The floor has zero slack to give -- at 280 px the whole
+    /// status budget IS the floor -- so the label is what had to be chosen to
+    /// fit, and the render test asserts that it still does.
+    pub fn short_label(self) -> &'static str {
+        match self {
+            Self::Retry => "Retry",
+            Self::StartFresh => "New",
+        }
+    }
+
+    /// The label to paint given the pixels the status group actually has.
+    ///
+    /// `spare_px` is what is left after everything the floor already reserved,
+    /// so the long form is shown only where it costs nothing that was promised
+    /// to something else.
+    ///
+    /// Deliberately NOT called `label_within`: `overlay_chrome::label_within`
+    /// is the painter's truncating-label helper, a source guard counts its
+    /// call sites by name to prove the title row has exactly two of them, and
+    /// a third match here would have made that guard say the row grew a
+    /// truncating label it did not grow. (It did fire, which is the only
+    /// reason this is named differently.)
+    pub fn label_for_room(self, spare_px: f32, extra_px: f32) -> &'static str {
+        if spare_px >= extra_px {
+            self.label()
+        } else {
+            self.short_label()
+        }
+    }
 }
 
 /// The one button the title row spends its width on. Everything else lives
@@ -166,7 +260,7 @@ pub fn panel_chrome(
         (Some(NeedsYou::Permission { .. }), _) => {
             (Some("?"), "Permission".to_string(), StatusTone::Attention)
         }
-        (Some(NeedsYou::Blocked { cause }), _) => (
+        (Some(NeedsYou::Blocked { cause, .. }), _) => (
             Some("!"),
             bound(cause, STATUS_CAUSE_MAX_CHARS),
             StatusTone::Blocked,
@@ -271,7 +365,10 @@ mod tests {
             false,
             false,
             false,
-            Some(NeedsYou::Blocked { cause: long }),
+            Some(NeedsYou::Blocked {
+                cause: long,
+                recovery: BlockedRecovery::Retry,
+            }),
             false,
             String::new(),
         );

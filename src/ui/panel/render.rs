@@ -251,14 +251,45 @@ fn status_room(width_px: f32, chrome: &PanelChrome, layout: StatusLayout, blocke
         .max(status_floor_for(chrome, layout, blocked))
 }
 
+/// Which recovery a blocked panel owes, or `None` for a panel that is not
+/// blocked. One read, so the label and the handler cannot disagree.
+fn blocked_recovery(chrome: &PanelChrome) -> Option<crate::ui::panel::model::BlockedRecovery> {
+    match chrome.needs_you {
+        Some(NeedsYou::Blocked { recovery, .. }) => Some(recovery),
+        _ => None,
+    }
+}
+
 /// One status glyph at [`INLINE_STATUS_FONT_SIZE`]. The widest of the five is
 /// the working triangle.
 const STATUS_ICON_WIDTH: f32 = 10.0;
 /// `format_age` is at most four characters ("59s", "23h", and days for a task
 /// nobody has touched in a year), so this is its box at the status font size.
 const STATUS_AGE_MAX_WIDTH: f32 = 25.0;
-/// The five characters of "Retry".
+/// The box the always-visible recovery label is painted in, at the status font
+/// size. "Retry" measures 27.0 px inside it and "New" 22.5.
+///
+/// Keeps its original name deliberately. A concurrent branch grew a THIRD use
+/// site for it (`status_floor_for`), and renaming it here auto-merged cleanly
+/// while leaving that site referring to a constant that no longer exists -- a
+/// merge that does not compile, invisible in both diffstats. Measured with
+/// `git merge-tree`.
+///
+/// The floor reserves the SHORT form
+/// (`BlockedRecovery::short_label`), because it is the form that fits at every
+/// width. Reserving the long one would put the floor above its own budget at
+/// 280 px, where the entire status budget is the floor; and a `flex_none`
+/// child under an under-reserved floor is clipped rather than moved, which is
+/// the defect `status_floor` exists for.
 const STATUS_RETRY_WIDTH: f32 = 28.0;
+
+/// How much wider the long label is than the reserved short one, so the
+/// painter can spend genuinely spare pixels on it and nothing else.
+fn recovery_label_extra_width(recovery: crate::ui::panel::model::BlockedRecovery) -> f32 {
+    (crate::ui::overlay_chrome::approx_text_width(recovery.label(), INLINE_STATUS_FONT_SIZE)
+        - STATUS_RETRY_WIDTH)
+        .max(0.0)
+}
 
 /// The width the status may never be squeezed below, because these parts are
 /// present at every width and are `flex_none`: the state icon, the age, and on
@@ -643,13 +674,30 @@ fn inline_status_element(
         ));
     }
 
-    // A blocked panel keeps its Retry at every width: the cause can be dropped
-    // and still leave the panel usable, but a blocked panel with no way to
-    // retry is a dead panel, and the narrow widths are exactly where a person
-    // would otherwise have to zoom just to find the affordance. `status_floor`
-    // is what makes that true rather than merely intended -- Retry is
-    // `flex_none`, so without the floor it is clipped, not moved.
-    if blocked {
+    // A blocked panel keeps its recovery affordance at every width: the cause
+    // can be dropped and still leave the panel usable, but a blocked panel
+    // with no way forward is a dead panel, and the narrow widths are exactly
+    // where a person would otherwise have to zoom just to find it.
+    // `status_floor` is what makes that true rather than merely intended -- it
+    // is `flex_none`, so without the floor it is clipped, not moved.
+    //
+    // The LABEL yields where the floor does not: the floor reserves the 28 px
+    // that both recoveries' short forms fit inside, and "Start fresh" is
+    // painted only out of pixels the status genuinely has spare. That is the
+    // same rule the status text above follows, and it is why widening the
+    // floor was not the answer -- at 280 px the whole status budget IS the
+    // floor, so a floor sized to the long label sits above its own budget.
+    if let Some(recovery) = blocked_recovery(chrome) {
+        let spare = status_text_max_width(width_px, chrome, layout, blocked)
+            - if layout.show_text {
+                crate::ui::overlay_chrome::approx_text_width(
+                    &chrome.status.text,
+                    INLINE_STATUS_FONT_SIZE,
+                )
+            } else {
+                0.0
+            };
+        let recovery_label = recovery.label_for_room(spare, recovery_label_extra_width(recovery));
         let retry_key = chrome.key.clone();
         let on_retry = handlers.on_retry.clone();
         row = row.child(
@@ -666,7 +714,7 @@ fn inline_status_element(
                         (on_retry)(&retry_key, window, app);
                     },
                 )
-                .child("Retry"),
+                .child(recovery_label),
         );
     }
 
@@ -1179,6 +1227,7 @@ mod tests {
     use crate::domain::id::TaskId;
     use crate::ui::board::{BoardProgress, BoardRow, BoardState};
     use crate::ui::panel::model::panel_chrome;
+    use crate::ui::panel::model::BlockedRecovery;
     use crate::ui::task_cockpit::inbox::PrimaryProviderIcon;
     use crate::ui::tokens::{Density, Scale};
 
@@ -1329,6 +1378,7 @@ mod tests {
                 (
                     Some(NeedsYou::Blocked {
                         cause: "x".repeat(200),
+                        recovery: crate::ui::panel::model::BlockedRecovery::Retry,
                     }),
                     BoardState::Blocked,
                 ),
@@ -1486,8 +1536,48 @@ mod tests {
         assert_eq!(status_floor(true), 73.0);
         assert!(
             status_floor(true) > status_floor(false),
-            "a blocked panel owes a Retry the others do not"
+            "a blocked panel owes a recovery affordance the others do not"
         );
+        // The floor reserves the SHORT label, and both recoveries share it, so
+        // adding "Start fresh" cannot have moved the arithmetic above. This is
+        // the assertion that would have caught it: a floor sized to the long
+        // label sits above the whole 73 px budget at 280 px.
+        for recovery in [BlockedRecovery::Retry, BlockedRecovery::StartFresh] {
+            // FITS in what the floor reserves, not equals it: the reserved
+            // width is a hand-picked box that over-reserves slightly, and over
+            // -reserving is the safe direction (the status text loses a pixel;
+            // under-reserving clips the affordance).
+            assert!(
+                crate::ui::overlay_chrome::approx_text_width(
+                    recovery.short_label(),
+                    INLINE_STATUS_FONT_SIZE
+                ) <= STATUS_RETRY_WIDTH,
+                "{recovery:?}'s always-visible label must fit what the floor reserves"
+            );
+        }
+        // Why the long label cannot simply be reserved: a floor sized to
+        // it sits ABOVE the whole status budget at the narrowest panel,
+        // and a floor above its own budget clips the affordance. This is
+        // the arithmetic that forced a yielding label rather than a wider
+        // floor, and it is asserted so a later font or budget change says
+        // so instead of leaving the machinery unexplained.
+        let floor_with_long_label = status_floor(true) - STATUS_RETRY_WIDTH
+            + crate::ui::overlay_chrome::approx_text_width(
+                BlockedRecovery::StartFresh.label(),
+                INLINE_STATUS_FONT_SIZE,
+            );
+        assert!(
+            floor_with_long_label > status_budget(280.0, true),
+            "a floor reserving the long label would fit the narrowest budget after all, \
+             so the yielding label is unnecessary machinery -- simplify it"
+        );
+        // And it does yield: no spare pixels means the short form.
+        assert_eq!(BlockedRecovery::StartFresh.label_for_room(0.0, 30.0), "New");
+        assert_eq!(
+            BlockedRecovery::StartFresh.label_for_room(30.0, 30.0),
+            "Start fresh"
+        );
+        assert_eq!(BlockedRecovery::Retry.label_for_room(0.0, 0.0), "Retry");
 
         // The title floor widens with the panel, so the title is never
         // anonymous at a width that could afford to name it. These four are the
@@ -1791,6 +1881,7 @@ mod tests {
                 BoardState::Blocked,
                 Some(NeedsYou::Blocked {
                     cause: "x".to_string(),
+                    recovery: crate::ui::panel::model::BlockedRecovery::StartFresh,
                 }),
             ),
         ];

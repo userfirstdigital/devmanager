@@ -276,6 +276,41 @@ fn run_provider_dispatch_pass(
     Ok(held)
 }
 
+/// Whether a `NewConversation` start may pass the persisted-launch gate.
+///
+/// A persisted launch graph normally proves the agent ALREADY has a
+/// conversation, so a fresh start would double-launch it. That inference stops
+/// holding once the provider itself has refused to resume that conversation:
+/// the graph then names an id the provider no longer has, and refusing is what
+/// leaves such a task with nothing that can work -- not a retry, not a fresh
+/// start.
+///
+/// Pure, and separate from the call site, so the rule can be exercised over
+/// every combination instead of asserted by reading the source text around it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum NewConversationLaunchVerdict {
+    Allow,
+    RefusePersistedLaunch,
+    RefuseUnknown,
+}
+
+pub(crate) fn new_conversation_launch_verdict(
+    persisted_launch: Result<Option<bool>, ()>,
+    exact_resume_refused: bool,
+) -> NewConversationLaunchVerdict {
+    match persisted_launch {
+        // The one override, and it is narrow: a graph is present AND the
+        // provider has refused to resume what it names.
+        Ok(Some(true)) if exact_resume_refused => NewConversationLaunchVerdict::Allow,
+        Ok(Some(true)) => NewConversationLaunchVerdict::RefusePersistedLaunch,
+        Ok(Some(false)) => NewConversationLaunchVerdict::Allow,
+        // Unknown is never overridden. A refusal we recorded is not a licence
+        // to start a second provider onto a launch graph we could not read --
+        // that would be a double-launch, which is worse than the wedge.
+        Ok(None) | Err(()) => NewConversationLaunchVerdict::RefuseUnknown,
+    }
+}
+
 fn provider_start_requires_existing_binding(
     mode: crate::domain::command::ProviderStartMode,
 ) -> bool {
@@ -2816,6 +2851,16 @@ pub struct HostRequestExecutor {
     /// task is not re-queued while one is recorded, and it is logged once, not
     /// once per maintenance tick.
     provider_restore_permanent_refusals: HashMap<TaskId, PermanentProviderRestoreRefusal>,
+    /// Tasks whose durable provider conversation the PROVIDER refused to
+    /// resume, and the exact id it refused.
+    ///
+    /// This is the one refusal a retry can never clear: `--resume <id>` against
+    /// a conversation the provider no longer has fails identically every time,
+    /// so the task is wedged until a person asks for a fresh conversation. The
+    /// id is kept, not just the task, because abandoning a durable provider
+    /// identity must be fenced on the EXACT id the failure named -- a binding
+    /// that moved on in between must not be discarded on stale evidence.
+    provider_exact_resume_refusals: HashMap<TaskId, crate::domain::ProviderSessionId>,
     /// Native profile provider settings + health (exact `--config-base` root).
     provider_settings:
         Option<std::sync::Arc<crate::providers::settings::ProviderSettingsAuthority>>,
@@ -3209,6 +3254,7 @@ impl HostRequestExecutor {
             provider_restore_failed_action_epochs: HashMap::new(),
             provider_restore_cause: HashMap::new(),
             provider_restore_permanent_refusals: HashMap::new(),
+            provider_exact_resume_refusals: HashMap::new(),
             provider_settings,
             provider_health_jobs: FuturesUnordered::new(),
             terminal_service: TerminalService::new(),
@@ -3309,6 +3355,7 @@ impl HostRequestExecutor {
             provider_restore_failed_action_epochs: HashMap::new(),
             provider_restore_cause: HashMap::new(),
             provider_restore_permanent_refusals: HashMap::new(),
+            provider_exact_resume_refusals: HashMap::new(),
             provider_settings: None,
             provider_health_jobs: FuturesUnordered::new(),
             terminal_service: TerminalService::new(),
@@ -3938,6 +3985,11 @@ impl HostRequestExecutor {
                 self.provider_restore_failed_action_epochs
                     .insert(failure.task_id, 0);
             }
+            self.note_exact_resume_refusal(
+                failure.task_id,
+                failure.agent_session_id,
+                failure.failure,
+            );
             self.mark_provider_restore_failed(failure.task_id);
         }
         tick.step("cs.queue_restarts");
@@ -3945,6 +3997,145 @@ impl HostRequestExecutor {
             host_log!("devmanager-host: provider session identity sync failed: {error}");
         }
         tick.step("cs.identity_sync");
+    }
+
+    /// Record that the provider refused to resume this task's exact durable
+    /// conversation, with the id it refused.
+    ///
+    /// Only the two failures that mean "the conversation is not there" count.
+    /// The others are about authority or support and are answered by signing
+    /// in or by choosing a different provider, not by throwing a conversation
+    /// away.
+    fn note_exact_resume_refusal(
+        &mut self,
+        task_id: TaskId,
+        agent_session_id: crate::domain::AgentSessionId,
+        failure: crate::providers::session::ExactResumeFailure,
+    ) {
+        if !matches!(
+            failure,
+            crate::providers::session::ExactResumeFailure::NotFound
+                | crate::providers::session::ExactResumeFailure::ProviderRejected
+        ) {
+            return;
+        }
+        let bound = match self.bus.durable_provider_binding(agent_session_id) {
+            Ok(Some((provider_session_id, _resource_id))) => provider_session_id,
+            // No durable conversation to abandon: whatever failed, it was not
+            // an exact resume of a bound id, so there is nothing to offer.
+            Ok(None) => return,
+            Err(error) => {
+                host_log!(
+                    "devmanager-host: exact resume refusal binding lookup failed task={task_id}: {error}"
+                );
+                return;
+            }
+        };
+        // Edge-triggered: one line per (task, id), not one per attempt.
+        if self
+            .provider_exact_resume_refusals
+            .insert(task_id, bound.clone())
+            .as_ref()
+            != Some(&bound)
+        {
+            host_log!(
+                "devmanager-host: provider refused to resume task={task_id} agent={agent_session_id} provider_session_id={}; a fresh conversation is now offered",
+                bound.as_str()
+            );
+        }
+    }
+
+    /// Release a durable provider conversation the provider refused to resume,
+    /// so this start can be a fresh one. Returns whether one was released.
+    ///
+    /// Re-verified against CURRENT durable state rather than trusting the
+    /// recorded refusal: the gate above only needs to know that a refusal
+    /// exists, but the write has to be fenced on the exact id that is bound
+    /// right now, or a conversation rebound since the failure would be
+    /// discarded on stale evidence.
+    fn abandon_refused_provider_conversation(
+        &mut self,
+        intent: &mut crate::domain::command::StartProviderSessionIntent,
+    ) -> Result<bool, IpcError> {
+        if intent.mode != crate::domain::command::ProviderStartMode::NewConversation {
+            return Ok(false);
+        }
+        let Some(refused) = self
+            .provider_exact_resume_refusals
+            .get(&intent.task_id)
+            .cloned()
+        else {
+            return Ok(false);
+        };
+        let snapshot = self
+            .bus
+            .task_snapshot(intent.task_id)
+            .map_err(map_store_error)?
+            .ok_or(IpcError::Unavailable)?;
+        let Some(agent) = snapshot.agents.get(&intent.agent_session_id) else {
+            return Err(IpcError::Unavailable);
+        };
+        let runtime_generation = agent.runtime_generation;
+        match agent.provider_session_id.as_ref() {
+            Some(bound) if bound == &refused => {}
+            // Nothing bound, or a different conversation bound since the
+            // refusal. Either way the recorded failure no longer describes
+            // durable state, so it is retired rather than acted on.
+            _ => {
+                self.provider_exact_resume_refusals.remove(&intent.task_id);
+                return Ok(false);
+            }
+        }
+        let receipt = self
+            .bus
+            .execute_host_authorized(
+                CommandEnvelope {
+                    command_id: crate::domain::CommandId::new(),
+                    client_id: crate::domain::ClientId::new(),
+                    task_id: Some(intent.task_id),
+                    issued_at_ms: unix_time_ms_u64() as i64,
+                    expected_task_revision: Some(snapshot.task.revision),
+                    command: Command::AbandonProviderSession {
+                        agent_session_id: intent.agent_session_id,
+                        abandoned_provider_session_id: refused.clone(),
+                        expected_runtime_generation: runtime_generation,
+                    },
+                },
+                None,
+                RequestId::new(),
+                Uuid::nil(),
+            )
+            .map_err(|error| {
+                host_log!("devmanager-host: provider conversation abandon failed: {error}");
+                map_store_error(error)
+            })?;
+        if !matches!(receipt, CommandReceipt::Accepted { .. }) {
+            host_log!("devmanager-host: provider conversation abandon rejected: {receipt:?}");
+            return Err(IpcError::Unavailable);
+        }
+        // The one line for the one place a durable provider identity is thrown
+        // away. It names the id, because after this the durable record does
+        // not, and "which conversation did we give up on" is the question this
+        // line exists to answer six weeks from now.
+        host_log!(
+            "devmanager-host: provider conversation abandoned task={} agent={} provider_session_id={}; starting a fresh conversation",
+            intent.task_id,
+            intent.agent_session_id,
+            refused.as_str()
+        );
+        self.provider_exact_resume_refusals.remove(&intent.task_id);
+        self.provider_restore_failed_action_epochs
+            .remove(&intent.task_id);
+        self.provider_restore_cause.remove(&intent.task_id);
+        self.fan_out_live_durable_events();
+        let released = self
+            .bus
+            .task_snapshot(intent.task_id)
+            .map_err(map_store_error)?
+            .ok_or(IpcError::Unavailable)?;
+        intent.expected_task_revision = released.task.revision;
+        intent.expected_action_epoch = released.task.action_epoch;
+        Ok(true)
     }
 
     fn queue_held_provider_restart(
@@ -4291,6 +4482,11 @@ impl HostRequestExecutor {
             self.provider_restore_permanent_refusals
                 .remove(&outcome.task_id);
             self.provider_restore_cause.remove(&outcome.task_id);
+            // A start that WORKED is the only evidence that retires the
+            // exact-resume refusal. Clearing it on an explicit client action
+            // instead -- the way a permanent pin refusal is re-armed -- would
+            // retire it on the very command whose gate reads it.
+            self.provider_exact_resume_refusals.remove(&outcome.task_id);
             if let Err(error) = self.attach_provider_terminal(outcome.task_id) {
                 host_log!(
                     "devmanager-host: provider terminal attachment failed task={}: {error}",
@@ -6210,15 +6406,28 @@ impl HostRequestExecutor {
                     }
                     Some(false) => {}
                 }
-                match manager.try_classify_persisted_provider_launch(intent.agent_session_id) {
-                    Ok(Some(true)) => {
+                // A persisted launch graph normally means "this agent already
+                // HAS a conversation, so NewConversation would double-launch
+                // it". That reasoning stops holding the moment the provider
+                // itself has refused to resume that conversation: the graph
+                // then names an id the provider no longer has, and refusing
+                // here is what left such a task with no way forward at all --
+                // not a retry, not a fresh start, nothing.
+                let refused_conversation = self
+                    .provider_exact_resume_refusals
+                    .contains_key(&intent.task_id);
+                match new_conversation_launch_verdict(
+                    manager.try_classify_persisted_provider_launch(intent.agent_session_id),
+                    refused_conversation,
+                ) {
+                    NewConversationLaunchVerdict::Allow => {}
+                    NewConversationLaunchVerdict::RefusePersistedLaunch => {
                         host_log!(
                             "devmanager-host: NewConversation refused; persisted launch graph present"
                         );
                         return Err(IpcError::Unavailable);
                     }
-                    Ok(Some(false)) => {}
-                    Ok(None) | Err(()) => {
+                    NewConversationLaunchVerdict::RefuseUnknown => {
                         host_log!(
                             "devmanager-host: NewConversation refused; persisted launch classification unknown"
                         );
@@ -6310,6 +6519,13 @@ impl HostRequestExecutor {
                 intent.expected_action_epoch = rebound.task.action_epoch;
             }
         }
+        // Release the refused conversation before preparing the start. Left
+        // bound, the fresh conversation's own SessionStart could not be
+        // recorded at all: the durable bind is fenced on
+        // `provider_session_id IS NULL`, so it would be rejected as a binding
+        // fence mismatch and the task would resume the dead id again on the
+        // next restart.
+        self.abandon_refused_provider_conversation(&mut intent)?;
         let (binding, agent, snapshot) =
             self.bus.prepare_provider_start(&intent).map_err(|error| {
                 host_log!("devmanager-host: provider start prepare failed: {error}");
@@ -7272,6 +7488,15 @@ impl HostRequestExecutor {
                         .or_else(|| self.provider_restore_cause.get(&task_id).cloned())
                 });
                 let provider_launch_hint = match envelope.task_id {
+                    // Outranks StartPending, for the same reason the permanent
+                    // refusal above outranks a stale transient cause: an
+                    // attempt that is certain to fail with the same refusal is
+                    // not news the client can act on, and reporting it as
+                    // "starting" is what leaves a wedged panel promising
+                    // progress forever.
+                    Some(task_id) if self.provider_exact_resume_refusals.contains_key(&task_id) => {
+                        super::cockpit::ProviderLaunchReadinessHint::ConversationNotFound
+                    }
                     Some(task_id)
                         if self.provider_restore_in_flight.contains(&task_id)
                             || self
@@ -15202,6 +15427,59 @@ mod output_tests {
         assert!(
             body.contains("Command::RebindUnstartedPrimaryProvider"),
             "rebind command must be the host-only rebound variant"
+        );
+    }
+
+    /// The gate the escape hatch turns on, over every combination.
+    ///
+    /// Before this, a task whose provider had forgotten its conversation could
+    /// neither resume (the provider refuses) nor start fresh (the host refuses
+    /// on the persisted launch graph). The override has to be exactly one cell
+    /// of this table: any wider and a recorded refusal becomes a licence to
+    /// double-launch onto a graph the host could not even read.
+    #[test]
+    fn new_conversation_is_allowed_past_a_persisted_launch_only_on_a_refused_resume() {
+        use super::{new_conversation_launch_verdict, NewConversationLaunchVerdict as V};
+
+        // No graph: allowed either way. The refusal changes nothing here.
+        assert_eq!(
+            new_conversation_launch_verdict(Ok(Some(false)), false),
+            V::Allow
+        );
+        assert_eq!(
+            new_conversation_launch_verdict(Ok(Some(true)), false),
+            V::RefusePersistedLaunch
+        );
+        assert_eq!(
+            new_conversation_launch_verdict(Ok(Some(false)), true),
+            V::Allow
+        );
+
+        // The one override.
+        assert_eq!(
+            new_conversation_launch_verdict(Ok(Some(true)), true),
+            V::Allow,
+            "a provider that refused to resume its own conversation is what unwedges the task"
+        );
+
+        // Unknown is never overridden, in EITHER direction: a refusal we
+        // recorded says nothing about a launch graph we could not read.
+        assert_eq!(
+            new_conversation_launch_verdict(Ok(None), false),
+            V::RefuseUnknown
+        );
+        assert_eq!(
+            new_conversation_launch_verdict(Ok(None), true),
+            V::RefuseUnknown
+        );
+        assert_eq!(
+            new_conversation_launch_verdict(Err(()), false),
+            V::RefuseUnknown
+        );
+        assert_eq!(
+            new_conversation_launch_verdict(Err(()), true),
+            V::RefuseUnknown,
+            "an unreadable launch graph must not be overridden by a recorded refusal"
         );
     }
 
