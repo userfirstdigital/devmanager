@@ -142,6 +142,51 @@ pub fn format_usage_summary(usage: &UiUsage) -> String {
     }
 }
 
+/// The quota segment of the composer's meta line (fix wave 1, F4): the bare
+/// percentages, one per window, joined by " / " -- "56% / 73%".
+///
+/// The line has room for the numbers, not for "5-hour: 56% left · Weekly: 73%
+/// left"; the window labels are spelled out in the provider selector the
+/// segment opens. Read from the windows rather than by re-parsing
+/// [`format_usage_summary`]'s output, so there is one reader of the wire and
+/// the long and short renderings cannot disagree about which number is which.
+///
+/// `None` whenever no window carries a percentage, or the usage is in a state
+/// with no number to show. Its absence is not a claim that the quota is fine:
+/// the selector still says so in full, and a segment reading "Usage unknown"
+/// on a line this short is noise.
+pub fn format_usage_compact(usage: &UiUsage) -> Option<String> {
+    if matches!(
+        usage.state.as_str(),
+        "unsupported" | "authRequired" | "backoff" | "failed" | "unavailable" | "unknown"
+    ) {
+        return None;
+    }
+    let parts: Vec<String> = usage
+        .windows
+        .iter()
+        .filter_map(|window| {
+            window
+                .remaining_percent
+                .map(|percent| format!("{percent}%"))
+                .or_else(|| {
+                    window
+                        .used_percent
+                        .map(|percent| format!("{percent}% used"))
+                })
+        })
+        .collect();
+    if parts.is_empty() {
+        return None;
+    }
+    let joined = parts.join(" / ");
+    Some(if usage.state.as_str() == "stale" {
+        format!("{joined} (stale)")
+    } else {
+        joined
+    })
+}
+
 fn format_windows_summary(windows: &[UiUsageWindow]) -> String {
     windows
         .iter()
@@ -186,6 +231,81 @@ fn format_windows_summary(windows: &[UiUsageWindow]) -> String {
 mod tests {
     use super::*;
     use crate::providers::settings::ProviderMetadataSource;
+
+    /// Fix wave 1, F4: the composer's meta line carries the quota as one
+    /// segment -- "56% / 73%" -- and the four stacked rows it replaced carried
+    /// "5-hour: 56% left · Weekly: 73% left" on a row of its own.
+    ///
+    /// The denominator is every state the wire can be in: the six that have no
+    /// number, "stale", and the ordinary one, plus the three shapes a window
+    /// can take (remaining, used-only, neither).
+    #[test]
+    fn the_compact_quota_is_the_bare_percentages_and_nothing_when_there_are_none() {
+        let window = |remaining: Option<u8>, used: Option<u8>| UiUsageWindow {
+            id: "w".into(),
+            label: "5-hour".into(),
+            used_percent: used,
+            remaining_percent: remaining,
+            resets_at_unix_ms: None,
+            window_duration_mins: None,
+            scope_label: Some("5-hour".into()),
+        };
+        use crate::providers::settings::ProviderUsageStateWire as State;
+        let usage = |state: State, windows: Vec<UiUsageWindow>| UiUsage {
+            instance_id: "claude".into(),
+            driver: "claude".into(),
+            state,
+            windows,
+            checked_at_unix_ms: None,
+            error: None,
+            retry_after_unix_ms: None,
+            source: ProviderMetadataSource::Live,
+            account_fingerprint: None,
+            config_fingerprint: None,
+        };
+
+        // The shape the user's capture showed, in the space the line has.
+        assert_eq!(
+            format_usage_compact(&usage(
+                State::Fresh,
+                vec![window(Some(56), None), window(Some(73), None)]
+            ))
+            .as_deref(),
+            Some("56% / 73%")
+        );
+        // "used" is spelled, so it can never be read as "left".
+        assert_eq!(
+            format_usage_compact(&usage(State::Fresh, vec![window(None, Some(12))])).as_deref(),
+            Some("12% used")
+        );
+        // Stale is a number you can still read, said to be stale.
+        assert_eq!(
+            format_usage_compact(&usage(State::Stale, vec![window(Some(56), None)])).as_deref(),
+            Some("56% (stale)")
+        );
+        // No number: no segment. Every state that has none, and the window
+        // that carries none.
+        for state in [
+            State::Unsupported,
+            State::AuthRequired,
+            State::Backoff,
+            State::Failed,
+            State::Unavailable,
+            State::Unknown,
+        ] {
+            assert_eq!(
+                format_usage_compact(&usage(state, vec![window(Some(56), None)])),
+                None,
+                "{} has no quota to show",
+                state.as_str()
+            );
+        }
+        assert_eq!(format_usage_compact(&usage(State::Fresh, vec![])), None);
+        assert_eq!(
+            format_usage_compact(&usage(State::Fresh, vec![window(None, None)])),
+            None
+        );
+    }
 
     #[test]
     fn live_catalog_replaces_offline_models_and_keeps_dynamic_efforts() {

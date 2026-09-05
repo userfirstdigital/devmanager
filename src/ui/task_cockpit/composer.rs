@@ -112,10 +112,52 @@ pub const COMPOSER_ATTACHMENT_THUMBNAIL: f32 = 20.0;
 /// The tallest a chip's label may get before it truncates.
 pub const COMPOSER_CHIP_LABEL_MAX_WIDTH: f32 = 160.0;
 
-/// How tall the empty composer stands, and how much room the surfaces above it
-/// reserve for it. Unchanged by the redesign: they are layout, not look.
-pub const COMPOSER_INPUT_MIN_HEIGHT: f32 = 88.0;
-pub const COMPOSER_HEIGHT_RESERVE: f32 = 200.0;
+/// The key hints that sit at the field's right, inside the sunken rule --
+/// the mockup's `.compose .k`. Real key names rather than glyphs: the shell
+/// has no key-cap font, and a bare arrow glyph is unreadable at 10.5 px.
+pub const COMPOSER_KEY_HINTS: &str = "Enter send \u{b7} Shift+Enter newline";
+/// The separator between the meta line's segments, and the one the panel and
+/// the board already spend on the same job.
+pub const COMPOSER_META_SEPARATOR: &str = "\u{b7}";
+/// What the empty field invites, given the provider that would answer it
+/// (the mockup's "Message Claude...").
+///
+/// A function rather than a constant because it names the provider, and a
+/// placeholder that named the wrong one would be a claim about where the
+/// draft is going.
+pub fn composer_placeholder(provider_label: &str) -> String {
+    format!("Message {provider_label}\u{2026}")
+}
+
+/// How many lines of draft the field shows before it scrolls inside itself.
+///
+/// The panel body is a column of [stream, composer]: the stream is what the
+/// panel is FOR, so the composer is `flex_none` behind a real ceiling rather
+/// than a box that grows with the draft. At one-of-eight height a panel body is
+/// roughly 330 px, and an unbounded field took 250 of them -- which is the
+/// clipped composer in the user's `5.png` and the 60 px stream in `4.png`.
+pub const COMPOSER_MAX_VISIBLE_LINES: f32 = 6.0;
+/// The field at one line of draft, and the field at [`COMPOSER_MAX_VISIBLE_LINES`].
+/// Both include the field's own vertical padding, so they are the element's
+/// `min_h`/`max_h` directly rather than numbers a painter has to add to.
+pub const COMPOSER_INPUT_MIN_HEIGHT: f32 = COMPOSER_LINE_HEIGHT + 2.0 * COMPOSER_PADDING_Y;
+pub const COMPOSER_INPUT_MAX_HEIGHT: f32 =
+    COMPOSER_MAX_VISIBLE_LINES * COMPOSER_LINE_HEIGHT + 2.0 * COMPOSER_PADDING_Y;
+/// The meta line under the field: one 10.5 px muted row whose right end is the
+/// attach affordance, so it is rule 4's 24 px icon hit box tall.
+pub const COMPOSER_META_ROW_HEIGHT: f32 = COMPOSER_ICON_BUTTON_SIZE;
+/// How much room the stream above the composer yields to it.
+///
+/// Derived from the parts rather than pinned, so the reserve cannot drift from
+/// the composer it is reserving for: the region's top gap, the card's two
+/// border pixels and its tallest field, the gap to the meta line, that line,
+/// and the region's bottom padding.
+pub const COMPOSER_HEIGHT_RESERVE: f32 = COMPOSER_CONTROL_GAP
+    + 2.0 * COMPOSER_BORDER_WIDTH
+    + COMPOSER_INPUT_MAX_HEIGHT
+    + COMPOSER_CHIP_GAP
+    + COMPOSER_META_ROW_HEIGHT
+    + COMPOSER_REGION_PADDING;
 
 /// What the one control in the composer's send slot is saying right now.
 /// Rule 4 gives an icon button one resting tint and one hover tint, and rule 1
@@ -2689,6 +2731,56 @@ mod tests {
         assert_eq!(
             (COMPOSER_CHIP_PADDING_X, COMPOSER_CHIP_PADDING_Y),
             (6.0, 1.0)
+        );
+    }
+
+    /// Fix wave 1, F3: the stream is `flex_1`, the composer is `flex_none`
+    /// behind a ceiling. The user's `5.png` shows the opposite -- the draft
+    /// grew the composer until it overflowed the panel and was clipped at the
+    /// bottom edge -- and `4.png` shows what that costs the stream: about
+    /// 60 px of it, at the top of a 330 px body.
+    #[test]
+    fn the_composer_field_is_bounded_at_six_lines_and_the_reserve_follows_it() {
+        // One line and six lines, each including the field's own padding.
+        assert_eq!(COMPOSER_MAX_VISIBLE_LINES, 6.0);
+        assert_eq!(COMPOSER_INPUT_MIN_HEIGHT, COMPOSER_LINE_HEIGHT + 12.0);
+        assert_eq!(COMPOSER_INPUT_MAX_HEIGHT, 6.0 * COMPOSER_LINE_HEIGHT + 12.0);
+        // The brief's "~110 px": six 11.5 px lines at 1.5 leading plus 6 px of
+        // padding above and below.
+        assert!(
+            (COMPOSER_INPUT_MAX_HEIGHT - 115.5).abs() < 0.001,
+            "six lines of 11.5/1.5 plus padding is 115.5, found {COMPOSER_INPUT_MAX_HEIGHT}"
+        );
+        // A field that can only ever be six lines tall must not be able to
+        // start taller than it may end.
+        assert!(COMPOSER_INPUT_MIN_HEIGHT < COMPOSER_INPUT_MAX_HEIGHT);
+
+        // The reserve is the composer's real maximum, part for part. Written
+        // as the sum rather than as a number so a change to any part moves it.
+        assert_eq!(
+            COMPOSER_HEIGHT_RESERVE,
+            COMPOSER_CONTROL_GAP
+                + 2.0 * COMPOSER_BORDER_WIDTH
+                + COMPOSER_INPUT_MAX_HEIGHT
+                + COMPOSER_CHIP_GAP
+                + COMPOSER_META_ROW_HEIGHT
+                + COMPOSER_REGION_PADDING
+        );
+        // And it is a real reduction on the 200 px the shipped composer took,
+        // which is the whole point of collapsing the four stacked rows (F4).
+        assert!(
+            COMPOSER_HEIGHT_RESERVE < 200.0,
+            "the collapsed composer must reserve less than the stacked one, found \
+             {COMPOSER_HEIGHT_RESERVE}"
+        );
+        // The stream is what is left. At the 330 px body a panel gets as one
+        // of eight, `4.png` left the stream about 60 px; the bound above has
+        // to buy it multiples of that, which is the claim this fix makes.
+        let body = 330.0_f32;
+        let stream = body - COMPOSER_HEIGHT_RESERVE;
+        assert!(
+            stream >= 2.5 * 60.0,
+            "the stream must keep multiples of the 60 px `4.png` showed; it keeps {stream}"
         );
     }
 
