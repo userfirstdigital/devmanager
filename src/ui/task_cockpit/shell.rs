@@ -856,33 +856,18 @@ impl TaskCockpitShell {
                     .into_any_element()
             })
             .unwrap_or_else(|| {
-                div()
-                    .id(("native-semantic-timeline-pane-hold", {
+                // Rule 9 and F6: one sentence, at the stream's left edge.
+                stream_hold_element(
+                    ("native-semantic-timeline-pane-hold", {
                         u64::from_be_bytes(
                             task_id.as_bytes()[8..]
                                 .try_into()
                                 .expect("task identity tail is exactly eight bytes"),
                         )
-                    }))
-                    .w_full()
-                    .flex_1()
-                    .min_h(gpui::px(0.0))
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .p(gpui::px(STREAM_HOLD_PADDING))
-                    // Rule 9: an empty state is one 11.5 px `text.muted`
-                    // sentence. No glyph, no heading, no surface of its own.
-                    .child(
-                        div()
-                            .max_w(gpui::px(STREAM_HOLD_MAX_WIDTH))
-                            .text_center()
-                            .text_size(gpui::px(STREAM_HOLD_FONT_SIZE))
-                            .line_height(gpui::px(STREAM_HOLD_LINE_HEIGHT))
-                            .text_color(tokens.text.muted.to_gpui())
-                            .child(hold_copy),
-                    )
-                    .into_any_element()
+                    }),
+                    hold_copy,
+                    tokens,
+                )
             })
     }
 
@@ -1053,31 +1038,9 @@ impl TaskCockpitShell {
                     .into_any_element()
             })
             .unwrap_or_else(move || {
-                // A hold is an expected state, not an error surface. Centred
-                // secondary copy keeps the panel composed while it waits, so a
-                // bound timeline is what draws the eye once one is admitted.
-                div()
-                    .id("native-semantic-timeline-hold")
-                    .w_full()
-                    .flex_1()
-                    .min_h(gpui::px(0.0))
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .p(gpui::px(STREAM_HOLD_PADDING))
-                    // Rule 9, same sentence shape as the per-task hold above.
-                    .child(
-                        div()
-                            .w_full()
-                            .min_w(gpui::px(0.0))
-                            .max_w(gpui::px(STREAM_HOLD_MAX_WIDTH))
-                            .text_center()
-                            .text_size(gpui::px(STREAM_HOLD_FONT_SIZE))
-                            .line_height(gpui::px(STREAM_HOLD_LINE_HEIGHT))
-                            .text_color(tokens.text.muted.to_gpui())
-                            .child(timeline_error),
-                    )
-                    .into_any_element()
+                // A hold is an expected state, not an error surface: one
+                // sentence where the first message would be (rule 9, F6).
+                stream_hold_element("native-semantic-timeline-hold", timeline_error, tokens)
             })
     }
 

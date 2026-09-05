@@ -27752,11 +27752,15 @@ impl NativeShell {
                     .min_h(px(0.0))
                     .flex()
                     .flex_col()
-                    .child(Self::empty_state(
+                    // F6: rule 9's one sentence, at the stream's own left
+                    // edge and body size, through the same helper the two
+                    // timeline holds use -- not centred in a band with 72 px
+                    // of dead space under it, which read as a placeholder
+                    // graphic rather than as the stream saying it is empty.
+                    .child(crate::ui::task_cockpit::shell::stream_hold_element(
                         "native-empty-conversation",
-                        "This conversation is open and ready. Send a message to begin.",
+                        CONVERSATION_EMPTY_COPY,
                         tokens,
-                        None,
                     ))
                     .child(conversation_footer)
                     .into_any_element()
