@@ -14,6 +14,13 @@
   in from the main working copy: that directory is gitignored but its files are
   inputs to `build.rs`'s bundle fingerprint, so a checkout holds 183 of the 188
   files the hash needs. The error's suggested recovery command is not the fix.
+- A full `cargo test --lib` run while another Rust build or test run is going
+  on this machine means nothing: measured 2026-09-04, the same binary went
+  13 red plus a harness crash (STATUS_STACK_BUFFER_OVERRUN) under load, 7 red
+  quiet at `--test-threads=4`, 5 red serial, and every red in every run was on
+  the pre-existing list. The extra reds under load are cancellation, race and
+  pipe tests. Two sessions building at once should take turns for the full
+  run, and a red list from a loaded machine is not evidence about the code.
 - Give every concurrently active Rust worktree its own `CARGO_TARGET_DIR`.
   Sharing one target directory serializes builds behind Cargo locks, obscures
   which worker owns compiler processes, and can turn a focused task into a false
