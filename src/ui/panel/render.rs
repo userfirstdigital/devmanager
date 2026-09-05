@@ -29,6 +29,7 @@ use crate::ui::board::render::{ordinal_chip, segments_element};
 use crate::ui::board::ProjectColourBook;
 use crate::ui::panel::model::{
     status_layout, NeedsYou, PanelChrome, PrimaryAction, StatusLayout, StatusTone,
+    STATUS_YIELD_WIDTH, TITLE_MIN_SHARE,
 };
 use crate::ui::task_workspace::PaneView;
 use crate::ui::tokens::{Color, ThemeTokens};
@@ -236,6 +237,7 @@ fn status_room(width_px: f32, chrome: &PanelChrome, layout: StatusLayout, blocke
     let title = title_width(
         width_px,
         chrome,
+        layout,
         estimated_status_width(chrome, layout, blocked),
         blocked,
     );
@@ -244,9 +246,9 @@ fn status_room(width_px: f32, chrome: &PanelChrome, layout: StatusLayout, blocke
     // under the status" true even when the width estimate is wrong, because
     // `CONTROLS_RESERVE + title_floor(w) + status_budget(w) == w` holds by
     // construction at every width and does not depend on an estimate.
-    (width_px - controls_reserve(chrome) - title)
+    (width_px - controls_reserve(chrome, layout) - title)
         .min(status_budget(width_px, blocked))
-        .max(status_floor(blocked))
+        .max(status_floor_for(chrome, layout, blocked))
 }
 
 /// One status glyph at [`INLINE_STATUS_FONT_SIZE`]. The widest of the five is
@@ -281,6 +283,28 @@ fn status_floor(blocked: bool) -> f32 {
     }
 }
 
+/// What THIS panel's status group may never be squeezed below, at THIS layout.
+///
+/// [`status_floor`] is the worst case every width must survive and is what
+/// [`status_budget`]'s invariant is written against. This is the same question
+/// asked of the parts actually painted: an idle panel has no glyph, and W3's
+/// ladder can take the age, so a floor that always reserved both spent 35 px
+/// of the title's room on two things that are not there. Never above
+/// [`status_floor`], which is what keeps the budget's guarantee intact.
+fn status_floor_for(chrome: &PanelChrome, layout: StatusLayout, blocked: bool) -> f32 {
+    let mut width = 0.0;
+    if chrome.status.icon.is_some() {
+        width += STATUS_ICON_WIDTH + STATUS_GAP;
+    }
+    if layout.show_age {
+        width += STATUS_AGE_MAX_WIDTH;
+    }
+    if blocked {
+        width += STATUS_RETRY_WIDTH + STATUS_GAP;
+    }
+    width
+}
+
 /// Roughly how wide the inline status group paints, so the title can be given
 /// the room the status does NOT need.
 ///
@@ -310,21 +334,49 @@ fn estimated_status_width(chrome: &PanelChrome, layout: StatusLayout, blocked: b
 /// difference out of the TITLE, which on a 296 px panel left it three
 /// characters wide.
 fn status_fixed_parts(chrome: &PanelChrome, layout: StatusLayout, blocked: bool) -> f32 {
-    let mut width =
-        crate::ui::overlay_chrome::approx_text_width(&chrome.status.age, INLINE_STATUS_FONT_SIZE);
+    let mut width = 0.0;
     if chrome.status.icon.is_some() {
         width += STATUS_ICON_WIDTH + STATUS_GAP;
     }
-    if layout.show_text {
-        width += 2.0 * STATUS_GAP + STATUS_SEPARATOR_WIDTH;
+    if layout.show_age {
+        width += crate::ui::overlay_chrome::approx_text_width(
+            &chrome.status.age,
+            INLINE_STATUS_FONT_SIZE,
+        );
     }
     if blocked {
         width += STATUS_RETRY_WIDTH + STATUS_GAP;
     }
-    if chrome.status.progress.is_some() && layout.show_segments {
-        width += STATUS_SEGMENTS_MAX_WIDTH + STATUS_GAP + STATUS_SEPARATOR_WIDTH + STATUS_GAP;
+    if shows_segments(chrome, layout) {
+        width += STATUS_SEGMENTS_MAX_WIDTH;
     }
+    // One separator BETWEEN each pair of the three separated groups, and the
+    // group's own gap on either side of it. Counting a separator per part is
+    // how the estimate used to charge for a "·" in front of an age that had
+    // nothing before it.
+    width +=
+        status_separator_count(chrome, layout) as f32 * (STATUS_SEPARATOR_WIDTH + 2.0 * STATUS_GAP);
     width
+}
+
+/// Does this panel paint the plan strip?
+fn shows_segments(chrome: &PanelChrome, layout: StatusLayout) -> bool {
+    chrome.status.progress.is_some() && layout.show_segments
+}
+
+/// How many "·" the status group paints: one fewer than the number of
+/// separated groups it has (the verb, the age, the strip). The icon and Retry
+/// travel with the verb, so neither earns one.
+fn status_separator_count(chrome: &PanelChrome, layout: StatusLayout) -> usize {
+    [
+        layout.show_text,
+        layout.show_age,
+        shows_segments(chrome, layout),
+    ]
+    .into_iter()
+    .filter(|shown| *shown)
+    .count()
+    .saturating_sub(1)
 }
 
 /// The middle dot between two status parts, at [`INLINE_STATUS_FONT_SIZE`].
@@ -339,11 +391,68 @@ const STATUS_SEGMENTS_MAX_WIDTH: f32 = 90.0;
 /// `flex_1` slot and truncate: this is the arithmetic that replaces the flex
 /// line. Everything the status is not going to use is the title's, floored at
 /// [`title_floor`] and capped so the status keeps the parts it may never drop.
-fn title_width(width_px: f32, chrome: &PanelChrome, status_estimate: f32, blocked: bool) -> f32 {
-    let reserve = controls_reserve(chrome);
-    let ceiling = (width_px - reserve - status_floor(blocked)).max(TITLE_MIN_WIDTH);
+fn title_width(
+    width_px: f32,
+    chrome: &PanelChrome,
+    layout: StatusLayout,
+    status_estimate: f32,
+    blocked: bool,
+) -> f32 {
+    let reserve = controls_reserve(chrome, layout);
+    let ceiling =
+        (width_px - reserve - status_floor_for(chrome, layout, blocked)).max(TITLE_MIN_WIDTH);
     let floor = title_floor(width_px).min(ceiling);
     (width_px - reserve - status_estimate).clamp(floor, ceiling)
+}
+
+/// What the title row shows at this width, after the status group has yielded
+/// as far as it must (W3, fix wave 3).
+///
+/// The title is the panel's identity: the stripe says which project, the mark
+/// says which provider, and only the title says which task. In the fix wave 2
+/// render three 296 px panels read "are there ...", "Build the ..." and "Reply
+/// wit..." while "Idle · 7d ⤢ Done ⋯" kept about 200 px of the same row -- so
+/// the row spent two thirds of itself on facts the board row beside it already
+/// carries, and the panels could not be told apart.
+///
+/// The ladder, in order, and each rung is chosen because it costs the least:
+///
+/// 0. the **plan strip**, at up to [`STATUS_SEGMENTS_MAX_WIDTH`] by far the
+///    widest thing in the group. It is not in W3's own list because no panel
+///    in the fix wave 2 capture carried one, but the rule this module already
+///    had says the strip goes first and the text second ([`StatusLayout`]),
+///    and a 90 px strip on a 350 px panel costs more than the other three
+///    rungs put together;
+/// 1. the **zoom glyph**, which is a duplicate -- Zoom is a row of the ⋯ menu
+///    (`menu::panel_menu_rows`) and has a key of its own;
+/// 2. the **age**, which the board row shows for the same task;
+/// 3. the **verb**, likewise.
+///
+/// `Done` and `⋯` never yield: they are how the panel is operated at all, and
+/// a panel you cannot finish or open a menu on is worse than an anonymous one.
+/// Above [`STATUS_YIELD_WIDTH`] nothing yields, so on a panel with room the
+/// rule costs nothing -- and at the mockup's own 470 px a working panel keeps
+/// the whole of the status the way `02-panel-chrome-2` draws it, even where
+/// that is more of the row than the title gets.
+fn title_row_layout(width_px: f32, chrome: &PanelChrome, blocked: bool) -> StatusLayout {
+    let mut layout = status_layout(width_px);
+    if width_px >= STATUS_YIELD_WIDTH {
+        return layout;
+    }
+    let claim = width_px * TITLE_MIN_SHARE;
+    for rung in 0..4 {
+        let estimate = estimated_status_width(chrome, layout, blocked);
+        if title_width(width_px, chrome, layout, estimate, blocked) >= claim {
+            return layout;
+        }
+        match rung {
+            0 => layout.show_segments = false,
+            1 => layout.show_zoom = false,
+            2 => layout.show_age = false,
+            _ => layout.show_text = false,
+        }
+    }
+    layout
 }
 
 /// What the fixed controls on THIS panel actually take, as opposed to
@@ -354,14 +463,14 @@ fn title_width(width_px: f32, chrome: &PanelChrome, status_estimate: f32, blocke
 /// what decides how much of the leftover the title may have. Spending the
 /// worst case twice is what made the title 23 px wide on a 296 px panel with a
 /// one-digit chip and a four-letter button.
-fn controls_reserve(chrome: &PanelChrome) -> f32 {
-    let mut width = ROW_PADDING_LEFT
-        + ROW_PADDING_X
-        + PROVIDER_MARK_SIZE
-        + ZOOM_AFFORDANCE_WIDTH
-        + MENU_GLYPH_WIDTH
-        + CONTROLS_SAFETY;
-    let mut gaps = 4.0;
+fn controls_reserve(chrome: &PanelChrome, layout: StatusLayout) -> f32 {
+    let mut width =
+        ROW_PADDING_LEFT + ROW_PADDING_X + PROVIDER_MARK_SIZE + MENU_GLYPH_WIDTH + CONTROLS_SAFETY;
+    let mut gaps = 3.0;
+    if layout.show_zoom {
+        width += ZOOM_AFFORDANCE_WIDTH;
+        gaps += 1.0;
+    }
     if chrome.ordinal.is_some() {
         width += ordinal_chip_width(chrome.ordinal.unwrap_or(1));
         gaps += 1.0;
@@ -505,7 +614,7 @@ fn inline_status_element(
         // `status_floor`, the group can neither eat the title's floor nor be
         // squeezed out of its own icon, age and Retry.
         .flex_none()
-        .min_w(px(status_floor(blocked)))
+        .min_w(px(status_floor_for(chrome, layout, blocked)))
         // The title now claims a DEFINITE width, so the group's ceiling is
         // what the row has left after it -- never the budget, which assumed
         // the title had shrunk to its floor. Without this the two definite
@@ -561,20 +670,29 @@ fn inline_status_element(
         );
     }
 
-    if layout.show_text {
-        row = row.child(status_separator(tokens));
+    // A "·" sits BETWEEN two groups that are both there and nowhere else. W3
+    // can take the age, so "the separator is painted whenever the text is"
+    // would leave a row ending on a dangling dot -- the same defect F8 fixed
+    // at the other end of the row.
+    let mut painted_a_group = layout.show_text;
+    if layout.show_age {
+        if painted_a_group {
+            row = row.child(status_separator(tokens));
+        }
+        row = row.child(
+            div()
+                .flex_none()
+                .text_color(tokens.text.muted.to_gpui())
+                .child(chrome.status.age.clone()),
+        );
+        painted_a_group = true;
     }
-    row = row.child(
-        div()
-            .flex_none()
-            .text_color(tokens.text.muted.to_gpui())
-            .child(chrome.status.age.clone()),
-    );
 
     if let Some(progress) = chrome.status.progress.filter(|_| layout.show_segments) {
-        row = row
-            .child(status_separator(tokens))
-            .child(segments_element(progress, tokens, true));
+        if painted_a_group {
+            row = row.child(status_separator(tokens));
+        }
+        row = row.child(segments_element(progress, tokens, true));
     }
 
     row.into_any_element()
@@ -612,7 +730,7 @@ fn title_row_element(
 
     let blocked = matches!(chrome.needs_you, Some(NeedsYou::Blocked { .. }));
     let status_estimate = estimated_status_width(chrome, layout, blocked);
-    let title_width_px = title_width(width_px, chrome, status_estimate, blocked);
+    let title_width_px = title_width(width_px, chrome, layout, status_estimate, blocked);
 
     let mut row = div()
         .flex()
@@ -689,22 +807,28 @@ fn title_row_element(
         handlers,
     ));
 
-    row = row.child(
-        div()
-            .id(("devmanager-panel-zoom", element_key))
-            .tab_stop(true)
-            .flex_none()
-            .cursor_pointer()
-            .text_size(px(ZOOM_ICON_FONT_SIZE))
-            .text_color(tokens.text.muted.to_gpui())
-            .on_mouse_down(
-                MouseButton::Left,
-                move |_event: &MouseDownEvent, window, app| {
-                    (on_zoom)(&zoom_key, window, app);
-                },
-            )
-            .child(if chrome.zoomed { "⤡ Esc" } else { "⤢" }),
-    );
+    // W3: the first thing the row gives up when the title is under 40% of it.
+    // Nothing is lost -- Zoom is a row of the ⋯ menu with a key of its own --
+    // and a zoomed panel owns the whole window, so it is always above the
+    // width at which anything yields.
+    if layout.show_zoom {
+        row = row.child(
+            div()
+                .id(("devmanager-panel-zoom", element_key))
+                .tab_stop(true)
+                .flex_none()
+                .cursor_pointer()
+                .text_size(px(ZOOM_ICON_FONT_SIZE))
+                .text_color(tokens.text.muted.to_gpui())
+                .on_mouse_down(
+                    MouseButton::Left,
+                    move |_event: &MouseDownEvent, window, app| {
+                        (on_zoom)(&zoom_key, window, app);
+                    },
+                )
+                .child(if chrome.zoomed { "⤡ Esc" } else { "⤢" }),
+        );
+    }
 
     // A minimised panel is the title row alone: it keeps the status, which is
     // the whole reason to leave a panel minimised, and drops the two controls
@@ -879,7 +1003,11 @@ pub fn panel_chrome_element(
     handlers: &PanelHandlers,
 ) -> AnyElement {
     let element_key = panel_element_key(&chrome.key);
-    let layout = status_layout(width_px);
+    let layout = title_row_layout(
+        width_px,
+        chrome,
+        matches!(chrome.needs_you, Some(NeedsYou::Blocked { .. })),
+    );
     let focus_key = chrome.key.clone();
     let key_key = chrome.key.clone();
     let on_focus = handlers.on_focus.clone();
@@ -1419,51 +1547,187 @@ mod tests {
             String::new(),
         );
         for width in [TIGHT_WIDTH, 300.0, 370.0, 470.0, 1060.0] {
-            let layout = status_layout(width);
+            let layout = title_row_layout(width, &idle, false);
             let estimate = estimated_status_width(&idle, layout, false);
-            let title = title_width(width, &idle, estimate, false);
+            let title = title_width(width, &idle, layout, estimate, false);
+            let floor = status_floor_for(&idle, layout, false);
+            let reserve = controls_reserve(&idle, layout);
             // 1. It never squeezes the title out of existence, and never below
             //    the floor the budget promises at this width.
             assert!(
-                title
-                    >= title_floor(width)
-                        .min(width - controls_reserve(&idle) - status_floor(false)),
+                title >= title_floor(width).min(width - reserve - floor),
                 "at {width} px the title fell below its floor"
             );
             // 2. Title plus the status floor plus the controls this panel
             //    actually carries always fit, so the row can never push its
             //    own buttons off the right edge.
             assert!(
-                title + status_floor(false) + controls_reserve(&idle) <= width + 0.01,
+                title + floor + reserve <= width + 0.01,
                 "at {width} px the title row does not fit"
             );
             // 3. The status is given exactly what is left, never less than the
             //    parts it may not drop.
             let room = status_room(width, &idle, layout, false);
             assert!(
-                room >= status_floor(false) - 0.01,
+                room >= floor - 0.01,
                 "at {width} px the status lost its floor"
             );
             assert!(
                 status_text_max_width(width, &idle, layout, false) >= 0.0,
                 "the status text cap went negative"
             );
+            // The parts this panel actually owes never outgrow the worst case
+            // the budget is written against, or the budget guarantees nothing.
+            assert!(
+                floor <= status_floor(false) + 0.01,
+                "at {width} px the actual status floor outgrew the worst case"
+            );
         }
         // Wider panel, wider title: the arithmetic replaced a flex line and
         // has to keep the behaviour a flex line had.
+        let narrow_layout = title_row_layout(300.0, &idle, false);
         let narrow = title_width(
             300.0,
             &idle,
-            estimated_status_width(&idle, status_layout(300.0), false),
+            narrow_layout,
+            estimated_status_width(&idle, narrow_layout, false),
             false,
         );
+        let wide_layout = title_row_layout(700.0, &idle, false);
         let wide = title_width(
             700.0,
             &idle,
-            estimated_status_width(&idle, status_layout(700.0), false),
+            wide_layout,
+            estimated_status_width(&idle, wide_layout, false),
             false,
         );
         assert!(wide > narrow, "the title must grow with the panel");
+    }
+
+    /// W3 (fix wave 3): the title is the panel's identity, so the status
+    /// group yields to it -- zoom, then age, then verb -- until the title has
+    /// [`TITLE_MIN_SHARE`] of the row. `Done` and the menu never yield.
+    ///
+    /// Pinned at the four widths the wave was read at: 296 (one of four in the
+    /// capture), 350, 420 (the yield ceiling) and 470 (the mockup's width).
+    /// Pure arithmetic over the constants, so no layout pass can quietly
+    /// satisfy it.
+    #[test]
+    fn the_status_group_yields_zoom_then_age_then_verb_until_the_title_has_its_share() {
+        let idle = panel_chrome(
+            &row(BoardState::Idle),
+            PaneView::Conversation,
+            false,
+            false,
+            false,
+            None,
+            false,
+            String::new(),
+        );
+
+        // The ladder's rungs, in order. Read off the four widths rather than
+        // asserted as a formula: what matters is the ORDER things go in, and a
+        // formula restating the implementation would not check that.
+        for width in [296.0_f32, 350.0, 420.0, 470.0] {
+            let layout = title_row_layout(width, &idle, false);
+            let estimate = estimated_status_width(&idle, layout, false);
+            let title = title_width(width, &idle, layout, estimate, false);
+            let base = status_layout(width);
+            if width < STATUS_YIELD_WIDTH {
+                assert!(
+                    title >= width * TITLE_MIN_SHARE - 0.01,
+                    "at {width} px the title kept only {title} px, under its {}% share",
+                    TITLE_MIN_SHARE * 100.0
+                );
+            } else {
+                // Above the ceiling nothing yields: the mockup's own 470 px
+                // panel spends most of its row on the status, on purpose.
+                assert_eq!(layout, base, "at {width} px nothing should have yielded");
+            }
+            // The order: a part is never dropped while a cheaper one is still
+            // painted. The strip is the widest and goes first, then the zoom
+            // glyph (it is a menu row), then the age, then the verb.
+            if !layout.show_zoom {
+                assert!(
+                    !layout.show_segments,
+                    "at {width} px the zoom glyph went before the plan strip"
+                );
+            }
+            if !layout.show_age {
+                assert!(
+                    !layout.show_zoom,
+                    "at {width} px the age went before the zoom glyph"
+                );
+            }
+            if !layout.show_text && base.show_text {
+                assert!(
+                    !layout.show_age && !layout.show_zoom,
+                    "at {width} px the verb went before the age or the zoom glyph"
+                );
+            }
+        }
+
+        // The two narrow widths must actually exercise the ladder, or the
+        // assertions above are a tautology over four layouts that never moved.
+        assert!(
+            !title_row_layout(296.0, &idle, false).show_zoom,
+            "at 296 px the zoom glyph must yield: this is the capture's own width"
+        );
+        assert!(
+            !title_row_layout(350.0, &idle, false).show_zoom,
+            "at 350 px the zoom glyph must yield"
+        );
+        assert_eq!(
+            title_row_layout(470.0, &idle, false),
+            status_layout(470.0),
+            "at the mockup's width the row keeps everything"
+        );
+        // A panel with no progress does not spend a rung on a strip it has
+        // not got, and the ladder still reaches the title's share without one.
+        let mut quiet = idle.clone();
+        quiet.status.progress = None;
+        let quiet_layout = title_row_layout(296.0, &quiet, false);
+        assert!(
+            !quiet_layout.show_zoom,
+            "the ladder still runs on a panel with no plan strip"
+        );
+        assert!(
+            title_width(
+                296.0,
+                &quiet,
+                quiet_layout,
+                estimated_status_width(&quiet, quiet_layout, false),
+                false
+            ) >= 296.0 * TITLE_MIN_SHARE - 0.01
+        );
+
+        // Done and the menu are not in the layout at all: there is no rung
+        // that can take them, which is the point.
+        let source = include_str!("render.rs").replace("\r\n", "\n");
+        let painter = source
+            .split("#[cfg(test)]")
+            .next()
+            .expect("the painter is everything above its tests");
+        let title_row = painter
+            .split("fn title_row_element(")
+            .nth(1)
+            .expect("the anchor has stopped matching and this test is guarding nothing");
+        let compact: String = title_row.chars().filter(|c| !c.is_whitespace()).collect();
+        assert!(
+            compact.contains("iflayout.show_zoom{"),
+            "the zoom affordance is the rung the ladder takes first"
+        );
+        assert_eq!(
+            compact.matches("layout.show_zoom").count(),
+            1,
+            "one gate, on the one control the ladder may take"
+        );
+        for never_gated in ["devmanager-panel-primary", "devmanager-panel-menu"] {
+            assert!(
+                compact.contains(never_gated),
+                "the title row must still paint {never_gated}"
+            );
+        }
     }
 
     /// A tab that does not fit is dropped, not clipped -- and the selected one

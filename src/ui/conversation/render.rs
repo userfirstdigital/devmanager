@@ -117,8 +117,28 @@ pub fn assistant_message_paint_backend() -> AssistantMarkdownBackend {
 /// `text.muted`. It replaces the old right-aligned user bubble and the
 /// assistant's coloured dot: the stream has no avatars and no role tints.
 const ROLE_LABEL_FONT_SIZE: f32 = 10.5;
-/// Rule 6: 4 px between a role label and the body it heads.
-const ROLE_LABEL_GAP: f32 = 4.0;
+/// Rule 2/5, as fix wave 3 tightened it: the role label sits DIRECTLY above
+/// the body it heads -- 2 px, off the 4/8 grid on purpose.
+///
+/// At 4 px, plus a 14.7 px label line box and a 17.25 px body line box, the
+/// label floated clear of its paragraph and read as a caption belonging to
+/// nothing: measured 23.5 logical px baseline to baseline in
+/// `fix-wave-2-panel-grid.png`, against 50 px between two whole blocks -- a
+/// ratio of 1:2 where the eye needs at least 1:4 to group a label with the
+/// text under it.
+const ROLE_LABEL_GAP: f32 = 2.0;
+/// The 4 px grid step the cards and folds inside the stream space themselves
+/// on: a card's top margin, a fold's padding, the gap between a glyph and its
+/// label. It is [`ROLE_LABEL_GAP`]'s old value, split out because the two are
+/// different jobs and only one of them is "a label above its body".
+const CARD_GAP: f32 = 4.0;
+/// Rule 6: 10 px of air between two message blocks.
+///
+/// This is the whole cadence of the stream, and the block's own bottom padding
+/// is now the only thing paying for it -- the meta row used to sit in the flow
+/// under every block at `4 + caption line + 8`, so two blocks stood ~40 px
+/// apart whether or not anything was visible in that space.
+const BLOCK_GAP: f32 = 10.0;
 /// Rule 2: message body -- 11.5 px `text.primary`.
 const BODY_FONT_SIZE: f32 = 11.5;
 /// 11.5 px at the mockup stream's 1.5 leading (`.stream { font: 11.5px/1.5 }`).
@@ -206,6 +226,11 @@ fn role_label_element(text: &str, tokens: ThemeTokens) -> AnyElement {
     div()
         .w_full()
         .text_size(px(ROLE_LABEL_FONT_SIZE))
+        // The line box the scroll estimate has always assumed. Without it the
+        // label inherits the surrounding leading, which measured about 4 px
+        // taller than [`ROLE_LABEL_LINE_HEIGHT`] in the fix wave 3 render and
+        // spent the difference on the gap W2 had just tightened.
+        .line_height(px(ROLE_LABEL_LINE_HEIGHT))
         .text_color(tokens.text.muted.to_gpui())
         .child(role_label(text))
         .into_any_element()
@@ -327,15 +352,12 @@ pub fn conversation_row_height(row: &ConversationRow, tokens: ThemeTokens) -> u3
             ..
         } => 2.0 * (ROW_PADDING_Y + 1.0) + text_lines(text) * caption_line_height,
         // Both turns paint the same block now, so they estimate the same way:
-        // the role label and its gap, the body, then the meta row and the gap
-        // above it.
+        // the role label and its gap, the body, then the air before the next
+        // block. The meta row is NOT counted -- it is absolutely positioned
+        // over the label line and takes no space in the flow, so counting it
+        // would reserve scroll room for a box that never displaces anything.
         ConversationRow::Message { text, .. } => {
-            ROLE_LABEL_LINE_HEIGHT
-                + ROLE_LABEL_GAP
-                + markdown_body_height(text, tokens)
-                + ROLE_LABEL_GAP
-                + caption_line_height
-                + CONTROL_GAP
+            ROLE_LABEL_LINE_HEIGHT + ROLE_LABEL_GAP + markdown_body_height(text, tokens) + BLOCK_GAP
         }
         ConversationRow::Error { text, .. } => {
             ROLE_LABEL_LINE_HEIGHT + ROLE_LABEL_GAP + text_lines(text) * BODY_LINE_HEIGHT
@@ -425,9 +447,9 @@ fn activity_row_height(entries: &[ActivityEntry], caption_line_height: f32) -> f
     }
 
     // The card's own chrome: the 4 px it sits below the rows above it, its
-    // 8 px of padding top and bottom, and the 4 px between its label and the
+    // 8 px of padding top and bottom, and the gap between its label and the
     // first step. Then the label line, then one row per step.
-    let plan_card_height = ROLE_LABEL_GAP
+    let plan_card_height = CARD_GAP
         + 2.0 * CONTROL_GAP
         + ROLE_LABEL_GAP
         + caption_line_height
@@ -445,7 +467,7 @@ fn turn_fold_element(label: &str, expanded: bool, tokens: ThemeTokens) -> AnyEle
     };
     div()
         .w_full()
-        .pt(px(ROLE_LABEL_GAP))
+        .pt(px(CARD_GAP))
         .pb(px(CONTROL_GAP))
         .border_b(px(HAIRLINE_WIDTH))
         .border_color(tokens.borders.subtle.to_gpui())
@@ -453,7 +475,7 @@ fn turn_fold_element(label: &str, expanded: bool, tokens: ThemeTokens) -> AnyEle
             div()
                 .flex()
                 .items_center()
-                .gap(px(ROLE_LABEL_GAP))
+                .gap(px(CARD_GAP))
                 .text_size(px(ROLE_LABEL_FONT_SIZE))
                 .text_color(tokens.text.muted.to_gpui())
                 .child(row_glyph(chevron, tokens.text.muted))
@@ -545,20 +567,36 @@ fn message_row_element(
     div()
         .w_full()
         .group(group.clone())
+        .relative()
         .flex()
         .flex_col()
         .min_w(px(0.0))
-        .gap(px(ROLE_LABEL_GAP))
-        .pb(px(CONTROL_GAP))
+        // The one thing between two blocks (W2). Everything else that used to
+        // sit under a block has left the flow.
+        .pb(px(BLOCK_GAP))
         .child(body)
-        .child(message_meta_element(
-            group,
-            text,
-            occurred_at_ms,
-            user,
-            streaming,
-            tokens,
-        ))
+        // The meta row is CHROME, not content: invisible until the block is
+        // hovered or its own control takes focus. In the flow it cost every
+        // block roughly 27 px of dead air -- a gap, a caption line and 8 px of
+        // padding -- which is most of the ~40 px that stood between two blocks
+        // in `fix-wave-2-panel-grid.png`. It is positioned over the block's own
+        // label line instead: the label is two short words at the left and the
+        // meta is right-aligned, so the two never meet, and no message body is
+        // ever covered by an affordance that appears under the pointer.
+        .child(
+            div()
+                .absolute()
+                .top_0()
+                .right_0()
+                .child(message_meta_element(
+                    group,
+                    text,
+                    occurred_at_ms,
+                    user,
+                    streaming,
+                    tokens,
+                )),
+        )
         .into_any_element()
 }
 
@@ -596,11 +634,12 @@ fn message_meta_element(
     tokens: ThemeTokens,
 ) -> AnyElement {
     let copy_id = (ElementId::from("copy-conversation-message"), group.clone());
+    // Content-sized, not `w_full`: the row is positioned at its block's right
+    // edge rather than stretched across it, so there is nothing left for
+    // `justify_end` to push against.
     let mut meta = div()
-        .w_full()
         .flex()
         .items_center()
-        .justify_end()
         .gap(px(8.0))
         .pr(px(4.0))
         .opacity(message_meta_opacity(false))
@@ -940,7 +979,7 @@ fn plan_card_element(entries: &[&ActivityEntry], tokens: ThemeTokens) -> AnyElem
     div()
         .w_full()
         .min_w(px(0.0))
-        .mt(px(ROLE_LABEL_GAP))
+        .mt(px(CARD_GAP))
         .px(px(10.0))
         .py(px(CONTROL_GAP))
         .rounded(px(CARD_RADIUS_6))
@@ -1302,6 +1341,76 @@ mod tests {
             choices: choices.iter().map(|choice| (*choice).to_string()).collect(),
             settled_choice: None,
         }
+    }
+
+    /// W2 (fix wave 3): the stream's block cadence -- a label 2 px above its
+    /// body, 10 px between blocks, and nothing invisible in between.
+    ///
+    /// Two halves, because the defect had two causes. The numbers are the
+    /// rhythm itself; the source scan is the meta row, which was invisible at
+    /// rest and still cost every block a gap, a caption line and 8 px of
+    /// padding -- roughly 27 of the ~40 px that stood between two blocks in
+    /// `fix-wave-2-panel-grid.png`, and none of it attributable by reading the
+    /// painted pixels.
+    #[test]
+    fn a_message_block_hugs_its_label_and_keeps_ten_pixels_from_the_next() {
+        assert_eq!(ROLE_LABEL_GAP, 2.0);
+        assert_eq!(BLOCK_GAP, 10.0);
+        assert_eq!(CARD_GAP, 4.0, "the 4 px grid step the cards kept");
+        assert!(
+            BLOCK_GAP >= 4.0 * ROLE_LABEL_GAP,
+            "a role label must sit at least four times nearer its own body \
+             than the next block, or it reads as a caption belonging to nothing"
+        );
+
+        // The scroll estimate is exactly the parts the painter lays out, and
+        // the meta row is not one of them any more.
+        let tokens = crate::ui::tokens::dark(
+            crate::ui::tokens::Density::Comfortable,
+            crate::ui::tokens::Scale::Scale100,
+        );
+        let one_line = ConversationRow::Message {
+            id: crate::ui::renderers::TimelineItemId::Event(crate::domain::EventId::new()),
+            role: MessageRole::Assistant,
+            text: "one line".into(),
+            markdown: sample_assistant_document(),
+            occurred_at_ms: None,
+            streaming: false,
+        };
+        assert_eq!(
+            conversation_row_height(&one_line, tokens),
+            (ROLE_LABEL_LINE_HEIGHT + ROLE_LABEL_GAP + BODY_LINE_HEIGHT + BLOCK_GAP) as u32,
+            "the estimate must count the label, its gap, the body and the block gap -- and nothing else"
+        );
+
+        // The shared checkout is CRLF; normalise before slicing or the anchors
+        // below match nothing and every assertion goes vacuously green.
+        let source = include_str!("render.rs").replace("\r\n", "\n");
+        let painter = source
+            .split("#[cfg(test)]")
+            .next()
+            .expect("the painter is everything above its tests");
+        let block = painter
+            .split("fn message_row_element(")
+            .nth(1)
+            .expect("the anchor has stopped matching and this test is guarding nothing")
+            .split("fn message_timestamp_format(")
+            .next()
+            .expect("the block painter ends where the next function begins");
+        let compact: String = block.chars().filter(|c| !c.is_whitespace()).collect();
+        assert!(
+            compact.contains(".absolute().top_0().right_0()"),
+            "the meta row must be positioned over the block rather than laid \
+             out under it"
+        );
+        assert!(
+            compact.contains(".pb(px(BLOCK_GAP))"),
+            "the block's own bottom padding is the whole gap between blocks"
+        );
+        assert!(
+            !compact.contains(".pb(px(CONTROL_GAP))"),
+            "the 8 px that used to sit under the meta row is gone"
+        );
     }
 
     #[test]
@@ -1671,10 +1780,12 @@ mod tests {
         let plan_only = activity_row_height(&[plan("one"), plan("two")], 16.0);
         let mixed = activity_row_height(&[tool, plan("one"), plan("two")], 16.0);
 
-        // One 22 px row per step, plus the card's 4 + 8 + 8 + 4 chrome and its
-        // 16 px label line: 24 + 16 + 44.
+        // One 22 px row per step, plus the card's 4 + 8 + 8 + 2 chrome and its
+        // 16 px label line: 22 + 16 + 44. The last of those four is
+        // ROLE_LABEL_GAP, which W2 took from 4 to 2 -- the card's label is a
+        // role label above its own body like every other one in the stream.
         assert_eq!(stream_row_height(16.0), 22.0);
-        assert_eq!(plan_only, 84.0);
+        assert_eq!(plan_only, 82.0);
         // A tool row above the card adds exactly one more row.
         assert_eq!(mixed - plan_only, stream_row_height(16.0));
     }

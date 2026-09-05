@@ -19,7 +19,7 @@ pub use menu::{
 };
 pub use model::{
     panel_chrome, status_layout, NeedsYou, PanelChrome, PanelStatus, PrimaryAction, StatusLayout,
-    StatusTone, STATUS_CAUSE_MAX_CHARS,
+    StatusTone, STATUS_CAUSE_MAX_CHARS, STATUS_YIELD_WIDTH, TITLE_MIN_SHARE,
 };
 pub use render::{
     panel_chrome_element, panel_element_id, panel_frame, PanelHandlers, MINIMISED_HEIGHT,

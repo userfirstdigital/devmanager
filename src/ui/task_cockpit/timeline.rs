@@ -44,9 +44,13 @@ pub const MAX_PAINTED_ROWS: usize = 48;
 /// A ceiling, not a width: inside a redesign panel `max_w_full` clamps it to
 /// the panel, so the stream fills the panel it is in.
 pub const CONVERSATION_CONTENT_MAX_WIDTH: f32 = 768.0;
-/// Rule 6: region padding is 10-12. The stream's column takes the lower end,
-/// because every row inside it is already full-width with its own rhythm.
-const STREAM_REGION_PADDING: f32 = 10.0;
+/// Rule 6: region padding is 10-12, and the stream takes the upper end (W2):
+/// its rows carry no side padding of their own, so this is the only thing
+/// holding the text off the panel's border and off the project stripe.
+///
+/// The composer's own region padding is the same number for the same reason --
+/// the two stack inside one panel body and must share a left edge.
+pub const STREAM_REGION_PADDING: f32 = 12.0;
 /// Rule 6: 8 px between the summary caption and the stream below it.
 const STREAM_REGION_GAP: f32 = 8.0;
 /// Rule 2: 10.5 px captions. The activity summary is one.
@@ -55,6 +59,26 @@ const STREAM_CAPTION_FONT_SIZE: f32 = 10.5;
 /// half-viewport "near end" test re-arms live-follow while the user is reading
 /// history and yanks them back down on the next streamed chunk.
 pub const FOLLOW_REARM_THRESHOLD_PX: u32 = 40;
+
+/// A conversation starts at the TOP of its panel and only scrolls to the end
+/// once the content overflows -- the chat convention, and what every stream in
+/// the mockups shows (01 composition A, 02 panel chrome).
+///
+/// A `Bottom`-aligned GPUI list does the opposite. When the content is shorter
+/// than the viewport it sets the scroll offset NEGATIVE
+/// (`rendered_height - available_height`, `gpui-0.2.2/src/elements/list.rs`)
+/// and pins the last row to the viewport's bottom, so a four-message
+/// conversation in a 1,900 px panel painted as four lines at the floor with
+/// the whole panel empty above them -- `fix-wave-2-panel-grid.png` and
+/// `fix-wave-2-two-panels.png`. `Top` clamps the same offset at zero, which is
+/// the top-anchored short stream, and leaves the scrolled-to-end case to
+/// [`Timeline::scroll_to_end`].
+///
+/// The cost of `Top` is that the list loses its implicit end anchor: a
+/// `Bottom` list treats `logical_scroll_top == None` as "stuck to the end" and
+/// `reset` as "go there", and a `Top` list has no such sentinel. Every place
+/// that meant "the end" therefore says so explicitly below.
+const STREAM_ALIGNMENT: ListAlignment = ListAlignment::Top;
 
 pub type ActivityToggleHandler = Rc<dyn Fn(String, &mut App)>;
 
@@ -266,10 +290,16 @@ impl Timeline {
         };
         let activity_summary = conversation_activity_summary(&items, status);
         let following = Rc::new(Cell::new(true));
-        let list_state = ListState::new(rows.len(), ListAlignment::Bottom, px(2048.0));
+        let list_state = ListState::new(rows.len(), STREAM_ALIGNMENT, px(2048.0));
         let following_for_handler = following.clone();
         list_state.set_scroll_handler(move |event, _window, _cx| {
-            following_for_handler.set(!event.is_scrolled);
+            // `is_scrolled` is `logical_scroll_top.is_some()`, which a
+            // `Bottom` list clears at the end and a `Top` list never does --
+            // reading it here would detach follow on the very wheel event that
+            // arrives AT the bottom. The visible range answers the question
+            // the flag used to: the last row is on screen, so the reader is
+            // looking at the end.
+            following_for_handler.set(event.visible_range.end >= event.count);
         });
         let mut timeline = Self {
             task_id,
@@ -639,8 +669,11 @@ impl Timeline {
         }
         self.rebuild_heights();
         if following {
-            // Splicing preserves the Bottom list's implicit end anchor. Reset
-            // would discard all measured heights and drop the next scroll input.
+            // A `Top` list has no implicit end anchor, so appended rows land
+            // BELOW a scroll offset that has not moved: ask for the end
+            // explicitly. Not `reset`, which would discard every measured
+            // height and drop the next scroll input.
+            self.scroll_to_end();
             self.viewport.scroll_offset = self.content_height.saturating_sub(self.viewport.height);
             self.following.set(true);
             self.refresh_window();
@@ -799,8 +832,46 @@ impl Timeline {
         !self.follow_latest()
     }
 
+    /// Is the list parked at the end of its content?
+    ///
+    /// Under [`STREAM_ALIGNMENT`] there is no sentinel offset for "the end",
+    /// so this asks the two witnesses that exist, in order, and says which
+    /// answered rather than collapsing them:
+    ///
+    /// 1. the logical offset, which is one past the last row for exactly as
+    ///    long as it takes the next paint to resolve it into a real position
+    ///    (this is what [`Self::scroll_to_end`] leaves behind, and the only
+    ///    witness a unit test's unmeasured list has for the end);
+    /// 2. the painted pixels, once the list has laid out AND overflows.
+    ///
+    /// `max_offset_for_scrollbar` is zero both for a list that has never been
+    /// laid out and for one whose content fits its viewport, which is why it
+    /// cannot be the only test: in that case the estimated viewport answers,
+    /// and a stream with no overflow is at its end by definition.
+    fn list_is_at_end(&self) -> bool {
+        if self.list_state.logical_scroll_top().item_ix >= self.rows.len() {
+            return true;
+        }
+        let max = self.list_state.max_offset_for_scrollbar().height;
+        if max <= px(0.0) {
+            return self.at_bottom();
+        }
+        let offset = -self.list_state.scroll_px_offset_for_scrollbar().y;
+        max - offset <= px(FOLLOW_REARM_THRESHOLD_PX as f32)
+    }
+
     fn list_state_is_scrolled_away(&self) -> bool {
-        self.list_state.logical_scroll_top().item_ix < self.rows.len()
+        !self.list_is_at_end()
+    }
+
+    /// Park the list one row past the last one. `ListState::scroll_to` clamps
+    /// an index at or past the end to exactly the end, so this means "the end"
+    /// at every row count, including zero.
+    fn scroll_to_end(&self) {
+        self.list_state.scroll_to(ListOffset {
+            item_ix: self.rows.len(),
+            offset_in_item: px(0.0),
+        });
     }
 
     /// Carry reader intent across a fresh journal projection. ListState
@@ -812,7 +883,7 @@ impl Timeline {
         }
 
         let scroll_top = previous.list_state.logical_scroll_top();
-        let list_following = scroll_top.item_ix >= previous.rows.len();
+        let list_following = !previous.list_state_is_scrolled_away();
         let was_following = previous.following.get() || list_following;
         let anchor_key = previous
             .rows
@@ -861,8 +932,7 @@ impl Timeline {
     pub fn jump_to_latest(&mut self) {
         self.viewport.scroll_offset = self.content_height.saturating_sub(self.viewport.height);
         self.following.set(true);
-        // Bottom-aligned ListState treats reset as "stick to the end".
-        self.list_state.reset(self.rows.len());
+        self.scroll_to_end();
         self.refresh_window();
         self.capture_anchor_from_list();
     }
@@ -969,7 +1039,7 @@ impl Timeline {
                 offset_in_item: px(within as f32),
             });
         } else {
-            self.list_state.reset(self.rows.len());
+            self.scroll_to_end();
         }
         self.refresh_window();
         self.capture_anchor_from_list();
@@ -1049,8 +1119,8 @@ fn assert_task_projection(
 #[cfg(test)]
 mod tests {
     use super::{
-        conversation_activity_summary, ActivityCounts, Timeline, CONVERSATION_CONTENT_MAX_WIDTH,
-        FOLLOW_REARM_THRESHOLD_PX,
+        conversation_activity_summary, ActivityCounts, ListAlignment, ListState, Timeline,
+        CONVERSATION_CONTENT_MAX_WIDTH, FOLLOW_REARM_THRESHOLD_PX, STREAM_ALIGNMENT,
     };
     use crate::ui::conversation::fixtures::{generic_item, message_item, tool_item};
     use crate::ui::conversation::rows::{derive_conversation_rows, ConversationVerbosity};
@@ -1256,6 +1326,72 @@ mod tests {
         let mut timeline = Timeline::for_test_items(items);
         timeline.set_viewport_height(viewport_height);
         timeline
+    }
+
+    /// W1 (fix wave 3): the stream is anchored at its TOP, and "the end" is
+    /// asked for rather than inherited from the list's alignment.
+    ///
+    /// The top-anchoring itself is only visible in a render -- GPUI resolves
+    /// it inside `prepaint` and a unit test has no window -- so what is pinned
+    /// here is the decision that produces it plus the two consequences that
+    /// live in this file: an unscrolled list of this alignment sits at item 0
+    /// (the top), and every path that used to lean on the `Bottom` list's
+    /// implicit end anchor now names the end.
+    #[test]
+    fn the_stream_is_top_anchored_and_asks_for_its_end_explicitly() {
+        assert_eq!(
+            STREAM_ALIGNMENT,
+            ListAlignment::Top,
+            "a Bottom-aligned list pins a short conversation to the panel floor"
+        );
+        // The half a unit test can see: with this alignment a list nobody has
+        // scrolled reports the FIRST item, which is the top-anchored stream.
+        // A Bottom list reports the item count instead.
+        let unscrolled = ListState::new(3, STREAM_ALIGNMENT, gpui::px(2048.0));
+        assert_eq!(unscrolled.logical_scroll_top().item_ix, 0);
+
+        // Both the short conversation and the long one open at their end,
+        // which for a short one the paint then clamps back to the top.
+        for count in [3usize, 40] {
+            let items = (0..count)
+                .map(|index| message_item(MessageRole::Assistant, &format!("message {index}")))
+                .collect();
+            let timeline = Timeline::for_test_items(items);
+            assert_eq!(
+                timeline.list_state().logical_scroll_top().item_ix,
+                timeline.rows().len(),
+                "a {count}-message stream must open parked one past its last row"
+            );
+            assert!(timeline.list_is_at_end());
+            assert!(timeline.follow_latest());
+        }
+
+        // The shared checkout is CRLF, so normalise before slicing or this
+        // guard reads a file it cannot match.
+        let source = include_str!("timeline.rs").replace("\r\n", "\n");
+        let painter = source
+            .split("#[cfg(test)]")
+            .next()
+            .expect("the painter is everything above its tests");
+        assert!(
+            painter.contains("const STREAM_ALIGNMENT"),
+            "the anchor has stopped matching and this test is guarding nothing"
+        );
+        assert!(
+            !painter.contains("ListAlignment::Bottom"),
+            "one alignment, named once: a second Bottom list would anchor half \
+             the stream to the floor again"
+        );
+        assert!(
+            !painter.contains("!event.is_scrolled"),
+            "`is_scrolled` is never false on a Top list, so following would \
+             detach on the wheel event that arrives at the bottom"
+        );
+        assert!(
+            !painter.contains("self.list_state.reset("),
+            "`reset` means \"go to the end\" only on a Bottom list, and it \
+             discards every measured height"
+        );
     }
 
     #[test]

@@ -1,0 +1,214 @@
+{
+  "schema": "devmanager.ui.preview/v1",
+  "id": "task-cockpit-stream-anchoring",
+  "title": "Stream anchoring: three messages and forty",
+  "capture": {
+    "cursor": "excluded",
+    "border": "excluded"
+  },
+  "root": {
+    "kind": "task-cockpit",
+    "label": "Task Cockpit",
+    "tasks": [
+      {
+        "title": "Three messages: paints from the top",
+        "provider": "claude",
+        "state": "idle",
+        "age_ms": 600000,
+        "project": "Snake Game",
+        "open": true,
+        "focused": true,
+        "view": "conversation",
+        "conversation": {
+          "messages": [
+            {
+              "role": "user",
+              "text": "does the stream start at the top?"
+            },
+            {
+              "role": "assistant",
+              "text": "It should. A conversation with three messages in a full-height panel paints from the top with empty space below it, the way every chat does."
+            },
+            {
+              "role": "user",
+              "text": "and a long one?"
+            }
+          ]
+        }
+      },
+      {
+        "title": "Forty messages: scrolled to the end",
+        "provider": "codex",
+        "state": "idle",
+        "age_ms": 1200000,
+        "project": "command",
+        "open": true,
+        "view": "conversation",
+        "conversation": {
+          "messages": [
+            {
+              "role": "user",
+              "text": "where does the board live when eight agents are running?"
+            },
+            {
+              "role": "assistant",
+              "text": "As a left column, 236 px wide. Composition A: the panels tile beside it and reflow when you close one."
+            },
+            {
+              "role": "user",
+              "text": "what does a panel wear as chrome?"
+            },
+            {
+              "role": "assistant",
+              "text": "Two rows. The title row folds the status into itself, then the tab row. Arrangement 2 in the mockup."
+            },
+            {
+              "role": "user",
+              "text": "what happens at 296 px?"
+            },
+            {
+              "role": "assistant",
+              "text": "The status group yields: the zoom glyph first, then the age, then the verb, until the title has 40% of the row."
+            },
+            {
+              "role": "user",
+              "text": "why does the zoom glyph go first?"
+            },
+            {
+              "role": "assistant",
+              "text": "It is a duplicate. Zoom is a row of the menu and it has a key of its own, so the glyph costs 20 px for nothing."
+            },
+            {
+              "role": "user",
+              "text": "does Done ever yield?"
+            },
+            {
+              "role": "assistant",
+              "text": "No. Done and the menu are how the panel is operated at all; an anonymous panel beats an inoperable one."
+            },
+            {
+              "role": "user",
+              "text": "what about the plan strip?"
+            },
+            {
+              "role": "assistant",
+              "text": "It goes before all three. Ninety pixels of strip on a 350 px panel costs more than the other rungs together."
+            },
+            {
+              "role": "user",
+              "text": "how are the blocks spaced?"
+            },
+            {
+              "role": "assistant",
+              "text": "Ten pixels between blocks, two between a role label and the body it heads, twelve of region padding."
+            },
+            {
+              "role": "user",
+              "text": "what was wrong before?"
+            },
+            {
+              "role": "assistant",
+              "text": "The meta row sat in the flow under every block, invisible, and charged each one about 27 px of dead air."
+            },
+            {
+              "role": "user",
+              "text": "where did the meta row go?"
+            },
+            {
+              "role": "assistant",
+              "text": "Over the block's own label line, at the right. The label is two short words at the left, so the two never meet."
+            },
+            {
+              "role": "user",
+              "text": "does the composer still wrap?"
+            },
+            {
+              "role": "assistant",
+              "text": "No. The pill is one line at rest and the placeholder ellipsises rather than folding onto a second."
+            },
+            {
+              "role": "user",
+              "text": "when do the key hints show?"
+            },
+            {
+              "role": "assistant",
+              "text": "Only where the field is at least 420 px wide. Below that they eat the field they are annotating."
+            },
+            {
+              "role": "user",
+              "text": "and the meta line?"
+            },
+            {
+              "role": "assistant",
+              "text": "Segments drop from the right - quota, branch, access, effort - and the provider and the model never drop."
+            },
+            {
+              "role": "user",
+              "text": "why keep the provider and the model?"
+            },
+            {
+              "role": "assistant",
+              "text": "They say where the draft is going. Everything else on that line is reachable from a selector or the menu."
+            },
+            {
+              "role": "user",
+              "text": "is this scrolled to the end?"
+            },
+            {
+              "role": "assistant",
+              "text": "It is. A top-aligned list has no implicit end anchor, so the timeline asks for one past the last row."
+            },
+            {
+              "role": "user",
+              "text": "what did the bottom alignment do?"
+            },
+            {
+              "role": "assistant",
+              "text": "It set a negative scroll offset when the content was short and pinned the last row to the panel floor."
+            },
+            {
+              "role": "user",
+              "text": "how is follow kept?"
+            },
+            {
+              "role": "assistant",
+              "text": "By the visible range on the wheel event, and by a pixel test against the scrollbar's own maximum offset."
+            },
+            {
+              "role": "user",
+              "text": "what is the re-arm band?"
+            },
+            {
+              "role": "assistant",
+              "text": "Forty pixels above the true content bottom. Strict, so reading history does not re-arm live follow."
+            },
+            {
+              "role": "user",
+              "text": "does the estimate still match?"
+            },
+            {
+              "role": "assistant",
+              "text": "Yes - the row height counts the label, its gap, the body and the block gap, and nothing that has left the flow."
+            },
+            {
+              "role": "user",
+              "text": "what proves any of this?"
+            },
+            {
+              "role": "assistant",
+              "text": "The renders. Every claim in the report was read off a PNG rather than reasoned about."
+            },
+            {
+              "role": "user",
+              "text": "and the last message?"
+            },
+            {
+              "role": "assistant",
+              "text": "This one. If you can read it without scrolling, the stream is anchored at its end."
+            }
+          ]
+        }
+      }
+    ]
+  }
+}

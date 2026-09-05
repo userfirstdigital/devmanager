@@ -94,22 +94,50 @@ pub struct PanelChrome {
     pub minimised: bool,
 }
 
-/// Which parts of the inline status survive at a given panel width. The strip
-/// goes first, then the text.
+/// Which parts of the title row's right-hand group survive at a given panel
+/// width.
 ///
-/// The icon and the age are not here because they are never dropped: "12s"
-/// answers "is this stuck?" in three characters, and the painter reserves a
-/// floor for them (and for a blocked panel's Retry) so no width can clip them.
+/// Two rules produce this, and they are different questions. This function
+/// answers the first: below a width a part is simply too small to read, so the
+/// plan strip goes at 320 px and the doing-now text at 260 px whatever else
+/// the row contains. The painter then applies the second in
+/// `render::title_row_layout`: the title is the panel's identity, so above
+/// those floors the group keeps yielding -- the zoom glyph, then the age, then
+/// the verb -- until the title has [`TITLE_MIN_SHARE`] of the row.
+///
+/// `show_zoom` and `show_age` open true here because neither has a legibility
+/// floor of its own: "12s" answers "is this stuck?" in three characters and
+/// the glyph is one character, so only the title's claim ever takes them.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct StatusLayout {
+    pub show_zoom: bool,
     pub show_segments: bool,
     pub show_text: bool,
+    pub show_age: bool,
 }
+
+/// The share of the title row the title may not be squeezed below while
+/// anything in the status group is still droppable.
+///
+/// At 296 px the fix wave 2 render gave the title 66 px against roughly 200 px
+/// of "Idle · 7d ⤢ Done ⋯", so three panels read "are there ...", "Build the
+/// ..." and "Reply wit..." -- three panels that could not be told apart while
+/// the row spent two thirds of itself on facts the board row already carries.
+pub const TITLE_MIN_SHARE: f32 = 0.4;
+
+/// The width above which nothing in the status group has to yield.
+///
+/// Roughly the width at which the whole group plus a 40% title fits, so above
+/// it the ladder never fires and the rule costs nothing; below it the title is
+/// under real pressure and the group pays for it.
+pub const STATUS_YIELD_WIDTH: f32 = 420.0;
 
 pub fn status_layout(panel_width_px: f32) -> StatusLayout {
     StatusLayout {
+        show_zoom: true,
         show_segments: panel_width_px >= 320.0,
         show_text: panel_width_px >= 260.0,
+        show_age: true,
     }
 }
 
@@ -291,24 +319,34 @@ mod tests {
         assert_eq!(
             status_layout(470.0),
             StatusLayout {
+                show_zoom: true,
                 show_segments: true,
-                show_text: true
+                show_text: true,
+                show_age: true,
             }
         );
         assert_eq!(
             status_layout(319.0),
             StatusLayout {
+                show_zoom: true,
                 show_segments: false,
-                show_text: true
+                show_text: true,
+                show_age: true,
             }
         );
         assert_eq!(
             status_layout(259.0),
             StatusLayout {
+                show_zoom: true,
                 show_segments: false,
-                show_text: false
+                show_text: false,
+                show_age: true,
             }
         );
+        // The legibility floors alone never take the zoom or the age: only the
+        // title's claim does, and that is the painter's ladder.
+        assert_eq!(TITLE_MIN_SHARE, 0.4);
+        assert_eq!(STATUS_YIELD_WIDTH, 420.0);
     }
 
     /// The chrome carries the row's identity, its age and its progress

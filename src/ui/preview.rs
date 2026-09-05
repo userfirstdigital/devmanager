@@ -306,15 +306,24 @@ pub struct PreviewPlanStepFixture {
     pub status: String,
 }
 
+/// How long a seeded conversation may be.
+///
+/// It was 32 until fix wave 3, and 32 short messages do not fill a full-height
+/// panel: the stream-anchoring fixture has to show BOTH halves of the rule --
+/// a short conversation painting from the top with space below it, and a long
+/// one scrolled to its last message -- and the long half is unreachable from a
+/// fixture that cannot overflow the panel it is rendered into.
+pub const MAX_PREVIEW_CONVERSATION_ROWS: usize = 64;
+
 impl PreviewConversationFixture {
     fn validate(&self) -> Result<(), String> {
         if (self.plan_steps.is_empty() && self.messages.is_empty())
-            || self.plan_steps.len() > 32
-            || self.messages.len() > 32
+            || self.plan_steps.len() > MAX_PREVIEW_CONVERSATION_ROWS
+            || self.messages.len() > MAX_PREVIEW_CONVERSATION_ROWS
         {
-            return Err(
-                "preview conversation must carry 1..=32 messages or plan steps".to_string(),
-            );
+            return Err(format!(
+                "preview conversation must carry 1..={MAX_PREVIEW_CONVERSATION_ROWS} messages or plan steps"
+            ));
         }
         let mut identities = BTreeSet::new();
         for step in &self.plan_steps {
