@@ -87,6 +87,38 @@ pub const SEGMENT_GAP: f32 = 2.0;
 pub const SEGMENT_RADIUS: f32 = 1.5;
 pub const META_GAP: f32 = 6.0;
 
+/// The one-line top bar across the window. `.dm-top { height: 34px }` in
+/// `01-composition-A.html`, which is the only source for this bar: the spec's
+/// section 3 chooses composition A but gives the bar no geometry of its own,
+/// so every number here is the mockup's and none of them is the spec's.
+pub const TOP_BAR_HEIGHT: f32 = 34.0;
+/// `.dm-top { gap: 14px; padding: 0 12px }`.
+pub const TOP_BAR_GAP: f32 = 14.0;
+pub const TOP_BAR_PADDING_X: f32 = 12.0;
+/// `.dm-top .brand` sets a weight and a colour and no size at all, so the
+/// brand is the bar's own 11.5 px in semibold. It
+/// reads as the product name by weight, not by being a size nothing else is.
+/// Kept equal to [`TOP_BAR_SCOPE_FONT_SIZE`] by the test beneath, so the two
+/// literals cannot drift apart.
+pub const TOP_BAR_BRAND_FONT_SIZE: f32 = 11.5;
+/// `.dm-top { font-size: 11.5px }` -- the scope label inherits the bar's size.
+pub const TOP_BAR_SCOPE_FONT_SIZE: f32 = 11.5;
+/// `.dm-top .kbd { border: 1px solid; border-radius: 4px; padding: 1px 6px;
+/// font-size: 10.5px }`.
+pub const KBD_FONT_SIZE: f32 = 10.5;
+pub const KBD_RADIUS: f32 = 4.0;
+pub const KBD_PADDING_X: f32 = 6.0;
+pub const KBD_PADDING_Y: f32 = 1.0;
+/// The needs-you chip is a `kbd` chip repainted amber: composition C gives it
+/// the attention amber for its text and a much darker olive for its border,
+/// which is that same amber at roughly a third alpha over the mockup's ground.
+/// Solving the two colours per channel gives 0.333/0.361/0.327; the spec pins
+/// the shipped value at 0.35, a hair above the solved mean of 0.340.
+pub const NEEDS_YOU_CHIP_BORDER_ALPHA: f32 = 0.35;
+/// The settings glyph at the right end of the bar, the same 14 px the footer
+/// strip's icons were.
+pub const TOP_BAR_SETTINGS_ICON_SIZE: f32 = 14.0;
+
 /// `.hd { padding: 9px 10px 7px; gap: 8px }` with a 13 px title and an
 /// 11.5 px `+ New` button in a 6 px-radius 1 px box.
 pub const HEADER_PADDING_TOP: f32 = 9.0;
@@ -97,6 +129,17 @@ pub const HEADER_BUTTON_FONT_SIZE: f32 = 11.5;
 pub const HEADER_BUTTON_PADDING_X: f32 = 8.0;
 pub const HEADER_BUTTON_PADDING_Y: f32 = 2.0;
 pub const HEADER_BUTTON_RADIUS: f32 = 6.0;
+/// The `+ New` button's own text line, its 11.5 px at the mockup's 1.4 ratio
+/// rounded to a whole pixel, and the 1 px box around it.
+pub const HEADER_BUTTON_LINE_HEIGHT: f32 = 16.0;
+pub const HEADER_BUTTON_BORDER: f32 = 1.0;
+/// The board header's whole box: its 9/7 padding around the tallest control in
+/// the row, which is the `+ New` button rather than the 13 px title.
+///
+/// A constant because the board's `...` menu drops from under this header, and
+/// a menu placed off a number only the painter knows drifts the moment the
+/// header changes. Asserted against its parts below.
+pub const HEADER_HEIGHT: f32 = 38.0;
 
 /// `.g { padding: 8px 10px 3px; gap: 6px; font-size: 10.5px }`.
 pub const GROUP_LABEL_PADDING_TOP: f32 = 8.0;
@@ -269,6 +312,44 @@ mod tests {
     fn pinned_line_heights_match_the_mockup_ratio() {
         assert!((TITLE_LINE_HEIGHT - TITLE_FONT_SIZE * LINE_HEIGHT_RATIO).abs() <= 0.55);
         assert!((META_LINE_HEIGHT - META_FONT_SIZE * LINE_HEIGHT_RATIO).abs() <= 0.55);
+    }
+
+    /// The bar is the mockup's `.dm-top`, and that CSS is its only source:
+    /// `height: 34px`, `font-size: 11.5px`, and a `.brand` rule that changes the
+    /// weight and the colour but never the size. A bar pinned shorter, or a
+    /// brand sized on its own, is a deviation from the approved composition
+    /// rather than a reading of it.
+    #[test]
+    fn the_top_bar_is_the_composition_bar() {
+        assert_eq!(TOP_BAR_HEIGHT, 34.0);
+        assert_eq!(TOP_BAR_SCOPE_FONT_SIZE, 11.5);
+        assert_eq!(
+            TOP_BAR_BRAND_FONT_SIZE, TOP_BAR_SCOPE_FONT_SIZE,
+            "the brand inherits the bar's font-size; only its weight differs"
+        );
+    }
+
+    /// The header is border-box like every row, so its padding around its
+    /// tallest control must add up to [`HEADER_HEIGHT`] exactly. The `+ New`
+    /// button is that control, not the title -- a later change that makes the
+    /// title taller fails here rather than silently leaving the board's menu
+    /// hanging over the header it drops from.
+    #[test]
+    fn the_header_height_is_its_padding_around_the_tallest_control() {
+        let button =
+            2.0 * HEADER_BUTTON_BORDER + 2.0 * HEADER_BUTTON_PADDING_Y + HEADER_BUTTON_LINE_HEIGHT;
+        assert_eq!(
+            HEADER_PADDING_TOP + button + HEADER_PADDING_BOTTOM,
+            HEADER_HEIGHT
+        );
+        assert!(
+            button > HEADER_TITLE_FONT_SIZE * LINE_HEIGHT_RATIO,
+            "the + New button sets the header height, not the title"
+        );
+        assert!(
+            (HEADER_BUTTON_LINE_HEIGHT - HEADER_BUTTON_FONT_SIZE * LINE_HEIGHT_RATIO).abs() <= 0.55,
+            "the button's line stays within half a pixel of the mockup ratio"
+        );
     }
 
     /// The meta line starts under the title, not under the dot.

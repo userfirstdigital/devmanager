@@ -430,8 +430,13 @@ const T3_WORKSPACE_TOPBAR_HEIGHT: f32 = 32.0;
 /// `ui::board::layout`; these place the panel, nothing more.
 const BOARD_MENU_WIDTH: f32 = 220.0;
 const BOARD_MENU_LEFT_INSET: f32 = 8.0;
-const BOARD_MENU_TOP_INSET: f32 = 30.0;
-const T3_SIDEBAR_NAV_TOP_INSET: f32 = 12.0;
+/// The one short suffix a row disabled by remote ownership carries. The whole
+/// sentence is the row's tooltip; this is what the menu itself prints.
+const BOARD_MENU_LOCAL_ONLY_SUFFIX: &str = "(local only)";
+/// Every menu in this shell hangs this far under the control it drops from.
+/// One number, so the board menu and the scope menu cannot disagree about what
+/// "just below" means.
+const MENU_DROP_GAP: f32 = 4.0;
 const CONVERSATION_COMPOSER_PLACEHOLDER: &str =
     crate::ui::native_composer::NATIVE_COMPOSER_PLACEHOLDER;
 const COMPOSER_DRAFT_PERSIST_INTERVAL: Duration = Duration::from_millis(250);
@@ -1010,6 +1015,32 @@ enum ProviderInboxAffordance {
     ConnectedAdd,
     Checking,
     DisconnectedAdd,
+}
+
+/// Why the "New project..." row refuses, or `None` when it is live.
+///
+/// The words are not copied: `connect_canvas_copy` is CALLED for the state the
+/// affordance names, so this row and the empty-board canvas cannot drift apart.
+/// `DisconnectedAdd` asks with `None`, which is that function's own
+/// not-connected branch; `Checking` asks with the real snapshot, which is only
+/// ever in the checking state when the affordance says so.
+///
+/// Ledgered: a `CheckFailed` snapshot reaches here as `DisconnectedAdd`, because
+/// `provider_inbox_affordance` already collapses the two, so the row says
+/// "connect an agent" rather than the canvas's "could not check agents".
+fn new_project_disabled(
+    affordance: ProviderInboxAffordance,
+    snapshot: Option<&AgentConnectionSnapshot>,
+) -> Option<BoardMenuDisabled> {
+    let (heading, detail) = match affordance {
+        ProviderInboxAffordance::ConnectedAdd => return None,
+        ProviderInboxAffordance::Checking => connect_canvas_copy(snapshot),
+        ProviderInboxAffordance::DisconnectedAdd => connect_canvas_copy(None),
+    };
+    Some(BoardMenuDisabled {
+        suffix: format!("({})", heading.to_lowercase()),
+        detail,
+    })
 }
 
 fn action_lane_total(
@@ -4561,6 +4592,47 @@ enum BoardMenuAction {
     ToggleArchived,
     ToggleRail,
     ToggleDensity,
+    /// The four destinations the column's footer strip carried, plus the
+    /// folder picker its "New project" button opened. Composition A has no
+    /// footer, so the one board menu is where they live now.
+    NewProject,
+    OpenDock(DockTool),
+    OpenGitWindow,
+    OpenSettings,
+}
+
+/// One row in a board menu. It carries its own disabled state, so the painter
+/// never decides whether a destination is reachable and the tests can read the
+/// answer without painting an overlay.
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct BoardMenuEntry {
+    element_id: String,
+    label: String,
+    action: BoardMenuAction,
+    /// `None` when the row is live. `Some(_)` disables it and says why.
+    disabled: Option<BoardMenuDisabled>,
+}
+
+/// Why a board menu row refuses, in the two lengths the menu needs: a short
+/// parenthetical the row can carry on its own line, and the full sentence for
+/// the tooltip. A menu is scanned, so the row gets the short one.
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct BoardMenuDisabled {
+    /// Painted after the greyed label, e.g. `(local only)`.
+    suffix: String,
+    /// The whole explanation, shown on hover and never inline.
+    detail: String,
+}
+
+impl BoardMenuEntry {
+    fn live(element_id: String, label: String, action: BoardMenuAction) -> Self {
+        Self {
+            element_id,
+            label,
+            action,
+            disabled: None,
+        }
+    }
 }
 
 /// What the board paints under its header.
@@ -13994,31 +14066,9 @@ impl NativeShell {
             composer.as_ref(),
         );
         let mut overlay_nodes = Vec::new();
-        overlay_nodes.push(
-            AccessibilityNode::new(
-                AccessibleRole::Button,
-                if self.show_archived_tasks {
-                    "Show active tasks"
-                } else {
-                    "Show archived tasks"
-                },
-                "Toggle the sidebar between active tasks and the archived-task browser.",
-            )
-            .gpui("native-sidebar-archived", true, true),
-        );
-        overlay_nodes.push(
-            AccessibilityNode::new(
-                AccessibleRole::Button,
-                "New task",
-                if self.startup_gates_actions() {
-                    crate::ui::startup_status::STARTUP_LOADING_TOOLTIP.to_string()
-                } else {
-                    "Open a new task dialog for the selected owner's project (provider start stays deferred).".to_string()
-                },
-            )
-            .gpui("native-sidebar-new-task", true, true)
-            .with_disabled(self.startup_gates_actions()),
-        );
+        // The archived toggle is the board menu's `Archived...` row and nothing
+        // else. It published a node for a footer icon composition A deleted, so
+        // the tree named a control that is not on screen and cannot be reached.
         // The board header's own `+ New`. The per-project "+Claude"/"+Codex"
         // buttons went with the project rail; this one control opens the menu
         // that lists every project instead.
@@ -14035,9 +14085,47 @@ impl NativeShell {
             AccessibilityNode::new(
                 AccessibleRole::Button,
                 "Board options",
-                "Archived tasks, collapse the board to a rail, and row density.",
+                "Files, Git, Activity, Settings, a new project, archived tasks, collapse the board to a rail, and row density.",
             )
             .gpui("board-header-menu", true, true),
+        );
+        let scope_label = self.project_scope().label(|id| {
+            self.local_slot()
+                .config_sidebar
+                .projects
+                .iter()
+                .find_map(|project| {
+                    (ProjectId::parse(&project.workspace_id).ok() == Some(id))
+                        .then(|| project.label.as_str())
+                })
+        });
+        overlay_nodes.push(
+            AccessibilityNode::new(
+                AccessibleRole::Button,
+                format!("Project scope: {scope_label}"),
+                "Choose whether the board shows every project or one of them.",
+            )
+            .gpui(crate::ui::board::topbar::SCOPE_ELEMENT_ID, true, true),
+        );
+        let needs_you = self.top_bar_needs_you_count();
+        if needs_you > 0 {
+            let task_word = if needs_you == 1 { "task" } else { "tasks" };
+            overlay_nodes.push(
+                AccessibilityNode::new(
+                    AccessibleRole::Button,
+                    format!("{needs_you} {task_word} need you"),
+                    "Select the task that has been waiting for you longest.",
+                )
+                .gpui(crate::ui::board::topbar::NEEDS_YOU_ELEMENT_ID, true, true),
+            );
+        }
+        overlay_nodes.push(
+            AccessibilityNode::new(
+                AccessibleRole::Button,
+                "Settings",
+                "Open agent sign-in settings.",
+            )
+            .gpui(crate::ui::board::topbar::SETTINGS_ELEMENT_ID, true, true),
         );
         if let Some((owner, approval_state)) = selected_key.as_ref().and_then(|owner| {
             self.host_slot(&owner.host)
@@ -14079,24 +14167,6 @@ impl NativeShell {
                 .with_children(children),
             );
         }
-        overlay_nodes.push(
-            AccessibilityNode::new(
-                AccessibleRole::Button,
-                "New project",
-                if self.shows_add_project_plus() {
-                    "Add a local project from the sidebar footer. Creates on this machine only."
-                        .to_string()
-                } else {
-                    "Local host is not connected for project creation.".to_string()
-                },
-            )
-            .gpui(
-                "native-sidebar-new-project",
-                self.shows_add_project_plus(),
-                self.shows_add_project_plus(),
-            )
-            .with_disabled(!self.shows_add_project_plus()),
-        );
         overlay_nodes.push(
             AccessibilityNode::new(
                 AccessibleRole::Region,
@@ -30689,40 +30759,9 @@ impl NativeShell {
         cx: &Context<Self>,
     ) -> AnyElement {
         let menu = self.board_menu.expect("board menu is open");
-        let (title, entries): (&str, Vec<(String, String, BoardMenuAction)>) = match menu {
+        let (title, entries): (&str, Vec<BoardMenuEntry>) = match menu {
             BoardMenu::NewTask => ("New task in", self.board_new_task_menu_entries()),
-            BoardMenu::Options => (
-                "Board",
-                vec![
-                    (
-                        "board-menu-archived".to_string(),
-                        if self.show_archived_tasks {
-                            "Active tasks".to_string()
-                        } else {
-                            "Archived…".to_string()
-                        },
-                        BoardMenuAction::ToggleArchived,
-                    ),
-                    (
-                        "board-menu-rail".to_string(),
-                        if self.layout.board_rail {
-                            "Expand board".to_string()
-                        } else {
-                            "Collapse to rail".to_string()
-                        },
-                        BoardMenuAction::ToggleRail,
-                    ),
-                    (
-                        "board-menu-density".to_string(),
-                        if self.board_density_compact() {
-                            "Density: Compact".to_string()
-                        } else {
-                            "Density: Comfortable".to_string()
-                        },
-                        BoardMenuAction::ToggleDensity,
-                    ),
-                ],
-            ),
+            BoardMenu::Options => ("Board", self.board_options_menu_entries()),
         };
         let mut rows: Vec<AnyElement> = Vec::new();
         if entries.is_empty() {
@@ -30738,22 +30777,35 @@ impl NativeShell {
                     .into_any_element(),
             );
         }
-        for (element_id, label, action) in entries {
-            rows.push(
-                div()
-                    .id(SharedString::from(element_id))
-                    .w_full()
-                    .px(px(tokens.density.spacing.md))
-                    .py(px(tokens.density.spacing.xs))
-                    .text_size(px(tokens.density.typography.body))
+        for entry in entries {
+            let label = entry.label.clone();
+            let row = div()
+                .id(SharedString::from(entry.element_id.clone()))
+                .w_full()
+                .px(px(tokens.density.spacing.md))
+                .py(px(tokens.density.spacing.xs))
+                .text_size(px(tokens.density.typography.body));
+            rows.push(match entry.disabled.clone() {
+                // A disabled row stays one line: the greyed label and one short
+                // parenthetical. The whole sentence goes to the tooltip -- as
+                // wrapped caption text it was several lines of prose per row
+                // inside a 220 px menu that exists to be scanned.
+                Some(BoardMenuDisabled { suffix, detail }) => row
+                    .text_color(tokens.text.disabled.to_gpui())
+                    .tooltip(move |window, app| {
+                        gpui_component::tooltip::Tooltip::new(detail.clone()).build(window, app)
+                    })
+                    .child(format!("{label} {suffix}"))
+                    .into_any_element(),
+                None => row
                     .text_color(tokens.text.primary.to_gpui())
                     .cursor_pointer()
                     .hover(|style| style.bg(tokens.surfaces.hover.to_gpui()))
                     .on_mouse_down(
                         MouseButton::Left,
-                        cx.listener(move |shell, _event: &MouseDownEvent, _window, cx| {
+                        cx.listener(move |shell, _event: &MouseDownEvent, window, cx| {
                             cx.stop_propagation();
-                            shell.apply_board_menu_action(action.clone());
+                            shell.apply_board_menu_action(&entry, window, cx);
                             shell.close_board_menu();
                             shell.refresh_accessibility_tree();
                             cx.notify();
@@ -30761,7 +30813,7 @@ impl NativeShell {
                     )
                     .child(label)
                     .into_any_element(),
-            );
+            });
         }
         deferred(
             anchored()
@@ -30792,9 +30844,18 @@ impl NativeShell {
                             div()
                                 .id("board-menu")
                                 .absolute()
-                                .left(px(BOARD_MENU_LEFT_INSET))
-                                .top(px(Self::HEADER_HEIGHT + BOARD_MENU_TOP_INSET))
+                                .left(px(Self::board_menu_anchor().1))
+                                .top(px(Self::board_menu_anchor().0))
                                 .w(px(BOARD_MENU_WIDTH))
+                                // The row count is a projection -- one per
+                                // project on the New-task menu -- so the panel
+                                // is bounded by what is left of the window
+                                // under it and scrolls rather than growing off
+                                // the bottom edge.
+                                .max_h(px((f32::from(viewport.height)
+                                    - Self::board_menu_anchor().0)
+                                    .max(0.0)))
+                                .overflow_y_scroll()
                                 .flex()
                                 .flex_col()
                                 .py(px(tokens.density.spacing.xs))
@@ -30820,8 +30881,146 @@ impl NativeShell {
         .into_any_element()
     }
 
-    fn apply_board_menu_action(&mut self, action: BoardMenuAction) {
-        match action {
+    /// The board `⋯` menu. Composition A gives the column no footer strip and
+    /// no "New project" button, so the destinations those carried are rows
+    /// here: Files, Git and Activity are the three the footer's icons opened,
+    /// Settings is its glyph, and "New project…" is its plus. They sit above
+    /// "Archived…", which is the footer's fourth icon and was already a row.
+    ///
+    /// A method rather than a literal inside the painter, because the only
+    /// other way to ask "is Settings still reachable" is to paint the overlay.
+    fn board_options_menu_entries(&self) -> Vec<BoardMenuEntry> {
+        Self::board_options_menu_rows(
+            self.show_archived_tasks,
+            self.layout.board_rail,
+            self.board_density_compact(),
+            self.selected_owner_is_remote(),
+            new_project_disabled(
+                self.new_project_affordance(),
+                self.local_slot().agent_connection.as_ref(),
+            ),
+        )
+    }
+
+    /// The affordance the "New project..." row honours: local canonical
+    /// authority first, then the provider connection. The same chain the
+    /// column footer's "New project" button read before that button became
+    /// this row.
+    fn new_project_affordance(&self) -> ProviderInboxAffordance {
+        let snapshot = self.local_slot().agent_connection.as_ref();
+        let checking = snapshot.is_some_and(|snapshot| {
+            snapshot
+                .agents
+                .iter()
+                .any(|row| row.presence == AgentPresence::Checking)
+        });
+        project_creation_affordance(
+            self.shows_add_project_plus(),
+            provider_inbox_affordance(snapshot_connected(snapshot), checking),
+        )
+    }
+
+    /// The rows themselves, as a pure function of what the menu depends on, so
+    /// which destinations are reachable can be asserted without painting an
+    /// overlay or attaching a remote host.
+    fn board_options_menu_rows(
+        show_archived: bool,
+        board_rail: bool,
+        density_compact: bool,
+        owner_is_remote: bool,
+        new_project: Option<BoardMenuDisabled>,
+    ) -> Vec<BoardMenuEntry> {
+        // Git and Activity opened the two footer icons that had
+        // `-unavailable` twins on a remote owner, and the dispatcher answers
+        // for them with this same sentence. Files and Settings had no twin.
+        let remote = owner_is_remote.then(|| BoardMenuDisabled {
+            suffix: BOARD_MENU_LOCAL_ONLY_SUFFIX.to_string(),
+            detail: Self::remote_local_authority_reason().to_string(),
+        });
+        vec![
+            BoardMenuEntry::live(
+                "board-menu-files".to_string(),
+                "Files".to_string(),
+                BoardMenuAction::OpenDock(DockTool::Files),
+            ),
+            BoardMenuEntry {
+                disabled: remote.clone(),
+                ..BoardMenuEntry::live(
+                    "board-menu-git".to_string(),
+                    "Git".to_string(),
+                    BoardMenuAction::OpenGitWindow,
+                )
+            },
+            BoardMenuEntry {
+                disabled: remote,
+                ..BoardMenuEntry::live(
+                    "board-menu-activity".to_string(),
+                    "Activity".to_string(),
+                    BoardMenuAction::OpenDock(DockTool::Services),
+                )
+            },
+            BoardMenuEntry::live(
+                "board-menu-settings".to_string(),
+                "Settings".to_string(),
+                BoardMenuAction::OpenSettings,
+            ),
+            BoardMenuEntry {
+                disabled: new_project,
+                ..BoardMenuEntry::live(
+                    "board-menu-new-project".to_string(),
+                    "New project…".to_string(),
+                    BoardMenuAction::NewProject,
+                )
+            },
+            BoardMenuEntry::live(
+                "board-menu-archived".to_string(),
+                if show_archived {
+                    "Active tasks".to_string()
+                } else {
+                    "Archived…".to_string()
+                },
+                BoardMenuAction::ToggleArchived,
+            ),
+            BoardMenuEntry::live(
+                "board-menu-rail".to_string(),
+                if board_rail {
+                    "Expand board".to_string()
+                } else {
+                    "Collapse to rail".to_string()
+                },
+                BoardMenuAction::ToggleRail,
+            ),
+            BoardMenuEntry::live(
+                "board-menu-density".to_string(),
+                if density_compact {
+                    "Density: Compact".to_string()
+                } else {
+                    "Density: Comfortable".to_string()
+                },
+                BoardMenuAction::ToggleDensity,
+            ),
+        ]
+    }
+
+    fn apply_board_menu_action(
+        &mut self,
+        entry: &BoardMenuEntry,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        // The painter wires no click onto a disabled row, but the entry's own
+        // state is the single source: any later route to a menu row -- a
+        // keyboard one, say -- refuses here rather than walking past a guard
+        // that lives in the paint. Named, because a row that silently does
+        // nothing is indistinguishable from one that is broken.
+        if let Some(disabled) = &entry.disabled {
+            eprintln!(
+                "devmanager: board menu row {} is disabled and was not applied: {}",
+                entry.element_id, disabled.detail
+            );
+            return;
+        }
+        match entry.action.clone() {
             BoardMenuAction::NewTaskIn(project_key) => {
                 self.begin_new_task_for_project_key(project_key);
             }
@@ -30833,6 +31032,10 @@ impl NativeShell {
             }
             BoardMenuAction::ToggleRail => self.toggle_board_rail(),
             BoardMenuAction::ToggleDensity => self.toggle_board_density(),
+            BoardMenuAction::NewProject => self.begin_choose_folder(cx),
+            BoardMenuAction::OpenDock(tool) => self.dispatch_dock_tool(tool),
+            BoardMenuAction::OpenGitWindow => self.open_native_git_window(window, cx),
+            BoardMenuAction::OpenSettings => self.settings_open = true,
         }
     }
 
@@ -31209,7 +31412,7 @@ impl NativeShell {
     /// the project rail carried, now in one place instead of on every header.
     /// A remote project, and a local one with no provider signed in, gets the
     /// new-task dialog instead: provider start there stays deferred.
-    fn board_new_task_menu_entries(&self) -> Vec<(String, String, BoardMenuAction)> {
+    fn board_new_task_menu_entries(&self) -> Vec<BoardMenuEntry> {
         let local = self.local_host_id();
         let providers: Vec<ProviderKind> = self
             .local_slot()
@@ -31224,14 +31427,14 @@ impl NativeShell {
         for (index, (project_key, label)) in self.board_new_task_targets().into_iter().enumerate() {
             if project_key.host == local && !providers.is_empty() {
                 for (slot, provider) in providers.iter().copied().enumerate() {
-                    entries.push((
+                    entries.push(BoardMenuEntry::live(
                         format!("board-menu-new-{index}-{slot}"),
                         format!("{label} · {}", provider.display_name()),
                         BoardMenuAction::StartAgentIn(project_key.project_id, provider),
                     ));
                 }
             } else {
-                entries.push((
+                entries.push(BoardMenuEntry::live(
                     format!("board-menu-new-{index}"),
                     format!("{label} · New task…"),
                     BoardMenuAction::NewTaskIn(project_key),
@@ -31763,24 +31966,99 @@ impl NativeShell {
         let Some(key) = self.selected_task_key.clone() else {
             return;
         };
-        let _ = self.dispatch_action_recorded_for_owner(
+        self.archive_task_key(key);
+    }
+
+    /// Archive `key` and close its panel. Keyed rather than selection-driven
+    /// because the panel's own Done/Archive control names the task it belongs
+    /// to, and a panel that is not the focused one must still act on itself.
+    fn archive_task_key(&mut self, key: HostTaskKey) {
+        match self.dispatch_action_recorded_for_owner(
             &key.host,
             ActionRequest::TaskArchive {
                 task_id: key.task_id,
             },
-        );
+        ) {
+            Ok(_) => self.close_task_pane(&key),
+            // Observe rather than close: the panel staying open IS the correct
+            // outcome, but a silently kept panel is indistinguishable from a
+            // control that did nothing, so the refusal names the task.
+            Err(failure) => eprintln!(
+                "devmanager: archive was not enqueued for task {}: {}; its panel stays open",
+                key.task_id, failure.message
+            ),
+        }
     }
 
     fn settle_selected_task(&mut self) {
         let Some(key) = self.selected_task_key.clone() else {
             return;
         };
-        let _ = self.dispatch_action_recorded_for_owner(
+        self.settle_task_key(key);
+    }
+
+    /// Done closes the panel and collapses the split (plan 2 line 27; the
+    /// spec's section 10 is the keyboard model and says nothing about this).
+    /// The task leaves the live board on the same beat, so leaving its panel on
+    /// screen would keep a finished task occupying a share of the window nobody
+    /// asked for.
+    fn settle_task_key(&mut self, key: HostTaskKey) {
+        match self.dispatch_action_recorded_for_owner(
             &key.host,
             ActionRequest::TaskSettle {
                 task_id: key.task_id,
             },
-        );
+        ) {
+            Ok(_) => self.close_task_pane(&key),
+            // Same as archive: the panel is right to stay, and the reason it
+            // stayed is worth saying rather than leaving as a Done that
+            // apparently did nothing.
+            Err(failure) => eprintln!(
+                "devmanager: Done was not enqueued for task {}: {}; its panel stays open",
+                key.task_id, failure.message
+            ),
+        }
+    }
+
+    /// Remove `key`'s pane and let the split collapse, leaving focus on the
+    /// pane that had it before.
+    ///
+    /// Routed through the toggle gesture rather than calling `remove_pane`
+    /// here, because closing a pane is not only a tree edit: the selection, the
+    /// composer owner and its cached draft, the header projection and the
+    /// accessibility tree all follow it, and `select_fleet_task_key` is the one
+    /// place that does all of that. A second copy would drift, and the drift
+    /// would show up as a composer still bound to a closed pane.
+    fn close_task_pane(&mut self, key: &HostTaskKey) {
+        let open = self
+            .layout
+            .task_workspace
+            .as_ref()
+            .is_some_and(|workspace| workspace.contains_task(key.clone()));
+        if !open {
+            return;
+        }
+        let _ = self.select_fleet_task_key(key.clone(), FleetSelectMode::Toggle);
+    }
+
+    /// Give `key` a pane and focus it: focus the one it already has, otherwise
+    /// insert one BESIDE the focused pane rather than replacing it. Reopening a
+    /// Done task, or sending a message to one, must not evict whatever the
+    /// person was already looking at.
+    fn open_task_pane(&mut self, key: HostTaskKey) {
+        let already_open = self
+            .layout
+            .task_workspace
+            .as_ref()
+            .is_some_and(|workspace| workspace.contains_task(key.clone()));
+        let mode = if already_open {
+            FleetSelectMode::Replace
+        } else {
+            // Toggle on a task with no pane is exactly `insert_after_focused`;
+            // Plain would replace the focused pane's task instead.
+            FleetSelectMode::Toggle
+        };
+        let _ = self.select_fleet_task_key(key, mode);
     }
 
     fn reopen_task(&mut self, task_id: TaskId) {
@@ -31793,7 +32071,7 @@ impl NativeShell {
     }
 
     fn reopen_task_key(&mut self, key: HostTaskKey) {
-        let _ = self.select_fleet_task_key(key.clone(), FleetSelectMode::Replace);
+        self.open_task_pane(key.clone());
         let _ = self.dispatch_action_recorded_for_owner(
             &key.host,
             ActionRequest::TaskReopen {
@@ -32638,6 +32916,11 @@ impl NativeShell {
         if let Some(slot) = self.host_slot_mut(host_id) {
             slot.pending_settled_send = None;
         }
+        // The reopen landed, so the task is live again and wants a panel. It
+        // normally still has the one it was sending from; a Done task whose
+        // panel was closed on settle gets one beside the focused pane rather
+        // than in place of it (spec 2026-09-03 section 10).
+        self.open_task_pane(pending.owner.clone());
         // Re-enter normal send admission: an unopened Done draft still needs
         // the exact provider-start receipt and ready projection before input.
         self.activate_composer_control(pending.control);
@@ -34178,8 +34461,6 @@ impl NativeShell {
                     | "native-browser-reload"
                     | "native-browser-address"
                     | "native-browser-go"
-                    | "native-sidebar-changes"
-                    | "native-sidebar-services"
             ) || NATIVE_DOCK_TABS.iter().any(|(tool, dock_element_id, _)| {
                 *dock_element_id == element_id && !Self::remote_dock_tab_supported(*tool)
             });
@@ -34192,7 +34473,7 @@ impl NativeShell {
             return;
         }
         match element_id {
-            "native-projects-add" | "native-sidebar-new-project" => {
+            "native-projects-add" => {
                 self.local_slot_mut().interaction.close_palettes();
                 self.new_task = None;
                 if self.shows_add_project_plus() {
@@ -34202,9 +34483,13 @@ impl NativeShell {
                     self.settings_open = true;
                 }
             }
-            "native-sidebar-new-task" => {
-                self.begin_new_task();
+            crate::ui::board::topbar::SCOPE_ELEMENT_ID => {
+                self.project_scope_menu.toggle_menu();
             }
+            crate::ui::board::topbar::NEEDS_YOU_ELEMENT_ID => {
+                self.focus_first_needs_you_task();
+            }
+            crate::ui::board::topbar::SETTINGS_ELEMENT_ID => self.settings_open = true,
             "board-header-new" => self.open_board_menu(BoardMenu::NewTask),
             "board-header-menu" => self.open_board_menu(BoardMenu::Options),
             "board-group-done" => {
@@ -34232,10 +34517,6 @@ impl NativeShell {
             "native-composer-model" => self.open_composer_model_selector(),
             "native-composer-reasoning" => self.open_composer_reasoning_selector(),
             "native-composer-access" => self.open_composer_access_selector(),
-            "native-sidebar-archived" => {
-                self.show_archived_tasks = !self.show_archived_tasks;
-                self.refresh_accessibility_tree();
-            }
             "native-task-composer-attach" => {
                 if let Some(reason) = self.remote_image_attach_blocked_reason() {
                     if let Some(owner) = self.composer_draft_owner() {
@@ -39062,6 +39343,35 @@ impl NativeShell {
         .into_any_element()
     }
 
+    /// Where the project-scope menu hangs: `(top, left)` in pixels. The menu
+    /// drops from the top bar's scope label, so both numbers are the bar's own
+    /// -- its height plus the shared drop gap, and its left padding. A helper
+    /// rather than two literals inside the painter, because the only other way
+    /// to ask where the menu lands is to paint the overlay.
+    fn project_scope_overlay_anchor() -> (f32, f32) {
+        (
+            crate::ui::board::layout::TOP_BAR_HEIGHT + MENU_DROP_GAP,
+            crate::ui::board::layout::TOP_BAR_PADDING_X,
+        )
+    }
+
+    /// Where the board's `...` menu hangs: `(top, left)` in pixels.
+    ///
+    /// It drops from the `...` in the board header, so its top is the window
+    /// bar plus the board header plus the same drop gap the scope menu uses --
+    /// all of it the board column's own geometry. It was anchored off
+    /// `HEADER_HEIGHT`, the T3 workspace top bar, which belongs to the other
+    /// column: raising the window bar then moved the trigger and left the menu
+    /// behind.
+    fn board_menu_anchor() -> (f32, f32) {
+        (
+            crate::ui::board::layout::TOP_BAR_HEIGHT
+                + crate::ui::board::layout::HEADER_HEIGHT
+                + MENU_DROP_GAP,
+            BOARD_MENU_LEFT_INSET,
+        )
+    }
+
     fn render_project_scope_overlay(
         &self,
         tokens: crate::ui::tokens::ThemeTokens,
@@ -39135,8 +39445,8 @@ impl NativeShell {
                         .flex()
                         .items_start()
                         .justify_start()
-                        .pt(px(84.0))
-                        .pl(px(24.0))
+                        .pt(px(Self::project_scope_overlay_anchor().0))
+                        .pl(px(Self::project_scope_overlay_anchor().1))
                         .bg(Self::modal_backdrop())
                         .on_mouse_down(
                             MouseButton::Left,
@@ -42003,6 +42313,7 @@ impl NativeShell {
     fn main_column(
         &self,
         tokens: crate::ui::tokens::ThemeTokens,
+        top_bar: AnyElement,
         conversation: AnyElement,
         sidebar: AnyElement,
         workspace_header: AnyElement,
@@ -42031,7 +42342,10 @@ impl NativeShell {
         let show_dock = !layout.dock_collapsed;
         let conversation_panel =
             Self::conversation_canvas_panel(tokens, conversation, conversation_trailing);
-        div()
+        // Composition A's top bar spans the whole window, not the board column:
+        // it is the parent of both the column and the workspace, so this is a
+        // column of [bar, row] rather than the bare row it used to be.
+        let content = div()
             .id("native-shell-main-content")
             .flex()
             .flex_row()
@@ -42078,8 +42392,108 @@ impl NativeShell {
                                     .child(dock)
                             })),
                     ),
-            )
+            );
+        div()
+            .id("native-shell-window-column")
+            .flex()
+            .flex_col()
+            .flex_1()
+            .min_h(px(0.0))
+            .min_w(px(0.0))
+            .child(top_bar)
+            .child(content)
             .into_any_element()
+    }
+
+    /// The window's one-line top bar (composition A). The scope opens the same
+    /// chooser the column's scope row opened; the needs-you chip selects the
+    /// first waiting row; the glyph opens the settings surface the footer's
+    /// glyph opened.
+    ///
+    /// `shell` is `None` on the handler-less smoke path, which paints the bar
+    /// so the accessibility tree and the element tree agree about it but has no
+    /// entity to route a click through.
+    fn top_bar_element(
+        &self,
+        tokens: crate::ui::tokens::ThemeTokens,
+        board: &crate::ui::board::BoardModel,
+        shell: Option<gpui::WeakEntity<Self>>,
+    ) -> AnyElement {
+        let scope_label = self.project_scope().label(|id| {
+            self.local_slot()
+                .config_sidebar
+                .projects
+                .iter()
+                .find_map(|project| {
+                    (ProjectId::parse(&project.workspace_id).ok() == Some(id))
+                        .then(|| project.label.as_str())
+                })
+        });
+        let model = crate::ui::board::top_bar_model(scope_label, board, &self.keyboard);
+        let handlers = match shell {
+            Some(shell) => crate::ui::board::TopBarHandlers {
+                on_scope: Rc::new({
+                    let shell = shell.clone();
+                    move |_window: &mut Window, app: &mut gpui::App| {
+                        let _ = shell.update(app, |shell, cx| {
+                            cx.stop_propagation();
+                            shell.project_scope_menu.toggle_menu();
+                            cx.notify();
+                        });
+                    }
+                }),
+                on_needs_you: Rc::new({
+                    let shell = shell.clone();
+                    move |_window: &mut Window, app: &mut gpui::App| {
+                        let _ = shell.update(app, |shell, cx| {
+                            cx.stop_propagation();
+                            shell.focus_first_needs_you_task();
+                            cx.notify();
+                        });
+                    }
+                }),
+                on_settings: Rc::new({
+                    let shell = shell.clone();
+                    move |_window: &mut Window, app: &mut gpui::App| {
+                        let _ = shell.update(app, |shell, cx| {
+                            cx.stop_propagation();
+                            shell.settings_open = true;
+                            cx.notify();
+                        });
+                    }
+                }),
+            },
+            None => crate::ui::board::TopBarHandlers {
+                on_scope: Rc::new(|_, _| {}),
+                on_needs_you: Rc::new(|_, _| {}),
+                on_settings: Rc::new(|_, _| {}),
+            },
+        };
+        crate::ui::board::top_bar_element(&model, tokens, &handlers)
+    }
+
+    /// How many rows the top bar's amber chip counts: the Needs-you group's
+    /// size, read from the same board model the chip's painter reads, so the
+    /// chip, the section heading and the accessibility node cannot disagree.
+    fn top_bar_needs_you_count(&mut self) -> usize {
+        crate::ui::board::needs_you_count(&self.board_model(unix_time_ms()))
+    }
+
+    /// Select the row the needs-you chip counts first. Reads the same board
+    /// model the chip's count came from, so the chip can never point at a row
+    /// the board does not show.
+    fn focus_first_needs_you_task(&mut self) {
+        let Some(key) = self
+            .board_model(unix_time_ms())
+            .groups
+            .iter()
+            .find(|group| group.group == BoardGroup::NeedsYou)
+            .and_then(|group| group.rows.first())
+            .map(|row| row.key.clone())
+        else {
+            return;
+        };
+        let _ = self.select_fleet_task_key(key, FleetSelectMode::Replace);
     }
 
     fn sidebar(
@@ -42104,52 +42518,6 @@ impl NativeShell {
             .into_any_element()
     }
 
-    fn sidebar_brand(tokens: crate::ui::tokens::ThemeTokens) -> AnyElement {
-        div()
-            .id("native-shell-sidebar-brand")
-            .w_full()
-            .h(px(T3_WORKSPACE_TOPBAR_HEIGHT))
-            .flex()
-            .flex_none()
-            .items_center()
-            .gap(px(8.0))
-            .px(px(12.0))
-            .child(
-                div()
-                    .size(px(22.0))
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .rounded(px(6.0))
-                    .overflow_hidden()
-                    .child(
-                        img("icons/devmanager-32.png")
-                            .size(px(22.0))
-                            .object_fit(ObjectFit::Cover),
-                    ),
-            )
-            .child(
-                div()
-                    .min_w(px(0.0))
-                    .truncate()
-                    .text_size(px(tokens.density.typography.body))
-                    .font_weight(FontWeight::SEMIBOLD)
-                    .text_color(tokens.text.primary.to_gpui())
-                    .child("DevManager"),
-            )
-            .child(
-                div()
-                    .px(px(6.0))
-                    .py(px(2.0))
-                    .rounded_full()
-                    .bg(tokens.surfaces.raised.to_gpui())
-                    .text_size(px(9.0))
-                    .text_color(tokens.text.muted.to_gpui())
-                    .child("Visual"),
-            )
-            .into_any_element()
-    }
-
     /// The board column. Docked flush to the window edge, no radius, a one
     /// pixel subtle right border and the canvas ground -- the placement
     /// `01-composition-A.html` specifies for the column that holds the board.
@@ -42158,10 +42526,7 @@ impl NativeShell {
     fn reference_sidebar(
         tokens: crate::ui::tokens::ThemeTokens,
         width: f32,
-        rail: bool,
-        navigation: AnyElement,
         inbox: AnyElement,
-        footer: AnyElement,
     ) -> AnyElement {
         let column = div()
             .id("native-shell-sidebar-column")
@@ -42175,19 +42540,13 @@ impl NativeShell {
             .bg(tokens.surfaces.canvas.to_gpui())
             .border_r(px(1.0))
             .border_color(tokens.borders.subtle.to_gpui());
-        // Collapsed, the column is 36 px of dots. The brand, the project
-        // scope control and the footer buttons do not fit in that and would
-        // be silently clipped, so the rail carries the board alone -- which
-        // is what "collapse to rail" asks for.
-        if rail {
-            return column.child(inbox).into_any_element();
-        }
-        column
-            .child(Self::sidebar_brand(tokens))
-            .child(navigation)
-            .child(inbox)
-            .child(footer)
-            .into_any_element()
+        // Composition A: the column is the board and nothing else, at every
+        // width. The brand and the project scope moved to the window's top
+        // bar; Search is the palette that Ctrl+K already opens; the footer's
+        // four destinations and "New project" moved into the board's own menu.
+        // Nothing here varies with the rail any more, because there is nothing
+        // left that a 36 px column would have to clip.
+        column.child(inbox).into_any_element()
     }
 
     fn element_body(&self, task_rows: Vec<AnyElement>) -> impl IntoElement {
@@ -42257,63 +42616,6 @@ impl NativeShell {
                 .children(task_rows)
                 .into_any_element()
         };
-        let navigation = div()
-            .w_full()
-            .flex()
-            .flex_col()
-            .gap(px(2.0))
-            .px(px(8.0))
-            .pb(px(8.0))
-            .child(
-                div()
-                    .id("native-shell-sidebar-search")
-                    .h(px(32.0))
-                    .flex()
-                    .items_center()
-                    .gap(px(8.0))
-                    .px(px(8.0))
-                    .rounded(px(6.0))
-                    .text_color(tokens.text.secondary.to_gpui())
-                    .child(crate::icons::app_icon(
-                        crate::icons::SEARCH,
-                        14.0,
-                        tokens.text.muted.to_u32(),
-                    ))
-                    .child("Search"),
-            )
-            .child(
-                div()
-                    .id("native-shell-sidebar-project-scope")
-                    .h(px(32.0))
-                    .flex()
-                    .items_center()
-                    .gap(px(8.0))
-                    .px(px(8.0))
-                    .rounded(px(6.0))
-                    .text_color(tokens.text.secondary.to_gpui())
-                    .child(crate::icons::app_icon(
-                        crate::icons::FOLDER,
-                        14.0,
-                        tokens.text.muted.to_u32(),
-                    ))
-                    .child(div().flex_1().child(self.project_scope().label(|id| {
-                        self.local_slot()
-                            .config_sidebar
-                            .projects
-                            .iter()
-                            .find_map(|project| {
-                                (ProjectId::parse(&project.workspace_id).ok() == Some(id))
-                                    .then(|| project.label.as_str())
-                            })
-                    })))
-                    .child(crate::icons::app_icon(
-                        crate::icons::CHEVRON_DOWN,
-                        12.0,
-                        tokens.text.muted.to_u32(),
-                    ))
-                    .child("＋"),
-            )
-            .into_any_element();
         let inbox = div()
             .id("native-shell-task-inbox")
             .w_full()
@@ -42324,61 +42626,11 @@ impl NativeShell {
             .overflow_hidden()
             .child(inbox_body)
             .into_any_element();
-        let footer = div()
-            .id("native-shell-sidebar-footer")
-            .w_full()
-            .h(px(44.0))
-            .flex()
-            .flex_none()
-            .items_center()
-            .justify_between()
-            .px(px(10.0))
-            .border_t(px(1.0))
-            .border_color(tokens.borders.subtle.to_gpui())
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .gap(px(14.0))
-                    .child(crate::icons::app_icon(
-                        crate::icons::SETTINGS,
-                        14.0,
-                        tokens.text.muted.to_u32(),
-                    ))
-                    .child(crate::icons::app_icon(
-                        crate::icons::GIT_BRANCH,
-                        14.0,
-                        tokens.text.muted.to_u32(),
-                    ))
-                    .child(crate::icons::app_icon(
-                        crate::icons::ACTIVITY,
-                        14.0,
-                        tokens.text.muted.to_u32(),
-                    )),
-            )
-            .child(
-                div()
-                    .size(px(28.0))
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .rounded_full()
-                    .bg(tokens.actions.primary.default.background.to_gpui())
-                    .child(crate::icons::app_icon(
-                        crate::icons::PLUS,
-                        14.0,
-                        tokens.actions.primary.default.foreground.to_u32(),
-                    )),
-            )
-            .into_any_element();
-        let sidebar = Self::reference_sidebar(
-            tokens,
-            self.board_column_width(),
-            self.layout.board_rail,
-            navigation,
-            inbox,
-            footer,
-        );
+        let sidebar = Self::reference_sidebar(tokens, self.board_column_width(), inbox);
+        // The handler-less smoke path has no fleet projection to group, so the
+        // bar paints with an empty board: its geometry and its three hint chips
+        // are what this path exercises, not the needs-you count.
+        let top_bar = self.top_bar_element(tokens, &build_board_model(Vec::new(), false), None);
         let dock = Self::stacked_panel_grow(
             "native-shell-context-dock",
             self.local_slot().cockpit.active_tool().label(),
@@ -42404,6 +42656,7 @@ impl NativeShell {
             .text_color(tokens.text.primary.to_gpui())
             .child(self.main_column(
                 tokens,
+                top_bar,
                 if self.local_slot().interaction.selected_task().is_none() {
                     self.idle_conversation_photo_surface(tokens, None)
                 } else {
@@ -42572,20 +42825,9 @@ impl NativeShell {
         );
         let row_height = Self::inbox_row_height(tokens);
         let inbox_is_empty = inbox_items.is_empty();
-        let agents_connected = snapshot_connected(self.local_slot_mut().agent_connection.as_ref());
-        let agents_checking =
-            self.local_slot_mut()
-                .agent_connection
-                .as_ref()
-                .is_some_and(|snapshot| {
-                    snapshot
-                        .agents
-                        .iter()
-                        .any(|row| row.presence == AgentPresence::Checking)
-                });
-        let provider_affordance = provider_inbox_affordance(agents_connected, agents_checking);
-        let project_creation_affordance =
-            project_creation_affordance(self.shows_add_project_plus(), provider_affordance);
+        // The provider-connection chain lives on `new_project_affordance`,
+        // which the board menu's "New project..." row reads. The footer strip
+        // that used to read it here is gone.
         let shell_entity = cx.entity().downgrade();
         let services_shell_entity = shell_entity.clone();
         // The board painter. Every gesture the project rail carried moves here
@@ -43463,109 +43705,6 @@ impl NativeShell {
             .child(self.context_dock_surface(tokens, Some(services_shell_entity)))
             .into_any_element();
 
-        let navigation = div()
-            .id("native-shell-sidebar-navigation")
-            .w_full()
-            .flex()
-            .flex_col()
-            .flex_none()
-            .gap(px(3.0))
-            .px(px(8.0))
-            .pt(px(T3_SIDEBAR_NAV_TOP_INSET))
-            .pb(px(8.0))
-            .child(
-                div()
-                    .id("native-shell-sidebar-search")
-                    .tab_stop(true)
-                    .w_full()
-                    .h(px(34.0))
-                    .flex()
-                    .items_center()
-                    .gap(px(8.0))
-                    .px(px(8.0))
-                    .rounded(px(6.0))
-                    .cursor_pointer()
-                    .text_size(px(tokens.density.typography.caption))
-                    .text_color(tokens.text.secondary.to_gpui())
-                    .hover(|style| style.bg(tokens.surfaces.hover.to_gpui()))
-                    .on_click(cx.listener(|shell, _event: &ClickEvent, window, cx| {
-                        cx.stop_propagation();
-                        shell.dispatch_keyboard(KeyboardShortcut::ctrl(
-                            crate::ui::actions::ShortcutKey::Character('p'),
-                        ));
-                        shell.focus_task_search_input(window);
-                        cx.notify();
-                    }))
-                    .child(crate::icons::app_icon(
-                        crate::icons::SEARCH,
-                        14.0,
-                        tokens.text.muted.to_u32(),
-                    ))
-                    .child(div().flex_1().child("Search")),
-            )
-            .child(
-                div()
-                    .id("native-shell-sidebar-project-scope")
-                    .tab_stop(true)
-                    .w_full()
-                    .h(px(34.0))
-                    .flex()
-                    .items_center()
-                    .gap(px(8.0))
-                    .px(px(8.0))
-                    .rounded(px(6.0))
-                    .cursor_pointer()
-                    .text_size(px(tokens.density.typography.caption))
-                    .text_color(tokens.text.secondary.to_gpui())
-                    .hover(|style| style.bg(tokens.surfaces.hover.to_gpui()))
-                    .on_click(cx.listener(|shell, _event: &ClickEvent, _window, cx| {
-                        cx.stop_propagation();
-                        shell.project_scope_menu.toggle_menu();
-                        cx.notify();
-                    }))
-                    .child(crate::icons::app_icon(
-                        crate::icons::FOLDER,
-                        14.0,
-                        tokens.text.muted.to_u32(),
-                    ))
-                    .child(div().flex_1().font_weight(FontWeight::SEMIBOLD).child(
-                        self.project_scope().label(|id| {
-                            self.local_slot_mut()
-                                .config_sidebar
-                                .projects
-                                .iter()
-                                .find_map(|project| {
-                                    (ProjectId::parse(&project.workspace_id).ok() == Some(id))
-                                        .then(|| project.label.as_str())
-                                })
-                        }),
-                    ))
-                    .child(crate::icons::app_icon(
-                        crate::icons::CHEVRON_DOWN,
-                        12.0,
-                        tokens.text.muted.to_u32(),
-                    ))
-                    .child(
-                        Button::new("native-sidebar-new-task")
-                            .label("New task")
-                            .icon(gpui_component::IconName::Plus)
-                            .tooltip(if self.startup_gates_actions() {
-                                crate::ui::startup_status::STARTUP_LOADING_TOOLTIP
-                            } else {
-                                "New task"
-                            })
-                            .disabled(self.startup_gates_actions())
-                            .primary()
-                            .small()
-                            .rounded(px(8.0))
-                            .on_click(cx.listener(|shell, _event: &ClickEvent, _window, cx| {
-                                cx.stop_propagation();
-                                shell.begin_new_task();
-                                cx.notify();
-                            })),
-                    ),
-            )
-            .into_any_element();
         let inbox_panel = div()
             .id("native-shell-task-inbox")
             .w_full()
@@ -43626,195 +43765,8 @@ impl NativeShell {
                 }
             })
             .into_any_element();
-        let sidebar_footer = div()
-            .id("native-shell-sidebar-footer")
-            .w_full()
-            .h(px(44.0))
-            .flex()
-            .flex_none()
-            .items_center()
-            .justify_between()
-            .px(px(10.0))
-            .border_t(px(1.0))
-            .border_color(tokens.borders.subtle.to_gpui())
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .gap(px(4.0))
-                    .child(
-                        div()
-                            .id("native-sidebar-archived")
-                            .tab_stop(true)
-                            .size(px(28.0))
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .rounded(px(6.0))
-                            .cursor_pointer()
-                            .when(archived_view, |button| {
-                                button.bg(tokens.surfaces.selection.to_gpui())
-                            })
-                            .hover(|style| style.bg(tokens.surfaces.hover.to_gpui()))
-                            .on_click(cx.listener(|shell, _event: &ClickEvent, _window, cx| {
-                                cx.stop_propagation();
-                                shell.show_archived_tasks = !shell.show_archived_tasks;
-                                shell.refresh_accessibility_tree();
-                                cx.notify();
-                            }))
-                            .child(crate::icons::app_icon(
-                                crate::icons::FILE_TEXT,
-                                14.0,
-                                if archived_view {
-                                    tokens.text.primary.to_u32()
-                                } else {
-                                    tokens.text.muted.to_u32()
-                                },
-                            )),
-                    )
-                    .child(
-                        div()
-                            .id("native-header-settings")
-                            .tab_stop(true)
-                            .size(px(28.0))
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .rounded(px(6.0))
-                            .cursor_pointer()
-                            .hover(|style| style.bg(tokens.surfaces.hover.to_gpui()))
-                            .on_click(cx.listener(|shell, _event: &ClickEvent, _window, cx| {
-                                cx.stop_propagation();
-                                shell.settings_open = true;
-                                cx.notify();
-                            }))
-                            .child(crate::icons::app_icon(
-                                crate::icons::SETTINGS,
-                                14.0,
-                                tokens.text.muted.to_u32(),
-                            )),
-                    )
-                    .child(if self.selected_owner_is_remote() {
-                        div()
-                            .id("native-sidebar-changes-unavailable")
-                            .size(px(28.0))
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .rounded(px(6.0))
-                            .child(crate::icons::app_icon(
-                                crate::icons::GIT_BRANCH,
-                                14.0,
-                                tokens.text.disabled.to_u32(),
-                            ))
-                    } else {
-                        div()
-                            .id("native-sidebar-changes")
-                            .tab_stop(true)
-                            .size(px(28.0))
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .rounded(px(6.0))
-                            .cursor_pointer()
-                            .hover(|style| style.bg(tokens.surfaces.hover.to_gpui()))
-                            .on_click(cx.listener(|shell, _event: &ClickEvent, window, cx| {
-                                cx.stop_propagation();
-                                shell.open_native_git_window(window, cx);
-                                cx.notify();
-                            }))
-                            .child(crate::icons::app_icon(
-                                crate::icons::GIT_BRANCH,
-                                14.0,
-                                tokens.text.muted.to_u32(),
-                            ))
-                    })
-                    .child(if self.selected_owner_is_remote() {
-                        div()
-                            .id("native-sidebar-services-unavailable")
-                            .size(px(28.0))
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .rounded(px(6.0))
-                            .child(crate::icons::app_icon(
-                                crate::icons::ACTIVITY,
-                                14.0,
-                                tokens.text.disabled.to_u32(),
-                            ))
-                    } else {
-                        div()
-                            .id("native-sidebar-services")
-                            .tab_stop(true)
-                            .size(px(28.0))
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .rounded(px(6.0))
-                            .cursor_pointer()
-                            .hover(|style| style.bg(tokens.surfaces.hover.to_gpui()))
-                            .on_click(cx.listener(|shell, _event: &ClickEvent, _window, cx| {
-                                cx.stop_propagation();
-                                shell.dispatch_dock_tool(DockTool::Services);
-                                cx.notify();
-                            }))
-                            .child(crate::icons::app_icon(
-                                crate::icons::ACTIVITY,
-                                14.0,
-                                tokens.text.muted.to_u32(),
-                            ))
-                    }),
-            )
-            .child({
-                let new_project = div()
-                    .id("native-sidebar-new-project")
-                    .tab_stop(true)
-                    .h(px(28.0))
-                    .px(px(10.0))
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .gap(px(6.0))
-                    .rounded(px(6.0))
-                    .cursor_pointer()
-                    .bg(tokens.actions.primary.default.background.to_gpui())
-                    .hover(|style| style.bg(tokens.actions.primary.hover.background.to_gpui()))
-                    .child(crate::icons::app_icon(
-                        crate::icons::FOLDER,
-                        14.0,
-                        tokens.actions.primary.default.foreground.to_u32(),
-                    ))
-                    .child(
-                        div()
-                            .text_size(px(tokens.density.typography.caption))
-                            .text_color(tokens.actions.primary.default.foreground.to_gpui())
-                            .child("New project"),
-                    );
-                match project_creation_affordance {
-                    ProviderInboxAffordance::ConnectedAdd => new_project
-                        .on_click(cx.listener(|shell, _event: &ClickEvent, _window, cx| {
-                            cx.stop_propagation();
-                            shell.begin_choose_folder(cx);
-                            cx.notify();
-                        }))
-                        .into_any_element(),
-                    ProviderInboxAffordance::Checking => {
-                        new_project.opacity(0.6).into_any_element()
-                    }
-                    ProviderInboxAffordance::DisconnectedAdd => {
-                        new_project.opacity(0.45).into_any_element()
-                    }
-                }
-            })
-            .into_any_element();
-        let sidebar = Self::reference_sidebar(
-            tokens,
-            board_width,
-            self.layout.board_rail,
-            navigation,
-            inbox_panel,
-            sidebar_footer,
-        );
+        let sidebar = Self::reference_sidebar(tokens, board_width, inbox_panel);
+        let top_bar = self.top_bar_element(tokens, &board, Some(cx.entity().downgrade()));
 
         let layout = self
             .layout
@@ -44016,6 +43968,7 @@ impl NativeShell {
             .text_color(tokens.text.primary.to_gpui())
             .child(self.main_column(
                 tokens,
+                top_bar,
                 conversation,
                 sidebar,
                 workspace_header,
@@ -46703,6 +46656,7 @@ pub(crate) mod tests {
         composer_reasoning_choice_label,
         composer_waits_for_provider_identity,
         concrete_default_effort_token,
+        connect_canvas_copy,
         consume_pending_terminal_echo_prefix,
         cycle_project_choice,
         decode_idle_conversation_photo_bytes,
@@ -46720,6 +46674,7 @@ pub(crate) mod tests {
         native_command_id,
         native_git_reconciled_selector,
         native_reconnect_source_for,
+        new_project_disabled,
         next_controller_wait,
         overlay_pending_terminal_echo,
         owned_matches_admission,
@@ -46774,6 +46729,8 @@ pub(crate) mod tests {
         BoardGroup,
         BoardMenu,
         BoardMenuAction,
+        BoardMenuDisabled,
+        BoardMenuEntry,
         BoardState,
         ClientId,
         CockpitDockTool,
@@ -46849,6 +46806,8 @@ pub(crate) mod tests {
         UpdateState,
         UpdaterStage,
         ARCHIVED_ROW_HEIGHT,
+        BOARD_MENU_LEFT_INSET,
+        BOARD_MENU_LOCAL_ONLY_SUFFIX,
         COMPOSER_CARET_BLINK_INTERVAL,
         COMPOSER_CARET_BLINK_TICKS,
         CONTROLLER_IDLE_RECOVERY_INTERVAL,
@@ -46873,12 +46832,12 @@ pub(crate) mod tests {
         MAX_RETAINED_CHILDREN,
         MAX_RETAINED_WORKERS,
         MAX_RETRY_HOST_ACTIONS,
+        MENU_DROP_GAP,
         NATIVE_SNAPSHOT_PAGE_ITEMS,
         NATIVE_STARTUP_BUDGET,
         PROVIDER_SETUP_RESOLUTION_TIMEOUT,
         REMOTE_RECONNECT_BACKOFF_MAX,
         REMOTE_RECONNECT_BACKOFF_MIN,
-        T3_SIDEBAR_NAV_TOP_INSET,
         T3_WORKSPACE_TOPBAR_HEIGHT,
     };
     use super::{
@@ -47643,7 +47602,6 @@ pub(crate) mod tests {
         // asserted there against the mockup.
         assert_eq!(ARCHIVED_ROW_HEIGHT, 78.0);
         assert_eq!(T3_WORKSPACE_TOPBAR_HEIGHT, 32.0);
-        assert_eq!(T3_SIDEBAR_NAV_TOP_INSET, 12.0);
         assert_eq!(CONVERSATION_CONTENT_MAX_WIDTH, 768.0);
     }
 
@@ -49542,11 +49500,15 @@ pub(crate) mod tests {
         );
     }
 
+    /// Composition A (spec 2026-09-03 section 3): the board column is the board
+    /// and nothing else. The brand row, the Search row, the scope row with its
+    /// "New task" button and the footer strip are gone from the paint AND from
+    /// the accessibility tree; the top bar carries the scope and the settings
+    /// glyph instead, and the board's own `+ New` is the one new-task control.
     #[test]
-    fn connected_shell_exposes_new_task_beside_projects_and_footer_new_project_without_search_plus()
-    {
+    fn the_board_column_sheds_its_chrome_and_the_top_bar_publishes_the_scope() {
         if rerun_headless_shell_test_in_child(
-            "ui::native_shell::tests::connected_shell_exposes_new_task_beside_projects_and_footer_new_project_without_search_plus",
+            "ui::native_shell::tests::the_board_column_sheds_its_chrome_and_the_top_bar_publishes_the_scope",
         ) {
             return;
         }
@@ -49563,36 +49525,528 @@ pub(crate) mod tests {
                 shell.local_slot_mut().agent_connection =
                     Some(agent_connection_snapshot(AgentPresence::SignedIn));
                 shell.install_named_folder_for_test("command");
+                // One task that has asked a question, so the bar's amber chip
+                // has something to count and its node has to appear.
+                let (model, task_ids) = open_tasks_client_model_with_attention(
+                    1,
+                    crate::domain::task::TaskAttention::NeedsAnswer,
+                );
+                let project_id = model.task(task_ids[0]).expect("task").task.project_id;
+                shell.install_project_for_test("DevManager", project_id);
+                shell
+                    .apply_client_model(Arc::new(model))
+                    .expect("apply model");
                 let _ = shell.element_without_handlers();
                 shell.refresh_accessibility_tree();
-                shell
+                let ids = shell
                     .accessibility_tree()
                     .gpui_nodes()
                     .into_iter()
                     .map(|node| node.element_id)
-                    .collect::<Vec<_>>()
+                    .collect::<Vec<_>>();
+                let menu_rows = shell
+                    .board_options_menu_entries()
+                    .into_iter()
+                    .map(|entry| entry.label)
+                    .collect::<Vec<_>>();
+                (ids, menu_rows)
             });
             *completed_for_app.borrow_mut() = Some(snapshot);
             cx.quit();
         });
-        let ids = completed.borrow().clone().expect("rail control ids");
+        let (ids, menu_rows) = completed.borrow().clone().expect("column control ids");
         assert!(
-            ids.iter().any(|id| id == "native-sidebar-new-task"),
-            "New task must sit beside All projects: {ids:?}"
+            ids.iter().any(|id| id == "native-top-bar-scope"),
+            "the project scope moved to the window top bar: {ids:?}"
         );
         assert!(
-            ids.iter().any(|id| id == "native-sidebar-new-project"),
-            "footer must expose exactly one New project action: {ids:?}"
+            ids.iter().any(|id| id == "native-top-bar-settings"),
+            "the footer's settings glyph moved to the window top bar: {ids:?}"
         );
         assert!(
-            !ids.iter().any(|id| id == "native-search-plus"),
-            "Search must not keep a plus control: {ids:?}"
+            ids.iter().any(|id| id == "native-top-bar-needs-you"),
+            "a task waiting on an answer publishes the bar's needs-you chip: {ids:?}"
+        );
+        // Only ids that WERE accessibility nodes. The Search row published
+        // none, so asserting its absence from the tree stayed green with the
+        // row still on screen; the painter scan below is its only guard.
+        for gone in ["native-sidebar-new-task", "native-sidebar-new-project"] {
+            assert!(
+                !ids.iter().any(|id| id == gone),
+                "{gone} is column chrome composition A does not have: {ids:?}"
+            );
+        }
+        assert!(
+            ids.iter().any(|id| id == "board-header-new"),
+            "the board's own + New replaces the scope row's New task button: {ids:?}"
         );
         assert!(
             ids.iter()
                 .any(|id| id == "native-shell-task-inbox-scrollbar-gutter"),
             "inbox must project a dedicated scrollbar gutter sibling: {ids:?}"
         );
+        // The four footer destinations plus the folder picker, above the
+        // archived toggle that was already a row.
+        for row in [
+            "Files",
+            "Git",
+            "Activity",
+            "Settings",
+            "New project\u{2026}",
+        ] {
+            assert!(
+                menu_rows.iter().any(|label| label == row),
+                "the board menu must carry the column footer's {row} destination: {menu_rows:?}"
+            );
+        }
+        let archived = menu_rows
+            .iter()
+            .position(|label| label == "Archived\u{2026}" || label == "Active tasks")
+            .expect("the archived toggle stays in the menu");
+        let new_project = menu_rows
+            .iter()
+            .position(|label| label == "New project\u{2026}")
+            .expect("New project row");
+        assert!(
+            new_project < archived,
+            "the moved destinations sit above Archived: {menu_rows:?}"
+        );
+    }
+
+    /// The destinations the column footer carried kept its disabled states
+    /// when they became menu rows. Git and Activity are local-authority work,
+    /// so a remote owner disables them exactly as the footer's
+    /// `-unavailable` twins did and with the sentence the dispatcher already
+    /// answers with; "New project..." follows `project_creation_affordance`,
+    /// which dimmed the footer's button while agents were being checked and
+    /// while none was connected. Dropping the states with the buttons would
+    /// have shipped rows that look live and do nothing.
+    /// One row's disabled state, by element id. Panics rather than answering
+    /// `None` for a row that is not there, so a renamed id fails loudly instead
+    /// of reading as "that destination is live".
+    fn board_menu_disabled<'a>(
+        rows: &'a [BoardMenuEntry],
+        element_id: &str,
+    ) -> Option<&'a BoardMenuDisabled> {
+        rows.iter()
+            .find(|row| row.element_id == element_id)
+            .unwrap_or_else(|| panic!("{element_id} must be a board menu row"))
+            .disabled
+            .as_ref()
+    }
+
+    #[test]
+    fn the_moved_destinations_keep_the_footers_disabled_states() {
+        let live = NativeShell::board_options_menu_rows(false, false, false, false, None);
+        for element_id in [
+            "board-menu-files",
+            "board-menu-git",
+            "board-menu-activity",
+            "board-menu-new-project",
+        ] {
+            assert_eq!(
+                board_menu_disabled(&live, element_id),
+                None,
+                "{element_id} is live for a connected local owner"
+            );
+        }
+
+        let remote = NativeShell::board_options_menu_rows(false, false, false, true, None);
+        for element_id in ["board-menu-git", "board-menu-activity"] {
+            let disabled = board_menu_disabled(&remote, element_id)
+                .unwrap_or_else(|| panic!("{element_id} must be disabled on a remote owner"));
+            assert_eq!(
+                disabled.detail,
+                NativeShell::remote_local_authority_reason(),
+                "{element_id} replaced a footer icon with an -unavailable twin"
+            );
+        }
+        assert_eq!(
+            board_menu_disabled(&remote, "board-menu-files"),
+            None,
+            "Files had no -unavailable twin; a remote owner must not disable it"
+        );
+        assert_eq!(
+            board_menu_disabled(&remote, "board-menu-settings"),
+            None,
+            "Settings is not local-authority work"
+        );
+
+        for affordance in [
+            ProviderInboxAffordance::Checking,
+            ProviderInboxAffordance::DisconnectedAdd,
+        ] {
+            let snapshot = agent_connection_snapshot(AgentPresence::Checking);
+            let rows = NativeShell::board_options_menu_rows(
+                false,
+                false,
+                false,
+                false,
+                new_project_disabled(affordance, Some(&snapshot)),
+            );
+            assert!(
+                board_menu_disabled(&rows, "board-menu-new-project").is_some(),
+                "the footer's New project button dimmed for {affordance:?}"
+            );
+            assert_eq!(
+                board_menu_disabled(&rows, "board-menu-git"),
+                None,
+                "the provider connection has nothing to do with Git on a local owner"
+            );
+        }
+    }
+
+    /// A disabled row is a greyed label plus ONE short parenthetical, and the
+    /// full sentence lives in the tooltip. `remote_local_authority_reason()` is
+    /// 176 characters: painted inline it wrapped to several lines under BOTH
+    /// the Git and the Activity row, inside a 220 px panel that exists to be
+    /// scanned. The suffix words are never copied -- they come from the one
+    /// constant, or from calling `connect_canvas_copy` for the matching state.
+    #[test]
+    fn a_disabled_row_shows_one_short_suffix_and_keeps_the_sentence_for_the_tooltip() {
+        let remote = NativeShell::board_options_menu_rows(false, false, false, true, None);
+        for element_id in ["board-menu-git", "board-menu-activity"] {
+            let disabled = board_menu_disabled(&remote, element_id).expect("disabled");
+            assert_eq!(disabled.suffix, BOARD_MENU_LOCAL_ONLY_SUFFIX);
+            assert!(
+                disabled.suffix.chars().count() <= 16,
+                "the row's own text stays scannable: {:?}",
+                disabled.suffix
+            );
+            assert_eq!(
+                disabled.detail,
+                NativeShell::remote_local_authority_reason()
+            );
+            assert!(
+                disabled.detail.chars().count() > 100,
+                "the long sentence is still carried, just not painted inline"
+            );
+            assert_ne!(
+                disabled.suffix, disabled.detail,
+                "the row must not paint the sentence it hides in the tooltip"
+            );
+        }
+
+        let checking = agent_connection_snapshot(AgentPresence::Checking);
+        for (affordance, snapshot, expected) in [
+            (
+                ProviderInboxAffordance::Checking,
+                Some(&checking),
+                "(checking agents)",
+            ),
+            (
+                ProviderInboxAffordance::DisconnectedAdd,
+                None,
+                "(connect an agent)",
+            ),
+        ] {
+            let disabled = new_project_disabled(affordance, snapshot).expect("disabled");
+            assert_eq!(disabled.suffix, expected, "{affordance:?}");
+            // Called, not copied: the same words the empty-board canvas prints
+            // for this state.
+            let canvas = match affordance {
+                ProviderInboxAffordance::Checking => connect_canvas_copy(snapshot),
+                _ => connect_canvas_copy(None),
+            };
+            assert_eq!(disabled.suffix, format!("({})", canvas.0.to_lowercase()));
+            assert_eq!(disabled.detail, canvas.1);
+            assert!(
+                disabled.suffix.chars().count() <= 20,
+                "the row's own text stays scannable: {:?}",
+                disabled.suffix
+            );
+        }
+        assert_eq!(
+            new_project_disabled(ProviderInboxAffordance::ConnectedAdd, None),
+            None,
+            "a live row carries no suffix at all"
+        );
+    }
+
+    /// The `Archived...` row IS the archived toggle now that the footer icon is
+    /// gone, so the row, the action it carries and the state it flips have to
+    /// work as one path -- asserting the row's label alone would pass with the
+    /// action wired to nothing. And a disabled entry has to refuse here, not
+    /// only in the painter: the entry's own state is the single source, so a
+    /// later keyboard route cannot walk past a guard that lives in the paint.
+    #[test]
+    fn the_archived_menu_row_toggles_the_archived_browser() {
+        const TEST_NAME: &str =
+            "ui::native_shell::tests::the_archived_menu_row_toggles_the_archived_browser";
+        if rerun_headless_shell_test_in_child(TEST_NAME) {
+            return;
+        }
+        let completed = std::rc::Rc::new(std::cell::Cell::new(false));
+        let completed_for_app = std::rc::Rc::clone(&completed);
+        gpui::Application::new().run(move |cx| {
+            crate::ui::init(cx);
+            let workspace = tempfile::tempdir().expect("workspace tempdir");
+            let profile = isolated_dev_profile(workspace.path()).expect("isolated profile");
+            let (runtime, _) = TestRuntime::new(true, NativeHostActionResult::Queued);
+            let window = cx
+                .open_window(
+                    WindowOptions {
+                        show: false,
+                        ..WindowOptions::default()
+                    },
+                    move |_window, cx| {
+                        cx.new(|cx| {
+                            NativeShell::new_with_host_runtime_port(
+                                profile,
+                                Box::new(runtime),
+                                crate::ui::tokens::RuntimePreferencesSnapshot::default(),
+                                cx,
+                            )
+                        })
+                    },
+                )
+                .expect("open hidden board-menu window");
+            let entity = window.entity(cx).expect("board menu shell entity");
+            let any_window = window.into();
+            cx.update_window(any_window, |_root, window, cx| {
+                entity.update(cx, |shell, cx| {
+                    fn archived_row(shell: &NativeShell) -> BoardMenuEntry {
+                        shell
+                            .board_options_menu_entries()
+                            .into_iter()
+                            .find(|row| row.element_id == "board-menu-archived")
+                            .expect("the archived toggle is a board menu row")
+                    }
+
+                    assert!(
+                        !shell.show_archived_tasks,
+                        "the board starts on active tasks"
+                    );
+                    let row = archived_row(shell);
+                    assert_eq!(row.action, BoardMenuAction::ToggleArchived);
+                    assert_eq!(row.label, "Archived\u{2026}");
+                    shell.apply_board_menu_action(&row, window, cx);
+                    assert!(
+                        shell.show_archived_tasks,
+                        "choosing the row opens the archived browser"
+                    );
+
+                    let back = archived_row(shell);
+                    assert_eq!(
+                        back.label, "Active tasks",
+                        "and the row relabels itself for the way back"
+                    );
+                    shell.apply_board_menu_action(&back, window, cx);
+                    assert!(!shell.show_archived_tasks, "which closes it again");
+
+                    let blocked = BoardMenuEntry {
+                        disabled: Some(BoardMenuDisabled {
+                            suffix: BOARD_MENU_LOCAL_ONLY_SUFFIX.to_string(),
+                            detail: NativeShell::remote_local_authority_reason().to_string(),
+                        }),
+                        ..archived_row(shell)
+                    };
+                    shell.apply_board_menu_action(&blocked, window, cx);
+                    assert!(
+                        !shell.show_archived_tasks,
+                        "a disabled entry applies nothing, whatever route reached it"
+                    );
+                });
+            })
+            .expect("apply the archived menu row");
+            completed_for_app.set(true);
+            cx.quit();
+        });
+        assert!(completed.get(), "archived menu row scenario completed");
+    }
+
+    /// The board's `...` menu drops from the `...` in the BOARD header, so its
+    /// top is the board column's own geometry: the window bar, the board
+    /// header, and the shared drop gap. It was anchored off the T3 workspace
+    /// top bar instead, which belongs to the other column entirely -- so
+    /// raising the window bar from 28 to 34 moved the trigger and left the menu
+    /// where it was. Pinned to the two layout constants, so the next change to
+    /// either moves the menu with it.
+    #[test]
+    fn the_board_menu_hangs_off_the_board_header_not_the_workspace_bar() {
+        use crate::ui::board::layout::{HEADER_HEIGHT, TOP_BAR_HEIGHT};
+
+        let (top, left) = NativeShell::board_menu_anchor();
+        assert_eq!(top, TOP_BAR_HEIGHT + HEADER_HEIGHT + MENU_DROP_GAP);
+        assert_eq!(left, BOARD_MENU_LEFT_INSET);
+        assert!(
+            top >= TOP_BAR_HEIGHT + HEADER_HEIGHT,
+            "the menu opens below the header it drops from, never over it"
+        );
+        assert_eq!(
+            MENU_DROP_GAP,
+            NativeShell::project_scope_overlay_anchor().0 - TOP_BAR_HEIGHT,
+            "both menus drop by the same gap"
+        );
+    }
+
+    /// The project-scope menu drops from under the top bar's scope label, so
+    /// its anchor is the bar's own height and padding. The shipped pair was a
+    /// literal 84/24 that matched no constant in the bar: raising the bar to
+    /// the composition's 34 px would have left the menu floating a bar and a
+    /// half below the control that opens it, and moving the padding would not
+    /// have moved the menu at all.
+    #[test]
+    fn the_project_scope_overlay_hangs_off_the_top_bar() {
+        use crate::ui::board::layout::{TOP_BAR_HEIGHT, TOP_BAR_PADDING_X};
+
+        let (top, left) = NativeShell::project_scope_overlay_anchor();
+        assert_eq!(
+            left, TOP_BAR_PADDING_X,
+            "the menu lines up with the bar's own left padding"
+        );
+        assert_eq!(
+            top,
+            TOP_BAR_HEIGHT + 4.0,
+            "the menu hangs 4 px under the bar it drops from"
+        );
+        assert_eq!((top, left), (38.0, 12.0));
+    }
+
+    /// The ids above are absent from the accessibility tree because the
+    /// elements are gone -- not because the tree happened never to publish
+    /// them, which is why that loop names only ids that WERE nodes. The Search
+    /// row was painted without a node at all, so no tree assertion can speak
+    /// for it: this scan reads the production source instead and is its only
+    /// guard.
+    #[test]
+    fn the_removed_column_chrome_is_gone_from_the_painter_too() {
+        let source = include_str!("native_shell.rs");
+        let production_source = source
+            .split("mod tests {")
+            .next()
+            .expect("production native shell source");
+        for gone in [
+            "native-shell-sidebar-brand",
+            "native-shell-sidebar-search",
+            "native-shell-sidebar-navigation",
+            "native-shell-sidebar-project-scope",
+            "native-shell-sidebar-footer",
+            "native-sidebar-new-task",
+            "native-sidebar-new-project",
+            "native-sidebar-changes",
+            "native-sidebar-services",
+            "native-sidebar-archived",
+        ] {
+            assert!(
+                !production_source.contains(gone),
+                "{gone} is column chrome composition A removed; it must not be painted"
+            );
+        }
+        // The removal is only meaningful if the scan can see the ids that DID
+        // survive: without this the loop above passes on an empty string. The
+        // top bar's own ids are named through `board::topbar`, so this pins the
+        // reference rather than the literal -- the literal lives in that module.
+        for kept in [
+            "crate::ui::board::topbar::SCOPE_ELEMENT_ID",
+            "board-header-new",
+            "native-shell-task-inbox",
+        ] {
+            assert!(
+                production_source.contains(kept),
+                "{kept} must still be painted, or this scan is reading the wrong source"
+            );
+        }
+        assert_eq!(
+            crate::ui::board::topbar::SCOPE_ELEMENT_ID,
+            "native-top-bar-scope",
+            "the id the tree publishes and the id the painter puts on the element are one constant"
+        );
+    }
+
+    /// Done closes the task's panel and the split collapses onto the pane that
+    /// had focus before; reopening inserts a panel BESIDE that survivor rather
+    /// than replacing it.
+    #[test]
+    fn done_closes_the_pane_and_reopen_brings_one_back() {
+        if rerun_headless_shell_test_in_child(
+            "ui::native_shell::tests::done_closes_the_pane_and_reopen_brings_one_back",
+        ) {
+            return;
+        }
+        let _test_guard = HEADLESS_SHELL_TEST_LOCK
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .expect("headless shell test lock");
+        gpui::Application::headless().run(move |cx| {
+            crate::ui::init(cx);
+            let (runtime, _shared) = TestRuntime::new(true, NativeHostActionResult::Queued);
+            let (model, task_ids) = open_tasks_client_model(2);
+            let project_id = model.task(task_ids[0]).expect("task").task.project_id;
+            with_test_shell_in_app(cx, runtime, |shell| {
+                shell.install_project_for_test("DevManager", project_id);
+                shell
+                    .apply_client_model(Arc::new(model))
+                    .expect("apply model");
+                let keys: Vec<HostTaskKey> = task_ids
+                    .iter()
+                    .map(|task_id| shell.local_task_key(*task_id))
+                    .collect();
+                let mut workspace =
+                    crate::ui::task_workspace::Workspace::<HostTaskKey>::single(keys[0].clone());
+                workspace
+                    .insert_after_focused(
+                        keys[1].clone(),
+                        crate::ui::task_workspace::Axis::Horizontal,
+                    )
+                    .expect("second pane");
+                shell.layout.task_workspace = Some(workspace);
+                shell
+                    .select_fleet_task_key(keys[1].clone(), FleetSelectMode::Replace)
+                    .expect("focus the second pane");
+                assert_eq!(
+                    shell
+                        .layout
+                        .task_workspace
+                        .as_ref()
+                        .expect("workspace")
+                        .pane_count(),
+                    2,
+                    "the fixture opens two panes"
+                );
+
+                shell.settle_task_key(keys[1].clone());
+
+                let workspace = shell
+                    .layout
+                    .task_workspace
+                    .as_ref()
+                    .expect("the survivor keeps the workspace alive");
+                assert_eq!(
+                    workspace.pane_count(),
+                    1,
+                    "Done removes the settled task's panel and the split collapses"
+                );
+                assert!(
+                    !workspace.contains_task(keys[1].clone()),
+                    "the settled task has no panel"
+                );
+                assert_eq!(
+                    workspace.focused_task(),
+                    Some(keys[0].clone()),
+                    "focus falls back to the pane that had it before"
+                );
+
+                shell.reopen_task_key(keys[1].clone());
+
+                let workspace = shell.layout.task_workspace.as_ref().expect("workspace");
+                assert_eq!(
+                    workspace.pane_count(),
+                    2,
+                    "reopen inserts a panel rather than replacing the survivor's"
+                );
+                assert!(
+                    workspace.contains_task(keys[0].clone()),
+                    "reopen must not evict the pane that was already open"
+                );
+                assert_eq!(
+                    workspace.focused_task(),
+                    Some(keys[1].clone()),
+                    "the reopened task takes focus"
+                );
+            });
+            cx.quit();
+        });
     }
 
     #[test]
@@ -53700,13 +54154,22 @@ pub(crate) mod tests {
     /// `open_task_without_agent_client_model`, widened to N open tasks in one
     /// project so a cost probe has something to measure.
     fn open_tasks_client_model(count: u8) -> (crate::client::ClientModel, Vec<TaskId>) {
+        open_tasks_client_model_with_attention(count, crate::domain::task::TaskAttention::None)
+    }
+
+    /// The same fixture with every task carrying one attention state, so a test
+    /// can ask for a board row that needs you rather than only idle ones.
+    fn open_tasks_client_model_with_attention(
+        count: u8,
+        attention: crate::domain::task::TaskAttention,
+    ) -> (crate::client::ClientModel, Vec<TaskId>) {
         use crate::client::ClientModelBuilder;
         use crate::domain::{
             id::{EnvironmentId, ProjectId, SnapshotId},
             snapshot::{SnapshotItem, SnapshotPage, SnapshotSection, TaskSnapshotItem},
             task::{
-                ReviewReadiness, TaskActivity, TaskAssignment, TaskAttention, TaskConnectivity,
-                TaskFacts, TaskLifecycle, WorkspaceRef,
+                ReviewReadiness, TaskActivity, TaskAssignment, TaskConnectivity, TaskFacts,
+                TaskLifecycle, WorkspaceRef,
             },
         };
 
@@ -53748,7 +54211,7 @@ pub(crate) mod tests {
                     created_at_ms: 1,
                 },
                 connectivity: TaskConnectivity::Connected,
-                attention: TaskAttention::None,
+                attention,
                 activity: TaskActivity::Idle,
                 review_readiness: ReviewReadiness::NotReady,
                 primary_agent_id: None,
@@ -54248,7 +54711,7 @@ pub(crate) mod tests {
                 let entries: Vec<_> = shell
                     .board_new_task_menu_entries()
                     .into_iter()
-                    .map(|(_, label, action)| (label, action))
+                    .map(|entry| (entry.label, entry.action))
                     .collect();
                 assert!(
                     entries.iter().any(|(label, action)| label

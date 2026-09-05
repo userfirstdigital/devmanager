@@ -305,6 +305,16 @@ impl ArrowKey {
             Self::Down => Edge::Bottom,
         }
     }
+
+    /// The glyph an interface prints for the arrow.
+    pub const fn glyph(self) -> char {
+        match self {
+            Self::Left => '←',
+            Self::Right => '→',
+            Self::Up => '↑',
+            Self::Down => '↓',
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -315,6 +325,20 @@ pub enum ShortcutKey {
     Backtick,
     Tab,
     Escape,
+}
+
+impl ShortcutKey {
+    /// How the key is written when an interface names it.
+    pub fn display_label(self) -> String {
+        match self {
+            Self::Character(character) => character.to_uppercase().to_string(),
+            Self::Digit(digit) => digit.to_string(),
+            Self::Arrow(arrow) => arrow.glyph().to_string(),
+            Self::Backtick => "`".to_string(),
+            Self::Tab => "Tab".to_string(),
+            Self::Escape => "Esc".to_string(),
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -349,6 +373,34 @@ impl KeyboardShortcut {
 
     pub const fn escape() -> Self {
         Self::new(false, false, false, ShortcutKey::Escape)
+    }
+
+    /// Just the modifiers, trailing `+` included, so several chords that share
+    /// them can be printed as one label.
+    pub fn modifier_prefix(self) -> String {
+        let mut prefix = String::new();
+        if self.ctrl {
+            prefix.push_str("Ctrl+");
+        }
+        if self.shift {
+            prefix.push_str("Shift+");
+        }
+        if self.alt {
+            prefix.push_str("Alt+");
+        }
+        prefix
+    }
+
+    /// How this chord is written wherever the interface names it: `Ctrl+P`,
+    /// `Ctrl+Shift+Z`. The one formatter, so a hint chip and a menu row cannot
+    /// spell the same chord two ways.
+    ///
+    /// New rather than extended: every shortcut label in this shell today is a
+    /// hand-written literal with no binding behind it (`ACTION_*`
+    /// presentations, `PROMPT_LIBRARY_SHORTCUT`, the window-action table), so
+    /// there was no existing formatter to reuse.
+    pub fn display_label(self) -> String {
+        format!("{}{}", self.modifier_prefix(), self.key.display_label())
     }
 }
 
@@ -451,6 +503,44 @@ impl KeyboardModel {
             .iter()
             .find(|binding| binding.shortcut == shortcut)
             .map(|binding| binding.action)
+    }
+
+    /// The chord bound to `action` today, or `None` when nothing is. The
+    /// inverse of [`Self::resolve`]: anything that PRINTS a shortcut reads this
+    /// rather than naming keys of its own, so a label cannot promise a chord
+    /// the model does not honour.
+    pub fn shortcut_for(&self, action: KeyboardAction) -> Option<KeyboardShortcut> {
+        self.bindings
+            .iter()
+            .find(|binding| binding.action == action)
+            .map(|binding| binding.shortcut)
+    }
+
+    /// Directional focus is four bindings and one label: the modifier they
+    /// share, then every arrow they bind, in the reading order the composition
+    /// prints. `None` when the model binds no arrow to `FocusPane`, or when the
+    /// four do not share a modifier -- four unrelated chords are not one label.
+    pub fn focus_pane_label(&self) -> Option<String> {
+        let mut prefix: Option<String> = None;
+        let mut glyphs = String::new();
+        for arrow in [
+            ArrowKey::Up,
+            ArrowKey::Down,
+            ArrowKey::Left,
+            ArrowKey::Right,
+        ] {
+            let Some(shortcut) = self.shortcut_for(KeyboardAction::FocusPane(arrow.edge())) else {
+                continue;
+            };
+            let modifiers = shortcut.modifier_prefix();
+            match prefix.as_ref() {
+                None => prefix = Some(modifiers),
+                Some(shared) if *shared != modifiers => return None,
+                Some(_) => {}
+            }
+            glyphs.push(arrow.glyph());
+        }
+        Some(format!("{}{glyphs}", prefix?))
     }
 
     /// Resolve a local shortcut through the shared interaction policy.
