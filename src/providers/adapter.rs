@@ -1806,6 +1806,10 @@ struct ProbeProcess {
     attestation_barrier_killed: bool,
     #[cfg(target_os = "linux")]
     linux_process_start: u64,
+    /// Holds the attested files open from just before `CreateProcess` until
+    /// this process handle is dropped. Never read: its whole effect is the
+    /// share mode on the open files.
+    _launch_pins: Vec<crate::providers::capabilities::ProviderExecutablePin>,
 }
 
 impl ProbeProcess {
@@ -1830,6 +1834,12 @@ impl ProbeProcess {
         unsafe {
             command.pre_exec(linux_ptrace_traceme);
         }
+        // Pin the launch graph immediately before CreateProcess: acquiring
+        // re-verifies each attested identity, and the resulting share mode is
+        // what stops the path being swapped underneath the spawn.
+        let launch_pins = requested
+            .pin_launch_graph()
+            .map_err(|_| ProviderProbeError::Io(ProviderProbeIoError::ExecutableNotAllowed))?;
         let mut child = command.spawn().map_err(|error| {
             ProviderProbeError::Io(if error.kind() == std::io::ErrorKind::NotFound {
                 ProviderProbeIoError::ExecutableMissing
@@ -1905,6 +1915,7 @@ impl ProbeProcess {
             attestation_barrier_killed: false,
             #[cfg(target_os = "linux")]
             linux_process_start,
+            _launch_pins: launch_pins,
         })
     }
 
@@ -1930,6 +1941,11 @@ impl ProbeProcess {
 
         requested
             .revalidate_bound_identity()
+            .map_err(|_| ProviderProbeError::Io(ProviderProbeIoError::ExecutableNotAllowed))?;
+        // Held until this process handle is dropped; acquiring re-verifies each
+        // attested identity immediately before the spawn.
+        let launch_pins = requested
+            .pin_launch_graph()
             .map_err(|_| ProviderProbeError::Io(ProviderProbeIoError::ExecutableNotAllowed))?;
         let executable_c = cstring(executable.as_os_str())?;
         let mut arguments = Vec::with_capacity(1 + fixed_arguments.len() + request_arguments.len());
@@ -2129,6 +2145,7 @@ impl ProbeProcess {
             #[cfg(target_os = "linux")]
             linux_ptrace_stopped: false,
             attestation_barrier_killed: false,
+            _launch_pins: launch_pins,
         })
     }
 

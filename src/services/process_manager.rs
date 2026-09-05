@@ -3423,6 +3423,29 @@ impl ProcessManager {
                 .executable()
                 .validate_current()
                 .map_err(|_| ProviderLaunchError::SpawnFailed)?;
+            // Hold the attested files open from here through CreateProcess:
+            // acquiring re-verifies the identity that was just validated, and
+            // the share mode is what stops the path being swapped in between.
+            // The pins drop at the end of this launch, so an idle provider CLI
+            // can still be upgraded in place while devmanager runs.
+            let _launch_pins = {
+                let mut pins = Vec::with_capacity(2);
+                pins.push(
+                    request
+                        .launch_spec()
+                        .executable()
+                        .pin()
+                        .map_err(|_| ProviderLaunchError::SpawnFailed)?,
+                );
+                if let Some(dependency) = request.launch_spec().runtime_dependency() {
+                    pins.push(
+                        dependency
+                            .pin()
+                            .map_err(|_| ProviderLaunchError::SpawnFailed)?,
+                    );
+                }
+                pins
+            };
             let program = request
                 .launch_spec()
                 .executable()

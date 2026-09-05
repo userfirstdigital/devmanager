@@ -2203,13 +2203,139 @@ impl ProviderAuthEvidenceRegistry {
     }
 }
 
+/// The attested file, kept open only while a launch is in flight.
+///
+/// The open handle's Windows share mode (see `open_nofollow`) is what stops the
+/// path being renamed or replaced between identity capture and `CreateProcess`.
+/// Holding it for the whole process lifetime extended that guarantee across
+/// idle time it was never meant to cover, and blocked every in-place upgrade of
+/// a provider CLI: `npm i -g @openai/codex` fails with `EBUSY` renaming
+/// `codex.cmd` while devmanager runs, and npm treats the half-written package
+/// as a success. Holders take a pin for the launch and drop it once the child
+/// is gone; with no holders the file is closed and the path is free again.
+struct ProviderExecutablePinState {
+    path: PathBuf,
+    file_identity: ProviderFileIdentity,
+    is_native: bool,
+    slot: Mutex<ProviderExecutablePinSlot>,
+}
+
+#[derive(Default)]
+struct ProviderExecutablePinSlot {
+    file: Option<File>,
+    holders: usize,
+}
+
+impl ProviderExecutablePinState {
+    fn poisoned(&self) -> ProviderExecutableError {
+        ProviderExecutableError::Io {
+            path: self.path.clone(),
+            kind: io::ErrorKind::Other,
+        }
+    }
+
+    /// Open the path and refuse anything that is no longer the attested file.
+    /// Every transient open goes through here so an unpinned executable can
+    /// never hand a caller a different image than the one that was attested.
+    fn open_verified(&self) -> Result<File, ProviderExecutableError> {
+        let file = open_nofollow(&self.path)?;
+        let identity = inspect_opened_metadata(&file, &self.path, self.is_native)?;
+        if identity != self.file_identity {
+            return Err(ProviderExecutableError::ChangedDuringValidation(
+                self.path.clone(),
+            ));
+        }
+        Ok(file)
+    }
+
+    fn acquire(self: &Arc<Self>) -> Result<ProviderExecutablePin, ProviderExecutableError> {
+        let mut slot = self.slot.lock().map_err(|_| self.poisoned())?;
+        if slot.file.is_none() {
+            slot.file = Some(self.open_verified()?);
+        }
+        slot.holders = slot.holders.saturating_add(1);
+        drop(slot);
+        Ok(ProviderExecutablePin {
+            state: Arc::clone(self),
+        })
+    }
+
+    /// Inspect the bound file. While a launch holds a pin this is the same open
+    /// handle the launch is bound to; with no pin it is a fresh open of the
+    /// same path, which additionally catches the path being repointed at a
+    /// different file. Callers compare the identity themselves, so this open is
+    /// deliberately unverified.
+    fn with_bound_file<T>(
+        &self,
+        action: impl FnOnce(&mut File) -> Result<T, ProviderExecutableError>,
+    ) -> Result<T, ProviderExecutableError> {
+        let mut slot = self.slot.lock().map_err(|_| self.poisoned())?;
+        match slot.file.as_mut() {
+            Some(file) => action(file),
+            None => {
+                let mut transient = open_nofollow(&self.path)?;
+                action(&mut transient)
+            }
+        }
+    }
+
+    /// An owned handle to the attested file, verified when nothing holds a pin.
+    fn verified_file(&self) -> Result<File, ProviderExecutableError> {
+        let slot = self.slot.lock().map_err(|_| self.poisoned())?;
+        match slot.file.as_ref() {
+            Some(file) => file
+                .try_clone()
+                .map_err(|error| ProviderExecutableError::Io {
+                    path: self.path.clone(),
+                    kind: error.kind(),
+                }),
+            None => {
+                drop(slot);
+                self.open_verified()
+            }
+        }
+    }
+
+    #[cfg(test)]
+    fn is_open(&self) -> bool {
+        self.slot.lock().is_ok_and(|slot| slot.file.is_some())
+    }
+}
+
+/// Holds the attested file open across a launch. Dropping the last pin closes
+/// it, which is what lets a provider CLI be upgraded in place while devmanager
+/// keeps running.
+pub(crate) struct ProviderExecutablePin {
+    state: Arc<ProviderExecutablePinState>,
+}
+
+impl fmt::Debug for ProviderExecutablePin {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ProviderExecutablePin")
+            .field("pinned", &true)
+            .finish()
+    }
+}
+
+impl Drop for ProviderExecutablePin {
+    fn drop(&mut self) {
+        if let Ok(mut slot) = self.state.slot.lock() {
+            slot.holders = slot.holders.saturating_sub(1);
+            if slot.holders == 0 {
+                slot.file = None;
+            }
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct ProviderExecutable {
     canonical_path: PathBuf,
     file_identity: ProviderFileIdentity,
     sha256: [u8; 32],
     is_native: bool,
-    handle: Arc<Mutex<File>>,
+    pin: Arc<ProviderExecutablePinState>,
 }
 
 impl fmt::Debug for ProviderExecutable {
@@ -2597,25 +2723,42 @@ impl ProviderExecutable {
             ));
         }
 
+        // The attesting handles are dropped here on purpose: from this point
+        // the file is opened only for the span of a launch (see
+        // `ProviderExecutablePinState`). `pin()` re-verifies the identity
+        // captured above before it hands the launch anything.
+        drop(first.file);
+        drop(confirmation);
         Ok(Self {
-            canonical_path,
+            canonical_path: canonical_path.clone(),
             file_identity: first.identity,
             sha256: first.sha256,
             is_native,
-            handle: Arc::new(Mutex::new(first.file)),
+            pin: Arc::new(ProviderExecutablePinState {
+                path: canonical_path,
+                file_identity: first.identity,
+                is_native,
+                slot: Mutex::new(ProviderExecutablePinSlot::default()),
+            }),
         })
     }
 
     fn validate_bound_handle(&self) -> Result<bool, ProviderExecutableError> {
-        let file = self
-            .handle
-            .lock()
-            .map_err(|_| ProviderExecutableError::Io {
-                path: self.canonical_path.clone(),
-                kind: io::ErrorKind::Other,
-            })?;
-        let identity = inspect_opened_metadata(&file, &self.canonical_path, self.is_native)?;
-        Ok(identity == self.file_identity)
+        self.pin.with_bound_file(|file| {
+            let identity = inspect_opened_metadata(file, &self.canonical_path, self.is_native)?;
+            Ok(identity == self.file_identity)
+        })
+    }
+
+    /// Hold the attested file open for as long as the returned pin lives. A
+    /// launch must hold one across `CreateProcess`; nothing else should.
+    pub(crate) fn pin(&self) -> Result<ProviderExecutablePin, ProviderExecutableError> {
+        self.pin.acquire()
+    }
+
+    #[cfg(test)]
+    fn file_is_open(&self) -> bool {
+        self.pin.is_open()
     }
 
     /// Cheap TOCTOU check: the captured file ID is still the same open file.
@@ -2632,34 +2775,18 @@ impl ProviderExecutable {
     }
 
     fn clone_file_handle(&self) -> Result<File, ProviderExecutableError> {
-        self.handle
-            .lock()
-            .map_err(|_| ProviderExecutableError::Io {
-                path: self.canonical_path.clone(),
-                kind: io::ErrorKind::Other,
-            })?
-            .try_clone()
-            .map_err(|error| ProviderExecutableError::Io {
-                path: self.canonical_path.clone(),
-                kind: error.kind(),
-            })
+        self.pin.verified_file()
     }
 
     fn read_handle_contents(&self) -> Result<Vec<u8>, ProviderExecutableError> {
-        let mut file = self
-            .handle
-            .lock()
-            .map_err(|_| ProviderExecutableError::Io {
-                path: self.canonical_path.clone(),
-                kind: io::ErrorKind::Other,
-            })?;
+        let mut file = self.pin.verified_file()?;
         file.seek(SeekFrom::Start(0))
             .map_err(|error| ProviderExecutableError::Io {
                 path: self.canonical_path.clone(),
                 kind: error.kind(),
             })?;
         let mut contents = Vec::with_capacity(MAX_PROVIDER_SHIM_BYTES + 1);
-        let mut bounded = (&mut *file).take((MAX_PROVIDER_SHIM_BYTES + 1) as u64);
+        let mut bounded = (&mut file).take((MAX_PROVIDER_SHIM_BYTES + 1) as u64);
         bounded
             .read_to_end(&mut contents)
             .map_err(|error| ProviderExecutableError::Io {
@@ -2729,6 +2856,26 @@ impl ProviderExecutableHandle {
             }
         }
         Ok(())
+    }
+
+    /// Pin every file this launch runs from, for as long as the caller holds
+    /// the returned guards. A launch must take these before `CreateProcess`
+    /// and hold them for the child's lifetime: that is the span the share mode
+    /// exists to cover, and holding them any longer is what blocks an in-place
+    /// upgrade of the provider CLI. Acquiring re-verifies the attested identity
+    /// of each file, so a swap between attestation and launch is refused here.
+    pub(crate) fn pin_launch_graph(
+        &self,
+    ) -> Result<Vec<ProviderExecutablePin>, ProviderExecutableError> {
+        let mut pins = Vec::with_capacity(3);
+        pins.push(self.launch_program().pin()?);
+        if let Some(script) = self.runtime_dependency() {
+            pins.push(script.pin()?);
+        }
+        // A `DirectTarget` plan runs the target, not the wrapper that named it;
+        // the wrapper is not a runtime dependency and is deliberately not
+        // pinned. `Direct` plans have already pinned `executable` above.
+        Ok(pins)
     }
 
     pub(crate) fn revalidate_bound_identity(&self) -> Result<(), ProviderExecutableError> {
@@ -5991,6 +6138,100 @@ mod executable_repin_tests {
     fn copy_native_executable(destination: &Path) {
         let source = std::env::current_exe().expect("test binary path");
         fs::copy(source, destination).expect("copy the test binary");
+    }
+
+    /// The defect this pin scoping exists for: an attested executable used to
+    /// keep its file open for the whole process lifetime, so Windows refused
+    /// every rename of the path and `npm i -g` of a provider CLI failed with
+    /// `EBUSY` while devmanager ran.
+    #[test]
+    fn an_attested_executable_holds_no_handle_while_idle() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("provider-idle.exe");
+        copy_native_executable(&path);
+        let attested = ProviderExecutable::from_path(&path).expect("inspect the copied binary");
+
+        assert!(
+            !attested.file_is_open(),
+            "an idle executable must not hold its file open"
+        );
+        // The operation an in-place upgrade performs, and the one that used to
+        // fail: rename the attested path aside while the executable is live.
+        let renamed = temp.path().join("provider-idle.exe.old");
+        fs::rename(&path, &renamed).expect("an idle attested path must be renameable");
+        fs::rename(&renamed, &path).expect("restore the attested path");
+        assert!(attested.validate_current().is_ok());
+    }
+
+    #[test]
+    fn a_launch_pin_holds_the_file_and_releases_it_on_drop() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("provider-pinned.exe");
+        copy_native_executable(&path);
+        let attested = ProviderExecutable::from_path(&path).expect("inspect the copied binary");
+
+        let pin = attested.pin().expect("pin the attested file");
+        assert!(
+            attested.file_is_open(),
+            "a launch pin must hold the attested file open"
+        );
+        #[cfg(windows)]
+        {
+            // The share mode is the whole point: while a launch holds the pin,
+            // Windows must refuse to move the image out from under it.
+            let blocked = temp.path().join("provider-pinned.exe.old");
+            assert!(
+                fs::rename(&path, &blocked).is_err(),
+                "a pinned path must not be renameable"
+            );
+        }
+
+        drop(pin);
+        assert!(
+            !attested.file_is_open(),
+            "dropping the last pin must close the attested file"
+        );
+    }
+
+    #[test]
+    fn nested_pins_release_only_when_the_last_one_drops() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("provider-nested.exe");
+        copy_native_executable(&path);
+        let attested = ProviderExecutable::from_path(&path).expect("inspect the copied binary");
+
+        let first = attested.pin().expect("first pin");
+        let second = attested.pin().expect("second pin");
+        drop(first);
+        assert!(
+            attested.file_is_open(),
+            "a concurrent launch still holds the file"
+        );
+        drop(second);
+        assert!(!attested.file_is_open(), "the last drop closes the file");
+    }
+
+    #[test]
+    fn pinning_refuses_a_file_replaced_since_attestation() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("provider-swapped.exe");
+        copy_native_executable(&path);
+        let attested = ProviderExecutable::from_path(&path).expect("inspect the copied binary");
+
+        // Releasing the handle between launches means the path can be swapped
+        // in the gap, so the pin re-verifies the attested identity rather than
+        // trusting the attestation that produced it. Delete and recreate: the
+        // file index moves, which is what the identity is built from.
+        fs::remove_file(&path).expect("remove the attested image");
+        copy_native_executable(&path);
+
+        let error = attested
+            .pin()
+            .expect_err("a replaced image must not be pinnable under the old attestation");
+        assert!(matches!(
+            error,
+            ProviderExecutableError::ChangedDuringValidation(_)
+        ));
     }
 
     #[test]
