@@ -3174,6 +3174,31 @@ impl TerminalTarget {
     }
 }
 
+/// The exact cockpit queries the BACKGROUND-READ lane carries.
+///
+/// One definition, read by `Interaction::capture_action`'s fence on the way
+/// out and by `Interaction::accepts_action_record`'s admission on the way in,
+/// so the two cannot drift into a lane that captures a query the host never
+/// accepts.
+///
+/// The rule is a property, not a list of conveniences: **a background read may
+/// not START or MUTATE anything.** `Conversation` and the two terminal
+/// readiness queries are pure reads. `TaskTerminals` builds the strip from
+/// durable facts. Every terminal query that is absent is absent on purpose --
+/// `Terminal` makes the host attach and lazily RESTORE the provider runtime
+/// (`provider_terminal_query_may_attach`), and Scroll/Resize move a live PTY.
+/// A background pane must never be able to launch a provider process or move
+/// someone else's viewport.
+fn background_read_query(query: &TaskCockpitQuery) -> bool {
+    matches!(
+        query,
+        TaskCockpitQuery::Conversation { .. }
+            | TaskCockpitQuery::TaskTerminals
+            | TaskCockpitQuery::TerminalReadiness
+            | TaskCockpitQuery::TerminalReadinessFor { .. }
+    )
+}
+
 /// One rendered chip on a Task's terminal strip.
 ///
 /// This is presentation only: every field is derived from the host-owned
@@ -9077,15 +9102,15 @@ impl NativeInteraction {
 
     pub fn accepts_action_record(&self, record: &NativeActionRecord) -> bool {
         if record.background_read {
-            let exact_background_conversation = matches!(
+            let exact_background_read = matches!(
                 &record.command,
                 NativeHostCommand::TaskCockpitQuery {
                     task_id,
-                    query: TaskCockpitQuery::Conversation { .. },
+                    query,
                     ..
-                } if Some(*task_id) == record.task_id
+                } if Some(*task_id) == record.task_id && background_read_query(query)
             );
-            return exact_background_conversation
+            return exact_background_read
                 && record.client_epoch <= self.client_epoch
                 && record.connection_epoch == self.connection_epoch
                 && record.resource_generation == self.resource_generation
@@ -9677,6 +9702,35 @@ impl NativeInteraction {
         )
     }
 
+    /// Read one OPEN PANE's terminal without selecting it.
+    ///
+    /// A pane is a claim that its terminal is on screen, and
+    /// [`Self::capture_action`]'s fence refuses an ordinary TaskCockpit query
+    /// for any task but the slot's selected one -- measured: an ordinary
+    /// capture of `TerminalReadiness` for a second open pane returns `None`.
+    /// So a background pane's read has to travel the background lane, exactly
+    /// as its conversation does.
+    ///
+    /// [`background_read_query`] is the one definition of what that lane
+    /// carries, and it deliberately excludes `TaskCockpitQuery::Terminal`: the
+    /// host ATTACHES -- and lazily RESTORES -- the provider runtime for that
+    /// query, so putting it here would launch a provider process for every
+    /// open pane. Readiness reads the same screen and never starts anything.
+    pub fn background_terminal_read_on_current_handler(
+        &mut self,
+        task_id: TaskId,
+        query: TaskCockpitQuery,
+    ) -> Option<NativeActionRecord> {
+        self.capture_action(
+            ActionRequest::TaskCockpit { task_id, query },
+            ActivationSource::Keyboard {
+                key: crate::ui::components::KeyboardKey::Enter,
+            },
+            true,
+            true,
+        )
+    }
+
     pub fn action_from_source(
         &mut self,
         request: ActionRequest,
@@ -9733,10 +9787,7 @@ impl NativeInteraction {
         if background_read
             && !matches!(
                 &request,
-                ActionRequest::TaskCockpit {
-                    query: TaskCockpitQuery::Conversation { .. },
-                    ..
-                }
+                ActionRequest::TaskCockpit { query, .. } if background_read_query(query)
             )
         {
             return None;
@@ -11594,6 +11645,11 @@ pub struct NativeShell {
     /// host has NEVER answered, and one answer of any length retires a pane
     /// from it for good.
     last_unanswered_conversation_sweep_at: Option<Instant>,
+    /// When `sweep_unattached_open_pane_terminals` last ran. Same bounded
+    /// retry shape as the conversation sweep above: only panes the host has
+    /// never ANSWERED about are asked, and one answer of any kind -- a screen,
+    /// a refusal, a start-pending classification -- retires a pane from it.
+    last_unattached_terminal_sweep_at: Option<Instant>,
     last_provider_settings_poll: Option<Instant>,
     last_bootstrap_retry_at: Option<Instant>,
     composer_caret_epoch: Instant,
@@ -12656,6 +12712,7 @@ impl NativeShell {
             // out an interval before the first ask is exactly the hold this
             // sweep exists to end.
             last_unanswered_conversation_sweep_at: None,
+            last_unattached_terminal_sweep_at: None,
             last_provider_settings_poll: Some(Instant::now()),
             last_bootstrap_retry_at: None,
             composer_caret_epoch: Instant::now(),
@@ -15697,21 +15754,44 @@ impl NativeShell {
     /// flight.
     ///
     /// This is the whole strip cadence (addendum E): the Terminal tool
-    /// becoming visible, an accepted terminal mutation, and a terminal screen
-    /// reply each call it. There is no timer.
+    /// becoming visible, an accepted terminal mutation, a terminal screen
+    /// reply, and the open-pane sweep each call it. There is no timer.
+    ///
+    /// The lane is chosen by SELECTION, in one place, because
+    /// `Interaction::capture_action` refuses an ordinary TaskCockpit query for
+    /// any task but its own slot's selected one -- so an open pane that is not
+    /// selected could never get a strip at all. `TaskTerminals` is a pure read
+    /// of durable facts, which is why it is allowed on the background lane at
+    /// all (`background_read_query`).
     fn request_task_terminals_refresh(&mut self, owner: &HostTaskKey) -> bool {
         if self.task_terminals_query_in_flight(owner) {
             return false;
         }
-        let dispatched = self
-            .dispatch_action_recorded_for_owner(
+        let dispatched = if self.selected_task_key.as_ref() == Some(owner) {
+            self.dispatch_action_recorded_for_owner(
                 &owner.host,
                 ActionRequest::TaskCockpit {
                     task_id: owner.task_id,
                     query: TaskCockpitQuery::TaskTerminals,
                 },
             )
-            .is_ok();
+            .is_ok()
+        } else {
+            let record = self.host_slot_mut(&owner.host).and_then(|slot| {
+                slot.interaction
+                    .background_terminal_read_on_current_handler(
+                        owner.task_id,
+                        TaskCockpitQuery::TaskTerminals,
+                    )
+            });
+            match record {
+                Some(mut record) => matches!(
+                    self.enqueue_host_action_for_owner(&owner.host, &mut record),
+                    NativeHostActionResult::Queued
+                ),
+                None => false,
+            }
+        };
         if dispatched {
             self.pending_task_terminals_queries
                 .insert(owner.clone(), Instant::now());
@@ -18159,15 +18239,12 @@ impl NativeShell {
             }
             self.refresh_accessibility_tree();
         }
-        if self.selected_task_key.as_ref() != Some(&owner) {
-            return;
-        }
-        let selected_ok = self
-            .host_slot(host_id)
-            .is_some_and(|slot| slot.interaction.selected_task() == Some(projection.task_id));
-        if !selected_ok {
-            return;
-        }
+        // The SURFACE admission comes before the selection fence, because an
+        // open pane paints from `task_surfaces`, not from the dock -- the same
+        // split `admit_owner_task_terminals` already keeps for the strip. A
+        // reply dropped here for an unselected owner is a screen the pane
+        // asked for on the background lane and would never see, which is what
+        // left a background pane's terminal blank on a remote host.
         if self
             .task_surfaces
             .admit_terminal(owner.clone(), projection)
@@ -18179,6 +18256,18 @@ impl NativeShell {
         // A terminal screen reply is the third leg of the strip cadence: a
         // chip's runtime state, title or cwd may have moved with it.
         self.request_task_terminals_refresh(&owner);
+        // Dock focus and the terminal adapter below are per-SELECTED-task
+        // presentation state; applying them for another owner would rewrite
+        // the visible task's memory.
+        if self.selected_task_key.as_ref() != Some(&owner) {
+            return;
+        }
+        let selected_ok = self
+            .host_slot(host_id)
+            .is_some_and(|slot| slot.interaction.selected_task() == Some(projection.task_id));
+        if !selected_ok {
+            return;
+        }
         // The grid renders exactly one chip, so a live answer for a terminal
         // that is not the focused one is a legitimate reply that simply is not
         // on screen -- never an overwrite of the visible replica.
@@ -19185,6 +19274,7 @@ impl NativeShell {
         }
 
         self.sweep_unanswered_open_pane_conversations(now);
+        self.sweep_unattached_open_pane_terminals(now);
 
         // ConversationDirty is the primary refresh signal. A slow recovery
         // heartbeat covers missed pushes without high-frequency idle polling.
@@ -43647,6 +43737,125 @@ impl NativeShell {
             });
             if let Some(mut record) = record {
                 let _ = self.enqueue_host_action_for_owner(&key.host, &mut record);
+            }
+        }
+    }
+
+    /// Ask the host about every open pane that is showing its Terminal tab and
+    /// that the host has NEVER answered about.
+    ///
+    /// A pane on `PaneView::Terminal` is a claim that its terminal is on
+    /// screen, so the request follows the PANE, not the selection. Every route
+    /// into a terminal query before this one was selection-shaped, and all of
+    /// them dispatch through `Interaction::capture_action`, whose fence
+    /// (`request_task != selected_task => None`) refuses an ordinary
+    /// TaskCockpit query for any task but the slot's selected one. Measured on
+    /// a two-pane workspace with both panes on Terminal: the shell issued
+    /// **zero** terminal queries of any kind -- no strip, no screen, not even
+    /// for the selected pane -- and an ordinary capture of `TerminalReadiness`
+    /// for the second pane returned `None`. The unanswered slots then read as
+    /// their default `Unavailable` ("Terminal unavailable"), or held the
+    /// optimistic `Starting` promise ("Terminal starting") that an earlier
+    /// selection had left behind and that nothing settles.
+    ///
+    /// Three routes are covered by this one sweep rather than by three edits,
+    /// because a rule that depends on every future route remembering to ask is
+    /// not enforced: a pane RESTORED from the persisted layout, a pane whose
+    /// Terminal TAB was just clicked (`select_pane_view_for` has no arm for
+    /// `PaneView::Terminal` -- `dock_tool_for_view` answers `None` and it
+    /// returns), and a pane that is simply not the selected one.
+    ///
+    /// **It reads, it never starts.** The query is the READINESS one, not
+    /// `TaskCockpitQuery::Terminal`: the host attaches and lazily restores a
+    /// task's provider runtime for `Terminal`
+    /// (`provider_terminal_query_may_attach`), so sweeping with it would
+    /// launch a provider process for every open pane -- the exact cost the
+    /// lazy-restore design exists to avoid. Readiness returns the same screen
+    /// for a terminal that is already running and starts nothing for one that
+    /// is not. Selecting a pane still runs the attaching query through
+    /// `restore_center_canvas_for_task`, which is what actually starts a
+    /// provider, and remains the only thing that does.
+    fn sweep_unattached_open_pane_terminals(&mut self, now: Instant) {
+        let elapsed = self
+            .last_unattached_terminal_sweep_at
+            .map(|at| now.saturating_duration_since(at))
+            .unwrap_or(crate::ui::task_workspace::UNATTACHED_TERMINAL_SWEEP_INTERVAL);
+        if elapsed < crate::ui::task_workspace::UNATTACHED_TERMINAL_SWEEP_INTERVAL
+            || self.action_lane_len() >= MAX_ACTION_LANE_RECORDS / 2
+        {
+            return;
+        }
+        let unattached: Vec<HostTaskKey> = match self.layout.task_workspace.as_ref() {
+            Some(workspace) => workspace.task_ids(),
+            None => Vec::new(),
+        }
+        .into_iter()
+        .filter(|key| {
+            if self.pane_view(key) != PaneView::Terminal {
+                return false;
+            }
+            let target = self.focused_terminal_target(key).surface_target();
+            // "Never answered" is the whole membership rule. A slot that has
+            // been told there is no terminal has been ANSWERED, and re-asking
+            // it every cadence would be a poll rather than a bounded retry;
+            // re-selecting the pane is what asks again, with the query that
+            // can actually start one.
+            !self
+                .task_surfaces
+                .terminal_answered_for(key.clone(), target)
+                && !self
+                    .task_surfaces
+                    .terminal_query_in_flight_for(key.clone(), target)
+        })
+        .take(crate::ui::task_workspace::MAX_UNATTACHED_TERMINAL_SWEEP)
+        .collect();
+        if unattached.is_empty() {
+            return;
+        }
+        self.last_unattached_terminal_sweep_at = Some(now);
+        for key in unattached {
+            if self.action_lane_len_for_owner(&key.host) >= MAX_ACTION_LANE_RECORDS / 2 {
+                continue;
+            }
+            // The strip decides WHICH terminal the screen query addresses, so
+            // it goes first; it is a pure read and picks its own lane.
+            self.request_task_terminals_refresh(&key);
+            let selected = self.selected_task_key.as_ref() == Some(&key);
+            let target = self.focused_terminal_target(&key);
+            let query = target.readiness_query();
+            self.task_surfaces
+                .note_terminal_query_started_for(key.clone(), target.surface_target());
+            let dispatched = if selected {
+                self.dispatch_action_recorded_for_owner(
+                    &key.host,
+                    ActionRequest::TaskCockpit {
+                        task_id: key.task_id,
+                        query,
+                    },
+                )
+                .is_ok()
+            } else {
+                let record = self.host_slot_mut(&key.host).and_then(|slot| {
+                    slot.interaction
+                        .background_terminal_read_on_current_handler(key.task_id, query)
+                });
+                match record {
+                    Some(mut record) => matches!(
+                        self.enqueue_host_action_for_owner(&key.host, &mut record),
+                        NativeHostActionResult::Queued
+                    ),
+                    None => false,
+                }
+            };
+            if !dispatched {
+                // Never leave the optimistic startup promise standing on a
+                // request that was refused. `note_terminal_query_started_for`
+                // publishes "Terminal starting" before the dispatch, and every
+                // caller of it discarded the dispatch result with `let _ =` --
+                // which is exactly how three panels came to sit on that
+                // sentence with nothing in flight to settle it.
+                self.task_surfaces
+                    .note_terminal_reconnecting_for(key.clone(), target.surface_target());
             }
         }
     }
@@ -70068,6 +70277,271 @@ mod "
                     Some(1),
                     "the pane paints from the ListState, not from rows(): a row count                      the ListState does not carry is a blank stream"
                 );
+            });
+            cx.quit();
+        });
+    }
+
+    fn apply_terminal_query_outcome_for_test(
+        shell: &mut NativeShell,
+        host_id: &HostId,
+        action: NativeActionRecord,
+        projection: crate::domain::cockpit::TaskTerminalProjection,
+    ) {
+        shell.apply_epoch_fenced_action_outcome_for_host(
+            host_id,
+            NativeHostActionOutcome::Queried {
+                action,
+                detail: "terminal".into(),
+                body: NativeHostQueryBody::TaskCockpit(crate::domain::TaskCockpitResult::Terminal(
+                    projection,
+                )),
+            },
+        );
+    }
+
+    fn dispatched_terminal_queries_for_test(
+        shared: &Arc<Mutex<TestRuntimeState>>,
+    ) -> Vec<(TaskId, TaskCockpitQuery)> {
+        shared
+            .lock()
+            .expect("test runtime")
+            .accepted
+            .iter()
+            .filter_map(|record| match &record.command {
+                NativeHostCommand::TaskCockpitQuery { task_id, query, .. }
+                    if super::TerminalTarget::for_screen_query(query).is_some()
+                        || matches!(query, TaskCockpitQuery::TaskTerminals) =>
+                {
+                    Some((*task_id, query.clone()))
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// The defect this pins, stated once: a pane open on its Terminal tab that
+    /// is not the selected task is never asked for a terminal at all. Every
+    /// route into a terminal query is selection-shaped and dispatches through
+    /// `Interaction::capture_action`, whose fence refuses an ordinary
+    /// TaskCockpit query for any task but the slot's selected one; and the tab
+    /// click itself (`select_pane_view_for`) has no arm for `PaneView::Terminal`
+    /// at all. Measured before the fix on a two-pane workspace with both panes
+    /// on Terminal: the shell issued ZERO terminal queries of any kind, and an
+    /// ordinary capture of `TerminalReadiness` for the second pane returned
+    /// `None`. The panes then read as their default "Terminal unavailable", or
+    /// held a "Terminal starting" promise an earlier selection had left behind.
+    #[test]
+    fn every_open_terminal_pane_the_host_has_never_answered_is_asked_for_a_screen() {
+        if rerun_headless_shell_test_in_child(
+            "ui::native_shell::tests::every_open_terminal_pane_the_host_has_never_answered_is_asked_for_a_screen",
+        ) {
+            return;
+        }
+        gpui::Application::headless().run(move |cx| {
+            crate::ui::init(cx);
+            let (runtime, shared) = TestRuntime::new(true, NativeHostActionResult::Queued);
+            with_test_shell_in_app_cx(cx, runtime, |shell, cx| {
+                shell.install_idle_conversation_photo_for_test();
+                let (model, first, second) = two_task_terminal_bound_client_model();
+                let model = std::sync::Arc::new(model);
+                shell
+                    .apply_client_model(std::sync::Arc::clone(&model))
+                    .expect("client model");
+                let local = shell.local_host_id();
+                let first_key = HostTaskKey::new(local.clone(), first);
+                let second_key = HostTaskKey::new(local.clone(), second);
+                shell
+                    .select_fleet_task_key(first_key.clone(), FleetSelectMode::Replace)
+                    .expect("select first");
+                shell
+                    .select_fleet_task_key(second_key.clone(), FleetSelectMode::Toggle)
+                    .expect("open second pane");
+                shell
+                    .select_fleet_task_key(first_key.clone(), FleetSelectMode::Replace)
+                    .expect("reselect first");
+                // Both panes are parked on the Terminal tab, which is the shape
+                // the persisted layout restores and the shape a tab click
+                // leaves behind.
+                shell.set_pane_view(&first_key, PaneView::Terminal);
+                shell.set_pane_view(&second_key, PaneView::Terminal);
+                shared.lock().expect("test runtime").accepted.clear();
+
+                // Preconditions, asserted so this cannot pass by measuring
+                // nothing.
+                assert_eq!(
+                    shell
+                        .layout
+                        .task_workspace
+                        .as_ref()
+                        .map(|workspace| workspace.task_ids().len()),
+                    Some(2),
+                    "the scenario needs two open panes to say anything"
+                );
+                assert_eq!(shell.pane_view(&second_key), PaneView::Terminal);
+                assert!(
+                    !shell.task_surfaces.terminal_answered_for(second_key.clone(), None),
+                    "the background pane must start unanswered or this proves nothing"
+                );
+
+                let tokens = shell.preferences.tokens();
+                let size = gpui::size(gpui::px(1900.0), gpui::px(700.0));
+                let _ = shell.task_workspace_grid(tokens, size, cx);
+                shell.controller_tick_for_test(0);
+
+                let asked = dispatched_terminal_queries_for_test(&shared);
+                assert!(
+                    asked.iter().any(|(task_id, query)| *task_id == second
+                        && matches!(query, TaskCockpitQuery::TerminalReadiness)),
+                    "the open pane that is not selected must be asked for its terminal screen; asked {asked:?}"
+                );
+                assert!(
+                    asked.iter().any(|(task_id, query)| *task_id == first
+                        && matches!(query, TaskCockpitQuery::TerminalReadiness)),
+                    "the selected pane on the Terminal tab must be asked too; asked {asked:?}"
+                );
+                // The sweep READS. `TaskCockpitQuery::Terminal` is the one
+                // query the host attaches and lazily RESTORES a provider
+                // runtime for, so a sweep that used it would launch a provider
+                // process for every open pane.
+                assert!(
+                    !asked
+                        .iter()
+                        .any(|(_, query)| matches!(query, TaskCockpitQuery::Terminal)),
+                    "the sweep must never issue the attaching Terminal query; asked {asked:?}"
+                );
+
+                // And the answer must reach that pane's own surface.
+                let record = shared
+                    .lock()
+                    .expect("test runtime")
+                    .accepted
+                    .iter()
+                    .find(|record| {
+                        matches!(
+                            &record.command,
+                            NativeHostCommand::TaskCockpitQuery {
+                                task_id,
+                                query: TaskCockpitQuery::TerminalReadiness,
+                                ..
+                            } if *task_id == second
+                        )
+                    })
+                    .cloned()
+                    .expect("the background pane's terminal query record");
+                let projection = provider_terminal_projection_for_test(&model, second, 9);
+                apply_terminal_query_outcome_for_test(shell, &local, record, projection);
+                assert!(
+                    shell
+                        .task_surfaces
+                        .state(second_key.clone())
+                        .and_then(|state| state.latest_terminal())
+                        .is_some(),
+                    "the admitted screen must land on the background pane's own surface"
+                );
+                assert_eq!(
+                    shell.task_surfaces.terminal_label(second_key.clone()),
+                    "Terminal is live",
+                    "an answered background pane must stop saying starting/unavailable"
+                );
+
+                // A pane the host has answered leaves the sweep for good: the
+                // cadence is a bounded retry, not a poll.
+                shared.lock().expect("test runtime").accepted.clear();
+                shell.last_unattached_terminal_sweep_at = None;
+                shell.controller_tick_for_test(0);
+                let after = dispatched_terminal_queries_for_test(&shared);
+                assert!(
+                    !after.iter().any(|(task_id, query)| *task_id == second
+                        && super::TerminalTarget::for_screen_query(query).is_some()),
+                    "an answered pane must not be re-swept; asked {after:?}"
+                );
+            });
+            cx.quit();
+        });
+    }
+
+    /// The guard on the guard. The background-read lane exists so an open pane
+    /// that is not selected can be READ; it must never become a way to START
+    /// something. `TaskCockpitQuery::Terminal` makes the host attach and lazily
+    /// restore the task's provider runtime, so admitting it here would launch a
+    /// provider process for every open pane.
+    #[test]
+    fn the_background_read_lane_carries_reads_and_refuses_the_attaching_terminal_query() {
+        if rerun_headless_shell_test_in_child(
+            "ui::native_shell::tests::the_background_read_lane_carries_reads_and_refuses_the_attaching_terminal_query",
+        ) {
+            return;
+        }
+        gpui::Application::headless().run(move |cx| {
+            crate::ui::init(cx);
+            let (runtime, _shared) = TestRuntime::new(true, NativeHostActionResult::Queued);
+            with_test_shell_in_app(cx, runtime, |shell| {
+                let (model, first, second) = two_task_terminal_bound_client_model();
+                shell
+                    .apply_client_model(std::sync::Arc::new(model))
+                    .expect("client model");
+                let local = shell.local_host_id();
+                shell
+                    .select_fleet_task_key(
+                        HostTaskKey::new(local.clone(), first),
+                        FleetSelectMode::Replace,
+                    )
+                    .expect("select first");
+
+                // The precondition that makes the lane necessary at all: an
+                // ORDINARY capture for a task that is not the selected one is
+                // refused outright.
+                assert!(
+                    shell
+                        .host_slot_mut(&local)
+                        .and_then(|slot| slot.interaction.action_on_current_handler(
+                            ActionRequest::TaskCockpit {
+                                task_id: second,
+                                query: TaskCockpitQuery::TerminalReadiness,
+                            }
+                        ))
+                        .is_none(),
+                    "an ordinary terminal query for an unselected task must be refused"
+                );
+
+                for query in [
+                    TaskCockpitQuery::TerminalReadiness,
+                    TaskCockpitQuery::TaskTerminals,
+                ] {
+                    let record = shell.host_slot_mut(&local).and_then(|slot| {
+                        slot.interaction
+                            .background_terminal_read_on_current_handler(second, query.clone())
+                    });
+                    let record = record
+                        .unwrap_or_else(|| panic!("the background lane must carry {query:?}"));
+                    assert!(record.background_read);
+                    assert!(
+                        shell
+                            .host_slot(&local)
+                            .is_some_and(|slot| slot.interaction.accepts_action_record(&record)),
+                        "the lane that captures {query:?} must also admit it"
+                    );
+                }
+
+                for query in [
+                    TaskCockpitQuery::Terminal,
+                    TaskCockpitQuery::TerminalResize { cols: 80, rows: 24 },
+                    TaskCockpitQuery::TerminalScroll { delta_lines: 3 },
+                ] {
+                    assert!(
+                        shell
+                            .host_slot_mut(&local)
+                            .and_then(|slot| slot
+                                .interaction
+                                .background_terminal_read_on_current_handler(
+                                    second,
+                                    query.clone()
+                                ))
+                            .is_none(),
+                        "{query:?} starts or mutates something and must never travel the background lane"
+                    );
+                }
             });
             cx.quit();
         });

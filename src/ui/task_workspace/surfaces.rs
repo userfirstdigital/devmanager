@@ -29,6 +29,14 @@ pub const WORKING_CONVERSATION_POLL_INTERVAL: Duration = Duration::from_secs(1);
 /// cadence, not a poll: a pane leaves the sweep for good on its first answer,
 /// so this only paces the case where the ask could not be enqueued at all.
 pub const UNANSWERED_CONVERSATION_SWEEP_INTERVAL: Duration = Duration::from_millis(500);
+/// How often the unattached-open-pane TERMINAL sweep may re-ask. Same bounded
+/// retry shape as the conversation sweep above: a pane leaves the sweep for
+/// good on its first ANSWER of any kind -- a screen, a refusal, or a
+/// start-pending classification -- so this only paces the case where the ask
+/// could not be enqueued at all.
+pub const UNATTACHED_TERMINAL_SWEEP_INTERVAL: Duration = Duration::from_millis(500);
+/// At most this many open panes are asked for a terminal screen per sweep.
+pub const MAX_UNATTACHED_TERMINAL_SWEEP: usize = 2;
 /// Panes asked per sweep. The same bound the background recovery wave uses, so
 /// a restored eight-pane workspace fills over four sweeps instead of putting
 /// eight queries on the action lane at once.
@@ -368,6 +376,16 @@ struct TerminalAttachment {
     /// installed" from "the recipe was rejected", and the operator reading the
     /// client has no access to the host's stderr.
     detail: Option<String>,
+    /// Whether the host has ever SETTLED a query for this exact terminal --
+    /// with a screen, with a refusal, or with a start-pending classification.
+    ///
+    /// The same distinction `conversation_answered` keeps one surface over:
+    /// the default `Unavailable` state is what an UNASKED slot reads as, and
+    /// "nobody has asked" is not "the host says there is no terminal". A
+    /// bounded sweep that cannot tell the two apart either never asks (and a
+    /// pane holds "Terminal starting" forever) or asks every cadence (which is
+    /// a poll, not a retry).
+    answered: bool,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -540,6 +558,7 @@ impl TaskSurfaceState {
         let has_screen = self.screen_for_target(target).is_some();
         let attachment = self.attachments.entry(target).or_default();
         attachment.query_in_flight = false;
+        attachment.answered = true;
         attachment.state = if has_screen {
             TerminalAttachmentState::StaleReconnecting
         } else {
@@ -563,6 +582,7 @@ impl TaskSurfaceState {
         let has_screen = self.screen_for_target(target).is_some();
         let attachment = self.attachments.entry(target).or_default();
         attachment.query_in_flight = false;
+        attachment.answered = true;
         attachment.state = if has_screen {
             TerminalAttachmentState::StaleReconnecting
         } else {
@@ -578,6 +598,7 @@ impl TaskSurfaceState {
         let target = self.focused_surface_target();
         let attachment = self.attachments.entry(target).or_default();
         attachment.query_in_flight = false;
+        attachment.answered = true;
         attachment.state = TerminalAttachmentState::Unavailable;
     }
 
@@ -585,6 +606,7 @@ impl TaskSurfaceState {
         let target = self.focused_surface_target();
         let attachment = self.attachments.entry(target).or_default();
         attachment.query_in_flight = false;
+        attachment.answered = true;
         attachment.state = TerminalAttachmentState::Exited;
     }
 
@@ -595,6 +617,14 @@ impl TaskSurfaceState {
 
     pub fn terminal_query_in_flight(&self) -> bool {
         self.terminal_query_in_flight_for(self.focused_surface_target())
+    }
+
+    /// Whether the host has ever settled a query for one exact terminal.
+    ///
+    /// False is "nobody has asked", which the default `Unavailable` state is
+    /// indistinguishable from. See [`TerminalAttachment::answered`].
+    pub fn terminal_answered_for(&self, target: TerminalSurfaceTarget) -> bool {
+        self.attachment(target).answered
     }
 
     pub fn conversation_has_content(&self) -> bool {
@@ -1086,6 +1116,7 @@ impl<K: Clone + Ord + Eq> TaskSurfaceRegistry<K> {
         let attachment = state.attachments.entry(target).or_default();
         attachment.state = TerminalAttachmentState::Live;
         attachment.query_in_flight = false;
+        attachment.answered = true;
         Ok(())
     }
 
@@ -1250,6 +1281,12 @@ impl<K: Clone + Ord + Eq> TaskSurfaceRegistry<K> {
     pub fn terminal_query_in_flight_for(&self, task_id: K, target: TerminalSurfaceTarget) -> bool {
         self.state(task_id)
             .is_some_and(|state| state.terminal_query_in_flight_for(target))
+    }
+
+    /// See [`TaskSurfaceState::terminal_answered_for`].
+    pub fn terminal_answered_for(&self, task_id: K, target: TerminalSurfaceTarget) -> bool {
+        self.state(task_id)
+            .is_some_and(|state| state.terminal_answered_for(target))
     }
 
     pub fn terminal_is_interactive(&self, task_id: K) -> bool {
@@ -2235,6 +2272,57 @@ mod tests {
             registry.conversation_answered(pending_task),
             "an optimistic user row is content the pane must paint"
         );
+    }
+
+    /// The terminal's half of the same distinction, one surface over.
+    /// `TerminalAttachmentState` DEFAULTS to `Unavailable`, so a slot nobody
+    /// has asked about is indistinguishable from one the host has told there
+    /// is no terminal -- and the bounded open-pane sweep needs exactly that
+    /// difference to decide whom to ask. Every settlement counts as an answer,
+    /// including a refusal: re-asking a refused pane every cadence would be a
+    /// poll rather than a retry.
+    #[test]
+    fn terminal_answered_separates_an_unasked_slot_from_a_refused_one() {
+        let task = TaskId::new();
+        let mut registry = TaskSurfaceRegistry::default();
+        registry.ensure_task(task);
+
+        assert_eq!(
+            registry.terminal_label(task),
+            "Terminal unavailable",
+            "the unasked default is what makes the distinction necessary"
+        );
+        assert!(
+            !registry.terminal_answered_for(task, None),
+            "registering a surface is not an answer"
+        );
+
+        registry.note_terminal_query_started_for(task, None);
+        assert!(
+            !registry.terminal_answered_for(task, None),
+            "asking is not being answered -- this is the state that read as              'Terminal starting' forever"
+        );
+        assert!(registry.terminal_query_in_flight_for(task, None));
+
+        registry.note_terminal_reconnecting_for(task, None);
+        assert!(
+            registry.terminal_answered_for(task, None),
+            "a refusal is an answer: the pane must leave the sweep"
+        );
+        assert!(!registry.terminal_query_in_flight_for(task, None));
+
+        // A screen is an answer too, and it is the one the sweep exists for.
+        let screened = TaskId::new();
+        let mut registry = TaskSurfaceRegistry::default();
+        assert!(!registry.terminal_answered_for(screened, None));
+        registry
+            .admit_terminal(
+                screened,
+                &terminal_projection_fixture(screened, crate::domain::id::ResourceId::new(), true),
+            )
+            .expect("admit a provider screen");
+        assert!(registry.terminal_answered_for(screened, None));
+        assert_eq!(registry.terminal_label(screened), "Terminal is live");
     }
 
     #[test]
