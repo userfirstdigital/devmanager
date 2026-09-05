@@ -11556,6 +11556,11 @@ pub struct NativeShell {
     controller_wake: ControllerWake,
     last_conversation_recovery_at: Option<Instant>,
     last_working_conversation_poll_at: Option<Instant>,
+    /// When `sweep_unanswered_open_pane_conversations` last ran. It is a
+    /// bounded retry cadence, not a poll: the sweep asks only about panes the
+    /// host has NEVER answered, and one answer of any length retires a pane
+    /// from it for good.
+    last_unanswered_conversation_sweep_at: Option<Instant>,
     last_provider_settings_poll: Option<Instant>,
     last_bootstrap_retry_at: Option<Instant>,
     composer_caret_epoch: Instant,
@@ -12613,6 +12618,11 @@ impl NativeShell {
             controller_wake,
             last_conversation_recovery_at: Some(Instant::now()),
             last_working_conversation_poll_at: Some(Instant::now()),
+            // `None` so the first controller tick sweeps: a workspace restored
+            // from the persisted layout has every pane unanswered, and waiting
+            // out an interval before the first ask is exactly the hold this
+            // sweep exists to end.
+            last_unanswered_conversation_sweep_at: None,
             last_provider_settings_poll: Some(Instant::now()),
             last_bootstrap_retry_at: None,
             composer_caret_epoch: Instant::now(),
@@ -18854,6 +18864,8 @@ impl NativeShell {
                 }
             }
         }
+
+        self.sweep_unanswered_open_pane_conversations(now);
 
         // ConversationDirty is the primary refresh signal. A slow recovery
         // heartbeat covers missed pushes without high-frequency idle polling.
@@ -26431,8 +26443,18 @@ impl NativeShell {
                     .map(|timeline| timeline.rows().len()),
             )
         });
+        // Fix wave 2. `conversation_page` INVENTS an empty page for a surface
+        // `ensure_task` merely registered, so at that accessor "nobody has
+        // answered yet" and "the host says this task has no events" are one
+        // fact. Hydrating from it installed a LiveProjection timeline with zero
+        // rows on every open pane's first paint, and the empty-state predicate
+        // then published rule 9's "This conversation is open and ready. Send a
+        // message to begin." at tasks with seven days of history. Only a page
+        // the host has ANSWERED may install a timeline; an unanswered pane
+        // holds instead, and `sweep_unanswered_open_pane_conversations` is what
+        // ends the hold.
         let page = needs_hydration
-            .then(|| self.task_surfaces.conversation_page(owner.clone()))
+            .then(|| self.task_surfaces.admitted_conversation_page(owner.clone()))
             .flatten();
         let timeline_height = (f32::from(idle_photo_size.height)
             - if show_input {
@@ -43178,6 +43200,74 @@ impl NativeShell {
     fn conversation_after_sequence_for(&self, task_key: HostTaskKey) -> u64 {
         self.task_surfaces
             .conversation_after_sequence(task_key.clone())
+    }
+
+    /// Ask the host about every open pane whose conversation it has NEVER
+    /// answered.
+    ///
+    /// A pane is a claim that its conversation is on screen, so the request
+    /// follows the PANE, not the selection. Every other route into
+    /// `TaskCockpitQuery::Conversation` is selection-shaped or push-shaped:
+    /// `refresh_selected_cockpit_surfaces` asks only about the selected task, a
+    /// `ConversationDirty` push carries a high-water the client must already be
+    /// behind, the working poll visits only Working/Settling tasks, and the
+    /// recovery heartbeat is thirty seconds apart and two panes wide. A pane
+    /// RESTORED from the persisted layout goes through none of them -- measured
+    /// on a two-pane workspace, a client-model apply issued ZERO conversation
+    /// queries -- so nothing had ever asked the host about it and it held a
+    /// blank stream over a full history.
+    ///
+    /// The selected owner's query goes on the interactive handler and every
+    /// other owner's on the background-read lane, because
+    /// `Interaction::capture_action` refuses an ordinary TaskCockpit query for
+    /// any task but its own slot's selected one.
+    fn sweep_unanswered_open_pane_conversations(&mut self, now: Instant) {
+        let elapsed = self
+            .last_unanswered_conversation_sweep_at
+            .map(|at| now.saturating_duration_since(at))
+            .unwrap_or(crate::ui::task_workspace::UNANSWERED_CONVERSATION_SWEEP_INTERVAL);
+        if elapsed < crate::ui::task_workspace::UNANSWERED_CONVERSATION_SWEEP_INTERVAL
+            || self.action_lane_len() >= MAX_ACTION_LANE_RECORDS / 2
+        {
+            return;
+        }
+        let unanswered: Vec<HostTaskKey> = match self.layout.task_workspace.as_ref() {
+            Some(workspace) => workspace.task_ids(),
+            None => Vec::new(),
+        }
+        .into_iter()
+        .filter(|key| {
+            !self.task_surfaces.conversation_answered(key.clone())
+                && !self.task_surfaces.conversation_in_flight(key.clone())
+        })
+        .take(crate::ui::task_workspace::MAX_UNANSWERED_CONVERSATION_SWEEP)
+        .collect();
+        if unanswered.is_empty() {
+            return;
+        }
+        self.last_unanswered_conversation_sweep_at = Some(now);
+        for key in unanswered {
+            if self.action_lane_len_for_owner(&key.host) >= MAX_ACTION_LANE_RECORDS / 2 {
+                continue;
+            }
+            let after_sequence = self.conversation_after_sequence_for(key.clone());
+            let selected = self.selected_task_key.as_ref() == Some(&key);
+            let record = self.host_slot_mut(&key.host).and_then(|slot| {
+                if selected {
+                    slot.interaction
+                        .action_on_current_handler(ActionRequest::TaskCockpit {
+                            task_id: key.task_id,
+                            query: TaskCockpitQuery::Conversation { after_sequence },
+                        })
+                } else {
+                    slot.interaction
+                        .background_conversation_on_current_handler(key.task_id, after_sequence)
+                }
+            });
+            if let Some(mut record) = record {
+                let _ = self.enqueue_host_action_for_owner(&key.host, &mut record);
+            }
+        }
     }
 
     fn project_owner_conversation_presentation(
@@ -69301,6 +69391,243 @@ pub(crate) mod tests {
                     timeline_message_roles_for_test(shell, &local, task_id).len(),
                     before_pending,
                     "rejecting pending presentation must restore prior Timeline.rows()"
+                );
+            });
+            cx.quit();
+        });
+    }
+
+    /// The defect this pins, stated once: a pane RESTORED from the persisted
+    /// layout is open, is not the selected task, and no route ever asks the
+    /// host for its conversation -- selection asks only about the selected
+    /// task, a `ConversationDirty` push needs a high-water the client is
+    /// already behind, the working poll visits only Working/Settling tasks,
+    /// and the recovery heartbeat is thirty seconds apart and two panes wide.
+    /// Measured before the fix: a client-model apply over a two-pane workspace
+    /// issued ZERO conversation queries, and the pane held a blank stream over
+    /// a full history.
+    #[test]
+    fn every_open_pane_the_host_has_never_answered_is_asked_for_its_conversation() {
+        if rerun_headless_shell_test_in_child(
+            "ui::native_shell::tests::every_open_pane_the_host_has_never_answered_is_asked_for_its_conversation",
+        ) {
+            return;
+        }
+        gpui::Application::headless().run(move |cx| {
+            crate::ui::init(cx);
+            let (runtime, shared) = TestRuntime::new(true, NativeHostActionResult::Queued);
+            with_test_shell_in_app_cx(cx, runtime, |shell, cx| {
+                shell.install_idle_conversation_photo_for_test();
+                let (model, first, second) = two_task_terminal_bound_client_model();
+                let model = std::sync::Arc::new(model);
+                shell
+                    .apply_client_model(std::sync::Arc::clone(&model))
+                    .expect("client model");
+                let local = shell.local_host_id();
+                let first_key = HostTaskKey::new(local.clone(), first);
+                let second_key = HostTaskKey::new(local.clone(), second);
+                shell
+                    .select_fleet_task_key(first_key.clone(), FleetSelectMode::Replace)
+                    .expect("select first");
+                shell
+                    .select_fleet_task_key(second_key.clone(), FleetSelectMode::Toggle)
+                    .expect("open second pane");
+                shell
+                    .select_fleet_task_key(first_key.clone(), FleetSelectMode::Replace)
+                    .expect("reselect first");
+
+                // The restart shape: both panes persist, one task is
+                // reselected, and NEITHER surface has ever been answered.
+                shell.task_surfaces.remove_task(first_key.clone());
+                shell.task_surfaces.remove_task(second_key.clone());
+                if let Some(slot) = shell.host_slot_mut(&local) {
+                    slot.cockpit.retain_open_timelines(&[]);
+                }
+                shell
+                    .apply_client_model(std::sync::Arc::clone(&model))
+                    .expect("client model after restart");
+                {
+                    let mut guard = shared.lock().expect("test runtime");
+                    guard.accepted.clear();
+                    guard.pending.clear();
+                }
+                assert_eq!(
+                    shell
+                        .layout
+                        .task_workspace
+                        .as_ref()
+                        .map(|workspace| workspace.task_ids().len()),
+                    Some(2),
+                    "the scenario needs two open panes to say anything"
+                );
+                assert!(
+                    !shell.task_surfaces.conversation_answered(second_key.clone()),
+                    "the restored pane must start unanswered or this proves nothing"
+                );
+
+                // The window paints before the first controller tick.
+                let tokens = shell.preferences.tokens();
+                let size = gpui::size(gpui::px(1900.0), gpui::px(700.0));
+                let _ = shell.task_workspace_grid(tokens, size, cx);
+
+                shell.controller_tick_for_test(0);
+
+                let asked: Vec<TaskId> = shared
+                    .lock()
+                    .expect("test runtime")
+                    .accepted
+                    .iter()
+                    .filter_map(|record| match &record.command {
+                        super::NativeHostCommand::TaskCockpitQuery {
+                            task_id,
+                            query: TaskCockpitQuery::Conversation { .. },
+                            ..
+                        } => Some(*task_id),
+                        _ => None,
+                    })
+                    .collect();
+                assert!(
+                    asked.contains(&second),
+                    "the open pane that is not selected must be asked for its conversation; asked {asked:?}"
+                );
+                assert!(
+                    asked.contains(&first),
+                    "the selected pane must be asked too; asked {asked:?}"
+                );
+
+                // And the answer must reach that pane's own timeline.
+                let record = shared
+                    .lock()
+                    .expect("test runtime")
+                    .accepted
+                    .iter()
+                    .find(|record| {
+                        matches!(
+                            &record.command,
+                            super::NativeHostCommand::TaskCockpitQuery {
+                                task_id,
+                                query: TaskCockpitQuery::Conversation { .. },
+                                ..
+                            } if *task_id == second
+                        )
+                    })
+                    .cloned()
+                    .expect("the background pane conversation query record");
+                apply_conversation_query_outcome_for_test(
+                    shell,
+                    &local,
+                    record,
+                    test_conversation_assistant_page(4, 0, 4, "seven days of history"),
+                );
+                let _ = shell.task_workspace_grid(tokens, size, cx);
+                assert_eq!(
+                    shell
+                        .host_slot(&local)
+                        .and_then(|slot| slot.cockpit.timeline_for(second))
+                        .map(|timeline| timeline.rows().len()),
+                    Some(1),
+                    "the admitted page must paint as the pane's own timeline rows"
+                );
+                assert_eq!(
+                    shell
+                        .host_slot(&local)
+                        .and_then(|slot| slot.cockpit.timeline_for(second))
+                        .map(|timeline| timeline.list_state().item_count()),
+                    Some(1),
+                    "the pane paints from the ListState, not from rows(): a row count                      the ListState does not carry is a blank stream"
+                );
+            });
+            cx.quit();
+        });
+    }
+
+    /// The second half of the same defect: `conversation_page` INVENTS an empty
+    /// page for a surface `ensure_task` merely registered, so an unanswered
+    /// pane installed a `LiveProjection` timeline with zero rows on its first
+    /// paint and the empty-state predicate published rule 9's "This
+    /// conversation is open and ready. Send a message to begin." at a task with
+    /// a week of history. Both directions are asserted: unanswered must not say
+    /// it, and an ANSWER of zero facts must.
+    #[test]
+    fn an_unanswered_pane_never_claims_its_conversation_is_empty() {
+        if rerun_headless_shell_test_in_child(
+            "ui::native_shell::tests::an_unanswered_pane_never_claims_its_conversation_is_empty",
+        ) {
+            return;
+        }
+        gpui::Application::headless().run(move |cx| {
+            crate::ui::init(cx);
+            let (runtime, _shared) = TestRuntime::new(true, NativeHostActionResult::Queued);
+            with_test_shell_in_app_cx(cx, runtime, |shell, cx| {
+                shell.install_idle_conversation_photo_for_test();
+                let (model, first, second) = two_task_terminal_bound_client_model();
+                let model = std::sync::Arc::new(model);
+                shell
+                    .apply_client_model(std::sync::Arc::clone(&model))
+                    .expect("client model");
+                let local = shell.local_host_id();
+                let first_key = HostTaskKey::new(local.clone(), first);
+                let second_key = HostTaskKey::new(local.clone(), second);
+                shell
+                    .select_fleet_task_key(first_key.clone(), FleetSelectMode::Replace)
+                    .expect("select first");
+                shell
+                    .select_fleet_task_key(second_key.clone(), FleetSelectMode::Toggle)
+                    .expect("open second pane");
+                shell
+                    .select_fleet_task_key(first_key.clone(), FleetSelectMode::Replace)
+                    .expect("reselect first");
+                shell.task_surfaces.remove_task(second_key.clone());
+                if let Some(slot) = shell.host_slot_mut(&local) {
+                    slot.cockpit.retain_open_timelines(&[first]);
+                }
+                shell
+                    .apply_client_model(std::sync::Arc::clone(&model))
+                    .expect("client model after restart");
+
+                let tokens = shell.preferences.tokens();
+                let size = gpui::size(gpui::px(1900.0), gpui::px(700.0));
+                let _ = shell.task_workspace_grid(tokens, size, cx);
+                assert!(
+                    shell
+                        .host_slot(&local)
+                        .and_then(|slot| slot.cockpit.timeline_for(second))
+                        .is_none(),
+                    "an unanswered pane must install no timeline at all"
+                );
+                assert!(
+                    !shell.honest_empty_conversation_for(&second_key),
+                    "an unanswered pane must not paint the empty-conversation sentence"
+                );
+
+                // The must-MATCH half: an answer of zero facts is a real claim
+                // that the task has no events, and the sentence is then true.
+                shell
+                    .task_surfaces
+                    .begin_conversation(second_key.clone(), 7);
+                let empty = crate::domain::SemanticJournalPage {
+                    oldest_sequence: 0,
+                    cursor_rolled_over: false,
+                    after_sequence: 0,
+                    through_sequence: 0,
+                    high_water: 0,
+                    encoded_bytes: 0,
+                    next_sequence: None,
+                    facts: Vec::new(),
+                };
+                shell
+                    .admit_and_project_conversation_for_owner(&local, second_key.clone(), 7, &empty)
+                    .expect("admit the empty answer");
+                assert!(
+                    shell
+                        .task_surfaces
+                        .conversation_answered(second_key.clone()),
+                    "an answer of zero facts is still an answer"
+                );
+                let _ = shell.task_workspace_grid(tokens, size, cx);
+                assert!(
+                    shell.honest_empty_conversation_for(&second_key),
+                    "an answered, genuinely empty conversation must still say so"
                 );
             });
             cx.quit();
