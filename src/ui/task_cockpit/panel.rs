@@ -493,4 +493,84 @@ mod tests {
         assert_eq!(ROW_PADDING_Y, 5.0, "rule 5: rows are padded 5x10");
         assert_eq!(ROW_GAP, 8.0, "rule 6: control gap is 8");
     }
+
+    /// The panel bodies this lane restyled, by path. A file that disappears or
+    /// is renamed fails the scan below loudly instead of dropping out of it.
+    const RESTYLED_BODIES: [&str; 6] = [
+        "src/ui/task_cockpit/panel.rs",
+        "src/ui/task_cockpit/browser_panel.rs",
+        "src/ui/task_cockpit/changes_panel.rs",
+        "src/ui/task_cockpit/config_sidebar.rs",
+        "src/ui/task_cockpit/dock.rs",
+        "src/ui/native_trusted_hosts_view.rs",
+    ];
+
+    /// Every text-size call in a restyled body names a size on rule 2's
+    /// scale -- as a literal that is one of the scale's values, or as a
+    /// `*_FONT_SIZE` constant, which the test above then pins to a number.
+    ///
+    /// The needle is assembled from two halves so that this scan cannot match
+    /// its own source: written out whole it found three hits inside this very
+    /// function, which is a denominator inflated by the scanner counting
+    /// itself.
+    ///
+    /// The regression this exists to catch is the second form going back to
+    /// `tokens.density.typography.*`: that scale is the *density* scale
+    /// (caption 11/12, body 13/14, title 18/20) and is not rule 2's, so a body
+    /// that reads a size from it is off the redesign while looking as
+    /// principled as one that is on it. Every one of these files read from it
+    /// before this lane.
+    ///
+    /// The denominator is asserted, not merely computed: this scan is new, so
+    /// its first green is the one to distrust, and a scan that has stopped
+    /// finding its subject reads exactly like a scan that found nothing wrong.
+    /// It has already fired once for that reason.
+    #[test]
+    fn every_text_size_in_a_restyled_body_names_rule_2s_scale() {
+        const ALLOWED_LITERALS: [&str; 5] = ["10.5", "11.0", "11.5", "12.0", "13.0"];
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let mut checked = 0usize;
+        let mut offenders: Vec<String> = Vec::new();
+        for relative in RESTYLED_BODIES {
+            let path = root.join(relative);
+            let source = std::fs::read_to_string(&path)
+                .unwrap_or_else(|error| panic!("cannot read {relative}: {error}"));
+            for (line_number, line) in source.lines().enumerate() {
+                let needle = concat!("text_size", "(px(");
+                let mut rest = line;
+                while let Some(start) = rest.find(needle) {
+                    rest = &rest[start + needle.len()..];
+                    let Some(end) = rest.find(')') else { break };
+                    let value = rest[..end].trim();
+                    checked += 1;
+                    let is_number = !value.is_empty()
+                        && value
+                            .chars()
+                            .all(|character| character.is_ascii_digit() || character == '.');
+                    let on_scale = if is_number {
+                        ALLOWED_LITERALS.contains(&value)
+                    } else {
+                        // A named size, pinned by `the_body_type_scale_is_the_
+                        // redesigns_scale` or by its own module's equivalent.
+                        // The density scale is excluded by name because it is
+                        // the one wrong answer that looks right.
+                        value.ends_with("FONT_SIZE") && !value.contains("density")
+                    };
+                    if !on_scale {
+                        offenders.push(format!("{relative}:{}: {value}", line_number + 1));
+                    }
+                }
+            }
+        }
+        assert!(
+            checked >= 15,
+            "the scan found only {checked} text sizes across {} files; it has \
+             stopped seeing its subject",
+            RESTYLED_BODIES.len()
+        );
+        assert!(
+            offenders.is_empty(),
+            "text sizes off rule 2's scale (of {checked} checked): {offenders:?}"
+        );
+    }
 }
