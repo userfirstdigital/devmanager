@@ -14142,6 +14142,19 @@ impl NativeShell {
             )
             .gpui(crate::ui::board::topbar::SCOPE_ELEMENT_ID, true, true),
         );
+        if let Some(headline) = self.top_bar_connection_notice() {
+            overlay_nodes.push(
+                AccessibilityNode::new(
+                    AccessibleRole::Status,
+                    headline,
+                    "The host this window talks to is not connected. Nothing on the board can move until it is.",
+                )
+                // Neither focusable nor a tab stop: it is an announcement, not
+                // a control, and a screen reader user tabbing the bar should
+                // reach the things they can operate.
+                .gpui(crate::ui::board::topbar::CONNECTION_ELEMENT_ID, false, false),
+            );
+        }
         let needs_you = self.top_bar_needs_you_count();
         if needs_you > 0 {
             let task_word = if needs_you == 1 { "task" } else { "tasks" };
@@ -42797,6 +42810,23 @@ impl NativeShell {
             .into_any_element()
     }
 
+    /// The top bar's connection chip, or `None` while the host is connected.
+    ///
+    /// The predicate is the one the retired header's chip used -- "not
+    /// `Connected`", rather than a second reading of the same state -- and the
+    /// copy is the same `host_status_headline` that chip printed. One function
+    /// so the chip and the accessibility node it publishes cannot say two
+    /// different things about one host (fix wave 1, F14).
+    fn top_bar_connection_notice(&self) -> Option<String> {
+        if matches!(
+            self.local_slot().host_state,
+            NativeHostState::Connected { .. }
+        ) {
+            return None;
+        }
+        Some(self.host_status_headline())
+    }
+
     /// Header-sized projection of the status line. The full string carries
     /// boot, connection, and build identifiers, which truncate mid-identifier
     /// in a chip; the leading segments already state connection truth.
@@ -43366,7 +43396,12 @@ impl NativeShell {
                         .then(|| project.label.as_str())
                 })
         });
-        let model = crate::ui::board::top_bar_model(scope_label, board, &self.keyboard);
+        let model = crate::ui::board::top_bar_model(
+            scope_label,
+            board,
+            &self.keyboard,
+            self.top_bar_connection_notice(),
+        );
         let handlers = match shell {
             Some(shell) => crate::ui::board::TopBarHandlers {
                 on_scope: Rc::new({

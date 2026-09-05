@@ -18,8 +18,8 @@ use gpui::{
 use crate::ui::actions::{KeyboardAction, KeyboardModel, KeyboardShortcut};
 use crate::ui::board::layout::{
     KBD_FONT_SIZE, KBD_PADDING_X, KBD_PADDING_Y, KBD_RADIUS, NEEDS_YOU_CHIP_BORDER_ALPHA,
-    TOP_BAR_BRAND_FONT_SIZE, TOP_BAR_GAP, TOP_BAR_HEIGHT, TOP_BAR_PADDING_X,
-    TOP_BAR_SCOPE_FONT_SIZE, TOP_BAR_SETTINGS_ICON_SIZE,
+    TOP_BAR_BRAND_FONT_SIZE, TOP_BAR_CONNECTION_MAX_WIDTH, TOP_BAR_GAP, TOP_BAR_HEIGHT,
+    TOP_BAR_PADDING_X, TOP_BAR_SCOPE_FONT_SIZE, TOP_BAR_SETTINGS_ICON_SIZE,
 };
 use crate::ui::board::model::{BoardGroup, BoardModel};
 use crate::ui::tokens::ThemeTokens;
@@ -30,6 +30,7 @@ pub const BRAND: &str = "DevManager";
 
 pub const SCOPE_ELEMENT_ID: &str = "native-top-bar-scope";
 pub const NEEDS_YOU_ELEMENT_ID: &str = "native-top-bar-needs-you";
+pub const CONNECTION_ELEMENT_ID: &str = "native-top-bar-connection";
 pub const SETTINGS_ELEMENT_ID: &str = "native-top-bar-settings";
 
 /// What the bar prints. Pure, so the needs-you count and the hint order are
@@ -39,6 +40,15 @@ pub struct TopBarModel {
     pub brand: &'static str,
     pub scope_label: String,
     pub needs_you: usize,
+    /// The host's own sentence about why it is not connected, or `None` while
+    /// it is.
+    ///
+    /// This is the shell's only "host not connected" indicator. It lived in the
+    /// 32 px workspace header, which composition A does not have, so it moved
+    /// here rather than being deleted with the row that carried it (fix wave 1,
+    /// F14). `Option`, not a `bool` plus a string: a connected host has no
+    /// sentence, and two fields would let the painter print an empty chip.
+    pub connection: Option<String>,
     /// `(keys, verb)` -- the chip's key text and the word after it. The keys
     /// are a `String` because they are read out of the keyboard model at build
     /// time, not written here.
@@ -59,11 +69,15 @@ pub fn top_bar_model(
     scope_label: String,
     board: &BoardModel,
     keyboard: &KeyboardModel,
+    connection: Option<String>,
 ) -> TopBarModel {
     TopBarModel {
         brand: BRAND,
         scope_label,
         needs_you: needs_you_count(board),
+        // Blank is the same fact as absent, and a chip with no words in it
+        // says "something is wrong" without saying what -- worse than no chip.
+        connection: connection.filter(|headline| !headline.trim().is_empty()),
         hints: hints_from(keyboard),
     }
 }
@@ -178,6 +192,41 @@ pub fn top_bar_element(
         // however many chips there are, and the brand and scope must stay
         // adjacent on the left.
         .child(div().flex_1().min_w(px(0.0)));
+    // Left of the needs-you chip: a host that is not connected outranks the
+    // count of tasks waiting on a person, because none of them can move until
+    // it is back.
+    if let Some(headline) = model.connection.clone() {
+        bar = bar.child(
+            div()
+                .id(CONNECTION_ELEMENT_ID)
+                .flex_none()
+                .max_w(px(TOP_BAR_CONNECTION_MAX_WIDTH))
+                .overflow_hidden()
+                .px(px(KBD_PADDING_X))
+                .py(px(KBD_PADDING_Y))
+                .rounded(px(KBD_RADIUS))
+                .border_1()
+                // The amber chip's construction, in the red half of the
+                // vocabulary: the state colour for the text and the same
+                // colour at the same low alpha for the rule. Sharing the alpha
+                // rather than solving a second one keeps the two chips looking
+                // like one control in two states.
+                .border_color(
+                    tokens
+                        .status
+                        .destructive
+                        .with_alpha(NEEDS_YOU_CHIP_BORDER_ALPHA)
+                        .to_gpui(),
+                )
+                .text_size(px(KBD_FONT_SIZE))
+                .text_color(tokens.status.destructive.to_gpui())
+                // The headline is three segments long; it ellipses inside the
+                // chip's ceiling rather than pushing the bar's right-hand end
+                // off the window. `w_full` on the inner child is what gives
+                // GPUI the definite width an ellipsis is measured against.
+                .child(div().w_full().truncate().child(headline)),
+        );
+    }
     if needs_you > 0 {
         bar = bar.child(
             div()
@@ -270,12 +319,12 @@ mod tests {
         let keyboard = KeyboardModel::default();
         let empty = build_board_model(vec![], false);
         assert_eq!(
-            top_bar_model("All projects".into(), &empty, &keyboard).needs_you,
+            top_bar_model("All projects".into(), &empty, &keyboard, None).needs_you,
             0
         );
         let one = build_board_model(vec![row(BoardState::Question)], false);
         assert_eq!(
-            top_bar_model("All projects".into(), &one, &keyboard).needs_you,
+            top_bar_model("All projects".into(), &one, &keyboard, None).needs_you,
             1
         );
     }
@@ -302,7 +351,7 @@ mod tests {
         );
         assert_eq!(none.groups[0].rows.len(), 2, "the naive answer here is 2");
         assert_eq!(
-            top_bar_model("All projects".into(), &none, &keyboard).needs_you,
+            top_bar_model("All projects".into(), &none, &keyboard, None).needs_you,
             0
         );
         let mixed = build_board_model(
@@ -314,7 +363,7 @@ mod tests {
             false,
         );
         assert_eq!(
-            top_bar_model("All projects".into(), &mixed, &keyboard).needs_you,
+            top_bar_model("All projects".into(), &mixed, &keyboard, None).needs_you,
             1,
             "Blocked is a needs-you state"
         );
@@ -326,6 +375,7 @@ mod tests {
             "All projects".into(),
             &build_board_model(vec![], false),
             &KeyboardModel::default(),
+            None,
         );
         let verbs: Vec<_> = m.hints.iter().map(|(_, v)| *v).collect();
         assert_eq!(verbs, vec!["switch", "zoom", "focus"]);
@@ -342,6 +392,7 @@ mod tests {
             "All projects".into(),
             &build_board_model(vec![], false),
             &keyboard,
+            None,
         );
         let switcher = keyboard
             .shortcut_for(KeyboardAction::OpenTaskSwitcher)
@@ -374,8 +425,100 @@ mod tests {
             "Snake Game".into(),
             &build_board_model(vec![], false),
             &KeyboardModel::default(),
+            None,
         );
         assert_eq!(m.scope_label, "Snake Game");
         assert_eq!(m.brand, "DevManager");
+    }
+
+    /// F14: the shell's only "host not connected" indicator. It lived in the
+    /// 32 px workspace header that composition A does not have, so it moved
+    /// into the bar rather than being deleted with the row around it.
+    ///
+    /// Both directions, because a chip that is always absent and a chip that
+    /// is always present are the same defect with the sign flipped: absent
+    /// while the host is connected, present and carrying the host's own
+    /// headline verbatim while it is not.
+    #[test]
+    fn the_connection_chip_appears_only_while_the_host_is_not_connected() {
+        let board = build_board_model(vec![], false);
+        let keyboard = KeyboardModel::default();
+
+        let connected = top_bar_model("All projects".into(), &board, &keyboard, None);
+        assert_eq!(
+            connected.connection, None,
+            "a connected host has nothing to say and gets no chip"
+        );
+
+        let headline = "Disconnected · retrying in 4s · build 1.2.3";
+        let offline = top_bar_model(
+            "All projects".into(),
+            &board,
+            &keyboard,
+            Some(headline.to_string()),
+        );
+        assert_eq!(
+            offline.connection.as_deref(),
+            Some(headline),
+            "the chip carries the host's own headline verbatim, not a copy of the words"
+        );
+
+        // Blank is the same fact as absent. A chip with no words in it says
+        // "something is wrong" without saying what, which is worse than none.
+        for blank in ["", "   "] {
+            assert_eq!(
+                top_bar_model(
+                    "All projects".into(),
+                    &board,
+                    &keyboard,
+                    Some(blank.to_string())
+                )
+                .connection,
+                None,
+                "a blank headline must not paint an empty chip"
+            );
+        }
+    }
+
+    /// The chip is painted left of the needs-you chip, in the destructive half
+    /// of the vocabulary, built the same way the amber one is. A source scan
+    /// because the order is a position in the builder chain and the colours
+    /// are tokens: neither is readable out of the model.
+    #[test]
+    fn the_connection_chip_is_the_amber_chips_construction_in_red_and_sits_left_of_it() {
+        let source = include_str!("topbar.rs");
+        let painter = source
+            .split("#[cfg(test)]")
+            .next()
+            .expect("the painter is everything above its tests");
+        let connection = painter
+            .find("CONNECTION_ELEMENT_ID)")
+            .expect("the bar paints a connection chip");
+        let needs_you = painter
+            .find("NEEDS_YOU_ELEMENT_ID)")
+            .expect("the bar paints a needs-you chip");
+        assert!(
+            connection < needs_you,
+            "the connection chip is painted before the needs-you chip, so it sits to its left"
+        );
+
+        let chip = &painter[connection..needs_you];
+        assert!(
+            chip.contains("tokens.status.destructive.to_gpui()"),
+            "the chip's text is status.destructive"
+        );
+        assert!(
+            chip.contains("NEEDS_YOU_CHIP_BORDER_ALPHA"),
+            "the rule is the state colour at the same low alpha the amber chip uses"
+        );
+        assert!(
+            chip.contains("TOP_BAR_CONNECTION_MAX_WIDTH"),
+            "the chip is bounded, or a long headline pushes the bar's right end off the window"
+        );
+        let compact: String = chip.chars().filter(|c| !c.is_whitespace()).collect();
+        assert!(
+            compact.contains(".w_full().truncate()"),
+            "the headline must resolve its width through an inner w_full child to ellipse"
+        );
     }
 }

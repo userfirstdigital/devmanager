@@ -133,6 +133,13 @@ pub const NEEDS_YOU_CHIP_BORDER_ALPHA: f32 = 0.35;
 /// The settings glyph at the right end of the bar, the same 14 px the footer
 /// strip's icons were.
 pub const TOP_BAR_SETTINGS_ICON_SIZE: f32 = 14.0;
+/// The connection chip's ceiling. `host_status_headline` is three " · "
+/// segments of boot and connection truth and can run well past a hundred
+/// characters; unbounded it would push the needs-you chip and the hints off
+/// the right of the bar, which is the one thing the bar must never do. Wide
+/// enough for the leading segment that states the connection, which is the
+/// part a person reads.
+pub const TOP_BAR_CONNECTION_MAX_WIDTH: f32 = 320.0;
 
 /// `.hd { padding: 9px 10px 7px; gap: 8px }` with a 13 px title and an
 /// 11.5 px `+ New` button in a 6 px-radius 1 px box.
