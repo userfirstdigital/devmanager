@@ -30811,19 +30811,14 @@ impl NativeShell {
             );
         }
         for entry in entries {
-            let BoardMenuEntry {
-                element_id,
-                label,
-                action,
-                disabled,
-            } = entry;
+            let label = entry.label.clone();
             let row = div()
-                .id(SharedString::from(element_id))
+                .id(SharedString::from(entry.element_id.clone()))
                 .w_full()
                 .px(px(tokens.density.spacing.md))
                 .py(px(tokens.density.spacing.xs))
                 .text_size(px(tokens.density.typography.body));
-            rows.push(match disabled {
+            rows.push(match entry.disabled.clone() {
                 // A disabled row stays one line: the greyed label and one short
                 // parenthetical. The whole sentence goes to the tooltip -- as
                 // wrapped caption text it was several lines of prose per row
@@ -30843,7 +30838,7 @@ impl NativeShell {
                         MouseButton::Left,
                         cx.listener(move |shell, _event: &MouseDownEvent, window, cx| {
                             cx.stop_propagation();
-                            shell.apply_board_menu_action(action.clone(), window, cx);
+                            shell.apply_board_menu_action(&entry, window, cx);
                             shell.close_board_menu();
                             shell.refresh_accessibility_tree();
                             cx.notify();
@@ -31042,11 +31037,23 @@ impl NativeShell {
 
     fn apply_board_menu_action(
         &mut self,
-        action: BoardMenuAction,
+        entry: &BoardMenuEntry,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        match action {
+        // The painter wires no click onto a disabled row, but the entry's own
+        // state is the single source: any later route to a menu row -- a
+        // keyboard one, say -- refuses here rather than walking past a guard
+        // that lives in the paint. Named, because a row that silently does
+        // nothing is indistinguishable from one that is broken.
+        if let Some(disabled) = &entry.disabled {
+            eprintln!(
+                "devmanager: board menu row {} is disabled and was not applied: {}",
+                entry.element_id, disabled.detail
+            );
+            return;
+        }
+        match entry.action.clone() {
             BoardMenuAction::NewTaskIn(project_key) => {
                 self.begin_new_task_for_project_key(project_key);
             }
@@ -49753,6 +49760,98 @@ pub(crate) mod tests {
             None,
             "a live row carries no suffix at all"
         );
+    }
+
+    /// The `Archived...` row IS the archived toggle now that the footer icon is
+    /// gone, so the row, the action it carries and the state it flips have to
+    /// work as one path -- asserting the row's label alone would pass with the
+    /// action wired to nothing. And a disabled entry has to refuse here, not
+    /// only in the painter: the entry's own state is the single source, so a
+    /// later keyboard route cannot walk past a guard that lives in the paint.
+    #[test]
+    fn the_archived_menu_row_toggles_the_archived_browser() {
+        const TEST_NAME: &str =
+            "ui::native_shell::tests::the_archived_menu_row_toggles_the_archived_browser";
+        if rerun_headless_shell_test_in_child(TEST_NAME) {
+            return;
+        }
+        let completed = std::rc::Rc::new(std::cell::Cell::new(false));
+        let completed_for_app = std::rc::Rc::clone(&completed);
+        gpui::Application::new().run(move |cx| {
+            crate::ui::init(cx);
+            let workspace = tempfile::tempdir().expect("workspace tempdir");
+            let profile = isolated_dev_profile(workspace.path()).expect("isolated profile");
+            let (runtime, _) = TestRuntime::new(true, NativeHostActionResult::Queued);
+            let window = cx
+                .open_window(
+                    WindowOptions {
+                        show: false,
+                        ..WindowOptions::default()
+                    },
+                    move |_window, cx| {
+                        cx.new(|cx| {
+                            NativeShell::new_with_host_runtime_port(
+                                profile,
+                                Box::new(runtime),
+                                crate::ui::tokens::RuntimePreferencesSnapshot::default(),
+                                cx,
+                            )
+                        })
+                    },
+                )
+                .expect("open hidden board-menu window");
+            let entity = window.entity(cx).expect("board menu shell entity");
+            let any_window = window.into();
+            cx.update_window(any_window, |_root, window, cx| {
+                entity.update(cx, |shell, cx| {
+                    fn archived_row(shell: &NativeShell) -> BoardMenuEntry {
+                        shell
+                            .board_options_menu_entries()
+                            .into_iter()
+                            .find(|row| row.element_id == "board-menu-archived")
+                            .expect("the archived toggle is a board menu row")
+                    }
+
+                    assert!(
+                        !shell.show_archived_tasks,
+                        "the board starts on active tasks"
+                    );
+                    let row = archived_row(shell);
+                    assert_eq!(row.action, BoardMenuAction::ToggleArchived);
+                    assert_eq!(row.label, "Archived\u{2026}");
+                    shell.apply_board_menu_action(&row, window, cx);
+                    assert!(
+                        shell.show_archived_tasks,
+                        "choosing the row opens the archived browser"
+                    );
+
+                    let back = archived_row(shell);
+                    assert_eq!(
+                        back.label, "Active tasks",
+                        "and the row relabels itself for the way back"
+                    );
+                    shell.apply_board_menu_action(&back, window, cx);
+                    assert!(!shell.show_archived_tasks, "which closes it again");
+
+                    let blocked = BoardMenuEntry {
+                        disabled: Some(BoardMenuDisabled {
+                            suffix: BOARD_MENU_LOCAL_ONLY_SUFFIX.to_string(),
+                            detail: NativeShell::remote_local_authority_reason().to_string(),
+                        }),
+                        ..archived_row(shell)
+                    };
+                    shell.apply_board_menu_action(&blocked, window, cx);
+                    assert!(
+                        !shell.show_archived_tasks,
+                        "a disabled entry applies nothing, whatever route reached it"
+                    );
+                });
+            })
+            .expect("apply the archived menu row");
+            completed_for_app.set(true);
+            cx.quit();
+        });
+        assert!(completed.get(), "archived menu row scenario completed");
     }
 
     /// The board's `...` menu drops from the `...` in the BOARD header, so its
