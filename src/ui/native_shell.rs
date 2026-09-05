@@ -12283,115 +12283,6 @@ impl NativeGitWindow {
     }
 }
 
-fn native_git_diff_rows(
-    diff: &crate::git::git_service::GitDiffResult,
-    tokens: &crate::ui::tokens::ThemeTokens,
-) -> Vec<AnyElement> {
-    if diff.is_binary {
-        return vec![div()
-            .p(px(16.0))
-            .text_color(tokens.text.muted.to_gpui())
-            .child("Binary file changed")
-            .into_any_element()];
-    }
-    let mut rows = Vec::new();
-    let mut index = 0usize;
-    for hunk in &diff.hunks {
-        rows.push(
-            div()
-                .id(("native-git-diff-hunk", index))
-                .w_full()
-                .px(px(12.0))
-                .py(px(6.0))
-                .font_family("Consolas")
-                .text_size(px(tokens.density.typography.caption))
-                .bg(tokens.surfaces.selection.to_gpui())
-                .text_color(tokens.text.secondary.to_gpui())
-                .child(hunk.header.clone())
-                .into_any_element(),
-        );
-        index += 1;
-        for line in &hunk.lines {
-            let (prefix, background, foreground) = match line.kind {
-                crate::git::git_service::DiffLineKind::Add => (
-                    "+",
-                    tokens.status.success_surface.to_gpui(),
-                    tokens.status.success_foreground.to_gpui(),
-                ),
-                crate::git::git_service::DiffLineKind::Delete => (
-                    "−",
-                    tokens.status.destructive_surface.to_gpui(),
-                    tokens.status.destructive_foreground.to_gpui(),
-                ),
-                crate::git::git_service::DiffLineKind::HunkHeader => (
-                    " ",
-                    tokens.surfaces.selection.to_gpui(),
-                    tokens.text.secondary.to_gpui(),
-                ),
-                crate::git::git_service::DiffLineKind::Context => (
-                    " ",
-                    tokens.surfaces.canvas.to_gpui(),
-                    tokens.text.primary.to_gpui(),
-                ),
-            };
-            rows.push(
-                div()
-                    .id(("native-git-diff-line", index))
-                    .w_full()
-                    .flex()
-                    .font_family("Consolas")
-                    .text_size(px(tokens.density.typography.caption))
-                    .bg(background)
-                    .text_color(foreground)
-                    .child(
-                        div()
-                            .w(px(44.0))
-                            .flex_none()
-                            .px(px(6.0))
-                            .text_color(tokens.text.muted.to_gpui())
-                            .child(
-                                line.old_lineno
-                                    .map(|line| line.to_string())
-                                    .unwrap_or_default(),
-                            ),
-                    )
-                    .child(
-                        div()
-                            .w(px(44.0))
-                            .flex_none()
-                            .px(px(6.0))
-                            .text_color(tokens.text.muted.to_gpui())
-                            .child(
-                                line.new_lineno
-                                    .map(|line| line.to_string())
-                                    .unwrap_or_default(),
-                            ),
-                    )
-                    .child(div().w(px(20.0)).flex_none().child(prefix))
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w_0()
-                            .whitespace_nowrap()
-                            .child(line.content.clone()),
-                    )
-                    .into_any_element(),
-            );
-            index += 1;
-        }
-    }
-    if rows.is_empty() {
-        rows.push(
-            div()
-                .p(px(16.0))
-                .text_color(tokens.text.muted.to_gpui())
-                .child("No patch content for this selection")
-                .into_any_element(),
-        );
-    }
-    rows
-}
-
 impl NativeShell {
     pub fn new(profile: IsolatedDevProfile, cx: &mut Context<Self>) -> Self {
         Self::new_with_host_runtime_and_preferences(
@@ -46267,7 +46158,9 @@ impl Render for NativeGitWindow {
                 .into_any_element()
         });
         let active_file_diff_rows = active_file_diff
-            .map(|projection| native_git_diff_rows(&projection.diff, &tokens))
+            .map(|projection| {
+                crate::ui::task_cockpit::changes_panel::diff_rows(&projection.diff, &tokens)
+            })
             .unwrap_or_default();
         let history_rows = history_entries.iter().enumerate().map(|(index, entry)| {
             let commit_hash = entry.full_hash.clone();
@@ -46308,7 +46201,9 @@ impl Render for NativeGitWindow {
                 .into_any_element()
         });
         let active_commit_diff_rows = active_commit_diff
-            .map(|projection| native_git_diff_rows(&projection.diff, &tokens))
+            .map(|projection| {
+                crate::ui::task_cockpit::changes_panel::diff_rows(&projection.diff, &tokens)
+            })
             .unwrap_or_default();
 
         let commit = cx.listener(|this, _event: &ClickEvent, window, cx| {
@@ -72997,6 +72892,100 @@ pub(crate) mod tests {
             });
             cx.quit();
         });
+    }
+
+    // -----------------------------------------------------------------------
+    // The dock panel bodies call lane R2's painters
+    //
+    // The six bodies are painted inline in this file, so what these scans
+    // protect is a *call site*: that the shell asks
+    // `src/ui/task_cockpit/panel.rs` and `changes_panel.rs` for its rows,
+    // rather than growing a second body language beside them again. Every one
+    // asserts a denominator -- how many call sites survived -- because a scan
+    // that only asks "does the name appear" keeps passing when one of two
+    // sites reverts, and a scan whose anchor stopped matching reads exactly
+    // like a scan that found nothing wrong.
+    //
+    // Needles that name this file's own contents are split with `concat!`:
+    // the scanned file *is* the file these tests live in, so a needle written
+    // out whole would match its own source and turn every count into a lie.
+    // -----------------------------------------------------------------------
+
+    /// This file's own source, for the call-site scans below.
+    fn shell_source() -> String {
+        std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/ui/native_shell.rs"),
+        )
+        .expect("the shell's own source")
+    }
+
+    /// The body of one of the shell's methods, sliced from its declaration to
+    /// the next declaration at the same indent.
+    ///
+    /// Anchored on the declaration's NAME, required to be unique, rather than
+    /// on a line number or a fragment of the body: a rename or a reformat then
+    /// fails loudly here instead of quietly slicing nothing and leaving every
+    /// assertion over the slice vacuously true.
+    fn shell_method_body<'a>(source: &'a str, name: &str) -> &'a str {
+        let needle = format!("fn {name}(");
+        assert_eq!(
+            source.matches(needle.as_str()).count(),
+            1,
+            "`fn {name}` should be declared exactly once for this slice to mean anything"
+        );
+        let start = source
+            .find(needle.as_str())
+            .unwrap_or_else(|| panic!("the shell no longer declares `fn {name}`"));
+        let rest = &source[start..];
+        let end = rest.find("\n    fn ").unwrap_or(rest.len());
+        let body = &rest[..end];
+        assert!(
+            body.len() > 200,
+            "the slice for `fn {name}` is only {} bytes; the anchor has stopped \
+             finding its subject",
+            body.len()
+        );
+        body
+    }
+
+    /// Both git diff views paint through lane R2's `diff_rows`, and the shell
+    /// no longer carries a diff painter of its own.
+    ///
+    /// Two call sites is the denominator, and they are different views -- the
+    /// working-tree file and the selected commit -- so a revert of either is a
+    /// visible regression that a bare "the name appears" scan would miss.
+    #[test]
+    fn both_git_diff_views_paint_through_lane_r2s_diff_rows() {
+        let shell = shell_source();
+        // The needle stops at the opening parenthesis: `rustfmt` may wrap the
+        // arguments across lines at will, and a needle that spelled them out
+        // would decay into "the formatter has not run" rather than "the
+        // painter is still called".
+        let call = concat!("changes_panel::diff", "_rows(");
+        assert_eq!(
+            shell.matches(call).count(),
+            2,
+            "the shell should ask the shared diff painter for its rows at exactly \
+             two sites (the working-tree file and the selected commit)"
+        );
+        assert!(
+            !shell.contains(concat!("native_git", "_diff_rows")),
+            "the shell still defines or calls its own diff painter, so the four \
+             opaque status fills rule 1 forbids are still on screen"
+        );
+
+        // And the painter it now calls is the one whose colour decision is
+        // asserted directly by
+        // `changes_panel::a_patch_tints_only_the_lines_that_changed`.
+        let changes = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("src/ui/task_cockpit/changes_panel.rs"),
+        )
+        .expect("the changes panel's source");
+        assert!(
+            changes.contains(concat!("pub fn diff", "_rows(")),
+            "lane R2's diff painter is gone; the call sites above point at nothing"
+        );
     }
 }
 
