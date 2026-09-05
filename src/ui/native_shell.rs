@@ -45098,7 +45098,7 @@ impl Render for NativeGitWindow {
                     div()
                         .flex()
                         .gap(px(8.0))
-                        .text_size(px(tokens.density.typography.caption))
+                        .text_size(px(overlay_chrome::CAPTION_FONT_SIZE))
                         .text_color(tokens.text.muted.to_gpui())
                         .child(entry.hash.clone())
                         .child(entry.author_name.clone())
@@ -45158,16 +45158,19 @@ impl Render for NativeGitWindow {
                     )
                     .child(
                         div()
-                            .px(px(10.0))
-                            .py(px(6.0))
-                            .rounded(px(tokens.density.radii.sm))
-                            .bg(tokens.surfaces.sunken.to_gpui())
+                            .px(px(overlay_chrome::KBD_PADDING_X))
+                            .py(px(overlay_chrome::KBD_PADDING_Y))
+                            .rounded(px(overlay_chrome::KBD_RADIUS))
+                            .border(px(overlay_chrome::OVERLAY_BORDER_WIDTH))
+                            .border_color(tokens.borders.default.to_gpui())
+                            .text_size(px(overlay_chrome::ROW_META_FONT_SIZE))
+                            .text_color(tokens.text.muted.to_gpui())
                             .child(branch),
                     )
                     .child(div().flex_1())
                     .children(status.as_ref().map(|status| {
                         div()
-                            .text_size(px(tokens.density.typography.caption))
+                            .text_size(px(overlay_chrome::CAPTION_FONT_SIZE))
                             .text_color(tokens.text.secondary.to_gpui())
                             .child(format!("↑{}  ↓{}", status.ahead, status.behind))
                             .into_any_element()
@@ -45290,7 +45293,7 @@ impl Render for NativeGitWindow {
                                         .gap(px(12.0))
                                         .child(
                                             div()
-                                                .text_size(px(tokens.density.typography.title))
+                                                .text_size(px(overlay_chrome::HEADING_FONT_SIZE))
                                                 .font_weight(FontWeight::SEMIBOLD)
                                                 .child(file.relative_path),
                                         )
