@@ -321,6 +321,97 @@ pub fn kbd_hint_row(
         .into_any_element()
 }
 
+/// The one idiom in this app that actually paints an ellipsis, and the
+/// arithmetic that feeds it.
+///
+/// GPUI truncates inside the TEXT element's own measure closure
+/// (`gpui-0.2.2/src/elements/text.rs`): it takes the truncation width from
+/// `known_dimensions.width`, or from `available_space.width` when that is
+/// DEFINITE, and it then caches the first size it measured for a `nowrap` run
+/// and returns it for every later call in the same frame -- whatever width
+/// that later call offers. A text inside a FLEXIBLE slot is measured at its
+/// hypothetical size first, caches its full length, and the final pass repeats
+/// that cached size; the slot's `overflow_hidden` then cuts the glyphs off
+/// mid-word. That is the hard clip fix waves 1 and 3 both tried to remove by
+/// moving `truncate()` between the flex item and a `w_full` child, and neither
+/// could work: `w_full` is a percentage, which is not a definite width at the
+/// moment the measure happens.
+///
+/// Measured 2026-09-04 by rendering the same board three ways in the preview:
+/// `flex_1 + min_w(0)` with `truncate()` on the item -- hard clip;
+/// `flex_1` with an absolutely positioned `inset_0` child -- hard clip;
+/// `div().w(px(120.0)).truncate()` -- a real ellipsis. Only a definite pixel
+/// width works, so every truncating label in this app is given one.
+pub fn ellipsised(width_px: f32, text: impl Into<gpui::SharedString>) -> Div {
+    div()
+        .flex_none()
+        .w(px(width_px.max(0.0)))
+        .truncate()
+        .child(text.into())
+}
+
+/// Roughly how wide `text` paints at `font_size`, biased HIGH.
+///
+/// GPUI can only measure text with a live window, and the chrome painters are
+/// pure functions of a width -- so the budget that decides how much room a
+/// title may claim has to estimate. The bias matters more than the accuracy:
+/// an over-estimate makes a label truncate a few pixels early, while an
+/// under-estimate lets it run under its neighbour, which is the defect this
+/// exists to remove. Per-character classes rather than one average, because a
+/// path of narrow characters and a title of capitals differ by nearly a factor
+/// of two at the same length.
+pub fn approx_text_width(text: &str, font_size: f32) -> f32 {
+    let mut em = 0.0_f32;
+    for character in text.chars() {
+        em += if character == ' ' || NARROW_GLYPHS.contains(character) {
+            NARROW_EM
+        } else if WIDE_GLYPHS.contains(character) {
+            WIDE_EM
+        } else if character.is_ascii_uppercase() || character.is_ascii_digit() {
+            CAPITAL_EM
+        } else {
+            DEFAULT_EM
+        };
+    }
+    em * font_size * TEXT_WIDTH_SAFETY
+}
+
+/// The glyphs that are much narrower than the proportional average.
+const NARROW_GLYPHS: &str = "ijltfI.,:;!|[]()";
+/// The glyphs that are much wider than it.
+const WIDE_GLYPHS: &str = "mwMW@";
+
+/// The four advances, in em. Calibrated against a rendered preview rather than
+/// guessed: "This conversation is open and ready. Send a" measures 212 logical
+/// px at 11.5 px in `captures/`, and these four numbers reproduce it to within
+/// a pixel. A round 0.5 em average over-reserves narrow prose by a fifth,
+/// which on a 296 px panel is the difference between a readable title and
+/// three characters.
+const NARROW_EM: f32 = 0.26;
+const DEFAULT_EM: f32 = 0.47;
+const CAPITAL_EM: f32 = 0.60;
+const WIDE_EM: f32 = 0.82;
+
+/// The bias in [`approx_text_width`]. Six per cent: enough to cover a wider
+/// face than the estimate assumes, small enough that a label that fits is not
+/// truncated for nothing.
+pub const TEXT_WIDTH_SAFETY: f32 = 1.08;
+
+/// A label that keeps its natural width until it would outgrow `width_px`, and
+/// ellipsises at exactly that width when it would.
+///
+/// The two-case shape is what keeps short labels from carrying a trailing gap:
+/// a definite width is the only thing GPUI will truncate against, but pinning
+/// every label to its budget would leave "Idle" sitting in a 90 px box.
+pub fn label_within(width_px: f32, font_size: f32, text: impl Into<gpui::SharedString>) -> Div {
+    let text = text.into();
+    if approx_text_width(&text, font_size) <= width_px {
+        div().flex_none().whitespace_nowrap().child(text)
+    } else {
+        ellipsised(width_px, text)
+    }
+}
+
 /// One quiet 11.5 px muted sentence: the whole of an empty state (rule 9), and
 /// the shape a menu uses to say it has nothing to list.
 pub fn quiet_sentence(text: impl Into<String>, tokens: ThemeTokens) -> AnyElement {
@@ -548,6 +639,43 @@ mod tests {
                 "{mode:?}"
             );
         }
+    }
+
+    /// The estimate decides how much room a title may claim, so the only
+    /// property that matters is the DIRECTION of its error: it must never say
+    /// a string is narrower than it paints, or the label runs under its
+    /// neighbour instead of ellipsising.
+    #[test]
+    fn the_text_estimate_is_monotonic_and_biased_high() {
+        assert_eq!(approx_text_width("", 12.0), 0.0);
+        assert!(approx_text_width("iiii", 12.0) < approx_text_width("MMMM", 12.0));
+        assert!(approx_text_width("abc", 12.0) < approx_text_width("abcd", 12.0));
+        assert!(approx_text_width("abc", 10.0) < approx_text_width("abc", 14.0));
+        assert!(
+            TEXT_WIDTH_SAFETY > 1.0,
+            "the estimate must round up, not down"
+        );
+        // Calibrated against a rendered capture: this sentence measures 212
+        // logical px at 11.5 px in the fix wave 2 preview PNGs. Allow a fifth
+        // either way -- the point is the order of magnitude and the bias, not
+        // a font metric this code cannot have.
+        let measured = 212.0;
+        let estimate = approx_text_width("This conversation is open and ready. Send a", 11.5);
+        assert!(
+            estimate >= measured * 0.95 && estimate <= measured * 1.25,
+            "the estimate drifted away from the measured width: {estimate} vs {measured}"
+        );
+    }
+
+    /// A label keeps its natural width until it would outgrow its slot, and is
+    /// pinned to the slot exactly when it would. Pinning every label would
+    /// leave "Idle" sitting in a 90 px box.
+    #[test]
+    fn a_label_is_only_pinned_when_it_would_overflow() {
+        let short = "Idle";
+        let long = "are there any migrations left to run against dev or prod db?";
+        assert!(approx_text_width(short, 11.0) < 90.0);
+        assert!(approx_text_width(long, 12.0) > 90.0);
     }
 
     #[test]

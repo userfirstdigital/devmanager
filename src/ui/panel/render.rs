@@ -22,7 +22,9 @@ use gpui::{
 use sha2::{Digest, Sha256};
 
 use crate::client::HostTaskKey;
-use crate::ui::board::layout::{PROVIDER_MARK_SIZE, ROW_STRIPE_WIDTH};
+use crate::ui::board::layout::{
+    ORDINAL_CHIP_FONT_SIZE, ORDINAL_CHIP_PADDING_X, PROVIDER_MARK_SIZE, ROW_STRIPE_WIDTH,
+};
 use crate::ui::board::render::{ordinal_chip, segments_element};
 use crate::ui::board::ProjectColourBook;
 use crate::ui::panel::model::{
@@ -214,8 +216,37 @@ fn status_budget(width_px: f32, blocked: bool) -> f32 {
 /// It used to be the budget itself, which under-counted the icon, the age and
 /// a blocked panel's Retry -- 187 px of text plus a 40 px floor on a 470 px
 /// panel is 227 px for a group that only has 187 to spend.
-fn status_text_max_width(width_px: f32, blocked: bool) -> f32 {
-    (status_budget(width_px, blocked) - status_floor(blocked)).max(0.0)
+fn status_text_max_width(
+    width_px: f32,
+    chrome: &PanelChrome,
+    layout: StatusLayout,
+    blocked: bool,
+) -> f32 {
+    (status_room(width_px, chrome, layout, blocked) - status_fixed_parts(chrome, layout, blocked))
+        .max(0.0)
+}
+
+/// Every pixel the status group actually has: the row less the fixed controls
+/// and less the width the title has already been given.
+///
+/// Never below [`status_floor`], so the icon, the age and a blocked panel's
+/// Retry survive at every width -- `title_width` reserves that floor before it
+/// takes anything, which is what makes the two agree.
+fn status_room(width_px: f32, chrome: &PanelChrome, layout: StatusLayout, blocked: bool) -> f32 {
+    let title = title_width(
+        width_px,
+        chrome,
+        estimated_status_width(chrome, layout, blocked),
+        blocked,
+    );
+    // Bounded by BOTH: what this panel's own controls leave, and the
+    // worst-case budget above. The second is what keeps "the title never runs
+    // under the status" true even when the width estimate is wrong, because
+    // `CONTROLS_RESERVE + title_floor(w) + status_budget(w) == w` holds by
+    // construction at every width and does not depend on an estimate.
+    (width_px - controls_reserve(chrome) - title)
+        .min(status_budget(width_px, blocked))
+        .max(status_floor(blocked))
 }
 
 /// One status glyph at [`INLINE_STATUS_FONT_SIZE`]. The widest of the five is
@@ -249,6 +280,119 @@ fn status_floor(blocked: bool) -> f32 {
         base
     }
 }
+
+/// Roughly how wide the inline status group paints, so the title can be given
+/// the room the status does NOT need.
+///
+/// The budget above answers "how much may the status take"; this answers "how
+/// much is it actually going to take", which is the number the title's own
+/// definite width is the remainder of. Biased high by
+/// [`crate::ui::overlay_chrome::approx_text_width`], and the direction is safe:
+/// over-estimating leaves the title a little narrower, while the status is the
+/// part the design says yields first.
+fn estimated_status_width(chrome: &PanelChrome, layout: StatusLayout, blocked: bool) -> f32 {
+    status_fixed_parts(chrome, layout, blocked)
+        + if layout.show_text {
+            crate::ui::overlay_chrome::approx_text_width(
+                &chrome.status.text,
+                INLINE_STATUS_FONT_SIZE,
+            )
+        } else {
+            0.0
+        }
+}
+
+/// Everything in the status group except the one part that can be truncated.
+///
+/// The parts that are actually present, not the floor's worst case: an idle
+/// panel has no glyph, and "7d" is not the four characters
+/// [`STATUS_AGE_MAX_WIDTH`] reserves. Counting the worst case here spends the
+/// difference out of the TITLE, which on a 296 px panel left it three
+/// characters wide.
+fn status_fixed_parts(chrome: &PanelChrome, layout: StatusLayout, blocked: bool) -> f32 {
+    let mut width =
+        crate::ui::overlay_chrome::approx_text_width(&chrome.status.age, INLINE_STATUS_FONT_SIZE);
+    if chrome.status.icon.is_some() {
+        width += STATUS_ICON_WIDTH + STATUS_GAP;
+    }
+    if layout.show_text {
+        width += 2.0 * STATUS_GAP + STATUS_SEPARATOR_WIDTH;
+    }
+    if blocked {
+        width += STATUS_RETRY_WIDTH + STATUS_GAP;
+    }
+    if chrome.status.progress.is_some() && layout.show_segments {
+        width += STATUS_SEGMENTS_MAX_WIDTH + STATUS_GAP + STATUS_SEPARATOR_WIDTH + STATUS_GAP;
+    }
+    width
+}
+
+/// The middle dot between two status parts, at [`INLINE_STATUS_FONT_SIZE`].
+const STATUS_SEPARATOR_WIDTH: f32 = 8.0;
+/// Six segments, their gaps and the "5/6" count beside them.
+const STATUS_SEGMENTS_MAX_WIDTH: f32 = 90.0;
+
+/// The definite width the title paints at.
+///
+/// GPUI will only ellipsise against a definite width (see
+/// [`crate::ui::overlay_chrome::ellipsised`]), so the title cannot be a
+/// `flex_1` slot and truncate: this is the arithmetic that replaces the flex
+/// line. Everything the status is not going to use is the title's, floored at
+/// [`title_floor`] and capped so the status keeps the parts it may never drop.
+fn title_width(width_px: f32, chrome: &PanelChrome, status_estimate: f32, blocked: bool) -> f32 {
+    let reserve = controls_reserve(chrome);
+    let ceiling = (width_px - reserve - status_floor(blocked)).max(TITLE_MIN_WIDTH);
+    let floor = title_floor(width_px).min(ceiling);
+    (width_px - reserve - status_estimate).clamp(floor, ceiling)
+}
+
+/// What the fixed controls on THIS panel actually take, as opposed to
+/// [`CONTROLS_RESERVE`], which is the worst case every width must survive.
+///
+/// The two are different questions and the budget above needs both: the
+/// worst case is what guarantees the row can never overflow, and the actual is
+/// what decides how much of the leftover the title may have. Spending the
+/// worst case twice is what made the title 23 px wide on a 296 px panel with a
+/// one-digit chip and a four-letter button.
+fn controls_reserve(chrome: &PanelChrome) -> f32 {
+    let mut width = ROW_PADDING_LEFT
+        + ROW_PADDING_X
+        + PROVIDER_MARK_SIZE
+        + ZOOM_AFFORDANCE_WIDTH
+        + MENU_GLYPH_WIDTH
+        + CONTROLS_SAFETY;
+    let mut gaps = 4.0;
+    if chrome.ordinal.is_some() {
+        width += ordinal_chip_width(chrome.ordinal.unwrap_or(1));
+        gaps += 1.0;
+    }
+    width += primary_button_width(chrome.primary);
+    gaps += 1.0;
+    width + gaps * TITLE_ROW_GAP
+}
+
+/// The ordinal chip at its real digit count: two paddings, two border pixels
+/// and the digits themselves.
+fn ordinal_chip_width(ordinal: u8) -> f32 {
+    let digits = if ordinal >= 10 { 2.0 } else { 1.0 };
+    2.0 * ORDINAL_CHIP_PADDING_X + 2.0 + digits * ORDINAL_CHIP_FONT_SIZE * 0.62
+}
+
+/// The primary button at its real label.
+fn primary_button_width(primary: PrimaryAction) -> f32 {
+    let label = match primary {
+        PrimaryAction::Done => "Done",
+        PrimaryAction::Reopen => "Reopen",
+    };
+    crate::ui::overlay_chrome::approx_text_width(label, ACTION_FONT_SIZE)
+        + 2.0 * ACTION_PADDING_X
+        + 2.0
+}
+
+/// Slack on the actual controls, because their widths are estimated and an
+/// under-estimate would push the menu glyph off the right edge rather than
+/// merely narrowing the title.
+const CONTROLS_SAFETY: f32 = 6.0;
 
 /// What the shell does when the chrome is clicked or typed into. The painter
 /// owns no state: it hands the panel's key back and the shell decides.
@@ -362,7 +506,12 @@ fn inline_status_element(
         // squeezed out of its own icon, age and Retry.
         .flex_none()
         .min_w(px(status_floor(blocked)))
-        .max_w(px(status_budget(width_px, blocked)))
+        // The title now claims a DEFINITE width, so the group's ceiling is
+        // what the row has left after it -- never the budget, which assumed
+        // the title had shrunk to its floor. Without this the two definite
+        // widths could sum past the panel and push Done and the menu off the
+        // right edge.
+        .max_w(px(status_room(width_px, chrome, layout, blocked)))
         // The plan strip is `flex_none` and as wide as the plan is long, so the
         // group still clips rather than pushing when a plan outgrows the panel.
         .overflow_hidden()
@@ -378,20 +527,11 @@ fn inline_status_element(
     }
 
     if layout.show_text {
-        row = row.child(
-            div()
-                .flex_shrink()
-                .min_w(px(0.0))
-                .max_w(px(status_text_max_width(width_px, blocked)))
-                .overflow_hidden()
-                // The ellipsis needs a DEFINITE width to be measured against:
-                // GPUI truncates in the text element's measure pass, which only
-                // sees one when `known_dimensions.width` is set. `w_full` on
-                // the inner child resolves against the bounded box above, which
-                // is why the same two-div shape is used for every truncating
-                // label in this app (`task_cockpit::panel::panel_list_row`).
-                .child(div().w_full().truncate().child(chrome.status.text.clone())),
-        );
+        row = row.child(crate::ui::overlay_chrome::label_within(
+            status_text_max_width(width_px, chrome, layout, blocked),
+            INLINE_STATUS_FONT_SIZE,
+            chrome.status.text.clone(),
+        ));
     }
 
     // A blocked panel keeps its Retry at every width: the cause can be dropped
@@ -470,6 +610,10 @@ fn title_row_element(
     let menu_key = chrome.key.clone();
     let on_menu = handlers.on_menu.clone();
 
+    let blocked = matches!(chrome.needs_you, Some(NeedsYou::Blocked { .. }));
+    let status_estimate = estimated_status_width(chrome, layout, blocked);
+    let title_width_px = title_width(width_px, chrome, status_estimate, blocked);
+
     let mut row = div()
         .flex()
         .items_center()
@@ -500,11 +644,7 @@ fn title_row_element(
         .child(
             div()
                 .id(("devmanager-panel-title", element_key))
-                .flex_1()
-                // The floor, not zero, and it widens with the panel: the status
-                // text yields first, and a title squeezed to nothing leaves an
-                // anonymous panel at any width.
-                .min_w(px(title_floor(width_px)))
+                .flex_none()
                 .overflow_hidden()
                 .text_size(px(TITLE_FONT_SIZE))
                 .font_weight(FontWeight::SEMIBOLD)
@@ -512,15 +652,20 @@ fn title_row_element(
                 .tooltip(move |window, app| {
                     gpui_component::tooltip::Tooltip::new(tooltip_text.clone()).build(window, app)
                 })
-                // `truncate()` on the flex item itself gave a HARD clip, not an
-                // ellipsis: a `flex-basis: 0` item is measured with unbounded
-                // available space, so the text element never learns the width
-                // it has to fit and lays out at its full length inside a box
-                // that is `overflow_hidden`. `w_full` on an inner child
-                // resolves against the item's settled width, which is the one
-                // number the measure pass will accept.
-                .child(div().w_full().truncate().child(chrome.title.clone())),
-        );
+                // A DEFINITE width, not a flex slot: GPUI ellipsises only
+                // against one (`overlay_chrome::ellipsised`). The slack the
+                // status does not use is already inside `title_width`, so the
+                // title still grows with the panel -- it just does its growing
+                // in the arithmetic rather than in the flex line.
+                .child(crate::ui::overlay_chrome::label_within(
+                    title_width_px,
+                    TITLE_FONT_SIZE,
+                    chrome.title.clone(),
+                )),
+        )
+        // The slack the estimate over-reserved lands here rather than after the
+        // controls, so the status and the three buttons stay right-aligned.
+        .child(div().flex_1().min_w(px(0.0)));
 
     // The crumb only earns its width when the panel is zoomed; at one-of-eight
     // width the board's stripe and provider mark already say project and
@@ -616,9 +761,41 @@ fn title_row_element(
 /// The five tabs, the active one filled. The three views behind the menu
 /// ([`PaneView::MORE`]) deliberately have no tab: five is what fits at the
 /// width a panel gets as one of eight.
+/// How wide one tab paints: its label plus the padding on both sides.
+fn tab_width(view: PaneView) -> f32 {
+    crate::ui::overlay_chrome::approx_text_width(view.label(), TAB_FONT_SIZE) + 2.0 * TAB_PADDING_X
+}
+
+/// The tabs that fit in a panel of this width, in order.
+///
+/// A tab that does not fit is DROPPED, not clipped: the row had no budget at
+/// all, so at one-of-eight width the last tab was painted as three letters
+/// running off the panel edge ("Brc"), which reads as a rendering fault rather
+/// than as a view you can reach. The selected tab is always kept, wherever it
+/// sits in the order, because the row has to say which view you are looking
+/// at.
+fn tabs_that_fit(width_px: f32, selected: PaneView) -> Vec<PaneView> {
+    let mut budget = width_px - ROW_PADDING_LEFT - ROW_PADDING_X - tab_width(selected) - TAB_GAP;
+    let mut kept: Vec<PaneView> = Vec::with_capacity(PaneView::TABS.len());
+    for view in PaneView::TABS {
+        if view == selected {
+            kept.push(view);
+            continue;
+        }
+        let cost = tab_width(view) + TAB_GAP;
+        if cost > budget {
+            continue;
+        }
+        budget -= cost;
+        kept.push(view);
+    }
+    kept
+}
+
 fn tab_row_element(
     chrome: &PanelChrome,
     tokens: ThemeTokens,
+    width_px: f32,
     element_key: u64,
     handlers: &PanelHandlers,
 ) -> AnyElement {
@@ -636,7 +813,7 @@ fn tab_row_element(
         .border_color(tokens.borders.subtle.to_gpui())
         .text_size(px(TAB_FONT_SIZE));
 
-    for view in PaneView::TABS {
+    for view in tabs_that_fit(width_px, chrome.view) {
         let active = view == chrome.view;
         let select_key = chrome.key.clone();
         let on_select = handlers.on_select_view.clone();
@@ -734,7 +911,13 @@ pub fn panel_chrome_element(
         ));
 
     if !chrome.minimised {
-        column = column.child(tab_row_element(chrome, tokens, element_key, handlers));
+        column = column.child(tab_row_element(
+            chrome,
+            tokens,
+            width_px,
+            element_key,
+            handlers,
+        ));
     }
 
     column.into_any_element()
@@ -827,7 +1010,22 @@ pub fn panel_frame(
                 .bg(stripe.to_gpui()),
         )
         .child(chrome_element)
-        .child(div().flex_1().min_h(px(0.0)).overflow_hidden().child(body));
+        // GPUI's `div()` is `display: block` by default (`Style::default`), and a
+        // BLOCK container gives its child an auto height: the body's own
+        // `flex_1` then means nothing, so the conversation column sized to its
+        // content and left the rest of the panel empty -- the composer floating
+        // near the top with a void under it, and the terminal's one sentence
+        // reading as a raised band. The body slot is a definite-height flex
+        // COLUMN, and it is the only place that decision belongs.
+        .child(
+            div()
+                .flex()
+                .flex_col()
+                .flex_1()
+                .min_h(px(0.0))
+                .overflow_hidden()
+                .child(body),
+        );
 
     match attention {
         // The glow is a second, fainter ring outside the frame rather than a
@@ -1197,23 +1395,109 @@ mod tests {
                     status_budget(width, blocked) >= status_floor(blocked),
                     "at {width} px the status budget sits below its own floor"
                 );
-                assert_eq!(
-                    status_text_max_width(width, blocked),
-                    status_budget(width, blocked) - status_floor(blocked),
-                    "the text cap is not the budget less the floor"
-                );
             }
         }
 
-        // A blocked panel at the tight width has spent everything on its icon,
-        // its age and its Retry: the cause is the part that goes.
-        assert_eq!(status_text_max_width(TIGHT_WIDTH, true), 0.0);
-        assert_eq!(status_text_max_width(TIGHT_WIDTH, false), 33.0);
         // Below the tight width the floor stops shrinking and the budget floors
         // at what the status may never give up rather than going negative.
         assert_eq!(title_floor(100.0), TITLE_MIN_WIDTH);
         assert_eq!(status_budget(100.0, true), status_floor(true));
-        assert_eq!(status_text_max_width(100.0, true), 0.0);
+    }
+
+    /// V2 (fix wave 2): the title is painted at a DEFINITE width, because GPUI
+    /// ellipsises against nothing else. The three facts that width has to have.
+    #[test]
+    fn the_title_width_is_definite_bounded_and_leaves_the_status_its_floor() {
+        let idle = panel_chrome(
+            &row(BoardState::Idle),
+            PaneView::Conversation,
+            false,
+            false,
+            false,
+            None,
+            false,
+            String::new(),
+        );
+        for width in [TIGHT_WIDTH, 300.0, 370.0, 470.0, 1060.0] {
+            let layout = status_layout(width);
+            let estimate = estimated_status_width(&idle, layout, false);
+            let title = title_width(width, &idle, estimate, false);
+            // 1. It never squeezes the title out of existence, and never below
+            //    the floor the budget promises at this width.
+            assert!(
+                title
+                    >= title_floor(width)
+                        .min(width - controls_reserve(&idle) - status_floor(false)),
+                "at {width} px the title fell below its floor"
+            );
+            // 2. Title plus the status floor plus the controls this panel
+            //    actually carries always fit, so the row can never push its
+            //    own buttons off the right edge.
+            assert!(
+                title + status_floor(false) + controls_reserve(&idle) <= width + 0.01,
+                "at {width} px the title row does not fit"
+            );
+            // 3. The status is given exactly what is left, never less than the
+            //    parts it may not drop.
+            let room = status_room(width, &idle, layout, false);
+            assert!(
+                room >= status_floor(false) - 0.01,
+                "at {width} px the status lost its floor"
+            );
+            assert!(
+                status_text_max_width(width, &idle, layout, false) >= 0.0,
+                "the status text cap went negative"
+            );
+        }
+        // Wider panel, wider title: the arithmetic replaced a flex line and
+        // has to keep the behaviour a flex line had.
+        let narrow = title_width(
+            300.0,
+            &idle,
+            estimated_status_width(&idle, status_layout(300.0), false),
+            false,
+        );
+        let wide = title_width(
+            700.0,
+            &idle,
+            estimated_status_width(&idle, status_layout(700.0), false),
+            false,
+        );
+        assert!(wide > narrow, "the title must grow with the panel");
+    }
+
+    /// A tab that does not fit is dropped, not clipped -- and the selected one
+    /// is never the tab that goes, or the row stops saying which view is open.
+    #[test]
+    fn the_tab_row_drops_what_it_cannot_paint() {
+        let all = tabs_that_fit(1200.0, PaneView::Conversation);
+        assert_eq!(
+            all.len(),
+            PaneView::TABS.len(),
+            "a wide panel shows every tab"
+        );
+        for width in [120.0, 200.0, 260.0, 320.0] {
+            for selected in PaneView::TABS {
+                let kept = tabs_that_fit(width, selected);
+                assert!(
+                    kept.contains(&selected),
+                    "at {width} px the selected tab was dropped"
+                );
+                let painted: f32 = kept.iter().map(|view| tab_width(*view) + TAB_GAP).sum();
+                assert!(
+                    painted <= width - ROW_PADDING_LEFT - ROW_PADDING_X + tab_width(selected),
+                    "at {width} px the tab row overflows the panel"
+                );
+                // Order is the canonical one, never re-sorted around the
+                // selection: a row whose tabs move as you click them is worse
+                // than one that drops the last.
+                let canonical: Vec<PaneView> = PaneView::TABS
+                    .into_iter()
+                    .filter(|view| kept.contains(view))
+                    .collect();
+                assert_eq!(kept, canonical, "the tab order changed");
+            }
+        }
     }
 
     /// F8: idle has no verb, so it has no glyph -- otherwise the status opens
@@ -1264,13 +1548,54 @@ mod tests {
         }
     }
 
-    /// Both truncating labels in the title row hang the text off an inner
-    /// `w_full` child. GPUI measures an ellipsis against a DEFINITE width, and
-    /// a `flex-basis: 0` item is measured with unbounded available space, so
-    /// `truncate()` applied to the flex item itself clips hard instead --
-    /// which is what put "C:/Code/userfir" flush against the status in the
-    /// capture. A source scan because the failure is a layout one: no pure
-    /// assertion over the constants can see it.
+    /// V1 (fix wave 2): the panel BODY slot is a definite-height flex COLUMN.
+    ///
+    /// GPUI's `div()` is `display: block` by default, and a block container
+    /// gives its child an auto height -- so the body's own `flex_1` meant
+    /// nothing, the conversation column sized to its content, and the composer
+    /// sat near the top of the panel with a void under it. Every chain of
+    /// `flex_1` below this point was already correct and none of it could
+    /// work. A source scan because the defect is one missing `.flex()`.
+    #[test]
+    fn the_panel_body_slot_is_a_flex_column() {
+        let source = include_str!("render.rs");
+        let frame = source
+            .split("pub fn panel_frame(")
+            .nth(1)
+            .expect("the frame painter")
+            .split("\n#[cfg(test)]")
+            .next()
+            .expect("everything above the tests");
+        let body = frame
+            .split(".child(chrome_element)")
+            .nth(1)
+            .expect("the body slot follows the chrome")
+            .split("match attention")
+            .next()
+            .expect("everything up to the needs-you ring");
+        let compact: String = body.chars().filter(|c| !c.is_whitespace()).collect();
+        assert!(
+            compact.contains(".child(body)"),
+            "the anchor has stopped matching and this test is guarding nothing"
+        );
+        for required in [".flex()", ".flex_col()", ".flex_1()", ".min_h(px(0.0))"] {
+            assert!(
+                compact.contains(required),
+                "the body slot must carry {required}: without it the panel body has no height"
+            );
+        }
+    }
+
+    /// V2 (fix wave 2): both truncating labels in the title row are painted at
+    /// a DEFINITE pixel width, which is the only thing GPUI will ellipsise
+    /// against.
+    ///
+    /// A source scan because the failure is a layout one: `truncate()` on a
+    /// `flex-basis: 0` item, and `truncate()` on a `w_full` child of one, are
+    /// both measured with unbounded available space, so both lay the text out
+    /// at full length and let `overflow_hidden` cut it off -- which is what put
+    /// "C:/Code/userfir" flush against the status in the capture. Both were
+    /// tried, rendered and read back before this test was rewritten.
     #[test]
     fn the_title_and_the_status_text_truncate_against_a_definite_width() {
         let source = include_str!("render.rs");
@@ -1278,18 +1603,29 @@ mod tests {
             .split("#[cfg(test)]")
             .next()
             .expect("the painter is everything above its tests");
+        assert!(
+            painter.contains("fn title_row_element(") && painter.contains("chrome.status.text"),
+            "the anchor has stopped matching and this test is guarding nothing"
+        );
         // Whitespace-stripped so `cargo fmt` breaking the builder chain over
-        // three lines cannot quietly turn either assertion vacuous.
+        // three lines cannot quietly turn an assertion vacuous.
         let compact: String = painter.chars().filter(|c| !c.is_whitespace()).collect();
         assert_eq!(
-            compact.matches(".truncate()").count(),
+            compact.matches("label_within(").count(),
             2,
             "the title row has exactly two truncating labels: the title and the status text"
         );
-        assert_eq!(
-            compact.matches(".w_full().truncate()").count(),
-            2,
-            "every truncating label must resolve its width through an inner w_full child"
+        assert!(
+            compact.contains("label_within(title_width_px,"),
+            "the title must be given the width the row budget computed for it"
+        );
+        assert!(
+            compact.contains("label_within(status_text_max_width("),
+            "the status text must be given the room the budget left it"
+        );
+        assert!(
+            !compact.contains(".w_full().truncate()"),
+            "a percentage width is not a definite width; it clips instead of ellipsising"
         );
     }
 

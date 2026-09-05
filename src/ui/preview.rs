@@ -71,6 +71,215 @@ pub struct PreviewRootFixture {
     pub gallery: Option<ComponentGalleryFixture>,
     #[serde(default)]
     pub conversation: Option<PreviewConversationFixture>,
+    /// Several seeded tasks, so a `task-cockpit` fixture can reproduce the
+    /// board and the panel grid rather than one bare conversation.
+    ///
+    /// Additive: absent is the empty list, which is exactly the single-task
+    /// behaviour every fixture written before fix wave 2 relies on, so the
+    /// schema stays `devmanager.ui.preview/v1` and `deny_unknown_fields` still
+    /// rejects a typo in the name.
+    #[serde(default)]
+    pub tasks: Vec<PreviewTaskFixture>,
+}
+
+/// The provider that owns a seeded task. The board and the panel title paint
+/// its 11 px grey mark from this.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PreviewTaskProvider {
+    #[default]
+    Claude,
+    Codex,
+    Cursor,
+}
+
+/// What the board row and the panel status line say about a seeded task.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PreviewTaskState {
+    #[default]
+    Idle,
+    Working,
+    Question,
+    Blocked,
+    Done,
+}
+
+/// Which view an opened panel starts on. Only the two the redesign's defects
+/// live in; the dock tools are reachable from the tab row itself.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PreviewTaskView {
+    #[default]
+    Conversation,
+    Terminal,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PreviewTaskFixture {
+    pub title: String,
+    #[serde(default)]
+    pub provider: PreviewTaskProvider,
+    #[serde(default)]
+    pub state: PreviewTaskState,
+    /// How long ago this task last moved, in milliseconds. The board prints it
+    /// as the age chip ("4d"), so it is the fixture's clock rather than the
+    /// wall clock.
+    #[serde(default)]
+    pub age_ms: i64,
+    #[serde(default)]
+    pub project: Option<String>,
+    /// Open this task as a panel in the workspace grid.
+    #[serde(default)]
+    pub open: bool,
+    /// The one focused panel. Exactly zero or one task may claim it, and it
+    /// must be open.
+    #[serde(default)]
+    pub focused: bool,
+    #[serde(default)]
+    pub view: PreviewTaskView,
+    #[serde(default)]
+    pub conversation: Option<PreviewConversationFixture>,
+}
+
+pub const MAX_PREVIEW_TASKS: usize = 24;
+pub const MAX_PREVIEW_OPEN_TASKS: usize = 8;
+/// 400 days. Longer than any age the board has a label for, and short enough
+/// that the seeded timestamp cannot go negative on any machine's clock.
+pub const MAX_PREVIEW_TASK_AGE_MS: i64 = 400 * 24 * 60 * 60 * 1000;
+
+/// The fixture's conversation as the two seed vectors the shell installs.
+///
+/// One conversion for every caller: the same mapping used to be written out
+/// three times, and a role added to the fixture would have had to be added to
+/// all three.
+#[cfg(debug_assertions)]
+fn preview_conversation_seed(
+    conversation: &PreviewConversationFixture,
+) -> (
+    Vec<crate::ui::task_cockpit::timeline::PreviewPlanStep>,
+    Vec<crate::ui::task_cockpit::timeline::PreviewConversationMessage>,
+) {
+    let steps = conversation
+        .plan_steps
+        .iter()
+        .map(|step| crate::ui::task_cockpit::timeline::PreviewPlanStep {
+            step_id: step.step_id.clone(),
+            title: step.title.clone(),
+            status: step.status.clone(),
+        })
+        .collect();
+    let messages = conversation
+        .messages
+        .iter()
+        .map(
+            |message| crate::ui::task_cockpit::timeline::PreviewConversationMessage {
+                role: match message.role.as_str() {
+                    "user" => crate::ui::renderers::MessageRole::User,
+                    "assistant" => crate::ui::renderers::MessageRole::Assistant,
+                    "reasoning" => crate::ui::renderers::MessageRole::Reasoning,
+                    "error" => crate::ui::renderers::MessageRole::Error,
+                    _ => unreachable!("preview conversation role was validated"),
+                },
+                text: message.text.clone(),
+            },
+        )
+        .collect();
+    (steps, messages)
+}
+
+/// The fixture's task list as the shell's own seed type.
+#[cfg(debug_assertions)]
+fn preview_task_seeds(
+    tasks: &[PreviewTaskFixture],
+) -> Vec<crate::ui::native_shell::PreviewTaskSeed> {
+    use crate::ui::native_shell::{PreviewTaskSeed, PreviewTaskSeedState};
+    tasks
+        .iter()
+        .map(|task| {
+            let (plan_steps, messages) = task
+                .conversation
+                .as_ref()
+                .map(preview_conversation_seed)
+                .unwrap_or_default();
+            PreviewTaskSeed {
+                title: task.title.clone(),
+                provider: match task.provider {
+                    PreviewTaskProvider::Claude => crate::providers::ProviderKind::ClaudeCode,
+                    PreviewTaskProvider::Codex => crate::providers::ProviderKind::Codex,
+                    PreviewTaskProvider::Cursor => crate::providers::ProviderKind::Cursor,
+                },
+                state: match task.state {
+                    PreviewTaskState::Idle => PreviewTaskSeedState::Idle,
+                    PreviewTaskState::Working => PreviewTaskSeedState::Working,
+                    PreviewTaskState::Question => PreviewTaskSeedState::Question,
+                    PreviewTaskState::Blocked => PreviewTaskSeedState::Blocked,
+                    PreviewTaskState::Done => PreviewTaskSeedState::Done,
+                },
+                age_ms: task.age_ms,
+                project: task.project.clone(),
+                open: task.open,
+                focused: task.focused,
+                terminal_view: matches!(task.view, PreviewTaskView::Terminal),
+                plan_steps,
+                messages,
+            }
+        })
+        .collect()
+}
+
+pub fn validate_preview_tasks(tasks: &[PreviewTaskFixture]) -> Result<(), String> {
+    if tasks.len() > MAX_PREVIEW_TASKS {
+        return Err(format!(
+            "preview fixtures seed at most {MAX_PREVIEW_TASKS} tasks"
+        ));
+    }
+    let mut titles = BTreeSet::new();
+    let mut open = 0usize;
+    let mut focused = 0usize;
+    for task in tasks {
+        if task.title.trim().is_empty() || task.title.chars().count() > 512 {
+            return Err("preview task title is empty or oversized".to_string());
+        }
+        if !titles.insert(task.title.as_str()) {
+            return Err("preview task titles must be unique".to_string());
+        }
+        if task.age_ms < 0 || task.age_ms > MAX_PREVIEW_TASK_AGE_MS {
+            return Err("preview task age is out of range".to_string());
+        }
+        if task
+            .project
+            .as_ref()
+            .is_some_and(|label| label.trim().is_empty() || label.chars().count() > 128)
+        {
+            return Err("preview task project label is empty or oversized".to_string());
+        }
+        if task.focused && !task.open {
+            return Err("a focused preview task must also be open".to_string());
+        }
+        if task.open {
+            open += 1;
+        }
+        if task.focused {
+            focused += 1;
+        }
+        if let Some(conversation) = task.conversation.as_ref() {
+            conversation.validate()?;
+        }
+    }
+    if open > MAX_PREVIEW_OPEN_TASKS {
+        return Err(format!(
+            "preview fixtures open at most {MAX_PREVIEW_OPEN_TASKS} panels"
+        ));
+    }
+    if focused > 1 {
+        return Err("only one preview task may be focused".to_string());
+    }
+    if focused == 0 && open > 0 {
+        return Err("an opened preview workspace needs one focused task".to_string());
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -552,6 +761,7 @@ pub struct PreviewRootSnapshot {
     pub body: String,
     pub component_gallery: Option<ComponentGalleryFixture>,
     pub conversation: Option<PreviewConversationFixture>,
+    pub tasks: Vec<PreviewTaskFixture>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -703,6 +913,17 @@ impl PreviewApplication {
             }
             (_, None) => None,
         };
+        let tasks = fixture.root.tasks;
+        if !tasks.is_empty() && fixture.root.kind != "task-cockpit" {
+            return Err(PreviewError::MalformedFixture {
+                path: request.fixture_path,
+                message: "seeded tasks require a task-cockpit root".into(),
+            });
+        }
+        validate_preview_tasks(&tasks).map_err(|message| PreviewError::MalformedFixture {
+            path: request.fixture_path.clone(),
+            message,
+        })?;
         let is_task_cockpit = fixture.root.kind == "task-cockpit";
         let body = if is_task_cockpit {
             format!(
@@ -719,6 +940,7 @@ impl PreviewApplication {
             title: fixture.title,
             component_gallery,
             conversation,
+            tasks,
         };
         Ok(Self {
             request,
@@ -903,38 +1125,29 @@ impl PreviewRoot {
         })?;
         let shell = cx.new(|cx| NativeShell::new_for_headless(profile, cx));
         #[cfg(debug_assertions)]
-        if let Some(conversation) = self.snapshot.conversation.as_ref() {
-            let steps = conversation
-                .plan_steps
-                .iter()
-                .map(|step| crate::ui::task_cockpit::timeline::PreviewPlanStep {
-                    step_id: step.step_id.clone(),
-                    title: step.title.clone(),
-                    status: step.status.clone(),
-                })
-                .collect();
-            let messages = conversation
-                .messages
-                .iter()
-                .map(
-                    |message| crate::ui::task_cockpit::timeline::PreviewConversationMessage {
-                        role: match message.role.as_str() {
-                            "user" => crate::ui::renderers::MessageRole::User,
-                            "assistant" => crate::ui::renderers::MessageRole::Assistant,
-                            "reasoning" => crate::ui::renderers::MessageRole::Reasoning,
-                            "error" => crate::ui::renderers::MessageRole::Error,
-                            _ => unreachable!("preview conversation role was validated"),
-                        },
-                        text: message.text.clone(),
-                    },
-                )
-                .collect();
-            let _ = shell.update(cx, |shell, _cx| {
-                shell.install_preview_conversation(steps, messages)
-            });
-        }
+        self.seed_shell(&shell, cx);
         self.native_shell = Some(shell);
         Ok(self)
+    }
+
+    /// Seed whatever the fixture asked for into a freshly built shell.
+    ///
+    /// One seam for both instantiation paths, so the headless report and the
+    /// captured PNG can never be looking at two differently seeded shells.
+    #[cfg(debug_assertions)]
+    fn seed_shell(&self, shell: &gpui::Entity<NativeShell>, cx: &mut gpui::App) {
+        if !self.snapshot.tasks.is_empty() {
+            let seeds = preview_task_seeds(&self.snapshot.tasks);
+            let _ = shell.update(cx, |shell, cx| shell.install_preview_tasks(&seeds, cx));
+            return;
+        }
+        let Some(conversation) = self.snapshot.conversation.as_ref() else {
+            return;
+        };
+        let (steps, messages) = preview_conversation_seed(conversation);
+        let _ = shell.update(cx, |shell, _cx| {
+            shell.install_preview_conversation(steps, messages)
+        });
     }
 
     /// Visible capture owns the one real isolated host/runtime. The host
@@ -953,56 +1166,46 @@ impl PreviewRoot {
                 reason: format!("preview native shell profile: {error}"),
             }
         })?;
-        let mut bootstrap = ProcessNativeHostBootstrap;
-        let attachment = bootstrap.start_until(&profile, deadline).map_err(|error| {
-            PreviewError::ApplicationFailed {
-                reason: error.to_string(),
+        // A fixture that seeds its own tasks must NOT start a host: the host's
+        // first `ClientModel` would replace the seeded one, and the panels the
+        // fixture asked for would vanish a few hundred milliseconds into the
+        // capture. There is nothing for a host to serve here, so the seeded
+        // capture uses the same headless shell the init report does.
+        let seeded = {
+            #[cfg(debug_assertions)]
+            {
+                !self.snapshot.tasks.is_empty()
             }
-        })?;
-        let shell = match attachment {
-            NativeHostRuntimeAttachment::Client(runtime) => {
-                cx.new(|cx| NativeShell::new_with_host_runtime(profile, Some(runtime), cx))
+            #[cfg(not(debug_assertions))]
+            {
+                false
             }
-            NativeHostRuntimeAttachment::Injected(runtime) => cx.new(|cx| {
-                NativeShell::new_with_host_runtime_port(
-                    profile,
-                    runtime,
-                    RuntimePreferencesSnapshot::default(),
-                    cx,
-                )
-            }),
+        };
+        let shell = if seeded {
+            cx.new(|cx| NativeShell::new_for_headless(profile, cx))
+        } else {
+            let mut bootstrap = ProcessNativeHostBootstrap;
+            let attachment = bootstrap.start_until(&profile, deadline).map_err(|error| {
+                PreviewError::ApplicationFailed {
+                    reason: error.to_string(),
+                }
+            })?;
+            match attachment {
+                NativeHostRuntimeAttachment::Client(runtime) => {
+                    cx.new(|cx| NativeShell::new_with_host_runtime(profile, Some(runtime), cx))
+                }
+                NativeHostRuntimeAttachment::Injected(runtime) => cx.new(|cx| {
+                    NativeShell::new_with_host_runtime_port(
+                        profile,
+                        runtime,
+                        RuntimePreferencesSnapshot::default(),
+                        cx,
+                    )
+                }),
+            }
         };
         #[cfg(debug_assertions)]
-        if let Some(conversation) = self.snapshot.conversation.as_ref() {
-            let steps = conversation
-                .plan_steps
-                .iter()
-                .map(|step| crate::ui::task_cockpit::timeline::PreviewPlanStep {
-                    step_id: step.step_id.clone(),
-                    title: step.title.clone(),
-                    status: step.status.clone(),
-                })
-                .collect();
-            let messages = conversation
-                .messages
-                .iter()
-                .map(
-                    |message| crate::ui::task_cockpit::timeline::PreviewConversationMessage {
-                        role: match message.role.as_str() {
-                            "user" => crate::ui::renderers::MessageRole::User,
-                            "assistant" => crate::ui::renderers::MessageRole::Assistant,
-                            "reasoning" => crate::ui::renderers::MessageRole::Reasoning,
-                            "error" => crate::ui::renderers::MessageRole::Error,
-                            _ => unreachable!("preview conversation role was validated"),
-                        },
-                        text: message.text.clone(),
-                    },
-                )
-                .collect();
-            let _ = shell.update(cx, |shell, _cx| {
-                shell.install_preview_conversation(steps, messages)
-            });
-        }
+        self.seed_shell(&shell, cx);
         self.native_shell = Some(shell);
         Ok(self)
     }
@@ -1471,3 +1674,152 @@ impl Display for PreviewError {
 }
 
 impl Error for PreviewError {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn fixture(tasks_json: &str) -> Result<PreviewFixture, serde_json::Error> {
+        let body = format!(
+            r#"{{"schema":"devmanager.ui.preview/v1","id":"t","title":"t",
+                 "root":{{"kind":"task-cockpit","label":"Task Cockpit","tasks":{tasks_json}}}}}"#
+        );
+        serde_json::from_str(&body)
+    }
+
+    /// The whole point of the extension: one fixture can stand up several
+    /// tasks, each with its own provider, state, age, panel and conversation.
+    #[test]
+    fn a_task_cockpit_fixture_seeds_several_tasks() {
+        let parsed = fixture(
+            r#"[
+              {"title":"one","provider":"claude","state":"idle","age_ms":1000,
+               "open":true,"focused":true,"view":"conversation",
+               "conversation":{"messages":[{"role":"user","text":"hi"}]}},
+              {"title":"two","provider":"codex","state":"blocked","open":true,"view":"terminal"},
+              {"title":"three","provider":"cursor","state":"question"}
+            ]"#,
+        )
+        .expect("the fixture parses");
+        let tasks = &parsed.root.tasks;
+        assert_eq!(tasks.len(), 3, "every seeded task survives the parse");
+        assert_eq!(tasks[0].provider, PreviewTaskProvider::Claude);
+        assert_eq!(tasks[0].state, PreviewTaskState::Idle);
+        assert_eq!(tasks[0].age_ms, 1_000);
+        assert!(tasks[0].open && tasks[0].focused);
+        assert_eq!(tasks[0].view, PreviewTaskView::Conversation);
+        assert_eq!(
+            tasks[0]
+                .conversation
+                .as_ref()
+                .expect("task one carries a conversation")
+                .messages
+                .len(),
+            1
+        );
+        assert_eq!(tasks[1].view, PreviewTaskView::Terminal);
+        assert_eq!(tasks[1].state, PreviewTaskState::Blocked);
+        // The defaults are the quiet ones, so an existing fixture that says
+        // nothing about a field keeps behaving as it did.
+        assert!(!tasks[2].open && !tasks[2].focused);
+        assert_eq!(tasks[2].view, PreviewTaskView::Conversation);
+        assert!(tasks[2].conversation.is_none());
+        validate_preview_tasks(tasks).expect("the seeded tasks validate");
+    }
+
+    /// Additive: a fixture written before the extension parses unchanged, with
+    /// no tasks, which is exactly the single-conversation behaviour it relies
+    /// on.
+    #[test]
+    fn a_fixture_without_tasks_still_parses_and_seeds_none() {
+        let parsed: PreviewFixture = serde_json::from_str(
+            r#"{"schema":"devmanager.ui.preview/v1","id":"t","title":"t",
+                "root":{"kind":"task-cockpit","label":"Task Cockpit"}}"#,
+        )
+        .expect("the older shape parses");
+        assert!(parsed.root.tasks.is_empty());
+        validate_preview_tasks(&parsed.root.tasks).expect("no tasks is valid");
+    }
+
+    /// `deny_unknown_fields` still holds, on the root AND on the new task
+    /// shape: a typo in a field name has to be a parse error, not a silently
+    /// ignored instruction.
+    #[test]
+    fn unknown_fields_are_still_rejected() {
+        assert!(fixture(r#"[{"title":"one","provder":"claude"}]"#).is_err());
+        assert!(serde_json::from_str::<PreviewFixture>(
+            r#"{"schema":"devmanager.ui.preview/v1","id":"t","title":"t",
+                "root":{"kind":"task-cockpit","label":"L","taks":[]}}"#
+        )
+        .is_err());
+    }
+
+    /// The rules that make a seeded workspace paintable at all.
+    #[test]
+    fn the_seed_rules_are_enforced() {
+        let one = |json: &str| fixture(json).expect("parses").root.tasks;
+        // A focused task must be open, or the workspace has a focus with no pane.
+        assert!(validate_preview_tasks(&one(r#"[{"title":"a","focused":true}]"#)).is_err());
+        // Exactly one focus.
+        assert!(validate_preview_tasks(&one(
+            r#"[{"title":"a","open":true,"focused":true},{"title":"b","open":true,"focused":true}]"#
+        ))
+        .is_err());
+        // An opened workspace needs one.
+        assert!(validate_preview_tasks(&one(r#"[{"title":"a","open":true}]"#)).is_err());
+        // Titles identify the seeded rows, so they must be unique and present.
+        assert!(validate_preview_tasks(&one(r#"[{"title":"a"},{"title":"a"}]"#)).is_err());
+        assert!(validate_preview_tasks(&one(r#"[{"title":"  "}]"#)).is_err());
+        // The age is a duration, not a timestamp.
+        assert!(validate_preview_tasks(&one(r#"[{"title":"a","age_ms":-1}]"#)).is_err());
+        // Bounded, so a fixture cannot ask for a thousand panels.
+        let many: Vec<String> = (0..=MAX_PREVIEW_TASKS)
+            .map(|index| format!(r#"{{"title":"t{index}"}}"#))
+            .collect();
+        let many = format!("[{}]", many.join(","));
+        assert!(validate_preview_tasks(&one(&many)).is_err());
+        let open: Vec<String> = (0..=MAX_PREVIEW_OPEN_TASKS)
+            .map(|index| {
+                format!(
+                    r#"{{"title":"t{index}","open":true{}}}"#,
+                    if index == 0 { r#","focused":true"# } else { "" }
+                )
+            })
+            .collect();
+        let open = format!("[{}]", open.join(","));
+        assert!(validate_preview_tasks(&one(&open)).is_err());
+    }
+
+    /// Seeded tasks are a task-cockpit thing. A gallery fixture carrying them
+    /// is a fixture that would silently paint none of them.
+    #[test]
+    fn seeded_tasks_require_a_task_cockpit_root() {
+        let parsed: PreviewFixture = serde_json::from_str(
+            r#"{"schema":"devmanager.ui.preview/v1","id":"t","title":"t",
+                "root":{"kind":"minimal","label":"L","tasks":[{"title":"a"}]}}"#,
+        )
+        .expect("the shape itself parses");
+        assert_eq!(parsed.root.kind, "minimal");
+        assert!(!parsed.root.tasks.is_empty());
+        // `PreviewApplication::load` is what refuses it; this asserts the pair
+        // the refusal is written against.
+    }
+
+    /// The fixtures this wave rendered its evidence from are committed and
+    /// still valid, so a later change that breaks the schema breaks a test
+    /// rather than a capture nobody re-runs.
+    #[test]
+    fn the_committed_panel_fixtures_are_valid() {
+        for body in [
+            include_str!("../../tests/fixtures/ui/task-cockpit-panel-grid.json"),
+            include_str!("../../tests/fixtures/ui/task-cockpit-two-panels.json"),
+        ] {
+            let parsed: PreviewFixture =
+                serde_json::from_str(body).expect("the committed fixture parses");
+            assert_eq!(parsed.schema, PREVIEW_SCHEMA);
+            assert_eq!(parsed.root.kind, "task-cockpit");
+            assert!(parsed.root.tasks.len() >= 4);
+            validate_preview_tasks(&parsed.root.tasks).expect("the committed fixture validates");
+        }
+    }
+}

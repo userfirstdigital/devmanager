@@ -145,6 +145,15 @@ pub const COMPOSER_INPUT_MAX_HEIGHT: f32 =
     COMPOSER_MAX_VISIBLE_LINES * COMPOSER_LINE_HEIGHT + 2.0 * COMPOSER_PADDING_Y;
 /// The meta line under the field: one 10.5 px muted row whose right end is the
 /// attach affordance, so it is rule 4's 24 px icon hit box tall.
+/// The composer field is a PILL: fully rounded, i.e. radius half its resting
+/// height (the reference capture, 2026-09-04). It keeps that radius as it
+/// grows to six lines, which is what a rounded input does in every app that
+/// has one.
+pub const COMPOSER_PILL_RADIUS: f32 = COMPOSER_INPUT_MIN_HEIGHT / 2.0;
+/// A pill needs more horizontal padding than a rectangle: the first glyph must
+/// clear the arc rather than sit inside it.
+pub const COMPOSER_PILL_PADDING_X: f32 = COMPOSER_PADDING_X + COMPOSER_PILL_RADIUS / 2.0;
+
 pub const COMPOSER_META_ROW_HEIGHT: f32 = COMPOSER_ICON_BUTTON_SIZE;
 /// How much room the stream above the composer yields to it.
 ///
