@@ -10,8 +10,8 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use gpui::{
-    div, px, AnyElement, AppContext, ClickEvent, Context, Entity, FontWeight, IntoElement,
-    ParentElement, SharedString, Styled, Window,
+    div, px, AnyElement, AppContext, ClickEvent, Context, Entity, IntoElement, ParentElement,
+    SharedString, Styled, Window,
 };
 use gpui_component::button::{Button, ButtonVariants};
 use gpui_component::input::{Input, InputState};
