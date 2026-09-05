@@ -292,6 +292,12 @@ impl<K: Clone + Ord + Eq> KeyedWorkspaceLayout<K> {
         self.sanitize_task_workspace();
         self.adopt_legacy_terminal_preferences();
         self.restore_minimised_panes();
+        // The right dock is retired (spec 6.2: its tools are panel views). A
+        // file written before it was retired can still carry an expanded dock,
+        // and honouring that would put a second Files panel on screen beside
+        // the panel already showing Files. Forced here rather than at the
+        // paint so exactly one place decides it.
+        self.dock_collapsed = true;
         self
     }
 
@@ -776,6 +782,55 @@ fn replace_file(temporary: &Path, destination: &Path) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Ruling (f): Done on a ZOOMED panel must not leave the workspace zoomed
+    /// on a pane that no longer exists.
+    ///
+    /// Done settles the task, the task leaves the live projection, and THIS is
+    /// the pass that removes its pane -- so the invariant is asserted where it
+    /// actually has to hold, not on `remove_pane` in isolation.
+    #[test]
+    fn settling_a_zoomed_task_removes_its_pane_and_leaves_nothing_zoomed() {
+        let settled = TaskId::new();
+        let survivor = TaskId::new();
+        let mut workspace = crate::ui::task_workspace::TaskWorkspace::single(survivor);
+        workspace
+            .insert_after_focused(settled, crate::ui::task_workspace::Axis::Horizontal)
+            .expect("second pane");
+        let zoomed_pane = workspace.pane_for_task(settled).expect("settled pane").id;
+        workspace
+            .zoom(zoomed_pane)
+            .expect("zoom the pane Done acts on");
+        assert_eq!(workspace.zoomed(), Some(zoomed_pane));
+
+        let mut layout = WorkspaceLayout {
+            selected_task: Some(survivor),
+            task_workspace: Some(workspace),
+            ..WorkspaceLayout::default()
+        };
+        layout.reconcile_task_workspace(&[survivor]);
+
+        let workspace = layout.task_workspace.as_ref().expect("workspace survives");
+        assert_eq!(workspace.pane_count(), 1);
+        assert!(!workspace.contains_task(settled));
+        assert_eq!(
+            workspace.zoomed(),
+            None,
+            "a zoom pointing at a removed pane would fill the canvas with nothing"
+        );
+    }
+
+    /// The right dock is retired: a file written before it was, which carries
+    /// an expanded dock, must not reopen it beside the panel already showing
+    /// the same tool.
+    #[test]
+    fn a_stored_expanded_dock_loads_collapsed() {
+        let layout = WorkspaceLayout {
+            dock_collapsed: false,
+            ..WorkspaceLayout::default()
+        };
+        assert!(layout.sanitized().dock_collapsed);
+    }
 
     #[test]
     fn stored_layout_round_trips_through_the_profile_store() {

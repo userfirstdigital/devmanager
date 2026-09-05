@@ -89,12 +89,17 @@ use crate::remote::web::image_paste::{
 };
 use crate::remote::RemoteImageAttachment;
 use crate::ui::actions::{
-    self, DockTool, HostActions, HostStatus, KeyboardAction, KeyboardModel, KeyboardShortcut,
-    NativeCycleTerminal, NativeCycleTerminalBack, NativeDismissTransient, NativeDockArtifacts,
-    NativeDockBrowser, NativeDockChanges, NativeDockFiles, NativeDockReview, NativeDockServices,
-    NativeDockTerminal, NativeOpenCommandPalette, NativeOpenPalette, NativeOpenShellTerminal,
-    NativeOpenTaskSwitcher, NativeOpenTerminal, NativeResetLayout, NativeToggleDock,
-    NativeToggleSidebar, NativeToggleTerminal, TaskCreate, TaskListAction, TaskRename, TaskShow,
+    self, keyboard_action_yields_to_armed_terminal, ArrowKey, DockTool, HostActions, HostStatus,
+    KeyboardAction, KeyboardModel, KeyboardShortcut, NativeCycleTerminal, NativeCycleTerminalBack,
+    NativeDismissTransient, NativeDockArtifacts, NativeDockBrowser, NativeDockChanges,
+    NativeDockFiles, NativeDockReview, NativeDockServices, NativeDockTerminal,
+    NativeOpenCommandPalette, NativeOpenPalette, NativeOpenShellTerminal, NativeOpenTaskSwitcher,
+    NativeOpenTerminal, NativePanelFocusDown, NativePanelFocusLeft, NativePanelFocusRight,
+    NativePanelFocusUp, NativePanelMoveDown, NativePanelMoveLeft, NativePanelMoveRight,
+    NativePanelMoveUp, NativePanelSettle, NativePanelView1, NativePanelView2, NativePanelView3,
+    NativePanelView4, NativePanelView5, NativePanelZoom, NativeResetLayout, NativeToggleDock,
+    NativeToggleSidebar, NativeToggleTerminal, ShortcutKey, TaskCreate, TaskListAction, TaskRename,
+    TaskShow,
 };
 use crate::ui::agent_connection::{
     connect_canvas_copy, inbox_agent_actions, placeholder_task_title, settings_row_copy,
@@ -106,6 +111,14 @@ use crate::ui::components::text_field::{TextField, TextFieldKey};
 use crate::ui::components::{
     AccessibilityMetadata, AccessibleRole, ActionEvent, ActionRequest, ActivationSource,
     InteractionStateModel,
+};
+use crate::ui::panel::permission::{
+    permission_dock_element, permission_names_a_file, PermissionHandlers,
+};
+use crate::ui::panel::{
+    more_views, panel_chrome, panel_chrome_element, panel_frame, panel_key_action, panel_menu_rows,
+    NeedsYou, PanelChrome, PanelHandlers, PanelKeyAction, PanelMenuItem, PrimaryAction,
+    TAB_ROW_HEIGHT, TITLE_ROW_HEIGHT,
 };
 use crate::ui::prompts::mutation::apply_host_reply_to_session;
 use crate::ui::prompts::{PromptLibraryKey, PromptLibrarySession};
@@ -156,7 +169,7 @@ use crate::terminal::protocol::{
 };
 use crate::ui::board::layout::BOARD_RAIL_WIDTH;
 use crate::ui::board::render::{
-    board_row_element_id, ordinal_chip, render_board, BoardHeaderHandlers, BoardRowHandlers,
+    board_row_element_id, render_board, BoardHeaderHandlers, BoardRowHandlers,
 };
 use crate::ui::board::{
     board_activity, board_state_of, build_board_model, BoardActivity, BoardGroup, BoardModel,
@@ -431,6 +444,9 @@ const T3_WORKSPACE_TOPBAR_HEIGHT: f32 = 32.0;
 const BOARD_MENU_WIDTH: f32 = 220.0;
 const BOARD_MENU_LEFT_INSET: f32 = 8.0;
 const BOARD_MENU_TOP_INSET: f32 = 30.0;
+/// The panel ⋯ menu is wider than the board's: its rows carry a shortcut
+/// column ("Move ← ↑ ↓ →" plus "Shift+Ctrl+arrows"), which the board's do not.
+const PANE_MENU_WIDTH: f32 = 260.0;
 const T3_SIDEBAR_NAV_TOP_INSET: f32 = 12.0;
 const CONVERSATION_COMPOSER_PLACEHOLDER: &str =
     crate::ui::native_composer::NATIVE_COMPOSER_PLACEHOLDER;
@@ -1408,6 +1424,50 @@ fn stable_task_element_key(task_id: TaskId, suffix: &str) -> u64 {
         .try_into()
         .expect("sha256 prefixes are always eight bytes");
     u64::from_le_bytes(bytes)
+}
+
+/// The accessibility id of one panel's view tab.
+///
+/// The painted tab's own GPUI id is a tuple of the label and the panel digest,
+/// which no accessibility tree can carry, so the tree names the same tab in a
+/// form a screen reader (and `activate_accessibility_element`) can round-trip.
+/// One builder for the publish and the activation, so they cannot drift.
+fn panel_view_tab_element_id(key: &HostTaskKey, view: PaneView) -> String {
+    format!(
+        "native-panel-tab-{}-{:016x}",
+        view.label().to_ascii_lowercase(),
+        stable_host_task_element_key(key, "pane")
+    )
+}
+
+/// The accessibility id of one panel's single primary action.
+fn panel_primary_element_id(key: &HostTaskKey) -> String {
+    format!(
+        "native-panel-primary-{:016x}",
+        stable_host_task_element_key(key, "pane")
+    )
+}
+
+/// Whether the shell must leave this chord to an armed provider terminal.
+///
+/// Ruling (a): while terminal input is armed, Ctrl+D is EOF and the Ctrl+arrows
+/// are word motion, so those three chords belong to the program on the other
+/// end of the PTY. Declining means returning WITHOUT stopping propagation,
+/// which is what leaves the keystroke reaching the terminal exactly as it does
+/// today.
+///
+/// A free function taking `armed` rather than a method reading it, so both
+/// branches are testable without a live PTY -- the armed branch is the one that
+/// cannot be reached from a headless shell, and it is the one that matters.
+fn armed_terminal_declines_chord(
+    keyboard: &KeyboardModel,
+    shortcut: KeyboardShortcut,
+    terminal_armed: bool,
+) -> bool {
+    terminal_armed
+        && keyboard
+            .resolve(shortcut)
+            .is_some_and(keyboard_action_yields_to_armed_terminal)
 }
 
 fn stable_host_task_element_key(key: &HostTaskKey, suffix: &str) -> u64 {
@@ -4599,6 +4659,22 @@ enum BoardMenu {
     NewTask,
     /// The header's `⋯`: archived view, rail, density.
     Options,
+}
+
+/// The panel's ⋯ menu, and the panel it belongs to.
+///
+/// The owner is carried rather than read from the selection because the menu
+/// outlives a click somewhere else: a menu opened on panel three must keep
+/// acting on panel three even if the pointer lands on panel one behind it.
+#[derive(Clone, Debug, PartialEq)]
+struct PaneMenu {
+    owner: HostTaskKey,
+    position: Point<Pixels>,
+    /// The "More views ▸" submenu is disclosed in place rather than as a
+    /// second popover: one overlay, one dismissal.
+    more_views_open: bool,
+    /// Delete confirms. The first press arms; the second deletes.
+    confirming_delete: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -11519,6 +11595,22 @@ pub struct NativeShell {
     project_colours: ProjectColourBook,
     /// Which board header menu is open, if either.
     board_menu: Option<BoardMenu>,
+    /// The panel ⋯ menu, and which panel opened it.
+    pane_menu: Option<PaneMenu>,
+    /// Whether the retired dock has already said so. Once per process: the
+    /// gesture is reachable from a menu row and a chord, and a line per press
+    /// would bury the log it is meant to be found in.
+    dock_retirement_logged: bool,
+    /// Tools a person has said "Always for this task" about: `(owner, verb)`,
+    /// where the verb is the first word of the approval summary ("Bash",
+    /// "Write"). Deliberately in memory only and deliberately per task -- the
+    /// spec's rule is that it grants for the remainder of the task and never
+    /// writes to the provider's global settings, so a restart must ask again.
+    auto_allow: HashSet<(HostTaskKey, String)>,
+    /// The rects the last paint actually gave the panes. Directional focus and
+    /// pane moves are questions about what is on screen, so they are answered
+    /// from what was on screen rather than from a nominal probe.
+    workspace_allocation: crate::ui::task_workspace::AllocatedWorkspace<HostTaskKey>,
     /// Plan progress and doing-now per task, keyed by the marker
     /// `TaskSurfaceRegistry::conversation_facts` returns. Recomputed only when
     /// that marker moves: the board repaints on every frame and on every
@@ -12599,6 +12691,10 @@ impl NativeShell {
             board_done_expanded: false,
             project_colours,
             board_menu: None,
+            pane_menu: None,
+            dock_retirement_logged: false,
+            auto_allow: HashSet::new(),
+            workspace_allocation: crate::ui::task_workspace::AllocatedWorkspace::default(),
             board_activity_cache: HashMap::new(),
             task_search: TaskSearchState::default(),
             project_scope_menu: ProjectScopeMenuState::default(),
@@ -14372,7 +14468,7 @@ impl NativeShell {
             );
         }
         if self.local_slot().cockpit.active_tool() == CockpitDockTool::Changes
-            && !self.layout.dock_collapsed
+            && (!self.layout.dock_collapsed || self.workspace_shows_view(PaneView::Changes))
         {
             if let Some(task_id) = self.local_slot().interaction.selected_task() {
                 let selected = self.selected_repository_for_task(task_id);
@@ -14416,7 +14512,7 @@ impl NativeShell {
             }
         }
         if self.local_slot_mut().cockpit.active_tool() == CockpitDockTool::Browser
-            && !self.layout.dock_collapsed
+            && (!self.layout.dock_collapsed || self.workspace_shows_view(PaneView::Browser))
         {
             for (id, label, description) in [
                 (
@@ -14452,6 +14548,38 @@ impl NativeShell {
                     "Enter a URL for the task browser.",
                 )
                 .gpui("native-browser-address", true, true),
+            );
+        }
+        // Every open panel publishes its five view tabs and its one primary
+        // action. The chrome is painted from `PanelChrome`, and a screen
+        // reader that could not name the tabs would be reading a panel with no
+        // way to change what it shows.
+        for (owner, view, done) in self.workspace_panel_accessibility_rows() {
+            for tab in PaneView::TABS {
+                overlay_nodes.push(
+                    AccessibilityNode::new(
+                        AccessibleRole::Button,
+                        tab.label(),
+                        format!("Show the {} view in this panel.", tab.label()),
+                    )
+                    .gpui(
+                        panel_view_tab_element_id(&owner, tab),
+                        true,
+                        tab != view,
+                    ),
+                );
+            }
+            overlay_nodes.push(
+                AccessibilityNode::new(
+                    AccessibleRole::Button,
+                    if done { "Reopen" } else { "Done" },
+                    if done {
+                        "Reopen this task and give it a panel again."
+                    } else {
+                        "Mark this task done and close its panel."
+                    },
+                )
+                .gpui(panel_primary_element_id(&owner), true, true),
             );
         }
         if !overlay_nodes.is_empty() {
@@ -24624,7 +24752,11 @@ impl NativeShell {
             .as_ref()
             .map(|workspace| workspace.pane_count())
             .unwrap_or(0);
-        if pane_count <= 1 {
+        // One pane is still a PANEL: it wears the same two-row chrome, the same
+        // tabs and the same one primary action as one of eight. The old
+        // short-circuit painted a bare conversation with no title row, no view
+        // tabs and no Done at exactly the width where they are easiest to read.
+        if pane_count == 0 {
             let Some(owner) = self.selected_task_key.clone() else {
                 return self.idle_conversation_photo_surface(tokens, Some(workspace_size));
             };
@@ -24662,18 +24794,20 @@ impl NativeShell {
             };
             return self.task_conversation_surface_for(owner, true, tokens, workspace_size, cx);
         };
-        // One map per frame, shared by every pane header and identical to the
-        // one the board rows read: the row's number and the panel's number are
-        // the same number by construction, not by two call sites agreeing.
-        let ordinals = self.workspace_pane_ordinals();
-        let workspace = self.render_task_workspace_node(
-            root,
-            &allocated,
-            &ordinals,
-            tokens,
-            workspace_size,
-            cx,
-        );
+        // The panels read the board's own rows, so a panel and its row can
+        // never say two different things about one task -- including the
+        // ordinal chip, which is `row.open` rather than a second lookup.
+        let rows: HashMap<HostTaskKey, BoardRow> = self
+            .board_rows(unix_time_ms())
+            .into_iter()
+            .map(|row| (row.key.clone(), row))
+            .collect();
+        // Directional focus and pane moves are questions about what is on
+        // screen, so the rects that answered them are the ones this frame
+        // actually used.
+        self.workspace_allocation = allocated.clone();
+        let workspace =
+            self.render_task_workspace_node(root, &allocated, &rows, tokens, workspace_size, cx);
         div().size_full().child(workspace).into_any_element()
     }
 
@@ -24681,7 +24815,7 @@ impl NativeShell {
         &mut self,
         node: &TaskWorkspaceViewNode<HostTaskKey>,
         allocated: &crate::ui::task_workspace::AllocatedWorkspace<HostTaskKey>,
-        ordinals: &HashMap<HostTaskKey, u8>,
+        rows: &HashMap<HostTaskKey, BoardRow>,
         tokens: crate::ui::tokens::ThemeTokens,
         workspace_size: Size<Pixels>,
         cx: &mut Context<Self>,
@@ -24692,8 +24826,19 @@ impl NativeShell {
                     .rect(pane.task_id.clone())
                     .map(|rect| size(px(rect.width), px(rect.height)))
                     .unwrap_or(workspace_size);
-                let ordinal = ordinals.get(&pane.task_id).copied();
-                self.render_task_workspace_pane(pane, ordinal, tokens, pane_size, cx)
+                // A pane with no board row is a pane for a task the fleet
+                // projection has dropped. It keeps its chrome from a minimal
+                // Idle row rather than vanishing mid-frame, and the row's
+                // absence is what the empty status says.
+                let fallback;
+                let row = match rows.get(&pane.task_id) {
+                    Some(row) => row,
+                    None => {
+                        fallback = Self::orphan_board_row(pane);
+                        &fallback
+                    }
+                };
+                self.render_task_workspace_pane(pane, row, tokens, pane_size, cx)
             }
             TaskWorkspaceViewNode::Split {
                 split_id,
@@ -24705,7 +24850,7 @@ impl NativeShell {
                     let content = self.render_task_workspace_node(
                         &child.node,
                         allocated,
-                        ordinals,
+                        rows,
                         tokens,
                         workspace_size,
                         cx,
@@ -24912,19 +25057,108 @@ impl NativeShell {
     fn render_task_workspace_pane(
         &mut self,
         pane: &TaskPaneViewModel<HostTaskKey>,
-        ordinal: Option<u8>,
+        row: &BoardRow,
         tokens: crate::ui::tokens::ThemeTokens,
         pane_size: Size<Pixels>,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let task_key = pane.task_id.clone();
         let pane_id = pane.pane_id;
-        let focus_key = task_key.clone();
-        let focus = cx.listener(move |shell, _event: &MouseDownEvent, _window, cx| {
-            cx.stop_propagation();
-            let _ = shell.select_fleet_task_key(focus_key.clone(), FleetSelectMode::Replace);
-            cx.notify();
-        });
+        let task_element_key = stable_host_task_element_key(&task_key, "pane");
+        let chrome = self.panel_chrome_for(pane, row);
+        let dragged_pane = DraggedTaskPane {
+            pane_id,
+            title: pane.title.clone(),
+            background: tokens.surfaces.raised.to_gpui().into(),
+            foreground: tokens.text.primary.to_gpui().into(),
+        };
+        let handlers = self.panel_handlers(cx);
+        let chrome_element = div()
+            .id(("native-task-pane-chrome", task_element_key))
+            .w_full()
+            .flex_none()
+            .on_drag(dragged_pane, |dragged, _, _, cx| {
+                cx.new(|_| TaskPaneDragPreview {
+                    title: dragged.title.clone(),
+                    background: dragged.background,
+                    foreground: dragged.foreground,
+                })
+            })
+            .child(panel_chrome_element(
+                &chrome,
+                &self.project_colours,
+                tokens,
+                f32::from(pane_size.width),
+                &handlers,
+            ))
+            .into_any_element();
+
+        let body = if chrome.minimised {
+            // The title row IS the minimised panel (spec 6.5.1), so there is
+            // nothing under it to paint -- not even a summary, which is the
+            // distilled compact presentation the redesign removed.
+            div().into_any_element()
+        } else {
+            let body_height =
+                (f32::from(pane_size.height) - TITLE_ROW_HEIGHT - TAB_ROW_HEIGHT).max(1.0);
+            let body_size = size(pane_size.width, px(body_height));
+            let dock_entity = Some(cx.entity().downgrade());
+            match chrome.view {
+                PaneView::Terminal if pane.paint_terminal => {
+                    self.task_terminal_surface_for(&task_key, tokens, cx)
+                }
+                // A debug preview conversation displaces the terminal
+                // (`preview_conversation_installed`, ruling g): the model has
+                // already decided that in `paint_terminal`, and the painter
+                // must not re-decide it.
+                PaneView::Conversation | PaneView::Terminal => self.task_conversation_surface_for(
+                    task_key.clone(),
+                    pane.build_composer,
+                    tokens,
+                    body_size,
+                    cx,
+                ),
+                PaneView::Files => self.workspace_dock_surface_for(
+                    task_key.clone(),
+                    CockpitDockTool::Files,
+                    tokens,
+                    dock_entity,
+                ),
+                PaneView::Changes => self.workspace_dock_surface_for(
+                    task_key.clone(),
+                    CockpitDockTool::Changes,
+                    tokens,
+                    dock_entity,
+                ),
+                PaneView::Browser => self.workspace_dock_surface_for(
+                    task_key.clone(),
+                    CockpitDockTool::Browser,
+                    tokens,
+                    dock_entity,
+                ),
+                PaneView::Review => self.workspace_dock_surface_for(
+                    task_key.clone(),
+                    CockpitDockTool::Review,
+                    tokens,
+                    dock_entity,
+                ),
+                PaneView::Artifacts => self.workspace_dock_surface_for(
+                    task_key.clone(),
+                    CockpitDockTool::Artifacts,
+                    tokens,
+                    dock_entity,
+                ),
+                PaneView::Services => self.workspace_dock_surface_for(
+                    task_key.clone(),
+                    CockpitDockTool::Services,
+                    tokens,
+                    dock_entity,
+                ),
+            }
+        };
+
+        let framed = panel_frame(&chrome, &self.project_colours, tokens, chrome_element, body);
+
         let focus_anywhere_key = task_key.clone();
         let focus_anywhere = cx.listener(move |shell, _event: &ClickEvent, _window, cx| {
             if shell.selected_task_key.as_ref() != Some(&focus_anywhere_key) {
@@ -24933,146 +25167,6 @@ impl NativeShell {
                 cx.notify();
             }
         });
-        let close_key = task_key.clone();
-        let close = cx.listener(move |shell, _event: &ClickEvent, _window, cx| {
-            cx.stop_propagation();
-            let _ = shell.select_fleet_task_key(close_key.clone(), FleetSelectMode::Toggle);
-            shell.drop_ephemeral_task(&close_key);
-            cx.notify();
-        });
-        // `borders.focus` is a hairline against `surfaces.canvas` at 2 px --
-        // the finding was that the active pane's frame does not read at all.
-        // `text.primary` is the brightest neutral the palette has, and it is
-        // the same colour the active row's chip is filled with, so the frame
-        // and the marker are one visual family.
-        let focus_border = if pane.focused {
-            tokens.text.primary
-        } else {
-            tokens.borders.subtle
-        };
-
-        let task_element_key = stable_host_task_element_key(&task_key, "pane");
-        let dragged_pane = DraggedTaskPane {
-            pane_id,
-            title: pane.title.clone(),
-            background: tokens.surfaces.raised.to_gpui().into(),
-            foreground: tokens.text.primary.to_gpui().into(),
-        };
-        let header = div()
-            .id(("native-task-pane-header", task_element_key))
-            .w_full()
-            .h(px(42.0))
-            .flex_none()
-            .flex()
-            .items_center()
-            .gap(px(8.0))
-            .px(px(10.0))
-            .border_b(px(1.0))
-            .border_color(tokens.borders.subtle.to_gpui())
-            .bg(tokens.surfaces.raised.to_gpui())
-            .on_mouse_down(MouseButton::Left, focus)
-            .on_drag(dragged_pane, |dragged, _, _, cx| {
-                cx.new(|_| TaskPaneDragPreview {
-                    title: dragged.title.clone(),
-                    background: dragged.background,
-                    foreground: dragged.foreground,
-                })
-            })
-            .child(
-                div()
-                    .min_w(px(0.0))
-                    .flex_1()
-                    .flex()
-                    .flex_col()
-                    .child(
-                        div()
-                            .flex()
-                            .items_center()
-                            .gap(px(6.0))
-                            .min_w(px(0.0))
-                            .child(
-                                div()
-                                    .min_w(px(0.0))
-                                    .flex_shrink()
-                                    .truncate()
-                                    .text_size(px(tokens.density.typography.body))
-                                    .font_weight(FontWeight::SEMIBOLD)
-                                    .text_color(tokens.text.primary.to_gpui())
-                                    .child(pane.title.clone()),
-                            )
-                            // The same chip the board row carries, solid on the
-                            // focused pane: the number is what ties a row to
-                            // its panel, so it must be the same mark on both.
-                            .children(
-                                ordinal.map(|ordinal| ordinal_chip(ordinal, pane.focused, tokens)),
-                            ),
-                    )
-                    .child(
-                        div()
-                            .truncate()
-                            .text_size(px(tokens.density.typography.caption))
-                            .text_color(tokens.text.muted.to_gpui())
-                            .child(format!(
-                                "{} · {} · {}",
-                                pane.project_name, pane.provider_label, pane.status_label
-                            )),
-                    ),
-            )
-            .child(
-                div()
-                    .id(("native-task-pane-close", task_element_key))
-                    .tab_stop(true)
-                    .size(px(24.0))
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .rounded(px(5.0))
-                    .cursor_pointer()
-                    .text_color(tokens.text.muted.to_gpui())
-                    .hover(|style| style.bg(tokens.surfaces.hover.to_gpui()))
-                    .on_click(close)
-                    .child(crate::icons::app_icon(
-                        crate::icons::X,
-                        12.0,
-                        tokens.text.muted.to_u32(),
-                    )),
-            );
-
-        let body = if pane.minimised {
-            // Nothing but the title row fits, and the header above already is
-            // that row, so the body is an empty spacer rather than a summary.
-            div()
-                .w_full()
-                .flex_1()
-                .min_h(px(0.0))
-                .bg(tokens.surfaces.sunken.to_gpui())
-                .into_any_element()
-        } else if pane.paint_terminal {
-            self.task_terminal_surface_for(&task_key, tokens, cx)
-        } else if pane.build_composer {
-            // Focused Full pane owns the interactive composer. Pane chrome
-            // already reserved the 42px header; pass only body height.
-            let body_height = (f32::from(pane_size.height) - 42.0).max(1.0);
-            self.task_conversation_surface_for(
-                task_key.clone(),
-                true,
-                tokens,
-                size(pane_size.width, px(body_height)),
-                cx,
-            )
-        } else {
-            // Background Full panes render the same owner semantic history;
-            // only the interactive composer/input is withheld.
-            let body_height = (f32::from(pane_size.height) - 42.0).max(1.0);
-            self.task_conversation_surface_for(
-                task_key.clone(),
-                false,
-                tokens,
-                size(pane_size.width, px(body_height)),
-                cx,
-            )
-        };
-
         let center_drop = cx.listener(move |shell, dragged: &DraggedTaskPane, _window, cx| {
             shell.move_workspace_pane(dragged.pane_id, DropTarget::Center { pane: pane_id });
             cx.notify();
@@ -25087,10 +25181,6 @@ impl NativeShell {
             .flex()
             .flex_col()
             .overflow_hidden()
-            .border(px(if pane.focused { 2.0 } else { 1.0 }))
-            .border_color(focus_border.to_gpui())
-            .rounded(px(tokens.density.radii.md))
-            .bg(tokens.surfaces.canvas.to_gpui())
             // Focus on the completed click, not mouse-down. Rebuilding an
             // unfocused pane between press and release destroys the original
             // child control, so Send/Approve/model buttons appear to click but
@@ -25109,14 +25199,779 @@ impl NativeShell {
                 }
             })
             .on_drop(center_drop)
-            .child(header)
-            .child(body)
+            .child(framed)
             .children(
                 [Edge::Left, Edge::Right, Edge::Top, Edge::Bottom]
                     .into_iter()
                     .map(|edge| Self::task_workspace_drop_zone(pane_id, edge, tokens, cx)),
             )
             .into_any_element()
+    }
+
+    /// The one place the panel painter is wired to the shell.
+    ///
+    /// Every closure goes through a weak entity handle rather than capturing
+    /// `self`: the chrome outlives this frame in GPUI's element tree, and a
+    /// handler that reached a stale shell would act on a task that has moved.
+    fn panel_handlers(&self, cx: &mut Context<Self>) -> PanelHandlers {
+        let entity = cx.entity().downgrade();
+        let focus_entity = entity.clone();
+        let view_entity = entity.clone();
+        let primary_entity = entity.clone();
+        let zoom_entity = entity.clone();
+        let menu_entity = entity.clone();
+        let retry_entity = entity.clone();
+        let key_entity = entity;
+        PanelHandlers {
+            on_focus: Rc::new(move |key, _window, app| {
+                let key = key.clone();
+                let _ = focus_entity.update(app, |shell, cx| {
+                    shell.focus_workspace_pane_for(&key);
+                    if shell.selected_task_key.as_ref() != Some(&key) {
+                        let _ = shell.select_fleet_task_key(key, FleetSelectMode::Replace);
+                    }
+                    cx.notify();
+                });
+            }),
+            on_select_view: Rc::new(move |key, view, _window, app| {
+                let key = key.clone();
+                let _ = view_entity.update(app, |shell, cx| {
+                    shell.focus_workspace_pane_for(&key);
+                    shell.set_pane_view(&key, view);
+                    cx.notify();
+                });
+            }),
+            on_primary: Rc::new(move |key, primary, _window, app| {
+                let key = key.clone();
+                let _ = primary_entity.update(app, |shell, cx| {
+                    match primary {
+                        PrimaryAction::Done => shell.settle_task_from_panel(&key),
+                        PrimaryAction::Reopen => shell.reopen_task_key(key.clone()),
+                    }
+                    cx.notify();
+                });
+            }),
+            on_zoom: Rc::new(move |key, _window, app| {
+                let key = key.clone();
+                let _ = zoom_entity.update(app, |shell, cx| {
+                    shell.focus_workspace_pane_for(&key);
+                    shell.toggle_workspace_zoom();
+                    cx.notify();
+                });
+            }),
+            on_menu: Rc::new(move |key, position, _window, app| {
+                let key = key.clone();
+                let _ = menu_entity.update(app, |shell, cx| {
+                    shell.open_pane_menu(key, position);
+                    cx.notify();
+                });
+            }),
+            on_retry: Rc::new(move |key, _window, app| {
+                let key = key.clone();
+                let _ = retry_entity.update(app, |shell, cx| {
+                    shell.retry_provider_for(&key);
+                    cx.notify();
+                });
+            }),
+            on_key: Rc::new(move |key, event, _window, app| {
+                let key = key.clone();
+                let event = event.clone();
+                let _ = key_entity.update(app, |shell, cx| {
+                    if shell.handle_panel_key(&key, &event) {
+                        cx.stop_propagation();
+                    }
+                    cx.notify();
+                });
+            }),
+        }
+    }
+
+    /// The row a pane keeps when the fleet projection no longer lists its
+    /// task. Idle and titled from the pane's own projection: the panel says
+    /// what it can still stand behind, and nothing it cannot.
+    fn orphan_board_row(pane: &TaskPaneViewModel<HostTaskKey>) -> BoardRow {
+        BoardRow {
+            key: pane.task_id.clone(),
+            title: pane.title.clone(),
+            state: BoardState::Idle,
+            why: BoardState::Idle.why_label().to_string(),
+            state_age_ms: 0,
+            progress: None,
+            provider: PrimaryProviderIcon::Other,
+            project_colour: 0,
+            project_id: None,
+            project_label: pane.project_name.clone(),
+            branch: String::new(),
+            last_activity_ms: 0,
+            open: None,
+            active: pane.focused,
+        }
+    }
+
+    /// Project one board row plus the shell's needs-you detail into the panel
+    /// chrome. The row is the board's own row for the same task, so the board
+    /// and the panel cannot say two different things about one task.
+    fn panel_chrome_for(
+        &self,
+        pane: &TaskPaneViewModel<HostTaskKey>,
+        row: &BoardRow,
+    ) -> PanelChrome {
+        let owner = pane.task_id.clone();
+        let needs_you = self.panel_needs_you_for(&owner, row);
+        let done = row.state == BoardState::Done;
+        let crumb = format!(
+            "{} · {} · {}",
+            row.project_label, pane.provider_label, row.branch
+        );
+        panel_chrome(
+            row,
+            pane.view,
+            pane.focused,
+            pane.zoomed,
+            pane.minimised,
+            needs_you,
+            done,
+            crumb,
+        )
+    }
+
+    /// Why this panel wants a person, or `None` for a panel that is merely
+    /// working. Question and permission outrank blocked: a provider that is
+    /// asking is not broken.
+    fn panel_needs_you_for(&self, owner: &HostTaskKey, row: &BoardRow) -> Option<NeedsYou> {
+        if self.owner_has_pending_question(owner) {
+            return Some(NeedsYou::Question {
+                choices: self.pending_question_choices_for(owner).len(),
+            });
+        }
+        if let Some(summary) = self.pending_permission_summary_for(owner) {
+            return Some(NeedsYou::Permission {
+                names_a_file: permission_names_a_file(&summary),
+            });
+        }
+        let blocked = matches!(
+            self.task_row_status_for_owner(owner),
+            Some(
+                VisibleTaskStatus::Failed
+                    | VisibleTaskStatus::Disconnected
+                    | VisibleTaskStatus::UncertainOutcome
+            )
+        );
+        blocked.then(|| NeedsYou::Blocked {
+            // The provider's own sentence when there is one; the board's word
+            // for the state when there is not. Never a fabricated cause.
+            cause: self
+                .task_surfaces
+                .terminal_refusal_detail(owner.clone())
+                .unwrap_or_else(|| row.why.clone()),
+        })
+    }
+
+    /// Does this owner have a question waiting? The composer is the authority
+    /// for the task it is bound to -- it is what a number key would answer --
+    /// and the snapshot answers for every other panel on screen.
+    fn owner_has_pending_question(&self, owner: &HostTaskKey) -> bool {
+        if self.selected_task_key.as_ref() == Some(owner) {
+            if let Some(composer) = self.composer.as_ref() {
+                return composer.pending_question_identity().is_some();
+            }
+        }
+        self.owner_provider_session_has(owner, |provider| provider.open_question.is_some())
+    }
+
+    fn owner_has_pending_permission(&self, owner: &HostTaskKey) -> bool {
+        if self.selected_task_key.as_ref() == Some(owner) {
+            if let Some(composer) = self.composer.as_ref() {
+                return composer.pending_approval_identity().is_some();
+            }
+        }
+        self.owner_provider_session_has(owner, |provider| provider.open_approval.is_some())
+    }
+
+    fn owner_provider_session_has(
+        &self,
+        owner: &HostTaskKey,
+        predicate: impl Fn(&crate::domain::ProviderSessionProjection) -> bool,
+    ) -> bool {
+        self.host_slot(&owner.host)
+            .and_then(|slot| slot.client_model.as_ref())
+            .and_then(|model| model.task(owner.task_id))
+            .is_some_and(|snapshot| snapshot.provider_sessions.values().any(&predicate))
+    }
+
+    /// The choices a number key can pick, in the order the card paints them.
+    fn pending_question_choices_for(&self, owner: &HostTaskKey) -> Vec<String> {
+        if self.selected_task_key.as_ref() == Some(owner) {
+            if let Some(options) = self
+                .composer
+                .as_ref()
+                .and_then(|composer| composer.presented_question_options().ok())
+            {
+                return options;
+            }
+        }
+        self.timeline_question_choices_for(owner)
+    }
+
+    fn timeline_question_choices_for(&self, owner: &HostTaskKey) -> Vec<String> {
+        self.host_slot(&owner.host)
+            .and_then(|slot| slot.cockpit.timeline_for(owner.task_id))
+            .map(|timeline| {
+                timeline
+                    .items()
+                    .iter()
+                    .rev()
+                    .find_map(|item| match &item.content {
+                        crate::ui::renderers::TimelineItemContent::Question(view)
+                            if view.settled_choice.is_none() =>
+                        {
+                            Some(view.choices.clone())
+                        }
+                        _ => None,
+                    })
+                    .unwrap_or_default()
+            })
+            .unwrap_or_default()
+    }
+
+    /// The one line a permission dock asks about: the command, or the file with
+    /// its line delta. Read from the timeline item the approval belongs to,
+    /// because the approval projection carries only its identity.
+    fn pending_permission_summary_for(&self, owner: &HostTaskKey) -> Option<String> {
+        if !self.owner_has_pending_permission(owner) {
+            return None;
+        }
+        let request_id = self
+            .composer
+            .as_ref()
+            .filter(|_| self.selected_task_key.as_ref() == Some(owner))
+            .and_then(TaskComposer::pending_approval_identity)
+            .map(|(request_id, _)| request_id);
+        let timeline = self
+            .host_slot(&owner.host)
+            .and_then(|slot| slot.cockpit.timeline_for(owner.task_id))?;
+        timeline
+            .items()
+            .iter()
+            .rev()
+            .find_map(|item| match &item.content {
+                crate::ui::renderers::TimelineItemContent::Approval(view)
+                    if !view.settled
+                        && request_id.map_or(true, |wanted| wanted == view.request_id) =>
+                {
+                    Some(view.summary.clone())
+                }
+                _ => None,
+            })
+    }
+
+    /// The tool a permission grant is remembered by: the first word of the
+    /// summary ("Bash: cargo test" grants Bash, not that exact command line).
+    /// One definition, so the write and the read cannot disagree about what
+    /// "the same tool" means.
+    fn auto_allow_tool(summary: &str) -> String {
+        summary
+            .split_whitespace()
+            .next()
+            .unwrap_or_default()
+            .trim_end_matches(':')
+            .to_string()
+    }
+
+    fn auto_allow_covers(&self, owner: &HostTaskKey, summary: &str) -> bool {
+        let tool = Self::auto_allow_tool(summary);
+        !tool.is_empty() && self.auto_allow.contains(&(owner.clone(), tool))
+    }
+
+    /// Grant this tool for the rest of the task, then answer the request that
+    /// asked. Per-task and in memory only (spec 6.4): it never writes to the
+    /// provider's own settings.
+    fn always_allow_for(&mut self, owner: &HostTaskKey, summary: &str) {
+        let tool = Self::auto_allow_tool(summary);
+        if tool.is_empty() {
+            eprintln!("devmanager: refusing to grant an unnamed tool for {owner:?}");
+        } else {
+            self.auto_allow.insert((owner.clone(), tool));
+        }
+        self.activate_composer_approval(ApprovalDecision::Approve);
+    }
+
+    /// Answer a newly admitted approval without asking, when the person has
+    /// already said "Always for this task" about the same tool.
+    fn apply_auto_allow_to_pending_approval(&mut self) {
+        let Some(owner) = self.selected_task_key.clone() else {
+            return;
+        };
+        let Some(summary) = self.pending_permission_summary_for(&owner) else {
+            return;
+        };
+        if self.auto_allow_covers(&owner, &summary) {
+            self.activate_composer_approval(ApprovalDecision::Approve);
+        }
+    }
+
+    /// Give the workspace's own focus to this panel. The board's ACTIVE mark
+    /// and the panel's bright frame both read `focused_task`, so every panel
+    /// gesture moves it rather than only moving the shell's selection.
+    fn focus_workspace_pane_for(&mut self, owner: &HostTaskKey) {
+        let moved = self
+            .layout
+            .task_workspace
+            .as_mut()
+            .is_some_and(|workspace| workspace.focus_task(owner.clone()).is_ok());
+        if moved {
+            self.mark_layout_dirty();
+        }
+    }
+
+    /// Zoom is transient and deliberately not persisted (`serde(skip)`), so it
+    /// is not marked dirty here. The allocate pass in `task_workspace_surface`
+    /// compares whole workspaces and does mark it -- ledgered rather than
+    /// worked around, because the compare is what catches the presentation
+    /// changes that DO need saving.
+    fn toggle_workspace_zoom(&mut self) {
+        if let Some(workspace) = self.layout.task_workspace.as_mut() {
+            workspace.toggle_zoom_focused();
+        }
+    }
+
+    fn unzoom_workspace(&mut self) {
+        if let Some(workspace) = self.layout.task_workspace.as_mut() {
+            workspace.unzoom();
+        }
+    }
+
+    /// Settle the task this panel owns.
+    ///
+    /// 2f: settle_task_key -- lane 2f lands an owner-scoped settle; until it
+    /// merges, focusing the pane's task first is what makes
+    /// `settle_selected_task` act on the panel that was clicked rather than on
+    /// whatever the shell's cursor was last on.
+    fn settle_task_from_panel(&mut self, owner: &HostTaskKey) {
+        self.focus_workspace_pane_for(owner);
+        let _ = self.select_fleet_task_key(owner.clone(), FleetSelectMode::Replace);
+        self.settle_selected_task();
+    }
+
+    /// One entry per open panel: its owner, the view it is showing and
+    /// whether its primary action reads Reopen rather than Done.
+    fn workspace_panel_accessibility_rows(&self) -> Vec<(HostTaskKey, PaneView, bool)> {
+        let Some(workspace) = self.layout.task_workspace.as_ref() else {
+            return Vec::new();
+        };
+        workspace
+            .task_ids()
+            .into_iter()
+            .map(|owner| {
+                let view = workspace.view_of(owner.clone()).unwrap_or_default();
+                let done = self
+                    .host_slot(&owner.host)
+                    .and_then(|slot| slot.client_model.as_ref())
+                    .and_then(|model| model.tasks().get(&owner.task_id))
+                    .is_some_and(|snapshot| {
+                        matches!(
+                            snapshot.task.lifecycle,
+                            crate::domain::task::TaskLifecycle::Settled
+                                | crate::domain::task::TaskLifecycle::Archived
+                        )
+                    });
+                (owner, view, done)
+            })
+            .collect()
+    }
+
+    /// Activate a panel's tab or primary action named by its accessibility id.
+    /// Returns whether the id belonged to a panel.
+    fn activate_panel_accessibility_element(&mut self, element_id: &str) -> bool {
+        for (owner, _, done) in self.workspace_panel_accessibility_rows() {
+            if element_id == panel_primary_element_id(&owner) {
+                if done {
+                    self.reopen_task_key(owner);
+                } else {
+                    self.settle_task_from_panel(&owner);
+                }
+                return true;
+            }
+            for tab in PaneView::TABS {
+                if element_id == panel_view_tab_element_id(&owner, tab) {
+                    self.focus_workspace_pane_for(&owner);
+                    self.select_pane_view_for(&owner, tab);
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    /// Which view every open panel is showing. With the right dock retired,
+    /// "this tool is on screen" is a question about the panels, and this is the
+    /// one place that is answered.
+    fn workspace_shows_view(&self, view: PaneView) -> bool {
+        self.layout
+            .task_workspace
+            .as_ref()
+            .is_some_and(|workspace| {
+                workspace
+                    .task_ids()
+                    .into_iter()
+                    .any(|task_id| workspace.view_of(task_id) == Some(view))
+            })
+    }
+
+    /// The dock tool a view is served by, or `None` for the two views the
+    /// panel paints itself.
+    fn dock_tool_for_view(view: PaneView) -> Option<CockpitDockTool> {
+        match view {
+            PaneView::Conversation | PaneView::Terminal => None,
+            PaneView::Files => Some(CockpitDockTool::Files),
+            PaneView::Changes => Some(CockpitDockTool::Changes),
+            PaneView::Browser => Some(CockpitDockTool::Browser),
+            PaneView::Review => Some(CockpitDockTool::Review),
+            PaneView::Artifacts => Some(CockpitDockTool::Artifacts),
+            PaneView::Services => Some(CockpitDockTool::Services),
+        }
+    }
+
+    /// Choose a panel's view AND fetch what that view needs.
+    ///
+    /// A tab that only changed a field would paint an empty panel for ever:
+    /// the typed dock panels are fed by host queries that the tool selection
+    /// is what asks for. This runs the same admission the dock's own tabs ran.
+    fn select_pane_view_for(&mut self, owner: &HostTaskKey, view: PaneView) {
+        self.set_pane_view(owner, view);
+        let Some(tool) = Self::dock_tool_for_view(view) else {
+            return;
+        };
+        if let Some(slot) = self.host_slot_mut(&owner.host) {
+            let _ = slot.cockpit.handle_tool_action(tool, RequestId::new());
+        }
+        if owner.host == self.local_host_id() {
+            self.reconcile_browser_dock_lifecycle(None);
+            match tool {
+                CockpitDockTool::Services => {
+                    let _ = self.dispatch_action(ActionRequest::HostActions);
+                    self.refresh_selected_cockpit_surfaces();
+                }
+                CockpitDockTool::Changes | CockpitDockTool::Files => {
+                    self.refresh_selected_cockpit_surfaces();
+                }
+                CockpitDockTool::Review => {
+                    let _ = self.dispatch_action_recorded_for_owner(
+                        &owner.host,
+                        ActionRequest::TaskShow {
+                            task_id: owner.task_id,
+                        },
+                    );
+                }
+                _ => {}
+            }
+        } else {
+            self.refresh_cockpit_surfaces_for_owner(owner);
+        }
+    }
+
+    /// Bring a blocked panel's provider back.
+    ///
+    /// There is no dedicated restore command in the shell: re-selecting the
+    /// task is what triggers a restore attempt today (it re-runs the owner's
+    /// cockpit refresh, which re-queries the terminal and the conversation),
+    /// so Retry does exactly that and says so rather than pretending to a
+    /// command that does not exist.
+    fn retry_provider_for(&mut self, owner: &HostTaskKey) {
+        let _ = self.select_fleet_task_key(owner.clone(), FleetSelectMode::Replace);
+        if owner.host == self.local_host_id() {
+            self.refresh_selected_cockpit_surfaces();
+        } else {
+            self.refresh_cockpit_surfaces_for_owner(owner);
+        }
+    }
+
+    fn open_pane_menu(&mut self, owner: HostTaskKey, position: Point<Pixels>) {
+        self.focus_workspace_pane_for(&owner);
+        self.pane_menu = Some(PaneMenu {
+            owner,
+            position,
+            more_views_open: false,
+            confirming_delete: false,
+        });
+    }
+
+    fn close_pane_menu(&mut self) {
+        self.pane_menu = None;
+    }
+
+    /// Keys the open panel menu owns. Escape is the only one: the rows are
+    /// pointer targets and the panel's own one-key vocabulary already reaches
+    /// every item without opening the menu at all.
+    fn handle_pane_menu_key(&mut self, event: &KeyDownEvent) {
+        if event.keystroke.key.as_str() == "escape" {
+            self.close_pane_menu();
+        }
+    }
+
+    /// One panel menu item, from a click or from its one-key form. Both routes
+    /// land here so a key and a row can never do two different things.
+    fn apply_pane_menu_item(&mut self, owner: &HostTaskKey, item: PanelMenuItem) {
+        match item {
+            PanelMenuItem::AddAction => {
+                let _ = self.select_fleet_task_key(owner.clone(), FleetSelectMode::Replace);
+                self.open_project_action_menu();
+            }
+            PanelMenuItem::Commit => {
+                let _ = self.select_fleet_task_key(owner.clone(), FleetSelectMode::Replace);
+                self.begin_header_commit();
+            }
+            PanelMenuItem::Zoom => {
+                self.focus_workspace_pane_for(owner);
+                self.toggle_workspace_zoom();
+            }
+            // Pin and Swap are workspace operations with no shell entry point
+            // yet: the tree can pin a SPLIT CHILD and swap two PANE IDS, but
+            // nothing names "this panel" for either. Reported rather than
+            // silently ignored, because a menu row that does nothing and says
+            // nothing is worse than one that admits it.
+            PanelMenuItem::PinSize => {
+                eprintln!("devmanager: pin size is not wired for {owner:?} (Task 9 leaves it)")
+            }
+            PanelMenuItem::Swap => {
+                eprintln!("devmanager: swap with is not wired for {owner:?} (Task 9 leaves it)")
+            }
+            // Move is the Ctrl+Shift+arrow chord; the row is the label that
+            // teaches it, so choosing it opens nothing.
+            PanelMenuItem::Move => {}
+            PanelMenuItem::MoreViews => {
+                if let Some(menu) = self.pane_menu.as_mut() {
+                    menu.more_views_open = !menu.more_views_open;
+                }
+                return;
+            }
+            PanelMenuItem::Rename => self.begin_task_rename_key(owner.clone()),
+            PanelMenuItem::Archive => {
+                let _ = self.select_fleet_task_key(owner.clone(), FleetSelectMode::Replace);
+                self.archive_selected_task();
+            }
+            PanelMenuItem::Delete => self.begin_task_delete_key(owner.clone()),
+        }
+        self.close_pane_menu();
+    }
+
+    /// The panel's one-key vocabulary (spec 6.3/6.4), routed through lane 2c's
+    /// `panel_key_action` so the panel and the menu agree by construction.
+    /// Returns whether the key was consumed.
+    fn handle_panel_key(&mut self, owner: &HostTaskKey, event: &KeyDownEvent) -> bool {
+        let key = event.keystroke.key.to_ascii_lowercase();
+        // A modified keystroke belongs to the shell's chord table, not to the
+        // panel's letters: Ctrl+D is Done and `d` is "view the diff".
+        if event.keystroke.modifiers.control
+            || event.keystroke.modifiers.alt
+            || event.keystroke.modifiers.platform
+        {
+            return false;
+        }
+        let has_question = self.owner_has_pending_question(owner);
+        let permission = self.pending_permission_summary_for(owner);
+        let Some(action) = panel_key_action(&key, has_question, permission.is_some()) else {
+            return false;
+        };
+        match action {
+            PanelKeyAction::Answer(number) => {
+                let choices = self.pending_question_choices_for(owner);
+                let index = usize::from(number).saturating_sub(1);
+                let Some(label) = choices.get(index).cloned() else {
+                    return false;
+                };
+                let _ = self.select_fleet_task_key(owner.clone(), FleetSelectMode::Replace);
+                self.activate_composer_answer_option(index, label);
+            }
+            PanelKeyAction::Allow => {
+                let _ = self.select_fleet_task_key(owner.clone(), FleetSelectMode::Replace);
+                self.activate_composer_approval(ApprovalDecision::Approve);
+            }
+            PanelKeyAction::Deny => {
+                let _ = self.select_fleet_task_key(owner.clone(), FleetSelectMode::Replace);
+                self.activate_composer_approval(ApprovalDecision::Reject { reason: None });
+            }
+            PanelKeyAction::ViewDiff => {
+                self.focus_workspace_pane_for(owner);
+                self.select_pane_view_for(owner, PaneView::Changes);
+            }
+            PanelKeyAction::Unzoom => {
+                if self
+                    .layout
+                    .task_workspace
+                    .as_ref()
+                    .and_then(|workspace| workspace.zoomed())
+                    .is_none()
+                {
+                    // Escape with nothing zoomed belongs to whatever transient
+                    // layer is open above the panel.
+                    return false;
+                }
+                self.unzoom_workspace();
+            }
+            // Nothing in the panel's table returns Done: Ctrl+D is the shell's
+            // chord and arrives through `KeyboardModel`, so the two cannot
+            // disagree about the modifier.
+            PanelKeyAction::Done => return false,
+            PanelKeyAction::Menu(item) => self.apply_pane_menu_item(owner, item),
+        }
+        true
+    }
+
+    /// The panel ⋯ menu: the same occluding backdrop the board menu uses, with
+    /// the rows and the shortcut column from lane 2b's `panel_menu_rows`.
+    fn render_pane_menu_overlay(
+        &self,
+        tokens: crate::ui::tokens::ThemeTokens,
+        viewport: Size<Pixels>,
+        cx: &Context<Self>,
+    ) -> AnyElement {
+        let menu = self.pane_menu.clone().expect("pane menu is open");
+        let zoomed = self
+            .layout
+            .task_workspace
+            .as_ref()
+            .and_then(|workspace| workspace.zoomed())
+            .is_some();
+        let mut rows: Vec<AnyElement> = Vec::new();
+        for row in panel_menu_rows(zoomed) {
+            if row.separator_before {
+                rows.push(
+                    div()
+                        .w_full()
+                        .h(px(1.0))
+                        .my(px(tokens.density.spacing.xs))
+                        .bg(tokens.borders.subtle.to_gpui())
+                        .into_any_element(),
+                );
+            }
+            let owner = menu.owner.clone();
+            let item = row.item;
+            let danger = row.danger;
+            rows.push(
+                div()
+                    .id(SharedString::from(format!(
+                        "pane-menu-{}",
+                        row.label
+                            .trim_end_matches('…')
+                            .trim_end_matches(" ▸")
+                            .to_ascii_lowercase()
+                            .replace(' ', "-")
+                    )))
+                    .w_full()
+                    .flex()
+                    .items_center()
+                    .gap(px(tokens.density.spacing.sm))
+                    .px(px(tokens.density.spacing.md))
+                    .py(px(tokens.density.spacing.xs))
+                    .text_size(px(tokens.density.typography.body))
+                    .text_color(if danger {
+                        tokens.status.destructive.to_gpui()
+                    } else {
+                        tokens.text.primary.to_gpui()
+                    })
+                    .cursor_pointer()
+                    .hover(|style| style.bg(tokens.surfaces.hover.to_gpui()))
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |shell, _event: &MouseDownEvent, _window, cx| {
+                            cx.stop_propagation();
+                            shell.apply_pane_menu_item(&owner, item);
+                            shell.refresh_accessibility_tree();
+                            cx.notify();
+                        }),
+                    )
+                    .child(row.label)
+                    .child(div().flex_1())
+                    .child(
+                        div()
+                            .flex_none()
+                            .text_size(px(tokens.density.typography.caption))
+                            .text_color(tokens.text.muted.to_gpui())
+                            .child(row.key),
+                    )
+                    .into_any_element(),
+            );
+            if row.item == PanelMenuItem::MoreViews && menu.more_views_open {
+                for view in more_views() {
+                    let owner = menu.owner.clone();
+                    let view = *view;
+                    rows.push(
+                        div()
+                            .id(SharedString::from(format!(
+                                "pane-menu-view-{}",
+                                view.label().to_ascii_lowercase()
+                            )))
+                            .w_full()
+                            .px(px(tokens.density.spacing.md + tokens.density.spacing.md))
+                            .py(px(tokens.density.spacing.xs))
+                            .text_size(px(tokens.density.typography.body))
+                            .text_color(tokens.text.secondary.to_gpui())
+                            .cursor_pointer()
+                            .hover(|style| style.bg(tokens.surfaces.hover.to_gpui()))
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(move |shell, _event: &MouseDownEvent, _window, cx| {
+                                    cx.stop_propagation();
+                                    shell.focus_workspace_pane_for(&owner);
+                                    shell.select_pane_view_for(&owner, view);
+                                    shell.close_pane_menu();
+                                    shell.refresh_accessibility_tree();
+                                    cx.notify();
+                                }),
+                            )
+                            .child(view.label())
+                            .into_any_element(),
+                    );
+                }
+            }
+        }
+        deferred(
+            anchored()
+                .position(point(px(0.0), px(0.0)))
+                .snap_to_window()
+                .child(
+                    div()
+                        .id("pane-menu-backdrop")
+                        .occlude()
+                        .w(viewport.width)
+                        .h(viewport.height)
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(|shell, _event: &MouseDownEvent, _window, cx| {
+                                cx.stop_propagation();
+                                shell.close_pane_menu();
+                                cx.notify();
+                            }),
+                        )
+                        .on_key_down(cx.listener(
+                            move |shell, event: &KeyDownEvent, _window, cx| {
+                                cx.stop_propagation();
+                                shell.handle_pane_menu_key(event);
+                                cx.notify();
+                            },
+                        ))
+                        .child(
+                            div()
+                                .id("pane-menu")
+                                .absolute()
+                                .left(menu.position.x)
+                                .top(menu.position.y + px(4.0))
+                                .w(px(PANE_MENU_WIDTH))
+                                .flex()
+                                .flex_col()
+                                .py(px(tokens.density.spacing.xs))
+                                .rounded(px(tokens.density.radii.md))
+                                .bg(tokens.surfaces.overlay.to_gpui())
+                                .border(px(1.0))
+                                .border_color(tokens.borders.default.to_gpui())
+                                .shadow_sm()
+                                .children(rows),
+                        ),
+                ),
+        )
+        .with_priority(2)
+        .into_any_element()
     }
 
     fn task_workspace_drop_zone(
@@ -26004,7 +26859,61 @@ impl NativeShell {
                 })
         };
         let owns_input = show_input && self.selected_task_key.as_ref() == Some(&owner);
-        let composer_footer = if !owns_input {
+        // Spec 6.4: a pending approval REPLACES the composer with a docked
+        // one-liner. It is docked rather than in the stream because the agent
+        // is stopped waiting for it, so it must not be able to scroll away --
+        // which is exactly the opposite of the question card's rule.
+        let pending_permission = owns_input
+            .then(|| self.pending_permission_summary_for(&owner))
+            .flatten();
+        let composer_footer = if let Some(summary) = pending_permission {
+            let entity = cx.entity().downgrade();
+            let allow_entity = entity.clone();
+            let always_entity = entity.clone();
+            let always_owner = owner.clone();
+            let always_summary = summary.clone();
+            let deny_entity = entity.clone();
+            let diff_entity = entity;
+            let diff_owner = owner.clone();
+            let handlers = PermissionHandlers {
+                on_allow: Rc::new(move |_window, app| {
+                    let _ = allow_entity.update(app, |shell, cx| {
+                        shell.activate_composer_approval(ApprovalDecision::Approve);
+                        cx.notify();
+                    });
+                }),
+                on_always: Rc::new(move |_window, app| {
+                    let owner = always_owner.clone();
+                    let summary = always_summary.clone();
+                    let _ = always_entity.update(app, |shell, cx| {
+                        shell.always_allow_for(&owner, &summary);
+                        cx.notify();
+                    });
+                }),
+                on_deny: Rc::new(move |_window, app| {
+                    let _ = deny_entity.update(app, |shell, cx| {
+                        shell.activate_composer_approval(ApprovalDecision::Reject { reason: None });
+                        cx.notify();
+                    });
+                }),
+                on_view_diff: Rc::new(move |_window, app| {
+                    let owner = diff_owner.clone();
+                    let _ = diff_entity.update(app, |shell, cx| {
+                        shell.select_pane_view_for(&owner, PaneView::Changes);
+                        cx.notify();
+                    });
+                }),
+            };
+            div()
+                .id("native-permission-dock")
+                .w_full()
+                .flex_none()
+                .px(px(16.0))
+                .pb(px(12.0))
+                .pt(px(8.0))
+                .child(permission_dock_element(&summary, tokens, &handlers))
+                .into_any_element()
+        } else if !owns_input {
             // Background Full panes keep their complete live conversation but
             // do not impersonate an editable composer. The selected pane alone
             // owns GPUI text focus and the input footer.
@@ -28150,6 +29059,7 @@ impl NativeShell {
                     if let Some(slot) = self.host_slot_mut(&key.host) {
                         slot.composer_error = None;
                     }
+                    self.apply_auto_allow_to_pending_approval();
                     return;
                 }
                 Err(error) => Err(error),
@@ -28162,6 +29072,11 @@ impl NativeShell {
                 slot.composer_error = None;
             }
         }
+        // Every admitted approval passes through here, so this is the one
+        // place a standing "Always for this task" can answer one without a
+        // click. It runs after the binding is installed because approving
+        // needs the composer that carries the request's identity.
+        self.apply_auto_allow_to_pending_approval();
     }
 
     fn clear_cockpit_projection(&mut self) {
@@ -28242,9 +29157,9 @@ impl NativeShell {
                     }
                     .to_string(),
                 );
-                if self.layout.dock_collapsed {
-                    self.layout.dock_collapsed = false;
-                }
+                // The dock is retired: selecting a tool records WHICH tool
+                // (the panel views read it) without reopening the panel that
+                // used to hold it.
                 self.mark_layout_dirty();
                 let owner = self.selected_task_key.clone().or_else(|| {
                     self.local_slot()
@@ -28279,11 +29194,6 @@ impl NativeShell {
                     }
                 }
             }
-            // Lane 2a replaces this arm with `set_pane_view(selected, view)`.
-            // Until that accessor lands there is exactly one view switch the
-            // shell can already make -- the task-centre terminal preference --
-            // so the two views it covers are routed and the rest wait rather
-            // than half-selecting something.
             KeyboardAction::SelectView(view) => {
                 let owner = self.selected_task_key.clone().or_else(|| {
                     self.local_slot()
@@ -28292,17 +29202,33 @@ impl NativeShell {
                         .map(|task_id| self.local_task_key(task_id))
                 });
                 if let Some(owner) = owner {
-                    self.set_pane_view(&owner, view);
+                    self.select_pane_view_for(&owner, view);
                 }
             }
             KeyboardAction::SettleTask => self.settle_selected_task(),
-            // Zoom is Task 9 and directional pane focus/move belong to the
-            // workspace lane. The chords are decided here so the binding table
-            // stays the single place they are named; the arms stay empty until
-            // that lane wires `toggle_zoom` and `focus_pane_toward`.
-            KeyboardAction::ToggleZoom
-            | KeyboardAction::MovePane(_)
-            | KeyboardAction::FocusPane(_) => {}
+            KeyboardAction::ToggleZoom => self.toggle_workspace_zoom(),
+            // Directional work is answered from the rects the last paint gave
+            // the panes, so `⌘→` means the panel to the right ON SCREEN.
+            KeyboardAction::FocusPane(edge) => {
+                let allocation = self.workspace_allocation.clone();
+                if let Some(workspace) = self.layout.task_workspace.as_mut() {
+                    if workspace.focus_pane_toward(edge, &allocation) {
+                        let focused = workspace.focused_task();
+                        self.mark_layout_dirty();
+                        if let Some(focused) = focused {
+                            let _ = self.select_fleet_task_key(focused, FleetSelectMode::Replace);
+                        }
+                    }
+                }
+            }
+            KeyboardAction::MovePane(edge) => {
+                let allocation = self.workspace_allocation.clone();
+                if let Some(workspace) = self.layout.task_workspace.as_mut() {
+                    if workspace.move_pane_toward(edge, &allocation) {
+                        self.mark_layout_dirty();
+                    }
+                }
+            }
             KeyboardAction::OpenTerminal => {
                 self.set_provider_terminal_visible(true);
             }
@@ -28545,27 +29471,40 @@ impl NativeShell {
             .into_any_element()
     }
 
-    fn workspace_dock_surface(
+    /// The one owner-scoped tool surface. A panel's view names the owner, so
+    /// the tool is rendered for THAT task rather than for whatever the shell's
+    /// cursor is on -- which is the whole difference between a dock and a
+    /// per-panel view.
+    fn workspace_dock_surface_for(
         &self,
+        owner_key: HostTaskKey,
         tool: CockpitDockTool,
         tokens: crate::ui::tokens::ThemeTokens,
         shell_entity: Option<gpui::WeakEntity<NativeShell>>,
     ) -> AnyElement {
-        let owner_key = self.selected_task_key.clone().or_else(|| {
-            self.local_slot()
-                .interaction
-                .selected_task()
-                .map(|task_id| self.local_task_key(task_id))
-        });
-        let remote = owner_key
-            .as_ref()
-            .is_some_and(|key| key.host != self.local_host_id());
+        match tool {
+            // One WebView, one HWND: the browser can be in exactly one place,
+            // and it follows the selection. Any other panel showing the
+            // Browser view says so rather than painting a second, dead chrome.
+            CockpitDockTool::Browser => {
+                return if self.selected_task_key.as_ref() == Some(&owner_key) {
+                    self.context_dock_surface(tokens, shell_entity)
+                } else {
+                    Self::dock_empty_state(tool, tokens)
+                };
+            }
+            CockpitDockTool::Services => {
+                return self.services_dock_surface(tokens, shell_entity, owner_key);
+            }
+            CockpitDockTool::Terminal => {
+                return self.terminal_dock_surface(tokens, Some(owner_key), shell_entity);
+            }
+            _ => {}
+        }
+        let remote = owner_key.host != self.local_host_id();
         if remote && !Self::remote_typed_dock_tool_supported(tool) {
             return self.remote_dock_unavailable_surface(tool, tokens);
         }
-        let Some(owner_key) = owner_key else {
-            return Self::dock_empty_state(tool, tokens);
-        };
         let Some(slot) = self.host_slot(&owner_key.host) else {
             return Self::dock_empty_state(tool, tokens);
         };
@@ -29342,7 +30281,19 @@ impl NativeShell {
             CockpitDockTool::Services => {
                 self.services_dock_surface(tokens, shell_entity, owner_key.expect("services owner"))
             }
-            tool => self.workspace_dock_surface(tool, tokens, shell_entity),
+            // The retired right dock's own entry point: it has no owner of its
+            // own, so it borrows the selection's. Kept so the dock module's
+            // remaining callers still compile while the chrome around them is
+            // dead code to remove in a follow-up.
+            tool => match self.selected_task_key.clone().or_else(|| {
+                self.local_slot()
+                    .interaction
+                    .selected_task()
+                    .map(|task_id| self.local_task_key(task_id))
+            }) {
+                Some(owner) => self.workspace_dock_surface_for(owner, tool, tokens, shell_entity),
+                None => Self::dock_empty_state(tool, tokens),
+            },
         }
     }
 
@@ -34191,6 +35142,13 @@ impl NativeShell {
             }
             return;
         }
+        // The panels' ids carry their owner's digest, so they cannot be
+        // matched as literals. Resolved first: a panel tab and a panel's Done
+        // are the only ids in the tree that name a task other than the
+        // selected one, and every arm below assumes the selection.
+        if self.activate_panel_accessibility_element(element_id) {
+            return;
+        }
         match element_id {
             "native-projects-add" | "native-sidebar-new-project" => {
                 self.local_slot_mut().interaction.close_palettes();
@@ -35257,6 +36215,9 @@ impl NativeShell {
         }
         if self.board_menu.is_some() {
             return Some(self.render_board_menu_overlay(tokens, viewport, cx));
+        }
+        if self.pane_menu.is_some() {
+            return Some(self.render_pane_menu_overlay(tokens, viewport, cx));
         }
         if self.task_search.open()
             || self
@@ -40293,9 +41254,12 @@ impl NativeShell {
             return;
         };
         self.layout.active_dock_tab = Some("Files".to_string());
-        self.layout.dock_collapsed = false;
         self.mark_layout_dirty();
         self.dispatch_dock_tool(DockTool::Files);
+        // Open now means "show Files in this panel", not "reopen the dock".
+        if let Some(owner) = self.selected_task_key.clone() {
+            self.select_pane_view_for(&owner, PaneView::Files);
+        }
         let _ = self.dispatch_task_cockpit_query(
             task_id,
             TaskCockpitQuery::FilesList {
@@ -40313,7 +41277,11 @@ impl NativeShell {
         let browser_tab_active = !self.selected_owner_is_remote()
             && !self.owner_showing_raw_terminal()
             && self.local_slot_mut().cockpit.active_tool() == CockpitDockTool::Browser;
-        let dock_expanded = !self.layout.dock_collapsed;
+        // With the right dock retired, "the browser surface is on screen" is a
+        // question about the panels. Reading `dock_collapsed` here would keep
+        // the WebView parked for ever, because the dock is now always closed.
+        let dock_expanded =
+            !self.layout.dock_collapsed || self.workspace_shows_view(PaneView::Browser);
         let host_available = self.browser_host.status().available;
         let attached = self
             .local_slot_mut()
@@ -41415,37 +42383,9 @@ impl NativeShell {
             .bg(tokens.surfaces.raised.to_gpui())
             .child(conversation_option)
             .child(terminal_option);
-        let dock_visible = !self.layout.dock_collapsed;
-        let context_dock_toggle = div()
-            .id("native-shell-context-dock-toggle")
-            .tab_stop(true)
-            .flex()
-            .flex_none()
-            .items_center()
-            .justify_center()
-            .size(px(26.0))
-            .rounded(px(tokens.density.radii.md))
-            .cursor_pointer()
-            .bg(if dock_visible {
-                tokens.surfaces.overlay.to_gpui()
-            } else {
-                tokens.surfaces.canvas.to_gpui()
-            })
-            .hover(|style| style.bg(tokens.surfaces.overlay.to_gpui()))
-            .on_click(cx.listener(|shell, _event: &ClickEvent, _window, cx| {
-                cx.stop_propagation();
-                shell.toggle_pane(PaneEdge::Dock);
-                cx.notify();
-            }))
-            .child(crate::icons::app_icon(
-                crate::icons::PANEL_RIGHT,
-                15.0,
-                if dock_visible {
-                    tokens.text.primary.to_u32()
-                } else {
-                    tokens.text.muted.to_u32()
-                },
-            ));
+        // The right dock is retired, so its toggle is gone with it: a button
+        // that opens nothing is worse than no button, and the tools it used to
+        // reveal are the panel's own view tabs now.
         div()
             .id("native-shell-pane-toggles")
             .flex()
@@ -41453,7 +42393,6 @@ impl NativeShell {
             .items_center()
             .gap(px(5.0))
             .child(center_mode_switch)
-            .child(context_dock_toggle)
             .into_any_element()
     }
 
@@ -41822,6 +42761,20 @@ impl NativeShell {
     }
 
     fn toggle_pane(&mut self, edge: PaneEdge) {
+        // The right dock is retired: its tools are panel views now, and a
+        // gesture that reopened it would put a second copy of Files or Changes
+        // on screen beside the panel already showing it. Said out loud once
+        // rather than silently ignored, so a caller that still expects the
+        // dock is visible in the log rather than invisible in the UI.
+        if edge == PaneEdge::Dock {
+            if !self.dock_retirement_logged {
+                self.dock_retirement_logged = true;
+                eprintln!(
+                    "devmanager: the right dock is retired; its tools are panel views (Ctrl+1..5 and the panel menu)"
+                );
+            }
+            return;
+        }
         self.pane_drag = None;
         self.layout.toggle(edge);
         self.mark_layout_dirty();
@@ -43309,6 +44262,79 @@ impl NativeShell {
                     crate::ui::actions::ShortcutKey::Tab,
                 ));
             });
+        // The panel's chords. Each names one shortcut and hands it to the same
+        // `dispatch_keyboard` every other chord uses, so `KeyboardModel` stays
+        // the only place a chord's MEANING is written down.
+        let panel_settle = cx.listener(|shell, _action: &NativePanelSettle, _window, cx| {
+            cx.stop_propagation();
+            shell.dispatch_keyboard(KeyboardShortcut::ctrl(ShortcutKey::Character('d')));
+        });
+        let panel_zoom = cx.listener(|shell, _action: &NativePanelZoom, _window, cx| {
+            cx.stop_propagation();
+            shell.dispatch_keyboard(KeyboardShortcut::ctrl_shift(ShortcutKey::Character('z')));
+        });
+        let panel_view_1 = cx.listener(|shell, _action: &NativePanelView1, _window, cx| {
+            cx.stop_propagation();
+            shell.dispatch_keyboard(KeyboardShortcut::ctrl(ShortcutKey::Digit(1)));
+        });
+        let panel_view_2 = cx.listener(|shell, _action: &NativePanelView2, _window, cx| {
+            cx.stop_propagation();
+            shell.dispatch_keyboard(KeyboardShortcut::ctrl(ShortcutKey::Digit(2)));
+        });
+        let panel_view_3 = cx.listener(|shell, _action: &NativePanelView3, _window, cx| {
+            cx.stop_propagation();
+            shell.dispatch_keyboard(KeyboardShortcut::ctrl(ShortcutKey::Digit(3)));
+        });
+        let panel_view_4 = cx.listener(|shell, _action: &NativePanelView4, _window, cx| {
+            cx.stop_propagation();
+            shell.dispatch_keyboard(KeyboardShortcut::ctrl(ShortcutKey::Digit(4)));
+        });
+        let panel_view_5 = cx.listener(|shell, _action: &NativePanelView5, _window, cx| {
+            cx.stop_propagation();
+            shell.dispatch_keyboard(KeyboardShortcut::ctrl(ShortcutKey::Digit(5)));
+        });
+        let panel_focus_left = cx.listener(|shell, _action: &NativePanelFocusLeft, _window, cx| {
+            cx.stop_propagation();
+            shell.dispatch_keyboard(KeyboardShortcut::ctrl(ShortcutKey::Arrow(ArrowKey::Left)));
+        });
+        let panel_focus_right =
+            cx.listener(|shell, _action: &NativePanelFocusRight, _window, cx| {
+                cx.stop_propagation();
+                shell
+                    .dispatch_keyboard(KeyboardShortcut::ctrl(ShortcutKey::Arrow(ArrowKey::Right)));
+            });
+        let panel_focus_up = cx.listener(|shell, _action: &NativePanelFocusUp, _window, cx| {
+            cx.stop_propagation();
+            shell.dispatch_keyboard(KeyboardShortcut::ctrl(ShortcutKey::Arrow(ArrowKey::Up)));
+        });
+        let panel_focus_down = cx.listener(|shell, _action: &NativePanelFocusDown, _window, cx| {
+            cx.stop_propagation();
+            shell.dispatch_keyboard(KeyboardShortcut::ctrl(ShortcutKey::Arrow(ArrowKey::Down)));
+        });
+        let panel_move_left = cx.listener(|shell, _action: &NativePanelMoveLeft, _window, cx| {
+            cx.stop_propagation();
+            shell.dispatch_keyboard(KeyboardShortcut::ctrl_shift(ShortcutKey::Arrow(
+                ArrowKey::Left,
+            )));
+        });
+        let panel_move_right = cx.listener(|shell, _action: &NativePanelMoveRight, _window, cx| {
+            cx.stop_propagation();
+            shell.dispatch_keyboard(KeyboardShortcut::ctrl_shift(ShortcutKey::Arrow(
+                ArrowKey::Right,
+            )));
+        });
+        let panel_move_up = cx.listener(|shell, _action: &NativePanelMoveUp, _window, cx| {
+            cx.stop_propagation();
+            shell.dispatch_keyboard(KeyboardShortcut::ctrl_shift(ShortcutKey::Arrow(
+                ArrowKey::Up,
+            )));
+        });
+        let panel_move_down = cx.listener(|shell, _action: &NativePanelMoveDown, _window, cx| {
+            cx.stop_propagation();
+            shell.dispatch_keyboard(KeyboardShortcut::ctrl_shift(ShortcutKey::Arrow(
+                ArrowKey::Down,
+            )));
+        });
         let dismiss = cx.listener(|shell, _action: &NativeDismissTransient, _window, cx| {
             cx.stop_propagation();
             // Escape closes shell-local transient UI even when the selected
@@ -43820,7 +44846,11 @@ impl NativeShell {
             .layout
             .clone()
             .fitted(f32::from(viewport.width), f32::from(viewport.height));
-        let workspace_actions = self.conversation_delete_action(cx);
+        // Spec 6.3: one primary action per panel and everything else behind
+        // its ⋯ menu. The header's Done/Restore/Archive/Delete strip acted on
+        // "the selected task" no matter which panel you were looking at, which
+        // is exactly the ambiguity the per-panel action removes.
+        let workspace_actions: Option<AnyElement> = None;
         let workspace_header = self.header_bar(
             tokens,
             None,
@@ -43998,6 +45028,21 @@ impl NativeShell {
             .on_action::<NativeCycleTerminal>(cycle_terminal)
             .on_action::<NativeCycleTerminalBack>(cycle_terminal_back)
             .on_action::<NativeDismissTransient>(dismiss)
+            .on_action::<NativePanelSettle>(panel_settle)
+            .on_action::<NativePanelZoom>(panel_zoom)
+            .on_action::<NativePanelView1>(panel_view_1)
+            .on_action::<NativePanelView2>(panel_view_2)
+            .on_action::<NativePanelView3>(panel_view_3)
+            .on_action::<NativePanelView4>(panel_view_4)
+            .on_action::<NativePanelView5>(panel_view_5)
+            .on_action::<NativePanelFocusLeft>(panel_focus_left)
+            .on_action::<NativePanelFocusRight>(panel_focus_right)
+            .on_action::<NativePanelFocusUp>(panel_focus_up)
+            .on_action::<NativePanelFocusDown>(panel_focus_down)
+            .on_action::<NativePanelMoveLeft>(panel_move_left)
+            .on_action::<NativePanelMoveRight>(panel_move_right)
+            .on_action::<NativePanelMoveUp>(panel_move_up)
+            .on_action::<NativePanelMoveDown>(panel_move_down)
             .on_action::<NativeDockChanges>(dock_changes)
             .on_action::<NativeDockFiles>(dock_files)
             .on_action::<NativeDockTerminal>(dock_terminal)
@@ -44353,6 +45398,9 @@ impl NativeShell {
     }
 
     fn dispatch_keyboard(&mut self, shortcut: KeyboardShortcut) {
+        if armed_terminal_declines_chord(&self.keyboard, shortcut, self.terminal_input_is_armed()) {
+            return;
+        }
         // Disjoint field borrows: interaction lives under `hosts`, keyboard is a sibling.
         let local_id = self.local_host_id();
         let Some((focus_epoch, request_generation, action)) = self
@@ -50668,18 +51716,19 @@ pub(crate) mod tests {
             .expect("headless shell test lock");
         gpui::Application::headless().run(|cx| {
             crate::ui::init(cx);
-            with_test_shell_in_app_cx(cx, runtime, |shell, cx| {
+            with_test_shell_in_app_cx(cx, runtime, |shell, _cx| {
                 assert!(shell.layout.dock_collapsed);
-                assert!(
-                    shell.conversation_delete_action(cx).is_some(),
-                    "collapsed dock must keep an Add action affordance"
-                );
+                // The right dock is retired (spec 6.2): its tools are panel
+                // views, so the toggle that used to open it must not, or the
+                // same tool would paint twice on one screen. The assertion is
+                // inverted rather than deleted -- this is the rule now.
                 shell.toggle_pane(PaneEdge::Dock);
-                assert!(!shell.layout.dock_collapsed);
                 assert!(
-                    shell.conversation_delete_action(cx).is_some(),
-                    "Add action is independent from the right-panel visibility"
+                    shell.layout.dock_collapsed,
+                    "the retired dock must stay closed however it is asked to open"
                 );
+                shell.dispatch_named_accessibility_action("native-shell-context-dock-toggle");
+                assert!(shell.layout.dock_collapsed);
             });
             cx.quit();
         });
@@ -55787,8 +56836,8 @@ pub(crate) mod tests {
             assert!(shell.layout.dock_collapsed);
             shell.dispatch_named_accessibility_action("native-shell-context-dock-toggle");
             assert!(
-                !shell.layout.dock_collapsed,
-                "the compact right-panel control must expand the context dock"
+                shell.layout.dock_collapsed,
+                "the retired right dock must not reopen; its tools are panel views"
             );
             for (element_id, expected_tool) in [
                 ("native-dock-tab-changes", CockpitDockTool::Changes),
@@ -55849,8 +56898,8 @@ pub(crate) mod tests {
                 "the center-mode switch must not replace the expanded right-panel surface"
             );
             assert!(
-                !shell.layout.dock_collapsed,
-                "switching the center canvas must not collapse the right panel"
+                shell.layout.dock_collapsed,
+                "the retired right dock stays closed across every centre-canvas switch"
             );
             assert!(
                 shell.local_slot_mut().composer_error.as_deref() != Some("provider terminal turn is not ready yet"),
@@ -55900,7 +56949,7 @@ pub(crate) mod tests {
                 MainConversationCanvas::TaskConversation
             );
             assert_eq!(shell.cockpit().active_tool(), CockpitDockTool::Browser);
-            assert!(!shell.layout.dock_collapsed);
+            assert!(shell.layout.dock_collapsed);
         });
     }
 
@@ -58323,6 +59372,229 @@ pub(crate) mod tests {
                 && empty_branch.contains("native-empty-conversation")
                 && empty_branch.contains(".child(conversation_footer)"),
             "zero-row conversations must keep the canonical surface + composer/footer contract"
+        );
+    }
+
+    /// Ruling (a), both branches. The armed branch is the one a headless shell
+    /// cannot reach -- there is no PTY -- so the rule is a free function over
+    /// the binding table and the armed flag, and this drives both values.
+    #[test]
+    fn an_armed_terminal_keeps_eof_and_word_motion_and_gives_back_everything_else() {
+        use crate::ui::actions::{ArrowKey, KeyboardModel, KeyboardShortcut, ShortcutKey};
+        let keyboard = KeyboardModel::default();
+        let pty_chords = [
+            KeyboardShortcut::ctrl(ShortcutKey::Character('d')),
+            KeyboardShortcut::ctrl(ShortcutKey::Arrow(ArrowKey::Left)),
+            KeyboardShortcut::ctrl_shift(ShortcutKey::Arrow(ArrowKey::Down)),
+        ];
+        for shortcut in pty_chords {
+            assert!(
+                super::armed_terminal_declines_chord(&keyboard, shortcut, true),
+                "{shortcut:?} must reach the PTY while the terminal is armed"
+            );
+            assert!(
+                !super::armed_terminal_declines_chord(&keyboard, shortcut, false),
+                "{shortcut:?} is the shell's while the terminal is not armed"
+            );
+        }
+        // The panel chords that mean nothing inside a PTY stay with the shell
+        // in BOTH states, so typing in a terminal never loses the panel.
+        for shortcut in [
+            KeyboardShortcut::ctrl_shift(ShortcutKey::Character('z')),
+            KeyboardShortcut::ctrl(ShortcutKey::Digit(3)),
+            KeyboardShortcut::ctrl(ShortcutKey::Character('k')),
+        ] {
+            assert!(!super::armed_terminal_declines_chord(
+                &keyboard, shortcut, true
+            ));
+            assert!(!super::armed_terminal_declines_chord(
+                &keyboard, shortcut, false
+            ));
+        }
+    }
+
+    /// "Always for this task" grants the TOOL, not the exact command line.
+    /// The write and the read use one definition, so a second Bash command is
+    /// covered and a Write is not.
+    #[test]
+    fn always_for_this_task_covers_the_same_tool_and_nothing_else() {
+        assert_eq!(NativeShell::auto_allow_tool("Bash: cargo test"), "Bash");
+        assert_eq!(
+            NativeShell::auto_allow_tool("Write src/x.rs (+4 -1)"),
+            "Write"
+        );
+        assert_eq!(
+            NativeShell::auto_allow_tool("Bash: cargo test"),
+            NativeShell::auto_allow_tool("Bash: cargo build"),
+            "the grant is the tool, so a second Bash command is the same grant"
+        );
+        assert_ne!(
+            NativeShell::auto_allow_tool("Bash: cargo test"),
+            NativeShell::auto_allow_tool("Write src/x.rs"),
+            "a Write must still ask after Bash was granted"
+        );
+        assert_eq!(NativeShell::auto_allow_tool("   "), "");
+    }
+
+    /// Every view a panel can show has to reach a surface. A view that mapped
+    /// to no tool and is not one of the two the panel paints itself would be a
+    /// tab that opens an empty panel.
+    #[test]
+    fn every_pane_view_names_the_surface_that_serves_it() {
+        for view in PaneView::TABS.iter().chain(PaneView::MORE.iter()) {
+            let tool = NativeShell::dock_tool_for_view(*view);
+            match view {
+                PaneView::Conversation | PaneView::Terminal => assert!(
+                    tool.is_none(),
+                    "{view:?} is painted by the panel itself, not by a dock tool"
+                ),
+                _ => assert!(tool.is_some(), "{view:?} has no surface behind it"),
+            }
+        }
+        assert_eq!(
+            NativeShell::dock_tool_for_view(PaneView::Files),
+            Some(CockpitDockTool::Files)
+        );
+        assert_eq!(
+            NativeShell::dock_tool_for_view(PaneView::Services),
+            Some(CockpitDockTool::Services)
+        );
+    }
+
+    /// The accessibility ids the panel publishes must be stable for one task
+    /// and distinct between tasks and between tabs -- a screen reader that
+    /// activated "Conversation" and reached another panel's Files would be
+    /// worse than no node at all.
+    #[test]
+    fn panel_accessibility_ids_are_stable_and_owner_scoped() {
+        use crate::client::HostId;
+        let key = |tail: u8| {
+            let mut bytes = [
+                0x01, 0x8f, 0x60, 0xb0, 0x9c, 0x1a, 0x70, 0x01, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00,
+                0x00, 0x01,
+            ];
+            bytes[15] = tail;
+            HostTaskKey::new(
+                HostId::LocalProfile("p".into()),
+                TaskId::from_bytes(bytes).expect("task id"),
+            )
+        };
+        let first = key(1);
+        let second = key(2);
+        assert_eq!(
+            super::panel_view_tab_element_id(&first, PaneView::Conversation),
+            super::panel_view_tab_element_id(&first, PaneView::Conversation),
+            "one task's tab must keep one id across paints"
+        );
+        assert_ne!(
+            super::panel_view_tab_element_id(&first, PaneView::Conversation),
+            super::panel_view_tab_element_id(&first, PaneView::Files)
+        );
+        assert_ne!(
+            super::panel_view_tab_element_id(&first, PaneView::Conversation),
+            super::panel_view_tab_element_id(&second, PaneView::Conversation)
+        );
+        assert_ne!(
+            super::panel_primary_element_id(&first),
+            super::panel_primary_element_id(&second)
+        );
+        assert!(
+            super::panel_view_tab_element_id(&first, PaneView::Conversation)
+                .starts_with("native-panel-tab-conversation-")
+        );
+        assert!(super::panel_primary_element_id(&first).starts_with("native-panel-primary-"));
+    }
+
+    /// The pane renderer paints the two-row chrome and the frame from the
+    /// panel module, and nothing of the header it replaced.
+    ///
+    /// A source scan because a GPUI element tree is not introspectable
+    /// headlessly: what it can see is that the renderer calls the painters and
+    /// no longer builds the old header, its close button or its 42 px row.
+    #[test]
+    fn the_pane_renderer_is_the_panel_chrome_and_not_the_old_header() {
+        let source = include_str!("native_shell.rs");
+        let renderer = source
+            .split("    fn render_task_workspace_pane(")
+            .nth(1)
+            .and_then(|tail| tail.split("    fn panel_handlers(").next())
+            .expect("pane renderer");
+        assert!(
+            renderer.contains("panel_chrome_element(")
+                && renderer.contains("panel_frame(")
+                && renderer.contains("self.panel_chrome_for(pane, row)"),
+            "the pane must be painted by the panel module, from its board row"
+        );
+        for gone in [
+            "native-task-pane-header",
+            "native-task-pane-close",
+            "h(px(42.0))",
+        ] {
+            assert!(
+                !renderer.contains(gone),
+                "{gone} belongs to the header the two-row chrome replaced"
+            );
+        }
+        // Every view reaches a body: the two the panel paints itself and the
+        // six the dock serves, each with the pane's OWN owner.
+        assert_eq!(
+            renderer.matches("self.workspace_dock_surface_for(").count(),
+            6,
+            "the six dock-served views must each render for the pane's owner"
+        );
+        // Task 12's rules survive the rewrite.
+        assert!(
+            source.contains("chrome.ordinal") || {
+                let panel = include_str!("panel/render.rs");
+                panel.contains("chrome\n                .ordinal")
+                    || panel.contains("chrome.ordinal")
+            },
+            "the ordinal chip must still sit in the title row"
+        );
+    }
+
+    /// Spec 6.4: a pending approval replaces the composer with the docked
+    /// one-liner, and the question stays a card in the stream.
+    #[test]
+    fn a_pending_approval_replaces_the_composer_and_the_question_stays_in_the_stream() {
+        let source = include_str!("native_shell.rs");
+        let surface = source
+            .split("    fn task_conversation_surface_for(")
+            .nth(1)
+            .and_then(|tail| tail.split("\n    fn ").next())
+            .expect("conversation surface");
+        assert!(
+            surface.contains("let composer_footer = if let Some(summary) = pending_permission {")
+                && surface.contains("permission_dock_element(&summary, tokens, &handlers)")
+                && surface.contains("native-permission-dock"),
+            "a pending approval must replace the composer, not sit beside it"
+        );
+        // The question card belongs to the stream renderer, not to the dock.
+        let conversation = include_str!("conversation/render.rs");
+        assert!(
+            conversation.contains("ConversationRow::Question {")
+                && conversation.contains("question_element("),
+            "the question is a card in the stream (needs-you option 1)"
+        );
+        assert!(
+            !surface.contains("question_element("),
+            "the question must never be docked"
+        );
+    }
+
+    /// Spec 6.3: one primary action per panel, everything else behind its ⋯
+    /// menu. The header's task action strip acted on "the selected task" from
+    /// a place that named no panel, which is the ambiguity that removed it.
+    #[test]
+    fn the_workspace_header_no_longer_carries_a_task_action_strip() {
+        let source = include_str!("native_shell.rs");
+        assert!(
+            source.contains("let workspace_actions: Option<AnyElement> = None;"),
+            "the header must pass no task actions"
+        );
+        assert!(
+            !source.contains("let workspace_actions = self.conversation_delete_action(cx);"),
+            "the action strip must not be built for the header any more"
         );
     }
 
