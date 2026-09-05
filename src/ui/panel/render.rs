@@ -55,10 +55,19 @@ const ROW_PADDING_X: f32 = 10.0;
 const ROW_PADDING_LEFT: f32 = ROW_PADDING_X + PANEL_STRIPE_WIDTH;
 /// `.hdr { gap: 8px }`.
 const TITLE_ROW_GAP: f32 = 8.0;
-/// `.hdr .title { font-size: 13px; font-weight: 600 }`.
-const TITLE_FONT_SIZE: f32 = 13.0;
-/// `.hdr .inline { font-size: 11.5px }` -- the status folded into the title row.
-const INLINE_STATUS_FONT_SIZE: f32 = 11.5;
+/// `.hdr .title { font-weight: 600 }`, at the redesign's title size.
+///
+/// The mockup CSS says 13 px, and 13 px is what shipped -- against the PNGs
+/// the row then read one to two pixels large everywhere, because the mockup's
+/// browser and GPUI do not measure "13 px" the same way. The spec's type scale
+/// is the authority over the CSS literal (design language rule 2: 12 for
+/// titles, 13 for the ONE heading a surface gets, and the panel title is not
+/// that heading), so the constant is pinned at 12 (fix wave 1, F12).
+const TITLE_FONT_SIZE: f32 = 12.0;
+/// `.hdr .inline` -- the status folded into the title row, at the scale's
+/// "secondary rows" size. 11.5 is the BODY size in rule 2; the status is a
+/// secondary row beside a 12 px title, and at 11.5 it read as a second title.
+const INLINE_STATUS_FONT_SIZE: f32 = 11.0;
 /// `.st .s { gap: 5px }`.
 const STATUS_GAP: f32 = 5.0;
 /// The title floor at [`TIGHT_WIDTH`], where the row has nothing to spare.
@@ -1255,6 +1264,60 @@ mod tests {
         assert!(
             !tabs.contains("tokens.text.muted.to_gpui()"),
             "no tab is painted in the muted grey, which reads as disabled"
+        );
+    }
+
+    /// F12: the redesign's type scale, pinned at the density the shell is
+    /// actually running, and shown not to move with it.
+    ///
+    /// Where the density comes from: `NativeShell::theme_tokens` builds its
+    /// tokens from `self.preferences`, and the window is opened with
+    /// `RuntimePreferencesSnapshot::from_system(appearance, scale_factor,
+    /// RuntimePreferencesSnapshot::default().density())` -- so the shipped
+    /// default is `Density::Comfortable` with the display's own `Scale`, and
+    /// only the board's density toggle ever changes it.
+    ///
+    /// Whether it reaches these numbers: it does not. `density_metrics` gives
+    /// Comfortable a 12 px caption and a 14 px body against Compact's 11 and
+    /// 13, but this painter never reads `tokens.density.typography` -- every
+    /// size here is a literal measured off the mockup. So "the redesign
+    /// numbers ARE the comfortable numbers" holds by the painter ignoring the
+    /// density, and the scan below is what keeps it true.
+    #[test]
+    fn the_chrome_type_scale_is_the_specs_and_no_density_moves_it() {
+        assert_eq!(TITLE_FONT_SIZE, 12.0, "spec: panel title 12 semibold");
+        assert_eq!(INLINE_STATUS_FONT_SIZE, 11.0, "spec: status 11");
+        assert_eq!(TAB_FONT_SIZE, 11.5, "spec: tabs 11.5");
+        // Nothing in the chrome is larger than the 12 px title: rule 2 keeps 13
+        // for the one heading a surface gets, and a panel's heading is its
+        // title. The two exceptions are glyph boxes, not text.
+        assert!(ACTION_FONT_SIZE <= TAB_FONT_SIZE);
+        assert!(INLINE_STATUS_FONT_SIZE < TITLE_FONT_SIZE);
+
+        // The four sizes the shell can hand the painter, at both densities.
+        // The metrics differ; the chrome does not.
+        let comfortable = crate::ui::tokens::dark(Density::Comfortable, Scale::Scale100);
+        let compact = crate::ui::tokens::dark(Density::Compact, Scale::Scale100);
+        assert_eq!(comfortable.density.density, Density::Comfortable);
+        assert_ne!(
+            comfortable.density.typography.body, compact.density.typography.body,
+            "the two densities must really differ, or this test proves nothing"
+        );
+
+        let source = include_str!("render.rs");
+        let painter = source
+            .split("#[cfg(test)]")
+            .next()
+            .expect("the painter is everything above its tests");
+        assert!(
+            !painter.contains("density.typography"),
+            "the panel chrome must not take its type scale from the density metrics"
+        );
+        // Every text size in the painter comes from a named constant, so a
+        // literal cannot creep back in beside them.
+        assert!(
+            !painter.contains(".text_size(px(1"),
+            "text sizes belong in the constants above, not inline"
         );
     }
 }
