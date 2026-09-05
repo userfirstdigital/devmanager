@@ -18,6 +18,8 @@ use gpui_component::input::{Input, InputState};
 use gpui_component::{Disableable, IconName, Sizable};
 use zeroize::Zeroizing;
 
+use crate::ui::overlay_chrome;
+
 use crate::client::{
     hex_encode, ConnectTrustedOptions, FleetError, FleetRemoval, HostFleet, HostId,
     PairEnrollRequest, RemoteTrustError, RemoteTrustStore, TrustedHostRecord,
@@ -2243,35 +2245,28 @@ impl NativeShell {
         let mut section = div()
             .flex()
             .flex_col()
-            .gap(px(10.0))
+            .gap(px(overlay_chrome::REGION_PADDING))
             .mt(px(16.0))
-            .child(
-                div()
-                    .text_size(px(14.0))
-                    .font_weight(FontWeight::SEMIBOLD)
-                    .child("Other PCs"),
-            )
-            .child(
-                div()
-                    .text_size(px(12.0))
-                    .text_color(tokens.text.secondary.to_gpui())
-                    .child(
-                        "Pair another DevManager PC over your LAN. Saved PCs restore into this window's fleet; closing this window does not erase durable trust.",
-                    ),
-            );
+            .text_size(px(overlay_chrome::BODY_FONT_SIZE))
+            .child(overlay_chrome::field_label("Other PCs", tokens))
+            .child(overlay_chrome::caption(
+                "Pair another DevManager PC over your LAN. Saved PCs restore into this window's fleet; closing this window does not erase durable trust.",
+                tokens,
+            ));
         if let Some(fields) = &self.trusted_hosts.fields {
             section = section
                 .child(
                     div()
                         .flex()
                         .items_center()
-                        .gap(px(12.0))
+                        .gap(px(overlay_chrome::CONTROL_GAP))
                         .child(
                             div()
                                 .w(px(140.0))
                                 .flex_shrink_0()
-                                .text_size(px(12.0))
-                                .child("Endpoint"),
+                                .text_size(px(overlay_chrome::SECTION_LABEL_FONT_SIZE))
+                                .text_color(tokens.text.muted.to_gpui())
+                                .child("ENDPOINT"),
                         )
                         .child(
                             div()
@@ -2284,13 +2279,14 @@ impl NativeShell {
                     div()
                         .flex()
                         .items_center()
-                        .gap(px(12.0))
+                        .gap(px(overlay_chrome::CONTROL_GAP))
                         .child(
                             div()
                                 .w(px(140.0))
                                 .flex_shrink_0()
-                                .text_size(px(12.0))
-                                .child("Pairing code"),
+                                .text_size(px(overlay_chrome::SECTION_LABEL_FONT_SIZE))
+                                .text_color(tokens.text.muted.to_gpui())
+                                .child("PAIRING CODE"),
                         )
                         .child(
                             div()
@@ -2303,13 +2299,14 @@ impl NativeShell {
                     div()
                         .flex()
                         .items_center()
-                        .gap(px(12.0))
+                        .gap(px(overlay_chrome::CONTROL_GAP))
                         .child(
                             div()
                                 .w(px(140.0))
                                 .flex_shrink_0()
-                                .text_size(px(12.0))
-                                .child("CA PEM path"),
+                                .text_size(px(overlay_chrome::SECTION_LABEL_FONT_SIZE))
+                                .text_color(tokens.text.muted.to_gpui())
+                                .child("CA PEM PATH"),
                         )
                         .child(
                             div()
@@ -2319,19 +2316,24 @@ impl NativeShell {
                         ),
                 );
         }
-        let mut actions = div().flex().flex_wrap().items_center().gap(px(8.0)).child(
-            Button::new("native-trusted-connect")
-                .label("Connect")
-                .primary()
-                .small()
-                .icon(IconName::Plus)
-                .disabled(busy)
-                .on_click(cx.listener(|shell, _: &ClickEvent, window, cx| {
-                    cx.stop_propagation();
-                    shell.trusted_connect_clicked(window, cx);
-                    cx.notify();
-                })),
-        );
+        let mut actions = div()
+            .flex()
+            .flex_wrap()
+            .items_center()
+            .gap(px(overlay_chrome::CONTROL_GAP))
+            .child(
+                Button::new("native-trusted-connect")
+                    .label("Connect")
+                    .primary()
+                    .small()
+                    .icon(IconName::Plus)
+                    .disabled(busy)
+                    .on_click(cx.listener(|shell, _: &ClickEvent, window, cx| {
+                        cx.stop_propagation();
+                        shell.trusted_connect_clicked(window, cx);
+                        cx.notify();
+                    })),
+            );
         actions = actions.child(
             Button::new("native-trusted-refresh")
                 .label("Refresh")
@@ -2348,7 +2350,7 @@ impl NativeShell {
         if let Some(feedback) = self.trusted_hosts.controller.feedback() {
             section = section.child(
                 div()
-                    .text_size(px(12.0))
+                    .text_size(px(overlay_chrome::BODY_FONT_SIZE))
                     .text_color(tokens.status.warning.to_gpui())
                     .child(SharedString::from(feedback.to_string())),
             );
@@ -2362,7 +2364,7 @@ impl NativeShell {
             for (key, retained) in self.trusted_hosts.controller.retained_forget_ledgers() {
                 section = section.child(
                     div()
-                        .text_size(px(11.0))
+                        .text_size(px(overlay_chrome::ROW_META_FONT_SIZE))
                         .text_color(tokens.text.secondary.to_gpui())
                         .child(format!(
                             "Retained forget ledger {} gen {}: {:?}",
@@ -2388,30 +2390,33 @@ impl NativeShell {
                 .flex()
                 .flex_col()
                 .gap(px(4.0))
-                .p(px(10.0))
-                .rounded(px(8.0))
-                .bg(tokens.surfaces.sunken.to_gpui())
+                .px(px(overlay_chrome::ROW_PADDING_X))
+                .py(px(overlay_chrome::ROW_PADDING_Y))
+                .border_b(px(overlay_chrome::OVERLAY_BORDER_WIDTH))
+                .border_color(tokens.borders.subtle.to_gpui())
                 .child(
                     div()
-                        .text_size(px(12.0))
-                        .font_weight(FontWeight::MEDIUM)
+                        .text_size(px(overlay_chrome::ROW_TITLE_FONT_SIZE))
+                        .line_height(px(overlay_chrome::ROW_TITLE_LINE_HEIGHT))
+                        .text_color(tokens.text.primary.to_gpui())
                         .child(safe_host_label(&row.record)),
                 )
                 .child(
                     div()
-                        .text_size(px(11.0))
-                        .text_color(tokens.text.secondary.to_gpui())
+                        .text_size(px(overlay_chrome::ROW_META_FONT_SIZE))
+                        .line_height(px(overlay_chrome::ROW_META_LINE_HEIGHT))
+                        .text_color(tokens.text.muted.to_gpui())
                         .child(status),
                 );
             if let Some(error) = &row.last_error {
                 row_el = row_el.child(
                     div()
-                        .text_size(px(11.0))
+                        .text_size(px(overlay_chrome::ROW_META_FONT_SIZE))
                         .text_color(tokens.status.destructive.to_gpui())
                         .child(error.clone()),
                 );
             }
-            let mut buttons = div().flex().flex_wrap().gap(px(6.0));
+            let mut buttons = div().flex().flex_wrap().gap(px(overlay_chrome::CHIP_GAP));
             if matches!(
                 row.phase,
                 TrustedHostRowPhase::Failed

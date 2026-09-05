@@ -234,6 +234,54 @@ pub fn section_label(text: impl Into<String>, tokens: ThemeTokens) -> AnyElement
         .into_any_element()
 }
 
+/// The one heading a surface is allowed (rule 2): 13 px semibold, primary.
+pub fn heading(text: impl Into<String>, tokens: ThemeTokens) -> AnyElement {
+    div()
+        .text_size(px(HEADING_FONT_SIZE))
+        .font_weight(gpui::FontWeight::SEMIBOLD)
+        .text_color(tokens.text.primary.to_gpui())
+        .child(text.into())
+        .into_any_element()
+}
+
+/// A caption under a heading, or any explanatory sentence a surface carries:
+/// 10.5 px, muted (rule 2).
+pub fn caption(text: impl Into<String>, tokens: ThemeTokens) -> AnyElement {
+    div()
+        .text_size(px(CAPTION_FONT_SIZE))
+        .text_color(tokens.text.muted.to_gpui())
+        .child(text.into())
+        .into_any_element()
+}
+
+/// The label above an input. Same vocabulary as a group label (rule 2), with no
+/// padding of its own so the field's own column owns the spacing.
+pub fn field_label(text: impl Into<String>, tokens: ThemeTokens) -> AnyElement {
+    div()
+        .text_size(px(SECTION_LABEL_FONT_SIZE))
+        .text_color(tokens.text.muted.to_gpui())
+        .child(text.into().to_uppercase())
+        .into_any_element()
+}
+
+/// A modal dialog's surface. Same chrome as a menu, at a dialog's padding: the
+/// redesign gives a dialog no card of its own beyond the overlay it already is.
+pub fn dialog_surface(id: impl Into<ElementId>, tokens: ThemeTokens) -> Stateful<Div> {
+    div()
+        .id(id)
+        .flex()
+        .flex_col()
+        .gap(px(REGION_PADDING))
+        .p(px(REGION_PADDING))
+        .rounded(px(OVERLAY_RADIUS))
+        .bg(tokens.surfaces.overlay.to_gpui())
+        .border(px(OVERLAY_BORDER_WIDTH))
+        .border_color(tokens.borders.default.to_gpui())
+        .shadow_sm()
+        .text_size(px(BODY_FONT_SIZE))
+        .text_color(tokens.text.primary.to_gpui())
+}
+
 /// A keyboard chip. The mockup's `kbd`: a hairline box, radius 4, 1x6, 10.5 px,
 /// muted -- never a coloured badge.
 pub fn kbd_chip(text: impl Into<String>, tokens: ThemeTokens) -> AnyElement {

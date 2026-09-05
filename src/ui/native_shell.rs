@@ -35326,16 +35326,17 @@ impl NativeShell {
             .id(id)
             .relative()
             .w_full()
-            .px(px(tokens.density.spacing.md))
-            .py(px(tokens.density.spacing.sm))
-            .rounded(px(tokens.density.radii.md))
+            .px(px(overlay_chrome::INPUT_PADDING_X))
+            .py(px(overlay_chrome::INPUT_PADDING_Y))
+            .rounded(px(overlay_chrome::INPUT_RADIUS))
             .bg(tokens.surfaces.sunken.to_gpui())
-            .border(px(1.0))
+            .border(px(overlay_chrome::OVERLAY_BORDER_WIDTH))
             .border_color(if chrome.show_focus_ring {
-                tokens.borders.selection.to_gpui()
+                tokens.borders.focus.to_gpui()
             } else {
-                tokens.borders.subtle.to_gpui()
+                tokens.borders.default.to_gpui()
             })
+            .text_size(px(overlay_chrome::BODY_FONT_SIZE))
             .flex()
             .items_center()
             .min_h(px(tokens.density.controls.row_height));
@@ -35410,16 +35411,17 @@ impl NativeShell {
             .id(id)
             .relative()
             .w_full()
-            .px(px(tokens.density.spacing.md))
-            .py(px(tokens.density.spacing.sm))
-            .rounded(px(tokens.density.radii.md))
+            .px(px(overlay_chrome::INPUT_PADDING_X))
+            .py(px(overlay_chrome::INPUT_PADDING_Y))
+            .rounded(px(overlay_chrome::INPUT_RADIUS))
             .bg(tokens.surfaces.sunken.to_gpui())
-            .border(px(1.0))
+            .border(px(overlay_chrome::OVERLAY_BORDER_WIDTH))
             .border_color(if chrome.show_focus_ring {
-                tokens.borders.selection.to_gpui()
+                tokens.borders.focus.to_gpui()
             } else {
-                tokens.borders.subtle.to_gpui()
+                tokens.borders.default.to_gpui()
             })
+            .text_size(px(overlay_chrome::BODY_FONT_SIZE))
             .flex()
             .items_center()
             .min_h(px(tokens.density.controls.row_height));
@@ -35451,8 +35453,8 @@ impl NativeShell {
                 .id(("native-overlay-field-caret", index))
                 .flex_none()
                 .w(px(1.0))
-                .h(px(16.0))
-                .bg(tokens.actions.primary.default.background.to_gpui())
+                .h(px(overlay_chrome::ROW_TITLE_LINE_HEIGHT))
+                .bg(tokens.text.primary.to_gpui())
                 .into_any_element(),
             OverlayTextFieldPart::Text(text) => div()
                 .id(("native-overlay-field-text", index))
@@ -35697,11 +35699,11 @@ impl NativeShell {
             .overflow_y_scroll()
             .track_scroll(&self.theme_editor_scroll_handle)
             .flex_none()
-            .rounded(px(tokens.density.radii.lg))
-            .border(px(1.0))
-            .border_color(tokens.borders.subtle.to_gpui())
+            .rounded(px(overlay_chrome::OVERLAY_RADIUS))
+            .border(px(overlay_chrome::OVERLAY_BORDER_WIDTH))
+            .border_color(tokens.borders.default.to_gpui())
             .bg(tokens.surfaces.overlay.to_gpui())
-            .p(px(tokens.density.spacing.md))
+            .p(px(overlay_chrome::REGION_PADDING))
             .flex()
             .flex_col()
             .gap(px(tokens.density.spacing.sm))
@@ -35711,23 +35713,18 @@ impl NativeShell {
                 tokens.scrollbar,
                 tokens.surfaces.overlay,
             ))
-            .child(
-                div()
-                    .text_size(px(tokens.density.typography.body))
-                    .font_weight(FontWeight::SEMIBOLD)
-                    .text_color(tokens.text.primary.to_gpui())
-                    .child(if editor.editing_id.is_some() {
-                        "Edit theme"
-                    } else {
-                        "Create theme"
-                    }),
-            )
-            .child(
-                div()
-                    .text_size(px(tokens.density.typography.caption))
-                    .text_color(tokens.text.muted.to_gpui())
-                    .child(format!("id · {}", editor.theme_id)),
-            )
+            .child(overlay_chrome::heading(
+                if editor.editing_id.is_some() {
+                    "Edit theme"
+                } else {
+                    "Create theme"
+                },
+                tokens,
+            ))
+            .child(overlay_chrome::caption(
+                format!("id · {}", editor.theme_id),
+                tokens,
+            ))
             .child(
                 div()
                     .flex()
@@ -36189,12 +36186,12 @@ impl NativeShell {
                     div()
                         .w(px(168.0))
                         .p(px(tokens.density.spacing.sm))
-                        .rounded(px(tokens.density.radii.md))
-                        .border(px(1.0))
+                        .rounded(px(overlay_chrome::OVERLAY_RADIUS))
+                        .border(px(overlay_chrome::OVERLAY_BORDER_WIDTH))
                         .border_color(if selected {
                             tokens.borders.focus.to_gpui()
                         } else {
-                            tokens.borders.subtle.to_gpui()
+                            tokens.borders.default.to_gpui()
                         })
                         .bg(tokens.surfaces.canvas.to_gpui())
                         .flex()
@@ -36323,21 +36320,11 @@ impl NativeShell {
                     .min_w(px(0.0))
                     .child(
                         div()
-                            .child(
-                                div()
-                                    .text_size(px(tokens.density.typography.heading))
-                                    .font_weight(FontWeight::SEMIBOLD)
-                                    .text_color(tokens.text.primary.to_gpui())
-                                    .child("Appearance"),
-                            )
-                            .child(
-                                div()
-                                    .text_size(px(tokens.density.typography.caption))
-                                    .text_color(tokens.text.muted.to_gpui())
-                                    .child(
-                                        "Pick System, Light, or Dark, then select a built-in or custom theme. Create, import, duplicate, and edit custom themes here; built-ins stay read-only.",
-                                    ),
-                            ),
+                            .child(overlay_chrome::heading("Appearance", tokens))
+                            .child(overlay_chrome::caption(
+                                "Pick System, Light, or Dark, then select a built-in or custom theme. Create, import, duplicate, and edit custom themes here; built-ins stay read-only.",
+                                tokens,
+                            )),
                     )
                     .child(
                         div()
@@ -36391,19 +36378,16 @@ impl NativeShell {
                                     )),
                             ),
                     )
-                    .child(
-                        div()
-                            .text_size(px(tokens.density.typography.body))
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .text_color(tokens.text.primary.to_gpui())
-                            .child(format!(
-                                "{} themes",
-                                match resolved.appearance {
-                                    ThemeAppearance::Light => "Light",
-                                    ThemeAppearance::Dark => "Dark",
-                                }
-                            )),
-                    )
+                    .child(overlay_chrome::field_label(
+                        format!(
+                            "{} themes",
+                            match resolved.appearance {
+                                ThemeAppearance::Light => "Light",
+                                ThemeAppearance::Dark => "Dark",
+                            }
+                        ),
+                        tokens,
+                    ))
                     .child(
                         div()
                             .flex()
@@ -36485,21 +36469,11 @@ impl NativeShell {
             .flex()
             .flex_col()
             .gap(px(tokens.density.spacing.md))
-            .child(
-                div()
-                    .text_size(px(tokens.density.typography.heading))
-                    .font_weight(FontWeight::SEMIBOLD)
-                    .text_color(tokens.text.primary.to_gpui())
-                    .child("Providers"),
-            )
-            .child(
-                div()
-                    .text_size(px(tokens.density.typography.caption))
-                    .text_color(tokens.text.muted.to_gpui())
-                    .child(
-                        "Configure Claude, Codex, and Cursor instances. Grok and OpenCode are listed as unavailable stubs. Health uses cached snapshots; Refresh runs a bounded background probe.",
-                    ),
-            )
+            .child(overlay_chrome::heading("Providers", tokens))
+            .child(overlay_chrome::caption(
+                "Configure Claude, Codex, and Cursor instances. Grok and OpenCode are listed as unavailable stubs. Health uses cached snapshots; Refresh runs a bounded background probe.",
+                tokens,
+            ))
             .child(
                 div()
                     .flex()
@@ -36839,17 +36813,17 @@ impl NativeShell {
             ))
             .flex()
             .flex_col()
-            .gap(px(tokens.density.spacing.sm))
-            .p(px(tokens.density.spacing.md))
-            .rounded(px(tokens.density.radii.md))
-            .border(px(1.0))
-            .border_color(tokens.borders.subtle.to_gpui())
-            .bg(tokens.surfaces.sunken.to_gpui())
+            .gap(px(overlay_chrome::ROW_PADDING_Y))
+            .px(px(overlay_chrome::ROW_PADDING_X))
+            .py(px(overlay_chrome::ROW_PADDING_Y))
+            .rounded(px(overlay_chrome::OVERLAY_RADIUS))
+            .border(px(overlay_chrome::OVERLAY_BORDER_WIDTH))
+            .border_color(tokens.borders.default.to_gpui())
             .child(
                 div()
                     .flex()
                     .items_center()
-                    .gap(px(tokens.density.spacing.sm))
+                    .gap(px(overlay_chrome::CONTROL_GAP))
                     .child(
                         div()
                             .size(px(8.0))
@@ -36862,14 +36836,15 @@ impl NativeShell {
                     .child(
                         div()
                             .flex_1()
-                            .text_size(px(tokens.density.typography.body))
+                            .min_w(px(0.0))
+                            .text_size(px(overlay_chrome::TITLE_FONT_SIZE))
                             .font_weight(FontWeight::SEMIBOLD)
                             .text_color(tokens.text.primary.to_gpui())
                             .child(instance.display_name.clone()),
                     )
                     .child(
                         div()
-                            .text_size(px(tokens.density.typography.caption))
+                            .text_size(px(overlay_chrome::ROW_META_FONT_SIZE))
                             .text_color(tokens.text.muted.to_gpui())
                             .child(version),
                     )
@@ -36903,14 +36878,27 @@ impl NativeShell {
             );
         if !is_stub {
             card = card.child(
-                Button::new((
-                    "native-provider-enable",
-                    stable_provider_element_key(&id, "enable"),
-                ))
-                .label(if enabled { "Disable" } else { "Enable" })
-                .ghost()
-                .on_click(cx.listener(
-                    move |shell, _event: &ClickEvent, _window, cx| {
+                div()
+                    .id((
+                        "native-provider-enable",
+                        stable_provider_element_key(&id, "enable"),
+                    ))
+                    .tab_stop(true)
+                    .w_full()
+                    .flex()
+                    .items_center()
+                    .gap(px(overlay_chrome::CONTROL_GAP))
+                    .cursor_pointer()
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w(px(0.0))
+                            .text_size(px(overlay_chrome::ROW_TITLE_FONT_SIZE))
+                            .text_color(tokens.text.primary.to_gpui())
+                            .child("Enabled"),
+                    )
+                    .child(overlay_chrome::quiet_toggle(enabled, tokens))
+                    .on_click(cx.listener(move |shell, _event: &ClickEvent, _window, cx| {
                         cx.stop_propagation();
                         shell.ensure_provider_settings();
                         if let Some(ctl) = shell.provider_settings.as_mut() {
@@ -36918,16 +36906,10 @@ impl NativeShell {
                         }
                         shell.flush_provider_settings_pending();
                         cx.notify();
-                    },
-                )),
+                    })),
             );
         } else {
-            card = card.child(
-                div()
-                    .text_size(px(tokens.density.typography.caption))
-                    .text_color(tokens.text.muted.to_gpui())
-                    .child("Unavailable"),
-            );
+            card = card.child(overlay_chrome::caption("Unavailable", tokens));
         }
         let mut body = div()
             .flex()
@@ -38041,23 +38023,29 @@ impl NativeShell {
             Some(RemoteSetupState::Failed) => "Remote access needs attention",
             _ => "Checking local host…",
         };
-        let mut content = div().flex().flex_col().gap(px(12.0))
+        let mut content = div()
+            .flex()
+            .flex_col()
+            .gap(px(overlay_chrome::REGION_PADDING))
+            .text_size(px(overlay_chrome::BODY_FONT_SIZE))
             .text_color(tokens.text.primary.to_gpui())
-            .child(div().text_size(px(16.0)).font_weight(FontWeight::SEMIBOLD).child(state_label))
-            .child(div().text_size(px(12.0)).text_color(tokens.text.secondary.to_gpui())
-                .child("Connect a phone or another browser directly over your LAN. Conversations stay on this PC; closing the desktop window does not move their execution."));
+            .child(overlay_chrome::heading(state_label, tokens))
+            .child(overlay_chrome::caption(
+                "Connect a phone or another browser directly over your LAN. Conversations stay on this PC; closing the desktop window does not move their execution.",
+                tokens,
+            ));
         if let Some(status) = &self.remote_settings.status {
             if let Some(origin) = &status.origin {
                 content = content.child(
                     div()
-                        .text_size(px(12.0))
+                        .text_size(px(overlay_chrome::BODY_FONT_SIZE))
                         .child(format!("Endpoint: {origin}")),
                 );
             }
             if let Some(host) = &status.host_public_id {
                 content = content.child(
                     div()
-                        .text_size(px(11.0))
+                        .text_size(px(overlay_chrome::ROW_META_FONT_SIZE))
                         .text_color(tokens.text.secondary.to_gpui())
                         .child(format!("Host identity: {host}")),
                 );
@@ -38065,7 +38053,7 @@ impl NativeShell {
             if let Some(error) = &status.error {
                 content = content.child(
                     div()
-                        .text_size(px(12.0))
+                        .text_size(px(overlay_chrome::BODY_FONT_SIZE))
                         .text_color(tokens.status.destructive.to_gpui())
                         .child(error.clone()),
                 );
@@ -38086,13 +38074,14 @@ impl NativeShell {
                     div()
                         .flex()
                         .items_center()
-                        .gap(px(12.0))
+                        .gap(px(overlay_chrome::CONTROL_GAP))
                         .child(
                             div()
                                 .w(px(160.0))
                                 .flex_shrink_0()
-                                .text_size(px(12.0))
-                                .child(label),
+                                .text_size(px(overlay_chrome::SECTION_LABEL_FONT_SIZE))
+                                .text_color(tokens.text.muted.to_gpui())
+                                .child(label.to_uppercase()),
                         )
                         .child(
                             div()
@@ -38103,13 +38092,15 @@ impl NativeShell {
                 );
             }
         }
-        content = content.child(div().text_size(px(12.0)).text_color(tokens.text.secondary.to_gpui())
-            .child("LAN access requires a certificate trusted by your phone/PC and matching the HTTPS hostname. DevManager does not silently change certificate trust or firewall rules. HTTP is permitted only on loopback for local testing."));
+        content = content.child(overlay_chrome::caption(
+            "LAN access requires a certificate trusted by your phone/PC and matching the HTTPS hostname. DevManager does not silently change certificate trust or firewall rules. HTTP is permitted only on loopback for local testing.",
+            tokens,
+        ));
         let mut buttons = div()
             .flex()
             .flex_wrap()
             .items_center()
-            .gap(px(8.0))
+            .gap(px(overlay_chrome::CONTROL_GAP))
             .child(
                 Button::new("native-remote-enable")
                     .label(if listening {
@@ -38169,7 +38160,11 @@ impl NativeShell {
         }
         content = content.child(buttons);
         if let Some(feedback) = &self.remote_settings.feedback {
-            content = content.child(div().text_size(px(12.0)).child(feedback.clone()));
+            content = content.child(
+                div()
+                    .text_size(px(overlay_chrome::BODY_FONT_SIZE))
+                    .child(feedback.clone()),
+            );
         }
         if let Some((code, url)) = &self.remote_settings.pairing {
             content = content.child(
@@ -38177,9 +38172,10 @@ impl NativeShell {
                     .flex()
                     .flex_col()
                     .gap(px(6.0))
-                    .p(px(12.0))
-                    .rounded(px(8.0))
-                    .bg(tokens.surfaces.sunken.to_gpui())
+                    .p(px(overlay_chrome::REGION_PADDING))
+                    .rounded(px(overlay_chrome::OVERLAY_RADIUS))
+                    .border(px(overlay_chrome::OVERLAY_BORDER_WIDTH))
+                    .border_color(tokens.borders.default.to_gpui())
                     .child(div().child(format!("Open {url} on your other device")))
                     .child(
                         div()
@@ -38240,23 +38236,13 @@ impl NativeShell {
                             }),
                         )
                         .child(
-                            div()
-                                .id("native-settings-dialog")
+                            overlay_chrome::dialog_surface("native-settings-dialog", tokens)
                                 .w(px(if self.theme_editor.is_some() {
                                     1100.0
                                 } else {
                                     760.0
                                 }))
                                 .max_h(px((f32::from(viewport.height) - 48.0).max(320.0)))
-                                .rounded(px(tokens.density.radii.lg))
-                                .bg(tokens.surfaces.raised.to_gpui())
-                                .border(px(1.0))
-                                .border_color(tokens.borders.subtle.to_gpui())
-                                .shadow_sm()
-                                .p(px(tokens.density.spacing.xl))
-                                .flex()
-                                .flex_col()
-                                .gap(px(tokens.density.spacing.md))
                                 .on_mouse_down(
                                     MouseButton::Left,
                                     cx.listener(|shell, _event: &MouseDownEvent, window, cx| {
@@ -38271,13 +38257,7 @@ impl NativeShell {
                                         .flex()
                                         .items_center()
                                         .justify_between()
-                                        .child(
-                                            div()
-                                                .text_size(px(tokens.density.typography.heading))
-                                                .font_weight(FontWeight::SEMIBOLD)
-                                                .text_color(tokens.text.primary.to_gpui())
-                                                .child("Settings"),
-                                        )
+                                        .child(overlay_chrome::heading("Settings", tokens))
                                         .child(
                                             Button::new("native-settings-cancel")
                                                 .label("Close")
