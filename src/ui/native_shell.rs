@@ -21557,25 +21557,29 @@ impl NativeShell {
             .map(|(index, (label, choice))| {
                 let is_selected = choice == selected;
                 let is_highlighted = index == self.composer_selector_highlight;
-                let check = if is_selected { "✓ " } else { "  " };
-                div()
-                    .id(("native-composer-selector-row", index))
-                    .w_full()
-                    .h(px(24.0))
-                    .px(px(8.0))
-                    .py(px(2.0))
-                    .rounded(px(4.0))
-                    .cursor_pointer()
-                    .hover(|style| style.bg(tokens.surfaces.hover.to_gpui()))
-                    .when(is_highlighted || is_selected, |row| {
-                        row.bg(tokens.surfaces.selection.to_gpui())
-                    })
+                let state = OverlayRowState::selected_when(is_highlighted || is_selected);
+                overlay_chrome::overlay_row(("native-composer-selector-row", index), state, tokens)
                     .on_click(cx.listener(move |shell, _event: &ClickEvent, _window, cx| {
                         cx.stop_propagation();
                         shell.apply_composer_selector_choice(choice.clone());
                         cx.notify();
                     }))
-                    .child(format!("{check}{label}"))
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap(px(overlay_chrome::CHIP_GAP))
+                            .child(overlay_chrome::row_title(label, state, tokens))
+                            .children(is_selected.then(|| {
+                                div()
+                                    .flex_none()
+                                    .text_size(px(overlay_chrome::ROW_META_FONT_SIZE))
+                                    .text_color(
+                                        overlay_chrome::row_meta_colour(state, tokens).to_gpui(),
+                                    )
+                                    .child("\u{2713}")
+                            })),
+                    )
                     .into_any_element()
             });
         Some(
@@ -21601,7 +21605,7 @@ impl NativeShell {
                     div()
                         .id("native-composer-selector-menu")
                         .absolute()
-                        .bottom(px(28.0))
+                        .bottom(px(28.0 + overlay_chrome::OVERLAY_ANCHOR_DROP))
                         .left(px(0.0))
                         .w(px(200.0))
                         .max_w(px(240.0))
@@ -21615,13 +21619,15 @@ impl NativeShell {
                             tokens.scrollbar,
                             tokens.surfaces.overlay,
                         ))
-                        .p(px(4.0))
-                        .rounded(px(6.0))
+                        .flex()
+                        .flex_col()
+                        .py(px(overlay_chrome::OVERLAY_PADDING_Y))
+                        .rounded(px(overlay_chrome::OVERLAY_RADIUS))
                         .bg(tokens.surfaces.overlay.to_gpui())
-                        .border(px(1.0))
-                        .border_color(tokens.borders.subtle.to_gpui())
+                        .border(px(overlay_chrome::OVERLAY_BORDER_WIDTH))
+                        .border_color(tokens.borders.default.to_gpui())
                         .shadow_sm()
-                        .text_size(px(11.0))
+                        .text_size(px(overlay_chrome::ROW_TITLE_FONT_SIZE))
                         .on_mouse_down(
                             MouseButton::Left,
                             cx.listener(|_shell, _event: &MouseDownEvent, _window, cx| {
@@ -27636,23 +27642,22 @@ impl NativeShell {
                   enabled: bool,
                   tone: gpui::Rgba,
                   handler: Box<dyn Fn(&mut NativeShell, &mut Context<NativeShell>)>| {
-                let mut element = div()
-                    .id(id)
-                    .w_full()
-                    .px(px(tokens.density.spacing.md))
-                    .py(px(tokens.density.spacing.xs))
-                    .text_size(px(tokens.density.typography.body))
-                    .text_color(if enabled {
-                        tone
-                    } else {
-                        tokens.text.disabled.to_gpui()
-                    })
-                    .child(text);
-                if enabled {
-                    element = element
-                        .cursor_pointer()
-                        .hover(|style| style.bg(tokens.surfaces.hover.to_gpui()));
-                }
+                let state = if enabled {
+                    OverlayRowState::Idle
+                } else {
+                    OverlayRowState::Disabled
+                };
+                let element = overlay_chrome::overlay_row(id, state, tokens).child(
+                    div()
+                        .text_size(px(overlay_chrome::ROW_TITLE_FONT_SIZE))
+                        .line_height(px(overlay_chrome::ROW_TITLE_LINE_HEIGHT))
+                        .text_color(if enabled {
+                            tone
+                        } else {
+                            tokens.text.disabled.to_gpui()
+                        })
+                        .child(text),
+                );
                 (element, enabled, handler)
             };
         let mut rows: Vec<AnyElement> = Vec::new();
@@ -27661,31 +27666,34 @@ impl NativeShell {
                 div()
                     .id("native-terminal-chip-rename")
                     .w_full()
-                    .px(px(tokens.density.spacing.md))
-                    .py(px(tokens.density.spacing.xs))
-                    .text_size(px(tokens.density.typography.body))
+                    .mx(px(overlay_chrome::ROW_PADDING_X))
+                    .my(px(overlay_chrome::ROW_PADDING_Y))
+                    .px(px(overlay_chrome::INPUT_PADDING_X))
+                    .py(px(overlay_chrome::INPUT_PADDING_Y))
+                    .rounded(px(overlay_chrome::INPUT_RADIUS))
+                    .border(px(overlay_chrome::OVERLAY_BORDER_WIDTH))
+                    .border_color(tokens.borders.focus.to_gpui())
+                    .bg(tokens.surfaces.sunken.to_gpui())
+                    .text_size(px(overlay_chrome::ROW_TITLE_FONT_SIZE))
                     .text_color(tokens.text.primary.to_gpui())
-                    .child(format!("Rename to: {draft}|"))
+                    .child(format!("{draft}|"))
                     .into_any_element(),
             );
-            rows.push(
-                div()
-                    .id("native-terminal-chip-rename-hint")
-                    .w_full()
-                    .px(px(tokens.density.spacing.md))
-                    .pb(px(tokens.density.spacing.xs))
-                    .text_size(px(tokens.density.typography.caption))
-                    .text_color(tokens.text.muted.to_gpui())
-                    .child("Type a name, Enter to apply, Escape to cancel")
-                    .into_any_element(),
-            );
+            rows.push(overlay_chrome::kbd_hint_row(
+                [
+                    ("Enter".to_string(), "apply".to_string()),
+                    ("Esc".to_string(), "cancel".to_string()),
+                ],
+                tokens,
+            ));
             rows.extend(rename_error.map(|message| {
                 div()
                     .id("native-terminal-chip-rename-error")
                     .w_full()
-                    .px(px(tokens.density.spacing.md))
-                    .pb(px(tokens.density.spacing.xs))
-                    .text_size(px(tokens.density.typography.caption))
+                    .px(px(overlay_chrome::ROW_PADDING_X))
+                    .pb(px(overlay_chrome::ROW_PADDING_Y))
+                    .text_size(px(overlay_chrome::ROW_META_FONT_SIZE))
+                    .line_height(px(overlay_chrome::ROW_META_LINE_HEIGHT))
                     .text_color(tokens.status.destructive.to_gpui())
                     .child(message)
                     .into_any_element()
@@ -27775,9 +27783,10 @@ impl NativeShell {
                     div()
                         .id("native-terminal-chip-menu-close-warning")
                         .w_full()
-                        .px(px(tokens.density.spacing.md))
-                        .pb(px(tokens.density.spacing.xs))
-                        .text_size(px(tokens.density.typography.caption))
+                        .px(px(overlay_chrome::ROW_PADDING_X))
+                        .pb(px(overlay_chrome::ROW_PADDING_Y))
+                        .text_size(px(overlay_chrome::ROW_META_FONT_SIZE))
+                        .line_height(px(overlay_chrome::ROW_META_LINE_HEIGHT))
                         .text_color(tokens.status.destructive.to_gpui())
                         .child("Still running. Close again to confirm.")
                         .into_any_element(),
@@ -27810,29 +27819,12 @@ impl NativeShell {
                             },
                         ))
                         .child(
-                            div()
-                                .id("native-terminal-chip-menu")
+                            overlay_chrome::overlay_surface("native-terminal-chip-menu", tokens)
                                 .absolute()
                                 .left(menu.position.x)
-                                .top(menu.position.y)
+                                .top(menu.position.y + px(overlay_chrome::OVERLAY_ANCHOR_DROP))
                                 .w(px(200.0))
-                                .flex()
-                                .flex_col()
-                                .py(px(tokens.density.spacing.xs))
-                                .rounded(px(tokens.density.radii.md))
-                                .bg(tokens.surfaces.overlay.to_gpui())
-                                .border(px(1.0))
-                                .border_color(tokens.borders.subtle.to_gpui())
-                                .shadow_sm()
-                                .child(
-                                    div()
-                                        .w_full()
-                                        .px(px(tokens.density.spacing.md))
-                                        .pb(px(tokens.density.spacing.xs))
-                                        .text_size(px(tokens.density.typography.caption))
-                                        .text_color(tokens.text.muted.to_gpui())
-                                        .child(label),
-                                )
+                                .child(overlay_chrome::section_label(label, tokens))
                                 .children(rows),
                         ),
                 ),
@@ -45057,10 +45049,10 @@ impl Render for NativeGitWindow {
             div()
                 .id("native-git-repository-menu")
                 .absolute()
-                .top(px(38.0))
+                .top(px(34.0 + overlay_chrome::OVERLAY_ANCHOR_DROP))
                 .left(px(12.0))
                 .w(px(300.0))
-                .max_h(px(320.0))
+                .max_h(px(overlay_chrome::OVERLAY_MAX_HEIGHT))
                 .relative()
                 .overflow_y_scroll()
                 .track_scroll(&self.repository_menu_scroll_handle)
@@ -45070,28 +45062,26 @@ impl Render for NativeGitWindow {
                     tokens.scrollbar,
                     tokens.surfaces.overlay,
                 ))
-                .p(px(6.0))
-                .rounded(px(tokens.density.radii.md))
-                .border(px(1.0))
-                .border_color(tokens.borders.subtle.to_gpui())
-                .bg(tokens.surfaces.raised.to_gpui())
-                .shadow_lg()
+                .flex()
+                .flex_col()
+                .py(px(overlay_chrome::OVERLAY_PADDING_Y))
+                .rounded(px(overlay_chrome::OVERLAY_RADIUS))
+                .border(px(overlay_chrome::OVERLAY_BORDER_WIDTH))
+                .border_color(tokens.borders.default.to_gpui())
+                .bg(tokens.surfaces.overlay.to_gpui())
+                .shadow_sm()
+                .child(overlay_chrome::section_label("Repositories", tokens))
                 .children(repositories.iter().enumerate().map(|(index, entry)| {
                     let selector = entry.selector.clone();
                     let label = entry.label.clone();
                     let available = entry.available;
                     let selected = selector == self.selected_repository;
-                    div()
-                        .id(("native-git-repository", index))
-                        .w_full()
-                        .px(px(10.0))
-                        .py(px(8.0))
-                        .rounded(px(tokens.density.radii.sm))
-                        .when(selected, |row| row.bg(tokens.surfaces.selection.to_gpui()))
-                        .when(available, |row| {
-                            row.cursor_pointer()
-                                .hover(|style| style.bg(tokens.surfaces.hover.to_gpui()))
-                        })
+                    let state = if !available {
+                        OverlayRowState::Disabled
+                    } else {
+                        OverlayRowState::selected_when(selected)
+                    };
+                    overlay_chrome::overlay_row(("native-git-repository", index), state, tokens)
                         .on_click(cx.listener(move |this, _event: &ClickEvent, _window, cx| {
                             if available {
                                 this.selected_repository = selector.clone();
@@ -45105,7 +45095,7 @@ impl Render for NativeGitWindow {
                                 cx.notify();
                             }
                         }))
-                        .child(label)
+                        .child(overlay_chrome::row_title(label, state, tokens))
                         .into_any_element()
                 }))
                 .into_any_element()
