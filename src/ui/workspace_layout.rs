@@ -43,6 +43,21 @@ pub const TERMINAL_MAX: f32 = 800.0;
 /// floor that the draggable rails are not allowed to cross.
 pub const CENTER_MIN: f32 = 320.0;
 
+/// What [`KeyedWorkspaceLayout::regrid_task_workspace`] found.
+///
+/// Three answers, not two: a canvas that cannot hold the panes as a grid has
+/// not judged the arrangement at all, and treating that as "nothing to do"
+/// spends the one repair a restored layout gets on a frame that could not see.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum WorkspaceRegrid {
+    /// The canvas cannot tile these panes at the full minimum. Ask again.
+    Unmeasurable,
+    /// Measured, and the arrangement needs nothing.
+    Settled,
+    /// Measured, and the tree was rebuilt as the grid.
+    Rebuilt,
+}
+
 /// A pane edge the user can drag. Each one owns exactly one stored dimension.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum PaneEdge {
@@ -336,6 +351,54 @@ impl<K: Clone + Ord + Eq> KeyedWorkspaceLayout<K> {
             }
         }
         self.task_center_terminal.clear();
+    }
+
+    /// Repair a stored arrangement the canvas has outgrown (spec 6.5).
+    ///
+    /// A file written before panes tiled carries the ladder of splits
+    /// `insert_after_focused` used to build, and restoring it faithfully is
+    /// restoring the defect: panels a fifth of the width they need, nested
+    /// three deep. When the canvas could tile every one of those panes at the
+    /// full minimum and nothing in the tree was sized by hand, the tree is
+    /// rebuilt as the grid, in the reading order the panel ordinals already
+    /// use -- so the panels keep their numbers and only their shape changes.
+    ///
+    /// Called once against the FIRST real canvas rather than at parse time,
+    /// because "is this cramped" is a question about a window this function
+    /// has no other way to learn the size of. Returns whether it changed
+    /// anything, so the caller knows whether to persist.
+    pub fn regrid_task_workspace(
+        &mut self,
+        viewport: crate::ui::task_workspace::Viewport,
+        metrics: crate::ui::task_workspace::AllocationMetrics,
+    ) -> WorkspaceRegrid
+    where
+        K: Clone + Ord + Eq,
+    {
+        let Some(workspace) = self.task_workspace.as_mut() else {
+            return WorkspaceRegrid::Settled;
+        };
+        // "This canvas cannot tile these panes" and "this arrangement is fine"
+        // are two different facts, and the caller acts on them differently: the
+        // first means ASK AGAIN at a real canvas, the second means stop asking.
+        // Returning one boolean for both is how the very first paint -- which
+        // GPUI runs before the window has its size -- consumed the one chance
+        // this had to repair a stored ladder, and the panels stayed cramped
+        // with nothing anywhere saying why.
+        if !workspace.grid_fits_canvas(viewport, metrics) {
+            return WorkspaceRegrid::Unmeasurable;
+        }
+        if !workspace.grid_is_cramped(viewport, metrics) {
+            return WorkspaceRegrid::Settled;
+        }
+        if !workspace.regrid_to_canvas(viewport, metrics) {
+            return WorkspaceRegrid::Settled;
+        }
+        self.selected_task = self
+            .task_workspace
+            .as_ref()
+            .and_then(Workspace::focused_task);
+        WorkspaceRegrid::Rebuilt
     }
 
     /// Reconcile local pane membership against the canonical task projection.
@@ -782,6 +845,165 @@ fn replace_file(temporary: &Path, destination: &Path) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ui::task_workspace::{AllocationMetrics, Axis, Edge, Viewport, WorkspaceNode};
+
+    /// The arrangement the live capture (9.png) showed: five panes as
+    /// `H[ V[ H[1, 2], 5 ], 3, 4 ]`, built through the ordinary split gestures
+    /// so it is a tree the shell could really have written.
+    fn the_capture_tree() -> (WorkspaceLayout, Vec<TaskId>) {
+        let tasks: Vec<TaskId> = (0..5).map(|_| TaskId::new()).collect();
+        let mut workspace = TaskWorkspace::single(tasks[0]);
+        let first = workspace.focused_pane_id().expect("the one pane");
+        let third = workspace
+            .insert_beside(tasks[2], first, Edge::Right)
+            .expect("pane 3");
+        workspace
+            .insert_beside(tasks[3], third, Edge::Right)
+            .expect("pane 4");
+        workspace
+            .insert_beside(tasks[4], first, Edge::Bottom)
+            .expect("pane 5");
+        workspace
+            .insert_beside(tasks[1], first, Edge::Right)
+            .expect("pane 2");
+        let mut layout = WorkspaceLayout {
+            task_workspace: Some(workspace),
+            ..WorkspaceLayout::default()
+        };
+        layout.selected_task = layout
+            .task_workspace
+            .as_ref()
+            .and_then(Workspace::focused_task);
+        (layout, tasks)
+    }
+
+    /// The rows of a rebuilt grid, as task ids. `None` means a cell is itself a
+    /// split, i.e. something is still nested.
+    fn grid_rows(workspace: &TaskWorkspace) -> Option<Vec<Vec<TaskId>>> {
+        fn row_of(node: &WorkspaceNode<TaskId>) -> Option<Vec<TaskId>> {
+            match node {
+                WorkspaceNode::Pane(pane) => Some(vec![pane.task_id]),
+                WorkspaceNode::Split {
+                    axis: Axis::Horizontal,
+                    children,
+                    ..
+                } => children
+                    .iter()
+                    .map(|child| match &child.node {
+                        WorkspaceNode::Pane(pane) => Some(pane.task_id),
+                        WorkspaceNode::Split { .. } => None,
+                    })
+                    .collect(),
+                WorkspaceNode::Split {
+                    axis: Axis::Vertical,
+                    ..
+                } => None,
+            }
+        }
+        match workspace.root()? {
+            WorkspaceNode::Split {
+                axis: Axis::Vertical,
+                children,
+                ..
+            } => children.iter().map(|child| row_of(&child.node)).collect(),
+            node => row_of(node).map(|row| vec![row]),
+        }
+    }
+
+    /// X3: a stored arrangement that squeezes panes under the full minimum on a
+    /// canvas that could tile them is rebuilt as the grid, keeping the panel
+    /// ORDINALS -- reading order, top to bottom then left to right.
+    #[test]
+    fn a_stored_ladder_is_rebuilt_as_the_grid_at_the_first_real_canvas() {
+        let metrics = AllocationMetrics::production();
+        let canvas = Viewport::new(1100.0, 900.0);
+        let (mut layout, tasks) = the_capture_tree();
+
+        // Before: the two nested panes are far under the 320 px minimum.
+        let mut probe = layout.task_workspace.clone().expect("workspace");
+        let allocated = probe.allocate(canvas, metrics);
+        let nested_width = allocated.width(tasks[0]).expect("pane 1 has a rect");
+        assert!(
+            nested_width < metrics.full_min_width,
+            "the capture's tree gives pane 1 {nested_width} px, which is why this exists"
+        );
+
+        assert_eq!(
+            layout.regrid_task_workspace(canvas, metrics),
+            WorkspaceRegrid::Rebuilt,
+            "a cramped tree on a canvas that fits is rebuilt"
+        );
+        let workspace = layout.task_workspace.clone().expect("workspace");
+        assert_eq!(
+            grid_rows(&workspace),
+            Some(vec![
+                vec![tasks[0], tasks[1], tasks[2]],
+                vec![tasks[3], tasks[4]],
+            ]),
+            "the rebuild is three columns then a row of two, in reading order"
+        );
+        let mut probe = workspace.clone();
+        let allocated = probe.allocate(canvas, metrics);
+        for (index, task) in tasks.iter().enumerate() {
+            let width = allocated.width(*task).expect("every pane has a rect");
+            assert!(
+                width + 0.5 >= metrics.full_min_width,
+                "pane {index} is {width} px after the rebuild"
+            );
+        }
+
+        // Idempotent: the grid it just built is not cramped, so a second pass
+        // leaves it exactly as it is.
+        assert_eq!(
+            layout.regrid_task_workspace(canvas, metrics),
+            WorkspaceRegrid::Settled,
+            "a grid is never rebuilt again"
+        );
+    }
+
+    /// The rebuild is off limits on a tree somebody sized by hand: a pinned
+    /// child means a person chose those widths, and a narrow pane in it is that
+    /// choice rather than this rule's to overrule.
+    #[test]
+    fn a_hand_sized_arrangement_is_never_rebuilt() {
+        let metrics = AllocationMetrics::production();
+        let canvas = Viewport::new(1100.0, 900.0);
+        let (mut layout, tasks) = the_capture_tree();
+        layout
+            .task_workspace
+            .as_mut()
+            .expect("workspace")
+            .pin_task_axis_size(tasks[2], 700.0)
+            .expect("pin the third column");
+        assert_eq!(
+            layout.regrid_task_workspace(canvas, metrics),
+            WorkspaceRegrid::Settled,
+            "a pinned tree is left alone"
+        );
+    }
+
+    /// A canvas that cannot tile the panes at the minimum is not an answer, and
+    /// must not be mistaken for "this arrangement is fine".
+    #[test]
+    fn a_canvas_too_small_to_tile_is_reported_as_no_change() {
+        let metrics = AllocationMetrics::production();
+        let (mut layout, _tasks) = the_capture_tree();
+        assert_eq!(
+            layout.regrid_task_workspace(Viewport::new(300.0, 200.0), metrics),
+            WorkspaceRegrid::Unmeasurable,
+            "five panes do not fit a 300x200 canvas, so nothing was judged"
+        );
+        // And the arrangement survived being asked at a canvas that could not
+        // answer -- which is the whole point of the third verdict.
+        assert_eq!(
+            layout
+                .task_workspace
+                .as_ref()
+                .expect("workspace")
+                .pane_count(),
+            5
+        );
+    }
 
     /// Ruling (f): Done on a ZOOMED panel must not leave the workspace zoomed
     /// on a pane that no longer exists.

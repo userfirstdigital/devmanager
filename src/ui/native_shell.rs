@@ -11927,6 +11927,16 @@ pub struct NativeShell {
     /// pane moves are questions about what is on screen, so they are answered
     /// from what was on screen rather than from a nominal probe.
     workspace_allocation: crate::ui::task_workspace::AllocatedWorkspace<HostTaskKey>,
+    /// The canvas the last paint gave the panel grid. Whether one more panel
+    /// is a new column or the start of a second row is a question about the
+    /// window, and a gesture arrives between frames with no window to ask.
+    workspace_canvas: Option<crate::ui::task_workspace::Viewport>,
+    /// A restored arrangement has not been measured against a real canvas yet.
+    /// Cleared by the first paint that has one, which is the single moment
+    /// [`crate::ui::workspace_layout::KeyedWorkspaceLayout::regrid_task_workspace`]
+    /// may rebuild a cramped stored tree; every later frame leaves the tree
+    /// exactly as the user has arranged it.
+    workspace_regrid_pending: bool,
     /// Plan progress and doing-now per task, keyed by the marker
     /// `TaskSurfaceRegistry::conversation_facts` returns. Recomputed only when
     /// that marker moves: the board repaints on every frame and on every
@@ -12908,6 +12918,8 @@ impl NativeShell {
             dock_retirement_logged: false,
             auto_allow: HashSet::new(),
             workspace_allocation: crate::ui::task_workspace::AllocatedWorkspace::default(),
+            workspace_canvas: None,
+            workspace_regrid_pending: true,
             board_activity_cache: HashMap::new(),
             task_search: TaskSearchState::default(),
             project_scope_menu: ProjectScopeMenuState::default(),
@@ -13245,6 +13257,14 @@ impl NativeShell {
                         break;
                     }
                 }
+            }
+            // A fixture that SPELLS OUT a tree is asking for that exact tree,
+            // so the load-time regrid must not rearrange it before the first
+            // frame -- a capture of a nested arrangement is the only way to
+            // prove the painter handles one. A fixture that says nothing about
+            // placement is arranged by the shell like any other workspace.
+            if seeds.iter().any(|seed| seed.placement.is_some()) {
+                self.workspace_regrid_pending = false;
             }
             self.layout.task_workspace = Some(workspace);
             self.mark_layout_dirty();
@@ -25433,6 +25453,34 @@ impl NativeShell {
         board: &BoardModel,
         cx: &mut Context<Self>,
     ) -> AnyElement {
+        // The canvas the grid is painted at, recorded before anything can
+        // short-circuit: a pane opened by a click between frames has no window
+        // to measure, and this is the only place one is measured at all.
+        let canvas = Viewport::new(
+            f32::from(workspace_size.width),
+            f32::from(workspace_size.height),
+        );
+        if canvas.width > 0.0 && canvas.height > 0.0 {
+            let confirmed = Self::workspace_canvas_is_confirmed(self.workspace_canvas, canvas);
+            self.workspace_canvas = Some(canvas);
+            if self.workspace_regrid_pending && confirmed {
+                match self
+                    .layout
+                    .regrid_task_workspace(canvas, Self::workspace_allocation_metrics())
+                {
+                    // A canvas that cannot tile these panes has judged nothing,
+                    // so the repair stays armed for one that can.
+                    crate::ui::workspace_layout::WorkspaceRegrid::Unmeasurable => {}
+                    crate::ui::workspace_layout::WorkspaceRegrid::Settled => {
+                        self.workspace_regrid_pending = false;
+                    }
+                    crate::ui::workspace_layout::WorkspaceRegrid::Rebuilt => {
+                        self.workspace_regrid_pending = false;
+                        self.mark_layout_dirty();
+                    }
+                }
+            }
+        }
         if self.preview_conversation_installed() {
             let owner = self.selected_task_key.clone().or_else(|| {
                 self.layout.task_workspace.as_ref().and_then(|workspace| {
@@ -32340,8 +32388,14 @@ impl NativeShell {
         }
         debug_assert!(remote_raw_terminal_allowed(&key.host));
         // Done/Archived open via selection; never restore lifecycle from a click.
-        apply_fleet_workspace_selection(&mut self.layout.task_workspace, key.clone(), mode)
-            .map_err(|error| format!("{error:?}"))?;
+        let canvas_width = self.workspace_canvas_width();
+        apply_fleet_workspace_selection(
+            &mut self.layout.task_workspace,
+            key.clone(),
+            mode,
+            canvas_width,
+        )
+        .map_err(|error| format!("{error:?}"))?;
         // Selector choices belong to the composer owner that opened them. A task
         // switch must never leave that transient menu floating over the next
         // conversation with stale provider/model choices.
@@ -33239,6 +33293,39 @@ impl NativeShell {
     /// copy of the numbers that can drift from it.
     fn workspace_allocation_metrics() -> AllocationMetrics {
         AllocationMetrics::production()
+    }
+
+    /// Whether this canvas is the WINDOW, rather than a layout pass on its way
+    /// to one.
+    ///
+    /// Measured 2026-09-06 against the preview harness: the first frame's
+    /// `window.bounds()` reported a 4275.6 x 1180 canvas for a window that then
+    /// painted at 1210 x 1620 on every later frame. At the wide reading five
+    /// panels are not cramped at all, so the one load-time repair
+    /// (`workspace_regrid_pending`) was spent deciding that a genuinely cramped
+    /// arrangement was fine -- silently, on a canvas that never existed.
+    ///
+    /// A size the window has now reported TWICE running is one it has settled
+    /// on. This costs a frame and it is the only reading available: nothing in
+    /// a single `bounds()` says whether the window is still being sized.
+    fn workspace_canvas_is_confirmed(
+        previous: Option<crate::ui::task_workspace::Viewport>,
+        current: crate::ui::task_workspace::Viewport,
+    ) -> bool {
+        previous == Some(current)
+    }
+
+    /// The width the panel grid was last painted at, which is what decides how
+    /// many top-level columns one more panel may make.
+    ///
+    /// Before the first paint there is no window to measure, so an open falls
+    /// back to the nominal canvas -- one row, as many columns as there are
+    /// panes -- which is exactly what the grid did before it could reflow.
+    fn workspace_canvas_width(&self) -> f32 {
+        self.workspace_canvas
+            .map(|canvas| canvas.width)
+            .filter(|width| *width > 0.0)
+            .unwrap_or(crate::ui::task_workspace::GRID_NOMINAL_CANVAS_WIDTH)
     }
 
     /// The panel number each open task carries: 1-based, in the workspace's
@@ -62327,6 +62414,42 @@ mod "
         assert!(
             !source.contains(retired),
             "the nested-flex child wrapper is gone, not left beside its replacement"
+        );
+    }
+
+    /// X3: the canvas the one load-time repair is judged against has to be the
+    /// WINDOW, not a layout pass on its way to one.
+    ///
+    /// The three sizes below are the ones the preview harness actually reported
+    /// on 2026-09-06, in order. The first is nearly four times too wide, and at
+    /// that reading five cramped panels look perfectly comfortable -- which is
+    /// exactly how the repair was spent on a canvas that never existed.
+    #[test]
+    fn the_regrid_waits_for_a_canvas_the_window_has_settled_on() {
+        use crate::ui::task_workspace::Viewport;
+        let measured = [
+            Viewport::new(4275.6, 1180.0),
+            Viewport::new(1210.0, 1620.0),
+            Viewport::new(1210.0, 1620.0),
+        ];
+        let mut previous: Option<Viewport> = None;
+        let mut confirmed_at = None;
+        for (frame, canvas) in measured.into_iter().enumerate() {
+            if NativeShell::workspace_canvas_is_confirmed(previous, canvas)
+                && confirmed_at.is_none()
+            {
+                confirmed_at = Some(frame);
+            }
+            previous = Some(canvas);
+        }
+        assert_eq!(
+            confirmed_at,
+            Some(2),
+            "the first repeated size is the window; the opening measurement is not"
+        );
+        assert!(
+            !NativeShell::workspace_canvas_is_confirmed(None, Viewport::new(1210.0, 1620.0)),
+            "a first frame confirms nothing"
         );
     }
 

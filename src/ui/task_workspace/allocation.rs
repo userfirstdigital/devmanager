@@ -238,6 +238,113 @@ impl<K: Clone + Ord + Eq> Workspace<K> {
         candidates.into_iter().next().map(|(_, task_id)| task_id)
     }
 
+    /// The panes in the order a person reads them off the screen: top to
+    /// bottom, then left to right, with tree order as the tiebreak.
+    ///
+    /// The same ordering the panel ordinals are numbered in, so a regrid keeps
+    /// every panel's number.
+    pub fn panes_in_reading_order(
+        &self,
+        viewport: Viewport,
+        metrics: AllocationMetrics,
+    ) -> Vec<super::layout::PaneId> {
+        // `allocate` restores minimised panes, so it needs `&mut`. This is a
+        // measurement: the probe takes the mutation, not the live tree.
+        let mut probe = self.clone();
+        let allocated = probe.allocate(viewport, metrics);
+        let mut ordered: Vec<(u8, f32, f32, usize, super::layout::PaneId)> = Vec::new();
+        for (index, task_id) in self.task_ids().into_iter().enumerate() {
+            let Some(pane_id) = self.pane_for_task(task_id.clone()).map(|pane| pane.id) else {
+                continue;
+            };
+            match allocated.rect(task_id) {
+                Some(rect) => ordered.push((0, rect.y, rect.x, index, pane_id)),
+                None => ordered.push((1, 0.0, 0.0, index, pane_id)),
+            }
+        }
+        ordered.sort_by(|left, right| {
+            left.0
+                .cmp(&right.0)
+                .then_with(|| left.1.total_cmp(&right.1))
+                .then_with(|| left.2.total_cmp(&right.2))
+                .then_with(|| left.3.cmp(&right.3))
+        });
+        ordered.into_iter().map(|entry| entry.4).collect()
+    }
+
+    /// Whether this canvas could hold every pane as a grid at the full
+    /// minimum. False is "cannot judge", never "the arrangement is fine".
+    pub fn grid_fits_canvas(&self, viewport: Viewport, metrics: AllocationMetrics) -> bool {
+        let metrics = metrics.sanitized();
+        let panes = self.pane_count();
+        panes > 0 && grid_fits(panes, viewport, metrics)
+    }
+
+    /// Whether this arrangement is squeezing panes into less than the full
+    /// minimum on a canvas that could tile every one of them.
+    ///
+    /// Three conditions, and the middle one is what keeps it off a layout the
+    /// user built: some pane is allocated less than `full_min_width`; NOTHING
+    /// in the tree is pinned, so every size on screen was chosen by the
+    /// allocator rather than by a person; and the canvas has room for all the
+    /// panes as a grid at the full minimum. A tree with a pinned child is a
+    /// tree somebody sized on purpose, and a narrow pane in it is that
+    /// person's decision, not this one's to overrule.
+    pub fn grid_is_cramped(&self, viewport: Viewport, metrics: AllocationMetrics) -> bool {
+        let metrics = metrics.sanitized();
+        let panes = self.pane_count();
+        if panes == 0 {
+            return false;
+        }
+        let Some(root) = self.root() else {
+            return false;
+        };
+        if node_has_pinned_child(root) {
+            return false;
+        }
+        if !grid_fits(panes, viewport, metrics) {
+            return false;
+        }
+        let mut probe = self.clone();
+        let allocated = probe.allocate(viewport, metrics);
+        self.task_ids().into_iter().any(|task_id| {
+            allocated
+                .rect(task_id)
+                .is_some_and(|rect| rect.width + 0.5 < metrics.full_min_width)
+        })
+    }
+
+    /// Lay the existing panes out as the grid composition A shows, keeping
+    /// their identity, view, focus clock and reading order.
+    ///
+    /// Returns whether the tree changed. Idempotent by construction: a grid
+    /// this produced is never cramped, so a second call sees nothing to do.
+    pub fn regrid_to_canvas(&mut self, viewport: Viewport, metrics: AllocationMetrics) -> bool {
+        let metrics = metrics.sanitized();
+        let order = self.panes_in_reading_order(viewport, metrics);
+        let columns = super::layout::grid_columns_for(viewport.width, metrics);
+        self.rebuild_as_grid(order, columns)
+    }
+}
+
+/// Whether every pane fits at the full minimum in a grid of this canvas.
+fn grid_fits(panes: usize, viewport: Viewport, metrics: AllocationMetrics) -> bool {
+    let columns = super::layout::grid_columns_for(viewport.width, metrics);
+    let rows = super::layout::grid_rows_for(panes, columns);
+    let width = columns as f32 * metrics.full_min_width
+        + metrics.divider * columns.saturating_sub(1) as f32;
+    let height =
+        rows as f32 * metrics.full_min_height + metrics.divider * rows.saturating_sub(1) as f32;
+    width <= viewport.width + 0.5 && height <= viewport.height + 0.5
+}
+
+fn node_has_pinned_child<K>(node: &WorkspaceNode<K>) -> bool {
+    match node {
+        WorkspaceNode::Pane(_) => false,
+        WorkspaceNode::Split { children, .. } => children
+            .iter()
+            .any(|child| child.allocation.is_pinned() || node_has_pinned_child(&child.node)),
+    }
 }
 
 #[derive(Clone, Copy)]

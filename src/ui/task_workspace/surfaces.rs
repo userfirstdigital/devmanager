@@ -11,7 +11,7 @@ use crate::domain::{
 use super::terminal_window::{apply_local_scroll_to_projection, RetainedTerminalWindow};
 #[cfg(test)]
 use super::TaskWorkspace;
-use super::{Axis, PanePresentation, Workspace, WorkspaceError};
+use super::{PanePresentation, Workspace, WorkspaceError};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ConversationQueryPriority {
@@ -82,10 +82,16 @@ pub enum WorkspaceSelectionGesture {
 /// Apply the task-list gesture without coupling the recursive model to GPUI.
 /// Plain selection focuses an open task or replaces the focused slot. Shift-
 /// selection adds or removes panes.
+///
+/// `canvas_width` is the width the workspace grid is being painted at, which
+/// is what decides whether one more panel is a new column or the start of a
+/// second row (see [`Workspace::insert_into_grid`]). A caller with no window
+/// to measure passes [`crate::ui::task_workspace::GRID_NOMINAL_CANVAS_WIDTH`].
 pub fn apply_workspace_selection<K: Clone + Ord + Eq>(
     workspace: &mut Option<Workspace<K>>,
     task_id: K,
     gesture: WorkspaceSelectionGesture,
+    canvas_width: f32,
 ) -> Result<(), WorkspaceError> {
     let Some(current) = workspace.as_mut() else {
         *workspace = Some(Workspace::single(task_id));
@@ -115,7 +121,15 @@ pub fn apply_workspace_selection<K: Clone + Ord + Eq>(
             Ok(())
         }
         WorkspaceSelectionGesture::Toggle => {
-            current.insert_after_focused(task_id, Axis::Horizontal)?;
+            // Composition A, not a ladder: one more panel is one more column
+            // while the canvas holds it, then a second row. `insert_after_
+            // focused` nested it inside whatever the focused pane sat in, so a
+            // column accumulated panes and every one of them got narrower.
+            current.insert_into_grid(
+                task_id,
+                canvas_width,
+                crate::ui::task_workspace::AllocationMetrics::production(),
+            )?;
             Ok(())
         }
     }
@@ -1443,6 +1457,7 @@ mod tests {
         SemanticJournalPayload, TaskId,
     };
 
+    use super::super::{Axis, GRID_NOMINAL_CANVAS_WIDTH};
     use super::*;
 
     fn page(sequence: u64, text: &str) -> SemanticJournalPage {
@@ -2535,14 +2550,34 @@ mod tests {
         let third = TaskId::new();
         let mut workspace = None;
 
-        apply_workspace_selection(&mut workspace, first, WorkspaceSelectionGesture::Plain)
-            .expect("select first");
-        apply_workspace_selection(&mut workspace, second, WorkspaceSelectionGesture::Toggle)
-            .expect("add second");
-        apply_workspace_selection(&mut workspace, third, WorkspaceSelectionGesture::Toggle)
-            .expect("add third");
-        apply_workspace_selection(&mut workspace, first, WorkspaceSelectionGesture::Plain)
-            .expect("focus first");
+        apply_workspace_selection(
+            &mut workspace,
+            first,
+            WorkspaceSelectionGesture::Plain,
+            GRID_NOMINAL_CANVAS_WIDTH,
+        )
+        .expect("select first");
+        apply_workspace_selection(
+            &mut workspace,
+            second,
+            WorkspaceSelectionGesture::Toggle,
+            GRID_NOMINAL_CANVAS_WIDTH,
+        )
+        .expect("add second");
+        apply_workspace_selection(
+            &mut workspace,
+            third,
+            WorkspaceSelectionGesture::Toggle,
+            GRID_NOMINAL_CANVAS_WIDTH,
+        )
+        .expect("add third");
+        apply_workspace_selection(
+            &mut workspace,
+            first,
+            WorkspaceSelectionGesture::Plain,
+            GRID_NOMINAL_CANVAS_WIDTH,
+        )
+        .expect("focus first");
 
         let workspace = workspace.expect("workspace");
         assert_eq!(workspace.pane_count(), 3);
@@ -2555,10 +2590,21 @@ mod tests {
         let second = TaskId::new();
         let next = TaskId::new();
         let mut workspace = Some(TaskWorkspace::single(first));
-        apply_workspace_selection(&mut workspace, second, WorkspaceSelectionGesture::Toggle)
-            .unwrap();
+        apply_workspace_selection(
+            &mut workspace,
+            second,
+            WorkspaceSelectionGesture::Toggle,
+            GRID_NOMINAL_CANVAS_WIDTH,
+        )
+        .unwrap();
         let slot = workspace.as_ref().unwrap().focused_pane_id();
-        apply_workspace_selection(&mut workspace, next, WorkspaceSelectionGesture::Plain).unwrap();
+        apply_workspace_selection(
+            &mut workspace,
+            next,
+            WorkspaceSelectionGesture::Plain,
+            GRID_NOMINAL_CANVAS_WIDTH,
+        )
+        .unwrap();
         let workspace = workspace.unwrap();
         assert_eq!(workspace.pane_count(), 2);
         assert_eq!(workspace.focused_pane_id(), slot);
@@ -2573,8 +2619,13 @@ mod tests {
         let second = TaskId::new();
         let third = TaskId::new();
         let mut workspace = Some(TaskWorkspace::single(first));
-        apply_workspace_selection(&mut workspace, second, WorkspaceSelectionGesture::Toggle)
-            .expect("open second");
+        apply_workspace_selection(
+            &mut workspace,
+            second,
+            WorkspaceSelectionGesture::Toggle,
+            GRID_NOMINAL_CANVAS_WIDTH,
+        )
+        .expect("open second");
         let focused = workspace.as_ref().unwrap().focused_pane_id().unwrap();
         workspace
             .as_mut()
@@ -2596,8 +2647,13 @@ mod tests {
             .pin_task_axis_size(second, 260.0)
             .unwrap();
 
-        apply_workspace_selection(&mut workspace, third, WorkspaceSelectionGesture::Plain)
-            .expect("replace focused with third");
+        apply_workspace_selection(
+            &mut workspace,
+            third,
+            WorkspaceSelectionGesture::Plain,
+            GRID_NOMINAL_CANVAS_WIDTH,
+        )
+        .expect("replace focused with third");
         let workspace = workspace.expect("workspace");
         assert_eq!(workspace.pane_count(), 2);
         assert_eq!(workspace.focused_pane_id(), Some(focused));
@@ -2922,12 +2978,14 @@ mod tests {
             &mut workspace,
             local.clone(),
             WorkspaceSelectionGesture::Plain,
+            GRID_NOMINAL_CANVAS_WIDTH,
         )
         .unwrap();
         apply_workspace_selection(
             &mut workspace,
             remote.clone(),
             WorkspaceSelectionGesture::Toggle,
+            GRID_NOMINAL_CANVAS_WIDTH,
         )
         .unwrap();
         let workspace = workspace.expect("workspace");
