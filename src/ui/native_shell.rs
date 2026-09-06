@@ -135,21 +135,22 @@ use crate::ui::task_cockpit::changes_panel::{
     reconcile_selected_repository, repository_mutation_allowed, repository_status_readable,
 };
 use crate::ui::task_cockpit::composer::{
-    composer_meta_line_room, composer_meta_segments_within, composer_placeholder_within,
-    composer_send_element_id, composer_send_glyph, composer_send_look, composer_send_tints,
-    composer_shows_key_hints, provider_command_catalog, provider_command_opens_terminal,
-    AnswerPayload, ApprovalDecision, ComposerControl, ComposerDraftProjection, ComposerError,
-    ComposerFence, ComposerHostProjection, ComposerIntent, ComposerPayload, ComposerSendLook,
-    ProviderCommandSuggestion, TaskComposer, COMPOSER_ATTACHMENT_THUMBNAIL, COMPOSER_BORDER_WIDTH,
-    COMPOSER_BUTTON_FONT_SIZE, COMPOSER_BUTTON_PADDING_X, COMPOSER_BUTTON_PADDING_Y,
-    COMPOSER_BUTTON_RADIUS, COMPOSER_CAPTION_FONT_SIZE, COMPOSER_CHIP_FONT_SIZE, COMPOSER_CHIP_GAP,
+    composer_key_hints_for, composer_meta_line_room, composer_meta_segments_within,
+    composer_placeholder_within, composer_send_element_id, composer_send_glyph, composer_send_look,
+    composer_send_tints, provider_command_catalog, provider_command_opens_terminal, AnswerPayload,
+    ApprovalDecision, ComposerControl, ComposerDraftProjection, ComposerError, ComposerFence,
+    ComposerHostProjection, ComposerIntent, ComposerPayload, ComposerSendLook,
+    ProviderCommandSuggestion, TaskComposer, COMPOSER_ANSWER_LABEL, COMPOSER_APPROVE_LABEL,
+    COMPOSER_ATTACHMENT_THUMBNAIL, COMPOSER_BORDER_WIDTH, COMPOSER_BUTTON_FONT_SIZE,
+    COMPOSER_BUTTON_PADDING_X, COMPOSER_BUTTON_PADDING_Y, COMPOSER_BUTTON_RADIUS,
+    COMPOSER_CAPTION_FONT_SIZE, COMPOSER_CHIP_FONT_SIZE, COMPOSER_CHIP_GAP,
     COMPOSER_CHIP_LABEL_MAX_WIDTH, COMPOSER_CHIP_PADDING_X, COMPOSER_CHIP_PADDING_Y,
     COMPOSER_CHIP_RADIUS, COMPOSER_CONTROL_GAP, COMPOSER_FONT_SIZE, COMPOSER_HEIGHT_RESERVE,
     COMPOSER_ICON_BUTTON_SIZE, COMPOSER_ICON_GLYPH_SIZE, COMPOSER_INPUT_MAX_HEIGHT,
-    COMPOSER_INPUT_MIN_HEIGHT, COMPOSER_KEY_HINTS, COMPOSER_LINE_HEIGHT, COMPOSER_META_ROW_HEIGHT,
+    COMPOSER_INPUT_MIN_HEIGHT, COMPOSER_LINE_HEIGHT, COMPOSER_META_ROW_HEIGHT,
     COMPOSER_META_SEPARATOR as META_SEPARATOR, COMPOSER_PADDING_X, COMPOSER_PADDING_Y,
     COMPOSER_PILL_PADDING_X, COMPOSER_PILL_RADIUS, COMPOSER_RADIUS, COMPOSER_REGION_PADDING,
-    COMPOSER_ROW_PADDING_Y,
+    COMPOSER_REJECT_LABEL, COMPOSER_ROW_PADDING_Y,
 };
 use crate::ui::task_cockpit::dock::{DockEdge, DockTool as CockpitDockTool};
 use crate::ui::task_cockpit::draft_store::{
@@ -27768,7 +27769,9 @@ impl NativeShell {
                 .iter()
                 .map(|(label, _)| label.clone())
                 .collect::<Vec<_>>(),
-            composer_meta_line_room(surface_width_px),
+            // The Answer / Reject / Approve buttons are painted inside this
+            // same row, so the room the strip has is the room LEFT after them.
+            composer_meta_line_room(surface_width_px, has_question, has_approval),
         );
         meta_segments.truncate(meta_kept);
         let meta_segments: Vec<AnyElement> = meta_segments
@@ -28316,14 +28319,19 @@ impl NativeShell {
                                             // the row than the field they
                                             // annotate and folded the
                                             // placeholder onto a second line.
-                                            .children(composer_shows_key_hints(surface_width_px).then(
-                                                || {
+                                            //
+                                            // Three bands, not two: between
+                                            // them is the panel's own
+                                            // one-of-eight width, where the
+                                            // mockup prints the short form.
+                                            .children(composer_key_hints_for(surface_width_px).map(
+                                                |hints| {
                                                     div()
                                                         .flex_none()
                                                         .pb(px(COMPOSER_PADDING_Y))
                                                         .text_size(px(COMPOSER_CAPTION_FONT_SIZE))
                                                         .text_color(tokens.text.muted.to_gpui())
-                                                        .child(COMPOSER_KEY_HINTS)
+                                                        .child(hints)
                                                         .into_any_element()
                                                 },
                                             ))
@@ -28472,9 +28480,12 @@ impl NativeShell {
                                         ))
                                         .children(self.composer_selector_menu(tokens, cx)),
                                 )
+                                // The three labels come from the constants the
+                                // width arithmetic above measured, so the room
+                                // reserved and the text painted cannot drift.
                                 .children(has_question.then(|| {
                                     Button::new("native-task-composer-answer")
-                                        .label("Answer")
+                                        .label(COMPOSER_ANSWER_LABEL)
                                         .ghost()
                                         .xsmall()
                                         .compact()
@@ -28483,7 +28494,7 @@ impl NativeShell {
                                 }))
                                 .children(has_approval.then(|| {
                                     Button::new("native-task-composer-reject")
-                                        .label("Reject")
+                                        .label(COMPOSER_REJECT_LABEL)
                                         .ghost()
                                         .xsmall()
                                         .compact()
@@ -28492,7 +28503,7 @@ impl NativeShell {
                                 }))
                                 .children(has_approval.then(|| {
                                     Button::new("native-task-composer-approve")
-                                        .label("Approve")
+                                        .label(COMPOSER_APPROVE_LABEL)
                                         .ghost()
                                         .xsmall()
                                         .compact()
@@ -49471,7 +49482,11 @@ pub(crate) mod tests {
         // (b) and nothing else: no meta line, no key hints, no send control
         for forbidden in [
             "COMPOSER_META_ROW_HEIGHT",
-            "COMPOSER_KEY_HINTS",
+            // The hints are chosen by band now, so the painter names the
+            // chooser rather than the constant. Following the rename keeps
+            // this a real refusal instead of one that passes because the
+            // token it looks for no longer exists anywhere.
+            "composer_key_hints_for",
             "native-task-composer-meta",
             "send_control",
         ] {
@@ -49490,7 +49505,7 @@ pub(crate) mod tests {
             .expect("its own branch, up to the resting one");
         assert!(
             focused.contains(r#".id("native-task-composer-meta")"#)
-                && focused.contains("COMPOSER_KEY_HINTS"),
+                && focused.contains("composer_key_hints_for"),
             "the focused composer keeps its one meta line and its key hints"
         );
         // (d) both resting branches use the one painter
@@ -49659,9 +49674,11 @@ mod "
         // The hints and the send slot sit inside the field`s own rule, to its
         // right, as the mockup`s `.compose` does.
         assert!(
-            footer.contains(".child(COMPOSER_KEY_HINTS)")
+            footer.contains("composer_key_hints_for(surface_width_px)")
+                && footer.contains(".child(hints)")
                 && footer.contains(".child(send_control)"),
-            "the key hints and the send slot belong to the field row"
+            "the key hints and the send slot belong to the field row, and the hints are \
+             whichever of the three bands the field width earns"
         );
         // Attach is rule 4`s icon button now, not a labelled `+` pill.
         assert!(
