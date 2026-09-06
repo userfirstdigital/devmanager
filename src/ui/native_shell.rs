@@ -11838,6 +11838,21 @@ pub struct NativeShell {
     /// entered a visible state -- so it is never persisted, and a task that
     /// leaves the fleet projection is forgotten rather than left to leak.
     board_state_clock: StateClock<HostTaskKey>,
+    /// The age labels the board LAST PAINTED, as `(origin_ms, label)`.
+    ///
+    /// Written by `board_rows` on every paint and read once a second by the
+    /// controller: an idle shell asks for no repaints, so nothing else would
+    /// ever notice that "Last reply 12s" should now read 13s. Comparing the
+    /// text rather than the clock is what keeps this from being a repaint per
+    /// frame -- see [`crate::ui::board::age_labels_changed`].
+    painted_board_age_labels: Vec<(i64, String)>,
+    /// When the age-label comparison above last ran, in wall milliseconds.
+    /// `None` until the first controller pass.
+    last_board_age_label_check_ms: Option<i64>,
+    /// How many controller passes have asked for a repaint because an age
+    /// label changed. The idle probe reads it, so a repaint an idle shell
+    /// asks for is attributable rather than merely counted.
+    board_age_label_repaints: usize,
     /// Whether the board's Done section is disclosed.
     board_done_expanded: bool,
     /// One palette slot per project, restored from and written back to
@@ -12835,6 +12850,9 @@ impl NativeShell {
             // `StateClock::new` rather than `Default`: the derive needs
             // `K: Default` and `HostTaskKey` has no default identity.
             board_state_clock: StateClock::new(),
+            painted_board_age_labels: Vec::new(),
+            last_board_age_label_check_ms: None,
+            board_age_label_repaints: 0,
             board_done_expanded: false,
             project_colours,
             board_menu: None,
@@ -19064,6 +19082,12 @@ impl NativeShell {
             self.composer_caret_visible_rendered,
         );
         self.composer_caret_visible_rendered = next_rendered;
+        // The board's ages advance on a shell nobody is touching. Nothing else
+        // here would notice: the ages are computed during a paint, and an idle
+        // shell asks for no paints. Keyed on the label the board WOULD print
+        // rather than on the clock, so a board of day-old rows costs one
+        // repaint a day and a board of fresh ones costs one a second.
+        let age_label_repaint = self.board_age_label_repaint(unix_time_ms());
         let mut semantic_repaint = self.settle_provider_setup_input_completions();
         semantic_repaint |= self.expire_stalled_provider_setup_approvals();
         semantic_repaint |= self.retry_due_terminal_queries(now);
@@ -19718,7 +19742,7 @@ impl NativeShell {
         if semantic_repaint {
             self.refresh_accessibility_tree();
         }
-        caret_repaint || semantic_repaint
+        caret_repaint || age_label_repaint || semantic_repaint
     }
 
     fn dispatch_due_automatic_title(&mut self) {
@@ -33344,7 +33368,75 @@ impl NativeShell {
             self.layout.project_colours = self.project_colours.to_persisted();
             self.mark_layout_dirty();
         }
+        // What every age label on screen says right now, and when each of them
+        // started counting. One snapshot covers all three surfaces that print
+        // an age, because all three read `row.state_age_ms`: the board row's
+        // title line, its "Last reply ..." meta line, and the panel chrome's
+        // status age.
+        //
+        // The controller compares this a second later against the label it
+        // WOULD paint. Without it the ages freeze: an idle shell asks for no
+        // repaints at all (the perf lane measured 0 over 500 idle passes), and
+        // the ages are computed during a paint, so nothing recomputes them.
+        // The origin is recorded rather than the elapsed time, so the
+        // comparison needs no second reading of the state clock.
+        self.painted_board_age_labels = rows
+            .iter()
+            .map(|row| {
+                (
+                    now_ms.saturating_sub(row.state_age_ms),
+                    crate::ui::board::format_age(row.state_age_ms),
+                )
+            })
+            .collect();
         rows
+    }
+
+    /// How often the controller may ask whether an age label has changed.
+    ///
+    /// A second is the finest granularity [`crate::ui::board::format_age`]
+    /// has, so checking more often cannot find anything the previous check
+    /// missed. The check itself is one `format_age` per visible row, which is
+    /// why the interval is a floor on the WORK rather than on the repaints:
+    /// the repaints are already bounded by the labels actually changing.
+    const BOARD_AGE_LABEL_CHECK_INTERVAL_MS: i64 = 1_000;
+
+    /// Whether any age label the board last painted would read differently at
+    /// `now_ms`, checked at most once a second.
+    ///
+    /// Deliberately NOT a semantic repaint: the accessibility tree carries no
+    /// age (`ProjectInboxItem::Task` has no age field), and folding this into
+    /// `semantic_repaint` would rebuild the whole tree -- and a second board
+    /// model with it -- once a second forever on a shell nobody is touching.
+    /// It is the same shape as the caret blink: pixels change, meaning does
+    /// not.
+    fn board_age_label_repaint(&mut self, now_ms: i64) -> bool {
+        if self.last_board_age_label_check_ms.is_some_and(|last| {
+            now_ms.saturating_sub(last) < Self::BOARD_AGE_LABEL_CHECK_INTERVAL_MS
+        }) {
+            return false;
+        }
+        self.last_board_age_label_check_ms = Some(now_ms);
+        if crate::ui::board::age_labels_changed(&self.painted_board_age_labels, now_ms) {
+            self.board_age_label_repaints = self.board_age_label_repaints.saturating_add(1);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// The controller's own age check, driven from a clock the caller chooses.
+    /// A unit test cannot wait a second, and the whole rule is about what a
+    /// second does.
+    #[cfg(test)]
+    pub(crate) fn board_age_label_repaint_for_test(&mut self, now_ms: i64) -> bool {
+        self.board_age_label_repaint(now_ms)
+    }
+
+    /// How many repaints the age check has asked for. Read by the idle probe.
+    #[cfg(test)]
+    pub(crate) fn board_age_label_repaints_for_test(&self) -> usize {
+        self.board_age_label_repaints
     }
 
     /// This task's plan progress and doing-now, recomputed only when its
@@ -57794,13 +57886,20 @@ mod "
         });
     }
 
-    /// An idle shell must not ask to be repainted at all.
+    /// An idle shell must not ask to be repainted UNLESS an age label changed.
     ///
     /// The controller pass is the only thing that runs on a shell nobody is
     /// touching, and every pass that returns `true` is a frame. A pass that
     /// says `true` unconditionally puts the app at the wake rate forever, and
     /// no build profile makes that cheaper -- it makes each wasted frame
     /// cheaper and leaves the count alone.
+    ///
+    /// The one legitimate exception is the board's age labels, which are
+    /// computed during a paint and therefore freeze on a shell that never
+    /// paints. So the assertion is not "zero repaints" -- it is that every
+    /// repaint is ATTRIBUTABLE to a changed age label, which is the only way
+    /// to tell a fixed clock from a returning storm. A bare zero would go red
+    /// the moment a fixture's rows crossed a second boundary mid-run.
     #[test]
     fn an_idle_shell_asks_for_no_repaints() {
         const TEST_NAME: &str = "ui::native_shell::tests::an_idle_shell_asks_for_no_repaints";
@@ -57824,15 +57923,24 @@ mod "
                     let _ = shell.controller_tick_for_test(MAX_PENDING_HOST_ACTIONS);
                 }
                 let before_trees = shell.accessibility_tree_builds;
+                let before_age_repaints = shell.board_age_label_repaints_for_test();
                 let mut repaints = 0_usize;
                 for _ in 0..50 {
                     if shell.controller_tick_for_test(MAX_PENDING_HOST_ACTIONS) {
                         repaints += 1;
                     }
                 }
+                let age_repaints = shell.board_age_label_repaints_for_test() - before_age_repaints;
                 assert_eq!(
-                    repaints, 0,
-                    "fifty passes over a shell nobody touched asked for {repaints} repaints"
+                    repaints, age_repaints,
+                    "fifty passes over a shell nobody touched asked for {repaints} repaints, \
+                     of which only {age_repaints} were an age label changing"
+                );
+                // Fifty passes take far less than a second, and the check is
+                // gated at one a second, so at most one of them can even look.
+                assert!(
+                    age_repaints <= 1,
+                    "the age check ran {age_repaints} times inside one second"
                 );
                 assert_eq!(
                     shell.accessibility_tree_builds - before_trees,
@@ -57844,6 +57952,147 @@ mod "
             cx.quit();
         });
         assert!(completed.get(), "idle shell scenario completed");
+    }
+
+    /// The ages on an idle board advance, and cost a repaint only when the
+    /// LABEL moves.
+    ///
+    /// Driven from a clock the test supplies, because the whole rule is about
+    /// what one second does and a unit test cannot wait one.
+    /// `board_age_label_repaint_for_test` is the controller's own check with
+    /// the wall clock passed in; `controller_tick` calls the same method with
+    /// `unix_time_ms()` and folds its answer into the value it returns. What
+    /// this does NOT prove is that call -- the idle probe above does, by
+    /// asserting that every repaint fifty idle passes ask for is one this
+    /// counter also counted.
+    #[test]
+    fn an_idle_board_repaints_when_an_age_label_changes_and_not_before() {
+        if rerun_headless_shell_test_in_child(
+            "ui::native_shell::tests::an_idle_board_repaints_when_an_age_label_changes_and_not_before",
+        ) {
+            return;
+        }
+        let _test_guard = HEADLESS_SHELL_TEST_LOCK
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .expect("headless shell test lock");
+        let completed = std::rc::Rc::new(std::cell::RefCell::new(false));
+        let completed_for_app = std::rc::Rc::clone(&completed);
+        gpui::Application::headless().run(move |cx| {
+            crate::ui::init(cx);
+            let (runtime, _shared) = TestRuntime::new(true, NativeHostActionResult::Queued);
+            let (model, task_id) = open_task_without_agent_client_model();
+            let project_id = model.task(task_id).expect("task").task.project_id;
+            with_test_shell_in_app(cx, runtime, |shell| {
+                shell.install_project_for_test("DevManager", project_id);
+                shell
+                    .apply_client_model(Arc::new(model))
+                    .expect("apply model");
+
+                // Read the fixture's own event time rather than picking a
+                // constant. An Idle row's age counts from its last event, not
+                // from this process, so a hand-picked instant lands wherever
+                // the fixture's timestamp happens to be -- the first version
+                // of this test chose 10,000,000 ms and every row read "2h",
+                // where a second changes nothing and the assertion below was
+                // measuring the wrong thing.
+                let occurred = shell
+                    .board_model(0)
+                    .groups
+                    .iter()
+                    .flat_map(|group| group.rows.iter())
+                    .map(|row| row.last_activity_ms)
+                    .max()
+                    .expect("the fixture has to paint at least one row");
+                let painted_at = occurred + 12_000;
+                let rows: usize = shell
+                    .board_model(painted_at)
+                    .groups
+                    .iter()
+                    .map(|group| group.rows.len())
+                    .sum();
+                assert!(
+                    rows > 0,
+                    "the fixture has to paint at least one age label or this proves nothing"
+                );
+                assert_eq!(
+                    shell.painted_board_age_labels.len(),
+                    rows,
+                    "one recorded label per painted row"
+                );
+                assert!(
+                    shell
+                        .painted_board_age_labels
+                        .iter()
+                        .all(|(_, label)| label == "12s"),
+                    "the board is painted twelve seconds after its last event: {:?}",
+                    shell.painted_board_age_labels
+                );
+
+                assert!(
+                    !shell.board_age_label_repaint_for_test(painted_at),
+                    "at the instant it was painted, nothing reads differently"
+                );
+                assert!(
+                    !shell.board_age_label_repaint_for_test(painted_at + 999),
+                    "and 999 ms later the check does not even look"
+                );
+                assert!(
+                    shell.board_age_label_repaint_for_test(painted_at + 1_000),
+                    "a second later every 12s label would read 13s"
+                );
+                assert!(
+                    !shell.board_age_label_repaint_for_test(painted_at + 1_001),
+                    "and the next pass is inside the interval, so one repaint per second at most"
+                );
+                assert_eq!(
+                    shell.board_age_label_repaints_for_test(),
+                    1,
+                    "exactly one repaint was asked for across those four passes"
+                );
+
+                // The PAINT is what settles it: repainting at the new instant
+                // records the new labels, so the same change is not reported
+                // twice, and the next one is measured from there.
+                let _ = shell.board_model(painted_at + 1_000);
+                assert!(
+                    shell
+                        .painted_board_age_labels
+                        .iter()
+                        .all(|(_, label)| label == "13s"),
+                    "the repaint recorded the new labels"
+                );
+                assert!(
+                    shell.board_age_label_repaint_for_test(painted_at + 2_000),
+                    "13s -> 14s is the next change, measured from the repaint"
+                );
+                assert_eq!(shell.board_age_label_repaints_for_test(), 2);
+
+                // And an hours-old board costs nothing a second later: the
+                // clock moved, the label did not. This is the case the whole
+                // design turns on, and it is why the comparison is on the text.
+                let _ = shell.board_model(occurred + 3 * 3_600_000);
+                assert!(
+                    shell
+                        .painted_board_age_labels
+                        .iter()
+                        .all(|(_, label)| label == "3h"),
+                    "three hours after its last event the row reads 3h"
+                );
+                assert!(
+                    !shell.board_age_label_repaint_for_test(occurred + 3 * 3_600_000 + 60_000),
+                    "a minute later a 3h row still reads 3h, so it asks for nothing"
+                );
+                assert_eq!(
+                    shell.board_age_label_repaints_for_test(),
+                    2,
+                    "and the counter did not move"
+                );
+            });
+            *completed_for_app.borrow_mut() = true;
+            cx.quit();
+        });
+        assert!(*completed.borrow(), "idle age-label scenario completed");
     }
 
     /// The board replaces the project rail: tasks group by what they are

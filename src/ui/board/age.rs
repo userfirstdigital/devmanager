@@ -20,6 +20,23 @@ pub fn format_age(elapsed_ms: i64) -> String {
     }
 }
 
+/// Whether any age label a surface last painted would read differently now.
+///
+/// Each entry is `(origin_ms, label)`: the instant that label started counting
+/// from, and the exact text that was painted for it.
+///
+/// The comparison is on the LABEL, never on the clock. [`format_age`] is a
+/// step function, so a row that reads "3d" changes once a day where its age in
+/// milliseconds changes every millisecond -- a repaint keyed on the age itself
+/// would be a repaint every frame, and keyed on the label it is a repaint per
+/// visible change and nothing else. That difference is the whole reason this
+/// function exists rather than a `now - painted_at > 1s` test.
+pub fn age_labels_changed(painted: &[(i64, String)], now_ms: i64) -> bool {
+    painted
+        .iter()
+        .any(|(origin_ms, label)| format_age(now_ms.saturating_sub(*origin_ms)) != *label)
+}
+
 #[derive(Debug, Default)]
 pub struct StateClock<K: Hash + Eq> {
     entered: HashMap<K, (BoardState, i64)>,
@@ -87,6 +104,45 @@ mod tests {
         assert_eq!(clock.observe("a", BoardState::Question, 9_500), 500);
         clock.forget(&"a");
         assert_eq!(clock.observe("a", BoardState::Question, 20_000), 0);
+    }
+
+    /// The rule the idle repaint is keyed on: a changed LABEL, not a changed
+    /// clock.
+    ///
+    /// A shell nobody is touching asks for no repaints at all (the perf lane
+    /// measured 0 in 500 idle passes), so the ages simply stopped advancing.
+    /// The remedy has to be exactly as cheap as the change it reports: a row
+    /// reading "12s" earns a repaint a second later, and a row reading "3d"
+    /// earns one a day later, not one a second later.
+    #[test]
+    fn only_a_changed_label_is_worth_a_repaint() {
+        let young = vec![(0_i64, format_age(12_000))];
+        assert!(!age_labels_changed(&young, 12_000), "the painted instant");
+        assert!(!age_labels_changed(&young, 12_999), "still reads 12s");
+        assert!(age_labels_changed(&young, 13_000), "now it reads 13s");
+
+        // Three days old: a second later is not a change, a day later is. The
+        // clock moved by 1,000 ms in the first case and the label did not.
+        let old = vec![(0_i64, format_age(3 * 86_400_000))];
+        assert!(!age_labels_changed(&old, 3 * 86_400_000 + 1_000));
+        assert!(!age_labels_changed(&old, 3 * 86_400_000 + 3_600_000));
+        assert!(age_labels_changed(&old, 4 * 86_400_000));
+
+        // One changed label among many is enough, and none is not.
+        let mixed = vec![
+            (0_i64, format_age(3 * 86_400_000)),
+            (0_i64, format_age(12_000)),
+        ];
+        assert!(age_labels_changed(&mixed, 13_000));
+
+        assert!(
+            !age_labels_changed(&[], 10_000_000),
+            "a board with no rows asks for nothing"
+        );
+        // Clock skew backwards is a real label change -- "12s" would repaint
+        // as "0s" -- and it is reported as one rather than hidden, because
+        // `format_age` clamps the negative and the two texts genuinely differ.
+        assert!(age_labels_changed(&young, -5_000));
     }
 
     /// The prune the shell runs every frame: whatever is still in the clock but
