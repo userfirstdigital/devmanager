@@ -337,6 +337,39 @@ impl<K: Clone + Ord + Eq> Workspace<K> {
         task_id: K,
         axis: Axis,
     ) -> Result<PaneId, WorkspaceError> {
+        let target = match self.focused {
+            Some(target) => target,
+            None if self.root.is_none() => {
+                if self.contains_task(task_id.clone()) {
+                    return Err(WorkspaceError::DuplicateTask);
+                }
+                *self = Self::single(task_id);
+                return self.focused.ok_or(WorkspaceError::InvalidTree);
+            }
+            None => return Err(WorkspaceError::InvalidTree),
+        };
+        self.insert_beside(
+            task_id,
+            target,
+            match axis {
+                Axis::Horizontal => Edge::Right,
+                Axis::Vertical => Edge::Bottom,
+            },
+        )
+    }
+
+    /// Split one named pane and put a new one on the given side of it.
+    ///
+    /// The general form of [`Self::insert_after_focused`], which is this with
+    /// the focused pane and the trailing edge. A caller that knows which pane
+    /// it is splitting -- a drag, a drop, a fixture describing an exact tree --
+    /// says so rather than moving focus first and inserting blind.
+    pub fn insert_beside(
+        &mut self,
+        task_id: K,
+        target: PaneId,
+        edge: Edge,
+    ) -> Result<PaneId, WorkspaceError> {
         if self.contains_task(task_id.clone()) {
             return Err(WorkspaceError::DuplicateTask);
         }
@@ -344,13 +377,13 @@ impl<K: Clone + Ord + Eq> Workspace<K> {
             *self = Self::single(task_id);
             return self.focused.ok_or(WorkspaceError::InvalidTree);
         }
-        let target = self.focused.ok_or(WorkspaceError::InvalidTree)?;
         let mut candidate = self.clone();
         candidate.focus_clock = candidate.focus_clock.saturating_add(1).max(1);
         let pane = TaskPane::new(task_id, candidate.focus_clock);
         let pane_id = pane.id;
         let root = candidate.root.take().ok_or(WorkspaceError::InvalidTree)?;
-        let (next_root, inserted) = insert_pane_near(root, target, pane, axis, true);
+        let (next_root, inserted) =
+            insert_pane_near(root, target, pane, edge.axis(), edge.inserts_after());
         if !inserted {
             return Err(WorkspaceError::MissingPane);
         }

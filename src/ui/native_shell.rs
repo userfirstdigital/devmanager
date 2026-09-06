@@ -1819,6 +1819,9 @@ pub struct PreviewTaskSeed {
     pub project: Option<String>,
     pub open: bool,
     pub focused: bool,
+    /// Which already-seeded pane this one splits, and on which side. `None` is
+    /// the plain seeding: one more pane beside the one opened before it.
+    pub placement: Option<(usize, crate::ui::task_workspace::Edge)>,
     pub terminal_view: bool,
     pub plan_steps: Vec<PreviewPlanStep>,
     pub messages: Vec<crate::ui::task_cockpit::timeline::PreviewConversationMessage>,
@@ -13213,15 +13216,34 @@ impl NativeShell {
             .filter(|(_, seed)| seed.open)
             .map(|(index, _)| (index, self.local_task_key(task_ids[index])))
             .collect();
-        if let Some(((_, first), rest)) = open.split_first() {
+        if let Some(((first_index, first), rest)) = open.split_first() {
             let mut workspace =
                 crate::ui::task_workspace::Workspace::<HostTaskKey>::single(first.clone());
-            for (_, key) in rest {
-                if workspace
-                    .insert_after_focused(key.clone(), crate::ui::task_workspace::Axis::Horizontal)
-                    .is_err()
+            // Which pane each seeded task ended up as, so a later seed can say
+            // "beside that one" and reproduce a nested tree exactly.
+            let mut panes: HashMap<usize, crate::ui::task_workspace::PaneId> = HashMap::new();
+            if let Some(pane_id) = workspace.focused_pane_id() {
+                panes.insert(*first_index, pane_id);
+            }
+            for (index, key) in rest {
+                let inserted = match seeds[*index]
+                    .placement
+                    .and_then(|(beside, edge)| panes.get(&beside).map(|pane| (*pane, edge)))
                 {
-                    break;
+                    Some((target, edge)) => workspace.insert_beside(key.clone(), target, edge),
+                    None => workspace.insert_after_focused(
+                        key.clone(),
+                        crate::ui::task_workspace::Axis::Horizontal,
+                    ),
+                };
+                match inserted {
+                    Ok(pane_id) => {
+                        panes.insert(*index, pane_id);
+                    }
+                    Err(error) => {
+                        eprintln!("preview task seed: pane {index} not opened: {error:?}");
+                        break;
+                    }
                 }
             }
             self.layout.task_workspace = Some(workspace);
@@ -25493,11 +25515,47 @@ impl NativeShell {
         // screen, so the rects that answered them are the ones this frame
         // actually used.
         self.workspace_allocation = allocated.clone();
-        let workspace =
-            self.render_task_workspace_node(root, &allocated, &rows, tokens, workspace_size, cx);
-        div().size_full().child(workspace).into_any_element()
+        let mut placed: Vec<AnyElement> = Vec::with_capacity(allocated.pane_count() * 2);
+        self.render_task_workspace_node(
+            root,
+            &allocated,
+            &rows,
+            tokens,
+            workspace_size,
+            cx,
+            &mut placed,
+        );
+        // The grid is a positioned CANVAS, not a tree of flex boxes. See
+        // `render_task_workspace_node`.
+        div()
+            .relative()
+            .size_full()
+            .min_w(px(0.0))
+            .min_h(px(0.0))
+            .overflow_hidden()
+            .children(placed)
+            .into_any_element()
     }
 
+    /// Paint one node of the tree straight onto the grid canvas.
+    ///
+    /// Every pane frame is POSITIONED AND SIZED FROM ITS ALLOCATED RECT, at
+    /// any nesting depth. That is the whole point of this shape.
+    ///
+    /// The tree used to be painted as nested flex: a split was a flex row or
+    /// column and each child a `flex_none` box that took its cross extent from
+    /// `h_full`/`w_full`. A percentage size only resolves against a parent
+    /// whose own size is definite, so the deeper a pane sat the more ancestors
+    /// there were for one of them to be content-sized -- and a pane whose
+    /// height resolved to `auto` painted its title row, its tab row and
+    /// nothing else, leaving most of its rect empty inside a frame that had
+    /// stopped growing. The allocator and the flex tree were two independent
+    /// claims about one geometry, and only one of them was ever measured.
+    ///
+    /// There is one claim now. `allocate` owns every rectangle; this walks the
+    /// tree only to find out which rectangle belongs to which pane and where
+    /// the resize rails between them sit. A split contributes no box of its
+    /// own, so nesting cannot change what a pane is given.
     fn render_task_workspace_node(
         &mut self,
         node: &TaskWorkspaceViewNode<HostTaskKey>,
@@ -25506,13 +25564,20 @@ impl NativeShell {
         tokens: crate::ui::tokens::ThemeTokens,
         workspace_size: Size<Pixels>,
         cx: &mut Context<Self>,
-    ) -> AnyElement {
+        placed: &mut Vec<AnyElement>,
+    ) {
         match node {
             TaskWorkspaceViewNode::Pane(pane) => {
-                let pane_size = allocated
-                    .rect(pane.task_id.clone())
-                    .map(|rect| size(px(rect.width), px(rect.height)))
-                    .unwrap_or(workspace_size);
+                // A pane the allocator has no rect for cannot be placed
+                // against its neighbours, so it takes the whole canvas rather
+                // than a zero-sized box nobody can see or click.
+                let rect = allocated.rect(pane.task_id.clone()).unwrap_or(PaneRect {
+                    x: 0.0,
+                    y: 0.0,
+                    width: f32::from(workspace_size.width),
+                    height: f32::from(workspace_size.height),
+                });
+                let pane_size = size(px(rect.width), px(rect.height));
                 // A pane with no board row is a pane for a task the fleet
                 // projection has dropped. It keeps its chrome from a minimal
                 // Idle row rather than vanishing mid-frame, and the row's
@@ -25525,75 +25590,106 @@ impl NativeShell {
                         &fallback
                     }
                 };
-                self.render_task_workspace_pane(pane, row, tokens, pane_size, cx)
+                let content = self.render_task_workspace_pane(pane, row, tokens, pane_size, cx);
+                placed.push(Self::task_workspace_placed(rect, content));
             }
             TaskWorkspaceViewNode::Split {
                 split_id,
                 axis,
                 children,
             } => {
-                let mut rendered = Vec::with_capacity(children.len().saturating_mul(2));
+                let parent_rect =
+                    Self::task_workspace_node_rect(node, allocated).unwrap_or_default();
+                let parent_extent = match axis {
+                    Axis::Horizontal => parent_rect.width,
+                    Axis::Vertical => parent_rect.height,
+                };
+                // The painted rail IS the allocator's gap: a second copy of
+                // the number would leave a seam or an overlap the moment one
+                // of the two moved.
+                let divider_width = Self::workspace_allocation_metrics()
+                    .divider
+                    .min(parent_extent / children.len().saturating_sub(1).max(1) as f32);
+                let divider_total = divider_width * children.len().saturating_sub(1) as f32;
                 for (index, child) in children.iter().enumerate() {
-                    let content = self.render_task_workspace_node(
+                    self.render_task_workspace_node(
                         &child.node,
                         allocated,
                         rows,
                         tokens,
                         workspace_size,
                         cx,
+                        placed,
                     );
-                    rendered.push(Self::task_workspace_child(*axis, child, allocated, content));
-                    if index + 1 < children.len() {
-                        let start_size = Self::task_workspace_node_rect(&child.node, allocated)
-                            .map(|rect| match axis {
-                                Axis::Horizontal => rect.width,
-                                Axis::Vertical => rect.height,
-                            })
-                            .unwrap_or(240.0);
-                        let parent_rect =
-                            Self::task_workspace_node_rect(node, allocated).unwrap_or_default();
-                        let parent_extent = match axis {
-                            Axis::Horizontal => parent_rect.width,
-                            Axis::Vertical => parent_rect.height,
-                        };
-                        // The painted rail IS the allocator's gap: a second
-                        // copy of the number would leave a seam or an overlap
-                        // the moment one of the two moved.
-                        let divider_width = Self::workspace_allocation_metrics()
-                            .divider
-                            .min(parent_extent / children.len().saturating_sub(1).max(1) as f32);
-                        let sibling_floor_total = children
-                            .iter()
-                            .enumerate()
-                            .filter(|(sibling, _)| *sibling != index)
-                            .map(|(_, sibling)| Self::task_workspace_child_floor(sibling, *axis))
-                            .sum();
-                        let min_size = Self::task_workspace_child_floor(child, *axis)
-                            .min(start_size)
-                            .max(1.0);
-                        let divider_total = divider_width * children.len().saturating_sub(1) as f32;
-                        rendered.push(self.task_workspace_divider(
-                            *split_id,
-                            *axis,
-                            index,
-                            start_size,
-                            min_size,
-                            parent_extent,
-                            divider_total,
-                            sibling_floor_total,
-                            divider_width,
-                            tokens,
-                            cx,
-                        ));
+                    if index + 1 >= children.len() {
+                        continue;
                     }
-                }
-                let split = div().w_full().h_full().min_w(px(0.0)).min_h(px(0.0)).flex();
-                match axis {
-                    Axis::Horizontal => split.flex_row().children(rendered).into_any_element(),
-                    Axis::Vertical => split.flex_col().children(rendered).into_any_element(),
+                    let child_rect = Self::task_workspace_node_rect(&child.node, allocated)
+                        .unwrap_or(parent_rect);
+                    let next_rect =
+                        Self::task_workspace_node_rect(&children[index + 1].node, allocated)
+                            .unwrap_or(parent_rect);
+                    let start_size = match axis {
+                        Axis::Horizontal => child_rect.width,
+                        Axis::Vertical => child_rect.height,
+                    };
+                    let sibling_floor_total = children
+                        .iter()
+                        .enumerate()
+                        .filter(|(sibling, _)| *sibling != index)
+                        .map(|(_, sibling)| Self::task_workspace_child_floor(sibling, *axis))
+                        .sum();
+                    let min_size = Self::task_workspace_child_floor(child, *axis)
+                        .min(start_size)
+                        .max(1.0);
+                    // The rail fills the gap the two rects actually leave, so
+                    // the affordance can never be somewhere other than the
+                    // seam a person sees.
+                    let rail = match axis {
+                        Axis::Horizontal => PaneRect {
+                            x: child_rect.x + child_rect.width,
+                            y: parent_rect.y,
+                            width: (next_rect.x - (child_rect.x + child_rect.width)).max(1.0),
+                            height: parent_rect.height,
+                        },
+                        Axis::Vertical => PaneRect {
+                            x: parent_rect.x,
+                            y: child_rect.y + child_rect.height,
+                            width: parent_rect.width,
+                            height: (next_rect.y - (child_rect.y + child_rect.height)).max(1.0),
+                        },
+                    };
+                    let divider = self.task_workspace_divider(
+                        *split_id,
+                        *axis,
+                        index,
+                        start_size,
+                        min_size,
+                        parent_extent,
+                        divider_total,
+                        sibling_floor_total,
+                        tokens,
+                        cx,
+                    );
+                    placed.push(Self::task_workspace_placed(rail, divider));
                 }
             }
         }
+    }
+
+    /// One element at one allocated rect on the grid canvas.
+    fn task_workspace_placed(rect: PaneRect, content: AnyElement) -> AnyElement {
+        div()
+            .absolute()
+            .left(px(rect.x))
+            .top(px(rect.y))
+            .w(px(rect.width))
+            .h(px(rect.height))
+            .min_w(px(0.0))
+            .min_h(px(0.0))
+            .overflow_hidden()
+            .child(content)
+            .into_any_element()
     }
 
     fn task_workspace_node_rect(
@@ -25663,7 +25759,6 @@ impl NativeShell {
         parent_extent: f32,
         divider_total: f32,
         sibling_floor_total: f32,
-        divider_width: f32,
         tokens: crate::ui::tokens::ThemeTokens,
         cx: &mut Context<Self>,
     ) -> AnyElement {
@@ -25710,45 +25805,14 @@ impl NativeShell {
             // under the pointer, which is the only moment it is a control.
             .bg(tokens.surfaces.canvas.to_gpui())
             .hover(|style| style.bg(tokens.borders.focus.to_gpui()))
-            .on_mouse_down(MouseButton::Left, begin);
+            .on_mouse_down(MouseButton::Left, begin)
+            // The rail's own box is the gap the two allocated rects leave; it
+            // is positioned and sized by `task_workspace_placed`, so there is
+            // no second copy of the 8 px here to drift from the allocator's.
+            .size_full();
         match axis {
-            Axis::Horizontal => divider
-                .w(px(divider_width))
-                .h_full()
-                .cursor_col_resize()
-                .into_any_element(),
-            Axis::Vertical => divider
-                .h(px(divider_width))
-                .w_full()
-                .cursor_row_resize()
-                .into_any_element(),
-        }
-    }
-
-    fn task_workspace_child(
-        axis: Axis,
-        child: &TaskWorkspaceViewChild<HostTaskKey>,
-        allocated: &crate::ui::task_workspace::AllocatedWorkspace<HostTaskKey>,
-        content: AnyElement,
-    ) -> AnyElement {
-        let logical_px = Self::task_workspace_node_rect(&child.node, allocated)
-            .map(|rect| match axis {
-                Axis::Horizontal => rect.width,
-                Axis::Vertical => rect.height,
-            })
-            .unwrap_or_else(|| match child.allocation {
-                Allocation::Pinned { logical_px } => logical_px,
-                Allocation::Auto { .. } => 0.0,
-            });
-        let wrapper = div()
-            .min_w(px(0.0))
-            .min_h(px(0.0))
-            .flex_none()
-            .overflow_hidden()
-            .child(content);
-        match axis {
-            Axis::Horizontal => wrapper.w(px(logical_px)).h_full().into_any_element(),
-            Axis::Vertical => wrapper.h(px(logical_px)).w_full().into_any_element(),
+            Axis::Horizontal => divider.cursor_col_resize().into_any_element(),
+            Axis::Vertical => divider.cursor_row_resize().into_any_element(),
         }
     }
 
@@ -62205,6 +62269,64 @@ mod "
         assert_eq!(
             named, "Claude Code was updated; the restore recipe no longer matches",
             "the host's own sentence is what a person reads when there is one"
+        );
+    }
+
+    /// X1: every pane frame is positioned and sized from its allocated rect,
+    /// at any nesting depth.
+    ///
+    /// The defect this guards was invisible in the source: a `flex_none` child
+    /// with `h_full` looks correct and resolves to `auto` whenever an ancestor
+    /// has no definite height, so a nested pane painted its two chrome rows and
+    /// stopped. Anchored on the two functions by name and on the four sides
+    /// they must read off the rect, so a return to a percentage cross-size
+    /// fails here rather than in a screenshot nobody re-takes.
+    #[test]
+    fn the_workspace_grid_positions_every_pane_from_its_allocated_rect() {
+        let source = normalised_source(include_str!("native_shell.rs"));
+        let placed = source
+            .split("    fn task_workspace_placed(")
+            .nth(1)
+            .expect("the grid canvas places elements at rects")
+            .split("    fn task_workspace_node_rect(")
+            .next()
+            .expect("the placement function ends at its neighbour");
+        for side in [
+            ".absolute()",
+            ".left(px(rect.x))",
+            ".top(px(rect.y))",
+            ".w(px(rect.width))",
+            ".h(px(rect.height))",
+        ] {
+            assert!(
+                placed.contains(side),
+                "the grid canvas must place an element with {side}"
+            );
+        }
+        let painter = source
+            .split("    fn render_task_workspace_node(")
+            .nth(1)
+            .expect("the node painter exists")
+            .split("    /// One element at one allocated rect")
+            .next()
+            .expect("the painter ends at its neighbour");
+        assert!(
+            painter.contains("Self::task_workspace_placed(rect, content)")
+                && painter.contains("Self::task_workspace_placed(rail, divider)"),
+            "panes and rails both go through the one placement"
+        );
+        for banned in [".flex_row()", ".flex_col()", ".h_full()", ".w_full()"] {
+            assert!(
+                !painter.contains(banned),
+                "the node painter is a positioned canvas, not nested flex, and it still has {banned}"
+            );
+        }
+        // Split with `concat!` so this assertion is not itself a match: the
+        // needle must not appear verbatim in the file it scans.
+        let retired = concat!("fn task_workspace_", "child(");
+        assert!(
+            !source.contains(retired),
+            "the nested-flex child wrapper is gone, not left beside its replacement"
         );
     }
 

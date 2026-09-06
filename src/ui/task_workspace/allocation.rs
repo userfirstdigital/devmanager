@@ -84,6 +84,11 @@ impl<K: Clone + Ord + Eq> AllocatedWorkspace<K> {
         self.panes.get(&task_id).copied()
     }
 
+    /// How many panes this allocation placed.
+    pub fn pane_count(&self) -> usize {
+        self.panes.len()
+    }
+
     pub fn width(&self, task_id: K) -> Option<f32> {
         self.rect(task_id).map(|rect| rect.width)
     }
@@ -232,6 +237,7 @@ impl<K: Clone + Ord + Eq> Workspace<K> {
         candidates.sort_by(|a, b| (a.0, &a.1).cmp(&(b.0, &b.1)));
         candidates.into_iter().next().map(|(_, task_id)| task_id)
     }
+
 }
 
 #[derive(Clone, Copy)]
