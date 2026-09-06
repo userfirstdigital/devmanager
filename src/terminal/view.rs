@@ -1637,20 +1637,13 @@ fn render_grid_canvas(
 
             if let Some(interaction) = grid_selection.as_ref() {
                 (interaction.on_paint)(bounds, window, cx);
-                let text_bounds = TerminalTextBounds {
-                    left: f32::from(bounds.origin.x),
-                    top: f32::from(bounds.origin.y),
-                    width: terminal_column_offset(grid_cols, cell_pitch)
-                        .min(f32::from(bounds.size.width))
-                        .max(cell_pitch),
-                    height: (grid_rows as f32 * line_height)
-                        .min(f32::from(bounds.size.height))
-                        .max(line_height),
-                    cell_width: cell_pitch,
-                    row_height: line_height,
-                    rows: grid_rows,
-                    cols: grid_cols,
-                };
+                let text_bounds = terminal_grid_text_bounds(
+                    bounds,
+                    grid_cols,
+                    grid_rows,
+                    cell_pitch,
+                    line_height,
+                );
                 let on_mouse_down = interaction.on_mouse_down.clone();
                 window.on_mouse_event({
                     let text_bounds = text_bounds;
@@ -2429,6 +2422,49 @@ pub fn terminal_selection_for_click(
 }
 
 /// Hit-test a window-space point against the actual painted grid bounds.
+/// The rectangle a painted terminal grid claims pointer events inside, in
+/// window coordinates.
+///
+/// Two rules, in this order:
+///
+/// 1. at least one cell, so a one-column or one-row grid is still clickable;
+/// 2. and never larger than `element`, the bounds the grid was painted into.
+///
+/// Rule 2 is the property: a pointer event outside this rectangle belongs to
+/// whatever is under it, and [`terminal_endpoint_for_mouse`] with
+/// `clamp_to_terminal = false` is what refuses it. The two together are why
+/// a visible terminal is not a window-wide modal pointer surface.
+///
+/// Extracted from the paint closure so that property is a fact about a
+/// function a test can call, rather than a claim about a slice of this file's
+/// text: the guard that used to assert it sliced the closure between two
+/// literals and stopped matching -- and therefore stopped guarding -- the
+/// moment the closure moved.
+pub fn terminal_grid_text_bounds(
+    element: Bounds<Pixels>,
+    grid_cols: usize,
+    grid_rows: usize,
+    cell_pitch: f32,
+    line_height: f32,
+) -> TerminalTextBounds {
+    let element_width = f32::from(element.size.width).max(0.0);
+    let element_height = f32::from(element.size.height).max(0.0);
+    TerminalTextBounds {
+        left: f32::from(element.origin.x),
+        top: f32::from(element.origin.y),
+        width: terminal_column_offset(grid_cols, cell_pitch)
+            .max(cell_pitch)
+            .min(element_width),
+        height: (grid_rows as f32 * line_height)
+            .max(line_height)
+            .min(element_height),
+        cell_width: cell_pitch,
+        row_height: line_height,
+        rows: grid_rows,
+        cols: grid_cols,
+    }
+}
+
 pub fn terminal_endpoint_for_mouse(
     position: Point<Pixels>,
     bounds: TerminalTextBounds,
@@ -3258,12 +3294,13 @@ mod selection_helper_tests {
         begin_simple_selection, extend_selection_head, finish_simple_selection,
         selected_text_from_lines, selected_text_from_screen, selection_mode_for_click,
         selection_range_from, terminal_ctrl_c_action, terminal_endpoint_for_mouse,
-        terminal_grid_size_for_bounds, terminal_selection_for_click, top_visible_buffer_line,
-        TerminalCellSide, TerminalCtrlCAction, TerminalGridPosition, TerminalSelectionEndpoint,
-        TerminalSelectionMode, TerminalSelectionRange, TerminalTextBounds,
+        terminal_grid_size_for_bounds, terminal_grid_text_bounds, terminal_selection_for_click,
+        top_visible_buffer_line, TerminalCellSide, TerminalCtrlCAction, TerminalGridPosition,
+        TerminalSelectionEndpoint, TerminalSelectionMode, TerminalSelectionRange,
+        TerminalTextBounds,
     };
     use crate::terminal::session::{TerminalCellSnapshot, TerminalScreenSnapshot};
-    use gpui::{point, px};
+    use gpui::{point, px, size, Bounds};
 
     fn snapshot_cell(character: char) -> TerminalCellSnapshot {
         TerminalCellSnapshot {
@@ -3431,26 +3468,129 @@ mod selection_helper_tests {
         assert!(rejected.is_none());
     }
 
+    /// A painted terminal grid must not claim a pointer event outside its own
+    /// bounds -- a visible terminal is not a window-wide modal pointer
+    /// surface.
+    ///
+    /// This replaces a source-text guard that sliced the paint closure between
+    /// two string literals and asserted on the slice. It had stopped matching
+    /// its own end literal, so `.expect("terminal grid canvas handlers end")`
+    /// panicked at every base: a decayed anchor, red for a reason that had
+    /// nothing to do with the property.
+    ///
+    /// The property is now measured in two halves, and the FIRST is
+    /// behavioural:
+    ///
+    /// * [`terminal_grid_text_bounds`] never returns a rectangle larger than
+    ///   the element it was given, at any grid shape -- including an element
+    ///   narrower than one cell, which the old inline arithmetic got wrong
+    ///   (`.max(cell_pitch)` came last, so a 4 px element claimed 8 px).
+    /// * [`terminal_endpoint_for_mouse`] with `clamp_to_terminal = false`
+    ///   refuses every point outside that rectangle, on all four sides.
+    ///
+    /// The second half is the wiring, which no headless test can reach: the
+    /// handlers are installed on the WINDOW, and only a real window delivers
+    /// an event to them. That half is a source scan, and it carries a
+    /// DENOMINATOR -- the total number of call sites in the painter -- so a
+    /// call site that is renamed, moved or added fails loudly instead of
+    /// silently dropping out of the count.
     #[test]
     fn rendered_terminal_grid_never_claims_pointer_events_outside_its_bounds() {
-        let source = include_str!("view.rs");
-        let start = source
-            .find("let on_mouse_down = interaction.on_mouse_down.clone();")
-            .expect("terminal grid pointer handlers");
-        let body = &source[start..];
-        let end = body
-            .find("\n            }\n        },")
-            .expect("terminal grid canvas handlers end");
-        let body = &body[..end];
+        // --- half one: behaviour ---
+        let element = Bounds::new(point(px(40.0), px(12.0)), size(px(300.0), px(200.0)));
+        // (cols, rows, cell pitch, line height): an ordinary 80x24, a single
+        // cell, a grid far larger than its element, and cells larger than the
+        // element itself.
+        for (cols, rows, pitch, line) in [
+            (80_usize, 24_usize, 8.0_f32, 16.0_f32),
+            (1, 1, 8.0, 16.0),
+            (400, 200, 8.0, 16.0),
+            (10, 4, 512.0, 512.0),
+        ] {
+            let claimed = terminal_grid_text_bounds(element, cols, rows, pitch, line);
+            let left = f32::from(element.origin.x);
+            let top = f32::from(element.origin.y);
+            let right = left + f32::from(element.size.width);
+            let bottom = top + f32::from(element.size.height);
+            assert_eq!((claimed.left, claimed.top), (left, top));
+            assert!(
+                claimed.left + claimed.width <= right,
+                "{cols}x{rows} claimed {} px to the right of its element",
+                claimed.left + claimed.width - right
+            );
+            assert!(
+                claimed.top + claimed.height <= bottom,
+                "{cols}x{rows} claimed {} px below its element",
+                claimed.top + claimed.height - bottom
+            );
+
+            // Every point outside the claimed rectangle is refused, on all
+            // four sides; the middle of it is not.
+            let outside = [
+                point(px(claimed.left - 1.0), px(claimed.top + 1.0)),
+                point(px(claimed.left + 1.0), px(claimed.top - 1.0)),
+                point(px(claimed.left + claimed.width), px(claimed.top + 1.0)),
+                point(px(claimed.left + 1.0), px(claimed.top + claimed.height)),
+            ];
+            for position in outside {
+                assert!(
+                    terminal_endpoint_for_mouse(position, claimed, false).is_none(),
+                    "{cols}x{rows} accepted {position:?}, which is outside its own bounds"
+                );
+            }
+            assert!(
+                terminal_endpoint_for_mouse(
+                    point(
+                        px(claimed.left + claimed.width / 2.0),
+                        px(claimed.top + claimed.height / 2.0),
+                    ),
+                    claimed,
+                    false,
+                )
+                .is_some(),
+                "{cols}x{rows} refused its own centre"
+            );
+        }
+
+        // --- half two: the wiring, with its denominator ---
+        let source = include_str!("view.rs").replace("\r\n", "\n");
+        let painter = source
+            .split("#[cfg(test)]")
+            .next()
+            .expect("the painter, up to the first test module");
+        assert!(
+            painter.len() > 40_000,
+            "the painter half of the file did not parse; every count below would be vacuous"
+        );
         assert_eq!(
-            body.matches("terminal_endpoint_for_mouse(event.position, text_bounds, false)")
+            painter.matches("fn terminal_grid_text_bounds(").count(),
+            1,
+            "one definition of the rectangle the grid claims"
+        );
+        // The denominator: one declaration plus the three window handlers.
+        // Nothing else in the painter may ask this question at all.
+        assert_eq!(
+            painter.matches("terminal_endpoint_for_mouse(").count(),
+            4,
+            "the census of pointer-endpoint call sites moved; re-read them before adjusting this"
+        );
+        assert_eq!(
+            painter
+                .matches("terminal_endpoint_for_mouse(event.position, text_bounds, false)")
                 .count(),
             3,
             "terminal mouse down, drag, and release must not clamp unrelated window events into the grid"
         );
         assert!(
-            !body.contains("terminal_endpoint_for_mouse(event.position, text_bounds, true)"),
+            !painter.contains("text_bounds, true)"),
             "a visible terminal must not become a window-wide modal pointer surface"
+        );
+        assert_eq!(
+            painter
+                .matches("let text_bounds = terminal_grid_text_bounds(")
+                .count(),
+            1,
+            "the handlers share one rectangle, computed by the one function that bounds it"
         );
     }
 
