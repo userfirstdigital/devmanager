@@ -1,3 +1,4 @@
+# watch.bat is the hot-reload entry (this script, watching); launch-dev.bat passes -Once and is build-once.
 param(
     [int]$DebounceMs = 500,
     [switch]$Release,
