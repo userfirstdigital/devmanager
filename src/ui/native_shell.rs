@@ -886,13 +886,76 @@ fn terminal_query_refusal(
 ) -> Option<(String, Option<crate::domain::TaskCockpitUnavailableReason>)> {
     match result {
         crate::domain::TaskCockpitResult::Unavailable { reason, detail, .. } => Some((
-            cockpit_reason_line(*reason, detail.as_deref()),
+            refusal_sentence(detail.as_deref(), || terminal_unavailable_sentence(*reason)),
             Some(*reason),
         )),
-        crate::domain::TaskCockpitResult::Denied { reason, detail, .. } => {
-            Some((cockpit_reason_line(*reason, detail.as_deref()), None))
-        }
+        crate::domain::TaskCockpitResult::Denied { reason, detail, .. } => Some((
+            refusal_sentence(detail.as_deref(), || terminal_denied_sentence(*reason)),
+            None,
+        )),
         _ => None,
+    }
+}
+
+/// The host's own sentence if it sent one, and the closed reason's sentence if
+/// it did not.
+///
+/// Never the reason's Debug name. `{reason:?}` is a Rust identifier -- the
+/// panel body read "Terminal unavailable: TerminalUnavailable", which says
+/// nothing twice and looks like a leaked internal -- and it is the only thing
+/// there is to print when the host sends `detail: None`, which is the common
+/// case.
+fn refusal_sentence(detail: Option<&str>, fallback: impl FnOnce() -> &'static str) -> String {
+    match detail.map(str::trim) {
+        Some(detail) if !detail.is_empty() => detail.to_string(),
+        _ => fallback().to_string(),
+    }
+}
+
+/// One short human clause per unavailable reason, written to follow "Terminal
+/// unavailable: " and to be readable on its own in the blocked status line.
+///
+/// Exhaustive by construction: no wildcard arm, so a new variant of
+/// `TaskCockpitUnavailableReason` fails the build here rather than shipping as
+/// a Debug name in a panel body.
+fn terminal_unavailable_sentence(
+    reason: crate::domain::TaskCockpitUnavailableReason,
+) -> &'static str {
+    use crate::domain::TaskCockpitUnavailableReason as Reason;
+    match reason {
+        Reason::TerminalUnavailable => "this task has no terminal on its host",
+        Reason::TerminalStartPending => "its provider session is still starting",
+        Reason::TerminalNotStarted => "no provider session has been started yet",
+        Reason::TerminalProviderSetupRequired => "the provider is waiting on a setup prompt",
+        Reason::TerminalProviderSessionNotFound => "the provider no longer has this conversation",
+        Reason::GitAuthorityNotIssued => "the host has not issued git authority for this task",
+        Reason::FileAuthorityNotIssued => "the host has not issued file authority for this task",
+        Reason::SshOperationUnsupported => "this SSH host does not support that",
+        Reason::SshTaskSupervisorAdapterMissing => "this SSH host runs no task supervisor",
+        Reason::ServiceSupervisorUnavailable => "the service supervisor is not running",
+        Reason::WriteUnsupported => "this host does not accept writes",
+        Reason::LogsUnsupported => "this host does not serve logs",
+        Reason::HealthUnsupported => "this host does not report health",
+        Reason::WorkspaceAuthorityUnavailable => "the host has not issued workspace authority",
+        Reason::BrowserProcessSessionUnavailable => "the browser session is not running",
+    }
+}
+
+/// One short human clause per denied reason. See
+/// [`terminal_unavailable_sentence`]; same rule, same reason for having no
+/// wildcard arm.
+fn terminal_denied_sentence(reason: crate::domain::TaskCockpitDeniedReason) -> &'static str {
+    use crate::domain::TaskCockpitDeniedReason as Reason;
+    match reason {
+        Reason::MissingTask => "the host does not know this task",
+        Reason::Unauthorized => "the host refused the request",
+        Reason::PathTraversal => "the path left the workspace",
+        Reason::OutsideWorkspace => "the path is outside the workspace",
+        Reason::CapabilityDenied => "the host has not granted that capability",
+        Reason::StaleFence => "the request was for an older session",
+        Reason::UnknownService => "the host does not know that service",
+        Reason::ForeignScope => "the request was for another host's task",
+        Reason::RevisionConflict => "the task changed while the request was in flight",
     }
 }
 
@@ -61998,6 +62061,151 @@ mod "
             crate::providers::ProviderKind::Codex,
             false,
         ));
+    }
+
+    /// Source with the shared checkout's CRLF taken out, so a scan can slice
+    /// it the same way on every machine. `char::from(13)` rather than an escape
+    /// literal: this string is edited by scripts often enough that an escape is
+    /// a hazard rather than a convenience.
+    fn normalised_source(source: &str) -> String {
+        source.replace(char::from(13), "")
+    }
+
+    /// The variant names of one enum in `src/domain/cockpit.rs`.
+    ///
+    /// Parsed rather than assumed: a hand-written list of reasons goes stale
+    /// silently, and a stale list makes every assertion over it vacuous for the
+    /// variant that was added.
+    fn domain_enum_variants(name: &str) -> Vec<String> {
+        let source = normalised_source(include_str!("../domain/cockpit.rs"));
+        let body = source
+            .split(&format!("pub enum {name} {{"))
+            .nth(1)
+            .unwrap_or_else(|| panic!("{name} is declared in src/domain/cockpit.rs"));
+        let variants: Vec<String> = body
+            .lines()
+            .map(str::trim)
+            .take_while(|line| *line != "}")
+            .filter(|line| !line.starts_with("//"))
+            .filter_map(|line| line.strip_suffix(','))
+            .map(str::to_string)
+            .collect();
+        assert!(
+            variants.len() > 3,
+            "{name} parsed to {} variants, which means the parse failed",
+            variants.len()
+        );
+        variants
+    }
+
+    /// X4: the panel body must never print a Rust identifier.
+    ///
+    /// "Terminal unavailable: TerminalUnavailable" is what the live capture
+    /// showed on three panels: the host sent no sentence, so the formatter had
+    /// nothing but `{reason:?}`. Every reason now carries one short human
+    /// clause, and the match has no wildcard arm, so a new variant fails the
+    /// BUILD rather than shipping its Debug name to a person.
+    #[test]
+    fn every_terminal_refusal_reason_has_a_human_sentence() {
+        use crate::domain::{TaskCockpitDeniedReason, TaskCockpitUnavailableReason};
+
+        const UNAVAILABLE: &[TaskCockpitUnavailableReason] = &[
+            TaskCockpitUnavailableReason::TerminalUnavailable,
+            TaskCockpitUnavailableReason::TerminalStartPending,
+            TaskCockpitUnavailableReason::TerminalNotStarted,
+            TaskCockpitUnavailableReason::TerminalProviderSetupRequired,
+            TaskCockpitUnavailableReason::TerminalProviderSessionNotFound,
+            TaskCockpitUnavailableReason::GitAuthorityNotIssued,
+            TaskCockpitUnavailableReason::FileAuthorityNotIssued,
+            TaskCockpitUnavailableReason::SshOperationUnsupported,
+            TaskCockpitUnavailableReason::SshTaskSupervisorAdapterMissing,
+            TaskCockpitUnavailableReason::ServiceSupervisorUnavailable,
+            TaskCockpitUnavailableReason::WriteUnsupported,
+            TaskCockpitUnavailableReason::LogsUnsupported,
+            TaskCockpitUnavailableReason::HealthUnsupported,
+            TaskCockpitUnavailableReason::WorkspaceAuthorityUnavailable,
+            TaskCockpitUnavailableReason::BrowserProcessSessionUnavailable,
+        ];
+        const DENIED: &[TaskCockpitDeniedReason] = &[
+            TaskCockpitDeniedReason::MissingTask,
+            TaskCockpitDeniedReason::Unauthorized,
+            TaskCockpitDeniedReason::PathTraversal,
+            TaskCockpitDeniedReason::OutsideWorkspace,
+            TaskCockpitDeniedReason::CapabilityDenied,
+            TaskCockpitDeniedReason::StaleFence,
+            TaskCockpitDeniedReason::UnknownService,
+            TaskCockpitDeniedReason::ForeignScope,
+            TaskCockpitDeniedReason::RevisionConflict,
+        ];
+
+        let declared = domain_enum_variants("TaskCockpitUnavailableReason");
+        assert_eq!(
+            declared.len(),
+            UNAVAILABLE.len(),
+            "an unavailable reason was added to the domain without a sentence here: {declared:?}"
+        );
+        for reason in UNAVAILABLE {
+            let debug_name = format!("{reason:?}");
+            assert!(
+                declared.contains(&debug_name),
+                "{debug_name} is not a variant of the domain enum any more"
+            );
+            let sentence = super::terminal_unavailable_sentence(*reason);
+            assert!(!sentence.trim().is_empty(), "{debug_name} has no sentence");
+            assert!(
+                !sentence.contains(&debug_name),
+                "{debug_name} still prints its own identifier: {sentence}"
+            );
+            assert!(
+                sentence.contains(' '),
+                "{debug_name} reads as an identifier, not a sentence: {sentence}"
+            );
+        }
+
+        let declared = domain_enum_variants("TaskCockpitDeniedReason");
+        assert_eq!(
+            declared.len(),
+            DENIED.len(),
+            "a denied reason was added to the domain without a sentence here: {declared:?}"
+        );
+        for reason in DENIED {
+            let debug_name = format!("{reason:?}");
+            assert!(
+                declared.contains(&debug_name),
+                "{debug_name} is not a variant of the domain enum any more"
+            );
+            let sentence = super::terminal_denied_sentence(*reason);
+            assert!(!sentence.trim().is_empty(), "{debug_name} has no sentence");
+            assert!(
+                !sentence.contains(&debug_name),
+                "{debug_name} still prints its own identifier: {sentence}"
+            );
+            assert!(sentence.contains(' '), "{debug_name} is not a sentence");
+        }
+
+        // And the whole path: the host's own sentence wins when it sent one,
+        // and the reason's stands in when it did not. Neither is a Debug name.
+        let unavailable = |detail: Option<&str>| crate::domain::TaskCockpitResult::Unavailable {
+            surface: crate::domain::TaskCockpitSurface::Terminal,
+            reason: TaskCockpitUnavailableReason::TerminalUnavailable,
+            detail: detail.map(str::to_string),
+        };
+        let (bare, reason) = super::terminal_query_refusal(&unavailable(None))
+            .expect("an unavailable result is a refusal");
+        assert_eq!(
+            reason,
+            Some(TaskCockpitUnavailableReason::TerminalUnavailable),
+            "the typed reason still reaches the recovery that branches on it"
+        );
+        assert_eq!(bare, "this task has no terminal on its host");
+        let (named, _) = super::terminal_query_refusal(&unavailable(Some(
+            "Claude Code was updated; the restore recipe no longer matches",
+        )))
+        .expect("a refusal");
+        assert_eq!(
+            named, "Claude Code was updated; the restore recipe no longer matches",
+            "the host's own sentence is what a person reads when there is one"
+        );
     }
 
     #[test]
