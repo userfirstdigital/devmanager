@@ -191,38 +191,6 @@ pub struct NativePanelMoveUp;
 #[action(name = "native.panel_move_down")]
 pub struct NativePanelMoveDown;
 
-#[derive(Clone, Debug, Default, PartialEq, Eq, gpui::Action)]
-#[action(name = "dock.tool.changes")]
-pub struct DockSelectChanges;
-
-#[derive(Clone, Debug, Default, PartialEq, Eq, gpui::Action)]
-#[action(name = "dock.tool.files")]
-pub struct DockSelectFiles;
-
-#[derive(Clone, Debug, Default, PartialEq, Eq, gpui::Action)]
-#[action(name = "dock.tool.terminal")]
-pub struct DockSelectTerminal;
-
-#[derive(Clone, Debug, Default, PartialEq, Eq, gpui::Action)]
-#[action(name = "dock.tool.browser")]
-pub struct DockSelectBrowser;
-
-#[derive(Clone, Debug, Default, PartialEq, Eq, gpui::Action)]
-#[action(name = "dock.tool.services")]
-pub struct DockSelectServices;
-
-#[derive(Clone, Debug, Default, PartialEq, Eq, gpui::Action)]
-#[action(name = "dock.tool.artifacts")]
-pub struct DockSelectArtifacts;
-
-#[derive(Clone, Debug, Default, PartialEq, Eq, gpui::Action)]
-#[action(name = "dock.tool.review")]
-pub struct DockSelectReview;
-
-#[derive(Clone, Debug, Default, PartialEq, Eq, gpui::Action)]
-#[action(name = "dock.terminal.toggle")]
-pub struct DockToggleRawTerminal;
-
 pub const TASK_COCKPIT_ACTION_NAMES: [&str; 6] = [
     ACTION_HOST_ACTIONS,
     ACTION_HOST_STATUS,
