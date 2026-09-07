@@ -522,7 +522,7 @@ fn acquire_linux(profile_root: &Path, profile: String) -> Result<HostLock, HostL
             message,
         ))
     };
-    fs::create_dir_all(profile_root).map_err(HostLockError::Io)?;
+    crate::persistence::create_private_directory(profile_root, true).map_err(HostLockError::Io)?;
     let directory = fs::OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
@@ -592,6 +592,30 @@ fn acquire_linux(profile_root: &Path, profile: String) -> Result<HostLock, HostL
 #[cfg(all(test, target_os = "linux"))]
 mod linux_tests {
     use super::*;
+    #[test]
+    fn linux_new_profile_is_private_and_existing_directory_permissions_are_preserved() {
+        use std::os::unix::fs::PermissionsExt;
+        let parent = tempfile::tempdir().unwrap();
+        fs::set_permissions(parent.path(), fs::Permissions::from_mode(0o750)).unwrap();
+        let root = parent.path().join("new-profile");
+        let lock = HostLock::acquire(&root, "private-profile").unwrap();
+        assert_eq!(
+            fs::metadata(&root).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        assert_eq!(
+            fs::metadata(parent.path()).unwrap().permissions().mode() & 0o777,
+            0o750
+        );
+        drop(lock);
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o770)).unwrap();
+        assert!(HostLock::acquire(&root, "private-profile").is_err());
+        assert_eq!(
+            fs::metadata(&root).unwrap().permissions().mode() & 0o777,
+            0o770
+        );
+    }
+
     #[test]
     fn linux_host_lock_retains_exclusion_and_rejects_link_aliases() {
         let root = tempfile::tempdir().unwrap();

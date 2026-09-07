@@ -2489,11 +2489,13 @@ fn isolated_host_logs_dir(profile: &IsolatedDevProfile) -> Result<PathBuf, Nativ
             message: format!("isolated host log path cannot be resolved: {error}"),
         },
     )?;
-    std::fs::create_dir_all(&paths.logs).map_err(|error| NativeShellError::HostConnect {
-        message: format!(
-            "isolated host log directory cannot be created {}: {error}",
-            paths.logs.display()
-        ),
+    crate::persistence::create_private_directory(&paths.logs, true).map_err(|error| {
+        NativeShellError::HostConnect {
+            message: format!(
+                "isolated host log directory cannot be created {}: {error}",
+                paths.logs.display()
+            ),
+        }
     })?;
     Ok(paths.logs)
 }
@@ -2799,8 +2801,10 @@ fn ensure_isolated_directory(
                     });
                 }
             }
-            std::fs::create_dir(path).map_err(|error| NativeShellError::HostConnect {
-                message: format!("{label} could not be created {}: {error}", path.display()),
+            crate::persistence::create_private_directory(path, false).map_err(|error| {
+                NativeShellError::HostConnect {
+                    message: format!("{label} could not be created {}: {error}", path.display()),
+                }
             })?;
             let metadata =
                 std::fs::symlink_metadata(path).map_err(|error| NativeShellError::HostConnect {

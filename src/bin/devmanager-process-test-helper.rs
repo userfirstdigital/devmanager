@@ -6061,6 +6061,19 @@ fn main() {
     let mode = mode.to_string_lossy().to_string();
     let result = match mode.as_str() {
         #[cfg(target_os = "linux")]
+        "linux-death-signal" => {
+            let marker = required_path(&mut args, "death-signal marker");
+            let mut signal: libc::c_int = 0;
+            assert_eq!(
+                unsafe { libc::prctl(libc::PR_GET_PDEATHSIG, &mut signal) },
+                0
+            );
+            write_marker(&marker, signal.to_string());
+            loop {
+                std::thread::park();
+            }
+        }
+        #[cfg(target_os = "linux")]
         "linux-detached-tree" => {
             use std::os::unix::process::CommandExt;
             let root_marker = required_path(&mut args, "root marker");

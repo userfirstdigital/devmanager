@@ -176,8 +176,18 @@ impl LinuxProcessTree {
         // Do not raise SIGSTOP here: std::Command::spawn waits for the exec
         // error pipe to close. TRACEME alone produces the post-exec SIGTRAP
         // after the pipe closes, before the new program executes user code.
+        let parent_pid = std::process::id() as libc::pid_t;
         unsafe {
-            command.pre_exec(|| {
+            command.pre_exec(move || {
+                // EXITKILL is installed at the first exec stop. Cover the
+                // earlier fork-to-exec interval too, including a parent exit
+                // racing prctl itself. This thread remains the lifetime owner.
+                if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) < 0 {
+                    return Err(io::Error::last_os_error());
+                }
+                if libc::getppid() != parent_pid {
+                    return Err(io::Error::from_raw_os_error(libc::ESRCH));
+                }
                 if libc::ptrace(libc::PTRACE_TRACEME, 0, 0, 0) < 0 {
                     return Err(io::Error::last_os_error());
                 }
@@ -641,6 +651,75 @@ mod tests {
         assert_eq!(members[0].id().pid(), pid);
         drop(tree);
         assert!(!PathBuf::from(format!("/proc/{pid}")).exists());
+    }
+
+    #[test]
+    fn linux_process_tree_owner_death_kills_gated_and_running_roots() {
+        const CHILD_ROOT: &str = "DEVMANAGER_TEST_PROBE_OWNER_DEATH_ROOT";
+        if let Some(root) = std::env::var_os(CHILD_ROOT) {
+            let root = PathBuf::from(root);
+            let mut command = Command::new(helper());
+            command.arg("linux-death-signal").arg(root.join("started"));
+            let (child, tree) = LinuxProcessTree::spawn(command, Instant::now() + CLEANUP).unwrap();
+            std::fs::write(root.join("pid"), child.id().to_string()).unwrap();
+            if root.join("resume").exists() {
+                tree.control().resume(Instant::now() + CLEANUP).unwrap();
+            }
+            loop {
+                std::thread::park();
+            }
+        }
+        struct Owner(Child);
+        impl Drop for Owner {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+        for resume in [false, true] {
+            let root = tempfile::tempdir().unwrap();
+            if resume {
+                std::fs::write(root.path().join("resume"), b"").unwrap();
+            }
+            let mut owner = Owner(Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "process::linux::tests::linux_process_tree_owner_death_kills_gated_and_running_roots", "--test-threads=1"])
+                .env(CHILD_ROOT, root.path())
+                .stdout(std::process::Stdio::null())
+                .spawn().unwrap());
+            wait_marker(&root.path().join("pid"));
+            let pid: i32 = std::fs::read_to_string(root.path().join("pid"))
+                .unwrap()
+                .parse()
+                .unwrap();
+            let raw = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) };
+            assert!(raw >= 0);
+            let process = unsafe { OwnedFd::from_raw_fd(raw as i32) };
+            if resume {
+                wait_marker(&root.path().join("started"));
+                assert_eq!(
+                    std::fs::read_to_string(root.path().join("started")).unwrap(),
+                    libc::SIGKILL.to_string()
+                );
+            } else {
+                assert!(!root.path().join("started").exists());
+            }
+            owner.0.kill().unwrap();
+            owner.0.wait().unwrap();
+            let mut poll = libc::pollfd {
+                fd: process.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            assert_eq!(
+                unsafe { libc::poll(&mut poll, 1, 5000) },
+                1,
+                "provider survived owner death"
+            );
+            assert_ne!(poll.revents & libc::POLLIN, 0);
+            if !resume {
+                assert!(!root.path().join("started").exists());
+            }
+        }
     }
 
     #[test]

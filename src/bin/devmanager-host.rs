@@ -647,12 +647,14 @@ fn prepare_production_paths() -> Result<PreparedProductionPaths, String> {
             }
         }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            fs::create_dir_all(&resolved.root).map_err(|create_error| {
-                format!(
-                    "failed to create production profile root {}: {create_error}",
-                    resolved.root.display()
-                )
-            })?;
+            devmanager::persistence::create_private_directory(&resolved.root, true).map_err(
+                |create_error| {
+                    format!(
+                        "failed to create production profile root {}: {create_error}",
+                        resolved.root.display()
+                    )
+                },
+            )?;
         }
         Err(error) => {
             return Err(format!(
@@ -744,12 +746,14 @@ fn prepare_debug_paths(args: &HostArgs) -> Result<PreparedDebugPaths, String> {
             }
         }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            fs::create_dir(&root).map_err(|create_error| {
-                format!(
-                    "failed to create profile root {}: {create_error}",
-                    root.display()
-                )
-            })?;
+            devmanager::persistence::create_private_directory(&root, false).map_err(
+                |create_error| {
+                    format!(
+                        "failed to create profile root {}: {create_error}",
+                        root.display()
+                    )
+                },
+            )?;
         }
         Err(error) => {
             return Err(format!(

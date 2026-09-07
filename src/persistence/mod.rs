@@ -204,6 +204,20 @@ pub(crate) fn persist_github_token_reference(token: Option<&str>) -> Result<()> 
         .map_err(PersistenceError::Config)
 }
 
+/// Create application-owned storage without making a new Unix directory
+/// writable by the caller's group under a permissive umask. Existing paths
+/// keep their permissions; callers still validate their identity and ownership.
+pub fn create_private_directory(path: &Path, recursive: bool) -> std::io::Result<()> {
+    let mut builder = std::fs::DirBuilder::new();
+    builder.recursive(recursive);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        builder.mode(0o700);
+    }
+    builder.create(path)
+}
+
 pub fn app_config_dir() -> Result<PathBuf> {
     #[cfg(test)]
     {

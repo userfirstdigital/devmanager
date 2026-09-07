@@ -51,6 +51,9 @@ Local logs are sibling files of the isolated worktree:
 
 | Check | Observed result |
 | --- | --- |
+| Linux owner-death and tree cleanup | Four passed (`linux-production/death-owner-tests.log`) |
+| New private Linux profiles / existing permissions | Passed (`linux-production/private-profile-test.log`) |
+| Startup edge-case all-target check | Passed (`linux-production/private-startup-check.log`) |
 | Linux provider discovery identity | 44 passed (`linux-production/discovery-identity-final.log`) |
 | Linux registry PATH and override aliases | Passed (`linux-production/discovery-registry-final.log`) |
 | Interactive probe exchange, cancellation and full-pipe deadline | Two passed (`linux-production/interactive-probe-tests.log`) |
