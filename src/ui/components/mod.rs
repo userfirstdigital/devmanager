@@ -22,3 +22,5 @@ pub use interaction::{
 };
 pub use status_light::{ExternalPortStatus, StatusLight, StatusPresentation};
 pub use text_field::{TextField, TextFieldError, TextFieldKey, TextFieldLimits};
+
+pub mod tabs;

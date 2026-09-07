@@ -18,8 +18,8 @@ Neither historical branch report is acceptance evidence for this combined build.
 - [x] Finish the production color-ownership source gate (29 theme tests passed).
 - [x] Implement Claude task-list settings, additive tool enablement and TaskUpdate ingestion.
 - [x] Verify provider settings (104 tests passed).
-- [ ] Finish provider capability verdicts.
-- [ ] Complete provider subagent attribution and tabs, with capability verdicts.
+- [x] Document provider capability verdicts in `provider-ux-capabilities.md`; live acceptance remains pending.
+- [x] Implement correlated Claude subagent attribution and native tabs; six focused tests pass.
 - [ ] Run the complete Rust library suite serially with its process helper built.
 - [ ] Run required integration and final compiler checks on frozen source.
 - [x] Web tests: 606 passed, one existing skip.
@@ -78,3 +78,12 @@ The follow-up compiler gate (`cargo check --locked --lib --bins --tests`) and
 verification is green: 994 UI tests, 104 provider-settings tests, 29 theme tests,
 and both the real shell-teardown and deterministic contention regressions.
 These focused results do not replace the outstanding complete-suite verdict.
+
+The subagent follow-up passes six focused hook/protocol/scope tests and 997 UI
+tests (six existing skips). The protocol regression invokes the production
+cockpit boundary both with and without `semantic_subagents`; the scope test
+asserts actual projected timeline rows before and after model refresh. Browser
+tests pass again (606 passed, one skip). The pinned Connect WASM artifact was
+rebuilt with Rust 1.94.0 and wasm-bindgen 0.2.114, then bundled by the normal web
+build. Production hashes remain unchanged and no owned test/build process
+remains after these focused runs. Live visual and input acceptance is pending.

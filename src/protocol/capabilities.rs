@@ -79,6 +79,8 @@ pub enum Capability {
     /// token. This is separate from HostShutdown so older clients never see
     /// the new reply variant on the wire.
     UpdateHandoff = 18,
+    /// Optional conversation attribution and typed tool-result context.
+    SemanticSubagents = 19,
 }
 
 impl Capability {
@@ -108,6 +110,7 @@ impl Capability {
             Self::ServiceSupervisor => "service_supervisor",
             Self::TaskCockpit => "task_cockpit",
             Self::UpdateHandoff => "update_handoff",
+            Self::SemanticSubagents => "semantic_subagents",
         }
     }
 }

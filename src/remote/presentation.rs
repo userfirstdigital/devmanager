@@ -186,6 +186,9 @@ pub struct SemanticEvent {
     pub sequence: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub replaces_sequence: Option<u64>,
+    /// Provider-issued identity scoped to the correlated provider conversation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subagent_id: Option<String>,
     pub occurred_at_epoch_ms: u64,
     pub source: SemanticSource,
     #[serde(flatten)]
@@ -201,6 +204,7 @@ pub enum SemanticRetention {
 #[derive(Debug, Clone)]
 pub struct SemanticEventDraft {
     pub stable_session_key: StableSessionKey,
+    pub subagent_id: Option<String>,
     pub occurred_at_epoch_ms: u64,
     pub source: SemanticSource,
     pub kind: SemanticEventKind,
@@ -454,6 +458,7 @@ impl SemanticJournal {
             stable_session_key: draft.stable_session_key,
             sequence,
             replaces_sequence,
+            subagent_id: draft.subagent_id,
             occurred_at_epoch_ms: draft.occurred_at_epoch_ms,
             source: draft.source,
             kind: draft.kind,
@@ -642,6 +647,7 @@ impl SemanticJournal {
 
     fn upsert_verbose_truncation_marker(&mut self, key: &StableSessionKey) {
         let event = SemanticEvent {
+            subagent_id: None,
             stable_session_key: key.clone(),
             sequence: self.allocate_sequence(),
             replaces_sequence: None,
@@ -894,6 +900,7 @@ impl SemanticJournalStore {
         let status_changed = previous_status != Some(runtime.status);
         if status_changed {
             let event = SemanticEventDraft {
+                subagent_id: None,
                 stable_session_key: key.clone(),
                 occurred_at_epoch_ms,
                 source: SemanticSource::System,
@@ -947,6 +954,7 @@ impl SemanticJournalStore {
             return false;
         }
         self.record(SemanticEventDraft {
+            subagent_id: None,
             stable_session_key: binding.key,
             occurred_at_epoch_ms,
             source: binding.source,
@@ -977,6 +985,7 @@ impl SemanticJournalStore {
         let session = self.ensure_session(&key, false);
         session.metadata.raw_required = raw_required;
         self.record(SemanticEventDraft {
+            subagent_id: None,
             stable_session_key: key,
             occurred_at_epoch_ms,
             source: SemanticSource::System,
@@ -1868,6 +1877,7 @@ mod tests {
         deduplication_key: Option<&str>,
     ) -> SemanticEventDraft {
         SemanticEventDraft {
+            subagent_id: None,
             stable_session_key: key,
             occurred_at_epoch_ms: 7,
             source: SemanticSource::Server,
@@ -2620,6 +2630,7 @@ mod tests {
         store.observe_runtime(&runtime, std::slice::from_ref(&tab), 1);
 
         store.record(SemanticEventDraft {
+            subagent_id: None,
             stable_session_key: key.clone(),
             occurred_at_epoch_ms: 2,
             source: SemanticSource::Claude,
@@ -2647,6 +2658,7 @@ mod tests {
         );
 
         store.record(SemanticEventDraft {
+            subagent_id: None,
             stable_session_key: key.clone(),
             occurred_at_epoch_ms: 4,
             source: SemanticSource::Claude,
@@ -2668,6 +2680,7 @@ mod tests {
         let mut store = SemanticJournalStore::default();
         let key = StableSessionKey::from_tab("ai-tab");
         store.record(SemanticEventDraft {
+            subagent_id: None,
             stable_session_key: key.clone(),
             occurred_at_epoch_ms: 1,
             source: SemanticSource::Claude,
@@ -2683,6 +2696,7 @@ mod tests {
         );
 
         store.record(SemanticEventDraft {
+            subagent_id: None,
             stable_session_key: key.clone(),
             occurred_at_epoch_ms: 2,
             source: SemanticSource::Claude,
@@ -2698,6 +2712,7 @@ mod tests {
         );
 
         store.record(SemanticEventDraft {
+            subagent_id: None,
             stable_session_key: key.clone(),
             occurred_at_epoch_ms: 3,
             source: SemanticSource::Claude,
@@ -2718,6 +2733,7 @@ mod tests {
         let mut store = SemanticJournalStore::default();
         let key = StableSessionKey::from_tab("ai-tab");
         store.record(SemanticEventDraft {
+            subagent_id: None,
             stable_session_key: key.clone(),
             occurred_at_epoch_ms: 1,
             source: SemanticSource::Claude,
@@ -2730,6 +2746,7 @@ mod tests {
         assert_eq!(store.metadata(&key).unwrap().task_title, None);
 
         store.record(SemanticEventDraft {
+            subagent_id: None,
             stable_session_key: key.clone(),
             occurred_at_epoch_ms: 2,
             source: SemanticSource::Claude,
@@ -2751,6 +2768,7 @@ mod tests {
         let key = StableSessionKey::from_tab("ai-tab");
         let long = "字".repeat(100);
         store.record(SemanticEventDraft {
+            subagent_id: None,
             stable_session_key: key.clone(),
             occurred_at_epoch_ms: 1,
             source: SemanticSource::Claude,
@@ -2778,6 +2796,7 @@ mod tests {
         let survivor = StableSessionKey::for_task("018f60b0-9c1a-7001-8000-000000000041");
         for key in [&purged, &survivor] {
             store.record(SemanticEventDraft {
+                subagent_id: None,
                 stable_session_key: key.clone(),
                 occurred_at_epoch_ms: 1,
                 source: SemanticSource::Claude,
@@ -3214,6 +3233,7 @@ mod tests {
         );
 
         store.record(SemanticEventDraft {
+            subagent_id: None,
             stable_session_key: key.clone(),
             occurred_at_epoch_ms: 11,
             source: SemanticSource::Claude,
@@ -3268,6 +3288,7 @@ mod tests {
         {
             let mut store = SemanticJournalStore::open(&path).expect("open empty history");
             store.record(SemanticEventDraft {
+                subagent_id: None,
                 stable_session_key: key.clone(),
                 occurred_at_epoch_ms: 10,
                 source: SemanticSource::Claude,
@@ -3278,6 +3299,7 @@ mod tests {
                 deduplication_key: None,
             });
             store.record(SemanticEventDraft {
+                subagent_id: None,
                 stable_session_key: key.clone(),
                 occurred_at_epoch_ms: 11,
                 source: SemanticSource::Claude,

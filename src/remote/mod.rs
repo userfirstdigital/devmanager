@@ -13909,6 +13909,7 @@ mod tests {
 
         let key = StableSessionKey::from_tab("claude-shared");
         service.push_semantic_draft(SemanticEventDraft {
+            subagent_id: None,
             stable_session_key: key.clone(),
             occurred_at_epoch_ms: 10,
             source: SemanticSource::Claude,
@@ -13947,6 +13948,7 @@ mod tests {
         let key = StableSessionKey::from_tab("claude-semantic");
 
         let completed = SemanticEventDraft {
+            subagent_id: None,
             stable_session_key: key.clone(),
             occurred_at_epoch_ms: 10,
             source: SemanticSource::Claude,
@@ -13973,6 +13975,7 @@ mod tests {
             journals.set_attention(&key, SemanticAttention::None, 0)
         });
         let question = SemanticEventDraft {
+            subagent_id: None,
             stable_session_key: key.clone(),
             occurred_at_epoch_ms: 11,
             source: SemanticSource::Claude,
@@ -14006,6 +14009,7 @@ mod tests {
         service.push_session_runtime("claude-removed", removed_runtime);
         let removed_key = StableSessionKey::from_tab("claude-removed");
         service.push_semantic_draft(SemanticEventDraft {
+            subagent_id: None,
             stable_session_key: removed_key.clone(),
             occurred_at_epoch_ms: 20,
             source: SemanticSource::Claude,
@@ -14035,6 +14039,7 @@ mod tests {
         service.push_session_runtime("claude-current", current_runtime);
         let current_key = StableSessionKey::from_tab("claude-current");
         service.push_semantic_draft(SemanticEventDraft {
+            subagent_id: None,
             stable_session_key: current_key,
             occurred_at_epoch_ms: 21,
             source: SemanticSource::Claude,
@@ -14069,6 +14074,7 @@ mod tests {
         let (service, receiver) = service_with_push_subscription("phone-provider-status");
         let codex_key = StableSessionKey::from_tab("codex-status");
         let status = |source, key: StableSessionKey, state: &str| SemanticEventDraft {
+            subagent_id: None,
             stable_session_key: key,
             occurred_at_epoch_ms: 20,
             source,
@@ -18888,6 +18894,7 @@ mod tests {
         occurred_at_epoch_ms: u64,
     ) -> SemanticEventDraft {
         SemanticEventDraft {
+            subagent_id: None,
             stable_session_key,
             occurred_at_epoch_ms,
             source: SemanticSource::System,

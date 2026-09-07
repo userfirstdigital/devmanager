@@ -38,6 +38,7 @@ pub enum ActivityKind {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ActivityEntry {
+    pub subagent_id: Option<String>,
     pub identity: String,
     pub kind: ActivityKind,
     pub label: String,
@@ -156,6 +157,7 @@ fn activity_summary(entries: &[ActivityEntry]) -> String {
 fn activity_entry_of(item: &TimelineItemModel) -> Option<ActivityEntry> {
     match &item.content {
         TimelineItemContent::Tool(view) => Some(ActivityEntry {
+            subagent_id: view.subagent_id.clone(),
             identity: format!("tool:{}", view.tool_id),
             kind: ActivityKind::Tool,
             label: view.name.clone(),
@@ -167,6 +169,7 @@ fn activity_entry_of(item: &TimelineItemModel) -> Option<ActivityEntry> {
             },
         }),
         TimelineItemContent::Plan(view) => Some(ActivityEntry {
+            subagent_id: view.subagent_id.clone(),
             identity: view
                 .step_id
                 .as_ref()

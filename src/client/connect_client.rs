@@ -66,6 +66,7 @@ impl ConnectClientConfig {
             Capability::PagedSnapshots,
             Capability::EventReplay,
             Capability::SemanticConversation,
+            Capability::SemanticSubagents,
             Capability::ProviderInput,
             Capability::TaskCockpit,
             Capability::BrowserProjection,

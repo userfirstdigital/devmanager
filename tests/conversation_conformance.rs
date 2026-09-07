@@ -223,6 +223,7 @@ fn tool_item(tool_id: &str, name: &str, state: &str) -> TimelineItemModel {
         renderer_selection: RendererSelection::Specialized(SemanticKind::Tool),
         interaction: InteractionEligibility::None,
         content: TimelineItemContent::Tool(ToolView {
+            subagent_id: None,
             tool_id: tool_id.to_string(),
             name: name.to_string(),
             state: state.to_string(),

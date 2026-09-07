@@ -1957,6 +1957,7 @@ impl IsolatedDevProfile {
                 Capability::ProviderInput,
                 Capability::TaskCockpit,
                 Capability::SemanticConversation,
+                Capability::SemanticSubagents,
                 Capability::ExplicitDetach,
                 Capability::HostShutdown,
                 Capability::UpdateHandoff,
@@ -26076,6 +26077,7 @@ impl NativeShell {
         let entity = cx.entity().downgrade();
         let focus_entity = entity.clone();
         let view_entity = entity.clone();
+        let subagent_entity = entity.clone();
         let primary_entity = entity.clone();
         let zoom_entity = entity.clone();
         let menu_entity = entity.clone();
@@ -26083,6 +26085,21 @@ impl NativeShell {
         let tooltip_entity = entity.clone();
         let key_entity = entity;
         PanelHandlers {
+            on_subagent: Rc::new(move |key, action, _window, app| {
+                let _ = subagent_entity.update(app, |shell, cx| {
+                    match action {
+                        crate::ui::task_cockpit::subagents::SubagentTabAction::Select(id) => {
+                            shell.select_panel_subagent(key, Some(id));
+                        }
+                        crate::ui::task_cockpit::subagents::SubagentTabAction::ToggleCompleted => {
+                            if let Some(slot) = shell.host_slot_mut(&key.host) {
+                                slot.cockpit.toggle_completed_subagents(key.task_id);
+                            }
+                        }
+                    }
+                    cx.notify();
+                });
+            }),
             on_focus: Rc::new(move |key, _window, app| {
                 let key = key.clone();
                 let _ = focus_entity.update(app, |shell, cx| {
@@ -26097,6 +26114,7 @@ impl NativeShell {
                 let key = key.clone();
                 let _ = view_entity.update(app, |shell, cx| {
                     shell.focus_workspace_pane_for(&key);
+                    shell.select_panel_subagent(&key, None);
                     shell.set_pane_view(&key, view);
                     cx.notify();
                 });
@@ -26155,6 +26173,20 @@ impl NativeShell {
         }
     }
 
+    fn select_panel_subagent(&mut self, owner: &HostTaskKey, id: Option<String>) -> bool {
+        let Some(page) = self.task_surfaces.admitted_conversation_page(owner.clone()) else {
+            return false;
+        };
+        let accepted = self
+            .host_slot_mut(&owner.host)
+            .is_some_and(|slot| slot.cockpit.select_subagent(owner.task_id, id, &page));
+        if accepted {
+            self.focus_workspace_pane_for(owner);
+            self.set_pane_view(owner, PaneView::Conversation);
+        }
+        accepted
+    }
+
     /// The four facts the terminal body's 22 px debug strip used to print
     /// across its own top, for the panel's Terminal tab tooltip (fix wave 1,
     /// F7). `None` when this panel has no terminal attached yet.
@@ -26210,7 +26242,7 @@ impl NativeShell {
             "{} · {} · {}",
             row.project_label, pane.provider_label, row.branch
         );
-        panel_chrome(
+        let mut chrome = panel_chrome(
             row,
             pane.view,
             pane.focused,
@@ -26219,7 +26251,16 @@ impl NativeShell {
             needs_you,
             done,
             crumb,
-        )
+        );
+        if let Some(slot) = self.host_slot(&owner.host) {
+            chrome.subagents = slot.cockpit.subagent_tabs(owner.task_id).to_vec();
+            chrome.selected_subagent = slot
+                .cockpit
+                .selected_subagent(owner.task_id)
+                .map(str::to_owned);
+            chrome.subagents_expanded = slot.cockpit.subagents_expanded(owner.task_id);
+        }
+        chrome
     }
 
     /// Why this panel wants a person, or `None` for a panel that is merely
@@ -26776,6 +26817,37 @@ impl NativeShell {
     /// Returns whether the key was consumed.
     fn handle_panel_key(&mut self, owner: &HostTaskKey, event: &KeyDownEvent) -> bool {
         let key = event.keystroke.key.to_ascii_lowercase();
+        if (event.keystroke.modifiers.control || event.keystroke.modifiers.platform)
+            && !event.keystroke.modifiers.alt
+            && matches!(key.as_str(), "[" | "]")
+        {
+            let Some(page) = self.task_surfaces.admitted_conversation_page(owner.clone()) else {
+                return false;
+            };
+            let tabs = crate::ui::task_cockpit::subagents::catalog(&page);
+            if tabs.is_empty() {
+                return false;
+            }
+            let selected = self
+                .host_slot(&owner.host)
+                .and_then(|slot| slot.cockpit.selected_subagent(owner.task_id));
+            let current = tabs
+                .iter()
+                .position(|tab| Some(tab.id.as_str()) == selected)
+                .map(|index| index + 1)
+                .unwrap_or(0);
+            let count = tabs.len() + 1;
+            let next = if key == "]" {
+                (current + 1) % count
+            } else {
+                (current + count - 1) % count
+            };
+            return self.select_panel_subagent(
+                owner,
+                next.checked_sub(1).map(|index| tabs[index].id.clone()),
+            );
+        }
+
         // A modified keystroke belongs to the shell's chord table, not to the
         // panel's letters: Ctrl+D is Done and `d` is "view the diff".
         if event.keystroke.modifiers.control
@@ -27386,6 +27458,10 @@ impl NativeShell {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let _section = crate::ui::frame_trace::section("conversation");
+        let show_input = show_input
+            && self
+                .host_slot(&owner.host)
+                .is_none_or(|slot| slot.cockpit.selected_subagent(owner.task_id).is_none());
         self.ensure_idle_conversation_photo(cx);
         let surface_width_px = f32::from(surface_size.width);
         let owner_task_id = owner.task_id;
@@ -28882,8 +28958,8 @@ impl NativeShell {
             .flex_none()
             .flex()
             .flex_col()
-            .children(provider_setup_card)
-            .child(composer_footer)
+            .children(show_input.then_some(provider_setup_card).flatten())
+            .children(show_input.then_some(composer_footer))
             .into_any_element();
         // "Conversation is live" is a claim about an admitted canonical model.
         // While startup is still running the phase line replaces it.
@@ -28893,10 +28969,15 @@ impl NativeShell {
             let owner_key = owner.clone();
             let activity_toggle: ActivityToggleHandler = Rc::new(move |group, app| {
                 let _ = shell_entity.update(app, |shell, cx| {
-                    let toggled = shell
-                        .host_slot_mut(&owner_key.host)
-                        .and_then(|slot| slot.cockpit.timeline_mut_for(owner_key.task_id))
-                        .is_some_and(|timeline| timeline.toggle_activity_group(&group));
+                    let toggled = match group {
+                        crate::ui::task_cockpit::timeline::ActivityAction::Toggle(group) => shell
+                            .host_slot_mut(&owner_key.host)
+                            .and_then(|slot| slot.cockpit.timeline_mut_for(owner_key.task_id))
+                            .is_some_and(|timeline| timeline.toggle_activity_group(&group)),
+                        crate::ui::task_cockpit::timeline::ActivityAction::OpenSubagent(id) => {
+                            shell.select_panel_subagent(&owner_key, Some(id))
+                        }
+                    };
                     if toggled {
                         cx.notify();
                     }
@@ -50430,6 +50511,7 @@ mod "
         };
 
         let fact = |sequence: u64, text: &str| SemanticJournalFact {
+            subagent_id: None,
             id: EventId::new(),
             sequence,
             occurred_at_ms: Some(sequence as i64),
@@ -57025,6 +57107,7 @@ mod "
 
         let facts = (0..count)
             .map(|sequence| SemanticJournalFact {
+                subagent_id: None,
                 id: EventId::new(),
                 sequence: sequence + 1,
                 occurred_at_ms: Some(sequence as i64),
@@ -57041,6 +57124,7 @@ mod "
                     }
                 } else {
                     SemanticJournalPayload::ToolResult {
+                        context: None,
                         call_id: format!("call-{}", sequence - 1),
                         status: "ok".into(),
                     }
@@ -57401,6 +57485,7 @@ mod "
 
         let facts = (0..count)
             .map(|sequence| SemanticJournalFact {
+                subagent_id: None,
                 id: EventId::new(),
                 sequence: sequence + 1,
                 occurred_at_ms: Some(sequence as i64),
@@ -71020,6 +71105,7 @@ mod "
         let through = after + MEASURED_CONVERSATION_PAGE_ITEMS;
         let facts = (after + 1..=through)
             .map(|sequence| SemanticJournalFact {
+                subagent_id: None,
                 id: EventId::new(),
                 sequence,
                 occurred_at_ms: Some(sequence as i64),
@@ -71222,6 +71308,7 @@ mod "
             encoded_bytes: 1,
             next_sequence: None,
             facts: vec![SemanticJournalFact {
+                subagent_id: None,
                 id: EventId::new(),
                 sequence,
                 occurred_at_ms: Some(sequence as i64),
@@ -71254,6 +71341,7 @@ mod "
             encoded_bytes: 1,
             next_sequence: None,
             facts: vec![SemanticJournalFact {
+                subagent_id: None,
                 id: EventId::new(),
                 sequence,
                 occurred_at_ms: Some(sequence as i64),

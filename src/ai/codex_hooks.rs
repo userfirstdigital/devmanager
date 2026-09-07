@@ -292,6 +292,7 @@ impl CodexHookReducer {
         deduplication_key: String,
     ) -> SemanticEventDraft {
         SemanticEventDraft {
+            subagent_id: None,
             stable_session_key: self.stable_session_key.clone(),
             occurred_at_epoch_ms,
             source: SemanticSource::Codex,

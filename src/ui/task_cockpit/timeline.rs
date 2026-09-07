@@ -80,7 +80,11 @@ pub const FOLLOW_REARM_THRESHOLD_PX: u32 = 40;
 /// that meant "the end" therefore says so explicitly below.
 const STREAM_ALIGNMENT: ListAlignment = ListAlignment::Top;
 
-pub type ActivityToggleHandler = Rc<dyn Fn(String, &mut App)>;
+pub enum ActivityAction {
+    Toggle(String),
+    OpenSubagent(String),
+}
+pub type ActivityToggleHandler = Rc<dyn Fn(ActivityAction, &mut App)>;
 
 #[cfg(debug_assertions)]
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -105,6 +109,43 @@ fn timeline_row_element(
     cx: &mut App,
 ) -> AnyElement {
     let visual = conversation_row_element(row, tokens, window, cx);
+    if let (ConversationRow::Activity { entries, .. }, Some(handler)) =
+        (row, activity_toggle.as_ref())
+    {
+        let mut links = Vec::new();
+        let mut seen = BTreeSet::new();
+        for entry in entries {
+            if entry.kind != crate::ui::conversation::rows::ActivityKind::PlanStep {
+                continue;
+            }
+            let Some(id) = entry
+                .subagent_id
+                .as_ref()
+                .filter(|id| seen.insert((*id).clone()))
+            else {
+                continue;
+            };
+            let id = id.clone();
+            let handler = handler.clone();
+            links.push(crate::ui::components::tabs::tab_strip(
+                gpui::SharedString::from(format!("conversation-subagent-jump:{id}")),
+                vec![format!("Open {} →", entry.detail)],
+                None,
+                tokens,
+                move |_, _, app| handler(ActivityAction::OpenSubagent(id.clone()), app),
+            ));
+        }
+        if !links.is_empty() {
+            return div()
+                .w_full()
+                .flex()
+                .flex_col()
+                .child(visual)
+                .children(links)
+                .into_any_element();
+        }
+    }
+
     let ConversationRow::ActivityToggle { group, .. } = row else {
         return visual;
     };
@@ -119,7 +160,9 @@ fn timeline_row_element(
         .id(("native-conversation-activity-toggle", element_key))
         .tab_stop(true)
         .cursor_pointer()
-        .on_click(move |_event, _window, app| activity_toggle(group.clone(), app))
+        .on_click(move |_event, _window, app| {
+            activity_toggle(ActivityAction::Toggle(group.clone()), app)
+        })
         .child(visual)
         .into_any_element()
 }
@@ -396,6 +439,7 @@ impl Timeline {
                 renderer_selection: RendererSelection::Specialized(SemanticKind::Plan),
                 interaction: InteractionEligibility::None,
                 content: TimelineItemContent::Plan(PlanView {
+                    subagent_id: None,
                     step_id: Some(step.step_id.clone()),
                     title: step.title.clone(),
                     steps: vec![step.title.clone()],

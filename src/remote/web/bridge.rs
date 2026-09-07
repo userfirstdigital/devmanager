@@ -4659,6 +4659,7 @@ fn dispatch_composer_submit_for_connection(
                     publish_semantic_event(
                         &host,
                         SemanticEventDraft {
+                            subagent_id: None,
                             stable_session_key: stable_session_key.clone(),
                             occurred_at_epoch_ms,
                             source,
@@ -6143,6 +6144,7 @@ mod tests {
         text_bytes: usize,
     ) -> Arc<super::super::super::presentation::SemanticEvent> {
         Arc::new(super::super::super::presentation::SemanticEvent {
+            subagent_id: None,
             stable_session_key: StableSessionKey::from_server("paged"),
             sequence,
             replaces_sequence: None,
@@ -8621,6 +8623,7 @@ mod tests {
         service.push_claude_semantic_draft(
             identity,
             SemanticEventDraft {
+                subagent_id: None,
                 stable_session_key: stable_key.clone(),
                 occurred_at_epoch_ms: 1_200,
                 source: SemanticSource::Claude,
@@ -8726,6 +8729,7 @@ mod tests {
         service.push_codex_semantic_draft(
             identity,
             SemanticEventDraft {
+                subagent_id: None,
                 stable_session_key: stable_key.clone(),
                 occurred_at_epoch_ms: 1_200,
                 source: SemanticSource::Codex,
@@ -8811,6 +8815,7 @@ mod tests {
                 hook_service.push_claude_semantic_draft(
                     hook_identity.clone(),
                     SemanticEventDraft {
+                        subagent_id: None,
                         stable_session_key: hook_identity.stable_session_key.clone(),
                         occurred_at_epoch_ms: 1_100 + number as u64,
                         source: SemanticSource::Claude,
@@ -8858,6 +8863,7 @@ mod tests {
         service.push_claude_semantic_draft(
             identity.clone(),
             SemanticEventDraft {
+                subagent_id: None,
                 stable_session_key: stable_key.clone(),
                 occurred_at_epoch_ms: 1_200,
                 source: SemanticSource::Claude,
@@ -8880,6 +8886,7 @@ mod tests {
                 ..identity.clone()
             },
             SemanticEventDraft {
+                subagent_id: None,
                 stable_session_key: stable_key.clone(),
                 occurred_at_epoch_ms: 1_201,
                 source: SemanticSource::Claude,
@@ -8896,6 +8903,7 @@ mod tests {
             service.push_claude_semantic_draft(
                 identity.clone(),
                 SemanticEventDraft {
+                    subagent_id: None,
                     stable_session_key: stable_key.clone(),
                     occurred_at_epoch_ms,
                     source: SemanticSource::Claude,
@@ -8930,6 +8938,7 @@ mod tests {
         service.push_claude_semantic_draft(
             identity.clone(),
             SemanticEventDraft {
+                subagent_id: None,
                 stable_session_key: stable_key.clone(),
                 occurred_at_epoch_ms: 1_001,
                 source: SemanticSource::Claude,
@@ -8942,6 +8951,7 @@ mod tests {
         );
         service.push_claude_adapter_removed(&identity);
         service.push_semantic_draft(SemanticEventDraft {
+            subagent_id: None,
             stable_session_key: stable_key.clone(),
             occurred_at_epoch_ms: 1_002,
             source: SemanticSource::Claude,
@@ -8988,6 +8998,7 @@ mod tests {
         service.push_claude_semantic_draft(
             identity.clone(),
             SemanticEventDraft {
+                subagent_id: None,
                 stable_session_key: stable_key.clone(),
                 occurred_at_epoch_ms: 1_001,
                 source: SemanticSource::Claude,
@@ -9003,6 +9014,7 @@ mod tests {
             ..identity.clone()
         });
         service.push_semantic_draft(SemanticEventDraft {
+            subagent_id: None,
             stable_session_key: stable_key.clone(),
             occurred_at_epoch_ms: 1_002,
             source: SemanticSource::Claude,
@@ -9046,6 +9058,7 @@ mod tests {
             "late provider hook",
         );
         service.push_semantic_draft(SemanticEventDraft {
+            subagent_id: None,
             stable_session_key: stable_key.clone(),
             occurred_at_epoch_ms: 1_001,
             source: SemanticSource::Claude,
@@ -9062,6 +9075,7 @@ mod tests {
             service.push_claude_semantic_draft(
                 identity.clone(),
                 SemanticEventDraft {
+                    subagent_id: None,
                     stable_session_key: stable_key.clone(),
                     occurred_at_epoch_ms,
                     source: SemanticSource::Claude,
@@ -9108,6 +9122,7 @@ mod tests {
         service.push_claude_semantic_draft(
             identity.clone(),
             SemanticEventDraft {
+                subagent_id: None,
                 stable_session_key: stable_key.clone(),
                 occurred_at_epoch_ms: 1_001,
                 source: SemanticSource::Claude,
@@ -9124,6 +9139,7 @@ mod tests {
         service.push_claude_semantic_draft(
             identity,
             SemanticEventDraft {
+                subagent_id: None,
                 stable_session_key: stable_key.clone(),
                 occurred_at_epoch_ms: 1_002,
                 source: SemanticSource::Claude,
@@ -9187,6 +9203,7 @@ mod tests {
             provider_service.push_codex_semantic_draft(
                 provider_identity.clone(),
                 SemanticEventDraft {
+                    subagent_id: None,
                     stable_session_key: provider_identity.stable_session_key.clone(),
                     occurred_at_epoch_ms: 1_100 + number as u64,
                     source: SemanticSource::Codex,
@@ -9233,6 +9250,7 @@ mod tests {
         service.push_codex_semantic_draft(
             identity.clone(),
             SemanticEventDraft {
+                subagent_id: None,
                 stable_session_key: stable_key.clone(),
                 occurred_at_epoch_ms: 1_200,
                 source: SemanticSource::Codex,
@@ -9251,6 +9269,7 @@ mod tests {
                 ..identity.clone()
             },
             SemanticEventDraft {
+                subagent_id: None,
                 stable_session_key: stable_key.clone(),
                 occurred_at_epoch_ms: 1_201,
                 source: SemanticSource::Codex,
@@ -9266,6 +9285,7 @@ mod tests {
         service.push_codex_semantic_draft(
             identity,
             SemanticEventDraft {
+                subagent_id: None,
                 stable_session_key: stable_key.clone(),
                 occurred_at_epoch_ms: 1_202,
                 source: SemanticSource::Codex,
@@ -9332,6 +9352,7 @@ mod tests {
             provider_service.push_codex_semantic_draft(
                 provider_identity.clone(),
                 SemanticEventDraft {
+                    subagent_id: None,
                     stable_session_key: provider_identity.stable_session_key.clone(),
                     occurred_at_epoch_ms: 1_100 + number as u64,
                     source: SemanticSource::Codex,
@@ -9409,6 +9430,7 @@ mod tests {
         service.push_codex_semantic_draft(
             identity,
             SemanticEventDraft {
+                subagent_id: None,
                 stable_session_key: stable_key.clone(),
                 occurred_at_epoch_ms: 1_200,
                 source: SemanticSource::Codex,
@@ -9436,6 +9458,7 @@ mod tests {
             registration_generation: 9,
         };
         let provider = |text: &str, key: &str, occurred_at_epoch_ms| SemanticEventDraft {
+            subagent_id: None,
             stable_session_key: stable_key.clone(),
             occurred_at_epoch_ms,
             source: SemanticSource::Codex,
@@ -9446,6 +9469,7 @@ mod tests {
             deduplication_key: Some(key.to_string()),
         };
         let composer = |text: &str, mutation: &str, occurred_at_epoch_ms| SemanticEventDraft {
+            subagent_id: None,
             stable_session_key: stable_key.clone(),
             occurred_at_epoch_ms,
             source: SemanticSource::Codex,
@@ -9552,6 +9576,7 @@ mod tests {
             hook_service.push_claude_semantic_draft(
                 identity.clone(),
                 SemanticEventDraft {
+                    subagent_id: None,
                     stable_session_key: identity.stable_session_key.clone(),
                     occurred_at_epoch_ms: 1_101,
                     source: SemanticSource::Claude,
@@ -12412,6 +12437,7 @@ mod tests {
         let retained = publish_semantic_event(
             &service.inner,
             SemanticEventDraft {
+                subagent_id: None,
                 stable_session_key: key.clone(),
                 occurred_at_epoch_ms: 1,
                 source: SemanticSource::System,
@@ -12444,6 +12470,7 @@ mod tests {
         let live = publish_semantic_event(
             &service.inner,
             SemanticEventDraft {
+                subagent_id: None,
                 stable_session_key: key.clone(),
                 occurred_at_epoch_ms: 2,
                 source: SemanticSource::System,
@@ -12465,6 +12492,7 @@ mod tests {
         let partial = publish_semantic_event(
             &service.inner,
             SemanticEventDraft {
+                subagent_id: None,
                 stable_session_key: key.clone(),
                 occurred_at_epoch_ms: 3,
                 source: SemanticSource::Claude,
@@ -12485,6 +12513,7 @@ mod tests {
         let replacement = publish_semantic_event(
             &service.inner,
             SemanticEventDraft {
+                subagent_id: None,
                 stable_session_key: key.clone(),
                 occurred_at_epoch_ms: 4,
                 source: SemanticSource::Claude,
@@ -12518,6 +12547,7 @@ mod tests {
         publish_semantic_event(
             &service.inner,
             SemanticEventDraft {
+                subagent_id: None,
                 stable_session_key: key,
                 occurred_at_epoch_ms: 3,
                 source: SemanticSource::System,

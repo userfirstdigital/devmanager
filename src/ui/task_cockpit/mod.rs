@@ -94,3 +94,5 @@ pub use services_panel::{
     ServicePanelAction, ServicePanelRow, ServicePanelTone, ServicesPanelProjection,
 };
 pub use workspace_panel::WorkspacePanelProjection;
+
+pub mod subagents;

@@ -60,6 +60,7 @@ pub(crate) fn tool_item(tool_id: &str, name: &str, state: &str) -> TimelineItemM
         renderer_selection: RendererSelection::Specialized(SemanticKind::Tool),
         interaction: InteractionEligibility::None,
         content: TimelineItemContent::Tool(ToolView {
+            subagent_id: None,
             tool_id: tool_id.to_string(),
             name: name.to_string(),
             state: state.to_string(),
@@ -81,6 +82,7 @@ pub(crate) fn plan_item(step_id: &str, title: &str, status: &str) -> TimelineIte
         renderer_selection: RendererSelection::Specialized(SemanticKind::Plan),
         interaction: InteractionEligibility::None,
         content: TimelineItemContent::Plan(PlanView {
+            subagent_id: None,
             step_id: Some(step_id.to_string()),
             title: title.to_string(),
             steps: vec![title.to_string()],

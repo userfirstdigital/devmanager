@@ -573,6 +573,14 @@ const CONTROLS_SAFETY: f32 = 6.0;
 /// What the shell does when the chrome is clicked or typed into. The painter
 /// owns no state: it hands the panel's key back and the shell decides.
 pub struct PanelHandlers {
+    pub on_subagent: Rc<
+        dyn Fn(
+            &HostTaskKey,
+            crate::ui::task_cockpit::subagents::SubagentTabAction,
+            &mut Window,
+            &mut App,
+        ),
+    >,
     pub on_focus: Rc<dyn Fn(&HostTaskKey, &mut Window, &mut App)>,
     pub on_select_view: Rc<dyn Fn(&HostTaskKey, PaneView, &mut Window, &mut App)>,
     pub on_primary: Rc<dyn Fn(&HostTaskKey, PrimaryAction, &mut Window, &mut App)>,
@@ -1039,8 +1047,14 @@ fn tab_row_element(
         .border_color(tokens.borders.subtle.to_gpui())
         .text_size(px(TAB_FONT_SIZE));
 
-    for view in tabs_that_fit(width_px, chrome.view) {
-        let active = view == chrome.view;
+    let view_width = if chrome.subagents.is_empty() {
+        width_px
+    } else {
+        width_px * 0.5
+    };
+    for view in tabs_that_fit(view_width, chrome.view) {
+        let active = view == chrome.view
+            && (chrome.selected_subagent.is_none() || view != PaneView::Conversation);
         let select_key = chrome.key.clone();
         let on_select = handlers.on_select_view.clone();
         let tooltip_key = chrome.key.clone();
@@ -1088,6 +1102,67 @@ fn tab_row_element(
         );
     }
 
+    if !chrome.subagents.is_empty() {
+        use crate::ui::task_cockpit::subagents::SubagentTabAction;
+        let visible = chrome
+            .subagents
+            .iter()
+            .filter(|tab| {
+                !tab.foldable
+                    || chrome.subagents_expanded
+                    || chrome.selected_subagent.as_ref() == Some(&tab.id)
+            })
+            .collect::<Vec<_>>();
+        let selected = (chrome.view == PaneView::Conversation)
+            .then(|| {
+                visible
+                    .iter()
+                    .position(|tab| chrome.selected_subagent.as_ref() == Some(&tab.id))
+            })
+            .flatten();
+        let mut labels = visible
+            .iter()
+            .map(|tab| {
+                format!(
+                    "{} {}",
+                    if tab.active {
+                        "●"
+                    } else if tab.completed {
+                        "○"
+                    } else {
+                        "·"
+                    },
+                    tab.label
+                )
+            })
+            .collect::<Vec<_>>();
+        let mut actions = visible
+            .iter()
+            .map(|tab| SubagentTabAction::Select(tab.id.clone()))
+            .collect::<Vec<_>>();
+        let completed = chrome.subagents.iter().filter(|tab| tab.foldable).count();
+        if completed > 0 {
+            labels.push(if chrome.subagents_expanded {
+                "Hide completed".into()
+            } else {
+                format!("{completed} completed")
+            });
+            actions.push(SubagentTabAction::ToggleCompleted);
+        }
+        let owner = chrome.key.clone();
+        let on_subagent = handlers.on_subagent.clone();
+        row = row.child(crate::ui::components::tabs::tab_strip(
+            ("panel-subagents", element_key),
+            labels,
+            selected,
+            tokens,
+            move |index, window, app| {
+                if let Some(action) = actions.get(*index) {
+                    on_subagent(&owner, action.clone(), window, app);
+                }
+            },
+        ));
+    }
     row.into_any_element()
 }
 
@@ -1325,6 +1400,7 @@ mod tests {
 
     fn noop_handlers() -> PanelHandlers {
         PanelHandlers {
+            on_subagent: Rc::new(|_, _, _, _| {}),
             on_focus: Rc::new(|_, _, _| {}),
             on_select_view: Rc::new(|_, _, _, _| {}),
             on_primary: Rc::new(|_, _, _, _| {}),

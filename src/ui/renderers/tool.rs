@@ -9,6 +9,7 @@ pub struct ToolRenderer;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ToolView {
+    pub subagent_id: Option<String>,
     pub tool_id: String,
     pub name: String,
     pub state: String,
@@ -40,6 +41,7 @@ impl SemanticRenderer for ToolRenderer {
             renderer_selection: RendererSelection::Specialized(SemanticKind::Tool),
             interaction: InteractionEligibility::None,
             content: TimelineItemContent::Tool(ToolView {
+                subagent_id: event.subagent_id.clone(),
                 tool_id: tool_id.clone(),
                 name: name.clone(),
                 state: state.clone(),

@@ -461,6 +461,7 @@ mod workspace_security_tests {
     fn ai_acceptance_semantic_question_gets_stable_durable_identity() {
         let task_id = TaskId::new();
         let draft = || SemanticEventDraft {
+            subagent_id: None,
             stable_session_key: StableSessionKey::from_tab(task_id.to_string()),
             occurred_at_epoch_ms: 42,
             source: SemanticSource::Claude,
@@ -13430,6 +13431,7 @@ mod output_tests {
             StableSessionKey,
         };
         SemanticEventDraft {
+            subagent_id: None,
             stable_session_key: StableSessionKey::from_tab(task_id.to_string()),
             occurred_at_epoch_ms: 1_725_000_000_000 + index,
             source: SemanticSource::Codex,
@@ -16499,6 +16501,7 @@ mod tests {
                     }
                 };
                 self.journal.record(SemanticEventDraft {
+                    subagent_id: None,
                     stable_session_key: StableSessionKey::from_tab(self.task_id.to_string()),
                     occurred_at_epoch_ms: 1_725_000_000_000 + index as u64,
                     source: SemanticSource::Codex,

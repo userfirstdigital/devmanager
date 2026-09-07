@@ -266,10 +266,22 @@ fn live_fact_event(
                 state: "running".to_string(),
                 summary: String::new(),
             },
-            SemanticJournalPayload::ToolResult { call_id, status } => SemanticEventBody::Tool {
+            SemanticJournalPayload::ToolResult {
+                call_id,
+                status,
+                context,
+            } => SemanticEventBody::Tool {
                 tool_id: call_id.clone(),
-                name: "Tool result".to_string(),
-                state: "completed".to_string(),
+                name: context
+                    .as_ref()
+                    .map(|context| context.name.clone())
+                    .unwrap_or_else(|| "Tool result".into()),
+                state: if context.as_ref().is_some_and(|context| context.failed) {
+                    "failed"
+                } else {
+                    "completed"
+                }
+                .into(),
                 summary: status.clone(),
             },
             SemanticJournalPayload::Question {
@@ -360,6 +372,7 @@ fn live_fact_event(
         }
     };
     Ok(SemanticEvent {
+        subagent_id: fact.subagent_id.clone(),
         event_id: fact.id,
         task_id,
         schema_version: u16::try_from(fact.schema_version).unwrap_or(u16::MAX),
@@ -547,6 +560,7 @@ mod tests {
         let task_id = TaskId::new();
         let occurred_at_ms = 1_725_000_001_234_i64;
         let fact = SemanticJournalFact {
+            subagent_id: None,
             id: EventId::new(),
             sequence: 17,
             occurred_at_ms: Some(occurred_at_ms),

@@ -562,6 +562,7 @@ mod tests {
         use crate::remote::presentation::{SemanticEventKind, SemanticSource};
 
         let event = SemanticEvent {
+            subagent_id: None,
             stable_session_key: StableSessionKey::from_tab("tab-a"),
             sequence: 13,
             replaces_sequence: None,

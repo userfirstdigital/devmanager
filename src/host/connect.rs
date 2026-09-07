@@ -1609,6 +1609,7 @@ mod tests {
 
         let high_water = requests
             .record_test_semantic(SemanticEventDraft {
+                subagent_id: None,
                 stable_session_key: StableSessionKey::from_tab(task_id.to_string()),
                 occurred_at_epoch_ms: 1_725_000_000_001,
                 source: SemanticSource::Codex,

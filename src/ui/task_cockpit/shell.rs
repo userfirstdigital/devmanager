@@ -123,6 +123,9 @@ pub struct TaskCockpitShell {
     /// Single authoritative timeline per open task. ListState, expansion, and
     /// follow intent live here only — never duplicated as a focused clone.
     timelines: BTreeMap<TaskId, Timeline>,
+    subagent_selection: BTreeMap<TaskId, String>,
+    subagent_tabs: BTreeMap<TaskId, Vec<super::subagents::SubagentTab>>,
+    expanded_subagents: std::collections::BTreeSet<TaskId>,
     /// When set, the focused conversation surface paints this task's map entry.
     /// Cleared on projection holds so the error/hold footer can show without
     /// deleting the retained map entry used by background panes.
@@ -187,11 +190,58 @@ impl TaskCockpitShell {
             browser_controller: BrowserNativeShellController::for_current_platform(),
             browser_projection: None,
             timelines: BTreeMap::new(),
+            subagent_selection: BTreeMap::new(),
+            subagent_tabs: BTreeMap::new(),
+            expanded_subagents: std::collections::BTreeSet::new(),
             focused_timeline_task: None,
             timeline_error: None,
             conversation: None,
             attachment_banner: None,
         }
+    }
+
+    pub fn subagent_tabs(&self, task: TaskId) -> &[super::subagents::SubagentTab] {
+        self.subagent_tabs
+            .get(&task)
+            .map(Vec::as_slice)
+            .unwrap_or(&[])
+    }
+
+    pub fn selected_subagent(&self, task: TaskId) -> Option<&str> {
+        self.subagent_selection.get(&task).map(String::as_str)
+    }
+
+    pub fn subagents_expanded(&self, task: TaskId) -> bool {
+        self.expanded_subagents.contains(&task)
+    }
+
+    pub fn toggle_completed_subagents(&mut self, task: TaskId) {
+        if !self.expanded_subagents.remove(&task) {
+            self.expanded_subagents.insert(task);
+        }
+    }
+
+    pub fn select_subagent(
+        &mut self,
+        task: TaskId,
+        id: Option<String>,
+        page: &SemanticJournalPage,
+    ) -> bool {
+        if id.as_ref().is_some_and(|id| {
+            !super::subagents::catalog(page)
+                .iter()
+                .any(|tab| &tab.id == id)
+        }) {
+            return false;
+        }
+        if let Some(id) = id {
+            self.subagent_selection.insert(task, id);
+        } else {
+            self.subagent_selection.remove(&task);
+        }
+        self.timelines.remove(&task);
+        self.install_admitted_conversation_page(task, page);
+        true
     }
 
     pub fn dock(&self) -> &ContextDock {
@@ -418,6 +468,15 @@ impl TaskCockpitShell {
         task_id: TaskId,
         page: &SemanticJournalPage,
     ) {
+        if self.selected_subagent(task_id).is_some_and(|id| {
+            !page
+                .facts
+                .iter()
+                .any(|fact| fact.subagent_id.as_deref() == Some(id))
+        }) {
+            self.subagent_selection.remove(&task_id);
+            self.timelines.remove(&task_id);
+        }
         if self.dock.selected_task() == Some(task_id) {
             self.conversation = Some(page.clone());
         }
@@ -464,6 +523,8 @@ impl TaskCockpitShell {
         self.dock.bind_cockpit_projection(projection.clone());
         self.projection = Some(projection);
         if let TaskCockpitResult::Conversation(page) = result {
+            self.subagent_tabs
+                .insert(task_id, super::subagents::catalog(page));
             let high_water = page.high_water.max(page.through_sequence);
             let unchanged_page = self.conversation.as_ref().is_some_and(|previous| {
                 previous.high_water.max(previous.through_sequence) == high_water
@@ -598,7 +659,11 @@ impl TaskCockpitShell {
         }
         let result = (|| {
             let journal = match self.conversation.as_ref() {
-                Some(page) => SemanticJournalView::from_live_page(model, task_id, page),
+                Some(page) => SemanticJournalView::from_live_page(
+                    model,
+                    task_id,
+                    &super::subagents::scoped_page(page, self.selected_subagent(task_id)),
+                ),
                 None => SemanticJournalView::from_live_projection(model, task_id),
             }
             .map_err(|error| error.to_string())?;
@@ -673,6 +738,12 @@ impl TaskCockpitShell {
     pub fn retain_open_timelines(&mut self, task_ids: &[TaskId]) {
         let valid: std::collections::BTreeSet<_> = task_ids.iter().copied().collect();
         self.timelines.retain(|task_id, _| valid.contains(task_id));
+        self.subagent_tabs
+            .retain(|task_id, _| valid.contains(task_id));
+        self.subagent_selection
+            .retain(|task_id, _| valid.contains(task_id));
+        self.expanded_subagents
+            .retain(|task_id| valid.contains(task_id));
         if self
             .focused_timeline_task
             .is_some_and(|task_id| !valid.contains(&task_id))
@@ -751,10 +822,13 @@ impl TaskCockpitShell {
         page: &SemanticJournalPage,
         presentation_signature: u64,
     ) {
+        self.subagent_tabs
+            .insert(task_id, super::subagents::catalog(page));
         let Some(model) = self.model.clone() else {
             return;
         };
-        let Ok(journal) = SemanticJournalView::from_live_page(&model, task_id, page) else {
+        let scoped = super::subagents::scoped_page(page, self.selected_subagent(task_id));
+        let Ok(journal) = SemanticJournalView::from_live_page(&model, task_id, &scoped) else {
             return;
         };
         let Ok(registry) = RendererRegistry::standard() else {
@@ -1156,6 +1230,7 @@ mod ai_acceptance_tests {
             encoded_bytes: 0,
             next_sequence: None,
             facts: vec![SemanticJournalFact {
+                subagent_id: None,
                 id: fact_id,
                 sequence: 17,
                 occurred_at_ms: None,
@@ -1272,6 +1347,7 @@ mod tests {
             encoded_bytes: 1,
             next_sequence: None,
             facts: vec![SemanticJournalFact {
+                subagent_id: None,
                 id: EventId::new(),
                 sequence: 1,
                 occurred_at_ms: None,
@@ -1286,6 +1362,132 @@ mod tests {
         };
         shell.apply_cockpit_result(&TaskCockpitResult::Conversation(page));
         shell
+    }
+
+    fn bound_conversation_model(task_id: TaskId) -> ClientModel {
+        use crate::client::ClientModelBuilder;
+        use crate::domain::{
+            agent::{AgentRole, AgentSessionFacts, AgentSessionLifecycle},
+            id::{AgentSessionId, EnvironmentId, ProjectId, SnapshotId},
+            snapshot::{SnapshotItem, SnapshotPage, SnapshotSection, TaskSnapshotItem},
+            task::{
+                ReviewReadiness, TaskActivity, TaskAssignment, TaskAttention, TaskConnectivity,
+                TaskFacts, TaskLifecycle, WorkspaceRef,
+            },
+        };
+        let agent = AgentSessionId::new();
+        let snapshot = SnapshotId::new();
+        let mut builder = ClientModelBuilder::new();
+        for (section, items) in [
+            (
+                SnapshotSection::Tasks,
+                vec![SnapshotItem::Task(TaskSnapshotItem {
+                    task: TaskFacts {
+                        id: task_id,
+                        environment_id: EnvironmentId::new(),
+                        title: "Conversation".into(),
+                        description: None,
+                        project_id: ProjectId::new(),
+                        workspace: WorkspaceRef::Main,
+                        assignment: TaskAssignment::LocalOwner,
+                        lifecycle: TaskLifecycle::Open,
+                        action_epoch: 0,
+                        revision: 1,
+                        created_at_ms: 1,
+                    },
+                    connectivity: TaskConnectivity::Connected,
+                    attention: TaskAttention::None,
+                    activity: TaskActivity::Idle,
+                    review_readiness: ReviewReadiness::NotReady,
+                    primary_agent_id: Some(agent),
+                })],
+            ),
+            (
+                SnapshotSection::AgentSessions,
+                vec![SnapshotItem::AgentSession(AgentSessionFacts {
+                    id: agent,
+                    task_id,
+                    role: AgentRole::Primary,
+                    provider_kind: crate::providers::ProviderKind::ClaudeCode,
+                    provider_session_id: None,
+                    lifecycle: AgentSessionLifecycle::Open,
+                    runtime_generation: 1,
+                    revision: 0,
+                })],
+            ),
+            (SnapshotSection::Artifacts, vec![]),
+            (SnapshotSection::Resources, vec![]),
+            (SnapshotSection::Operations, vec![]),
+        ] {
+            builder
+                .ingest_page(SnapshotPage {
+                    snapshot_id: snapshot,
+                    through_sequence: 1,
+                    section,
+                    after_item: None,
+                    items,
+                    encoded_bytes: 1,
+                    next_cursor: None,
+                })
+                .unwrap();
+        }
+        builder.finish().unwrap()
+    }
+
+    #[test]
+    fn subagent_selection_survives_model_refresh_and_rejects_foreign_context() {
+        use crate::protocol::Capability;
+        let mut shell = cockpit_with_conversation("parent answer");
+        let task = shell.dock.selected_task().unwrap();
+        let model = bound_conversation_model(task);
+        shell.follow_projection(
+            &model,
+            CapabilitySet::from_capabilities([
+                Capability::SemanticConversation,
+                Capability::SemanticSubagents,
+            ]),
+        );
+        let rendered_text = |shell: &TaskCockpitShell| {
+            shell
+                .timeline_for(task)
+                .expect("real timeline")
+                .rows()
+                .iter()
+                .filter_map(|row| match row {
+                    crate::ui::conversation::rows::ConversationRow::Message { text, .. } => {
+                        Some(text.clone())
+                    }
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        let mut page = shell.conversation.clone().unwrap();
+        page.facts[0].provider = "claude_code".into();
+        let mut child = page.facts[0].clone();
+        child.id = EventId::new();
+        child.sequence += 1;
+        child.subagent_id = Some("provider-child".into());
+        child.payload = SemanticJournalPayload::AssistantText {
+            text: "child answer".into(),
+        };
+        page.facts.push(child);
+        page.high_water += 1;
+        page.through_sequence += 1;
+        shell.install_admitted_conversation_page(task, &page);
+        assert!(shell.select_subagent(task, Some("provider-child".into()), &page));
+        assert_eq!(shell.selected_subagent(task), Some("provider-child"));
+        assert!(rendered_text(&shell).contains("child answer"));
+        assert!(!rendered_text(&shell).contains("parent answer"));
+        let model = shell.model.clone().unwrap();
+        shell.follow_projection(&model, shell.capabilities);
+        assert!(rendered_text(&shell).contains("child answer"));
+        assert!(!rendered_text(&shell).contains("parent answer"));
+        assert!(!shell.select_subagent(task, Some("foreign-child".into()), &page));
+        assert_eq!(shell.selected_subagent(task), Some("provider-child"));
+        assert!(shell.select_subagent(task, None, &page));
+        assert!(rendered_text(&shell).contains("parent answer"));
+        assert!(!rendered_text(&shell).contains("child answer"));
     }
 
     #[test]
@@ -1355,6 +1557,7 @@ mod tests {
             encoded_bytes: 0,
             next_sequence: None,
             facts: vec![SemanticJournalFact {
+                subagent_id: None,
                 id: EventId::new(),
                 sequence: 5,
                 occurred_at_ms: None,

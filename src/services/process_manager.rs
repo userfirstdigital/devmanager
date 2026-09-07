@@ -14573,6 +14573,7 @@ mod tests {
             );
         }
         let draft = |detail: &str| SemanticEventDraft {
+            subagent_id: None,
             stable_session_key: stable_session_key.clone(),
             occurred_at_epoch_ms: 1,
             source: SemanticSource::Codex,
@@ -14651,6 +14652,7 @@ mod tests {
             "old",
             &old,
             SemanticEventDraft {
+                subagent_id: None,
                 stable_session_key,
                 occurred_at_epoch_ms: 1,
                 source: SemanticSource::Codex,
