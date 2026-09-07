@@ -9,6 +9,7 @@ pub struct PlanRenderer;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PlanView {
+    pub subagent_id: Option<String>,
     pub step_id: Option<String>,
     pub title: String,
     pub steps: Vec<String>,
@@ -39,6 +40,7 @@ impl SemanticRenderer for PlanRenderer {
             renderer_selection: RendererSelection::Specialized(SemanticKind::Plan),
             interaction: InteractionEligibility::None,
             content: TimelineItemContent::Plan(PlanView {
+                subagent_id: event.subagent_id.clone(),
                 step_id: step_id.clone(),
                 title: title.clone(),
                 steps: steps.clone(),

@@ -6627,7 +6627,7 @@ fn link_handle_to_tombstone(
                 return Ok(Some(name));
             }
             let observed =
-                open_child_nofollow(parent, name).and_then(|child| opened_file_info(&child));
+                open_child_nofollow(parent, &name).and_then(|child| opened_file_info(&child));
             if !matches!(observed, Ok((observed_identity, _)) if observed_identity == identity) {
                 return Ok(None);
             }
@@ -7853,7 +7853,7 @@ fn restore_or_retain_cleanup_entry(
     reservation: &mut TombstoneReservation,
     deadline: &OperationDeadline,
 ) -> io::Error {
-    let mut retain_authority_entry = || {
+    let retain_authority_entry = |reservation: &mut TombstoneReservation| {
         let Some(binding) = parse_authority_entry_binding(cleanup_name) else {
             return;
         };
@@ -7888,7 +7888,7 @@ fn restore_or_retain_cleanup_entry(
     // the exact authority path remains restart-discoverable before timeout is
     // returned to the caller.
     if let Err(error) = check_deadline_io(deadline) {
-        retain_authority_entry();
+        retain_authority_entry(reservation);
         return error;
     }
 
@@ -7900,7 +7900,7 @@ fn restore_or_retain_cleanup_entry(
         match accounting.tombstones.lock_until(deadline) {
             Ok(records) => Some(records),
             Err(_) => {
-                retain_authority_entry();
+                retain_authority_entry(reservation);
                 return original;
             }
         }
@@ -7916,13 +7916,13 @@ fn restore_or_retain_cleanup_entry(
             // authority entry in place instead of creating an unowned
             // workspace residue.
             drop(recovery_records);
-            retain_authority_entry();
+            retain_authority_entry(reservation);
             return original;
         }
     };
     if let Err(error) = check_deadline_io(deadline) {
         drop(recovery_records);
-        retain_authority_entry();
+        retain_authority_entry(reservation);
         return error;
     }
     let mut publish_restored_record = |records: &mut Vec<TombstoneRecord>| {
@@ -8012,12 +8012,12 @@ fn restore_or_retain_cleanup_entry(
         }
         Ok(RestoreCleanupOutcome::NotRestored) => {
             drop(recovery_records);
-            retain_authority_entry();
+            retain_authority_entry(reservation);
             original
         }
         Err(restore_error) => {
             drop(recovery_records);
-            retain_authority_entry();
+            retain_authority_entry(reservation);
             restore_error
         }
     }
@@ -8236,7 +8236,7 @@ fn cleanup_exact_private_entry(
             source_parent_identity,
             name,
             authority,
-            cleanup_name,
+            &cleanup_name,
             expected_identity,
             accounting,
             &mut reservation,
@@ -8267,7 +8267,7 @@ fn cleanup_exact_private_entry(
             source_parent_identity,
             name,
             authority,
-            cleanup_name,
+            &cleanup_name,
             expected_identity,
             accounting,
             &mut reservation,
@@ -8303,7 +8303,7 @@ fn cleanup_exact_private_entry(
             source_parent_identity,
             name,
             authority,
-            cleanup_name,
+            &cleanup_name,
             expected_identity,
             accounting,
             &mut reservation,
@@ -8317,7 +8317,7 @@ fn cleanup_exact_private_entry(
             source_parent_identity,
             name,
             authority,
-            cleanup_name,
+            &cleanup_name,
             expected_identity,
             accounting,
             &mut reservation,

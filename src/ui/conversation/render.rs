@@ -858,6 +858,34 @@ fn entry_tone(state: ActivityState, tokens: ThemeTokens) -> (gpui::Rgba, &'stati
 /// a long command cannot turn one tool call into a paragraph.
 fn work_entry_element(entry: &ActivityEntry, tokens: ThemeTokens) -> AnyElement {
     let (heading_color, icon) = entry_tone(entry.state, tokens);
+    if entry.subagent_id.is_some() && entry.detail.contains('\n') {
+        return div()
+            .w_full()
+            .min_w(px(0.0))
+            .flex()
+            .flex_col()
+            .gap(px(CONTROL_GAP))
+            .py(px(ROW_PADDING_Y))
+            .text_size(px(SECONDARY_FONT_SIZE))
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(CONTROL_GAP))
+                    .child(row_glyph(icon, tokens.text.muted))
+                    .text_color(heading_color)
+                    .child(entry.label.clone()),
+            )
+            .child(
+                div()
+                    .w_full()
+                    .whitespace_normal()
+                    .text_color(tokens.text.secondary.to_gpui())
+                    .child(entry.detail.clone()),
+            )
+            .into_any_element();
+    }
+
     div()
         .w_full()
         .min_w(px(0.0))
@@ -1736,6 +1764,7 @@ mod tests {
     #[test]
     fn tasks_card_progress_counts_only_completed_plan_steps() {
         let completed = ActivityEntry {
+            subagent_id: None,
             identity: "plan:one".into(),
             kind: ActivityKind::PlanStep,
             label: "Plan".into(),
@@ -1743,6 +1772,7 @@ mod tests {
             state: ActivityState::Success,
         };
         let active = ActivityEntry {
+            subagent_id: None,
             identity: "plan:two".into(),
             kind: ActivityKind::PlanStep,
             label: "Plan".into(),
@@ -1750,6 +1780,7 @@ mod tests {
             state: ActivityState::Active,
         };
         let failed = ActivityEntry {
+            subagent_id: None,
             identity: "plan:three".into(),
             kind: ActivityKind::PlanStep,
             label: "Plan".into(),
@@ -1763,6 +1794,7 @@ mod tests {
     #[test]
     fn tasks_card_height_accounts_for_header_padding_and_every_step() {
         let plan = |identity: &str| ActivityEntry {
+            subagent_id: None,
             identity: identity.into(),
             kind: ActivityKind::PlanStep,
             label: "Plan".into(),
@@ -1770,6 +1802,7 @@ mod tests {
             state: ActivityState::Active,
         };
         let tool = ActivityEntry {
+            subagent_id: None,
             identity: "tool".into(),
             kind: ActivityKind::Tool,
             label: "Command".into(),

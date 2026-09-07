@@ -135,21 +135,22 @@ use crate::ui::task_cockpit::changes_panel::{
     reconcile_selected_repository, repository_mutation_allowed, repository_status_readable,
 };
 use crate::ui::task_cockpit::composer::{
-    composer_meta_line_room, composer_meta_segments_within, composer_placeholder_within,
-    composer_send_element_id, composer_send_glyph, composer_send_look, composer_send_tints,
-    composer_shows_key_hints, provider_command_catalog, provider_command_opens_terminal,
-    AnswerPayload, ApprovalDecision, ComposerControl, ComposerDraftProjection, ComposerError,
-    ComposerFence, ComposerHostProjection, ComposerIntent, ComposerPayload, ComposerSendLook,
-    ProviderCommandSuggestion, TaskComposer, COMPOSER_ATTACHMENT_THUMBNAIL, COMPOSER_BORDER_WIDTH,
-    COMPOSER_BUTTON_FONT_SIZE, COMPOSER_BUTTON_PADDING_X, COMPOSER_BUTTON_PADDING_Y,
-    COMPOSER_BUTTON_RADIUS, COMPOSER_CAPTION_FONT_SIZE, COMPOSER_CHIP_FONT_SIZE, COMPOSER_CHIP_GAP,
+    composer_key_hints_for, composer_meta_line_room, composer_meta_segments_within,
+    composer_placeholder_within, composer_send_element_id, composer_send_glyph, composer_send_look,
+    composer_send_tints, provider_command_catalog, provider_command_opens_terminal, AnswerPayload,
+    ApprovalDecision, ComposerControl, ComposerDraftProjection, ComposerError, ComposerFence,
+    ComposerHostProjection, ComposerIntent, ComposerPayload, ComposerSendLook,
+    ProviderCommandSuggestion, TaskComposer, COMPOSER_ANSWER_LABEL, COMPOSER_APPROVE_LABEL,
+    COMPOSER_ATTACHMENT_THUMBNAIL, COMPOSER_BORDER_WIDTH, COMPOSER_BUTTON_FONT_SIZE,
+    COMPOSER_BUTTON_PADDING_X, COMPOSER_BUTTON_PADDING_Y, COMPOSER_BUTTON_RADIUS,
+    COMPOSER_CAPTION_FONT_SIZE, COMPOSER_CHIP_FONT_SIZE, COMPOSER_CHIP_GAP,
     COMPOSER_CHIP_LABEL_MAX_WIDTH, COMPOSER_CHIP_PADDING_X, COMPOSER_CHIP_PADDING_Y,
     COMPOSER_CHIP_RADIUS, COMPOSER_CONTROL_GAP, COMPOSER_FONT_SIZE, COMPOSER_HEIGHT_RESERVE,
     COMPOSER_ICON_BUTTON_SIZE, COMPOSER_ICON_GLYPH_SIZE, COMPOSER_INPUT_MAX_HEIGHT,
-    COMPOSER_INPUT_MIN_HEIGHT, COMPOSER_KEY_HINTS, COMPOSER_LINE_HEIGHT, COMPOSER_META_ROW_HEIGHT,
+    COMPOSER_INPUT_MIN_HEIGHT, COMPOSER_LINE_HEIGHT, COMPOSER_META_ROW_HEIGHT,
     COMPOSER_META_SEPARATOR as META_SEPARATOR, COMPOSER_PADDING_X, COMPOSER_PADDING_Y,
     COMPOSER_PILL_PADDING_X, COMPOSER_PILL_RADIUS, COMPOSER_RADIUS, COMPOSER_REGION_PADDING,
-    COMPOSER_ROW_PADDING_Y,
+    COMPOSER_REJECT_LABEL, COMPOSER_ROW_PADDING_Y,
 };
 use crate::ui::task_cockpit::dock::{DockEdge, DockTool as CockpitDockTool};
 use crate::ui::task_cockpit::draft_store::{
@@ -1956,6 +1957,7 @@ impl IsolatedDevProfile {
                 Capability::ProviderInput,
                 Capability::TaskCockpit,
                 Capability::SemanticConversation,
+                Capability::SemanticSubagents,
                 Capability::ExplicitDetach,
                 Capability::HostShutdown,
                 Capability::UpdateHandoff,
@@ -4184,6 +4186,7 @@ enum ProviderSettingsFieldFocus {
     HomePath,
     ShadowHomePath,
     LaunchArgs,
+    PlanInstruction,
     ApiEndpoint,
     EnvName(usize),
     EnvValue(usize),
@@ -4202,6 +4205,7 @@ struct ProviderSettingsEditor {
     home: TextField,
     shadow: TextField,
     launch_args: TextField,
+    plan_instruction: TextField,
     endpoint: TextField,
     env_names: Vec<TextField>,
     env_values: Vec<TextField>,
@@ -4290,11 +4294,7 @@ enum ThemeRemovalDecision {
     ConfirmRemove(String),
 }
 
-const THEME_GUIDED_SWATCHES: &[&str] = &[
-    "#fbfafc", "#18151d", "#ffffff", "#0b0b0f", "#f4f4f5", "#111827", "#0f172a", "#d60057",
-    "#e0005b", "#0055cc", "#79a7ff", "#16a34a", "#22c55e", "#ea580c", "#f59e0b", "#7c3aed",
-    "#a78bfa", "#0891b2", "#67e8f9", "#dc2626",
-];
+use crate::ui::tokens::THEME_GUIDED_SWATCHES;
 
 fn safe_theme_id_from_label(label: &str) -> String {
     let mut out = String::new();
@@ -4917,6 +4917,7 @@ struct PaneMenu {
     /// The "More views ▸" submenu is disclosed in place rather than as a
     /// second popover: one overlay, one dismissal.
     more_views_open: bool,
+    swap_open: bool,
     /// Delete confirms. The first press arms; the second deletes.
     confirming_delete: bool,
 }
@@ -11904,6 +11905,21 @@ pub struct NativeShell {
     /// entered a visible state -- so it is never persisted, and a task that
     /// leaves the fleet projection is forgotten rather than left to leak.
     board_state_clock: StateClock<HostTaskKey>,
+    /// The age labels the board LAST PAINTED, as `(origin_ms, label)`.
+    ///
+    /// Written by `board_rows` on every paint and read once a second by the
+    /// controller: an idle shell asks for no repaints, so nothing else would
+    /// ever notice that "Last reply 12s" should now read 13s. Comparing the
+    /// text rather than the clock is what keeps this from being a repaint per
+    /// frame -- see [`crate::ui::board::age_labels_changed`].
+    painted_board_age_labels: Vec<(i64, String)>,
+    /// When the age-label comparison above last ran, in wall milliseconds.
+    /// `None` until the first controller pass.
+    last_board_age_label_check_ms: Option<i64>,
+    /// How many controller passes have asked for a repaint because an age
+    /// label changed. The idle probe reads it, so a repaint an idle shell
+    /// asks for is attributable rather than merely counted.
+    board_age_label_repaints: usize,
     /// Whether the board's Done section is disclosed.
     board_done_expanded: bool,
     /// One palette slot per project, restored from and written back to
@@ -12911,6 +12927,9 @@ impl NativeShell {
             // `StateClock::new` rather than `Default`: the derive needs
             // `K: Default` and `HostTaskKey` has no default identity.
             board_state_clock: StateClock::new(),
+            painted_board_age_labels: Vec::new(),
+            last_board_age_label_check_ms: None,
+            board_age_label_repaints: 0,
             board_done_expanded: false,
             project_colours,
             board_menu: None,
@@ -13650,6 +13669,7 @@ impl NativeShell {
                     home: prev.home,
                     shadow: prev.shadow,
                     launch_args: prev.launch_args,
+                    plan_instruction: prev.plan_instruction,
                     endpoint: prev.endpoint,
                     env_names,
                     env_values,
@@ -13701,6 +13721,10 @@ impl NativeShell {
             launch_args: Self::new_provider_text_field(
                 "Launch args (JSON string array)",
                 &crate::ui::provider_settings::encode_launch_args_json(&instance.launch_args),
+            ),
+            plan_instruction: Self::new_provider_text_field(
+                "Task-list instruction",
+                &instance.plan_progress.instruction,
             ),
             endpoint: Self::new_provider_text_field(
                 "API endpoint",
@@ -13773,6 +13797,7 @@ impl NativeShell {
                             home: prev.home,
                             shadow: prev.shadow,
                             launch_args: prev.launch_args,
+                            plan_instruction: prev.plan_instruction,
                             endpoint: prev.endpoint,
                             env_names,
                             env_values,
@@ -13825,6 +13850,10 @@ impl NativeShell {
                         "Launch args (JSON string array)",
                         &crate::ui::provider_settings::encode_launch_args_json(&config.launch_args),
                     ),
+                    plan_instruction: Self::new_provider_text_field(
+                        "Task-list instruction",
+                        &config.plan_progress.instruction,
+                    ),
                     endpoint: Self::new_provider_text_field(
                         "API endpoint",
                         config.api_endpoint.as_deref().unwrap_or(""),
@@ -13858,6 +13887,10 @@ impl NativeShell {
                 home: Self::new_provider_text_field("Home path", ""),
                 shadow: Self::new_provider_text_field("Shadow home path", ""),
                 launch_args: Self::new_provider_text_field("Launch args (JSON string array)", "[]"),
+                plan_instruction: Self::new_provider_text_field(
+                    "Task-list instruction",
+                    crate::providers::settings::DEFAULT_PLAN_INSTRUCTION,
+                ),
                 endpoint: Self::new_provider_text_field("API endpoint", ""),
                 env_names: Vec::new(),
                 env_values: Vec::new(),
@@ -13887,6 +13920,7 @@ impl NativeShell {
             ProviderSettingsFieldFocus::HomePath => &mut editor.home,
             ProviderSettingsFieldFocus::ShadowHomePath => &mut editor.shadow,
             ProviderSettingsFieldFocus::LaunchArgs => &mut editor.launch_args,
+            ProviderSettingsFieldFocus::PlanInstruction => &mut editor.plan_instruction,
             ProviderSettingsFieldFocus::ApiEndpoint => &mut editor.endpoint,
             ProviderSettingsFieldFocus::EnvName(index) => editor
                 .env_names
@@ -13923,6 +13957,7 @@ impl NativeShell {
         let home = editor.home.value().to_string();
         let shadow = editor.shadow.value().to_string();
         let launch_args = editor.launch_args.value().to_string();
+        let plan_instruction = editor.plan_instruction.value().to_string();
         let endpoint = editor.endpoint.value().to_string();
         let custom_model = editor.custom_model.value().to_string();
         let wizard_id = editor.wizard_id.value().to_string();
@@ -13976,6 +14011,7 @@ impl NativeShell {
             ctl.set_draft_home_path(home);
             ctl.set_draft_shadow_home_path(shadow);
             ctl.set_draft_launch_args(launch_args);
+            ctl.set_draft_plan_instruction(plan_instruction);
             ctl.set_draft_api_endpoint(endpoint);
             ctl.set_custom_model_draft(custom_model);
             for (index, name) in env_names.into_iter().enumerate() {
@@ -14017,7 +14053,7 @@ impl NativeShell {
                     .roles
                     .get(&role)
                     .cloned()
-                    .unwrap_or_else(|| "#000000".into());
+                    .unwrap_or_else(|| crate::ui::tokens::THEME_EMPTY_COLOR_HEX.into());
                 (
                     role,
                     Self::new_theme_color_field(theme_role_display_label(role), &value),
@@ -14047,7 +14083,7 @@ impl NativeShell {
                 .roles
                 .get(role)
                 .cloned()
-                .unwrap_or_else(|| "#000000".into());
+                .unwrap_or_else(|| crate::ui::tokens::THEME_EMPTY_COLOR_HEX.into());
             let _ = field.set_value(value);
         }
     }
@@ -14062,9 +14098,10 @@ impl NativeShell {
             .unwrap_or_else(|| {
                 ThemePalette::managed(
                     ThemeAppearance::Light,
-                    ThemeColor::from_hex("#fbfafc")
-                        .unwrap_or_else(|_| ThemeColor::rgb(251, 250, 252)),
-                    ThemeColor::from_hex("#d60057").unwrap_or_else(|_| ThemeColor::rgb(214, 0, 87)),
+                    ThemeColor::from_hex(crate::ui::tokens::T3_CODE_LIGHT_CANVAS_HEX)
+                        .expect("canonical editor seed"),
+                    ThemeColor::from_hex(crate::ui::tokens::T3_CODE_LIGHT_ACCENT_HEX)
+                        .expect("canonical editor seed"),
                 )
             });
         let dark = self
@@ -14076,8 +14113,10 @@ impl NativeShell {
             .unwrap_or_else(|| {
                 ThemePalette::managed(
                     ThemeAppearance::Dark,
-                    ThemeColor::from_hex("#18151d").unwrap_or_else(|_| ThemeColor::rgb(24, 21, 29)),
-                    ThemeColor::from_hex("#e0005b").unwrap_or_else(|_| ThemeColor::rgb(224, 0, 91)),
+                    ThemeColor::from_hex(crate::ui::tokens::T3_CODE_DARK_CANVAS_HEX)
+                        .expect("canonical editor seed"),
+                    ThemeColor::from_hex(crate::ui::tokens::T3_CODE_DARK_ACCENT_HEX)
+                        .expect("canonical editor seed"),
                 )
             });
         (light, dark)
@@ -19169,6 +19208,12 @@ impl NativeShell {
             self.composer_caret_visible_rendered,
         );
         self.composer_caret_visible_rendered = next_rendered;
+        // The board's ages advance on a shell nobody is touching. Nothing else
+        // here would notice: the ages are computed during a paint, and an idle
+        // shell asks for no paints. Keyed on the label the board WOULD print
+        // rather than on the clock, so a board of day-old rows costs one
+        // repaint a day and a board of fresh ones costs one a second.
+        let age_label_repaint = self.board_age_label_repaint(unix_time_ms());
         let mut semantic_repaint = self.settle_provider_setup_input_completions();
         semantic_repaint |= self.expire_stalled_provider_setup_approvals();
         semantic_repaint |= self.retry_due_terminal_queries(now);
@@ -19823,7 +19868,7 @@ impl NativeShell {
         if semantic_repaint {
             self.refresh_accessibility_tree();
         }
-        caret_repaint || semantic_repaint
+        caret_repaint || age_label_repaint || semantic_repaint
     }
 
     fn dispatch_due_automatic_title(&mut self) {
@@ -23773,6 +23818,9 @@ impl NativeShell {
                 ProviderSettingsFieldFocus::HomePath => editor.home.value().to_string(),
                 ProviderSettingsFieldFocus::ShadowHomePath => editor.shadow.value().to_string(),
                 ProviderSettingsFieldFocus::LaunchArgs => editor.launch_args.value().to_string(),
+                ProviderSettingsFieldFocus::PlanInstruction => {
+                    editor.plan_instruction.value().to_string()
+                }
                 ProviderSettingsFieldFocus::ApiEndpoint => editor.endpoint.value().to_string(),
                 ProviderSettingsFieldFocus::EnvName(index) => editor
                     .env_names
@@ -23844,6 +23892,7 @@ impl NativeShell {
                 ProviderSettingsFieldFocus::HomePath => &editor.home,
                 ProviderSettingsFieldFocus::ShadowHomePath => &editor.shadow,
                 ProviderSettingsFieldFocus::LaunchArgs => &editor.launch_args,
+                ProviderSettingsFieldFocus::PlanInstruction => &editor.plan_instruction,
                 ProviderSettingsFieldFocus::ApiEndpoint => &editor.endpoint,
                 ProviderSettingsFieldFocus::EnvName(index) => {
                     editor.env_names.get(index).unwrap_or(&editor.display_name)
@@ -26028,6 +26077,7 @@ impl NativeShell {
         let entity = cx.entity().downgrade();
         let focus_entity = entity.clone();
         let view_entity = entity.clone();
+        let subagent_entity = entity.clone();
         let primary_entity = entity.clone();
         let zoom_entity = entity.clone();
         let menu_entity = entity.clone();
@@ -26035,6 +26085,21 @@ impl NativeShell {
         let tooltip_entity = entity.clone();
         let key_entity = entity;
         PanelHandlers {
+            on_subagent: Rc::new(move |key, action, _window, app| {
+                let _ = subagent_entity.update(app, |shell, cx| {
+                    match action {
+                        crate::ui::task_cockpit::subagents::SubagentTabAction::Select(id) => {
+                            shell.select_panel_subagent(key, Some(id));
+                        }
+                        crate::ui::task_cockpit::subagents::SubagentTabAction::ToggleCompleted => {
+                            if let Some(slot) = shell.host_slot_mut(&key.host) {
+                                slot.cockpit.toggle_completed_subagents(key.task_id);
+                            }
+                        }
+                    }
+                    cx.notify();
+                });
+            }),
             on_focus: Rc::new(move |key, _window, app| {
                 let key = key.clone();
                 let _ = focus_entity.update(app, |shell, cx| {
@@ -26049,6 +26114,7 @@ impl NativeShell {
                 let key = key.clone();
                 let _ = view_entity.update(app, |shell, cx| {
                     shell.focus_workspace_pane_for(&key);
+                    shell.select_panel_subagent(&key, None);
                     shell.set_pane_view(&key, view);
                     cx.notify();
                 });
@@ -26107,6 +26173,20 @@ impl NativeShell {
         }
     }
 
+    fn select_panel_subagent(&mut self, owner: &HostTaskKey, id: Option<String>) -> bool {
+        let Some(page) = self.task_surfaces.admitted_conversation_page(owner.clone()) else {
+            return false;
+        };
+        let accepted = self
+            .host_slot_mut(&owner.host)
+            .is_some_and(|slot| slot.cockpit.select_subagent(owner.task_id, id, &page));
+        if accepted {
+            self.focus_workspace_pane_for(owner);
+            self.set_pane_view(owner, PaneView::Conversation);
+        }
+        accepted
+    }
+
     /// The four facts the terminal body's 22 px debug strip used to print
     /// across its own top, for the panel's Terminal tab tooltip (fix wave 1,
     /// F7). `None` when this panel has no terminal attached yet.
@@ -26162,7 +26242,7 @@ impl NativeShell {
             "{} · {} · {}",
             row.project_label, pane.provider_label, row.branch
         );
-        panel_chrome(
+        let mut chrome = panel_chrome(
             row,
             pane.view,
             pane.focused,
@@ -26171,7 +26251,16 @@ impl NativeShell {
             needs_you,
             done,
             crumb,
-        )
+        );
+        if let Some(slot) = self.host_slot(&owner.host) {
+            chrome.subagents = slot.cockpit.subagent_tabs(owner.task_id).to_vec();
+            chrome.selected_subagent = slot
+                .cockpit
+                .selected_subagent(owner.task_id)
+                .map(str::to_owned);
+            chrome.subagents_expanded = slot.cockpit.subagents_expanded(owner.task_id);
+        }
+        chrome
     }
 
     /// Why this panel wants a person, or `None` for a panel that is merely
@@ -26626,6 +26715,7 @@ impl NativeShell {
             owner,
             position,
             more_views_open: false,
+            swap_open: false,
             confirming_delete: false,
         });
     }
@@ -26634,12 +26724,26 @@ impl NativeShell {
         self.pane_menu = None;
     }
 
-    /// Keys the open panel menu owns. Escape is the only one: the rows are
-    /// pointer targets and the panel's own one-key vocabulary already reaches
-    /// every item without opening the menu at all.
+    /// Escape closes the menu; unmodified digits choose a swap target.
     fn handle_pane_menu_key(&mut self, event: &KeyDownEvent) {
         if event.keystroke.key.as_str() == "escape" {
             self.close_pane_menu();
+            return;
+        }
+        if event.keystroke.modifiers.modified() {
+            return;
+        }
+        if let Some(menu) = self.pane_menu.clone().filter(|menu| menu.swap_open) {
+            if let Ok(choice) = event.keystroke.key.parse::<usize>() {
+                if let Some(target) = choice.checked_sub(1).and_then(|index| {
+                    self.workspace_task_keys()
+                        .into_iter()
+                        .filter(|key| key != &menu.owner)
+                        .nth(index)
+                }) {
+                    self.swap_workspace_tasks(&menu.owner, &target);
+                }
+            }
         }
     }
 
@@ -26659,16 +26763,35 @@ impl NativeShell {
                 self.focus_workspace_pane_for(owner);
                 self.toggle_workspace_zoom();
             }
-            // Pin and Swap are workspace operations with no shell entry point
-            // yet: the tree can pin a SPLIT CHILD and swap two PANE IDS, but
-            // nothing names "this panel" for either. Reported rather than
-            // silently ignored, because a menu row that does nothing and says
-            // nothing is worse than one that admits it.
             PanelMenuItem::PinSize => {
-                eprintln!("devmanager: pin size is not wired for {owner:?} (Task 9 leaves it)")
+                if let (Some(canvas), Some(workspace)) =
+                    (self.workspace_canvas, self.layout.task_workspace.as_mut())
+                {
+                    if workspace
+                        .toggle_task_size_pin(
+                            owner.clone(),
+                            canvas,
+                            Self::workspace_allocation_metrics(),
+                        )
+                        .is_ok()
+                    {
+                        self.mark_layout_dirty();
+                    }
+                }
             }
             PanelMenuItem::Swap => {
-                eprintln!("devmanager: swap with is not wired for {owner:?} (Task 9 leaves it)")
+                if self
+                    .pane_menu
+                    .as_ref()
+                    .is_none_or(|menu| &menu.owner != owner)
+                {
+                    self.open_pane_menu(owner.clone(), point(px(250.0), px(50.0)));
+                }
+                if let Some(menu) = self.pane_menu.as_mut() {
+                    menu.swap_open = !menu.swap_open;
+                    menu.more_views_open = false;
+                }
+                return;
             }
             // Move is the Ctrl+Shift+arrow chord; the row is the label that
             // teaches it, so choosing it opens nothing.
@@ -26694,6 +26817,37 @@ impl NativeShell {
     /// Returns whether the key was consumed.
     fn handle_panel_key(&mut self, owner: &HostTaskKey, event: &KeyDownEvent) -> bool {
         let key = event.keystroke.key.to_ascii_lowercase();
+        if (event.keystroke.modifiers.control || event.keystroke.modifiers.platform)
+            && !event.keystroke.modifiers.alt
+            && matches!(key.as_str(), "[" | "]")
+        {
+            let Some(page) = self.task_surfaces.admitted_conversation_page(owner.clone()) else {
+                return false;
+            };
+            let tabs = crate::ui::task_cockpit::subagents::catalog(&page);
+            if tabs.is_empty() {
+                return false;
+            }
+            let selected = self
+                .host_slot(&owner.host)
+                .and_then(|slot| slot.cockpit.selected_subagent(owner.task_id));
+            let current = tabs
+                .iter()
+                .position(|tab| Some(tab.id.as_str()) == selected)
+                .map(|index| index + 1)
+                .unwrap_or(0);
+            let count = tabs.len() + 1;
+            let next = if key == "]" {
+                (current + 1) % count
+            } else {
+                (current + count - 1) % count
+            };
+            return self.select_panel_subagent(
+                owner,
+                next.checked_sub(1).map(|index| tabs[index].id.clone()),
+            );
+        }
+
         // A modified keystroke belongs to the shell's chord table, not to the
         // panel's letters: Ctrl+D is Done and `d` is "view the diff".
         if event.keystroke.modifiers.control
@@ -26754,6 +26908,24 @@ impl NativeShell {
 
     /// The panel ⋯ menu: the same occluding backdrop the board menu uses, with
     /// the rows and the shortcut column from lane 2b's `panel_menu_rows`.
+    fn swap_workspace_tasks(&mut self, owner: &HostTaskKey, target: &HostTaskKey) -> bool {
+        let Some(workspace) = self.layout.task_workspace.as_mut() else {
+            return false;
+        };
+        let Some(source) = workspace.pane_for_task(owner.clone()).map(|pane| pane.id) else {
+            return false;
+        };
+        let Some(destination) = workspace.pane_for_task(target.clone()).map(|pane| pane.id) else {
+            return false;
+        };
+        if workspace.swap_panes(source, destination).is_err() {
+            return false;
+        }
+        self.mark_layout_dirty();
+        self.close_pane_menu();
+        true
+    }
+
     fn render_pane_menu_overlay(
         &self,
         tokens: crate::ui::tokens::ThemeTokens,
@@ -26768,7 +26940,17 @@ impl NativeShell {
             .and_then(|workspace| workspace.zoomed())
             .is_some();
         let mut rows: Vec<AnyElement> = Vec::new();
-        for row in panel_menu_rows(zoomed) {
+        for mut row in panel_menu_rows(zoomed) {
+            if row.item == PanelMenuItem::PinSize
+                && self
+                    .layout
+                    .task_workspace
+                    .as_ref()
+                    .and_then(|workspace| workspace.task_axis_allocation(&menu.owner))
+                    .is_some_and(|(_, allocation)| allocation.is_pinned())
+            {
+                row.label = "Unpin size";
+            }
             if row.separator_before {
                 rows.push(
                     div()
@@ -26782,6 +26964,14 @@ impl NativeShell {
             let owner = menu.owner.clone();
             let item = row.item;
             let danger = row.danger;
+            let enabled = item != PanelMenuItem::PinSize
+                || (self.workspace_canvas.is_some()
+                    && self
+                        .layout
+                        .task_workspace
+                        .as_ref()
+                        .and_then(|workspace| workspace.task_axis_allocation(&menu.owner))
+                        .is_some());
             rows.push(
                 div()
                     .id(SharedString::from(format!(
@@ -26799,7 +26989,9 @@ impl NativeShell {
                     .px(px(tokens.density.spacing.md))
                     .py(px(tokens.density.spacing.xs))
                     .text_size(px(tokens.density.typography.body))
-                    .text_color(if danger {
+                    .text_color(if !enabled {
+                        tokens.text.disabled.to_gpui()
+                    } else if danger {
                         tokens.status.destructive.to_gpui()
                     } else {
                         tokens.text.primary.to_gpui()
@@ -26810,7 +27002,9 @@ impl NativeShell {
                         MouseButton::Left,
                         cx.listener(move |shell, _event: &MouseDownEvent, _window, cx| {
                             cx.stop_propagation();
-                            shell.apply_pane_menu_item(&owner, item);
+                            if enabled {
+                                shell.apply_pane_menu_item(&owner, item);
+                            }
                             shell.refresh_accessibility_tree();
                             cx.notify();
                         }),
@@ -26826,6 +27020,52 @@ impl NativeShell {
                     )
                     .into_any_element(),
             );
+            if row.item == PanelMenuItem::Swap && menu.swap_open {
+                let targets = self
+                    .workspace_task_keys()
+                    .into_iter()
+                    .filter(|key| key != &menu.owner)
+                    .collect::<Vec<_>>();
+                if targets.is_empty() {
+                    rows.push(
+                        div()
+                            .px(px(tokens.density.spacing.md))
+                            .text_color(tokens.text.muted.to_gpui())
+                            .child("Open another panel to swap")
+                            .into_any_element(),
+                    );
+                }
+                for (index, target) in targets.into_iter().enumerate() {
+                    let owner = menu.owner.clone();
+                    let title = format!(
+                        "{} · {}",
+                        index + 1,
+                        self.owner_pane_projection_labels(&target).0
+                    );
+                    rows.push(
+                        crate::ui::task_cockpit::panel::panel_row_shell(tokens, false)
+                            .id(SharedString::from(format!("pane-swap-{:?}", target)))
+                            .cursor_pointer()
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(move |shell, _event: &MouseDownEvent, _window, cx| {
+                                    cx.stop_propagation();
+                                    shell.swap_workspace_tasks(&owner, &target);
+                                    shell.refresh_accessibility_tree();
+                                    cx.notify();
+                                }),
+                            )
+                            .child(
+                                div()
+                                    .min_w(px(0.0))
+                                    .overflow_hidden()
+                                    .text_ellipsis()
+                                    .child(title),
+                            )
+                            .into_any_element(),
+                    );
+                }
+            }
             if row.item == PanelMenuItem::MoreViews && menu.more_views_open {
                 for view in more_views() {
                     let owner = menu.owner.clone();
@@ -27218,6 +27458,10 @@ impl NativeShell {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let _section = crate::ui::frame_trace::section("conversation");
+        let show_input = show_input
+            && self
+                .host_slot(&owner.host)
+                .is_none_or(|slot| slot.cockpit.selected_subagent(owner.task_id).is_none());
         self.ensure_idle_conversation_photo(cx);
         let surface_width_px = f32::from(surface_size.width);
         let owner_task_id = owner.task_id;
@@ -27919,7 +28163,9 @@ impl NativeShell {
                 .iter()
                 .map(|(label, _)| label.clone())
                 .collect::<Vec<_>>(),
-            composer_meta_line_room(surface_width_px),
+            // The Answer / Reject / Approve buttons are painted inside this
+            // same row, so the room the strip has is the room LEFT after them.
+            composer_meta_line_room(surface_width_px, has_question, has_approval),
         );
         meta_segments.truncate(meta_kept);
         let meta_segments: Vec<AnyElement> = meta_segments
@@ -28467,14 +28713,19 @@ impl NativeShell {
                                             // the row than the field they
                                             // annotate and folded the
                                             // placeholder onto a second line.
-                                            .children(composer_shows_key_hints(surface_width_px).then(
-                                                || {
+                                            //
+                                            // Three bands, not two: between
+                                            // them is the panel's own
+                                            // one-of-eight width, where the
+                                            // mockup prints the short form.
+                                            .children(composer_key_hints_for(surface_width_px).map(
+                                                |hints| {
                                                     div()
                                                         .flex_none()
                                                         .pb(px(COMPOSER_PADDING_Y))
                                                         .text_size(px(COMPOSER_CAPTION_FONT_SIZE))
                                                         .text_color(tokens.text.muted.to_gpui())
-                                                        .child(COMPOSER_KEY_HINTS)
+                                                        .child(hints)
                                                         .into_any_element()
                                                 },
                                             ))
@@ -28623,9 +28874,12 @@ impl NativeShell {
                                         ))
                                         .children(self.composer_selector_menu(tokens, cx)),
                                 )
+                                // The three labels come from the constants the
+                                // width arithmetic above measured, so the room
+                                // reserved and the text painted cannot drift.
                                 .children(has_question.then(|| {
                                     Button::new("native-task-composer-answer")
-                                        .label("Answer")
+                                        .label(COMPOSER_ANSWER_LABEL)
                                         .ghost()
                                         .xsmall()
                                         .compact()
@@ -28634,7 +28888,7 @@ impl NativeShell {
                                 }))
                                 .children(has_approval.then(|| {
                                     Button::new("native-task-composer-reject")
-                                        .label("Reject")
+                                        .label(COMPOSER_REJECT_LABEL)
                                         .ghost()
                                         .xsmall()
                                         .compact()
@@ -28643,7 +28897,7 @@ impl NativeShell {
                                 }))
                                 .children(has_approval.then(|| {
                                     Button::new("native-task-composer-approve")
-                                        .label("Approve")
+                                        .label(COMPOSER_APPROVE_LABEL)
                                         .ghost()
                                         .xsmall()
                                         .compact()
@@ -28704,8 +28958,8 @@ impl NativeShell {
             .flex_none()
             .flex()
             .flex_col()
-            .children(provider_setup_card)
-            .child(composer_footer)
+            .children(show_input.then_some(provider_setup_card).flatten())
+            .children(show_input.then_some(composer_footer))
             .into_any_element();
         // "Conversation is live" is a claim about an admitted canonical model.
         // While startup is still running the phase line replaces it.
@@ -28715,10 +28969,15 @@ impl NativeShell {
             let owner_key = owner.clone();
             let activity_toggle: ActivityToggleHandler = Rc::new(move |group, app| {
                 let _ = shell_entity.update(app, |shell, cx| {
-                    let toggled = shell
-                        .host_slot_mut(&owner_key.host)
-                        .and_then(|slot| slot.cockpit.timeline_mut_for(owner_key.task_id))
-                        .is_some_and(|timeline| timeline.toggle_activity_group(&group));
+                    let toggled = match group {
+                        crate::ui::task_cockpit::timeline::ActivityAction::Toggle(group) => shell
+                            .host_slot_mut(&owner_key.host)
+                            .and_then(|slot| slot.cockpit.timeline_mut_for(owner_key.task_id))
+                            .is_some_and(|timeline| timeline.toggle_activity_group(&group)),
+                        crate::ui::task_cockpit::timeline::ActivityAction::OpenSubagent(id) => {
+                            shell.select_panel_subagent(&owner_key, Some(id))
+                        }
+                    };
                     if toggled {
                         cx.notify();
                     }
@@ -33558,7 +33817,75 @@ impl NativeShell {
             self.layout.project_colours = self.project_colours.to_persisted();
             self.mark_layout_dirty();
         }
+        // What every age label on screen says right now, and when each of them
+        // started counting. One snapshot covers all three surfaces that print
+        // an age, because all three read `row.state_age_ms`: the board row's
+        // title line, its "Last reply ..." meta line, and the panel chrome's
+        // status age.
+        //
+        // The controller compares this a second later against the label it
+        // WOULD paint. Without it the ages freeze: an idle shell asks for no
+        // repaints at all (the perf lane measured 0 over 500 idle passes), and
+        // the ages are computed during a paint, so nothing recomputes them.
+        // The origin is recorded rather than the elapsed time, so the
+        // comparison needs no second reading of the state clock.
+        self.painted_board_age_labels = rows
+            .iter()
+            .map(|row| {
+                (
+                    now_ms.saturating_sub(row.state_age_ms),
+                    crate::ui::board::format_age(row.state_age_ms),
+                )
+            })
+            .collect();
         rows
+    }
+
+    /// How often the controller may ask whether an age label has changed.
+    ///
+    /// A second is the finest granularity [`crate::ui::board::format_age`]
+    /// has, so checking more often cannot find anything the previous check
+    /// missed. The check itself is one `format_age` per visible row, which is
+    /// why the interval is a floor on the WORK rather than on the repaints:
+    /// the repaints are already bounded by the labels actually changing.
+    const BOARD_AGE_LABEL_CHECK_INTERVAL_MS: i64 = 1_000;
+
+    /// Whether any age label the board last painted would read differently at
+    /// `now_ms`, checked at most once a second.
+    ///
+    /// Deliberately NOT a semantic repaint: the accessibility tree carries no
+    /// age (`ProjectInboxItem::Task` has no age field), and folding this into
+    /// `semantic_repaint` would rebuild the whole tree -- and a second board
+    /// model with it -- once a second forever on a shell nobody is touching.
+    /// It is the same shape as the caret blink: pixels change, meaning does
+    /// not.
+    fn board_age_label_repaint(&mut self, now_ms: i64) -> bool {
+        if self.last_board_age_label_check_ms.is_some_and(|last| {
+            now_ms.saturating_sub(last) < Self::BOARD_AGE_LABEL_CHECK_INTERVAL_MS
+        }) {
+            return false;
+        }
+        self.last_board_age_label_check_ms = Some(now_ms);
+        if crate::ui::board::age_labels_changed(&self.painted_board_age_labels, now_ms) {
+            self.board_age_label_repaints = self.board_age_label_repaints.saturating_add(1);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// The controller's own age check, driven from a clock the caller chooses.
+    /// A unit test cannot wait a second, and the whole rule is about what a
+    /// second does.
+    #[cfg(test)]
+    pub(crate) fn board_age_label_repaint_for_test(&mut self, now_ms: i64) -> bool {
+        self.board_age_label_repaint(now_ms)
+    }
+
+    /// How many repaints the age check has asked for. Read by the idle probe.
+    #[cfg(test)]
+    pub(crate) fn board_age_label_repaints_for_test(&self) -> usize {
+        self.board_age_label_repaints
     }
 
     /// This task's plan progress and doing-now, recomputed only when its
@@ -37071,70 +37398,6 @@ impl NativeShell {
             .into_any_element()
     }
 
-    /// Compact labelled fact. Keeping these as separate chips instead of one
-    /// concatenated sentence lets the eye find a single value without reading
-    /// the whole line.
-    fn meta_chip(
-        label: &'static str,
-        value: impl Into<String>,
-        tokens: crate::ui::tokens::ThemeTokens,
-    ) -> AnyElement {
-        div()
-            .flex()
-            .flex_none()
-            .items_center()
-            .gap(px(tokens.density.spacing.xs))
-            .px(px(tokens.density.spacing.sm))
-            .py(px(tokens.density.spacing.xxs))
-            .rounded(px(tokens.density.radii.pill))
-            .bg(tokens.surfaces.raised.to_gpui())
-            .text_size(px(tokens.density.typography.caption))
-            .line_height(px(tokens.density.typography.caption_line_height))
-            .child(div().text_color(tokens.text.muted.to_gpui()).child(label))
-            .child(
-                div()
-                    .font_weight(FontWeight::MEDIUM)
-                    .text_color(tokens.text.primary.to_gpui())
-                    .child(value.into()),
-            )
-            .into_any_element()
-    }
-
-    /// One labelled fact on its own line. A row of chips reads as debug output
-    /// once there are more than a few; a two-column list keeps the labels
-    /// scannable and lets the values truncate independently.
-    fn meta_row(
-        label: &'static str,
-        value: impl Into<String>,
-        tokens: crate::ui::tokens::ThemeTokens,
-    ) -> AnyElement {
-        div()
-            .flex()
-            .items_center()
-            .justify_between()
-            .gap(px(tokens.density.spacing.md))
-            .py(px(tokens.density.spacing.xs))
-            .text_size(px(tokens.density.typography.caption))
-            .line_height(px(tokens.density.typography.caption_line_height))
-            .child(
-                div()
-                    .flex_none()
-                    .text_color(tokens.text.muted.to_gpui())
-                    .child(label),
-            )
-            .child(
-                div()
-                    .flex_1()
-                    .min_w(px(0.0))
-                    .truncate()
-                    .text_right()
-                    .font_weight(FontWeight::MEDIUM)
-                    .text_color(tokens.text.primary.to_gpui())
-                    .child(value.into()),
-            )
-            .into_any_element()
-    }
-
     fn panel_header(
         label: impl Into<String>,
         tokens: crate::ui::tokens::ThemeTokens,
@@ -37162,237 +37425,6 @@ impl NativeShell {
                     .child(label.into().to_uppercase()),
             )
             .children(trailing)
-    }
-
-    fn conversation_delete_action(&self, cx: &Context<Self>) -> Option<AnyElement> {
-        let tokens = self.theme_tokens();
-        // Add/Commit stay available without a selected task (collapsed-dock chrome).
-        // Task lifecycle actions require an exact owner selection.
-        let selected_key = self.selected_task_key.clone();
-        let selected = selected_key.as_ref().map(|key| key.task_id);
-        let selected_lifecycle = selected_key.as_ref().and_then(|selected_key| {
-            self.host_slot(&selected_key.host)
-                .and_then(|slot| slot.client_model.as_ref())
-                .and_then(|model| model.tasks().get(&selected_key.task_id))
-                .map(|snapshot| snapshot.task.lifecycle)
-        });
-        let selected_is_settled =
-            selected_lifecycle == Some(crate::domain::task::TaskLifecycle::Settled);
-        let selected_is_archived =
-            selected_lifecycle == Some(crate::domain::task::TaskLifecycle::Archived);
-        let done = selected
-            .filter(|_| !selected_is_settled && !selected_is_archived)
-            .map(|_| {
-                div()
-                    .id("native-task-settle")
-                    .tab_stop(true)
-                    .h(px(26.0))
-                    .flex()
-                    .items_center()
-                    .gap(px(6.0))
-                    .px(px(10.0))
-                    .rounded(px(6.0))
-                    .cursor_pointer()
-                    .bg(tokens.surfaces.raised.to_gpui())
-                    .text_size(px(tokens.density.typography.caption))
-                    .text_color(tokens.text.secondary.to_gpui())
-                    .hover(|style| style.bg(tokens.surfaces.overlay.to_gpui()))
-                    .on_click(cx.listener(|shell, _event: &ClickEvent, _window, cx| {
-                        cx.stop_propagation();
-                        shell.settle_selected_task();
-                        cx.notify();
-                    }))
-                    .child(crate::icons::app_icon(
-                        crate::icons::CHECK,
-                        12.0,
-                        tokens.text.secondary.to_u32(),
-                    ))
-                    .child("Done")
-                    .into_any_element()
-            });
-        let restore = selected_key
-            .as_ref()
-            .filter(|_| selected_is_settled || selected_is_archived)
-            .map(|restore_key| {
-                let restore_key = restore_key.clone();
-                div()
-                    .id("native-task-restore")
-                    .tab_stop(true)
-                    .h(px(26.0))
-                    .flex()
-                    .items_center()
-                    .gap(px(6.0))
-                    .px(px(10.0))
-                    .rounded(px(6.0))
-                    .cursor_pointer()
-                    .bg(tokens.surfaces.raised.to_gpui())
-                    .text_size(px(tokens.density.typography.caption))
-                    .text_color(tokens.text.secondary.to_gpui())
-                    .hover(|style| style.bg(tokens.surfaces.overlay.to_gpui()))
-                    .on_click(cx.listener(move |shell, _event: &ClickEvent, _window, cx| {
-                        cx.stop_propagation();
-                        shell.reopen_task_key(restore_key.clone());
-                        cx.notify();
-                    }))
-                    .child(crate::icons::app_icon(
-                        crate::icons::REFRESH_CW,
-                        12.0,
-                        tokens.text.secondary.to_u32(),
-                    ))
-                    .child("Restore")
-                    .into_any_element()
-            });
-        let archive = selected.filter(|_| !selected_is_archived).map(|_| {
-            div()
-                .id("native-task-archive")
-                .tab_stop(true)
-                .h(px(26.0))
-                .flex()
-                .items_center()
-                .gap(px(6.0))
-                .px(px(10.0))
-                .rounded(px(6.0))
-                .cursor_pointer()
-                .bg(tokens.surfaces.raised.to_gpui())
-                .text_size(px(tokens.density.typography.caption))
-                .text_color(tokens.text.muted.to_gpui())
-                .hover(|style| style.bg(tokens.surfaces.overlay.to_gpui()))
-                .on_click(cx.listener(|shell, _event: &ClickEvent, _window, cx| {
-                    cx.stop_propagation();
-                    shell.archive_selected_task();
-                    cx.notify();
-                }))
-                .child(crate::icons::app_icon(
-                    crate::icons::ARCHIVE,
-                    12.0,
-                    tokens.text.muted.to_u32(),
-                ))
-                .child("Archive")
-                .into_any_element()
-        });
-        let delete = selected_key.as_ref().map(|key| {
-            let owner = key.clone();
-            div()
-                .id("native-task-delete")
-                .tab_stop(true)
-                .h(px(26.0))
-                .flex()
-                .items_center()
-                .gap(px(6.0))
-                .px(px(10.0))
-                .rounded(px(6.0))
-                .cursor_pointer()
-                .bg(tokens.surfaces.raised.to_gpui())
-                .text_size(px(tokens.density.typography.caption))
-                .text_color(tokens.status.destructive.to_gpui())
-                .hover(|style| style.bg(tokens.surfaces.overlay.to_gpui()))
-                .on_click(cx.listener(move |shell, _event: &ClickEvent, _window, cx| {
-                    cx.stop_propagation();
-                    // Capture the rendered HostTaskKey; never remint from current focus.
-                    if shell.host_slot(&owner.host).is_some_and(|slot| {
-                        slot.client_model
-                            .as_ref()
-                            .is_some_and(|model| model.tasks().contains_key(&owner.task_id))
-                    }) {
-                        shell.begin_task_delete_key(owner.clone());
-                    }
-                    cx.notify();
-                }))
-                .child(crate::icons::app_icon(
-                    crate::icons::TRASH,
-                    12.0,
-                    tokens.status.destructive.to_u32(),
-                ))
-                .child("Delete")
-                .into_any_element()
-        });
-        let add_action = if self.selected_owner_is_remote() {
-            div()
-                .id("native-shell-tools-affordance-unavailable")
-                .h(px(26.0))
-                .flex()
-                .items_center()
-                .gap(px(6.0))
-                .px(px(10.0))
-                .rounded(px(6.0))
-                .bg(tokens.surfaces.raised.to_gpui())
-                .text_size(px(tokens.density.typography.caption))
-                .text_color(tokens.text.disabled.to_gpui())
-                .child(crate::icons::app_icon(
-                    crate::icons::PLUS,
-                    12.0,
-                    tokens.text.disabled.to_u32(),
-                ))
-                .child("Add action (local only)")
-                .into_any_element()
-        } else {
-            div()
-                .id("native-shell-tools-affordance")
-                .tab_stop(true)
-                .h(px(26.0))
-                .flex()
-                .items_center()
-                .gap(px(6.0))
-                .px(px(10.0))
-                .rounded(px(6.0))
-                .cursor_pointer()
-                .bg(tokens.surfaces.raised.to_gpui())
-                .text_size(px(tokens.density.typography.caption))
-                .text_color(tokens.text.secondary.to_gpui())
-                .hover(|style| style.bg(tokens.surfaces.overlay.to_gpui()))
-                .on_click(cx.listener(|shell, _event: &ClickEvent, _window, cx| {
-                    cx.stop_propagation();
-                    shell.open_project_action_menu();
-                    cx.notify();
-                }))
-                .child(crate::icons::app_icon(
-                    crate::icons::PLUS,
-                    12.0,
-                    tokens.text.secondary.to_u32(),
-                ))
-                .child("Add action")
-                .into_any_element()
-        };
-        let commit = div()
-            .id("native-task-commit")
-            .tab_stop(true)
-            .h(px(26.0))
-            .flex()
-            .items_center()
-            .gap(px(6.0))
-            .px(px(10.0))
-            .rounded(px(6.0))
-            .cursor_pointer()
-            .bg(tokens.surfaces.raised.to_gpui())
-            .text_size(px(tokens.density.typography.caption))
-            .text_color(tokens.text.secondary.to_gpui())
-            .hover(|style| style.bg(tokens.surfaces.overlay.to_gpui()))
-            .on_click(cx.listener(|shell, _event: &ClickEvent, _window, cx| {
-                cx.stop_propagation();
-                shell.begin_header_commit();
-                cx.notify();
-            }))
-            .child(crate::icons::app_icon(
-                crate::icons::GIT_BRANCH,
-                12.0,
-                tokens.text.secondary.to_u32(),
-            ))
-            .child("Commit")
-            .into_any_element();
-        Some(
-            div()
-                .id("native-conversation-panel-actions")
-                .flex()
-                .items_center()
-                .gap(px(self.theme_tokens().density.spacing.xs))
-                .child(add_action)
-                .child(commit)
-                .children(done)
-                .children(restore)
-                .children(archive)
-                .children(delete)
-                .into_any_element(),
-        )
     }
 
     /// Low-chrome conversation canvas: the transcript is the primary surface,
@@ -38421,7 +38453,7 @@ impl NativeShell {
                                 .child(self.overlay_text_field(
                                     "native-theme-editor-canvas-field",
                                     &editor.canvas,
-                                    "#fbfafc",
+                                    crate::ui::tokens::T3_CODE_LIGHT_CANVAS_HEX,
                                     tokens,
                                 )),
                         ),
@@ -38456,7 +38488,7 @@ impl NativeShell {
                                 .child(self.overlay_text_field(
                                     "native-theme-editor-accent-field",
                                     &editor.accent,
-                                    "#d60057",
+                                    crate::ui::tokens::T3_CODE_LIGHT_ACCENT_HEX,
                                     tokens,
                                 )),
                         ),
@@ -38559,7 +38591,7 @@ impl NativeShell {
                                             stable_theme_element_key(role.as_str(), "role-field"),
                                         ),
                                         field,
-                                        "#000000",
+                                        crate::ui::tokens::THEME_EMPTY_COLOR_HEX,
                                         tokens,
                                     )),
                             ),
@@ -39021,6 +39053,7 @@ impl NativeShell {
                                                     "Launch args (JSON string array)",
                                                     "[]",
                                                 ),
+                                                plan_instruction: NativeShell::new_provider_text_field("Task-list instruction", crate::providers::settings::DEFAULT_PLAN_INSTRUCTION),
                                                 endpoint: NativeShell::new_provider_text_field(
                                                     "API endpoint",
                                                     "",
@@ -39647,6 +39680,50 @@ impl NativeShell {
                         "Cursor adapter limits: settings and health are real, but slash-command discovery and some Claude/Codex-only session surfaces are unsupported.",
                     ),
             );
+        }
+        let planning_supported =
+            working.driver == crate::providers::settings::ProviderDriverKind::Claude;
+        let planning_enabled = working.plan_progress.enabled;
+        let planning_owner = id.clone();
+        body = body.child(
+            Button::new((
+                "provider-plan-progress",
+                stable_provider_element_key(&id, "plan-progress"),
+            ))
+            .label(if planning_enabled {
+                "Keep a task list: On"
+            } else {
+                "Keep a task list: Off"
+            })
+            .small()
+            .ghost()
+            .disabled(!planning_supported)
+            .on_click(cx.listener(move |shell, _: &ClickEvent, _, cx| {
+                cx.stop_propagation();
+                if let Some(ctl) = shell.provider_settings.as_mut() {
+                    if !ctl.is_dirty() {
+                        ctl.begin_edit(&planning_owner);
+                    }
+                    ctl.set_draft_plan_progress_enabled(!planning_enabled);
+                }
+                cx.notify();
+            })),
+        );
+        body = body.child(overlay_chrome::caption(
+            if planning_supported {
+                "Applies on the next provider launch. Adds task tools and a session instruction; existing tools stay available."
+            } else {
+                "Structured task progress is not yet available through this native provider adapter."
+            }, tokens));
+        if planning_supported {
+            body = body.child(field_row(
+                "Task-list instruction",
+                editor.map(|e| &e.plan_instruction),
+                ProviderSettingsFieldFocus::PlanInstruction,
+                tokens,
+                self,
+                cx,
+            ));
         }
         let env_count = editor.map(|e| e.env_names.len()).unwrap_or(0);
         for index in 0..env_count {
@@ -43513,6 +43590,17 @@ impl NativeShell {
                 order.push(ProviderSettingsFieldFocus::ShadowHomePath);
             }
             order.push(ProviderSettingsFieldFocus::LaunchArgs);
+            if matches!(
+                driver,
+                Some(crate::providers::settings::ProviderDriverKind::Claude)
+            ) && self
+                .provider_settings
+                .as_ref()
+                .is_some_and(|ctl| ctl.add_wizard().is_none())
+            {
+                order.push(ProviderSettingsFieldFocus::PlanInstruction);
+            }
+
             if matches!(
                 driver,
                 Some(crate::providers::settings::ProviderDriverKind::Cursor)
@@ -49223,7 +49311,7 @@ pub(crate) mod tests {
             });
             *report_slot.borrow_mut() = Some(observed);
             drop(entity);
-            cx.quit();
+            crate::ui::finish_headless_test(cx);
         });
         let (local_error, remote_error) = report.borrow_mut().take().expect("report");
         assert!(
@@ -49290,7 +49378,7 @@ pub(crate) mod tests {
             });
             *report_slot.borrow_mut() = Some(observed);
             drop(entity);
-            cx.quit();
+            crate::ui::finish_headless_test(cx);
         });
         let (remote_error, local_error, current_owner) =
             report.borrow_mut().take().expect("report");
@@ -49356,7 +49444,7 @@ pub(crate) mod tests {
             });
             *report_slot.borrow_mut() = Some(observed);
             drop(entity);
-            cx.quit();
+            crate::ui::finish_headless_test(cx);
         });
         let (selected, pending) = report.borrow_mut().take().expect("report");
         assert_eq!(
@@ -49593,7 +49681,11 @@ pub(crate) mod tests {
         // (b) and nothing else: no meta line, no key hints, no send control
         for forbidden in [
             "COMPOSER_META_ROW_HEIGHT",
-            "COMPOSER_KEY_HINTS",
+            // The hints are chosen by band now, so the painter names the
+            // chooser rather than the constant. Following the rename keeps
+            // this a real refusal instead of one that passes because the
+            // token it looks for no longer exists anywhere.
+            "composer_key_hints_for",
             "native-task-composer-meta",
             "send_control",
         ] {
@@ -49612,7 +49704,7 @@ pub(crate) mod tests {
             .expect("its own branch, up to the resting one");
         assert!(
             focused.contains(r#".id("native-task-composer-meta")"#)
-                && focused.contains("COMPOSER_KEY_HINTS"),
+                && focused.contains("composer_key_hints_for"),
             "the focused composer keeps its one meta line and its key hints"
         );
         // (d) both resting branches use the one painter
@@ -49781,9 +49873,11 @@ mod "
         // The hints and the send slot sit inside the field`s own rule, to its
         // right, as the mockup`s `.compose` does.
         assert!(
-            footer.contains(".child(COMPOSER_KEY_HINTS)")
+            footer.contains("composer_key_hints_for(surface_width_px)")
+                && footer.contains(".child(hints)")
                 && footer.contains(".child(send_control)"),
-            "the key hints and the send slot belong to the field row"
+            "the key hints and the send slot belong to the field row, and the hints are \
+             whichever of the three bands the field width earns"
         );
         // Attach is rule 4`s icon button now, not a labelled `+` pill.
         assert!(
@@ -50273,7 +50367,7 @@ mod "
                     "pane geometry is what reset restores"
                 );
             });
-            cx.quit();
+            crate::ui::finish_headless_test(cx);
         });
     }
 
@@ -50417,6 +50511,7 @@ mod "
         };
 
         let fact = |sequence: u64, text: &str| SemanticJournalFact {
+            subagent_id: None,
             id: EventId::new(),
             sequence,
             occurred_at_ms: Some(sequence as i64),
@@ -50886,7 +50981,7 @@ mod "
                 )
             });
             *completed_for_app.borrow_mut() = Some(result);
-            cx.quit();
+            crate::ui::finish_headless_test(cx);
         });
         let (
             generation_before,
@@ -50936,7 +51031,7 @@ mod "
                 (repainted, builds_before, shell.accessibility_tree_builds)
             });
             *completed_for_app.borrow_mut() = Some(result);
-            cx.quit();
+            crate::ui::finish_headless_test(cx);
         });
         let (repainted, builds_before, builds_after) = completed
             .borrow_mut()
@@ -51317,7 +51412,7 @@ mod "
                 )
             });
             *completed_for_app.borrow_mut() = Some(snapshot);
-            cx.quit();
+            crate::ui::finish_headless_test(cx);
         });
         let (stage, title, ids) = completed.borrow().clone().expect("setup canvas snapshot");
         assert_eq!(
@@ -51382,7 +51477,7 @@ mod "
                 )
             });
             *completed_for_app.borrow_mut() = Some(snapshot);
-            cx.quit();
+            crate::ui::finish_headless_test(cx);
         });
         let (shows_plus, title, ids) = completed.borrow().clone().expect("setup canvas snapshot");
         assert!(
@@ -51617,7 +51712,7 @@ mod "
                 (shell.add_project_overlay_for_test(), path)
             });
             *completed_for_app.borrow_mut() = Some(snapshot);
-            cx.quit();
+            crate::ui::finish_headless_test(cx);
         });
         let (overlay, path) = completed.borrow().clone().expect("picked folder overlay");
         let (name, overlay_path) = overlay.expect("add-folder overlay after pick");
@@ -51646,7 +51741,7 @@ mod "
                 shell.add_project_overlay_for_test()
             });
             *completed_for_app.borrow_mut() = Some(overlay);
-            cx.quit();
+            crate::ui::finish_headless_test(cx);
         });
         assert_eq!(
             completed.borrow().clone().expect("choose-folder snapshot"),
@@ -51681,7 +51776,7 @@ mod "
                 (selected, typed, shell.add_project_overlay_for_test())
             });
             *completed_for_app.borrow_mut() = Some(snapshot);
-            cx.quit();
+            crate::ui::finish_headless_test(cx);
         });
         let (selected, typed, overlay) = completed.borrow().clone().expect("typed folder name");
         assert!(selected, "prefilled folder name must start selected");
@@ -51726,7 +51821,7 @@ mod "
                 )
             });
             *completed_for_app.borrow_mut() = Some(snapshot);
-            cx.quit();
+            crate::ui::finish_headless_test(cx);
         });
         let (stage, (title, status), body) = completed
             .borrow()
@@ -51771,7 +51866,7 @@ mod "
                 (shell.new_task_overlay_open_for_test(), shell.shell_stage())
             });
             *completed_for_app.borrow_mut() = Some(snapshot);
-            cx.quit();
+            crate::ui::finish_headless_test(cx);
         });
         let (opened, stage) = completed
             .borrow()
@@ -51827,7 +51922,7 @@ mod "
                 )
             });
             *completed_for_app.borrow_mut() = Some(snapshot);
-            cx.quit();
+            crate::ui::finish_headless_test(cx);
         });
         let (host_create_count, selected, ephemeral, overlay_open) = completed
             .borrow()
@@ -51892,7 +51987,7 @@ mod "
                         shell.ensure_provider_settings_wizard_editor();
                         drop(shell.render_settings_overlay(tokens, viewport, cx));
                     });
-                    cx.quit();
+                    crate::ui::finish_headless_test(cx);
                 });
             })
             .expect("start native-sized render thread")
@@ -51965,7 +52060,7 @@ mod "
                 )
             });
             *completed_for_app.borrow_mut() = Some(snapshot);
-            cx.quit();
+            crate::ui::finish_headless_test(cx);
         });
         let (after_type, selection, all_selected, masked) = completed
             .borrow()
@@ -52015,7 +52110,7 @@ mod "
                 )
             });
             *completed_for_app.borrow_mut() = Some(snapshot);
-            cx.quit();
+            crate::ui::finish_headless_test(cx);
         });
         let (welcome_shows, welcome_open, after_project_shows, after_project_open, stage) =
             completed
@@ -52066,7 +52161,7 @@ mod "
                 )
             });
             *completed_for_app.borrow_mut() = Some(snapshot);
-            cx.quit();
+            crate::ui::finish_headless_test(cx);
         });
         let (stage, settings_open, presence) = completed
             .borrow()
@@ -52102,7 +52197,7 @@ mod "
                 (shell.shell_stage(), shell.host_status_text())
             });
             *completed_for_app.borrow_mut() = Some(snapshot);
-            cx.quit();
+            crate::ui::finish_headless_test(cx);
         });
         let (stage, status) = completed
             .borrow()
@@ -52318,7 +52413,7 @@ mod "
                 (ids, menu_rows)
             });
             *completed_for_app.borrow_mut() = Some(snapshot);
-            cx.quit();
+            crate::ui::finish_headless_test(cx);
         });
         let (ids, menu_rows) = completed.borrow().clone().expect("column control ids");
         assert!(
@@ -52616,7 +52711,7 @@ mod "
             })
             .expect("apply the archived menu row");
             completed_for_app.set(true);
-            cx.quit();
+            crate::ui::finish_headless_test(cx);
         });
         assert!(completed.get(), "archived menu row scenario completed");
     }
@@ -52811,7 +52906,7 @@ mod "
                     "the reopened task takes focus"
                 );
             });
-            cx.quit();
+            crate::ui::finish_headless_test(cx);
         });
     }
 
@@ -52853,7 +52948,7 @@ mod "
                 (opened, expected_moved, moved, dismissed, after_enter)
             });
             *completed_for_app.borrow_mut() = Some(snapshot);
-            cx.quit();
+            crate::ui::finish_headless_test(cx);
         });
         let (opened, expected_moved, moved, dismissed, after_enter) =
             completed.borrow().clone().expect("composer selector");
@@ -52883,7 +52978,7 @@ mod "
                 shell.composer_launch_options_for(ProviderKind::Codex)
             });
             *completed_for_app.borrow_mut() = Some(observed);
-            cx.quit();
+            crate::ui::finish_headless_test(cx);
         });
         let codex = completed.borrow().clone().expect("codex defaults");
         assert_eq!(codex.custom_model_slug, None);
@@ -53005,7 +53100,7 @@ mod "
             });
             *report_slot.borrow_mut() = Some(observed);
             drop(entity);
-            cx.quit();
+            crate::ui::finish_headless_test(cx);
         });
         let (remote_creates, local_creates) = report.borrow_mut().take().expect("report");
         assert_eq!(
@@ -53084,7 +53179,7 @@ mod "
                 (preview_shows, preview_ids, empty_shows, empty_ids)
             });
             *completed_for_app.borrow_mut() = Some(snapshot);
-            cx.quit();
+            crate::ui::finish_headless_test(cx);
         });
         let (preview_shows, preview_ids, empty_shows, empty_ids) =
             completed.borrow().clone().expect("authority snapshot");
@@ -53134,7 +53229,7 @@ mod "
                 shell.host_status_text()
             });
             *completed_for_app.borrow_mut() = Some(snapshot);
-            cx.quit();
+            crate::ui::finish_headless_test(cx);
         });
         assert_eq!(
             completed.borrow().as_deref(),
@@ -53296,7 +53391,7 @@ mod "
                 )
             });
             *report_slot.borrow_mut() = Some(observed);
-            cx.quit();
+            crate::ui::finish_headless_test(cx);
         });
         let (still_pending, accepted_len) = report.borrow_mut().take().expect("report");
         assert!(!still_pending);
@@ -53458,7 +53553,7 @@ mod "
                     )
                 });
             *report_slot.borrow_mut() = Some(observed);
-            cx.quit();
+            crate::ui::finish_headless_test(cx);
         });
         let (message, accepted) = report.borrow_mut().take().expect("report");
         assert!(
@@ -53902,7 +53997,7 @@ mod "
                 shell.dispatch_named_accessibility_action("native-shell-context-dock-toggle");
                 assert!(shell.layout.dock_collapsed);
             });
-            cx.quit();
+            crate::ui::finish_headless_test(cx);
         });
     }
 
@@ -53966,7 +54061,7 @@ mod "
                     "Enter must not insert a newline"
                 );
             });
-            cx.quit();
+            crate::ui::finish_headless_test(cx);
         });
     }
 
@@ -54019,7 +54114,7 @@ mod "
                 );
                 assert!(shell.current_composer_images().is_empty());
             });
-            cx.quit();
+            crate::ui::finish_headless_test(cx);
         });
     }
 
@@ -54139,7 +54234,7 @@ mod "
                     "the live composer must own the focus target that receives its key handler"
                 );
             });
-            cx.quit();
+            crate::ui::finish_headless_test(cx);
         });
     }
 
@@ -55541,7 +55636,7 @@ mod "
             action_outcome_retention_pressure_keeps_exact_overflow_record(cx);
             native_shell_drop_retains_pending_overflow_and_deferred_as_uncertain(cx);
             *completed_for_app.borrow_mut() = true;
-            cx.quit();
+            crate::ui::finish_headless_test(cx);
         });
         assert!(*completed.borrow(), "action durability scenarios completed");
     }
@@ -56703,7 +56798,7 @@ mod "
                     "left took no grab, so there is none to release"
                 );
             });
-            cx.quit();
+            crate::ui::finish_headless_test(cx);
         });
     }
 
@@ -56766,7 +56861,7 @@ mod "
                     "and the two maps are pruned from one list, so they cannot disagree"
                 );
             });
-            cx.quit();
+            crate::ui::finish_headless_test(cx);
         });
     }
 
@@ -56826,7 +56921,7 @@ mod "
                     "Idle is still observed, so a later state change measures from that change"
                 );
             });
-            cx.quit();
+            crate::ui::finish_headless_test(cx);
         });
     }
 
@@ -56914,7 +57009,7 @@ mod "
                     "the archived view is never railed, or its header would not be painted"
                 );
             });
-            cx.quit();
+            crate::ui::finish_headless_test(cx);
         });
     }
 
@@ -57012,6 +57107,7 @@ mod "
 
         let facts = (0..count)
             .map(|sequence| SemanticJournalFact {
+                subagent_id: None,
                 id: EventId::new(),
                 sequence: sequence + 1,
                 occurred_at_ms: Some(sequence as i64),
@@ -57028,6 +57124,7 @@ mod "
                     }
                 } else {
                     SemanticJournalPayload::ToolResult {
+                        context: None,
                         call_id: format!("call-{}", sequence - 1),
                         status: "ok".into(),
                     }
@@ -57253,7 +57350,7 @@ mod "
                     "still one active row, still the focused pane"
                 );
             });
-            cx.quit();
+            crate::ui::finish_headless_test(cx);
         });
     }
 
@@ -57373,7 +57470,7 @@ mod "
                     "one cache entry per task, and no more"
                 );
             });
-            cx.quit();
+            crate::ui::finish_headless_test(cx);
         });
     }
 
@@ -57388,6 +57485,7 @@ mod "
 
         let facts = (0..count)
             .map(|sequence| SemanticJournalFact {
+                subagent_id: None,
                 id: EventId::new(),
                 sequence: sequence + 1,
                 occurred_at_ms: Some(sequence as i64),
@@ -57600,7 +57698,7 @@ mod "
             });
             crate::ui::frame_trace::set_enabled_for_test(false);
             completed_for_app.set(true);
-            cx.quit();
+            crate::ui::finish_headless_test(cx);
         });
         assert!(completed.get(), "frame invariant scenario completed");
     }
@@ -57687,7 +57785,7 @@ mod "
                 }
             });
             crate::ui::frame_trace::set_enabled_for_test(false);
-            cx.quit();
+            crate::ui::finish_headless_test(cx);
         });
     }
 
@@ -57793,7 +57891,7 @@ mod "
                 println!("  charged per move message:       {per_move:.3} ms");
             });
             crate::ui::frame_trace::set_enabled_for_test(false);
-            cx.quit();
+            crate::ui::finish_headless_test(cx);
         });
     }
 
@@ -57852,7 +57950,7 @@ mod "
                 );
             });
             completed_for_app.set(true);
-            cx.quit();
+            crate::ui::finish_headless_test(cx);
         });
         assert!(completed.get(), "window move scenario completed");
     }
@@ -57934,7 +58032,7 @@ mod "
                 );
             });
             crate::ui::frame_trace::set_enabled_for_test(false);
-            cx.quit();
+            crate::ui::finish_headless_test(cx);
         });
     }
 
@@ -58004,17 +58102,24 @@ mod "
                     probe_percentile(&tick_ms, 0.95)
                 );
             });
-            cx.quit();
+            crate::ui::finish_headless_test(cx);
         });
     }
 
-    /// An idle shell must not ask to be repainted at all.
+    /// An idle shell must not ask to be repainted UNLESS an age label changed.
     ///
     /// The controller pass is the only thing that runs on a shell nobody is
     /// touching, and every pass that returns `true` is a frame. A pass that
     /// says `true` unconditionally puts the app at the wake rate forever, and
     /// no build profile makes that cheaper -- it makes each wasted frame
     /// cheaper and leaves the count alone.
+    ///
+    /// The one legitimate exception is the board's age labels, which are
+    /// computed during a paint and therefore freeze on a shell that never
+    /// paints. So the assertion is not "zero repaints" -- it is that every
+    /// repaint is ATTRIBUTABLE to a changed age label, which is the only way
+    /// to tell a fixed clock from a returning storm. A bare zero would go red
+    /// the moment a fixture's rows crossed a second boundary mid-run.
     #[test]
     fn an_idle_shell_asks_for_no_repaints() {
         const TEST_NAME: &str = "ui::native_shell::tests::an_idle_shell_asks_for_no_repaints";
@@ -58038,15 +58143,24 @@ mod "
                     let _ = shell.controller_tick_for_test(MAX_PENDING_HOST_ACTIONS);
                 }
                 let before_trees = shell.accessibility_tree_builds;
+                let before_age_repaints = shell.board_age_label_repaints_for_test();
                 let mut repaints = 0_usize;
                 for _ in 0..50 {
                     if shell.controller_tick_for_test(MAX_PENDING_HOST_ACTIONS) {
                         repaints += 1;
                     }
                 }
+                let age_repaints = shell.board_age_label_repaints_for_test() - before_age_repaints;
                 assert_eq!(
-                    repaints, 0,
-                    "fifty passes over a shell nobody touched asked for {repaints} repaints"
+                    repaints, age_repaints,
+                    "fifty passes over a shell nobody touched asked for {repaints} repaints, \
+                     of which only {age_repaints} were an age label changing"
+                );
+                // Fifty passes take far less than a second, and the check is
+                // gated at one a second, so at most one of them can even look.
+                assert!(
+                    age_repaints <= 1,
+                    "the age check ran {age_repaints} times inside one second"
                 );
                 assert_eq!(
                     shell.accessibility_tree_builds - before_trees,
@@ -58055,9 +58169,150 @@ mod "
                 );
             });
             completed_for_app.set(true);
-            cx.quit();
+            crate::ui::finish_headless_test(cx);
         });
         assert!(completed.get(), "idle shell scenario completed");
+    }
+
+    /// The ages on an idle board advance, and cost a repaint only when the
+    /// LABEL moves.
+    ///
+    /// Driven from a clock the test supplies, because the whole rule is about
+    /// what one second does and a unit test cannot wait one.
+    /// `board_age_label_repaint_for_test` is the controller's own check with
+    /// the wall clock passed in; `controller_tick` calls the same method with
+    /// `unix_time_ms()` and folds its answer into the value it returns. What
+    /// this does NOT prove is that call -- the idle probe above does, by
+    /// asserting that every repaint fifty idle passes ask for is one this
+    /// counter also counted.
+    #[test]
+    fn an_idle_board_repaints_when_an_age_label_changes_and_not_before() {
+        if rerun_headless_shell_test_in_child(
+            "ui::native_shell::tests::an_idle_board_repaints_when_an_age_label_changes_and_not_before",
+        ) {
+            return;
+        }
+        let _test_guard = HEADLESS_SHELL_TEST_LOCK
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .expect("headless shell test lock");
+        let completed = std::rc::Rc::new(std::cell::RefCell::new(false));
+        let completed_for_app = std::rc::Rc::clone(&completed);
+        gpui::Application::headless().run(move |cx| {
+            crate::ui::init(cx);
+            let (runtime, _shared) = TestRuntime::new(true, NativeHostActionResult::Queued);
+            let (model, task_id) = open_task_without_agent_client_model();
+            let project_id = model.task(task_id).expect("task").task.project_id;
+            with_test_shell_in_app(cx, runtime, |shell| {
+                shell.install_project_for_test("DevManager", project_id);
+                shell
+                    .apply_client_model(Arc::new(model))
+                    .expect("apply model");
+
+                // Read the fixture's own event time rather than picking a
+                // constant. An Idle row's age counts from its last event, not
+                // from this process, so a hand-picked instant lands wherever
+                // the fixture's timestamp happens to be -- the first version
+                // of this test chose 10,000,000 ms and every row read "2h",
+                // where a second changes nothing and the assertion below was
+                // measuring the wrong thing.
+                let occurred = shell
+                    .board_model(0)
+                    .groups
+                    .iter()
+                    .flat_map(|group| group.rows.iter())
+                    .map(|row| row.last_activity_ms)
+                    .max()
+                    .expect("the fixture has to paint at least one row");
+                let painted_at = occurred + 12_000;
+                let rows: usize = shell
+                    .board_model(painted_at)
+                    .groups
+                    .iter()
+                    .map(|group| group.rows.len())
+                    .sum();
+                assert!(
+                    rows > 0,
+                    "the fixture has to paint at least one age label or this proves nothing"
+                );
+                assert_eq!(
+                    shell.painted_board_age_labels.len(),
+                    rows,
+                    "one recorded label per painted row"
+                );
+                assert!(
+                    shell
+                        .painted_board_age_labels
+                        .iter()
+                        .all(|(_, label)| label == "12s"),
+                    "the board is painted twelve seconds after its last event: {:?}",
+                    shell.painted_board_age_labels
+                );
+
+                assert!(
+                    !shell.board_age_label_repaint_for_test(painted_at),
+                    "at the instant it was painted, nothing reads differently"
+                );
+                assert!(
+                    !shell.board_age_label_repaint_for_test(painted_at + 999),
+                    "and 999 ms later the check does not even look"
+                );
+                assert!(
+                    shell.board_age_label_repaint_for_test(painted_at + 1_000),
+                    "a second later every 12s label would read 13s"
+                );
+                assert!(
+                    !shell.board_age_label_repaint_for_test(painted_at + 1_001),
+                    "and the next pass is inside the interval, so one repaint per second at most"
+                );
+                assert_eq!(
+                    shell.board_age_label_repaints_for_test(),
+                    1,
+                    "exactly one repaint was asked for across those four passes"
+                );
+
+                // The PAINT is what settles it: repainting at the new instant
+                // records the new labels, so the same change is not reported
+                // twice, and the next one is measured from there.
+                let _ = shell.board_model(painted_at + 1_000);
+                assert!(
+                    shell
+                        .painted_board_age_labels
+                        .iter()
+                        .all(|(_, label)| label == "13s"),
+                    "the repaint recorded the new labels"
+                );
+                assert!(
+                    shell.board_age_label_repaint_for_test(painted_at + 2_000),
+                    "13s -> 14s is the next change, measured from the repaint"
+                );
+                assert_eq!(shell.board_age_label_repaints_for_test(), 2);
+
+                // And an hours-old board costs nothing a second later: the
+                // clock moved, the label did not. This is the case the whole
+                // design turns on, and it is why the comparison is on the text.
+                let _ = shell.board_model(occurred + 3 * 3_600_000);
+                assert!(
+                    shell
+                        .painted_board_age_labels
+                        .iter()
+                        .all(|(_, label)| label == "3h"),
+                    "three hours after its last event the row reads 3h"
+                );
+                assert!(
+                    !shell.board_age_label_repaint_for_test(occurred + 3 * 3_600_000 + 60_000),
+                    "a minute later a 3h row still reads 3h, so it asks for nothing"
+                );
+                assert_eq!(
+                    shell.board_age_label_repaints_for_test(),
+                    2,
+                    "and the counter did not move"
+                );
+            });
+            *completed_for_app.borrow_mut() = true;
+            crate::ui::finish_headless_test(cx);
+        });
+        assert!(*completed.borrow(), "idle age-label scenario completed");
     }
 
     /// The board replaces the project rail: tasks group by what they are
@@ -58214,7 +58469,7 @@ mod "
                 );
             });
             *completed_for_app.borrow_mut() = true;
-            cx.quit();
+            crate::ui::finish_headless_test(cx);
         });
         assert!(*completed.borrow(), "board scenario completed");
     }
@@ -58665,7 +58920,7 @@ mod "
                     cols: 40,
                     rows: 8,
                     launch: Some(crate::domain::resource::TerminalLaunch {
-                        cwd: std::path::PathBuf::from("C:/workspace"),
+                        cwd: std::env::temp_dir(),
                         program: std::path::PathBuf::from("pwsh"),
                         args: Vec::new(),
                     }),
@@ -59297,7 +59552,7 @@ mod "
                     .collect::<Vec<_>>();
                 assert_eq!(texts, vec!["/model opus\r", "/effort high\r"]);
             });
-            cx.quit();
+            crate::ui::finish_headless_test(cx);
         });
     }
 
@@ -61383,7 +61638,7 @@ mod "
             delete_flow_cancel_and_failure_scenarios(cx);
             delete_flow_receipt_before_projection_and_delete_success(cx);
             *completed_for_app.borrow_mut() = true;
-            cx.quit();
+            crate::ui::finish_headless_test(cx);
         });
         assert!(
             *completed.borrow(),
@@ -61410,7 +61665,7 @@ mod "
             dismissed_slash_menu_stays_closed_while_background_state_caches(cx);
             center_task_canvas_switches_conversation_and_terminal(cx);
             *completed_for_app.borrow_mut() = true;
-            cx.quit();
+            crate::ui::finish_headless_test(cx);
         });
         assert!(
             *completed.borrow(),
@@ -61512,7 +61767,7 @@ mod "
                 "/p"
             );
             completed_for_app.set(true);
-            cx.quit();
+            crate::ui::finish_headless_test(cx);
         });
         assert!(completed.get(), "hidden composer scenario completed");
     }
@@ -61547,7 +61802,7 @@ mod "
                     CockpitDockTool::Review
                 );
             });
-            cx.quit();
+            crate::ui::finish_headless_test(cx);
         });
     }
 
@@ -61652,7 +61907,7 @@ mod "
             assert!(platform_input.supports_action(accesskit::Action::SetValue));
 
             completed_for_app.set(true);
-            cx.quit();
+            crate::ui::finish_headless_test(cx);
         });
         assert!(completed.get(), "hidden task-search scenario completed");
     }
@@ -61751,7 +62006,7 @@ mod "
             );
 
             completed_for_app.set(true);
-            cx.quit();
+            crate::ui::finish_headless_test(cx);
         });
         assert!(completed.get(), "hidden new-task scenario completed");
     }
@@ -61883,7 +62138,7 @@ mod "
                 )
             }));
             completed_for_app.set(true);
-            cx.quit();
+            crate::ui::finish_headless_test(cx);
         });
         assert!(completed.get(), "hidden terminal input scenario completed");
     }
@@ -62417,6 +62672,86 @@ mod "
         );
     }
 
+    #[test]
+    fn panel_menu_pins_and_swaps_the_captured_owner() {
+        use crate::ui::panel::PanelMenuItem;
+        use crate::ui::task_workspace::{Axis, Viewport};
+        use gpui::{point, px};
+        if rerun_headless_shell_test_in_child(
+            "ui::native_shell::tests::panel_menu_pins_and_swaps_the_captured_owner",
+        ) {
+            return;
+        }
+        gpui::Application::headless().run(move |cx| {
+            crate::ui::init(cx);
+            let (runtime, _) = TestRuntime::new(true, NativeHostActionResult::Queued);
+            with_test_shell_in_app(cx, runtime, |shell| {
+                shell.install_idle_conversation_photo_for_test();
+                let first = HostTaskKey::new(shell.local_host_id(), TaskId::new());
+                let second = HostTaskKey::new(shell.local_host_id(), TaskId::new());
+                let mut workspace = crate::ui::task_workspace::Workspace::single(first.clone());
+                workspace
+                    .insert_after_focused(second.clone(), Axis::Horizontal)
+                    .unwrap();
+                let first_slot = workspace.pane_for_task(first.clone()).unwrap().id;
+                let second_slot = workspace.pane_for_task(second.clone()).unwrap().id;
+                shell.layout.task_workspace = Some(workspace);
+                shell.workspace_canvas = Some(Viewport::new(1000.0, 800.0));
+                shell.open_pane_menu(first.clone(), point(px(0.0), px(0.0)));
+                shell.focus_workspace_pane_for(&second);
+                shell.apply_pane_menu_item(&first, PanelMenuItem::PinSize);
+                let workspace = shell.layout.task_workspace.as_ref().unwrap();
+                assert!(workspace
+                    .task_axis_allocation(&first)
+                    .unwrap()
+                    .1
+                    .is_pinned());
+                assert!(!workspace
+                    .task_axis_allocation(&second)
+                    .unwrap()
+                    .1
+                    .is_pinned());
+                shell.apply_pane_menu_item(&first, PanelMenuItem::PinSize);
+                assert!(!shell
+                    .layout
+                    .task_workspace
+                    .as_ref()
+                    .unwrap()
+                    .task_axis_allocation(&first)
+                    .unwrap()
+                    .1
+                    .is_pinned());
+                shell.apply_pane_menu_item(&first, PanelMenuItem::Swap);
+                assert!(shell.pane_menu.as_ref().unwrap().swap_open);
+                assert!(shell.swap_workspace_tasks(&first, &second));
+                let workspace = shell.layout.task_workspace.as_ref().unwrap();
+                assert_eq!(
+                    workspace.pane_for_task(first.clone()).unwrap().id,
+                    second_slot
+                );
+                assert_eq!(
+                    workspace.pane_for_task(second.clone()).unwrap().id,
+                    first_slot
+                );
+                assert!(shell.pane_menu.is_none());
+                let missing = HostTaskKey::new(shell.local_host_id(), TaskId::new());
+                assert!(!shell.swap_workspace_tasks(&first, &missing));
+                assert_eq!(
+                    shell
+                        .layout
+                        .task_workspace
+                        .as_ref()
+                        .unwrap()
+                        .pane_for_task(first)
+                        .unwrap()
+                        .id,
+                    second_slot
+                );
+            });
+            crate::ui::finish_headless_test(cx);
+        });
+    }
+
     /// X3: the canvas the one load-time repair is judged against has to be the
     /// WINDOW, not a layout pass on its way to one.
     ///
@@ -62935,7 +63270,7 @@ mod "
             });
             *report_slot_for_app.borrow_mut() = Some((before, attached, after));
             drop(entity);
-            cx.quit();
+            crate::ui::finish_headless_test(cx);
         });
         let (
             (before_state, before_runtime, before_canvas, before_inbox_items, before_tree),
@@ -63276,7 +63611,7 @@ mod "
             });
             *report_slot.borrow_mut() = Some(observed);
             drop(entity);
-            cx.quit();
+            crate::ui::finish_headless_test(cx);
         });
         let _ = report.borrow().clone();
     }
@@ -64359,7 +64694,7 @@ mod "
             });
             *report_slot_for_app.borrow_mut() = Some(report);
             drop(entity);
-            cx.quit();
+            crate::ui::finish_headless_test(cx);
         });
         let (kinds, has_model, mutations, empty_tasks, errored) = report_slot
             .borrow_mut()
@@ -64520,7 +64855,7 @@ mod "
             });
             *report_slot_for_app.borrow_mut() = Some(after_preview);
             drop(entity);
-            cx.quit();
+            crate::ui::finish_headless_test(cx);
         });
         let (kinds, has_model, mutations, ids) =
             report_slot.borrow_mut().take().expect("preview report");
@@ -64700,7 +65035,7 @@ mod "
             });
             *report_slot.borrow_mut() = Some(observed);
             drop(entity);
-            cx.quit();
+            crate::ui::finish_headless_test(cx);
         });
         let (host_count, local_rows) = report.borrow_mut().take().expect("multi-host report");
         assert_eq!(host_count, 1);
@@ -64771,7 +65106,7 @@ mod "
             });
             *report_slot.borrow_mut() = Some(observed);
             drop(entity);
-            cx.quit();
+            crate::ui::finish_headless_test(cx);
         });
         assert!(report.borrow_mut().take().expect("owner report"));
     }
@@ -64866,7 +65201,7 @@ mod "
             });
             *report_slot.borrow_mut() = Some(observed);
             drop(entity);
-            cx.quit();
+            crate::ui::finish_headless_test(cx);
         });
         let (kept, selected_host) = report.borrow_mut().take().expect("forget report");
         assert!(
@@ -64933,7 +65268,7 @@ mod "
             });
             *report_slot.borrow_mut() = Some(observed);
             drop(entity);
-            cx.quit();
+            crate::ui::finish_headless_test(cx);
         });
         let (selected, local_selected, remote_selected) =
             report.borrow_mut().take().expect("select report");
@@ -65238,7 +65573,7 @@ mod "
                 });
             *report_slot.borrow_mut() = Some(observed);
             drop(entity);
-            cx.quit();
+            crate::ui::finish_headless_test(cx);
         });
         let (cleared2, local_draft, selected, local_accepted, remote_accepted) =
             report.borrow_mut().take().expect("owner send report");
@@ -65553,7 +65888,7 @@ mod "
             });
             *report_slot.borrow_mut() = Some(observed);
             drop(entity);
-            cx.quit();
+            crate::ui::finish_headless_test(cx);
         });
         let (
             advanced,
@@ -66048,7 +66383,7 @@ mod "
             });
             *report_slot.borrow_mut() = Some(observed);
             drop(entity);
-            cx.quit();
+            crate::ui::finish_headless_test(cx);
         });
         let (
             sent_after_ready,
@@ -66164,7 +66499,7 @@ mod "
             });
             *report_slot.borrow_mut() = Some(observed);
             drop(entity);
-            cx.quit();
+            crate::ui::finish_headless_test(cx);
         });
         let (selected, lifecycle, restore_commands) =
             report.borrow_mut().take().expect("done report");
@@ -66333,7 +66668,7 @@ mod "
             });
             *report_slot.borrow_mut() = Some(observed);
             drop(entity);
-            cx.quit();
+            crate::ui::finish_headless_test(cx);
         });
         let (probes, starts, sends) = report.borrow_mut().take().expect("report");
         assert_eq!(probes, 1, "exactly one TerminalReadiness probe");
@@ -66526,7 +66861,7 @@ mod "
             });
             *report_slot.borrow_mut() = Some(observed);
             drop(entity);
-            cx.quit();
+            crate::ui::finish_headless_test(cx);
         });
         let (
             sends,
@@ -66811,7 +67146,7 @@ mod "
             });
             *report_slot.borrow_mut() = Some(observed);
             drop(entity);
-            cx.quit();
+            crate::ui::finish_headless_test(cx);
         });
         let (
             remote_error,
@@ -66969,7 +67304,7 @@ mod "
             });
             *report_slot.borrow_mut() = Some(observed);
             drop(entity);
-            cx.quit();
+            crate::ui::finish_headless_test(cx);
         });
         let (sends, draft, pending) = report.borrow_mut().take().expect("report");
         assert_eq!(
@@ -67147,7 +67482,7 @@ mod "
             });
             *report_slot.borrow_mut() = Some(observed);
             drop(entity);
-            cx.quit();
+            crate::ui::finish_headless_test(cx);
         });
         let (probes, starts, sends) = report.borrow_mut().take().expect("report");
         assert_eq!(probes, 1);
@@ -67278,7 +67613,7 @@ mod "
             });
             *report_slot.borrow_mut() = Some(observed);
             drop(entity);
-            cx.quit();
+            crate::ui::finish_headless_test(cx);
         });
         let (starts, pending_cleared, error, retained) =
             report.borrow_mut().take().expect("report");
@@ -67429,7 +67764,7 @@ mod "
             });
             *report_slot.borrow_mut() = Some(observed);
             drop(entity);
-            cx.quit();
+            crate::ui::finish_headless_test(cx);
         });
         let (still_pending, probes, starts) = report.borrow_mut().take().expect("report");
         assert!(
@@ -67694,7 +68029,7 @@ mod "
             });
             *report_slot.borrow_mut() = Some(observed);
             drop(entity);
-            cx.quit();
+            crate::ui::finish_headless_test(cx);
         });
         let (
             after_fail_starts,
@@ -67861,7 +68196,7 @@ mod "
             });
             *report_slot.borrow_mut() = Some(observed);
             drop(entity);
-            cx.quit();
+            crate::ui::finish_headless_test(cx);
         });
         let (remote_ok, retained_same, still_same, local_full, remote_busy) =
             report.borrow_mut().take().expect("report");
@@ -68054,7 +68389,7 @@ mod "
             });
             *report_slot.borrow_mut() = Some(observed);
             drop(entity);
-            cx.quit();
+            crate::ui::finish_headless_test(cx);
         });
         let (
             stage,
@@ -68289,7 +68624,7 @@ mod "
             });
             *report_slot.borrow_mut() = Some(observed);
             drop(entity);
-            cx.quit();
+            crate::ui::finish_headless_test(cx);
         });
         let (owner_create_ok, local_dialog, local_terminal) =
             report.borrow_mut().take().expect("create-guard report");
@@ -68456,7 +68791,7 @@ mod "
                     "promotion must not fall through to ordinary provider input"
                 );
             });
-            cx.quit();
+            crate::ui::finish_headless_test(cx);
         });
     }
 
@@ -68841,7 +69176,7 @@ mod "
                     .as_ref()
                     .is_some_and(|d| d.error.as_deref().is_some_and(|e| e.contains("owner"))));
             });
-            cx.quit();
+            crate::ui::finish_headless_test(cx);
         });
     }
 
@@ -69774,7 +70109,7 @@ mod "
                 );
                 let _ = local;
             });
-            cx.quit();
+            crate::ui::finish_headless_test(cx);
         });
     }
 
@@ -69979,7 +70314,7 @@ mod "
                     "unresolved retired markers must never be silently dropped"
                 );
             });
-            cx.quit();
+            crate::ui::finish_headless_test(cx);
         });
     }
 
@@ -70193,7 +70528,7 @@ mod "
                 );
                 let _ = shared_a;
             });
-            cx.quit();
+            crate::ui::finish_headless_test(cx);
         });
     }
 
@@ -70262,7 +70597,7 @@ mod "
                     "same TaskId focus peer must not become the delete owner"
                 );
             });
-            cx.quit();
+            crate::ui::finish_headless_test(cx);
         });
     }
 
@@ -70611,7 +70946,7 @@ mod "
                 );
                 assert!(shell.delete_task.is_none());
             });
-            cx.quit();
+            crate::ui::finish_headless_test(cx);
         });
 
         let command_b = CommandId::new();
@@ -70770,6 +71105,7 @@ mod "
         let through = after + MEASURED_CONVERSATION_PAGE_ITEMS;
         let facts = (after + 1..=through)
             .map(|sequence| SemanticJournalFact {
+                subagent_id: None,
                 id: EventId::new(),
                 sequence,
                 occurred_at_ms: Some(sequence as i64),
@@ -70940,7 +71276,7 @@ mod "
                 );
             });
             // A headless application's run loop does not return on its own.
-            cx.quit();
+            crate::ui::finish_headless_test(cx);
         });
     }
 
@@ -70972,6 +71308,7 @@ mod "
             encoded_bytes: 1,
             next_sequence: None,
             facts: vec![SemanticJournalFact {
+                subagent_id: None,
                 id: EventId::new(),
                 sequence,
                 occurred_at_ms: Some(sequence as i64),
@@ -71004,6 +71341,7 @@ mod "
             encoded_bytes: 1,
             next_sequence: None,
             facts: vec![SemanticJournalFact {
+                subagent_id: None,
                 id: EventId::new(),
                 sequence,
                 occurred_at_ms: Some(sequence as i64),
@@ -71188,7 +71526,7 @@ mod "
                     "incremental assistant page must append without replacing prior user rows"
                 );
             });
-            cx.quit();
+            crate::ui::finish_headless_test(cx);
         });
     }
 
@@ -71281,7 +71619,7 @@ mod "
                     "local user row must not appear on the remote owner timeline"
                 );
             });
-            cx.quit();
+            crate::ui::finish_headless_test(cx);
         });
     }
 
@@ -71459,7 +71797,7 @@ mod "
                     "background task timeline must retain its own assistant row"
                 );
             });
-            cx.quit();
+            crate::ui::finish_headless_test(cx);
         });
     }
 
@@ -71508,7 +71846,7 @@ mod "
                     "stale generation must not alter the existing timeline"
                 );
             });
-            cx.quit();
+            crate::ui::finish_headless_test(cx);
         });
     }
 
@@ -71603,7 +71941,7 @@ mod "
                     "rejecting pending presentation must restore prior Timeline.rows()"
                 );
             });
-            cx.quit();
+            crate::ui::finish_headless_test(cx);
         });
     }
 
@@ -71749,7 +72087,7 @@ mod "
                     "the pane paints from the ListState, not from rows(): a row count                      the ListState does not carry is a blank stream"
                 );
             });
-            cx.quit();
+            crate::ui::finish_headless_test(cx);
         });
     }
 
@@ -71990,7 +72328,7 @@ mod "
                     "an answered pane must not be re-swept; asked {after:?}"
                 );
             });
-            cx.quit();
+            crate::ui::finish_headless_test(cx);
         });
     }
 
@@ -72144,7 +72482,7 @@ mod "
                     "Start fresh must dispatch exactly one NewConversation start; got {started:?}"
                 );
             });
-            cx.quit();
+            crate::ui::finish_headless_test(cx);
         });
     }
 
@@ -72230,7 +72568,7 @@ mod "
                     );
                 }
             });
-            cx.quit();
+            crate::ui::finish_headless_test(cx);
         });
     }
 
@@ -72325,7 +72663,7 @@ mod "
                     "an answered, genuinely empty conversation must still say so"
                 );
             });
-            cx.quit();
+            crate::ui::finish_headless_test(cx);
         });
     }
 
@@ -72372,7 +72710,7 @@ mod "
                     "only the second paint pass should count as an interactive build"
                 );
             });
-            cx.quit();
+            crate::ui::finish_headless_test(cx);
         });
     }
 
@@ -72538,7 +72876,7 @@ mod "
                     "exact prompt reconciliation plus assistant reply must clear Working"
                 );
             });
-            cx.quit();
+            crate::ui::finish_headless_test(cx);
         });
     }
 
@@ -72647,7 +72985,7 @@ mod "
                     "stale query must not alter the existing timeline"
                 );
             });
-            cx.quit();
+            crate::ui::finish_headless_test(cx);
         });
     }
 
@@ -72721,7 +73059,7 @@ mod "
                     "stale failed query must not rewrite remote slot failure state"
                 );
             });
-            cx.quit();
+            crate::ui::finish_headless_test(cx);
         });
     }
 
@@ -72767,7 +73105,7 @@ mod "
                     "current foreground query must publish panel-local query detail"
                 );
             });
-            cx.quit();
+            crate::ui::finish_headless_test(cx);
         });
     }
 
@@ -72833,7 +73171,7 @@ mod "
                     "valid background conversation must still admit after focus moves"
                 );
             });
-            cx.quit();
+            crate::ui::finish_headless_test(cx);
         });
     }
 
@@ -72929,7 +73267,7 @@ mod "
                     "durable accepted send must still settle after focus moves away from remote"
                 );
             });
-            cx.quit();
+            crate::ui::finish_headless_test(cx);
         });
     }
 
@@ -72981,7 +73319,7 @@ mod "
                     "stale remote conversation generation must not alter the timeline"
                 );
             });
-            cx.quit();
+            crate::ui::finish_headless_test(cx);
         });
     }
 
@@ -73072,7 +73410,7 @@ mod "
                     "the reply to that exact query must retire the retry it armed"
                 );
             });
-            cx.quit();
+            crate::ui::finish_headless_test(cx);
         });
     }
 
@@ -73187,7 +73525,7 @@ mod "
                     "the retry must re-ask for the provider's screen"
                 );
             });
-            cx.quit();
+            crate::ui::finish_headless_test(cx);
         });
     }
 
@@ -73305,7 +73643,7 @@ mod "
                     "the resize must reach the focused shell, never the provider PTY"
                 );
             });
-            cx.quit();
+            crate::ui::finish_headless_test(cx);
         });
     }
 
@@ -73426,7 +73764,7 @@ mod "
                         .and_then(|slot| slot.composer_error.clone()),
                 ));
             });
-            cx.quit();
+            crate::ui::finish_headless_test(cx);
         });
         let (launched, provider_resource, shells, composer_error) =
             report.borrow_mut().take().expect("first-send report");
@@ -73602,7 +73940,7 @@ mod "
                     "host A Files projection must remain untouched"
                 );
             });
-            cx.quit();
+            crate::ui::finish_headless_test(cx);
         });
     }
 
@@ -73675,7 +74013,7 @@ mod "
                     "stale FilesList after focus switch must not land"
                 );
             });
-            cx.quit();
+            crate::ui::finish_headless_test(cx);
         });
     }
 
@@ -73751,7 +74089,7 @@ mod "
                     "a terminal panel query failure is not a durable task failure"
                 );
             });
-            cx.quit();
+            crate::ui::finish_headless_test(cx);
         });
     }
 
@@ -73926,7 +74264,7 @@ mod "
                         ))
                 );
             });
-            cx.quit();
+            crate::ui::finish_headless_test(cx);
         });
     }
 
@@ -74184,7 +74522,7 @@ mod "
                     "a newer canonical PTY projection must retire the paint-only echo instead of duplicating it"
                 );
             });
-            cx.quit();
+            crate::ui::finish_headless_test(cx);
         });
     }
 
@@ -74228,7 +74566,7 @@ mod "
                     .count();
                 assert_eq!(resizes, 1, "paint churn must not flood resize queries");
             });
-            cx.quit();
+            crate::ui::finish_headless_test(cx);
         });
     }
 
@@ -74285,7 +74623,7 @@ mod "
                     Some("src")
                 );
             });
-            cx.quit();
+            crate::ui::finish_headless_test(cx);
         });
     }
 
@@ -74520,7 +74858,7 @@ mod "
                     );
                 }
             });
-            cx.quit();
+            crate::ui::finish_headless_test(cx);
         });
     }
 
@@ -74598,7 +74936,7 @@ mod "
                     "stale host A callback must not remint onto host B"
                 );
             });
-            cx.quit();
+            crate::ui::finish_headless_test(cx);
         });
     }
 
@@ -74758,7 +75096,7 @@ mod "
                     "forged text must never enter the task-surface terminal tail"
                 );
             });
-            cx.quit();
+            crate::ui::finish_headless_test(cx);
         });
     }
 
@@ -74839,7 +75177,7 @@ mod "
                     "Conversation AT must restore owner canvas visibility"
                 );
             });
-            cx.quit();
+            crate::ui::finish_headless_test(cx);
         });
     }
 
@@ -74906,7 +75244,7 @@ mod "
                     "remote Commit must never fall back to the local host"
                 );
             });
-            cx.quit();
+            crate::ui::finish_headless_test(cx);
         });
     }
 
@@ -74991,7 +75329,7 @@ mod "
                     "hidden owner catalog must not dispatch GitStatus or local fallback"
                 );
             });
-            cx.quit();
+            crate::ui::finish_headless_test(cx);
         });
     }
 
@@ -75171,7 +75509,7 @@ mod "
                     "the wheel must scroll the focused shell, never the provider PTY"
                 );
             });
-            cx.quit();
+            crate::ui::finish_headless_test(cx);
         });
     }
 
@@ -75237,7 +75575,7 @@ mod "
                     "the strip the host answered the open-shell request with must be admitted"
                 );
             });
-            cx.quit();
+            crate::ui::finish_headless_test(cx);
         });
     }
 
@@ -75303,7 +75641,7 @@ mod "
                     "nothing may be armed under the reply's own target"
                 );
             });
-            cx.quit();
+            crate::ui::finish_headless_test(cx);
         });
     }
 
@@ -75409,7 +75747,7 @@ mod "
                     "the provider chip is not in `order`, so picking it clears the durable focus"
                 );
             });
-            cx.quit();
+            crate::ui::finish_headless_test(cx);
         });
     }
 
@@ -75496,7 +75834,7 @@ mod "
                     "forward from the provider chip must reach the first shell"
                 );
             });
-            cx.quit();
+            crate::ui::finish_headless_test(cx);
         });
     }
 
@@ -75548,7 +75886,7 @@ mod "
                     "a provider-only strip has nowhere to cycle to, in either direction"
                 );
             });
-            cx.quit();
+            crate::ui::finish_headless_test(cx);
         });
     }
 
@@ -75611,7 +75949,7 @@ mod "
                     "move right swaps the two neighbours and leaves focus alone"
                 );
             });
-            cx.quit();
+            crate::ui::finish_headless_test(cx);
         });
     }
 
@@ -75701,7 +76039,7 @@ mod "
                      the center canvas is painting"
                 );
             });
-            cx.quit();
+            crate::ui::finish_headless_test(cx);
         });
     }
 
@@ -75852,7 +76190,7 @@ mod "
                     "the focused chip's own screen must be queried"
                 );
             });
-            cx.quit();
+            crate::ui::finish_headless_test(cx);
         });
     }
 
@@ -75923,7 +76261,7 @@ mod "
                     "no slot may keep a lease the provider screen cannot release"
                 );
             });
-            cx.quit();
+            crate::ui::finish_headless_test(cx);
         });
     }
 
@@ -76055,7 +76393,7 @@ mod "
                     "a silent refusal is indistinguishable from a dead button"
                 );
             });
-            cx.quit();
+            crate::ui::finish_headless_test(cx);
         });
     }
 
@@ -76154,7 +76492,7 @@ mod "
                 );
                 assert_eq!(dispatched_rename_titles_for_test(&shared), vec![longest]);
             });
-            cx.quit();
+            crate::ui::finish_headless_test(cx);
         });
     }
 
@@ -76213,7 +76551,7 @@ mod "
                     "a menu that outlives its Task acts on the wrong owner"
                 );
             });
-            cx.quit();
+            crate::ui::finish_headless_test(cx);
         });
     }
 
@@ -76288,7 +76626,7 @@ mod "
                 let _ = shell.terminal_dock_surface(tokens, Some(owner.clone()), None);
                 let _ = shell.context_dock_surface(tokens, None);
             });
-            cx.quit();
+            crate::ui::finish_headless_test(cx);
         });
     }
 

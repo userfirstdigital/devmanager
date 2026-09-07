@@ -166,6 +166,9 @@ pub struct PanelStatus {
 /// fleet projection.
 #[derive(Clone, Debug, PartialEq)]
 pub struct PanelChrome {
+    pub subagents: Vec<crate::ui::task_cockpit::subagents::SubagentTab>,
+    pub selected_subagent: Option<String>,
+    pub subagents_expanded: bool,
     pub key: HostTaskKey,
     pub title: String,
     /// "Snake Game · Claude · main", shown only when zoomed: at one-of-eight
@@ -281,6 +284,9 @@ pub fn panel_chrome(
         (None, _) => (None, row.why.clone(), StatusTone::Neutral),
     };
     PanelChrome {
+        subagents: Vec::new(),
+        selected_subagent: None,
+        subagents_expanded: false,
         key: row.key.clone(),
         title: row.title.clone(),
         crumb,

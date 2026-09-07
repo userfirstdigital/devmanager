@@ -759,6 +759,7 @@ impl TaskSurfaceState {
         let mut next_sequence = page.high_water.max(page.through_sequence).saturating_add(1);
         for pending in &self.pending_user_messages {
             page.facts.push(SemanticJournalFact {
+                subagent_id: None,
                 id: pending.event_id,
                 sequence: next_sequence,
                 occurred_at_ms: None,
@@ -1470,6 +1471,7 @@ mod tests {
             encoded_bytes: 1,
             next_sequence: None,
             facts: vec![SemanticJournalFact {
+                subagent_id: None,
                 id: EventId::new(),
                 sequence,
                 occurred_at_ms: None,
@@ -2489,6 +2491,7 @@ mod tests {
             encoded_bytes: 1,
             next_sequence: None,
             facts: vec![SemanticJournalFact {
+                subagent_id: None,
                 id: EventId::new(),
                 sequence,
                 occurred_at_ms: None,

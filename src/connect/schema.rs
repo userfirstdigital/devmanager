@@ -1171,6 +1171,7 @@ pub fn native_browser_contract_fixtures() -> Vec<CanonicalSchemaFixture> {
             encoded_bytes: 0,
             next_sequence: more.then_some(1),
             facts: vec![SemanticJournalFact {
+                subagent_id: None,
                 id: fixture_event(0x55),
                 sequence: 1,
                 occurred_at_ms: Some(1),

@@ -406,7 +406,7 @@ mod tests {
             cols: 100,
             rows: 30,
             launch: Some(TerminalLaunch {
-                cwd: std::path::PathBuf::from(r"C:\Code\demo"),
+                cwd: std::env::temp_dir().join("demo"),
                 program: std::path::PathBuf::from(r"C:\Program Files\PowerShell\7\pwsh.exe"),
                 args: vec!["-NoLogo".to_string()],
             }),
@@ -471,7 +471,7 @@ mod tests {
             cols: 80,
             rows: 24,
             launch: Some(TerminalLaunch {
-                cwd: std::path::PathBuf::from(r"C:\Code"),
+                cwd: std::env::temp_dir().join("code"),
                 program: std::path::PathBuf::new(),
                 args: Vec::new(),
             }),
@@ -485,7 +485,7 @@ mod tests {
 
     fn sample_launch() -> TerminalLaunch {
         TerminalLaunch {
-            cwd: std::path::PathBuf::from(r"C:\Code"),
+            cwd: std::env::temp_dir().join("code"),
             program: std::path::PathBuf::from(r"C:\Windows\System32\cmd.exe"),
             args: vec!["-NoProfile".to_string()],
         }

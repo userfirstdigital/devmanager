@@ -1456,13 +1456,24 @@ pub(crate) fn serve_conversation(
             id: conversation_event_id(task_id, identities[&event.sequence]),
             sequence: event.sequence,
             occurred_at_ms: i64::try_from(event.occurred_at_epoch_ms).ok(),
+            subagent_id: dispatch
+                .capabilities
+                .contains(Capability::SemanticSubagents)
+                .then(|| event.subagent_id.clone())
+                .flatten(),
             provider: semantic_provider_name(event.source).to_string(),
             schema_version: 1,
             kind: semantic_payload_kind(&event.kind).to_string(),
             visibility: "task".to_string(),
             privacy_class: PrivacyClass::LocalOnly,
             redacted: false,
-            payload: semantic_payload(event),
+            payload: semantic_payload(
+                event,
+                identities[&event.sequence],
+                dispatch
+                    .capabilities
+                    .contains(Capability::SemanticSubagents),
+            ),
         })
         .collect::<Vec<_>>();
     let mut page = SemanticJournalPage {
@@ -1568,6 +1579,8 @@ fn semantic_payload_kind(kind: &crate::remote::presentation::SemanticEventKind) 
 
 fn semantic_payload(
     event: &crate::remote::presentation::SemanticEvent,
+    identity_sequence: u64,
+    include_context: bool,
 ) -> crate::domain::SemanticJournalPayload {
     use crate::domain::{provider_plan_step_lifecycle, SemanticJournalPayload};
     use crate::remote::presentation::{SemanticEventKind, SemanticToolState};
@@ -1596,6 +1609,10 @@ fn semantic_payload(
             }
             SemanticToolState::Completed | SemanticToolState::Failed => {
                 SemanticJournalPayload::ToolResult {
+                    context: include_context.then(|| crate::domain::snapshot::ToolResultContext {
+                        name: name.clone(),
+                        failed: *state == SemanticToolState::Failed,
+                    }),
                     call_id: tool_id.clone(),
                     status: if summary.is_empty() {
                         format!("{state:?}").to_ascii_lowercase()
@@ -1609,6 +1626,7 @@ fn semantic_payload(
             item_id,
             unified_diff,
         } => SemanticJournalPayload::ToolResult {
+            context: None,
             call_id: item_id.clone(),
             status: unified_diff.clone(),
         },
@@ -1617,6 +1635,7 @@ fn semantic_payload(
             text,
             exit_code,
         } => SemanticJournalPayload::ToolResult {
+            context: None,
             call_id: command_id.clone(),
             status: exit_code
                 .map(|code| format!("{text} (exit {code})"))
@@ -1634,7 +1653,8 @@ fn semantic_payload(
         SemanticEventKind::Status { state, detail } if semantic_status_is_plan_step(state) => {
             let lifecycle = provider_plan_step_lifecycle(state)
                 .expect("plan-step classification and projection share one typed mapping");
-            let identity_sequence = event.replaces_sequence.unwrap_or(event.sequence);
+            // Use the complete replacement lineage resolved for the fact ID.
+            // The immediate predecessor changes again on the third update.
             SemanticJournalPayload::PlanStep {
                 step_id: format!("{}:{identity_sequence}", lifecycle.kind.as_str()),
                 title: detail.clone().unwrap_or_else(|| match lifecycle.kind {
@@ -3534,6 +3554,7 @@ mod tests {
         };
 
         let event = SemanticEvent {
+            subagent_id: None,
             stable_session_key: StableSessionKey::from_tab("task"),
             sequence: 9,
             replaces_sequence: Some(4),
@@ -3547,14 +3568,14 @@ mod tests {
 
         assert_eq!(semantic_payload_kind(&event.kind), "plan_step");
         assert!(matches!(
-            semantic_payload(&event),
+            semantic_payload(&event, 4, false),
             crate::domain::SemanticJournalPayload::PlanStep { step_id, title, status }
                 if step_id == "task:4" && title == "Run verification" && status == "completed"
         ));
     }
 
     #[test]
-    fn claude_task_lifecycle_reaches_conversation_as_one_completed_plan_step() {
+    fn claude_task_lifecycle_reaches_conversation_as_one_step_through_all_states() {
         use crate::ai::claude_hooks::{ClaudeReducer, ClaudeReducerLimits};
         use crate::remote::presentation::{SemanticJournalStore, StableSessionKey};
         use std::sync::Mutex;
@@ -3562,18 +3583,15 @@ mod tests {
         let (_repository, bus, client_id, task_id, _roots) = create_bound_task();
         let key = StableSessionKey::from_tab(task_id.to_string());
         let mut reducer = ClaudeReducer::new(key, ClaudeReducerLimits::default());
-        let mut store = SemanticJournalStore::default();
-        for body in [
-            br#"{"hook_event_name":"TaskCreated","task_id":"task-7","task_subject":"Verify UX"}"#
-                .as_slice(),
-            br#"{"hook_event_name":"TaskCompleted","task_id":"task-7","task_subject":"Verify UX"}"#
-                .as_slice(),
+        let journal = Mutex::new(SemanticJournalStore::default());
+        for (body, expected) in [
+            (br#"{"hook_event_name":"TaskCreated","task_id":"task-7","task_subject":"Verify UX"}"#.as_slice(), "pending"),
+            (br#"{"hook_event_name":"PostToolUse","tool_use_id":"update-1","tool_name":"TaskUpdate","tool_input":{"taskId":"task-7","status":"in_progress"}}"#.as_slice(), "active"),
+            (br#"{"hook_event_name":"TaskCompleted","task_id":"task-7","task_subject":"Verify UX"}"#.as_slice(), "completed"),
         ] {
             for draft in reducer.apply_json(body, 10).drafts {
-                store.record(draft);
+                journal.lock().unwrap().record(draft);
             }
-        }
-        let journal = Mutex::new(store);
         let query = TaskCockpitQuery::Conversation { after_sequence: 0 };
         let outcome = serve_task_cockpit(TaskCockpitDispatch {
             capabilities: CapabilitySet::from_capabilities([
@@ -3605,12 +3623,110 @@ mod tests {
             panic!("expected conversation page, got {outcome:?}");
         };
 
-        assert_eq!(page.facts.len(), 1);
+        let plans = page.facts.iter().filter(|fact| matches!(fact.payload, crate::domain::SemanticJournalPayload::PlanStep { .. })).collect::<Vec<_>>();
+        assert_eq!(plans.len(), 1);
         assert!(matches!(
-            &page.facts[0].payload,
+            &plans[0].payload,
             crate::domain::SemanticJournalPayload::PlanStep { step_id, title, status }
-                if step_id == "task:1" && title == "Verify UX" && status == "completed"
+                if step_id == "task:1" && title == "Verify UX" && status == expected
         ));
+        }
+    }
+
+    #[test]
+    fn subagent_context_is_negotiated_at_the_production_conversation_boundary() {
+        use crate::ai::claude_hooks::{ClaudeReducer, ClaudeReducerLimits};
+        use crate::remote::presentation::{SemanticJournalStore, StableSessionKey};
+        use std::sync::Mutex;
+        let (_repository, bus, client_id, task_id, _roots) = create_bound_task();
+        let mut reducer = ClaudeReducer::new(
+            StableSessionKey::from_tab(task_id.to_string()),
+            ClaudeReducerLimits::default(),
+        );
+        let journal = Mutex::new(SemanticJournalStore::default());
+        for body in [
+            r#"{"hook_event_name":"UserPromptSubmit","session_id":"provider-one","prompt":"Review"}"#,
+            r#"{"hook_event_name":"SubagentStart","session_id":"provider-one","agent_id":"child-a","agent_type":"Explore"}"#,
+            r#"{"hook_event_name":"PostToolUseFailure","session_id":"provider-one","agent_id":"child-a","tool_name":"Bash","tool_use_id":"tool-one","tool_input":{"command":"false"},"error":"Command failed","tool_response":"nested output"}"#,
+            r#"{"hook_event_name":"SubagentStop","session_id":"provider-one","agent_id":"child-a","agent_type":"Explore","last_assistant_message":"Finished review"}"#,
+        ] {
+            for draft in reducer.apply_json(body.as_bytes(), 10).drafts {
+                journal.lock().unwrap().record(draft);
+            }
+        }
+        for enabled in [false, true] {
+            let capabilities = if enabled {
+                CapabilitySet::from_capabilities([
+                    Capability::TaskCockpit,
+                    Capability::SemanticConversation,
+                    Capability::SemanticSubagents,
+                ])
+            } else {
+                CapabilitySet::from_capabilities([
+                    Capability::TaskCockpit,
+                    Capability::SemanticConversation,
+                ])
+            };
+            let query = TaskCockpitQuery::Conversation { after_sequence: 0 };
+            let outcome = serve_task_cockpit(TaskCockpitDispatch {
+                capabilities,
+                envelope_task_id: Some(task_id),
+                client_id,
+                connection_id: Uuid::now_v7(),
+                request_id: RequestId::new(),
+                query: &query,
+                bus: &bus,
+                service_runtime: None,
+                semantic_journal: Some(&journal),
+                terminal_service: None,
+                ssh_endpoints: None,
+                ssh_runtime: None,
+                workspace_projects: None,
+                coordinator: None,
+                action_epoch: None,
+                runtime_generation: None,
+                config: None,
+                provider_launch_hint: ProviderLaunchReadinessHint::Unknown,
+                provider_restore_detail: None,
+            });
+            let QueryOutcome::Ok(QueryResult::TaskCockpit(TaskCockpitResult::Conversation(page))) =
+                outcome
+            else {
+                panic!("expected conversation page, got {outcome:?}");
+            };
+
+            assert_eq!(page.facts.len(), 4);
+            assert!(page.facts[0].subagent_id.is_none());
+            assert_eq!(
+                page.facts
+                    .iter()
+                    .filter(|fact| fact.subagent_id.is_some())
+                    .count(),
+                if enabled { 3 } else { 0 }
+            );
+            let result = page
+                .facts
+                .iter()
+                .find_map(|fact| match &fact.payload {
+                    crate::domain::SemanticJournalPayload::ToolResult {
+                        status, context, ..
+                    } => Some((status, context)),
+                    _ => None,
+                })
+                .expect("nested tool result");
+            assert!(result.0.contains("nested output"));
+            assert_eq!(result.1.is_some(), enabled);
+            if let Some(context) = result.1 {
+                assert_eq!(context.name, "Bash");
+                assert!(context.failed);
+            }
+            assert!(page.facts.iter().any(|fact| matches!(&fact.payload, crate::domain::SemanticJournalPayload::AssistantText { text } if text == "Finished review")));
+            if !enabled {
+                let wire = serde_json::to_string(&page).unwrap();
+                assert!(!wire.contains("subagent_id"));
+                assert!(!wire.contains("context"));
+            }
+        }
     }
 
     fn create_bound_task() -> (
@@ -3949,6 +4065,7 @@ mod tests {
         let (_repository, bus, client_id, task_id, _roots) = create_bound_task();
         let journal = Mutex::new(crate::remote::presentation::SemanticJournalStore::default());
         journal.lock().expect("journal").record(SemanticEventDraft {
+            subagent_id: None,
             stable_session_key: StableSessionKey::from_tab(&task_id.to_string()),
             occurred_at_epoch_ms: 10,
             source: SemanticSource::Claude,
@@ -4010,6 +4127,7 @@ mod tests {
         let key = StableSessionKey::from_tab(task_id.to_string());
         for index in 1..=130 {
             journal.lock().expect("journal").record(SemanticEventDraft {
+                subagent_id: None,
                 stable_session_key: key.clone(),
                 occurred_at_epoch_ms: index,
                 source: SemanticSource::Claude,
@@ -4100,6 +4218,7 @@ mod tests {
         let key = StableSessionKey::from_tab(task_id.to_string());
         for index in 0..40 {
             journal.lock().unwrap().record(SemanticEventDraft {
+                subagent_id: None,
                 stable_session_key: key.clone(),
                 occurred_at_epoch_ms: index,
                 source: SemanticSource::Claude,
@@ -4194,6 +4313,7 @@ mod tests {
         let mut first_id = None;
         for (index, text) in ["Hel", "Hello", "Hello world"].into_iter().enumerate() {
             journal.lock().unwrap().record(SemanticEventDraft {
+                subagent_id: None,
                 stable_session_key: StableSessionKey::from_tab(task_id.to_string()),
                 occurred_at_epoch_ms: index as u64 + 1,
                 source: SemanticSource::Claude,
@@ -4325,6 +4445,7 @@ mod tests {
             let mut store = journal.lock().expect("journal");
             let key = StableSessionKey::from_tab(&task_id.to_string());
             store.record(SemanticEventDraft {
+                subagent_id: None,
                 stable_session_key: key.clone(),
                 occurred_at_epoch_ms: 10,
                 source: SemanticSource::Claude,
@@ -4337,6 +4458,7 @@ mod tests {
                 deduplication_key: None,
             });
             store.record(SemanticEventDraft {
+                subagent_id: None,
                 stable_session_key: key,
                 occurred_at_epoch_ms: 11,
                 source: SemanticSource::Claude,
@@ -4948,11 +5070,14 @@ mod tests {
             "{}",
             String::from_utf8_lossy(&commit.stderr)
         );
-        let sibling_root = Path::new(r"C:\Temp");
-        fs::create_dir_all(sibling_root).expect("sibling temp root");
+        #[cfg(windows)]
+        let sibling_root = Path::new(r"C:\Temp").to_path_buf();
+        #[cfg(not(windows))]
+        let sibling_root = std::env::temp_dir();
+        fs::create_dir_all(&sibling_root).expect("sibling temp root");
         let sibling_parent = tempfile::Builder::new()
             .prefix("devmanager-cockpit-sibling-wt-")
-            .tempdir_in(sibling_root)
+            .tempdir_in(&sibling_root)
             .expect("sibling parent");
         let sibling = sibling_parent.path().join("sibling");
         let added = std::process::Command::new("git")

@@ -2572,7 +2572,6 @@ impl TeardownEffects for TerminalTeardownEffects {
     }
 }
 
-#[cfg(windows)]
 #[derive(Debug, Default)]
 struct CompletionStoreInner {
     reports: Mutex<VecDeque<(TeardownCompletionKey, TeardownReport)>>,
@@ -2628,7 +2627,6 @@ impl TeardownCompletionStore {
         })
     }
 
-    #[cfg(windows)]
     pub(crate) fn for_terminal_host() -> Result<Self, String> {
         let root = crate::persistence::app_config_dir()
             .map_err(|error| format!("resolve teardown completion journal root: {error}"))?;

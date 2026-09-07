@@ -5946,13 +5946,14 @@ impl RepositoryRoot {
                 .handle
                 .metadata()
                 .map_err(|_| "held repository root handle is unavailable".to_string())?;
+            // Match directory_identity: mutable directory timestamps/size are not replacement identity.
             let held_identity = FileIdentity {
                 device: metadata.dev(),
                 inode: metadata.ino(),
                 number_of_links: metadata.nlink(),
-                file_size: metadata.size(),
-                modified_seconds: metadata.mtime(),
-                modified_nanos: metadata.mtime_nsec(),
+                file_size: 0,
+                modified_seconds: 0,
+                modified_nanos: 0,
                 content_digest: [0; 32],
             };
             if held_identity != self.identity {
@@ -6986,7 +6987,7 @@ impl ManagedGitChild {
         }
 
         #[cfg(unix)]
-        if let Some(error) = terminate_unix_process_group(self.child.id(), deadline) {
+        if let Some(error) = terminate_unix_process_group(&mut self.child, deadline) {
             errors.push(error);
         }
 
@@ -9510,7 +9511,8 @@ fn unix_process_group_exists(pid: u32) -> Result<bool, String> {
 }
 
 #[cfg(unix)]
-fn terminate_unix_process_group(pid: u32, deadline: OperationDeadline) -> Option<String> {
+fn terminate_unix_process_group(child: &mut Child, deadline: OperationDeadline) -> Option<String> {
+    let pid = child.id();
     let mut errors = Vec::new();
     let term_error = send_unix_process_group_signal(pid, SIGTERM).err();
     let mut group_remaining = true;
@@ -9519,6 +9521,10 @@ fn terminate_unix_process_group(pid: u32, deadline: OperationDeadline) -> Option
         .unwrap_or_else(Instant::now);
 
     loop {
+        // Reap the owned root while waiting; its zombie otherwise keeps the group alive.
+        if let Err(error) = child.try_wait() {
+            errors.push(format!("owned root wait failed: {error}"));
+        }
         match unix_process_group_exists(pid) {
             Ok(false) => {
                 group_remaining = false;
@@ -9540,6 +9546,9 @@ fn terminate_unix_process_group(pid: u32, deadline: OperationDeadline) -> Option
     };
     if group_remaining {
         while group_remaining && !deadline.is_expired() {
+            if let Err(error) = child.try_wait() {
+                errors.push(format!("owned root wait failed: {error}"));
+            }
             match unix_process_group_exists(pid) {
                 Ok(false) => group_remaining = false,
                 Ok(true) => deadline.sleep(),
@@ -9599,7 +9608,7 @@ fn cleanup_unmanaged_child(child: &mut Child, deadline: OperationDeadline) -> Op
     let deadline = deadline.with_cleanup_reserve();
     let mut errors = Vec::new();
     #[cfg(unix)]
-    if let Some(error) = terminate_unix_process_group(child.id(), deadline) {
+    if let Some(error) = terminate_unix_process_group(child, deadline) {
         errors.push(error);
     }
 
@@ -12053,7 +12062,11 @@ mod tests {
         ];
 
         let error = repository
-            .run_test_process(Path::new("sh"), &arguments, GitExecutionPolicy::ReadOnly)
+            .run_test_process(
+                &fs::canonicalize("/bin/sh").expect("canonical shell fixture"),
+                &arguments,
+                GitExecutionPolicy::ReadOnly,
+            )
             .expect_err("the process group must exceed the operation deadline");
         assert!(matches!(
             error,
@@ -12468,7 +12481,11 @@ mod tests {
             pid_file.clone().into_os_string(),
         ];
         let handle = thread::spawn(move || {
-            repository.run_test_process(Path::new("sh"), &arguments, GitExecutionPolicy::ReadOnly)
+            repository.run_test_process(
+                &fs::canonicalize("/bin/sh").expect("canonical shell fixture"),
+                &arguments,
+                GitExecutionPolicy::ReadOnly,
+            )
         });
         let shell_pid = wait_for_pid_file(&pid_file);
         cancellation.cancel();

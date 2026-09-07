@@ -585,7 +585,7 @@ fn task_cockpit_actions_are_registered_and_dispatch_through_gpui() {
             dispatched.get(),
             "GPUI must dispatch the retained PreviewDismiss action"
         );
-        cx.quit();
+        devmanager::ui::finish_headless_test(cx);
     });
 }
 

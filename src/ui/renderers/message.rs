@@ -335,6 +335,7 @@ mod role_tests {
         use crate::domain::id::{EventId, TaskId};
 
         SemanticEvent {
+            subagent_id: None,
             event_id: EventId::new(),
             task_id: TaskId::new(),
             schema_version: 1,

@@ -9,7 +9,7 @@ use std::cell::Cell;
 use std::ffi::OsString;
 use std::fmt::Write as _;
 use std::fs;
-#[cfg(test)]
+#[cfg(any(test, unix))]
 use std::fs::OpenOptions;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};

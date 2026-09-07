@@ -1447,6 +1447,7 @@ impl JournalEvent {
             extensions: BTreeMap::new(),
             unknown: None,
             payload: crate::domain::snapshot::SemanticJournalPayload::ToolResult {
+                context: None,
                 call_id: "specialist-result".into(),
                 status: "completed".into(),
             },
@@ -1503,6 +1504,7 @@ impl JournalEvent {
         #[cfg(test)]
         debug_record_page_fact_materialization();
         SemanticJournalFact {
+            subagent_id: None,
             id: self.id,
             sequence: self.sequence,
             occurred_at_ms: Some(self.occurred_at_ms),
@@ -4223,7 +4225,9 @@ fn validate_semantic_payload(
             reject_display_bound(tool_name, MAX_TOOL_NAME_BYTES)?;
             reject_display_bound(call_id, MAX_CALL_ID_BYTES)?;
         }
-        SemanticJournalPayload::ToolResult { call_id, status } => {
+        SemanticJournalPayload::ToolResult {
+            call_id, status, ..
+        } => {
             reject_display_bound(call_id, MAX_CALL_ID_BYTES)?;
             reject_display_bound(status, MAX_SOURCE_TYPE_BYTES)?;
         }
@@ -4479,6 +4483,7 @@ fn classify_payload(content: &NativeJournalContent) -> Classified {
             payload: match &content.payload {
                 NativeJournalPayload::ToolResult { call_id, status } => {
                     SemanticJournalPayload::ToolResult {
+                        context: None,
                         call_id: call_id.clone(),
                         status: status.clone(),
                     }

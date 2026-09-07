@@ -892,7 +892,7 @@ mod tests {
                 noop_row_handlers(),
                 noop_header_handlers(),
             );
-            cx.quit();
+            crate::ui::finish_headless_test(cx);
         });
     }
 

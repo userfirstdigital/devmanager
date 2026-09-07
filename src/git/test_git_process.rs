@@ -24,11 +24,14 @@ fn git(repo: &Path, args: &[&str]) -> String {
 }
 
 fn test_tempdir(prefix: &str) -> TempDir {
-    let root = Path::new(r"C:\Temp");
-    fs::create_dir_all(root).expect("test temp root");
+    #[cfg(windows)]
+    let root = Path::new(r"C:\Temp").to_path_buf();
+    #[cfg(not(windows))]
+    let root = std::env::temp_dir();
+    fs::create_dir_all(&root).expect("test temp root");
     tempfile::Builder::new()
         .prefix(prefix)
-        .tempdir_in(root)
+        .tempdir_in(&root)
         .expect("temporary fixture")
 }
 

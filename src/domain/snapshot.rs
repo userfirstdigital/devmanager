@@ -187,9 +187,8 @@ impl PlanStepStatus {
     pub fn from_wire(status: &str) -> Option<Self> {
         match status {
             "pending" | "taskCreated" => Some(Self::Pending),
-            "active" | "running" | "in_progress" | "inProgress" | "subagentStarted" => {
-                Some(Self::Active)
-            }
+            "active" | "running" | "in_progress" | "inProgress" | "taskInProgress"
+            | "subagentStarted" => Some(Self::Active),
             "completed" | "succeeded" | "taskCompleted" | "subagentStopped"
             | "subagentCompleted" => Some(Self::Completed),
             "failed" => Some(Self::Failed),
@@ -210,6 +209,7 @@ pub struct ProviderPlanStepLifecycle {
 pub fn provider_plan_step_lifecycle(state: &str) -> Option<ProviderPlanStepLifecycle> {
     let (kind, status) = match state {
         "taskCreated" => (PlanStepKind::Task, PlanStepStatus::Pending),
+        "taskInProgress" => (PlanStepKind::Task, PlanStepStatus::Active),
         "taskCompleted" => (PlanStepKind::Task, PlanStepStatus::Completed),
         "subagentStarted" => (PlanStepKind::Subagent, PlanStepStatus::Active),
         "subagentStopped" => (PlanStepKind::Subagent, PlanStepStatus::Completed),
@@ -220,6 +220,15 @@ pub fn provider_plan_step_lifecycle(state: &str) -> Option<ProviderPlanStepLifec
 
 /// Provider-neutral, bounded semantic payload retained by the journal. Raw
 /// provider envelopes and terminal bytes are deliberately not represented.
+/// Present only when SemanticSubagents was negotiated. The legacy status text
+/// remains available to older clients without changing its interpretation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ToolResultContext {
+    pub name: String,
+    pub failed: bool,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum SemanticJournalPayload {
@@ -239,6 +248,8 @@ pub enum SemanticJournalPayload {
     ToolResult {
         call_id: String,
         status: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        context: Option<ToolResultContext>,
     },
     ApprovalRequest {
         request_id: String,
@@ -435,6 +446,8 @@ pub struct SemanticJournalFact {
     pub sequence: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub occurred_at_ms: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subagent_id: Option<String>,
     pub provider: String,
     pub schema_version: u32,
     pub kind: String,

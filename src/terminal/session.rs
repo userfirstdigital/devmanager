@@ -496,6 +496,8 @@ pub struct TerminalSession {
     actors: Arc<Mutex<TerminalActorHandles>>,
     #[cfg(not(windows))]
     killer: Arc<Mutex<Box<dyn ChildKiller + Send + Sync>>>,
+    #[cfg(not(windows))]
+    process_job: Arc<Mutex<Option<platform_service::ManagedProcessJob>>>,
     #[cfg(windows)]
     teardown: Arc<Mutex<Option<Arc<ManagedTerminalTeardown>>>>,
     #[cfg(windows)]
@@ -1046,7 +1048,12 @@ impl TerminalSession {
             )?
             .kill();
             if let Err(error) = kill_result {
-                if error.kind() != std::io::ErrorKind::NotFound {
+                // kill(2) reports an already-exited child as ESRCH, which Rust
+                // does not classify as ErrorKind::NotFound. Still join both
+                // owned actors below before reporting successful teardown.
+                if error.kind() != std::io::ErrorKind::NotFound
+                    && error.raw_os_error() != Some(libc::ESRCH)
+                {
                     return Err(format!("Failed to terminate shell session: {error}"));
                 }
             }
@@ -2742,7 +2749,23 @@ fn detach_pty_and_join_actor_slots(
     let cancellation_deadline = std::time::Instant::now()
         .checked_add(terminal_actor_cancellation_timeout())
         .ok_or_else(|| "terminal actor cancellation deadline overflow".to_string())?;
+    detach_pty_and_join_actor_slots_until(
+        input_admission,
+        writer,
+        master,
+        actors,
+        cancellation_deadline,
+    )
+}
 
+#[cfg(not(windows))]
+fn detach_pty_and_join_actor_slots_until(
+    input_admission: &AtomicBool,
+    writer: &Arc<Mutex<Box<dyn Write + Send>>>,
+    master: &Arc<Mutex<Option<Box<dyn MasterPty + Send>>>>,
+    actors: &Arc<Mutex<TerminalActorHandles>>,
+    cancellation_deadline: std::time::Instant,
+) -> Result<(), String> {
     // Acquire every ownership slot before mutating any PTY handle. If a
     // caller is still using one of these slots, fail closed without detaching
     // a different live reader/writer/waiter.
@@ -2832,14 +2855,9 @@ fn lock_terminal_actor_resource_until<'a, T>(
 
 #[cfg(not(windows))]
 fn terminal_actor_cancellation_timeout() -> Duration {
-    #[cfg(test)]
-    {
-        return Duration::from_millis(100);
-    }
-    #[cfg(not(test))]
-    {
-        Duration::from_secs(5)
-    }
+    // Real PTY tests exercise the production deadline. The deliberate lock-
+    // contention fixture supplies its own short deadline to the same join path.
+    Duration::from_secs(5)
 }
 
 fn initialize_runtime_entry(
@@ -5963,7 +5981,13 @@ mod tests {
         let writer_guard = writer.lock().expect("writer lock");
         let started = std::time::Instant::now();
 
-        let result = detach_pty_and_join_actor_slots(&input_admission, &writer, &master, &actors);
+        let result = detach_pty_and_join_actor_slots_until(
+            &input_admission,
+            &writer,
+            &master,
+            &actors,
+            started + Duration::from_millis(100),
+        );
 
         drop(writer_guard);
         assert!(

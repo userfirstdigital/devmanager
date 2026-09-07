@@ -7987,14 +7987,7 @@ impl TerminalAuthorityIssuer {
         };
         state.resources.insert(session_id.to_string(), issued);
         if state.completion_store.is_none() {
-            #[cfg(windows)]
-            {
-                state.completion_store = Some(TeardownCompletionStore::for_terminal_host()?);
-            }
-            #[cfg(not(windows))]
-            {
-                state.completion_store = Some(TeardownCompletionStore::new());
-            }
+            state.completion_store = Some(TeardownCompletionStore::for_terminal_host()?);
         }
         let completion_store = state
             .completion_store
@@ -8058,14 +8051,7 @@ impl TerminalAuthorityIssuer {
             },
         );
         if state.completion_store.is_none() {
-            #[cfg(windows)]
-            {
-                state.completion_store = Some(TeardownCompletionStore::for_terminal_host()?);
-            }
-            #[cfg(not(windows))]
-            {
-                state.completion_store = Some(TeardownCompletionStore::new());
-            }
+            state.completion_store = Some(TeardownCompletionStore::for_terminal_host()?);
         }
         let completion_store = state
             .completion_store
@@ -10558,7 +10544,7 @@ fn settle_server_port_start(
                 ),
             };
         #[cfg(not(windows))]
-        let settlement = Ok(classify_post_launch_listener_settlement(
+        let settlement: Result<_, String> = Ok(classify_post_launch_listener_settlement(
             listeners,
             |listener| listener_matches_session(inner, &launch.command_id, listener),
         ));
@@ -12410,6 +12396,8 @@ mod tests {
         }
     }
 
+    // This acceptance case requires the Windows managed Job fence.
+    #[cfg(windows)]
     #[test]
     fn identityless_codex_startup_gate_blocks_sealed_writer_before_physical_bytes() {
         use crate::domain::provider_input::ProviderInputAction;
@@ -14585,6 +14573,7 @@ mod tests {
             );
         }
         let draft = |detail: &str| SemanticEventDraft {
+            subagent_id: None,
             stable_session_key: stable_session_key.clone(),
             occurred_at_epoch_ms: 1,
             source: SemanticSource::Codex,
@@ -14663,6 +14652,7 @@ mod tests {
             "old",
             &old,
             SemanticEventDraft {
+                subagent_id: None,
                 stable_session_key,
                 occurred_at_epoch_ms: 1,
                 source: SemanticSource::Codex,
@@ -15854,7 +15844,9 @@ mod tests {
         let after = manager.session_view(session_id).expect("session view");
         assert!(!screen_text(&after).contains("hello world"));
 
-        let _ = manager.close_session(session_id);
+        manager
+            .close_session(session_id)
+            .expect("exact shell teardown");
     }
 
     #[test]
@@ -17289,6 +17281,7 @@ mod tests {
         session_id: &str,
         fence: ManagedProcessFence,
     ) -> ResourceSamplingSource {
+        stop_background_tasks_for_test(manager);
         let pid = fence.root().id().pid();
         let mut runtime = SessionRuntimeState::new(
             session_id,
@@ -17856,7 +17849,13 @@ mod tests {
                 memory_bytes: 4096,
                 memory_metric: ResourceMemoryMetric::PrivateResident,
                 creation_time_100ns: None,
-                executable: Some(r"C:\private\node.exe".to_string()),
+                executable: Some(
+                    std::env::temp_dir()
+                        .join("private")
+                        .join("node.exe")
+                        .to_string_lossy()
+                        .into_owned(),
+                ),
                 command_label: Some("Node".to_string()),
                 command_arg_count: 2,
                 command_arg_bytes: 42,

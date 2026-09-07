@@ -32,11 +32,14 @@ fn git(repo: &Path, args: &[&str]) -> String {
     String::from_utf8_lossy(&output.stdout).into_owned()
 }
 fn test_tempdir(prefix: &str) -> TempDir {
-    let root = Path::new(r"C:\Temp");
-    fs::create_dir_all(root).expect("test temp root");
+    #[cfg(windows)]
+    let root = Path::new(r"C:\Temp").to_path_buf();
+    #[cfg(not(windows))]
+    let root = std::env::temp_dir();
+    fs::create_dir_all(&root).expect("test temp root");
     tempfile::Builder::new()
         .prefix(prefix)
-        .tempdir_in(root)
+        .tempdir_in(&root)
         .expect("temporary fixture")
 }
 fn init_repo() -> TempDir {
@@ -678,7 +681,10 @@ fn fingerprint_contains_head_and_stable_status_digest() {
     let repo_dir = init_repo();
     commit_initial(repo_dir.path(), "a.txt", "a\n");
     let repo = GitRepository::test_open(repo_dir.path()).expect("open repository");
-    let clean = repo.status().expect("clean status");
+    let clean = repo.status().unwrap_or_else(|error| match error {
+        GitError::CleanupFailed { reason, .. } => panic!("clean status cleanup failed: {reason}"),
+        other => panic!("clean status: {other:?}"),
+    });
     let clean_again = repo.status().expect("clean status again");
     assert_eq!(clean.fingerprint, clean_again.fingerprint);
     assert_eq!(clean.fingerprint.head, clean.head);
@@ -724,7 +730,7 @@ fn path_plans_reject_absolute_and_parent_paths() {
     let repo_dir = init_repo();
     commit_initial(repo_dir.path(), "a.txt", "a\n");
     let repo = GitRepository::test_open(repo_dir.path()).expect("open repository");
-    let absolute = RepoPath::from_path(PathBuf::from("C:\\outside.txt"));
+    let absolute = RepoPath::from_path(std::env::temp_dir().join("outside.txt"));
     assert!(repo.plan_stage(&[absolute]).is_err());
     assert!(repo
         .plan_stage(&[RepoPath::from("../outside.txt")])
@@ -1901,7 +1907,9 @@ fn host_issuer_rejects_traversal_raw_path_and_unsupported_capability() {
     );
     assert!(
         matches!(
-            repo.plan_stage(&[RepoPath::from("C:\\Windows\\system32\\drivers\\etc\\hosts")]),
+            repo.plan_stage(&[RepoPath::from_path(
+                std::env::temp_dir().join("outside.txt")
+            )]),
             Err(GitError::InvalidPath { .. })
         ),
         "a raw absolute path must not become a mutation plan"

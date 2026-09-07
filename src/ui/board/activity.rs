@@ -24,7 +24,20 @@ pub fn board_activity(facts: &[SemanticJournalFact]) -> BoardActivity {
     let mut call_sequences: HashMap<&str, u64> = HashMap::new();
     let mut last_tool_sequence: Option<u64> = None;
     let mut last_reasoning_sequence: Option<u64> = None;
+    let mut children = BTreeMap::new();
     for fact in facts {
+        if let SemanticJournalPayload::PlanStep {
+            step_id, status, ..
+        } = &fact.payload
+        {
+            if step_id.starts_with("subagent:") {
+                children.insert(step_id, PlanStepStatus::from_wire(status));
+                continue;
+            }
+        }
+        if fact.subagent_id.is_some() {
+            continue;
+        }
         match &fact.payload {
             SemanticJournalPayload::PlanStep {
                 step_id, status, ..
@@ -57,6 +70,17 @@ pub fn board_activity(facts: &[SemanticJournalFact]) -> BoardActivity {
     });
     let doing_now = if let Some((_, tool)) = open_calls.iter().next_back() {
         Some(bound(tool, DOING_NOW_MAX_CHARS))
+    } else if children
+        .values()
+        .any(|status| *status == Some(PlanStepStatus::Active))
+    {
+        Some(format!(
+            "{} subagents working",
+            children
+                .values()
+                .filter(|status| **status == Some(PlanStepStatus::Active))
+                .count()
+        ))
     } else if last_reasoning_sequence > last_tool_sequence {
         // `None` sorts below every `Some`, so this holds only when reasoning
         // actually happened and it happened after the last tool call.
@@ -94,6 +118,7 @@ mod tests {
 
     fn fact(sequence: u64, payload: SemanticJournalPayload) -> SemanticJournalFact {
         SemanticJournalFact {
+            subagent_id: None,
             id: EventId::new(),
             sequence,
             occurred_at_ms: Some(sequence as i64),
@@ -224,6 +249,7 @@ mod tests {
             fact(
                 2,
                 P::ToolResult {
+                    context: None,
                     call_id: "c1".into(),
                     status: "ok".into(),
                 },
@@ -277,6 +303,7 @@ mod tests {
             fact(
                 2,
                 P::ToolResult {
+                    context: None,
                     call_id: "c1".into(),
                     status: "ok".into(),
                 },
@@ -298,6 +325,7 @@ mod tests {
             fact(
                 2,
                 P::ToolResult {
+                    context: None,
                     call_id: "c1".into(),
                     status: "ok".into(),
                 },

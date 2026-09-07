@@ -3193,8 +3193,8 @@ fn recover_stale_temps(
                             destination_path,
                             destination,
                             candidate.file_name().ok_or_else(|| {
-                                io::Error::new(
-                                    io::ErrorKind::Other,
+                                ConfigError::new(
+                                    ConfigErrorKind::AtomicWrite,
                                     "stale recovery backup has no final component",
                                 )
                             })?,

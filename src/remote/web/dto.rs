@@ -950,6 +950,7 @@ mod tests {
         let mut fixture = host_fixture_with_sentinels();
         let key = StableSessionKey::from_tab("tab-1");
         fixture.journals.record(SemanticEventDraft {
+            subagent_id: None,
             stable_session_key: key,
             occurred_at_epoch_ms: 10,
             source: SemanticSource::Claude,

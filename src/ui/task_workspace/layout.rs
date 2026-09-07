@@ -745,6 +745,11 @@ impl<K: Clone + Ord + Eq> Workspace<K> {
         } else if candidate.previous_focus == Some(second) {
             candidate.previous_focus = Some(first);
         }
+        if candidate.zoomed == Some(first) {
+            candidate.zoomed = Some(second);
+        } else if candidate.zoomed == Some(second) {
+            candidate.zoomed = Some(first);
+        }
         candidate.validate()?;
         *self = candidate;
         Ok(())
@@ -853,6 +858,58 @@ impl<K: Clone + Ord + Eq> Workspace<K> {
         self.root
             .as_mut()
             .and_then(|root| find_pane_mut(root, pane_id))
+    }
+
+    /// The immediate split owns a panel's size; an ancestor's pin belongs to
+    /// the entire group and must not be reset by a panel action.
+    pub fn task_axis_allocation(&self, task_id: &K) -> Option<(Axis, Allocation)> {
+        fn visit<K: PartialEq>(node: &WorkspaceNode<K>, task: &K) -> Option<(Axis, Allocation)> {
+            let WorkspaceNode::Split { axis, children, .. } = node else {
+                return None;
+            };
+            for child in children {
+                match &child.node {
+                    WorkspaceNode::Pane(pane) if &pane.task_id == task => {
+                        return Some((*axis, child.allocation));
+                    }
+                    _ => {
+                        if let Some(found) = visit(&child.node, task) {
+                            return Some(found);
+                        }
+                    }
+                }
+            }
+            None
+        }
+        visit(self.root.as_ref()?, task_id)
+    }
+
+    /// Toggle a panel's explicit pin at its measured, unzoomed size.
+    pub fn toggle_task_size_pin(
+        &mut self,
+        task_id: K,
+        viewport: super::allocation::Viewport,
+        metrics: AllocationMetrics,
+    ) -> Result<(), WorkspaceError> {
+        let (axis, allocation) = self
+            .task_axis_allocation(&task_id)
+            .ok_or(WorkspaceError::MissingPane)?;
+        if allocation.is_pinned() {
+            return self.reset_task_axis_size(task_id);
+        }
+        let mut measured = self.clone();
+        measured.unzoom();
+        let rect = measured
+            .allocate(viewport, metrics)
+            .rect(task_id.clone())
+            .ok_or(WorkspaceError::MissingPane)?;
+        self.pin_task_axis_size(
+            task_id,
+            match axis {
+                Axis::Horizontal => rect.width,
+                Axis::Vertical => rect.height,
+            },
+        )
     }
 
     pub fn pin_task_axis_size(
@@ -1554,6 +1611,58 @@ mod tests {
     /// it at the grid width, then a second ROW filling left to right. Never a
     /// nested split, which is what `insert_after_focused` built and what made
     /// five panels a ladder of ever-narrower columns.
+    #[test]
+    fn swapping_a_zoomed_panel_keeps_the_same_task_visible() {
+        let mut workspace = Workspace::single(1u32);
+        let first = workspace.focused_pane_id().unwrap();
+        let second = workspace.insert_after_focused(2, Axis::Horizontal).unwrap();
+        workspace.zoom(first).unwrap();
+        workspace.swap_panes(first, second).unwrap();
+        assert_eq!(workspace.zoomed(), Some(second));
+        assert_eq!(
+            workspace.pane(workspace.zoomed().unwrap()).unwrap().task_id,
+            1
+        );
+    }
+
+    #[test]
+    fn panel_size_pin_uses_its_parent_axis_and_preserves_zoom() {
+        use super::super::allocation::Viewport;
+        let mut workspace = Workspace::single(1u32);
+        workspace.insert_after_focused(2, Axis::Horizontal).unwrap();
+        workspace.insert_after_focused(3, Axis::Vertical).unwrap();
+        let metrics = AllocationMetrics::production();
+        let viewport = Viewport::new(1000.0, 800.0);
+        let before = workspace.allocate(viewport, metrics).rect(3).unwrap();
+        workspace.toggle_zoom_focused();
+        workspace
+            .toggle_task_size_pin(3, viewport, metrics)
+            .unwrap();
+        assert_eq!(
+            workspace.task_axis_allocation(&3),
+            Some((
+                Axis::Vertical,
+                Allocation::Pinned {
+                    logical_px: before.height
+                }
+            ))
+        );
+        assert!(
+            workspace.zoomed().is_some(),
+            "measurement must preserve zoom"
+        );
+        workspace
+            .toggle_task_size_pin(3, viewport, metrics)
+            .unwrap();
+        assert_eq!(
+            workspace.task_axis_allocation(&3),
+            Some((Axis::Vertical, Allocation::auto()))
+        );
+        assert!(Workspace::single(1u32)
+            .toggle_task_size_pin(1, viewport, metrics)
+            .is_err());
+    }
+
     #[test]
     fn opening_panels_tiles_into_columns_then_a_second_row() {
         let metrics = AllocationMetrics::production();

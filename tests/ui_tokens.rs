@@ -870,7 +870,7 @@ fn theme_exports_the_library_token_module_without_a_shadow_source() {
 fn ui_source_outside_tokens_contains_no_direct_color_literals() {
     let source_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
     let canonical_token_path = source_root
-        .join(r"ui\tokens.rs")
+        .join("ui/tokens.rs")
         .canonicalize()
         .expect("canonical token module");
     let mut production_files = Vec::new();
@@ -902,7 +902,7 @@ fn ui_source_outside_tokens_contains_no_direct_color_literals() {
         }
         let source = fs::read_to_string(&path).expect("read UI source");
         assert!(
-            !contains_direct_color_literal(&source),
+            !production_contains_direct_color_literal(&source),
             "{} contains a direct hex/RGB(A) color literal",
             path.display()
         );
@@ -923,6 +923,89 @@ fn collect_rust_files(path: &Path, files: &mut Vec<PathBuf>) {
 
 fn is_token_module(path: &Path) -> bool {
     path.file_stem().and_then(|name| name.to_str()) == Some("tokens")
+}
+
+// Parse Rust so fixture sabotage colors and documentation are not mistaken for
+// production palette ownership. The exact token module remains the only file
+// exemption; production items after a test module are still visited.
+fn production_contains_direct_color_literal(source: &str) -> bool {
+    use syn::visit::Visit;
+    fn test_only(attrs: &[syn::Attribute]) -> bool {
+        attrs.iter().any(|attr| {
+            attr.path().is_ident("cfg")
+                && attr
+                    .parse_args::<syn::Path>()
+                    .is_ok_and(|path| path.is_ident("test"))
+        })
+    }
+    #[derive(Default)]
+    struct Scan(bool);
+    impl<'ast> Visit<'ast> for Scan {
+        fn visit_item_mod(&mut self, item: &'ast syn::ItemMod) {
+            if !test_only(&item.attrs) {
+                syn::visit::visit_item_mod(self, item);
+            }
+        }
+        fn visit_item_fn(&mut self, item: &'ast syn::ItemFn) {
+            if !test_only(&item.attrs) {
+                syn::visit::visit_item_fn(self, item);
+            }
+        }
+        fn visit_attribute(&mut self, _: &'ast syn::Attribute) {}
+        fn visit_macro(&mut self, item: &'ast syn::Macro) {
+            let tokens = item
+                .tokens
+                .to_string()
+                .replace("rgb (", "rgb(")
+                .replace("rgba (", "rgba(");
+            self.0 |= contains_direct_color_literal(&tokens);
+        }
+        fn visit_lit(&mut self, literal: &'ast syn::Lit) {
+            let text = match literal {
+                syn::Lit::Str(value) => value.value(),
+                syn::Lit::Int(value) => value.to_string(),
+                _ => return,
+            };
+            self.0 |= contains_direct_color_literal(&text);
+        }
+        fn visit_expr_call(&mut self, call: &'ast syn::ExprCall) {
+            if let syn::Expr::Path(path) = call.func.as_ref() {
+                let rgb = path
+                    .path
+                    .segments
+                    .last()
+                    .is_some_and(|segment| segment.ident == "rgb" || segment.ident == "rgba");
+                if rgb
+                    && call
+                        .args
+                        .first()
+                        .is_some_and(|arg| matches!(arg, syn::Expr::Lit(_)))
+                {
+                    self.0 = true;
+                }
+            }
+            syn::visit::visit_expr_call(self, call);
+        }
+    }
+    let file = syn::parse_file(source).expect("UI source must parse as Rust");
+    let mut scan = Scan::default();
+    scan.visit_file(&file);
+    scan.0
+}
+
+#[test]
+fn color_ownership_scan_distinguishes_fixtures_from_later_production_items() {
+    let fixture = "// Reference color: #123456\n#[cfg(test)] mod tests { fn fixture() { let c = 0x123456; } }";
+    assert!(!production_contains_direct_color_literal(fixture));
+    assert!(production_contains_direct_color_literal(&format!(
+        "{fixture} fn paint() {{ let c = 0x123456; }}"
+    )));
+    assert!(production_contains_direct_color_literal(
+        "fn paint() { let c = Color::rgb(1, 2, 3); }"
+    ));
+    assert!(production_contains_direct_color_literal(
+        "fn paint() { let c = \"#123456\"; }"
+    ));
 }
 
 fn contains_direct_color_literal(source: &str) -> bool {
@@ -997,7 +1080,7 @@ fn direct_color_scan_allows_token_to_rgb_conversion_but_rejects_literals() {
 #[test]
 fn direct_color_scan_uses_only_the_exact_canonical_token_module_exemption() {
     let test_source =
-        fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join(r"tests\ui_tokens.rs"))
+        fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/ui_tokens.rs"))
             .expect("read token tests");
     assert!(
         !test_source
@@ -1019,7 +1102,7 @@ fn direct_color_scan_uses_only_the_exact_canonical_token_module_exemption() {
     );
 
     let canonical = source_root
-        .join(r"ui\tokens.rs")
+        .join("ui/tokens.rs")
         .canonicalize()
         .expect("canonical token module");
     assert_eq!(
@@ -1033,7 +1116,7 @@ fn direct_color_scan_uses_only_the_exact_canonical_token_module_exemption() {
 #[test]
 fn theme_matrix_is_typed_independent_fixture_data_not_generated_expectations() {
     let test_source =
-        fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join(r"tests\ui_tokens.rs"))
+        fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/ui_tokens.rs"))
             .expect("read token tests");
     let generated_matrix_marker = ["serde_json", "::json!({"].concat();
     assert!(
@@ -1425,13 +1508,11 @@ macro_rules! projected_theme_gate {
 }
 
 projected_theme_gate!(
-    #[ignore = "devmanager-classic dark: border_disabled_on_surface_disabled 1.000:1, action_primary_disabled_background_on_canvas 1.107:1, action_destructive_default_on_surface 3.260:1 (13 pairs); the same palette is pinned pair-for-pair by default_selection_dark_projection_drift_is_exactly_the_pinned_set; tracked in .superpowers/sdd/2026-09-03-ui-redesign-2-panel-chrome-and-needs-you/lane-tokens-report.md"]
     projected_devmanager_classic_dark_meets_every_contrast_floor,
     "devmanager-classic",
     ThemeAppearance::Dark
 );
 projected_theme_gate!(
-    #[ignore = "devmanager-classic light: action_destructive_default_on_surface 1.000:1, action_primary_disabled_border_on_canvas 1.053:1 (68 pairs); tracked in .superpowers/sdd/2026-09-03-ui-redesign-2-panel-chrome-and-needs-you/lane-tokens-report.md"]
     projected_devmanager_classic_light_meets_every_contrast_floor,
     "devmanager-classic",
     ThemeAppearance::Light
@@ -1528,61 +1609,7 @@ projected_theme_gate!(
 /// a known defect cannot quietly absorb a further regression in the same pair.
 type PinnedDrift = (&'static str, &'static str, f64);
 
-const DEFAULT_DARK_PROJECTION_DRIFT: &[PinnedDrift] = &[
-    (
-        "normal_text",
-        "action_destructive_default_on_surface",
-        3.260,
-    ),
-    ("normal_text", "action_destructive_hover_on_surface", 2.917),
-    ("normal_text", "action_destructive_focus_on_surface", 3.260),
-    (
-        "ui_indicator",
-        "action_primary_disabled_background_on_canvas",
-        1.107,
-    ),
-    (
-        "ui_indicator",
-        "action_primary_disabled_border_on_canvas",
-        1.107,
-    ),
-    (
-        "ui_indicator",
-        "action_destructive_selected_background_on_canvas",
-        1.177,
-    ),
-    (
-        "ui_indicator",
-        "action_destructive_selected_border_on_canvas",
-        1.177,
-    ),
-    (
-        "ui_indicator",
-        "action_destructive_disabled_background_on_canvas",
-        1.107,
-    ),
-    (
-        "ui_indicator",
-        "action_destructive_disabled_border_on_canvas",
-        1.107,
-    ),
-    (
-        "interaction_text",
-        "action_destructive_default_on_surface",
-        3.260,
-    ),
-    (
-        "interaction_text",
-        "action_destructive_hover_on_surface",
-        2.917,
-    ),
-    (
-        "interaction_text",
-        "action_destructive_focus_on_surface",
-        3.260,
-    ),
-    ("runtime_only", "border_disabled_on_surface_disabled", 1.000),
-];
+const DEFAULT_DARK_PROJECTION_DRIFT: &[PinnedDrift] = &[];
 
 /// The sixty-eight pairs the default *light* projection fails, same shape and
 /// same enforcement. Light is not merely worse than dark, it is worse in kind:
@@ -1590,168 +1617,7 @@ const DEFAULT_DARK_PROJECTION_DRIFT: &[PinnedDrift] = &[
 /// white ANSI slots on a white background (`terminal_white_on_background`
 /// 1.002:1), which reads as unreviewed rather than drifted. Bounding it here
 /// stops the count growing while it waits for a palette owner.
-const DEFAULT_LIGHT_PROJECTION_DRIFT: &[PinnedDrift] = &[
-    ("normal_text", "text_disabled_on_canvas", 2.455),
-    ("normal_text", "text_disabled_on_raised", 2.563),
-    ("normal_text", "text_muted_on_overlay", 4.397),
-    ("normal_text", "text_disabled_on_overlay", 2.332),
-    ("normal_text", "text_muted_on_sunken", 4.397),
-    ("normal_text", "text_disabled_on_sunken", 2.332),
-    ("normal_text", "text_muted_on_hover", 3.270),
-    ("normal_text", "text_disabled_on_hover", 1.734),
-    ("normal_text", "text_muted_on_selection", 3.240),
-    ("normal_text", "text_disabled_on_selection", 1.718),
-    ("normal_text", "text_muted_on_disabled_surface", 4.397),
-    ("normal_text", "text_disabled_on_disabled_surface", 2.332),
-    ("normal_text", "text_inverse_on_terminal_background", 1.044),
-    (
-        "normal_text",
-        "text_on_accent_on_action_primary_selected",
-        1.178,
-    ),
-    ("normal_text", "terminal_black_on_background", 2.457),
-    ("normal_text", "terminal_red_on_background", 2.416),
-    ("normal_text", "terminal_green_on_background", 1.472),
-    ("normal_text", "terminal_yellow_on_background", 1.544),
-    ("normal_text", "terminal_blue_on_background", 2.019),
-    ("normal_text", "terminal_magenta_on_background", 1.936),
-    ("normal_text", "terminal_cyan_on_background", 1.389),
-    ("normal_text", "terminal_white_on_background", 1.002),
-    ("normal_text", "terminal_bright_black_on_background", 1.181),
-    ("normal_text", "terminal_bright_red_on_background", 1.862),
-    ("normal_text", "terminal_bright_green_on_background", 1.229),
-    ("normal_text", "terminal_bright_yellow_on_background", 1.193),
-    ("normal_text", "terminal_bright_blue_on_background", 1.361),
-    (
-        "normal_text",
-        "terminal_bright_magenta_on_background",
-        1.304,
-    ),
-    ("normal_text", "terminal_bright_cyan_on_background", 1.196),
-    ("normal_text", "terminal_bright_white_on_background", 1.044),
-    ("normal_text", "action_primary_selected_on_surface", 1.178),
-    ("normal_text", "action_primary_disabled_on_surface", 1.099),
-    (
-        "normal_text",
-        "action_destructive_default_on_surface",
-        1.000,
-    ),
-    ("normal_text", "action_destructive_hover_on_surface", 1.198),
-    ("normal_text", "action_destructive_focus_on_surface", 1.000),
-    (
-        "normal_text",
-        "action_destructive_selected_on_surface",
-        4.276,
-    ),
-    (
-        "normal_text",
-        "action_destructive_disabled_on_surface",
-        1.099,
-    ),
-    ("normal_text", "status_destructive_surface", 4.276),
-    (
-        "ui_indicator",
-        "action_primary_selected_background_on_canvas",
-        1.180,
-    ),
-    (
-        "ui_indicator",
-        "action_primary_selected_border_on_canvas",
-        1.180,
-    ),
-    (
-        "ui_indicator",
-        "action_primary_disabled_background_on_canvas",
-        1.053,
-    ),
-    (
-        "ui_indicator",
-        "action_primary_disabled_border_on_canvas",
-        1.053,
-    ),
-    (
-        "ui_indicator",
-        "action_destructive_selected_background_on_canvas",
-        1.052,
-    ),
-    (
-        "ui_indicator",
-        "action_destructive_selected_border_on_canvas",
-        1.052,
-    ),
-    (
-        "ui_indicator",
-        "action_destructive_disabled_background_on_canvas",
-        1.053,
-    ),
-    (
-        "ui_indicator",
-        "action_destructive_disabled_border_on_canvas",
-        1.053,
-    ),
-    ("ui_indicator", "status_warning_indicator_on_surface", 2.840),
-    ("disabled_text", "text_disabled_on_raised", 2.563),
-    ("disabled_text", "text_disabled_on_canvas", 2.455),
-    ("disabled_text", "text_disabled_on_overlay", 2.332),
-    ("disabled_text", "text_disabled_on_sunken", 2.332),
-    ("disabled_text", "text_disabled_on_hover", 1.734),
-    ("disabled_text", "text_disabled_on_selection", 1.718),
-    ("disabled_text", "text_disabled_on_disabled_surface", 2.332),
-    (
-        "interaction_text",
-        "action_primary_selected_on_surface",
-        1.178,
-    ),
-    (
-        "interaction_text",
-        "action_primary_disabled_on_surface",
-        1.099,
-    ),
-    (
-        "interaction_text",
-        "action_destructive_default_on_surface",
-        1.000,
-    ),
-    (
-        "interaction_text",
-        "action_destructive_hover_on_surface",
-        1.198,
-    ),
-    (
-        "interaction_text",
-        "action_destructive_focus_on_surface",
-        1.000,
-    ),
-    (
-        "interaction_text",
-        "action_destructive_selected_on_surface",
-        4.276,
-    ),
-    (
-        "interaction_text",
-        "action_destructive_disabled_on_surface",
-        1.099,
-    ),
-    ("status_surface", "status_destructive_surface", 4.276),
-    ("runtime_only", "border_disabled_on_surface_disabled", 1.000),
-    (
-        "runtime_only",
-        "text_inverse_on_backdrop_over_raised",
-        2.434,
-    ),
-    (
-        "runtime_only",
-        "text_inverse_on_backdrop_over_canvas",
-        2.523,
-    ),
-    (
-        "runtime_only",
-        "text_inverse_on_backdrop_over_terminal_background",
-        2.523,
-    ),
-    ("runtime_only", "action_primary_disabled_label", 1.099),
-    ("runtime_only", "action_destructive_disabled_label", 1.099),
-];
+const DEFAULT_LIGHT_PROJECTION_DRIFT: &[PinnedDrift] = &[];
 
 /// A default-selection controller whose resolved appearance is *proved* to be
 /// the one asked for. `ThemeController::active_palette` takes the SYSTEM
@@ -1856,11 +1722,6 @@ fn default_selection_light_projection_drift_is_exactly_the_pinned_set() {
 }
 
 #[test]
-#[ignore = "devmanager-classic dark: border_disabled_on_surface_disabled 1.000:1, \
-            action_primary_disabled_background_on_canvas 1.107:1, \
-            action_destructive_hover_on_surface 2.917:1 (13 pairs), pinned by \
-            default_selection_dark_projection_drift_is_exactly_the_pinned_set; tracked in \
-            .superpowers/sdd/2026-09-03-ui-redesign-2-panel-chrome-and-needs-you/lane-tokens-report.md"]
 fn default_selection_dark_projection_meets_every_contrast_floor() {
     let root = tempfile::tempdir().expect("temp profile root");
     let controller =
@@ -1877,9 +1738,6 @@ fn default_selection_dark_projection_meets_every_contrast_floor() {
 }
 
 #[test]
-#[ignore = "devmanager-classic light: action_destructive_default_on_surface 1.000:1, \
-            action_primary_disabled_border_on_canvas 1.053:1 (68 pairs); tracked in \
-            .superpowers/sdd/2026-09-03-ui-redesign-2-panel-chrome-and-needs-you/lane-tokens-report.md"]
 fn default_selection_light_projection_meets_every_contrast_floor() {
     let root = tempfile::tempdir().expect("temp profile root");
     let controller =

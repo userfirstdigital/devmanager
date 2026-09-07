@@ -302,11 +302,9 @@ fn snapshot_listener_endpoints_with_lsof(
         trusted_lsof_program(),
         &["-nP", "-iTCP", "-sTCP:LISTEN", "-F", "pn"],
     )?;
-    if !output.status.success() {
-        return Err("listener_probe.command_failed".to_string());
-    }
+    require_listener_command_success(&output)?;
 
-    let mut listeners = BTreeMap::new();
+    let mut listeners: BTreeMap<u16, Vec<TcpEndpointRecord>> = BTreeMap::new();
     let mut current_pid = None;
     let stdout = std::str::from_utf8(&output.stdout)
         .map_err(|_| "listener_probe.invalid_utf8".to_string())?;
@@ -379,6 +377,15 @@ struct BoundedChildOutput {
     status: std::process::ExitStatus,
     stdout: Vec<u8>,
     stderr: Vec<u8>,
+}
+
+#[cfg(not(windows))]
+fn require_listener_command_success(output: &BoundedChildOutput) -> Result<(), String> {
+    if output.status.success() {
+        Ok(())
+    } else {
+        Err("listener_probe.command_failed".to_string())
+    }
 }
 
 #[cfg(not(windows))]
@@ -1460,7 +1467,9 @@ mod non_windows_tests {
         let error = match run_bounded_command(
             "/bin/sh",
             &["-c", "printf 'secret-path-and-diagnostics' >&2; exit 7"],
-        ) {
+        )
+        .and_then(|output| super::require_listener_command_success(&output))
+        {
             Ok(_) => panic!("nonzero command must fail at the listener boundary"),
             Err(error) => error,
         };
@@ -1631,8 +1640,11 @@ fn windows_terminate_pid(pid: u32) -> Result<(), String> {
     }
 }
 
-#[cfg(all(not(windows), test))]
+#[cfg(not(windows))]
 fn kill_unix_target(pid: u32, as_process_group: bool) -> Result<(), String> {
+    if pid == 0 || pid > i32::MAX as u32 {
+        return Err("invalid process id".to_string());
+    }
     let target = pid.to_string();
     let group_target = format!("-{pid}");
     let mut used_group = as_process_group;
@@ -1761,7 +1773,6 @@ fn unix_process_group_exists(target: &str) -> bool {
 }
 
 #[cfg(not(windows))]
-#[cfg(test)]
 fn wait_for_pid_exit(pid: u32, timeout: Duration) -> bool {
     let started_at = Instant::now();
     while started_at.elapsed() < timeout {

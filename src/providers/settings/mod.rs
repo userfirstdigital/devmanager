@@ -10,6 +10,7 @@ mod metadata_probe;
 mod metadata_types;
 mod model;
 mod profile;
+mod progress;
 pub(crate) mod secret;
 mod store;
 pub(crate) mod usage_http;
@@ -69,3 +70,5 @@ pub use model::{
 pub use profile::ProviderProfileOwner;
 pub use secret::{protect_secret_value, reveal_secret_value, SecretCustodyError};
 pub use store::{ProviderSettingsStore, ProviderSettingsStoreError};
+
+pub use progress::{PlanProgressSettings, DEFAULT_PLAN_INSTRUCTION};

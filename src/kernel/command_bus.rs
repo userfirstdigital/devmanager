@@ -2228,7 +2228,7 @@ mod terminal_and_provider_restart_tests {
                 cols: 120,
                 rows: 40,
                 launch: Some(crate::domain::resource::TerminalLaunch {
-                    cwd: std::path::PathBuf::from(r"C:\Code\demo"),
+                    cwd: std::env::temp_dir().join("demo"),
                     program: std::path::PathBuf::from(r"C:\Windows\System32\cmd.exe"),
                     args: Vec::new(),
                 }),
@@ -2344,7 +2344,7 @@ mod terminal_and_provider_restart_tests {
         assert_eq!(snapshot.terminal_strip.order, vec![second.id, shell.id]);
 
         // Host facts need no revision fence and do not bump the revision.
-        let live_cwd = std::path::PathBuf::from(r"C:\Code\demo\src");
+        let live_cwd = std::env::temp_dir().join("src");
         assert_eq!(
             bus.record_terminal_fact(
                 task_id,

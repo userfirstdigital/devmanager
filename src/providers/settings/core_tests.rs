@@ -56,6 +56,7 @@ fn canonical_default_binding_fingerprint_remains_compatible() {
         BuiltinProviderDriver::Cursor,
     ] {
         let mut instance = ProviderInstanceConfig::builtin_default(driver);
+        instance.plan_progress = super::PlanProgressSettings::default();
         let expected = format!(
             "{:x}",
             Sha256::digest(
@@ -68,7 +69,10 @@ fn canonical_default_binding_fingerprint_remains_compatible() {
         assert!(instance.matches_launch_identity_fingerprint(&expected));
         let dir = tempdir().unwrap();
         let store = ProviderInstanceBindingStore::open_dir(dir.path()).unwrap();
-        let settings = ProviderSettingsDocument::with_builtins();
+        let mut settings = ProviderSettingsDocument::with_builtins();
+        for configured in &mut settings.instances {
+            configured.plan_progress = super::PlanProgressSettings::default();
+        }
         let task = TaskId::new();
         store
             .bind_on_first_launch(
@@ -542,4 +546,38 @@ fn binding_failed_persist_leaves_no_phantom() {
     let owner = ProviderProfileOwner::open_dir_for_test(dir.path()).unwrap();
     // First launch deferred binding must not be readable until commit.
     assert!(owner.bindings.get(&TaskId::new()).is_none());
+}
+
+#[test]
+fn planning_preferences_survive_storage_and_change_launch_identity() {
+    let mut instance = ProviderInstanceConfig::builtin_default(BuiltinProviderDriver::Claude);
+    assert!(instance.plan_progress.enabled);
+    let mut old_document = serde_json::to_value(&instance).unwrap();
+    old_document.as_object_mut().unwrap().remove("planProgress");
+    let restored: ProviderInstanceConfig = serde_json::from_value(old_document).unwrap();
+    assert!(
+        !restored.plan_progress.enabled,
+        "an old configured instance must keep its launch behavior"
+    );
+    assert_ne!(
+        instance.launch_identity_fingerprint(),
+        restored.launch_identity_fingerprint()
+    );
+    let before = instance.launch_identity_fingerprint();
+    instance.plan_progress.instruction = "Track the requested steps.".into();
+    assert_ne!(before, instance.launch_identity_fingerprint());
+    let encoded = serde_json::to_vec(&instance).unwrap();
+    assert_eq!(
+        serde_json::from_slice::<ProviderInstanceConfig>(&encoded).unwrap(),
+        instance
+    );
+    let resolved = super::resolve_launch_config(&instance, b"planning-test", None).unwrap();
+    assert!(resolved
+        .extra_launch_args
+        .iter()
+        .any(|arg| arg == "Track the requested steps."));
+    assert!(resolved
+        .extra_launch_args
+        .iter()
+        .any(|arg| arg == "default,TaskCreate,TaskUpdate,TaskList"));
 }

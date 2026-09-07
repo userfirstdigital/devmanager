@@ -145,6 +145,7 @@ pub enum TimelineItemId {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SemanticEvent {
+    pub(crate) subagent_id: Option<String>,
     pub(crate) event_id: EventId,
     pub(crate) task_id: TaskId,
     pub(crate) schema_version: u16,
@@ -550,6 +551,7 @@ pub fn parse_semantic_event(value: &Value) -> Result<ParsedSemanticEvent, Render
 #[cfg(any(test, feature = "semantic-conformance"))]
 fn parse_envelope(value: &Value) -> Result<SemanticEvent, RenderModelError> {
     Ok(SemanticEvent {
+        subagent_id: None,
         event_id: parse_id(value, "event_id", EventId::parse)?,
         task_id: parse_id(value, "task_id", TaskId::parse)?,
         schema_version: value
