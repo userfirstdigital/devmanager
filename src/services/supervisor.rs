@@ -1747,7 +1747,7 @@ fn redact_log_text(text: &str, overlay: &EnvironmentOverlay) -> String {
     crate::domain::cockpit::truncate_to_max_bytes(&redacted, MAX_SERVICE_LOG_LINE_BYTES)
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "linux"))]
 pub fn prepare_managed_service_pty(
     slave: &dyn portable_pty::SlavePty,
     spec: ManagedLaunchSpec,

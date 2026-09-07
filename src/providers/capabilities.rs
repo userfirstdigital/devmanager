@@ -3759,6 +3759,12 @@ impl ProviderExecutablePolicy {
         if is_forbidden_runner_name(file_name) {
             return Err(ProviderExecutablePolicyViolation::ForbiddenRunner);
         }
+        #[cfg(target_os = "linux")]
+        if self.entrypoints.iter().any(|declared| declared == "claude")
+            && is_linux_claude_version(canonical_path)
+        {
+            return Ok(());
+        }
         if self
             .entrypoints
             .iter()
@@ -6584,5 +6590,32 @@ mod path_snapshot_tests {
         let snapshot = ProviderPathSnapshot::capture(path)
             .expect("an empty PATH slot must not abort later trusted directories");
         assert_eq!(snapshot.len(), 2);
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod linux_stock_policy_tests {
+    use super::*;
+    #[test]
+    fn claude_probe_policy_matches_the_attested_linux_installer_contract() {
+        let policy = ProviderExecutablePolicy::new(["claude"]).unwrap();
+        assert!(policy
+            .validate_canonical_path(Path::new("/home/test/.local/share/claude/versions/2.1.263"))
+            .is_ok());
+        for path in [
+            "/tmp/2.1.263",
+            "/tmp/other/versions/2.1.263",
+            "/tmp/claude/versions/bash",
+            "/tmp/claude/versions/2.1",
+        ] {
+            assert!(
+                policy.validate_canonical_path(Path::new(path)).is_err(),
+                "{path}"
+            );
+        }
+        let codex = ProviderExecutablePolicy::new(["codex"]).unwrap();
+        assert!(codex
+            .validate_canonical_path(Path::new("/tmp/claude/versions/2.1.263"))
+            .is_err());
     }
 }

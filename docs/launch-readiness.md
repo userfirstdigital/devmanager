@@ -140,6 +140,15 @@ Five live cgroup checks, both registry regression tests, and
 `cargo check --locked --lib --bins --tests` passed for this source wave.
 No owned harness, Cargo, compiler, guardian or session cgroup remained afterward.
 
+Linux managed ownership now feeds production terminal, provider and configured-service
+launch paths. A live PTY test passed input/output, exact generation restart, member
+observations and joined actor cleanup. Both installed Claude/Codex stock probes,
+32 terminal regressions and the all-target compiler check passed. The rebuilt
+X11 app reached canonical Ready in 614 ms; its project picker was exercised with
+physical keyboard input. The 960 × 640 minimum preserves the complete dialog under
+desktop tiling. Live project creation exposed an error-handling bug that leaves
+“Adding…” pending; that is the next UI acceptance gate.
+
 ## Remaining launch gates
 
 - [ ] Complete Linux provider ownership and discovery,

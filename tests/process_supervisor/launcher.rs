@@ -509,6 +509,9 @@ mod windows {
 
 #[cfg(not(windows))]
 #[test]
-fn suspended_managed_pty_is_windows_only() {
-    assert!(devmanager::process::launcher::is_supported().is_err());
+fn managed_pty_support_matches_native_ownership_backend() {
+    assert_eq!(
+        devmanager::process::launcher::is_supported().is_ok(),
+        cfg!(target_os = "linux")
+    );
 }

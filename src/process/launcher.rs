@@ -449,23 +449,26 @@ fn validation_error(detail: impl Into<String>) -> ManagedLaunchError {
 
 #[cfg(all(test, not(windows)))]
 pub(crate) fn is_supported() -> Result<(), ManagedLaunchError> {
-    if cfg!(windows) {
+    if cfg!(any(windows, target_os = "linux")) {
         Ok(())
     } else {
         Err(ManagedLaunchError::new(
             ManagedLaunchStage::Unsupported,
-            "suspended managed PTY launch is available only on Windows",
+            "managed PTY ownership requires Windows or Linux",
         ))
     }
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "linux"))]
 #[must_use = "a pending managed launch must be registered and resumed or dropped to abort"]
 #[derive(Debug)]
 pub(crate) struct PendingManagedLaunch {
     // Keep pending first: ordinary field drop order aborts the child before the
     // final Job handle is closed if a caller abandons this value.
+    #[cfg(windows)]
     pending: portable_pty::win::PendingChild,
+    #[cfg(target_os = "linux")]
+    pending: crate::process::linux_cgroup::PendingLinuxChild,
     job: ManagedProcessJob,
     fence: ResourceFence,
     owner: ProcessOwner,
@@ -473,7 +476,7 @@ pub(crate) struct PendingManagedLaunch {
     display_label: ProcessDisplayLabel,
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "linux"))]
 impl PendingManagedLaunch {
     #[cfg(test)]
     pub(crate) fn process_id(&self) -> u32 {
@@ -534,15 +537,18 @@ impl PendingManagedLaunch {
 /// A suspended root whose exact Job and identity fence are already present in
 /// the authoritative registry.  The host can build every fallible teardown
 /// adapter around this value before crossing the one-way resume boundary.
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "linux"))]
 #[must_use = "a registered suspended launch must be resumed or dropped to abort"]
 #[derive(Debug)]
 pub(crate) struct RegisteredPendingManagedLaunch {
+    #[cfg(windows)]
     pending: portable_pty::win::PendingChild,
+    #[cfg(target_os = "linux")]
+    pending: crate::process::linux_cgroup::PendingLinuxChild,
     fence: crate::process::registry::ManagedProcessFence,
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "linux"))]
 impl RegisteredPendingManagedLaunch {
     pub(crate) fn fence(&self) -> &crate::process::registry::ManagedProcessFence {
         &self.fence
@@ -589,14 +595,14 @@ impl RegisteredPendingManagedLaunch {
     }
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "linux"))]
 #[derive(Debug)]
 pub(crate) struct ManagedPtyChild {
     child: Box<dyn Child + Send + Sync>,
     fence: crate::process::registry::ManagedProcessFence,
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "linux"))]
 impl ManagedPtyChild {
     pub(crate) fn fence(&self) -> &crate::process::registry::ManagedProcessFence {
         &self.fence
@@ -909,4 +915,102 @@ mod tests {
             "a path inside the character limit must still be rewritten: {launchable:?}"
         );
     }
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn prepare_suspended_pty(
+    slave: &dyn SlavePty,
+    intent: LaunchIntent,
+) -> Result<PendingManagedLaunch, ManagedLaunchError> {
+    prepare_attested_linux_pty(slave, intent, None)
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn prepare_attested_linux_pty(
+    slave: &dyn SlavePty,
+    intent: LaunchIntent,
+    attested: Option<&crate::providers::capabilities::ProviderExecutable>,
+) -> Result<PendingManagedLaunch, ManagedLaunchError> {
+    use crate::providers::capabilities::ProviderExecutable;
+    use std::time::{Duration, Instant};
+    let intent = intent.validate()?;
+    let executable = match attested {
+        Some(executable) if executable.canonical_path() == intent.executable => executable.clone(),
+        Some(_) => {
+            return Err(validation_error(
+                "provider executable differs from its launch authority",
+            ))
+        }
+        None => ProviderExecutable::inspect_blocking(&intent.executable)
+            .map_err(|e| validation_error(e.to_string()))?,
+    };
+    let mut environment: BTreeMap<OsString, OsString> = if intent.replace_environment {
+        BTreeMap::new()
+    } else {
+        std::env::vars_os().collect()
+    };
+    environment.extend(intent.environment);
+    if !intent.replace_environment {
+        environment.remove(OsStr::new("NO_COLOR"));
+        environment.remove(OsStr::new("NODE_DISABLE_COLORS"));
+    }
+    for key in [
+        "DEVMANAGER_TASK_ID",
+        "DEVMANAGER_RESOURCE_ID",
+        "DEVMANAGER_RESOURCE_KIND",
+        "DEVMANAGER_PROCESS_LABEL",
+    ] {
+        environment.remove(OsStr::new(key));
+    }
+    environment.insert(
+        "DEVMANAGER_RESOURCE_ID".into(),
+        intent.fence.resource_id.to_string().into(),
+    );
+    environment.insert(
+        "DEVMANAGER_RESOURCE_KIND".into(),
+        match intent.kind {
+            ResourceKind::Terminal => "terminal",
+            ResourceKind::BrowserContext => "browser",
+            ResourceKind::Service => "service",
+        }
+        .into(),
+    );
+    environment.insert(
+        "DEVMANAGER_PROCESS_LABEL".into(),
+        intent.display_label.as_str().into(),
+    );
+    if let ProcessOwner::Task(task_id) = intent.owner {
+        environment.insert("DEVMANAGER_TASK_ID".into(), task_id.to_string().into());
+    }
+    let guardian = std::env::current_exe().map_err(|e| validation_error(e.to_string()))?;
+    // Each unit harness uses the explicitly built sibling helper. Production
+    // app and host binaries both dispatch guardian mode before initialization.
+    #[cfg(test)]
+    let guardian = guardian
+        .parent()
+        .and_then(|p| p.parent())
+        .ok_or_else(|| validation_error("test helper directory unavailable"))?
+        .join("devmanager-process-test-helper");
+    let slave = slave
+        .try_clone_owned_fd()
+        .map_err(|e| ManagedLaunchError::new(ManagedLaunchStage::ProcessCreation, e.to_string()))?;
+    let (pending, session) = crate::process::linux_cgroup::LinuxCgroup::spawn(
+        &guardian,
+        slave,
+        &executable,
+        &intent.args,
+        &intent.cwd,
+        &environment,
+        Instant::now() + Duration::from_secs(5),
+    )
+    .map_err(|e| ManagedLaunchError::new(ManagedLaunchStage::ProcessCreation, e.to_string()))?;
+    let root = session.root().clone();
+    Ok(PendingManagedLaunch {
+        pending,
+        job: ManagedProcessJob::from_linux_session(session),
+        fence: intent.fence,
+        owner: intent.owner,
+        root,
+        display_label: intent.display_label,
+    })
 }

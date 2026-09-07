@@ -7,20 +7,20 @@
 
 use std::collections::VecDeque;
 use std::future::Future;
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "linux"))]
 use std::io::Write;
 use std::panic::AssertUnwindSafe;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, TryLockError};
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "linux"))]
 use std::sync::{RwLock, RwLockReadGuard, RwLockWriteGuard};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use futures_util::FutureExt;
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "linux"))]
 use portable_pty::MasterPty;
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
@@ -34,9 +34,9 @@ use crate::process::registry::{ManagedProcessFence, ManagedProcessState, Process
 #[cfg(test)]
 use crate::process::registry::{ProcessDisplayLabel, RegisteredProcess};
 
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "linux"))]
 use crate::process::job::{JobMemberObservation, ManagedProcessJob};
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "linux"))]
 use crate::process::launcher::{
     ManagedPtyChild, PendingManagedLaunch, RegisteredPendingManagedLaunch,
 };
@@ -559,7 +559,7 @@ fn lock_mutex_until<'a, T>(
     }
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "linux"))]
 fn lock_rw_read_until<'a, T>(
     lock: &'a RwLock<T>,
     absolute_deadline: Instant,
@@ -582,7 +582,7 @@ fn lock_rw_read_until<'a, T>(
     }
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "linux"))]
 fn lock_rw_write_until<'a, T>(
     lock: &'a RwLock<T>,
     absolute_deadline: Instant,
@@ -1151,7 +1151,7 @@ impl TeardownHostAdapters {
     /// host implementation declared in this module. This is stronger than a
     /// marker trait: no other crate module can install a synchronously
     /// blocking future constructor in the shutdown worker boundary.
-    #[cfg(windows)]
+    #[cfg(any(windows, target_os = "linux"))]
     fn terminal(
         admission: Arc<TerminalTeardownAdmission>,
         effects: Arc<TerminalTeardownEffects>,
@@ -1169,7 +1169,7 @@ impl TeardownHostAdapters {
 /// Windows.  The managed Job is moved into the process registry at creation;
 /// terminal close/restart/drop can therefore never fall back to PID- or
 /// `ChildKiller`-selected termination once a session is live.
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "linux"))]
 #[derive(Default)]
 pub(crate) struct ManagedTerminalActorHandles {
     pub(crate) reader: Option<JoinHandle<()>>,
@@ -1179,7 +1179,7 @@ pub(crate) struct ManagedTerminalActorHandles {
 /// Concrete native-terminal resources detached only after receiver-owned
 /// ACTIVE_PROCESS_ZERO.  The slots are created before the suspended process
 /// is resumed, so every setup-failure path is covered by the same adapter.
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "linux"))]
 pub(crate) struct ManagedTerminalIo {
     writer: Arc<Mutex<Box<dyn Write + Send>>>,
     master: Arc<Mutex<Option<Box<dyn MasterPty + Send>>>>,
@@ -1188,7 +1188,7 @@ pub(crate) struct ManagedTerminalIo {
     detached: AtomicBool,
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "linux"))]
 impl ManagedTerminalIo {
     pub(crate) fn new(
         writer: Arc<Mutex<Box<dyn Write + Send>>>,
@@ -1343,6 +1343,7 @@ impl ManagedTerminalIo {
                 // only cancels that actor's synchronous PTY/wait operation;
                 // ownership remains in the slot until it acknowledges and is
                 // joined below.
+                #[cfg(windows)]
                 unsafe {
                     let _ = CancelSynchronousIo(handle.as_raw_handle());
                 }
@@ -1368,7 +1369,7 @@ impl ManagedTerminalIo {
     }
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "linux"))]
 pub(crate) fn validate_terminal_teardown_inputs(
     session_id: &str,
     action_epoch: u64,
@@ -1391,7 +1392,7 @@ pub(crate) fn validate_terminal_teardown_inputs(
     Ok(normalized)
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "linux"))]
 pub(crate) struct ManagedTerminalTeardown {
     coordinator: Arc<TeardownCoordinator>,
     ticket: TeardownTicket,
@@ -1407,14 +1408,14 @@ pub(crate) struct ManagedTerminalTeardown {
     armed: AtomicBool,
 }
 
-#[cfg(all(test, windows))]
+#[cfg(all(test, any(windows, target_os = "linux")))]
 struct TerminalReleaseTestBarrier {
     attempted: std::sync::mpsc::SyncSender<()>,
     resume: Mutex<std::sync::mpsc::Receiver<()>>,
     released: std::sync::mpsc::SyncSender<()>,
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "linux"))]
 struct ManagedTerminalTeardownState {
     registry: ProcessRegistry<ManagedProcessJob>,
     fence: ManagedProcessFence,
@@ -1428,7 +1429,7 @@ struct ManagedTerminalTeardownState {
     settlement_persisted: bool,
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "linux"))]
 impl ManagedTerminalTeardown {
     /// Completes the one safe production PTY handoff: the suspended root is
     /// registered in the exact Job-backed registry and only then resumed.
@@ -1821,7 +1822,7 @@ impl ManagedTerminalTeardown {
     }
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "linux"))]
 impl Drop for ManagedTerminalTeardown {
     fn drop(&mut self) {
         if self.armed.load(Ordering::Acquire) {
@@ -1856,7 +1857,7 @@ impl Drop for ManagedTerminalTeardown {
     }
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "linux"))]
 struct TerminalTeardownAdmission {
     fence: ManagedProcessFence,
     scope: TeardownScope,
@@ -1864,10 +1865,10 @@ struct TerminalTeardownAdmission {
     state: Mutex<AdmissionState>,
 }
 
-#[cfg(all(windows, not(test)))]
+#[cfg(all(any(windows, target_os = "linux"), not(test)))]
 impl sealed::Admission for TerminalTeardownAdmission {}
 
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "linux"))]
 impl TerminalTeardownAdmission {
     fn new(fence: ManagedProcessFence, scope: TeardownScope, action_epoch: u64) -> Self {
         Self {
@@ -1892,7 +1893,7 @@ impl TerminalTeardownAdmission {
     }
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "linux"))]
 impl TeardownAdmission for TerminalTeardownAdmission {
     fn close_admission(
         &self,
@@ -1982,7 +1983,7 @@ impl TeardownAdmission for TerminalTeardownAdmission {
     }
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "linux"))]
 struct TerminalTeardownEffects {
     state: Arc<Mutex<ManagedTerminalTeardownState>>,
     publication_release_guard: Arc<RwLock<()>>,
@@ -1990,10 +1991,10 @@ struct TerminalTeardownEffects {
     release_test_barrier: Arc<Mutex<Option<Arc<TerminalReleaseTestBarrier>>>>,
 }
 
-#[cfg(all(windows, not(test)))]
+#[cfg(all(any(windows, target_os = "linux"), not(test)))]
 impl sealed::Effects for TerminalTeardownEffects {}
 
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "linux"))]
 impl TerminalTeardownEffects {
     fn validate_ticket(
         state: &ManagedTerminalTeardownState,
@@ -2035,7 +2036,7 @@ impl TerminalTeardownEffects {
     }
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "linux"))]
 impl TeardownEffects for TerminalTeardownEffects {
     fn drain<'a>(
         &'a self,

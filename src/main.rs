@@ -10,6 +10,10 @@ fn main() -> ExitCode {
     // Sole product desktop entry: one native GPUI client plus durable host.
     // Hook relays and debug-only --ui-preview run before the product shell.
     let args = std::env::args().skip(1).collect::<Vec<_>>();
+    #[cfg(target_os = "linux")]
+    if let Some(code) = devmanager::process::linux_cgroup::run_guardian_subcommand(&args) {
+        return code;
+    }
     if let Some(exit_code) =
         devmanager::ai::claude_hooks::run_hook_relay_subcommand(&args, std::io::stdin().lock())
     {

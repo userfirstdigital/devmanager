@@ -50,9 +50,9 @@ use crate::state::{
     SessionExitState, SessionKind, SessionRuntimeState, SessionStatus, SshLaunchSpec,
 };
 use crate::terminal::protocol::TerminalSessionId;
-#[cfg(not(windows))]
+#[cfg(not(any(windows, target_os = "linux")))]
 use crate::terminal::session::ManagedProcessObservationQuery;
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "linux"))]
 use crate::terminal::session::ManagedResourceSamplePublication;
 use crate::terminal::session::{
     bash_shell_args, preferred_windows_bash_program, ManagedProcessObservationCapture,
@@ -3402,12 +3402,12 @@ impl ProcessManager {
                 }
             });
         }
-        #[cfg(not(windows))]
+        #[cfg(not(any(windows, target_os = "linux")))]
         {
             let _ = request;
             return Err(ProviderLaunchError::Unsupported);
         }
-        #[cfg(windows)]
+        #[cfg(any(windows, target_os = "linux"))]
         {
             let session_id = format!("provider-{}", request.terminal_id());
             if !request.launch_spec().executable().is_native() {
@@ -3502,6 +3502,9 @@ impl ProcessManager {
                     self.cleanup_ai_adapters_for_session(&session_id);
                     ProviderLaunchError::SpawnFailed
                 })?;
+            #[cfg(target_os = "linux")]
+            let authority =
+                authority.with_provider_executable(request.launch_spec().executable().clone());
             let session = TerminalSession::spawn_command(
                 session_id.clone(),
                 request.launch_spec().cwd().to_path_buf(),
@@ -3634,12 +3637,12 @@ impl ProcessManager {
         use crate::process::registry::{JoinedActiveProcessZeroProof, RegistryIssuedZeroReceipt};
         use crate::providers::session::ProviderLaunchError;
 
-        #[cfg(not(windows))]
+        #[cfg(not(any(windows, target_os = "linux")))]
         {
             let _ = lease;
             return Err(ProviderLaunchError::Unsupported);
         }
-        #[cfg(windows)]
+        #[cfg(any(windows, target_os = "linux"))]
         {
             let key = (
                 lease.fence().resource().resource_id,
@@ -3691,12 +3694,12 @@ impl ProcessManager {
     > {
         use crate::providers::session::ProviderLaunchError;
 
-        #[cfg(not(windows))]
+        #[cfg(not(any(windows, target_os = "linux")))]
         {
             let _ = lease;
             return Err(ProviderLaunchError::Unsupported);
         }
-        #[cfg(windows)]
+        #[cfg(any(windows, target_os = "linux"))]
         {
             let key = (
                 lease.fence().resource().resource_id,
@@ -3813,12 +3816,12 @@ impl ProcessManager {
         use crate::process::sampler::ExactProcessIdentityStatus;
         use crate::providers::session::{ProviderLaunchError, ProviderRecoveryZeroSettlement};
 
-        #[cfg(not(windows))]
+        #[cfg(not(any(windows, target_os = "linux")))]
         {
             let _ = state;
             return Err(ProviderLaunchError::Unsupported);
         }
-        #[cfg(windows)]
+        #[cfg(any(windows, target_os = "linux"))]
         {
             let key = crate::providers::session::RecoveryKey::from_state(state);
             let live_key = (state.launch_spec().resource_id(), state.generation());
@@ -3893,7 +3896,7 @@ impl ProcessManager {
         let session = self
             .get_session(&live.session_id)
             .map_err(|_| ProviderInputDeliveryError::SessionNotBound)?;
-        #[cfg(windows)]
+        #[cfg(any(windows, target_os = "linux"))]
         {
             let current = session
                 .managed_process_fence()
@@ -4008,7 +4011,7 @@ impl ProcessManager {
         let session = self
             .get_session(&live.session_id)
             .map_err(|_| ProviderInputDeliveryError::SessionNotBound)?;
-        #[cfg(windows)]
+        #[cfg(any(windows, target_os = "linux"))]
         {
             let current = session
                 .managed_process_fence()
@@ -6024,12 +6027,12 @@ fn refresh_resource_snapshots_with_source(
                     None => match terminal_sessions.get(session_id) {
                         Some(session) => {
                             tick_budget.note_job_query();
-                            #[cfg(windows)]
+                            #[cfg(any(windows, target_os = "linux"))]
                             let query = session.managed_process_observations_until(
                                 tick_budget.deadline(),
                                 query_member_limit,
                             );
-                            #[cfg(not(windows))]
+                            #[cfg(not(any(windows, target_os = "linux")))]
                             let query: Result<
                                 Option<ManagedProcessObservationQuery>,
                                 String,
@@ -6241,7 +6244,7 @@ fn refresh_resource_snapshots_with_source(
     let mut cleared_reap_sessions = Vec::new();
     let mut direct_snapshots = Vec::new();
     for (session_id, snapshot, awaiting_external_editor, terminal_session, capture) in snapshots {
-        #[cfg(windows)]
+        #[cfg(any(windows, target_os = "linux"))]
         if source.is_none() {
             let publication = match (terminal_session.as_ref(), capture.as_ref()) {
                 (Some(session), Some(capture)) => session
@@ -7611,14 +7614,14 @@ fn close_exact_session_owner(
         clear_unowned_managed_process_projection(inner, session_id, closed_by_user);
         return Ok(false);
     };
-    #[cfg(windows)]
+    #[cfg(any(windows, target_os = "linux"))]
     {
         let fence = session
             .managed_process_fence()?
             .ok_or_else(|| "Managed terminal teardown authority is missing".to_string())?;
         session.close_managed_process_exact(&fence, closed_by_user)?;
     }
-    #[cfg(not(windows))]
+    #[cfg(not(any(windows, target_os = "linux")))]
     session.close(closed_by_user)?;
 
     let removed = {
@@ -10524,7 +10527,7 @@ fn settle_server_port_start(
             .observation(port)
             .map(|observation| observation.listeners())
             .unwrap_or(&[]);
-        #[cfg(windows)]
+        #[cfg(any(windows, target_os = "linux"))]
         let settlement =
             match current_job_members_for_port_settlement(inner, &launch.command_id, deadline) {
                 Ok(Some(job_members)) => classify_post_launch_settlement_with_job_authority(
@@ -10543,7 +10546,7 @@ fn settle_server_port_start(
                     true,
                 ),
             };
-        #[cfg(not(windows))]
+        #[cfg(not(any(windows, target_os = "linux")))]
         let settlement: Result<_, String> = Ok(classify_post_launch_listener_settlement(
             listeners,
             |listener| listener_matches_session(inner, &launch.command_id, listener),
@@ -10661,7 +10664,7 @@ fn live_runtime_root_pid(inner: &Arc<ProcessManagerInner>, session_id: &str) -> 
 /// port. The TerminalSession API retains the Job handle and returns an identity
 /// snapshot tied to its current generation, without exposing termination
 /// authority or accepting a raw PID as proof.
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "linux"))]
 fn current_job_members_for_port_settlement(
     inner: &Arc<ProcessManagerInner>,
     session_id: &str,
@@ -10912,10 +10915,10 @@ fn close_managed_process_exact(
         ));
     };
 
-    #[cfg(windows)]
+    #[cfg(any(windows, target_os = "linux"))]
     session.close_managed_process_exact(fence, true)?;
-    #[cfg(not(windows))]
-    return Err("Exact managed-process close is unavailable off Windows".to_string());
+    #[cfg(not(any(windows, target_os = "linux")))]
+    return Err("Exact managed-process close requires Windows or Linux".to_string());
 
     let removed = {
         let mut sessions = inner

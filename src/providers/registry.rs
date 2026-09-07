@@ -1679,3 +1679,39 @@ fn map_discovery_error(
         other => ProviderError::Discovery(other),
     }
 }
+
+#[cfg(all(test, target_os = "linux"))]
+mod linux_stock_cli_acceptance {
+    use super::*;
+    #[tokio::test]
+    #[ignore = "inspects installed Claude and Codex CLIs in the current Linux user session"]
+    async fn linux_stock_clis_resolve_and_probe_through_production_registry() {
+        let registry = crate::providers::startup::stock_provider_registry().unwrap();
+        let config = ProviderDiscoveryConfig {
+            child_environment: [
+                "HOME",
+                "PATH",
+                "SHELL",
+                "TERM",
+                "XDG_CONFIG_HOME",
+                "XDG_DATA_HOME",
+                "XDG_RUNTIME_DIR",
+            ]
+            .into_iter()
+            .filter_map(|key| std::env::var_os(key).map(|value| (key.into(), value)))
+            .collect(),
+            ..Default::default()
+        };
+        for kind in [ProviderKind::ClaudeCode, ProviderKind::Codex] {
+            let observation = registry
+                .observe(kind, &config)
+                .await
+                .unwrap_or_else(|e| panic!("stock {kind:?} observation failed: {e}"));
+            assert_eq!(observation.kind(), kind);
+            assert!(observation.executable().is_native());
+            observation
+                .validate()
+                .expect("current stock capability facts");
+        }
+    }
+}

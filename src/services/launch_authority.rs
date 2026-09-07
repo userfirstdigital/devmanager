@@ -10,7 +10,7 @@ use std::{
     sync::{Arc, Mutex},
 };
 
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "linux"))]
 use std::{
     ffi::OsString,
     io::{Read, Write},
@@ -19,7 +19,7 @@ use std::{
     thread,
 };
 
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "linux"))]
 use portable_pty::{native_pty_system, MasterPty, PtySize, SlavePty};
 
 use crate::{
@@ -32,7 +32,7 @@ use crate::{
     },
 };
 
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "linux"))]
 use crate::{
     domain::{operation::ResourceFence, resource::ResourceKind},
     process::{
@@ -44,15 +44,15 @@ use crate::{
     },
 };
 
-#[cfg(not(windows))]
+#[cfg(not(any(windows, target_os = "linux")))]
 use crate::domain::{operation::ResourceFence, resource::ResourceKind};
 
 const MAX_SERVICE_AUTHORITY_RESOURCES: usize = 256;
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "linux"))]
 const MAX_SERVICE_PTY_DRAIN_CHUNK: usize = 4_096;
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "linux"))]
 const MAX_SERVICE_LOG_LINE_BYTES: usize = 256;
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "linux"))]
 const MAX_SERVICE_OUTPUT_LINES: usize = 64;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -151,11 +151,11 @@ impl ServiceLaunchIssuer {
             .checked_add(1)
             .ok_or_else(|| "service action epoch space is exhausted".to_string())?;
         if state.completion_store.is_none() {
-            #[cfg(windows)]
+            #[cfg(any(windows, target_os = "linux"))]
             {
                 state.completion_store = Some(TeardownCompletionStore::for_terminal_host()?);
             }
-            #[cfg(not(windows))]
+            #[cfg(not(any(windows, target_os = "linux")))]
             {
                 state.completion_store = Some(TeardownCompletionStore::default());
             }
@@ -174,7 +174,7 @@ impl Default for ServiceLaunchIssuer {
     }
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "linux"))]
 enum PendingStage {
     Prepared {
         pending: PendingManagedLaunch,
@@ -195,24 +195,24 @@ enum PendingStage {
 }
 
 pub struct HostPendingLaunch {
-    #[cfg(windows)]
+    #[cfg(any(windows, target_os = "linux"))]
     stage: PendingStage,
-    #[cfg(not(windows))]
+    #[cfg(not(any(windows, target_os = "linux")))]
     _private: (),
 }
 
 pub struct HostLiveLaunch {
-    #[cfg(windows)]
+    #[cfg(any(windows, target_os = "linux"))]
     teardown: Arc<ManagedTerminalTeardown>,
-    #[cfg(windows)]
+    #[cfg(any(windows, target_os = "linux"))]
     fence: ResourceFence,
-    #[cfg(windows)]
+    #[cfg(any(windows, target_os = "linux"))]
     output_lines: Arc<Mutex<VecDeque<String>>>,
-    #[cfg(windows)]
+    #[cfg(any(windows, target_os = "linux"))]
     exit_code: Arc<Mutex<Option<Option<i32>>>>,
-    #[cfg(windows)]
+    #[cfg(any(windows, target_os = "linux"))]
     writer: Arc<Mutex<Box<dyn Write + Send>>>,
-    #[cfg(not(windows))]
+    #[cfg(not(any(windows, target_os = "linux")))]
     _private: (),
 }
 
@@ -256,14 +256,14 @@ impl ManagedLaunchAuthority for HostManagedLaunchAuthority {
         &mut self,
         spec: &ManagedLaunchSpec,
     ) -> Result<Self::Pending, SupervisorError> {
-        #[cfg(not(windows))]
+        #[cfg(not(any(windows, target_os = "linux")))]
         {
             let _ = spec;
             Err(SupervisorError::Launch {
                 stage: ManagedLaunchStage::Prepare,
             })
         }
-        #[cfg(windows)]
+        #[cfg(any(windows, target_os = "linux"))]
         {
             if spec.generation == 0
                 || !matches!(spec.kind, ResourceKind::Service | ResourceKind::Terminal)
@@ -363,14 +363,14 @@ impl ManagedLaunchAuthority for HostManagedLaunchAuthority {
         &mut self,
         mut pending: Self::Pending,
     ) -> Result<Self::Pending, SupervisorError> {
-        #[cfg(not(windows))]
+        #[cfg(not(any(windows, target_os = "linux")))]
         {
             let _ = pending;
             Err(SupervisorError::Launch {
                 stage: ManagedLaunchStage::Register,
             })
         }
-        #[cfg(windows)]
+        #[cfg(any(windows, target_os = "linux"))]
         {
             let PendingStage::Prepared {
                 ref mut registered, ..
@@ -391,14 +391,14 @@ impl ManagedLaunchAuthority for HostManagedLaunchAuthority {
     }
 
     fn resume(&mut self, pending: Self::Pending) -> Result<Self::Live, SupervisorError> {
-        #[cfg(not(windows))]
+        #[cfg(not(any(windows, target_os = "linux")))]
         {
             let _ = pending;
             Err(SupervisorError::Launch {
                 stage: ManagedLaunchStage::Resume,
             })
         }
-        #[cfg(windows)]
+        #[cfg(any(windows, target_os = "linux"))]
         {
             let PendingStage::Prepared {
                 pending,
@@ -491,12 +491,12 @@ impl ManagedLaunchAuthority for HostManagedLaunchAuthority {
         live: &mut Option<Self::Live>,
         fence: ResourceFence,
     ) -> Result<(), SupervisorError> {
-        #[cfg(not(windows))]
+        #[cfg(not(any(windows, target_os = "linux")))]
         {
             let _ = (live, fence);
             Err(SupervisorError::TeardownFailed)
         }
-        #[cfg(windows)]
+        #[cfg(any(windows, target_os = "linux"))]
         {
             let Some(handle) = live.take() else {
                 return Ok(());
@@ -524,14 +524,14 @@ impl ManagedLaunchAuthority for HostManagedLaunchAuthority {
         bytes: &[u8],
         fence: ResourceFence,
     ) -> Result<(), SupervisorError> {
-        #[cfg(not(windows))]
+        #[cfg(not(any(windows, target_os = "linux")))]
         {
             let _ = (live, bytes, fence);
             Err(SupervisorError::Launch {
                 stage: ManagedLaunchStage::Resume,
             })
         }
-        #[cfg(windows)]
+        #[cfg(any(windows, target_os = "linux"))]
         {
             if live.fence != fence {
                 return Err(SupervisorError::TeardownFailed);
@@ -549,12 +549,12 @@ impl ManagedLaunchAuthority for HostManagedLaunchAuthority {
     }
 
     fn drain_output_lines(&self, live: &Self::Live) -> Vec<String> {
-        #[cfg(not(windows))]
+        #[cfg(not(any(windows, target_os = "linux")))]
         {
             let _ = live;
             Vec::new()
         }
-        #[cfg(windows)]
+        #[cfg(any(windows, target_os = "linux"))]
         {
             let Ok(mut queue) = live.output_lines.lock() else {
                 return Vec::new();
@@ -564,12 +564,12 @@ impl ManagedLaunchAuthority for HostManagedLaunchAuthority {
     }
 
     fn take_exit(&self, live: &Self::Live) -> Option<Option<i32>> {
-        #[cfg(not(windows))]
+        #[cfg(not(any(windows, target_os = "linux")))]
         {
             let _ = live;
             None
         }
-        #[cfg(windows)]
+        #[cfg(any(windows, target_os = "linux"))]
         {
             let Ok(mut slot) = live.exit_code.lock() else {
                 return None;
@@ -579,12 +579,12 @@ impl ManagedLaunchAuthority for HostManagedLaunchAuthority {
     }
 
     fn live_generation(live: &Self::Live) -> u64 {
-        #[cfg(not(windows))]
+        #[cfg(not(any(windows, target_os = "linux")))]
         {
             let _ = live;
             0
         }
-        #[cfg(windows)]
+        #[cfg(any(windows, target_os = "linux"))]
         {
             live.fence.runtime_generation
         }
@@ -599,7 +599,7 @@ impl ManagedLaunchAuthority for HostManagedLaunchAuthority {
     }
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "linux"))]
 fn spawn_service_pty_reader(
     mut reader: Box<dyn Read + Send>,
     output_lines: Arc<Mutex<VecDeque<String>>>,
@@ -644,7 +644,7 @@ fn spawn_service_pty_reader(
         })
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "linux"))]
 fn push_service_output_line(output_lines: &Mutex<VecDeque<String>>, mut line: String) {
     if line.len() > MAX_SERVICE_LOG_LINE_BYTES {
         line.truncate(MAX_SERVICE_LOG_LINE_BYTES);
@@ -657,7 +657,7 @@ fn push_service_output_line(output_lines: &Mutex<VecDeque<String>>, mut line: St
     }
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "linux"))]
 fn flush_service_output_line(output_lines: &Mutex<VecDeque<String>>, pending: &mut String) {
     if pending.is_empty() {
         return;
@@ -666,7 +666,7 @@ fn flush_service_output_line(output_lines: &Mutex<VecDeque<String>>, pending: &m
     push_service_output_line(output_lines, line);
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "linux"))]
 fn spawn_service_pty_waiter(
     mut child: Box<dyn portable_pty::Child + Send + Sync>,
     exit_code: Arc<Mutex<Option<Option<i32>>>>,
