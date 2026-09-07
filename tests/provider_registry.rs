@@ -2262,9 +2262,9 @@ async fn observe_rejects_identity_replacement_between_capability_probe_and_after
     );
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "linux"))]
 #[tokio::test]
-async fn windows_probe_runner_bounds_both_output_streams_exactly() {
+async fn provider_probe_runner_bounds_both_output_streams_exactly() {
     let temp = tempdir().unwrap();
     let executable = copied_probe_fixture(&temp, "probe-flood");
     let runner = probe_runner(&executable);
@@ -2289,9 +2289,9 @@ async fn windows_probe_runner_bounds_both_output_streams_exactly() {
     assert!(result.stdout().len() + result.stderr().len() <= 257);
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "linux"))]
 #[tokio::test]
-async fn windows_probe_runner_scrubs_inherited_provider_secrets() {
+async fn provider_probe_runner_scrubs_inherited_provider_secrets() {
     let temp = tempdir().unwrap();
     let executable = copied_probe_fixture(&temp, "probe-env");
     let previous = std::env::var_os("ANTHROPIC_API_KEY");
@@ -2308,13 +2308,14 @@ async fn windows_probe_runner_scrubs_inherited_provider_secrets() {
         4096,
     )
     .unwrap();
-    let result = runner.run(request).await.unwrap();
+    let result = runner.run(request).await;
 
     match previous {
         Some(value) => std::env::set_var("ANTHROPIC_API_KEY", value),
         None => std::env::remove_var("ANTHROPIC_API_KEY"),
     }
 
+    let result = result.unwrap();
     let output = String::from_utf8_lossy(result.stdout());
     assert!(output.contains("ANTHROPIC_API_KEY=<unset>"));
     assert!(!output.contains("fixture-secret-must-not-cross"));

@@ -1797,6 +1797,8 @@ struct ProbeProcess {
     process_group: bool,
     #[cfg(target_os = "linux")]
     linux_ptrace_stopped: bool,
+    #[cfg(target_os = "linux")]
+    linux_tree: crate::process::linux::LinuxProcessTree,
     #[cfg(target_os = "macos")]
     macos_suspended: bool,
     #[cfg(windows)]
@@ -1818,17 +1820,36 @@ impl ProbeProcess {
         expected: Option<&Path>,
         requested: &ProviderExecutableHandle,
     ) -> Result<Self, ProviderProbeError> {
-        // Command::spawn waits for exec; a pre-exec SIGSTOP deadlocks that wait.
-        // Keep the containment hold before any child exists until the owned
-        // fork/clone/setsid supervision and attestation barrier are implemented.
-        let _ = (
-            command,
+        let expected = expected.ok_or(ProviderProbeError::UnsupportedAttestation)?;
+        if expected != requested.launch_program().canonical_path() {
+            return Err(ProviderProbeError::Io(
+                ProviderProbeIoError::ExecutableNotAllowed,
+            ));
+        }
+        let launch_pins = requested
+            .pin_launch_graph()
+            .map_err(|_| ProviderProbeError::Io(ProviderProbeIoError::ExecutableNotAllowed))?;
+        let (child, linux_tree) = crate::process::linux::LinuxProcessTree::spawn(command, deadline)
+            .map_err(|_| ProviderProbeError::Io(ProviderProbeIoError::SpawnFailed))?;
+        // The owned tree remains at its first exec stop throughout both
+        // checks. Any failure drops that owner and reaps the stopped root.
+        attest_launched_image(&child, expected)?;
+        requested
+            .revalidate_bound_identity()
+            .map_err(|_| ProviderProbeError::Io(ProviderProbeIoError::ExecutableNotAllowed))?;
+        let linux_process_start = linux_process_start_token(child.id())
+            .ok_or(ProviderProbeError::Io(ProviderProbeIoError::SpawnFailed))?;
+        Ok(Self {
+            child,
+            linux_tree,
+            managed_job: None,
             deadline,
-            expected,
-            requested,
-            LINUX_DESCENDANT_CONTAINMENT_HOLD,
-        );
-        Err(ProviderProbeError::UnsupportedAttestation)
+            process_group: false,
+            linux_ptrace_stopped: true,
+            linux_process_start,
+            attestation_barrier_killed: false,
+            _launch_pins: launch_pins,
+        })
     }
 
     #[cfg(not(any(target_os = "macos", target_os = "linux")))]
@@ -1842,15 +1863,6 @@ impl ProbeProcess {
         {
             let _ = (&command, deadline, expected, requested);
             return Err(ProviderProbeError::UnsupportedAttestation);
-        }
-        #[cfg(target_os = "linux")]
-        if expected.is_none() {
-            let _ = (&command, deadline, requested);
-            return Err(ProviderProbeError::UnsupportedAttestation);
-        }
-        #[cfg(target_os = "linux")]
-        unsafe {
-            command.pre_exec(linux_ptrace_traceme);
         }
         // Pin the launch graph immediately before CreateProcess: acquiring
         // re-verifies each attested identity, and the resulting share mode is
@@ -1866,18 +1878,6 @@ impl ProbeProcess {
             } else {
                 ProviderProbeIoError::SpawnFailed
             })
-        })?;
-        #[cfg(target_os = "linux")]
-        if let Err(error) = wait_for_linux_exec_stop(&child, deadline) {
-            let _ = child.kill();
-            reap_child_until(&mut child, deadline);
-            return Err(error);
-        }
-        #[cfg(target_os = "linux")]
-        let linux_process_start = linux_process_start_token(child.id()).ok_or_else(|| {
-            let _ = child.kill();
-            reap_child_until(&mut child, deadline);
-            ProviderProbeError::Io(ProviderProbeIoError::SpawnFailed)
         })?;
         let managed_job =
             match crate::services::platform_service::claim_suspended_process(child.id()) {
@@ -1898,20 +1898,6 @@ impl ProbeProcess {
                 ProviderProbeIoError::ExecutableNotAllowed,
             ));
         }
-        #[cfg(target_os = "linux")]
-        if attest_launched_image(
-            &child,
-            expected.expect("Linux expected image checked above"),
-        )
-        .is_err()
-            || requested.revalidate_bound_identity().is_err()
-        {
-            let _ = child.kill();
-            reap_child_until(&mut child, deadline);
-            return Err(ProviderProbeError::Io(
-                ProviderProbeIoError::ExecutableNotAllowed,
-            ));
-        }
         #[cfg(windows)]
         if managed_job.is_none() {
             let _ = child.kill();
@@ -1924,15 +1910,11 @@ impl ProbeProcess {
             deadline,
             #[cfg(unix)]
             process_group: cfg!(unix),
-            #[cfg(target_os = "linux")]
-            linux_ptrace_stopped: true,
             #[cfg(target_os = "macos")]
             macos_suspended: true,
             #[cfg(windows)]
             windows_suspended: true,
             attestation_barrier_killed: false,
-            #[cfg(target_os = "linux")]
-            linux_process_start,
             _launch_pins: launch_pins,
         })
     }
@@ -2218,11 +2200,19 @@ impl ProbeProcess {
     }
 
     fn try_wait(&mut self) -> std::io::Result<ProbeWait> {
+        #[cfg(target_os = "linux")]
+        {
+            return self.linux_tree.control().root_status().map(|status| {
+                status
+                    .map(|status| ProbeWait::Exited(status.code()))
+                    .unwrap_or(ProbeWait::Running)
+            });
+        }
         #[cfg(target_os = "macos")]
         {
             return self.macos_try_wait();
         }
-        #[cfg(not(target_os = "macos"))]
+        #[cfg(not(any(target_os = "macos", target_os = "linux")))]
         {
             self.child.try_wait().map(|status| {
                 status
@@ -2267,13 +2257,11 @@ impl ProbeProcess {
         }
         #[cfg(target_os = "linux")]
         if self.linux_ptrace_stopped {
-            // PTRACE_DETACH is the single release boundary.  If the syscall
-            // fails, termination below kills/reaps the still-stopped child;
-            // a second detach attempt is not safe or necessary.
             self.linux_ptrace_stopped = false;
-            if unsafe { linux_ptrace_detach(self.pid()) } != 0 {
-                return Err(ProviderProbeError::Io(ProviderProbeIoError::SpawnFailed));
-            }
+            self.linux_tree
+                .control()
+                .resume(self.deadline)
+                .map_err(|_| ProviderProbeError::Io(ProviderProbeIoError::SpawnFailed))?;
         }
         #[cfg(target_os = "macos")]
         if self.macos_suspended {
@@ -2284,6 +2272,7 @@ impl ProbeProcess {
         Ok(())
     }
 
+    #[cfg(not(target_os = "linux"))]
     fn kill_while_attestation_barrier(&mut self) -> bool {
         if self.attestation_barrier_killed {
             return true;
@@ -2347,6 +2336,16 @@ impl ProbeProcess {
         killed
     }
 
+    #[cfg(target_os = "linux")]
+    fn terminate_tree(&mut self, deadline: std::time::Instant) -> Result<(), ProviderProbeError> {
+        self.linux_tree
+            .control()
+            .terminate()
+            .and_then(|()| self.linux_tree.join(deadline))
+            .map_err(|_| ProviderProbeError::Io(ProviderProbeIoError::DescendantCleanupFailed))
+    }
+
+    #[cfg(not(target_os = "linux"))]
     fn terminate_tree(&mut self, deadline: std::time::Instant) -> Result<(), ProviderProbeError> {
         let mut job_empty = true;
         let barrier_kill_ok = self.kill_while_attestation_barrier();
@@ -2440,6 +2439,7 @@ impl ProbeProcess {
         Ok(())
     }
 
+    #[cfg(not(target_os = "linux"))]
     fn kill_process(&mut self) -> std::io::Result<()> {
         #[cfg(target_os = "macos")]
         {
@@ -2454,6 +2454,7 @@ impl ProbeProcess {
         }
     }
 
+    #[cfg(not(target_os = "linux"))]
     fn reap_owned_until(&mut self, deadline: std::time::Instant) -> bool {
         #[cfg(target_os = "macos")]
         {
@@ -2472,205 +2473,6 @@ impl ProbeProcess {
             reap_child_until(&mut self.child, deadline)
         }
     }
-}
-
-#[cfg(target_os = "linux")]
-const LINUX_PTRACE_TRACEME: i64 = 0;
-#[cfg(target_os = "linux")]
-const LINUX_PTRACE_DETACH: i64 = 17;
-#[cfg(target_os = "linux")]
-const LINUX_PTRACE_CONT: i64 = 7;
-#[cfg(target_os = "linux")]
-const LINUX_PTRACE_SETOPTIONS: i64 = 0x4200;
-#[cfg(target_os = "linux")]
-const LINUX_PTRACE_GETEVENTMSG: i64 = 0x4201;
-#[cfg(target_os = "linux")]
-const LINUX_PTRACE_O_TRACEEXEC: i64 = 0x10;
-#[cfg(target_os = "linux")]
-const LINUX_PTRACE_O_EXITKILL: i64 = 0x0010_0000;
-#[cfg(target_os = "linux")]
-const LINUX_DESCENDANT_CONTAINMENT_HOLD: &str =
-    "platform HOLD: fork/clone/setsid descendants are not yet ptrace-supervised";
-#[cfg(target_os = "linux")]
-const LINUX_PTRACE_EVENT_EXEC: i32 = 4;
-#[cfg(target_os = "linux")]
-const LINUX_WAIT_NOHANG: i32 = 1;
-#[cfg(target_os = "linux")]
-const LINUX_WAIT_WALL: i32 = 0x4000_0000;
-#[cfg(target_os = "linux")]
-const LINUX_SIGTRAP: i32 = 5;
-#[cfg(target_os = "linux")]
-const LINUX_SIGSTOP: i32 = 19;
-
-#[cfg(target_os = "linux")]
-unsafe extern "C" {
-    #[link_name = "ptrace"]
-    fn linux_ptrace(
-        request: i64,
-        pid: i32,
-        address: *mut std::ffi::c_void,
-        data: *mut std::ffi::c_void,
-    ) -> i64;
-    #[link_name = "waitpid"]
-    fn linux_waitpid(pid: i32, status: *mut i32, options: i32) -> i32;
-}
-
-#[cfg(target_os = "linux")]
-fn linux_ptrace_traceme() -> std::io::Result<()> {
-    if unsafe {
-        linux_ptrace(
-            LINUX_PTRACE_TRACEME,
-            0,
-            std::ptr::null_mut(),
-            std::ptr::null_mut(),
-        )
-    } == -1
-    {
-        Err(std::io::Error::last_os_error())
-    } else if unsafe { libc::raise(LINUX_SIGSTOP) } != 0 {
-        Err(std::io::Error::last_os_error())
-    } else {
-        Ok(())
-    }
-}
-
-#[cfg(target_os = "linux")]
-fn wait_for_linux_exec_stop(
-    child: &Child,
-    deadline: std::time::Instant,
-) -> Result<(), ProviderProbeError> {
-    wait_for_linux_stop(child, deadline, |status| {
-        linux_status_is_stopped(status) && linux_status_signal(status) == LINUX_SIGSTOP
-    })?;
-    linux_ptrace_set_options(child.id())?;
-    linux_ptrace_continue(child.id())?;
-
-    wait_for_linux_stop(child, deadline, linux_status_is_exact_exec_event)?;
-    if linux_ptrace_event_message(child.id())? == 0 {
-        return Err(ProviderProbeError::Io(ProviderProbeIoError::SpawnFailed));
-    }
-    Ok(())
-}
-
-#[cfg(target_os = "linux")]
-fn linux_ptrace_set_options(pid: u32) -> Result<(), ProviderProbeError> {
-    // This implementation intentionally records an explicit platform HOLD:
-    // TRACEEXEC plus EXITKILL does not control fork/clone children that leave
-    // the process group (for example after setsid). No production provider
-    // launch may rely on Linux containment until those descendants are
-    // traced and reaped under the same absolute deadline.
-    let _platform_hold = LINUX_DESCENDANT_CONTAINMENT_HOLD;
-    if unsafe {
-        linux_ptrace(
-            LINUX_PTRACE_SETOPTIONS,
-            pid as i32,
-            std::ptr::null_mut(),
-            (LINUX_PTRACE_O_TRACEEXEC | LINUX_PTRACE_O_EXITKILL) as usize as *mut std::ffi::c_void,
-        )
-    } == -1
-    {
-        Err(ProviderProbeError::Io(ProviderProbeIoError::SpawnFailed))
-    } else {
-        Ok(())
-    }
-}
-
-#[cfg(target_os = "linux")]
-fn linux_ptrace_continue(pid: u32) -> Result<(), ProviderProbeError> {
-    if unsafe {
-        linux_ptrace(
-            LINUX_PTRACE_CONT,
-            pid as i32,
-            std::ptr::null_mut(),
-            std::ptr::null_mut(),
-        )
-    } == -1
-    {
-        Err(ProviderProbeError::Io(ProviderProbeIoError::SpawnFailed))
-    } else {
-        Ok(())
-    }
-}
-
-#[cfg(target_os = "linux")]
-fn linux_ptrace_event_message(pid: u32) -> Result<u64, ProviderProbeError> {
-    let mut event_message = 0_u64;
-    if unsafe {
-        linux_ptrace(
-            LINUX_PTRACE_GETEVENTMSG,
-            pid as i32,
-            std::ptr::null_mut(),
-            std::ptr::addr_of_mut!(event_message).cast(),
-        )
-    } == -1
-    {
-        Err(ProviderProbeError::Io(ProviderProbeIoError::SpawnFailed))
-    } else {
-        Ok(event_message)
-    }
-}
-
-#[cfg(target_os = "linux")]
-fn wait_for_linux_stop(
-    child: &Child,
-    deadline: std::time::Instant,
-    expected: impl Fn(i32) -> bool,
-) -> Result<i32, ProviderProbeError> {
-    let mut status = 0_i32;
-    loop {
-        let waited = unsafe {
-            linux_waitpid(
-                child.id() as i32,
-                &mut status,
-                LINUX_WAIT_NOHANG | LINUX_WAIT_WALL,
-            )
-        };
-        if waited == child.id() as i32 {
-            if expected(status) {
-                return Ok(status);
-            }
-            return Err(ProviderProbeError::Io(ProviderProbeIoError::SpawnFailed));
-        }
-        if waited < 0 {
-            return Err(ProviderProbeError::Io(ProviderProbeIoError::WaitFailed));
-        }
-        if std::time::Instant::now() >= deadline {
-            return Err(ProviderProbeError::TimedOut);
-        }
-        std::thread::sleep(Duration::from_millis(1));
-    }
-}
-
-#[cfg(target_os = "linux")]
-const fn linux_status_is_stopped(status: i32) -> bool {
-    (status & 0x7f) == 0x7f
-}
-
-#[cfg(target_os = "linux")]
-const fn linux_status_signal(status: i32) -> i32 {
-    (status >> 8) & 0xff
-}
-
-#[cfg(target_os = "linux")]
-const fn linux_status_event(status: i32) -> i32 {
-    (status >> 16) & 0xffff
-}
-
-#[cfg(target_os = "linux")]
-const fn linux_status_is_exact_exec_event(status: i32) -> bool {
-    linux_status_is_stopped(status)
-        && linux_status_signal(status) == LINUX_SIGTRAP
-        && linux_status_event(status) == LINUX_PTRACE_EVENT_EXEC
-}
-
-#[cfg(target_os = "linux")]
-unsafe fn linux_ptrace_detach(pid: u32) -> i64 {
-    linux_ptrace(
-        LINUX_PTRACE_DETACH,
-        pid as i32,
-        std::ptr::null_mut(),
-        std::ptr::null_mut(),
-    )
 }
 
 #[cfg(target_os = "linux")]
@@ -3744,13 +3546,10 @@ impl Drop for ProviderInteractiveSession {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(target_os = "linux")]
+    use super::attest_launched_image;
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     use super::ProbeProcess;
-    #[cfg(target_os = "linux")]
-    use super::{
-        attest_launched_image, linux_status_is_exact_exec_event, LINUX_PTRACE_EVENT_EXEC,
-        LINUX_SIGTRAP,
-    };
     use super::{
         classify_auth_output, ProviderAuthEvidenceError, ProviderAuthProbeResult,
         ProviderExecutable, ProviderKind, ProviderProbeKind, ProviderProbeOutput,
@@ -4032,16 +3831,6 @@ mod tests {
         let _ = child.wait();
     }
 
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn linux_plain_sigtrap_is_not_an_exec_event() {
-        let plain_sigtrap = (LINUX_SIGTRAP << 8) | 0x7f;
-        let exact_exec_event = plain_sigtrap | (LINUX_PTRACE_EVENT_EXEC << 16);
-
-        assert!(!linux_status_is_exact_exec_event(plain_sigtrap));
-        assert!(linux_status_is_exact_exec_event(exact_exec_event));
-    }
-
     struct WouldBlockProbePipe;
 
     impl super::ProbePipe for WouldBlockProbePipe {
@@ -4121,13 +3910,15 @@ mod tests {
         let result = ProbeProcess::spawn(
             command,
             std::time::Instant::now() + Duration::from_secs(3),
-            Some(expected.canonical_path()),
+            Some(requested.canonical_path()),
             &requested_handle,
         );
         #[cfg(target_os = "linux")]
         assert!(matches!(
             result,
-            Err(super::ProviderProbeError::UnsupportedAttestation)
+            Err(super::ProviderProbeError::Io(
+                super::ProviderProbeIoError::ExecutableNotAllowed
+            ))
         ));
         #[cfg(target_os = "macos")]
         let mut process = ProbeProcess::spawn_macos(

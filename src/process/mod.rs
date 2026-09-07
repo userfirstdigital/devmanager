@@ -1,6 +1,8 @@
 pub mod identity;
 pub mod job;
 pub mod launcher;
+#[cfg(target_os = "linux")]
+pub(crate) mod linux;
 pub mod ports;
 pub mod registry;
 pub mod sampler;

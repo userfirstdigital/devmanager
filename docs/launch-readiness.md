@@ -37,6 +37,9 @@ The candidate is not release-approved.
   exclusive retained host locks, and parent-bound cleanup using pidfds. The
   Windows path shares the existing handshake, framing, and delivery machinery.
 - Updated obsolete protocol fixtures to use host-authorized task creation.
+- Enabled bounded Linux provider probes behind an owned exec barrier. One tracer
+  thread retains fork/vfork/clone descendants, exact process handles and cleanup;
+  task-owned interactive provider runtimes still need this ownership integration.
 
 ## Verification evidence
 
@@ -44,6 +47,10 @@ Local logs are sibling files of the isolated worktree:
 `/home/robin/Projects/devmanager-launch-20260907-*.log`.
 
 | Check | Observed result |
+| Linux supervision behavior | Three passed: exec barrier, detached child/root exit, thread exec, drop cleanup and unrelated-child isolation (`linux-production/process-tests.log`) |
+| Provider identity integration on Linux | 41 passed (`linux-production/provider-identity-tests2.log`) |
+| Real Linux probe output, environment and tree cleanup | Three passed (`linux-production/probe-tree-tests2.log`) |
+| Mismatched executable at Linux exec barrier | Passed (`linux-production/probe-gate-test2.log`) |
 | Linux local socket / host lock tests | Two passed (`linux-production/socket-test.log`, `lock-test.log`) |
 | Cross-platform local IPC integration | 11 passed (`linux-production/protocol-tests2.log`) |
 | Host entry and drain tests on Linux | Nine passed (`linux-production/host-tests.log`) |
@@ -78,10 +85,9 @@ not been declared supported or silently skipped. Fresh Windows and Linux runs mu
 
 The broad run also exposed a pre-exec stopped-child deadlock in the Linux
 probe, retained cancellation socket handles, and a read-only fixture requesting
-write authority. The final cleanup slice rejects Linux probes before spawning
-until descendant supervision exists, releases cancellation-owned sockets, and
-uses the read-only issuer in that fixture. All four focused regressions and
-the final all-target compiler check pass. This does not convert the earlier
+write authority. The earlier cleanup slice refused Linux probes before spawning, released
+cancellation-owned sockets, and used the read-only issuer in that fixture.
+Linux probes now use the separately tested descendant supervisor above. This does not convert the earlier
 full-suite result into a green run.
 
 ## Live desktop inspection
@@ -91,7 +97,7 @@ Wayland desktop, using an isolated debug profile. Full canonical synchronization
 reached Ready in 1,938 ms on the first recorded launch. The empty workspace and
 Add a project dialog were inspected; physical typing appeared in its name field.
 The exact parent-bound host exited when the owned app closed. Provider discovery
-currently reports an invalid PATH directory; provider containment also remains a
+currently reports an invalid PATH directory; interactive provider runtime ownership also remains a
 launch gate. This is not yet provider-terminal acceptance.
 
 The earlier interactive fixture inspection below attaches no host. Current real

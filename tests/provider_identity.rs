@@ -177,23 +177,18 @@ fn provider_session_id_preserves_exact_bytes_through_serde_and_sql() {
 }
 
 #[test]
-fn linux_attestation_source_requires_an_exact_exec_event_before_release() {
-    let adapter_source =
-        fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("src/providers/adapter.rs"))
-            .expect("read provider adapter source");
-
-    for marker in [
-        "LINUX_PTRACE_SETOPTIONS",
-        "LINUX_PTRACE_O_TRACEEXEC",
-        "LINUX_PTRACE_EVENT_EXEC",
-        "LINUX_PTRACE_GETEVENTMSG",
-        "linux_ptrace_continue",
-    ] {
-        assert!(
-            adapter_source.contains(marker),
-            "Linux barrier is missing exact exec-stop marker {marker}"
-        );
-    }
+fn linux_attestation_delegates_to_the_owned_tree_before_release() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let adapter = fs::read_to_string(root.join("src/providers/adapter.rs")).unwrap();
+    let tree = fs::read_to_string(root.join("src/process/linux.rs")).unwrap();
+    assert!(adapter.contains("LinuxProcessTree::spawn(command, deadline)"));
+    assert!(adapter.contains("attest_launched_image(&child, expected)?"));
+    let compact: String = adapter.chars().filter(|c| !c.is_whitespace()).collect();
+    assert!(compact.contains("linux_tree.control().resume(self.deadline)"));
+    assert!(tree.contains("PTRACE_O_TRACEEXEC"));
+    assert!(tree.contains("PTRACE_GETEVENTMSG"));
+    // Behavioral gate, thread-exec and descendant acceptance lives beside the
+    // crate-private owner; this assertion checks production actually uses it.
 }
 
 #[test]
@@ -201,7 +196,9 @@ fn suspended_windows_claim_precedes_resume_and_graph_attestation() {
     let adapter_source =
         fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("src/providers/adapter.rs"))
             .expect("read provider adapter source");
-    let spawn_start = adapter_source.find("fn spawn(").expect("probe spawn seam");
+    let spawn_start = adapter_source
+        .find("#[cfg(not(any(target_os = \"macos\", target_os = \"linux\")))]\n    fn spawn(")
+        .expect("Windows probe spawn seam");
     let spawn_end = adapter_source[spawn_start..]
         .find("fn spawn_macos(")
         .map(|offset| spawn_start + offset)
@@ -288,31 +285,33 @@ fn provider_probe_uses_an_empty_base_environment_allowlist() {
         "provider probes must not inherit the caller environment"
     );
     assert!(
-        adapter_source.contains("provider_environment_allowlist"),
-        "provider probes must use a named bounded environment allowlist"
+        adapter_source.contains(
+            "apply_provider_environment_exact(&mut command, request.child_environment())"
+        ),
+        "provider probes must install the exact sealed environment"
     );
 }
 
 #[test]
-fn linux_probe_cleanup_requires_exit_kill_and_process_start_identity() {
-    let adapter_source =
-        fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("src/providers/adapter.rs"))
-            .expect("read provider adapter source");
+fn linux_probe_cleanup_uses_pidfds_and_the_dedicated_tracer_wait_lineage() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let adapter = fs::read_to_string(root.join("src/providers/adapter.rs")).unwrap();
+    let tree = fs::read_to_string(root.join("src/process/linux.rs")).unwrap();
     for marker in [
-        "LINUX_PTRACE_O_EXITKILL",
-        "linux_process_start_token",
-        "process_group_matches_start",
         "PTRACE_O_EXITKILL",
+        "PTRACE_O_TRACEFORK",
+        "PTRACE_O_TRACEVFORK",
+        "PTRACE_O_TRACECLONE",
+        "SYS_pidfd_send_signal",
+        "libc::__WNOTHREAD",
     ] {
         assert!(
-            adapter_source.contains(marker),
-            "Unix cleanup is missing owned identity marker {marker}"
+            tree.contains(marker),
+            "missing Linux ownership boundary: {marker}"
         );
     }
-    assert!(
-        adapter_source.contains("LINUX_DESCENDANT_CONTAINMENT_HOLD"),
-        "Linux fork/clone/setsid containment must remain an explicit platform HOLD"
-    );
+    assert!(adapter.contains("self.linux_tree.join(deadline)"));
+    assert!(!adapter.contains("LINUX_DESCENDANT_CONTAINMENT_HOLD"));
 }
 
 #[test]

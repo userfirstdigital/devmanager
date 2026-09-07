@@ -6060,6 +6060,45 @@ fn main() {
     let mode = args.next().expect("process-test helper mode");
     let mode = mode.to_string_lossy().to_string();
     let result = match mode.as_str() {
+        #[cfg(target_os = "linux")]
+        "linux-detached-tree" => {
+            use std::os::unix::process::CommandExt;
+            let root_marker = required_path(&mut args, "root marker");
+            let child_marker = required_path(&mut args, "child marker");
+            let child_pid = required_path(&mut args, "child pid");
+            write_marker(&root_marker, b"started");
+            let mut command = Command::new(std::env::current_exe().unwrap());
+            command.arg("mark-wait").arg(child_marker);
+            unsafe {
+                command.pre_exec(|| {
+                    if libc::setsid() < 0 {
+                        return Err(io::Error::last_os_error());
+                    }
+                    Ok(())
+                });
+            }
+            let mut child = command.spawn().expect("spawn detached child");
+            write_marker(&child_pid, child.id().to_string());
+            if args.next().as_deref() != Some(std::ffi::OsStr::new("exit-root")) {
+                let _ = child.wait();
+            }
+            Ok(())
+        }
+        #[cfg(target_os = "linux")]
+        "linux-thread-exec" => {
+            use std::os::unix::process::CommandExt;
+            let marker = required_path(&mut args, "thread exec marker");
+            std::thread::spawn(move || {
+                let error = Command::new(std::env::current_exe().unwrap())
+                    .arg("mark-wait")
+                    .arg(marker)
+                    .exec();
+                panic!("thread exec failed: {error}");
+            })
+            .join()
+            .expect("exec replaces the helper before join");
+            Err("thread exec returned".into())
+        }
         "membership-deadline-probe" => {
             #[cfg(windows)]
             {
