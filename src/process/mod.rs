@@ -3,6 +3,8 @@ pub mod job;
 pub mod launcher;
 #[cfg(target_os = "linux")]
 pub(crate) mod linux;
+#[cfg(target_os = "linux")]
+pub mod linux_cgroup;
 pub mod ports;
 pub mod registry;
 pub mod sampler;

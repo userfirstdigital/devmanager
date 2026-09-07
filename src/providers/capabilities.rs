@@ -2756,6 +2756,16 @@ impl ProviderExecutable {
         self.pin.acquire()
     }
 
+    #[cfg(target_os = "linux")]
+    pub(crate) fn open_linux_exec_file(&self) -> Result<File, ProviderExecutableError> {
+        if !self.is_native() {
+            return Err(ProviderExecutableError::NotNativeExecutable(
+                self.canonical_path.clone(),
+            ));
+        }
+        self.pin.open_verified()
+    }
+
     #[cfg(test)]
     fn file_is_open(&self) -> bool {
         self.pin.is_open()

@@ -6056,6 +6056,17 @@ mod windows_supervisor {
 }
 
 fn main() {
+    #[cfg(target_os = "linux")]
+    if let Some(code) = devmanager::process::linux_cgroup::run_guardian_subcommand(
+        &std::env::args().skip(1).collect::<Vec<_>>(),
+    ) {
+        std::process::exit(if code == std::process::ExitCode::SUCCESS {
+            0
+        } else {
+            2
+        });
+    }
+
     let mut args = std::env::args_os().skip(1);
     let mode = args.next().expect("process-test helper mode");
     let mode = mode.to_string_lossy().to_string();

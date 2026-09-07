@@ -164,6 +164,16 @@ pub trait SlavePty {
     /// Spawns the command specified by the provided CommandBuilder
     fn spawn_command(&self, cmd: CommandBuilder) -> Result<Box<dyn Child + Send + Sync>, Error>;
 
+    /// Retain the native slave descriptor for an external Linux process owner.
+    /// The receiver must establish the controlling terminal in the final child;
+    /// cloning this descriptor does not launch a process or create a second PTY.
+    #[cfg(target_os = "linux")]
+    fn try_clone_owned_fd(&self) -> Result<std::os::fd::OwnedFd, Error> {
+        Err(anyhow::anyhow!(
+            "this PTY cannot retain its Linux slave descriptor"
+        ))
+    }
+
     /// Creates a Windows child suspended and atomically assigns it to `job`.
     ///
     /// The returned type deliberately does not implement [`Child`]. Callers

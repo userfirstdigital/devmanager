@@ -332,6 +332,11 @@ fn cloexec(fd: RawFd) -> Result<(), Error> {
 }
 
 impl SlavePty for UnixSlavePty {
+    #[cfg(target_os = "linux")]
+    fn try_clone_owned_fd(&self) -> Result<std::os::fd::OwnedFd, Error> {
+        Ok(self.fd.0.as_fd().try_clone_to_owned()?)
+    }
+
     fn spawn_command(
         &self,
         builder: CommandBuilder,

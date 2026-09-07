@@ -81,6 +81,13 @@ impl From<String> for HostRunError {
 }
 
 fn main() -> ExitCode {
+    #[cfg(target_os = "linux")]
+    if let Some(code) = devmanager::process::linux_cgroup::run_guardian_subcommand(
+        &std::env::args().skip(1).collect::<Vec<_>>(),
+    ) {
+        return code;
+    }
+
     // Provider sessions are launched by the durable host, so their hook
     // settings point back to this executable. Relay subcommands must exit
     // before ctl parsing, HostLock acquisition, or server bootstrap.

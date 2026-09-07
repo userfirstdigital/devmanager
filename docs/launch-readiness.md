@@ -40,6 +40,10 @@ The candidate is not release-approved.
 - Enabled bounded Linux provider probes behind an owned exec barrier. One tracer
   thread retains fork/vfork/clone descendants, exact process handles and cleanup;
   task-owned interactive provider runtimes still need platform ownership.
+- Added a tested Linux native PTY custody backend using a systemd user service
+  and delegated cgroup v2 workload. It executes the selected native descriptor,
+  acknowledges resume, preserves job control, and cleans up on host/guardian
+  loss. Task/session registry integration is still outstanding.
 - Resolved Linux Claude installation links and Codex npm native distributions,
   retaining the selected native identity through registry revalidation. Enabled
   interactive metadata probes with nonblocking input and bounded cancellation.
@@ -51,6 +55,8 @@ Local logs are sibling files of the isolated worktree:
 
 | Check | Observed result |
 | --- | --- |
+| Linux cgroup PTY OS integration | Four passed explicitly with `--ignored`: exec/resume gate, expired/abandoned launch, job control, root exit, detached children, connection loss, guardian crash/pause, idle wakeups (`linux-production/cgroup-tests6.log`) |
+| Cgroup backend all-target check | Passed (`linux-production/cgroup-final-check6.log`) |
 | Linux owner-death and tree cleanup | Four passed (`linux-production/death-owner-tests.log`) |
 | New private Linux profiles / existing permissions | Passed (`linux-production/private-profile-test.log`) |
 | Startup edge-case all-target check | Passed (`linux-production/private-startup-check.log`) |
