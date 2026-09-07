@@ -4,7 +4,56 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::domain::TaskId;
-use crate::ui::task_workspace::allocation::AllocatedWorkspace;
+use crate::ui::task_workspace::allocation::{AllocatedWorkspace, AllocationMetrics};
+
+/// The column width the grid PACKS at, which is not the width below which a
+/// panel stops working.
+///
+/// `AllocationMetrics::full_min_width` (320) is the floor: below it a panel
+/// becomes a title strip. This is the target: composition A's canvas is about
+/// 1650 logical px and carries FOUR columns of roughly 390 px, not the five
+/// that 320 + an 8 px gap would allow, and the brief's own acceptance numbers
+/// (three columns at 1100 px, five at 2000) are the same ratio. Packing at the
+/// floor instead would make every panel the narrowest the chrome tolerates the
+/// moment one more task is opened, which is exactly the complaint this change
+/// answers.
+pub const GRID_COLUMN_WIDTH: f32 = 360.0;
+
+/// How many top-level columns this canvas holds at [`GRID_COLUMN_WIDTH`].
+///
+/// Always at least one: a canvas too narrow for a single column still has to
+/// put the pane somewhere, and the allocator's own floors decide what happens
+/// to it from there.
+pub fn grid_columns_for(canvas_width: f32, metrics: AllocationMetrics) -> usize {
+    if !canvas_width.is_finite() || canvas_width <= 0.0 {
+        return 1;
+    }
+    let gap = if metrics.divider.is_finite() && metrics.divider > 0.0 {
+        metrics.divider
+    } else {
+        0.0
+    };
+    let column = GRID_COLUMN_WIDTH.max(metrics.full_min_width).max(1.0);
+    let columns = ((canvas_width + gap) / (column + gap)).floor();
+    if columns < 1.0 {
+        1
+    } else {
+        columns as usize
+    }
+}
+
+/// The canvas a workspace is packed at when the caller only cares WHICH tasks
+/// are open and which is focused, not where their panes sit -- a pure
+/// reconstruction from a key list, or an open that happens before the first
+/// paint has measured a window. Wide enough that the grid never starts a
+/// second row for a workspace anyone could supervise.
+pub const GRID_NOMINAL_CANVAS_WIDTH: f32 = 8_192.0;
+
+/// How many rows `panes` need at `columns` per row.
+pub fn grid_rows_for(panes: usize, columns: usize) -> usize {
+    let columns = columns.max(1);
+    panes.div_ceil(columns).max(1)
+}
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
 pub struct PaneId(Uuid);
@@ -337,6 +386,39 @@ impl<K: Clone + Ord + Eq> Workspace<K> {
         task_id: K,
         axis: Axis,
     ) -> Result<PaneId, WorkspaceError> {
+        let target = match self.focused {
+            Some(target) => target,
+            None if self.root.is_none() => {
+                if self.contains_task(task_id.clone()) {
+                    return Err(WorkspaceError::DuplicateTask);
+                }
+                *self = Self::single(task_id);
+                return self.focused.ok_or(WorkspaceError::InvalidTree);
+            }
+            None => return Err(WorkspaceError::InvalidTree),
+        };
+        self.insert_beside(
+            task_id,
+            target,
+            match axis {
+                Axis::Horizontal => Edge::Right,
+                Axis::Vertical => Edge::Bottom,
+            },
+        )
+    }
+
+    /// Split one named pane and put a new one on the given side of it.
+    ///
+    /// The general form of [`Self::insert_after_focused`], which is this with
+    /// the focused pane and the trailing edge. A caller that knows which pane
+    /// it is splitting -- a drag, a drop, a fixture describing an exact tree --
+    /// says so rather than moving focus first and inserting blind.
+    pub fn insert_beside(
+        &mut self,
+        task_id: K,
+        target: PaneId,
+        edge: Edge,
+    ) -> Result<PaneId, WorkspaceError> {
         if self.contains_task(task_id.clone()) {
             return Err(WorkspaceError::DuplicateTask);
         }
@@ -344,13 +426,13 @@ impl<K: Clone + Ord + Eq> Workspace<K> {
             *self = Self::single(task_id);
             return self.focused.ok_or(WorkspaceError::InvalidTree);
         }
-        let target = self.focused.ok_or(WorkspaceError::InvalidTree)?;
         let mut candidate = self.clone();
         candidate.focus_clock = candidate.focus_clock.saturating_add(1).max(1);
         let pane = TaskPane::new(task_id, candidate.focus_clock);
         let pane_id = pane.id;
         let root = candidate.root.take().ok_or(WorkspaceError::InvalidTree)?;
-        let (next_root, inserted) = insert_pane_near(root, target, pane, axis, true);
+        let (next_root, inserted) =
+            insert_pane_near(root, target, pane, edge.axis(), edge.inserts_after());
         if !inserted {
             return Err(WorkspaceError::MissingPane);
         }
@@ -360,6 +442,90 @@ impl<K: Clone + Ord + Eq> Workspace<K> {
         candidate.validate()?;
         *self = candidate;
         Ok(pane_id)
+    }
+
+    /// Open a pane as one more cell of the grid (spec 6.5 / composition A).
+    ///
+    /// `insert_after_focused` nests the new pane INSIDE whatever the focused
+    /// pane already sits in, so opening five tasks in a row builds a ladder of
+    /// splits and the panels get narrower and narrower without the grid ever
+    /// reflowing. Composition A tiles instead: a new panel is a new top-level
+    /// column while the canvas can still hold one, and starts (or joins) a
+    /// second row when it cannot.
+    ///
+    /// Explicit gestures are untouched -- a drag, a move or a drop still nests
+    /// exactly where the user aimed, and this never rearranges what is already
+    /// on screen. It only decides where the NEW pane goes.
+    pub fn insert_into_grid(
+        &mut self,
+        task_id: K,
+        canvas_width: f32,
+        metrics: AllocationMetrics,
+    ) -> Result<PaneId, WorkspaceError> {
+        if self.contains_task(task_id.clone()) {
+            return Err(WorkspaceError::DuplicateTask);
+        }
+        if self.root.is_none() {
+            *self = Self::single(task_id);
+            return self.focused.ok_or(WorkspaceError::InvalidTree);
+        }
+        let columns = grid_columns_for(canvas_width, metrics);
+        let mut candidate = self.clone();
+        candidate.focus_clock = candidate.focus_clock.saturating_add(1).max(1);
+        let pane = TaskPane::new(task_id, candidate.focus_clock);
+        let pane_id = pane.id;
+        let root = candidate.root.take().ok_or(WorkspaceError::InvalidTree)?;
+        candidate.root = Some(place_in_grid(root, WorkspaceNode::Pane(pane), columns));
+        candidate.previous_focus = candidate.focused;
+        candidate.focused = Some(pane_id);
+        candidate.validate()?;
+        *self = candidate;
+        Ok(pane_id)
+    }
+
+    /// Rebuild the tree as a plain grid of `columns` columns, keeping every
+    /// pane's identity, view and focus clock, in the order given.
+    ///
+    /// The panes are re-parented, not recreated: a `PaneId` survives, so focus,
+    /// zoom and any in-flight drag still name the same pane afterwards.
+    pub(crate) fn rebuild_as_grid(&mut self, order: Vec<PaneId>, columns: usize) -> bool {
+        let Some(root) = self.root.take() else {
+            return false;
+        };
+        let mut panes: Vec<TaskPane<K>> = Vec::new();
+        collect_panes(root, &mut panes);
+        let mut ordered: Vec<TaskPane<K>> = Vec::with_capacity(panes.len());
+        for pane_id in order {
+            if let Some(index) = panes.iter().position(|pane| pane.id == pane_id) {
+                ordered.push(panes.remove(index));
+            }
+        }
+        // Anything the caller's order did not name keeps its tree order at the
+        // end rather than being dropped: a pane the ordering could not see is
+        // still a pane somebody opened.
+        ordered.append(&mut panes);
+        let rebuilt = grid_tree(ordered, columns);
+        let changed = rebuilt != self.root;
+        self.root = rebuilt;
+        if self
+            .focused
+            .is_none_or(|pane_id| self.pane(pane_id).is_none())
+        {
+            self.focused = self.root.as_ref().and_then(first_pane_id);
+        }
+        if self
+            .previous_focus
+            .is_some_and(|pane_id| self.pane(pane_id).is_none())
+        {
+            self.previous_focus = None;
+        }
+        if self
+            .zoomed
+            .is_some_and(|pane_id| self.pane(pane_id).is_none())
+        {
+            self.zoomed = None;
+        }
+        changed
     }
 
     pub fn focus_pane(&mut self, pane_id: PaneId) -> Result<(), WorkspaceError> {
@@ -1010,6 +1176,171 @@ fn task_path_is_auto<K: PartialEq>(
     }
 }
 
+/// Put `new` in the grid `root` describes, without moving anything already in
+/// it.
+///
+/// The shape the grid reads off an existing tree is deliberately shallow: a
+/// vertical root is a stack of ROWS, anything else is one row. A tree the user
+/// built by dragging is therefore never rearranged -- it becomes one cell of
+/// the row it already occupies, and the new pane goes beside or below it.
+fn place_in_grid<K>(
+    root: WorkspaceNode<K>,
+    new: WorkspaceNode<K>,
+    columns: usize,
+) -> WorkspaceNode<K> {
+    match root {
+        WorkspaceNode::Split {
+            id,
+            axis: Axis::Vertical,
+            mut children,
+        } => {
+            match children.pop() {
+                // A vertical root with no children cannot be built by any
+                // gesture and would fail `validate`; the new pane simply
+                // replaces it rather than the caller seeing a torn tree.
+                None => new,
+                Some(last) => {
+                    let allocation = last.allocation;
+                    match append_column(last.node, new, columns) {
+                        Ok(row) => {
+                            children.push(SplitChild {
+                                node: row,
+                                allocation,
+                            });
+                        }
+                        Err((row, new)) => {
+                            children.push(SplitChild {
+                                node: row,
+                                allocation,
+                            });
+                            children.push(SplitChild::auto(new));
+                        }
+                    }
+                    WorkspaceNode::Split {
+                        id,
+                        axis: Axis::Vertical,
+                        children,
+                    }
+                }
+            }
+        }
+        row => match append_column(row, new, columns) {
+            Ok(row) => row,
+            Err((row, new)) => WorkspaceNode::Split {
+                id: SplitId::new(),
+                axis: Axis::Vertical,
+                children: vec![SplitChild::auto(row), SplitChild::auto(new)],
+            },
+        },
+    }
+}
+
+/// The widened row, or the row and the pane the caller now has to put on a
+/// second row. Both nodes come back untouched on the refusal so nothing is
+/// dropped and nothing has to be cloned to try again.
+type ColumnAppend<K> = Result<WorkspaceNode<K>, (WorkspaceNode<K>, WorkspaceNode<K>)>;
+
+/// Add one more column to a row, or give both nodes back untouched when the
+/// row is already `columns` wide and the caller has to start another row.
+fn append_column<K>(
+    row: WorkspaceNode<K>,
+    new: WorkspaceNode<K>,
+    columns: usize,
+) -> ColumnAppend<K> {
+    match row {
+        WorkspaceNode::Split {
+            id,
+            axis: Axis::Horizontal,
+            mut children,
+        } => {
+            if children.len() >= columns.max(1) {
+                return Err((
+                    WorkspaceNode::Split {
+                        id,
+                        axis: Axis::Horizontal,
+                        children,
+                    },
+                    new,
+                ));
+            }
+            children.push(SplitChild::auto(new));
+            Ok(WorkspaceNode::Split {
+                id,
+                axis: Axis::Horizontal,
+                children,
+            })
+        }
+        node => {
+            if columns < 2 {
+                return Err((node, new));
+            }
+            Ok(WorkspaceNode::Split {
+                id: SplitId::new(),
+                axis: Axis::Horizontal,
+                children: vec![SplitChild::auto(node), SplitChild::auto(new)],
+            })
+        }
+    }
+}
+
+/// Every pane of a tree, in tree order, taken out of it.
+fn collect_panes<K>(node: WorkspaceNode<K>, panes: &mut Vec<TaskPane<K>>) {
+    match node {
+        WorkspaceNode::Pane(pane) => panes.push(pane),
+        WorkspaceNode::Split { children, .. } => {
+            for child in children {
+                collect_panes(child.node, panes);
+            }
+        }
+    }
+}
+
+/// `panes` laid out left to right in rows of `columns`, as composition A tiles
+/// them. One row is a bare horizontal split; several are a vertical split of
+/// horizontal ones. One pane is one pane, with no split around it.
+fn grid_tree<K>(panes: Vec<TaskPane<K>>, columns: usize) -> Option<WorkspaceNode<K>> {
+    if panes.is_empty() {
+        return None;
+    }
+    let columns = columns.max(1);
+    let mut rows: Vec<WorkspaceNode<K>> = Vec::new();
+    let mut children: Vec<SplitChild<K>> = Vec::with_capacity(columns);
+    for pane in panes {
+        children.push(SplitChild::auto(WorkspaceNode::Pane(pane)));
+        if children.len() == columns {
+            rows.push(grid_row(std::mem::take(&mut children)));
+        }
+    }
+    if !children.is_empty() {
+        rows.push(grid_row(children));
+    }
+    if rows.len() == 1 {
+        return rows.pop();
+    }
+    Some(WorkspaceNode::Split {
+        id: SplitId::new(),
+        axis: Axis::Vertical,
+        children: rows.into_iter().map(SplitChild::auto).collect(),
+    })
+}
+
+/// One row of the grid. A single cell is the pane itself: wrapping it in a
+/// split of one child would fail `validate`'s "a split has more than one
+/// child" rule and would paint a divider with nothing on the other side.
+fn grid_row<K>(mut children: Vec<SplitChild<K>>) -> WorkspaceNode<K> {
+    if children.len() == 1 {
+        return children
+            .pop()
+            .expect("a one-child row has exactly one child")
+            .node;
+    }
+    WorkspaceNode::Split {
+        id: SplitId::new(),
+        axis: Axis::Horizontal,
+        children,
+    }
+}
+
 fn insert_pane_near<K>(
     node: WorkspaceNode<K>,
     target: PaneId,
@@ -1184,6 +1515,155 @@ mod tests {
     use super::*;
     use crate::domain::TaskId;
     use crate::ui::task_workspace::allocation::{AllocationMetrics, Viewport};
+
+    /// The grid a tree describes, as rows of task ids, or `None` if the tree
+    /// is not a grid at all -- a cell that is itself a split means a pane got
+    /// NESTED instead of tiled, which is the defect these tests exist for.
+    fn grid_rows<K: Clone + Ord + Eq>(workspace: &Workspace<K>) -> Option<Vec<Vec<K>>> {
+        fn row_of<K: Clone>(node: &WorkspaceNode<K>) -> Option<Vec<K>> {
+            match node {
+                WorkspaceNode::Pane(pane) => Some(vec![pane.task_id.clone()]),
+                WorkspaceNode::Split {
+                    axis: Axis::Horizontal,
+                    children,
+                    ..
+                } => children
+                    .iter()
+                    .map(|child| match &child.node {
+                        WorkspaceNode::Pane(pane) => Some(pane.task_id.clone()),
+                        WorkspaceNode::Split { .. } => None,
+                    })
+                    .collect(),
+                WorkspaceNode::Split {
+                    axis: Axis::Vertical,
+                    ..
+                } => None,
+            }
+        }
+        match workspace.root()? {
+            WorkspaceNode::Split {
+                axis: Axis::Vertical,
+                children,
+                ..
+            } => children.iter().map(|child| row_of(&child.node)).collect(),
+            node => row_of(node).map(|row| vec![row]),
+        }
+    }
+
+    /// Composition A: one more panel is one more COLUMN while the canvas holds
+    /// it at the grid width, then a second ROW filling left to right. Never a
+    /// nested split, which is what `insert_after_focused` built and what made
+    /// five panels a ladder of ever-narrower columns.
+    #[test]
+    fn opening_panels_tiles_into_columns_then_a_second_row() {
+        let metrics = AllocationMetrics::production();
+        assert_eq!(grid_columns_for(1100.0, metrics), 3);
+        assert_eq!(grid_columns_for(2000.0, metrics), 5);
+
+        let open = |canvas: f32| {
+            let mut workspace = Workspace::<u32>::single(1);
+            for task in 2..=6u32 {
+                workspace
+                    .insert_into_grid(task, canvas, metrics)
+                    .expect("a new task opens");
+            }
+            workspace
+        };
+
+        let narrow = open(1100.0);
+        assert_eq!(
+            grid_rows(&narrow),
+            Some(vec![vec![1, 2, 3], vec![4, 5, 6]]),
+            "at 1100 px the grid is three columns, then a second row"
+        );
+        let wide = open(2000.0);
+        assert_eq!(
+            grid_rows(&wide),
+            Some(vec![vec![1, 2, 3, 4, 5], vec![6]]),
+            "at 2000 px the grid is five columns before it needs a row"
+        );
+
+        // And the ladder it replaces: `insert_after_focused` nests, which is
+        // why this rule had to exist at all.
+        let mut nested = Workspace::<u32>::single(1);
+        for task in 2..=6u32 {
+            nested
+                .insert_after_focused(task, Axis::Horizontal)
+                .expect("a new task opens");
+        }
+        assert_eq!(
+            grid_rows(&nested),
+            Some(vec![vec![1, 2, 3, 4, 5, 6]]),
+            "the focused-insert path keeps every pane on one row at any width"
+        );
+    }
+
+    /// Every column the grid packs is at or above the pane minimum, which is
+    /// the promise the whole rule is for.
+    #[test]
+    fn a_packed_grid_never_puts_a_column_under_the_pane_minimum() {
+        let metrics = AllocationMetrics::production();
+        for canvas in [400.0_f32, 740.0, 1100.0, 1530.0, 2000.0, 3000.0] {
+            let columns = grid_columns_for(canvas, metrics);
+            assert!(columns >= 1, "at {canvas} px the grid has no column");
+            if columns > 1 {
+                let each = (canvas - metrics.divider * (columns - 1) as f32) / columns as f32;
+                assert!(
+                    each >= metrics.full_min_width,
+                    "at {canvas} px a column is {each} px, under the {} px minimum",
+                    metrics.full_min_width
+                );
+            }
+        }
+        // A canvas too narrow for one column still places the pane.
+        assert_eq!(grid_columns_for(10.0, AllocationMetrics::production()), 1);
+        assert_eq!(
+            grid_columns_for(f32::NAN, AllocationMetrics::production()),
+            1
+        );
+    }
+
+    /// A drag is still a drag: `insert_beside` puts the pane exactly where it
+    /// was aimed, at any depth, and the grid never rearranges what is there.
+    #[test]
+    fn an_explicit_split_still_nests_where_it_was_aimed() {
+        let metrics = AllocationMetrics::production();
+        let mut workspace = Workspace::<u32>::single(1);
+        let first = workspace.focused_pane_id().expect("the one pane");
+        workspace
+            .insert_into_grid(2, 1100.0, metrics)
+            .expect("a second column");
+        workspace
+            .insert_beside(3, first, Edge::Bottom)
+            .expect("a nested split under pane 1");
+        assert_eq!(
+            grid_rows(&workspace),
+            None,
+            "a hand-built nested tree is not a grid, and must not be flattened"
+        );
+        assert_eq!(workspace.pane_count(), 3);
+        // One more opened panel joins the row beside it rather than diving in.
+        workspace
+            .insert_into_grid(4, 1100.0, metrics)
+            .expect("a third column");
+        let Some(WorkspaceNode::Split {
+            axis: Axis::Horizontal,
+            children,
+            ..
+        }) = workspace.root()
+        else {
+            panic!("the root is still the row");
+        };
+        assert_eq!(
+            children.len(),
+            3,
+            "the new pane is a third top-level column"
+        );
+        assert!(
+            matches!(&children[2].node, WorkspaceNode::Pane(pane) if pane.task_id == 4),
+            "and it is the pane itself, not another split"
+        );
+    }
 
     /// Four panes in a 2x2: 1 top-left, 3 bottom-left, 2 top-right, 4
     /// bottom-right. Built through the ordinary insert path so the tree is one

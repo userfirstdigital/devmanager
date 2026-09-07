@@ -1,0 +1,72 @@
+{
+  "schema": "devmanager.ui.preview/v1",
+  "id": "fix-wave-4-nested",
+  "title": "The live capture's tree: H[ V[ H[1,2], 5 ], 3, 4 ]",
+  "capture": {
+    "cursor": "excluded",
+    "border": "excluded"
+  },
+  "root": {
+    "kind": "task-cockpit",
+    "label": "Task Cockpit",
+    "tasks": [
+      {
+        "title": "are there any migrations left to run against dev or prod db?",
+        "provider": "claude",
+        "state": "idle",
+        "age_ms": 691200000,
+        "project": "command",
+        "open": true,
+        "focused": true,
+        "view": "terminal"
+      },
+      {
+        "title": "Reply with exactly OPTIONS_ARGS_LIVE",
+        "provider": "codex",
+        "state": "idle",
+        "age_ms": 432000000,
+        "project": "command",
+        "open": true,
+        "view": "terminal",
+        "placement": { "beside": 1, "edge": "right" }
+      },
+      {
+        "title": "Snake Frontend",
+        "provider": "claude",
+        "state": "idle",
+        "age_ms": 432000000,
+        "project": "snake-game",
+        "open": true,
+        "view": "terminal",
+        "placement": { "beside": 2, "edge": "right" }
+      },
+      {
+        "title": "New task",
+        "provider": "claude",
+        "state": "idle",
+        "age_ms": 518400000,
+        "project": "command",
+        "open": true,
+        "view": "terminal",
+        "placement": { "beside": 1, "edge": "below" }
+      },
+      {
+        "title": "Build the Snake backend in C:/Code/userfirst/snake-game-backend. You own only that folder and nothing above it.",
+        "provider": "codex",
+        "state": "idle",
+        "age_ms": 518400000,
+        "project": "snake-game",
+        "open": true,
+        "view": "terminal",
+        "placement": { "beside": 1, "edge": "right" }
+      },
+      {
+        "title": "hi there",
+        "provider": "codex",
+        "state": "idle",
+        "age_ms": 864000000,
+        "project": "command"
+      }
+    ]
+  }
+}

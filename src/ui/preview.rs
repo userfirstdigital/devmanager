@@ -115,6 +115,44 @@ pub enum PreviewTaskView {
     Terminal,
 }
 
+/// Which side of an already-open panel a new one is split off.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PreviewPaneEdge {
+    Left,
+    Right,
+    Above,
+    Below,
+}
+
+impl PreviewPaneEdge {
+    fn edge(self) -> crate::ui::task_workspace::Edge {
+        use crate::ui::task_workspace::Edge;
+        match self {
+            Self::Left => Edge::Left,
+            Self::Right => Edge::Right,
+            Self::Above => Edge::Top,
+            Self::Below => Edge::Bottom,
+        }
+    }
+}
+
+/// Where one panel joins the workspace, for a fixture that needs an exact
+/// tree rather than the flat left-to-right row the plain seeding builds.
+///
+/// This is how a NESTED arrangement gets into a capture at all: the shape a
+/// person builds by dragging is the shape the grid painter has to be proved
+/// against, and without it the harness could only ever render one flat row --
+/// which is exactly the case the painter never got wrong.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PreviewPanePlacement {
+    /// The 1-based position in `root.tasks` of the open task this panel is
+    /// split off. It must come earlier in the list and must itself be open.
+    pub beside: usize,
+    pub edge: PreviewPaneEdge,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PreviewTaskFixture {
@@ -139,6 +177,10 @@ pub struct PreviewTaskFixture {
     pub focused: bool,
     #[serde(default)]
     pub view: PreviewTaskView,
+    /// Where this panel joins the grid. Absent is the plain seeding: one more
+    /// column beside the panel opened before it.
+    #[serde(default)]
+    pub placement: Option<PreviewPanePlacement>,
     #[serde(default)]
     pub conversation: Option<PreviewConversationFixture>,
 }
@@ -221,6 +263,9 @@ fn preview_task_seeds(
                 project: task.project.clone(),
                 open: task.open,
                 focused: task.focused,
+                placement: task
+                    .placement
+                    .map(|placement| (placement.beside.saturating_sub(1), placement.edge.edge())),
                 terminal_view: matches!(task.view, PreviewTaskView::Terminal),
                 plan_steps,
                 messages,
@@ -238,7 +283,7 @@ pub fn validate_preview_tasks(tasks: &[PreviewTaskFixture]) -> Result<(), String
     let mut titles = BTreeSet::new();
     let mut open = 0usize;
     let mut focused = 0usize;
-    for task in tasks {
+    for (index, task) in tasks.iter().enumerate() {
         if task.title.trim().is_empty() || task.title.chars().count() > 512 {
             return Err("preview task title is empty or oversized".to_string());
         }
@@ -257,6 +302,23 @@ pub fn validate_preview_tasks(tasks: &[PreviewTaskFixture]) -> Result<(), String
         }
         if task.focused && !task.open {
             return Err("a focused preview task must also be open".to_string());
+        }
+        if let Some(placement) = task.placement {
+            if !task.open {
+                return Err("only an open preview task may name a placement".to_string());
+            }
+            let beside = placement
+                .beside
+                .checked_sub(1)
+                .ok_or_else(|| "preview placement.beside is 1-based".to_string())?;
+            if beside >= index {
+                return Err(
+                    "preview placement.beside must name an EARLIER task in the list".to_string(),
+                );
+            }
+            if !tasks[beside].open {
+                return Err("preview placement.beside must name an open task".to_string());
+            }
         }
         if task.open {
             open += 1;
@@ -1822,6 +1884,8 @@ mod tests {
         for body in [
             include_str!("../../tests/fixtures/ui/task-cockpit-panel-grid.json"),
             include_str!("../../tests/fixtures/ui/task-cockpit-two-panels.json"),
+            include_str!("../../tests/fixtures/ui/fix-wave-4-nested.json"),
+            include_str!("../../tests/fixtures/ui/fix-wave-4-grid.json"),
         ] {
             let parsed: PreviewFixture =
                 serde_json::from_str(body).expect("the committed fixture parses");

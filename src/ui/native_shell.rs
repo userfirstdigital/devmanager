@@ -886,13 +886,76 @@ fn terminal_query_refusal(
 ) -> Option<(String, Option<crate::domain::TaskCockpitUnavailableReason>)> {
     match result {
         crate::domain::TaskCockpitResult::Unavailable { reason, detail, .. } => Some((
-            cockpit_reason_line(*reason, detail.as_deref()),
+            refusal_sentence(detail.as_deref(), || terminal_unavailable_sentence(*reason)),
             Some(*reason),
         )),
-        crate::domain::TaskCockpitResult::Denied { reason, detail, .. } => {
-            Some((cockpit_reason_line(*reason, detail.as_deref()), None))
-        }
+        crate::domain::TaskCockpitResult::Denied { reason, detail, .. } => Some((
+            refusal_sentence(detail.as_deref(), || terminal_denied_sentence(*reason)),
+            None,
+        )),
         _ => None,
+    }
+}
+
+/// The host's own sentence if it sent one, and the closed reason's sentence if
+/// it did not.
+///
+/// Never the reason's Debug name. `{reason:?}` is a Rust identifier -- the
+/// panel body read "Terminal unavailable: TerminalUnavailable", which says
+/// nothing twice and looks like a leaked internal -- and it is the only thing
+/// there is to print when the host sends `detail: None`, which is the common
+/// case.
+fn refusal_sentence(detail: Option<&str>, fallback: impl FnOnce() -> &'static str) -> String {
+    match detail.map(str::trim) {
+        Some(detail) if !detail.is_empty() => detail.to_string(),
+        _ => fallback().to_string(),
+    }
+}
+
+/// One short human clause per unavailable reason, written to follow "Terminal
+/// unavailable: " and to be readable on its own in the blocked status line.
+///
+/// Exhaustive by construction: no wildcard arm, so a new variant of
+/// `TaskCockpitUnavailableReason` fails the build here rather than shipping as
+/// a Debug name in a panel body.
+fn terminal_unavailable_sentence(
+    reason: crate::domain::TaskCockpitUnavailableReason,
+) -> &'static str {
+    use crate::domain::TaskCockpitUnavailableReason as Reason;
+    match reason {
+        Reason::TerminalUnavailable => "this task has no terminal on its host",
+        Reason::TerminalStartPending => "its provider session is still starting",
+        Reason::TerminalNotStarted => "no provider session has been started yet",
+        Reason::TerminalProviderSetupRequired => "the provider is waiting on a setup prompt",
+        Reason::TerminalProviderSessionNotFound => "the provider no longer has this conversation",
+        Reason::GitAuthorityNotIssued => "the host has not issued git authority for this task",
+        Reason::FileAuthorityNotIssued => "the host has not issued file authority for this task",
+        Reason::SshOperationUnsupported => "this SSH host does not support that",
+        Reason::SshTaskSupervisorAdapterMissing => "this SSH host runs no task supervisor",
+        Reason::ServiceSupervisorUnavailable => "the service supervisor is not running",
+        Reason::WriteUnsupported => "this host does not accept writes",
+        Reason::LogsUnsupported => "this host does not serve logs",
+        Reason::HealthUnsupported => "this host does not report health",
+        Reason::WorkspaceAuthorityUnavailable => "the host has not issued workspace authority",
+        Reason::BrowserProcessSessionUnavailable => "the browser session is not running",
+    }
+}
+
+/// One short human clause per denied reason. See
+/// [`terminal_unavailable_sentence`]; same rule, same reason for having no
+/// wildcard arm.
+fn terminal_denied_sentence(reason: crate::domain::TaskCockpitDeniedReason) -> &'static str {
+    use crate::domain::TaskCockpitDeniedReason as Reason;
+    match reason {
+        Reason::MissingTask => "the host does not know this task",
+        Reason::Unauthorized => "the host refused the request",
+        Reason::PathTraversal => "the path left the workspace",
+        Reason::OutsideWorkspace => "the path is outside the workspace",
+        Reason::CapabilityDenied => "the host has not granted that capability",
+        Reason::StaleFence => "the request was for an older session",
+        Reason::UnknownService => "the host does not know that service",
+        Reason::ForeignScope => "the request was for another host's task",
+        Reason::RevisionConflict => "the task changed while the request was in flight",
     }
 }
 
@@ -1756,6 +1819,9 @@ pub struct PreviewTaskSeed {
     pub project: Option<String>,
     pub open: bool,
     pub focused: bool,
+    /// Which already-seeded pane this one splits, and on which side. `None` is
+    /// the plain seeding: one more pane beside the one opened before it.
+    pub placement: Option<(usize, crate::ui::task_workspace::Edge)>,
     pub terminal_view: bool,
     pub plan_steps: Vec<PreviewPlanStep>,
     pub messages: Vec<crate::ui::task_cockpit::timeline::PreviewConversationMessage>,
@@ -11861,6 +11927,16 @@ pub struct NativeShell {
     /// pane moves are questions about what is on screen, so they are answered
     /// from what was on screen rather than from a nominal probe.
     workspace_allocation: crate::ui::task_workspace::AllocatedWorkspace<HostTaskKey>,
+    /// The canvas the last paint gave the panel grid. Whether one more panel
+    /// is a new column or the start of a second row is a question about the
+    /// window, and a gesture arrives between frames with no window to ask.
+    workspace_canvas: Option<crate::ui::task_workspace::Viewport>,
+    /// A restored arrangement has not been measured against a real canvas yet.
+    /// Cleared by the first paint that has one, which is the single moment
+    /// [`crate::ui::workspace_layout::KeyedWorkspaceLayout::regrid_task_workspace`]
+    /// may rebuild a cramped stored tree; every later frame leaves the tree
+    /// exactly as the user has arranged it.
+    workspace_regrid_pending: bool,
     /// Plan progress and doing-now per task, keyed by the marker
     /// `TaskSurfaceRegistry::conversation_facts` returns. Recomputed only when
     /// that marker moves: the board repaints on every frame and on every
@@ -12842,6 +12918,8 @@ impl NativeShell {
             dock_retirement_logged: false,
             auto_allow: HashSet::new(),
             workspace_allocation: crate::ui::task_workspace::AllocatedWorkspace::default(),
+            workspace_canvas: None,
+            workspace_regrid_pending: true,
             board_activity_cache: HashMap::new(),
             task_search: TaskSearchState::default(),
             project_scope_menu: ProjectScopeMenuState::default(),
@@ -13150,16 +13228,43 @@ impl NativeShell {
             .filter(|(_, seed)| seed.open)
             .map(|(index, _)| (index, self.local_task_key(task_ids[index])))
             .collect();
-        if let Some(((_, first), rest)) = open.split_first() {
+        if let Some(((first_index, first), rest)) = open.split_first() {
             let mut workspace =
                 crate::ui::task_workspace::Workspace::<HostTaskKey>::single(first.clone());
-            for (_, key) in rest {
-                if workspace
-                    .insert_after_focused(key.clone(), crate::ui::task_workspace::Axis::Horizontal)
-                    .is_err()
+            // Which pane each seeded task ended up as, so a later seed can say
+            // "beside that one" and reproduce a nested tree exactly.
+            let mut panes: HashMap<usize, crate::ui::task_workspace::PaneId> = HashMap::new();
+            if let Some(pane_id) = workspace.focused_pane_id() {
+                panes.insert(*first_index, pane_id);
+            }
+            for (index, key) in rest {
+                let inserted = match seeds[*index]
+                    .placement
+                    .and_then(|(beside, edge)| panes.get(&beside).map(|pane| (*pane, edge)))
                 {
-                    break;
+                    Some((target, edge)) => workspace.insert_beside(key.clone(), target, edge),
+                    None => workspace.insert_after_focused(
+                        key.clone(),
+                        crate::ui::task_workspace::Axis::Horizontal,
+                    ),
+                };
+                match inserted {
+                    Ok(pane_id) => {
+                        panes.insert(*index, pane_id);
+                    }
+                    Err(error) => {
+                        eprintln!("preview task seed: pane {index} not opened: {error:?}");
+                        break;
+                    }
                 }
+            }
+            // A fixture that SPELLS OUT a tree is asking for that exact tree,
+            // so the load-time regrid must not rearrange it before the first
+            // frame -- a capture of a nested arrangement is the only way to
+            // prove the painter handles one. A fixture that says nothing about
+            // placement is arranged by the shell like any other workspace.
+            if seeds.iter().any(|seed| seed.placement.is_some()) {
+                self.workspace_regrid_pending = false;
             }
             self.layout.task_workspace = Some(workspace);
             self.mark_layout_dirty();
@@ -25348,6 +25453,34 @@ impl NativeShell {
         board: &BoardModel,
         cx: &mut Context<Self>,
     ) -> AnyElement {
+        // The canvas the grid is painted at, recorded before anything can
+        // short-circuit: a pane opened by a click between frames has no window
+        // to measure, and this is the only place one is measured at all.
+        let canvas = Viewport::new(
+            f32::from(workspace_size.width),
+            f32::from(workspace_size.height),
+        );
+        if canvas.width > 0.0 && canvas.height > 0.0 {
+            let confirmed = Self::workspace_canvas_is_confirmed(self.workspace_canvas, canvas);
+            self.workspace_canvas = Some(canvas);
+            if self.workspace_regrid_pending && confirmed {
+                match self
+                    .layout
+                    .regrid_task_workspace(canvas, Self::workspace_allocation_metrics())
+                {
+                    // A canvas that cannot tile these panes has judged nothing,
+                    // so the repair stays armed for one that can.
+                    crate::ui::workspace_layout::WorkspaceRegrid::Unmeasurable => {}
+                    crate::ui::workspace_layout::WorkspaceRegrid::Settled => {
+                        self.workspace_regrid_pending = false;
+                    }
+                    crate::ui::workspace_layout::WorkspaceRegrid::Rebuilt => {
+                        self.workspace_regrid_pending = false;
+                        self.mark_layout_dirty();
+                    }
+                }
+            }
+        }
         if self.preview_conversation_installed() {
             let owner = self.selected_task_key.clone().or_else(|| {
                 self.layout.task_workspace.as_ref().and_then(|workspace| {
@@ -25430,11 +25563,47 @@ impl NativeShell {
         // screen, so the rects that answered them are the ones this frame
         // actually used.
         self.workspace_allocation = allocated.clone();
-        let workspace =
-            self.render_task_workspace_node(root, &allocated, &rows, tokens, workspace_size, cx);
-        div().size_full().child(workspace).into_any_element()
+        let mut placed: Vec<AnyElement> = Vec::with_capacity(allocated.pane_count() * 2);
+        self.render_task_workspace_node(
+            root,
+            &allocated,
+            &rows,
+            tokens,
+            workspace_size,
+            cx,
+            &mut placed,
+        );
+        // The grid is a positioned CANVAS, not a tree of flex boxes. See
+        // `render_task_workspace_node`.
+        div()
+            .relative()
+            .size_full()
+            .min_w(px(0.0))
+            .min_h(px(0.0))
+            .overflow_hidden()
+            .children(placed)
+            .into_any_element()
     }
 
+    /// Paint one node of the tree straight onto the grid canvas.
+    ///
+    /// Every pane frame is POSITIONED AND SIZED FROM ITS ALLOCATED RECT, at
+    /// any nesting depth. That is the whole point of this shape.
+    ///
+    /// The tree used to be painted as nested flex: a split was a flex row or
+    /// column and each child a `flex_none` box that took its cross extent from
+    /// `h_full`/`w_full`. A percentage size only resolves against a parent
+    /// whose own size is definite, so the deeper a pane sat the more ancestors
+    /// there were for one of them to be content-sized -- and a pane whose
+    /// height resolved to `auto` painted its title row, its tab row and
+    /// nothing else, leaving most of its rect empty inside a frame that had
+    /// stopped growing. The allocator and the flex tree were two independent
+    /// claims about one geometry, and only one of them was ever measured.
+    ///
+    /// There is one claim now. `allocate` owns every rectangle; this walks the
+    /// tree only to find out which rectangle belongs to which pane and where
+    /// the resize rails between them sit. A split contributes no box of its
+    /// own, so nesting cannot change what a pane is given.
     fn render_task_workspace_node(
         &mut self,
         node: &TaskWorkspaceViewNode<HostTaskKey>,
@@ -25443,13 +25612,20 @@ impl NativeShell {
         tokens: crate::ui::tokens::ThemeTokens,
         workspace_size: Size<Pixels>,
         cx: &mut Context<Self>,
-    ) -> AnyElement {
+        placed: &mut Vec<AnyElement>,
+    ) {
         match node {
             TaskWorkspaceViewNode::Pane(pane) => {
-                let pane_size = allocated
-                    .rect(pane.task_id.clone())
-                    .map(|rect| size(px(rect.width), px(rect.height)))
-                    .unwrap_or(workspace_size);
+                // A pane the allocator has no rect for cannot be placed
+                // against its neighbours, so it takes the whole canvas rather
+                // than a zero-sized box nobody can see or click.
+                let rect = allocated.rect(pane.task_id.clone()).unwrap_or(PaneRect {
+                    x: 0.0,
+                    y: 0.0,
+                    width: f32::from(workspace_size.width),
+                    height: f32::from(workspace_size.height),
+                });
+                let pane_size = size(px(rect.width), px(rect.height));
                 // A pane with no board row is a pane for a task the fleet
                 // projection has dropped. It keeps its chrome from a minimal
                 // Idle row rather than vanishing mid-frame, and the row's
@@ -25462,75 +25638,106 @@ impl NativeShell {
                         &fallback
                     }
                 };
-                self.render_task_workspace_pane(pane, row, tokens, pane_size, cx)
+                let content = self.render_task_workspace_pane(pane, row, tokens, pane_size, cx);
+                placed.push(Self::task_workspace_placed(rect, content));
             }
             TaskWorkspaceViewNode::Split {
                 split_id,
                 axis,
                 children,
             } => {
-                let mut rendered = Vec::with_capacity(children.len().saturating_mul(2));
+                let parent_rect =
+                    Self::task_workspace_node_rect(node, allocated).unwrap_or_default();
+                let parent_extent = match axis {
+                    Axis::Horizontal => parent_rect.width,
+                    Axis::Vertical => parent_rect.height,
+                };
+                // The painted rail IS the allocator's gap: a second copy of
+                // the number would leave a seam or an overlap the moment one
+                // of the two moved.
+                let divider_width = Self::workspace_allocation_metrics()
+                    .divider
+                    .min(parent_extent / children.len().saturating_sub(1).max(1) as f32);
+                let divider_total = divider_width * children.len().saturating_sub(1) as f32;
                 for (index, child) in children.iter().enumerate() {
-                    let content = self.render_task_workspace_node(
+                    self.render_task_workspace_node(
                         &child.node,
                         allocated,
                         rows,
                         tokens,
                         workspace_size,
                         cx,
+                        placed,
                     );
-                    rendered.push(Self::task_workspace_child(*axis, child, allocated, content));
-                    if index + 1 < children.len() {
-                        let start_size = Self::task_workspace_node_rect(&child.node, allocated)
-                            .map(|rect| match axis {
-                                Axis::Horizontal => rect.width,
-                                Axis::Vertical => rect.height,
-                            })
-                            .unwrap_or(240.0);
-                        let parent_rect =
-                            Self::task_workspace_node_rect(node, allocated).unwrap_or_default();
-                        let parent_extent = match axis {
-                            Axis::Horizontal => parent_rect.width,
-                            Axis::Vertical => parent_rect.height,
-                        };
-                        // The painted rail IS the allocator's gap: a second
-                        // copy of the number would leave a seam or an overlap
-                        // the moment one of the two moved.
-                        let divider_width = Self::workspace_allocation_metrics()
-                            .divider
-                            .min(parent_extent / children.len().saturating_sub(1).max(1) as f32);
-                        let sibling_floor_total = children
-                            .iter()
-                            .enumerate()
-                            .filter(|(sibling, _)| *sibling != index)
-                            .map(|(_, sibling)| Self::task_workspace_child_floor(sibling, *axis))
-                            .sum();
-                        let min_size = Self::task_workspace_child_floor(child, *axis)
-                            .min(start_size)
-                            .max(1.0);
-                        let divider_total = divider_width * children.len().saturating_sub(1) as f32;
-                        rendered.push(self.task_workspace_divider(
-                            *split_id,
-                            *axis,
-                            index,
-                            start_size,
-                            min_size,
-                            parent_extent,
-                            divider_total,
-                            sibling_floor_total,
-                            divider_width,
-                            tokens,
-                            cx,
-                        ));
+                    if index + 1 >= children.len() {
+                        continue;
                     }
-                }
-                let split = div().w_full().h_full().min_w(px(0.0)).min_h(px(0.0)).flex();
-                match axis {
-                    Axis::Horizontal => split.flex_row().children(rendered).into_any_element(),
-                    Axis::Vertical => split.flex_col().children(rendered).into_any_element(),
+                    let child_rect = Self::task_workspace_node_rect(&child.node, allocated)
+                        .unwrap_or(parent_rect);
+                    let next_rect =
+                        Self::task_workspace_node_rect(&children[index + 1].node, allocated)
+                            .unwrap_or(parent_rect);
+                    let start_size = match axis {
+                        Axis::Horizontal => child_rect.width,
+                        Axis::Vertical => child_rect.height,
+                    };
+                    let sibling_floor_total = children
+                        .iter()
+                        .enumerate()
+                        .filter(|(sibling, _)| *sibling != index)
+                        .map(|(_, sibling)| Self::task_workspace_child_floor(sibling, *axis))
+                        .sum();
+                    let min_size = Self::task_workspace_child_floor(child, *axis)
+                        .min(start_size)
+                        .max(1.0);
+                    // The rail fills the gap the two rects actually leave, so
+                    // the affordance can never be somewhere other than the
+                    // seam a person sees.
+                    let rail = match axis {
+                        Axis::Horizontal => PaneRect {
+                            x: child_rect.x + child_rect.width,
+                            y: parent_rect.y,
+                            width: (next_rect.x - (child_rect.x + child_rect.width)).max(1.0),
+                            height: parent_rect.height,
+                        },
+                        Axis::Vertical => PaneRect {
+                            x: parent_rect.x,
+                            y: child_rect.y + child_rect.height,
+                            width: parent_rect.width,
+                            height: (next_rect.y - (child_rect.y + child_rect.height)).max(1.0),
+                        },
+                    };
+                    let divider = self.task_workspace_divider(
+                        *split_id,
+                        *axis,
+                        index,
+                        start_size,
+                        min_size,
+                        parent_extent,
+                        divider_total,
+                        sibling_floor_total,
+                        tokens,
+                        cx,
+                    );
+                    placed.push(Self::task_workspace_placed(rail, divider));
                 }
             }
         }
+    }
+
+    /// One element at one allocated rect on the grid canvas.
+    fn task_workspace_placed(rect: PaneRect, content: AnyElement) -> AnyElement {
+        div()
+            .absolute()
+            .left(px(rect.x))
+            .top(px(rect.y))
+            .w(px(rect.width))
+            .h(px(rect.height))
+            .min_w(px(0.0))
+            .min_h(px(0.0))
+            .overflow_hidden()
+            .child(content)
+            .into_any_element()
     }
 
     fn task_workspace_node_rect(
@@ -25600,7 +25807,6 @@ impl NativeShell {
         parent_extent: f32,
         divider_total: f32,
         sibling_floor_total: f32,
-        divider_width: f32,
         tokens: crate::ui::tokens::ThemeTokens,
         cx: &mut Context<Self>,
     ) -> AnyElement {
@@ -25647,45 +25853,14 @@ impl NativeShell {
             // under the pointer, which is the only moment it is a control.
             .bg(tokens.surfaces.canvas.to_gpui())
             .hover(|style| style.bg(tokens.borders.focus.to_gpui()))
-            .on_mouse_down(MouseButton::Left, begin);
+            .on_mouse_down(MouseButton::Left, begin)
+            // The rail's own box is the gap the two allocated rects leave; it
+            // is positioned and sized by `task_workspace_placed`, so there is
+            // no second copy of the 8 px here to drift from the allocator's.
+            .size_full();
         match axis {
-            Axis::Horizontal => divider
-                .w(px(divider_width))
-                .h_full()
-                .cursor_col_resize()
-                .into_any_element(),
-            Axis::Vertical => divider
-                .h(px(divider_width))
-                .w_full()
-                .cursor_row_resize()
-                .into_any_element(),
-        }
-    }
-
-    fn task_workspace_child(
-        axis: Axis,
-        child: &TaskWorkspaceViewChild<HostTaskKey>,
-        allocated: &crate::ui::task_workspace::AllocatedWorkspace<HostTaskKey>,
-        content: AnyElement,
-    ) -> AnyElement {
-        let logical_px = Self::task_workspace_node_rect(&child.node, allocated)
-            .map(|rect| match axis {
-                Axis::Horizontal => rect.width,
-                Axis::Vertical => rect.height,
-            })
-            .unwrap_or_else(|| match child.allocation {
-                Allocation::Pinned { logical_px } => logical_px,
-                Allocation::Auto { .. } => 0.0,
-            });
-        let wrapper = div()
-            .min_w(px(0.0))
-            .min_h(px(0.0))
-            .flex_none()
-            .overflow_hidden()
-            .child(content);
-        match axis {
-            Axis::Horizontal => wrapper.w(px(logical_px)).h_full().into_any_element(),
-            Axis::Vertical => wrapper.h(px(logical_px)).w_full().into_any_element(),
+            Axis::Horizontal => divider.cursor_col_resize().into_any_element(),
+            Axis::Vertical => divider.cursor_row_resize().into_any_element(),
         }
     }
 
@@ -32213,8 +32388,14 @@ impl NativeShell {
         }
         debug_assert!(remote_raw_terminal_allowed(&key.host));
         // Done/Archived open via selection; never restore lifecycle from a click.
-        apply_fleet_workspace_selection(&mut self.layout.task_workspace, key.clone(), mode)
-            .map_err(|error| format!("{error:?}"))?;
+        let canvas_width = self.workspace_canvas_width();
+        apply_fleet_workspace_selection(
+            &mut self.layout.task_workspace,
+            key.clone(),
+            mode,
+            canvas_width,
+        )
+        .map_err(|error| format!("{error:?}"))?;
         // Selector choices belong to the composer owner that opened them. A task
         // switch must never leave that transient menu floating over the next
         // conversation with stale provider/model choices.
@@ -33112,6 +33293,39 @@ impl NativeShell {
     /// copy of the numbers that can drift from it.
     fn workspace_allocation_metrics() -> AllocationMetrics {
         AllocationMetrics::production()
+    }
+
+    /// Whether this canvas is the WINDOW, rather than a layout pass on its way
+    /// to one.
+    ///
+    /// Measured 2026-09-06 against the preview harness: the first frame's
+    /// `window.bounds()` reported a 4275.6 x 1180 canvas for a window that then
+    /// painted at 1210 x 1620 on every later frame. At the wide reading five
+    /// panels are not cramped at all, so the one load-time repair
+    /// (`workspace_regrid_pending`) was spent deciding that a genuinely cramped
+    /// arrangement was fine -- silently, on a canvas that never existed.
+    ///
+    /// A size the window has now reported TWICE running is one it has settled
+    /// on. This costs a frame and it is the only reading available: nothing in
+    /// a single `bounds()` says whether the window is still being sized.
+    fn workspace_canvas_is_confirmed(
+        previous: Option<crate::ui::task_workspace::Viewport>,
+        current: crate::ui::task_workspace::Viewport,
+    ) -> bool {
+        previous == Some(current)
+    }
+
+    /// The width the panel grid was last painted at, which is what decides how
+    /// many top-level columns one more panel may make.
+    ///
+    /// Before the first paint there is no window to measure, so an open falls
+    /// back to the nominal canvas -- one row, as many columns as there are
+    /// panes -- which is exactly what the grid did before it could reflow.
+    fn workspace_canvas_width(&self) -> f32 {
+        self.workspace_canvas
+            .map(|canvas| canvas.width)
+            .filter(|width| *width > 0.0)
+            .unwrap_or(crate::ui::task_workspace::GRID_NOMINAL_CANVAS_WIDTH)
     }
 
     /// The panel number each open task carries: 1-based, in the workspace's
@@ -61998,6 +62212,245 @@ mod "
             crate::providers::ProviderKind::Codex,
             false,
         ));
+    }
+
+    /// Source with the shared checkout's CRLF taken out, so a scan can slice
+    /// it the same way on every machine. `char::from(13)` rather than an escape
+    /// literal: this string is edited by scripts often enough that an escape is
+    /// a hazard rather than a convenience.
+    fn normalised_source(source: &str) -> String {
+        source.replace(char::from(13), "")
+    }
+
+    /// The variant names of one enum in `src/domain/cockpit.rs`.
+    ///
+    /// Parsed rather than assumed: a hand-written list of reasons goes stale
+    /// silently, and a stale list makes every assertion over it vacuous for the
+    /// variant that was added.
+    fn domain_enum_variants(name: &str) -> Vec<String> {
+        let source = normalised_source(include_str!("../domain/cockpit.rs"));
+        let body = source
+            .split(&format!("pub enum {name} {{"))
+            .nth(1)
+            .unwrap_or_else(|| panic!("{name} is declared in src/domain/cockpit.rs"));
+        let variants: Vec<String> = body
+            .lines()
+            .map(str::trim)
+            .take_while(|line| *line != "}")
+            .filter(|line| !line.starts_with("//"))
+            .filter_map(|line| line.strip_suffix(','))
+            .map(str::to_string)
+            .collect();
+        assert!(
+            variants.len() > 3,
+            "{name} parsed to {} variants, which means the parse failed",
+            variants.len()
+        );
+        variants
+    }
+
+    /// X4: the panel body must never print a Rust identifier.
+    ///
+    /// "Terminal unavailable: TerminalUnavailable" is what the live capture
+    /// showed on three panels: the host sent no sentence, so the formatter had
+    /// nothing but `{reason:?}`. Every reason now carries one short human
+    /// clause, and the match has no wildcard arm, so a new variant fails the
+    /// BUILD rather than shipping its Debug name to a person.
+    #[test]
+    fn every_terminal_refusal_reason_has_a_human_sentence() {
+        use crate::domain::{TaskCockpitDeniedReason, TaskCockpitUnavailableReason};
+
+        const UNAVAILABLE: &[TaskCockpitUnavailableReason] = &[
+            TaskCockpitUnavailableReason::TerminalUnavailable,
+            TaskCockpitUnavailableReason::TerminalStartPending,
+            TaskCockpitUnavailableReason::TerminalNotStarted,
+            TaskCockpitUnavailableReason::TerminalProviderSetupRequired,
+            TaskCockpitUnavailableReason::TerminalProviderSessionNotFound,
+            TaskCockpitUnavailableReason::GitAuthorityNotIssued,
+            TaskCockpitUnavailableReason::FileAuthorityNotIssued,
+            TaskCockpitUnavailableReason::SshOperationUnsupported,
+            TaskCockpitUnavailableReason::SshTaskSupervisorAdapterMissing,
+            TaskCockpitUnavailableReason::ServiceSupervisorUnavailable,
+            TaskCockpitUnavailableReason::WriteUnsupported,
+            TaskCockpitUnavailableReason::LogsUnsupported,
+            TaskCockpitUnavailableReason::HealthUnsupported,
+            TaskCockpitUnavailableReason::WorkspaceAuthorityUnavailable,
+            TaskCockpitUnavailableReason::BrowserProcessSessionUnavailable,
+        ];
+        const DENIED: &[TaskCockpitDeniedReason] = &[
+            TaskCockpitDeniedReason::MissingTask,
+            TaskCockpitDeniedReason::Unauthorized,
+            TaskCockpitDeniedReason::PathTraversal,
+            TaskCockpitDeniedReason::OutsideWorkspace,
+            TaskCockpitDeniedReason::CapabilityDenied,
+            TaskCockpitDeniedReason::StaleFence,
+            TaskCockpitDeniedReason::UnknownService,
+            TaskCockpitDeniedReason::ForeignScope,
+            TaskCockpitDeniedReason::RevisionConflict,
+        ];
+
+        let declared = domain_enum_variants("TaskCockpitUnavailableReason");
+        assert_eq!(
+            declared.len(),
+            UNAVAILABLE.len(),
+            "an unavailable reason was added to the domain without a sentence here: {declared:?}"
+        );
+        for reason in UNAVAILABLE {
+            let debug_name = format!("{reason:?}");
+            assert!(
+                declared.contains(&debug_name),
+                "{debug_name} is not a variant of the domain enum any more"
+            );
+            let sentence = super::terminal_unavailable_sentence(*reason);
+            assert!(!sentence.trim().is_empty(), "{debug_name} has no sentence");
+            assert!(
+                !sentence.contains(&debug_name),
+                "{debug_name} still prints its own identifier: {sentence}"
+            );
+            assert!(
+                sentence.contains(' '),
+                "{debug_name} reads as an identifier, not a sentence: {sentence}"
+            );
+        }
+
+        let declared = domain_enum_variants("TaskCockpitDeniedReason");
+        assert_eq!(
+            declared.len(),
+            DENIED.len(),
+            "a denied reason was added to the domain without a sentence here: {declared:?}"
+        );
+        for reason in DENIED {
+            let debug_name = format!("{reason:?}");
+            assert!(
+                declared.contains(&debug_name),
+                "{debug_name} is not a variant of the domain enum any more"
+            );
+            let sentence = super::terminal_denied_sentence(*reason);
+            assert!(!sentence.trim().is_empty(), "{debug_name} has no sentence");
+            assert!(
+                !sentence.contains(&debug_name),
+                "{debug_name} still prints its own identifier: {sentence}"
+            );
+            assert!(sentence.contains(' '), "{debug_name} is not a sentence");
+        }
+
+        // And the whole path: the host's own sentence wins when it sent one,
+        // and the reason's stands in when it did not. Neither is a Debug name.
+        let unavailable = |detail: Option<&str>| crate::domain::TaskCockpitResult::Unavailable {
+            surface: crate::domain::TaskCockpitSurface::Terminal,
+            reason: TaskCockpitUnavailableReason::TerminalUnavailable,
+            detail: detail.map(str::to_string),
+        };
+        let (bare, reason) = super::terminal_query_refusal(&unavailable(None))
+            .expect("an unavailable result is a refusal");
+        assert_eq!(
+            reason,
+            Some(TaskCockpitUnavailableReason::TerminalUnavailable),
+            "the typed reason still reaches the recovery that branches on it"
+        );
+        assert_eq!(bare, "this task has no terminal on its host");
+        let (named, _) = super::terminal_query_refusal(&unavailable(Some(
+            "Claude Code was updated; the restore recipe no longer matches",
+        )))
+        .expect("a refusal");
+        assert_eq!(
+            named, "Claude Code was updated; the restore recipe no longer matches",
+            "the host's own sentence is what a person reads when there is one"
+        );
+    }
+
+    /// X1: every pane frame is positioned and sized from its allocated rect,
+    /// at any nesting depth.
+    ///
+    /// The defect this guards was invisible in the source: a `flex_none` child
+    /// with `h_full` looks correct and resolves to `auto` whenever an ancestor
+    /// has no definite height, so a nested pane painted its two chrome rows and
+    /// stopped. Anchored on the two functions by name and on the four sides
+    /// they must read off the rect, so a return to a percentage cross-size
+    /// fails here rather than in a screenshot nobody re-takes.
+    #[test]
+    fn the_workspace_grid_positions_every_pane_from_its_allocated_rect() {
+        let source = normalised_source(include_str!("native_shell.rs"));
+        let placed = source
+            .split("    fn task_workspace_placed(")
+            .nth(1)
+            .expect("the grid canvas places elements at rects")
+            .split("    fn task_workspace_node_rect(")
+            .next()
+            .expect("the placement function ends at its neighbour");
+        for side in [
+            ".absolute()",
+            ".left(px(rect.x))",
+            ".top(px(rect.y))",
+            ".w(px(rect.width))",
+            ".h(px(rect.height))",
+        ] {
+            assert!(
+                placed.contains(side),
+                "the grid canvas must place an element with {side}"
+            );
+        }
+        let painter = source
+            .split("    fn render_task_workspace_node(")
+            .nth(1)
+            .expect("the node painter exists")
+            .split("    /// One element at one allocated rect")
+            .next()
+            .expect("the painter ends at its neighbour");
+        assert!(
+            painter.contains("Self::task_workspace_placed(rect, content)")
+                && painter.contains("Self::task_workspace_placed(rail, divider)"),
+            "panes and rails both go through the one placement"
+        );
+        for banned in [".flex_row()", ".flex_col()", ".h_full()", ".w_full()"] {
+            assert!(
+                !painter.contains(banned),
+                "the node painter is a positioned canvas, not nested flex, and it still has {banned}"
+            );
+        }
+        // Split with `concat!` so this assertion is not itself a match: the
+        // needle must not appear verbatim in the file it scans.
+        let retired = concat!("fn task_workspace_", "child(");
+        assert!(
+            !source.contains(retired),
+            "the nested-flex child wrapper is gone, not left beside its replacement"
+        );
+    }
+
+    /// X3: the canvas the one load-time repair is judged against has to be the
+    /// WINDOW, not a layout pass on its way to one.
+    ///
+    /// The three sizes below are the ones the preview harness actually reported
+    /// on 2026-09-06, in order. The first is nearly four times too wide, and at
+    /// that reading five cramped panels look perfectly comfortable -- which is
+    /// exactly how the repair was spent on a canvas that never existed.
+    #[test]
+    fn the_regrid_waits_for_a_canvas_the_window_has_settled_on() {
+        use crate::ui::task_workspace::Viewport;
+        let measured = [
+            Viewport::new(4275.6, 1180.0),
+            Viewport::new(1210.0, 1620.0),
+            Viewport::new(1210.0, 1620.0),
+        ];
+        let mut previous: Option<Viewport> = None;
+        let mut confirmed_at = None;
+        for (frame, canvas) in measured.into_iter().enumerate() {
+            if NativeShell::workspace_canvas_is_confirmed(previous, canvas)
+                && confirmed_at.is_none()
+            {
+                confirmed_at = Some(frame);
+            }
+            previous = Some(canvas);
+        }
+        assert_eq!(
+            confirmed_at,
+            Some(2),
+            "the first repeated size is the window; the opening measurement is not"
+        );
+        assert!(
+            !NativeShell::workspace_canvas_is_confirmed(None, Viewport::new(1210.0, 1620.0)),
+            "a first frame confirms nothing"
+        );
     }
 
     #[test]

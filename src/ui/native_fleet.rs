@@ -13,7 +13,7 @@ use crate::domain::task::TaskLifecycle;
 use crate::ui::native_host_state::{FleetInboxProjection, FleetTaskRow};
 use crate::ui::task_cockpit::{ConfigSidebarProjection, Inbox, TaskRowModel};
 use crate::ui::task_workspace::surfaces::{apply_workspace_selection, WorkspaceSelectionGesture};
-use crate::ui::task_workspace::{Workspace, WorkspaceError};
+use crate::ui::task_workspace::{Workspace, WorkspaceError, GRID_NOMINAL_CANVAS_WIDTH};
 
 /// Visible host label for the rail. Actual project names stay on each row.
 ///
@@ -198,12 +198,14 @@ pub fn apply_fleet_rail_selection(
             &mut workspace,
             first.clone(),
             WorkspaceSelectionGesture::Plain,
+            GRID_NOMINAL_CANVAS_WIDTH,
         );
         for key in open_keys.iter().skip(1) {
             let _ = apply_workspace_selection(
                 &mut workspace,
                 key.clone(),
                 WorkspaceSelectionGesture::Toggle,
+                GRID_NOMINAL_CANVAS_WIDTH,
             );
         }
         if let Some(focused_key) = focused {
@@ -212,7 +214,12 @@ pub fn apply_fleet_rail_selection(
             }
         }
     }
-    let _ = apply_fleet_workspace_selection(&mut workspace, clicked.key.clone(), mode);
+    let _ = apply_fleet_workspace_selection(
+        &mut workspace,
+        clicked.key.clone(),
+        mode,
+        GRID_NOMINAL_CANVAS_WIDTH,
+    );
     let open_keys = workspace
         .as_ref()
         .map(|ws| ws.task_ids())
@@ -233,8 +240,14 @@ pub fn apply_fleet_workspace_selection(
     workspace: &mut Option<Workspace<HostTaskKey>>,
     key: HostTaskKey,
     mode: FleetSelectMode,
+    canvas_width: f32,
 ) -> Result<(), WorkspaceError> {
-    apply_workspace_selection(workspace, key, WorkspaceSelectionGesture::from(mode))
+    apply_workspace_selection(
+        workspace,
+        key,
+        WorkspaceSelectionGesture::from(mode),
+        canvas_width,
+    )
 }
 
 /// Forget one host: drop only its open panes; never retarget survivors to local.

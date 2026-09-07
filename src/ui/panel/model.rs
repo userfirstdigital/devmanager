@@ -208,6 +208,13 @@ pub struct StatusLayout {
     pub show_segments: bool,
     pub show_text: bool,
     pub show_age: bool,
+    /// The primary action has given up its label and is a glyph.
+    ///
+    /// The last rung of the yield ladder and the only one that touches a
+    /// control rather than the status: Done and the menu are how a panel is
+    /// operated at all, so the button never DISAPPEARS -- it just stops
+    /// spending 44 px on a word to buy the title enough room to name its task.
+    pub primary_icon_only: bool,
 }
 
 /// The share of the title row the title may not be squeezed below while
@@ -232,6 +239,7 @@ pub fn status_layout(panel_width_px: f32) -> StatusLayout {
         show_segments: panel_width_px >= 320.0,
         show_text: panel_width_px >= 260.0,
         show_age: true,
+        primary_icon_only: false,
     }
 }
 
@@ -420,6 +428,7 @@ mod tests {
                 show_segments: true,
                 show_text: true,
                 show_age: true,
+                primary_icon_only: false,
             }
         );
         assert_eq!(
@@ -429,6 +438,7 @@ mod tests {
                 show_segments: false,
                 show_text: true,
                 show_age: true,
+                primary_icon_only: false,
             }
         );
         assert_eq!(
@@ -438,6 +448,7 @@ mod tests {
                 show_segments: false,
                 show_text: false,
                 show_age: true,
+                primary_icon_only: false,
             }
         );
         // The legibility floors alone never take the zoom or the age: only the

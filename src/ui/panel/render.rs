@@ -112,8 +112,25 @@ const TITLE_GROWTH: f32 = 0.4;
 fn title_floor(width_px: f32) -> f32 {
     TITLE_MIN_WIDTH + TITLE_GROWTH * (width_px - TIGHT_WIDTH).max(0.0)
 }
+
+/// The narrowest title that still names a task: three characters and the
+/// ellipsis, at the title's own size.
+///
+/// Below this the title paints as a bare ellipsis or one letter and a dot --
+/// which is what the live capture showed on two panels -- and at that point
+/// the row is spending its width on a word ("Done") that a glyph says just as
+/// well, while the one thing only the title can say has stopped being said.
+fn title_legible_width() -> f32 {
+    crate::ui::overlay_chrome::approx_text_width("nnn.", TITLE_FONT_SIZE)
+}
 /// `.act { padding: 2px 9px; border-radius: 6px; font-size: 11.5px }`.
 const ACTION_FONT_SIZE: f32 = 11.5;
+/// The primary action as a glyph: a 14 px lucide mark in a 24 px box (design
+/// language rule 4), keeping the 1 px rule that says it is still the button.
+const PRIMARY_ICON_SIZE: f32 = 14.0;
+const PRIMARY_ICON_PADDING_X: f32 = 4.0;
+const PRIMARY_ICON_BUTTON_WIDTH: f32 =
+    PRIMARY_ICON_SIZE + 2.0 * PRIMARY_ICON_PADDING_X + 2.0 * PANEL_BORDER_WIDTH;
 const ACTION_PADDING_X: f32 = 9.0;
 const ACTION_PADDING_Y: f32 = 2.0;
 const ACTION_RADIUS: f32 = 6.0;
@@ -466,6 +483,21 @@ fn title_width(
 /// the whole of the status the way `02-panel-chrome-2` draws it, even where
 /// that is more of the row than the title gets.
 fn title_row_layout(width_px: f32, chrome: &PanelChrome, blocked: bool) -> StatusLayout {
+    let mut layout = status_yield_ladder(width_px, chrome, blocked);
+    // Rung 4, and the only one that costs a control rather than a fact the
+    // board row repeats: the button drops its label. It runs whatever the
+    // ladder above decided -- including the early return at a wide panel --
+    // because "the title has fewer than three characters" is a question about
+    // the title, not about how many rungs the status had left.
+    let estimate = estimated_status_width(chrome, layout, blocked);
+    if title_width(width_px, chrome, layout, estimate, blocked) + 0.5 < title_legible_width() {
+        layout.primary_icon_only = true;
+    }
+    layout
+}
+
+/// The status group yielding, rung by rung, until the title has its share.
+fn status_yield_ladder(width_px: f32, chrome: &PanelChrome, blocked: bool) -> StatusLayout {
     let mut layout = status_layout(width_px);
     if width_px >= STATUS_YIELD_WIDTH {
         return layout;
@@ -506,7 +538,7 @@ fn controls_reserve(chrome: &PanelChrome, layout: StatusLayout) -> f32 {
         width += ordinal_chip_width(chrome.ordinal.unwrap_or(1));
         gaps += 1.0;
     }
-    width += primary_button_width(chrome.primary);
+    width += primary_button_width(chrome.primary, layout.primary_icon_only);
     gaps += 1.0;
     width + gaps * TITLE_ROW_GAP
 }
@@ -518,8 +550,12 @@ fn ordinal_chip_width(ordinal: u8) -> f32 {
     2.0 * ORDINAL_CHIP_PADDING_X + 2.0 + digits * ORDINAL_CHIP_FONT_SIZE * 0.62
 }
 
-/// The primary button at its real label.
-fn primary_button_width(primary: PrimaryAction) -> f32 {
+/// The primary button at its real label, or at its glyph once the title has
+/// run out of room for one.
+fn primary_button_width(primary: PrimaryAction, icon_only: bool) -> f32 {
+    if icon_only {
+        return PRIMARY_ICON_BUTTON_WIDTH;
+    }
     let label = match primary {
         PrimaryAction::Done => "Done",
         PrimaryAction::Reopen => "Reopen",
@@ -882,49 +918,67 @@ fn title_row_element(
     // the whole reason to leave a panel minimised, and drops the two controls
     // that need the panel open to be useful.
     if !chrome.minimised {
-        row = row
-            .child(
-                div()
-                    .id(("devmanager-panel-primary", element_key))
-                    .tab_stop(true)
-                    .flex_none()
-                    .px(px(ACTION_PADDING_X))
-                    .py(px(ACTION_PADDING_Y))
-                    .rounded(px(ACTION_RADIUS))
-                    .border(px(PANEL_BORDER_WIDTH))
-                    .border_color(tokens.borders.default.to_gpui())
-                    .text_size(px(ACTION_FONT_SIZE))
-                    .text_color(tokens.text.primary.to_gpui())
-                    .cursor_pointer()
-                    .hover(|style| style.bg(tokens.surfaces.hover.to_gpui()))
-                    .on_mouse_down(
-                        MouseButton::Left,
-                        move |_event: &MouseDownEvent, window, app| {
-                            (on_primary)(&primary_key, primary, window, app);
-                        },
-                    )
-                    .child(match primary {
-                        PrimaryAction::Done => "Done",
-                        PrimaryAction::Reopen => "Reopen",
-                    }),
-            )
-            .child(
-                div()
-                    .id(("devmanager-panel-menu", element_key))
-                    .tab_stop(true)
-                    .flex_none()
-                    .px(px(MENU_PADDING_X))
-                    .text_size(px(MENU_FONT_SIZE))
-                    .text_color(tokens.text.muted.to_gpui())
-                    .cursor_pointer()
-                    .on_mouse_down(
-                        MouseButton::Left,
-                        move |event: &MouseDownEvent, window, app| {
-                            (on_menu)(&menu_key, event.position, window, app);
-                        },
-                    )
-                    .child("⋯"),
+        // Same id and same handler in both forms: the glyph IS the button, so
+        // a test that finds the control and a person who clicks it are looking
+        // at one thing whichever way it is painted.
+        let primary_button = div()
+            .id(("devmanager-panel-primary", element_key))
+            .tab_stop(true)
+            .flex_none()
+            .rounded(px(ACTION_RADIUS))
+            .border(px(PANEL_BORDER_WIDTH))
+            .border_color(tokens.borders.default.to_gpui())
+            .text_color(tokens.text.primary.to_gpui())
+            .cursor_pointer()
+            .hover(|style| style.bg(tokens.surfaces.hover.to_gpui()))
+            .on_mouse_down(
+                MouseButton::Left,
+                move |_event: &MouseDownEvent, window, app| {
+                    (on_primary)(&primary_key, primary, window, app);
+                },
             );
+        let primary_button = if layout.primary_icon_only {
+            primary_button
+                .flex()
+                .items_center()
+                .justify_center()
+                .px(px(PRIMARY_ICON_PADDING_X))
+                .py(px(ACTION_PADDING_Y))
+                .child(crate::icons::app_icon(
+                    match primary {
+                        PrimaryAction::Done => crate::icons::CHECK,
+                        PrimaryAction::Reopen => crate::icons::REFRESH_CW,
+                    },
+                    PRIMARY_ICON_SIZE,
+                    tokens.text.primary.to_u32(),
+                ))
+        } else {
+            primary_button
+                .px(px(ACTION_PADDING_X))
+                .py(px(ACTION_PADDING_Y))
+                .text_size(px(ACTION_FONT_SIZE))
+                .child(match primary {
+                    PrimaryAction::Done => "Done",
+                    PrimaryAction::Reopen => "Reopen",
+                })
+        };
+        row = row.child(primary_button).child(
+            div()
+                .id(("devmanager-panel-menu", element_key))
+                .tab_stop(true)
+                .flex_none()
+                .px(px(MENU_PADDING_X))
+                .text_size(px(MENU_FONT_SIZE))
+                .text_color(tokens.text.muted.to_gpui())
+                .cursor_pointer()
+                .on_mouse_down(
+                    MouseButton::Left,
+                    move |event: &MouseDownEvent, window, app| {
+                        (on_menu)(&menu_key, event.position, window, app);
+                    },
+                )
+                .child("⋯"),
+        );
     }
 
     row.into_any_element()
@@ -1620,6 +1674,140 @@ mod tests {
         // at what the status may never give up rather than going negative.
         assert_eq!(title_floor(100.0), TITLE_MIN_WIDTH);
         assert_eq!(status_budget(100.0, true), status_floor(true));
+    }
+
+    /// X5: the title never decays to a bare ellipsis.
+    ///
+    /// The live capture (9.png) had two panels whose whole title was a bare
+    /// ellipsis -- two panels that could not be told apart -- while the row
+    /// still spent 21 px saying "Done", a word the check glyph says just as
+    /// well. So the last rung of the ladder is the button's LABEL, not the
+    /// title's characters.
+    ///
+    /// Measured, not assumed. On an ordinary numbered panel the ladder alone
+    /// pays for a legible title from about 190 px up, so at the 260 and 296 px
+    /// the brief names the button keeps its word and there is nothing to buy.
+    /// The rung fires below that -- and 170-190 px is exactly where the live
+    /// capture's nested panes were. Both directions are asserted: a guard
+    /// verified in one direction is untested.
+    #[test]
+    fn the_title_keeps_three_characters_before_the_primary_keeps_its_label() {
+        // Every open panel carries an ordinal chip, so the fixture does too:
+        // without it the row has 21 px it never really has, and the rung under
+        // test would look like machinery guarding nothing.
+        let mut numbered = row(BoardState::Idle);
+        numbered.open = Some(1);
+        let idle = panel_chrome(
+            &numbered,
+            PaneView::Conversation,
+            false,
+            false,
+            false,
+            None,
+            false,
+            String::new(),
+        );
+        let title_at = |width: f32| {
+            let layout = title_row_layout(width, &idle, false);
+            let estimate = estimated_status_width(&idle, layout, false);
+            (layout, title_width(width, &idle, layout, estimate, false))
+        };
+
+        // The two widths the brief names, and every width above them: the
+        // status group alone already pays for the title, so the button keeps
+        // its label and the title still names its task.
+        for width in [260.0_f32, 296.0, 320.0, 470.0, 1060.0] {
+            let (layout, title) = title_at(width);
+            assert!(
+                !layout.primary_icon_only,
+                "at {width} px the status group already pays for the title; collapsing the button as well would cost a control for nothing"
+            );
+            assert!(
+                title >= title_legible_width(),
+                "at {width} px the title is {title} px, under the {} px that three characters and the ellipsis need",
+                title_legible_width()
+            );
+        }
+
+        // And where the live capture's nested panes actually were, the button
+        // pays and the title is legible again.
+        for width in [170.0_f32, 180.0] {
+            let (layout, title) = title_at(width);
+            assert!(
+                layout.primary_icon_only,
+                "at {width} px the button must give up its label before the title gives up its name"
+            );
+            assert!(
+                title >= title_legible_width(),
+                "and buying that room must buy a legible title rather than merely narrowing the button: it is {title} px"
+            );
+            // Sabotage: without the rung the title at that width is a bare
+            // ellipsis, which is what makes the rung load-bearing.
+            let without_rung = StatusLayout {
+                primary_icon_only: false,
+                ..layout
+            };
+            let estimate = estimated_status_width(&idle, without_rung, false);
+            let unrescued = title_width(width, &idle, without_rung, estimate, false);
+            assert!(
+                unrescued < title_legible_width(),
+                "the rung is guarding nothing at {width} px: the title is {unrescued} px even with the label"
+            );
+        }
+
+        // Below roughly 160 px the rung still fires and can no longer rescue
+        // the title: 21 px is all it has to give, and the row owes more than
+        // the panel is wide. Recorded rather than asserted away -- after X2
+        // and X3 no pane is allocated under 320 px, so this is the shape of
+        // the floor rather than a width the grid produces.
+        let (starved, starved_title) = title_at(150.0);
+        assert!(starved.primary_icon_only);
+        assert!(starved_title < title_legible_width());
+        assert_eq!(starved_title, TITLE_MIN_WIDTH);
+
+        // The glyph is genuinely cheaper than the word, in both primary states.
+        for primary in [PrimaryAction::Done, PrimaryAction::Reopen] {
+            assert!(
+                primary_button_width(primary, true) < primary_button_width(primary, false),
+                "the collapsed {primary:?} button must be narrower than its label"
+            );
+            assert_eq!(
+                primary_button_width(primary, true),
+                PRIMARY_ICON_BUTTON_WIDTH,
+                "and it is the same 24 px box whichever action it is"
+            );
+        }
+        assert_eq!(PRIMARY_ICON_BUTTON_WIDTH, 24.0);
+    }
+
+    /// The collapsed button is the SAME control: one id, one handler, one
+    /// action. A second element beside the first would be two ways to finish a
+    /// task, and only one of them would keep working.
+    #[test]
+    fn the_collapsed_primary_is_the_same_button() {
+        let source = include_str!("render.rs").replace(char::from(13), "");
+        let row = source
+            .split("fn title_row_element(")
+            .nth(1)
+            .expect("the title row painter exists")
+            .split("fn tab_width(")
+            .next()
+            .expect("the painter ends before the tab measurements");
+        assert_eq!(
+            row.matches("devmanager-panel-primary").count(),
+            1,
+            "the primary action is built once, in both forms"
+        );
+        assert_eq!(
+            row.matches("(on_primary)(&primary_key, primary, window, app);")
+                .count(),
+            1,
+            "and it carries one handler"
+        );
+        assert!(
+            row.contains("crate::icons::CHECK"),
+            "the collapsed Done is the check glyph"
+        );
     }
 
     /// V2 (fix wave 2): the title is painted at a DEFINITE width, because GPUI
