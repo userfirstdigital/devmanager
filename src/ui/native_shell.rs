@@ -19915,6 +19915,9 @@ impl NativeShell {
 
     pub(crate) fn install_window_observers(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.platform_accessibility.attach_window(window);
+        if window.focused(cx).is_none() {
+            self.focus_handle.focus(window);
+        }
         let appearance = cx.observe_window_appearance(window, |shell, window, _cx| {
             shell.queue_preferences(RuntimePreferencesSnapshot::from_system(
                 window.appearance(),
@@ -24262,6 +24265,7 @@ impl NativeShell {
             return;
         }
         let input = match key {
+            "backspace" if Self::word_delete_modifier(event) => Some(TextFieldKey::WordBackspace),
             "backspace" => Some(TextFieldKey::Backspace),
             "delete" => Some(TextFieldKey::Delete),
             "left" => Some(TextFieldKey::Left),
@@ -30789,6 +30793,29 @@ impl NativeShell {
                 self.refresh_accessibility_tree();
             }
             KeyboardAction::DismissTransient => {
+                let keyboard = self.local_slot().interaction.keyboard_state();
+                let has_transient = self.composer_selector.is_some()
+                    || self.trigger_menu.is_some()
+                    || self.add_project.is_some()
+                    || self.new_task.is_some()
+                    || self.rename_task.is_some()
+                    || self.delete_task.is_some()
+                    || self.settings_open
+                    || !matches!(self.header_commit.phase, HeaderCommitPhase::Idle)
+                    || !matches!(self.project_actions.mode, ProjectActionMenuMode::Closed)
+                    || self.project_scope_menu.open()
+                    || self.terminal_chip_menu.is_some()
+                    || self.board_menu.is_some()
+                    || self.pane_menu.is_some()
+                    || self.task_search.open()
+                    || keyboard.palette_open
+                    || keyboard.command_palette_open
+                    || keyboard.task_switcher_open;
+                if !has_transient {
+                    self.unzoom_workspace();
+                }
+                self.pane_menu = None;
+                self.local_slot_mut().interaction.close_palettes();
                 self.dismiss_composer_selector();
                 self.trigger_menu = None;
                 self.add_project = None;
@@ -33158,7 +33185,11 @@ impl NativeShell {
                 key: row.key.clone(),
                 title: row.title.clone(),
                 project_label: row.project_label.clone(),
-                host_label: row.host_label.clone(),
+                host_label: if row.key.host == self.local_host_id() {
+                    "This computer".to_string()
+                } else {
+                    row.host_label.clone()
+                },
             })
             .collect()
     }
@@ -37888,8 +37919,13 @@ impl NativeShell {
                 index,
             ));
         }
-        row.child(self.root_editor_input_registration())
-            .into_any_element()
+        // The platform input proxy alone does not put this field in GPUI's
+        // keyboard dispatch tree. Register only the form's focused field.
+        row.when(field.is_focused(), |row| {
+            row.track_focus(&self.root_editor_focus_handle)
+        })
+        .child(self.root_editor_input_registration())
+        .into_any_element()
     }
 
     fn overlay_text_field_chrome(field: &TextField) -> OverlayTextFieldChrome {
@@ -37973,8 +38009,13 @@ impl NativeShell {
                 index,
             ));
         }
-        row.child(self.root_editor_input_registration())
-            .into_any_element()
+        // The platform input proxy alone does not put this field in GPUI's
+        // keyboard dispatch tree. Register only the form's focused field.
+        row.when(field.is_focused(), |row| {
+            row.track_focus(&self.root_editor_focus_handle)
+        })
+        .child(self.root_editor_input_registration())
+        .into_any_element()
     }
 
     fn overlay_text_field_part(
@@ -43291,8 +43332,17 @@ impl NativeShell {
         .into_any_element()
     }
 
+    fn word_delete_modifier(event: &KeyDownEvent) -> bool {
+        if cfg!(target_os = "macos") {
+            event.keystroke.modifiers.alt
+        } else {
+            event.keystroke.modifiers.control
+        }
+    }
+
     fn overlay_key_input(event: &KeyDownEvent) -> Option<TextFieldKey> {
         match event.keystroke.key.as_str() {
+            "backspace" if Self::word_delete_modifier(event) => Some(TextFieldKey::WordBackspace),
             "backspace" => Some(TextFieldKey::Backspace),
             "delete" => Some(TextFieldKey::Delete),
             "left" => Some(TextFieldKey::Left),
@@ -45709,12 +45759,14 @@ impl NativeShell {
         let task_create = cx.listener(|shell, _action: &TaskCreate, _window, cx| {
             cx.stop_propagation();
             shell.begin_new_task();
+            cx.notify();
         });
         let task_rename = cx.listener(|shell, _action: &TaskRename, _window, cx| {
             cx.stop_propagation();
             if let Some(key) = shell.selected_task_key.clone() {
                 shell.begin_task_rename_key(key);
             }
+            cx.notify();
         });
 
         let open_palette = cx.listener(|shell, _action: &NativeOpenPalette, _window, cx| {
@@ -45722,6 +45774,7 @@ impl NativeShell {
             shell.dispatch_keyboard(KeyboardShortcut::ctrl(
                 crate::ui::actions::ShortcutKey::Character('k'),
             ));
+            cx.notify();
         });
         let open_switcher = cx.listener(|shell, _action: &NativeOpenTaskSwitcher, window, cx| {
             cx.stop_propagation();
@@ -45729,6 +45782,7 @@ impl NativeShell {
                 crate::ui::actions::ShortcutKey::Character('p'),
             ));
             shell.focus_task_search_input(window);
+            cx.notify();
         });
         let open_command_palette =
             cx.listener(|shell, _action: &NativeOpenCommandPalette, _window, cx| {
@@ -45736,12 +45790,14 @@ impl NativeShell {
                 shell.dispatch_keyboard(KeyboardShortcut::ctrl_shift(
                     crate::ui::actions::ShortcutKey::Character('p'),
                 ));
+                cx.notify();
             });
         let open_terminal = cx.listener(|shell, _action: &NativeOpenTerminal, _window, cx| {
             cx.stop_propagation();
             shell.dispatch_keyboard(KeyboardShortcut::ctrl(
                 crate::ui::actions::ShortcutKey::Backtick,
             ));
+            cx.notify();
         });
         let open_shell_terminal =
             cx.listener(|shell, _action: &NativeOpenShellTerminal, _window, cx| {
@@ -45749,10 +45805,12 @@ impl NativeShell {
                 shell.dispatch_keyboard(KeyboardShortcut::ctrl_shift(
                     crate::ui::actions::ShortcutKey::Backtick,
                 ));
+                cx.notify();
             });
         let cycle_terminal = cx.listener(|shell, _action: &NativeCycleTerminal, _window, cx| {
             cx.stop_propagation();
             shell.dispatch_keyboard(KeyboardShortcut::ctrl(crate::ui::actions::ShortcutKey::Tab));
+            cx.notify();
         });
         let cycle_terminal_back =
             cx.listener(|shell, _action: &NativeCycleTerminalBack, _window, cx| {
@@ -45760,6 +45818,7 @@ impl NativeShell {
                 shell.dispatch_keyboard(KeyboardShortcut::ctrl_shift(
                     crate::ui::actions::ShortcutKey::Tab,
                 ));
+                cx.notify();
             });
         // The panel's chords. Each names one shortcut and hands it to the same
         // `dispatch_keyboard` every other chord uses, so `KeyboardModel` stays
@@ -45767,107 +45826,134 @@ impl NativeShell {
         let panel_settle = cx.listener(|shell, _action: &NativePanelSettle, _window, cx| {
             cx.stop_propagation();
             shell.dispatch_keyboard(KeyboardShortcut::ctrl(ShortcutKey::Character('d')));
+            cx.notify();
         });
         let panel_zoom = cx.listener(|shell, _action: &NativePanelZoom, _window, cx| {
             cx.stop_propagation();
             shell.dispatch_keyboard(KeyboardShortcut::ctrl_shift(ShortcutKey::Character('z')));
+            cx.notify();
         });
         let panel_view_1 = cx.listener(|shell, _action: &NativePanelView1, _window, cx| {
             cx.stop_propagation();
             shell.dispatch_keyboard(KeyboardShortcut::ctrl(ShortcutKey::Digit(1)));
+            cx.notify();
         });
         let panel_view_2 = cx.listener(|shell, _action: &NativePanelView2, _window, cx| {
             cx.stop_propagation();
             shell.dispatch_keyboard(KeyboardShortcut::ctrl(ShortcutKey::Digit(2)));
+            cx.notify();
         });
         let panel_view_3 = cx.listener(|shell, _action: &NativePanelView3, _window, cx| {
             cx.stop_propagation();
             shell.dispatch_keyboard(KeyboardShortcut::ctrl(ShortcutKey::Digit(3)));
+            cx.notify();
         });
         let panel_view_4 = cx.listener(|shell, _action: &NativePanelView4, _window, cx| {
             cx.stop_propagation();
             shell.dispatch_keyboard(KeyboardShortcut::ctrl(ShortcutKey::Digit(4)));
+            cx.notify();
         });
         let panel_view_5 = cx.listener(|shell, _action: &NativePanelView5, _window, cx| {
             cx.stop_propagation();
             shell.dispatch_keyboard(KeyboardShortcut::ctrl(ShortcutKey::Digit(5)));
+            cx.notify();
         });
         let panel_focus_left = cx.listener(|shell, _action: &NativePanelFocusLeft, _window, cx| {
             cx.stop_propagation();
             shell.dispatch_keyboard(KeyboardShortcut::ctrl(ShortcutKey::Arrow(ArrowKey::Left)));
+            cx.notify();
         });
         let panel_focus_right =
             cx.listener(|shell, _action: &NativePanelFocusRight, _window, cx| {
                 cx.stop_propagation();
                 shell
                     .dispatch_keyboard(KeyboardShortcut::ctrl(ShortcutKey::Arrow(ArrowKey::Right)));
+                cx.notify();
             });
         let panel_focus_up = cx.listener(|shell, _action: &NativePanelFocusUp, _window, cx| {
             cx.stop_propagation();
             shell.dispatch_keyboard(KeyboardShortcut::ctrl(ShortcutKey::Arrow(ArrowKey::Up)));
+            cx.notify();
         });
         let panel_focus_down = cx.listener(|shell, _action: &NativePanelFocusDown, _window, cx| {
             cx.stop_propagation();
             shell.dispatch_keyboard(KeyboardShortcut::ctrl(ShortcutKey::Arrow(ArrowKey::Down)));
+            cx.notify();
         });
         let panel_move_left = cx.listener(|shell, _action: &NativePanelMoveLeft, _window, cx| {
             cx.stop_propagation();
             shell.dispatch_keyboard(KeyboardShortcut::ctrl_shift(ShortcutKey::Arrow(
                 ArrowKey::Left,
             )));
+            cx.notify();
         });
         let panel_move_right = cx.listener(|shell, _action: &NativePanelMoveRight, _window, cx| {
             cx.stop_propagation();
             shell.dispatch_keyboard(KeyboardShortcut::ctrl_shift(ShortcutKey::Arrow(
                 ArrowKey::Right,
             )));
+            cx.notify();
         });
         let panel_move_up = cx.listener(|shell, _action: &NativePanelMoveUp, _window, cx| {
             cx.stop_propagation();
             shell.dispatch_keyboard(KeyboardShortcut::ctrl_shift(ShortcutKey::Arrow(
                 ArrowKey::Up,
             )));
+            cx.notify();
         });
         let panel_move_down = cx.listener(|shell, _action: &NativePanelMoveDown, _window, cx| {
             cx.stop_propagation();
             shell.dispatch_keyboard(KeyboardShortcut::ctrl_shift(ShortcutKey::Arrow(
                 ArrowKey::Down,
             )));
+            cx.notify();
         });
-        let dismiss = cx.listener(|shell, _action: &NativeDismissTransient, _window, cx| {
+        let dismiss = cx.listener(|shell, _action: &NativeDismissTransient, window, cx| {
             cx.stop_propagation();
             // Escape closes shell-local transient UI even when the selected
             // task is loading or otherwise cannot admit provider actions.
             shell.apply_keyboard_shell_effects(KeyboardAction::DismissTransient);
+            // The overlay editor disappears on the next frame. Return its
+            // focus to the persistent shell so the next chord still routes.
+            if shell.root_editor_focus_handle.is_focused(window) {
+                shell.focus_handle.focus(window);
+            }
             cx.notify();
         });
         let dock_changes = cx.listener(|shell, _action: &NativeDockChanges, _window, cx| {
             cx.stop_propagation();
             shell.dispatch_dock_tool(DockTool::Changes);
+            cx.notify();
         });
         let dock_files = cx.listener(|shell, _action: &NativeDockFiles, _window, cx| {
             cx.stop_propagation();
             shell.dispatch_dock_tool(DockTool::Files);
+            cx.notify();
         });
         let dock_terminal = cx.listener(|shell, _action: &NativeDockTerminal, _window, cx| {
             cx.stop_propagation();
             shell.dispatch_dock_tool(DockTool::Terminal);
+            cx.notify();
         });
         let dock_browser = cx.listener(|shell, _action: &NativeDockBrowser, _window, cx| {
             cx.stop_propagation();
             shell.dispatch_dock_tool(DockTool::Browser);
+            cx.notify();
         });
         let dock_services = cx.listener(|shell, _action: &NativeDockServices, _window, cx| {
             cx.stop_propagation();
             shell.dispatch_dock_tool(DockTool::Services);
+            cx.notify();
         });
         let dock_artifacts = cx.listener(|shell, _action: &NativeDockArtifacts, _window, cx| {
             cx.stop_propagation();
             shell.dispatch_dock_tool(DockTool::Artifacts);
+            cx.notify();
         });
         let dock_review = cx.listener(|shell, _action: &NativeDockReview, _window, cx| {
             cx.stop_propagation();
             shell.dispatch_dock_tool(DockTool::Review);
+            cx.notify();
         });
         let toggle_sidebar = cx.listener(|shell, _action: &NativeToggleSidebar, _window, cx| {
             cx.stop_propagation();
@@ -48033,10 +48119,9 @@ fn launch_native_shell(
                         title: Some(window_title.clone().into()),
                         ..gpui::TitlebarOptions::default()
                     }),
-                    // AccessKit's subclass must own the HWND before its first
-                    // show. The registered-window callback below reveals it
-                    // after open_window has installed the root view.
-                    show: false,
+                    // Windows AccessKit must attach before the first show;
+                    // other platforms have no HWND reveal callback.
+                    show: !cfg!(windows),
                     ..WindowOptions::default()
                 },
                 move |window, cx| {
@@ -52940,7 +53025,27 @@ mod "
                 let expected_moved = (initial + 1) % choices.len();
                 shell.move_composer_selector_highlight(1);
                 let moved = shell.composer_selector_highlight;
+                shell.dispatch_keyboard(super::KeyboardShortcut::ctrl(
+                    crate::ui::actions::ShortcutKey::Character('p'),
+                ));
+                assert!(shell.task_search.open());
+                assert!(
+                    shell
+                        .local_slot()
+                        .interaction
+                        .keyboard_state()
+                        .task_switcher_open
+                );
+                // The native Escape action takes this direct path even while a task is loading.
                 shell.apply_keyboard_shell_effects(super::KeyboardAction::DismissTransient);
+                assert!(!shell.task_search.open());
+                assert!(
+                    !shell
+                        .local_slot()
+                        .interaction
+                        .keyboard_state()
+                        .task_switcher_open
+                );
                 let dismissed = shell.composer_selector;
                 shell.open_composer_model_selector();
                 shell.confirm_composer_selector_highlight();
@@ -61818,6 +61923,7 @@ mod "
         let completed_for_app = std::rc::Rc::clone(&completed);
         gpui::Application::new().run(move |cx| {
             crate::ui::init(cx);
+            crate::ui::actions::register_native_keyboard_bindings(cx);
             let workspace = tempfile::tempdir().expect("workspace tempdir");
             let profile = isolated_dev_profile(workspace.path()).expect("isolated profile");
             let (runtime, _) = TestRuntime::new(true, NativeHostActionResult::Queued);
@@ -61866,6 +61972,17 @@ mod "
             let any_window = window.into();
 
             entity.update(cx, |shell, cx| {
+                shell.layout.task_workspace = Some(crate::ui::task_workspace::Workspace::single(
+                    shell.local_task_key(task_id),
+                ));
+                shell.toggle_workspace_zoom();
+                assert!(shell
+                    .layout
+                    .task_workspace
+                    .as_ref()
+                    .unwrap()
+                    .zoomed()
+                    .is_some());
                 shell.dispatch_keyboard_for_test(crate::ui::actions::KeyboardShortcut::ctrl(
                     crate::ui::actions::ShortcutKey::Character('p'),
                 ));
@@ -61905,6 +62022,71 @@ mod "
             assert_eq!(platform_input.value(), Some("d"));
             assert!(platform_input.supports_action(accesskit::Action::Focus));
             assert!(platform_input.supports_action(accesskit::Action::SetValue));
+
+            cx.update_window(any_window, |_root, window, cx| {
+                window.dispatch_keystroke(Keystroke::parse("escape").unwrap(), cx);
+                assert!(!entity.read(cx).task_search.open());
+                assert!(
+                    !entity
+                        .read(cx)
+                        .local_slot()
+                        .interaction
+                        .keyboard_state()
+                        .task_switcher_open
+                );
+                assert!(entity.read(cx).focus_handle.is_focused(window));
+                assert!(
+                    entity
+                        .read(cx)
+                        .layout
+                        .task_workspace
+                        .as_ref()
+                        .unwrap()
+                        .zoomed()
+                        .is_some(),
+                    "closing search must preserve the underlying zoom"
+                );
+                window.dispatch_keystroke(Keystroke::parse("ctrl-p").unwrap(), cx);
+                assert!(
+                    entity.read(cx).task_search.open(),
+                    "the next shortcut must route after Escape"
+                );
+            })
+            .expect("dismiss and reopen search through native actions");
+            cx.update_window(any_window, |_root, window, cx| {
+                window.dispatch_keystroke(Keystroke::parse("escape").unwrap(), cx);
+                window.dispatch_keystroke(Keystroke::parse("escape").unwrap(), cx);
+                assert!(
+                    entity
+                        .read(cx)
+                        .layout
+                        .task_workspace
+                        .as_ref()
+                        .unwrap()
+                        .zoomed()
+                        .is_none(),
+                    "Escape with no transient layer must exit zoom"
+                );
+            })
+            .expect("unzoom through native Escape");
+
+            entity.update(cx, |shell, cx| {
+                shell.begin_task_rename_key(shell.local_task_key(task_id));
+                cx.notify();
+            });
+            cx.refresh_windows();
+            cx.update_window(any_window, |_root, window, cx| {
+                entity.update(cx, |shell, _cx| {
+                    shell.root_editor_focus_handle.focus(window)
+                });
+                window.dispatch_keystroke(Keystroke::parse("escape").unwrap(), cx);
+                assert!(
+                    entity.read(cx).rename_task.is_none(),
+                    "rename Escape must route from its input"
+                );
+                assert!(entity.read(cx).focus_handle.is_focused(window));
+            })
+            .expect("dismiss rename through native Escape");
 
             completed_for_app.set(true);
             crate::ui::finish_headless_test(cx);

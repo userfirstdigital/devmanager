@@ -6,6 +6,7 @@ use super::interaction::{
 };
 use std::fmt::{Display, Formatter};
 use std::ops::Range;
+use unicode_segmentation::UnicodeSegmentation;
 
 pub const MAX_TEXT_FIELD_SCALARS: usize = 4_096;
 pub const MAX_TEXT_FIELD_BYTES: usize = 16_384;
@@ -112,6 +113,7 @@ impl std::error::Error for TextFieldError {}
 pub enum TextFieldKey {
     Character(char),
     Backspace,
+    WordBackspace,
     Delete,
     Left,
     Right,
@@ -388,6 +390,23 @@ impl TextField {
                     Ok(self.delete_before_cursor())
                 }
             }
+            TextFieldKey::WordBackspace => {
+                if self.read_only || self.cursor == 0 && self.selection_range().is_none() {
+                    Ok(false)
+                } else if self.clear_selection_contents() {
+                    Ok(true)
+                } else {
+                    let prefix: String = self.value.chars().take(self.cursor).collect();
+                    let byte_start = prefix
+                        .split_word_bound_indices()
+                        .rev()
+                        .find(|(_, part)| !part.chars().all(char::is_whitespace))
+                        .map(|(index, _)| index)
+                        .unwrap_or(0);
+                    let start = prefix[..byte_start].chars().count();
+                    self.replace_range(start..self.cursor, "", focus_epoch)
+                }
+            }
             TextFieldKey::Delete => {
                 if self.read_only {
                     Ok(false)
@@ -630,6 +649,44 @@ mod tests {
         field.set_value(value).expect("set value");
         field.focus();
         field
+    }
+
+    #[test]
+    fn word_backspace_preserves_unicode_boundaries_suffix_and_undo() {
+        let mut field = focused_field("alpha café  suffix");
+        field.set_cursor("alpha café  ".chars().count(), false);
+        let epoch = field.focus_epoch();
+        assert!(field
+            .handle_key(TextFieldKey::WordBackspace, epoch)
+            .unwrap());
+        assert_eq!(field.value(), "alpha suffix");
+        assert!(field.handle_key(TextFieldKey::Undo, epoch).unwrap());
+        assert_eq!(field.value(), "alpha café  suffix");
+        field.set_value("hi 👨‍👩‍👧‍👦").unwrap();
+        field.handle_key(TextFieldKey::End, epoch).unwrap();
+        field
+            .handle_key(TextFieldKey::WordBackspace, epoch)
+            .unwrap();
+        assert_eq!(field.value(), "hi ");
+        field.select_all();
+        field.set_read_only(true);
+        assert!(!field
+            .handle_key(TextFieldKey::WordBackspace, epoch)
+            .unwrap());
+        field.set_read_only(false);
+        field
+            .handle_key(TextFieldKey::WordBackspace, epoch)
+            .unwrap();
+        assert_eq!(field.value(), "");
+        assert!(!field
+            .handle_key(TextFieldKey::WordBackspace, epoch)
+            .unwrap());
+        field.set_value("unchanged").unwrap();
+        field.blur();
+        assert!(!field
+            .handle_key(TextFieldKey::WordBackspace, epoch)
+            .unwrap());
+        assert_eq!(field.value(), "unchanged");
     }
 
     #[test]

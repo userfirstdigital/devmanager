@@ -1354,6 +1354,86 @@ where
     preview.render_to_output()
 }
 
+/// Interactive debug fixture window. It owns no production host and does not
+/// claim a captured PNG; desktop inspection captures the rendered window.
+#[cfg(debug_assertions)]
+pub fn run_live_cli(args: Vec<OsString>, policy: &PreviewPathPolicy) -> Result<(), PreviewError> {
+    if args.len() != 2 || args[0] != "--ui-preview-live" {
+        return Err(PreviewError::InvalidArgument(
+            "usage: devmanager --ui-preview-live <fixture.json>".into(),
+        ));
+    }
+    // Share the bounded fixture/path admission with automated previews. This
+    // reserved output authority is never published by interactive mode.
+    let request = parse_preview_args(
+        [
+            OsString::from("--ui-preview"),
+            args[1].clone(),
+            OsString::from("--output"),
+            policy
+                .output_root()
+                .join("live-preview.png")
+                .into_os_string(),
+        ],
+        policy,
+    )?;
+    let preview = PreviewApplication::load(request, policy)?;
+    let root = preview.root();
+    let errors = Rc::new(RefCell::new(None));
+    let errors_for_app = errors.clone();
+    gpui::Application::new()
+        .with_assets(AppAssets::new())
+        .run(move |cx| {
+            crate::ui::init(cx);
+            crate::ui::actions::register_native_keyboard_bindings(cx);
+            cx.on_window_closed(|cx| {
+                if cx.windows().is_empty() {
+                    cx.quit();
+                }
+            })
+            .detach();
+            let root = match root.instantiate_native_shell(cx) {
+                Ok(root) => root,
+                Err(error) => {
+                    *errors_for_app.borrow_mut() = Some(error);
+                    cx.quit();
+                    return;
+                }
+            };
+            let result = cx.open_window(
+                gpui::WindowOptions {
+                    window_bounds: Some(gpui::WindowBounds::centered(
+                        gpui::size(px(1280.0), px(800.0)),
+                        cx,
+                    )),
+                    titlebar: Some(gpui::TitlebarOptions {
+                        title: Some("DevManager — interactive fixture".into()),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                },
+                move |window, cx| {
+                    let view = cx.new(|cx| {
+                        let mut root = root;
+                        root.install_window_observers(window, cx);
+                        root
+                    });
+                    cx.new(|cx| gpui_component::Root::new(view, window, cx))
+                },
+            );
+            if let Err(error) = result {
+                *errors_for_app.borrow_mut() = Some(PreviewError::ApplicationFailed {
+                    reason: error.to_string(),
+                });
+                cx.quit();
+            } else {
+                cx.activate(true);
+            }
+        });
+    let result = errors.borrow_mut().take().map_or(Ok(()), Err);
+    result
+}
+
 fn absolute_path(path: &Path) -> Result<PathBuf, PreviewError> {
     if path.is_absolute() {
         return Ok(path.to_path_buf());
