@@ -4074,6 +4074,7 @@ pub struct NativeKeyboardState {
 }
 
 struct AddProjectDraft {
+    pending: Option<NativeActionRecord>,
     name: TextField,
     path: String,
     error: Option<String>,
@@ -9869,16 +9870,9 @@ impl NativeInteraction {
             ActionRequest::TaskDelete { task_id } => Some(*task_id),
             ActionRequest::ProviderInput(arguments) => Some(arguments.arguments.task_id),
             ActionRequest::StartProviderSession(arguments) => Some(arguments.task_id),
-            ActionRequest::TaskCockpit { task_id, query } => match query {
-                TaskCockpitQuery::ConfigSnapshot
-                | TaskCockpitQuery::AgentConnection
-                | TaskCockpitQuery::ConfigCreateProject { .. }
-                | TaskCockpitQuery::ConfigUpsertCommand { .. }
-                | TaskCockpitQuery::ConfigArchiveCommand { .. }
-                | TaskCockpitQuery::ConfigRunCommand { .. }
-                | TaskCockpitQuery::ConfigCommandDetail { .. } => None,
-                _ => Some(*task_id),
-            },
+            ActionRequest::TaskCockpit { task_id, query } => {
+                (!query.is_host_config_query()).then_some(*task_id)
+            }
             ActionRequest::Browser(arguments) => Some(arguments.task_id()),
             _ => None,
         };
@@ -15324,7 +15318,7 @@ impl NativeShell {
                 self.local_slot_mut().config_sidebar =
                     ConfigSidebarProjection::from_host_snapshot(&snapshot);
                 if !self.local_slot_mut().config_sidebar.projects.is_empty() {
-                    self.finish_add_project_after_host_accept();
+                    self.finish_add_project_after_host_accept(action);
                 }
                 self.sync_header_projection();
                 self.refresh_accessibility_tree();
@@ -15520,7 +15514,7 @@ impl NativeShell {
                 if let crate::domain::TaskCockpitResult::Config(snapshot) = &result {
                     self.local_slot_mut().config_sidebar =
                         ConfigSidebarProjection::from_host_snapshot(snapshot);
-                    self.finish_add_project_after_host_accept();
+                    self.finish_add_project_after_host_accept(action);
                     self.sync_header_projection();
                     self.refresh_accessibility_tree();
                 }
@@ -17179,6 +17173,11 @@ impl NativeShell {
     }
 
     fn discard_native_query_action(&mut self, action: &NativeActionRecord) {
+        self.settle_add_project_failure(
+            action,
+            "Project addition was not confirmed. Check the project list before trying again."
+                .into(),
+        );
         if let Some(request_id) = native_request_id(&action.command) {
             self.local_slot_mut()
                 .first_send_readiness_requests
@@ -17231,6 +17230,7 @@ impl NativeShell {
     }
 
     fn settle_native_query_failure(&mut self, action: &NativeActionRecord, error: String) {
+        self.settle_add_project_failure(action, error.clone());
         let local = self.local_host_id();
         if self.settle_pending_draft_first_send_probe_transport_failure_for_host(
             &local,
@@ -17677,6 +17677,14 @@ impl NativeShell {
                 return;
             }
             self.apply_action_outcome_for_host(host_id, outcome);
+            return;
+        }
+        if self.owns_add_project_action(&action) {
+            if self.add_project_action_is_current(&action) {
+                self.apply_action_outcome(outcome);
+            } else {
+                self.settle_add_project_failure(&action, "The connection changed before project addition was confirmed. Check the project list before trying again.".into());
+            }
             return;
         }
         // Existing local delete/settled/first-send fencing continues below.
@@ -19603,10 +19611,11 @@ impl NativeShell {
                 None => None,
             };
             if let Some(action) = pending_action.as_ref() {
-                if !self
-                    .local_slot_mut()
-                    .interaction
-                    .accepts_action_record(action)
+                if !self.add_project_action_is_current(action)
+                    && !self
+                        .local_slot_mut()
+                        .interaction
+                        .accepts_action_record(action)
                 {
                     let stale = match self.local_slot_mut().host_runtime.as_mut() {
                         Some(NativeHostRuntimeAttachment::Injected(runtime)) => {
@@ -28971,7 +28980,14 @@ impl NativeShell {
             .into_any_element();
         // "Conversation is live" is a claim about an admitted canonical model.
         // While startup is still running the phase line replaces it.
-        let startup_hold_copy = startup_status.as_ref().map(|line| line.primary.clone());
+        let startup_hold_copy = startup_status
+            .as_ref()
+            .map(|line| line.primary.clone())
+            .or_else(|| {
+                self.ephemeral_tasks
+                    .contains_key(&owner)
+                    .then(|| "Send a message to start this task.".to_string())
+            });
         let conversation = {
             let shell_entity = cx.entity().downgrade();
             let owner_key = owner.clone();
@@ -34269,6 +34285,7 @@ impl NativeShell {
         let mut name = TextField::new("Project name").expect("project name field");
         name.focus();
         self.add_project = Some(AddProjectDraft {
+            pending: None,
             name,
             path: String::new(),
             error: None,
@@ -34352,6 +34369,7 @@ impl NativeShell {
                 name.focus();
                 name.select_all();
                 self.add_project = Some(AddProjectDraft {
+                    pending: None,
                     name,
                     path: path.display().to_string(),
                     error: None,
@@ -34501,6 +34519,13 @@ impl NativeShell {
     }
 
     fn browse_add_project_folder(&mut self, cx: &mut Context<Self>) {
+        if self
+            .add_project
+            .as_ref()
+            .is_some_and(|draft| draft.submitting)
+        {
+            return;
+        }
         self.schedule_folder_prompt(cx);
     }
 
@@ -34543,31 +34568,73 @@ impl NativeShell {
             }
             return;
         }
-        if self
-            .dispatch_action_recorded_for_owner(
-                &local,
-                ActionRequest::TaskCockpit {
-                    task_id: TaskId::new(),
-                    query: TaskCockpitQuery::ConfigCreateProject { name, root_path },
-                },
-            )
-            .is_err()
-        {
-            if let Some(draft) = self.add_project.as_mut() {
-                draft.error = Some("Couldn't add this project. Try again.".into());
-                draft.submitting = false;
+        let action = match self.dispatch_action_recorded_for_owner(
+            &local,
+            ActionRequest::TaskCockpit {
+                task_id: TaskId::new(),
+                query: TaskCockpitQuery::ConfigCreateProject { name, root_path },
+            },
+        ) {
+            Ok(action) => action,
+            Err(_) => {
+                if let Some(draft) = self.add_project.as_mut() {
+                    draft.error = Some("Couldn't add this project. Try again.".into());
+                    draft.submitting = false;
+                    draft.pending = None;
+                }
+                return;
             }
-            return;
-        }
+        };
         if let Some(draft) = self.add_project.as_mut() {
+            draft.pending = Some(action);
             draft.submitting = true;
             draft.error = None;
         }
     }
 
-    fn finish_add_project_after_host_accept(&mut self) {
-        self.add_project = None;
-        self.offer_first_task_if_needed();
+    fn owns_add_project_action(&self, action: &NativeActionRecord) -> bool {
+        matches!(
+            &action.command,
+            NativeHostCommand::TaskCockpitQuery {
+                query: TaskCockpitQuery::ConfigCreateProject { .. },
+                ..
+            }
+        ) && self
+            .add_project
+            .as_ref()
+            .and_then(|draft| draft.pending.as_ref())
+            .is_some_and(|pending| {
+                same_native_action_identity(pending, action)
+                    && pending.connection_epoch == action.connection_epoch
+                    && pending.resource_generation == action.resource_generation
+                    && pending.runtime_generation == action.runtime_generation
+            })
+    }
+
+    fn add_project_action_is_current(&self, action: &NativeActionRecord) -> bool {
+        let epochs = self.local_slot().interaction.action_epochs();
+        self.owns_add_project_action(action)
+            && action.connection_epoch == epochs.connection_epoch
+            && action.resource_generation == epochs.resource_generation
+            && action.runtime_generation == epochs.runtime_generation
+            && action.client_epoch <= epochs.client_epoch
+    }
+
+    fn settle_add_project_failure(&mut self, action: &NativeActionRecord, error: String) {
+        if self.owns_add_project_action(action) {
+            if let Some(draft) = self.add_project.as_mut() {
+                draft.pending = None;
+                draft.submitting = false;
+                draft.error = Some(error);
+            }
+        }
+    }
+
+    fn finish_add_project_after_host_accept(&mut self, action: &NativeActionRecord) {
+        if self.owns_add_project_action(action) {
+            self.add_project = None;
+            self.offer_first_task_if_needed();
+        }
     }
 
     fn offer_first_task_if_needed(&mut self) {}
@@ -36722,6 +36789,8 @@ impl NativeShell {
             if let Some(slot) = self.host_slot_mut(&key.host) {
                 slot.composer_error = Some(format!("Couldn't open the new task: {error}"));
             }
+        } else {
+            self.request_composer_accessibility_focus();
         }
     }
 
@@ -38186,7 +38255,7 @@ impl NativeShell {
                                                     }),
                                             )
                                             .child(
-                                                Button::new("native-add-project-browse")
+                                                Button::new("native-add-project-browse").disabled(submitting)
                                                     .label(if has_folder {
                                                         "Choose a different folder"
                                                     } else {
@@ -38216,7 +38285,7 @@ impl NativeShell {
                                     .gap(px(tokens.density.spacing.sm))
                                     .child(
                                         Button::new("native-add-project-cancel")
-                                            .label("Cancel")
+                                            .label(if submitting { "Close" } else { "Cancel" })
                                             .ghost()
                                             .on_click(cx.listener(
                                                 |shell, _event: &ClickEvent, _window, cx| {
@@ -38227,7 +38296,7 @@ impl NativeShell {
                                             )),
                                     )
                                     .child(
-                                        Button::new("native-add-project-submit")
+                                        Button::new("native-add-project-submit").disabled(submitting)
                                             .label(if submitting {
                                                 "Adding…"
                                             } else if has_folder {
@@ -43759,6 +43828,14 @@ impl NativeShell {
             self.add_project = None;
             return;
         }
+        if self
+            .add_project
+            .as_ref()
+            .is_some_and(|draft| draft.submitting)
+        {
+            window.prevent_default();
+            return;
+        }
         if key == "enter" {
             window.prevent_default();
             self.submit_add_project(cx);
@@ -47978,9 +48055,17 @@ impl Render for NativeShell {
         if self.pending_task_search_focus && self.task_search.open() {
             self.focus_task_search_input(window);
         }
-        if self.pending_root_overlay_focus {
+        let root_editor_mounted = self.root_editor_value().is_some() || self.new_task.is_some();
+        if self.pending_root_overlay_focus && root_editor_mounted {
             self.root_editor_focus_handle.focus(window);
             self.pending_root_overlay_focus = false;
+        } else if !root_editor_mounted {
+            self.pending_root_overlay_focus = false;
+            // Host replies and pointer actions can remove an editor without an
+            // Escape gesture. Its detached focus handle no longer routes keys.
+            if self.root_editor_focus_handle.is_focused(window) {
+                self.focus_handle.focus(window);
+            }
         }
         let composer_is_focused =
             self.composer.is_some() && self.composer_focus_handle.is_focused(window);
@@ -53109,6 +53194,184 @@ mod "
         assert!(
             PaletteItem::for_stage(ShellStage::Welcome, true).contains(&PaletteItem::AddProject)
         );
+    }
+
+    #[test]
+    fn add_project_failure_settles_exact_dialog_and_preserves_replacement() {
+        if rerun_headless_shell_test_in_child(
+            "ui::native_shell::tests::add_project_failure_settles_exact_dialog_and_preserves_replacement",
+        ) { return; }
+        let (runtime, shared) = TestRuntime::new(true, NativeHostActionResult::Queued);
+        let workspace = tempfile::tempdir().unwrap();
+        let profile = isolated_dev_profile(workspace.path()).unwrap();
+        let path = workspace.path().display().to_string();
+        gpui::Application::headless().run(move |cx| {
+            crate::ui::init(cx);
+            let entity = cx.new(|cx| {
+                NativeShell::new_with_host_runtime_port(
+                    profile,
+                    Box::new(runtime),
+                    crate::ui::tokens::RuntimePreferencesSnapshot::default(),
+                    cx,
+                )
+            });
+            entity.update(cx, |shell, _cx| {
+                shell.install_idle_conversation_photo_for_test();
+                let (model, _) = terminal_bound_client_model();
+                shell.apply_client_model(Arc::new(model)).unwrap();
+                shell.open_add_project();
+                let draft = shell.add_project.as_mut().unwrap();
+                draft.name.set_value("Launch acceptance").unwrap();
+                draft.path = path.clone();
+                shell.commit_add_project();
+                let action = shared.lock().unwrap().accepted.last().unwrap().clone();
+                assert!(shell.add_project.as_ref().unwrap().submitting);
+                let before = shared.lock().unwrap().accepted.len();
+                shell.commit_add_project();
+                assert_eq!(
+                    shared.lock().unwrap().accepted.len(),
+                    before,
+                    "duplicate activation must not enqueue a second write"
+                );
+                let _ = shell.dispatch_action(ActionRequest::HostStatus);
+                shell.apply_epoch_fenced_action_outcome(NativeHostActionOutcome::Failed {
+                    action: action.clone(),
+                    error: "project folder unavailable".into(),
+                });
+                let draft = shell.add_project.as_ref().unwrap();
+                assert!(
+                    !draft.submitting,
+                    "a failed host query must stop the pending spinner"
+                );
+                assert_eq!(draft.error.as_deref(), Some("project folder unavailable"));
+                assert_eq!(draft.name.value(), "Launch acceptance");
+                assert_eq!(draft.path, path);
+                shell.commit_add_project();
+                let retry = shared.lock().unwrap().accepted.last().unwrap().clone();
+                shell.apply_epoch_fenced_action_outcome(NativeHostActionOutcome::Failed {
+                    action: action.clone(),
+                    error: "late first-attempt failure".into(),
+                });
+                assert!(shell.add_project.as_ref().unwrap().submitting);
+                shell.apply_epoch_fenced_action_outcome(NativeHostActionOutcome::Queried {
+                    action: retry,
+                    detail: "project added".into(),
+                    body: NativeHostQueryBody::TaskCockpit(
+                        crate::domain::TaskCockpitResult::Config(
+                            crate::domain::ConfigSidebarSnapshot {
+                                revision: 1,
+                                projects: Vec::new(),
+                                servers: Vec::new(),
+                                ssh_connections: Vec::new(),
+                                providers: Vec::new(),
+                            },
+                        ),
+                    ),
+                });
+                assert!(shell.add_project.is_none());
+                shell.open_add_project();
+                shell
+                    .add_project
+                    .as_mut()
+                    .unwrap()
+                    .name
+                    .set_value("Replacement")
+                    .unwrap();
+                shell.apply_epoch_fenced_action_outcome(NativeHostActionOutcome::Failed {
+                    action,
+                    error: "late failure".into(),
+                });
+                let draft = shell.add_project.as_ref().unwrap();
+                assert!(draft.error.is_none());
+                assert_eq!(draft.name.value(), "Replacement");
+            });
+            drop(entity);
+            crate::ui::finish_headless_test(cx);
+        });
+    }
+
+    #[test]
+    fn add_project_host_reply_restores_keyboard_routing() {
+        if rerun_headless_shell_test_in_child(
+            "ui::native_shell::tests::add_project_host_reply_restores_keyboard_routing",
+        ) {
+            return;
+        }
+        gpui::Application::new().run(move |cx| {
+            crate::ui::init(cx);
+            crate::ui::actions::register_native_keyboard_bindings(cx);
+            let workspace = tempfile::tempdir().unwrap();
+            let profile = isolated_dev_profile(workspace.path()).unwrap();
+            let path = workspace.path().display().to_string();
+            let (runtime, shared) = TestRuntime::new(true, NativeHostActionResult::Queued);
+            let window = cx
+                .open_window(
+                    WindowOptions {
+                        show: false,
+                        ..WindowOptions::default()
+                    },
+                    move |_window, cx| {
+                        let entity = cx.new(|cx| {
+                            NativeShell::new_with_host_runtime_port(
+                                profile,
+                                Box::new(runtime),
+                                crate::ui::tokens::RuntimePreferencesSnapshot::default(),
+                                cx,
+                            )
+                        });
+                        entity.update(cx, |shell, cx| {
+                            shell.install_idle_conversation_photo_for_test();
+                            let (model, _) = terminal_bound_client_model();
+                            shell.apply_client_model(Arc::new(model)).unwrap();
+                            shell.open_add_project();
+                            let draft = shell.add_project.as_mut().unwrap();
+                            draft.name.set_value("Keyboard launch").unwrap();
+                            draft.path = path;
+                            shell.commit_add_project();
+                            cx.notify();
+                        });
+                        entity
+                    },
+                )
+                .unwrap();
+            let entity = window.entity(cx).unwrap();
+            cx.refresh_windows();
+            cx.update_window(window.into(), |_root, window, cx| {
+                assert!(entity.read(cx).root_editor_focus_handle.is_focused(window));
+                let action = shared.lock().unwrap().accepted.last().unwrap().clone();
+                entity.update(cx, |shell, cx| {
+                    shell.apply_epoch_fenced_action_outcome(NativeHostActionOutcome::Queried {
+                        action,
+                        detail: "project added".into(),
+                        body: NativeHostQueryBody::TaskCockpit(
+                            crate::domain::TaskCockpitResult::Config(
+                                crate::domain::ConfigSidebarSnapshot {
+                                    revision: 1,
+                                    projects: Vec::new(),
+                                    servers: Vec::new(),
+                                    ssh_connections: Vec::new(),
+                                    providers: Vec::new(),
+                                },
+                            ),
+                        ),
+                    });
+                    assert!(shell.add_project.is_none());
+                    cx.notify();
+                });
+                let _ = window.draw(cx);
+                assert!(
+                    entity.read(cx).focus_handle.is_focused(window),
+                    "a host-closed editor must return focus to the shell"
+                );
+                window.dispatch_keystroke(Keystroke::parse("ctrl-p").unwrap(), cx);
+                assert!(
+                    entity.read(cx).task_search.open(),
+                    "the first shortcut after confirmation must route"
+                );
+            })
+            .unwrap();
+            crate::ui::finish_headless_test(cx);
+        });
     }
 
     #[test]
@@ -62111,6 +62374,7 @@ mod "
         let completed_for_app = std::rc::Rc::clone(&completed);
         gpui::Application::new().run(move |cx| {
             crate::ui::init(cx);
+            crate::ui::actions::register_native_keyboard_bindings(cx);
             let workspace = tempfile::tempdir().expect("workspace tempdir");
             let profile = isolated_dev_profile(workspace.path()).expect("isolated profile");
             let (runtime, _) = TestRuntime::new(true, NativeHostActionResult::Queued);
@@ -62191,6 +62455,15 @@ mod "
                 Some(second_project),
                 "Down must select the next project instead of reaching the terminal"
             );
+
+            cx.update_window(any_window, |_root, window, cx| {
+                window.dispatch_keystroke(Keystroke::parse("enter").unwrap(), cx);
+                let _ = window.draw(cx);
+                assert!(entity.read(cx).new_task.is_none());
+                assert!(entity.read(cx).composer_focus_handle.is_focused(window),
+                    "opening the task must focus its message box");
+                assert!(entity.read(cx).composer.is_some());
+            }).unwrap();
 
             completed_for_app.set(true);
             crate::ui::finish_headless_test(cx);

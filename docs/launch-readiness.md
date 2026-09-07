@@ -39,11 +39,11 @@ The candidate is not release-approved.
 - Updated obsolete protocol fixtures to use host-authorized task creation.
 - Enabled bounded Linux provider probes behind an owned exec barrier. One tracer
   thread retains fork/vfork/clone descendants, exact process handles and cleanup;
-  task-owned interactive provider runtimes still need platform ownership.
+  task-owned interactive provider runtimes use the cgroup backend below.
 - Added a tested Linux native PTY custody backend using a systemd user service
   and delegated cgroup v2 workload. It executes the selected native descriptor,
   acknowledges resume, preserves job control, and cleans up on host/guardian
-  loss. Task/session registry integration is still outstanding.
+  loss. Task/session registry integration retains exact completion authority.
 - Resolved Linux Claude installation links and Codex npm native distributions,
   retaining the selected native identity through registry revalidation. Enabled
   interactive metadata probes with nonblocking input and bounded cancellation.
@@ -116,7 +116,7 @@ The exact parent-bound host exited when the owned app closed. The latest real la
 and Codex model/usage metadata in the isolated profile. Cursor still reports its
 non-native shell launcher as unavailable. Follow-up desktop capture could not
 reliably focus the owned window; an observed narrow window also needs sizing
-acceptance. Interactive provider runtime ownership remains a launch gate.
+acceptance. Production provider launch and input still need end-to-end acceptance.
 This is not yet provider-terminal acceptance.
 
 The earlier interactive fixture inspection below attaches no host. Current real
@@ -146,8 +146,15 @@ observations and joined actor cleanup. Both installed Claude/Codex stock probes,
 32 terminal regressions and the all-target compiler check passed. The rebuilt
 X11 app reached canonical Ready in 614 ms; its project picker was exercised with
 physical keyboard input. The 960 × 640 minimum preserves the complete dialog under
-desktop tiling. Live project creation exposed an error-handling bug that leaves
-“Adding…” pending; that is the next UI acceptance gate.
+desktop tiling. Live project creation now persists the selected test folder.
+Host-level configuration requests no longer invent task ownership; failed and late
+replies settle only the matching dialog. Eight project UI tests, six typed-query
+tests, the host persistence test and the all-target check pass. The real-window
+regression verifies keyboard routing after the host closes the dialog. The new-task window test also verifies focus transfers to the composer.
+Physical typing now appears in the live message box and first Send creates the
+canonical task. Provider startup then fails in the Linux launch-environment
+persistence codec (`key must be a string`); protected session storage is the next
+acceptance gate. The exact rebuilt app and sibling host exited afterward.
 
 ## Remaining launch gates
 

@@ -670,6 +670,34 @@ mod workspace_security_tests {
     }
 
     #[test]
+    fn user_project_creation_persists_and_reissues_workspace_authority() {
+        let root = tempfile::tempdir().unwrap();
+        let project = root.path().join("project");
+        std::fs::create_dir(&project).unwrap();
+        std::fs::create_dir(root.path().join("com.userfirst.devmanager-native-next-dev")).unwrap();
+        let store = super::ConfigStore::open_test_fixture(
+            root.path()
+                .join("com.userfirst.devmanager-native-next-dev/config.json"),
+        )
+        .unwrap();
+        let mut admission = super::HostWorkspaceAdmission::new(store, 1, 1).unwrap();
+        admission
+            .create_user_project("Launch acceptance", project.to_str().unwrap())
+            .unwrap();
+        assert_eq!(admission.store.snapshot().config.projects.len(), 1);
+        admission.validate_current().unwrap();
+        let reopened = super::ConfigStore::open_test_fixture(
+            root.path()
+                .join("com.userfirst.devmanager-native-next-dev/config.json"),
+        )
+        .unwrap();
+        assert_eq!(
+            reopened.snapshot().config.projects[0].root_path,
+            project.to_str().unwrap()
+        );
+    }
+
+    #[test]
     fn authenticated_v2_create_resolves_workspace_before_persistence() {
         let repository = tempfile::tempdir().expect("temporary repository");
         let output = ProcessCommand::new("git")

@@ -1861,3 +1861,20 @@ mod tests {
         assert_eq!(decoded, mutate);
     }
 }
+
+impl TaskCockpitQuery {
+    /// Configuration operations belong to the host and configured project IDs,
+    /// independently of the currently selected task.
+    pub fn is_host_config_query(&self) -> bool {
+        matches!(
+            self,
+            Self::ConfigSnapshot
+                | Self::AgentConnection
+                | Self::ConfigCreateProject { .. }
+                | Self::ConfigUpsertCommand { .. }
+                | Self::ConfigArchiveCommand { .. }
+                | Self::ConfigRunCommand { .. }
+                | Self::ConfigCommandDetail { .. }
+        )
+    }
+}

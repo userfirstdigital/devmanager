@@ -1488,8 +1488,8 @@ pub fn require_unique_ids() -> Result<(), String> {
     Ok(())
 }
 
-/// Build a task-scoped Task Cockpit query. The host resolves workspace
-/// identity from the envelope task; callers must not attach a path.
+/// Build a cockpit query with its authoritative scope. Host configuration
+/// requests carry no task; task surfaces retain the supplied exact task ID.
 pub fn task_cockpit_query(
     request_id: RequestId,
     client_id: ClientId,
@@ -1499,7 +1499,7 @@ pub fn task_cockpit_query(
     QueryEnvelope {
         request_id,
         client_id,
-        task_id: Some(task_id),
+        task_id: (!query.is_host_config_query()).then_some(task_id),
         query: Query::TaskCockpit(query),
     }
 }

@@ -497,6 +497,67 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn configuration_cockpit_requests_do_not_invent_task_ownership() {
+        let mut port = FakeAsyncPort::new(
+            fixed_client(),
+            CapabilitySet::from_capabilities([Capability::TaskCockpit]),
+        );
+        let host_queries = [
+            TaskCockpitQuery::ConfigSnapshot,
+            TaskCockpitQuery::AgentConnection,
+            TaskCockpitQuery::ConfigCreateProject {
+                name: "project".into(),
+                root_path: "/repo".into(),
+            },
+            TaskCockpitQuery::ConfigUpsertCommand {
+                project_id: "p".into(),
+                folder_id: "f".into(),
+                command_id: None,
+                label: "run".into(),
+                command: "test".into(),
+            },
+            TaskCockpitQuery::ConfigArchiveCommand {
+                project_id: "p".into(),
+                folder_id: "f".into(),
+                command_id: "c".into(),
+            },
+            TaskCockpitQuery::ConfigRunCommand {
+                project_id: "p".into(),
+                folder_id: "f".into(),
+                command_id: "c".into(),
+            },
+            TaskCockpitQuery::ConfigCommandDetail {
+                project_id: "p".into(),
+                folder_id: "f".into(),
+                command_id: "c".into(),
+            },
+        ];
+        for query in host_queries {
+            port.set_query(Ok(QueryReply {
+                request_id: RequestId::new(),
+                outcome: QueryOutcome::Err(QueryError::InvalidRequest),
+            }))
+            .await;
+            let _ = query_task_cockpit(&mut port, fixed_task(), query)
+                .await
+                .unwrap();
+            assert!(port.queries().await.last().unwrap().0.task_id.is_none());
+        }
+        port.set_query(Ok(QueryReply {
+            request_id: RequestId::new(),
+            outcome: QueryOutcome::Err(QueryError::InvalidRequest),
+        }))
+        .await;
+        let _ = query_task_cockpit(&mut port, fixed_task(), TaskCockpitQuery::Terminal)
+            .await
+            .unwrap();
+        assert_eq!(
+            port.queries().await.last().unwrap().0.task_id,
+            Some(fixed_task())
+        );
+    }
+
+    #[tokio::test]
     async fn cockpit_and_agent_keep_custom_timeouts() {
         let mut port = FakeAsyncPort::new(
             fixed_client(),
