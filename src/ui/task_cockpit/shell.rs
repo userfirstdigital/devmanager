@@ -1,9 +1,6 @@
 //! Native shell mount for the single context dock.
 
-use gpui::{
-    div, AnyElement, Context, InteractiveElement, IntoElement, ParentElement, Render, Styled,
-    Window,
-};
+use gpui::{div, AnyElement, InteractiveElement, IntoElement, ParentElement, Styled};
 use std::collections::BTreeMap;
 
 use crate::browser::{
@@ -17,10 +14,6 @@ use crate::domain::id::{ApprovalId, QuestionId, RequestId, TaskId};
 use crate::domain::SemanticJournalPage;
 use crate::domain::TaskCockpitResult;
 use crate::protocol::CapabilitySet;
-use crate::ui::actions::{
-    DockSelectArtifacts, DockSelectBrowser, DockSelectChanges, DockSelectFiles, DockSelectReview,
-    DockSelectServices, DockSelectTerminal, DockToggleRawTerminal,
-};
 use crate::ui::native_shell::AGENT_NOT_STARTED_HINT;
 use crate::ui::renderers::{live_target, RendererRegistry, SemanticJournalView};
 use crate::ui::task_cockpit::cockpit_projection::TaskCockpitLiveProjection;
@@ -32,7 +25,6 @@ use crate::ui::task_cockpit::dock::{
 #[cfg(debug_assertions)]
 use crate::ui::task_cockpit::timeline::PreviewPlanStep;
 use crate::ui::task_cockpit::timeline::{ActivityToggleHandler, Timeline, TimelineViewport};
-use crate::ui::tokens::{theme, Density, Scale, ThemeMode};
 
 /// What the timeline fallback says once a canonical model is admitted for
 /// the task but no messages have arrived yet.
@@ -1092,17 +1084,6 @@ impl TaskCockpitShell {
         self.dock.dispatch_action(dispatch, &model)
     }
 
-    pub fn handle_toggle_raw(&mut self, request_id: RequestId) -> Result<(), DockProjectionError> {
-        let Some(model) = self.model.clone() else {
-            return Err(DockProjectionError::NoTaskSelected);
-        };
-        self.dock.dispatch_shortcut(
-            crate::ui::task_cockpit::dock::DockShortcut::ToggleRawTerminal,
-            request_id,
-            &model,
-        )
-    }
-
     pub fn handle_gpui_pointer(&mut self, phase: PointerPhase, press: PointerPress) -> bool {
         self.dock.handle_gpui_pointer(phase, press)
     }
@@ -1152,38 +1133,6 @@ fn question_projection_from_page(
         state_revision: page.through_sequence,
         options,
     })
-}
-
-impl Render for TaskCockpitShell {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let tokens = theme(ThemeMode::Dark, Density::Compact, Scale::Scale100);
-        div()
-            .on_action(cx.listener(|this, _: &DockSelectChanges, _, _| {
-                let _ = this.handle_tool_action(DockTool::Changes, RequestId::new());
-            }))
-            .on_action(cx.listener(|this, _: &DockSelectFiles, _, _| {
-                let _ = this.handle_tool_action(DockTool::Files, RequestId::new());
-            }))
-            .on_action(cx.listener(|this, _: &DockSelectTerminal, _, _| {
-                let _ = this.handle_tool_action(DockTool::Terminal, RequestId::new());
-            }))
-            .on_action(cx.listener(|this, _: &DockSelectBrowser, _, _| {
-                let _ = this.handle_tool_action(DockTool::Browser, RequestId::new());
-            }))
-            .on_action(cx.listener(|this, _: &DockSelectServices, _, _| {
-                let _ = this.handle_tool_action(DockTool::Services, RequestId::new());
-            }))
-            .on_action(cx.listener(|this, _: &DockSelectArtifacts, _, _| {
-                let _ = this.handle_tool_action(DockTool::Artifacts, RequestId::new());
-            }))
-            .on_action(cx.listener(|this, _: &DockSelectReview, _, _| {
-                let _ = this.handle_tool_action(DockTool::Review, RequestId::new());
-            }))
-            .on_action(cx.listener(|this, _: &DockToggleRawTerminal, _, _| {
-                let _ = this.handle_toggle_raw(RequestId::new());
-            }))
-            .child(self.dock.render_context_dock(tokens))
-    }
 }
 
 #[cfg(test)]

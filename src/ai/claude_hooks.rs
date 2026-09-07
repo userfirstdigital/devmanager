@@ -274,6 +274,7 @@ pub struct ClaudeReducer {
     messages: HashMap<MessageKey, MessageRecord>,
     message_clock: u64,
     event_clock: u64,
+    task_titles: HashMap<(String, String), (String, u64)>,
 }
 
 impl ClaudeReducer {
@@ -299,6 +300,7 @@ impl ClaudeReducer {
             messages: HashMap::new(),
             message_clock: 0,
             event_clock: 0,
+            task_titles: HashMap::new(),
         }
     }
 
@@ -393,12 +395,22 @@ impl ClaudeReducer {
                 SemanticToolState::Running,
                 "running",
             ),
-            "PostToolUse" => self.tool_event(
-                &value,
-                occurred_at_epoch_ms,
-                SemanticToolState::Completed,
-                "completed",
-            ),
+            "PostToolUse" => {
+                let mut outcome = self.tool_event(
+                    &value,
+                    occurred_at_epoch_ms,
+                    SemanticToolState::Completed,
+                    "completed",
+                );
+                // Preserve the tool's completion and add its structured plan fact.
+                // A duplicate or malformed tool event must not replay an old update.
+                if !outcome.degraded && !outcome.drafts.is_empty() {
+                    if let Some(draft) = self.task_update(&value, occurred_at_epoch_ms) {
+                        outcome.drafts.push(draft);
+                    }
+                }
+                outcome
+            }
             "PostToolUseFailure" => self.tool_event(
                 &value,
                 occurred_at_epoch_ms,
@@ -920,7 +932,7 @@ impl ClaudeReducer {
     }
 
     fn lifecycle_status(
-        &self,
+        &mut self,
         event_name: &str,
         value: &Value,
         occurred_at_epoch_ms: u64,
@@ -943,6 +955,13 @@ impl ClaudeReducer {
             "TaskCreated" | "TaskCompleted" => Some(("task_id", "claude-task")),
             _ => None,
         };
+        if matches!(event_name, "TaskCreated" | "TaskCompleted") {
+            if let (Some(id), Some(title)) =
+                (official_identifier(value, "task_id"), detail.as_ref())
+            {
+                self.remember_task_title(self.provider_session_id(value), id, title.clone());
+            }
+        }
         // Start and finish for one provider-native subject share a key. The
         // semantic store therefore retains a replacement lineage instead of
         // showing two plan rows for one task/subagent.
@@ -960,6 +979,68 @@ impl ClaudeReducer {
             )],
             degraded: false,
         }
+    }
+
+    fn remember_task_title(&mut self, session: String, id: String, title: String) {
+        self.task_titles
+            .insert((session, id), (title, self.event_clock));
+        while self.task_titles.len() > self.limits.max_tool_records {
+            let Some(oldest) = self
+                .task_titles
+                .iter()
+                .min_by_key(|(_, (_, clock))| *clock)
+                .map(|(key, _)| key.clone())
+            else {
+                break;
+            };
+            self.task_titles.remove(&oldest);
+        }
+    }
+
+    fn task_update(
+        &mut self,
+        value: &Value,
+        occurred_at_epoch_ms: u64,
+    ) -> Option<SemanticEventDraft> {
+        if value.get("tool_name")?.as_str()? != "TaskUpdate"
+            || value
+                .get("tool_response")
+                .and_then(|r| r.get("is_error"))
+                .and_then(Value::as_bool)
+                == Some(true)
+        {
+            return None;
+        }
+        let input = value.get("tool_input")?;
+        let id = official_identifier(input, "taskId")?;
+        let state = match input.get("status")?.as_str()? {
+            "pending" => "taskCreated",
+            "in_progress" => "taskInProgress",
+            "completed" => "taskCompleted",
+            _ => return None,
+        };
+        let session = self.provider_session_id(value);
+        let title = input
+            .get("subject")
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())
+            .map(bounded_text)
+            .or_else(|| {
+                self.task_titles
+                    .get(&(session.clone(), id.clone()))
+                    .map(|(title, _)| title.clone())
+            })
+            .unwrap_or_else(|| format!("Task {id}"));
+        self.remember_task_title(session.clone(), id.clone(), title.clone());
+        Some(self.draft(
+            occurred_at_epoch_ms,
+            SemanticEventKind::Status {
+                state: state.to_string(),
+                detail: Some(title),
+            },
+            SemanticRetention::Canonical,
+            Some(scoped_deduplication_key("claude-task", &session, &id)),
+        ))
     }
 
     fn enforce_tool_limit(&mut self) {
@@ -4456,6 +4537,63 @@ mod registry_race_tests {
 #[cfg(test)]
 mod ai_acceptance_tests {
     use super::*;
+
+    #[test]
+    fn task_updates_keep_tool_settlement_and_session_scoped_plan_identity() {
+        let mut reducer = ClaudeReducer::new(
+            StableSessionKey::from_tab("progress"),
+            ClaudeReducerLimits::default(),
+        );
+        let created = reducer.apply_json(br#"{"hook_event_name":"TaskCreated","session_id":"session-a","task_id":"7","task_subject":"Verify UX"}"#, 1);
+        let update = br#"{"hook_event_name":"PostToolUse","session_id":"session-a","tool_use_id":"call-1","tool_name":"TaskUpdate","tool_input":{"taskId":"7","status":"in_progress"}}"#;
+        let active = reducer.apply_json(update, 2);
+        assert_eq!(active.drafts.len(), 2);
+        assert!(matches!(
+            &active.drafts[0].kind,
+            SemanticEventKind::Tool {
+                state: SemanticToolState::Completed,
+                ..
+            }
+        ));
+        assert!(
+            matches!(&active.drafts[1].kind, SemanticEventKind::Status { state, detail: Some(title) } if state == "taskInProgress" && title == "Verify UX")
+        );
+        assert_eq!(
+            created.drafts[0].deduplication_key,
+            active.drafts[1].deduplication_key
+        );
+        assert!(
+            reducer.apply_json(update, 3).drafts.is_empty(),
+            "duplicate tool completion cannot regress progress"
+        );
+        let foreign = reducer.apply_json(br#"{"hook_event_name":"PostToolUse","session_id":"session-b","tool_use_id":"call-1","tool_name":"TaskUpdate","tool_input":{"taskId":"7","status":"in_progress"}}"#, 4);
+        assert_ne!(
+            foreign.drafts[1].deduplication_key,
+            active.drafts[1].deduplication_key
+        );
+        assert!(
+            matches!(&foreign.drafts[1].kind, SemanticEventKind::Status { detail: Some(title), .. } if title == "Task 7")
+        );
+        for (index, status) in ["invented", "deleted"].into_iter().enumerate() {
+            let body = serde_json::json!({"hook_event_name":"PostToolUse", "tool_use_id":format!("unknown-{index}"), "tool_name":"TaskUpdate", "tool_input":{"taskId":"7", "status":status}});
+            assert_eq!(
+                reducer
+                    .apply_json(&serde_json::to_vec(&body).unwrap(), 5)
+                    .drafts
+                    .len(),
+                1
+            );
+        }
+        let failure = reducer.apply_json(br#"{"hook_event_name":"PostToolUseFailure","tool_use_id":"failed","tool_name":"TaskUpdate","tool_input":{"taskId":"7","status":"completed"}}"#, 6);
+        assert_eq!(failure.drafts.len(), 1);
+        assert!(matches!(
+            &failure.drafts[0].kind,
+            SemanticEventKind::Tool {
+                state: SemanticToolState::Failed,
+                ..
+            }
+        ));
+    }
 
     #[test]
     fn lifecycle_start_and_finish_share_provider_subject_identity() {

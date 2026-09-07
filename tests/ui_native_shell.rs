@@ -385,7 +385,7 @@ fn native_gpui_smoke_report() -> NativeGpuiSmokeReport {
             platform_roles: first_report.9,
             platform_focus_is_root: first_report.10,
         });
-        cx.quit();
+        devmanager::ui::finish_headless_test(cx);
     });
     let report = report_slot
         .borrow_mut()
@@ -813,7 +813,7 @@ fn native_shell_projects_typed_inbox_and_header_from_client_model() {
         });
         *report_slot_for_app.borrow_mut() = Some(report);
         drop(entity);
-        cx.quit();
+        devmanager::ui::finish_headless_test(cx);
     });
     let (header_projected_after_model, header_title, titles, selected) = report_slot
         .borrow_mut()
@@ -895,7 +895,7 @@ fn task_preview_projects_inbox_without_becoming_client_model() {
         });
         *report_slot_for_app.borrow_mut() = Some(report);
         drop(entity);
-        cx.quit();
+        devmanager::ui::finish_headless_test(cx);
     });
     let (
         (preview_had_client_model, preview_ids, preview_titles, preview_mutations),
@@ -961,7 +961,7 @@ fn idle_conversation_photo_rotates_after_task_selection() {
         });
         *report_slot_for_app.borrow_mut() = Some(report);
         drop(entity);
-        cx.quit();
+        devmanager::ui::finish_headless_test(cx);
     });
     let (idle_before, still_idle, with_task, idle_again, photo_present) =
         report_slot.borrow_mut().take().expect("idle photo report");

@@ -3268,13 +3268,17 @@ mod tests {
         drop(retained.handle.take());
 
         let barrier = std::sync::Arc::new((std::sync::Barrier::new(2), std::sync::Barrier::new(2)));
-        *TEST_CLEANUP_BARRIER.lock().unwrap() = Some(std::sync::Arc::clone(&barrier));
+        *TEST_CLEANUP_BARRIER
+            .get_or_init(|| Mutex::new(None))
+            .lock()
+            .unwrap() = Some(std::sync::Arc::clone(&barrier));
         let (started_tx, started_rx) = std::sync::mpsc::channel();
         let (finished_tx, finished_rx) = std::sync::mpsc::channel();
         let replacement_lock = std::sync::Arc::clone(&replacement_store.inner.operation_lock);
         let replacement_path = path.clone();
+        let replacement_barrier = Arc::clone(&barrier);
         let replacement = std::thread::spawn(move || {
-            barrier.0.wait();
+            replacement_barrier.0.wait();
             started_tx.send(()).expect("replacement started");
             let _guard = replacement_lock.lock().unwrap();
             fs::write(&replacement_path, b"replacement after cleanup").expect("replacement");
@@ -3294,7 +3298,10 @@ mod tests {
             .recv_timeout(std::time::Duration::from_secs(1))
             .expect("replacement after cleanup");
         replacement.join().expect("replacement join");
-        *TEST_CLEANUP_BARRIER.lock().unwrap() = None;
+        *TEST_CLEANUP_BARRIER
+            .get_or_init(|| Mutex::new(None))
+            .lock()
+            .unwrap() = None;
         assert_eq!(
             fs::read(&path).expect("replacement remains"),
             b"replacement after cleanup"
@@ -3321,7 +3328,10 @@ mod tests {
         drop(retained.handle.take());
 
         let barrier = Arc::new((std::sync::Barrier::new(2), std::sync::Barrier::new(2)));
-        *TEST_POSTCHECK_SWAP_BARRIER.lock().unwrap() = Some(Arc::clone(&barrier));
+        *TEST_POSTCHECK_SWAP_BARRIER
+            .get_or_init(|| Mutex::new(None))
+            .lock()
+            .unwrap() = Some(Arc::clone(&barrier));
         let swap_path = path.clone();
         let swap = std::thread::spawn(move || {
             barrier.0.wait();
@@ -3332,7 +3342,10 @@ mod tests {
 
         let result = store.cleanup(&identity);
         swap.join().expect("swap join");
-        *TEST_POSTCHECK_SWAP_BARRIER.lock().unwrap() = None;
+        *TEST_POSTCHECK_SWAP_BARRIER
+            .get_or_init(|| Mutex::new(None))
+            .lock()
+            .unwrap() = None;
 
         assert!(matches!(result, Err(CredentialError::CleanupUncertain)));
         assert_eq!(

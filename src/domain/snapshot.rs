@@ -187,9 +187,8 @@ impl PlanStepStatus {
     pub fn from_wire(status: &str) -> Option<Self> {
         match status {
             "pending" | "taskCreated" => Some(Self::Pending),
-            "active" | "running" | "in_progress" | "inProgress" | "subagentStarted" => {
-                Some(Self::Active)
-            }
+            "active" | "running" | "in_progress" | "inProgress" | "taskInProgress"
+            | "subagentStarted" => Some(Self::Active),
             "completed" | "succeeded" | "taskCompleted" | "subagentStopped"
             | "subagentCompleted" => Some(Self::Completed),
             "failed" => Some(Self::Failed),
@@ -210,6 +209,7 @@ pub struct ProviderPlanStepLifecycle {
 pub fn provider_plan_step_lifecycle(state: &str) -> Option<ProviderPlanStepLifecycle> {
     let (kind, status) = match state {
         "taskCreated" => (PlanStepKind::Task, PlanStepStatus::Pending),
+        "taskInProgress" => (PlanStepKind::Task, PlanStepStatus::Active),
         "taskCompleted" => (PlanStepKind::Task, PlanStepStatus::Completed),
         "subagentStarted" => (PlanStepKind::Subagent, PlanStepStatus::Active),
         "subagentStopped" => (PlanStepKind::Subagent, PlanStepStatus::Completed),

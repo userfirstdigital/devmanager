@@ -2094,6 +2094,7 @@ dependencies = [
  "sha2",
  "snow",
  "static_assertions",
+ "syn 2.0.117",
  "sysinfo 0.38.4",
  "tempfile",
  "time",

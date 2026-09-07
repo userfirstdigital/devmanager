@@ -1487,7 +1487,7 @@ mod tests {
                 );
                 let _ = panel_chrome_element(&done, &colours, tokens, 470.0, &handlers);
             }
-            cx.quit();
+            crate::ui::finish_headless_test(cx);
         });
     }
 

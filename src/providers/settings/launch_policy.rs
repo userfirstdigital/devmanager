@@ -316,7 +316,9 @@ pub fn resolve_launch_config_with_known_models(
         discovery,
         environment,
         sensitive_env_keys,
-        extra_launch_args: instance.launch_args.clone(),
+        extra_launch_args: instance
+            .plan_progress
+            .launch_args(instance.driver, &instance.launch_args),
         selected_model,
         home_path,
         shadow_home_path,

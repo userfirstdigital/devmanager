@@ -107,6 +107,12 @@ pub const COMPOSER_BUTTON_FONT_SIZE: f32 = 11.0;
 pub const COMPOSER_BUTTON_PADDING_X: f32 = 8.0;
 pub const COMPOSER_BUTTON_PADDING_Y: f32 = 2.0;
 pub const COMPOSER_BUTTON_RADIUS: f32 = 6.0;
+/// The three labels the composer's meta line grows when a question or an
+/// approval is pending. Named so the painter and the width arithmetic that
+/// reserves room for them cannot disagree about what they say.
+pub const COMPOSER_ANSWER_LABEL: &str = "Answer";
+pub const COMPOSER_REJECT_LABEL: &str = "Reject";
+pub const COMPOSER_APPROVE_LABEL: &str = "Approve";
 /// The attachment thumbnail. Rule 3's chip radius, small enough that a chip
 /// stays one line tall beside the 24 px icon buttons.
 pub const COMPOSER_ATTACHMENT_THUMBNAIL: f32 = 20.0;
@@ -117,6 +123,12 @@ pub const COMPOSER_CHIP_LABEL_MAX_WIDTH: f32 = 160.0;
 /// the mockup's `.compose .k`. Real key names rather than glyphs: the shell
 /// has no key-cap font, and a bare arrow glyph is unreadable at 10.5 px.
 pub const COMPOSER_KEY_HINTS: &str = "Enter send \u{b7} Shift+Enter newline";
+/// The same note for a field that can afford one hint but not two.
+///
+/// Mockup 02's chosen arrangement paints exactly this at the panel's
+/// one-of-eight width (about 470 px): `⏎ send` and nothing after it. Only the
+/// glyph differs, for the reason above -- there is no key-cap font here.
+pub const COMPOSER_KEY_HINTS_SHORT: &str = "Enter send";
 /// The separator between the meta line's segments, and the one the panel and
 /// the board already spend on the same job.
 pub const COMPOSER_META_SEPARATOR: &str = "\u{b7}";
@@ -178,6 +190,15 @@ pub const COMPOSER_HEIGHT_RESERVE: f32 = COMPOSER_CONTROL_GAP
 /// field is wide enough that the note costs it nothing.
 pub const COMPOSER_HINTS_MIN_FIELD_WIDTH: f32 = 420.0;
 
+/// The narrowest draft field that still earns the SHORT hint.
+///
+/// Between this and [`COMPOSER_HINTS_MIN_FIELD_WIDTH`] the field has room for
+/// one note but not two, and the mockup's answer for that band is `⏎ send`
+/// alone -- the one key a person needs told. Below it the field is the
+/// 296 px panel's, where any note costs more of the row than the draft it
+/// annotates, and there is none.
+pub const COMPOSER_HINTS_MIN_SHORT_FIELD_WIDTH: f32 = 320.0;
+
 /// The width the composer CARD gets on a surface this wide.
 ///
 /// The card is centred at [`CONVERSATION_CONTENT_MAX_WIDTH`] and clamped to
@@ -194,7 +215,7 @@ pub fn composer_card_width(surface_width_px: f32) -> f32 {
 ///
 /// The key hints are deliberately NOT subtracted -- this is the width the
 /// field would have WITHOUT them, which is the question
-/// [`composer_shows_key_hints`] asks. Subtracting them would make the answer
+/// [`composer_key_hints_for`] asks. Subtracting them would make the answer
 /// depend on itself.
 pub fn composer_field_width(surface_width_px: f32) -> f32 {
     (composer_card_width(surface_width_px)
@@ -204,9 +225,23 @@ pub fn composer_field_width(surface_width_px: f32) -> f32 {
         .max(0.0)
 }
 
-/// Does the composer on a surface this wide show its key hints?
-pub fn composer_shows_key_hints(surface_width_px: f32) -> bool {
-    composer_field_width(surface_width_px) >= COMPOSER_HINTS_MIN_FIELD_WIDTH
+/// Which key hints the composer on a surface this wide prints, if any.
+///
+/// Three bands, on the FIELD width rather than the surface, because the field
+/// is what the note takes room from: the full note above
+/// [`COMPOSER_HINTS_MIN_FIELD_WIDTH`], the short one down to
+/// [`COMPOSER_HINTS_MIN_SHORT_FIELD_WIDTH`], and nothing below that. Returns
+/// the text rather than a band, so a caller cannot pick a band and then print
+/// something else.
+pub fn composer_key_hints_for(surface_width_px: f32) -> Option<&'static str> {
+    let field = composer_field_width(surface_width_px);
+    if field >= COMPOSER_HINTS_MIN_FIELD_WIDTH {
+        Some(COMPOSER_KEY_HINTS)
+    } else if field >= COMPOSER_HINTS_MIN_SHORT_FIELD_WIDTH {
+        Some(COMPOSER_KEY_HINTS_SHORT)
+    } else {
+        None
+    }
 }
 
 /// The placeholder trimmed to one line of the field it sits in, ellipsised
@@ -270,14 +305,51 @@ pub fn composer_meta_line_width(labels: &[String]) -> f32 {
     text + separators * (separator_width + 2.0 * COMPOSER_CHIP_PADDING_X)
 }
 
+/// What the pending-question and pending-approval buttons take off the meta
+/// line, including the control gap before each of them.
+///
+/// They are `Button::new(..).ghost().xsmall().compact()` -- rule 4's default
+/// button -- and they sit in the SAME `gap(COMPOSER_CONTROL_GAP)` row as the
+/// segment strip and the attach affordance, between the two. Measured with
+/// the biased-high `approx_text_width` the panel chrome and the board rows
+/// already use, so the strip drops a segment a character early rather than a
+/// character late.
+pub fn composer_answer_buttons_width(has_question: bool, has_approval: bool) -> f32 {
+    let button = |label: &str| {
+        COMPOSER_CONTROL_GAP
+            + 2.0 * COMPOSER_BUTTON_PADDING_X
+            + crate::ui::overlay_chrome::approx_text_width(label, COMPOSER_BUTTON_FONT_SIZE)
+    };
+    let mut width = 0.0;
+    if has_question {
+        width += button(COMPOSER_ANSWER_LABEL);
+    }
+    if has_approval {
+        width += button(COMPOSER_REJECT_LABEL) + button(COMPOSER_APPROVE_LABEL);
+    }
+    width
+}
+
 /// The room the segment strip has: the card, less its padding, the attach
-/// affordance and the control gap before it.
-pub fn composer_meta_line_room(surface_width_px: f32) -> f32 {
+/// affordance and the control gap before it -- and less whatever the Answer /
+/// Reject / Approve buttons are taking.
+///
+/// Those buttons are painted only while a question or an approval is pending,
+/// and they are painted INSIDE this row. Without them in the arithmetic the
+/// drop rule believed it had the whole line and kept segments that then had
+/// to share the row with three buttons, which is the case a person is most
+/// likely to be looking at: the composer is not answering, it is asking.
+pub fn composer_meta_line_room(
+    surface_width_px: f32,
+    has_question: bool,
+    has_approval: bool,
+) -> f32 {
     (composer_card_width(surface_width_px)
         - 2.0 * COMPOSER_PADDING_X
         - COMPOSER_ICON_BUTTON_SIZE
-        - COMPOSER_CONTROL_GAP)
-        .max(0.0)
+        - COMPOSER_CONTROL_GAP
+        - composer_answer_buttons_width(has_question, has_approval))
+    .max(0.0)
 }
 
 /// How many of the meta line's segments survive in `room_px`.
@@ -2836,25 +2908,72 @@ mod tests {
     #[test]
     fn the_composer_pill_is_one_line_and_its_hints_wait_for_a_field_that_can_afford_them() {
         assert_eq!(COMPOSER_HINTS_MIN_FIELD_WIDTH, 420.0);
-        // A panel as one of four in the capture, and the mockup's own width:
-        // both leave the field under the threshold, so neither shows a note
-        // about two keys instead of the draft it annotates.
-        assert!(!composer_shows_key_hints(296.0));
-        assert!(!composer_shows_key_hints(470.0));
+        assert_eq!(COMPOSER_HINTS_MIN_SHORT_FIELD_WIDTH, 320.0);
+        // Three bands, named at the widths that produced them.
+        //
+        // 296 px is a panel as one of four in the capture: the field is 240 px
+        // and any note there costs more of the row than the draft it
+        // annotates, so there is none.
+        assert_eq!(composer_key_hints_for(296.0), None);
+        assert_eq!(composer_key_hints_for(200.0), None);
+        // 470 px is the mockup's own one-of-eight width, and the field is
+        // 414 px: mockup 02's chosen arrangement prints `⏎ send` there and
+        // nothing after it. Before this the whole 400..520 band showed no
+        // hint at all.
+        assert_eq!(
+            composer_key_hints_for(470.0),
+            Some(COMPOSER_KEY_HINTS_SHORT)
+        );
+        assert_eq!(
+            composer_key_hints_for(400.0),
+            Some(COMPOSER_KEY_HINTS_SHORT)
+        );
         // Two panels across a 1912 px window, and a zoomed one: both are wide
-        // enough that the hints cost the field nothing.
-        assert!(composer_shows_key_hints(940.0));
-        assert!(composer_shows_key_hints(1800.0));
-        // The rule is monotonic in the width, or a panel could gain hints by
-        // getting narrower.
-        let mut previous = false;
-        for width in [200.0_f32, 296.0, 400.0, 470.0, 520.0, 700.0, 940.0, 1800.0] {
-            let shown = composer_shows_key_hints(width);
+        // enough that the whole note costs the field nothing.
+        assert_eq!(composer_key_hints_for(940.0), Some(COMPOSER_KEY_HINTS));
+        assert_eq!(composer_key_hints_for(1800.0), Some(COMPOSER_KEY_HINTS));
+        // The bands are exactly the field-width thresholds, checked either
+        // side of both boundaries rather than at panel widths that happen to
+        // land in them.
+        let surface_for_field = |field: f32| {
+            let mut surface = 0.0_f32;
+            while composer_field_width(surface) < field {
+                surface += 0.5;
+            }
+            surface
+        };
+        let short_edge = surface_for_field(COMPOSER_HINTS_MIN_SHORT_FIELD_WIDTH);
+        let full_edge = surface_for_field(COMPOSER_HINTS_MIN_FIELD_WIDTH);
+        assert_eq!(composer_key_hints_for(short_edge - 0.5), None);
+        assert_eq!(
+            composer_key_hints_for(short_edge),
+            Some(COMPOSER_KEY_HINTS_SHORT)
+        );
+        assert_eq!(
+            composer_key_hints_for(full_edge - 0.5),
+            Some(COMPOSER_KEY_HINTS_SHORT)
+        );
+        assert_eq!(composer_key_hints_for(full_edge), Some(COMPOSER_KEY_HINTS));
+        // The short form is a prefix of the long one, so the band change reads
+        // as the note losing its tail rather than as two different notes.
+        assert!(COMPOSER_KEY_HINTS.starts_with(COMPOSER_KEY_HINTS_SHORT));
+        // The rule is monotonic in the width, in both steps, or a panel could
+        // gain a hint by getting narrower.
+        let rank = |width: f32| match composer_key_hints_for(width) {
+            None => 0_u8,
+            Some(hints) if hints == COMPOSER_KEY_HINTS_SHORT => 1,
+            Some(_) => 2,
+        };
+        let mut previous = 0_u8;
+        for width in [
+            200.0_f32, 296.0, 376.0, 400.0, 470.0, 520.0, 700.0, 940.0, 1800.0,
+        ] {
+            let now = rank(width);
             assert!(
-                shown || !previous,
-                "the hints came back at {width} px after being dropped"
+                now >= previous,
+                "the hints went backwards at {width} px: {previous} -> {now}"
             );
-            previous = shown;
+            previous = now;
         }
 
         // The placeholder is one line at every width: untouched where it fits,
@@ -2896,7 +3015,7 @@ mod tests {
 
         // A wide surface keeps everything.
         assert_eq!(
-            composer_meta_segments_within(&labels, composer_meta_line_room(1800.0)),
+            composer_meta_segments_within(&labels, composer_meta_line_room(1800.0, false, false)),
             labels.len()
         );
 
@@ -2905,7 +3024,7 @@ mod tests {
         // place the line is allowed to overflow rather than lie.
         let mut previous = labels.len();
         for width in [1800.0_f32, 940.0, 700.0, 470.0, 400.0, 350.0, 296.0, 200.0] {
-            let room = composer_meta_line_room(width);
+            let room = composer_meta_line_room(width, false, false);
             let kept = composer_meta_segments_within(&labels, room);
             assert!(
                 kept <= previous,
@@ -2925,7 +3044,8 @@ mod tests {
 
         // The capture's own width: "Full access" was the segment clipped to
         // "Full acces", so it must be one of the ones that go.
-        let narrow = composer_meta_segments_within(&labels, composer_meta_line_room(296.0));
+        let narrow =
+            composer_meta_segments_within(&labels, composer_meta_line_room(296.0, false, false));
         assert!(
             narrow < labels.len(),
             "a 296 px panel cannot paint the whole line"
@@ -2939,6 +3059,98 @@ mod tests {
         );
         // And a line that is already at the floor is left alone.
         assert_eq!(composer_meta_segments_within(&labels[..2], 0.0), 2);
+    }
+
+    /// The drop rule sees the room it actually has, not the room it would have
+    /// if the composer were not asking a question.
+    ///
+    /// Answer, Reject and Approve are painted INSIDE the meta row, between the
+    /// segment strip and the attach affordance, and they appear exactly when a
+    /// person is most likely to be looking at the panel. Without them in the
+    /// arithmetic the strip kept segments that then had to share the row with
+    /// three buttons.
+    #[test]
+    fn a_pending_question_or_approval_takes_its_buttons_room_off_the_meta_line() {
+        // Nothing pending costs nothing, so the ordinary line is unchanged.
+        assert_eq!(composer_answer_buttons_width(false, false), 0.0);
+        assert_eq!(
+            composer_meta_line_room(940.0, false, false),
+            composer_card_width(940.0)
+                - 2.0 * COMPOSER_PADDING_X
+                - COMPOSER_ICON_BUTTON_SIZE
+                - COMPOSER_CONTROL_GAP,
+            "a composer with nothing pending measures exactly as it did"
+        );
+
+        // Each button is its label in rule 4's padding, plus the row's own gap
+        // before it. An approval paints two of them.
+        let button = |label: &str| {
+            COMPOSER_CONTROL_GAP
+                + 2.0 * COMPOSER_BUTTON_PADDING_X
+                + crate::ui::overlay_chrome::approx_text_width(label, COMPOSER_BUTTON_FONT_SIZE)
+        };
+        assert_eq!(
+            composer_answer_buttons_width(true, false),
+            button(COMPOSER_ANSWER_LABEL)
+        );
+        assert_eq!(
+            composer_answer_buttons_width(false, true),
+            button(COMPOSER_REJECT_LABEL) + button(COMPOSER_APPROVE_LABEL)
+        );
+        // Associated exactly as the implementation accumulates it: the answer
+        // button, then the approval pair. Comparing f32 sums that were added
+        // in a different order is a test that fails on a last-bit difference
+        // and says nothing about the rule.
+        assert_eq!(
+            composer_answer_buttons_width(true, true),
+            button(COMPOSER_ANSWER_LABEL)
+                + (button(COMPOSER_REJECT_LABEL) + button(COMPOSER_APPROVE_LABEL))
+        );
+
+        // The room shrinks by exactly that, at every width, and never past
+        // zero.
+        for width in [1800.0_f32, 940.0, 470.0, 296.0, 120.0, 0.0] {
+            for (question, approval) in [(true, false), (false, true), (true, true)] {
+                let plain = composer_meta_line_room(width, false, false);
+                let pending = composer_meta_line_room(width, question, approval);
+                assert!(pending >= 0.0, "negative room at {width} px");
+                assert!(
+                    pending <= plain,
+                    "at {width} px a pending question gained room"
+                );
+                if plain > composer_answer_buttons_width(question, approval) {
+                    assert_eq!(
+                        pending,
+                        plain - composer_answer_buttons_width(question, approval),
+                        "at {width} px the buttons were not fully subtracted"
+                    );
+                }
+            }
+        }
+
+        // And it changes the answer where it matters. At the mockup's own
+        // one-of-eight width the three buttons take 181.9 px off a 394 px
+        // line, and the capture's five segments become three -- which is the
+        // whole point: those two were being kept in room that was not there.
+        let labels: Vec<String> = ["Codex", "GPT-5.6 Sol", "Extra high", "Full access", "main"]
+            .iter()
+            .map(|label| (*label).to_string())
+            .collect();
+        let quiet =
+            composer_meta_segments_within(&labels, composer_meta_line_room(470.0, false, false));
+        let asking =
+            composer_meta_segments_within(&labels, composer_meta_line_room(470.0, true, true));
+        assert_eq!(quiet, labels.len(), "a quiet 470 px line keeps everything");
+        assert!(
+            asking < quiet,
+            "the three buttons cost the line nothing: {quiet} segments either way"
+        );
+        // A wide panel has room for both, so nothing is dropped there and the
+        // rule is not simply "drop a segment whenever anything is pending".
+        assert_eq!(
+            composer_meta_segments_within(&labels, composer_meta_line_room(940.0, true, true)),
+            labels.len()
+        );
     }
 
     #[test]

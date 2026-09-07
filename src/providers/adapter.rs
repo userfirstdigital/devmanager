@@ -1684,9 +1684,7 @@ fn inherit_descriptor(file: &std::fs::File) -> Result<PathBuf, ProviderProbeErro
 }
 
 #[cfg(unix)]
-unsafe extern "C" {
-    fn unix_fcntl(fd: i32, command: i32, argument: i32) -> i32;
-}
+use libc::fcntl as unix_fcntl;
 
 const PROVIDER_ENVIRONMENT_ALLOWLIST: &[&str] = &[
     "PATH",
@@ -2486,12 +2484,14 @@ const LINUX_SIGSTOP: i32 = 19;
 
 #[cfg(target_os = "linux")]
 unsafe extern "C" {
+    #[link_name = "ptrace"]
     fn linux_ptrace(
         request: i64,
         pid: i32,
         address: *mut std::ffi::c_void,
         data: *mut std::ffi::c_void,
     ) -> i64;
+    #[link_name = "waitpid"]
     fn linux_waitpid(pid: i32, status: *mut i32, options: i32) -> i32;
 }
 
@@ -3726,6 +3726,11 @@ impl Drop for ProviderInteractiveSession {
 mod tests {
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     use super::ProbeProcess;
+    #[cfg(target_os = "linux")]
+    use super::{
+        attest_launched_image, linux_status_is_exact_exec_event, LINUX_PTRACE_EVENT_EXEC,
+        LINUX_SIGTRAP,
+    };
     use super::{
         classify_auth_output, ProviderAuthEvidenceError, ProviderAuthProbeResult,
         ProviderExecutable, ProviderKind, ProviderProbeKind, ProviderProbeOutput,
@@ -3734,6 +3739,8 @@ mod tests {
     #[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
     use super::{ProviderExecutablePolicy, ProviderProbeError};
     use crate::providers::capabilities::ProviderAuthEvidenceRegistry;
+    #[cfg(unix)]
+    use std::os::unix::process::CommandExt;
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     use std::path::Path;
     #[cfg(target_os = "linux")]

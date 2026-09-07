@@ -1642,8 +1642,9 @@ const DARK_ACTION_DESTRUCTIVE_DISABLED: Color = Color::from_u32(0x606876);
 const DARK_ACTION_DESTRUCTIVE_FOREGROUND: Color = Color::from_u32(0xffffff);
 
 /// Shared translucent scrim for native modal surfaces. Kept in the canonical
-/// token module so native views never own ad-hoc RGB(A) literals.
-pub const MODAL_BACKDROP_RGBA: u32 = 0x00000059;
+/// token module so native views never own ad-hoc RGB(A) literals. Sixty percent
+/// black keeps inverse captions above 4.5:1 even over the light canvas.
+pub const MODAL_BACKDROP_RGBA: u32 = 0x00000099;
 
 /// One muted hue per project, in the order the board's colour book hands them
 /// out. Dim and cool by construction so amber and red stay the only saturated
@@ -2920,3 +2921,24 @@ mod tests {
         assert_eq!(PROJECT_PALETTE[7], Color::from_u32(0xa8806f));
     }
 }
+
+// Managed-theme generation and editor seeds share canonical color ownership.
+pub const MANAGED_PALETTE_WHITE: Color = Color::from_u32(0xffffff);
+pub const MANAGED_PALETTE_BLACK: Color = Color::from_u32(0x121216);
+pub const MANAGED_DARK_ERROR: Color = Color::from_u32(0xeb6879);
+pub const MANAGED_LIGHT_ERROR: Color = Color::from_u32(0xc13144);
+pub const MANAGED_DARK_WARNING: Color = Color::from_u32(0xeeb852);
+pub const MANAGED_LIGHT_WARNING: Color = Color::from_u32(0x9f630a);
+pub const MANAGED_LIGHT_FOREGROUND: Color = Color::from_u32(0xfffaff);
+pub const MANAGED_DARK_FOREGROUND: Color = Color::from_u32(0x19141c);
+pub const T3_CODE_LIGHT_CANVAS_HEX: &str = "#fbfafc";
+pub const T3_CODE_LIGHT_ACCENT_HEX: &str = "#d60057";
+pub const T3_CODE_DARK_CANVAS_HEX: &str = "#18151d";
+pub const T3_CODE_DARK_ACCENT_HEX: &str = "#e0005b";
+pub const THEME_EMPTY_COLOR_HEX: &str = "#000000";
+
+pub const THEME_GUIDED_SWATCHES: &[&str] = &[
+    "#fbfafc", "#18151d", "#ffffff", "#0b0b0f", "#f4f4f5", "#111827", "#0f172a", "#d60057",
+    "#e0005b", "#0055cc", "#79a7ff", "#16a34a", "#22c55e", "#ea580c", "#f59e0b", "#7c3aed",
+    "#a78bfa", "#0891b2", "#67e8f9", "#dc2626",
+];

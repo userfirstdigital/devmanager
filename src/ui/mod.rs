@@ -92,3 +92,17 @@ pub use task_cockpit::{
     project_services_panel, ServiceActionAffordance, ServicePanelAction, ServicePanelRow,
     ServicePanelTone, ServicesPanelProjection,
 };
+
+/// Finish a headless acceptance run after the platform event loop starts.
+///
+/// Linux's calloop resets its stop signal on entry, so quitting synchronously
+/// inside `Application::run`'s launch callback loses the request. Dispatching it
+/// also lets the callback release its window/entity borrows before teardown.
+#[doc(hidden)]
+pub fn finish_headless_test(cx: &mut App) {
+    cx.spawn(async |cx| {
+        cx.update(|cx| cx.quit())
+            .expect("headless application is alive");
+    })
+    .detach();
+}

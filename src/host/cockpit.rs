@@ -1462,7 +1462,7 @@ pub(crate) fn serve_conversation(
             visibility: "task".to_string(),
             privacy_class: PrivacyClass::LocalOnly,
             redacted: false,
-            payload: semantic_payload(event),
+            payload: semantic_payload(event, identities[&event.sequence]),
         })
         .collect::<Vec<_>>();
     let mut page = SemanticJournalPage {
@@ -1568,6 +1568,7 @@ fn semantic_payload_kind(kind: &crate::remote::presentation::SemanticEventKind) 
 
 fn semantic_payload(
     event: &crate::remote::presentation::SemanticEvent,
+    identity_sequence: u64,
 ) -> crate::domain::SemanticJournalPayload {
     use crate::domain::{provider_plan_step_lifecycle, SemanticJournalPayload};
     use crate::remote::presentation::{SemanticEventKind, SemanticToolState};
@@ -1634,7 +1635,8 @@ fn semantic_payload(
         SemanticEventKind::Status { state, detail } if semantic_status_is_plan_step(state) => {
             let lifecycle = provider_plan_step_lifecycle(state)
                 .expect("plan-step classification and projection share one typed mapping");
-            let identity_sequence = event.replaces_sequence.unwrap_or(event.sequence);
+            // Use the complete replacement lineage resolved for the fact ID.
+            // The immediate predecessor changes again on the third update.
             SemanticJournalPayload::PlanStep {
                 step_id: format!("{}:{identity_sequence}", lifecycle.kind.as_str()),
                 title: detail.clone().unwrap_or_else(|| match lifecycle.kind {
@@ -3547,14 +3549,14 @@ mod tests {
 
         assert_eq!(semantic_payload_kind(&event.kind), "plan_step");
         assert!(matches!(
-            semantic_payload(&event),
+            semantic_payload(&event, 4),
             crate::domain::SemanticJournalPayload::PlanStep { step_id, title, status }
                 if step_id == "task:4" && title == "Run verification" && status == "completed"
         ));
     }
 
     #[test]
-    fn claude_task_lifecycle_reaches_conversation_as_one_completed_plan_step() {
+    fn claude_task_lifecycle_reaches_conversation_as_one_step_through_all_states() {
         use crate::ai::claude_hooks::{ClaudeReducer, ClaudeReducerLimits};
         use crate::remote::presentation::{SemanticJournalStore, StableSessionKey};
         use std::sync::Mutex;
@@ -3562,18 +3564,15 @@ mod tests {
         let (_repository, bus, client_id, task_id, _roots) = create_bound_task();
         let key = StableSessionKey::from_tab(task_id.to_string());
         let mut reducer = ClaudeReducer::new(key, ClaudeReducerLimits::default());
-        let mut store = SemanticJournalStore::default();
-        for body in [
-            br#"{"hook_event_name":"TaskCreated","task_id":"task-7","task_subject":"Verify UX"}"#
-                .as_slice(),
-            br#"{"hook_event_name":"TaskCompleted","task_id":"task-7","task_subject":"Verify UX"}"#
-                .as_slice(),
+        let journal = Mutex::new(SemanticJournalStore::default());
+        for (body, expected) in [
+            (br#"{"hook_event_name":"TaskCreated","task_id":"task-7","task_subject":"Verify UX"}"#.as_slice(), "pending"),
+            (br#"{"hook_event_name":"PostToolUse","tool_use_id":"update-1","tool_name":"TaskUpdate","tool_input":{"taskId":"task-7","status":"in_progress"}}"#.as_slice(), "active"),
+            (br#"{"hook_event_name":"TaskCompleted","task_id":"task-7","task_subject":"Verify UX"}"#.as_slice(), "completed"),
         ] {
             for draft in reducer.apply_json(body, 10).drafts {
-                store.record(draft);
+                journal.lock().unwrap().record(draft);
             }
-        }
-        let journal = Mutex::new(store);
         let query = TaskCockpitQuery::Conversation { after_sequence: 0 };
         let outcome = serve_task_cockpit(TaskCockpitDispatch {
             capabilities: CapabilitySet::from_capabilities([
@@ -3605,12 +3604,14 @@ mod tests {
             panic!("expected conversation page, got {outcome:?}");
         };
 
-        assert_eq!(page.facts.len(), 1);
+        let plans = page.facts.iter().filter(|fact| matches!(fact.payload, crate::domain::SemanticJournalPayload::PlanStep { .. })).collect::<Vec<_>>();
+        assert_eq!(plans.len(), 1);
         assert!(matches!(
-            &page.facts[0].payload,
+            &plans[0].payload,
             crate::domain::SemanticJournalPayload::PlanStep { step_id, title, status }
-                if step_id == "task:1" && title == "Verify UX" && status == "completed"
+                if step_id == "task:1" && title == "Verify UX" && status == expected
         ));
+        }
     }
 
     fn create_bound_task() -> (

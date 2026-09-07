@@ -306,7 +306,7 @@ fn snapshot_listener_endpoints_with_lsof(
         return Err("listener_probe.command_failed".to_string());
     }
 
-    let mut listeners = BTreeMap::new();
+    let mut listeners: BTreeMap<u16, Vec<TcpEndpointRecord>> = BTreeMap::new();
     let mut current_pid = None;
     let stdout = std::str::from_utf8(&output.stdout)
         .map_err(|_| "listener_probe.invalid_utf8".to_string())?;
@@ -1631,8 +1631,11 @@ fn windows_terminate_pid(pid: u32) -> Result<(), String> {
     }
 }
 
-#[cfg(all(not(windows), test))]
+#[cfg(not(windows))]
 fn kill_unix_target(pid: u32, as_process_group: bool) -> Result<(), String> {
+    if pid == 0 || pid > i32::MAX as u32 {
+        return Err("invalid process id".to_string());
+    }
     let target = pid.to_string();
     let group_target = format!("-{pid}");
     let mut used_group = as_process_group;
@@ -1761,7 +1764,6 @@ fn unix_process_group_exists(target: &str) -> bool {
 }
 
 #[cfg(not(windows))]
-#[cfg(test)]
 fn wait_for_pid_exit(pid: u32, timeout: Duration) -> bool {
     let started_at = Instant::now();
     while started_at.elapsed() < timeout {

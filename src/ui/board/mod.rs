@@ -11,7 +11,7 @@ pub mod render;
 pub mod topbar;
 
 pub use activity::{board_activity, BoardActivity, DOING_NOW_MAX_CHARS};
-pub use age::{format_age, StateClock};
+pub use age::{age_labels_changed, format_age, StateClock};
 pub use layout::{
     row_height, row_layout, BoardRowLayout, BOARD_COLUMN_WIDTH, BOARD_DONE_ROW_HEIGHT,
     BOARD_RAIL_WIDTH, BOARD_ROW_GAP, BOARD_ROW_HEIGHT, BOARD_ROW_HEIGHT_COMPACT, TOP_BAR_HEIGHT,

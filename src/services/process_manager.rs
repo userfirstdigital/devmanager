@@ -7987,14 +7987,7 @@ impl TerminalAuthorityIssuer {
         };
         state.resources.insert(session_id.to_string(), issued);
         if state.completion_store.is_none() {
-            #[cfg(windows)]
-            {
-                state.completion_store = Some(TeardownCompletionStore::for_terminal_host()?);
-            }
-            #[cfg(not(windows))]
-            {
-                state.completion_store = Some(TeardownCompletionStore::new());
-            }
+            state.completion_store = Some(TeardownCompletionStore::for_terminal_host()?);
         }
         let completion_store = state
             .completion_store
@@ -8058,14 +8051,7 @@ impl TerminalAuthorityIssuer {
             },
         );
         if state.completion_store.is_none() {
-            #[cfg(windows)]
-            {
-                state.completion_store = Some(TeardownCompletionStore::for_terminal_host()?);
-            }
-            #[cfg(not(windows))]
-            {
-                state.completion_store = Some(TeardownCompletionStore::new());
-            }
+            state.completion_store = Some(TeardownCompletionStore::for_terminal_host()?);
         }
         let completion_store = state
             .completion_store
@@ -10558,7 +10544,7 @@ fn settle_server_port_start(
                 ),
             };
         #[cfg(not(windows))]
-        let settlement = Ok(classify_post_launch_listener_settlement(
+        let settlement: Result<_, String> = Ok(classify_post_launch_listener_settlement(
             listeners,
             |listener| listener_matches_session(inner, &launch.command_id, listener),
         ));
@@ -12410,6 +12396,8 @@ mod tests {
         }
     }
 
+    // This acceptance case requires the Windows managed Job fence.
+    #[cfg(windows)]
     #[test]
     fn identityless_codex_startup_gate_blocks_sealed_writer_before_physical_bytes() {
         use crate::domain::provider_input::ProviderInputAction;
@@ -15854,7 +15842,9 @@ mod tests {
         let after = manager.session_view(session_id).expect("session view");
         assert!(!screen_text(&after).contains("hello world"));
 
-        let _ = manager.close_session(session_id);
+        manager
+            .close_session(session_id)
+            .expect("exact shell teardown");
     }
 
     #[test]

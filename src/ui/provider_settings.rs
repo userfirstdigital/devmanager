@@ -524,6 +524,18 @@ impl ProviderSettingsController {
         });
     }
 
+    pub fn set_draft_plan_progress_enabled(&mut self, enabled: bool) {
+        self.mutate_draft(|draft| {
+            if draft.driver == crate::providers::settings::ProviderDriverKind::Claude {
+                draft.plan_progress.enabled = enabled;
+            }
+        });
+    }
+
+    pub fn set_draft_plan_instruction(&mut self, instruction: String) {
+        self.mutate_draft(|draft| draft.plan_progress.instruction = instruction);
+    }
+
     pub fn set_draft_launch_args(&mut self, value: String) {
         match decode_launch_args_json(&value) {
             Ok(args) => {
@@ -1489,6 +1501,24 @@ mod tests {
         assert_eq!(masked.encode_utf16().count(), secret.encode_utf16().count());
         assert!(!masked.contains('a'));
         assert!(!masked.contains('€'));
+    }
+
+    #[test]
+    fn planning_changes_stay_in_the_draft_until_save() {
+        let mut ctl = test_ctl();
+        let before = ctl.snapshot().document.clone();
+        ctl.begin_edit("claude");
+        ctl.set_draft_plan_progress_enabled(true);
+        ctl.set_draft_plan_instruction("Track each requested step.".into());
+        assert!(ctl.is_dirty());
+        assert_eq!(ctl.snapshot().document, before);
+        let draft = ctl.dirty_draft.as_ref().unwrap();
+        assert!(draft.plan_progress.enabled);
+        assert_eq!(
+            draft.plan_progress.instruction,
+            "Track each requested step."
+        );
+        assert!(draft.validate().is_ok());
     }
 
     #[test]

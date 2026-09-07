@@ -1,0 +1,99 @@
+name: Launch candidate
+
+on:
+  workflow_dispatch:
+  push:
+    branches: ["codex/launch-ready-*"]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: launch-candidate-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    timeout-minutes: 90
+    env:
+      CARGO_PROFILE_DEV_DEBUG: "0"
+      CARGO_PROFILE_TEST_DEBUG: "0"
+      CARGO_INCREMENTAL: "0"
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
+        with:
+          toolchain: "1.94.0"
+          components: rustfmt
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: "24"
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+
+      - name: Prepare isolated target and reviewed WASM inputs
+        shell: pwsh
+        run: |
+          $sourceRoot = (Resolve-Path .).Path
+          $targetRoot = Join-Path $sourceRoot 'target'
+          New-Item -ItemType Directory -Force $targetRoot | Out-Null
+          $targetRoot = (Resolve-Path $targetRoot).Path
+          if (-not $targetRoot.StartsWith($sourceRoot + '\', [StringComparison]::OrdinalIgnoreCase)) {
+            throw 'Cargo target escaped the isolated checkout'
+          }
+          Write-Output "Isolated Cargo target: $targetRoot"
+          "CARGO_TARGET_DIR=$targetRoot" >> $env:GITHUB_ENV
+          New-Item -ItemType Directory -Force launch-evidence, web/src/connect/wasm | Out-Null
+          # A checkout omits these ignored fingerprint inputs. Restore the exact
+          # reviewed artifacts already shipped in the tracked browser bundle.
+          Copy-Item web/bundle/assets/wasm/* web/src/connect/wasm/
+
+      - name: Check formatting and browser build
+        shell: pwsh
+        run: |
+          cargo fmt --all -- --check
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          npm --prefix web ci --no-audit --no-fund
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          npm --prefix web test
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          npm --prefix web run build
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          $env:GIT_OPTIONAL_LOCKS = '0'
+          git diff --exit-code -- web/bundle
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+
+      - name: Compile every target and run tests serially
+        shell: pwsh
+        run: |
+          cargo check --locked --lib --bins --tests --target-dir "$env:CARGO_TARGET_DIR" -j 2 2>&1 | Tee-Object launch-evidence/compiler.log
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          cargo build --locked --bin devmanager-process-test-helper --target-dir "$env:CARGO_TARGET_DIR" -j 2 2>&1 | Tee-Object launch-evidence/process-helper.log
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          cargo test --locked --all-targets --target-dir "$env:CARGO_TARGET_DIR" -j 2 -- --test-threads=1 2>&1 | Tee-Object launch-evidence/tests.log
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+
+      - name: Check for owned process residue
+        if: always()
+        shell: pwsh
+        run: |
+          if (-not $env:CARGO_TARGET_DIR) { exit 0 }
+          $targetRoot = $env:CARGO_TARGET_DIR
+          $owned = @(Get-CimInstance Win32_Process | Where-Object {
+            $_.ProcessId -ne $PID -and (
+              ($_.ExecutablePath -and $_.ExecutablePath.StartsWith($targetRoot + '\', [StringComparison]::OrdinalIgnoreCase)) -or
+              ($_.Name -in @('cargo.exe', 'rustc.exe', 'rust-lld.exe', 'link.exe') -and $_.CommandLine -and $_.CommandLine.Contains($targetRoot))
+            )
+          })
+          if ($owned.Count) {
+            $owned | Select-Object ProcessId, ParentProcessId, Name, ExecutablePath
+            throw 'Owned test/build processes remain after verification'
+          }
+          Write-Output 'No owned test harness, Cargo, compiler, or linker process remains.'
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        if: always()
+        with:
+          name: windows-launch-verification
+          path: launch-evidence/*.log

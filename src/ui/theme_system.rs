@@ -606,7 +606,20 @@ impl ThemePalette {
     /// share one role. Where they disagree the role follows the token with the
     /// most render call sites, and the losers are named in the comments below.
     pub fn redesign_dark() -> Self {
-        let tokens = crate::ui::tokens::dark(Density::Comfortable, Scale::Scale100);
+        Self::from_canonical_tokens(crate::ui::tokens::dark(
+            Density::Comfortable,
+            Scale::Scale100,
+        ))
+    }
+
+    pub fn redesign_light() -> Self {
+        Self::from_canonical_tokens(crate::ui::tokens::light(
+            Density::Comfortable,
+            Scale::Scale100,
+        ))
+    }
+
+    fn from_canonical_tokens(tokens: ThemeTokens) -> Self {
         let role = ThemeColor::from_token;
         let pairs = [
             (ThemeColorRole::Canvas, role(tokens.surfaces.canvas)),
@@ -778,8 +791,8 @@ impl ThemePalette {
     }
 
     pub fn managed(appearance: ThemeAppearance, canvas: ThemeColor, accent: ThemeColor) -> Self {
-        let white = ThemeColor::rgb(255, 255, 255);
-        let black = ThemeColor::rgb(18, 18, 22);
+        let white = ThemeColor::from_token(crate::ui::tokens::MANAGED_PALETTE_WHITE);
+        let black = ThemeColor::from_token(crate::ui::tokens::MANAGED_PALETTE_BLACK);
         let foreground = readable_foreground(canvas);
         let accent_foreground = readable_foreground(accent);
         let toward_foreground = |amount| canvas.mix(foreground, amount);
@@ -826,14 +839,14 @@ impl ThemePalette {
             },
         );
         let error = if appearance == ThemeAppearance::Dark {
-            ThemeColor::rgb(235, 104, 121)
+            ThemeColor::from_token(crate::ui::tokens::MANAGED_DARK_ERROR)
         } else {
-            ThemeColor::rgb(193, 49, 68)
+            ThemeColor::from_token(crate::ui::tokens::MANAGED_LIGHT_ERROR)
         };
         let warning = if appearance == ThemeAppearance::Dark {
-            ThemeColor::rgb(238, 184, 82)
+            ThemeColor::from_token(crate::ui::tokens::MANAGED_DARK_WARNING)
         } else {
-            ThemeColor::rgb(159, 99, 10)
+            ThemeColor::from_token(crate::ui::tokens::MANAGED_LIGHT_WARNING)
         };
         let update = if accent.contrast(canvas) >= 3.0 {
             accent
@@ -1012,7 +1025,9 @@ impl ThemePalette {
         // the opposite of the rule that colour is reserved for state that needs
         // you -- and under the redesign it would draw the outline in the primary
         // button's near-white fill.
-        tokens.borders.disabled = color(ThemeColorRole::Muted);
+        // Muted names the fill. Reusing it for the outline erases the edge;
+        // the focus role is already the palette's contrasting control outline.
+        tokens.borders.disabled = color(ThemeColorRole::Focus);
 
         set_interaction_colors(
             &mut tokens.actions.primary,
@@ -1020,22 +1035,11 @@ impl ThemePalette {
             color(ThemeColorRole::MessageActionHover),
             color(ThemeColorRole::Focus),
             color(ThemeColorRole::AccentSurface),
-            color(ThemeColorRole::Muted),
             color(ThemeColorRole::AccentForeground),
         );
-        set_interaction_colors(
-            &mut tokens.actions.destructive,
-            color(ThemeColorRole::Error),
-            mix_color(
-                color(ThemeColorRole::Error),
-                color(ThemeColorRole::Text),
-                0.12,
-            ),
-            color(ThemeColorRole::Error),
-            color(ThemeColorRole::ErrorSurface),
-            color(ThemeColorRole::Muted),
-            color(ThemeColorRole::ErrorForeground),
-        );
+        // Error roles describe inline notices, not filled action controls.
+        // Keep the canonical destructive interaction states: projecting a red
+        // text role onto a button lost foreground contrast and its focus ring.
 
         // status.attention, status.success, text.emphasis and every terminal
         // ANSI slot have no role of their own, so they stay as the token module
@@ -1064,7 +1068,6 @@ fn set_interaction_colors(
     hover: Color,
     focus: Color,
     selected: Color,
-    disabled: Color,
     foreground: Color,
 ) {
     tokens.default = ActionStateTokens {
@@ -1087,22 +1090,13 @@ fn set_interaction_colors(
         background: selected,
         border: selected,
     };
-    // The disabled state keeps whatever foreground the token module gave it.
-    // One accent foreground for all five states is only sound while every fill
-    // has the same polarity, and the disabled fill never does: it is
-    // `surfaces.disabled`, a near-black on the dark shell, so the redesign's
-    // dark accent foreground would paint disabled labels at 1.144:1. This is
-    // also what makes `action_primary_disabled_on_surface` describe a real pair.
-    tokens.disabled = ActionStateTokens {
-        foreground: tokens.disabled.foreground,
-        background: disabled,
-        border: disabled,
-    };
+    // Muted is a surface, not a disabled action fill. The complete canonical
+    // disabled state keeps both its text and its outline readable.
 }
 
 fn readable_foreground(background: ThemeColor) -> ThemeColor {
-    let light = ThemeColor::rgb(255, 250, 255);
-    let dark = ThemeColor::rgb(25, 20, 28);
+    let light = ThemeColor::from_token(crate::ui::tokens::MANAGED_LIGHT_FOREGROUND);
+    let dark = ThemeColor::from_token(crate::ui::tokens::MANAGED_DARK_FOREGROUND);
     if light.contrast(background) >= dark.contrast(background) {
         light
     } else {
@@ -1926,65 +1920,6 @@ const IRIS_DARK_ROLES: &[(&str, &str)] = &[
 ];
 
 /// Light companion for Classic so the built-in library stays paired.
-const DEVMANAGER_CLASSIC_LIGHT_ROLES: &[(&str, &str)] = &[
-    ("canvas", "#fafafa"),
-    ("chrome", "#f4f4f5"),
-    ("toolbar", "#f4f4f5"),
-    ("toolbarForeground", "#18181b"),
-    ("toolbarBorder", "#e4e4e7"),
-    ("toolbarControl", "#e4e4e7"),
-    ("toolbarControlForeground", "#18181b"),
-    ("toolbarControlHover", "#d4d4d8"),
-    ("surface", "#ffffff"),
-    ("surfaceRaised", "#ffffff"),
-    ("surfaceOverlay", "#f4f4f5"),
-    ("text", "#18181b"),
-    ("textMuted", "#71717a"),
-    ("border", "#e4e4e7"),
-    ("input", "#e4e4e7"),
-    ("focus", "#4f46e5"),
-    ("accent", "#4f46e5"),
-    ("accentForeground", "#f8fafc"),
-    ("secondary", "#f4f4f5"),
-    ("secondaryForeground", "#18181b"),
-    ("muted", "#f4f4f5"),
-    ("mutedForeground", "#71717a"),
-    ("placeholder", "#a1a1aa"),
-    ("secondaryLabel", "#71717a"),
-    ("iconMuted", "#71717a"),
-    ("error", "#e11d48"),
-    ("errorForeground", "#e11d48"),
-    ("errorSurface", "#fff1f2"),
-    ("warning", "#ca8a04"),
-    ("warningForeground", "#a16207"),
-    ("warningSurface", "#fefce8"),
-    ("update", "#4f46e5"),
-    ("updateForeground", "#3730a3"),
-    ("updateSurface", "#e0e7ff"),
-    ("accentSurface", "#e0e7ff"),
-    ("accentSurfaceForeground", "#18181b"),
-    ("messageSurface", "#e0e7ff"),
-    ("messageForeground", "#18181b"),
-    ("messageAction", "#4f46e5"),
-    ("messageActionForeground", "#f8fafc"),
-    ("messageActionHover", "#4338ca"),
-    ("codeBackground", "#f4f4f5"),
-    ("codeForeground", "#18181b"),
-    ("sidebar", "#f4f4f5"),
-    ("sidebarForeground", "#18181b"),
-    ("sidebarMutedForeground", "#71717a"),
-    ("sidebarControlSurface", "#e4e4e7"),
-    ("sidebarRowHover", "#e4e4e7"),
-    ("sidebarRowActive", "#e4e4e7"),
-    ("sidebarRowSelected", "#c7d2fe"),
-    ("sidebarBorder", "#e4e4e7"),
-    ("terminalBackground", "#fafafa"),
-    ("terminalForeground", "#18181b"),
-    ("terminalCursor", "#4f46e5"),
-    ("terminalSelection", "#c7d2fe"),
-    ("terminalScrollbar", "#d4d4d8"),
-    ("terminalScrollbarHover", "#a1a1aa"),
-];
 
 fn built_in_themes() -> Vec<ThemeDefinition> {
     vec![
@@ -1994,11 +1929,16 @@ fn built_in_themes() -> Vec<ThemeDefinition> {
         ThemeDefinition::paired_palettes(
             "devmanager-classic",
             "DevManager Classic",
-            palette_from_oklch_roles(DEVMANAGER_CLASSIC_LIGHT_ROLES),
+            ThemePalette::redesign_light(),
             ThemePalette::redesign_dark(),
         ),
         ThemeDefinition::paired_managed(
-            "t3-code", "T3 Code", "#fbfafc", "#d60057", "#18151d", "#e0005b",
+            "t3-code",
+            "T3 Code",
+            crate::ui::tokens::T3_CODE_LIGHT_CANVAS_HEX,
+            crate::ui::tokens::T3_CODE_LIGHT_ACCENT_HEX,
+            crate::ui::tokens::T3_CODE_DARK_CANVAS_HEX,
+            crate::ui::tokens::T3_CODE_DARK_ACCENT_HEX,
         ),
         ThemeDefinition::paired_semantic(
             "t3-chat",

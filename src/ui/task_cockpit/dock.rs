@@ -2,10 +2,7 @@
 
 use std::collections::BTreeMap;
 
-use gpui::{div, rgb, IntoElement, ParentElement, Styled};
-
 use crate::client::action::ActionRequest;
-use crate::client::action::CockpitSurfaceKind;
 use crate::client::model::{
     admit_subscription_stream, AdmittedStreamFrame, ClientModel, StreamAdmissionReject,
 };
@@ -21,13 +18,11 @@ use crate::terminal::view::{
     TerminalScrollbarModel, TerminalSearchHighlight, TerminalSearchUiModel,
     TerminalSelectionSnapshot,
 };
-use crate::ui::components::empty_state::EmptyState;
 use crate::ui::components::interaction::{
     redacted_bounded_text, AccessibilityMetadata, AccessibleRole, FocusEpoch, FocusEpochSource,
     KeyboardKey,
 };
-use crate::ui::task_cockpit::cockpit_projection::{summary_line, TaskCockpitLiveProjection};
-use crate::ui::tokens::ThemeTokens;
+use crate::ui::task_cockpit::cockpit_projection::TaskCockpitLiveProjection;
 
 pub const DOCK_MIN_SIZE_RATIO: f32 = 0.18;
 pub const DOCK_MAX_SIZE_RATIO: f32 = 0.55;
@@ -854,17 +849,6 @@ impl ContextDock {
 
     pub fn live_output(&self) -> String {
         self.current_memory().live_output
-    }
-
-    fn cockpit_surface_summary(&self, tool: DockTool) -> Option<String> {
-        let projection = self.cockpit_projection.as_ref()?;
-        let kind = match tool {
-            DockTool::Changes => CockpitSurfaceKind::Git,
-            DockTool::Files => CockpitSurfaceKind::Files,
-            DockTool::Services => CockpitSurfaceKind::Services,
-            _ => return None,
-        };
-        Some(summary_line(projection, kind))
     }
 
     pub fn admit_subscription_stream(
@@ -1791,72 +1775,6 @@ impl ContextDock {
         })
     }
 
-    pub fn render_context_dock(&self, tokens: ThemeTokens) -> impl IntoElement {
-        let chrome = self.chrome();
-        let tabs = chrome.tabs.into_iter().fold(
-            div().flex().bg(rgb(tokens.surfaces.raised.to_u32())),
-            |row, tab| {
-                row.child(
-                    div()
-                        .px_2()
-                        .py_1()
-                        .text_color(rgb(tokens.text.primary.to_u32()))
-                        .child(tab.name),
-                )
-            },
-        );
-        // The body only. The tab strip above and the collapse chrome are the
-        // panel's own furniture and belong to Task 9's retirement of this
-        // surface -- they are deliberately left exactly as they are.
-        let body = if let Some(summary) = self.cockpit_surface_summary(chrome.active_tool) {
-            // Rule 5: a full-width region on the row grid, 11.5 px content.
-            div()
-                .w_full()
-                .px(gpui::px(super::panel::ROW_PADDING_X))
-                .py(gpui::px(super::panel::ROW_PADDING_Y))
-                .text_size(gpui::px(super::panel::ROW_FONT_SIZE))
-                .text_color(rgb(tokens.text.primary.to_u32()))
-                .child(summary)
-                .into_any_element()
-        } else {
-            let unavailable = chrome
-                .unavailable
-                .as_ref()
-                .map(|reason| match reason.reason {
-                    DockUnavailableReason::NoTaskSelected => "Select a task to use this dock",
-                    DockUnavailableReason::MissingHostProjection => {
-                        "This dock tool has no host projection yet"
-                    }
-                    DockUnavailableReason::NoMatchingTerminal => {
-                        "No matching terminal replica is bound"
-                    }
-                })
-                .unwrap_or("Dock");
-            let empty = EmptyState::new(chrome.active_tool.label(), unavailable)
-                .map(|state| state.rendered_payload())
-                .unwrap_or_else(|_| unavailable.to_string());
-            div()
-                .text_color(rgb(tokens.text.muted.to_u32()))
-                .child(empty)
-                .into_any_element()
-        };
-        let resize = if chrome.resize_handle.is_some() {
-            div()
-                .h(gpui::px(4.0))
-                .bg(rgb(tokens.surfaces.raised.to_u32()))
-                .into_any_element()
-        } else {
-            div().into_any_element()
-        };
-        div()
-            .flex()
-            .flex_col()
-            .bg(rgb(tokens.surfaces.sunken.to_u32()))
-            .child(tabs)
-            .child(resize)
-            .child(body)
-    }
-
     fn capture_press(&mut self, task_id: TaskId, press: PointerPress) {
         let identity = self.current_memory().identity;
         self.press_owner = Some(DockPressOwner {
@@ -2202,7 +2120,7 @@ mod process_census_tests {
                         cols: 40,
                         rows: 8,
                         launch: Some(crate::domain::resource::TerminalLaunch {
-                            cwd: std::path::PathBuf::from("C:/workspace"),
+                            cwd: std::env::temp_dir(),
                             program: std::path::PathBuf::from("pwsh"),
                             args: Vec::new(),
                         }),

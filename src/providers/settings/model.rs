@@ -5,6 +5,7 @@ use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
 
+use super::PlanProgressSettings;
 use crate::providers::ProviderKind;
 
 pub const CLAUDE_DEFAULT_INSTANCE_ID: &str = "claude";
@@ -378,6 +379,8 @@ pub struct ProviderInstanceConfig {
     pub shadow_home_path: Option<String>,
     #[serde(default)]
     pub launch_args: Vec<String>,
+    #[serde(default)]
+    pub plan_progress: PlanProgressSettings,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub api_endpoint: Option<String>,
     #[serde(default)]
@@ -401,6 +404,7 @@ impl PartialEq for ProviderInstanceConfig {
             && self.home_path == other.home_path
             && self.shadow_home_path == other.shadow_home_path
             && self.launch_args == other.launch_args
+            && self.plan_progress == other.plan_progress
             && self.api_endpoint == other.api_endpoint
             && self.custom_models == other.custom_models
             && self.model_policy == other.model_policy
@@ -423,6 +427,7 @@ impl std::fmt::Debug for ProviderInstanceConfig {
             .field("home_path", &self.home_path)
             .field("shadow_home_path", &self.shadow_home_path)
             .field("launch_args", &self.launch_args)
+            .field("plan_progress", &self.plan_progress)
             .field("api_endpoint", &self.api_endpoint)
             .field("custom_models", &self.custom_models)
             .field("model_policy", &self.model_policy)
@@ -449,6 +454,10 @@ impl ProviderInstanceConfig {
             home_path: None,
             shadow_home_path: None,
             launch_args: Vec::new(),
+            plan_progress: PlanProgressSettings {
+                enabled: matches!(driver, BuiltinProviderDriver::Claude),
+                ..Default::default()
+            },
             api_endpoint: None,
             custom_models: Vec::new(),
             model_policy: ModelVisibilityPolicy::default(),
@@ -472,6 +481,7 @@ impl ProviderInstanceConfig {
             home_path: None,
             shadow_home_path: None,
             launch_args: Vec::new(),
+            plan_progress: PlanProgressSettings::default(),
             api_endpoint: None,
             custom_models: Vec::new(),
             model_policy: ModelVisibilityPolicy::default(),
@@ -498,6 +508,13 @@ impl ProviderInstanceConfig {
         if self.driver.is_stub() && self.enabled {
             return Err(ProviderSettingsError::StubCannotEnable(
                 self.driver.as_str().to_string(),
+            ));
+        }
+        self.plan_progress.validate()?;
+        if self.plan_progress.enabled && self.driver != ProviderDriverKind::Claude {
+            return Err(ProviderSettingsError::Corrupt(
+                "structured task progress is not yet supported by this native provider adapter"
+                    .into(),
             ));
         }
         if self.environment.len() > MAX_ENV_VARS {
@@ -582,7 +599,8 @@ impl ProviderInstanceConfig {
         .into_iter()
         .all(|value| value.is_none_or(str::is_empty))
             && self.environment.is_empty()
-            && self.launch_args.is_empty();
+            && self.launch_args.is_empty()
+            && self.plan_progress == PlanProgressSettings::default();
         canonical_default
             && expected
                 == format!(
@@ -623,6 +641,11 @@ impl ProviderInstanceConfig {
             } else {
                 field(&mut hasher, env.value.as_deref().unwrap_or(""));
             }
+        }
+        if self.plan_progress != PlanProgressSettings::default() {
+            field(&mut hasher, "devmanager-plan-progress-v1");
+            hasher.update([u8::from(self.plan_progress.enabled)]);
+            field(&mut hasher, &self.plan_progress.instruction);
         }
         format!("{:x}", hasher.finalize())
     }

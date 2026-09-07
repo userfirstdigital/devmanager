@@ -613,22 +613,21 @@ fn cursor_jwt_sub_cache_scope_from_real_auth_shape() {
 #[test]
 fn claude_account_config_path_stock_vs_explicit() {
     use crate::providers::settings::usage_http::claude_account_config_path;
-    use std::path::PathBuf;
-    let stock_dir = PathBuf::from(r"C:\Users\example\.claude");
+    let root = std::env::temp_dir().join("provider-account-path-fixture");
+    let stock_dir = root.join("user").join(".claude");
     assert_eq!(
         claude_account_config_path(&stock_dir, false),
-        PathBuf::from(r"C:\Users\example\.claude.json")
+        root.join("user").join(".claude.json")
     );
-    let explicit = PathBuf::from(r"D:\profiles\work-claude");
+    let explicit = root.join("profiles").join("work-claude");
     assert_eq!(
         claude_account_config_path(&explicit, true),
-        PathBuf::from(r"D:\profiles\work-claude\.claude.json")
+        explicit.join(".claude.json")
     );
-    // Explicit override ending in `.claude` still nests `.claude.json` inside D.
-    let explicit_dot = PathBuf::from(r"D:\profiles\alt\.claude");
+    let explicit_dot = root.join("profiles").join("alt").join(".claude");
     assert_eq!(
         claude_account_config_path(&explicit_dot, true),
-        PathBuf::from(r"D:\profiles\alt\.claude\.claude.json")
+        explicit_dot.join(".claude.json")
     );
 }
 
