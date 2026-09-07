@@ -1,7 +1,9 @@
 # Launch candidate, 2026-09-07
 
-Candidate branch: `codex/launch-ready-20260907`. Windows is the assumed launch
-platform; this Linux machine cannot certify the Windows desktop or installer.
+Candidate branch: `codex/launch-ready-20260907`. Windows and Linux are required
+launch platforms. macOS is outside the verified launch scope because no Mac
+test machine is available. This Linux machine cannot certify the Windows
+desktop or installer.
 The candidate is not release-approved.
 
 ## Implemented
@@ -31,12 +33,20 @@ The candidate is not release-approved.
   in both candidate and release workflows. Artifact hashes are verified before
   restoring ignored compiler inputs; each checkout owns its Cargo target.
 
+- Enabled the real Linux local host with same-user authenticated Unix sockets,
+  exclusive retained host locks, and parent-bound cleanup using pidfds. The
+  Windows path shares the existing handshake, framing, and delivery machinery.
+- Updated obsolete protocol fixtures to use host-authorized task creation.
+
 ## Verification evidence
 
 Local logs are sibling files of the isolated worktree:
 `/home/robin/Projects/devmanager-launch-20260907-*.log`.
 
 | Check | Observed result |
+| Linux local socket / host lock tests | Two passed (`linux-production/socket-test.log`, `lock-test.log`) |
+| Cross-platform local IPC integration | 11 passed (`linux-production/protocol-tests2.log`) |
+| Host entry and drain tests on Linux | Nine passed (`linux-production/host-tests.log`) |
 | --- | --- |
 | Native UI library tests | 998 passed, six existing ignores (`live-ux/ui-tests-final.log`) |
 | Correlated child hook/protocol/scope tests | Six passed |
@@ -64,8 +74,7 @@ retention, protected host trust, process identity observation, file mutation,
 provider launch and Windows installer inspection. Four provider session tests
 also expose the unsupported platform's legacy environment-map codec; three
 live port-forward tests exceed the Linux inventory deadline. These paths have
-not been declared supported or silently skipped. Windows CI must establish the
-launch-platform verdict.
+not been declared supported or silently skipped. Fresh Windows and Linux runs must establish the launch-platform verdicts.
 
 The broad run also exposed a pre-exec stopped-child deadlock in the Linux
 probe, retained cancellation socket handles, and a read-only fixture requesting
@@ -77,10 +86,16 @@ full-suite result into a green run.
 
 ## Live desktop inspection
 
-The rebuilt native shell was launched on this Linux Wayland desktop. The
-production startup exposes `named-pipe ipc is unsupported on this platform`;
-Linux provider containment is also unavailable. Interactive fixture inspection
-therefore attaches no host and cannot certify provider-terminal acceptance.
+The rebuilt native shell now launches with its real sibling host on this Linux
+Wayland desktop, using an isolated debug profile. Full canonical synchronization
+reached Ready in 1,938 ms on the first recorded launch. The empty workspace and
+Add a project dialog were inspected; physical typing appeared in its name field.
+The exact parent-bound host exited when the owned app closed. Provider discovery
+currently reports an invalid PATH directory; provider containment also remains a
+launch gate. This is not yet provider-terminal acceptance.
+
+The earlier interactive fixture inspection below attaches no host. Current real
+host evidence is under `launch-evidence/linux-production/`.
 
 Full-window screenshots at approximately 1,523 × 834 logical pixels were
 compared with composition A: board placement, two-panel layout, compact header,
@@ -94,6 +109,11 @@ Private screenshots and gesture evidence are under the isolated worktree's
 `native-ui-system.md`.
 
 ## Remaining launch gates
+
+- [ ] Complete Linux provider ownership and discovery,
+      protected storage, workspace mutation and process reporting.
+- [ ] Pass Linux integration/serial library checks, real provider desktop input,
+      restart/recovery and native package installation.
 
 - [ ] Obtain a green Windows candidate workflow on the final commit, including
       all-target compilation, serial tests, browser checks and packaging scans.

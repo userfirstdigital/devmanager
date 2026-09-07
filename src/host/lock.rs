@@ -89,7 +89,11 @@ impl HostLock {
         {
             acquire_windows(profile_root, profile)
         }
-        #[cfg(not(windows))]
+        #[cfg(target_os = "linux")]
+        {
+            acquire_linux(profile_root, profile)
+        }
+        #[cfg(not(any(windows, target_os = "linux")))]
         {
             let _ = profile_root;
             let _ = profile;
@@ -506,4 +510,114 @@ fn acquire_windows(profile_root: &Path, profile: String) -> Result<HostLock, Hos
 #[cfg(windows)]
 fn is_sharing_violation(error: &std::io::Error) -> bool {
     matches!(error.raw_os_error(), Some(32 | 33))
+}
+
+#[cfg(target_os = "linux")]
+fn acquire_linux(profile_root: &Path, profile: String) -> Result<HostLock, HostLockError> {
+    use std::os::fd::{AsRawFd, FromRawFd};
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+    let io_error = |message| {
+        HostLockError::Io(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            message,
+        ))
+    };
+    fs::create_dir_all(profile_root).map_err(HostLockError::Io)?;
+    let directory = fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(profile_root)
+        .map_err(HostLockError::Io)?;
+    let metadata = directory.metadata().map_err(HostLockError::Io)?;
+    if metadata.uid() != unsafe { libc::geteuid() } || metadata.mode() & 0o022 != 0 {
+        return Err(io_error(
+            "host profile directory must be owned by this user and not writable by others",
+        ));
+    }
+    // The retained directory owns the lookup. Never follow a substituted lock
+    // symlink or truncate diagnostic metadata before obtaining the OS lock.
+    let fd = unsafe {
+        libc::openat(
+            directory.as_raw_fd(),
+            c"host.lock".as_ptr(),
+            libc::O_RDWR | libc::O_CREAT | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+            0o600,
+        )
+    };
+    if fd < 0 {
+        return Err(HostLockError::Io(std::io::Error::last_os_error()));
+    }
+    let mut file = unsafe { File::from_raw_fd(fd) };
+    let metadata = file.metadata().map_err(HostLockError::Io)?;
+    if !metadata.is_file()
+        || metadata.nlink() != 1
+        || metadata.uid() != unsafe { libc::geteuid() }
+        || metadata.mode() & 0o022 != 0
+    {
+        return Err(io_error(
+            "host lock must be a private regular file with one link",
+        ));
+    }
+    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+        let error = std::io::Error::last_os_error();
+        return Err(if error.kind() == std::io::ErrorKind::WouldBlock {
+            HostLockError::AlreadyRunning {
+                identity: read_identity_from_file(&mut file),
+            }
+        } else {
+            HostLockError::Io(error)
+        });
+    }
+    let creation =
+        crate::services::platform_service::capture_process_creation_time_100ns(std::process::id())
+            .ok_or_else(|| io_error("cannot observe host process generation"))?;
+    let identity = HostIdentity {
+        pid: std::process::id(),
+        process_creation_filetime_ticks: creation,
+        executable_path: std::env::current_exe()
+            .and_then(|p| p.canonicalize())
+            .map_err(HostLockError::Io)?,
+        profile,
+        protocol_major: PROTOCOL_MAJOR,
+        boot_id: Uuid::now_v7(),
+    };
+    write_identity(&mut file, &identity)?;
+    Ok(HostLock {
+        _file: file,
+        identity,
+        profile_root: profile_root.canonicalize().map_err(HostLockError::Io)?,
+    })
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod linux_tests {
+    use super::*;
+    #[test]
+    fn linux_host_lock_retains_exclusion_and_rejects_link_aliases() {
+        let root = tempfile::tempdir().unwrap();
+        let first = HostLock::acquire(root.path(), "linux-lock").unwrap();
+        assert!(matches!(
+            HostLock::acquire(root.path(), "linux-lock"),
+            Err(HostLockError::AlreadyRunning { .. })
+        ));
+        let identity = fs::read(root.path().join(LOCK_FILE_NAME)).unwrap();
+        assert_eq!(
+            serde_json::from_slice::<HostIdentity>(&identity)
+                .unwrap()
+                .boot_id,
+            first.identity().boot_id
+        );
+        drop(first);
+        let second = HostLock::acquire(root.path(), "linux-lock").unwrap();
+        drop(second);
+        let lock = root.path().join(LOCK_FILE_NAME);
+        let alias = root.path().join("alias");
+        fs::hard_link(&lock, &alias).unwrap();
+        assert!(HostLock::acquire(root.path(), "linux-lock").is_err());
+        fs::remove_file(&alias).unwrap();
+        fs::remove_file(&lock).unwrap();
+        std::os::unix::fs::symlink("alias", &lock).unwrap();
+        assert!(HostLock::acquire(root.path(), "linux-lock").is_err());
+        assert!(!alias.exists());
+    }
 }

@@ -1450,7 +1450,12 @@ pub async fn connect(endpoint: &str, hello: &ClientHello) -> Result<ClientConnec
     {
         windows_connect(endpoint, hello).await
     }
-    #[cfg(not(windows))]
+    #[cfg(target_os = "linux")]
+    {
+        let pipe = crate::host::local_socket::connect(endpoint).await?;
+        finish_local_connect(pipe, hello).await
+    }
+    #[cfg(not(any(windows, target_os = "linux")))]
     {
         let _ = endpoint;
         let _ = hello;
@@ -1495,16 +1500,23 @@ async fn windows_connect(
     endpoint: &str,
     hello: &ClientHello,
 ) -> Result<ClientConnection, IpcError> {
-    use tokio::io::AsyncWriteExt;
-    use tokio::net::windows::named_pipe::ClientOptions;
-
-    let (hello_physical, hello_message) = handshake_codecs()?;
-    let encoded = hello_message.encode(hello).map_err(IpcError::MessagePack)?;
-
-    let mut pipe = ClientOptions::new()
+    let pipe = tokio::net::windows::named_pipe::ClientOptions::new()
         .open(endpoint)
         .map_err(map_named_pipe_open_error)?;
+    finish_local_connect(pipe, hello).await
+}
 
+#[cfg(any(windows, target_os = "linux"))]
+async fn finish_local_connect<S>(
+    mut pipe: S,
+    hello: &ClientHello,
+) -> Result<ClientConnection, IpcError>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+{
+    use tokio::io::AsyncWriteExt;
+    let (hello_physical, hello_message) = handshake_codecs()?;
+    let encoded = hello_message.encode(hello).map_err(IpcError::MessagePack)?;
     let server_hello = tokio::time::timeout(handshake_timeout(), async {
         write_physical_frame(&mut pipe, &hello_physical, &encoded).await?;
         pipe.flush().await.map_err(IpcError::Io)?;
@@ -1527,14 +1539,17 @@ async fn windows_connect(
     ))
 }
 
-#[cfg(windows)]
-fn spawn_duplex_supervisor(
+#[cfg(any(windows, target_os = "linux"))]
+fn spawn_duplex_supervisor<S>(
     client_id: ClientId,
     metadata: ConnectionMetadata,
     physical: PhysicalFrameCodec,
     message: MessagePackCodec,
-    pipe: tokio::net::windows::named_pipe::NamedPipeClient,
-) -> ClientConnection {
+    pipe: S,
+) -> ClientConnection
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+{
     let (mut reader, mut writer) = tokio::io::split(pipe);
     let handles = new_supervisor_handles();
     let SupervisorHandles {

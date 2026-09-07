@@ -10,6 +10,8 @@ mod connection;
 mod conversation_wake;
 pub mod diag;
 mod ipc;
+#[cfg(target_os = "linux")]
+pub(crate) mod local_socket;
 mod lock;
 mod organization_runtime;
 mod provider_health;

@@ -38,10 +38,10 @@ const PARENT_POLL_INTERVAL: Duration = Duration::from_millis(50);
 /// Short bounded normal drain for connection tasks after intentional quit.
 const INTENTIONAL_CONNECTION_DRAIN: Duration = Duration::from_millis(500);
 /// Stable pipe/lock profile for the packaged production host.
-#[cfg(all(windows, not(debug_assertions)))]
+#[cfg(all(any(windows, target_os = "linux"), not(debug_assertions)))]
 const PRODUCTION_HOST_PROFILE: &str = "production";
 
-#[cfg(all(windows, debug_assertions))]
+#[cfg(all(any(windows, target_os = "linux"), debug_assertions))]
 #[derive(Debug)]
 struct HostArgs {
     profile: String,
@@ -53,7 +53,7 @@ struct HostArgs {
     test_slow_durable_reader_client_id: Option<ClientId>,
 }
 
-#[cfg(all(windows, debug_assertions))]
+#[cfg(all(any(windows, target_os = "linux"), debug_assertions))]
 #[derive(Debug)]
 struct PreparedDebugPaths {
     profile_root: PathBuf,
@@ -61,7 +61,7 @@ struct PreparedDebugPaths {
     resolved: ResolvedAppPaths,
 }
 
-#[cfg(all(windows, not(debug_assertions)))]
+#[cfg(all(any(windows, target_os = "linux"), not(debug_assertions)))]
 #[derive(Debug)]
 struct PreparedProductionPaths {
     profile_root: PathBuf,
@@ -121,7 +121,7 @@ fn main() -> ExitCode {
 
 /// First line of every host launch, so a slow start has a fixed origin to
 /// measure from. `build` is the crate version; this binary carries no git sha.
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "linux"))]
 fn log_startup_banner(profile: &str) {
     host_log!(
         "devmanager-host: startup profile={profile} pid={} build={}",
@@ -132,7 +132,7 @@ fn log_startup_banner(profile: &str) {
 
 /// Kernel open runs migrations, so it is the first plausible multi-second
 /// stall on a cold launch and needs its own measured span.
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "linux"))]
 fn log_kernel_opened(started: std::time::Instant) {
     host_log!(
         "devmanager-host: kernel opened in {} ms",
@@ -141,15 +141,15 @@ fn log_kernel_opened(started: std::time::Instant) {
 }
 
 fn run(raw_args: Vec<String>) -> Result<(), HostRunError> {
-    #[cfg(not(windows))]
+    #[cfg(not(any(windows, target_os = "linux")))]
     {
         let _ = raw_args;
         return Err(HostRunError::Message(
-            "devmanager-host requires Windows".to_string(),
+            "devmanager-host requires Windows or Linux".to_string(),
         ));
     }
 
-    #[cfg(all(windows, debug_assertions))]
+    #[cfg(all(any(windows, target_os = "linux"), debug_assertions))]
     {
         let args = parse_args(raw_args)?;
         log_startup_banner(&args.profile);
@@ -192,7 +192,7 @@ fn run(raw_args: Vec<String>) -> Result<(), HostRunError> {
         Ok(())
     }
 
-    #[cfg(all(windows, not(debug_assertions)))]
+    #[cfg(all(any(windows, target_os = "linux"), not(debug_assertions)))]
     {
         parse_production_args(raw_args)?;
         log_startup_banner(PRODUCTION_HOST_PROFILE);
@@ -234,7 +234,7 @@ fn run(raw_args: Vec<String>) -> Result<(), HostRunError> {
 
 /// One-way pre-bind ownership gate: only ServeResume/ServeInspection may return
 /// the bus for runtime construction and HelloListener::bind.
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "linux"))]
 fn prepare_host_bus_before_bind(mut bus: CommandBus) -> Result<Option<CommandBus>, HostRunError> {
     match HostCleanupWorker::restart_disposition(&bus)
         .map_err(|error| format!("failed to read host restart disposition: {error}"))?
@@ -252,7 +252,7 @@ fn prepare_host_bus_before_bind(mut bus: CommandBus) -> Result<Option<CommandBus
     }
 }
 
-#[cfg(all(windows, debug_assertions))]
+#[cfg(all(any(windows, target_os = "linux"), debug_assertions))]
 fn parse_args(raw: Vec<String>) -> Result<HostArgs, String> {
     let mut foreground = false;
     let mut profile: Option<String> = None;
@@ -416,7 +416,7 @@ fn validate_instance_label(raw: &str) -> Result<String, String> {
     Ok(trimmed.to_string())
 }
 
-#[cfg(all(windows, debug_assertions))]
+#[cfg(all(any(windows, target_os = "linux"), debug_assertions))]
 fn validate_slow_durable_reader_isolation(
     instance_label: &str,
     profile: &str,
@@ -576,7 +576,7 @@ fn validate_config_base(config_base: &Path) -> Result<PathBuf, String> {
     Ok(canonical)
 }
 
-#[cfg(all(windows, not(debug_assertions)))]
+#[cfg(all(any(windows, target_os = "linux"), not(debug_assertions)))]
 fn parse_production_args(raw: Vec<String>) -> Result<(), String> {
     if std::env::var_os("DEVMANAGER_PROFILE").is_some() {
         return Err("DEVMANAGER_PROFILE is forbidden for production host".to_string());
@@ -610,7 +610,7 @@ fn parse_production_args(raw: Vec<String>) -> Result<(), String> {
     Ok(())
 }
 
-#[cfg(all(windows, not(debug_assertions)))]
+#[cfg(all(any(windows, target_os = "linux"), not(debug_assertions)))]
 fn prepare_production_paths() -> Result<PreparedProductionPaths, String> {
     if std::env::var_os("DEVMANAGER_PROFILE").is_some() {
         return Err("DEVMANAGER_PROFILE is forbidden for production host".to_string());
@@ -633,9 +633,7 @@ fn prepare_production_paths() -> Result<PreparedProductionPaths, String> {
     }
     match fs::symlink_metadata(&resolved.root) {
         Ok(metadata) => {
-            use std::os::windows::fs::MetadataExt;
-            use windows::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT;
-            if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT.0 != 0 {
+            if metadata_is_redirect(&metadata) {
                 return Err(format!(
                     "production profile root must not be a reparse point: {}",
                     resolved.root.display()
@@ -691,22 +689,28 @@ fn prepare_production_paths() -> Result<PreparedProductionPaths, String> {
     })
 }
 
-#[cfg(all(windows, debug_assertions))]
-fn is_reparse_point(path: &Path) -> Result<bool, String> {
-    use std::os::windows::fs::MetadataExt;
-    use windows::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT;
-
-    // symlink_metadata does not follow junctions/reparse points.
-    let metadata = fs::symlink_metadata(path).map_err(|error| {
-        format!(
-            "failed to read symlink metadata for {}: {error}",
-            path.display()
-        )
-    })?;
-    Ok(metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT.0 != 0)
+#[cfg(any(windows, target_os = "linux"))]
+fn metadata_is_redirect(metadata: &fs::Metadata) -> bool {
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        use windows::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT;
+        metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT.0 != 0
+    }
+    #[cfg(target_os = "linux")]
+    {
+        metadata.file_type().is_symlink()
+    }
 }
 
-#[cfg(all(windows, debug_assertions))]
+#[cfg(all(any(windows, target_os = "linux"), debug_assertions))]
+fn is_reparse_point(path: &Path) -> Result<bool, String> {
+    let metadata = fs::symlink_metadata(path)
+        .map_err(|error| format!("failed to inspect profile path {}: {error}", path.display()))?;
+    Ok(metadata_is_redirect(&metadata))
+}
+
+#[cfg(all(any(windows, target_os = "linux"), debug_assertions))]
 fn prepare_debug_paths(args: &HostArgs) -> Result<PreparedDebugPaths, String> {
     let profile = AppProfile::named(&args.profile).map_err(|error| error.to_string())?;
     let paths = resolve_app_paths(&args.config_base, profile, BuildKind::Debug)
@@ -786,7 +790,7 @@ fn prepare_debug_paths(args: &HostArgs) -> Result<PreparedDebugPaths, String> {
     })
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "linux"))]
 fn acquire_lock(profile_root: &Path, profile: &str) -> Result<HostLock, HostRunError> {
     match HostLock::acquire(profile_root, profile) {
         Ok(lock) => Ok(lock),
@@ -935,7 +939,68 @@ fn parent_has_exited(parent: &ParentProcess) -> Result<bool, String> {
     Ok(true)
 }
 
-#[cfg(windows)]
+#[cfg(target_os = "linux")]
+struct ParentProcess {
+    // An owned pidfd stays bound to this process even after PID reuse.
+    handle: std::os::fd::OwnedFd,
+}
+
+#[cfg(all(target_os = "linux", debug_assertions))]
+fn open_and_validate_parent(parent_pid: u32) -> Result<ParentProcess, String> {
+    use std::os::fd::FromRawFd;
+
+    validate_parent_pid_shape(parent_pid)?;
+    let actual = unsafe { libc::getppid() };
+    if actual <= 1 || parent_pid != actual as u32 {
+        return Err(format!(
+            "supplied --parent-pid {parent_pid} does not match actual parent PID {actual}"
+        ));
+    }
+    // SAFETY: pidfd_open returns a new descriptor or -1; ownership is armed
+    // immediately. Recheck the parent relation after opening to close the
+    // exit/reparent/PID-reuse race without trusting a numeric PID alone.
+    let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, actual, 0) };
+    if fd < 0 {
+        return Err(format!(
+            "failed to open parent pidfd: {}",
+            io::Error::last_os_error()
+        ));
+    }
+    let parent = ParentProcess {
+        handle: unsafe { std::os::fd::OwnedFd::from_raw_fd(fd as i32) },
+    };
+    if unsafe { libc::getppid() } != actual || parent_has_exited(&parent)? {
+        return Err("parent process exited during host startup".into());
+    }
+    Ok(parent)
+}
+
+#[cfg(target_os = "linux")]
+fn parent_has_exited(parent: &ParentProcess) -> Result<bool, String> {
+    use std::os::fd::AsRawFd;
+
+    let mut poll = libc::pollfd {
+        fd: parent.handle.as_raw_fd(),
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    loop {
+        let result = unsafe { libc::poll(&mut poll, 1, 0) };
+        if result < 0 {
+            let error = io::Error::last_os_error();
+            if error.kind() == io::ErrorKind::Interrupted {
+                continue;
+            }
+            return Err(format!("failed to poll parent pidfd: {error}"));
+        }
+        if poll.revents & (libc::POLLERR | libc::POLLNVAL) != 0 {
+            return Err("parent pidfd became invalid".into());
+        }
+        return Ok(poll.revents & (libc::POLLIN | libc::POLLHUP) != 0);
+    }
+}
+
+#[cfg(any(windows, target_os = "linux"))]
 async fn wait_for_parent_exit(parent: &ParentProcess) -> Result<(), String> {
     loop {
         if parent_has_exited(parent)? {
@@ -945,7 +1010,7 @@ async fn wait_for_parent_exit(parent: &ParentProcess) -> Result<(), String> {
     }
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "linux"))]
 fn join_error_message(context: &str, error: tokio::task::JoinError) -> String {
     if error.is_panic() {
         format!("{context} panicked")
@@ -956,7 +1021,7 @@ fn join_error_message(context: &str, error: tokio::task::JoinError) -> String {
     }
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "linux"))]
 async fn abort_and_drain_connection_tasks(
     tasks: &mut tokio::task::JoinSet<()>,
 ) -> Result<(), String> {
@@ -975,7 +1040,7 @@ async fn abort_and_drain_connection_tasks(
     first_error.map_or(Ok(()), Err)
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "linux"))]
 async fn drain_then_abort_connection_tasks(
     tasks: &mut tokio::task::JoinSet<()>,
     drain: Duration,
@@ -1008,7 +1073,7 @@ async fn drain_then_abort_connection_tasks(
     }
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "linux"))]
 enum HostLoopExit {
     Parent(Result<(), String>),
     Listener(String),
@@ -1018,7 +1083,7 @@ enum HostLoopExit {
     Connection(tokio::task::JoinError),
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "linux"))]
 async fn finish_supervised_host(
     exit: HostLoopExit,
     connection_tasks: &mut tokio::task::JoinSet<()>,
@@ -1100,7 +1165,7 @@ async fn finish_supervised_host(
     }
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "linux"))]
 fn spawn_connection_task(
     tasks: &mut tokio::task::JoinSet<()>,
     connection: HostConnection,
@@ -1128,7 +1193,7 @@ fn spawn_connection_task(
     });
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "linux"))]
 async fn serve_foreground_host(
     host_lock: &HostLock,
     profile: &str,
@@ -1393,7 +1458,7 @@ async fn serve_foreground_host(
     result
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "linux"))]
 fn installed_binaries_dir() -> Result<std::path::PathBuf, String> {
     let exe = std::env::current_exe().map_err(|error| {
         format!("unable to resolve host executable for update recovery: {error}")
@@ -1406,7 +1471,7 @@ fn installed_binaries_dir() -> Result<std::path::PathBuf, String> {
 /// New production host startup: validate durable handoff marker against live
 /// Host Hello, complete matching start + resync, then clear the marker.
 /// Failed validation leaves the recoverable marker and fails closed.
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "linux"))]
 fn complete_update_handoff_recovery_if_present(
     request_handle: &HostRequestHandle,
     server_build: &str,
@@ -1429,7 +1494,7 @@ fn complete_update_handoff_recovery_if_present(
     )
 }
 
-#[cfg(all(windows, debug_assertions, test))]
+#[cfg(all(any(windows, target_os = "linux"), debug_assertions, test))]
 mod tests {
     use super::{
         drain_then_abort_connection_tasks, parse_args, path_strictly_beneath,

@@ -1,4 +1,4 @@
-//! Profile-scoped named-pipe ClientHello/ServerHello handshake transport.
+//! Profile-scoped local ClientHello/ServerHello handshake transport.
 //!
 //! After Hello, each production connection owns one reader half and one writer
 //! half. The reader decodes ClientRequest frames and submits them to the
@@ -228,12 +228,12 @@ impl std::fmt::Display for IpcError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::InvalidProfile(name) => write!(f, "invalid host ipc profile name: {name:?}"),
-            Self::Unsupported => write!(f, "named-pipe ipc is unsupported on this platform"),
+            Self::Unsupported => write!(f, "local host IPC is unsupported on this platform"),
             Self::UnsupportedCapability => {
                 write!(f, "requested capability is not granted on this connection")
             }
-            Self::Io(error) => write!(f, "named-pipe ipc I/O error: {error}"),
-            Self::Timeout => write!(f, "named-pipe operation timed out"),
+            Self::Io(error) => write!(f, "local host IPC I/O error: {error}"),
+            Self::Timeout => write!(f, "local host operation timed out"),
             Self::Frame(error) => error.fmt(f),
             Self::MessagePack(error) => error.fmt(f),
             Self::ClientHello(error) => error.fmt(f),
@@ -258,7 +258,7 @@ impl std::fmt::Display for IpcError {
             Self::ConnectionPoisoned => {
                 write!(
                     f,
-                    "named-pipe connection is poisoned and must not be reused"
+                    "local host connection is poisoned and must not be reused"
                 )
             }
             Self::Busy => write!(f, "kernel store is busy"),
@@ -267,7 +267,7 @@ impl std::fmt::Display for IpcError {
                 f,
                 "retired subscription queue exceeded bounded drain limit of {limit}"
             ),
-            Self::Security(message) => write!(f, "named-pipe security error: {message}"),
+            Self::Security(message) => write!(f, "local host security error: {message}"),
         }
     }
 }
@@ -310,7 +310,14 @@ pub fn profile_fingerprint_for_named_profile(
 /// Derive the boot-independent pipe endpoint for a normalized named profile.
 pub fn pipe_endpoint_for_named_profile(profile: &str) -> Result<String, IpcError> {
     let fingerprint = profile_fingerprint_for_named_profile(profile)?;
-    Ok(format!("{PIPE_PRODUCT_PREFIX}{}", fingerprint.to_hex()))
+    #[cfg(target_os = "linux")]
+    {
+        Ok(super::local_socket::endpoint(fingerprint))
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        Ok(format!("{PIPE_PRODUCT_PREFIX}{}", fingerprint.to_hex()))
+    }
 }
 
 fn normalize_named_profile(profile: &str) -> Result<String, IpcError> {
@@ -375,6 +382,8 @@ pub struct HelloListener {
     config: AcceptHelloConfig,
     #[cfg(windows)]
     server: tokio::net::windows::named_pipe::NamedPipeServer,
+    #[cfg(target_os = "linux")]
+    server: tokio::net::UnixListener,
 }
 
 impl HelloListener {
@@ -388,7 +397,7 @@ impl HelloListener {
 
     pub fn bind(profile: &str, config: AcceptHelloConfig) -> Result<Self, IpcError> {
         let expected_fingerprint = profile_fingerprint_for_named_profile(profile)?;
-        let endpoint = format!("{PIPE_PRODUCT_PREFIX}{}", expected_fingerprint.to_hex());
+        let endpoint = pipe_endpoint_for_named_profile(profile)?;
         config
             .local_limits
             .validate_offer()
@@ -402,7 +411,17 @@ impl HelloListener {
         {
             windows_bind(endpoint, expected_fingerprint, config, true)
         }
-        #[cfg(not(windows))]
+        #[cfg(target_os = "linux")]
+        {
+            let server = super::local_socket::bind(&endpoint)?;
+            Ok(Self {
+                endpoint,
+                expected_fingerprint,
+                config,
+                server,
+            })
+        }
+        #[cfg(not(any(windows, target_os = "linux")))]
         {
             let _ = endpoint;
             let _ = expected_fingerprint;
@@ -417,7 +436,11 @@ impl HelloListener {
         {
             windows_accept(self).await
         }
-        #[cfg(not(windows))]
+        #[cfg(target_os = "linux")]
+        {
+            self.accept_linux().await
+        }
+        #[cfg(not(any(windows, target_os = "linux")))]
         {
             let _ = self;
             Err(IpcError::Unsupported)
@@ -436,11 +459,23 @@ impl HelloListener {
         {
             windows_accept_with_successor(self).await
         }
-        #[cfg(not(windows))]
+        #[cfg(target_os = "linux")]
+        {
+            let result = self.accept_linux().await;
+            Ok((result, self))
+        }
+        #[cfg(not(any(windows, target_os = "linux")))]
         {
             let _ = self;
             Err(IpcError::Unsupported)
         }
+    }
+
+    #[cfg(target_os = "linux")]
+    async fn accept_linux(&self) -> Result<HostConnection, IpcError> {
+        let (stream, _) = self.server.accept().await.map_err(IpcError::Io)?;
+        super::local_socket::authenticate_peer(&stream)?;
+        finish_handshake(stream, self.expected_fingerprint, &self.config).await
     }
 
     /// Accept Hello and drop the retained pipe (compatibility wrapper).
@@ -461,6 +496,8 @@ pub struct HostConnection {
     poisoned: bool,
     #[cfg(windows)]
     pipe: tokio::net::windows::named_pipe::NamedPipeServer,
+    #[cfg(target_os = "linux")]
+    pipe: tokio::net::UnixStream,
 }
 
 impl HostConnection {
@@ -499,12 +536,12 @@ impl HostConnection {
     /// task creation must use the resolver-backed executor path.
     pub async fn serve_request(&mut self, bus: &mut CommandBus) -> Result<(), IpcError> {
         connection_ensure_live(self.poisoned)?;
-        #[cfg(windows)]
+        #[cfg(any(windows, target_os = "linux"))]
         {
-            let result = windows_serve_request(self, bus).await;
+            let result = local_serve_request(self, bus).await;
             connection_fail_closed(&mut self.poisoned, result)
         }
-        #[cfg(not(windows))]
+        #[cfg(not(any(windows, target_os = "linux")))]
         {
             let _ = bus;
             connection_fail_closed(&mut self.poisoned, Err(IpcError::Unsupported))
@@ -520,12 +557,12 @@ impl HostConnection {
         requests: &HostRequestHandle,
     ) -> Result<(), IpcError> {
         connection_ensure_live(self.poisoned)?;
-        #[cfg(windows)]
+        #[cfg(any(windows, target_os = "linux"))]
         {
-            let result = windows_serve_request_on_executor(self, requests).await;
+            let result = local_serve_request_on_executor(self, requests).await;
             connection_fail_closed(&mut self.poisoned, result)
         }
-        #[cfg(not(windows))]
+        #[cfg(not(any(windows, target_os = "linux")))]
         {
             let _ = requests;
             connection_fail_closed(&mut self.poisoned, Err(IpcError::Unsupported))
@@ -535,12 +572,12 @@ impl HostConnection {
     /// Read one authenticated client request (scripted-host / test helper).
     pub async fn read_request(&mut self) -> Result<ClientRequest, IpcError> {
         connection_ensure_live(self.poisoned)?;
-        #[cfg(windows)]
+        #[cfg(any(windows, target_os = "linux"))]
         {
-            let result = windows_read_request(self).await;
+            let result = local_read_request(self).await;
             connection_fail_closed(&mut self.poisoned, result)
         }
-        #[cfg(not(windows))]
+        #[cfg(not(any(windows, target_os = "linux")))]
         {
             connection_fail_closed(&mut self.poisoned, Err(IpcError::Unsupported))
         }
@@ -549,12 +586,12 @@ impl HostConnection {
     /// Write one server message (scripted-host / test helper).
     pub async fn write_message(&mut self, message: &ServerMessage) -> Result<(), IpcError> {
         connection_ensure_live(self.poisoned)?;
-        #[cfg(windows)]
+        #[cfg(any(windows, target_os = "linux"))]
         {
-            let result = windows_write_message(self, message).await;
+            let result = local_write_message(self, message).await;
             connection_fail_closed(&mut self.poisoned, result)
         }
-        #[cfg(not(windows))]
+        #[cfg(not(any(windows, target_os = "linux")))]
         {
             let _ = message;
             connection_fail_closed(&mut self.poisoned, Err(IpcError::Unsupported))
@@ -564,9 +601,9 @@ impl HostConnection {
     /// Production duplex serve: one reader owner, one writer owner, until disconnect.
     pub async fn serve_duplex(self, requests: HostRequestHandle) -> Result<(), IpcError> {
         connection_ensure_live(self.poisoned)?;
-        #[cfg(windows)]
+        #[cfg(any(windows, target_os = "linux"))]
         {
-            windows_serve_duplex(
+            local_serve_duplex(
                 self,
                 requests,
                 HOST_CRITICAL_OUTPUT_QUEUE_CAPACITY,
@@ -575,7 +612,7 @@ impl HostConnection {
             )
             .await
         }
-        #[cfg(not(windows))]
+        #[cfg(not(any(windows, target_os = "linux")))]
         {
             let _ = requests;
             Err(IpcError::Unsupported)
@@ -594,9 +631,9 @@ impl HostConnection {
         requests: HostRequestHandle,
     ) -> Result<(), IpcError> {
         connection_ensure_live(self.poisoned)?;
-        #[cfg(windows)]
+        #[cfg(any(windows, target_os = "linux"))]
         {
-            windows_serve_duplex(
+            local_serve_duplex(
                 self,
                 requests,
                 HOST_CRITICAL_OUTPUT_QUEUE_CAPACITY,
@@ -605,7 +642,7 @@ impl HostConnection {
             )
             .await
         }
-        #[cfg(not(windows))]
+        #[cfg(not(any(windows, target_os = "linux")))]
         {
             let _ = requests;
             Err(IpcError::Unsupported)
@@ -644,7 +681,12 @@ fn windows_bind(
 async fn windows_accept(listener: HelloListener) -> Result<HostConnection, IpcError> {
     // Idle accept waits for a client indefinitely; host shutdown cancels this later.
     listener.server.connect().await.map_err(IpcError::Io)?;
-    windows_finish_handshake(listener).await
+    finish_handshake(
+        listener.server,
+        listener.expected_fingerprint,
+        &listener.config,
+    )
+    .await
 }
 
 #[cfg(windows)]
@@ -661,36 +703,52 @@ async fn windows_accept_with_successor(
         false,
     )?;
     let connection = match connected {
-        Ok(()) => windows_finish_handshake(listener).await,
+        Ok(()) => {
+            finish_handshake(
+                listener.server,
+                listener.expected_fingerprint,
+                &listener.config,
+            )
+            .await
+        }
         Err(error) => Err(error),
     };
     Ok((connection, successor))
 }
 
 #[cfg(windows)]
-async fn windows_finish_handshake(mut listener: HelloListener) -> Result<HostConnection, IpcError> {
+type LocalServerStream = tokio::net::windows::named_pipe::NamedPipeServer;
+#[cfg(target_os = "linux")]
+type LocalServerStream = tokio::net::UnixStream;
+
+#[cfg(any(windows, target_os = "linux"))]
+async fn finish_handshake(
+    mut pipe: LocalServerStream,
+    expected_fingerprint: ProfileFingerprint,
+    config: &AcceptHelloConfig,
+) -> Result<HostConnection, IpcError> {
     use tokio::io::AsyncWriteExt;
 
     let (hello_physical, hello_message) = handshake_codecs()?;
 
     let (client_id, negotiated, server_hello, reconnect_from) =
         tokio::time::timeout(HANDSHAKE_TIMEOUT, async {
-            let payload = read_physical_frame(&mut listener.server, &hello_physical).await?;
+            let payload = read_physical_frame(&mut pipe, &hello_physical).await?;
             let hello = hello_message
                 .decode::<ClientHello>(&payload)
                 .map_err(IpcError::MessagePack)?;
-            if hello.profile_fingerprint != listener.expected_fingerprint {
+            if hello.profile_fingerprint != expected_fingerprint {
                 return Err(IpcError::ProfileMismatch);
             }
             let negotiated = fence_capabilities_by_transport(
                 hello
-                    .negotiate(listener.config.supported, listener.config.local_limits)
+                    .negotiate(config.supported, config.local_limits)
                     .map_err(IpcError::ClientHello)?,
             );
             let mut server_hello = ServerHello::from_negotiated(
-                listener.config.server_build.clone(),
-                listener.config.host_boot_id,
-                listener.expected_fingerprint,
+                config.server_build.clone(),
+                config.host_boot_id,
+                expected_fingerprint,
                 negotiated,
             )
             .map_err(IpcError::ServerHello)?;
@@ -698,7 +756,7 @@ async fn windows_finish_handshake(mut listener: HelloListener) -> Result<HostCon
                 .lock()
                 .map_err(|_| IpcError::Security("reconnect grant ledger poisoned".into()))?
                 .admit(
-                    listener.config.host_boot_id,
+                    config.host_boot_id,
                     hello.client_id,
                     hello.reconnect_grant.as_ref(),
                     server_hello.connection_id,
@@ -708,8 +766,8 @@ async fn windows_finish_handshake(mut listener: HelloListener) -> Result<HostCon
             let encoded = hello_message
                 .encode(&server_hello)
                 .map_err(IpcError::MessagePack)?;
-            write_physical_frame(&mut listener.server, &hello_physical, &encoded).await?;
-            listener.server.flush().await.map_err(IpcError::Io)?;
+            write_physical_frame(&mut pipe, &hello_physical, &encoded).await?;
+            pipe.flush().await.map_err(IpcError::Io)?;
             Ok((
                 negotiated.client_id,
                 negotiated,
@@ -729,12 +787,12 @@ async fn windows_finish_handshake(mut listener: HelloListener) -> Result<HostCon
         physical,
         message,
         poisoned: false,
-        pipe: listener.server,
+        pipe,
     })
 }
 
-#[cfg(windows)]
-async fn windows_serve_request(
+#[cfg(any(windows, target_os = "linux"))]
+async fn local_serve_request(
     connection: &mut HostConnection,
     bus: &mut CommandBus,
 ) -> Result<(), IpcError> {
@@ -767,8 +825,8 @@ async fn windows_serve_request(
     .map_err(|_| IpcError::Timeout)?
 }
 
-#[cfg(windows)]
-async fn windows_serve_request_on_executor(
+#[cfg(any(windows, target_os = "linux"))]
+async fn local_serve_request_on_executor(
     connection: &mut HostConnection,
     requests: &HostRequestHandle,
 ) -> Result<(), IpcError> {
@@ -796,8 +854,8 @@ async fn windows_serve_request_on_executor(
     .map_err(|_| IpcError::Timeout)?
 }
 
-#[cfg(windows)]
-async fn windows_read_request(connection: &mut HostConnection) -> Result<ClientRequest, IpcError> {
+#[cfg(any(windows, target_os = "linux"))]
+async fn local_read_request(connection: &mut HostConnection) -> Result<ClientRequest, IpcError> {
     let first = read_first_request_byte_idle(&mut connection.pipe).await?;
     tokio::time::timeout(REQUEST_COMPLETION_TIMEOUT, async {
         let payload =
@@ -812,8 +870,8 @@ async fn windows_read_request(connection: &mut HostConnection) -> Result<ClientR
     .map_err(|_| IpcError::Timeout)?
 }
 
-#[cfg(windows)]
-async fn windows_write_message(
+#[cfg(any(windows, target_os = "linux"))]
+async fn local_write_message(
     connection: &mut HostConnection,
     message: &ServerMessage,
 ) -> Result<(), IpcError> {
@@ -832,7 +890,7 @@ async fn windows_write_message(
     .map_err(|_| IpcError::Timeout)?
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "linux"))]
 #[derive(Clone, Copy)]
 enum OutputDrainMode {
     Prioritized,
@@ -840,8 +898,8 @@ enum OutputDrainMode {
     CriticalOnly,
 }
 
-#[cfg(windows)]
-async fn windows_serve_duplex(
+#[cfg(any(windows, target_os = "linux"))]
+async fn local_serve_duplex(
     connection: HostConnection,
     requests: HostRequestHandle,
     critical_capacity: usize,

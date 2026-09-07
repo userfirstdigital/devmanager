@@ -1,17 +1,19 @@
-//! Named-pipe ClientHello/ServerHello handshake acceptance.
+//! Local ClientHello/ServerHello and authenticated request acceptance.
 //!
 //! Fixtures use a process-unique named profile and a TempDir root only as
 //! isolation evidence. They must never resolve installed app-data paths or the
 //! production pipe namespace.
 
-#![cfg(windows)]
+#![cfg(any(windows, target_os = "linux"))]
 
+#[cfg(windows)]
 use std::os::windows::fs::OpenOptionsExt;
 use std::path::Path;
 use std::time::Duration;
 
 use tempfile::TempDir;
 use tokio::io::AsyncWriteExt;
+#[cfg(windows)]
 use tokio::net::windows::named_pipe::ClientOptions;
 use tokio::sync::oneshot;
 use tokio::time::timeout;
@@ -21,7 +23,9 @@ use devmanager::client::{
     connect, perform_client_hello, HostClient, HostClientConfig, TrackedOperation,
     UnsolicitedServerMessage,
 };
-use devmanager::domain::command::{Command, CommandEnvelope, CommandReceipt, CreateTaskIntent};
+use devmanager::domain::command::{
+    Command, CommandEnvelope, CommandReceipt, CreateTaskIntent, CreateTaskRequestIntent,
+};
 use devmanager::domain::event::{DomainEvent, Event};
 use devmanager::domain::id::{
     CommandId, EnvironmentId, EventId, ProjectId, RequestId, SubscriptionId, TaskId,
@@ -91,11 +95,79 @@ fn fixed_uuid_v7(tail: u8) -> [u8; 16] {
     ]
 }
 
+fn configured_host(
+    root: &Path,
+) -> (
+    devmanager::host::HostRequestHandle,
+    devmanager::host::SupervisedHostExecutor,
+    ProjectId,
+) {
+    use devmanager::config::paths::ResolvedAppPaths;
+    use devmanager::config::Project;
+    use devmanager::config::{ConfigCommand, ConfigStore};
+    use devmanager::workspace::WorkspaceProjectRoots;
+    let paths = ResolvedAppPaths {
+        root: root.to_path_buf(),
+        config: root.join("config.json"),
+        remote: root.join("remote.json"),
+        database: root.join("kernel.sqlite3"),
+        browser_root: root.join("browser"),
+        logs: root.join("logs"),
+    };
+    let mut store = ConfigStore::open_host(&paths).expect("isolated config");
+    let config_id = ProjectId::new().to_string();
+    store
+        .execute(
+            store.snapshot().revision,
+            ConfigCommand::CreateProject {
+                project: Project {
+                    id: config_id.clone(),
+                    name: "IPC fixture".into(),
+                    root_path: root.to_string_lossy().into_owned(),
+                    created_at: "now".into(),
+                    updated_at: "now".into(),
+                    ..Project::default()
+                },
+            },
+        )
+        .expect("configure isolated project");
+    let revision = store.snapshot().revision;
+    let roots = WorkspaceProjectRoots::from_host_config_store(&mut store, revision, 1, 1)
+        .expect("host-owned project roots");
+    let project_id = roots
+        .project_id_for_config_id(&config_id)
+        .expect("project id");
+    let bus = CommandBus::open(&paths.database).expect("isolated bus");
+    let (requests, executor) =
+        HostRequestExecutor::start_supervised_with_config_store(bus, store, root)
+            .expect("configured host executor");
+    (requests, executor, project_id)
+}
+
+fn create_request(task: TaskId, project_id: ProjectId, root: &Path, title: &str) -> Command {
+    let intent = create_intent(task, title);
+    Command::CreateTaskV2(CreateTaskRequestIntent {
+        id: task,
+        environment_id: intent.environment_id,
+        title: title.into(),
+        description: None,
+        project_id,
+        workspace: devmanager::workspace::WorkspaceRequest::confirmed_external(root),
+        primary_provider: None,
+        defer_primary_provider_start: false,
+        assignment: intent.assignment,
+        created_at_ms: intent.created_at_ms,
+        connectivity: intent.connectivity,
+        attention: intent.attention,
+        activity: intent.activity,
+        review_readiness: intent.review_readiness,
+    })
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn pipe_request_create_retry_then_task_read() {
     let root = isolation_root();
     assert_isolated_from_app_data(root.path());
-    let db_path = root.path().join("kernel.sqlite3");
 
     let profile_uuid = Uuid::now_v7();
     let profile = format!(
@@ -122,26 +194,14 @@ async fn pipe_request_create_retry_then_task_read() {
     let command_id = CommandId::from_bytes(fixed_uuid_v7(0x53)).expect("command");
     let request_id = RequestId::from_bytes(fixed_uuid_v7(0x54)).expect("request");
 
+    let (requests, executor, project_id) = configured_host(root.path());
     let create = CommandEnvelope {
         command_id,
         client_id,
         task_id: None,
         issued_at_ms: 1_725_000_000_100,
         expected_task_revision: None,
-        command: Command::CreateTask(CreateTaskIntent {
-            id: task,
-            environment_id: EnvironmentId::from_bytes(fixed_uuid_v7(0x55)).expect("env"),
-            title: "Pipe create retry".into(),
-            description: None,
-            project_id: ProjectId::from_bytes(fixed_uuid_v7(0x56)).expect("project"),
-            workspace: WorkspaceRef::Main,
-            assignment: TaskAssignment::LocalOwner,
-            created_at_ms: 1_725_000_000_000,
-            connectivity: TaskConnectivity::Connected,
-            attention: TaskAttention::None,
-            activity: TaskActivity::Idle,
-            review_readiness: ReviewReadiness::NotReady,
-        }),
+        command: create_request(task, project_id, root.path(), "Pipe create retry"),
     };
 
     let listener = HelloListener::bind(
@@ -157,19 +217,20 @@ async fn pipe_request_create_retry_then_task_read() {
 
     let server_task = tokio::spawn(async move {
         let mut connection = listener.accept().await.expect("accept connection");
-        let mut bus = CommandBus::open(&db_path).expect("open host command bus");
         connection
-            .serve_request(&mut bus)
+            .serve_request_on_executor(&requests)
             .await
             .expect("serve create");
         connection
-            .serve_request(&mut bus)
+            .serve_request_on_executor(&requests)
             .await
             .expect("serve retry");
         connection
-            .serve_request(&mut bus)
+            .serve_request_on_executor(&requests)
             .await
             .expect("serve task query");
+        drop(requests);
+        let _ = executor.join.await.expect("host executor joined");
         connection.accepted_hello()
     });
 
@@ -255,7 +316,11 @@ async fn pipe_hello_round_trip_negotiates_minimums() {
     let fingerprint = profile_fingerprint_for_named_profile(&profile).expect("fingerprint");
     let endpoint = pipe_endpoint_for_named_profile(&profile).expect("endpoint");
     assert!(
-        endpoint.starts_with(r"\\.\pipe\devmanager-"),
+        if cfg!(windows) {
+            endpoint.starts_with(r"\\.\pipe\devmanager-")
+        } else {
+            endpoint.starts_with("unix-abstract:devmanager-")
+        },
         "endpoint must use DevManager product namespace: {endpoint}"
     );
     assert_eq!(
@@ -463,7 +528,15 @@ async fn pipe_oversized_header_is_rejected_before_payload_allocation() {
 
     let server_task = tokio::spawn(async move { listener.accept_hello().await });
 
+    #[cfg(windows)]
     let mut client = ClientOptions::new().open(&endpoint).expect("open client");
+    #[cfg(target_os = "linux")]
+    let mut client = tokio::net::UnixStream::connect(format!(
+        "\0{}",
+        endpoint.strip_prefix("unix-abstract:").unwrap()
+    ))
+    .await
+    .expect("open client");
     let oversized = (MAX_PHYSICAL_FRAME_BYTES + 1).to_be_bytes();
     client
         .write_all(&oversized)
@@ -505,31 +578,18 @@ async fn client_reconnect_resolves_tracked_operation_while_host_database_is_lock
         local_limits: FrameLimits::v1_default(),
     };
 
+    let (requests, executor, project_id) = configured_host(root.path());
     let create = CommandEnvelope {
         command_id,
         client_id,
         task_id: None,
         issued_at_ms: 1_725_000_000_100,
         expected_task_revision: None,
-        command: Command::CreateTask(CreateTaskIntent {
-            id: task,
-            environment_id: EnvironmentId::from_bytes(fixed_uuid_v7(0x64)).expect("env"),
-            title: "HostClient reconnect settle".into(),
-            description: None,
-            project_id: ProjectId::from_bytes(fixed_uuid_v7(0x65)).expect("project"),
-            workspace: WorkspaceRef::Main,
-            assignment: TaskAssignment::LocalOwner,
-            created_at_ms: 1_725_000_000_000,
-            connectivity: TaskConnectivity::Connected,
-            attention: TaskAttention::None,
-            activity: TaskActivity::Idle,
-            review_readiness: ReviewReadiness::NotReady,
-        }),
+        command: create_request(task, project_id, root.path(), "HostClient reconnect settle"),
     };
 
     let (bound1_tx, bound1_rx) = oneshot::channel::<()>();
     let (hello1_tx, hello1_rx) = oneshot::channel();
-    let db_path_host1 = db_path.clone();
     let profile_host1 = profile.clone();
     let hello_config_host1 = hello_config.clone();
     let host1 = tokio::spawn(async move {
@@ -537,14 +597,14 @@ async fn client_reconnect_resolves_tracked_operation_while_host_database_is_lock
         let _ = bound1_tx.send(());
         let mut connection = listener.accept().await.expect("accept1");
         let accepted = connection.accepted_hello();
-        let mut bus = CommandBus::open(&db_path_host1).expect("open bus1");
         connection
-            .serve_request(&mut bus)
+            .serve_request_on_executor(&requests)
             .await
             .expect("serve create");
         let _ = hello1_tx.send(accepted);
         drop(connection);
-        drop(bus);
+        drop(requests);
+        let _ = executor.join.await.expect("host executor joined");
     });
 
     timeout(OUTER_TIMEOUT, bound1_rx)
@@ -641,11 +701,18 @@ async fn client_reconnect_resolves_tracked_operation_while_host_database_is_lock
     // This is a focused attach-path proof: reconnect does not need the active
     // host database. The later child-process gate observes canonical client
     // handles across the complete lifecycle.
+    #[cfg(windows)]
     let canary = std::fs::OpenOptions::new()
         .read(true)
         .share_mode(0)
         .open(&db_path)
         .expect("exclusive hold on kernel.sqlite3");
+    #[cfg(target_os = "linux")]
+    let canary = {
+        let held_path = db_path.with_extension("held");
+        std::fs::rename(&db_path, &held_path).expect("hold database away from reconnect path");
+        held_path
+    };
 
     timeout(OUTER_TIMEOUT, client.reconnect())
         .await
@@ -668,7 +735,16 @@ async fn client_reconnect_resolves_tracked_operation_while_host_database_is_lock
         Some(TrackedOperation::Pending { .. })
     ));
 
+    #[cfg(windows)]
     drop(canary);
+    #[cfg(target_os = "linux")]
+    {
+        assert!(
+            !db_path.exists(),
+            "reconnect must not open or recreate the host database"
+        );
+        std::fs::rename(canary, &db_path).expect("restore host database before the query");
+    }
     let _ = release_tx.send(());
 
     let state = timeout(OUTER_TIMEOUT, client.refresh_operation(operation_id))
@@ -1087,7 +1163,9 @@ async fn duplicate_in_flight_ids_are_rejected_before_write() {
 async fn disconnected_client_does_not_interrupt_other_connection() {
     let root = isolation_root();
     assert_isolated_from_app_data(root.path());
-    let db_path = root.path().join("kernel.sqlite3");
+    let (requests, executor, project_id) = configured_host(root.path());
+    let task = TaskId::from_bytes(fixed_uuid_v7(0xa0)).expect("task");
+    let create = create_request(task, project_id, root.path(), "healthy");
     let profile = unique_profile("cq");
     let fingerprint = profile_fingerprint_for_named_profile(&profile).expect("fingerprint");
     let endpoint = pipe_endpoint_for_named_profile(&profile).expect("endpoint");
@@ -1107,8 +1185,6 @@ async fn disconnected_client_does_not_interrupt_other_connection() {
     .expect("bind");
 
     let host = tokio::spawn(async move {
-        let bus = CommandBus::open(&db_path).expect("bus");
-        let (requests, executor) = HostRequestExecutor::start(bus);
         let _ = bound_tx.send(());
         let mut tasks = tokio::task::JoinSet::new();
         let mut accept = Box::pin(listener.accept_with_successor());
@@ -1126,8 +1202,7 @@ async fn disconnected_client_does_not_interrupt_other_connection() {
         // Keep serving until both connection tasks finish or outer timeout cancels.
         while tasks.join_next().await.is_some() {}
         drop(requests);
-        executor.abort();
-        let _ = executor.await;
+        let _ = executor.join.await.expect("host executor joined");
     });
 
     timeout(OUTER_TIMEOUT, bound_rx)
@@ -1161,7 +1236,6 @@ async fn disconnected_client_does_not_interrupt_other_connection() {
             )
             .expect("hello b");
             let connection = connect(&endpoint, &hello).await.expect("connect b");
-            let task = TaskId::from_bytes(fixed_uuid_v7(0xa0)).expect("task");
             let command_id = CommandId::from_bytes(fixed_uuid_v7(0xa1)).expect("command");
             let receipt = connection
                 .execute_command(CommandEnvelope {
@@ -1170,7 +1244,7 @@ async fn disconnected_client_does_not_interrupt_other_connection() {
                     task_id: None,
                     issued_at_ms: 1_725_000_000_100,
                     expected_task_revision: None,
-                    command: Command::CreateTask(create_intent(task, "healthy")),
+                    command: create,
                 })
                 .await
                 .expect("healthy client must still execute");
