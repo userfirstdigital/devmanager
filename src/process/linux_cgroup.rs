@@ -9,7 +9,7 @@ use std::ffi::{CString, OsString};
 use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::net::Shutdown;
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
+use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd, RawFd};
 use std::os::linux::net::SocketAddrExt;
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
@@ -237,31 +237,104 @@ fn open_child(directory: &File, name: &std::ffi::CStr, flags: i32) -> io::Result
     Ok(unsafe { File::from_raw_fd(fd) })
 }
 fn members(directory: &File, guardian: u32, deadline: Instant) -> io::Result<Vec<u32>> {
+    const MAX_GROUPS: usize = 256;
     checkpoint(deadline)?;
-    let mut text = String::new();
-    open_child(directory, c"cgroup.procs", libc::O_RDONLY)?
-        .take((MAX_MEMBERS * 12 + 1) as u64)
-        .read_to_string(&mut text)?;
-    if text.len() > MAX_MEMBERS * 12 {
-        return Err(error("Linux process group exceeds membership bound"));
-    }
-    let mut pids = Vec::new();
-    for line in text.lines() {
-        let pid = line.parse::<u32>().map_err(error)?;
-        if pid == 0 {
-            return Err(error("Linux process group returned zero PID"));
+    let mut queue = vec![(
+        open_child(directory, c".", libc::O_RDONLY | libc::O_DIRECTORY)?,
+        true,
+    )];
+    let mut groups = 1;
+    let mut pids = std::collections::BTreeSet::new();
+    while let Some((group, is_root)) = queue.pop() {
+        checkpoint(deadline)?;
+        let mut text = String::new();
+        let processes = match open_child(&group, c"cgroup.procs", libc::O_RDONLY) {
+            Ok(file) => file,
+            Err(e) if !is_root && matches!(e.raw_os_error(), Some(libc::ENOENT | libc::ENODEV)) => {
+                continue
+            }
+            Err(e) => return Err(e),
+        };
+        processes
+            .take((MAX_MEMBERS * 12 + 1) as u64)
+            .read_to_string(&mut text)?;
+        if text.len() > MAX_MEMBERS * 12 {
+            return Err(error("Linux process group exceeds membership bound"));
         }
-        if pid != guardian {
-            pids.push(pid);
+        for line in text.lines() {
+            let pid = line.parse::<u32>().map_err(error)?;
+            if pid == 0 {
+                return Err(error("Linux process group returned zero PID"));
+            }
+            if pid != guardian {
+                pids.insert(pid);
+            }
+            if pids.len() > MAX_MEMBERS {
+                return Err(error("Linux process group exceeds membership bound"));
+            }
         }
-    }
-    pids.sort_unstable();
-    pids.dedup();
-    if pids.len() > MAX_MEMBERS {
-        return Err(error("Linux process group exceeds membership bound"));
+        // A fresh open file description avoids sharing directory offsets
+        // between simultaneous read-only inventory requests.
+        let enumeration = match open_child(&group, c".", libc::O_RDONLY | libc::O_DIRECTORY) {
+            Ok(file) => file,
+            Err(e) if !is_root && matches!(e.raw_os_error(), Some(libc::ENOENT | libc::ENODEV)) => {
+                continue
+            }
+            Err(e) => return Err(e),
+        };
+        let raw = enumeration.into_raw_fd();
+        let directory = unsafe { libc::fdopendir(raw) };
+        if directory.is_null() {
+            unsafe {
+                libc::close(raw);
+            }
+            return Err(io::Error::last_os_error());
+        }
+        struct Directory(*mut libc::DIR);
+        impl Drop for Directory {
+            fn drop(&mut self) {
+                unsafe {
+                    libc::closedir(self.0);
+                }
+            }
+        }
+        let directory = Directory(directory);
+        loop {
+            checkpoint(deadline)?;
+            unsafe {
+                *libc::__errno_location() = 0;
+            }
+            let entry = unsafe { libc::readdir(directory.0) };
+            if entry.is_null() {
+                let errno = unsafe { *libc::__errno_location() };
+                if errno != 0 {
+                    return Err(io::Error::from_raw_os_error(errno));
+                }
+                break;
+            }
+            let entry = unsafe { &*entry };
+            if entry.d_type != libc::DT_DIR && entry.d_type != libc::DT_UNKNOWN {
+                continue;
+            }
+            let name = unsafe { std::ffi::CStr::from_ptr(entry.d_name.as_ptr()) };
+            if name == c"." || name == c".." {
+                continue;
+            }
+            match open_child(&group, name, libc::O_RDONLY | libc::O_DIRECTORY) {
+                Ok(child) => {
+                    groups += 1;
+                    if groups > MAX_GROUPS {
+                        return Err(error("Linux session exceeds subgroup bound"));
+                    }
+                    queue.push((child, false));
+                }
+                Err(e) if matches!(e.raw_os_error(), Some(libc::ENOENT | libc::ENOTDIR)) => {}
+                Err(e) => return Err(e),
+            }
+        }
     }
     checkpoint(deadline)?;
-    Ok(pids)
+    Ok(pids.into_iter().collect())
 }
 
 #[derive(Debug)]
@@ -296,7 +369,6 @@ impl Shared {
             Ok(pids) => Ok(pids),
             Err(e)
                 if matches!(e.raw_os_error(), Some(libc::ENOENT | libc::ENODEV))
-                    && self.joined.load(Ordering::Acquire)
                     && exited(&self.guardian_process)? =>
             {
                 Ok(Vec::new())
@@ -552,8 +624,39 @@ impl LinuxCgroup {
     pub(crate) fn active_process_ids(&self, deadline: Instant) -> io::Result<Vec<u32>> {
         self.shared.active(deadline)
     }
+    pub(crate) fn inspect_member(
+        &self,
+        pid: u32,
+        deadline: Instant,
+    ) -> io::Result<ManagedProcessIdentity> {
+        checkpoint(deadline)?;
+        let process = pidfd(pid)?;
+        if !self.shared.active(deadline)?.contains(&pid) || exited(&process)? {
+            return Err(error("process is not a live member of this Linux session"));
+        }
+        let creation = crate::services::platform_service::capture_process_creation_time_100ns(pid)
+            .ok_or_else(|| error("Linux member creation identity unavailable"))?;
+        let executable = std::fs::read_link(format!("/proc/{pid}/exe"))?;
+        let identity = ManagedProcessIdentity::new(
+            ManagedProcessId::new(pid, creation).map_err(error)?,
+            executable,
+        )
+        .map_err(error)?;
+        if exited(&process)?
+            || crate::services::platform_service::capture_process_creation_time_100ns(pid)
+                != Some(creation)
+            || !self.shared.active(deadline)?.contains(&pid)
+        {
+            return Err(error("Linux member changed during exact inspection"));
+        }
+        checkpoint(deadline)?;
+        Ok(identity)
+    }
     pub(crate) fn terminate(&self) -> io::Result<()> {
         self.shared.terminate()
+    }
+    pub(crate) fn resumed(&self) -> bool {
+        self.shared.resumed.load(Ordering::Acquire)
     }
     pub(crate) fn settled(&self) -> bool {
         self.shared.joined.load(Ordering::Acquire)
@@ -837,7 +940,15 @@ fn guardian(args: &[String]) -> io::Result<()> {
         // descendants after root exit. Read before the predicate so a later exit cannot lose its wakeup.
         events.seek(SeekFrom::Start(0))?;
         let mut event_bytes = [0u8; 256];
-        let _ = events.read(&mut event_bytes)?;
+        let event_count = events.read(&mut event_bytes)?;
+        let populated = std::str::from_utf8(&event_bytes[..event_count])
+            .map_err(error)?
+            .lines()
+            .find_map(|line| line.strip_prefix("populated "))
+            .ok_or_else(|| error("Linux cgroup populated fact is absent"))?;
+        if !matches!(populated, "0" | "1") {
+            return Err(error("invalid Linux cgroup populated fact"));
+        }
         match control.read(&mut resume) {
             Ok(0) => return Ok(()),
             Ok(_) => return Err(error("Linux session resume is one-way")),
@@ -850,9 +961,7 @@ fn guardian(args: &[String]) -> io::Result<()> {
                 root_exited = true;
             }
         }
-        if root_exited
-            && members(&directory, std::process::id(), Instant::now() + STARTUP)?.is_empty()
-        {
+        if root_exited && populated == "0" {
             drop(kill);
             return Ok(());
         }
@@ -1179,5 +1288,106 @@ mod tests {
         job.join(Instant::now() + CLEANUP).unwrap();
         assert!(exited(&process).unwrap());
         assert!(!root.path().join("started").exists());
+    }
+    #[test]
+    #[ignore = "requires a systemd user manager with cgroup v2 delegation"]
+    fn linux_cgroup_registry_keeps_nested_members_and_exact_zero_authority() {
+        use crate::domain::id::ResourceId;
+        use crate::domain::operation::ResourceFence;
+        use crate::process::identity::ProcessOwner;
+        use crate::process::job::ManagedProcessJob;
+        use crate::process::registry::{
+            ManagedProcessState, ProcessDisplayLabel, ProcessRegistry, RegisteredProcess,
+        };
+        let root = tempfile::tempdir().unwrap();
+        let pair = portable_pty::native_pty_system()
+            .openpty(PtySize::default())
+            .unwrap();
+        let executable = ProviderExecutable::from_path("/usr/bin/bash").unwrap();
+        let (pending, session) = LinuxCgroup::spawn(
+            &helper(),
+            pair.slave.try_clone_owned_fd().unwrap(),
+            &executable,
+            &[
+                "-c".into(),
+                "printf started > started; while :; do /usr/bin/sleep 30; done".into(),
+            ],
+            root.path(),
+            &BTreeMap::new(),
+            Instant::now() + STARTUP,
+        )
+        .unwrap();
+        let identity = session.root().clone();
+        let process = pidfd(identity.id().pid()).unwrap();
+        // Move only this test-owned, still-gated root into a delegated child
+        // group. cgroup.procs on the parent alone cannot observe it.
+        let group = std::fs::read_link(format!(
+            "/proc/self/fd/{}",
+            session.shared.directory.as_raw_fd()
+        ))
+        .unwrap();
+        let nested = group.join("nested");
+        std::fs::create_dir(&nested).unwrap();
+        std::fs::write(nested.join("cgroup.procs"), identity.id().pid().to_string()).unwrap();
+        let resource = ResourceId::new();
+        let mut registry = ProcessRegistry::new();
+        let fence = registry
+            .register(RegisteredProcess::new(
+                ResourceFence::new(resource, 1),
+                ProcessOwner::Host,
+                identity.clone(),
+                ProcessDisplayLabel::new("nested native session").unwrap(),
+                ManagedProcessJob::from_linux_session(session),
+            ))
+            .unwrap();
+        assert_eq!(
+            registry
+                .drain_job_completions_until(resource, Instant::now() + STARTUP)
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            registry.current(resource).unwrap().state(),
+            ManagedProcessState::Starting
+        );
+        assert!(!root.path().join("started").exists());
+        let mut child = pending.resume().unwrap();
+        registry.commit_resumed_exact(&fence).unwrap();
+        marker(&root.path().join("started"));
+        let job = registry.current(resource).unwrap().job();
+        assert_eq!(
+            job.inspect_process(identity.id().pid()).unwrap().identity(),
+            &identity
+        );
+        assert!(
+            job.inspect_process(std::process::id()).is_err(),
+            "foreign harness must not gain session ownership"
+        );
+        assert!(registry.active_process_zero_proof_exact(&fence).is_err());
+        assert!(registry.begin_stopping_exact(&fence));
+        registry
+            .current(resource)
+            .unwrap()
+            .job()
+            .terminate_tree()
+            .unwrap();
+        let deadline = Instant::now() + CLEANUP;
+        let proof = loop {
+            checkpoint(deadline).unwrap();
+            registry
+                .drain_job_completions_until(resource, deadline)
+                .unwrap();
+            if let Ok(proof) = registry.active_process_zero_proof_exact(&fence) {
+                break proof;
+            }
+            std::thread::sleep(POLL);
+        };
+        assert!(registry.settle_active_process_zero_exact(proof).unwrap());
+        assert_eq!(
+            registry.current(resource).unwrap().state(),
+            ManagedProcessState::ZeroSettled
+        );
+        assert!(exited(&process).unwrap());
+        assert!(child.try_wait().unwrap().is_some());
     }
 }

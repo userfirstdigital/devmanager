@@ -133,6 +133,13 @@ Private screenshots and gesture evidence are under the isolated worktree's
 `launch-evidence/live-ux/` directory. The debug command is documented in
 `native-ui-system.md`.
 
+Linux registry integration now retains nested cgroup membership and emits zero-process
+authority only after the guardian and wrapper have settled. Completion messages
+received at a deadline remain available for the exact generation on retry.
+Five live cgroup checks, both registry regression tests, and
+`cargo check --locked --lib --bins --tests` passed for this source wave.
+No owned harness, Cargo, compiler, guardian or session cgroup remained afterward.
+
 ## Remaining launch gates
 
 - [ ] Complete Linux provider ownership and discovery,

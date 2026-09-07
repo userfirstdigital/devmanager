@@ -1,6 +1,6 @@
 //! Generation-fenced ownership of managed process roots.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::fmt;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
@@ -339,6 +339,7 @@ pub struct RegisteredProcess<J> {
     authoritative_zero_settled: bool,
     settled_zero_nonce: Option<u64>,
     next_zero_proof_nonce: u64,
+    pending_completion_messages: VecDeque<JobCompletionMessage>,
 }
 
 impl<J> RegisteredProcess<J> {
@@ -364,6 +365,7 @@ impl<J> RegisteredProcess<J> {
             authoritative_zero_settled: false,
             settled_zero_nonce: None,
             next_zero_proof_nonce: 1,
+            pending_completion_messages: VecDeque::new(),
         }
     }
 
@@ -1350,51 +1352,46 @@ impl<J: JobMembership> ProcessRegistry<J> {
         resource_id: ResourceId,
         absolute_deadline: Instant,
     ) -> Result<usize, ProcessRegistryError> {
+        let expired = || ProcessRegistryError::CompletionNotificationsFailed {
+            resource_id,
+            detail: "Job completion application exceeded teardown absolute deadline".to_string(),
+        };
         if Instant::now() >= absolute_deadline {
-            return Err(ProcessRegistryError::CompletionNotificationsFailed {
-                resource_id,
-                detail: "Job completion drain exceeded teardown absolute deadline".to_string(),
-            });
+            return Err(expired());
         }
-        let messages = self
-            .current
-            .get(&resource_id)
-            .map(|process| {
-                process
+        // Retain receiver ownership on the exact generation before another
+        // deadline check. A late drain must not discard a one-shot zero fact.
+        if let Some(process) = self.current.get_mut(&resource_id) {
+            if process.pending_completion_messages.is_empty() {
+                let messages = process
                     .job
                     .drain_completion_messages_until(absolute_deadline)
-            })
-            .transpose()
-            .map_err(
-                |detail| ProcessRegistryError::CompletionNotificationsFailed {
-                    resource_id,
-                    detail,
-                },
-            )?
-            .unwrap_or_default();
-        if Instant::now() >= absolute_deadline {
-            return Err(ProcessRegistryError::CompletionNotificationsFailed {
-                resource_id,
-                detail: "Job completion drain exceeded teardown absolute deadline".to_string(),
-            });
-        }
-        let count = messages.len();
-        for message in messages {
-            if Instant::now() >= absolute_deadline {
-                return Err(ProcessRegistryError::CompletionNotificationsFailed {
-                    resource_id,
-                    detail: "Job completion application exceeded teardown absolute deadline"
-                        .to_string(),
-                });
+                    .map_err(
+                        |detail| ProcessRegistryError::CompletionNotificationsFailed {
+                            resource_id,
+                            detail,
+                        },
+                    )?;
+                process.pending_completion_messages.extend(messages);
             }
+        }
+        let mut count = 0;
+        loop {
+            if Instant::now() >= absolute_deadline {
+                return Err(expired());
+            }
+            let message = self
+                .current
+                .get_mut(&resource_id)
+                .and_then(|process| process.pending_completion_messages.pop_front());
+            let Some(message) = message else {
+                break;
+            };
             self.apply_job_completion(message);
+            count += 1;
         }
         if Instant::now() >= absolute_deadline {
-            return Err(ProcessRegistryError::CompletionNotificationsFailed {
-                resource_id,
-                detail: "Job completion application exceeded teardown absolute deadline"
-                    .to_string(),
-            });
+            return Err(expired());
         }
         Ok(count)
     }
@@ -1907,5 +1904,89 @@ mod release_authority_tests {
         ));
         assert!(registry.current(resource_id).is_none());
         assert_eq!(state.lock().expect("retry Job state").shutdown_attempts, 2);
+    }
+    #[derive(Debug)]
+    struct LateCompletionJob {
+        root: ManagedProcessIdentity,
+        fence: Option<ManagedProcessFence>,
+        drained: std::sync::atomic::AtomicBool,
+    }
+    impl JobMembership for LateCompletionJob {
+        fn active_process_ids(&self) -> Result<Vec<u32>, String> {
+            Ok(if self.drained.load(std::sync::atomic::Ordering::Acquire) {
+                vec![]
+            } else {
+                vec![self.root.id().pid()]
+            })
+        }
+        fn inspect_process(&self, pid: u32) -> Result<JobMemberInfo, String> {
+            if pid != self.root.id().pid() {
+                return Err("foreign test PID".into());
+            }
+            Ok(JobMemberInfo::new(self.root.clone(), None))
+        }
+        fn bind_completion_fence(&mut self, fence: ManagedProcessFence) -> Result<(), String> {
+            self.fence = Some(fence);
+            Ok(())
+        }
+        fn drain_completion_messages_until(
+            &self,
+            deadline: Instant,
+        ) -> Result<Vec<JobCompletionMessage>, String> {
+            if self.drained.swap(true, std::sync::atomic::Ordering::AcqRel) {
+                return Ok(Vec::new());
+            }
+            std::thread::sleep(
+                deadline.saturating_duration_since(Instant::now())
+                    + std::time::Duration::from_millis(1),
+            );
+            Ok(vec![JobCompletionMessage {
+                fence: self.fence.clone().unwrap(),
+                event: JobCompletionEvent::ActiveProcessZero,
+            }])
+        }
+    }
+    #[test]
+    fn completion_received_after_deadline_survives_for_exact_retry() {
+        let root = ManagedProcessIdentity::new(
+            ManagedProcessId::new(42_425, 8).unwrap(),
+            std::env::current_exe().unwrap(),
+        )
+        .unwrap();
+        let resource = ResourceId::new();
+        let job = LateCompletionJob {
+            root: root.clone(),
+            fence: None,
+            drained: std::sync::atomic::AtomicBool::new(false),
+        };
+        let mut registry = ProcessRegistry::new();
+        let fence = registry
+            .register(RegisteredProcess::new(
+                ResourceFence::new(resource, 1),
+                ProcessOwner::Host,
+                root,
+                ProcessDisplayLabel::new("late completion").unwrap(),
+                job,
+            ))
+            .unwrap();
+        assert!(registry
+            .drain_job_completions_until(
+                resource,
+                Instant::now() + std::time::Duration::from_millis(10)
+            )
+            .is_err());
+        assert!(registry.active_process_zero_proof_exact(&fence).is_err());
+        assert_eq!(
+            registry
+                .drain_job_completions_until(
+                    resource,
+                    Instant::now() + std::time::Duration::from_secs(1)
+                )
+                .unwrap(),
+            1
+        );
+        let proof = registry.active_process_zero_proof_exact(&fence).unwrap();
+        assert_eq!(proof.fence(), &fence);
+        assert!(registry.settle_active_process_zero_exact(proof).unwrap());
     }
 }

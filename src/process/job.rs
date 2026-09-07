@@ -1,4 +1,9 @@
-//! Windows Job Object ownership for managed process trees.
+//! Native ownership for managed process trees.
+
+#[cfg(target_os = "linux")]
+mod linux;
+#[cfg(target_os = "linux")]
+pub(crate) use linux::ManagedProcessJob;
 
 use std::time::{Duration, Instant};
 
@@ -587,13 +592,14 @@ pub(crate) struct ManagedProcessJob {
     completion_stop: Arc<AtomicBool>,
 }
 
-/// Non-Windows marker type returned only behind `Option::None`.
-#[cfg(not(windows))]
+/// Unsupported-platform marker returned only behind `Option::None`.
+#[cfg(not(any(windows, target_os = "linux")))]
 #[derive(Debug)]
 pub(crate) struct ManagedProcessJob {
     _unsupported: (),
 }
 
+#[cfg(not(target_os = "linux"))]
 impl ManagedProcessJob {
     /// Creates an empty, non-inheritable Job Object whose final handle closes
     /// every process in the tree.
