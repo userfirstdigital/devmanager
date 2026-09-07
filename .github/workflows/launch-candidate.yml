@@ -35,19 +35,9 @@ jobs:
       - name: Prepare isolated target and reviewed WASM inputs
         shell: pwsh
         run: |
-          $sourceRoot = (Resolve-Path .).Path
-          $targetRoot = Join-Path $sourceRoot 'target'
-          New-Item -ItemType Directory -Force $targetRoot | Out-Null
-          $targetRoot = (Resolve-Path $targetRoot).Path
-          if (-not $targetRoot.StartsWith($sourceRoot + '\', [StringComparison]::OrdinalIgnoreCase)) {
-            throw 'Cargo target escaped the isolated checkout'
-          }
-          Write-Output "Isolated Cargo target: $targetRoot"
-          "CARGO_TARGET_DIR=$targetRoot" >> $env:GITHUB_ENV
-          New-Item -ItemType Directory -Force launch-evidence, web/src/connect/wasm | Out-Null
-          # A checkout omits these ignored fingerprint inputs. Restore the exact
-          # reviewed artifacts already shipped in the tracked browser bundle.
-          Copy-Item web/bundle/assets/wasm/* web/src/connect/wasm/
+          python packaging/prepare-ci-checkout.py
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          New-Item -ItemType Directory -Force launch-evidence | Out-Null
 
       - name: Check formatting and browser build
         shell: pwsh
@@ -56,12 +46,22 @@ jobs:
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
           npm --prefix web ci --no-audit --no-fund
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          npm --prefix web audit --audit-level=high
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
           npm --prefix web test
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
           npm --prefix web run build
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
           $env:GIT_OPTIONAL_LOCKS = '0'
           git diff --exit-code -- web/bundle
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+
+      - name: Check packaging references and dependency provenance
+        shell: pwsh
+        run: |
+          ./packaging/Assert-StaleReferences.ps1
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          ./packaging/Assert-ThirdPartyProvenance.ps1
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
 
       - name: Compile every target and run tests serially

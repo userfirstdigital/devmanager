@@ -5070,11 +5070,14 @@ mod tests {
             "{}",
             String::from_utf8_lossy(&commit.stderr)
         );
-        let sibling_root = Path::new(r"C:\Temp");
-        fs::create_dir_all(sibling_root).expect("sibling temp root");
+        #[cfg(windows)]
+        let sibling_root = Path::new(r"C:\Temp").to_path_buf();
+        #[cfg(not(windows))]
+        let sibling_root = std::env::temp_dir();
+        fs::create_dir_all(&sibling_root).expect("sibling temp root");
         let sibling_parent = tempfile::Builder::new()
             .prefix("devmanager-cockpit-sibling-wt-")
-            .tempdir_in(sibling_root)
+            .tempdir_in(&sibling_root)
             .expect("sibling parent");
         let sibling = sibling_parent.path().join("sibling");
         let added = std::process::Command::new("git")

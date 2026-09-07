@@ -1259,7 +1259,7 @@ mod reducer_tests {
         let mut reducer = test_reducer();
         let payload = serde_json::json!({
             "session_id": "019f-abc", "cwd": "C:\\proj",
-            "transcript_path": "C:\\Users\\u\\.codex\\sessions\\2026\\07\\17\\rollout-x.jsonl",
+            "transcript_path": std::env::temp_dir().join("sessions").join("rollout-x.jsonl"),
             "hook_event_name": "SessionStart", "model": "gpt-5",
             "permission_mode": "danger-full-access"
         });

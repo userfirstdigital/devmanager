@@ -2192,7 +2192,7 @@ mod durable_workspace_serde_tests {
             },
             Event::TerminalCwdReported {
                 resource_id,
-                cwd: std::path::PathBuf::from(r"C:\Code\demo"),
+                cwd: std::env::temp_dir().join("demo"),
             },
             Event::TerminalExited {
                 resource_id,
@@ -2301,7 +2301,7 @@ mod durable_workspace_serde_tests {
         }
         let mut cwd_document = serde_json::to_value(Event::TerminalCwdReported {
             resource_id,
-            cwd: std::path::PathBuf::from(r"C:\Code\demo"),
+            cwd: std::env::temp_dir().join("demo"),
         })
         .expect("cwd json");
         cwd_document["payload"]["cwd"] = serde_json::Value::String("demo".to_string());
@@ -3447,7 +3447,7 @@ mod terminal_apply_tests {
             cols: 80,
             rows: 24,
             launch: Some(TerminalLaunch {
-                cwd: PathBuf::from(r"C:\Code"),
+                cwd: std::env::temp_dir().join("code"),
                 program: PathBuf::from(r"C:\Windows\System32\cmd.exe"),
                 args: vec![],
             }),
@@ -3597,14 +3597,14 @@ mod terminal_apply_tests {
             &mut snapshot,
             &Event::TerminalCwdReported {
                 resource_id,
-                cwd: PathBuf::from(r"C:\Code\demo"),
+                cwd: std::env::temp_dir().join("demo"),
             },
             1_725_000_000_600,
         )
         .expect("cwd");
         assert_eq!(
             snapshot.terminal_facts[&resource_id].live_cwd,
-            Some(PathBuf::from(r"C:\Code\demo"))
+            Some(std::env::temp_dir().join("demo"))
         );
 
         apply_into(

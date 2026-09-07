@@ -52,7 +52,7 @@ macro_rules! worktree_service_focused_tests {
             }
         }
 
-        struct OwnedChild(std::process::Child);
+        struct OwnedChild(std::process::Child, Option<u32>);
 
         impl std::ops::Deref for OwnedChild {
             type Target = std::process::Child;
@@ -84,6 +84,13 @@ macro_rules! worktree_service_focused_tests {
                         .stdout(Stdio::null())
                         .stderr(Stdio::null())
                         .status();
+                }
+                #[cfg(unix)]
+                if let Some(group) = self.1.take() {
+                    // This group was created for this exact test child before spawn.
+                    unsafe {
+                        libc::kill(-(group as i32), libc::SIGKILL);
+                    }
                 }
                 let _ = self.0.kill();
                 let _ = self.0.wait();
@@ -183,17 +190,24 @@ macro_rules! worktree_service_focused_tests {
                 self.active_children.fetch_add(1, Ordering::AcqRel);
                 let _active_child = ActiveChildGuard(Arc::clone(&self.active_children));
                 let result = (|| {
-                    let mut child = OwnedChild(
-                        Command::new("git")
-                            .args(args)
-                            .env("GIT_TERMINAL_PROMPT", "0")
-                            .stdin(Stdio::null())
-                            .stdout(Stdio::piped())
-                            .stderr(Stdio::piped())
-                            .current_dir(directory)
-                            .spawn()
-                            .map_err(|_| ExecutorError::CompensationFailed)?,
-                    );
+                    let mut command = Command::new("git");
+                    command
+                        .args(args)
+                        .env("GIT_TERMINAL_PROMPT", "0")
+                        .stdin(Stdio::null())
+                        .stdout(Stdio::piped())
+                        .stderr(Stdio::piped())
+                        .current_dir(directory);
+                    #[cfg(unix)]
+                    {
+                        use std::os::unix::process::CommandExt;
+                        command.process_group(0);
+                    }
+                    let child = command
+                        .spawn()
+                        .map_err(|_| ExecutorError::CompensationFailed)?;
+                    let group = child.id();
+                    let mut child = OwnedChild(child, Some(group));
                     let stdout = match child.stdout.take() {
                         Some(stdout) => stdout,
                         None => {

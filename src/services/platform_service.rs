@@ -302,9 +302,7 @@ fn snapshot_listener_endpoints_with_lsof(
         trusted_lsof_program(),
         &["-nP", "-iTCP", "-sTCP:LISTEN", "-F", "pn"],
     )?;
-    if !output.status.success() {
-        return Err("listener_probe.command_failed".to_string());
-    }
+    require_listener_command_success(&output)?;
 
     let mut listeners: BTreeMap<u16, Vec<TcpEndpointRecord>> = BTreeMap::new();
     let mut current_pid = None;
@@ -379,6 +377,15 @@ struct BoundedChildOutput {
     status: std::process::ExitStatus,
     stdout: Vec<u8>,
     stderr: Vec<u8>,
+}
+
+#[cfg(not(windows))]
+fn require_listener_command_success(output: &BoundedChildOutput) -> Result<(), String> {
+    if output.status.success() {
+        Ok(())
+    } else {
+        Err("listener_probe.command_failed".to_string())
+    }
 }
 
 #[cfg(not(windows))]
@@ -1460,7 +1467,9 @@ mod non_windows_tests {
         let error = match run_bounded_command(
             "/bin/sh",
             &["-c", "printf 'secret-path-and-diagnostics' >&2; exit 7"],
-        ) {
+        )
+        .and_then(|output| super::require_listener_command_success(&output))
+        {
             Ok(_) => panic!("nonzero command must fail at the listener boundary"),
             Err(error) => error,
         };

@@ -1037,7 +1037,16 @@ fn pin_ssh_executable_uncached(deadline: Instant) -> Result<Arc<PinnedFile>, Ssh
     #[cfg(test)]
     let path = std::env::var_os("COMSPEC")
         .map(PathBuf::from)
-        .or_else(|| std::env::current_exe().ok())
+        .or_else(|| {
+            #[cfg(unix)]
+            {
+                std::fs::canonicalize("/bin/sh").ok()
+            }
+            #[cfg(not(unix))]
+            {
+                std::env::current_exe().ok()
+            }
+        })
         .ok_or(SshLaunchError::UnsupportedRuntime)?;
     #[cfg(all(not(test), windows))]
     let path = {

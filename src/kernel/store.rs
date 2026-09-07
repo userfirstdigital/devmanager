@@ -4429,7 +4429,7 @@ mod tests {
             },
             Event::TerminalCwdReported {
                 resource_id,
-                cwd: std::path::PathBuf::from("C:/Code/demo"),
+                cwd: std::env::temp_dir().join("codec-cwd"),
             },
             Event::TerminalExited {
                 resource_id,

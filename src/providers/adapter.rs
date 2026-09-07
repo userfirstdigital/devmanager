@@ -1811,7 +1811,27 @@ struct ProbeProcess {
 }
 
 impl ProbeProcess {
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(target_os = "linux")]
+    fn spawn(
+        command: std::process::Command,
+        deadline: std::time::Instant,
+        expected: Option<&Path>,
+        requested: &ProviderExecutableHandle,
+    ) -> Result<Self, ProviderProbeError> {
+        // Command::spawn waits for exec; a pre-exec SIGSTOP deadlocks that wait.
+        // Keep the containment hold before any child exists until the owned
+        // fork/clone/setsid supervision and attestation barrier are implemented.
+        let _ = (
+            command,
+            deadline,
+            expected,
+            requested,
+            LINUX_DESCENDANT_CONTAINMENT_HOLD,
+        );
+        Err(ProviderProbeError::UnsupportedAttestation)
+    }
+
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     fn spawn(
         mut command: std::process::Command,
         deadline: std::time::Instant,
@@ -4074,12 +4094,13 @@ mod tests {
 
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
-    fn unix_probe_process_has_no_user_code_side_effect_before_attestation_release() {
+    fn unix_probe_process_never_runs_unattested_user_code() {
         let temp = tempfile::tempdir().unwrap();
         let marker = temp.path().join("provider-started");
         let requested = ProviderExecutable::from_path(std::env::current_exe().unwrap()).unwrap();
         let requested_handle = requested.open_for_launch().unwrap();
-        let expected = ProviderExecutable::from_path(Path::new("/bin/sh")).unwrap();
+        let expected =
+            ProviderExecutable::from_path(&std::fs::canonicalize("/bin/sh").unwrap()).unwrap();
 
         #[cfg(not(target_os = "macos"))]
         use std::process::{Command, Stdio};
@@ -4097,13 +4118,17 @@ mod tests {
         command.process_group(0);
 
         #[cfg(not(target_os = "macos"))]
-        let mut process = ProbeProcess::spawn(
+        let result = ProbeProcess::spawn(
             command,
             std::time::Instant::now() + Duration::from_secs(3),
             Some(expected.canonical_path()),
             &requested_handle,
-        )
-        .unwrap();
+        );
+        #[cfg(target_os = "linux")]
+        assert!(matches!(
+            result,
+            Err(super::ProviderProbeError::UnsupportedAttestation)
+        ));
         #[cfg(target_os = "macos")]
         let mut process = ProbeProcess::spawn_macos(
             expected.canonical_path(),
@@ -4118,6 +4143,7 @@ mod tests {
             std::time::Instant::now() + Duration::from_secs(3),
             expected.canonical_path(),
             &requested_handle,
+            &std::collections::BTreeMap::new(),
         )
         .unwrap();
 
@@ -4126,6 +4152,7 @@ mod tests {
             "provider user code ran before the image/graph attestation barrier released it"
         );
 
+        #[cfg(target_os = "macos")]
         let _ = process.terminate_tree(std::time::Instant::now() + Duration::from_secs(3));
     }
 }

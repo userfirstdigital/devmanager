@@ -414,7 +414,7 @@ mod tests {
     /// Every command also writes a `command_receipts` row and an `operations`
     /// row, and `BeginCloseTask` writes an `outbox` row, so the tables reached
     /// THROUGH `operations` are populated by real lineage rather than by hand.
-    fn seed_deleted_task(store: &mut KernelStore) -> TaskId {
+    fn seed_open_task(store: &mut KernelStore) -> TaskId {
         let task = task_id(0x40);
         accepted(
             store
@@ -485,6 +485,10 @@ mod tests {
                 .expect("register artifact"),
             "register artifact",
         );
+        task
+    }
+
+    fn delete_seeded_task(store: &mut KernelStore, task: TaskId) {
         accepted(
             store
                 .execute(envelope(
@@ -510,6 +514,11 @@ mod tests {
                 .expect("delete task"),
             "delete task",
         );
+    }
+
+    fn seed_deleted_task(store: &mut KernelStore) -> TaskId {
+        let task = seed_open_task(store);
+        delete_seeded_task(store, task);
         task
     }
 
@@ -1142,7 +1151,7 @@ mod tests {
         let dir = TempDir::new().expect("tempdir");
         let path = dir.path().join("kernel.sqlite3");
         let mut store = KernelStore::open(&path).expect("open");
-        let task = seed_deleted_task(&mut store);
+        let task = seed_open_task(&mut store);
 
         let session = store
             .begin_snapshot(PageLimits::new(100, 512 * 1024).expect("limits"))
@@ -1160,6 +1169,7 @@ mod tests {
             "the pinned snapshot must contain the task it was pinned over"
         );
 
+        delete_seeded_task(&mut store, task);
         assert!(matches!(
             store
                 .with_immediate_transaction(|tx| purge_deleted_task_in_tx(tx, task))

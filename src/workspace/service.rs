@@ -3803,7 +3803,7 @@ mod cockpit_authority_tests {
                 1,
             )
             .expect("file lease");
-        let files = issue_file_service(
+        let files = issue_read_file_service(
             &authorization,
             file_lease,
             task_id,

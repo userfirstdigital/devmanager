@@ -1,89 +1,100 @@
 # Launch candidate, 2026-09-07
 
-Working branch: `codex/launch-ready-20260907`.
+Candidate branch: `codex/launch-ready-20260907`. Windows is the assumed launch
+platform; this Linux machine cannot certify the Windows desktop or installer.
+The candidate is not release-approved.
 
-The candidate combines `ui-redesign-w4` (grid geometry, restored layouts,
-terminal refusal copy and narrow titles) with `ui-redesign-clean` (age-label
-refresh, composer hints, terminal pointer regression and obsolete UI removal).
-Neither historical branch report is acceptance evidence for this combined build.
+## Implemented
 
-## Completion checklist
+- Combined `ui-redesign-w4` and `ui-redesign-clean`: panel grid/regrid, narrow
+  titles, refusal messages, age refresh, composer hints and pointer fixes.
+- Completed pin/unpin, panel swap selection and zoom ownership.
+- Verified strict contrast for both default themes and enforced production
+  color ownership through the shared token layer.
+- Added Claude task-list settings and correlated pending/active/completed
+  progress with stable replacement lineage.
+- Added host-qualified child conversation tabs, bounded tool output and final
+  messages. Child attribution requires explicit current Claude session/agent
+  identity; old clients receive the compatible projection. Provider capability
+  limits are recorded in `provider-ux-capabilities.md`.
+- Rebuilt the pinned Connect WASM artifact and browser/PWA bundle; updated
+  compatible browser dependencies to clear the audit findings.
+- Corrected Unix terminal teardown, retained Git directory identity comparison
+  and process-group reaping. Corrected portable path fixtures and test-owned
+  process cleanup without relaxing production authority checks.
+- Prepared Windows candidate CI and repaired fresh-checkout WASM preparation
+  in both candidate and release workflows. Artifact hashes are verified before
+  restoring ignored compiler inputs; each checkout owns its Cargo target.
 
-- [x] Combine the two existing source branches without conflicts.
-- [x] Resolve Linux compiler failures exposed by the combined all-target check.
-- [x] Implement panel pin/unpin and a target chooser for swapping panels.
-- [x] Preserve the zoomed task when swapping its panel.
-- [x] Run the new layout and shell interaction regressions (994 UI tests passed).
-- [x] Verify both default themes against every strict contrast floor.
-- [x] Finish the production color-ownership source gate (29 theme tests passed).
-- [x] Implement Claude task-list settings, additive tool enablement and TaskUpdate ingestion.
-- [x] Verify provider settings (104 tests passed).
-- [x] Document provider capability verdicts in `provider-ux-capabilities.md`; live acceptance remains pending.
-- [x] Implement correlated Claude subagent attribution and native tabs; six focused tests pass.
-- [ ] Run the complete Rust library suite serially with its process helper built.
-- [ ] Run required integration and final compiler checks on frozen source.
-- [x] Web tests: 606 passed, one existing skip.
-- [x] Web typecheck and production/PWA build after dependency updates.
-- [x] Browser dependency audit: zero findings after compatible transitive updates.
-- [ ] Capture the complete native shell and compare against the design references.
-- [ ] Exercise divider dragging, keyboard questions/permissions, terminal input,
-      copy and scrolling, provider resume/recovery, and restart persistence live.
-- [ ] Validate packages, signatures and isolated install/update behavior on the
-      launch platforms.
-- [ ] Integrate the verified candidate into `VisualDevManager` and prepare push.
-- [x] Prepare a Windows candidate CI workflow without publication steps.
-- [ ] Run Windows CI (GitHub authentication is missing on this machine).
+## Verification evidence
 
-## Evidence and isolation
+Local logs are sibling files of the isolated worktree:
+`/home/robin/Projects/devmanager-launch-20260907-*.log`.
 
-The Linux worktree is `/home/robin/Projects/devmanager-launch-20260907`; its
-Cargo target is beneath that worktree. Compiler logs are sibling files named
-`devmanager-launch-20260907-*.log`. Production configuration hashes and process
-identity observations are in the worktree's local `launch-evidence` directory.
-The daily checkout's original index and merge metadata were backed up there
-before refreshing line endings; its staged source tree was preserved exactly.
+| Check | Observed result |
+| --- | --- |
+| Native UI library tests | 997 passed, six existing ignores |
+| Correlated child hook/protocol/scope tests | Six passed |
+| Provider settings tests | 104 passed |
+| Default-theme/source ownership tests | 29 passed |
+| Git regression group | 126 passed |
+| Browser tests | 606 passed, one existing skip |
+| Browser typecheck and production/PWA build | Passed |
+| Browser dependency audit | Zero findings |
+| Final all-target compiler check | Passed (`all-target-final.log`) |
+| Final formatting check | Passed |
+| Native-shell integration tests | 21 passed (`native-integration-final.log`) |
+| Cleanup, probe, direct CLI and read-only lease regressions | Four passed (`cleanup-final3.log`) |
+| Fresh-checkout preparation | Valid restore and four corrupt/escaping-input refusals passed |
+| Complete serial Linux library attempt | 4,052 passed, 22 failed, 12 ignored (`lib-full4.log`) |
 
-The first successful `cargo check --locked --lib --bins --tests` completed on
-Linux before the final menu/zoom refinements. It does not certify those later
-edits. No installer, production app, provider conversation, tag or public release
-has been changed by this candidate work.
+The complete attempt is **not green** and needed intervention for one stopped
+probe child. Its Cargo process and harness exited afterward; no compiler or
+executable under the isolated target remained. The process helper was built
+first, no external `DEVMANAGER_PROFILE` was set, and no concurrent Rust run was
+active. These counts do not certify edits made after that binary was built.
 
-## Current verification findings
+The remaining Linux failures include explicitly unavailable browser repair
+retention, protected host trust, process identity observation, file mutation,
+provider launch and Windows installer inspection. Four provider session tests
+also expose the unsupported platform's legacy environment-map codec; three
+live port-forward tests exceed the Linux inventory deadline. These paths have
+not been declared supported or silently skipped. Windows CI must establish the
+launch-platform verdict.
 
-The first complete serial Linux library attempt reported 101 failed tests and
-then aborted during `clear_virtual_output_resets_terminal_snapshot`. The abort
-reproduces independently: an already-exited child returns Unix `ESRCH`, which
-was incorrectly handled as fatal. The candidate now recognizes that result and
-still joins its owned actors. The teardown regression and the explicit
-100 ms contention test now pass; real PTY tests use the unchanged production
-5-second deadline. This suite
-is not green. Windows-specific fixtures and other failures still need separate
-classification against a Windows run.
+The broad run also exposed a pre-exec stopped-child deadlock in the Linux
+probe, retained cancellation socket handles, and a read-only fixture requesting
+write authority. The final cleanup slice rejects Linux probes before spawning
+until descendant supervision exists, releases cancellation-owned sockets, and
+uses the read-only issuer in that fixture. All four focused regressions and
+the final all-target compiler check pass. This does not convert the earlier
+full-suite result into a green run.
 
-The Claude lifecycle regression now exercises pending, active and completed
-states through the production cockpit query. It caught a changing plan-step ID
-on the third update; projection now uses the same complete replacement lineage
-as the conversation fact ID. It passed in the serial library attempt.
+## Remaining launch gates
 
-Production `config.json` and `remote.json` hashes remained unchanged after the
-attempt; no installed DevManager process was present before or afterward.
-The test harness and Cargo process exited after the abort.
+- [ ] Obtain a green Windows candidate workflow on the final commit, including
+      all-target compilation, serial tests, browser checks and packaging scans.
+- [ ] Capture the full rebuilt native shell at reference geometry and compare
+      composition, spacing, hierarchy and palette with the approved references.
+- [ ] Use the actual rendered provider prompt to verify immediate keyboard text,
+      control-key editing, drag/copy and wheel scrolling; exercise divider
+      dragging, questions/permissions, exact resume/recovery and restart state.
+- [ ] Verify signed packages and isolated install/update behavior on Windows.
+- [ ] Push and review the candidate, then complete release promotion.
 
-The original remote `VisualDevManager` head remains `d46fd569`. An HTTPS push
-dry run failed for missing credentials; SSH also failed authentication. No
-branch has been pushed, and the Windows candidate workflow has not run.
+GitHub authentication is unavailable here: HTTPS has no credentials and SSH
+was rejected. No branch, tag, installer or release has been published. The
+candidate workflow deliberately has no publication step.
 
-The follow-up compiler gate (`cargo check --locked --lib --bins --tests`) and
-`cargo fmt --all -- --check` both pass for the checkpoint source. Focused
-verification is green: 994 UI tests, 104 provider-settings tests, 29 theme tests,
-and both the real shell-teardown and deterministic contention regressions.
-These focused results do not replace the outstanding complete-suite verdict.
+## Isolation
 
-The subagent follow-up passes six focused hook/protocol/scope tests and 997 UI
-tests (six existing skips). The protocol regression invokes the production
-cockpit boundary both with and without `semantic_subagents`; the scope test
-asserts actual projected timeline rows before and after model refresh. Browser
-tests pass again (606 passed, one skip). The pinned Connect WASM artifact was
-rebuilt with Rust 1.94.0 and wasm-bindgen 0.2.114, then bundled by the normal web
-build. Production hashes remain unchanged and no owned test/build process
-remains after these focused runs. Live visual and input acceptance is pending.
+The candidate's source and target are isolated under
+`/home/robin/Projects/devmanager-launch-20260907`. The daily checkout's original
+index and merge metadata were preserved in private local `launch-evidence`
+before normalizing CRLF-only changes; its staged tree was unchanged.
+
+Production `config.json` and `remote.json` hashes match the captured baseline.
+No installed DevManager process was present at baseline or after verification.
+No installed app, provider conversation or production configuration was changed.
+`launch-evidence` contains private local verification and recovery data and is
+not part of the candidate commit.

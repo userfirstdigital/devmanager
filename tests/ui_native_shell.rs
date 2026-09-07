@@ -705,6 +705,14 @@ fn isolated_profile_exposes_one_explicit_native_host_client_config() {
     let profile = isolated_dev_profile(workspace.path()).expect("isolated profile");
     let config = profile.host_client_config();
 
+    let granted =
+        config
+            .requested
+            .intersection(devmanager::protocol::CapabilitySet::from_capabilities(
+                devmanager::host::NATIVE_HOST_BASE_CAPABILITIES,
+            ));
+    assert!(granted.contains(devmanager::protocol::Capability::SemanticConversation));
+    assert!(granted.contains(devmanager::protocol::Capability::SemanticSubagents));
     assert_ne!(profile.named_profile(), "native-next-dev");
     assert!(profile.named_profile().starts_with("native-next-"));
     assert_eq!(config.named_profile, profile.named_profile());

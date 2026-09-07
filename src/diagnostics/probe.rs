@@ -1024,8 +1024,8 @@ mod tests {
 
     fn settings() -> Settings {
         Settings {
-            claude_command: Some(r#"C:\tools\claude.exe"#.to_string()),
-            codex_command: Some(r#"C:\tools\codex.exe"#.to_string()),
+            claude_command: Some("claude.exe".to_string()),
+            codex_command: Some("codex.exe".to_string()),
             ..Settings::default()
         }
     }
@@ -1048,8 +1048,8 @@ mod tests {
     #[tokio::test]
     async fn healthy_version_output() {
         let runner = FakeRunner::new();
-        let claude = PathBuf::from(r"C:\tools\claude.exe");
-        let codex = PathBuf::from(r"C:\tools\codex.exe");
+        let claude = PathBuf::from("claude.exe");
+        let codex = PathBuf::from("codex.exe");
         runner.set(
             &format!("{}|--version", claude.display()),
             ok_out("claude 1.2.3\n"),
@@ -1124,7 +1124,7 @@ mod tests {
 
     #[tokio::test]
     async fn nonzero_and_timeout_map_to_broken() {
-        let claude = PathBuf::from(r"C:\tools\claude.exe");
+        let claude = PathBuf::from("claude.exe");
         let runner = FakeRunner::new();
         runner.set(
             &format!("{}|--version", claude.display()),
@@ -1372,8 +1372,8 @@ mod tests {
     #[tokio::test]
     async fn concurrent_scan_completes() {
         let runner = FakeRunner::new();
-        let claude = PathBuf::from(r"C:\tools\claude.exe");
-        let codex = PathBuf::from(r"C:\tools\codex.exe");
+        let claude = PathBuf::from("claude.exe");
+        let codex = PathBuf::from("codex.exe");
         runner.set(
             &format!("{}|--version", claude.display()),
             ok_out("claude 1.0\n"),
@@ -1438,7 +1438,7 @@ mod tests {
     #[tokio::test]
     async fn configured_cc_uses_path_claude_not_wrapper() {
         let runner = FakeRunner::new();
-        let claude = PathBuf::from(r"C:\tools\claude.exe");
+        let claude = PathBuf::from("claude.exe");
         runner.set(
             &format!("{}|--version", claude.display()),
             ok_out("claude 2.0.0\n"),
@@ -1501,7 +1501,7 @@ mod tests {
     #[tokio::test]
     async fn configured_direct_cli_used_when_no_path_fallback() {
         let runner = FakeRunner::new();
-        let claude = PathBuf::from(r"C:\custom\claude.exe");
+        let claude = std::env::temp_dir().join("custom").join("claude.exe");
         runner.set(
             &format!("{}|--version", claude.display()),
             ok_out("claude 3.0.0\n"),
@@ -1510,7 +1510,10 @@ mod tests {
         paths.insert(claude.display().to_string(), vec![claude.clone()]);
         let probe = probe_with(runner, HashMap::new(), paths);
         let mut cfg = Settings::default();
-        cfg.claude_command = Some(r"C:\custom\claude.exe --dangerously-skip-permissions".into());
+        cfg.claude_command = Some(format!(
+            "\"{}\" --dangerously-skip-permissions",
+            claude.display()
+        ));
         let result = probe.scan_one(DiagnosticId::ClaudeCli, &cfg).await;
         assert_eq!(result.status, DiagnosticStatus::Healthy);
         assert_eq!(result.detected_path.as_deref(), Some(claude.as_path()));

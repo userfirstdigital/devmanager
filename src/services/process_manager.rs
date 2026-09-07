@@ -17281,6 +17281,7 @@ mod tests {
         session_id: &str,
         fence: ManagedProcessFence,
     ) -> ResourceSamplingSource {
+        stop_background_tasks_for_test(manager);
         let pid = fence.root().id().pid();
         let mut runtime = SessionRuntimeState::new(
             session_id,
@@ -17848,7 +17849,13 @@ mod tests {
                 memory_bytes: 4096,
                 memory_metric: ResourceMemoryMetric::PrivateResident,
                 creation_time_100ns: None,
-                executable: Some(r"C:\private\node.exe".to_string()),
+                executable: Some(
+                    std::env::temp_dir()
+                        .join("private")
+                        .join("node.exe")
+                        .to_string_lossy()
+                        .into_owned(),
+                ),
                 command_label: Some("Node".to_string()),
                 command_arg_count: 2,
                 command_arg_bytes: 42,

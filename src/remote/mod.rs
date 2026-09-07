@@ -2734,11 +2734,13 @@ impl ForwardCancellation {
 
     fn cancel(&self) {
         self.cancelled.store(true, Ordering::Release);
-        let endpoints = self
+        let mut endpoints = self
             .endpoints
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        for endpoint in endpoints.iter() {
+        // Release the cancellation-owned handles as well as shutting down I/O.
+        // Retaining a clone can keep a blocked peer writer alive after the worker exits.
+        for endpoint in endpoints.drain(..) {
             let _ = endpoint.shutdown(Shutdown::Both);
         }
     }

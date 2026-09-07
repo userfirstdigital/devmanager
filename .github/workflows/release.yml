@@ -43,6 +43,10 @@ jobs:
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
 
+      - name: Prepare isolated checkout and reviewed WASM inputs
+        shell: bash
+        run: python packaging/prepare-ci-checkout.py
+
       - name: Install Rust stable
         uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
         with:
@@ -92,9 +96,9 @@ jobs:
           npm --prefix web run typecheck
           rm -rf web/bundle
           npm --prefix web run build
-          if [ -n "$(git status --porcelain -- web/bundle)" ]; then
-            git status --short -- web/bundle
-            git diff -- web/bundle
+          if [ -n "$(GIT_OPTIONAL_LOCKS=0 git status --porcelain -- web/bundle)" ]; then
+            GIT_OPTIONAL_LOCKS=0 git status --short -- web/bundle
+            GIT_OPTIONAL_LOCKS=0 git diff -- web/bundle
             echo "Generated web/bundle differs from the tracked bundle." >&2
             exit 1
           fi
@@ -104,6 +108,8 @@ jobs:
         run: |
           set -euo pipefail
           cargo fmt --all -- --check
+          cargo check --locked --lib --bins --tests
+          cargo build --locked --bin devmanager-process-test-helper
           cargo test --locked --all-targets -- --test-threads=1
 
   # Packaging (prepare/build) is independent from publication and never auto-publishes public.
@@ -289,6 +295,10 @@ jobs:
             echo "Missing repository variable: DEVMANAGER_UPDATE_PUBKEY" >&2
             exit 1
           fi
+
+      - name: Prepare isolated checkout and reviewed WASM inputs
+        shell: bash
+        run: python packaging/prepare-ci-checkout.py
 
       - name: Install Rust stable
         uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
