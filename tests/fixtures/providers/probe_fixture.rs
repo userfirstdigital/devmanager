@@ -1,6 +1,6 @@
 use std::env;
 use std::fs;
-use std::io::{self, Write};
+use std::io::{self, BufRead, Write};
 use std::process::Command;
 use std::thread;
 use std::time::Duration;
@@ -48,6 +48,33 @@ fn main() {
     }
 
     let stem = executable_stem();
+    if stem.contains("probe-interactive") {
+        let executable = env::current_exe().unwrap();
+        fs::write(
+            executable.with_extension("interactive.pid"),
+            std::process::id().to_string(),
+        )
+        .unwrap();
+        for line in io::stdin().lock().lines() {
+            println!("{}", line.unwrap());
+            io::stdout().flush().unwrap();
+        }
+        return;
+    }
+    #[cfg(target_os = "linux")]
+    if stem.contains("probe-no-read") {
+        // A small pipe makes backpressure deterministic without relying on
+        // the test machine's per-user pipe capacity or allocation pressure.
+        assert!(unsafe { libc::fcntl(0, libc::F_SETPIPE_SZ, 4096) } >= 0);
+        let executable = env::current_exe().unwrap();
+        fs::write(
+            executable.with_extension("interactive.pid"),
+            std::process::id().to_string(),
+        )
+        .unwrap();
+        thread::sleep(SLEEP);
+        return;
+    }
     if stem.contains("probe-tree") {
         tree_root();
     }

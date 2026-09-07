@@ -564,8 +564,11 @@ fn stock_path_claude_discovery_accepts_npm_hardlinked_native_target_when_present
         Err(error) => panic!("stock Claude discovery failed: {error}: {error:?}"),
     }
     let path = std::env::var_os("PATH").unwrap_or_default();
-    let has_codex_cmd =
-        std::env::split_paths(&path).any(|directory| directory.join("codex.cmd").is_file());
+    let has_codex_cmd = std::env::split_paths(&path).any(|directory| {
+        directory
+            .join(if cfg!(windows) { "codex.cmd" } else { "codex" })
+            .is_file()
+    });
     let codex = ProviderDiscoveryContract::for_kind(ProviderKind::Codex);
     match codex.resolve_all_from_path_snapshot(&snapshot) {
         Ok(candidates) if has_codex_cmd => {
@@ -721,6 +724,108 @@ fn path_snapshot_rejects_reparse_directory_before_canonicalization() {
         ProviderPathSnapshot::capture(&OsString::from(path_value)),
         Err(devmanager::providers::ProviderDiscoveryError::InvalidPathSnapshot(_))
     ));
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn linux_path_skips_unsafe_alias_directories_and_preserves_later_native_provenance() {
+    use std::os::unix::fs::symlink;
+    let temp = tempdir().unwrap();
+    let trusted = temp.path().join("trusted");
+    fs::create_dir(&trusted).unwrap();
+    let alias = temp.path().join("alias");
+    symlink(&trusted, &alias).unwrap();
+    let native = native_fixture(&trusted, "claude", b"");
+    let path = std::env::join_paths([&alias, &trusted]).unwrap();
+    let snapshot = ProviderPathSnapshot::capture(path).unwrap();
+    assert_eq!(snapshot.len(), 1);
+    let candidate = ProviderDiscoveryContract::for_kind(ProviderKind::ClaudeCode)
+        .resolve_from_path_snapshot(&snapshot)
+        .unwrap();
+    assert_eq!(candidate.executable().canonical_path(), native);
+    assert!(matches!(
+        candidate.origin(),
+        ProviderDiscoveryOrigin::PathEntry { index: 1, .. }
+    ));
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn linux_claude_install_link_resolves_a_retained_versioned_native_and_refuses_a_shell() {
+    use std::os::unix::fs::symlink;
+    let temp = tempdir().unwrap();
+    let bin = temp.path().join("bin");
+    let versions = temp.path().join("share/claude/versions");
+    fs::create_dir(&bin).unwrap();
+    fs::create_dir_all(&versions).unwrap();
+    let native = native_fixture(&versions, "2.1.263", b"");
+    let link = bin.join("claude");
+    symlink(&native, &link).unwrap();
+    let snapshot = ProviderPathSnapshot::capture(bin.as_os_str()).unwrap();
+    let contract = ProviderDiscoveryContract::for_kind(ProviderKind::ClaudeCode);
+    let candidate = contract.resolve_from_path_snapshot(&snapshot).unwrap();
+    assert_eq!(candidate.executable().canonical_path(), native);
+    contract
+        .validate_executable(candidate.executable())
+        .unwrap();
+    fs::remove_file(&link).unwrap();
+    symlink("/usr/bin/sh", &link).unwrap();
+    assert!(contract.resolve_from_path_snapshot(&snapshot).is_err());
+    // The already selected identity stays pinned to its original native file.
+    assert_eq!(
+        candidate
+            .executable()
+            .open_for_launch()
+            .unwrap()
+            .canonical_path(),
+        native
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn linux_codex_npm_link_selects_the_native_dependency_without_launching_javascript() {
+    use std::os::unix::fs::symlink;
+    let temp = tempdir().unwrap();
+    let bin = temp.path().join("bin");
+    let package = temp.path().join("lib/node_modules/@openai/codex");
+    fs::create_dir(&bin).unwrap();
+    fs::create_dir_all(package.join("bin")).unwrap();
+    fs::write(
+        package.join("package.json"),
+        br#"{"name":"@openai/codex","bin":{"codex":"bin/codex.js"}}"#,
+    )
+    .unwrap();
+    fs::write(
+        package.join("bin/codex.js"),
+        b"throw new Error('must never execute this bootstrap');",
+    )
+    .unwrap();
+    let (distribution, triple) = match std::env::consts::ARCH {
+        "x86_64" => ("codex-linux-x64", "x86_64-unknown-linux-musl"),
+        "aarch64" => ("codex-linux-arm64", "aarch64-unknown-linux-musl"),
+        arch => panic!("Linux launch target has no native distribution fixture: {arch}"),
+    };
+    let vendor = package
+        .join("node_modules/@openai")
+        .join(distribution)
+        .join("vendor")
+        .join(triple)
+        .join("bin");
+    fs::create_dir_all(&vendor).unwrap();
+    let native = native_fixture(&vendor, "codex", b"");
+    symlink(package.join("bin/codex.js"), bin.join("codex")).unwrap();
+    let snapshot = ProviderPathSnapshot::capture(bin.as_os_str()).unwrap();
+    let contract = ProviderDiscoveryContract::for_kind(ProviderKind::Codex);
+    let candidate = contract.resolve_from_path_snapshot(&snapshot).unwrap();
+    assert_eq!(candidate.executable().canonical_path(), native);
+    assert!(candidate.executable().is_native());
+    fs::write(
+        package.join("package.json"),
+        br#"{"name":"foreign","bin":{"codex":"bin/codex.js"}}"#,
+    )
+    .unwrap();
+    assert!(contract.resolve_from_path_snapshot(&snapshot).is_err());
 }
 
 #[cfg(windows)]

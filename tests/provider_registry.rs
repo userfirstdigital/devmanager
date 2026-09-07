@@ -2290,6 +2290,85 @@ async fn provider_probe_runner_bounds_both_output_streams_exactly() {
 }
 
 #[cfg(any(windows, target_os = "linux"))]
+#[test]
+fn interactive_probe_exchanges_lines_and_cancellation_reaps_its_process() {
+    use devmanager::providers::adapter::ProviderInteractiveProbeError;
+    let temp = tempdir().unwrap();
+    let executable = copied_probe_fixture(&temp, "probe-interactive");
+    let runner = probe_runner(&executable);
+    let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let mut session = runner
+        .spawn_interactive_with_cancel(
+            ProviderExecutable::from_path(&executable)
+                .unwrap()
+                .open_for_launch()
+                .unwrap(),
+            &["--metadata-echo".into()],
+            Default::default(),
+            Duration::from_secs(5),
+            4096,
+            Some(cancel.clone()),
+        )
+        .unwrap();
+    for line in [
+        r#"{"id":1,"method":"initialize"}"#,
+        r#"{"id":2,"method":"models"}"#,
+    ] {
+        session.write_line(line).unwrap();
+        assert_eq!(session.read_line().unwrap(), line);
+    }
+    let pid: u32 = std::fs::read_to_string(executable.with_extension("interactive.pid"))
+        .unwrap()
+        .parse()
+        .unwrap();
+    cancel.store(true, std::sync::atomic::Ordering::Release);
+    assert!(matches!(
+        session.read_line(),
+        Err(ProviderInteractiveProbeError::Cancelled)
+    ));
+    session.terminate().unwrap();
+    assert!(!devmanager::services::platform_service::is_pid_running(pid));
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn linux_interactive_probe_backpressure_obeys_the_input_deadline() {
+    use devmanager::providers::adapter::ProviderInteractiveProbeError;
+    let temp = tempdir().unwrap();
+    let executable = copied_probe_fixture(&temp, "probe-no-read");
+    let runner = probe_runner(&executable);
+    let started = std::time::Instant::now();
+    let mut session = runner
+        .spawn_interactive(
+            ProviderExecutable::from_path(&executable)
+                .unwrap()
+                .open_for_launch()
+                .unwrap(),
+            &["--metadata-no-read".into()],
+            Default::default(),
+            Duration::from_secs(2),
+            4096,
+        )
+        .unwrap();
+    let pid_path = executable.with_extension("interactive.pid");
+    while !pid_path.exists() {
+        assert!(started.elapsed() < Duration::from_secs(1));
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    let pid: u32 = std::fs::read_to_string(pid_path).unwrap().parse().unwrap();
+    assert!(matches!(
+        session.write_stdin(&vec![b'x'; 8192]),
+        Err(ProviderInteractiveProbeError::TimedOut)
+    ));
+    drop(session);
+    assert!(
+        started.elapsed() < Duration::from_secs(3),
+        "a full stdin pipe blocked past its deadline"
+    );
+    assert!(!devmanager::services::platform_service::is_pid_running(pid));
+}
+
+#[cfg(any(windows, target_os = "linux"))]
 #[tokio::test]
 async fn provider_probe_runner_scrubs_inherited_provider_secrets() {
     let temp = tempdir().unwrap();
@@ -2447,4 +2526,40 @@ async fn cursor_public_adapter_registers_without_accepting_desktop_cursor_exe() 
         Err(ProviderError::WrapperCommandNotAllowed { .. })
             | Err(ProviderError::ExecutableNotAllowed { .. })
     ));
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn linux_registry_reinspects_the_selected_native_target_for_path_and_override_aliases() {
+    use std::os::unix::fs::symlink;
+    let temp = tempdir().unwrap();
+    let bin = temp.path().join("bin");
+    let versions = temp.path().join("claude/versions");
+    std::fs::create_dir(&bin).unwrap();
+    std::fs::create_dir_all(&versions).unwrap();
+    let native = executable_file(&versions, "2.1.263", b"selected-native");
+    let alias = bin.join("claude");
+    symlink(&native, &alias).unwrap();
+    let mut registry = ProviderRegistry::new();
+    registry
+        .register(FakeAdapter::new(capabilities(
+            ProviderKind::ClaudeCode,
+            "fixture-1",
+            ProviderAuthState::Unknown,
+            CapabilitySupport::Supported,
+            CapabilitySupport::Unknown,
+            CapabilitySupport::Supported,
+        )))
+        .unwrap();
+    for config in [discovery(None, Some(&bin)), discovery(Some(alias), None)] {
+        let handle = registry
+            .resolve_executable_handle(ProviderKind::ClaudeCode, &config)
+            .await
+            .unwrap();
+        assert_eq!(handle.canonical_path(), native);
+        registry
+            .observe(ProviderKind::ClaudeCode, &config)
+            .await
+            .unwrap();
+    }
 }

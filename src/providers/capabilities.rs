@@ -3846,7 +3846,13 @@ impl ProviderPathSnapshot {
                 Ok(()) => {}
                 Err(ProviderExecutableError::Missing(_)) => continue,
                 Err(_) => {
-                    return Err(ProviderDiscoveryError::InvalidPathSnapshot(directory));
+                    // An unsafe entry cannot grant authority, but must not
+                    // hide later retained, trusted directories (e.g. /bin is
+                    // a symlink on otherwise ordinary Linux PATHs).
+                    first_invalid_entry.get_or_insert_with(|| {
+                        ProviderDiscoveryError::InvalidPathSnapshot(directory.clone())
+                    });
+                    continue;
                 }
             }
             let canonical = match fs::canonicalize(&directory) {
@@ -4216,6 +4222,34 @@ pub struct ProviderDiscoveryContract {
     shim_entrypoint: String,
 }
 
+#[cfg(target_os = "linux")]
+fn is_linux_claude_version(path: &Path) -> bool {
+    let Some(version) = path.file_name().and_then(|name| name.to_str()) else {
+        return false;
+    };
+    if version.len() > 64
+        || !version
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b".-".contains(&b))
+    {
+        return false;
+    }
+    let components: Vec<_> = version.split('-').next().unwrap_or("").split('.').collect();
+    components.len() == 3
+        && components
+            .iter()
+            .all(|part| !part.is_empty() && part.bytes().all(|b| b.is_ascii_digit()))
+        && path
+            .parent()
+            .and_then(Path::file_name)
+            .is_some_and(|name| name == "versions")
+        && path
+            .parent()
+            .and_then(Path::parent)
+            .and_then(Path::file_name)
+            .is_some_and(|name| name == "claude")
+}
+
 impl ProviderDiscoveryContract {
     pub fn for_kind(kind: ProviderKind) -> Self {
         let stem = match kind {
@@ -4273,7 +4307,12 @@ impl ProviderDiscoveryContract {
                 directory: entry.directory.clone(),
             };
             let native_path = entry.directory.join(&self.native_entrypoint);
-            match ProviderExecutable::from_path(&native_path) {
+            #[cfg(target_os = "linux")]
+            let resolved = self.resolve_linux_entrypoint(&native_path);
+            #[cfg(not(target_os = "linux"))]
+            let resolved = ProviderExecutable::from_path(&native_path)
+                .map_err(ProviderDiscoveryError::Executable);
+            match resolved {
                 Ok(executable) => {
                     self.validate_native_path(&executable)?;
                     candidates.push(ProviderDiscoveryCandidate {
@@ -4284,9 +4323,10 @@ impl ProviderDiscoveryContract {
                         form: ProviderExecutableForm::Native,
                     });
                 }
-                Err(ProviderExecutableError::Missing(_) | ProviderExecutableError::NotAFile(_)) => {
-                }
-                Err(error) => return Err(ProviderDiscoveryError::Executable(error)),
+                Err(ProviderDiscoveryError::Executable(
+                    ProviderExecutableError::Missing(_) | ProviderExecutableError::NotAFile(_),
+                )) => {}
+                Err(error) => return Err(error),
             }
 
             #[cfg(target_os = "windows")]
@@ -4337,7 +4377,9 @@ impl ProviderDiscoveryContract {
                     }
                     Err(error) => return Err(error.into()),
                 };
-                #[cfg(not(target_os = "windows"))]
+                #[cfg(target_os = "linux")]
+                let executable = self.resolve_linux_entrypoint(&path)?;
+                #[cfg(not(any(target_os = "windows", target_os = "linux")))]
                 let executable = ProviderExecutable::from_path(&path)?;
                 self.validate_origin(&executable, &origin)?;
                 self.validate_native_path(&executable)?;
@@ -4355,6 +4397,127 @@ impl ProviderDiscoveryContract {
                 origin,
             } => self.validate_windows_shim(shim_path, target_path, origin, false),
         }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn resolve_linux_entrypoint(
+        &self,
+        requested: &Path,
+    ) -> Result<ProviderExecutable, ProviderDiscoveryError> {
+        let path = match fs::symlink_metadata(requested) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                let name = requested
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .unwrap_or("");
+                if !same_entrypoint(name, &self.native_entrypoint) {
+                    return Err(ProviderDiscoveryError::WrongEntrypoint(
+                        requested.to_path_buf(),
+                    ));
+                }
+                fs::canonicalize(requested).map_err(|error| {
+                    ProviderDiscoveryError::Executable(if error.kind() == io::ErrorKind::NotFound {
+                        ProviderExecutableError::Missing(requested.to_path_buf())
+                    } else {
+                        ProviderExecutableError::Io {
+                            path: requested.to_path_buf(),
+                            kind: error.kind(),
+                        }
+                    })
+                })?
+            }
+            _ => requested.to_path_buf(),
+        };
+        match ProviderExecutable::from_path(&path) {
+            Ok(executable) => {
+                self.validate_native_path(&executable)?;
+                // From here every probe and runtime uses the retained canonical
+                // native identity, never resolves the entrypoint link again.
+                Ok(executable)
+            }
+            Err(ProviderExecutableError::NotNativeExecutable(_))
+                if self.kind == ProviderKind::Codex
+                    && path.file_name().is_some_and(|name| name == "codex.js")
+                    && path
+                        .parent()
+                        .and_then(Path::file_name)
+                        .is_some_and(|name| name == "bin") =>
+            {
+                self.resolve_linux_codex_package(&path)
+            }
+            Err(error) => Err(ProviderDiscoveryError::Executable(error)),
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn resolve_linux_codex_package(
+        &self,
+        script: &Path,
+    ) -> Result<ProviderExecutable, ProviderDiscoveryError> {
+        let package = script
+            .parent()
+            .and_then(Path::parent)
+            .ok_or_else(|| ProviderDiscoveryError::ShimProofInvalid(script.to_path_buf()))?;
+        if package.file_name().is_none_or(|name| name != "codex")
+            || package
+                .parent()
+                .and_then(Path::file_name)
+                .is_none_or(|name| name != "@openai")
+        {
+            return Err(ProviderDiscoveryError::ShimProofInvalid(
+                script.to_path_buf(),
+            ));
+        }
+        let manifest =
+            ProviderExecutable::inspect_non_native_blocking(&package.join("package.json"))?;
+        let content = manifest.read_handle_contents()?;
+        if content.len() > MAX_PROVIDER_SHIM_BYTES {
+            return Err(ProviderDiscoveryError::ShimProofInvalid(
+                script.to_path_buf(),
+            ));
+        }
+        let metadata: serde_json::Value = serde_json::from_slice(&content)
+            .map_err(|_| ProviderDiscoveryError::ShimProofInvalid(script.to_path_buf()))?;
+        if metadata.get("name").and_then(serde_json::Value::as_str) != Some("@openai/codex")
+            || metadata
+                .pointer("/bin/codex")
+                .and_then(serde_json::Value::as_str)
+                != Some("bin/codex.js")
+        {
+            return Err(ProviderDiscoveryError::ShimProofInvalid(
+                script.to_path_buf(),
+            ));
+        }
+        let (platform_package, triple) = match std::env::consts::ARCH {
+            "x86_64" => ("codex-linux-x64", "x86_64-unknown-linux-musl"),
+            "aarch64" => ("codex-linux-arm64", "aarch64-unknown-linux-musl"),
+            _ => return Err(ProviderDiscoveryError::UnsupportedPlatform),
+        };
+        let relative = PathBuf::from("vendor")
+            .join(triple)
+            .join("bin")
+            .join("codex");
+        // Match the package-local and hoisted optional native dependency, then
+        // the older bundled distribution. Existing invalid candidates refuse;
+        // they never fall through to running the JavaScript bootstrap.
+        let roots = [
+            package.join("node_modules/@openai").join(platform_package),
+            package.parent().unwrap().join(platform_package),
+            package.to_path_buf(),
+        ];
+        for root in roots {
+            let candidate = root.join(&relative);
+            match ProviderExecutable::from_path(&candidate) {
+                Ok(executable) => {
+                    manifest.validate_current()?;
+                    self.validate_native_path(&executable)?;
+                    return Ok(executable);
+                }
+                Err(ProviderExecutableError::Missing(_)) => continue,
+                Err(error) => return Err(ProviderDiscoveryError::Executable(error)),
+            }
+        }
+        Err(ProviderDiscoveryError::NoCandidate(self.kind))
     }
 
     pub fn validate_in_order<I>(
@@ -4410,7 +4573,12 @@ impl ProviderDiscoveryContract {
                 executable.canonical_path().to_path_buf(),
             ));
         }
-        if !same_entrypoint(file_name, &self.native_entrypoint) {
+        let expected_entrypoint = same_entrypoint(file_name, &self.native_entrypoint);
+        #[cfg(target_os = "linux")]
+        let expected_entrypoint = expected_entrypoint
+            || (self.kind == ProviderKind::ClaudeCode
+                && is_linux_claude_version(executable.canonical_path()));
+        if !expected_entrypoint {
             return Err(ProviderDiscoveryError::WrongEntrypoint(
                 executable.canonical_path().to_path_buf(),
             ));

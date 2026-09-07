@@ -1576,8 +1576,14 @@ impl ProviderRegistry {
                     override_path.clone(),
                 ))
                 .map_err(|error| map_discovery_error(kind, Some(override_path), error))?;
+            // Linux installation aliases have already resolved to a retained native
+            // target. Reinspect that selected target, never execute the alias.
+            #[cfg(target_os = "linux")]
+            let inspection_path = candidate.executable().canonical_path();
+            #[cfg(not(target_os = "linux"))]
+            let inspection_path = override_path.as_path();
             let identity = executable_inspector
-                .inspect(override_path)
+                .inspect(inspection_path)
                 .await
                 .map_err(|error| match error {
                     ProviderExecutableError::Missing(_) | ProviderExecutableError::NotAFile(_) => {
@@ -1597,7 +1603,11 @@ impl ProviderRegistry {
             let handle = candidate
                 .open_for_launch()
                 .map_err(ProviderError::Executable)?;
-            return Ok((candidate.requested_path().to_path_buf(), identity, handle));
+            #[cfg(target_os = "linux")]
+            let inspection_path = identity.canonical_path().to_path_buf();
+            #[cfg(not(target_os = "linux"))]
+            let inspection_path = candidate.requested_path().to_path_buf();
+            return Ok((inspection_path, identity, handle));
         }
 
         let path_value = config.path.clone().or_else(|| std::env::var_os("PATH"));
@@ -1616,11 +1626,11 @@ impl ProviderRegistry {
         let handle = candidate
             .open_for_launch()
             .map_err(ProviderError::Executable)?;
-        Ok((
-            candidate.requested_path().to_path_buf(),
-            candidate.executable().clone(),
-            handle,
-        ))
+        #[cfg(target_os = "linux")]
+        let inspection_path = candidate.executable().canonical_path().to_path_buf();
+        #[cfg(not(target_os = "linux"))]
+        let inspection_path = candidate.requested_path().to_path_buf();
+        Ok((inspection_path, candidate.executable().clone(), handle))
     }
 
     pub fn cache_len(&self) -> usize {

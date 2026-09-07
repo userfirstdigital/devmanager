@@ -3195,14 +3195,30 @@ impl WindowsProviderProbeRunner {
             command
                 .creation_flags(crate::services::platform_service::MANAGED_PROCESS_CREATION_FLAGS);
         }
-        #[cfg(not(windows))]
+        #[cfg(target_os = "linux")]
+        let (resolved, fixed_arguments, _launch_files) =
+            prepare_unix_launch(&self.policy, &executable)?;
+        #[cfg(target_os = "linux")]
+        let mut command = std::process::Command::new(&resolved);
+        #[cfg(target_os = "linux")]
+        {
+            command
+                .args(fixed_arguments)
+                .args(arguments)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped());
+            apply_provider_environment_exact(&mut command, &child_environment);
+            command.process_group(0);
+        }
+        #[cfg(not(any(windows, target_os = "linux")))]
         {
             let _ = (&executable, arguments, &child_environment, &self.policy);
             return Err(ProviderInteractiveProbeError::Protocol(
-                "interactive metadata probe is Windows-attested in this slice".into(),
+                "interactive metadata probing is unavailable on this platform".into(),
             ));
         }
-        #[cfg(windows)]
+        #[cfg(any(windows, target_os = "linux"))]
         {
             let mut process = ProbeProcess::spawn(
                 command,
@@ -3269,13 +3285,13 @@ impl WindowsProviderProbeRunner {
             let stdin = process.take_stdin();
             let stdout = process.take_stdout();
             let stderr = process.take_stderr();
-            #[cfg(windows)]
+            #[cfg(any(windows, target_os = "linux"))]
             {
                 if let Some(stdin_ref) = stdin.as_ref() {
                     if let Err(_) = set_stdin_pipe_nowait(stdin_ref) {
                         let _ = process.terminate_tree(deadline);
                         return Err(ProviderInteractiveProbeError::Protocol(
-                            "failed to set stdin PIPE_NOWAIT".into(),
+                            "failed to make probe input nonblocking".into(),
                         ));
                     }
                 } else {
@@ -3322,6 +3338,17 @@ fn set_stdin_pipe_nowait(stdin: &ChildStdin) -> io::Result<()> {
     } else {
         Ok(())
     }
+}
+
+#[cfg(target_os = "linux")]
+fn set_stdin_pipe_nowait(stdin: &ChildStdin) -> io::Result<()> {
+    use std::os::fd::AsRawFd;
+    let fd = stdin.as_raw_fd();
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+    if flags < 0 || unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
 }
 
 impl ProviderInteractiveSession {

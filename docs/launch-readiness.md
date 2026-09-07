@@ -39,7 +39,10 @@ The candidate is not release-approved.
 - Updated obsolete protocol fixtures to use host-authorized task creation.
 - Enabled bounded Linux provider probes behind an owned exec barrier. One tracer
   thread retains fork/vfork/clone descendants, exact process handles and cleanup;
-  task-owned interactive provider runtimes still need this ownership integration.
+  task-owned interactive provider runtimes still need platform ownership.
+- Resolved Linux Claude installation links and Codex npm native distributions,
+  retaining the selected native identity through registry revalidation. Enabled
+  interactive metadata probes with nonblocking input and bounded cancellation.
 
 ## Verification evidence
 
@@ -47,6 +50,11 @@ Local logs are sibling files of the isolated worktree:
 `/home/robin/Projects/devmanager-launch-20260907-*.log`.
 
 | Check | Observed result |
+| --- | --- |
+| Linux provider discovery identity | 44 passed (`linux-production/discovery-identity-final.log`) |
+| Linux registry PATH and override aliases | Passed (`linux-production/discovery-registry-final.log`) |
+| Interactive probe exchange, cancellation and full-pipe deadline | Two passed (`linux-production/interactive-probe-tests.log`) |
+| Latest Linux all-target check and native binaries | Passed (`linux-production/discovery-check2.log`, `discovery-build2.log`) |
 | Linux supervision behavior | Three passed: exec barrier, detached child/root exit, thread exec, drop cleanup and unrelated-child isolation (`linux-production/process-tests.log`) |
 | Provider identity integration on Linux | 41 passed (`linux-production/provider-identity-tests2.log`) |
 | Real Linux probe output, environment and tree cleanup | Three passed (`linux-production/probe-tree-tests2.log`) |
@@ -54,7 +62,6 @@ Local logs are sibling files of the isolated worktree:
 | Linux local socket / host lock tests | Two passed (`linux-production/socket-test.log`, `lock-test.log`) |
 | Cross-platform local IPC integration | 11 passed (`linux-production/protocol-tests2.log`) |
 | Host entry and drain tests on Linux | Nine passed (`linux-production/host-tests.log`) |
-| --- | --- |
 | Native UI library tests | 998 passed, six existing ignores (`live-ux/ui-tests-final.log`) |
 | Correlated child hook/protocol/scope tests | Six passed |
 | Provider settings tests | 104 passed |
@@ -96,9 +103,12 @@ The rebuilt native shell now launches with its real sibling host on this Linux
 Wayland desktop, using an isolated debug profile. Full canonical synchronization
 reached Ready in 1,938 ms on the first recorded launch. The empty workspace and
 Add a project dialog were inspected; physical typing appeared in its name field.
-The exact parent-bound host exited when the owned app closed. Provider discovery
-currently reports an invalid PATH directory; interactive provider runtime ownership also remains a
-launch gate. This is not yet provider-terminal acceptance.
+The exact parent-bound host exited when the owned app closed. The latest real launch reached canonical Ready in 1,554 ms and populated Claude
+and Codex model/usage metadata in the isolated profile. Cursor still reports its
+non-native shell launcher as unavailable. Follow-up desktop capture could not
+reliably focus the owned window; an observed narrow window also needs sizing
+acceptance. Interactive provider runtime ownership remains a launch gate.
+This is not yet provider-terminal acceptance.
 
 The earlier interactive fixture inspection below attaches no host. Current real
 host evidence is under `launch-evidence/linux-production/`.
