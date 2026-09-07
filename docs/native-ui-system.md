@@ -62,3 +62,18 @@ These are reference points for architecture and interaction patterns. Do not ven
 - Add a dedicated UI preview/debug surface with seeded editor states.
 - Replace remaining ad-hoc sidebar and dialog rows with semantic components.
 
+
+## Interactive native fixture inspection
+
+A debug build can open the canonical shell with bounded fixture data:
+
+```text
+devmanager --ui-preview-live tests/fixtures/ui/task-cockpit-two-panels.json
+```
+
+This uses the same native controls and keyboard bindings as the product shell.
+It uses the isolated development profile and attaches no production host. Close
+the window to stop it. Desktop screenshots and physical input can verify shell
+layout and interaction; fixture data cannot certify provider input, host
+recovery, persisted state, or installation. Automated Windows capture remains
+available through `--ui-preview <fixture.json> --output <preview.png>`.

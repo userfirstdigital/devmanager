@@ -22,7 +22,10 @@ fn main() -> ExitCode {
     }
 
     let args = std::env::args_os().skip(1).collect::<Vec<_>>();
-    if args.iter().any(|argument| argument == "--ui-preview") {
+    if args
+        .iter()
+        .any(|argument| argument == "--ui-preview" || argument == "--ui-preview-live")
+    {
         return run_ui_preview(args);
     }
     run_product_shell()
@@ -46,10 +49,15 @@ fn run_product_shell() -> ExitCode {
 fn run_ui_preview(args: Vec<std::ffi::OsString>) -> ExitCode {
     #[cfg(debug_assertions)]
     {
-        use devmanager::ui::preview::{run_cli, PreviewPathPolicy};
+        use devmanager::ui::preview::{run_cli, run_live_cli, PreviewPathPolicy};
         // Preview fixtures resolve against the package workspace in debug only.
         let policy = PreviewPathPolicy::for_workspace(env!("CARGO_MANIFEST_DIR"));
-        match run_cli(args, &policy) {
+        let result = if args.first().is_some_and(|arg| arg == "--ui-preview-live") {
+            run_live_cli(args, &policy)
+        } else {
+            run_cli(args, &policy)
+        };
+        match result {
             Ok(()) => ExitCode::SUCCESS,
             Err(error) => {
                 eprintln!("{error}");

@@ -9,6 +9,11 @@ The candidate is not release-approved.
 - Combined `ui-redesign-w4` and `ui-redesign-clean`: panel grid/regrid, narrow
   titles, refusal messages, age refresh, composer hints and pointer fixes.
 - Completed pin/unpin, panel swap selection and zoom ownership.
+- Iterated on the visible Wayland native shell: corrected stale task-switcher
+  state, focus after dismissal and before the first click, shared overlay input
+  keyboard registration, shortcut redraws, Escape zoom exit, and Unicode-aware
+  word deletion. Added a debug interactive
+  fixture mode using the canonical shell and shared controls.
 - Verified strict contrast for both default themes and enforced production
   color ownership through the shared token layer.
 - Added Claude task-list settings and correlated pending/active/completed
@@ -33,7 +38,7 @@ Local logs are sibling files of the isolated worktree:
 
 | Check | Observed result |
 | --- | --- |
-| Native UI library tests | 997 passed, six existing ignores |
+| Native UI library tests | 998 passed, six existing ignores (`live-ux/ui-tests-final.log`) |
 | Correlated child hook/protocol/scope tests | Six passed |
 | Provider settings tests | 104 passed |
 | Default-theme/source ownership tests | 29 passed |
@@ -41,7 +46,7 @@ Local logs are sibling files of the isolated worktree:
 | Browser tests | 606 passed, one existing skip |
 | Browser typecheck and production/PWA build | Passed |
 | Browser dependency audit | Zero findings |
-| Final all-target compiler check | Passed (`all-target-final.log`) |
+| Final all-target compiler check | Passed (`launch-evidence/live-ux/all-target-final.log`) |
 | Final formatting check | Passed |
 | Native-shell integration tests | 21 passed (`native-integration-final.log`) |
 | Cleanup, probe, direct CLI and read-only lease regressions | Four passed (`cleanup-final3.log`) |
@@ -69,6 +74,24 @@ until descendant supervision exists, releases cancellation-owned sockets, and
 uses the read-only issuer in that fixture. All four focused regressions and
 the final all-target compiler check pass. This does not convert the earlier
 full-suite result into a green run.
+
+## Live desktop inspection
+
+The rebuilt native shell was launched on this Linux Wayland desktop. The
+production startup exposes `named-pipe ipc is unsupported on this platform`;
+Linux provider containment is also unavailable. Interactive fixture inspection
+therefore attaches no host and cannot certify provider-terminal acceptance.
+
+Full-window screenshots at approximately 1,523 × 834 logical pixels were
+compared with composition A: board placement, two-panel layout, compact header,
+focused-panel outline, and attention colors follow the reference. This is
+Linux fixture evidence, not the outstanding Windows production capture.
+Physical keyboard and mouse checks verified search before the first click,
+Escape followed by zoom, Escape unzoom, whole-word composer deletion, new-task
+and rename dialog opening, rename Escape dismissal, and divider drag/release.
+Private screenshots and gesture evidence are under the isolated worktree's
+`launch-evidence/live-ux/` directory. The debug command is documented in
+`native-ui-system.md`.
 
 ## Remaining launch gates
 
