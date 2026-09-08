@@ -523,3 +523,29 @@ exact provider PID 3752185 and the app/host/guardian all exited. Production
 config/remote hashes were unchanged. Private evidence: `historical-*.log`,
 `historical-live.png` and `historical-live-result.json`; the pre-run database
 backup remains private in launch evidence.
+
+
+### Linux remote settings and live browser chat
+
+Remote-access InputState fields now keep their own keyboard handling before
+terminal routing. Physical Ctrl+A and digit entry changed the port to 43882;
+Apply & restart exposed the real listener there, and restoring 43872 also
+succeeded. Browser pairing instructions now match Settings → Remote access →
+Pair a device. Native tests: 365 passed, five ignored; browser transport,
+identity and session tests: 86 passed. Web build and all-target Rust check passed.
+
+The actual listener paired the browser, loaded canonical tasks/history and
+accepted `Reply exactly linux remote path verified`. Kernel events 97–100
+separately record input acceptance, operation acceptance, physical delivery and
+settlement; the expected response appeared in conversation and terminal views.
+The provider conversation ID remained unchanged. The browser reconnected after
+host restart without another pairing code. A ten-second idle live-terminal sample
+measured 1.3% of one core in the host and 4.4% in the native app.
+
+A production browser transport with a negotiated two-item limit loaded all five
+tasks over three encrypted snapshot pages, including binary resume cursors.
+It exposed a separate conversation limit defect: one page contained 38 facts.
+That defect still needs correction before multi-page conversation acceptance.
+Private evidence: `linux-production/remote-*`. Owned app, host, guardian,
+automation and Rust processes were joined; production configuration hashes did
+not change.

@@ -12,7 +12,7 @@ export function PairingGate() {
     event.preventDefault();
     const trimmed = token.trim();
     if (!trimmed) {
-      setError("Enter the browser pair token from the desktop app.");
+      setError("Enter the pairing code from the desktop app.");
       return;
     }
     setSubmitting(true);
@@ -26,9 +26,9 @@ export function PairingGate() {
           response.status === 429 && retryAfter > 0
             ? `Too many attempts. Wait ${retryAfter}s and try again.`
             : response.status === 401 && retryAfter > 0
-              ? `Token rejected. Wait ${retryAfter}s before trying again.`
+              ? `Code rejected. Wait ${retryAfter}s before trying again.`
               : response.status === 401
-                ? "Token rejected."
+                ? "Code rejected."
                 : `Pair failed (HTTP ${response.status})`,
         );
         return;
@@ -55,7 +55,7 @@ export function PairingGate() {
         </p>
         <form onSubmit={onSubmit} className="dm-pairing-form">
           <label>
-            <span>Browser pair token</span>
+            <span>Pairing code</span>
             <input
               type="text"
               inputMode="text"
@@ -65,7 +65,7 @@ export function PairingGate() {
               value={token}
               onChange={(event) => setToken(event.target.value)}
               disabled={submitting}
-              placeholder="Paste token"
+              placeholder="Enter pairing code"
             />
           </label>
           <button
@@ -82,7 +82,7 @@ export function PairingGate() {
         ) : null}
         <p className="dm-pairing-help">
           <LockKeyhole size={14} aria-hidden="true" />
-          Find the token in the desktop app under Remote, Host, Browser Access.
+          In the desktop app, open Settings → Remote access → Pair a device.
         </p>
       </div>
     </main>

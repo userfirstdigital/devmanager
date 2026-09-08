@@ -46699,6 +46699,18 @@ impl NativeShell {
                 }),
             )
             .on_key_down(cx.listener(|shell, event: &KeyDownEvent, window, cx| {
+                // Remote settings use InputState's own focus and text handler.
+                // Let it receive editing keys even if a terminal was armed
+                // before opening settings; only Escape belongs to the overlay.
+                if shell.settings_open
+                    && shell.settings_page == NativeSettingsPage::RemoteAccess
+                {
+                    if event.keystroke.key == "escape" {
+                        shell.handle_settings_overlay_key(event, window, cx);
+                        cx.stop_propagation();
+                    }
+                    return;
+                }
                 // Root editors own text before the center terminal. In
                 // particular, a terminal armed by an earlier click must not
                 // steal rename/search/settings input after an overlay opens.
