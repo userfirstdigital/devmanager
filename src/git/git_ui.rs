@@ -11,6 +11,125 @@ use gpui::{
 // ── Main window render ─────────────────────────────────────────────────────
 
 pub fn render_git_window(state: &GitWindow, cx: &mut Context<GitWindow>) -> AnyElement {
+    div()
+        .size_full()
+        .flex()
+        .when(state.is_native(), |view| {
+            view.child(render_repository_rail(state, cx))
+        })
+        .child(
+            div()
+                .flex_1()
+                .min_w_0()
+                .h_full()
+                .child(render_repository_detail(state, cx)),
+        )
+        .into_any_element()
+}
+
+fn render_repository_rail(state: &GitWindow, cx: &mut Context<GitWindow>) -> AnyElement {
+    let tokens = state.tokens;
+    div()
+        .id("git-repositories")
+        .w(px(230.0))
+        .h_full()
+        .flex_shrink_0()
+        .flex()
+        .flex_col()
+        .bg(tokens.surfaces.raised.to_gpui())
+        .border_r_1()
+        .border_color(tokens.borders.subtle.to_gpui())
+        .child(
+            div()
+                .p_3()
+                .flex()
+                .items_center()
+                .justify_between()
+                .child(format!("Repositories · {}", state.repos.len()))
+                .child(
+                    crate::ui::components::button::native_toolbar_button(
+                        "git-refresh-repositories",
+                        "Refresh",
+                        !state.is_mutating && !state.is_loading,
+                    )
+                    .tooltip("Refresh local changes and last fetched sync status")
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.reload_repositories(cx);
+                    })),
+                ),
+        )
+        .child(
+            div()
+                .px_3()
+                .pb_2()
+                .text_size(px(11.0))
+                .text_color(tokens.text.muted.to_gpui())
+                .child("All project folders"),
+        )
+        .child(
+            div().px_3().pb_2().child(
+                crate::ui::components::button::native_toolbar_button(
+                    "git-fetch-all",
+                    "Fetch all",
+                    !state.is_mutating && !state.is_loading && !state.repos.is_empty(),
+                )
+                .tooltip("Fetch every repository to update commits to push or pull")
+                .on_click(cx.listener(|this, _, _, cx| this.fetch_all_repositories(cx))),
+            ),
+        )
+        .child(
+            div()
+                .id("git-repository-list")
+                .flex_1()
+                .min_h_0()
+                .overflow_y_scroll()
+                .children(state.repos.iter().enumerate().map(|(index, repo)| {
+                    div()
+                        .px_2()
+                        .py_1()
+                        .when(index == state.active_repo, |row| {
+                            row.bg(tokens.surfaces.selection.to_gpui())
+                        })
+                        .child(
+                            crate::ui::components::button::native_list_button(
+                                gpui::ElementId::Name(format!("git-repository-{index}").into()),
+                                SharedString::from(repo.label.clone()),
+                                !state.is_mutating && !state.is_loading,
+                            )
+                            .w_full()
+                            .tooltip(SharedString::from(
+                                repo.status_error
+                                    .clone()
+                                    .unwrap_or_else(|| repo.label.clone()),
+                            ))
+                            .on_click(
+                                cx.listener(move |this, _, _, cx| this.switch_repo(index, cx)),
+                            ),
+                        )
+                        .child(
+                            div()
+                                .px_2()
+                                .text_size(px(11.0))
+                                .text_color(tokens.text.secondary.to_gpui())
+                                .child(repo.status_label()),
+                        )
+                        .into_any_element()
+                })),
+        )
+        .child(
+            div()
+                .p_3()
+                .text_size(px(11.0))
+                .text_color(tokens.text.muted.to_gpui())
+                .child(
+                    "↑ Push   ↓ Pull
+Fetch a repository to check its remote.",
+                ),
+        )
+        .into_any_element()
+}
+
+fn render_repository_detail(state: &GitWindow, cx: &mut Context<GitWindow>) -> AnyElement {
     let tokens = state.tokens;
     div()
         .size_full()
@@ -215,7 +334,7 @@ fn render_toolbar(state: &GitWindow, cx: &mut Context<GitWindow>) -> AnyElement 
         .border_color(rgb(tokens.borders.subtle.to_u32()))
         // Left: Repository
         .child({
-            let has_multiple = state.repos.len() > 1;
+            let has_multiple = state.repos.len() > 1 && !state.is_native();
             div()
                 .flex_1()
                 .flex()
@@ -1456,7 +1575,7 @@ pub fn render_branch_dropdown(state: &GitWindow, cx: &mut Context<GitWindow>) ->
         .occlude()
         .absolute()
         .top(px(70.0))
-        .left(px(200.0))
+        .left(px(if state.is_native() { 430.0 } else { 200.0 }))
         .w(px(320.0))
         .max_h(px(400.0))
         .overflow_y_scroll()

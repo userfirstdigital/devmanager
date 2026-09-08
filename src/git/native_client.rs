@@ -8,8 +8,8 @@ use super::{
     git_service,
 };
 use crate::client::{HostClient, HostClientConfig};
-use crate::domain::cockpit::{TaskCockpitQuery, TaskCockpitResult, TaskRepositorySelector};
-use crate::domain::{id::TaskId, ClientId};
+use crate::domain::cockpit::{TaskCockpitQuery, TaskCockpitResult};
+use crate::domain::ClientId;
 use crate::protocol::{Capability, CapabilitySet, FrameLimits};
 use crate::remote::{RemoteAction, RemoteActionPayload as Payload, RemoteActionResult};
 
@@ -27,22 +27,15 @@ pub struct NativeGitSession(Arc<Mutex<AuthSession>>);
 #[derive(Clone)]
 pub struct NativeGitClient {
     profile: String,
-    task_id: TaskId,
-    repositories: Arc<Vec<(String, TaskRepositorySelector)>>,
+    repositories: Arc<Vec<(String)>>,
     auth: Arc<Mutex<AuthSession>>,
 }
 
 impl NativeGitClient {
-    pub fn new(
-        profile: String,
-        task_id: TaskId,
-        repositories: Vec<(String, TaskRepositorySelector)>,
-        session: NativeGitSession,
-    ) -> Self {
+    pub fn new(profile: String, session: NativeGitSession) -> Self {
         Self {
             profile,
-            task_id,
-            repositories: Arc::new(repositories),
+            repositories: Arc::new(Vec::new()),
             auth: session.0,
         }
     }
@@ -65,7 +58,7 @@ impl NativeGitClient {
                     .await
                     .map_err(|e| e.to_string())?;
                 client
-                    .query_task_cockpit(self.task_id, query)
+                    .query_desktop_git(query)
                     .await
                     .map_err(|e| e.to_string())?
                     .map_err(|e| format!("Git request failed: {e:?}"))
@@ -79,61 +72,36 @@ impl NativeGitClient {
     }
 
     fn query(&self, repository: &str, action: Action) -> Result<DesktopGitPayload, String> {
-        let selector = self
-            .repositories
-            .iter()
-            .find(|(id, _)| id == repository)
-            .map(|(_, selector)| selector.clone())
-            .ok_or("Repository is no longer available.")?;
+        if !self.repositories.iter().any(|id| id == repository) {
+            return Err(
+                "Repository is no longer available. Reopen Git to reload repositories.".into(),
+            );
+        }
         let confirm = action.is_mutation();
-        match self.cockpit(TaskCockpitQuery::GitDesktopTargeted {
-            selector: selector.clone(),
+        match self.cockpit(TaskCockpitQuery::DesktopRepositoryAction {
+            repository_id: repository.into(),
             action,
             confirm,
         })? {
-            TaskCockpitResult::GitDesktop {
-                task_id,
-                selector: returned,
+            TaskCockpitResult::DesktopRepositoryAction {
+                repository_id,
                 payload,
-            } if task_id == self.task_id && returned == selector => Ok(payload),
+            } if repository_id == repository => Ok(payload),
             other => Err(format!("Git request was not accepted: {other:?}")),
         }
     }
 
     pub fn load_repositories(mut self) -> Result<(Self, Vec<(String, String)>), String> {
-        let TaskCockpitResult::GitRepositories(catalog) =
-            self.cockpit(TaskCockpitQuery::GitRepositories)?
+        let TaskCockpitResult::DesktopRepositories(entries) =
+            self.cockpit(TaskCockpitQuery::DesktopRepositories)?
         else {
-            return Err("The host could not load this task's repositories.".into());
+            return Err("The host could not load configured repositories.".into());
         };
-        if catalog.task_id != self.task_id {
-            return Err("Repository response did not match the task.".into());
-        }
-        let preferred = self
-            .repositories
-            .first()
-            .map(|(_, selector)| selector.clone());
-        let mut entries = catalog
-            .repositories
-            .into_iter()
-            .filter(|repo| repo.available)
-            .collect::<Vec<_>>();
-        entries.sort_by_key(|entry| Some(&entry.selector) != preferred.as_ref());
-        if entries.is_empty() {
-            return Err("No repositories are available for this task.".into());
-        }
+        self.repositories = Arc::new(entries.iter().map(|entry| entry.id.clone()).collect());
         let repos = entries
-            .iter()
-            .enumerate()
-            .map(|(index, entry)| (entry.label.clone(), format!("repository-{index}")))
+            .into_iter()
+            .map(|entry| (entry.label, entry.id))
             .collect();
-        self.repositories = Arc::new(
-            entries
-                .into_iter()
-                .enumerate()
-                .map(|(index, entry)| (format!("repository-{index}"), entry.selector))
-                .collect(),
-        );
         Ok((self, repos))
     }
 
@@ -181,9 +149,8 @@ impl NativeGitClient {
             ),
             RemoteAction::GitFetch { repo_path } => (repo_path, Action::Fetch),
             RemoteAction::GitPull { repo_path } => (repo_path, Action::Pull),
-            RemoteAction::GitPush { repo_path } | RemoteAction::GitSync { repo_path } => {
-                (repo_path, Action::Push)
-            }
+            RemoteAction::GitPush { repo_path } => (repo_path, Action::Push),
+            RemoteAction::GitSync { repo_path } => (repo_path, Action::Sync),
             RemoteAction::GitPushSetUpstream { repo_path, branch } => {
                 (repo_path, Action::Publish { branch })
             }

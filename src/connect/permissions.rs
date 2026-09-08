@@ -69,6 +69,8 @@ pub fn action_for_client_request(request: &ClientRequest) -> Option<(ActionId, O
                 Query::PromptLibrary(_) => ActionId::READ_PERSONAL_PROMPTS,
                 Query::TaskCockpit(
                     crate::domain::cockpit::TaskCockpitQuery::ConfigCreateProject { .. }
+                    | crate::domain::cockpit::TaskCockpitQuery::DesktopRepositories
+                    | crate::domain::cockpit::TaskCockpitQuery::DesktopRepositoryAction { .. }
                     | crate::domain::cockpit::TaskCockpitQuery::GitDesktopTargeted { .. }
                     | crate::domain::cockpit::TaskCockpitQuery::ConfigUpsertCommand { .. }
                     | crate::domain::cockpit::TaskCockpitQuery::ConfigArchiveCommand { .. }
@@ -512,6 +514,30 @@ mod tests {
                     action,
                     confirm: true,
                 }),
+            });
+            assert_eq!(action_for_client_request(&request), None);
+            assert_eq!(
+                SessionAuthorizer::paired_owner().authorize_request(&request),
+                PermissionDecision::Denied(PermissionDenyReason::UnknownAction)
+            );
+        }
+    }
+
+    #[test]
+    fn desktop_git_global_requests_stay_host_local() {
+        for query in [
+            TaskCockpitQuery::DesktopRepositories,
+            TaskCockpitQuery::DesktopRepositoryAction {
+                repository_id: "opaque".into(),
+                action: crate::git::desktop::DesktopGitAction::Status,
+                confirm: false,
+            },
+        ] {
+            let request = ClientRequest::Query(QueryEnvelope {
+                request_id: RequestId::new(),
+                client_id: ClientId::new(),
+                task_id: None,
+                query: Query::TaskCockpit(query),
             });
             assert_eq!(action_for_client_request(&request), None);
             assert_eq!(

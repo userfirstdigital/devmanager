@@ -575,6 +575,16 @@ impl HostClient {
 
     /// Query one Task Cockpit surface. Requires granted TaskCockpit and an
     /// exact selected Task identity in the envelope.
+    pub async fn query_desktop_git(
+        &mut self,
+        query: crate::domain::TaskCockpitQuery,
+    ) -> Result<
+        Result<crate::domain::TaskCockpitResult, crate::domain::query::QueryError>,
+        crate::host::IpcError,
+    > {
+        typed_queries::query_desktop_git(self, query).await
+    }
+
     pub async fn query_task_cockpit(
         &mut self,
         task_id: TaskId,

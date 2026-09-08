@@ -169,6 +169,32 @@ pub async fn query_task_cockpit<P: AsyncHostRequestPort>(
     }
 }
 
+pub async fn query_desktop_git<P: AsyncHostRequestPort>(
+    port: &mut P,
+    query: TaskCockpitQuery,
+) -> Result<Result<TaskCockpitResult, QueryError>, IpcError> {
+    if !port.granted_capabilities().grants_task_cockpit()
+        || !matches!(
+            query,
+            TaskCockpitQuery::DesktopRepositories
+                | TaskCockpitQuery::DesktopRepositoryAction { .. }
+        )
+    {
+        return Err(IpcError::UnsupportedCapability);
+    }
+    let reply = port
+        .request_query(
+            global_cockpit_query(port.client_id(), query),
+            Some(task_cockpit_query_timeout()),
+        )
+        .await?;
+    match reply.outcome {
+        QueryOutcome::Err(error) => Ok(Err(error)),
+        QueryOutcome::Ok(QueryResult::TaskCockpit(result)) => Ok(Ok(result)),
+        QueryOutcome::Ok(_) => Err(retire_unexpected(port, IpcError::CorrelationMismatch).await),
+    }
+}
+
 /// Host-owned redacted configuration projection; no task identity is invented.
 pub async fn query_config_sidebar<P: AsyncHostRequestPort>(
     port: &mut P,

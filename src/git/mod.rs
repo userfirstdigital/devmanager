@@ -46,6 +46,48 @@ pub struct RepoEntry {
     pub path: String,
     pub has_changes: bool,
     pub behind: u32,
+    pub ahead: u32,
+    pub status_error: Option<String>,
+    pub status_known: bool,
+}
+
+impl RepoEntry {
+    fn apply_status(&mut self, status: &Result<GitStatusResult, String>) {
+        self.status_known = true;
+        match status {
+            Ok(status) => {
+                self.has_changes = !status.entries.is_empty();
+                self.ahead = status.ahead;
+                self.behind = status.behind;
+                self.status_error = None;
+            }
+            Err(error) => self.status_error = Some(error.clone()),
+        }
+    }
+
+    pub fn status_label(&self) -> String {
+        if !self.status_known {
+            return "Checking…".into();
+        }
+        if self.status_error.is_some() {
+            return "Could not read status".into();
+        }
+        let mut parts = Vec::new();
+        if self.has_changes {
+            parts.push("Changes".to_string());
+        }
+        if self.ahead > 0 {
+            parts.push(format!("↑ {}", self.ahead));
+        }
+        if self.behind > 0 {
+            parts.push(format!("↓ {}", self.behind));
+        }
+        if parts.is_empty() {
+            "Up to date locally".into()
+        } else {
+            parts.join(" · ")
+        }
+    }
 }
 
 // ── Login state ─────────────────────────────────────────────────────────────
@@ -75,6 +117,7 @@ pub struct GitWindow {
     file_diff_epoch: u64,
     draft_epoch: u64,
     pub repos: Vec<RepoEntry>,
+    repo_scan_epoch: u64,
     pub active_repo: usize,
     pub show_repo_dropdown: bool,
     focus: FocusHandle,
@@ -173,36 +216,7 @@ impl GitWindow {
     ) -> Self {
         use gpui_component::input::{InputEvent, InputState};
         let mut view = Self::new_with_backend(repos, GitBackend::Native(client.clone()), cx);
-        git_spawn!(cx, |this, cx| {
-            let result = cx
-                .background_executor()
-                .spawn(async move { client.load_repositories() })
-                .await;
-            let _ = this.update(&mut cx, |this, cx| {
-                match result {
-                    Ok((client, repos)) => {
-                        this.backend = GitBackend::Native(client);
-                        this.repos = repos
-                            .into_iter()
-                            .map(|(label, path)| RepoEntry {
-                                label,
-                                path,
-                                has_changes: false,
-                                behind: 0,
-                            })
-                            .collect();
-                        this.active_repo = 0;
-                        this.repo_epoch += 1;
-                        this.refresh_status(cx);
-                    }
-                    Err(error) => {
-                        this.is_loading = false;
-                        this.operation_result = Some((false, error));
-                    }
-                }
-                cx.notify();
-            });
-        });
+        view.reload_repositories(cx);
         let summary = cx.new(|cx| InputState::new(window, cx).placeholder("Commit summary"));
         let description = cx.new(|cx| {
             InputState::new(window, cx)
@@ -253,6 +267,9 @@ impl GitWindow {
                 path,
                 has_changes: false,
                 behind: 0,
+                ahead: 0,
+                status_error: None,
+                status_known: false,
             })
             .collect();
         let mut win = Self {
@@ -267,6 +284,7 @@ impl GitWindow {
             file_diff_epoch: 0,
             draft_epoch: 0,
             repos,
+            repo_scan_epoch: 0,
             active_repo: 0,
             show_repo_dropdown: false,
             focus,
@@ -314,11 +332,21 @@ impl GitWindow {
     }
 
     pub fn repo_path(&self) -> &str {
-        &self.repos[self.active_repo].path
+        self.repos
+            .get(self.active_repo)
+            .map(|repo| repo.path.as_str())
+            .unwrap_or("")
     }
 
     pub fn repo_label(&self) -> &str {
-        &self.repos[self.active_repo].label
+        self.repos
+            .get(self.active_repo)
+            .map(|repo| repo.label.as_str())
+            .unwrap_or(if self.is_loading {
+                "Loading repositories…"
+            } else {
+                "No repositories"
+            })
     }
 
     fn remote_client(&self) -> Option<GitCommandClient> {
@@ -356,13 +384,14 @@ impl GitWindow {
     }
 
     fn ensure_mutation_control(&mut self, cx: &mut Context<Self>) -> bool {
-        if self.is_mutating || self.is_loading {
+        if self.is_mutating || self.is_loading || self.repos.is_empty() {
             return false;
         }
         if matches!(self.backend, GitBackend::Local(_)) && !self.ensure_config_write_available(cx) {
             return false;
         }
         if self.has_mutation_control() {
+            self.repo_scan_epoch += 1;
             return true;
         }
         self.operation_result = Some((
@@ -459,7 +488,137 @@ impl GitWindow {
 
     // ── Repo status scanning ──────────────────────────────────────────
 
+    pub fn reload_repositories(&mut self, cx: &mut Context<Self>) {
+        if self.is_mutating {
+            return;
+        }
+        let GitBackend::Native(client) = &self.backend else {
+            self.refresh_all_repo_statuses(cx);
+            self.refresh_status(cx);
+            return;
+        };
+        let client = client.clone();
+        let previous = self.repo_path().to_string();
+        self.is_generating_message = false;
+        self.is_loading = true;
+        self.repo_epoch += 1;
+        self.repo_scan_epoch += 1;
+        let epoch = self.repo_epoch;
+        git_spawn!(cx, |this, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move { client.load_repositories() })
+                .await;
+            let _ = this.update(&mut cx, |this, cx| {
+                if this.repo_epoch != epoch {
+                    return;
+                }
+                match result {
+                    Ok((client, repos)) => {
+                        this.backend = GitBackend::Native(client);
+                        this.repos = repos
+                            .into_iter()
+                            .map(|(label, path)| RepoEntry {
+                                label,
+                                path,
+                                has_changes: false,
+                                behind: 0,
+                                ahead: 0,
+                                status_error: None,
+                                status_known: false,
+                            })
+                            .collect();
+                        this.active_repo = this
+                            .repos
+                            .iter()
+                            .position(|repo| repo.path == previous)
+                            .unwrap_or(0);
+                        this.status = None;
+                        this.file_diff = None;
+                        if this.repo_path() != previous {
+                            this.commit_summary.clear();
+                            this.commit_description.clear();
+                            this.draft_epoch += 1;
+                        }
+                        this.operation_result = None;
+                        this.refresh_status(cx);
+                        this.refresh_all_repo_statuses(cx);
+                        if this.active_view == GitView::History && !this.repos.is_empty() {
+                            this.load_history(cx);
+                        }
+                    }
+                    Err(error) => {
+                        this.is_loading = false;
+                        this.operation_result = Some((false, error));
+                    }
+                }
+                cx.notify();
+            });
+        });
+    }
+
+    pub fn fetch_all_repositories(&mut self, cx: &mut Context<Self>) {
+        if !self.ensure_mutation_control(cx) {
+            return;
+        }
+        let Some(client) = self.remote_client() else {
+            return;
+        };
+        let repos = self.repos.clone();
+        self.is_mutating = true;
+        self.operation_result = Some((true, "Fetching repositories…".into()));
+        cx.notify();
+        git_spawn!(cx, |this, cx| {
+            let mut failures = Vec::new();
+            for repo in repos {
+                let client = client.clone();
+                let path = repo.path.clone();
+                let result = cx
+                    .background_executor()
+                    .spawn(
+                        async move { client.request(RemoteAction::GitFetch { repo_path: path }) },
+                    )
+                    .await;
+                match result {
+                    Ok(result) if result.ok => {}
+                    Ok(result) => failures.push(format!(
+                        "{}: {}",
+                        repo.label,
+                        result.message.unwrap_or_else(|| "Fetch failed".into())
+                    )),
+                    Err(error) => failures.push(format!("{}: {error}", repo.label)),
+                }
+                // Closing the window cancels admission of subsequent fetches.
+                if this
+                    .update(&mut cx, |this, cx| {
+                        this.operation_result = Some((true, format!("Fetched {}", repo.label)));
+                        cx.notify();
+                    })
+                    .is_err()
+                {
+                    return;
+                }
+            }
+            let _ = this.update(&mut cx, |this, cx| {
+                this.is_mutating = false;
+                this.operation_result = Some((
+                    failures.is_empty(),
+                    if failures.is_empty() {
+                        "All repositories fetched".into()
+                    } else {
+                        failures.join("; ")
+                    },
+                ));
+                this.refresh_status(cx);
+                this.refresh_all_repo_statuses(cx);
+                cx.notify();
+            });
+        });
+    }
+
     pub fn refresh_all_repo_statuses(&mut self, cx: &mut Context<Self>) {
+        self.repo_scan_epoch += 1;
+        let scan_epoch = self.repo_scan_epoch;
         let paths: Vec<(usize, String)> = self
             .repos
             .iter()
@@ -474,7 +633,7 @@ impl GitWindow {
         };
 
         git_spawn!(cx, |this, cx| {
-            let results: Vec<(usize, bool, u32)> =
+            let results: Vec<(usize, Result<GitStatusResult, String>)> =
                 cx.background_executor()
                     .spawn(async move {
                         paths
@@ -505,22 +664,18 @@ impl GitWindow {
                                         })
                                         .and_then(git_service::status)
                                 };
-                                match status {
-                                    Ok(s) => {
-                                        let has_changes = !s.entries.is_empty();
-                                        (i, has_changes, s.behind)
-                                    }
-                                    Err(_) => (i, false, 0),
-                                }
+                                (i, status)
                             })
                             .collect()
                     })
                     .await;
             let _ = this.update(&mut cx, |this, cx| {
-                for (i, has_changes, behind) in results {
+                if this.repo_scan_epoch != scan_epoch {
+                    return;
+                }
+                for (i, status) in results {
                     if let Some(repo) = this.repos.get_mut(i) {
-                        repo.has_changes = has_changes;
-                        repo.behind = behind;
+                        repo.apply_status(&status);
                     }
                 }
                 cx.notify();
@@ -535,6 +690,16 @@ impl GitWindow {
     }
 
     fn refresh_status_inner(&mut self, auto_stage: bool, cx: &mut Context<Self>) {
+        if self.repos.is_empty() {
+            self.is_loading = false;
+            self.operation_result = Some((
+                true,
+                "No repositories yet. Add a project base folder to see its Git repositories here."
+                    .into(),
+            ));
+            cx.notify();
+            return;
+        }
         self.status_epoch += 1;
         let status_epoch = self.status_epoch;
         let repo = self.repo_path().to_string();
@@ -593,6 +758,9 @@ impl GitWindow {
                     return;
                 }
                 this.is_loading = false;
+                if let Some(repo) = this.repos.get_mut(this.active_repo) {
+                    repo.apply_status(&status);
+                }
                 match status {
                     Ok(s) => {
                         this.status = Some(s);

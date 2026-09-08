@@ -638,8 +638,7 @@ fn execute_push(
         arguments.push(OsString::from("--set-upstream"));
     }
     arguments.extend([
-        OsString::from("--"),
-        OsString::from(plan.remote_policy().endpoint()),
+        OsString::from(plan.remote.as_str()),
         OsString::from(plan.branch.as_str()),
     ]);
     let output = repository

@@ -246,6 +246,13 @@ pub enum TaskCockpitQuery {
     /// This carries labels and capability metadata only; roots, commands,
     /// environment values, and credential material remain host-private.
     ConfigSnapshot,
+    /// Host-local repository manager, independent of task checkout authority.
+    DesktopRepositories,
+    DesktopRepositoryAction {
+        repository_id: String,
+        action: crate::git::desktop::DesktopGitAction,
+        confirm: bool,
+    },
     /// Read-only Claude and Codex CLI authentication observation.
     AgentConnection,
     /// Exact host-owned live provider-process session for the selected Task.
@@ -942,6 +949,11 @@ impl AgentConnectionSnapshot {
 pub enum TaskCockpitResult {
     ProviderInputState(ProviderInputStateProjection),
     Config(ConfigSidebarSnapshot),
+    DesktopRepositories(Vec<crate::git::desktop::DesktopRepositoryEntry>),
+    DesktopRepositoryAction {
+        repository_id: String,
+        payload: crate::git::desktop::DesktopGitPayload,
+    },
     ConfigCommandDetail(ConfigCommandDetailProjection),
     AgentConnection(AgentConnectionSnapshot),
     ProviderSettings(crate::providers::settings::ProviderSettingsReply),
@@ -1201,7 +1213,9 @@ pub fn cockpit_surface(query: &TaskCockpitQuery) -> TaskCockpitSurface {
         | TaskCockpitQuery::OpenShellTerminal { .. }
         | TaskCockpitQuery::OpenSshTerminal { .. } => TaskCockpitSurface::Terminal,
         TaskCockpitQuery::WorkspaceStatus => TaskCockpitSurface::Workspace,
-        TaskCockpitQuery::GitRepositories
+        TaskCockpitQuery::DesktopRepositories
+        | TaskCockpitQuery::DesktopRepositoryAction { .. }
+        | TaskCockpitQuery::GitRepositories
         | TaskCockpitQuery::GitStatus
         | TaskCockpitQuery::GitStatusTargeted { .. }
         | TaskCockpitQuery::GitDesktopTargeted { .. }
@@ -1913,6 +1927,8 @@ impl TaskCockpitQuery {
         matches!(
             self,
             Self::ConfigSnapshot
+                | Self::DesktopRepositories
+                | Self::DesktopRepositoryAction { .. }
                 | Self::AgentConnection
                 | Self::ConfigCreateProject { .. }
                 | Self::ConfigUpsertSsh { .. }

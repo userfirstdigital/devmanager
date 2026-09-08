@@ -31958,7 +31958,11 @@ impl NativeShell {
                                     {
                                         return;
                                     }
-                                    shell.open_native_git_window(window, cx);
+                                    if shell.selected_owner_is_remote() {
+                                        shell.open_task_git_window(window, cx);
+                                    } else {
+                                        shell.open_native_git_window(window, cx);
+                                    }
                                 });
                             })
                             .into_any_element();
@@ -43880,6 +43884,37 @@ impl NativeShell {
     }
 
     fn open_native_git_window(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
+        let client = crate::git::native_client::NativeGitClient::new(
+            self.profile.named_profile().into(),
+            self.git_session.clone(),
+        );
+        let tokens = self.theme_tokens();
+        cx.defer(move |cx| {
+            let bounds = Bounds::centered(None, size(px(1100.0), px(740.0)), cx);
+            let _ = cx.open_window(
+                WindowOptions {
+                    window_bounds: Some(WindowBounds::Windowed(bounds)),
+                    titlebar: Some(gpui::TitlebarOptions {
+                        title: Some("Git — DevManager".into()),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                },
+                move |window, cx| {
+                    let view = cx.new(|cx| {
+                        let mut view =
+                            crate::git::GitWindow::new_native(Vec::new(), client, window, cx);
+                        view.tokens = tokens;
+                        view.focus(window);
+                        view
+                    });
+                    cx.new(|cx| gpui_component::Root::new(view, window, cx))
+                },
+            );
+        });
+    }
+
+    fn open_task_git_window(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
         let Some(owner) = self.selected_task_key.clone() else {
             self.local_slot_mut().last_query_detail =
                 Some("Select a task before opening Git.".into());
@@ -43908,65 +43943,6 @@ impl NativeShell {
                 },
             ],
         );
-
-        if !self.selected_owner_is_remote() {
-            let mut entries = self
-                .repository_catalog_for_owner(&owner)
-                .map(|catalog| {
-                    catalog
-                        .repositories
-                        .iter()
-                        .filter(|repo| repo.available)
-                        .map(|repo| (repo.label.clone(), repo.selector.clone()))
-                        .collect::<Vec<_>>()
-                })
-                .unwrap_or_default();
-            if entries.is_empty() {
-                entries.push(("Task repository".into(), selector.clone()));
-            }
-            entries.sort_by_key(|(_, target)| *target != selector);
-            let repos = entries
-                .iter()
-                .enumerate()
-                .map(|(index, (label, _))| (label.clone(), format!("repository-{index}")))
-                .collect::<Vec<_>>();
-            let selectors = entries
-                .into_iter()
-                .enumerate()
-                .map(|(index, (_, target))| (format!("repository-{index}"), target))
-                .collect();
-            let client = crate::git::native_client::NativeGitClient::new(
-                self.profile.named_profile().into(),
-                owner.task_id,
-                selectors,
-                self.git_session.clone(),
-            );
-            let tokens = self.theme_tokens();
-            cx.defer(move |cx| {
-                let bounds = Bounds::centered(None, size(px(1100.0), px(740.0)), cx);
-                let _ = cx.open_window(
-                    WindowOptions {
-                        window_bounds: Some(WindowBounds::Windowed(bounds)),
-                        titlebar: Some(gpui::TitlebarOptions {
-                            title: Some("Git — DevManager".into()),
-                            ..Default::default()
-                        }),
-                        ..Default::default()
-                    },
-                    move |window, cx| {
-                        let view = cx.new(|cx| {
-                            let mut view =
-                                crate::git::GitWindow::new_native(repos, client, window, cx);
-                            view.tokens = tokens;
-                            view.focus(window);
-                            view
-                        });
-                        cx.new(|cx| gpui_component::Root::new(view, window, cx))
-                    },
-                );
-            });
-            return;
-        }
 
         let snapshot = NativeGitWindowSnapshot::from_shell(self, &owner, &selector);
         let shell = cx.entity();
@@ -46085,19 +46061,15 @@ impl NativeShell {
                         });
                     }
                 }),
-                on_git: self
-                    .selected_task_key
-                    .as_ref()
-                    .filter(|_| !self.selected_owner_is_remote())
-                    .map(|_| {
-                        let shell = shell.clone();
-                        Rc::new(move |window: &mut Window, app: &mut gpui::App| {
-                            let _ = shell.update(app, |shell, cx| {
-                                shell.open_native_git_window(window, cx);
-                                cx.notify();
-                            });
-                        }) as Rc<dyn Fn(&mut Window, &mut gpui::App)>
-                    }),
+                on_git: Some({
+                    let shell = shell.clone();
+                    Rc::new(move |window: &mut Window, app: &mut gpui::App| {
+                        let _ = shell.update(app, |shell, cx| {
+                            shell.open_native_git_window(window, cx);
+                            cx.notify();
+                        });
+                    })
+                }),
                 on_settings: Rc::new({
                     let shell = shell.clone();
                     move |_window: &mut Window, app: &mut gpui::App| {

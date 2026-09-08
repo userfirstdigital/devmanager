@@ -767,7 +767,12 @@ fn recognized_commands_generate_exec_form_hooks_and_cleanup_with_registration() 
         assert_eq!(command["args"][2], overlay.endpoint);
         assert_eq!(command["args"][3], "--nonce");
         assert_eq!(command["args"][4], registration.nonce);
-        assert_eq!(command["async"], true);
+        if event == "PreToolUse" {
+            // Interactive questions must reach the host before Claude blocks.
+            assert!(command.get("async").is_none());
+        } else {
+            assert_eq!(command["async"], true);
+        }
     }
     let serialized = serde_json::to_string(&settings).unwrap();
     assert!(!serialized.contains("permissionDecision"));

@@ -35,6 +35,7 @@ pub enum DesktopGitAction {
     Fetch,
     Pull,
     Push,
+    Sync,
     Publish {
         branch: String,
     },
@@ -74,4 +75,12 @@ pub enum DesktopGitPayload {
     Commit(String),
     Done(String),
     Error(String),
+}
+
+/// An opaque, identity-bound configured repository selector. Paths stay on the host.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DesktopRepositoryEntry {
+    pub id: String,
+    pub label: String,
 }

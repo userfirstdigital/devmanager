@@ -5,11 +5,59 @@ launch platforms. macOS is outside the verified launch scope because no Mac
 test machine is available. This Linux machine cannot certify the Windows
 desktop or installer.
 Linux production packaging and a real signed 0.4.1 → 0.4.2 AppImage upgrade
-pass. The latest serial Linux library suite passed: **4,188 passed, zero failed,
+pass. The latest serial Linux library suite passed: **4,192 passed, zero failed,
 22 ignored**. Exact-session identity checks, native contracts, the real WebKit
 engine, CLI/updater/package contracts, and the locked all-target compiler check
 are recorded below. Windows desktop and installer acceptance still require a
 Windows machine; public release promotion has not occurred.
+
+## Workspace Git manager
+
+Git now opens without a selected task and discovers repositories across configured
+project roots and folders, including repositories nested under a base folder and
+the configured default projects directory. A persistent repository rail shows
+local changes and commits ahead/behind; Refresh reloads discovery and local status,
+and Fetch all updates remote-tracking references without merging or pushing.
+The Changes/History window and existing AI commit-message flow remain in place.
+Task Changes and remote-task review keep their separate ownership context.
+
+A host-local catalog issues opaque, identity-bound repository selectors. Each
+operation resolves them again against current configuration. Browser Connect
+cannot invoke this authority. Branch switching admits the index transition that
+reference-only branch edits do not need. Publish preserves the named upstream and
+admits only the requested branch's `remote`/`merge` configuration changes, with
+unrelated changes still rejected. Opening and refreshing preserve the index.
+
+Regression coverage exercises two repositories with no task, stage/commit,
+create/switch branch, publish/fetch/pull/push through a disposable local bare
+remote, removed/replaced roots, generated-folder/symlink exclusion, and the
+host-local permission boundary. The focused group passed five tests. The complete serial library suite passed
+**4,192 tests, zero failed, 22 ignored**, and all **21 native UI contracts**
+passed. The locked library/bin/test compiler check and all **38 Claude hook integration
+tests** passed. A Linux atomic Git
+file replacement race found during verification was repaired; the complete
+stage/commit/branch/publish/sync workflow then passed **40 consecutive runs**.
+The UI
+loading/empty state now tolerates an empty catalog instead of indexing row zero.
+Live native verification used a base folder with no tasks: repository discovery,
+physical keyboard commit input, staging, selected-repository commit, history,
+Fetch all, pull, push, branch creation and refresh discovery all passed. Eight
+first-time branch publications were verified against exact remote hashes and
+named upstream configuration. Screenshots include `sync-overview-final.png`,
+`history.png`, and `verified-publish-final.png`. Private visual and verification
+evidence is in `launch-evidence/git-global/`.
+The Git identity/credential and Windows acceptance limitations below still apply.
+
+The workspace Git AppImage is installed at
+`/home/robin/Applications/DevManager.AppImage` with SHA-256
+`e400fc24e38fd13873369e6f4747aa3010637574dd570cbbeb2ea953bf3b3e59`. Its main window
+was visible on the actual KDE desktop and connected successfully; process-to-window
+was 920 ms. The toolbar remains enabled with no task.
+Installed Git-window input acceptance was not completed after desktop focus moved
+away; the rebuilt Git workflow was accepted on the isolated native desktop above.
+The old installed client/host were joined before replacement, production
+config/remote hashes are unchanged, and all owned verification app/host/display
+and compiler processes were retired. The updated installed app remains running.
 
 ## Restored SSH list and task-side terminals
 
@@ -56,8 +104,11 @@ and Windows interactive acceptance remain release-review work.
 The prior Windows candidate passed **4,297 library tests**. Its four browser
 recipe integration failures expected internal reasons in deliberately redacted
 public errors. The assertions now verify the typed internal reason separately
-from the unchanged redacted public surface. The new Windows CI run must still
-establish the final candidate result.
+from the unchanged redacted public surface. Those browser recipe assertions passed in the following Windows run, which
+stopped later at a stale Claude hook assertion requiring every hook to be
+asynchronous. The assertion now checks the deliberate synchronous `PreToolUse`
+exception and asynchronous observational hooks. The next Windows CI run must
+still establish the final candidate result.
 
 The rebuilt AppImage was installed at
 `/home/robin/Applications/DevManager.AppImage` and visually inspected on the
@@ -67,7 +118,7 @@ process-to-window was 614 ms. The old windowless installed client, the desktop
 manager's restored client, and their exact host were joined before replacement.
 The new installed app remains open; configuration hashes are unchanged.
 
-## Restored Git desktop window
+## Earlier Git desktop restoration (scope superseded above)
 
 The top-bar Git button opens the 0.4.1 Git window for a selected local task,
 using the new shell palette and shared native controls. Changes, History,
@@ -89,9 +140,9 @@ One intermediate Git run hit the existing host-authority admission test
 intermittently; its focused rerun and the subsequent complete Git group passed.
 Test configuration hashes and the installed client PID/start time were unchanged.
 
-Remaining boundaries: a task pins its checkout branch, so creating a branch
-creates its reference without switching the checkout; switching requires a task
-bound to that branch. GitHub sign-in here authorizes AI messages, not Git network
+The initial task-scoped branch restriction is superseded by the workspace Git
+manager. Task Changes still retains its checkout fence. GitHub sign-in here
+authorizes AI messages, not Git network
 authentication. Live AI generation and authenticated push/pull have not been
 accepted. The host Git sandbox currently excludes ambient global Git identity,
 credential helpers and SSH-agent configuration; the live commit fixture used

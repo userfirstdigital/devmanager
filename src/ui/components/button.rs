@@ -248,3 +248,16 @@ pub fn native_toolbar_button(
         .small()
         .disabled(!enabled)
 }
+
+/// Selectable navigation row for a bounded native list.
+pub fn native_list_button(
+    id: impl Into<gpui::ElementId>,
+    label: impl Into<gpui::SharedString>,
+    enabled: bool,
+) -> gpui_component::button::Button {
+    use gpui_component::{button::ButtonVariants, Disableable};
+    gpui_component::button::Button::new(id)
+        .label(label)
+        .ghost()
+        .disabled(!enabled)
+}

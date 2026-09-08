@@ -272,9 +272,9 @@ pub fn top_bar_element(
         on_git.is_some(),
     )
     .tooltip(if on_git.is_some() {
-        "Review changes, history and branches"
+        "Manage all repositories in your project folders"
     } else {
-        "Select a local task to review its repository"
+        "Repository manager is unavailable"
     })
     .on_click(move |_, window, app| {
         if let Some(handler) = &on_git {

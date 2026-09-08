@@ -5,6 +5,7 @@
 
 mod agent_connection;
 mod cockpit;
+pub(crate) mod desktop_git;
 
 /// Constructible only by host modules after explicit Git mutation admission.
 pub(crate) struct ConfirmedGitDesktopMutation {

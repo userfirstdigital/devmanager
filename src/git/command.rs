@@ -311,9 +311,9 @@ impl GitAuthorityCapability {
     }
 }
 
-/// Opaque host-issued Git authority. Production issuance requires a live
-/// [`crate::workspace::WorkspaceAuthorization`] plus an active Git resource
-/// lease. The test-only constructor remains available only under `cfg(test)`.
+/// Opaque host-issued Git authority. Task issuance requires a live workspace
+/// authorization and Git resource lease; the host-local desktop manager uses
+/// sealed configured-root admission. Test constructors remain under `cfg(test)`.
 #[derive(Clone)]
 pub(crate) struct GitHostBinding {
     capability: Arc<GitAuthorityCapability>,
@@ -446,6 +446,97 @@ pub(crate) fn test_issue_git_host_binding_with_fence(
             repository_identity: Arc::new(Mutex::new(repository_identity)),
             repository_static_identity,
             authority_deadline: Instant::now() + live_for,
+            forced_expiry: Arc::new(AtomicBool::new(false)),
+            limits: GitLimits::default(),
+            workspace_resource_lease: None,
+        }),
+    })
+}
+
+/// Host-local configured Git gestures have no task identity. The sealed
+/// admission is resolved from current config; retained directory/graph handles
+/// and the request lifetime fence every child exactly as task Git does.
+pub(crate) fn issue_desktop_repository_git_host_binding(
+    admission: &crate::host::desktop_git::ConfiguredDesktopRepository,
+    client_id: crate::domain::ClientId,
+    connection_id: Uuid,
+    request_id: crate::domain::RequestId,
+    publish_branch: Option<&str>,
+) -> Result<GitHostBinding, GitError> {
+    let mut root = RepositoryRoot::open_with_approved_external_roots_deadline_and_admission(
+        admission.path(),
+        &[],
+        OperationDeadline::from_now(HARD_MAX_TIMEOUT),
+        WorktreeDescriptorAdmission::Strict,
+    )
+    .map_err(|reason| GitError::InvalidRepositoryRoot {
+        path: "<configured-desktop-root>".to_string(),
+        reason,
+    })?;
+    canonicalize_approved_graph_roots(&root.path, &[]).map_err(|reason| {
+        GitError::InvalidRepositoryRoot {
+            path: "<configured-desktop-root>".to_string(),
+            reason,
+        }
+    })?;
+    let current =
+        crate::workspace::service::validate_host_workspace_path(root.path.as_path(), true)
+            .map_err(|_| GitError::AuthorityUnavailable)?;
+    if current.identity != admission.identity() {
+        return Err(GitError::AuthorityUnavailable);
+    }
+    if let Some(branch) = publish_branch {
+        BranchName::new(branch).map_err(|message| GitError::InvalidRequest { message })?;
+        root.graph.admit_desktop_publish(branch).map_err(|reason| {
+            GitError::InvalidRepositoryRoot {
+                path: "<configured-desktop-root>".into(),
+                reason,
+            }
+        })?;
+        root.pinned_handles = Arc::new(
+            pin_repository_graph(
+                &root.path,
+                &root.graph,
+                OperationDeadline::from_now(HARD_MAX_TIMEOUT),
+            )
+            .map_err(|reason| GitError::InvalidRepositoryRoot {
+                path: "<configured-desktop-root>".into(),
+                reason,
+            })?,
+        );
+    }
+    let repository_identity = repository_graph_identity(&root);
+    let repository_static_identity = repository_static_graph_identity(&root);
+    let workspace = WorkspaceIdentity::from_canonical_root(root.path.clone());
+    let identity = AuthorityIdentity {
+        task_id: format!("desktop:{}", admission.id()),
+        workspace,
+        repository_static_identity: repository_static_identity.clone(),
+        controller_id: client_id.to_string(),
+        connection_id: connection_id.to_string(),
+        request_id: request_id.to_string(),
+        command_id: request_id.to_string(),
+        action_epoch: 1,
+        runtime_generation: 1,
+    };
+    let state = Arc::new(AuthorityState::new(identity.clone()));
+    Ok(GitHostBinding {
+        capability: Arc::new(GitAuthorityCapability {
+            workspace_authorization: WorkspaceAuthorization(Arc::clone(&state)),
+            resource_lease: ResourceLease(Arc::clone(&state)),
+            controller: ControllerHandle(Arc::clone(&state)),
+            connection: ConnectionHandle(Arc::clone(&state)),
+            action_generation: ActionGeneration {
+                current: Arc::new(AtomicU64::new(1)),
+                issued: 1,
+            },
+            identity,
+            bound_root: root.clone(),
+            root_handle: Arc::clone(&root.handle),
+            graph_handles: Arc::clone(&root.pinned_handles),
+            repository_identity: Arc::new(Mutex::new(repository_identity)),
+            repository_static_identity,
+            authority_deadline: Instant::now() + HOST_AUTHORITY_LIFETIME,
             forced_expiry: Arc::new(AtomicBool::new(false)),
             limits: GitLimits::default(),
             workspace_resource_lease: None,
@@ -1315,7 +1406,11 @@ pub enum GitError {
 impl fmt::Display for GitError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::InvalidRepositoryRoot { .. } => {
+            Self::InvalidRepositoryRoot {
+                reason: _reason, ..
+            } => {
+                #[cfg(test)]
+                eprintln!("Git test repository validation: {_reason}");
                 formatter.write_str("invalid Git repository root")
             }
             Self::InvalidPath { .. } => formatter.write_str("invalid repository path"),
@@ -1823,10 +1918,11 @@ fn stable_file_identity_with_index_retry(
     }
 }
 
-/// Linux stat can observe the old index inode after Git's atomic rename has
-/// unlinked it. Retry only this zero-link observation in the admitted Stage
-/// window, before reading any bytes. Hard links and all strict reads retain
-/// their existing rejection; the post-transition proof is always strict.
+/// Linux stat can observe an old inode after Git's atomic rename unlinks it.
+/// Callers enable this bounded zero-link retry only for an admitted in-flight
+/// replacement, including parent-directory snapshots of that same file.
+/// Hard links and strict reads retain their rejection; the post-effect proof
+/// is always strict.
 fn graph_metadata_with_index_retry<F>(
     path: &Path,
     deadline: Option<OperationDeadline>,
@@ -2671,6 +2767,7 @@ enum WorktreeDescriptorAdmission {
 
 #[derive(Clone)]
 struct RepositoryGraph {
+    desktop_publish: Option<DesktopPublishConfig>,
     nodes: Vec<GraphNode>,
     git_dir: PathBuf,
     common_dir: Option<PathBuf>,
@@ -2701,9 +2798,12 @@ enum GraphTransition {
     Commit,
     Reset,
     Branch,
+    /// Checkout changes HEAD and the index; a reference-only branch edit does not.
+    Switch,
     Fetch,
     Pull,
     Push,
+    Publish,
 }
 
 impl GraphTransition {
@@ -2821,7 +2921,14 @@ impl GraphTransition {
     fn allows_ref_path(self, root: &Path, path: &Path, logs_root: bool) -> bool {
         if !matches!(
             self,
-            Self::Commit | Self::Reset | Self::Branch | Self::Fetch | Self::Pull | Self::Push
+            Self::Commit
+                | Self::Reset
+                | Self::Branch
+                | Self::Switch
+                | Self::Fetch
+                | Self::Pull
+                | Self::Push
+                | Self::Publish
         ) {
             return false;
         }
@@ -2874,6 +2981,7 @@ impl GraphTransition {
                 | Self::Commit
                 | Self::Reset
                 | Self::Branch
+                | Self::Switch
                 | Self::Fetch
                 | Self::Pull
         ) {
@@ -2898,10 +3006,18 @@ impl GraphTransition {
             };
             let name = name.strip_suffix(".lock").unwrap_or(name);
             return match name {
-                "HEAD" => matches!(self, Self::Commit | Self::Reset | Self::Branch | Self::Pull),
+                "HEAD" => matches!(
+                    self,
+                    Self::Commit | Self::Reset | Self::Branch | Self::Switch | Self::Pull
+                ),
                 "index" => matches!(
                     self,
-                    Self::StatusRefresh | Self::Stage | Self::Commit | Self::Reset | Self::Pull
+                    Self::StatusRefresh
+                        | Self::Stage
+                        | Self::Commit
+                        | Self::Reset
+                        | Self::Switch
+                        | Self::Pull
                 ),
                 "ORIG_HEAD" => matches!(self, Self::Commit | Self::Reset | Self::Pull),
                 "MERGE_HEAD" | "CHERRY_PICK_HEAD" | "REVERT_HEAD" => {
@@ -2913,7 +3029,12 @@ impl GraphTransition {
                 "logs" | "refs" => {
                     matches!(
                         self,
-                        Self::Commit | Self::Reset | Self::Branch | Self::Fetch | Self::Pull
+                        Self::Commit
+                            | Self::Reset
+                            | Self::Branch
+                            | Self::Switch
+                            | Self::Fetch
+                            | Self::Pull
                     )
                 }
                 _ => false,
@@ -2930,11 +3051,21 @@ impl GraphTransition {
             return match name {
                 "HEAD" => matches!(
                     self,
-                    Self::StatusRefresh | Self::Commit | Self::Reset | Self::Branch | Self::Pull
+                    Self::StatusRefresh
+                        | Self::Commit
+                        | Self::Reset
+                        | Self::Branch
+                        | Self::Switch
+                        | Self::Pull
                 ),
                 "index" => matches!(
                     self,
-                    Self::StatusRefresh | Self::Stage | Self::Commit | Self::Reset | Self::Pull
+                    Self::StatusRefresh
+                        | Self::Stage
+                        | Self::Commit
+                        | Self::Reset
+                        | Self::Switch
+                        | Self::Pull
                 ),
                 "ORIG_HEAD" => matches!(self, Self::Commit | Self::Reset | Self::Pull),
                 "MERGE_HEAD" | "CHERRY_PICK_HEAD" | "REVERT_HEAD" => {
@@ -2946,7 +3077,12 @@ impl GraphTransition {
                 "logs" | "refs" => {
                     matches!(
                         self,
-                        Self::Commit | Self::Reset | Self::Branch | Self::Fetch | Self::Pull
+                        Self::Commit
+                            | Self::Reset
+                            | Self::Branch
+                            | Self::Switch
+                            | Self::Fetch
+                            | Self::Pull
                     )
                 }
                 _ => false,
@@ -2956,7 +3092,12 @@ impl GraphTransition {
             Some("logs") | Some("refs") => {
                 if !matches!(
                     self,
-                    Self::Commit | Self::Reset | Self::Branch | Self::Fetch | Self::Pull
+                    Self::Commit
+                        | Self::Reset
+                        | Self::Branch
+                        | Self::Switch
+                        | Self::Fetch
+                        | Self::Pull
                 ) {
                     return false;
                 }
@@ -2983,17 +3124,29 @@ impl GraphTransition {
             };
             let name = name.strip_suffix(".lock").unwrap_or(name);
             match name {
+                "config" => self == Self::Publish,
                 "index" => matches!(
                     self,
-                    Self::StatusRefresh | Self::Stage | Self::Commit | Self::Reset | Self::Pull
+                    Self::StatusRefresh
+                        | Self::Stage
+                        | Self::Commit
+                        | Self::Reset
+                        | Self::Switch
+                        | Self::Pull
                 ),
-                "HEAD" => matches!(self, Self::Commit | Self::Reset | Self::Branch | Self::Pull),
+                "HEAD" => matches!(
+                    self,
+                    Self::Commit | Self::Reset | Self::Branch | Self::Switch | Self::Pull
+                ),
                 "FETCH_HEAD" => matches!(self, Self::Fetch | Self::Pull),
                 "MERGE_HEAD" | "ORIG_HEAD" | "CHERRY_PICK_HEAD" | "REVERT_HEAD" => {
                     matches!(self, Self::Commit | Self::Reset | Self::Pull)
                 }
                 "packed-refs" | "shallow" => {
-                    matches!(self, Self::Commit | Self::Branch | Self::Fetch | Self::Pull)
+                    matches!(
+                        self,
+                        Self::Commit | Self::Branch | Self::Switch | Self::Fetch | Self::Pull
+                    )
                 }
                 "COMMIT_EDITMSG" | "MERGE_MSG" | "SQUASH_MSG" => {
                     matches!(self, Self::Commit | Self::Pull)
@@ -3070,7 +3223,114 @@ struct MutableGraphInput {
 
 type MutableDirectorySnapshot = Vec<(OsString, bool, FileIdentity)>;
 
+#[derive(Clone)]
+struct DesktopPublishConfig {
+    path: PathBuf,
+    original: Vec<u8>,
+    unchanged: Vec<String>,
+    branch: String,
+    merge: String,
+}
+
+// Git's set-upstream preserves unrelated config text. Admit only its two
+// exact branch keys; ambiguous/continued target sections fail closed.
+fn desktop_publish_config_projection(
+    bytes: &[u8],
+    branch: &str,
+) -> Result<(Vec<String>, Vec<(String, String)>), String> {
+    let text = std::str::from_utf8(bytes).map_err(|_| "Git configuration is not UTF-8")?;
+    let expected_header = format!(r#"[branch "{}"]"#, branch);
+    let mut target = false;
+    let mut unchanged = Vec::new();
+    let mut values = Vec::new();
+    let mut target_other = false;
+    for line in text.lines().map(str::trim).filter(|line| !line.is_empty()) {
+        if line.starts_with('[') {
+            target = line == expected_header;
+            target_other = false;
+            if !target {
+                unchanged.push(line.to_string());
+            }
+            continue;
+        }
+        if target {
+            if line.ends_with('\\') {
+                return Err("Continued branch configuration cannot be published safely".into());
+            }
+            if let Some((key, value)) = line.split_once('=') {
+                let key = key.trim().to_ascii_lowercase();
+                if key == "remote" || key == "merge" {
+                    if values.iter().any(|(existing, _)| existing == &key) {
+                        return Err("Duplicate branch upstream configuration".into());
+                    }
+                    values.push((key, value.trim().to_string()));
+                    continue;
+                }
+            }
+            if !target_other {
+                unchanged.push(expected_header.clone());
+                target_other = true;
+            }
+        }
+        unchanged.push(line.to_string());
+    }
+    Ok((unchanged, values))
+}
+
 impl RepositoryGraph {
+    /// Retry only the transient zero-link stat of a file this operation may
+    /// replace. This grants no replacement permission: hard links, static
+    /// inputs, reads, and the complete post-effect proof stay fail-closed.
+    fn retry_inflight_file_replacement(
+        &self,
+        transition: GraphTransition,
+        path: &Path,
+        update_baseline: bool,
+    ) -> bool {
+        !update_baseline
+            && !matches!(
+                transition,
+                GraphTransition::ReadOnly | GraphTransition::StatusRefresh
+            )
+            && self
+                .nodes
+                .iter()
+                .find(|node| same_path(&node.path, path))
+                .is_none_or(|node| node.mutable)
+            && transition.allows_replacement(
+                &self.git_dir,
+                self.common_dir.as_deref(),
+                &self.object_stores,
+                &self.metadata_roots,
+                path,
+            )
+    }
+
+    fn admit_desktop_publish(&mut self, branch: &str) -> Result<(), String> {
+        let path = self
+            .common_dir
+            .as_ref()
+            .unwrap_or(&self.git_dir)
+            .join("config");
+        let original = read_file_bounded_with_deadline(&path, HARD_MAX_STDERR_BYTES, None)
+            .map_err(|error| error.to_string())?;
+        let (unchanged, _) = desktop_publish_config_projection(&original, branch)?;
+        let node = self
+            .nodes
+            .iter_mut()
+            .find(|node| node.path == path)
+            .ok_or("Git configuration is not pinned")?;
+        node.mutable = true;
+        self.desktop_publish = Some(DesktopPublishConfig {
+            path,
+            original,
+            unchanged,
+            branch: branch.into(),
+            merge: format!("refs/heads/{branch}"),
+        });
+        Ok(())
+    }
+
     fn open(root: &Path, approved_external_roots: &[PathBuf]) -> Result<Self, String> {
         Self::open_with_deadline(
             root,
@@ -3533,7 +3793,7 @@ impl RepositoryGraph {
                 node.path.clone(),
                 match &node.initial_entries {
                     Some(entries) => entries.clone(),
-                    None => mutable_directory_snapshot_for_node(node, Some(deadline))?,
+                    None => mutable_directory_snapshot_for_node(node, Some(deadline), |_| false)?,
                 },
             );
         }
@@ -3570,6 +3830,7 @@ impl RepositoryGraph {
         }
         check_graph_deadline(deadline)?;
         Ok(Self {
+            desktop_publish: None,
             nodes,
             git_dir: gitdir,
             common_dir: commondir,
@@ -3644,6 +3905,27 @@ impl RepositoryGraph {
         if deadline.is_some_and(OperationDeadline::is_expired) {
             return Err("repository validation exceeded the operation deadline".to_string());
         }
+        if let Some(publish) = &self.desktop_publish {
+            let contents =
+                read_file_bounded_with_deadline(&publish.path, HARD_MAX_STDERR_BYTES, deadline)
+                    .map_err(|error| error.to_string())?;
+            if contents != publish.original {
+                let (unchanged, values) =
+                    desktop_publish_config_projection(&contents, &publish.branch)?;
+                if unchanged != publish.unchanged
+                    || values.iter().any(|(key, value)| {
+                        value
+                            != if key == "remote" {
+                                "origin"
+                            } else {
+                                &publish.merge
+                            }
+                    })
+                {
+                    return Err("Publishing changed unrelated Git configuration".into());
+                }
+            }
+        }
         let baseline = self
             .mutable_baseline
             .lock()
@@ -3675,19 +3957,24 @@ impl RepositoryGraph {
                 && (full_content || !node.mutable_recursive)
                 && !node_content_deferred
             {
-                Some(mutable_directory_snapshot_for_node(node, deadline)?)
+                Some(mutable_directory_snapshot_for_node(
+                    node,
+                    deadline,
+                    |path| self.retry_inflight_file_replacement(transition, path, update_baseline),
+                )?)
             } else {
                 None
             };
             let identity = if node.is_file
-                && optional_mutable_absence_policy_for_revalidate(
-                    transition,
-                    true,
-                    &node.path,
-                    &self.git_dir,
-                    update_baseline,
-                    full_content,
-                ) == OptionalMutableAbsencePolicy::AllowApprovedIndexGone
+                && (self.retry_inflight_file_replacement(transition, &node.path, update_baseline)
+                    || optional_mutable_absence_policy_for_revalidate(
+                        transition,
+                        true,
+                        &node.path,
+                        &self.git_dir,
+                        update_baseline,
+                        full_content,
+                    ) == OptionalMutableAbsencePolicy::AllowApprovedIndexGone)
             {
                 stable_file_identity_with_index_retry(
                     &node.path, false, deadline, true, true, true, true,
@@ -5277,6 +5564,7 @@ fn mutable_directory_snapshot_with_file_mode(
 fn mutable_directory_snapshot_for_node(
     node: &GraphNode,
     deadline: Option<OperationDeadline>,
+    retry_inflight_file: impl Fn(&Path) -> bool,
 ) -> Result<MutableDirectorySnapshot, String> {
     if node.mutable_recursive {
         return mutable_directory_snapshot_with_file_mode(
@@ -5329,12 +5617,25 @@ fn mutable_directory_snapshot_for_node(
                 };
             entries.push((relative, false, identity));
         } else if metadata.is_file() {
-            let identity = match graph_snapshot_file_identity_after_reparse_check(
-                &path,
-                &metadata,
-                deadline,
-                node.hash_file_content,
-            ) {
+            let observed = if retry_inflight_file(&path) {
+                stable_file_identity_with_index_retry(
+                    &path,
+                    false,
+                    deadline,
+                    true,
+                    node.hash_file_content,
+                    true,
+                    true,
+                )
+            } else {
+                graph_snapshot_file_identity_after_reparse_check(
+                    &path,
+                    &metadata,
+                    deadline,
+                    node.hash_file_content,
+                )
+            };
+            let identity = match observed {
                 Ok(identity) => identity,
                 Err(_) if mutable_graph_entry_disappeared(&path) => continue,
                 Err(reason) => return Err(reason),
@@ -6743,9 +7044,13 @@ fn graph_transition_for(arguments: &[OsString], policy: &GitExecutionPolicy) -> 
         Some("add") | Some("restore") | Some("rm") => GraphTransition::Stage,
         Some("commit") => GraphTransition::Commit,
         Some("reset") => GraphTransition::Reset,
-        Some("branch") | Some("switch") => GraphTransition::Branch,
+        Some("branch") => GraphTransition::Branch,
+        Some("switch") => GraphTransition::Switch,
         Some("fetch") => GraphTransition::Fetch,
         Some("pull") => GraphTransition::Pull,
+        Some("push") if arguments.iter().any(|arg| arg == "--set-upstream") => {
+            GraphTransition::Publish
+        }
         Some("push") => GraphTransition::Push,
         _ => GraphTransition::ReadOnly,
     }
@@ -8351,6 +8656,10 @@ impl GitRepository {
         remote: Option<&str>,
         branch: Option<&str>,
     ) -> Result<PushPlan, GitError> {
+        if let Some(remote) = remote {
+            validate_remote(remote, "push remote")?;
+            validate_remote_name(remote)?;
+        }
         let status = self.status()?;
         let branch = branch
             .map(|branch| {
@@ -13212,5 +13521,54 @@ Start-Sleep -Seconds 10
         LOCK.get_or_init(|| Mutex::new(()))
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+}
+
+#[cfg(test)]
+mod desktop_publish_tests {
+    use super::*;
+    #[test]
+    fn desktop_git_publish_admits_only_its_exact_upstream_config() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(Command::new("git")
+            .args(["init", "-b", "main"])
+            .current_dir(dir.path())
+            .output()
+            .unwrap()
+            .status
+            .success());
+        let root = RepositoryRoot::open(dir.path()).unwrap();
+        let path = dir.path().join(".git/config");
+        let original = fs::read_to_string(&path).unwrap();
+        let mut graph = root.graph.clone();
+        drop(root);
+        let index = dir.path().join(".git/index");
+        assert!(graph.retry_inflight_file_replacement(GraphTransition::Stage, &index, false));
+        assert!(graph.retry_inflight_file_replacement(GraphTransition::Switch, &index, false));
+        assert!(!graph.retry_inflight_file_replacement(GraphTransition::Stage, &index, true));
+        assert!(!graph.retry_inflight_file_replacement(GraphTransition::ReadOnly, &index, false));
+        assert!(!graph.retry_inflight_file_replacement(GraphTransition::Publish, &path, false));
+        graph.admit_desktop_publish("main").unwrap();
+        assert!(graph.retry_inflight_file_replacement(GraphTransition::Publish, &path, false));
+        assert!(!graph.retry_inflight_file_replacement(GraphTransition::Publish, &path, true));
+        assert!(!graph.retry_inflight_file_replacement(GraphTransition::Stage, &path, false));
+        let valid = format!(
+            "{original}\n[branch \"main\"]\n\tremote = origin\n\tmerge = refs/heads/main\n"
+        );
+        fs::write(&path, &valid).unwrap();
+        graph
+            .revalidate_after_transition(GraphTransition::Publish)
+            .unwrap();
+        graph.revalidate().unwrap();
+        for changed in [
+            valid.replace("remote = origin", "remote = other"),
+            format!("{valid}\n[core]\nsshCommand = arbitrary\n"),
+            valid.replace("refs/heads/main", "refs/heads/other"),
+        ] {
+            fs::write(&path, changed).unwrap();
+            assert!(graph
+                .revalidate_after_transition(GraphTransition::Publish)
+                .is_err());
+        }
     }
 }

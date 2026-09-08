@@ -169,6 +169,12 @@ pub(crate) fn serve_task_cockpit_bounded(
             reason: "agent_connection",
         });
     }
+    if matches!(
+        dispatch.query,
+        TaskCockpitQuery::DesktopRepositories | TaskCockpitQuery::DesktopRepositoryAction { .. }
+    ) {
+        return super::desktop_git::serve(&dispatch);
+    }
     if matches!(dispatch.query, TaskCockpitQuery::ConfigSnapshot) {
         let Some(config) = dispatch.config else {
             return QueryOutcome::Err(QueryError::Unavailable {
@@ -231,7 +237,9 @@ pub(crate) fn serve_task_cockpit_bounded(
                 TaskCockpitResult::ProviderInputState(state),
             ))
         }
-        TaskCockpitQuery::ConfigSnapshot
+        TaskCockpitQuery::DesktopRepositories
+        | TaskCockpitQuery::DesktopRepositoryAction { .. }
+        | TaskCockpitQuery::ConfigSnapshot
         | TaskCockpitQuery::AgentConnection
         | TaskCockpitQuery::ConfigCreateProject { .. }
         | TaskCockpitQuery::ConfigUpsertSsh { .. }
@@ -2103,7 +2111,6 @@ fn serve_git_desktop(
     confirm: bool,
 ) -> QueryOutcome {
     use crate::git::desktop::{DesktopGitAction as A, DesktopGitPayload as P};
-    use crate::git::git_service as service;
     if action.is_mutation() && !confirm {
         return denied(
             TaskCockpitSurface::Git,
@@ -2134,31 +2141,6 @@ fn serve_git_desktop(
             Ok(opened) => opened,
             Err(outcome) => return outcome,
         };
-    let stage_all_paths = if matches!(action, A::StageAll | A::StagedDiff) {
-        let status = match repository.status() {
-            Ok(status) => status,
-            Err(error) => return map_git_error(error),
-        };
-        let paths = status
-            .entries
-            .iter()
-            .filter(|entry| {
-                !matches!(action, A::StagedDiff)
-                    || entry.index != crate::git::model::FileState::Unchanged
-            })
-            .map(|entry| entry.path.display_lossy().into_owned())
-            .collect::<Vec<_>>();
-        if paths.is_empty() {
-            None
-        } else {
-            match cockpit_repo_paths(&paths) {
-                Ok(paths) => Some(paths),
-                Err(outcome) => return outcome,
-            }
-        }
-    } else {
-        None
-    };
     let repository = if action.is_mutation() {
         if !resolved.mutation_allowed {
             return denied(
@@ -2179,47 +2161,14 @@ fn serve_git_desktop(
     } else {
         repository
     };
-    let result = match action {
-        A::Status => service::status(&repository).map(P::Status),
-        A::History { limit, skip } => service::log(&repository, *limit, *skip).map(P::History),
-        A::FileDiff { relative_path, staged } => service::diff_file(&repository, relative_path, *staged).map(P::Diff),
-        A::CommitDiff { hash } => service::diff_commit(&repository, hash).map(P::Diff),
-        A::Branches => service::branches(&repository).map(P::Branches),
-        A::StagedDiff => service::get_staged_diff(&repository).and_then(|diff| {
-            if diff.trim().is_empty() { return Err("Stage changes before generating a commit message.".into()); }
-            // The existing AI generator consumes at most 24,000 bytes. Keep the
-            // host response bounded and truncate only at a UTF-8 boundary.
-            let mut end = diff.len().min(24_000);
-            while !diff.is_char_boundary(end) { end -= 1; }
-            Ok(P::StagedDiff(diff[..end].to_string()))
-        }),
-        A::Stage { paths } => service::stage(&repository, &paths.iter().map(String::as_str).collect::<Vec<_>>()).map(|_| P::Done("Changes staged".into())),
-        A::Unstage { paths } => repository.plan_unstage(&paths.iter().map(|p| RepoPath::from(p.as_str())).collect::<Vec<_>>())
-            .and_then(|plan| confirm_git_mutation(&repository, &plan).and_then(|confirmation| repository.unstage(&plan, &confirmation)))
-            .map(|_| P::Done("Changes unstaged".into())).map_err(|error| error.to_string()),
-        A::StageAll => match stage_all_paths {
-            Some(paths) => repository.plan_stage(&paths)
-                .and_then(|plan| confirm_git_mutation(&repository, &plan).and_then(|confirmation| repository.stage(&plan, &confirmation)))
-                .map(|_| P::Done("All changes staged".into())).map_err(|error| error.to_string()),
-            None => Ok(P::Done("No changes to stage".into())),
-        },
-        A::UnstageAll => repository.status().and_then(|status| {
-            let paths = status.entries.iter().filter(|entry| entry.index != crate::git::model::FileState::Unchanged).map(|entry| entry.path.clone()).collect::<Vec<_>>();
-            repository.plan_unstage(&paths).and_then(|plan| confirm_git_mutation(&repository, &plan).and_then(|confirmation| repository.unstage(&plan, &confirmation)))
-        }).map(|_| P::Done("All changes unstaged".into())).map_err(|error| error.to_string()),
-        A::Commit { summary, description } => service::commit(&repository, summary, description.as_deref()).map(P::Commit),
-        A::Fetch => service::fetch(&repository).map(P::Done),
-        A::Pull => service::pull(&repository).map(P::Done),
-        A::Push => service::push(&repository).map(P::Done),
-        A::Publish { branch } => service::push_set_upstream(&repository, branch).map(P::Done),
-        A::SwitchBranch { .. } => Err("This checkout is bound to a task. Open or create a task on the desired branch to keep its workspace and running agents consistent.".into()),
-        A::CreateBranch { name } => service::create_branch_ref(&repository, name).map(|_| P::Done("Branch created. The task stays on its current branch.".into())),
-        A::DeleteBranch { name } => service::delete_branch(&repository, name).map(|_| P::Done("Branch deleted".into())),
+    let payload = match execute_desktop_action(&repository, action, true) {
+        Ok(payload) => payload,
+        Err(outcome) => return outcome,
     };
     QueryOutcome::Ok(QueryResult::TaskCockpit(TaskCockpitResult::GitDesktop {
         task_id,
         selector: resolved.selector,
-        payload: result.unwrap_or_else(P::Error),
+        payload,
     }))
 }
 
@@ -7172,4 +7121,80 @@ mod tests {
             "readiness must not call the blocking persisted peek"
         );
     }
+}
+
+/// Runs the same operation after task or configured-desktop authority admission.
+pub(super) fn execute_desktop_action(
+    repository: &GitRepository,
+    action: &crate::git::desktop::DesktopGitAction,
+    task_bound: bool,
+) -> Result<crate::git::desktop::DesktopGitPayload, QueryOutcome> {
+    use crate::git::desktop::{DesktopGitAction as A, DesktopGitPayload as P};
+    use crate::git::git_service as service;
+    let stage_all_paths = if matches!(action, A::StageAll | A::StagedDiff) {
+        let status = match repository.status() {
+            Ok(status) => status,
+            Err(error) => return Err(map_git_error(error)),
+        };
+        let paths = status
+            .entries
+            .iter()
+            .filter(|entry| {
+                !matches!(action, A::StagedDiff)
+                    || entry.index != crate::git::model::FileState::Unchanged
+            })
+            .map(|entry| entry.path.display_lossy().into_owned())
+            .collect::<Vec<_>>();
+        if paths.is_empty() {
+            None
+        } else {
+            match cockpit_repo_paths(&paths) {
+                Ok(paths) => Some(paths),
+                Err(outcome) => return Err(outcome),
+            }
+        }
+    } else {
+        None
+    };
+    let result = match action {
+        A::Status => service::status(&repository).map(P::Status),
+        A::History { limit, skip } => service::log(&repository, *limit, *skip).map(P::History),
+        A::FileDiff { relative_path, staged } => service::diff_file(&repository, relative_path, *staged).map(P::Diff),
+        A::CommitDiff { hash } => service::diff_commit(&repository, hash).map(P::Diff),
+        A::Branches => service::branches(&repository).map(P::Branches),
+        A::StagedDiff => service::get_staged_diff(&repository).and_then(|diff| {
+            if diff.trim().is_empty() { return Err("Stage changes before generating a commit message.".into()); }
+            // The existing AI generator consumes at most 24,000 bytes. Keep the
+            // host response bounded and truncate only at a UTF-8 boundary.
+            let mut end = diff.len().min(24_000);
+            while !diff.is_char_boundary(end) { end -= 1; }
+            Ok(P::StagedDiff(diff[..end].to_string()))
+        }),
+        A::Stage { paths } => service::stage(&repository, &paths.iter().map(String::as_str).collect::<Vec<_>>()).map(|_| P::Done("Changes staged".into())),
+        A::Unstage { paths } => repository.plan_unstage(&paths.iter().map(|p| RepoPath::from(p.as_str())).collect::<Vec<_>>())
+            .and_then(|plan| confirm_git_mutation(&repository, &plan).and_then(|confirmation| repository.unstage(&plan, &confirmation)))
+            .map(|_| P::Done("Changes unstaged".into())).map_err(|error| error.to_string()),
+        A::StageAll => match stage_all_paths {
+            Some(paths) => repository.plan_stage(&paths)
+                .and_then(|plan| confirm_git_mutation(&repository, &plan).and_then(|confirmation| repository.stage(&plan, &confirmation)))
+                .map(|_| P::Done("All changes staged".into())).map_err(|error| error.to_string()),
+            None => Ok(P::Done("No changes to stage".into())),
+        },
+        A::UnstageAll => repository.status().and_then(|status| {
+            let paths = status.entries.iter().filter(|entry| entry.index != crate::git::model::FileState::Unchanged).map(|entry| entry.path.clone()).collect::<Vec<_>>();
+            repository.plan_unstage(&paths).and_then(|plan| confirm_git_mutation(&repository, &plan).and_then(|confirmation| repository.unstage(&plan, &confirmation)))
+        }).map(|_| P::Done("All changes unstaged".into())).map_err(|error| error.to_string()),
+        A::Commit { summary, description } => service::commit(&repository, summary, description.as_deref()).map(P::Commit),
+        A::Fetch => service::fetch(&repository).map(P::Done),
+        A::Pull => service::pull(&repository).map(P::Done),
+        A::Push => service::push(&repository).map(P::Done),
+        A::Sync => service::sync(&repository).map(P::Done),
+        A::Publish { branch } => service::push_set_upstream(&repository, branch).map(P::Done),
+        A::SwitchBranch { name } if !task_bound => service::switch_branch(repository, name).map(|_| P::Done("Branch switched".into())),
+        A::CreateBranch { name } if !task_bound => service::create_branch(repository, name).map(|_| P::Done("Branch created".into())),
+        A::SwitchBranch { .. } => Err("This checkout is bound to a task. Open or create a task on the desired branch to keep its workspace and running agents consistent.".into()),
+        A::CreateBranch { name } => service::create_branch_ref(&repository, name).map(|_| P::Done("Branch created. The task stays on its current branch.".into())),
+        A::DeleteBranch { name } => service::delete_branch(&repository, name).map(|_| P::Done("Branch deleted".into())),
+    };
+    Ok(result.unwrap_or_else(P::Error))
 }

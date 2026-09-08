@@ -762,7 +762,9 @@ impl UpdaterAction {
 
 pub const fn cockpit_query_action_id(query: &TaskCockpitQuery) -> &'static str {
     match query {
-        TaskCockpitQuery::ConfigSnapshot => ACTION_WORKSPACE_STATUS,
+        TaskCockpitQuery::DesktopRepositories
+        | TaskCockpitQuery::DesktopRepositoryAction { .. }
+        | TaskCockpitQuery::ConfigSnapshot => ACTION_WORKSPACE_STATUS,
         TaskCockpitQuery::AgentConnection => ACTION_HOST_STATUS,
         TaskCockpitQuery::ConfigCreateProject { .. } => ACTION_CONFIG_CREATE_PROJECT,
         TaskCockpitQuery::ConfigUpsertCommand { .. }
