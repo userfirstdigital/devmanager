@@ -64,7 +64,15 @@ fn host_mutation_permit_cannot_authorize_a_replaced_host_binding() {
         .expect("open first bound repository");
     let plan = repo_a
         .plan_stage(&[RepoPath::from("tracked.txt")])
-        .expect("plan stage from the first binding");
+        .unwrap_or_else(|error| match error {
+            GitError::InvalidRepositoryRoot { reason, .. } => {
+                panic!("plan stage from the first binding: {reason}")
+            }
+            GitError::CommandStart { message, .. } => {
+                panic!("plan stage from the first binding: {message}")
+            }
+            error => panic!("plan stage from the first binding: {error}"),
+        });
     let confirmation = repo_a
         .test_confirm(&plan)
         .expect("confirm with the first host binding");

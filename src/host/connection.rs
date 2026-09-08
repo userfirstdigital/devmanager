@@ -693,7 +693,7 @@ mod workspace_security_tests {
         .unwrap();
         assert_eq!(
             reopened.snapshot().config.projects[0].root_path,
-            project.to_str().unwrap()
+            std::fs::canonicalize(&project).unwrap().to_str().unwrap()
         );
     }
 

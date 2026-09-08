@@ -597,9 +597,15 @@ mod tests {
             std::fs::write(
                 &script_path,
                 r#"param([string]$PidPath)
-$child = Start-Process -FilePath (Join-Path $PSHOME 'powershell.exe') -ArgumentList @('-NoProfile', '-NonInteractive', '-Command', 'Start-Sleep -Seconds 60') -PassThru -NoNewWindow
+$startInfo = [Diagnostics.ProcessStartInfo]::new()
+$startInfo.FileName = 'cmd.exe'
+$startInfo.Arguments = '/c ping.exe -n 60 127.0.0.1'
+$startInfo.UseShellExecute = $false
+$startInfo.CreateNoWindow = $true
+$child = [Diagnostics.Process]::Start($startInfo)
 [IO.File]::WriteAllText($PidPath, [string]$child.Id)
 [Console]::Out.WriteLine('probe-complete')
+exit 0
 "#,
             )
             .unwrap();
