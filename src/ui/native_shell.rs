@@ -25597,6 +25597,37 @@ impl NativeShell {
         }
     }
 
+    fn empty_workspace_surface(
+        &self,
+        tokens: crate::ui::tokens::ThemeTokens,
+        workspace_size: Size<Pixels>,
+        cx: &Context<Self>,
+    ) -> AnyElement {
+        let stage = self.shell_stage();
+        if matches!(stage, ShellStage::Connecting | ShellStage::Recovery) {
+            return self.setup_intro(stage, tokens, None);
+        }
+        if stage == ShellStage::Welcome {
+            let action = Button::new("native-empty-workspace-add-project")
+                .label("Add project")
+                .primary()
+                .disabled(!self.shows_add_project_plus())
+                .on_click(cx.listener(|shell, _event: &ClickEvent, _window, cx| {
+                    cx.stop_propagation();
+                    shell.open_add_project();
+                    cx.notify();
+                }))
+                .into_any_element();
+            return Self::empty_state(
+                "native-empty-workspace-welcome",
+                "Add a project folder to start working with your coding agent.",
+                tokens,
+                Some(action),
+            );
+        }
+        self.idle_conversation_photo_surface(tokens, Some(workspace_size))
+    }
+
     fn task_workspace_view_model(&self) -> Option<TaskWorkspaceViewModel<HostTaskKey>> {
         let workspace = self.layout.task_workspace.as_ref()?;
         // Shell-wide, but it decides what a pane paints, so it goes in as a
@@ -25815,7 +25846,7 @@ impl NativeShell {
         // tabs and no Done at exactly the width where they are easiest to read.
         if pane_count == 0 {
             let Some(owner) = self.selected_task_key.clone() else {
-                return self.idle_conversation_photo_surface(tokens, Some(workspace_size));
+                return self.empty_workspace_surface(tokens, workspace_size, cx);
             };
             return self.task_conversation_surface_for(owner, true, tokens, workspace_size, cx);
         }
@@ -25841,13 +25872,13 @@ impl NativeShell {
         }
         let Some(model) = self.task_workspace_view_model() else {
             let Some(owner) = self.selected_task_key.clone() else {
-                return self.idle_conversation_photo_surface(tokens, Some(workspace_size));
+                return self.empty_workspace_surface(tokens, workspace_size, cx);
             };
             return self.task_conversation_surface_for(owner, true, tokens, workspace_size, cx);
         };
         let Some(root) = model.root.as_ref() else {
             let Some(owner) = self.selected_task_key.clone() else {
-                return self.idle_conversation_photo_surface(tokens, Some(workspace_size));
+                return self.empty_workspace_surface(tokens, workspace_size, cx);
             };
             return self.task_conversation_surface_for(owner, true, tokens, workspace_size, cx);
         };

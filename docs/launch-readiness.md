@@ -45,6 +45,22 @@ live process populated the persisted Changes pane without any tab gesture
 cleanup passed; production config/remote hashes remained unchanged.
 These are private local evidence files, not release archive inputs.
 
+## Fresh-profile acceptance
+
+An extracted Linux archive launched from `/tmp` with its own profile beneath
+the extraction directory, whose name contained spaces. Every manifest file hash
+matched after extraction; the original source path was not used as its profile.
+
+That clean-profile pass exposed a blank center canvas with Add project buried
+in the board menu. The empty workspace now shows an explicit Add project button
+using the shared component and the existing canonical-authority-gated form.
+Physical clicking opened the live form with its name field focused. Connecting
+and recovery states retain the canonical shell and explain the state in place.
+The native suite passed 365 tests (five existing ignores), and the all-target
+check and app/host build passed. Logs/captures:
+`linux-production/empty-workspace-*`. Owned app/host and automation sessions
+were joined after inspection.
+
 ## Implemented
 
 - Combined `ui-redesign-w4` and `ui-redesign-clean`: panel grid/regrid, narrow
