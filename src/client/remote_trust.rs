@@ -1,7 +1,7 @@
 //! Native desktop device custody and per-host trust for remote Connect.
 //!
 //! Explicit profile-rooted store under the process-unique test config root in
-//! unit tests. Device static secrets and pairing cookies are DPAPI-wrapped with
+//! unit tests. Device static secrets and pairing cookies use OS-backed encryption with
 //! authenticated metadata in the entropy scope. Host pin + cookie persist only
 //! after Noise + Hello. Disk work uses `remote::blocking_work::RemoteBlockingWork`
 //! (bounded OS worker + reaper); mutation admission is one-shot under the store
@@ -355,11 +355,14 @@ impl RemoteTrustStore {
         validate_path_no_reparse(&explicit_root)?;
         let root = explicit_root.join(STORE_DIR_NAME);
         validate_existing_ancestors_no_reparse(&root)?;
-        fs::create_dir_all(&root).map_err(|_| RemoteTrustError::PersistFailed)?;
-        fs::create_dir_all(root.join(HOSTS_DIR_NAME))
+        crate::persistence::create_private_directory(&root, true)
+            .map_err(|_| RemoteTrustError::PersistFailed)?;
+        crate::persistence::create_private_directory(&root.join(HOSTS_DIR_NAME), true)
             .map_err(|_| RemoteTrustError::PersistFailed)?;
         validate_path_no_reparse(&root)?;
-        Ok(Self { root })
+        let store = Self { root };
+        store.revalidate_store_layout()?;
+        Ok(store)
     }
 
     /// Open under the active profile config directory (process-unique in tests).
@@ -373,11 +376,38 @@ impl RemoteTrustStore {
     }
 
     fn acquire_lock(&self) -> Result<StoreLock, RemoteTrustError> {
-        #[cfg(not(windows))]
+        #[cfg(not(any(windows, target_os = "linux")))]
         {
-            let _ = self;
-            // Desktop production is Windows; do not pretend flock is exclusive.
-            return Err(RemoteTrustError::Unsupported);
+            Err(RemoteTrustError::Unsupported)
+        }
+        #[cfg(target_os = "linux")]
+        {
+            use std::os::fd::AsRawFd;
+            use std::os::unix::fs::OpenOptionsExt;
+            self.revalidate_store_layout()?;
+            let path = self.root.join(STORE_LOCK_FILE_NAME);
+            let file = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .mode(0o600)
+                .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK)
+                .open(&path)
+                .map_err(|_| RemoteTrustError::PersistFailed)?;
+            validate_linux_store_file(&file, &path)?;
+            if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+                let error = std::io::Error::last_os_error();
+                return Err(if error.kind() == std::io::ErrorKind::WouldBlock {
+                    RemoteTrustError::Busy
+                } else {
+                    RemoteTrustError::PersistFailed
+                });
+            }
+            // A replacement while lock admission was pending is not the file
+            // whose descriptor we locked. Never unlink the mutex on release.
+            validate_linux_store_file(&file, &path)?;
+            self.revalidate_store_layout()?;
+            Ok(StoreLock { _file: file })
         }
         #[cfg(windows)]
         {
@@ -413,8 +443,14 @@ impl RemoteTrustStore {
     fn revalidate_store_layout(&self) -> Result<(), RemoteTrustError> {
         validate_existing_ancestors_no_reparse(&self.root)?;
         validate_path_no_reparse(&self.root)?;
+        #[cfg(target_os = "linux")]
+        validate_linux_store_directory(&self.root)?;
         let hosts = self.root.join(HOSTS_DIR_NAME);
         validate_existing_ancestors_no_reparse(&hosts)?;
+        #[cfg(target_os = "linux")]
+        if hosts.exists() {
+            validate_linux_store_directory(&hosts)?;
+        }
         match fs::symlink_metadata(&hosts) {
             Ok(meta) => {
                 if !meta.is_dir() || metadata_is_reparse(&meta) {
@@ -1014,6 +1050,38 @@ fn validate_existing_ancestors_no_reparse(path: &Path) -> Result<(), RemoteTrust
     Ok(())
 }
 
+#[cfg(target_os = "linux")]
+fn validate_linux_store_directory(path: &Path) -> Result<(), RemoteTrustError> {
+    use std::os::unix::fs::MetadataExt;
+    let metadata = fs::symlink_metadata(path).map_err(|_| RemoteTrustError::PersistFailed)?;
+    if !metadata.is_dir()
+        || metadata.uid() != unsafe { libc::geteuid() }
+        || metadata.mode() & 0o022 != 0
+    {
+        return Err(RemoteTrustError::Corrupt);
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn validate_linux_store_file(file: &File, path: &Path) -> Result<(), RemoteTrustError> {
+    use std::os::unix::fs::MetadataExt;
+    let held = file
+        .metadata()
+        .map_err(|_| RemoteTrustError::PersistFailed)?;
+    let current = fs::symlink_metadata(path).map_err(|_| RemoteTrustError::PersistFailed)?;
+    if !held.is_file()
+        || !current.is_file()
+        || held.nlink() != 1
+        || held.uid() != unsafe { libc::geteuid() }
+        || held.mode() & 0o777 != 0o600
+        || (held.dev(), held.ino()) != (current.dev(), current.ino())
+    {
+        return Err(RemoteTrustError::Corrupt);
+    }
+    Ok(())
+}
+
 fn read_bounded_file_nofollow(path: &Path) -> Result<Vec<u8>, RemoteTrustError> {
     let mut options = OpenOptions::new();
     options.read(true);
@@ -1024,6 +1092,11 @@ fn read_bounded_file_nofollow(path: &Path) -> Result<Vec<u8>, RemoteTrustError> 
         options
             .share_mode(FILE_SHARE_READ.0)
             .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT.0);
+    }
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK);
     }
     let mut file = options.open(path).map_err(|err| {
         if err.kind() == std::io::ErrorKind::NotFound {
@@ -1038,6 +1111,8 @@ fn read_bounded_file_nofollow(path: &Path) -> Result<Vec<u8>, RemoteTrustError> 
     if !meta.is_file() || metadata_is_reparse(&meta) || meta.len() > MAX_STORE_FILE_BYTES {
         return Err(RemoteTrustError::Corrupt);
     }
+    #[cfg(target_os = "linux")]
+    validate_linux_store_file(&file, path)?;
     let mut bytes = Vec::new();
     file.by_ref()
         .take(MAX_STORE_FILE_BYTES + 1)
@@ -1602,24 +1677,10 @@ fn set_persist_after_admit_seam(hook: Option<Box<dyn Fn() + Send>>) {
 
 #[cfg(test)]
 fn hold_store_lock_exclusive(store: &RemoteTrustStore) -> File {
-    #[cfg(windows)]
-    {
-        store.revalidate_store_layout().expect("layout");
-        let lock_path = store.root.join(STORE_LOCK_FILE_NAME);
-        let mut options = OpenOptions::new();
-        options.read(true).write(true).create(true);
-        use std::os::windows::fs::OpenOptionsExt;
-        use windows::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT;
-        options
-            .share_mode(0)
-            .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT.0);
-        options.open(&lock_path).expect("hold lock")
-    }
-    #[cfg(not(windows))]
-    {
-        let _ = store;
-        panic!("store lock tests require Windows exclusive share_mode(0)");
-    }
+    store
+        .acquire_lock()
+        .expect("hold exclusive store lock")
+        ._file
 }
 
 #[cfg(test)]
@@ -1674,12 +1735,75 @@ mod tests {
         port
     }
 
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_trust_lock_is_exclusive_private_and_rejects_replaced_or_linked_files() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let store = test_store();
+        assert_eq!(fs::metadata(store.root()).unwrap().mode() & 0o777, 0o700);
+        assert_eq!(
+            fs::metadata(store.root().join(HOSTS_DIR_NAME))
+                .unwrap()
+                .mode()
+                & 0o777,
+            0o700
+        );
+        let lock = store.acquire_lock().expect("first lock");
+        assert!(matches!(store.acquire_lock(), Err(RemoteTrustError::Busy)));
+        let path = store.root().join(STORE_LOCK_FILE_NAME);
+        let previous = store.root().join("old-lock");
+        fs::rename(&path, &previous).expect("replace lock path");
+        fs::write(&path, b"").expect("replacement");
+        assert_eq!(
+            validate_linux_store_file(&lock._file, &path),
+            Err(RemoteTrustError::Corrupt)
+        );
+        drop(lock);
+        fs::remove_file(&path).unwrap();
+        std::os::unix::fs::symlink(&previous, &path).unwrap();
+        assert!(store.acquire_lock().is_err());
+        fs::remove_file(&path).unwrap();
+        fs::hard_link(&previous, &path).unwrap();
+        assert!(matches!(
+            store.acquire_lock(),
+            Err(RemoteTrustError::Corrupt)
+        ));
+        fs::remove_file(&path).unwrap();
+        fs::rename(&previous, &path).unwrap();
+        let reacquired = store.acquire_lock().expect("lock released on drop");
+        drop(reacquired);
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o666)).unwrap();
+        assert!(matches!(
+            store.acquire_lock(),
+            Err(RemoteTrustError::Corrupt)
+        ));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_trust_read_and_rollback_writer_never_follow_a_symlink() {
+        let store = test_store();
+        let original = store.root().join("original");
+        write_store_file_atomic(&original, b"encrypted sentinel").expect("private record");
+        let alias = store.device_path();
+        std::os::unix::fs::symlink(&original, &alias).expect("linked device");
+        assert!(read_bounded_file_nofollow(&alias).is_err());
+        assert!(write_store_file_atomic(&alias, b"replacement").is_err());
+        assert_eq!(fs::read(&original).unwrap(), b"encrypted sentinel");
+        assert!(fs::symlink_metadata(&alias)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+    }
+
     #[test]
     fn device_custody_stable_reload_and_corrupt_failclosed() {
         let store = test_store();
         let first = match store.load_or_create_device() {
             Ok(device) => device,
-            Err(RemoteTrustError::Unsupported) => return,
+            Err(RemoteTrustError::Unsupported) if !cfg!(any(windows, target_os = "linux")) => {
+                return
+            }
             Err(error) => panic!("create device: {error:?}"),
         };
         let second = store.load_or_create_device().expect("reload");
@@ -1700,7 +1824,9 @@ mod tests {
         let store = test_store();
         match store.load_or_create_device() {
             Ok(_) => {}
-            Err(RemoteTrustError::Unsupported) => return,
+            Err(RemoteTrustError::Unsupported) if !cfg!(any(windows, target_os = "linux")) => {
+                return
+            }
             Err(error) => panic!("{error:?}"),
         }
         let bytes = fs::read(store.device_path()).expect("read device");
@@ -1727,12 +1853,16 @@ mod tests {
         let handle_b = std::thread::spawn(move || store_b.load_or_create_device());
         let a = match handle_a.join().expect("join a") {
             Ok(device) => device,
-            Err(RemoteTrustError::Unsupported) => return,
+            Err(RemoteTrustError::Unsupported) if !cfg!(any(windows, target_os = "linux")) => {
+                return
+            }
             Err(error) => panic!("{error:?}"),
         };
         let b = match handle_b.join().expect("join b") {
             Ok(device) => device,
-            Err(RemoteTrustError::Unsupported) => return,
+            Err(RemoteTrustError::Unsupported) if !cfg!(any(windows, target_os = "linux")) => {
+                return
+            }
             Err(error) => panic!("{error:?}"),
         };
         assert_eq!(a.device_public_id.0, b.device_public_id.0);
@@ -1744,7 +1874,9 @@ mod tests {
         let store = test_store();
         match store.load_or_create_device() {
             Ok(_) => {}
-            Err(RemoteTrustError::Unsupported) => return,
+            Err(RemoteTrustError::Unsupported) if !cfg!(any(windows, target_os = "linux")) => {
+                return
+            }
             Err(error) => panic!("{error:?}"),
         }
         let host = ConnectNoiseCustody::generate().expect("host");
@@ -1773,7 +1905,9 @@ mod tests {
         let store = test_store();
         match store.load_or_create_device() {
             Ok(_) => {}
-            Err(RemoteTrustError::Unsupported) => return,
+            Err(RemoteTrustError::Unsupported) if !cfg!(any(windows, target_os = "linux")) => {
+                return
+            }
             Err(error) => panic!("{error:?}"),
         }
         let host_id = fixture_host_id(8);
@@ -1810,7 +1944,9 @@ mod tests {
         let store = test_store();
         match store.load_or_create_device() {
             Ok(_) => {}
-            Err(RemoteTrustError::Unsupported) => return,
+            Err(RemoteTrustError::Unsupported) if !cfg!(any(windows, target_os = "linux")) => {
+                return
+            }
             Err(error) => panic!("{error:?}"),
         }
         let host = ConnectNoiseCustody::generate().expect("host");
@@ -1860,7 +1996,9 @@ mod tests {
         let store = test_store();
         match store.load_or_create_device() {
             Ok(_) => {}
-            Err(RemoteTrustError::Unsupported) => return,
+            Err(RemoteTrustError::Unsupported) if !cfg!(any(windows, target_os = "linux")) => {
+                return
+            }
             Err(error) => panic!("{error:?}"),
         }
         let host = ConnectNoiseCustody::generate().expect("host");
@@ -1919,7 +2057,9 @@ mod tests {
         let store = test_store();
         match store.load_or_create_device() {
             Ok(_) => {}
-            Err(RemoteTrustError::Unsupported) => return,
+            Err(RemoteTrustError::Unsupported) if !cfg!(any(windows, target_os = "linux")) => {
+                return
+            }
             Err(error) => panic!("{error:?}"),
         }
         let host = ConnectNoiseCustody::generate().expect("host");
@@ -1979,7 +2119,9 @@ mod tests {
         let store = test_store();
         match store.load_or_create_device() {
             Ok(_) => {}
-            Err(RemoteTrustError::Unsupported) => return,
+            Err(RemoteTrustError::Unsupported) if !cfg!(any(windows, target_os = "linux")) => {
+                return
+            }
             Err(error) => panic!("{error:?}"),
         }
         let host = ConnectNoiseCustody::generate().expect("host");
@@ -2041,7 +2183,9 @@ mod tests {
         let store = test_store();
         match store.load_or_create_device() {
             Ok(_) => {}
-            Err(RemoteTrustError::Unsupported) => return,
+            Err(RemoteTrustError::Unsupported) if !cfg!(any(windows, target_os = "linux")) => {
+                return
+            }
             Err(error) => panic!("{error:?}"),
         }
         let host = ConnectNoiseCustody::generate().expect("host");
@@ -2072,7 +2216,9 @@ mod tests {
         let store = test_store();
         match store.load_or_create_device() {
             Ok(_) => {}
-            Err(RemoteTrustError::Unsupported) => return,
+            Err(RemoteTrustError::Unsupported) if !cfg!(any(windows, target_os = "linux")) => {
+                return
+            }
             Err(error) => panic!("{error:?}"),
         }
         let ca = fixture_ca_pem();
@@ -2100,7 +2246,9 @@ mod tests {
         let store = test_store();
         match store.load_or_create_device() {
             Ok(_) => {}
-            Err(RemoteTrustError::Unsupported) => return,
+            Err(RemoteTrustError::Unsupported) if !cfg!(any(windows, target_os = "linux")) => {
+                return
+            }
             Err(error) => panic!("{error:?}"),
         }
         let host = ConnectNoiseCustody::generate().expect("host");
@@ -2149,7 +2297,9 @@ mod tests {
         let store = test_store();
         match store.load_or_create_device() {
             Ok(_) => {}
-            Err(RemoteTrustError::Unsupported) => return,
+            Err(RemoteTrustError::Unsupported) if !cfg!(any(windows, target_os = "linux")) => {
+                return
+            }
             Err(error) => panic!("{error:?}"),
         }
         let ca = fixture_ca_pem();
@@ -2296,7 +2446,9 @@ mod tests {
         };
         match persist_trusted_host_for_test(&store, &record_hi, "dm_web=cookie-hi") {
             Ok(()) => {}
-            Err(RemoteTrustError::Unsupported) => return,
+            Err(RemoteTrustError::Unsupported) if !cfg!(any(windows, target_os = "linux")) => {
+                return
+            }
             Err(error) => panic!("{error:?}"),
         }
         persist_trusted_host_for_test(&store, &record_lo, "dm_web=cookie-lo").expect("persist lo");
@@ -2348,7 +2500,9 @@ mod tests {
             };
             match persist_trusted_host_for_test(&store, &record, "dm_web=boundary-fixture") {
                 Ok(()) => expected.push(record),
-                Err(RemoteTrustError::Unsupported) => return,
+                Err(RemoteTrustError::Unsupported) if !cfg!(any(windows, target_os = "linux")) => {
+                    return
+                }
                 Err(error) => panic!("{error:?}"),
             }
         }
@@ -2397,7 +2551,9 @@ mod tests {
             "dm_web=ok",
         ) {
             Ok(()) => {}
-            Err(RemoteTrustError::Unsupported) => return,
+            Err(RemoteTrustError::Unsupported) if !cfg!(any(windows, target_os = "linux")) => {
+                return
+            }
             Err(error) => panic!("{error:?}"),
         }
         let bad_id = fixture_host_id(0x32);
@@ -2415,7 +2571,9 @@ mod tests {
         let store = test_store();
         let device = match store.load_or_create_device() {
             Ok(device) => device,
-            Err(RemoteTrustError::Unsupported) => return,
+            Err(RemoteTrustError::Unsupported) if !cfg!(any(windows, target_os = "linux")) => {
+                return
+            }
             Err(error) => panic!("{error:?}"),
         };
         let device_bytes = fs::read(store.device_path()).expect("device bytes");
@@ -2487,7 +2645,9 @@ mod tests {
         };
         match persist_trusted_host_for_test(&store, &old, "dm_web=old") {
             Ok(()) => {}
-            Err(RemoteTrustError::Unsupported) => return,
+            Err(RemoteTrustError::Unsupported) if !cfg!(any(windows, target_os = "linux")) => {
+                return
+            }
             Err(error) => panic!("{error:?}"),
         }
         let mut replacement = old.clone();
@@ -2524,7 +2684,9 @@ mod tests {
         };
         match persist_trusted_host_for_test(&store, &record, "dm_web=keep") {
             Ok(()) => {}
-            Err(RemoteTrustError::Unsupported) => return,
+            Err(RemoteTrustError::Unsupported) if !cfg!(any(windows, target_os = "linux")) => {
+                return
+            }
             Err(error) => panic!("{error:?}"),
         }
         let path = store.host_path(host_id);
@@ -2569,7 +2731,9 @@ mod tests {
         };
         match persist_trusted_host_for_test(&store, &record, "dm_web=will-forget") {
             Ok(()) => {}
-            Err(RemoteTrustError::Unsupported) => return,
+            Err(RemoteTrustError::Unsupported) if !cfg!(any(windows, target_os = "linux")) => {
+                return
+            }
             Err(error) => panic!("{error:?}"),
         }
         let (release, hold) = mpsc::sync_channel::<()>(1);

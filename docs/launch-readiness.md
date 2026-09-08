@@ -129,6 +129,25 @@ file mutation, browser repair retention and Windows installer inspection remain
 in the latest failure list. The previous port-forward failures did not recur
 in `full5`; their deadline sensitivity still warrants review.
 
+### Linux remote trust storage
+
+The Linux store now holds a nonblocking exclusive `flock` on an owner-only,
+no-follow lock descriptor. It validates owner, mode, link count and the held
+file's identity before and after acquisition, creates private trust directories,
+and refuses writable-by-others layouts. Encrypted record reads and rollback
+reads reject final symlinks. Windows retains its existing exclusive share mode.
+
+All **27 native remote-trust tests passed** on Linux, including concurrent device
+creation, exact encrypted reload, metadata/cookie tampering, queued cancellation,
+admitted-write timeout, sorted rosters and exact forget semantics. Linux tests
+no longer silently return on `Unsupported`. New regressions cover exclusive
+locking, replacement, symlink/hardlink and permission refusal, and no-follow
+transaction rollback. The all-target compiler check passed. Logs:
+`linux-production/trust-{green,check}.log`. These unit tests use process-local
+custody keys; the separately recorded real wallet acceptance remains applicable.
+Production config/remote hashes are unchanged and no owned build/test process
+remains. A live remote enrollment/Noise session is still a launch gate.
+
 ## Live desktop inspection
 
 The rebuilt native shell now launches with its real sibling host on this Linux
