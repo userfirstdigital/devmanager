@@ -6586,6 +6586,24 @@ fn main() {
         }
         "cycle" => run_cycle(args),
         "cycle-worker" => parse_bounded_options(args).and_then(run_cycle_worker),
+        "probe-parent-exit" => {
+            let pid_path = required_path(&mut args, "probe child PID path");
+            let child_marker = pid_path.with_extension("ready");
+            // The tested probe's process group / Windows Job owns this child.
+            // Deliberately let the parent exit while inherited stdout stays open.
+            let child = Command::new(std::env::current_exe().expect("helper executable"))
+                .arg("mark-wait")
+                .arg(child_marker)
+                .stdin(Stdio::null())
+                .stdout(Stdio::inherit())
+                .stderr(Stdio::inherit())
+                .spawn()
+                .expect("spawn inherited-pipe child");
+            write_marker(&pid_path, child.id().to_string());
+            println!("probe-complete");
+            io::stdout().flush().expect("flush probe completion");
+            Ok(())
+        }
         "mark-wait" => {
             mark_and_wait(&required_path(&mut args, "marker path"));
             Ok(())

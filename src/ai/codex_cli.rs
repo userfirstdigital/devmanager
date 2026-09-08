@@ -593,29 +593,24 @@ mod tests {
 
         #[cfg(windows)]
         let (executable, args) = {
-            let script_path = temp.join("probe-wrapper.ps1");
-            std::fs::write(
-                &script_path,
-                r#"param([string]$PidPath)
-$startInfo = [Diagnostics.ProcessStartInfo]::new()
-$startInfo.FileName = 'cmd.exe'
-$startInfo.Arguments = '/c ping.exe -n 60 127.0.0.1'
-$startInfo.UseShellExecute = $false
-$startInfo.CreateNoWindow = $true
-$child = [Diagnostics.Process]::Start($startInfo)
-[IO.File]::WriteAllText($PidPath, [string]$child.Id)
-[Console]::Out.WriteLine('probe-complete')
-exit 0
-"#,
-            )
-            .unwrap();
+            // Exercise inherited pipe ownership directly. Starting a fresh
+            // PowerShell runtime can consume the entire four-second cleanup
+            // assertion on a cold Windows runner before the wrapper even exits.
+            let harness = std::env::current_exe().expect("test harness");
+            let executable = harness
+                .parent()
+                .expect("deps")
+                .parent()
+                .expect("target debug")
+                .join("devmanager-process-test-helper.exe");
+            assert!(
+                executable.is_file(),
+                "build devmanager-process-test-helper before this test"
+            );
             (
-                resolve_executable("powershell.exe").unwrap(),
+                executable,
                 vec![
-                    "-NoProfile".to_string(),
-                    "-NonInteractive".to_string(),
-                    "-File".to_string(),
-                    script_path.to_string_lossy().into_owned(),
+                    "probe-parent-exit".to_string(),
                     pid_path.to_string_lossy().into_owned(),
                 ],
             )
