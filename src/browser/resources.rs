@@ -215,7 +215,7 @@ impl BrowserResourceStore {
         &self,
         authority: &BrowserReplayRepairRetentionAuthority,
     ) -> Result<BrowserReplayRepairRetentionLease, BrowserError> {
-        #[cfg(not(target_os = "windows"))]
+        #[cfg(not(any(target_os = "windows", target_os = "linux")))]
         {
             let _ = authority;
             return Err(BrowserError::UnavailablePlatform {
@@ -223,7 +223,7 @@ impl BrowserResourceStore {
             });
         }
 
-        #[cfg(target_os = "windows")]
+        #[cfg(any(target_os = "windows", target_os = "linux"))]
         {
             self.verify_root()?;
             let mut state = lock(&self.inner.runtime.gate);
@@ -795,7 +795,19 @@ fn open_root_lock_file(root: &Path) -> Result<File, BrowserError> {
         }
     };
 
-    #[cfg(not(target_os = "windows"))]
+    #[cfg(target_os = "linux")]
+    let result = {
+        use std::os::unix::fs::OpenOptionsExt;
+        std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK)
+            .open(&path)
+    };
+
+    #[cfg(not(any(target_os = "windows", target_os = "linux")))]
     let result = match std::fs::OpenOptions::new()
         .read(true)
         .write(true)
@@ -822,6 +834,20 @@ fn open_root_lock_file(root: &Path) -> Result<File, BrowserError> {
         BrowserError::ResourceRootUnavailable
     })?;
     validate_opened_root_lock(root, &path, &file, expected_identity)?;
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::fd::AsRawFd;
+        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+            return Err(
+                if std::io::Error::last_os_error().kind() == std::io::ErrorKind::WouldBlock {
+                    BrowserError::ResourceRootBusy
+                } else {
+                    BrowserError::ResourceRootUnavailable
+                },
+            );
+        }
+        validate_opened_root_lock(root, &path, &file, ())?;
+    }
     Ok(file)
 }
 
@@ -876,6 +902,30 @@ fn validate_opened_root_lock(
         }
     }
 
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let opened = file
+            .metadata()
+            .map_err(|_| BrowserError::ResourceRootUnavailable)?;
+        let named =
+            std::fs::symlink_metadata(path).map_err(|_| BrowserError::ResourceRootUnavailable)?;
+        let directory =
+            std::fs::symlink_metadata(root).map_err(|_| BrowserError::ResourceRootUnavailable)?;
+        let owner = unsafe { libc::geteuid() };
+        if !directory.is_dir()
+            || directory.uid() != owner
+            || directory.mode() & 0o022 != 0
+            || !opened.is_file()
+            || !named.is_file()
+            || opened.nlink() != 1
+            || opened.uid() != owner
+            || opened.mode() & 0o022 != 0
+            || (opened.dev(), opened.ino()) != (named.dev(), named.ino())
+        {
+            return Err(BrowserError::ResourceRootUnavailable);
+        }
+    }
     #[cfg(not(target_os = "windows"))]
     let _ = file;
     Ok(())
@@ -1061,7 +1111,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(target_os = "windows")]
+    #[cfg(any(target_os = "windows", target_os = "linux"))]
     fn exact_authority_allows_only_one_live_lease_and_carries_owner_and_scope() {
         let root = std::env::temp_dir().join(format!(
             "devmanager-browser-resource-authority-{}",
@@ -1094,7 +1144,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(target_os = "windows")]
+    #[cfg(any(target_os = "windows", target_os = "linux"))]
     fn retention_is_effectively_pinned_but_persisted_unpinned_until_drop() {
         let root = test_root("effective-pin");
         let first = BrowserResourceStore::open(&root, test_limits(0)).unwrap();
@@ -1130,7 +1180,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(target_os = "windows")]
+    #[cfg(any(target_os = "windows", target_os = "linux"))]
     fn repair_resources_reject_cross_root_wrong_kind_duplicates_and_manual_pins() {
         let first_root = test_root("exact-first");
         let other_root = test_root("exact-other");
@@ -1196,7 +1246,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(target_os = "windows")]
+    #[cfg(any(target_os = "windows", target_os = "linux"))]
     fn dropping_one_lease_releases_only_its_resources() {
         let root = test_root("lease-isolation");
         let store = BrowserResourceStore::open(&root, test_limits(0)).unwrap();
@@ -1273,7 +1323,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(target_os = "windows")]
+    #[cfg(any(target_os = "windows", target_os = "linux"))]
     fn resource_runtime_child_helper() {
         let Ok(mode) = std::env::var("DEVMANAGER_REPAIR_RESOURCE_UNIT_CHILD") else {
             return;
@@ -1308,7 +1358,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(target_os = "windows")]
+    #[cfg(any(target_os = "windows", target_os = "linux"))]
     fn lease_alone_keeps_lock_alive_and_final_drop_releases_it() {
         let root = test_root("lease-lock");
         let store = BrowserResourceStore::open(&root, test_limits(1)).unwrap();
@@ -1343,7 +1393,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(target_os = "windows")]
+    #[cfg(any(target_os = "windows", target_os = "linux"))]
     fn crash_reopen_observes_no_persistent_repair_pin() {
         let root = test_root("crash");
         std::fs::create_dir_all(&root).unwrap();
@@ -1378,6 +1428,29 @@ mod tests {
         ));
         drop(store);
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_resource_lock_rejects_linked_and_replaced_mutex_identity() {
+        let root = tempfile::tempdir().expect("resource root");
+        let held = open_root_lock_file(root.path()).expect("lock root");
+        assert!(matches!(
+            open_root_lock_file(root.path()),
+            Err(BrowserError::ResourceRootBusy)
+        ));
+        let path = root.path().join(ROOT_LOCK_FILE);
+        let old = root.path().join("old-lock");
+        std::fs::rename(&path, &old).unwrap();
+        std::fs::write(&path, b"").unwrap();
+        assert!(validate_opened_root_lock(root.path(), &path, &held, ()).is_err());
+        std::fs::remove_file(&path).unwrap();
+        std::os::unix::fs::symlink(&old, &path).unwrap();
+        assert!(open_root_lock_file(root.path()).is_err());
+        std::fs::remove_file(&path).unwrap();
+        std::fs::hard_link(&old, &path).unwrap();
+        assert!(open_root_lock_file(root.path()).is_err());
+        drop(held);
     }
 
     #[test]

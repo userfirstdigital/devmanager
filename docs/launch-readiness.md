@@ -167,6 +167,22 @@ workspace,check}.log`. This acceptance used workspaces on the same filesystem as
 the isolated temporary directory; cross-filesystem cleanup remains to be checked.
 Production config/remote hashes and installed-process baseline remain unchanged.
 
+### Linux browser resource retention
+
+Browser repair evidence now uses a retained exclusive Linux `flock`, with
+no-follow opens and owner, writable-mode, link-count and exact inode validation.
+The shared runtime and every live retention lease keep that lock alive. Enabled
+the portable retention tests on Linux: a separate harness process proves the
+lock outlives the store while a lease remains and becomes available after final
+drop; crash/reopen proves repair pins are not falsely persisted. Replacement,
+symlink/hardlink, exact owner/scope, cross-root and cleanup-isolation checks pass.
+
+All **185 matching browser library tests passed**, including both previously
+failing gateway lifecycle cases. All-target check passed. Logs:
+`linux-production/browser-linux-{resources,check}.log`. No owned child harness
+or compiler remains and production hashes are unchanged. This enables resource
+custody only; it does not supply or certify an embedded Linux browser host.
+
 ## Live desktop inspection
 
 The rebuilt native shell now launches with its real sibling host on this Linux
