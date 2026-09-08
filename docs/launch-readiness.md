@@ -493,3 +493,15 @@ The app, sibling host and automation exited; production config/remote hashes
 were unchanged and no owned Rust process remained. Private evidence:
 `cursor-{discovery-green,adapter,stock-probe,custody,custody-check}.log` and
 `cursor-provider-list.png`.
+
+### Narrow native workspace
+
+The pane canvas now subtracts the board's painted width. Previously it used a
+smaller fitted width while the board retained its saved width, pushing pane
+actions past the window edge. Live 960×640 inspection now shows the complete
+Changes pane, including View diff, Stage, Done and menu actions. Two selected
+tasks fit in stacked panes at 960×640 and remain contained at 1523×834.
+Validation: 365 native-shell tests passed (five existing ignored), all-target
+check and native build passed; the exact app and host exited. Private evidence:
+`narrow-{native,check,build}.log`, `narrow-fixed-live.png`,
+`narrow-multiple-panes.png`, and `wide-multiple-panes.png`.

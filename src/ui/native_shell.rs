@@ -44489,15 +44489,17 @@ impl NativeShell {
         tokens: crate::ui::tokens::ThemeTokens,
         viewport: Size<Pixels>,
         layout: KeyedWorkspaceLayout<HostTaskKey>,
-        archived: bool,
+        painted_board_width: f32,
     ) -> Size<Pixels> {
         let dock = if layout.dock_collapsed {
             0.0
         } else {
             Self::RAIL_THICKNESS + layout.dock_width
         };
-        let width =
-            f32::from(viewport.width) - board_column_width_for(&layout, archived) - dock - 2.0;
+        // The board paints its saved width; `layout` has fitted dock geometry.
+        // Subtracting a separately fitted inbox width overallocates the canvas
+        // on narrow windows and clips the pane's rightmost controls.
+        let width = f32::from(viewport.width) - painted_board_width - dock - 2.0;
         // F1: the panel grid starts directly under the window's own top bar,
         // so the row it fills is the window minus that bar and the frame's
         // hairline -- there is no header row between the two any more.
@@ -46643,7 +46645,7 @@ impl NativeShell {
                 tokens,
                 viewport,
                 layout.clone(),
-                self.show_archived_tasks,
+                board_width,
             ),
             &board,
             cx,
