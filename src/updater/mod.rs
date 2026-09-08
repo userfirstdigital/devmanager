@@ -2263,13 +2263,19 @@ mod tests {
             current_version: "0.2.0".to_string(),
             version: version.to_string(),
             date: None,
-            target: "windows".to_string(),
+            target: packager_os_target().expect("supported test platform"),
             extract_path: PathBuf::from("."),
             download_url: Url::parse("https://example.com/devmanager.exe").unwrap(),
             signature: "signature".to_string(),
             timeout: None,
             headers: Default::default(),
-            format: UpdateFormat::Nsis,
+            format: if cfg!(target_os = "linux") {
+                UpdateFormat::AppImage
+            } else if cfg!(target_os = "macos") {
+                UpdateFormat::App
+            } else {
+                UpdateFormat::Nsis
+            },
         }
     }
 

@@ -183,6 +183,16 @@ failing gateway lifecycle cases. All-target check passed. Logs:
 or compiler remains and production hashes are unchanged. This enables resource
 custody only; it does not supply or certify an embedded Linux browser host.
 
+### Portable updater state fixtures
+
+The four remaining updater state-test failures came from a Windows-only fixture
+being compared against the actual Linux OS/architecture. The fixture now selects
+the current platform and its packager format. All **18 updater library tests**
+and the all-target check passed (`linux-production/updater-platform-{fixtures,
+check}.log`). No production updater behavior changed. Real Linux package
+construction, paired binary names/staging and install/update acceptance remain
+separate gates; these state tests do not certify an installer.
+
 ## Live desktop inspection
 
 The rebuilt native shell now launches with its real sibling host on this Linux
