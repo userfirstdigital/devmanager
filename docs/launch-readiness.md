@@ -9,8 +9,7 @@ is green: **4,111 passed, zero failed, 20 ignored** on `d61142e4`. Native
 client/host integration (21 tests), exact-resume mismatch (four tests), file
 integration (83 tests), and all-target compiler checks passed. Real Windows
 desktop/install validation, Linux embedded-browser and package/update support,
-historical stranded recovery
-receipts, and live remote enrollment still require acceptance.
+and live remote enrollment still require acceptance.
 
 ## Changes panel and portable candidate follow-up
 
@@ -505,3 +504,22 @@ Validation: 365 native-shell tests passed (five existing ignored), all-target
 check and native build passed; the exact app and host exited. Private evidence:
 `narrow-{native,check,build}.log`, `narrow-fixed-live.png`,
 `narrow-multiple-panes.png`, and `wide-multiple-panes.png`.
+
+### Historical provider release cleanup
+
+A release receipt stranded after encrypted-row deletion failed can now retire
+after its session advances. One write transaction verifies the exact pending
+receipt, released and settled historical ownership, and the complete ordered
+provider state journal through the current projection. Missing, duplicate,
+foreign or unconfirmed history stays visible; no newer claim is released.
+The recovery scan has explicit row and byte bounds.
+
+The success and corruption tests passed, along with all 95 provider session
+tests and the all-target check. In the rebuilt live isolated profile both old
+receipts cleared. The existing 42 journal rows and historical settlement rows
+remained unchanged. One previously blocked task then restored the same provider
+conversation at action epoch 3, appending five legitimate journal rows. Its
+exact provider PID 3752185 and the app/host/guardian all exited. Production
+config/remote hashes were unchanged. Private evidence: `historical-*.log`,
+`historical-live.png` and `historical-live-result.json`; the pre-run database
+backup remains private in launch evidence.

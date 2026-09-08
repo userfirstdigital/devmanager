@@ -2779,6 +2779,16 @@ pub trait ProviderSessionStateStore: sealed::ProviderSessionStateStore {
         self.release_recovery(&receipt.state, &receipt.claim)
     }
 
+    /// Retire only obsolete release metadata after the store proves its exact
+    /// historical journal lineage and already-settled, unclaimed ownership.
+    /// This must not release or stop any current runtime.
+    fn retire_settled_historical_release(
+        &mut self,
+        _receipt: &RecoveryReleaseReceipt,
+    ) -> Result<bool, String> {
+        Ok(false)
+    }
+
     fn clear_recovery_release(&mut self, _receipt: &RecoveryReleaseReceipt) -> Result<(), String> {
         Err(
             "provider session store does not implement durable recovery release receipts"
@@ -5015,6 +5025,156 @@ impl ProviderSessionStateStore for SqliteProviderSessionStateStore {
         transaction.commit().map_err(|error| error.to_string())
     }
 
+    fn retire_settled_historical_release(
+        &mut self,
+        receipt: &RecoveryReleaseReceipt,
+    ) -> Result<bool, String> {
+        const MAX_JOURNAL_ROWS: usize = 4096;
+        const MAX_JOURNAL_BYTES: usize = 16 * 1024 * 1024;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|error| error.to_string())?;
+        let Some(row) = transaction
+            .query_row(
+                "SELECT receipt_id, agent_session_id, generation, action_epoch,
+                    launch_nonce, state_json, claim_owner_id, claim_generation,
+                    claim_deadline_ms, claim_settled, handoff_receipt_id, handoff_confirmed,
+                    cleanup_owner_id, cleanup_claim_generation, cleanup_deadline_ms
+             FROM provider_session_recovery_release_pending WHERE receipt_id = ?1",
+                params![receipt.receipt_id.to_string()],
+                pending_release_row,
+            )
+            .optional()
+            .map_err(|error| error.to_string())?
+        else {
+            return Ok(false);
+        };
+        let exact_ciphertext = row.5.clone();
+        let existing = decode_recovery_release_row(row)?;
+        if existing != *receipt {
+            return Err("historical provider release receipt is stale".into());
+        }
+        if (receipt.handoff_receipt.is_some() && !receipt.handoff_confirmed)
+            || (receipt.cleanup_owner_id.is_some()
+                && receipt.cleanup_deadline_ms > recovery_now_ms())
+        {
+            return Ok(false);
+        }
+        let current = Self::load_transaction_state(&transaction, receipt.state.agent_session_id)?
+            .ok_or("historical provider release current state is missing")?;
+        if same_recovery_identity(&receipt.state, &current)
+            || current.revision <= receipt.state.revision
+        {
+            return Ok(false);
+        }
+        let ownership: Option<(String, i64, Option<String>, i64, i64)> = transaction.query_row(
+            "SELECT ownership_state, revision, claim_owner_id, claim_generation, claim_deadline_ms
+             FROM provider_session_recovery_ownership
+             WHERE agent_session_id = ?1 AND generation = ?2 AND action_epoch = ?3 AND launch_nonce = ?4",
+            params![receipt.state.agent_session_id.to_string(),
+                checked_sql_i64(receipt.state.generation, "historical generation")?,
+                checked_sql_i64(receipt.state.action_epoch, "historical epoch")?,
+                receipt.state.launch_nonce.raw().to_string()],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
+        ).optional().map_err(|error| error.to_string())?;
+        let Some((status, revision, owner, claim_generation, deadline)) = ownership else {
+            return Ok(false);
+        };
+        let settled_revision = checked_sql_u64(revision, "historical settlement revision")?;
+        if status != RECOVERY_OWNERSHIP_SETTLED
+            || owner.is_some()
+            || deadline != 0
+            || checked_sql_u64(claim_generation, "historical claim generation")?
+                < receipt.claim.claim_generation
+            || settled_revision < receipt.state.revision
+            || settled_revision >= current.revision
+        {
+            return Ok(false);
+        }
+        // Consume the complete ordered state journal, including intermediate
+        // identity bindings and terminal facts. Neither the receipt nor the
+        // current projection alone is a trusted historical resume cursor.
+        let mut previous: Option<ProviderSessionState> = None;
+        let mut receipt_seen = false;
+        let mut settlement_seen = false;
+        let mut scanned_bytes = 0usize;
+        {
+            let mut statement = transaction
+                .prepare(
+                    "SELECT revision, lifecycle, state_json FROM provider_session_journal
+                 WHERE agent_session_id = ?1 ORDER BY sequence LIMIT ?2",
+                )
+                .map_err(|error| error.to_string())?;
+            let mut rows = statement
+                .query(params![
+                    receipt.state.agent_session_id.to_string(),
+                    (MAX_JOURNAL_ROWS + 1) as i64
+                ])
+                .map_err(|error| error.to_string())?;
+            let mut scanned = 0;
+            while let Some(row) = rows.next().map_err(|error| error.to_string())? {
+                scanned += 1;
+                let bytes = bounded_state_blob(row, 2).map_err(|error| error.to_string())?;
+                scanned_bytes = scanned_bytes.saturating_add(bytes.len());
+                if scanned > MAX_JOURNAL_ROWS || scanned_bytes > MAX_JOURNAL_BYTES {
+                    return Err("historical provider release journal exceeds recovery bound".into());
+                }
+                let state = ProviderSessionState::decode(&bytes)?;
+                let row_revision: i64 = row.get(0).map_err(|error| error.to_string())?;
+                let row_lifecycle: String = row.get(1).map_err(|error| error.to_string())?;
+                let expected_revision = previous
+                    .as_ref()
+                    .map_or(Some(1), |prior| prior.revision.checked_add(1))
+                    .ok_or("historical provider journal revision exhausted")?;
+                if state.revision != expected_revision
+                    || checked_sql_u64(row_revision, "historical journal revision")?
+                        != state.revision
+                    || row_lifecycle != persisted_lifecycle_name(state.lifecycle)
+                    || state.agent_session_id != receipt.state.agent_session_id
+                    || state.task_id != receipt.state.task_id
+                {
+                    return Err("historical provider release journal lineage is invalid".into());
+                }
+                if let Some(prior) = &previous {
+                    validate_same_generation_state_identity(prior, &state)?;
+                    validate_action_identity_transition(prior, &state)?;
+                }
+                if state.revision == receipt.state.revision {
+                    if state != receipt.state {
+                        return Err(
+                            "historical provider receipt has no exact journal lineage".into()
+                        );
+                    }
+                    receipt_seen = true;
+                }
+                if state.revision == settled_revision {
+                    if !same_recovery_identity(&receipt.state, &state) {
+                        return Err("historical provider settlement names another runtime".into());
+                    }
+                    settlement_seen = true;
+                }
+                previous = Some(state);
+            }
+        }
+        if !receipt_seen || !settlement_seen || previous.as_ref() != Some(&current) {
+            return Err(
+                "historical provider release journal does not reach the current projection".into(),
+            );
+        }
+        // Only metadata for this already-settled historical identity is removed.
+        // The current state, journal and every process claim remain untouched.
+        let removed = transaction.execute(
+            "DELETE FROM provider_session_recovery_release_pending WHERE receipt_id = ?1 AND state_json = ?2",
+            params![receipt.receipt_id.to_string(), exact_ciphertext],
+        ).map_err(|error| error.to_string())?;
+        if removed != 1 {
+            return Err("historical provider release receipt changed".into());
+        }
+        transaction.commit().map_err(|error| error.to_string())?;
+        Ok(true)
+    }
+
     fn forget_task(&mut self, task_id: TaskId) -> Result<u64, String> {
         // Which rows belong to this task can only be answered by decoding
         // `state_json`: `provider_session_states` is keyed by agent session
@@ -7170,6 +7330,19 @@ impl<L: ProviderProcessLauncher, S: ProviderSessionStateStore> ProviderSessionMa
                 }
             };
             if !same_recovery_identity(&receipt.state, &current) {
+                match self.state_store.retire_settled_historical_release(&receipt) {
+                    Ok(true) => {
+                        self.forget_release_receipt(&receipt);
+                        continue;
+                    }
+                    Ok(false) => {}
+                    Err(error) => {
+                        if first_error.is_none() {
+                            first_error = Some(ProviderSessionError::StateStore(error));
+                        }
+                        continue;
+                    }
+                }
                 if first_error.is_none() {
                     first_error = Some(ProviderSessionError::RecoveryAuthorityMismatch {
                         expected_generation: receipt.state.generation,
@@ -10569,6 +10742,143 @@ mod tests {
         store.clear_recovery_release(&receipt).unwrap();
         assert!(store.list_recovery_releases().unwrap().is_empty());
         store.clear_recovery_release(&receipt).unwrap();
+    }
+
+    fn historical_release_fixture() -> (
+        SqliteProviderSessionStateStore,
+        RecoveryReleaseReceipt,
+        ProviderSessionState,
+    ) {
+        let executable = ProviderExecutable::from_path(std::env::current_exe().unwrap()).unwrap();
+        let root = repin_fixture_root(&executable);
+        let mut state = repin_fixture_state(executable, Some(root));
+        state
+            .launch_spec
+            .environment
+            .insert("PRIVATE_ENV".into(), "historical-test-secret".into());
+        let mut store = SqliteProviderSessionStateStore::open(":memory:").unwrap();
+        store.persist(state.clone()).unwrap();
+        let claim = store
+            .claim_recovery(&state, Uuid::now_v7(), recovery_now_ms())
+            .unwrap()
+            .unwrap();
+        let receipt =
+            RecoveryReleaseReceipt::new(&state, &claim).with_handoff_intent(Uuid::now_v7());
+        let receipt = receipt.with_handoff_confirmed(receipt.handoff_receipt.unwrap());
+        store.record_recovery_release(&receipt).unwrap();
+        store.mark_recovery_settled(&state, &claim).unwrap();
+        store.release_recovery(&state, &claim).unwrap();
+        state.revision += 1;
+        state.lifecycle = PersistedRuntimeLifecycle::Replaced;
+        store.persist(state.clone()).unwrap();
+        state.revision += 1;
+        state.generation += 1;
+        state.action_epoch += 1;
+        state.launch_spec.generation = state.generation;
+        state.launch_nonce = LaunchNonce::new();
+        state.launch_spec.launch_nonce = state.launch_nonce;
+        state.lifecycle = PersistedRuntimeLifecycle::Starting;
+        state.process_root = None;
+        store.persist(state.clone()).unwrap();
+        store
+            .claim_recovery(&state, Uuid::now_v7(), recovery_now_ms())
+            .unwrap()
+            .unwrap();
+        (store, receipt, state)
+    }
+
+    #[test]
+    fn historical_settled_release_retires_without_touching_new_claim_or_journal() {
+        let (mut store, receipt, current) = historical_release_fixture();
+        let ownership = |store: &SqliteProviderSessionStateStore| -> Vec<(String, i64, i64)> {
+            store.connection.prepare("SELECT COALESCE(claim_owner_id, ''), claim_generation, revision FROM provider_session_recovery_ownership ORDER BY generation").unwrap()
+                .query_map([], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?))).unwrap().map(Result::unwrap).collect()
+        };
+        let before = ownership(&store);
+        assert!(store.retire_settled_historical_release(&receipt).unwrap());
+        assert!(store.list_recovery_releases().unwrap().is_empty());
+        assert_eq!(ownership(&store), before);
+        assert_eq!(
+            store.load(current.agent_session_id).unwrap().unwrap(),
+            current
+        );
+        let journal_count: i64 = store
+            .connection
+            .query_row("SELECT COUNT(*) FROM provider_session_journal", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(journal_count, 3);
+    }
+
+    #[test]
+    fn historical_release_rejects_missing_duplicate_foreign_or_unsettled_lineage() {
+        for corruption in [
+            "hole",
+            "duplicate",
+            "foreign",
+            "unsettled",
+            "claimed",
+            "revision",
+            "unconfirmed",
+            "stale_receipt",
+        ] {
+            let (mut store, mut receipt, _) = historical_release_fixture();
+            match corruption {
+                "hole" => {
+                    store
+                        .connection
+                        .execute(
+                            "DELETE FROM provider_session_journal WHERE revision = 2",
+                            [],
+                        )
+                        .unwrap();
+                }
+                "duplicate" => {
+                    store.connection.execute("INSERT INTO provider_session_journal(agent_session_id, revision, lifecycle, state_json) SELECT agent_session_id, revision, lifecycle, state_json FROM provider_session_journal WHERE revision = 1", []).unwrap();
+                }
+                "foreign" => {
+                    let bytes: Vec<u8> = store
+                        .connection
+                        .query_row(
+                            "SELECT state_json FROM provider_session_journal WHERE revision = 2",
+                            [],
+                            |row| row.get(0),
+                        )
+                        .unwrap();
+                    let mut foreign = ProviderSessionState::decode(&bytes).unwrap();
+                    foreign.task_id = TaskId::new();
+                    foreign.launch_spec.task_id = foreign.task_id;
+                    store.connection.execute("UPDATE provider_session_journal SET state_json = ?1 WHERE revision = 2", params![foreign.encode().unwrap()]).unwrap();
+                }
+                "unsettled" => {
+                    store.connection.execute("UPDATE provider_session_recovery_ownership SET ownership_state = 'running' WHERE generation = 1", []).unwrap();
+                }
+                "claimed" => {
+                    store.connection.execute("UPDATE provider_session_recovery_ownership SET claim_owner_id = ?1 WHERE generation = 1", params![Uuid::now_v7().to_string()]).unwrap();
+                }
+                "revision" => {
+                    store.connection.execute("UPDATE provider_session_recovery_ownership SET revision = 999 WHERE generation = 1", []).unwrap();
+                }
+                "unconfirmed" => {
+                    store.connection.execute("UPDATE provider_session_recovery_release_pending SET handoff_confirmed = 0", []).unwrap();
+                    receipt.handoff_confirmed = false;
+                }
+                "stale_receipt" => {
+                    receipt.state.revision += 1;
+                }
+                _ => unreachable!(),
+            }
+            assert!(
+                !matches!(store.retire_settled_historical_release(&receipt), Ok(true)),
+                "must preserve {corruption}"
+            );
+            assert_eq!(
+                store.list_recovery_releases().unwrap().len(),
+                1,
+                "must retain {corruption}"
+            );
+        }
     }
 
     #[test]
