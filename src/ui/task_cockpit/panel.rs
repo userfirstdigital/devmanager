@@ -204,7 +204,20 @@ pub fn panel_button_shell(tokens: ThemeTokens, enabled: bool) -> gpui::Div {
 /// Rule 4's default button, from `panel_button_shell`.
 pub fn render_panel_action(action: &PanelAction, target: &str, tokens: ThemeTokens) -> AnyElement {
     let label = action.disabled_reason.map_or_else(
-        || action_label(action.action_id),
+        || match &action.request {
+            ActionRequest::TaskCockpit { query, .. } => match query {
+                crate::domain::cockpit::TaskCockpitQuery::GitFileDiffTargeted { .. } => "View diff",
+                crate::domain::cockpit::TaskCockpitQuery::GitMutateTargeted { intent, .. } => {
+                    match intent {
+                        crate::domain::cockpit::TaskGitMutateIntent::Stage { .. } => "Stage",
+                        crate::domain::cockpit::TaskGitMutateIntent::Unstage { .. } => "Unstage",
+                        _ => action_label(action.action_id),
+                    }
+                }
+                _ => action_label(action.action_id),
+            },
+            _ => action_label(action.action_id),
+        },
         PanelDisabledReason::label,
     );
     panel_button_shell(tokens, action.is_enabled())

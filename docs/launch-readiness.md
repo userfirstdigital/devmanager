@@ -12,6 +12,39 @@ desktop/install validation, Linux embedded-browser and package/update support,
 Cursor discovery, cross-filesystem file cleanup, historical stranded recovery
 receipts, and live remote enrollment still require acceptance.
 
+## Changes panel and portable candidate follow-up
+
+The native Changes pane now lists the host's bounded changed-file entries,
+shows exact-repository diffs, and provides Stage/Unstage actions through the
+existing task/revision/focus-fenced dispatcher. Read-only repositories keep diff
+access and disable mutations. A Review and commit control opens the existing
+full Git window. The live Linux pass displayed the provider-created
+`launch-check.md`, rendered its added line, staged and unstaged it, and opened
+the commit window. The Git index independently confirmed both transitions.
+
+The pass also exposed a saved Changes pane whose initial host refresh still
+used the default dock tool. Canonical task follow now restores the pane's tool
+before its initial refresh, without adding a periodic query loop. Global
+startup status/settings requests are captured before that pane query wave, so
+they cannot invalidate its pending replies. The regression exercises the
+production reply-admission predicate as well as initial requests.
+
+Debug candidate launchers explicitly select the extracted directory as their
+isolated workspace/profile root. They no longer require the original build
+machine's source directory. The override is rejected by release builds.
+Candidate manifests include hashes for the generated launcher and README.
+
+Evidence: `linux-production/changes-final-*.log` (1,005 UI tests passed, six
+existing ignores; all-target check and app/host build passed),
+`changes-live-{row,diff,staged,git-window}.png`, and
+`candidate-entry-*.log` (two portable-entry tests, all-target check, build).
+The final native follow-up passed 365 tests (five existing ignores), the
+all-target check and app/host rebuild (`changes-admission-*.log`). A fresh
+live process populated the persisted Changes pane without any tab gesture
+(`changes-admission-live.png`). Exact app/host shutdown and compiler/harness
+cleanup passed; production config/remote hashes remained unchanged.
+These are private local evidence files, not release archive inputs.
+
 ## Implemented
 
 - Combined `ui-redesign-w4` and `ui-redesign-clean`: panel grid/regrid, narrow

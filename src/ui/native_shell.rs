@@ -20772,6 +20772,13 @@ impl NativeShell {
             .action_epochs()
             .client_epoch;
         self.rebind_pending_client_epoch(client_epoch);
+        if first_canonical {
+            // Global setup advances the interaction handler. Finish that wave
+            // before capturing the selected pane's initial response fences.
+            let _ = self.dispatch_action(ActionRequest::HostStatus);
+            let _ = self.dispatch_agent_connection_query(false);
+            self.ensure_provider_settings_cache_lane();
+        }
         if let Some(key) = preserved_ephemeral_selection {
             // A canonical bootstrap/reconnect still follows the host's durable
             // raw selection internally. Restore the project-only shell as the
@@ -20780,7 +20787,7 @@ impl NativeShell {
             self.sync_cockpit_follow_for_owner(&key);
         } else {
             self.sync_cockpit_follow_with_refresh(
-                selected_task_changed || selected_task_needs_initial_follow,
+                first_canonical || selected_task_changed || selected_task_needs_initial_follow,
             );
         }
         self.try_advance_pending_delete_after_archive();
@@ -20788,14 +20795,21 @@ impl NativeShell {
         self.try_advance_pending_draft_first_send();
         if first_canonical {
             self.restore_active_dock_tool_from_layout();
-            let _ = self.dispatch_action(ActionRequest::HostStatus);
-            let _ = self.dispatch_agent_connection_query(false);
-            self.ensure_provider_settings_cache_lane();
         }
         Ok(())
     }
 
     fn restore_active_dock_tool_from_layout(&mut self) {
+        // The restored pane is the authoritative visible surface. Legacy dock
+        // preference only applies when the pane has no typed tool of its own.
+        if self
+            .selected_task_key
+            .as_ref()
+            .and_then(|owner| Self::dock_tool_for_view(self.pane_view(owner)))
+            .is_some()
+        {
+            return;
+        }
         let tool = match self.layout.active_dock_tab.as_deref() {
             Some("Changes") => Some(CockpitDockTool::Changes),
             Some("Files") => Some(CockpitDockTool::Files),
@@ -21284,6 +21298,7 @@ impl NativeShell {
             None
         };
         if refresh_host_surfaces {
+            self.restore_pane_tool_for_owner(&local_key);
             self.refresh_selected_cockpit_surfaces();
         }
         if let Some(model) = composer_model {
@@ -21382,6 +21397,7 @@ impl NativeShell {
             }
         }
         if refresh_host_surfaces {
+            self.restore_pane_tool_for_owner(key);
             self.refresh_cockpit_surfaces_for_owner(key);
         }
         // Eager owner queries advance the host interaction epoch. Bind the
@@ -21391,6 +21407,19 @@ impl NativeShell {
             self.sync_task_composer_for_owner(key, model.as_ref());
         } else {
             self.clear_composer_binding();
+        }
+    }
+
+    /// A restored pane owns its visible tool just as a clicked tab does.
+    /// Synchronize it once before the initial query wave, after canonical follow.
+    fn restore_pane_tool_for_owner(&mut self, owner: &HostTaskKey) {
+        let Some(tool) = Self::dock_tool_for_view(self.pane_view(owner)) else {
+            return;
+        };
+        if let Some(slot) = self.host_slot_mut(&owner.host) {
+            if slot.cockpit.active_tool() != tool {
+                let _ = slot.cockpit.handle_tool_action(tool, RequestId::new());
+            }
         }
     }
 
@@ -31397,6 +31426,108 @@ impl NativeShell {
                         "No repositories in the Task catalog yet.",
                         tokens,
                     ));
+                }
+                for row in &changes.files {
+                    let controls = div()
+                        .flex()
+                        .items_center()
+                        .gap(px(8.0))
+                        .child(Self::panel_action_element_for_owner(
+                            row.diff.clone(),
+                            &row.entry.relative_path,
+                            tokens,
+                            shell_entity.clone(),
+                            owner_for_actions.clone(),
+                            captured_focus,
+                        ))
+                        .child(Self::panel_action_element_for_owner(
+                            row.toggle_stage.clone(),
+                            &row.entry.relative_path,
+                            tokens,
+                            shell_entity.clone(),
+                            owner_for_actions.clone(),
+                            captured_focus,
+                        ))
+                        .into_any_element();
+                    let state = if row.entry.staged && row.entry.unstaged {
+                        "Staged and unstaged"
+                    } else if row.entry.staged {
+                        "Staged"
+                    } else {
+                        "Unstaged"
+                    };
+                    rows.push(
+                        panel_list_row(
+                            tokens,
+                            Some(crate::icons::FILE_TEXT),
+                            row.entry.relative_path.clone(),
+                            Some(format!("{:?} · {state}", row.entry.status)),
+                            Some(controls),
+                            false,
+                        )
+                        .into_any_element(),
+                    );
+                }
+                if changes.disabled_reason.is_none() && changes.files.is_empty() {
+                    rows.push(panel_empty_state("No uncommitted changes.", tokens));
+                } else if changes.change_count as usize > changes.files.len() {
+                    rows.push(panel_caption(
+                        &format!(
+                            "Showing {} of {} changed files.",
+                            changes.files.len(),
+                            changes.change_count
+                        ),
+                        tokens,
+                    ));
+                }
+                if let Some(diff) = live
+                    .and_then(|projection| projection.git_file_diff.as_ref())
+                    .filter(|diff| changes.accepts_diff(diff))
+                {
+                    rows.push(panel_caption(&diff.relative_path, tokens));
+                    rows.extend(crate::ui::task_cockpit::changes_panel::diff_rows(
+                        &diff.diff, &tokens,
+                    ));
+                }
+                if changes.selected_selector.is_some() {
+                    if let Some(shell_entity) = shell_entity.clone() {
+                        let git_owner = owner_key.clone();
+                        let control = panel_button_shell(tokens, true)
+                            .id("native-changes-review-commit")
+                            .child("Review and commit")
+                            .on_mouse_down(MouseButton::Left, move |_, window, app| {
+                                let _ = shell_entity.update(app, |shell, cx| {
+                                    cx.stop_propagation();
+                                    if shell.selected_task_key.as_ref() != Some(&git_owner) {
+                                        return;
+                                    }
+                                    let Some(slot) = shell.host_slot(&git_owner.host) else {
+                                        return;
+                                    };
+                                    let revision = slot
+                                        .client_model
+                                        .as_ref()
+                                        .and_then(|model| model.task(git_owner.task_id))
+                                        .map(|snapshot| snapshot.task.revision);
+                                    if Some(slot.interaction.current_focus_epoch())
+                                        != captured_focus
+                                        || revision != captured_revision
+                                    {
+                                        return;
+                                    }
+                                    shell.open_native_git_window(window, cx);
+                                });
+                            })
+                            .into_any_element();
+                        rows.push(
+                            div()
+                                .flex()
+                                .px(px(crate::ui::task_cockpit::panel::ROW_PADDING_X))
+                                .py(px(crate::ui::task_cockpit::panel::ROW_PADDING_Y))
+                                .child(control)
+                                .into_any_element(),
+                        );
+                    }
                 }
                 (
                     // Repository status must never be presented as the Project branch.
@@ -61257,6 +61388,12 @@ mod "
                 .interaction
                 .sync_selected_task(Some(task_id));
             assert_eq!(shell.local_slot_mut().cockpit.selected_task(), None);
+            let owner = shell.local_task_key(task_id);
+            let mut workspace = crate::ui::task_workspace::Workspace::single(owner.clone());
+            workspace
+                .set_view(owner, PaneView::Changes)
+                .expect("restore Changes pane");
+            shell.layout.task_workspace = Some(workspace);
             shared.lock().expect("runtime").accepted.clear();
 
             shell
@@ -61267,14 +61404,45 @@ mod "
                 shell.local_slot_mut().cockpit.selected_task(),
                 Some(task_id)
             );
-            assert!(
-                shared
-                    .lock()
-                    .expect("runtime")
-                    .accepted
-                    .iter()
-                    .any(|record| matches!(record.command, super::NativeHostCommand::TaskCockpitQuery { .. })),
-                "a restored selection that the cockpit has not followed must issue its initial conversation/files query wave"
+            assert_eq!(
+                shell.local_slot().cockpit.active_tool(),
+                CockpitDockTool::Changes
+            );
+            let queries = shared
+                .lock()
+                .expect("runtime")
+                .accepted
+                .iter()
+                .filter_map(|record| match &record.command {
+                    super::NativeHostCommand::TaskCockpitQuery { query, .. } => Some(query.clone()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            assert!(queries.contains(&TaskCockpitQuery::WorkspaceStatus));
+            assert!(queries.contains(&TaskCockpitQuery::GitRepositories));
+            assert!(!queries
+                .iter()
+                .any(|query| matches!(query, TaskCockpitQuery::FilesList { .. })));
+            for record in &shared.lock().expect("runtime").accepted {
+                if matches!(
+                    record.command,
+                    super::NativeHostCommand::TaskCockpitQuery { .. }
+                ) {
+                    assert!(
+                        shell
+                            .local_slot()
+                            .interaction
+                            .accepts_action_outcome_record(record),
+                        "startup follow-up requests must not invalidate the initial pane replies"
+                    );
+                }
+            }
+            let before = shared.lock().expect("runtime").accepted.len();
+            shell.sync_cockpit_follow();
+            assert_eq!(
+                shared.lock().expect("runtime").accepted.len(),
+                before,
+                "a restored panel must not start a repeated refresh loop"
             );
         });
     }
@@ -77677,11 +77845,11 @@ mod "
         body
     }
 
-    /// Both git diff views paint through lane R2's `diff_rows`, and the shell
+    /// All three git diff views paint through lane R2's `diff_rows`, and the shell
     /// no longer carries a diff painter of its own.
     ///
-    /// Two call sites is the denominator, and they are different views -- the
-    /// working-tree file and the selected commit -- so a revert of either is a
+    /// The Changes dock, working-tree file and selected commit share the painter,
+    /// so a revert of any view is a
     /// visible regression that a bare "the name appears" scan would miss.
     #[test]
     fn both_git_diff_views_paint_through_lane_r2s_diff_rows() {
@@ -77693,9 +77861,9 @@ mod "
         let call = concat!("changes_panel::diff", "_rows(");
         assert_eq!(
             shell.matches(call).count(),
-            2,
+            3,
             "the shell should ask the shared diff painter for its rows at exactly \
-             two sites (the working-tree file and the selected commit)"
+             three sites (Changes dock, working-tree file and selected commit)"
         );
         assert!(
             !shell.contains(concat!("native_git", "_diff_rows")),
@@ -77775,9 +77943,9 @@ mod "
     /// rows, group label and frame -- and every handler that was wired to them
     /// is still wired.
     ///
-    /// The denominators are counted, not implied: six `panel_list_row` sites
-    /// (the Changes repository, the Files `..` and `/` navigators, the Files
-    /// listing, the Artifacts list and the Review list), one frame, and four
+    /// The denominators are counted, not implied: seven `panel_list_row` sites
+    /// (Changes repository and file rows, the Files `..` and `/` navigators, the Files
+    /// listing, the Artifacts list and the Review list), one frame, and six
     /// owner-scoped action sites. A scan that only asked "is the painter
     /// mentioned" would keep passing with five of the six reverted, which is
     /// exactly the shape a partial revert takes.
@@ -77788,9 +77956,9 @@ mod "
 
         let list_rows = body.matches("panel_list_row(").count();
         assert_eq!(
-            list_rows, 6,
-            "expected six rule-5 list rows in the workspace dock body \
-             (Changes repo, Files `..`, Files `/`, Files listing, Artifacts, Review), \
+            list_rows, 7,
+            "expected seven rule-5 list rows in the workspace dock body \
+             (Changes repo/file, Files `..`, Files `/`, Files listing, Artifacts, Review), \
              found {list_rows}"
         );
         assert_eq!(
@@ -77804,8 +77972,8 @@ mod "
         // on those prints `SRC/UI · MAIN` and renames `Feature/Foo`.
         assert_eq!(
             body.matches("panel_caption(").count(),
-            1,
-            "the file preview's `Open · …` header should be the body's one caption"
+            3,
+            "file preview, changed-file overflow and selected diff captions must remain"
         );
         assert!(
             !body.contains("panel_group_label("),
@@ -77813,16 +77981,16 @@ mod "
         );
         assert_eq!(
             body.matches("panel_empty_state(").count(),
-            1,
-            "the empty repository list should be rule 9's one sentence"
+            2,
+            "empty repositories and clean worktrees should use a single sentence"
         );
 
         // The handlers, ids and accessibility nodes this substitution had to
-        // preserve. Four owner-scoped action sites: the Files `..`, the Files
+        // preserve. Six owner-scoped action sites: diff, stage, the Files `..`, the Files
         // `/`, every file row's Read, and the frame's refresh controls.
         assert_eq!(
             body.matches("panel_action_element_for_owner(").count(),
-            4,
+            6,
             "an owner-scoped action site was dropped along with the row that carried it"
         );
         for kept in [

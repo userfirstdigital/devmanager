@@ -51,6 +51,35 @@ def digest(path):
     with path.open("rb") as handle:
         return hashlib.file_digest(handle, "sha256").hexdigest()
 
+readme = """DevManager desktop acceptance candidate
+
+Extract the whole archive, then run launch-devmanager.sh (Linux) or
+launch-devmanager.cmd (Windows). Keep both binaries and resources together.
+The launcher uses an isolated debug profile inside this extracted directory.
+This is a test candidate, not a signed release installer. Review candidate.json
+for source and file hashes.
+
+Linux requires a graphical desktop, Vulkan, a working systemd user session,
+cgroup v2 and a Secret Service wallet. Windows browser features need WebView2.
+Install and sign in to the provider CLI you want to use.
+
+Acceptance: create a project/task, send and receive a message, restart and resume
+that exact conversation, type/edit/copy/scroll in Terminal, and use Files/Git.
+The source repository's docs/launch-readiness.md records outstanding launch gates.
+"""
+generated = {"README.txt": (readme.encode(), 0o644)}
+if system == "windows":
+    launcher_name = "launch-devmanager.cmd"
+    launcher = '@echo off\r\nsetlocal\r\nset DEVMANAGER_DEBUG_HOST_PARENT_BOUND=1\r\n"%~dp0devmanager.exe" --dev-workspace "%~dp0."\r\n'
+else:
+    launcher_name = "launch-devmanager.sh"
+    launcher = '\n'.join([
+        '#!/bin/sh', 'set -eu',
+        'candidate_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd -P)',
+        'export DEVMANAGER_DEBUG_HOST_PARENT_BOUND=1',
+        'exec "$candidate_dir/devmanager" --dev-workspace "$candidate_dir"', '',
+    ])
+generated[launcher_name] = (launcher.encode(), 0o755)
 manifest = {
     "schema": "devmanager.launch-candidate/v1",
     "commit": commit,
@@ -61,21 +90,8 @@ manifest = {
     "files": [{"path": name, "bytes": source.stat().st_size, "sha256": digest(source)}
               for source, name, _ in files],
 }
-readme = """DevManager desktop acceptance candidate
-
-Extract the whole archive, then run devmanager (Linux) or devmanager.exe (Windows).
-Keep devmanager-host beside the app. This debug build uses the dev-debug profile.
-Close another dev-debug instance before opening it. This is a test candidate,
-not a signed release installer. Review candidate.json for source and file hashes.
-
-Linux requires a graphical desktop, Vulkan, a working systemd user session,
-cgroup v2 and a Secret Service wallet. Windows browser features need WebView2.
-Install and sign in to the provider CLI you want to use.
-
-Acceptance: create a project/task, send and receive a message, restart and resume
-that exact conversation, type/edit/copy/scroll in Terminal, and use Files/Git.
-The source repository's docs/launch-readiness.md records outstanding launch gates.
-"""
+manifest["files"].extend({"path": name, "bytes": len(data), "sha256": hashlib.sha256(data).hexdigest()}
+                         for name, (data, _) in generated.items())
 destination = root / "dist" / "launch-candidates"
 if not destination.resolve().is_relative_to(root):
     raise SystemExit("Candidate output escaped the checkout")
@@ -93,11 +109,15 @@ with tempfile.TemporaryDirectory(prefix="assemble-", dir=destination) as staging
                 while chunk := incoming.read(1024 * 1024):
                     outgoing.write(chunk)
         archive.writestr("candidate.json", json.dumps(manifest, indent=2) + "\n")
-        archive.writestr("README.txt", readme)
+        for name, (data, mode) in generated.items():
+            info = zipfile.ZipInfo(name, date_time=(1980, 1, 1, 0, 0, 0))
+            info.create_system = 3
+            info.external_attr = (0o100000 | mode) << 16
+            archive.writestr(info, data)
     with zipfile.ZipFile(temporary) as archive:
         if archive.testzip() is not None:
             raise SystemExit("Candidate archive verification failed")
-        if set(archive.namelist()) != {name for _, name, _ in files} | {"candidate.json", "README.txt"}:
+        if set(archive.namelist()) != {name for _, name, _ in files} | set(generated) | {"candidate.json"}:
             raise SystemExit("Candidate archive escaped its allowlist")
         for entry in manifest["files"]:
             with archive.open(entry["path"]) as handle:

@@ -2,12 +2,15 @@
 
 use crate::client::action::{self, ActionRequest};
 use crate::domain::cockpit::{
-    redact_repository_label, TaskCockpitQuery, TaskGitProjection, TaskGitRepositoriesProjection,
+    redact_repository_label, TaskCockpitQuery, TaskGitEntryProjection, TaskGitFileDiffProjection,
+    TaskGitMutateIntent, TaskGitProjection, TaskGitRepositoriesProjection,
     TaskRepositoryCatalogEntry, TaskRepositoryKind, TaskRepositorySelector, MAX_TASK_REPOSITORIES,
 };
 use crate::domain::id::TaskId;
 
-use super::panel::{task_identity, PanelAction, PanelDisabledReason, PanelIdentity};
+use super::panel::{
+    task_identity, PanelAction, PanelDisabledReason, PanelIdentity, MAX_PANEL_ROWS,
+};
 
 /// One bounded, path-redacted repository row for the Changes panel.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -24,6 +27,13 @@ pub struct ChangesRepositoryRow {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChangesFileRow {
+    pub entry: TaskGitEntryProjection,
+    pub diff: PanelAction,
+    pub toggle_stage: PanelAction,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ChangesPanelProjection {
     pub identity: PanelIdentity,
     pub selected_selector: Option<TaskRepositorySelector>,
@@ -34,6 +44,7 @@ pub struct ChangesPanelProjection {
     pub change_count: u32,
     pub detached: bool,
     pub repositories: Vec<ChangesRepositoryRow>,
+    pub files: Vec<ChangesFileRow>,
     pub refresh: PanelAction,
     pub disabled_reason: Option<PanelDisabledReason>,
 }
@@ -73,6 +84,7 @@ impl ChangesPanelProjection {
                 change_count: 0,
                 detached: false,
                 repositories,
+                files: Vec::new(),
                 refresh: PanelAction::disabled(identity, placeholder, disabled_reason),
                 disabled_reason: Some(disabled_reason),
             };
@@ -112,10 +124,62 @@ impl ChangesPanelProjection {
                 change_count: 0,
                 detached: false,
                 repositories,
+                files: Vec::new(),
                 refresh: PanelAction::disabled(identity, request, disabled_reason),
                 disabled_reason: Some(disabled_reason),
             };
         };
+
+        let writable = catalog.is_some_and(|catalog| {
+            catalog.repositories.iter().any(|entry| {
+                entry.selector == refresh_selector && repository_mutation_allowed(entry)
+            })
+        });
+        let files = projection
+            .entries
+            .iter()
+            .take(MAX_PANEL_ROWS)
+            .map(|entry| {
+                let staged = entry.staged && !entry.unstaged;
+                let diff = PanelAction::enabled(
+                    identity,
+                    ActionRequest::TaskCockpit {
+                        task_id,
+                        query: TaskCockpitQuery::GitFileDiffTargeted {
+                            selector: refresh_selector.clone(),
+                            relative_path: entry.relative_path.clone(),
+                            staged,
+                        },
+                    },
+                );
+                let relative_paths = vec![entry.relative_path.clone()];
+                let request = ActionRequest::TaskCockpit {
+                    task_id,
+                    query: TaskCockpitQuery::GitMutateTargeted {
+                        selector: refresh_selector.clone(),
+                        intent: if staged {
+                            TaskGitMutateIntent::Unstage { relative_paths }
+                        } else {
+                            TaskGitMutateIntent::Stage { relative_paths }
+                        },
+                        confirm: true,
+                    },
+                };
+                ChangesFileRow {
+                    entry: entry.clone(),
+                    diff,
+                    toggle_stage: if writable {
+                        PanelAction::enabled(identity, request)
+                    } else {
+                        PanelAction::disabled(
+                            identity,
+                            request,
+                            PanelDisabledReason::RepositoryReadOnly,
+                        )
+                    },
+                }
+            })
+            .collect();
 
         Self {
             identity,
@@ -127,9 +191,20 @@ impl ChangesPanelProjection {
             change_count: projection.change_count,
             detached: projection.detached,
             repositories,
+            files,
             refresh: PanelAction::enabled(identity, request),
             disabled_reason: None,
         }
+    }
+
+    /// Admit a patch only for a currently visible file in this exact Task/repository.
+    pub fn accepts_diff(&self, diff: &TaskGitFileDiffProjection) -> bool {
+        diff.task_id == self.identity.task_id
+            && self.selected_selector.as_ref() == Some(&diff.selector)
+            && self.files.iter().any(|row| {
+                row.entry.relative_path == diff.relative_path
+                    && diff.staged == (row.entry.staged && !row.entry.unstaged)
+            })
     }
 
     pub fn summary(&self) -> String {
@@ -460,6 +535,105 @@ mod tests {
                 },
             ],
         }
+    }
+
+    #[test]
+    fn changed_file_actions_are_bounded_and_owned_by_the_selected_repository() {
+        use crate::domain::cockpit::TaskGitEntryStatus;
+        let task_id = TaskId::new();
+        let mut catalog = catalog(task_id);
+        let selector = TaskRepositorySelector::Workspace;
+        let mut git = TaskGitProjection {
+            task_id,
+            selector: Some(selector.clone()),
+            label: None,
+            branch: Some("main".into()),
+            ahead: 0,
+            behind: 0,
+            change_count: 100,
+            detached: false,
+            entries: (0..100)
+                .map(|i| TaskGitEntryProjection {
+                    relative_path: format!("file-{i}.txt"),
+                    original_relative_path: None,
+                    status: TaskGitEntryStatus::Modified,
+                    staged: i % 2 == 0,
+                    unstaged: i % 2 != 0,
+                })
+                .collect(),
+        };
+        let panel = ChangesPanelProjection::from_host(
+            Some(&git),
+            Some(&catalog),
+            Some(&selector),
+            task_id,
+            Some(7),
+        );
+        assert_eq!(panel.files.len(), MAX_PANEL_ROWS);
+        let mut diff = TaskGitFileDiffProjection {
+            task_id,
+            selector: selector.clone(),
+            relative_path: "file-0.txt".into(),
+            staged: true,
+            diff: crate::git::git_service::GitDiffResult {
+                hunks: vec![],
+                is_binary: false,
+            },
+        };
+        assert!(panel.accepts_diff(&diff));
+        diff.staged = false;
+        assert!(!panel.accepts_diff(&diff));
+        diff.staged = true;
+        diff.relative_path = "file-98.txt".into();
+        assert!(!panel.accepts_diff(&diff));
+        diff.relative_path = "file-0.txt".into();
+        diff.selector = TaskRepositorySelector::ProjectRoot;
+        assert!(!panel.accepts_diff(&diff));
+        diff.selector = selector.clone();
+        diff.task_id = TaskId::new();
+        assert!(!panel.accepts_diff(&diff));
+
+        assert!(matches!(&panel.files[0].toggle_stage.request,
+            ActionRequest::TaskCockpit { task_id: owner, query: TaskCockpitQuery::GitMutateTargeted {
+                selector: target, intent: TaskGitMutateIntent::Unstage { relative_paths }, confirm: true,
+            }} if *owner == task_id && target == &selector && relative_paths == &["file-0.txt"]));
+        assert!(matches!(&panel.files[1].diff.request,
+            ActionRequest::TaskCockpit { query: TaskCockpitQuery::GitFileDiffTargeted {
+                relative_path, staged: false, .. }, .. } if relative_path == "file-1.txt"));
+        catalog.repositories[0].read_only = true;
+        let readonly = ChangesPanelProjection::from_host(
+            Some(&git),
+            Some(&catalog),
+            Some(&selector),
+            task_id,
+            Some(7),
+        );
+        assert!(readonly.files[0].diff.is_enabled());
+        assert_eq!(
+            readonly.files[0].toggle_stage.disabled_reason,
+            Some(PanelDisabledReason::RepositoryReadOnly)
+        );
+        git.selector = Some(TaskRepositorySelector::ProjectRoot);
+        assert!(ChangesPanelProjection::from_host(
+            Some(&git),
+            Some(&catalog),
+            Some(&selector),
+            task_id,
+            Some(7)
+        )
+        .files
+        .is_empty());
+        git.selector = Some(selector.clone());
+        git.task_id = TaskId::new();
+        assert!(ChangesPanelProjection::from_host(
+            Some(&git),
+            Some(&catalog),
+            Some(&selector),
+            task_id,
+            Some(7)
+        )
+        .files
+        .is_empty());
     }
 
     #[test]
