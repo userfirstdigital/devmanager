@@ -111,7 +111,7 @@ deadline. The regression covers more than 1,024 ordinary entries, the unchanged
 limit on actual recovery authorities, and deadline expiry. The real host
 FilesWrite authorization test then passed against the same crowded directory.
 
-The final AppImage SHA-256 is
+The native cleanup acceptance AppImage SHA-256 was
 `47792f2e04334aee1265f6ed0f4aac5e0b8489a549c0e80e43a847ddb91066e3`.
 Its signed upgrade preserved all 119 durable events byte-for-byte and both
 config/remote hashes. The old host exited at 0.52s, image exchange occurred at
@@ -120,6 +120,24 @@ remained Open and both journals cleared. First Send followed by Browser delivere
 one accepted input exactly once, displayed `SHIPPING LINUX READY.`, and cleared
 the composer. Archive removed the exact provider PID and emptied its running
 ledger; the packaged client then closed with exit code zero.
+
+The installed AppImage SHA-256 is
+`bcbe0d447ce59eb8e36129751c2fc9c667d7ff2444cfa563d18e7a4326104f8d`.
+It includes the repository's public update verification key, the official GitHub
+release feed, and the browser bundle reproduced identically on Windows and Linux.
+The final signed fixture upgrade preserved all **161 durable events** byte-for-byte
+and both settings files. The old host exited at 0.524s, image exchange occurred at
+1.458s, and the replacement client/host appeared at 2.370s/2.838s. Host admission
+remained Open and both recovery journals cleared. The fixture client, host,
+private display and update server all exited afterward.
+
+This artifact is installed at `/home/robin/Applications/DevManager.AppImage`, with
+a desktop launcher and icon. It is intentionally left running on the real KDE
+NVIDIA desktop. Process-to-window measured 0.615s; the subsequent full 960×640
+capture showed the canonical empty workspace with Add project enabled. Eight
+embedded browser asset tests and the locked all-target compiler check passed
+after the final browser bundle rebuild. Documentation and CI-only changes do
+not require a replacement of this verified binary.
 
 The final serial run also includes a deterministic test-only Claude hook
 publication fix: SessionStart publication finishes before the test arms its
@@ -261,7 +279,10 @@ were joined after inspection.
   retaining the selected native identity through registry revalidation. Enabled
   interactive metadata probes with nonblocking input and bounded cancellation.
 
-## Verification evidence
+## Historical verification evidence
+
+The entries below record earlier iterations and their follow-up fixes. The final
+Linux verdict and installed artifact are recorded at the top of this document.
 
 Local logs are sibling files of the isolated worktree:
 `/home/robin/Projects/devmanager-launch-20260907-*.log`.
@@ -483,7 +504,7 @@ canonical task. Provider startup then fails in the Linux launch-environment
 persistence codec (`key must be a string`); protected session storage is the next
 acceptance gate. The exact rebuilt app and sibling host exited afterward.
 
-## Remaining launch gates
+## Historical launch-gate follow-up
 
 Linux protected storage now uses the desktop Secret Service wallet for immutable
 master keys and scope-bound ChaCha20-Poly1305 envelopes for provider settings,
@@ -580,6 +601,8 @@ replace the pending complete serial library run. Evidence is private under
 Production config/remote hashes are unchanged; all owned app/host/provider and
 build/test processes exited after this pass.
 
+## Current launch checklist
+
 - [x] Complete Linux provider ownership and discovery,
       protected storage, workspace mutation and process reporting.
 - [x] Pass Linux integration/serial library checks, real provider desktop input,
@@ -593,11 +616,16 @@ build/test processes exited after this pass.
       control-key editing, drag/copy and wheel scrolling; exercise divider
       dragging, questions/permissions, exact resume/recovery and restart state.
 - [ ] Verify signed packages and isolated install/update behavior on Windows.
-- [ ] Push and review the candidate, then complete release promotion.
+- [x] Push the candidate and open draft PR #2.
+- [ ] Complete candidate review and release promotion.
 
-GitHub authentication became available during final verification. The verified
-candidate can now be pushed for Windows/Linux CI. The candidate workflow
-deliberately has no publication step; no public release has been promoted.
+The candidate is pushed in [draft PR #2](https://github.com/userfirstdigital/devmanager/pull/2).
+Its checks track Windows/Linux compilation, serial tests and candidate archives.
+Both platforms passed browser bundle parity and Windows passed package-reference
+and dependency-provenance scans. The Rust CI jobs are still running at this
+recording; consult the PR checks for their final result. The separate web workflow
+now restores the reviewed WASM inputs and installs the native dependencies needed
+by its embedded-asset tests. Neither workflow publishes a public release.
 
 ## Isolation
 
@@ -607,9 +635,12 @@ index and merge metadata were preserved in private local `launch-evidence`
 before normalizing CRLF-only changes; its staged tree was unchanged.
 
 Production `config.json` and `remote.json` hashes match the captured baseline.
-No installed DevManager process was present at baseline or after verification.
-Verification did not change an installed app or production configuration. Test-owned provider
-conversations were created and exercised in the isolated project.
+No installed DevManager process was present at baseline. After isolated
+verification, the final Linux AppImage was intentionally installed and launched
+for the user; it remains open. Test-owned provider conversations were created
+and exercised in the isolated project. Private release fixtures ran only while
+the production profile endpoint was unowned: changing XDG paths alone does not
+isolate the production abstract Unix socket.
 `launch-evidence` contains private local verification and recovery data and is
 not part of the candidate commit.
 
