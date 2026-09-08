@@ -11,6 +11,39 @@ engine, CLI/updater/package contracts, and the locked all-target compiler check
 are recorded below. Windows desktop and installer acceptance still require a
 Windows machine; public release promotion has not occurred.
 
+## Restored Git desktop window
+
+The top-bar Git button opens the 0.4.1 Git window for a selected local task,
+using the new shell palette and shared native controls. Changes, History,
+repository selection, staging, commit drafts, branches, and the existing GitHub
+AI commit-message flow are connected through task-scoped host authority.
+Opening the window preserves the existing index. Staged and unstaged versions
+of one file have separate diff selections, and stale asynchronous responses
+cannot replace the current repository, selection, or edited draft.
+
+The actual Linux native window passed keyboard text and Ctrl+A editing,
+partially staged file review, a staged-only commit, and history verification
+against a disposable repository. The rebuilt AppImage was installed and its
+Git button visually verified on the actual KDE desktop; SHA-256:
+`b87e94a9b9c26259bc31badfdb8703b1fb1d37db27201ac68a9fa8ee96969e0d`.
+The full library suite passed 4,181 tests
+(zero failed, 22 ignored); the final Git group passed 164 tests, all 21 native
+contracts passed, and formatting plus the locked all-target check passed.
+One intermediate Git run hit the existing host-authority admission test
+intermittently; its focused rerun and the subsequent complete Git group passed.
+Test configuration hashes and the installed client PID/start time were unchanged.
+
+Remaining boundaries: a task pins its checkout branch, so creating a branch
+creates its reference without switching the checkout; switching requires a task
+bound to that branch. GitHub sign-in here authorizes AI messages, not Git network
+authentication. Live AI generation and authenticated push/pull have not been
+accepted. The host Git sandbox currently excludes ambient global Git identity,
+credential helpers and SSH-agent configuration; the live commit fixture used
+repository-local author identity. A host-owned identity/credential integration
+is still a launch gap for ordinary global Git setups. Windows interactive
+acceptance remains outstanding; the new CI run also verifies a native inherited-
+pipe fixture that avoids cold PowerShell startup in the four-second assertion.
+
 ## KDE desktop first paint
 
 Direct compositor screenshots reproduced a mapped but blank DevManager window
