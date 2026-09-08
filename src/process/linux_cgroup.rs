@@ -1044,6 +1044,57 @@ mod tests {
         }
     }
 
+    #[test]
+    #[ignore = "requires installed Cursor and a systemd user manager with cgroup v2 delegation"]
+    fn linux_cursor_native_package_reaches_pty_and_leaves_no_processes() {
+        use crate::providers::capabilities::{
+            ProviderDiscoveryContract, ProviderKind, ProviderPathSnapshot,
+        };
+        let candidate = ProviderDiscoveryContract::for_kind(ProviderKind::Cursor)
+            .resolve_from_path_snapshot(&ProviderPathSnapshot::capture_current().unwrap())
+            .unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let pair = portable_pty::native_pty_system()
+            .openpty(PtySize {
+                rows: 32,
+                cols: 120,
+                pixel_width: 0,
+                pixel_height: 0,
+            })
+            .unwrap();
+        let master = pair.master.as_raw_fd().unwrap();
+        let environment = BTreeMap::from([
+            (OsString::from("PATH"), OsString::from("/usr/bin")),
+            (OsString::from("HOME"), root.path().as_os_str().to_owned()),
+            (OsString::from("TERM"), OsString::from("xterm-256color")),
+        ]);
+        let (pending, mut session) = LinuxCgroup::spawn(
+            &helper(),
+            pair.slave.try_clone_owned_fd().unwrap(),
+            candidate.executable(),
+            &[],
+            root.path(),
+            &environment,
+            Instant::now() + STARTUP,
+        )
+        .unwrap();
+        drop(pair.slave);
+        let process = pidfd(session.root().id().pid()).unwrap();
+        assert!(!session.resumed());
+        let _child = pending.resume().unwrap();
+        // A fresh isolated HOME must paint Cursor's own authentication screen.
+        // No account login or provider conversation is created by this test.
+        read_until(master, b"Cursor");
+        session.terminate().unwrap();
+        session.join(Instant::now() + CLEANUP).unwrap();
+        assert!(exited(&process).unwrap());
+        assert!(session
+            .active_process_ids(Instant::now() + CLEANUP)
+            .unwrap()
+            .is_empty());
+        assert!(session.settled());
+    }
+
     // This is an OS integration gate, run explicitly with --ignored in a
     // logged-in systemd user session. Unit-only CI has no user service manager.
     #[test]

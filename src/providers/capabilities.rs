@@ -3765,6 +3765,15 @@ impl ProviderExecutablePolicy {
         {
             return Ok(());
         }
+        #[cfg(target_os = "linux")]
+        if self
+            .entrypoints
+            .iter()
+            .any(|declared| declared == "cursor-agent")
+            && is_linux_cursor_native(canonical_path)
+        {
+            return Ok(());
+        }
         if self
             .entrypoints
             .iter()
@@ -4266,6 +4275,41 @@ fn is_linux_claude_version(path: &Path) -> bool {
             .is_some_and(|name| name == "claude")
 }
 
+#[cfg(target_os = "linux")]
+fn is_linux_cursor_native(path: &Path) -> bool {
+    let Some(package) = path.parent() else {
+        return false;
+    };
+    let Some(version) = package.file_name().and_then(|name| name.to_str()) else {
+        return false;
+    };
+    let Some((date, revision)) = version.split_once('-') else {
+        return false;
+    };
+    path.file_name()
+        .is_some_and(|name| name == "cursor-agent-sea")
+        && date.len() == 10
+        && date.bytes().enumerate().all(|(i, byte)| {
+            if i == 4 || i == 7 {
+                byte == b'.'
+            } else {
+                byte.is_ascii_digit()
+            }
+        })
+        && !revision.is_empty()
+        && revision.len() <= 40
+        && revision.bytes().all(|byte| byte.is_ascii_hexdigit())
+        && package
+            .parent()
+            .and_then(Path::file_name)
+            .is_some_and(|name| name == "versions")
+        && package
+            .parent()
+            .and_then(Path::parent)
+            .and_then(Path::file_name)
+            .is_some_and(|name| name == "cursor-agent")
+}
+
 impl ProviderDiscoveryContract {
     pub fn for_kind(kind: ProviderKind) -> Self {
         let stem = match kind {
@@ -4452,6 +4496,12 @@ impl ProviderDiscoveryContract {
                 Ok(executable)
             }
             Err(ProviderExecutableError::NotNativeExecutable(_))
+                if self.kind == ProviderKind::Cursor
+                    && path.file_name().is_some_and(|name| name == "cursor-agent") =>
+            {
+                self.resolve_linux_cursor_package(&path)
+            }
+            Err(ProviderExecutableError::NotNativeExecutable(_))
                 if self.kind == ProviderKind::Codex
                     && path.file_name().is_some_and(|name| name == "codex.js")
                     && path
@@ -4463,6 +4513,40 @@ impl ProviderDiscoveryContract {
             }
             Err(error) => Err(ProviderDiscoveryError::Executable(error)),
         }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn resolve_linux_cursor_package(
+        &self,
+        wrapper_path: &Path,
+    ) -> Result<ProviderExecutable, ProviderDiscoveryError> {
+        let invalid = || ProviderDiscoveryError::ShimProofInvalid(wrapper_path.to_path_buf());
+        let package = wrapper_path.parent().ok_or_else(invalid)?;
+        let native_path = package.join("cursor-agent-sea");
+        if !is_linux_cursor_native(&native_path) {
+            return Err(invalid());
+        }
+        let wrapper = ProviderExecutable::inspect_non_native_blocking(wrapper_path)?;
+        if wrapper.read_handle_contents()? != include_bytes!("fixtures/cursor-agent.sh") {
+            return Err(invalid());
+        }
+        let manifest =
+            ProviderExecutable::inspect_non_native_blocking(&package.join("package.json"))?;
+        let metadata: serde_json::Value =
+            serde_json::from_slice(&manifest.read_handle_contents()?).map_err(|_| invalid())?;
+        if metadata.get("name").and_then(serde_json::Value::as_str)
+            != Some("@anysphere/agent-cli-runtime")
+            || metadata.get("private").and_then(serde_json::Value::as_bool) != Some(true)
+        {
+            return Err(invalid());
+        }
+        // Cursor ships a standalone native image alongside its Node wrapper.
+        // Select that exact image; neither the wrapper nor JavaScript is run.
+        let native = ProviderExecutable::from_path(&native_path)?;
+        wrapper.validate_current()?;
+        manifest.validate_current()?;
+        self.validate_native_path(&native)?;
+        Ok(native)
     }
 
     #[cfg(target_os = "linux")]
@@ -4593,7 +4677,9 @@ impl ProviderDiscoveryContract {
         #[cfg(target_os = "linux")]
         let expected_entrypoint = expected_entrypoint
             || (self.kind == ProviderKind::ClaudeCode
-                && is_linux_claude_version(executable.canonical_path()));
+                && is_linux_claude_version(executable.canonical_path()))
+            || (self.kind == ProviderKind::Cursor
+                && is_linux_cursor_native(executable.canonical_path()));
         if !expected_entrypoint {
             return Err(ProviderDiscoveryError::WrongEntrypoint(
                 executable.canonical_path().to_path_buf(),

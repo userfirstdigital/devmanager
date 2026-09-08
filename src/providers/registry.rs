@@ -1684,7 +1684,7 @@ fn map_discovery_error(
 mod linux_stock_cli_acceptance {
     use super::*;
     #[tokio::test]
-    #[ignore = "inspects installed Claude and Codex CLIs in the current Linux user session"]
+    #[ignore = "inspects installed Claude, Codex and Cursor CLIs in the current Linux user session"]
     async fn linux_stock_clis_resolve_and_probe_through_production_registry() {
         let registry = crate::providers::startup::stock_provider_registry().unwrap();
         let config = ProviderDiscoveryConfig {
@@ -1702,13 +1702,22 @@ mod linux_stock_cli_acceptance {
             .collect(),
             ..Default::default()
         };
-        for kind in [ProviderKind::ClaudeCode, ProviderKind::Codex] {
+        for kind in [
+            ProviderKind::ClaudeCode,
+            ProviderKind::Codex,
+            ProviderKind::Cursor,
+        ] {
             let observation = registry
                 .observe(kind, &config)
                 .await
                 .unwrap_or_else(|e| panic!("stock {kind:?} observation failed: {e}"));
             assert_eq!(observation.kind(), kind);
             assert!(observation.executable().is_native());
+            assert_eq!(
+                observation.capabilities().build_launch,
+                crate::providers::capabilities::CapabilitySupport::Supported,
+                "stock {kind:?} must prove interactive launch"
+            );
             observation
                 .validate()
                 .expect("current stock capability facts");

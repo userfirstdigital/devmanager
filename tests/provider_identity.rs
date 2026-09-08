@@ -2005,3 +2005,67 @@ fn provider_executable_debug_redacts_path_file_name_and_content_hash() {
     assert!(!rendered.contains(&identity.sha256_hex()));
     assert!(!rendered.contains("canonical_path"));
 }
+
+#[cfg(target_os = "linux")]
+#[test]
+fn linux_cursor_install_selects_native_package_and_rejects_substitution() {
+    use std::os::unix::fs::symlink;
+    let temp = tempdir().unwrap();
+    let bin = temp.path().join("bin");
+    let version = temp
+        .path()
+        .join("share/cursor-agent/versions/2026.09.02-c22c1a3");
+    fs::create_dir(&bin).unwrap();
+    fs::create_dir_all(&version).unwrap();
+    fs::write(
+        version.join("package.json"),
+        br#"{"name":"@anysphere/agent-cli-runtime","private":true}"#,
+    )
+    .unwrap();
+    fs::write(
+        version.join("cursor-agent"),
+        include_bytes!("../src/providers/fixtures/cursor-agent.sh"),
+    )
+    .unwrap();
+    let native = native_fixture(&version, "cursor-agent-sea", b"");
+    symlink(version.join("cursor-agent"), bin.join("cursor-agent")).unwrap();
+    let contract = ProviderDiscoveryContract::for_kind(ProviderKind::Cursor);
+    let snapshot = ProviderPathSnapshot::capture(bin.as_os_str()).unwrap();
+    let candidate = contract.resolve_from_path_snapshot(&snapshot).unwrap();
+    assert_eq!(candidate.executable().canonical_path(), native);
+    assert!(matches!(candidate.form(), ProviderExecutableForm::Native));
+    let handle = candidate.open_for_launch().unwrap();
+    let override_candidate = contract
+        .validate(ProviderDiscoveryCandidateInput::configured_override(
+            bin.join("cursor-agent"),
+        ))
+        .unwrap();
+    assert_eq!(candidate.executable(), override_candidate.executable());
+    contract
+        .validate_executable(candidate.executable())
+        .unwrap();
+    devmanager::providers::capabilities::ProviderExecutablePolicy::new(["cursor-agent"])
+        .unwrap()
+        .validate_canonical_path(&native)
+        .unwrap();
+    fs::write(version.join("cursor-agent"), b"#!/bin/sh\nexec arbitrary\n").unwrap();
+    assert!(contract.resolve_from_path_snapshot(&snapshot).is_err());
+    fs::write(
+        version.join("cursor-agent"),
+        include_bytes!("../src/providers/fixtures/cursor-agent.sh"),
+    )
+    .unwrap();
+    fs::write(version.join("package.json"), br#"{"name":"foreign"}"#).unwrap();
+    assert!(contract.resolve_from_path_snapshot(&snapshot).is_err());
+    fs::write(
+        version.join("package.json"),
+        br#"{"name":"@anysphere/agent-cli-runtime","private":true}"#,
+    )
+    .unwrap();
+    fs::rename(&native, version.join("original")).unwrap();
+    native_fixture(&version, "cursor-agent-sea", b"replacement");
+    assert!(handle.revalidate().is_err());
+    fs::remove_file(&native).unwrap();
+    symlink("/usr/bin/bash", &native).unwrap();
+    assert!(contract.resolve_from_path_snapshot(&snapshot).is_err());
+}

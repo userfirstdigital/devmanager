@@ -9,7 +9,7 @@ is green: **4,111 passed, zero failed, 20 ignored** on `d61142e4`. Native
 client/host integration (21 tests), exact-resume mismatch (four tests), file
 integration (83 tests), and all-target compiler checks passed. Real Windows
 desktop/install validation, Linux embedded-browser and package/update support,
-Cursor discovery, historical stranded recovery
+historical stranded recovery
 receipts, and live remote enrollment still require acceptance.
 
 ## Changes panel and portable candidate follow-up
@@ -471,3 +471,25 @@ The cross-filesystem overwrite test reproduced the original conflict before
 the fix. Production config and remote hashes remain unchanged, and no owned
 app, harness, Cargo, compiler or linker remains. Private logs: `crossfs-red.log`,
 `crossfs-bind.log`, and `crossfs-final-{integration,workspace,check}.log`.
+
+### Linux Cursor native package discovery
+
+Cursor's recognized Linux installation wrapper now resolves to its sibling
+standalone native image after validating the versioned package layout, wrapper
+content and runtime manifest. Probe and managed launch retain that native file
+identity; neither Bash nor Node is introduced into the launch path. The adapter
+recognizes the observed 2026.09.02 interactive command contract while preserving
+typed unsupported exact-resume and semantic conversation capabilities. Cursor
+chat Send remains unsupported on both platforms; this closes Linux discovery
+and native terminal launch, not that separate provider transport limitation.
+
+All 45 provider identity tests and nine Cursor adapter tests passed. An explicit
+installed-provider test passed Claude, Codex and Cursor through the production
+registry. An explicit cgroup acceptance test launched the installed Cursor into
+a native PTY with an isolated HOME, observed its screen, terminated it, and
+verified the exact process and cgroup were empty. Both all-target checks passed.
+The rebuilt live app displayed Cursor as healthy with version 2026.09.02-c22c1a3.
+The app, sibling host and automation exited; production config/remote hashes
+were unchanged and no owned Rust process remained. Private evidence:
+`cursor-{discovery-green,adapter,stock-probe,custody,custody-check}.log` and
+`cursor-provider-list.png`.

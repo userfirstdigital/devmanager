@@ -280,7 +280,11 @@ fn evidence(
 }
 
 fn help_proves_interactive_terminal(help: &str) -> bool {
-    normalize_whitespace(help).contains(PINNED_INTERACTIVE_SURFACE)
+    let normalized = normalize_whitespace(help);
+    normalized.contains(PINNED_INTERACTIVE_SURFACE)
+        || (normalized.starts_with("Usage: agent [options] [command] [prompt...] Start the Cursor Agent Arguments:")
+            && normalized.contains("-p, --print Print responses to console (for scripts or non-interactive use). Has access to all tools, including write and shell. (default: false)")
+            && help.lines().any(|line| normalize_whitespace(line) == "agent [prompt...] Start the Cursor Agent"))
 }
 
 fn normalize_whitespace(text: &str) -> String {
@@ -464,6 +468,33 @@ mod tests {
                 ProviderCapability::ExactResume
             ))
         ));
+    }
+
+    #[test]
+    fn cursor_observed_native_help_proves_only_fresh_interactive_launch() {
+        let help = include_str!("../../tests/fixtures/providers/cursor/help-2026.09.02.txt");
+        let facts =
+            capabilities_from_cursor_probes(b"2026.09.02-c22c1a3", help.as_bytes(), OBSERVED_AT)
+                .unwrap();
+        assert_eq!(facts.build_launch, CapabilitySupport::Supported);
+        assert_eq!(facts.exact_resume, CapabilitySupport::Unsupported);
+        assert_eq!(facts.provider_session_id, CapabilitySupport::Unsupported);
+        for (before, after) in [
+            (
+                "Usage: agent [options] [command] [prompt...]",
+                "Usage: agent --print [prompt...]",
+            ),
+            ("(default: false)", "(default: true)"),
+            (
+                "agent [prompt...]            Start the Cursor Agent",
+                "agent --print               Start the Cursor Agent",
+            ),
+        ] {
+            assert!(
+                !help_proves_interactive_terminal(&help.replace(before, after)),
+                "changed launch contract: {before}"
+            );
+        }
     }
 
     #[tokio::test]
