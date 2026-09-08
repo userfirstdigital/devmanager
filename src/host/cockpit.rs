@@ -24,6 +24,7 @@ use crate::domain::cockpit::{
 };
 use crate::domain::id::{ClientId, CommandId, RequestId, TaskId};
 use crate::domain::query::{QueryError, QueryOutcome, QueryResult};
+use crate::domain::snapshot::PageLimits;
 use crate::domain::{AgentSessionFacts, ResourceFacts};
 use crate::git::command::{
     issue_configured_repository_git_host_binding, issue_git_host_binding, GitCancellation,
@@ -117,14 +118,21 @@ pub(crate) fn project_agent_resource(
 pub(crate) fn serve_task_cockpit(dispatch: TaskCockpitDispatch<'_>) -> QueryOutcome {
     serve_task_cockpit_bounded(
         dispatch,
-        crate::domain::snapshot::MAX_SNAPSHOT_PAGE_ENCODED_BYTES,
+        PageLimits {
+            max_items: crate::domain::snapshot::MAX_SNAPSHOT_PAGE_ITEMS,
+            max_encoded_bytes: crate::domain::snapshot::MAX_SNAPSHOT_PAGE_ENCODED_BYTES,
+        },
     )
 }
 
 pub(crate) fn serve_task_cockpit_bounded(
     dispatch: TaskCockpitDispatch<'_>,
-    max_response_bytes: u32,
+    page_limits: PageLimits,
 ) -> QueryOutcome {
+    if page_limits.validate().is_err() {
+        return QueryOutcome::Err(QueryError::InvalidRequest);
+    }
+    let max_response_bytes = page_limits.max_encoded_bytes;
     if !dispatch.capabilities.grants_task_cockpit() {
         return QueryOutcome::Err(QueryError::UnsupportedCapability);
     }
@@ -257,7 +265,7 @@ pub(crate) fn serve_task_cockpit_bounded(
             {
                 return QueryOutcome::Err(QueryError::UnsupportedCapability);
             }
-            serve_conversation(&dispatch, task_id, *after_sequence)
+            serve_conversation(&dispatch, task_id, *after_sequence, page_limits)
         }
         TaskCockpitQuery::OpenConversationSubscription { .. }
         | TaskCockpitQuery::ReleaseConversationSubscription { .. } => {
@@ -1374,7 +1382,11 @@ pub(crate) fn serve_conversation(
     dispatch: &TaskCockpitDispatch<'_>,
     task_id: TaskId,
     after_sequence: u64,
+    page_limits: PageLimits,
 ) -> QueryOutcome {
+    if page_limits.validate().is_err() {
+        return QueryOutcome::Err(QueryError::InvalidRequest);
+    }
     use crate::domain::{PrivacyClass, SemanticJournalFact, SemanticJournalPage};
     use crate::remote::presentation::StableSessionKey;
 
@@ -1451,7 +1463,7 @@ pub(crate) fn serve_conversation(
         .collect::<Vec<_>>();
     let facts = retained
         .iter()
-        .take(MAX_CONVERSATION_PAGE_ITEMS)
+        .take(MAX_CONVERSATION_PAGE_ITEMS.min(page_limits.max_items as usize))
         .map(|event| SemanticJournalFact {
             id: conversation_event_id(task_id, identities[&event.sequence]),
             sequence: event.sequence,
@@ -1505,7 +1517,9 @@ pub(crate) fn serve_conversation(
                 reason: "semantic_page_encode",
             });
         };
-        if encoded_bytes as usize <= MAX_CONVERSATION_PAGE_BYTES {
+        if encoded_bytes as usize
+            <= MAX_CONVERSATION_PAGE_BYTES.min(page_limits.max_encoded_bytes as usize)
+        {
             page.encoded_bytes = encoded_bytes;
             break;
         }

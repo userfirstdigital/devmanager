@@ -562,3 +562,24 @@ rejection behavior. Deterministic metadata tests cover these boundaries; eight
 consecutive real Stage/Unstage/Commit runs passed. The broader Git library suite
 passed 128 tests and both Git integration suites passed (five tests total).
 The host cockpit suite passed all 38 tests, including the original failing flow.
+
+
+### Encrypted browser conversation pagination
+
+Conversation subscription-open and continuation queries now use the negotiated
+item and byte budgets, capped by the existing carrier-safe page limits. The
+new executor regression failed with seven facts against a two-item negotiation
+before the fix; both independent item- and byte-limit scenarios now traverse
+the complete ordered history without duplicates. Conversation-related library
+checks passed 69 tests; all-target compiler checking and the live binaries built.
+
+Through the real isolated HTTP pairing and Noise/WASM transport, the production
+NativeHostSession negotiated two-item pages, received an assigned client ID,
+loaded five tasks in three pages (2/2/1), then loaded 38 unique, ordered
+conversation facts in 19 pages. The exact assistant reply remained present.
+Snapshot cursors arrived as MessagePack binary arrays and resumed successfully.
+After an exact host restart, the same route and retained browser trust recovered
+the live five-task/38-fact state without pairing again. No session error remained.
+Private evidence: `linux-production/remote-pages-live-result.json` and
+`remote-pages-*.log`. Exact app/host and Rust processes were joined; production
+configuration hashes remained unchanged.

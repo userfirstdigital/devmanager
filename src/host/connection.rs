@@ -7573,7 +7573,7 @@ impl HostRequestExecutor {
                         provider_launch_hint,
                         provider_restore_detail: provider_restore_detail.as_deref(),
                     },
-                    negotiated.limits.max_page_encoded_bytes,
+                    page_limits_from_negotiated(negotiated)?,
                 );
                 Ok(QueryReply {
                     request_id: envelope.request_id,
@@ -8038,7 +8038,16 @@ impl HostRequestExecutor {
             provider_launch_hint: super::cockpit::ProviderLaunchReadinessHint::Unknown,
             provider_restore_detail: None,
         };
-        let page = match super::cockpit::serve_conversation(&dispatch, task_id, after_sequence) {
+        let page_limits = match page_limits_from_negotiated(negotiated) {
+            Ok(limits) => limits,
+            Err(_) => {
+                self.semantic_dirty.untrack(&session_key);
+                return QueryOutcome::Err(QueryError::InvalidRequest);
+            }
+        };
+        let page = match super::cockpit::serve_conversation(
+            &dispatch, task_id, after_sequence, page_limits,
+        ) {
             QueryOutcome::Ok(QueryResult::TaskCockpit(TaskCockpitResult::Conversation(page))) => {
                 page
             }
@@ -13510,6 +13519,85 @@ mod output_tests {
             }) => (subscription_id, page),
             other => panic!("expected ConversationSubscription, got {other:?}"),
         }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn conversation_pages_obey_negotiated_limits_on_open_and_continue() {
+        use crate::domain::query::{Query, QueryEnvelope, QueryOutcome, QueryResult};
+        use crate::remote::presentation::{SemanticEventKind, SemanticJournalStore};
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut bus = crate::kernel::CommandBus::open(&dir.path().join("pages.db")).unwrap();
+        let client = ClientId::new();
+        let task_id = create_task_for_conversation_wake(&mut bus, client);
+        let (requests, executor) = HostRequestExecutor::start_without_automatic_maintenance(bus);
+        requests
+            .install_test_semantic_journal(Arc::new(Mutex::new(SemanticJournalStore::default())))
+            .await
+            .unwrap();
+        for index in 1..=7 {
+            let mut draft = sample_semantic_draft(task_id, index);
+            draft.kind = SemanticEventKind::UserMessage {
+                text: "x".repeat(400),
+            };
+            requests.record_test_semantic(draft).await.unwrap();
+        }
+        for (max_items, max_bytes) in [(2, 48 * 1024), (128, 800)] {
+            let mut negotiated = conversation_wake_negotiated(client);
+            negotiated.limits.max_page_items = max_items;
+            negotiated.limits.max_page_encoded_bytes = max_bytes;
+            let duplex = requests.open_connect_duplex(client).await.unwrap();
+            let (_, mut page) =
+                open_conversation_subscription(&duplex, negotiated, client, task_id, 0).await;
+            let mut seen = Vec::new();
+            let mut pages = 0;
+            loop {
+                pages += 1;
+                assert!(pages <= 7, "continuation must make progress");
+                assert!(page.facts.len() <= max_items as usize);
+                assert!(page.encoded_bytes <= max_bytes);
+                assert_eq!(
+                    page.encoded_bytes as usize,
+                    rmp_serde::to_vec_named(&page).unwrap().len()
+                );
+                seen.extend(page.facts.iter().map(|fact| fact.sequence));
+                let Some(after_sequence) = page.next_sequence else {
+                    break;
+                };
+                let reply = duplex
+                    .requests
+                    .execute(
+                        negotiated,
+                        ClientRequest::Query(QueryEnvelope {
+                            request_id: RequestId::new(),
+                            client_id: client,
+                            task_id: Some(task_id),
+                            query: Query::TaskCockpit(TaskCockpitQuery::Conversation {
+                                after_sequence,
+                            }),
+                        }),
+                    )
+                    .await
+                    .unwrap();
+                let ServerMessage::QueryReply(QueryReply {
+                    outcome:
+                        QueryOutcome::Ok(QueryResult::TaskCockpit(TaskCockpitResult::Conversation(
+                            next,
+                        ))),
+                    ..
+                }) = reply
+                else {
+                    panic!("expected continuation: {reply:?}")
+                };
+                page = next;
+            }
+            assert!(pages > 1);
+            assert_eq!(seen, (1..=7).collect::<Vec<_>>());
+            drop(duplex);
+        }
+        drop(requests);
+        executor.abort();
+        let _ = executor.await;
     }
 
     #[test]
