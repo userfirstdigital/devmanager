@@ -39,6 +39,11 @@ jobs:
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
           New-Item -ItemType Directory -Force launch-evidence | Out-Null
 
+      - name: Cache Rust dependencies
+        uses: swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          cache-on-failure: true
+
       - name: Check formatting and browser build
         shell: pwsh
         run: |
@@ -151,6 +156,11 @@ jobs:
           mkdir -p launch-evidence
           systemctl --user show-environment > /dev/null
           test -f /sys/fs/cgroup/cgroup.controllers
+
+      - name: Cache Rust dependencies
+        uses: swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          cache-on-failure: true
 
       - name: Check formatting and browser build
         run: |

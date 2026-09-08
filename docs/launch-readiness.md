@@ -622,8 +622,11 @@ build/test processes exited after this pass.
 The candidate is pushed in [draft PR #2](https://github.com/userfirstdigital/devmanager/pull/2).
 Its checks track Windows/Linux compilation, serial tests and candidate archives.
 Both platforms passed browser bundle parity and Windows passed package-reference
-and dependency-provenance scans. The Rust CI jobs are still running at this
-recording; consult the PR checks for their final result. The separate web workflow
+and dependency-provenance scans. Windows Rust CI is still running at this recording. Linux CI compiled all
+targets, then reproduced four CLI fixture failures because its default `/tmp`
+ancestor is writable by other users. CI now gives tests a private temporary
+directory beneath its isolated target; the same nine CLI tests pass with that
+setup. Consult the PR checks for the final run result. The separate web workflow
 now restores the reviewed WASM inputs and installs the native dependencies needed
 by its embedded-asset tests. Neither workflow publishes a public release.
 
