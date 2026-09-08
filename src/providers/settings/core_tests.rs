@@ -185,7 +185,7 @@ fn reserved_arg_aliases_rejected() {
     ));
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "linux"))]
 #[test]
 fn secret_runtime_roundtrip_no_plaintext_in_protected_blob() {
     let mut map = BTreeMap::new();

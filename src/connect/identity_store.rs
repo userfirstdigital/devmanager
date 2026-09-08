@@ -827,7 +827,24 @@ pub(crate) fn unprotect_noise_private(
     dpapi_unprotect(blob, entropy)
 }
 
-#[cfg(not(windows))]
+#[cfg(target_os = "linux")]
+pub(crate) fn protect_noise_private(
+    plaintext: &[u8],
+    entropy: &[u8],
+) -> Result<Vec<u8>, OsNoiseCustodyError> {
+    crate::secret_custody::protect(plaintext, entropy)
+        .map_err(|_| OsNoiseCustodyError::ProtectFailed)
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn unprotect_noise_private(
+    blob: &[u8],
+    entropy: &[u8],
+) -> Result<Zeroizing<Vec<u8>>, OsNoiseCustodyError> {
+    crate::secret_custody::reveal(blob, entropy).map_err(|_| OsNoiseCustodyError::UnprotectFailed)
+}
+
+#[cfg(not(any(windows, target_os = "linux")))]
 pub(crate) fn protect_noise_private(
     plaintext: &[u8],
     entropy: &[u8],
@@ -836,7 +853,7 @@ pub(crate) fn protect_noise_private(
     Err(OsNoiseCustodyError::UnsupportedPlatform)
 }
 
-#[cfg(not(windows))]
+#[cfg(not(any(windows, target_os = "linux")))]
 pub(crate) fn unprotect_noise_private(
     blob: &[u8],
     entropy: &[u8],

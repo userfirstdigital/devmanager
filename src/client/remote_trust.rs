@@ -129,6 +129,7 @@ impl From<SecretCustodyError> for RemoteTrustError {
             SecretCustodyError::ProtectFailed
             | SecretCustodyError::UnprotectFailed
             | SecretCustodyError::TooLarge
+            | SecretCustodyError::DesktopWallet(_)
             | SecretCustodyError::Empty => Self::Custody,
         }
     }

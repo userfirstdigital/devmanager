@@ -339,14 +339,14 @@ fn seal_env_in_place(
     }
     if let Some(plain) = env.value.take() {
         if !plain.is_empty() {
-            #[cfg(windows)]
+            #[cfg(any(windows, target_os = "linux"))]
             {
                 env.protected_value = Some(protect_secret_value(&plain, scope)?);
                 env.value_redacted = true;
             }
-            #[cfg(not(windows))]
+            #[cfg(not(any(windows, target_os = "linux")))]
             {
-                // Sensitive secrets remain honestly unsupported off Windows.
+                // Never substitute plaintext when OS custody is unavailable.
                 env.value = Some(plain);
                 return Err(ProviderSettingsStoreError::Secret(
                     SecretCustodyError::Unsupported,

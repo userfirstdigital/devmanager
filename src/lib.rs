@@ -24,6 +24,8 @@ pub mod prompts;
 pub mod protocol;
 pub mod providers;
 pub mod remote;
+#[cfg(target_os = "linux")]
+mod secret_custody;
 pub mod services;
 pub mod sidebar;
 pub mod ssh;

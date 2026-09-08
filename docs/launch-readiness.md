@@ -158,6 +158,30 @@ acceptance gate. The exact rebuilt app and sibling host exited afterward.
 
 ## Remaining launch gates
 
+Linux protected storage now uses the desktop Secret Service wallet for immutable
+master keys and scope-bound ChaCha20-Poly1305 envelopes for provider settings,
+launch environments and Noise custody. The lossless environment codec handles
+native Unix bytes. Wallet operations have a three-second deadline; missing,
+locked or invalid custody fails visibly without a plaintext fallback. Development
+builds use a separate wallet application namespace. Ordinary unit tests use a
+process-local test key and never access the user's wallet.
+
+The real Secret Service test created, reopened and removed its unique test key;
+AEAD tampering and cancellation cleanup tests passed. Provider settings: 108
+passed. Provider sessions: 91 passed, one existing failure remains in the
+unimplemented Linux exact-process observer. The Noise profile-binding test and
+`cargo check --locked --lib --bins --tests` passed. Evidence is under
+`linux-production/custody-*.log`. This does not yet establish provider desktop
+input or complete Linux protected-trust support.
+
+The rebuilt app launched an actual Codex runtime and displayed workspace trust.
+Its persisted environment is encrypted. Approving exposed a UI handoff defect:
+only a readiness refusal had been fetched, leaving no terminal projection for
+setup input. The app, sibling host, guardian and provider all exited on the owned
+stop, and their cgroup disappeared. The running-process ledger still retains the
+stopped provider; process reconciliation and shutdown ledger settlement remain
+acceptance gates. Production configuration hashes are unchanged.
+
 - [ ] Complete Linux provider ownership and discovery,
       protected storage, workspace mutation and process reporting.
 - [ ] Pass Linux integration/serial library checks, real provider desktop input,

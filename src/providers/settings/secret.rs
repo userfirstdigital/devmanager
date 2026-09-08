@@ -1,4 +1,4 @@
-//! OS-protected secret custody for provider environment values (Windows DPAPI).
+//! OS-protected secret custody for provider environment values.
 
 use std::fmt;
 
@@ -13,6 +13,7 @@ pub enum SecretCustodyError {
     UnprotectFailed,
     TooLarge,
     Empty,
+    DesktopWallet(String),
 }
 
 impl fmt::Display for SecretCustodyError {
@@ -23,6 +24,7 @@ impl fmt::Display for SecretCustodyError {
             Self::UnprotectFailed => write!(f, "secret unprotection failed"),
             Self::TooLarge => write!(f, "secret payload exceeds bound"),
             Self::Empty => write!(f, "secret payload is empty"),
+            Self::DesktopWallet(message) => f.write_str(message),
         }
     }
 }
@@ -315,12 +317,27 @@ fn dpapi_unprotect(
     }
 }
 
-#[cfg(not(windows))]
+#[cfg(target_os = "linux")]
+fn dpapi_protect(plaintext: &[u8], entropy: &[u8; 32]) -> Result<Vec<u8>, SecretCustodyError> {
+    crate::secret_custody::protect(plaintext, entropy)
+        .map_err(|error| SecretCustodyError::DesktopWallet(error.to_string()))
+}
+
+#[cfg(target_os = "linux")]
+fn dpapi_unprotect(
+    blob: &[u8],
+    entropy: &[u8; 32],
+) -> Result<Zeroizing<Vec<u8>>, SecretCustodyError> {
+    crate::secret_custody::reveal(blob, entropy)
+        .map_err(|error| SecretCustodyError::DesktopWallet(error.to_string()))
+}
+
+#[cfg(not(any(windows, target_os = "linux")))]
 fn dpapi_protect(_plaintext: &[u8], _entropy: &[u8; 32]) -> Result<Vec<u8>, SecretCustodyError> {
     Err(SecretCustodyError::Unsupported)
 }
 
-#[cfg(not(windows))]
+#[cfg(not(any(windows, target_os = "linux")))]
 fn dpapi_unprotect(
     _blob: &[u8],
     _entropy: &[u8; 32],
@@ -328,7 +345,7 @@ fn dpapi_unprotect(
     Err(SecretCustodyError::Unsupported)
 }
 
-#[cfg(all(test, windows))]
+#[cfg(all(test, any(windows, target_os = "linux")))]
 mod tests {
     use super::*;
 
@@ -354,6 +371,14 @@ mod tests {
             std::ffi::OsString::from("PATH"),
             std::ffi::OsString::from("C:\\tools"),
         );
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStringExt;
+            map.insert(
+                std::ffi::OsString::from("NATIVE"),
+                std::ffi::OsString::from_vec(vec![0xff, 0xfe]),
+            );
+        }
         let bytes = encode_os_string_map(&map).unwrap();
         let back = decode_os_string_map(&bytes).unwrap();
         assert_eq!(map, back);

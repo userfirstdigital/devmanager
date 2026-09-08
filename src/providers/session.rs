@@ -3157,7 +3157,7 @@ struct PersistedLaunchSpecWire {
     /// and store secrets under `environment_protected`.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     environment: BTreeMap<OsString, OsString>,
-    /// DPAPI-protected JSON map of launch environment. Preferred at-rest form.
+    /// OS-protected lossless map of launch environment. Preferred at-rest form.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     environment_protected: Option<String>,
     capabilities: ProviderCapabilities,
@@ -3183,8 +3183,10 @@ fn encode_launch_environment_at_rest(
     if environment.is_empty() {
         return Ok(None);
     }
-    let json = crate::providers::settings::secret::encode_os_string_map(environment)
-        .map_err(|error| error.to_string())?;
+    let json = zeroize::Zeroizing::new(
+        crate::providers::settings::secret::encode_os_string_map(environment)
+            .map_err(|error| error.to_string())?,
+    );
     crate::providers::settings::secret::protect_bytes(&json, scope)
         .map(Some)
         .map_err(|error| error.to_string())
@@ -3309,14 +3311,14 @@ impl ProviderSessionState {
                 mode,
                 arguments: self.launch_spec.arguments.clone(),
                 cwd: self.launch_spec.cwd.clone(),
-                #[cfg(windows)]
+                #[cfg(any(windows, target_os = "linux"))]
                 environment: BTreeMap::new(),
                 // Preserve the pre-existing ordinary environment encoding on
                 // platforms without OS custody. New sensitive provider fields
                 // are rejected there; never disguise plaintext as protection.
-                #[cfg(not(windows))]
+                #[cfg(not(any(windows, target_os = "linux")))]
                 environment: self.launch_spec.environment.clone(),
-                #[cfg(windows)]
+                #[cfg(any(windows, target_os = "linux"))]
                 environment_protected: encode_launch_environment_at_rest(
                     &self.launch_spec.environment,
                     &launch_env_custody_scope(
@@ -3325,7 +3327,7 @@ impl ProviderSessionState {
                         self.launch_spec.launch_nonce.raw(),
                     ),
                 )?,
-                #[cfg(not(windows))]
+                #[cfg(not(any(windows, target_os = "linux")))]
                 environment_protected: None,
                 capabilities: self.launch_spec.capabilities.stable_projection(),
                 task_id: self.launch_spec.task_id,
@@ -11904,6 +11906,21 @@ mod tests {
         );
         relaunched.process_root = None;
 
+        #[cfg(any(windows, target_os = "linux"))]
+        {
+            let encoded = relaunched.encode().unwrap();
+            let json: serde_json::Value = serde_json::from_slice(&encoded).unwrap();
+            assert!(json["launch_spec"].get("environment").is_none());
+            assert!(json["launch_spec"]["environment_protected"].is_string());
+            assert!(!String::from_utf8_lossy(&encoded).contains("fresh-launch-value"));
+            assert_eq!(
+                ProviderSessionState::decode(&encoded)
+                    .unwrap()
+                    .launch_spec
+                    .environment,
+                relaunched.launch_spec.environment
+            );
+        }
         store
             .persist(relaunched)
             .expect("an exact resume must admit its newly generated launch environment");

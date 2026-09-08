@@ -29,7 +29,7 @@ Machine-checked against `Cargo.lock` by `packaging/Assert-ThirdPartyProvenance.p
 | Crate | Locked version | Root-direct |
 | --- | --- | --- |
 | `rustls` | `0.23.37` | yes |
-| `ring` | `0.17.14` | no (via rustls) |
+| `ring` | `0.17.14` | yes (Linux custody; also via rustls) |
 | `rcgen` | `0.13.2` | yes |
 | `sha2` | `0.10.9` | yes |
 | `hmac` | `0.12.1` | yes |
@@ -47,6 +47,14 @@ Machine-checked against `Cargo.lock` by `packaging/Assert-ThirdPartyProvenance.p
 | `wasm-bindgen` | `0.2.114` | no (WASM leaf feature) |
 
 Connect production Noise is the pinned `snow` 0.10.0 crate listed above. Connect relay TLS uses `tokio-rustls` 0.26.4 plus `webpki-roots` 1.0.6 for `wss://` only. Packaging must not embed private keys, pairing secrets, or OS-vault material.
+
+## Linux Secret Service custody
+
+- `secret-service` 5.2.0: MIT OR Apache-2.0, source `https://crates.io/crates/secret-service/5.2.0`.
+- `zbus` 5.14.0: MIT, source `https://crates.io/crates/zbus/5.14.0`.
+- Both are exact Linux dependency pins. Secret Service uses its DH-encrypted session with the desktop wallet; local encrypted envelopes use `ring` 0.17.14 ChaCha20-Poly1305.
+- The selected Rust session-crypto dependencies include `aes` 0.9.1, `cbc` 0.2.1, `hkdf` 0.13.0 and `sha2` 0.11.0 (MIT OR Apache-2.0). Exact checksums and the complete transitive graph are in `Cargo.lock`.
+- Wallet keys and saved user data are runtime state and are excluded from packages.
 
 ## snow 0.10.0 (Connect production Noise)
 

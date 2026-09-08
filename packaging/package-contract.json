@@ -116,7 +116,7 @@
     },
     "selectedCrypto": [
       { "name": "rustls", "version": "0.23.37", "direct": true },
-      { "name": "ring", "version": "0.17.14", "direct": false },
+      { "name": "ring", "version": "0.17.14", "direct": true },
       { "name": "rcgen", "version": "0.13.2", "direct": true },
       { "name": "sha2", "version": "0.10.9", "direct": true },
       { "name": "hmac", "version": "0.12.1", "direct": true },
@@ -128,7 +128,9 @@
     "requiredDirect": [
       { "name": "gpui", "version": "0.2.2" },
       { "name": "gpui-component", "version": "0.5.1" },
-      { "name": "rusqlite", "version": "0.39.0" }
+      { "name": "rusqlite", "version": "0.39.0" },
+      { "name": "secret-service", "version": "5.2.0" },
+      { "name": "zbus", "version": "5.14.0" }
     ]
   },
   "staleReferenceScan": {
