@@ -37,6 +37,15 @@ impl Drop for TestDir {
     }
 }
 
+fn assert_invalid_recipe_reason(error: &BrowserError, expected: &str) {
+    let BrowserError::InvalidRecipe { message } = error else {
+        panic!("expected invalid recipe, got {error:?}");
+    };
+    assert!(message.contains(expected), "wrong validation reason");
+    // Public display is deliberately redacted on every platform.
+    assert_eq!(error.to_string(), "browser recipe is invalid");
+}
+
 fn checkout_locator() -> BrowserRecipeLocator {
     BrowserRecipeLocator {
         accessibility_role: Some("textbox".to_string()),
@@ -262,7 +271,8 @@ fn browser_recipe_serialization_rejects_credential_material_without_echoing_it()
 
     let error = serde_json::to_string(&recipe).expect_err("credential material must not serialize");
     let message = error.to_string();
-    assert!(message.contains("credential-like material"));
+    assert_invalid_recipe_reason(&recipe.validate().unwrap_err(), "credential-like material");
+    assert_eq!(message, "browser recipe is invalid");
     assert!(!message.contains("checkpoint-secret-123"));
 }
 
@@ -393,7 +403,7 @@ fn browser_recipe_input_wire_rejects_secret_and_file_defaults_on_deserialize() {
         );
         let error = serde_json::from_str::<BrowserRecipeInput>(&json)
             .expect_err("sensitive input default must not deserialize");
-        assert!(error.to_string().contains("input default"));
+        assert!(error.to_string().contains("browser recipe is invalid"));
         assert!(!error.to_string().contains("nested-sensitive-sentinel"));
     }
 }
@@ -461,7 +471,7 @@ fn browser_recipe_validation_bounds_structure_strings_selectors_and_select_value
             default_value: None,
         }));
     let error = recipe.validate().expect_err("input count must be bounded");
-    assert!(error.to_string().contains("at most 64 inputs"));
+    assert_invalid_recipe_reason(&error, "at most 64 inputs");
 
     let mut recipe = sample_recipe();
     recipe.steps = (0..=MAX_STEPS)
@@ -472,7 +482,7 @@ fn browser_recipe_validation_bounds_structure_strings_selectors_and_select_value
         })
         .collect();
     let error = recipe.validate().expect_err("step count must be bounded");
-    assert!(error.to_string().contains("at most 256 steps"));
+    assert_invalid_recipe_reason(&error, "at most 256 steps");
 
     let assertion = sample_recipe().steps[0].assertions[0].clone();
     let mut recipe = sample_recipe();
@@ -480,7 +490,7 @@ fn browser_recipe_validation_bounds_structure_strings_selectors_and_select_value
     let error = recipe
         .validate()
         .expect_err("per-step assertion count must be bounded");
-    assert!(error.to_string().contains("at most 16 assertions"));
+    assert_invalid_recipe_reason(&error, "at most 16 assertions");
 
     let mut recipe = sample_recipe();
     recipe.steps = (0..=MAX_ASSERTIONS / MAX_ASSERTIONS_PER_STEP)
@@ -494,7 +504,7 @@ fn browser_recipe_validation_bounds_structure_strings_selectors_and_select_value
     let error = recipe
         .validate()
         .expect_err("total assertion count must be bounded");
-    assert!(error.to_string().contains("at most 256 total assertions"));
+    assert_invalid_recipe_reason(&error, "at most 256 total assertions");
 
     let mut recipe = sample_recipe();
     if let BrowserRecipeAction::Type { locator, .. } = &mut recipe.steps[0].action {
@@ -505,7 +515,7 @@ fn browser_recipe_validation_bounds_structure_strings_selectors_and_select_value
     let error = recipe
         .validate()
         .expect_err("locator fallback count must be bounded");
-    assert!(error.to_string().contains("at most 16 CSS locators"));
+    assert_invalid_recipe_reason(&error, "at most 16 CSS locators");
 
     let mut recipe = sample_recipe();
     if let BrowserRecipeAction::Type { locator, .. } = &mut recipe.steps[0].action {
@@ -514,7 +524,7 @@ fn browser_recipe_validation_bounds_structure_strings_selectors_and_select_value
     let error = recipe
         .validate()
         .expect_err("locator string size must be bounded");
-    assert!(error.to_string().contains("locator fallback is too large"));
+    assert_invalid_recipe_reason(&error, "locator fallback is too large");
 
     let mut recipe = sample_recipe();
     recipe.steps[0].assertions = vec![BrowserRecipeAssertion::Text {
@@ -526,7 +536,7 @@ fn browser_recipe_validation_bounds_structure_strings_selectors_and_select_value
     let error = recipe
         .validate()
         .expect_err("literal string size must be bounded");
-    assert!(error.to_string().contains("literal value is too large"));
+    assert_invalid_recipe_reason(&error, "literal value is too large");
 
     let mut recipe = sample_recipe();
     recipe.steps[0].action = BrowserRecipeAction::Select {
@@ -541,7 +551,7 @@ fn browser_recipe_validation_bounds_structure_strings_selectors_and_select_value
     let error = recipe
         .validate()
         .expect_err("select value count must be bounded");
-    assert!(error.to_string().contains("at most 64 values"));
+    assert_invalid_recipe_reason(&error, "at most 64 values");
 }
 
 #[test]
@@ -564,7 +574,7 @@ fn browser_recipe_repository_bounds_file_bytes_directory_entries_and_recipe_coun
     let error = load_recipe(oversized.path(), "oversized")
         .expect_err("oversized recipe file must be rejected before parsing");
     let message = error.to_string();
-    assert!(message.contains("recipe file exceeds 1048576 bytes"));
+    assert_invalid_recipe_reason(&error, "recipe file exceeds 1048576 bytes");
     assert!(!message.contains(&oversized.path().display().to_string()));
 
     let crowded = TestDir::new("crowded-directory");
@@ -580,7 +590,7 @@ fn browser_recipe_repository_bounds_file_bytes_directory_entries_and_recipe_coun
     let error =
         list_recipes(crowded.path()).expect_err("recipe directory entry scan must be bounded");
     let message = error.to_string();
-    assert!(message.contains("recipe directory exceeds 1024 entries"));
+    assert_invalid_recipe_reason(&error, "recipe directory exceeds 1024 entries");
     assert!(!message.contains(&crowded.path().display().to_string()));
 
     let many = TestDir::new("too-many-recipes");
@@ -597,7 +607,7 @@ fn browser_recipe_repository_bounds_file_bytes_directory_entries_and_recipe_coun
     }
     let error = list_recipes(many.path()).expect_err("recipe count must be bounded");
     let message = error.to_string();
-    assert!(message.contains("at most 256 recipes"));
+    assert_invalid_recipe_reason(&error, "at most 256 recipes");
     assert!(!message.contains(&many.path().display().to_string()));
 }
 
