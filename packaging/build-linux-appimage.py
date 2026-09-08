@@ -96,7 +96,7 @@ def assemble(args):
             shutil.copytree(ROOT / resource, target)
         desktop = appdir / "usr/share/applications/devmanager.desktop"
         desktop.parent.mkdir(parents=True)
-        desktop.write_text("[Desktop Entry]\nType=Application\nName=DevManager\nExec=devmanager\nIcon=devmanager\nCategories=Development;\nTerminal=false\n")
+        desktop.write_text("[Desktop Entry]\nType=Application\nName=DevManager\nExec=devmanager\nIcon=devmanager\nStartupWMClass=devmanager\nCategories=Development;\nTerminal=false\n")
         icon = appdir / "usr/share/icons/hicolor/256x256/apps/devmanager.png"
         icon.parent.mkdir(parents=True)
         shutil.copy2(ROOT / "packaging/icons/devmanager-256.png", icon)

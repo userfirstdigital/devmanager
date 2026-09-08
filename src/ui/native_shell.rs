@@ -11313,7 +11313,7 @@ impl NativePlatformAccessibilityBridge {
 }
 
 #[cfg(windows)]
-fn apply_embedded_window_icons(hwnd: windows::Win32::Foundation::HWND) {
+pub(super) fn apply_embedded_window_icons(hwnd: windows::Win32::Foundation::HWND) {
     use std::sync::OnceLock;
     use windows::core::PCWSTR;
     use windows::Win32::Foundation::{LPARAM, WPARAM};

@@ -45,6 +45,7 @@ pub mod terminal_adapter;
 pub mod theme_system;
 pub mod tokens;
 pub mod workspace_layout;
+mod window_identity;
 
 pub use native_shell::{NativeClientDetach, NativeHostFullQuit};
 pub use preview::PreviewInitReport;
@@ -62,6 +63,7 @@ impl Global for ComponentInitialized {}
 pub fn init(cx: &mut App) {
     if cx.try_global::<ComponentInitialized>().is_none() {
         gpui_component::init(cx);
+        window_identity::init(cx);
         cx.set_global(ComponentInitialized);
         COMPONENT_INIT_COUNT.fetch_add(1, Ordering::SeqCst);
     }

@@ -11,6 +11,22 @@ engine, CLI/updater/package contracts, and the locked all-target compiler check
 are recorded below. Windows desktop and installer acceptance still require a
 Windows machine; public release promotion has not occurred.
 
+## Original application icon
+
+The original 0.4.1 packaging PNG/ICO assets are unchanged byte for byte. Native
+windows now share the `devmanager` desktop identity. Linux attaches the original
+32/128 px ARGB artwork directly to each X11 window and declares the matching
+launcher class; Wayland uses the matching app ID. Windows auxiliary windows use
+the same embedded original ICO as the main window. This restores desktop/taskbar
+branding without replacing the artwork.
+
+The locked library/bin/test compiler check and release/AppImage builds passed.
+The installed KDE/X11 window reports `WM_CLASS=devmanager` and its two icon
+images match the original PNG pixels exactly. Desktop/window captures and
+identity evidence are in `launch-evidence/icon-restoration/`. The installed
+AppImage SHA-256 is `fd80c1a28945547eda29656979233e9c319f09a7e2d87ebccb8b46759342ffec`.
+Windows interactive icon acceptance remains pending.
+
 ## Workspace Git manager
 
 Git now opens without a selected task and discovers repositories across configured
