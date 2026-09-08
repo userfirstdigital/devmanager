@@ -5,6 +5,11 @@
 
 mod agent_connection;
 mod cockpit;
+
+/// Constructible only by host modules after explicit Git mutation admission.
+pub(crate) struct ConfirmedGitDesktopMutation {
+    _private: (),
+}
 mod connect;
 mod connection;
 mod conversation_wake;

@@ -1,35 +1,17 @@
 use super::{GitField, GitView, GitWindow};
 use crate::git::git_service::{DiffLineKind, GitFileStatus};
 use crate::icons;
-use crate::theme;
+use crate::ui::tokens::ThemeTokens;
 use gpui::{
     div, prelude::*, px, rgb, AnyElement, App, ClipboardItem, Context, InteractiveElement,
     IntoElement, MouseButton, MouseDownEvent, ParentElement, SharedString,
     StatefulInteractiveElement, Styled, Window,
 };
 
-// ── Colors (GitHub Desktop palette adapted to dark theme) ───────────────────
-
-const GIT_GREEN: u32 = 0x2ea043;
-const GIT_GREEN_BG: u32 = 0x1b2b1e;
-const GIT_RED: u32 = 0xf85149;
-const GIT_RED_BG: u32 = 0x2d1b1e;
-const GIT_ORANGE: u32 = 0xd29922;
-const GIT_BLUE: u32 = 0x388bfd;
-const GIT_GREY: u32 = 0x8b949e;
-const TOOLBAR_BG: u32 = 0x161b22;
-const TOOLBAR_BORDER: u32 = 0x30363d;
-const TAB_ACTIVE_BORDER: u32 = 0x388bfd;
-const FILE_SELECTED_BG: u32 = 0x1f2937;
-const COMMIT_BUTTON_BG: u32 = 0x238636;
-const COMMIT_BUTTON_HOVER: u32 = 0x2ea043;
-const DIFF_HEADER_BG: u32 = 0x1c2128;
-const HUNK_HEADER_BG: u32 = 0x1c2d4f;
-const HUNK_HEADER_TEXT: u32 = 0x79c0ff;
-
 // ── Main window render ─────────────────────────────────────────────────────
 
 pub fn render_git_window(state: &GitWindow, cx: &mut Context<GitWindow>) -> AnyElement {
+    let tokens = state.tokens;
     div()
         .size_full()
         .flex()
@@ -42,7 +24,7 @@ pub fn render_git_window(state: &GitWindow, cx: &mut Context<GitWindow>) -> AnyE
             state
                 .operation_result
                 .as_ref()
-                .map(|(success, msg)| render_operation_banner(*success, msg)),
+                .map(|(success, msg)| render_operation_banner(tokens, *success, msg)),
         )
         .child(match state.active_view {
             GitView::Changes => render_changes_view(state, cx),
@@ -52,6 +34,7 @@ pub fn render_git_window(state: &GitWindow, cx: &mut Context<GitWindow>) -> AnyE
 }
 
 fn render_login_bar(state: &GitWindow, cx: &mut Context<GitWindow>) -> Option<AnyElement> {
+    let tokens = state.tokens;
     // If we're in the device code flow, show the code
     if let Some(ref login) = state.login_state {
         return Some(
@@ -63,13 +46,13 @@ fn render_login_bar(state: &GitWindow, cx: &mut Context<GitWindow>) -> Option<An
                 .gap(px(12.0))
                 .px_3()
                 .py(px(8.0))
-                .bg(rgb(HUNK_HEADER_BG))
+                .bg(rgb(tokens.surfaces.selection.to_u32()))
                 .border_b_1()
-                .border_color(rgb(TOOLBAR_BORDER))
+                .border_color(rgb(tokens.borders.subtle.to_u32()))
                 .child(
                     div()
                         .text_size(px(12.0))
-                        .text_color(rgb(theme::TEXT_MUTED))
+                        .text_color(rgb(tokens.text.secondary.to_u32()))
                         .child("Enter this code on GitHub:"),
                 )
                 .child(
@@ -77,12 +60,12 @@ fn render_login_bar(state: &GitWindow, cx: &mut Context<GitWindow>) -> Option<An
                         .px_3()
                         .py(px(4.0))
                         .rounded_md()
-                        .bg(rgb(TOOLBAR_BG))
+                        .bg(rgb(tokens.surfaces.raised.to_u32()))
                         .border_1()
-                        .border_color(rgb(GIT_BLUE))
+                        .border_color(rgb(tokens.actions.primary.default.background.to_u32()))
                         .text_size(px(18.0))
                         .font_weight(gpui::FontWeight::BOLD)
-                        .text_color(rgb(0xffffff))
+                        .text_color(rgb(tokens.actions.primary.default.foreground.to_u32()))
                         .child(SharedString::from(login.user_code.clone())),
                 )
                 .child({
@@ -90,12 +73,12 @@ fn render_login_bar(state: &GitWindow, cx: &mut Context<GitWindow>) -> Option<An
                     div()
                         .px_2()
                         .py(px(4.0))
-                        .rounded_sm()
-                        .bg(rgb(TOOLBAR_BORDER))
+                        .rounded_md()
+                        .bg(rgb(tokens.borders.subtle.to_u32()))
                         .text_size(px(11.0))
-                        .text_color(rgb(theme::TEXT_PRIMARY))
+                        .text_color(rgb(tokens.text.primary.to_u32()))
                         .cursor_pointer()
-                        .hover(|s| s.bg(rgb(theme::BUTTON_HOVER_BG)))
+                        .hover(|s| s.bg(rgb(tokens.surfaces.hover.to_u32())))
                         .child("Copy")
                         .on_mouse_down(
                             MouseButton::Left,
@@ -110,7 +93,7 @@ fn render_login_bar(state: &GitWindow, cx: &mut Context<GitWindow>) -> Option<An
                 .child(
                     div()
                         .text_size(px(11.0))
-                        .text_color(rgb(theme::TEXT_DIM))
+                        .text_color(rgb(tokens.text.muted.to_u32()))
                         .child("Waiting for authorization..."),
                 )
                 .into_any_element(),
@@ -127,26 +110,26 @@ fn render_login_bar(state: &GitWindow, cx: &mut Context<GitWindow>) -> Option<An
                 .justify_between()
                 .px_3()
                 .py(px(6.0))
-                .bg(rgb(HUNK_HEADER_BG))
+                .bg(rgb(tokens.surfaces.selection.to_u32()))
                 .border_b_1()
-                .border_color(rgb(TOOLBAR_BORDER))
+                .border_color(rgb(tokens.borders.subtle.to_u32()))
                 .child(
                     div()
                         .text_size(px(12.0))
-                        .text_color(rgb(theme::TEXT_MUTED))
-                        .child("Sign in to GitHub for AI commit messages and push/pull"),
+                        .text_color(rgb(tokens.text.secondary.to_u32()))
+                        .child("Sign in to GitHub to generate commit messages with AI"),
                 )
                 .child(
                     div()
                         .px_3()
                         .py(px(4.0))
-                        .rounded_sm()
-                        .bg(rgb(COMMIT_BUTTON_BG))
+                        .rounded_md()
+                        .bg(rgb(tokens.actions.primary.default.background.to_u32()))
                         .text_size(px(12.0))
-                        .text_color(rgb(0xffffff))
+                        .text_color(rgb(tokens.actions.primary.default.foreground.to_u32()))
                         .cursor_pointer()
-                        .hover(|s| s.bg(rgb(COMMIT_BUTTON_HOVER)))
-                        .child("Login with GitHub")
+                        .hover(|s| s.bg(rgb(tokens.actions.primary.hover.background.to_u32())))
+                        .child("Sign in with GitHub")
                         .on_mouse_down(
                             MouseButton::Left,
                             cx.listener(|this, _: &MouseDownEvent, _window, cx| {
@@ -164,6 +147,7 @@ fn render_login_bar(state: &GitWindow, cx: &mut Context<GitWindow>) -> Option<An
 // ── Toolbar (3 sections) ────────────────────────────────────────────────────
 
 fn render_toolbar(state: &GitWindow, cx: &mut Context<GitWindow>) -> AnyElement {
+    let tokens = state.tokens;
     let branch_name = state
         .status
         .as_ref()
@@ -192,7 +176,7 @@ fn render_toolbar(state: &GitWindow, cx: &mut Context<GitWindow>) -> AnyElement 
 
     // Sync button label and state
     let (sync_label, sync_detail) = if state.is_pushing {
-        ("Syncing...".to_string(), String::new())
+        ("Pushing…".to_string(), String::new())
     } else if state.is_pulling {
         ("Pulling...".to_string(), String::new())
     } else if state.is_fetching {
@@ -201,7 +185,7 @@ fn render_toolbar(state: &GitWindow, cx: &mut Context<GitWindow>) -> AnyElement 
         ("Publish branch".to_string(), String::new())
     } else if ahead > 0 && behind > 0 {
         (
-            format!("Sync"),
+            "Push".to_string(),
             format!("\u{2191}{} \u{2193}{}", ahead, behind),
         )
     } else if ahead > 0 {
@@ -226,9 +210,9 @@ fn render_toolbar(state: &GitWindow, cx: &mut Context<GitWindow>) -> AnyElement 
     div()
         .w_full()
         .flex()
-        .bg(rgb(TOOLBAR_BG))
+        .bg(rgb(tokens.surfaces.raised.to_u32()))
         .border_b_1()
-        .border_color(rgb(TOOLBAR_BORDER))
+        .border_color(rgb(tokens.borders.subtle.to_u32()))
         // Left: Repository
         .child({
             let has_multiple = state.repos.len() > 1;
@@ -239,10 +223,10 @@ fn render_toolbar(state: &GitWindow, cx: &mut Context<GitWindow>) -> AnyElement 
                 .px_3()
                 .py(px(8.0))
                 .border_r_1()
-                .border_color(rgb(TOOLBAR_BORDER))
+                .border_color(rgb(tokens.borders.subtle.to_u32()))
                 .when(has_multiple, |d| {
                     d.cursor_pointer()
-                        .hover(|s| s.bg(rgb(theme::ROW_HOVER_BG)))
+                        .hover(|s| s.bg(rgb(tokens.surfaces.hover.to_u32())))
                         .on_mouse_down(
                             MouseButton::Left,
                             cx.listener(|this, _: &MouseDownEvent, _window, cx| {
@@ -257,7 +241,7 @@ fn render_toolbar(state: &GitWindow, cx: &mut Context<GitWindow>) -> AnyElement 
                 .child(
                     div()
                         .text_size(px(11.0))
-                        .text_color(rgb(GIT_GREY))
+                        .text_color(rgb(tokens.text.muted.to_u32()))
                         .child("Current repository"),
                 )
                 .child(
@@ -275,7 +259,7 @@ fn render_toolbar(state: &GitWindow, cx: &mut Context<GitWindow>) -> AnyElement 
                             d.child(icons::app_icon(
                                 icons::CHEVRON_DOWN,
                                 12.0,
-                                theme::TEXT_MUTED,
+                                tokens.text.secondary.to_u32(),
                             ))
                         }),
                 )
@@ -289,15 +273,16 @@ fn render_toolbar(state: &GitWindow, cx: &mut Context<GitWindow>) -> AnyElement 
                 .px_3()
                 .py(px(8.0))
                 .border_r_1()
-                .border_color(rgb(TOOLBAR_BORDER))
+                .border_color(rgb(tokens.borders.subtle.to_u32()))
                 .cursor_pointer()
-                .hover(|s| s.bg(rgb(theme::ROW_HOVER_BG)))
+                .hover(|s| s.bg(rgb(tokens.surfaces.hover.to_u32())))
                 .on_mouse_down(
                     MouseButton::Left,
                     cx.listener(|this, _: &MouseDownEvent, _window, cx| {
                         this.show_branch_dropdown = !this.show_branch_dropdown;
                         if this.show_branch_dropdown {
                             this.load_branches(cx);
+                            this.focus(_window);
                             this.active_field = Some(GitField::BranchFilter);
                             this.cursor = 0;
                         }
@@ -307,7 +292,7 @@ fn render_toolbar(state: &GitWindow, cx: &mut Context<GitWindow>) -> AnyElement 
                 .child(
                     div()
                         .text_size(px(11.0))
-                        .text_color(rgb(GIT_GREY))
+                        .text_color(rgb(tokens.text.muted.to_u32()))
                         .child("Current branch"),
                 )
                 .child(
@@ -318,7 +303,7 @@ fn render_toolbar(state: &GitWindow, cx: &mut Context<GitWindow>) -> AnyElement 
                         .child(icons::app_icon(
                             icons::GIT_BRANCH,
                             14.0,
-                            theme::TEXT_PRIMARY,
+                            tokens.text.primary.to_u32(),
                         ))
                         .child(
                             div()
@@ -333,7 +318,7 @@ fn render_toolbar(state: &GitWindow, cx: &mut Context<GitWindow>) -> AnyElement 
                         .child(icons::app_icon(
                             icons::CHEVRON_DOWN,
                             12.0,
-                            theme::TEXT_MUTED,
+                            tokens.text.secondary.to_u32(),
                         )),
                 ),
         )
@@ -346,7 +331,7 @@ fn render_toolbar(state: &GitWindow, cx: &mut Context<GitWindow>) -> AnyElement 
                 .px_3()
                 .py(px(8.0))
                 .cursor_pointer()
-                .hover(|s| s.bg(rgb(theme::ROW_HOVER_BG)))
+                .hover(|s| s.bg(rgb(tokens.surfaces.hover.to_u32())))
                 .on_mouse_down(
                     MouseButton::Left,
                     cx.listener(move |this, _: &MouseDownEvent, _window, cx| {
@@ -372,7 +357,7 @@ fn render_toolbar(state: &GitWindow, cx: &mut Context<GitWindow>) -> AnyElement 
                         .child(icons::app_icon(
                             icons::REFRESH_CW,
                             14.0,
-                            theme::TEXT_PRIMARY,
+                            tokens.text.primary.to_u32(),
                         ))
                         .child(
                             div()
@@ -384,7 +369,12 @@ fn render_toolbar(state: &GitWindow, cx: &mut Context<GitWindow>) -> AnyElement 
                             Some(
                                 div()
                                     .text_size(px(11.0))
-                                    .text_color(rgb(GIT_BLUE))
+                                    .text_color(rgb(tokens
+                                        .actions
+                                        .primary
+                                        .default
+                                        .background
+                                        .to_u32()))
                                     .child(SharedString::from(sync_detail.clone())),
                             )
                         } else {
@@ -407,7 +397,7 @@ fn render_toolbar(state: &GitWindow, cx: &mut Context<GitWindow>) -> AnyElement 
                 .px_3()
                 .py(px(4.0))
                 .border_l_1()
-                .border_color(rgb(TOOLBAR_BORDER))
+                .border_color(rgb(tokens.borders.subtle.to_u32()))
                 .child(
                     div()
                         .flex()
@@ -418,21 +408,21 @@ fn render_toolbar(state: &GitWindow, cx: &mut Context<GitWindow>) -> AnyElement 
                                 .w(px(8.0))
                                 .h(px(8.0))
                                 .rounded_full()
-                                .bg(rgb(GIT_GREEN)),
+                                .bg(rgb(tokens.status.success.to_u32())),
                         )
                         .child(
                             div()
                                 .text_size(px(11.0))
-                                .text_color(rgb(theme::TEXT_MUTED))
+                                .text_color(rgb(tokens.text.secondary.to_u32()))
                                 .child(SharedString::from(username.clone())),
                         ),
                 )
                 .child(
                     div()
                         .text_size(px(9.0))
-                        .text_color(rgb(theme::TEXT_DIM))
+                        .text_color(rgb(tokens.text.muted.to_u32()))
                         .cursor_pointer()
-                        .hover(|s| s.text_color(rgb(GIT_RED)))
+                        .hover(|s| s.text_color(rgb(tokens.status.destructive.to_u32())))
                         .child("logout")
                         .on_mouse_down(
                             MouseButton::Left,
@@ -449,15 +439,27 @@ fn render_toolbar(state: &GitWindow, cx: &mut Context<GitWindow>) -> AnyElement 
 // ── Tab bar ─────────────────────────────────────────────────────────────────
 
 fn render_tab_bar(state: &GitWindow, cx: &mut Context<GitWindow>) -> AnyElement {
-    let file_count = state.status.as_ref().map(|s| s.entries.len()).unwrap_or(0);
+    let tokens = state.tokens;
+    let file_count = state
+        .status
+        .as_ref()
+        .map(|s| {
+            s.entries
+                .iter()
+                .map(|entry| &entry.path)
+                .collect::<std::collections::HashSet<_>>()
+                .len()
+        })
+        .unwrap_or(0);
 
     div()
         .w_full()
         .flex()
-        .bg(rgb(TOOLBAR_BG))
+        .bg(rgb(tokens.surfaces.raised.to_u32()))
         .border_b_1()
-        .border_color(rgb(TOOLBAR_BORDER))
+        .border_color(rgb(tokens.borders.subtle.to_u32()))
         .child(render_tab(
+            tokens,
             &format!("Changes ({})", file_count),
             state.active_view == GitView::Changes,
             cx.listener(|this, _: &MouseDownEvent, _window, cx| {
@@ -466,6 +468,7 @@ fn render_tab_bar(state: &GitWindow, cx: &mut Context<GitWindow>) -> AnyElement 
             }),
         ))
         .child(render_tab(
+            tokens,
             "History",
             state.active_view == GitView::History,
             cx.listener(|this, _: &MouseDownEvent, _window, cx| {
@@ -476,10 +479,29 @@ fn render_tab_bar(state: &GitWindow, cx: &mut Context<GitWindow>) -> AnyElement 
                 cx.notify();
             }),
         ))
+        .child(div().flex_1())
+        .child(
+            crate::ui::components::button::native_toolbar_button(
+                "git-refresh",
+                "Refresh",
+                !state.is_loading && !state.is_mutating,
+            )
+            .on_click(cx.listener(|this, _, _, cx| {
+                this.operation_result = None;
+                this.refresh_status(cx);
+                if this.active_view == GitView::History {
+                    this.log_page = 0;
+                    this.log_entries.clear();
+                    this.load_history(cx);
+                }
+                cx.notify();
+            })),
+        )
         .into_any_element()
 }
 
 fn render_tab(
+    tokens: ThemeTokens,
     label: &str,
     active: bool,
     on_click: impl Fn(&MouseDownEvent, &mut Window, &mut App) + 'static,
@@ -490,14 +512,15 @@ fn render_tab(
         .text_size(px(12.0))
         .cursor_pointer()
         .text_color(if active {
-            rgb(theme::TEXT_PRIMARY)
+            rgb(tokens.text.primary.to_u32())
         } else {
-            rgb(theme::TEXT_MUTED)
+            rgb(tokens.text.secondary.to_u32())
         })
         .when(active, |d| {
-            d.border_b_2().border_color(rgb(TAB_ACTIVE_BORDER))
+            d.border_b_2()
+                .border_color(rgb(tokens.actions.primary.default.background.to_u32()))
         })
-        .hover(|s| s.bg(rgb(theme::ROW_HOVER_BG)))
+        .hover(|s| s.bg(rgb(tokens.surfaces.hover.to_u32())))
         .child(SharedString::from(label.to_string()))
         .on_mouse_down(MouseButton::Left, move |ev, window, app| {
             on_click(ev, window, app)
@@ -507,17 +530,17 @@ fn render_tab(
 
 // ── Operation banner ────────────────────────────────────────────────────────
 
-fn render_operation_banner(success: bool, msg: &str) -> AnyElement {
+fn render_operation_banner(tokens: ThemeTokens, success: bool, msg: &str) -> AnyElement {
     div()
         .w_full()
         .px_3()
         .py(px(6.0))
-        .bg(rgb(if success { theme::SUCCESS_BG } else { 0x2d1b1e }))
+        .bg(tokens.surfaces.raised.to_gpui())
         .text_size(px(12.0))
         .text_color(rgb(if success {
-            theme::SUCCESS_TEXT
+            tokens.status.success.to_u32()
         } else {
-            GIT_RED
+            tokens.status.destructive.to_u32()
         }))
         .child(SharedString::from(msg.to_string()))
         .into_any_element()
@@ -526,6 +549,7 @@ fn render_operation_banner(success: bool, msg: &str) -> AnyElement {
 // ── Changes view ────────────────────────────────────────────────────────────
 
 fn render_changes_view(state: &GitWindow, cx: &mut Context<GitWindow>) -> AnyElement {
+    let tokens = state.tokens;
     div()
         .flex_1()
         .flex()
@@ -538,7 +562,7 @@ fn render_changes_view(state: &GitWindow, cx: &mut Context<GitWindow>) -> AnyEle
                 .flex()
                 .flex_col()
                 .border_r_1()
-                .border_color(rgb(TOOLBAR_BORDER))
+                .border_color(rgb(tokens.borders.subtle.to_u32()))
                 .child(render_file_filter(state, cx))
                 .child(render_file_list_header(state, cx))
                 .child(render_file_list(state, cx))
@@ -560,26 +584,28 @@ fn render_changes_view(state: &GitWindow, cx: &mut Context<GitWindow>) -> AnyEle
 // ── File filter ─────────────────────────────────────────────────────────────
 
 fn render_file_filter(state: &GitWindow, cx: &mut Context<GitWindow>) -> AnyElement {
+    let tokens = state.tokens;
     div()
         .w_full()
         .px_2()
         .py(px(4.0))
         .border_b_1()
-        .border_color(rgb(TOOLBAR_BORDER))
+        .border_color(rgb(tokens.borders.subtle.to_u32()))
         .child(
             div()
                 .w_full()
                 .px_2()
                 .py(px(3.0))
-                .rounded_sm()
-                .bg(rgb(theme::EDITOR_FIELD_BG))
+                .rounded_md()
+                .bg(rgb(tokens.surfaces.sunken.to_u32()))
                 .border_1()
-                .border_color(rgb(TOOLBAR_BORDER))
+                .border_color(rgb(tokens.borders.subtle.to_u32()))
                 .text_size(px(12.0))
                 .cursor_pointer()
                 .on_mouse_down(
                     MouseButton::Left,
                     cx.listener(|this, _: &MouseDownEvent, _window, cx| {
+                        this.focus(_window);
                         this.active_field = Some(GitField::FileFilter);
                         this.cursor = this.file_filter.len();
                         cx.notify();
@@ -587,12 +613,12 @@ fn render_file_filter(state: &GitWindow, cx: &mut Context<GitWindow>) -> AnyElem
                 )
                 .child(if state.file_filter.is_empty() {
                     div()
-                        .text_color(rgb(theme::TEXT_DIM))
+                        .text_color(rgb(tokens.text.muted.to_u32()))
                         .child("Filter")
                         .into_any_element()
                 } else {
                     div()
-                        .text_color(rgb(theme::TEXT_PRIMARY))
+                        .text_color(rgb(tokens.text.primary.to_u32()))
                         .child(SharedString::from(state.file_filter.clone()))
                         .into_any_element()
                 }),
@@ -603,8 +629,13 @@ fn render_file_filter(state: &GitWindow, cx: &mut Context<GitWindow>) -> AnyElem
 // ── File list header ────────────────────────────────────────────────────────
 
 fn render_file_list_header(state: &GitWindow, cx: &mut Context<GitWindow>) -> AnyElement {
+    let tokens = state.tokens;
     let entries = state.filtered_entries();
-    let total = entries.len();
+    let total = entries
+        .iter()
+        .map(|entry| &entry.path)
+        .collect::<std::collections::HashSet<_>>()
+        .len();
     let all_staged = total > 0 && entries.iter().all(|e| e.staged);
 
     div()
@@ -615,8 +646,9 @@ fn render_file_list_header(state: &GitWindow, cx: &mut Context<GitWindow>) -> An
         .px_2()
         .py(px(4.0))
         .border_b_1()
-        .border_color(rgb(TOOLBAR_BORDER))
+        .border_color(rgb(tokens.borders.subtle.to_u32()))
         .child(render_checkbox(
+            tokens,
             all_staged,
             cx.listener(move |this, _: &MouseDownEvent, _window, cx| {
                 if all_staged {
@@ -629,7 +661,7 @@ fn render_file_list_header(state: &GitWindow, cx: &mut Context<GitWindow>) -> An
         .child(
             div()
                 .text_size(px(12.0))
-                .text_color(rgb(theme::TEXT_MUTED))
+                .text_color(rgb(tokens.text.secondary.to_u32()))
                 .child(SharedString::from(format!("{} changed files", total))),
         )
         .into_any_element()
@@ -638,6 +670,7 @@ fn render_file_list_header(state: &GitWindow, cx: &mut Context<GitWindow>) -> An
 // ── File list ───────────────────────────────────────────────────────────────
 
 fn render_file_list(state: &GitWindow, cx: &mut Context<GitWindow>) -> AnyElement {
+    let tokens = state.tokens;
     let entries = state.filtered_entries();
     let selected = state.selected_file.as_deref();
 
@@ -649,24 +682,25 @@ fn render_file_list(state: &GitWindow, cx: &mut Context<GitWindow>) -> AnyElemen
         .flex_col()
         .children(entries.iter().map(|entry| {
             let path = entry.path.clone();
-            let is_selected = selected == Some(path.as_str());
+            let is_selected =
+                selected == Some(path.as_str()) && state.selected_file_staged == entry.staged;
             let staged = entry.staged;
 
             let (status_label, status_color) = match entry.status {
-                GitFileStatus::Added => ("+", GIT_GREEN),
-                GitFileStatus::Modified => ("\u{25CF}", GIT_ORANGE), // ●
-                GitFileStatus::Deleted => ("\u{2212}", GIT_RED),     // −
-                GitFileStatus::Renamed => ("R", GIT_BLUE),
-                GitFileStatus::Copied => ("C", GIT_BLUE),
-                GitFileStatus::Untracked => ("?", GIT_GREY),
-                GitFileStatus::Conflicted => ("!", GIT_RED),
+                GitFileStatus::Added => ("+", tokens.status.success.to_u32()),
+                GitFileStatus::Modified => ("\u{25CF}", tokens.status.attention.to_u32()), // ●
+                GitFileStatus::Deleted => ("\u{2212}", tokens.status.destructive.to_u32()), // −
+                GitFileStatus::Renamed => ("R", tokens.actions.primary.default.background.to_u32()),
+                GitFileStatus::Copied => ("C", tokens.actions.primary.default.background.to_u32()),
+                GitFileStatus::Untracked => ("?", tokens.text.muted.to_u32()),
+                GitFileStatus::Conflicted => ("!", tokens.status.destructive.to_u32()),
             };
 
             let click_path = path.clone();
             let check_path = path.clone();
 
             div()
-                .id(SharedString::from(format!("file-{}", &path)))
+                .id(SharedString::from(format!("file-{}-{}", &path, staged)))
                 .w_full()
                 .flex()
                 .items_center()
@@ -674,9 +708,12 @@ fn render_file_list(state: &GitWindow, cx: &mut Context<GitWindow>) -> AnyElemen
                 .px_2()
                 .py(px(3.0))
                 .cursor_pointer()
-                .when(is_selected, |d| d.bg(rgb(FILE_SELECTED_BG)))
-                .hover(|s| s.bg(rgb(theme::ROW_HOVER_BG)))
+                .when(is_selected, |d| {
+                    d.bg(rgb(tokens.surfaces.selection.to_u32()))
+                })
+                .hover(|s| s.bg(rgb(tokens.surfaces.hover.to_u32())))
                 .child(render_checkbox(
+                    tokens,
                     staged,
                     cx.listener(move |this, _: &MouseDownEvent, _window, cx| {
                         if staged {
@@ -703,7 +740,7 @@ fn render_file_list(state: &GitWindow, cx: &mut Context<GitWindow>) -> AnyElemen
                 .on_mouse_down(
                     MouseButton::Left,
                     cx.listener(move |this, _: &MouseDownEvent, _window, cx| {
-                        this.select_file(&click_path, cx);
+                        this.select_file_side(&click_path, staged, cx);
                     }),
                 )
                 .into_any_element()
@@ -714,6 +751,7 @@ fn render_file_list(state: &GitWindow, cx: &mut Context<GitWindow>) -> AnyElemen
 // ── Checkbox ────────────────────────────────────────────────────────────────
 
 fn render_checkbox(
+    tokens: ThemeTokens,
     checked: bool,
     on_click: impl Fn(&MouseDownEvent, &mut Window, &mut App) + 'static,
 ) -> AnyElement {
@@ -724,15 +762,23 @@ fn render_checkbox(
         .flex()
         .items_center()
         .justify_center()
-        .rounded_sm()
+        .rounded_md()
         .border_1()
-        .border_color(rgb(if checked { GIT_BLUE } else { TOOLBAR_BORDER }))
-        .bg(rgb(if checked { GIT_BLUE } else { 0x00000000 }))
+        .border_color(rgb(if checked {
+            tokens.actions.primary.default.background.to_u32()
+        } else {
+            tokens.borders.subtle.to_u32()
+        }))
+        .bg(rgb(if checked {
+            tokens.actions.primary.default.background.to_u32()
+        } else {
+            tokens.surfaces.canvas.to_u32()
+        }))
         .cursor_pointer()
         .child(if checked {
             div()
                 .text_size(px(11.0))
-                .text_color(rgb(0xffffff))
+                .text_color(rgb(tokens.actions.primary.default.foreground.to_u32()))
                 .child("\u{2713}") // ✓
                 .into_any_element()
         } else {
@@ -745,6 +791,7 @@ fn render_checkbox(
 // ── Commit form ─────────────────────────────────────────────────────────────
 
 fn render_commit_form(state: &GitWindow, cx: &mut Context<GitWindow>) -> AnyElement {
+    let tokens = state.tokens;
     let branch_name = state
         .status
         .as_ref()
@@ -752,29 +799,95 @@ fn render_commit_form(state: &GitWindow, cx: &mut Context<GitWindow>) -> AnyElem
         .unwrap_or("branch");
 
     let staged_count = state.staged_count();
+    if let Some((summary, description)) = &state.commit_inputs {
+        use crate::ui::components::button::native_toolbar_button;
+        use crate::ui::components::text_field::native_text_input;
+        let busy = state.is_mutating || state.is_generating_message || state.is_loading;
+        return div()
+            .w_full()
+            .flex()
+            .flex_col()
+            .gap(px(10.0))
+            .p_3()
+            .border_t_1()
+            .border_color(tokens.borders.subtle.to_gpui())
+            .child(
+                div()
+                    .text_size(px(12.0))
+                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                    .child("Commit changes"),
+            )
+            .child(native_text_input(summary))
+            .child(native_text_input(description).h(px(84.0)))
+            .child(
+                native_toolbar_button(
+                    "git-ai-commit-message",
+                    if state.is_generating_message {
+                        "Writing commit message…"
+                    } else {
+                        "Generate with AI"
+                    },
+                    !busy && staged_count > 0,
+                )
+                .tooltip("Summarize your staged changes with GitHub AI")
+                .on_click(cx.listener(|this, _, _, cx| {
+                    if this.github_token.is_none() {
+                        this.start_github_login(cx);
+                    } else {
+                        this.generate_commit_message(cx);
+                    }
+                })),
+            )
+            .child({
+                use gpui_component::button::ButtonVariants;
+                native_toolbar_button(
+                    "git-create-commit",
+                    if state.is_committing {
+                        "Committing…"
+                    } else {
+                        "Commit changes"
+                    },
+                    !busy && staged_count > 0 && !state.commit_summary.trim().is_empty(),
+                )
+                .primary()
+                .w_full()
+                .on_click(cx.listener(|this, _, _, cx| this.commit_action(cx)))
+            })
+            .child(
+                div()
+                    .text_size(px(11.0))
+                    .text_color(tokens.text.muted.to_gpui())
+                    .child(if staged_count == 0 {
+                        "Select changes to include in this commit".to_string()
+                    } else {
+                        format!("{staged_count} staged · {branch_name}")
+                    }),
+            )
+            .into_any_element();
+    }
 
     div()
         .w_full()
         .flex()
         .flex_col()
-        .gap(px(4.0))
-        .p_2()
+        .gap(px(8.0))
+        .p_3()
         .border_t_1()
-        .border_color(rgb(TOOLBAR_BORDER))
+        .border_color(rgb(tokens.borders.subtle.to_u32()))
         // Summary field
         .child(
             div()
                 .w_full()
                 .px_2()
                 .py(px(6.0))
-                .rounded_sm()
-                .bg(rgb(theme::EDITOR_FIELD_BG))
+                .rounded_md()
+                .bg(rgb(tokens.surfaces.sunken.to_u32()))
                 .border_1()
                 .border_color(rgb(
                     if matches!(state.active_field, Some(GitField::CommitSummary)) {
-                        GIT_BLUE
+                        tokens.actions.primary.default.background.to_u32()
                     } else {
-                        TOOLBAR_BORDER
+                        tokens.borders.subtle.to_u32()
                     },
                 ))
                 .text_size(px(12.0))
@@ -782,6 +895,7 @@ fn render_commit_form(state: &GitWindow, cx: &mut Context<GitWindow>) -> AnyElem
                 .on_mouse_down(
                     MouseButton::Left,
                     cx.listener(|this, _: &MouseDownEvent, _window, cx| {
+                        this.focus(_window);
                         this.active_field = Some(GitField::CommitSummary);
                         this.cursor = this.commit_summary.len();
                         cx.notify();
@@ -789,12 +903,12 @@ fn render_commit_form(state: &GitWindow, cx: &mut Context<GitWindow>) -> AnyElem
                 )
                 .child(if state.commit_summary.is_empty() {
                     div()
-                        .text_color(rgb(theme::TEXT_DIM))
-                        .child("Summary (required)")
+                        .text_color(rgb(tokens.text.muted.to_u32()))
+                        .child("Commit summary")
                         .into_any_element()
                 } else {
                     div()
-                        .text_color(rgb(theme::TEXT_PRIMARY))
+                        .text_color(rgb(tokens.text.primary.to_u32()))
                         .child(SharedString::from(state.commit_summary.clone()))
                         .into_any_element()
                 }),
@@ -805,14 +919,14 @@ fn render_commit_form(state: &GitWindow, cx: &mut Context<GitWindow>) -> AnyElem
                 .w_full()
                 .px_2()
                 .py(px(6.0))
-                .rounded_sm()
-                .bg(rgb(theme::EDITOR_FIELD_BG))
+                .rounded_md()
+                .bg(rgb(tokens.surfaces.sunken.to_u32()))
                 .border_1()
                 .border_color(rgb(
                     if matches!(state.active_field, Some(GitField::CommitDescription)) {
-                        GIT_BLUE
+                        tokens.actions.primary.default.background.to_u32()
                     } else {
-                        TOOLBAR_BORDER
+                        tokens.borders.subtle.to_u32()
                     },
                 ))
                 .text_size(px(12.0))
@@ -821,6 +935,7 @@ fn render_commit_form(state: &GitWindow, cx: &mut Context<GitWindow>) -> AnyElem
                 .on_mouse_down(
                     MouseButton::Left,
                     cx.listener(|this, _: &MouseDownEvent, _window, cx| {
+                        this.focus(_window);
                         this.active_field = Some(GitField::CommitDescription);
                         this.cursor = this.commit_description.len();
                         cx.notify();
@@ -828,12 +943,12 @@ fn render_commit_form(state: &GitWindow, cx: &mut Context<GitWindow>) -> AnyElem
                 )
                 .child(if state.commit_description.is_empty() {
                     div()
-                        .text_color(rgb(theme::TEXT_DIM))
-                        .child("Description")
+                        .text_color(rgb(tokens.text.muted.to_u32()))
+                        .child("Description (optional)")
                         .into_any_element()
                 } else {
                     div()
-                        .text_color(rgb(theme::TEXT_PRIMARY))
+                        .text_color(rgb(tokens.text.primary.to_u32()))
                         .child(SharedString::from(state.commit_description.clone()))
                         .into_any_element()
                 }),
@@ -845,18 +960,18 @@ fn render_commit_form(state: &GitWindow, cx: &mut Context<GitWindow>) -> AnyElem
                 .w_full()
                 .px_2()
                 .py(px(4.0))
-                .rounded_sm()
-                .bg(rgb(theme::EDITOR_CARD_BG))
+                .rounded_md()
+                .bg(rgb(tokens.surfaces.raised.to_u32()))
                 .border_1()
-                .border_color(rgb(TOOLBAR_BORDER))
+                .border_color(rgb(tokens.borders.subtle.to_u32()))
                 .text_size(px(11.0))
                 .text_color(rgb(if is_generating {
-                    theme::TEXT_DIM
+                    tokens.text.muted.to_u32()
                 } else {
-                    GIT_BLUE
+                    tokens.actions.primary.default.background.to_u32()
                 }))
                 .cursor_pointer()
-                .hover(|s| s.bg(rgb(theme::ROW_HOVER_BG)))
+                .hover(|s| s.bg(rgb(tokens.surfaces.hover.to_u32())))
                 .flex()
                 .items_center()
                 .justify_center()
@@ -865,7 +980,7 @@ fn render_commit_form(state: &GitWindow, cx: &mut Context<GitWindow>) -> AnyElem
                     icons::SPARKLES,
                     12.0,
                     if is_generating {
-                        theme::TEXT_DIM
+                        tokens.text.muted.to_u32()
                     } else {
                         0x388bfd
                     },
@@ -891,34 +1006,40 @@ fn render_commit_form(state: &GitWindow, cx: &mut Context<GitWindow>) -> AnyElem
                 .w_full()
                 .px_2()
                 .py(px(6.0))
-                .rounded_sm()
-                .bg(rgb(if staged_count > 0 {
-                    COMMIT_BUTTON_BG
+                .rounded_md()
+                .bg(rgb(if staged_count > 0 && !state.is_committing {
+                    tokens.actions.primary.default.background.to_u32()
                 } else {
-                    theme::BORDER_PRIMARY
+                    tokens.borders.default.to_u32()
                 }))
                 .text_size(px(13.0))
-                .text_color(rgb(if staged_count > 0 {
-                    0xffffff
+                .text_color(rgb(if staged_count > 0 && !state.is_committing {
+                    tokens.actions.primary.default.foreground.to_u32()
                 } else {
-                    theme::TEXT_DIM
+                    tokens.text.muted.to_u32()
                 }))
-                .cursor(if staged_count > 0 {
+                .cursor(if staged_count > 0 && !state.is_committing {
                     gpui::CursorStyle::PointingHand
                 } else {
                     gpui::CursorStyle::default()
                 })
-                .when(staged_count > 0, |d| {
-                    d.hover(|s| s.bg(rgb(COMMIT_BUTTON_HOVER)))
+                .when(staged_count > 0 && !state.is_committing, |d| {
+                    d.hover(|s| s.bg(rgb(tokens.actions.primary.hover.background.to_u32())))
                 })
                 .flex()
                 .justify_center()
                 .font_weight(gpui::FontWeight::BOLD)
-                .child(SharedString::from(if staged_count > 0 {
-                    format!("Commit {} files to {}", staged_count, branch_name)
-                } else {
-                    format!("Commit to {}", branch_name)
-                }))
+                .child(SharedString::from(
+                    if staged_count > 0 && !state.is_committing {
+                        format!("Commit {} files to {}", staged_count, branch_name)
+                    } else {
+                        if state.is_committing {
+                            "Committing…".into()
+                        } else {
+                            format!("Commit to {}", branch_name)
+                        }
+                    },
+                ))
                 .on_mouse_down(
                     MouseButton::Left,
                     cx.listener(|this, _: &MouseDownEvent, _window, cx| {
@@ -932,24 +1053,37 @@ fn render_commit_form(state: &GitWindow, cx: &mut Context<GitWindow>) -> AnyElem
 // ── Diff header ─────────────────────────────────────────────────────────────
 
 fn render_diff_header(state: &GitWindow) -> AnyElement {
+    let tokens = state.tokens;
     let file_name = state.selected_file.as_deref().unwrap_or("No file selected");
 
     div()
         .w_full()
         .px_3()
         .py(px(6.0))
-        .bg(rgb(DIFF_HEADER_BG))
+        .bg(rgb(tokens.surfaces.raised.to_u32()))
         .border_b_1()
-        .border_color(rgb(TOOLBAR_BORDER))
+        .border_color(rgb(tokens.borders.subtle.to_u32()))
         .text_size(px(12.0))
-        .text_color(rgb(theme::TEXT_MUTED))
-        .child(SharedString::from(file_name.to_string()))
+        .text_color(rgb(tokens.text.secondary.to_u32()))
+        .child(SharedString::from(if state.selected_file.is_some() {
+            format!(
+                "{file_name} · {}",
+                if state.selected_file_staged {
+                    "Staged"
+                } else {
+                    "Unstaged"
+                }
+            )
+        } else {
+            file_name.to_string()
+        }))
         .into_any_element()
 }
 
 // ── Diff panel ──────────────────────────────────────────────────────────────
 
 fn render_diff_panel(state: &GitWindow) -> AnyElement {
+    let tokens = state.tokens;
     let Some(ref diff) = state.file_diff else {
         return div()
             .flex_1()
@@ -957,7 +1091,7 @@ fn render_diff_panel(state: &GitWindow) -> AnyElement {
             .items_center()
             .justify_center()
             .text_size(px(13.0))
-            .text_color(rgb(theme::TEXT_DIM))
+            .text_color(rgb(tokens.text.muted.to_u32()))
             .child(if state.is_loading {
                 "Loading..."
             } else if state.selected_file.is_some() {
@@ -975,7 +1109,7 @@ fn render_diff_panel(state: &GitWindow) -> AnyElement {
             .items_center()
             .justify_center()
             .text_size(px(13.0))
-            .text_color(rgb(theme::TEXT_DIM))
+            .text_color(rgb(tokens.text.muted.to_u32()))
             .child("Binary file changed")
             .into_any_element();
     }
@@ -992,7 +1126,7 @@ fn render_diff_panel(state: &GitWindow) -> AnyElement {
             diff.hunks
                 .iter()
                 .take(50)
-                .map(|hunk| render_diff_hunk(hunk)),
+                .map(|hunk| render_diff_hunk(tokens, hunk)),
         )
         .children(truncated.then(|| {
             div()
@@ -1000,7 +1134,7 @@ fn render_diff_panel(state: &GitWindow) -> AnyElement {
                 .px_2()
                 .py(px(6.0))
                 .text_size(px(11.0))
-                .text_color(rgb(theme::TEXT_DIM))
+                .text_color(rgb(tokens.text.muted.to_u32()))
                 .child(SharedString::from(format!(
                     "Diff truncated ({} hunks, {} lines total)",
                     diff.hunks.len(),
@@ -1013,7 +1147,10 @@ fn render_diff_panel(state: &GitWindow) -> AnyElement {
 
 const MAX_DIFF_LINES: usize = 500;
 
-fn render_diff_hunk(hunk: &crate::git::git_service::GitDiffHunk) -> AnyElement {
+fn render_diff_hunk(
+    tokens: ThemeTokens,
+    hunk: &crate::git::git_service::GitDiffHunk,
+) -> AnyElement {
     // Batch lines into three groups by type to minimize element count.
     // Each group is rendered as a single pre-formatted text block per contiguous run.
     let mut children: Vec<AnyElement> = Vec::new();
@@ -1024,9 +1161,9 @@ fn render_diff_hunk(hunk: &crate::git::git_service::GitDiffHunk) -> AnyElement {
             .w_full()
             .px_2()
             .py(px(2.0))
-            .bg(rgb(HUNK_HEADER_BG))
+            .bg(rgb(tokens.surfaces.selection.to_u32()))
             .text_size(px(11.0))
-            .text_color(rgb(HUNK_HEADER_TEXT))
+            .text_color(rgb(tokens.text.secondary.to_u32()))
             .child(SharedString::from(hunk.header.clone()))
             .into_any_element(),
     );
@@ -1044,10 +1181,22 @@ fn render_diff_hunk(hunk: &crate::git::git_service::GitDiffHunk) -> AnyElement {
         let batch = &lines[batch_start..i];
 
         let (bg, text_color) = match kind {
-            DiffLineKind::Add => (GIT_GREEN_BG, GIT_GREEN),
-            DiffLineKind::Delete => (GIT_RED_BG, GIT_RED),
-            DiffLineKind::Context => (0x00000000, theme::TEXT_MUTED),
-            DiffLineKind::HunkHeader => (HUNK_HEADER_BG, HUNK_HEADER_TEXT),
+            DiffLineKind::Add => (
+                tokens.status.success_surface.to_u32(),
+                tokens.status.success.to_u32(),
+            ),
+            DiffLineKind::Delete => (
+                tokens.status.destructive_surface.to_u32(),
+                tokens.status.destructive.to_u32(),
+            ),
+            DiffLineKind::Context => (
+                tokens.surfaces.canvas.to_u32(),
+                tokens.text.secondary.to_u32(),
+            ),
+            DiffLineKind::HunkHeader => (
+                tokens.surfaces.selection.to_u32(),
+                tokens.text.secondary.to_u32(),
+            ),
         };
 
         // Build a single pre-formatted string for this batch
@@ -1096,7 +1245,7 @@ fn render_diff_hunk(hunk: &crate::git::git_service::GitDiffHunk) -> AnyElement {
                 .px_2()
                 .py(px(4.0))
                 .text_size(px(11.0))
-                .text_color(rgb(theme::TEXT_DIM))
+                .text_color(rgb(tokens.text.muted.to_u32()))
                 .child(SharedString::from(format!(
                     "... {} more lines not shown",
                     lines.len() - MAX_DIFF_LINES
@@ -1116,6 +1265,7 @@ fn render_diff_hunk(hunk: &crate::git::git_service::GitDiffHunk) -> AnyElement {
 // ── History view ────────────────────────────────────────────────────────────
 
 fn render_history_view(state: &GitWindow, cx: &mut Context<GitWindow>) -> AnyElement {
+    let tokens = state.tokens;
     div()
         .flex_1()
         .flex()
@@ -1128,7 +1278,7 @@ fn render_history_view(state: &GitWindow, cx: &mut Context<GitWindow>) -> AnyEle
                 .flex()
                 .flex_col()
                 .border_r_1()
-                .border_color(rgb(TOOLBAR_BORDER))
+                .border_color(rgb(tokens.borders.subtle.to_u32()))
                 .child(render_commit_list(state, cx)),
         )
         // Right: commit diff
@@ -1144,6 +1294,7 @@ fn render_history_view(state: &GitWindow, cx: &mut Context<GitWindow>) -> AnyEle
 }
 
 fn render_commit_list(state: &GitWindow, cx: &mut Context<GitWindow>) -> AnyElement {
+    let tokens = state.tokens;
     if state.log_entries.is_empty() {
         return div()
             .flex_1()
@@ -1151,7 +1302,7 @@ fn render_commit_list(state: &GitWindow, cx: &mut Context<GitWindow>) -> AnyElem
             .items_center()
             .justify_center()
             .text_size(px(13.0))
-            .text_color(rgb(theme::TEXT_DIM))
+            .text_color(rgb(tokens.text.muted.to_u32()))
             .child("Loading history...")
             .into_any_element();
     }
@@ -1175,10 +1326,12 @@ fn render_commit_list(state: &GitWindow, cx: &mut Context<GitWindow>) -> AnyElem
                 .px_2()
                 .py(px(6.0))
                 .cursor_pointer()
-                .when(is_selected, |d| d.bg(rgb(FILE_SELECTED_BG)))
-                .hover(|s| s.bg(rgb(theme::ROW_HOVER_BG)))
+                .when(is_selected, |d| {
+                    d.bg(rgb(tokens.surfaces.selection.to_u32()))
+                })
+                .hover(|s| s.bg(rgb(tokens.surfaces.hover.to_u32())))
                 .border_b_1()
-                .border_color(rgb(TOOLBAR_BORDER))
+                .border_color(rgb(tokens.borders.subtle.to_u32()))
                 .on_mouse_down(
                     MouseButton::Left,
                     cx.listener(move |this, _: &MouseDownEvent, _window, cx| {
@@ -1188,7 +1341,7 @@ fn render_commit_list(state: &GitWindow, cx: &mut Context<GitWindow>) -> AnyElem
                 .child(
                     div()
                         .text_size(px(12.0))
-                        .text_color(rgb(theme::TEXT_PRIMARY))
+                        .text_color(rgb(tokens.text.primary.to_u32()))
                         .child(SharedString::from(entry.subject.clone())),
                 )
                 .child(
@@ -1196,7 +1349,7 @@ fn render_commit_list(state: &GitWindow, cx: &mut Context<GitWindow>) -> AnyElem
                         .flex()
                         .gap(px(8.0))
                         .text_size(px(11.0))
-                        .text_color(rgb(theme::TEXT_DIM))
+                        .text_color(rgb(tokens.text.muted.to_u32()))
                         .child(SharedString::from(entry.hash.clone()))
                         .child(SharedString::from(entry.author_name.clone()))
                         .child(SharedString::from(format_relative_date(&entry.date))),
@@ -1212,9 +1365,9 @@ fn render_commit_list(state: &GitWindow, cx: &mut Context<GitWindow>) -> AnyElem
                 .flex()
                 .justify_center()
                 .cursor_pointer()
-                .hover(|s| s.bg(rgb(theme::ROW_HOVER_BG)))
+                .hover(|s| s.bg(rgb(tokens.surfaces.hover.to_u32())))
                 .text_size(px(12.0))
-                .text_color(rgb(GIT_BLUE))
+                .text_color(rgb(tokens.actions.primary.default.background.to_u32()))
                 .child("Load more...")
                 .on_mouse_down(
                     MouseButton::Left,
@@ -1228,6 +1381,7 @@ fn render_commit_list(state: &GitWindow, cx: &mut Context<GitWindow>) -> AnyElem
 }
 
 fn render_commit_diff_panel(state: &GitWindow) -> AnyElement {
+    let tokens = state.tokens;
     let Some(ref diff) = state.commit_diff else {
         return div()
             .flex_1()
@@ -1235,7 +1389,7 @@ fn render_commit_diff_panel(state: &GitWindow) -> AnyElement {
             .items_center()
             .justify_center()
             .text_size(px(13.0))
-            .text_color(rgb(theme::TEXT_DIM))
+            .text_color(rgb(tokens.text.muted.to_u32()))
             .child(if state.selected_commit.is_some() {
                 "Loading diff..."
             } else {
@@ -1250,7 +1404,7 @@ fn render_commit_diff_panel(state: &GitWindow) -> AnyElement {
             .flex()
             .items_center()
             .justify_center()
-            .text_color(rgb(theme::TEXT_DIM))
+            .text_color(rgb(tokens.text.muted.to_u32()))
             .child("Binary file changed")
             .into_any_element();
     }
@@ -1267,7 +1421,7 @@ fn render_commit_diff_panel(state: &GitWindow) -> AnyElement {
             diff.hunks
                 .iter()
                 .take(50)
-                .map(|hunk| render_diff_hunk(hunk)),
+                .map(|hunk| render_diff_hunk(tokens, hunk)),
         )
         .children(truncated.then(|| {
             div()
@@ -1275,7 +1429,7 @@ fn render_commit_diff_panel(state: &GitWindow) -> AnyElement {
                 .px_2()
                 .py(px(6.0))
                 .text_size(px(11.0))
-                .text_color(rgb(theme::TEXT_DIM))
+                .text_color(rgb(tokens.text.muted.to_u32()))
                 .child(SharedString::from(format!(
                     "Diff truncated ({} hunks, {} lines total)",
                     diff.hunks.len(),
@@ -1289,6 +1443,7 @@ fn render_commit_diff_panel(state: &GitWindow) -> AnyElement {
 // ── Branch dropdown ─────────────────────────────────────────────────────────
 
 pub fn render_branch_dropdown(state: &GitWindow, cx: &mut Context<GitWindow>) -> AnyElement {
+    let tokens = state.tokens;
     let filter = state.branch_filter.to_lowercase();
     let filtered_branches: Vec<_> = state
         .branches
@@ -1302,12 +1457,12 @@ pub fn render_branch_dropdown(state: &GitWindow, cx: &mut Context<GitWindow>) ->
         .absolute()
         .top(px(70.0))
         .left(px(200.0))
-        .w(px(300.0))
+        .w(px(320.0))
         .max_h(px(400.0))
         .overflow_y_scroll()
-        .bg(rgb(TOOLBAR_BG))
+        .bg(rgb(tokens.surfaces.raised.to_u32()))
         .border_1()
-        .border_color(rgb(TOOLBAR_BORDER))
+        .border_color(rgb(tokens.borders.subtle.to_u32()))
         .rounded_md()
         .shadow_lg()
         .flex()
@@ -1318,25 +1473,25 @@ pub fn render_branch_dropdown(state: &GitWindow, cx: &mut Context<GitWindow>) ->
                 .px_2()
                 .py(px(6.0))
                 .border_b_1()
-                .border_color(rgb(TOOLBAR_BORDER))
+                .border_color(rgb(tokens.borders.subtle.to_u32()))
                 .child(
                     div()
                         .w_full()
                         .px_2()
                         .py(px(3.0))
-                        .rounded_sm()
-                        .bg(rgb(theme::EDITOR_FIELD_BG))
+                        .rounded_md()
+                        .bg(rgb(tokens.surfaces.sunken.to_u32()))
                         .border_1()
-                        .border_color(rgb(TOOLBAR_BORDER))
+                        .border_color(rgb(tokens.borders.subtle.to_u32()))
                         .text_size(px(12.0))
                         .child(if state.branch_filter.is_empty() {
                             div()
-                                .text_color(rgb(theme::TEXT_DIM))
+                                .text_color(rgb(tokens.text.muted.to_u32()))
                                 .child("Filter branches")
                                 .into_any_element()
                         } else {
                             div()
-                                .text_color(rgb(theme::TEXT_PRIMARY))
+                                .text_color(rgb(tokens.text.primary.to_u32()))
                                 .child(SharedString::from(state.branch_filter.clone()))
                                 .into_any_element()
                         }),
@@ -1357,13 +1512,15 @@ pub fn render_branch_dropdown(state: &GitWindow, cx: &mut Context<GitWindow>) ->
                 .px_2()
                 .py(px(4.0))
                 .cursor_pointer()
-                .hover(|s| s.bg(rgb(theme::ROW_HOVER_BG)))
-                .when(is_current, |d| d.bg(rgb(FILE_SELECTED_BG)))
+                .hover(|s| s.bg(rgb(tokens.surfaces.hover.to_u32())))
+                .when(is_current, |d| {
+                    d.bg(rgb(tokens.surfaces.selection.to_u32()))
+                })
                 .child(
                     div()
                         .w(px(16.0))
                         .text_size(px(11.0))
-                        .text_color(rgb(GIT_GREEN))
+                        .text_color(rgb(tokens.status.success.to_u32()))
                         .child(if is_current { "\u{2713}" } else { "" }),
                 )
                 .child(
@@ -1375,7 +1532,7 @@ pub fn render_branch_dropdown(state: &GitWindow, cx: &mut Context<GitWindow>) ->
                 .children(branch.upstream.as_ref().map(|u| {
                     div()
                         .text_size(px(10.0))
-                        .text_color(rgb(theme::TEXT_DIM))
+                        .text_color(rgb(tokens.text.muted.to_u32()))
                         .child(SharedString::from(u.clone()))
                         .into_any_element()
                 }))
@@ -1397,21 +1554,22 @@ pub fn render_branch_dropdown(state: &GitWindow, cx: &mut Context<GitWindow>) ->
                 .px_2()
                 .py(px(6.0))
                 .border_t_1()
-                .border_color(rgb(TOOLBAR_BORDER))
+                .border_color(rgb(tokens.borders.subtle.to_u32()))
                 .child(
                     div()
                         .flex_1()
                         .px_2()
                         .py(px(3.0))
-                        .rounded_sm()
-                        .bg(rgb(theme::EDITOR_FIELD_BG))
+                        .rounded_md()
+                        .bg(rgb(tokens.surfaces.sunken.to_u32()))
                         .border_1()
-                        .border_color(rgb(TOOLBAR_BORDER))
+                        .border_color(rgb(tokens.borders.subtle.to_u32()))
                         .text_size(px(12.0))
                         .cursor_pointer()
                         .on_mouse_down(
                             MouseButton::Left,
                             cx.listener(|this, _: &MouseDownEvent, _window, cx| {
+                                this.focus(_window);
                                 this.active_field = Some(GitField::NewBranchName);
                                 this.cursor = this.new_branch_name.len();
                                 cx.notify();
@@ -1419,12 +1577,12 @@ pub fn render_branch_dropdown(state: &GitWindow, cx: &mut Context<GitWindow>) ->
                         )
                         .child(if state.new_branch_name.is_empty() {
                             div()
-                                .text_color(rgb(theme::TEXT_DIM))
+                                .text_color(rgb(tokens.text.muted.to_u32()))
                                 .child("New branch name")
                                 .into_any_element()
                         } else {
                             div()
-                                .text_color(rgb(theme::TEXT_PRIMARY))
+                                .text_color(rgb(tokens.text.primary.to_u32()))
                                 .child(SharedString::from(state.new_branch_name.clone()))
                                 .into_any_element()
                         }),
@@ -1433,12 +1591,12 @@ pub fn render_branch_dropdown(state: &GitWindow, cx: &mut Context<GitWindow>) ->
                     div()
                         .px_2()
                         .py(px(3.0))
-                        .rounded_sm()
-                        .bg(rgb(COMMIT_BUTTON_BG))
+                        .rounded_md()
+                        .bg(rgb(tokens.actions.primary.default.background.to_u32()))
                         .text_size(px(11.0))
-                        .text_color(rgb(0xffffff))
+                        .text_color(rgb(tokens.actions.primary.default.foreground.to_u32()))
                         .cursor_pointer()
-                        .hover(|s| s.bg(rgb(COMMIT_BUTTON_HOVER)))
+                        .hover(|s| s.bg(rgb(tokens.actions.primary.hover.background.to_u32())))
                         .child("Create")
                         .on_mouse_down(
                             MouseButton::Left,
@@ -1454,6 +1612,7 @@ pub fn render_branch_dropdown(state: &GitWindow, cx: &mut Context<GitWindow>) ->
 // ── Repo dropdown ───────────────────────────────────────────────────────────
 
 pub fn render_repo_dropdown(state: &GitWindow, cx: &mut Context<GitWindow>) -> AnyElement {
+    let tokens = state.tokens;
     div()
         .id("git-repo-dropdown")
         .occlude()
@@ -1463,9 +1622,9 @@ pub fn render_repo_dropdown(state: &GitWindow, cx: &mut Context<GitWindow>) -> A
         .w(px(320.0))
         .max_h(px(400.0))
         .overflow_y_scroll()
-        .bg(rgb(TOOLBAR_BG))
+        .bg(rgb(tokens.surfaces.raised.to_u32()))
         .border_1()
-        .border_color(rgb(TOOLBAR_BORDER))
+        .border_color(rgb(tokens.borders.subtle.to_u32()))
         .rounded_md()
         .shadow_lg()
         .flex()
@@ -1483,15 +1642,15 @@ pub fn render_repo_dropdown(state: &GitWindow, cx: &mut Context<GitWindow>) -> A
                 .px_2()
                 .py(px(6.0))
                 .cursor_pointer()
-                .hover(|s| s.bg(rgb(theme::ROW_HOVER_BG)))
-                .when(is_active, |d| d.bg(rgb(FILE_SELECTED_BG)))
+                .hover(|s| s.bg(rgb(tokens.surfaces.hover.to_u32())))
+                .when(is_active, |d| d.bg(rgb(tokens.surfaces.selection.to_u32())))
                 .border_b_1()
-                .border_color(rgb(TOOLBAR_BORDER))
+                .border_color(rgb(tokens.borders.subtle.to_u32()))
                 .child(
                     div()
                         .w(px(16.0))
                         .text_size(px(11.0))
-                        .text_color(rgb(GIT_GREEN))
+                        .text_color(rgb(tokens.status.success.to_u32()))
                         .child(if is_active { "\u{2713}" } else { "" }),
                 )
                 .child(
@@ -1505,18 +1664,20 @@ pub fn render_repo_dropdown(state: &GitWindow, cx: &mut Context<GitWindow>) -> A
                                 .font_weight(gpui::FontWeight::BOLD)
                                 .child(SharedString::from(repo.label.clone())),
                         )
-                        .child(
-                            div()
-                                .text_size(px(10.0))
-                                .text_color(rgb(theme::TEXT_DIM))
-                                .child(SharedString::from(repo.path.clone())),
-                        ),
+                        .when(!state.is_native(), |d| {
+                            d.child(
+                                div()
+                                    .text_size(px(10.0))
+                                    .text_color(tokens.text.muted.to_gpui())
+                                    .child(SharedString::from(repo.path.clone())),
+                            )
+                        }),
                 )
                 // Status indicators (right side)
                 .children((behind > 0).then(|| {
                     div()
                         .text_size(px(11.0))
-                        .text_color(rgb(GIT_BLUE))
+                        .text_color(rgb(tokens.actions.primary.default.background.to_u32()))
                         .child(SharedString::from(format!("\u{2193}{}", behind)))
                         .into_any_element()
                 }))
@@ -1525,7 +1686,7 @@ pub fn render_repo_dropdown(state: &GitWindow, cx: &mut Context<GitWindow>) -> A
                         .w(px(10.0))
                         .h(px(10.0))
                         .rounded_full()
-                        .bg(rgb(GIT_BLUE))
+                        .bg(rgb(tokens.actions.primary.default.background.to_u32()))
                         .into_any_element()
                 }))
                 .on_mouse_down(

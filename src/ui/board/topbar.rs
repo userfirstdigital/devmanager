@@ -59,6 +59,7 @@ pub struct TopBarModel {
 pub struct TopBarHandlers {
     pub on_scope: Rc<dyn Fn(&mut Window, &mut App)>,
     pub on_needs_you: Rc<dyn Fn(&mut Window, &mut App)>,
+    pub on_git: Option<Rc<dyn Fn(&mut Window, &mut App)>>,
     pub on_settings: Rc<dyn Fn(&mut Window, &mut App)>,
 }
 
@@ -264,27 +265,44 @@ pub fn top_bar_element(
         };
         bar = bar.child(kbd_chip(id, format!("{keys} {verb}"), tokens));
     }
-    bar.child(
-        div()
-            .id(SETTINGS_ELEMENT_ID)
-            .tab_stop(true)
-            .flex_none()
-            .flex()
-            .items_center()
-            .cursor_pointer()
-            .on_mouse_down(
-                MouseButton::Left,
-                move |_event: &MouseDownEvent, window, app| {
-                    (on_settings)(window, app);
-                },
-            )
-            .child(crate::icons::app_icon(
-                crate::icons::SETTINGS,
-                TOP_BAR_SETTINGS_ICON_SIZE,
-                tokens.text.muted.to_u32(),
-            )),
+    let on_git = handlers.on_git.clone();
+    let git_button = crate::ui::components::button::native_toolbar_button(
+        "native-top-bar-git",
+        "Git",
+        on_git.is_some(),
     )
-    .into_any_element()
+    .tooltip(if on_git.is_some() {
+        "Review changes, history and branches"
+    } else {
+        "Select a local task to review its repository"
+    })
+    .on_click(move |_, window, app| {
+        if let Some(handler) = &on_git {
+            handler(window, app);
+        }
+    });
+    bar.child(git_button)
+        .child(
+            div()
+                .id(SETTINGS_ELEMENT_ID)
+                .tab_stop(true)
+                .flex_none()
+                .flex()
+                .items_center()
+                .cursor_pointer()
+                .on_mouse_down(
+                    MouseButton::Left,
+                    move |_event: &MouseDownEvent, window, app| {
+                        (on_settings)(window, app);
+                    },
+                )
+                .child(crate::icons::app_icon(
+                    crate::icons::SETTINGS,
+                    TOP_BAR_SETTINGS_ICON_SIZE,
+                    tokens.text.muted.to_u32(),
+                )),
+        )
+        .into_any_element()
 }
 
 #[cfg(test)]

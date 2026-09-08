@@ -1,7 +1,9 @@
 pub mod command;
+pub mod desktop;
 pub mod git_service;
 mod git_ui;
 pub mod model;
+pub mod native_client;
 pub mod review;
 
 #[cfg(test)]
@@ -12,10 +14,9 @@ mod test_git_service;
 use crate::git::command::GitRepository;
 use crate::persistence;
 use crate::remote::{RemoteAction, RemoteActionPayload, RemoteClientHandle};
-use crate::theme;
 use git_service::{GitBranch, GitDiffResult, GitLogEntry, GitStatusEntry, GitStatusResult};
 use gpui::{
-    anchored, deferred, div, prelude::*, px, rgb, Context, Corner, FocusHandle, IntoElement,
+    anchored, deferred, div, prelude::*, px, Context, Corner, FocusHandle, IntoElement,
     KeyDownEvent, MouseButton, MouseDownEvent, ParentElement, Render, Styled, Window,
 };
 use std::time::Instant;
@@ -61,6 +62,18 @@ pub struct LoginState {
 
 pub struct GitWindow {
     backend: GitBackend,
+    pub tokens: crate::ui::tokens::ThemeTokens,
+    pub is_committing: bool,
+    pub is_mutating: bool,
+    pub commit_inputs: Option<(
+        gpui::Entity<gpui_component::input::InputState>,
+        gpui::Entity<gpui_component::input::InputState>,
+    )>,
+    input_subscriptions: Vec<gpui::Subscription>,
+    repo_epoch: u64,
+    status_epoch: u64,
+    file_diff_epoch: u64,
+    draft_epoch: u64,
     pub repos: Vec<RepoEntry>,
     pub active_repo: usize,
     pub show_repo_dropdown: bool,
@@ -68,6 +81,7 @@ pub struct GitWindow {
     pub active_view: GitView,
     pub status: Option<GitStatusResult>,
     pub selected_file: Option<String>,
+    pub selected_file_staged: bool,
     pub file_diff: Option<GitDiffResult>,
     pub file_filter: String,
     pub commit_summary: String,
@@ -98,6 +112,30 @@ pub struct GitWindow {
 enum GitBackend {
     Local(Vec<GitRepository>),
     Remote(RemoteClientHandle),
+    Native(native_client::NativeGitClient),
+}
+
+#[derive(Clone)]
+enum GitCommandClient {
+    Remote(RemoteClientHandle),
+    Native(native_client::NativeGitClient),
+}
+impl GitCommandClient {
+    fn request(&self, action: RemoteAction) -> Result<crate::remote::RemoteActionResult, String> {
+        match self {
+            Self::Remote(client) => client.request(action),
+            Self::Native(client) => client.request(action),
+        }
+    }
+    fn has_control(&self) -> bool {
+        match self {
+            Self::Remote(client) => client
+                .latest_snapshot()
+                .map(|s| s.you_have_control)
+                .unwrap_or(false),
+            Self::Native(_) => true,
+        }
+    }
 }
 
 macro_rules! git_spawn {
@@ -127,6 +165,81 @@ impl GitWindow {
         Self::new_with_backend(repos, GitBackend::Remote(client), cx)
     }
 
+    pub fn new_native(
+        repos: Vec<(String, String)>,
+        client: native_client::NativeGitClient,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        use gpui_component::input::{InputEvent, InputState};
+        let mut view = Self::new_with_backend(repos, GitBackend::Native(client.clone()), cx);
+        git_spawn!(cx, |this, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move { client.load_repositories() })
+                .await;
+            let _ = this.update(&mut cx, |this, cx| {
+                match result {
+                    Ok((client, repos)) => {
+                        this.backend = GitBackend::Native(client);
+                        this.repos = repos
+                            .into_iter()
+                            .map(|(label, path)| RepoEntry {
+                                label,
+                                path,
+                                has_changes: false,
+                                behind: 0,
+                            })
+                            .collect();
+                        this.active_repo = 0;
+                        this.repo_epoch += 1;
+                        this.refresh_status(cx);
+                    }
+                    Err(error) => {
+                        this.is_loading = false;
+                        this.operation_result = Some((false, error));
+                    }
+                }
+                cx.notify();
+            });
+        });
+        let summary = cx.new(|cx| InputState::new(window, cx).placeholder("Commit summary"));
+        let description = cx.new(|cx| {
+            InputState::new(window, cx)
+                .multi_line(true)
+                .placeholder("Description (optional)")
+        });
+        for (input, field) in [
+            (&summary, GitField::CommitSummary),
+            (&description, GitField::CommitDescription),
+        ] {
+            view.input_subscriptions
+                .push(
+                    cx.subscribe(input, move |this, input, event, cx| match event {
+                        InputEvent::Change => {
+                            let value = input.read(cx).value().to_string();
+                            let current = match field {
+                                GitField::CommitSummary => &this.commit_summary,
+                                _ => &this.commit_description,
+                            };
+                            if current != &value {
+                                this.draft_epoch += 1;
+                                match field {
+                                    GitField::CommitSummary => this.commit_summary = value,
+                                    _ => this.commit_description = value,
+                                }
+                                cx.notify();
+                            }
+                        }
+                        InputEvent::Focus => this.active_field = None,
+                        _ => {}
+                    }),
+                );
+        }
+        view.commit_inputs = Some((summary, description));
+        view
+    }
+
     fn new_with_backend(
         repos: Vec<(String, String)>,
         backend: GitBackend,
@@ -144,6 +257,15 @@ impl GitWindow {
             .collect();
         let mut win = Self {
             backend,
+            tokens: crate::ui::tokens::RuntimePreferencesSnapshot::default().tokens(),
+            is_committing: false,
+            is_mutating: false,
+            commit_inputs: None,
+            input_subscriptions: Vec::new(),
+            repo_epoch: 0,
+            status_epoch: 0,
+            file_diff_epoch: 0,
+            draft_epoch: 0,
             repos,
             active_repo: 0,
             show_repo_dropdown: false,
@@ -151,6 +273,7 @@ impl GitWindow {
             active_view: GitView::Changes,
             status: None,
             selected_file: None,
+            selected_file_staged: false,
             file_diff: None,
             file_filter: String::new(),
             commit_summary: String::new(),
@@ -180,8 +303,14 @@ impl GitWindow {
             win.load_persisted_token();
         }
         win.fetch_github_username(cx);
-        win.refresh_status(cx);
+        if !matches!(win.backend, GitBackend::Native(_)) {
+            win.refresh_status(cx);
+        }
         win
+    }
+
+    pub fn focus(&self, window: &mut Window) {
+        window.focus(&self.focus);
     }
 
     pub fn repo_path(&self) -> &str {
@@ -192,22 +321,27 @@ impl GitWindow {
         &self.repos[self.active_repo].label
     }
 
-    fn remote_client(&self) -> Option<RemoteClientHandle> {
+    fn remote_client(&self) -> Option<GitCommandClient> {
         match &self.backend {
             GitBackend::Local(_) => None,
-            GitBackend::Remote(client) => Some(client.clone()),
+            GitBackend::Remote(client) => Some(GitCommandClient::Remote(client.clone())),
+            GitBackend::Native(client) => Some(GitCommandClient::Native(client.clone())),
         }
     }
 
     fn local_repository(&self) -> Option<GitRepository> {
         match &self.backend {
             GitBackend::Local(repositories) => repositories.get(self.active_repo).cloned(),
-            GitBackend::Remote(_) => None,
+            GitBackend::Remote(_) | GitBackend::Native(_) => None,
         }
     }
 
+    fn is_native(&self) -> bool {
+        matches!(self.backend, GitBackend::Native(_))
+    }
+
     fn is_remote(&self) -> bool {
-        matches!(self.backend, GitBackend::Remote(_))
+        !matches!(self.backend, GitBackend::Local(_))
     }
 
     fn set_remote_auth_state(&mut self, has_token: bool, username: Option<String>) {
@@ -217,12 +351,14 @@ impl GitWindow {
 
     fn has_mutation_control(&self) -> bool {
         self.remote_client()
-            .and_then(|client| client.latest_snapshot())
-            .map(|snapshot| snapshot.you_have_control)
+            .map(|client| client.has_control())
             .unwrap_or(true)
     }
 
     fn ensure_mutation_control(&mut self, cx: &mut Context<Self>) -> bool {
+        if self.is_mutating || self.is_loading {
+            return false;
+        }
         if matches!(self.backend, GitBackend::Local(_)) && !self.ensure_config_write_available(cx) {
             return false;
         }
@@ -299,6 +435,11 @@ impl GitWindow {
         if index >= self.repos.len() || index == self.active_repo {
             return;
         }
+        if self.is_mutating || self.is_loading {
+            return;
+        }
+        self.repo_epoch += 1;
+        self.is_generating_message = false;
         self.active_repo = index;
         self.show_repo_dropdown = false;
         self.status = None;
@@ -329,7 +470,7 @@ impl GitWindow {
         let remote_client = self.remote_client();
         let local_repositories = match &self.backend {
             GitBackend::Local(repositories) => Some(repositories.clone()),
-            GitBackend::Remote(_) => None,
+            GitBackend::Remote(_) | GitBackend::Native(_) => None,
         };
 
         git_spawn!(cx, |this, cx| {
@@ -390,11 +531,14 @@ impl GitWindow {
     // ── Data loading ────────────────────────────────────────────────────
 
     pub fn refresh_status(&mut self, cx: &mut Context<Self>) {
-        self.refresh_status_inner(true, cx);
+        self.refresh_status_inner(false, cx);
     }
 
     fn refresh_status_inner(&mut self, auto_stage: bool, cx: &mut Context<Self>) {
+        self.status_epoch += 1;
+        let status_epoch = self.status_epoch;
         let repo = self.repo_path().to_string();
+        let repo_epoch = self.repo_epoch;
         let remote_client = self.remote_client();
         let local_repository = self.local_repository();
         self.is_loading = true;
@@ -445,16 +589,30 @@ impl GitWindow {
                 })
                 .await;
             let _ = this.update(&mut cx, |this, cx| {
+                if this.repo_epoch != repo_epoch || this.status_epoch != status_epoch {
+                    return;
+                }
                 this.is_loading = false;
                 match status {
                     Ok(s) => {
                         this.status = Some(s);
-                        if this.selected_file.is_none() {
-                            if let Some(ref st) = this.status {
-                                if let Some(first) = st.entries.first() {
-                                    this.select_file(&first.path.clone(), cx);
-                                }
-                            }
+                        let selected = this
+                            .selected_file
+                            .clone()
+                            .filter(|path| {
+                                this.status
+                                    .as_ref()
+                                    .is_some_and(|s| s.entries.iter().any(|e| &e.path == path))
+                            })
+                            .or_else(|| {
+                                this.status
+                                    .as_ref()
+                                    .and_then(|s| s.entries.first().map(|e| e.path.clone()))
+                            });
+                        this.selected_file = selected.clone();
+                        this.file_diff = None;
+                        if let Some(path) = selected {
+                            this.select_file(&path, cx);
                         }
                     }
                     Err(e) => {
@@ -468,6 +626,7 @@ impl GitWindow {
 
     pub fn load_branches(&mut self, cx: &mut Context<Self>) {
         let repo = self.repo_path().to_string();
+        let repo_epoch = self.repo_epoch;
         let remote_client = self.remote_client();
         let local_repository = self.local_repository();
         git_spawn!(cx, |this, cx| {
@@ -494,6 +653,9 @@ impl GitWindow {
                 })
                 .await;
             let _ = this.update(&mut cx, |this, cx| {
+                if this.repo_epoch != repo_epoch {
+                    return;
+                }
                 if let Ok(b) = branches {
                     this.branches = b;
                 }
@@ -504,6 +666,7 @@ impl GitWindow {
 
     pub fn load_history(&mut self, cx: &mut Context<Self>) {
         let repo = self.repo_path().to_string();
+        let repo_epoch = self.repo_epoch;
         let skip = self.log_page * 50;
         let remote_client = self.remote_client();
         let local_repository = self.local_repository();
@@ -535,6 +698,9 @@ impl GitWindow {
                 })
                 .await;
             let _ = this.update(&mut cx, |this, cx| {
+                if this.repo_epoch != repo_epoch {
+                    return;
+                }
                 if let Ok(e) = entries {
                     if this.log_page == 0 {
                         this.log_entries = e;
@@ -550,18 +716,33 @@ impl GitWindow {
     // ── File selection + diff ───────────────────────────────────────────
 
     pub fn select_file(&mut self, path: &str, cx: &mut Context<Self>) {
-        self.selected_file = Some(path.to_string());
-        self.file_diff = None;
-        let repo = self.repo_path().to_string();
-        let file_path = path.to_string();
-        let remote_client = self.remote_client();
-        let local_repository = self.local_repository();
         let staged = self
             .status
             .as_ref()
-            .and_then(|s| s.entries.iter().find(|e| e.path == file_path))
-            .map(|e| e.staged)
+            .and_then(|status| {
+                status
+                    .entries
+                    .iter()
+                    .find(|entry| entry.path == path && entry.staged == self.selected_file_staged)
+                    .or_else(|| status.entries.iter().find(|entry| entry.path == path))
+            })
+            .map(|entry| entry.staged)
             .unwrap_or(false);
+        self.select_file_side(path, staged, cx);
+    }
+
+    pub fn select_file_side(&mut self, path: &str, staged: bool, cx: &mut Context<Self>) {
+        self.file_diff_epoch += 1;
+        let file_diff_epoch = self.file_diff_epoch;
+        self.selected_file = Some(path.to_string());
+        self.selected_file_staged = staged;
+        self.file_diff = None;
+        let repo = self.repo_path().to_string();
+        let repo_epoch = self.repo_epoch;
+        let selected = self.selected_file.clone();
+        let file_path = path.to_string();
+        let remote_client = self.remote_client();
+        let local_repository = self.local_repository();
 
         git_spawn!(cx, |this, cx| {
             let diff = cx
@@ -593,9 +774,22 @@ impl GitWindow {
                 })
                 .await;
             let _ = this.update(&mut cx, |this, cx| {
+                if this.file_diff_epoch != file_diff_epoch
+                    || this.repo_epoch != repo_epoch
+                    || this.selected_file != selected
+                    || this.selected_file_staged != staged
+                {
+                    return;
+                }
                 match diff {
                     Ok(d) => this.file_diff = Some(d),
-                    Err(_) => this.file_diff = None,
+                    Err(error) => {
+                        this.file_diff = Some(GitDiffResult {
+                            hunks: Vec::new(),
+                            is_binary: false,
+                        });
+                        this.operation_result = Some((false, error));
+                    }
                 }
                 cx.notify();
             });
@@ -606,6 +800,8 @@ impl GitWindow {
         self.selected_commit = Some(hash.to_string());
         self.commit_diff = None;
         let repo = self.repo_path().to_string();
+        let repo_epoch = self.repo_epoch;
+        let selected = self.selected_commit.clone();
         let hash = hash.to_string();
         let remote_client = self.remote_client();
         let local_repository = self.local_repository();
@@ -637,9 +833,18 @@ impl GitWindow {
                 })
                 .await;
             let _ = this.update(&mut cx, |this, cx| {
+                if this.repo_epoch != repo_epoch || this.selected_commit != selected {
+                    return;
+                }
                 match diff {
                     Ok(d) => this.commit_diff = Some(d),
-                    Err(_) => this.commit_diff = None,
+                    Err(error) => {
+                        this.commit_diff = Some(GitDiffResult {
+                            hunks: Vec::new(),
+                            is_binary: false,
+                        });
+                        this.operation_result = Some((false, error));
+                    }
                 }
                 cx.notify();
             });
@@ -653,9 +858,13 @@ impl GitWindow {
             return;
         }
         let repo = self.repo_path().to_string();
+        let repo_epoch = self.repo_epoch;
         let file_path = path.to_string();
         let remote_client = self.remote_client();
         let local_repository = self.local_repository();
+        self.is_mutating = true;
+        self.draft_epoch += 1;
+        cx.notify();
         git_spawn!(cx, |this, cx| {
             let result = cx
                 .background_executor()
@@ -682,6 +891,10 @@ impl GitWindow {
                 })
                 .await;
             let _ = this.update(&mut cx, |this, cx| {
+                this.is_mutating = false;
+                if this.repo_epoch != repo_epoch {
+                    return;
+                }
                 if let Err(error) = result {
                     this.operation_result = Some((false, error));
                 }
@@ -695,9 +908,13 @@ impl GitWindow {
             return;
         }
         let repo = self.repo_path().to_string();
+        let repo_epoch = self.repo_epoch;
         let file_path = path.to_string();
         let remote_client = self.remote_client();
         let local_repository = self.local_repository();
+        self.is_mutating = true;
+        self.draft_epoch += 1;
+        cx.notify();
         git_spawn!(cx, |this, cx| {
             let result = cx
                 .background_executor()
@@ -724,6 +941,10 @@ impl GitWindow {
                 })
                 .await;
             let _ = this.update(&mut cx, |this, cx| {
+                this.is_mutating = false;
+                if this.repo_epoch != repo_epoch {
+                    return;
+                }
                 if let Err(error) = result {
                     this.operation_result = Some((false, error));
                 }
@@ -737,8 +958,12 @@ impl GitWindow {
             return;
         }
         let repo = self.repo_path().to_string();
+        let repo_epoch = self.repo_epoch;
         let remote_client = self.remote_client();
         let local_repository = self.local_repository();
+        self.is_mutating = true;
+        self.draft_epoch += 1;
+        cx.notify();
         git_spawn!(cx, |this, cx| {
             let result = cx
                 .background_executor()
@@ -760,6 +985,10 @@ impl GitWindow {
                 })
                 .await;
             let _ = this.update(&mut cx, |this, cx| {
+                this.is_mutating = false;
+                if this.repo_epoch != repo_epoch {
+                    return;
+                }
                 if let Err(error) = result {
                     this.operation_result = Some((false, error));
                 }
@@ -773,8 +1002,12 @@ impl GitWindow {
             return;
         }
         let repo = self.repo_path().to_string();
+        let repo_epoch = self.repo_epoch;
         let remote_client = self.remote_client();
         let local_repository = self.local_repository();
+        self.is_mutating = true;
+        self.draft_epoch += 1;
+        cx.notify();
         git_spawn!(cx, |this, cx| {
             let result = cx
                 .background_executor()
@@ -796,6 +1029,10 @@ impl GitWindow {
                 })
                 .await;
             let _ = this.update(&mut cx, |this, cx| {
+                this.is_mutating = false;
+                if this.repo_epoch != repo_epoch {
+                    return;
+                }
                 if let Err(error) = result {
                     this.operation_result = Some((false, error));
                 }
@@ -1078,16 +1315,23 @@ impl GitWindow {
     // ── AI commit message ─────────────────────────────────────────────
 
     pub fn generate_commit_message(&mut self, cx: &mut Context<Self>) {
+        if self.is_generating_message || self.is_committing {
+            return;
+        }
+        let draft_epoch = self.draft_epoch;
         if !self.ensure_mutation_control(cx) {
             return;
         }
         if self.github_token.is_none() {
-            self.operation_result =
-                Some((false, "GitHub token not configured in Settings".to_string()));
+            self.operation_result = Some((
+                false,
+                "Sign in to GitHub to generate a commit message.".to_string(),
+            ));
             cx.notify();
             return;
         }
         let repo = self.repo_path().to_string();
+        let repo_epoch = self.repo_epoch;
         let remote_client = self.remote_client();
         let local_repository = self.local_repository();
         let token = self.github_token.clone().unwrap_or_default();
@@ -1127,9 +1371,14 @@ impl GitWindow {
                     })
                     .await;
             let _ = this.update(&mut cx, |this, cx| {
+                if this.repo_epoch != repo_epoch { return; }
                 this.is_generating_message = false;
                 match result {
+                    Ok(_) if this.draft_epoch != draft_epoch => {
+                        this.operation_result = Some((false, "Your draft changed while AI was writing. Generate again to replace it.".into()));
+                    }
                     Ok(msg) => {
+                        this.draft_epoch += 1;
                         this.commit_summary = msg.title;
                         this.commit_description = msg.description;
                     }
@@ -1145,6 +1394,10 @@ impl GitWindow {
     // ── Commit ──────────────────────────────────────────────────────────
 
     pub fn commit_action(&mut self, cx: &mut Context<Self>) {
+        if self.is_committing || self.is_generating_message || self.staged_count() == 0 {
+            return;
+        }
+        let draft_epoch = self.draft_epoch;
         if !self.ensure_mutation_control(cx) {
             return;
         }
@@ -1154,6 +1407,7 @@ impl GitWindow {
             return;
         }
         let repo = self.repo_path().to_string();
+        let repo_epoch = self.repo_epoch;
         let summary = self.commit_summary.clone();
         let body = if self.commit_description.trim().is_empty() {
             None
@@ -1163,6 +1417,10 @@ impl GitWindow {
         let remote_client = self.remote_client();
         let local_repository = self.local_repository();
 
+        self.is_committing = true;
+        cx.notify();
+        self.is_mutating = true;
+        cx.notify();
         git_spawn!(cx, |this, cx| {
             let result = cx
                 .background_executor()
@@ -1193,11 +1451,19 @@ impl GitWindow {
                 })
                 .await;
             let _ = this.update(&mut cx, |this, cx| {
+                this.is_mutating = false;
+                if this.repo_epoch != repo_epoch {
+                    return;
+                }
+                this.is_committing = false;
                 match result {
                     Ok(hash) => {
                         this.operation_result = Some((true, format!("Committed {}", hash)));
-                        this.commit_summary.clear();
-                        this.commit_description.clear();
+                        if this.draft_epoch == draft_epoch {
+                            this.commit_summary.clear();
+                            this.commit_description.clear();
+                            this.draft_epoch += 1;
+                        }
                         this.refresh_status(cx);
                     }
                     Err(e) => {
@@ -1216,6 +1482,7 @@ impl GitWindow {
             return;
         }
         let repo = self.repo_path().to_string();
+        let repo_epoch = self.repo_epoch;
         let has_upstream = self
             .status
             .as_ref()
@@ -1231,6 +1498,9 @@ impl GitWindow {
         self.is_pushing = true;
         cx.notify();
 
+        self.is_mutating = true;
+        self.draft_epoch += 1;
+        cx.notify();
         git_spawn!(cx, |this, cx| {
             let result = cx
                 .background_executor()
@@ -1264,6 +1534,10 @@ impl GitWindow {
                 })
                 .await;
             let _ = this.update(&mut cx, |this, cx| {
+                this.is_mutating = false;
+                if this.repo_epoch != repo_epoch {
+                    return;
+                }
                 this.is_pushing = false;
                 match result {
                     Ok(msg) => {
@@ -1289,9 +1563,13 @@ impl GitWindow {
             return;
         }
         let repo = self.repo_path().to_string();
+        let repo_epoch = self.repo_epoch;
         let remote_client = self.remote_client();
         let local_repository = self.local_repository();
         self.is_pulling = true;
+        cx.notify();
+        self.is_mutating = true;
+        self.draft_epoch += 1;
         cx.notify();
         git_spawn!(cx, |this, cx| {
             let result = cx
@@ -1314,6 +1592,10 @@ impl GitWindow {
                 })
                 .await;
             let _ = this.update(&mut cx, |this, cx| {
+                this.is_mutating = false;
+                if this.repo_epoch != repo_epoch {
+                    return;
+                }
                 this.is_pulling = false;
                 match result {
                     Ok(msg) => {
@@ -1339,9 +1621,13 @@ impl GitWindow {
             return;
         }
         let repo = self.repo_path().to_string();
+        let repo_epoch = self.repo_epoch;
         let remote_client = self.remote_client();
         let local_repository = self.local_repository();
         self.is_fetching = true;
+        cx.notify();
+        self.is_mutating = true;
+        self.draft_epoch += 1;
         cx.notify();
         git_spawn!(cx, |this, cx| {
             let result = cx
@@ -1364,10 +1650,16 @@ impl GitWindow {
                 })
                 .await;
             let _ = this.update(&mut cx, |this, cx| {
+                this.is_mutating = false;
+                if this.repo_epoch != repo_epoch {
+                    return;
+                }
                 this.is_fetching = false;
-                this.last_fetch_at = Some(Instant::now());
                 match result {
-                    Ok(_) => this.refresh_status(cx),
+                    Ok(_) => {
+                        this.last_fetch_at = Some(Instant::now());
+                        this.refresh_status(cx);
+                    }
                     Err(e) => this.operation_result = Some((false, e)),
                 }
                 cx.notify();
@@ -1382,10 +1674,14 @@ impl GitWindow {
             return;
         }
         let repo = self.repo_path().to_string();
+        let repo_epoch = self.repo_epoch;
         let branch = name.to_string();
         let remote_client = self.remote_client();
         let local_repository = self.local_repository();
         self.show_branch_dropdown = false;
+        self.is_mutating = true;
+        self.draft_epoch += 1;
+        cx.notify();
         git_spawn!(cx, |this, cx| {
             let result = cx
                 .background_executor()
@@ -1410,6 +1706,10 @@ impl GitWindow {
                 })
                 .await;
             let _ = this.update(&mut cx, |this, cx| {
+                this.is_mutating = false;
+                if this.repo_epoch != repo_epoch {
+                    return;
+                }
                 match result {
                     Ok(()) => {
                         this.refresh_status(cx);
@@ -1436,11 +1736,15 @@ impl GitWindow {
             return;
         }
         let repo = self.repo_path().to_string();
+        let repo_epoch = self.repo_epoch;
         let name = self.new_branch_name.trim().to_string();
         self.new_branch_name.clear();
         self.show_branch_dropdown = false;
         let remote_client = self.remote_client();
         let local_repository = self.local_repository();
+        self.is_mutating = true;
+        self.draft_epoch += 1;
+        cx.notify();
         git_spawn!(cx, |this, cx| {
             let result = cx
                 .background_executor()
@@ -1465,6 +1769,10 @@ impl GitWindow {
                 })
                 .await;
             let _ = this.update(&mut cx, |this, cx| {
+                this.is_mutating = false;
+                if this.repo_epoch != repo_epoch {
+                    return;
+                }
                 match result {
                     Ok(()) => this.refresh_status(cx),
                     Err(e) => this.operation_result = Some((false, e)),
@@ -1479,9 +1787,13 @@ impl GitWindow {
             return;
         }
         let repo = self.repo_path().to_string();
+        let repo_epoch = self.repo_epoch;
         let branch = name.to_string();
         let remote_client = self.remote_client();
         let local_repository = self.local_repository();
+        self.is_mutating = true;
+        self.draft_epoch += 1;
+        cx.notify();
         git_spawn!(cx, |this, cx| {
             let result = cx
                 .background_executor()
@@ -1506,6 +1818,10 @@ impl GitWindow {
                 })
                 .await;
             let _ = this.update(&mut cx, |this, cx| {
+                this.is_mutating = false;
+                if this.repo_epoch != repo_epoch {
+                    return;
+                }
                 match result {
                     Ok(()) => this.load_branches(cx),
                     Err(e) => this.operation_result = Some((false, e)),
@@ -1529,6 +1845,12 @@ impl GitWindow {
     }
 
     pub fn apply_text(&mut self, value: String) {
+        if matches!(
+            self.active_field,
+            Some(GitField::CommitSummary | GitField::CommitDescription)
+        ) {
+            self.draft_epoch += 1;
+        }
         match self.active_field {
             Some(GitField::CommitSummary) => self.commit_summary = value,
             Some(GitField::CommitDescription) => self.commit_description = value,
@@ -1580,13 +1902,50 @@ impl GitWindow {
         if self.active_field.is_some() {
             let current = self.text_value().to_string();
             let current_len = current.len();
-            let cursor = self.cursor.min(current_len);
+            let mut cursor = self.cursor.min(current_len);
+            while !current.is_char_boundary(cursor) {
+                cursor -= 1;
+            }
+            let previous = current[..cursor]
+                .char_indices()
+                .last()
+                .map(|(i, _)| i)
+                .unwrap_or(0);
+            let next = current[cursor..]
+                .chars()
+                .next()
+                .map(|ch| cursor + ch.len_utf8())
+                .unwrap_or(cursor);
 
-            if keystroke.key == "backspace" {
+            if keystroke.modifiers.control && keystroke.key == "v" {
+                if let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) {
+                    let text = if matches!(self.active_field, Some(GitField::CommitDescription)) {
+                        text
+                    } else {
+                        text.replace(['\n', '\r'], " ")
+                    };
+                    let mut value = current;
+                    value.insert_str(cursor, &text);
+                    self.cursor = cursor + text.len();
+                    self.apply_text(value);
+                    cx.notify();
+                }
+            } else if keystroke.modifiers.control && keystroke.key == "backspace" {
+                let start = current[..cursor]
+                    .trim_end()
+                    .rfind(char::is_whitespace)
+                    .map(|i| i + 1)
+                    .unwrap_or(0);
+                let mut value = current;
+                value.replace_range(start..cursor, "");
+                self.cursor = start;
+                self.apply_text(value);
+                cx.notify();
+            } else if keystroke.key == "backspace" {
                 if cursor > 0 {
                     let mut v = current;
-                    v.remove(cursor - 1);
-                    self.cursor = cursor - 1;
+                    v.remove(previous);
+                    self.cursor = previous;
                     self.apply_text(v);
                     cx.notify();
                 }
@@ -1599,12 +1958,12 @@ impl GitWindow {
                 }
             } else if keystroke.key == "left" {
                 if cursor > 0 {
-                    self.cursor = cursor - 1;
+                    self.cursor = previous;
                     cx.notify();
                 }
             } else if keystroke.key == "right" {
                 if cursor < current_len {
-                    self.cursor = cursor + 1;
+                    self.cursor = next;
                     cx.notify();
                 }
             } else if keystroke.key == "home" {
@@ -1633,9 +1992,10 @@ impl GitWindow {
                 // ignore tab in text fields
             } else if let Some(ref text) = keystroke.key_char {
                 let mut v = current;
-                for (i, ch) in text.chars().enumerate() {
-                    v.insert(cursor + i, ch);
+                if keystroke.modifiers.control || keystroke.modifiers.platform {
+                    return;
                 }
+                v.insert_str(cursor, text);
                 self.cursor = cursor + text.len();
                 self.apply_text(v);
                 cx.notify();
@@ -1670,15 +2030,25 @@ impl GitWindow {
 }
 
 impl Render for GitWindow {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        if let Some((summary, description)) = &self.commit_inputs {
+            for (input, value) in [
+                (summary, &self.commit_summary),
+                (description, &self.commit_description),
+            ] {
+                if input.read(cx).value().as_str() != value {
+                    input.update(cx, |input, cx| input.set_value(value.clone(), window, cx));
+                }
+            }
+        }
         let show_branch_dd = self.show_branch_dropdown;
         let show_repo_dd = self.show_repo_dropdown;
         div()
             .size_full()
             .flex()
             .flex_col()
-            .bg(rgb(theme::PANEL_BG))
-            .text_color(rgb(theme::TEXT_PRIMARY))
+            .bg(self.tokens.surfaces.canvas.to_gpui())
+            .text_color(self.tokens.text.primary.to_gpui())
             .text_size(px(13.0))
             .track_focus(&self.focus)
             .on_key_down(cx.listener(Self::handle_key_down))

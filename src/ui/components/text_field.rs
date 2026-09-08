@@ -795,3 +795,12 @@ mod tests {
         assert!(field.selection_range().is_none());
     }
 }
+
+/// Native editor used by compact forms; preserves GPUI selection, clipboard,
+/// composition and keyboard behavior instead of emulating editing in a div.
+pub fn native_text_input(
+    state: &gpui::Entity<gpui_component::input::InputState>,
+) -> gpui_component::input::Input {
+    use gpui_component::Sizable;
+    gpui_component::input::Input::new(state).small()
+}

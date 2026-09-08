@@ -11953,6 +11953,8 @@ pub struct NativeShell {
     last_window_persist: Option<Instant>,
     add_project: Option<AddProjectDraft>,
     settings_open: bool,
+    git_session: crate::git::native_client::NativeGitSession,
+    pending_git_window: Option<HostTaskKey>,
     show_archived_tasks: bool,
     settings_page: NativeSettingsPage,
     remote_settings: NativeRemoteSettings,
@@ -12997,6 +12999,8 @@ impl NativeShell {
             last_window_persist: None,
             add_project: None,
             settings_open: false,
+            git_session: crate::git::native_client::NativeGitSession::default(),
+            pending_git_window: None,
             show_archived_tasks: false,
             settings_page: NativeSettingsPage::Appearance,
             remote_settings: NativeRemoteSettings::default(),
@@ -14837,6 +14841,15 @@ impl NativeShell {
                 .gpui(crate::ui::board::topbar::NEEDS_YOU_ELEMENT_ID, true, true),
             );
         }
+        let git_enabled = self.selected_task_key.is_some() && !self.selected_owner_is_remote();
+        overlay_nodes.push(
+            AccessibilityNode::new(
+                AccessibleRole::Button,
+                "Git",
+                "Review changes, commit with AI, and browse history and branches.",
+            )
+            .gpui("native-top-bar-git", git_enabled, git_enabled),
+        );
         overlay_nodes.push(
             AccessibilityNode::new(
                 AccessibleRole::Button,
@@ -38000,6 +38013,11 @@ impl NativeShell {
             crate::ui::board::topbar::NEEDS_YOU_ELEMENT_ID => {
                 self.focus_first_needs_you_task();
             }
+            "native-top-bar-git" => {
+                if self.selected_task_key.is_some() && !self.selected_owner_is_remote() {
+                    self.pending_git_window = self.selected_task_key.clone();
+                }
+            }
             crate::ui::board::topbar::SETTINGS_ELEMENT_ID => self.settings_open = true,
             "board-header-new" => self.open_board_menu(BoardMenu::NewTask),
             "board-header-menu" => self.open_board_menu(BoardMenu::Options),
@@ -43832,6 +43850,65 @@ impl NativeShell {
             ],
         );
 
+        if !self.selected_owner_is_remote() {
+            let mut entries = self
+                .repository_catalog_for_owner(&owner)
+                .map(|catalog| {
+                    catalog
+                        .repositories
+                        .iter()
+                        .filter(|repo| repo.available)
+                        .map(|repo| (repo.label.clone(), repo.selector.clone()))
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            if entries.is_empty() {
+                entries.push(("Task repository".into(), selector.clone()));
+            }
+            entries.sort_by_key(|(_, target)| *target != selector);
+            let repos = entries
+                .iter()
+                .enumerate()
+                .map(|(index, (label, _))| (label.clone(), format!("repository-{index}")))
+                .collect::<Vec<_>>();
+            let selectors = entries
+                .into_iter()
+                .enumerate()
+                .map(|(index, (_, target))| (format!("repository-{index}"), target))
+                .collect();
+            let client = crate::git::native_client::NativeGitClient::new(
+                self.profile.named_profile().into(),
+                owner.task_id,
+                selectors,
+                self.git_session.clone(),
+            );
+            let tokens = self.theme_tokens();
+            cx.defer(move |cx| {
+                let bounds = Bounds::centered(None, size(px(1100.0), px(740.0)), cx);
+                let _ = cx.open_window(
+                    WindowOptions {
+                        window_bounds: Some(WindowBounds::Windowed(bounds)),
+                        titlebar: Some(gpui::TitlebarOptions {
+                            title: Some("Git — DevManager".into()),
+                            ..Default::default()
+                        }),
+                        ..Default::default()
+                    },
+                    move |window, cx| {
+                        let view = cx.new(|cx| {
+                            let mut view =
+                                crate::git::GitWindow::new_native(repos, client, window, cx);
+                            view.tokens = tokens;
+                            view.focus(window);
+                            view
+                        });
+                        cx.new(|cx| gpui_component::Root::new(view, window, cx))
+                    },
+                );
+            });
+            return;
+        }
+
         let snapshot = NativeGitWindowSnapshot::from_shell(self, &owner, &selector);
         let shell = cx.entity();
         // GPUI paints a newly opened window synchronously. Defer this window until
@@ -45949,6 +46026,19 @@ impl NativeShell {
                         });
                     }
                 }),
+                on_git: self
+                    .selected_task_key
+                    .as_ref()
+                    .filter(|_| !self.selected_owner_is_remote())
+                    .map(|_| {
+                        let shell = shell.clone();
+                        Rc::new(move |window: &mut Window, app: &mut gpui::App| {
+                            let _ = shell.update(app, |shell, cx| {
+                                shell.open_native_git_window(window, cx);
+                                cx.notify();
+                            });
+                        }) as Rc<dyn Fn(&mut Window, &mut gpui::App)>
+                    }),
                 on_settings: Rc::new({
                     let shell = shell.clone();
                     move |_window: &mut Window, app: &mut gpui::App| {
@@ -45963,6 +46053,7 @@ impl NativeShell {
             None => crate::ui::board::TopBarHandlers {
                 on_scope: Rc::new(|_, _| {}),
                 on_needs_you: Rc::new(|_, _| {}),
+                on_git: None,
                 on_settings: Rc::new(|_, _| {}),
             },
         };
@@ -49159,6 +49250,11 @@ impl Render for NativeGitWindow {
 
 impl Render for NativeShell {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        if let Some(owner) = self.pending_git_window.take() {
+            if self.selected_task_key.as_ref() == Some(&owner) {
+                self.open_native_git_window(window, cx);
+            }
+        }
         crate::ui::frame_trace::begin_frame();
         let _frame = crate::ui::frame_trace::section("render");
         // Completes the round trip of every reply applied since the last paint.

@@ -470,6 +470,36 @@ pub(crate) fn issue_git_host_binding(
     action_epoch: u64,
     runtime_generation: u64,
 ) -> Result<GitHostBinding, GitError> {
+    issue_git_host_binding_with_desktop_admission(
+        authorization,
+        lease,
+        task_id,
+        project_id,
+        client_id,
+        connection_id,
+        request_id,
+        command_id,
+        workspace,
+        action_epoch,
+        runtime_generation,
+        false,
+    )
+}
+
+pub(crate) fn issue_git_host_binding_with_desktop_admission(
+    authorization: &crate::workspace::WorkspaceAuthorization,
+    lease: crate::workspace::WorkspaceResourceLease,
+    task_id: crate::domain::TaskId,
+    project_id: crate::domain::ProjectId,
+    client_id: crate::domain::ClientId,
+    connection_id: Uuid,
+    request_id: crate::domain::RequestId,
+    command_id: crate::domain::CommandId,
+    workspace: &crate::domain::task::WorkspaceRef,
+    action_epoch: u64,
+    runtime_generation: u64,
+    strict_worktree_descriptors: bool,
+) -> Result<GitHostBinding, GitError> {
     if lease.resource() != crate::workspace::WorkspaceResource::Git {
         return Err(GitError::AuthorityUnavailable);
     }
@@ -514,9 +544,15 @@ pub(crate) fn issue_git_host_binding(
             approved_external_roots.push(path_fact.path().to_path_buf());
         }
     }
-    let root = RepositoryRoot::open_with_approved_external_roots(
+    let root = RepositoryRoot::open_with_approved_external_roots_deadline_and_admission(
         root_pin.path(),
         &approved_external_roots,
+        OperationDeadline::from_now(HARD_MAX_TIMEOUT),
+        if strict_worktree_descriptors {
+            WorktreeDescriptorAdmission::Strict
+        } else {
+            WorktreeDescriptorAdmission::CurrentOnly
+        },
     )
     .map_err(|reason| GitError::InvalidRepositoryRoot {
         path: "<bound-root>".to_string(),
@@ -587,6 +623,40 @@ pub(crate) fn issue_configured_repository_git_host_binding(
     configured_path: &Path,
     configured_identity: &str,
 ) -> Result<GitHostBinding, GitError> {
+    issue_configured_repository_git_host_binding_with_desktop_admission(
+        authorization,
+        lease,
+        task_id,
+        project_id,
+        client_id,
+        connection_id,
+        request_id,
+        command_id,
+        workspace,
+        action_epoch,
+        runtime_generation,
+        configured_path,
+        configured_identity,
+        false,
+    )
+}
+
+pub(crate) fn issue_configured_repository_git_host_binding_with_desktop_admission(
+    authorization: &crate::workspace::WorkspaceAuthorization,
+    lease: crate::workspace::WorkspaceResourceLease,
+    task_id: crate::domain::TaskId,
+    project_id: crate::domain::ProjectId,
+    client_id: crate::domain::ClientId,
+    connection_id: Uuid,
+    request_id: crate::domain::RequestId,
+    command_id: crate::domain::CommandId,
+    workspace: &crate::domain::task::WorkspaceRef,
+    action_epoch: u64,
+    runtime_generation: u64,
+    configured_path: &Path,
+    configured_identity: &str,
+    strict_worktree_descriptors: bool,
+) -> Result<GitHostBinding, GitError> {
     if lease.resource() != crate::workspace::WorkspaceResource::Git {
         return Err(GitError::AuthorityUnavailable);
     }
@@ -619,11 +689,20 @@ pub(crate) fn issue_configured_repository_git_host_binding(
             reason: "configured repository identity changed".to_string(),
         });
     }
-    let root = RepositoryRoot::open_with_approved_external_roots(validated.path.as_path(), &[])
-        .map_err(|reason| GitError::InvalidRepositoryRoot {
-            path: "<configured-root>".to_string(),
-            reason,
-        })?;
+    let root = RepositoryRoot::open_with_approved_external_roots_deadline_and_admission(
+        validated.path.as_path(),
+        &[],
+        OperationDeadline::from_now(HARD_MAX_TIMEOUT),
+        if strict_worktree_descriptors {
+            WorktreeDescriptorAdmission::Strict
+        } else {
+            WorktreeDescriptorAdmission::CurrentOnly
+        },
+    )
+    .map_err(|reason| GitError::InvalidRepositoryRoot {
+        path: "<configured-root>".to_string(),
+        reason,
+    })?;
     // Identity pin immediately before open: reject replacement races.
     let revalidated =
         crate::workspace::service::validate_host_workspace_path(root.path.as_path(), true)
@@ -7486,6 +7565,7 @@ pub struct GitRepository {
     limits: GitLimits,
     cancellation: GitCancellation,
     authority: GitRepositoryAuthority,
+    desktop_mutations: bool,
     read_permit: Arc<Mutex<Option<GitOperationPermit>>>,
 }
 
@@ -7568,6 +7648,7 @@ impl GitRepository {
             limits: capability.limits.clone().bounded(),
             cancellation,
             authority: GitRepositoryAuthority::Host(binding),
+            desktop_mutations: false,
             read_permit: Arc::new(Mutex::new(Some(read_permit))),
         })
     }
@@ -7599,6 +7680,7 @@ impl GitRepository {
             limits: limits.clone(),
             cancellation: GitCancellation::new(),
             authority: GitRepositoryAuthority::Test,
+            desktop_mutations: false,
             read_permit: Arc::new(Mutex::new(Some(
                 GitOperationPermit::test_read_with_timeout(limits.timeout),
             ))),
@@ -7626,6 +7708,7 @@ impl GitRepository {
             limits: limits.clone(),
             cancellation: GitCancellation::new(),
             authority: GitRepositoryAuthority::Test,
+            desktop_mutations: false,
             read_permit: Arc::new(Mutex::new(Some(
                 GitOperationPermit::test_read_with_timeout(limits.timeout),
             ))),
@@ -7652,6 +7735,7 @@ impl GitRepository {
             limits: limits.clone(),
             cancellation,
             authority: GitRepositoryAuthority::Test,
+            desktop_mutations: false,
             read_permit: Arc::new(Mutex::new(Some(
                 GitOperationPermit::test_read_with_timeout(limits.timeout),
             ))),
@@ -7692,6 +7776,7 @@ impl GitRepository {
             limits: limits.clone(),
             cancellation,
             authority: GitRepositoryAuthority::Test,
+            desktop_mutations: false,
             read_permit: Arc::new(Mutex::new(Some(
                 GitOperationPermit::test_read_with_timeout(limits.timeout),
             ))),
@@ -8747,16 +8832,36 @@ impl GitRepository {
     /// Internal bridge for legacy UI mutations while the host authority seam
     /// is integrated. The command allow-list and repository graph remain the
     /// source of truth; no caller-provided capability or limit is accepted.
+    pub(crate) fn with_desktop_mutation_authority(
+        mut self,
+        _confirmation: &crate::host::ConfirmedGitDesktopMutation,
+    ) -> Self {
+        self.desktop_mutations = true;
+        self
+    }
+
     pub(crate) fn run_service_mutation(
         &self,
-        _arguments: Vec<OsString>,
-        _remote: Option<RemotePolicy>,
-        _remote_name: Option<String>,
+        arguments: Vec<OsString>,
+        remote: Option<RemotePolicy>,
+        remote_name: Option<String>,
     ) -> Result<GitOutput, GitError> {
-        // The legacy service adapter has no host-issued permit parameter. It
-        // remains a visible, typed-unavailable boundary until the later
-        // Config/Workspace union supplies one; it must never self-authorize.
-        Err(GitError::AuthorityUnavailable)
+        if !self.desktop_mutations {
+            return Err(GitError::AuthorityUnavailable);
+        }
+        let GitRepositoryAuthority::Host(binding) = &self.authority else {
+            return Err(GitError::AuthorityUnavailable);
+        };
+        if !binding.capability.is_live() {
+            return Err(GitError::AuthorityUnavailable);
+        }
+        let permit = GitOperationPermit::host_service(
+            Arc::clone(&binding.capability),
+            &arguments,
+            remote.clone(),
+            remote_name.clone(),
+        );
+        self.run_service_mutation_with_permit(arguments, remote, remote_name, permit)
     }
 
     pub(crate) fn run_service_mutation_with_permit(
@@ -12916,6 +13021,7 @@ Start-Sleep -Seconds 10
             limits: limits.clone(),
             cancellation,
             authority: GitRepositoryAuthority::Test,
+            desktop_mutations: false,
             read_permit: Arc::new(Mutex::new(Some(
                 GitOperationPermit::test_read_with_timeout(limits.timeout),
             ))),

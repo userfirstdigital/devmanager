@@ -69,6 +69,7 @@ pub fn action_for_client_request(request: &ClientRequest) -> Option<(ActionId, O
                 Query::PromptLibrary(_) => ActionId::READ_PERSONAL_PROMPTS,
                 Query::TaskCockpit(
                     crate::domain::cockpit::TaskCockpitQuery::ConfigCreateProject { .. }
+                    | crate::domain::cockpit::TaskCockpitQuery::GitDesktopTargeted { .. }
                     | crate::domain::cockpit::TaskCockpitQuery::ConfigUpsertCommand { .. }
                     | crate::domain::cockpit::TaskCockpitQuery::ConfigArchiveCommand { .. }
                     | crate::domain::cockpit::TaskCockpitQuery::ConfigRunCommand { .. }
@@ -483,6 +484,36 @@ mod tests {
                 authorizer.authorize_request_with_grant(&request, &read_only, context),
                 PermissionDecision::Allow,
                 "a read grant must still see {query:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn desktop_git_requests_never_inherit_connect_read_authority() {
+        use crate::git::desktop::DesktopGitAction;
+        for action in [
+            DesktopGitAction::Status,
+            DesktopGitAction::StageAll,
+            DesktopGitAction::StagedDiff,
+            DesktopGitAction::Commit {
+                summary: "commit".into(),
+                description: None,
+            },
+        ] {
+            let request = ClientRequest::Query(QueryEnvelope {
+                request_id: RequestId::new(),
+                client_id: ClientId::new(),
+                task_id: Some(TaskId::new()),
+                query: Query::TaskCockpit(TaskCockpitQuery::GitDesktopTargeted {
+                    selector: crate::domain::cockpit::TaskRepositorySelector::Workspace,
+                    action,
+                    confirm: true,
+                }),
+            });
+            assert_eq!(action_for_client_request(&request), None);
+            assert_eq!(
+                SessionAuthorizer::paired_owner().authorize_request(&request),
+                PermissionDecision::Denied(PermissionDenyReason::UnknownAction)
             );
         }
     }

@@ -392,6 +392,12 @@ pub enum TaskCockpitQuery {
     GitStatusTargeted {
         selector: TaskRepositorySelector,
     },
+    GitDesktopTargeted {
+        selector: TaskRepositorySelector,
+        action: crate::git::desktop::DesktopGitAction,
+        #[serde(default)]
+        confirm: bool,
+    },
     /// Bounded host-owned diff for one repository-relative changed file.
     GitFileDiffTargeted {
         selector: TaskRepositorySelector,
@@ -948,6 +954,11 @@ pub enum TaskCockpitResult {
     GitFileDiff(TaskGitFileDiffProjection),
     GitHistory(TaskGitHistoryProjection),
     GitCommitDiff(TaskGitCommitDiffProjection),
+    GitDesktop {
+        task_id: TaskId,
+        selector: TaskRepositorySelector,
+        payload: crate::git::desktop::DesktopGitPayload,
+    },
     FilesList(TaskFilesListProjection),
     FilesRead(TaskFilesReadProjection),
     Ssh(TaskSshProjection),
@@ -1175,6 +1186,7 @@ pub fn cockpit_surface(query: &TaskCockpitQuery) -> TaskCockpitSurface {
         TaskCockpitQuery::GitRepositories
         | TaskCockpitQuery::GitStatus
         | TaskCockpitQuery::GitStatusTargeted { .. }
+        | TaskCockpitQuery::GitDesktopTargeted { .. }
         | TaskCockpitQuery::GitFileDiffTargeted { .. }
         | TaskCockpitQuery::GitHistoryTargeted { .. }
         | TaskCockpitQuery::GitCommitDiffTargeted { .. }

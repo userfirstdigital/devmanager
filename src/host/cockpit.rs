@@ -26,10 +26,7 @@ use crate::domain::id::{ClientId, CommandId, RequestId, TaskId};
 use crate::domain::query::{QueryError, QueryOutcome, QueryResult};
 use crate::domain::snapshot::PageLimits;
 use crate::domain::{AgentSessionFacts, ResourceFacts};
-use crate::git::command::{
-    issue_configured_repository_git_host_binding, issue_git_host_binding, GitCancellation,
-    GitConfirmation, GitError, GitRepository,
-};
+use crate::git::command::{GitCancellation, GitConfirmation, GitError, GitRepository};
 use crate::git::model::{MutationPlan, RepoPath, StatusKind};
 use crate::host_log;
 use crate::kernel::CommandBus;
@@ -449,6 +446,18 @@ pub(crate) fn serve_task_cockpit_bounded(
         TaskCockpitQuery::GitStatusTargeted { selector } => {
             serve_git_status_targeted(&dispatch, task_id, &snapshot.task, selector)
         }
+        TaskCockpitQuery::GitDesktopTargeted {
+            selector,
+            action,
+            confirm,
+        } => serve_git_desktop(
+            &dispatch,
+            task_id,
+            &snapshot.task,
+            selector,
+            action,
+            *confirm,
+        ),
         TaskCockpitQuery::GitFileDiffTargeted {
             selector,
             relative_path,
@@ -2078,6 +2087,135 @@ fn serve_git_status_targeted(
     }
 }
 
+fn serve_git_desktop(
+    dispatch: &TaskCockpitDispatch<'_>,
+    task_id: TaskId,
+    task: &crate::domain::task::TaskFacts,
+    selector: &TaskRepositorySelector,
+    action: &crate::git::desktop::DesktopGitAction,
+    confirm: bool,
+) -> QueryOutcome {
+    use crate::git::desktop::{DesktopGitAction as A, DesktopGitPayload as P};
+    use crate::git::git_service as service;
+    if action.is_mutation() && !confirm {
+        return denied(
+            TaskCockpitSurface::Git,
+            TaskCockpitDeniedReason::CapabilityDenied,
+        );
+    }
+    if matches!(action, A::SwitchBranch { .. }) {
+        return QueryOutcome::Ok(QueryResult::TaskCockpit(TaskCockpitResult::GitDesktop { task_id, selector: selector.clone(), payload: P::Error("This checkout is bound to a task. Open or create a task on the desired branch to keep its workspace and running agents consistent.".into()) }));
+    }
+    match action {
+        A::Stage { paths } | A::Unstage { paths } => {
+            if let Err(outcome) = cockpit_repo_paths(paths) {
+                return outcome;
+            }
+        }
+        A::FileDiff { relative_path, .. } => {
+            if let Err(outcome) = cockpit_repo_paths(&[relative_path.clone()]) {
+                return outcome;
+            }
+        }
+        A::History { limit, skip } if *limit == 0 || *limit > 100 || *skip > 10_000 => {
+            return QueryOutcome::Err(QueryError::InvalidRequest);
+        }
+        _ => {}
+    }
+    let (repository, resolved) =
+        match open_git_repository_targeted(dispatch, task_id, task, selector) {
+            Ok(opened) => opened,
+            Err(outcome) => return outcome,
+        };
+    let stage_all_paths = if matches!(action, A::StageAll | A::StagedDiff) {
+        let status = match repository.status() {
+            Ok(status) => status,
+            Err(error) => return map_git_error(error),
+        };
+        let paths = status
+            .entries
+            .iter()
+            .filter(|entry| {
+                !matches!(action, A::StagedDiff)
+                    || entry.index != crate::git::model::FileState::Unchanged
+            })
+            .map(|entry| entry.path.display_lossy().into_owned())
+            .collect::<Vec<_>>();
+        if paths.is_empty() {
+            None
+        } else {
+            match cockpit_repo_paths(&paths) {
+                Ok(paths) => Some(paths),
+                Err(outcome) => return outcome,
+            }
+        }
+    } else {
+        None
+    };
+    let repository = if action.is_mutation() {
+        if !resolved.mutation_allowed {
+            return denied(
+                TaskCockpitSurface::Git,
+                TaskCockpitDeniedReason::CapabilityDenied,
+            );
+        }
+        if let Err(outcome) = revalidate_git_fence(dispatch, task_id, task) {
+            return outcome;
+        }
+        if let Err(outcome) =
+            revalidate_configured_target_identity(dispatch, task_id, task, selector)
+        {
+            return outcome;
+        }
+        repository
+            .with_desktop_mutation_authority(&super::ConfirmedGitDesktopMutation { _private: () })
+    } else {
+        repository
+    };
+    let result = match action {
+        A::Status => service::status(&repository).map(P::Status),
+        A::History { limit, skip } => service::log(&repository, *limit, *skip).map(P::History),
+        A::FileDiff { relative_path, staged } => service::diff_file(&repository, relative_path, *staged).map(P::Diff),
+        A::CommitDiff { hash } => service::diff_commit(&repository, hash).map(P::Diff),
+        A::Branches => service::branches(&repository).map(P::Branches),
+        A::StagedDiff => service::get_staged_diff(&repository).and_then(|diff| {
+            if diff.trim().is_empty() { return Err("Stage changes before generating a commit message.".into()); }
+            // The existing AI generator consumes at most 24,000 bytes. Keep the
+            // host response bounded and truncate only at a UTF-8 boundary.
+            let mut end = diff.len().min(24_000);
+            while !diff.is_char_boundary(end) { end -= 1; }
+            Ok(P::StagedDiff(diff[..end].to_string()))
+        }),
+        A::Stage { paths } => service::stage(&repository, &paths.iter().map(String::as_str).collect::<Vec<_>>()).map(|_| P::Done("Changes staged".into())),
+        A::Unstage { paths } => repository.plan_unstage(&paths.iter().map(|p| RepoPath::from(p.as_str())).collect::<Vec<_>>())
+            .and_then(|plan| confirm_git_mutation(&repository, &plan).and_then(|confirmation| repository.unstage(&plan, &confirmation)))
+            .map(|_| P::Done("Changes unstaged".into())).map_err(|error| error.to_string()),
+        A::StageAll => match stage_all_paths {
+            Some(paths) => repository.plan_stage(&paths)
+                .and_then(|plan| confirm_git_mutation(&repository, &plan).and_then(|confirmation| repository.stage(&plan, &confirmation)))
+                .map(|_| P::Done("All changes staged".into())).map_err(|error| error.to_string()),
+            None => Ok(P::Done("No changes to stage".into())),
+        },
+        A::UnstageAll => repository.status().and_then(|status| {
+            let paths = status.entries.iter().filter(|entry| entry.index != crate::git::model::FileState::Unchanged).map(|entry| entry.path.clone()).collect::<Vec<_>>();
+            repository.plan_unstage(&paths).and_then(|plan| confirm_git_mutation(&repository, &plan).and_then(|confirmation| repository.unstage(&plan, &confirmation)))
+        }).map(|_| P::Done("All changes unstaged".into())).map_err(|error| error.to_string()),
+        A::Commit { summary, description } => service::commit(&repository, summary, description.as_deref()).map(P::Commit),
+        A::Fetch => service::fetch(&repository).map(P::Done),
+        A::Pull => service::pull(&repository).map(P::Done),
+        A::Push => service::push(&repository).map(P::Done),
+        A::Publish { branch } => service::push_set_upstream(&repository, branch).map(P::Done),
+        A::SwitchBranch { .. } => Err("This checkout is bound to a task. Open or create a task on the desired branch to keep its workspace and running agents consistent.".into()),
+        A::CreateBranch { name } => service::create_branch_ref(&repository, name).map(|_| P::Done("Branch created. The task stays on its current branch.".into())),
+        A::DeleteBranch { name } => service::delete_branch(&repository, name).map(|_| P::Done("Branch deleted".into())),
+    };
+    QueryOutcome::Ok(QueryResult::TaskCockpit(TaskCockpitResult::GitDesktop {
+        task_id,
+        selector: resolved.selector,
+        payload: result.unwrap_or_else(P::Error),
+    }))
+}
+
 fn serve_git_file_diff_targeted(
     dispatch: &TaskCockpitDispatch<'_>,
     task_id: TaskId,
@@ -2523,8 +2661,17 @@ fn open_git_repository_targeted(
         host_log!("devmanager-host: cockpit Git fence revalidation failed: {outcome:?}");
         outcome
     })?;
+    let strict_descriptors = matches!(
+        dispatch.query,
+        TaskCockpitQuery::GitDesktopTargeted {
+            action: crate::git::desktop::DesktopGitAction::SwitchBranch { .. }
+                | crate::git::desktop::DesktopGitAction::CreateBranch { .. }
+                | crate::git::desktop::DesktopGitAction::DeleteBranch { .. },
+            ..
+        }
+    );
     let binding = match &resolved.selector {
-        TaskRepositorySelector::Workspace => issue_git_host_binding(
+        TaskRepositorySelector::Workspace => crate::git::command::issue_git_host_binding_with_desktop_admission(
             &authorization,
             lease,
             task_id,
@@ -2536,9 +2683,10 @@ fn open_git_repository_targeted(
             &task.workspace,
             action_epoch,
             runtime_generation,
+            strict_descriptors,
         ),
         TaskRepositorySelector::ProjectRoot | TaskRepositorySelector::Folder { .. } => {
-            issue_configured_repository_git_host_binding(
+            crate::git::command::issue_configured_repository_git_host_binding_with_desktop_admission(
                 &authorization,
                 lease,
                 task_id,
@@ -2552,6 +2700,7 @@ fn open_git_repository_targeted(
                 runtime_generation,
                 &resolved.path,
                 &resolved.identity,
+                strict_descriptors,
             )
         }
     }
@@ -4832,6 +4981,200 @@ mod tests {
             panic!("expected confirmed stage, got {staged:?}");
         };
         assert_eq!(staged.task_id, task_id);
+    }
+
+    #[test]
+    fn git_desktop_preserves_index_and_requires_confirmed_host_authority() {
+        use crate::git::desktop::{DesktopGitAction as A, DesktopGitPayload as P};
+        let (repository, bus, client_id, task_id, roots) = create_bound_task();
+        let coordinator = WorkspaceResourceCoordinator::new();
+        let query = |action, confirm| {
+            serve_task_cockpit(dispatch(
+                &bus,
+                client_id,
+                task_id,
+                &TaskCockpitQuery::GitDesktopTargeted {
+                    selector: TaskRepositorySelector::Workspace,
+                    action,
+                    confirm,
+                },
+                Some(&roots),
+                Some(&coordinator),
+                Some(1),
+                Some(1),
+            ))
+        };
+        let payload = |outcome| match outcome {
+            QueryOutcome::Ok(QueryResult::TaskCockpit(TaskCockpitResult::GitDesktop {
+                task_id: returned,
+                selector,
+                payload,
+            })) => {
+                assert_eq!(returned, task_id);
+                assert_eq!(selector, TaskRepositorySelector::Workspace);
+                payload
+            }
+            other => panic!("expected Git desktop response: {other:?}"),
+        };
+        let P::Status(status) = payload(query(A::Status, false)) else {
+            panic!("status");
+        };
+        assert!(status.entries.iter().all(|entry| !entry.staged));
+        assert!(matches!(
+            query(A::StageAll, true),
+            QueryOutcome::Ok(QueryResult::TaskCockpit(TaskCockpitResult::Denied { .. }))
+        ));
+        let P::Diff(binary) = payload(query(
+            A::FileDiff {
+                relative_path: "blob.bin".into(),
+                staged: false,
+            },
+            false,
+        )) else {
+            panic!("binary diff");
+        };
+        assert!(binary.is_binary);
+        assert!(binary.hunks.is_empty());
+        let P::Diff(diff) = payload(query(
+            A::FileDiff {
+                relative_path: "README.md".into(),
+                staged: false,
+            },
+            false,
+        )) else {
+            panic!("untracked diff");
+        };
+        assert!(diff
+            .hunks
+            .iter()
+            .flat_map(|hunk| &hunk.lines)
+            .any(|line| line.content.contains("hello-aé")));
+
+        assert!(matches!(
+            query(
+                A::Stage {
+                    paths: vec!["README.md".into()]
+                },
+                false
+            ),
+            QueryOutcome::Ok(QueryResult::TaskCockpit(TaskCockpitResult::Denied { .. }))
+        ));
+        assert!(matches!(
+            query(
+                A::Stage {
+                    paths: vec!["../escape".into()]
+                },
+                true
+            ),
+            QueryOutcome::Ok(QueryResult::TaskCockpit(TaskCockpitResult::Denied { .. }))
+        ));
+        assert!(matches!(
+            payload(query(
+                A::Stage {
+                    paths: vec!["README.md".into()]
+                },
+                true
+            )),
+            P::Done(_)
+        ));
+        let P::Status(status) = payload(query(A::Status, false)) else {
+            panic!("status");
+        };
+        assert!(status
+            .entries
+            .iter()
+            .any(|entry| entry.path == "README.md" && entry.staged));
+        assert!(status
+            .entries
+            .iter()
+            .filter(|entry| entry.path != "README.md")
+            .all(|entry| !entry.staged));
+        let P::StagedDiff(diff) = payload(query(A::StagedDiff, false)) else {
+            panic!("staged diff");
+        };
+        assert!(diff.contains("hello-aé"));
+        assert!(!diff.contains("SECRET=1"));
+        let P::Diff(diff) = payload(query(
+            A::FileDiff {
+                relative_path: "README.md".into(),
+                staged: true,
+            },
+            false,
+        )) else {
+            panic!("staged file diff");
+        };
+        assert!(!diff.hunks.is_empty());
+
+        assert!(matches!(
+            payload(query(
+                A::Unstage {
+                    paths: vec!["README.md".into()]
+                },
+                true
+            )),
+            P::Done(_)
+        ));
+        assert!(matches!(
+            payload(query(
+                A::Stage {
+                    paths: vec!["README.md".into()]
+                },
+                true
+            )),
+            P::Done(_)
+        ));
+        let committed = payload(query(
+            A::Commit {
+                summary: "Desktop commit".into(),
+                description: Some("Unicode: café".into()),
+            },
+            true,
+        ));
+        assert!(matches!(committed, P::Commit(_)), "{committed:?}");
+        let P::History(entries) = payload(query(A::History { limit: 50, skip: 0 }, false)) else {
+            panic!("history");
+        };
+        assert_eq!(entries.len(), 1);
+        let P::Diff(diff) = payload(query(
+            A::CommitDiff {
+                hash: entries[0].full_hash.clone(),
+            },
+            false,
+        )) else {
+            panic!("commit diff");
+        };
+        assert!(!diff.hunks.is_empty());
+
+        let branches = payload(query(
+            A::CreateBranch {
+                name: "desktop-review".into(),
+            },
+            true,
+        ));
+        assert!(matches!(branches, P::Done(_)), "{branches:?}");
+        let P::Branches(branches) = payload(query(A::Branches, false)) else {
+            panic!("branches");
+        };
+        assert!(branches
+            .iter()
+            .any(|branch| branch.name == "desktop-review"));
+        assert!(matches!(
+            payload(query(
+                A::SwitchBranch {
+                    name: "desktop-review".into()
+                },
+                true
+            )),
+            P::Error(_)
+        ));
+        assert!(matches!(payload(query(A::Status, false)), P::Status(_)));
+        let inspected = std::process::Command::new("git")
+            .env("GIT_OPTIONAL_LOCKS", "0")
+            .args(["log", "-1", "--format=%B"])
+            .current_dir(repository.path())
+            .output()
+            .unwrap();
+        assert!(String::from_utf8_lossy(&inspected.stdout).contains("Unicode: café"));
     }
 
     #[test]

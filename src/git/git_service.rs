@@ -16,7 +16,7 @@ pub enum GitFileStatus {
     Conflicted,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GitStatusEntry {
     pub path: String,
     pub status: GitFileStatus,
@@ -24,7 +24,7 @@ pub struct GitStatusEntry {
     pub original_path: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GitStatusResult {
     pub branch: Option<String>,
     pub upstream: Option<String>,
@@ -267,9 +267,16 @@ pub(crate) fn diff_file(
         .entry(file_path)
         .is_some_and(|entry| entry.kind == StatusKind::Untracked);
     let args = if staged {
-        vec!["diff", "--cached", "--", file_path]
+        vec![
+            "diff",
+            "--no-ext-diff",
+            "--no-textconv",
+            "--cached",
+            "--",
+            file_path,
+        ]
     } else {
-        vec!["diff", "--", file_path]
+        vec!["diff", "--no-ext-diff", "--no-textconv", "--", file_path]
     };
     let output = run_git(repository, &args)?;
 
@@ -283,7 +290,16 @@ pub(crate) fn diff_file(
 
 pub(crate) fn diff_commit(repository: &GitRepository, hash: &str) -> Result<GitDiffResult, String> {
     let hash = validate_hash(hash, "commit hash")?;
-    let output = run_git(repository, &["show", "--format=", hash.as_str()])?;
+    let output = run_git(
+        repository,
+        &[
+            "show",
+            "--no-ext-diff",
+            "--no-textconv",
+            "--format=",
+            hash.as_str(),
+        ],
+    )?;
     Ok(parse_diff(&output))
 }
 
@@ -299,6 +315,12 @@ fn diff_untracked(repository: &GitRepository, file_path: &str) -> Result<GitDiff
     let content = repository
         .read_service_file(&path, 8 * 1024 * 1024)
         .map_err(|error| error.to_string())?;
+    if content.contains(&0) {
+        return Ok(GitDiffResult {
+            hunks: Vec::new(),
+            is_binary: true,
+        });
+    }
     let content = String::from_utf8_lossy(&content);
 
     let lines: Vec<GitDiffLine> = content
@@ -472,7 +494,14 @@ pub(crate) fn diff_stat_commit(
 pub(crate) fn branches(repository: &GitRepository) -> Result<Vec<GitBranch>, String> {
     let format = "%(HEAD)\x1f%(refname:short)\x1f%(upstream:short)\x1f%(subject)";
     let format_arg = format!("--format={format}");
-    let output = run_git(repository, &["branch", &format_arg])?;
+    let output = repository
+        .run_service_read(vec![
+            "for-each-ref".into(),
+            format_arg.into(),
+            "refs/heads/".into(),
+        ])
+        .map_err(|error| error.to_string())?;
+    let output = String::from_utf8_lossy(&output);
 
     let mut result = Vec::new();
     for line in output.lines() {
@@ -733,6 +762,13 @@ pub(crate) fn create_branch(repository: &GitRepository, name: &str) -> Result<()
     Ok(())
 }
 
+/// Create a reference without changing the task's pinned checkout.
+pub(crate) fn create_branch_ref(repository: &GitRepository, name: &str) -> Result<(), String> {
+    let name = BranchName::new(name.to_string())?;
+    run_git(repository, &["branch", name.as_str()])?;
+    Ok(())
+}
+
 pub(crate) fn delete_branch(repository: &GitRepository, name: &str) -> Result<(), String> {
     let name = BranchName::new(name.to_string()).map_err(|message| message)?;
     run_git(repository, &["branch", "-d", name.as_str()])?;
@@ -786,13 +822,21 @@ pub fn get_github_client_id() -> Option<String> {
     None
 }
 
+fn github_http() -> ureq::Agent {
+    ureq::Agent::config_builder()
+        .timeout_global(Some(std::time::Duration::from_secs(30)))
+        .build()
+        .into()
+}
+
 pub fn request_device_code(client_id: &str) -> Result<DeviceCodeResponse, String> {
     let body = serde_json::json!({
         "client_id": client_id,
         "scope": ""
     });
 
-    let resp: serde_json::Value = ureq::post("https://github.com/login/device/code")
+    let resp: serde_json::Value = github_http()
+        .post("https://github.com/login/device/code")
         .header("Accept", "application/json")
         .send_json(&body)
         .map_err(|e| format!("Device code request failed: {e}"))?
@@ -827,7 +871,8 @@ pub fn poll_for_token(
         "grant_type": "urn:ietf:params:oauth:grant-type:device_code"
     });
 
-    let resp: serde_json::Value = ureq::post("https://github.com/login/oauth/access_token")
+    let resp: serde_json::Value = github_http()
+        .post("https://github.com/login/oauth/access_token")
         .header("Accept", "application/json")
         .send_json(&body)
         .map_err(|e| format!("Token poll failed: {e}"))?
@@ -858,7 +903,8 @@ pub fn poll_for_token(
 }
 
 pub fn get_github_username(token: &str) -> Result<String, String> {
-    let resp: serde_json::Value = ureq::get("https://api.github.com/user")
+    let resp: serde_json::Value = github_http()
+        .get("https://api.github.com/user")
         .header("Authorization", &format!("Bearer {token}"))
         .header("User-Agent", "DevManager")
         .call()
@@ -903,13 +949,20 @@ pub struct AiCommitMessage {
 pub(crate) fn get_staged_diff(repository: &GitRepository) -> Result<String, String> {
     run_git(
         repository,
-        &["diff", "--cached", "--no-ext-diff", "--no-color"],
+        &[
+            "diff",
+            "--cached",
+            "--no-ext-diff",
+            "--no-textconv",
+            "--no-color",
+        ],
     )
 }
 
 /// Exchange a GitHub OAuth token for a short-lived Copilot API token.
 fn get_copilot_token(github_token: &str) -> Result<String, String> {
-    let resp: serde_json::Value = ureq::get("https://api.github.com/copilot_internal/v2/token")
+    let resp: serde_json::Value = github_http()
+        .get("https://api.github.com/copilot_internal/v2/token")
         .header("Authorization", &format!("token {}", github_token))
         .header("User-Agent", "DevManager")
         .call()
@@ -995,7 +1048,8 @@ fn call_copilot_chat(
             std::thread::sleep(std::time::Duration::from_secs(1));
         }
 
-        let result = ureq::post("https://api.githubcopilot.com/chat/completions")
+        let result = github_http()
+            .post("https://api.githubcopilot.com/chat/completions")
             .header("Authorization", &format!("Bearer {}", copilot_token))
             .header("Copilot-Integration-Id", "vscode-chat")
             .header("Editor-Version", "vscode/1.96.0")

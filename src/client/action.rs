@@ -797,6 +797,7 @@ pub const fn cockpit_query_action_id(query: &TaskCockpitQuery) -> &'static str {
         TaskCockpitQuery::GitRepositories => ACTION_GIT_REPOSITORIES,
         TaskCockpitQuery::GitStatus
         | TaskCockpitQuery::GitStatusTargeted { .. }
+        | TaskCockpitQuery::GitDesktopTargeted { .. }
         | TaskCockpitQuery::GitFileDiffTargeted { .. }
         | TaskCockpitQuery::GitHistoryTargeted { .. }
         | TaskCockpitQuery::GitCommitDiffTargeted { .. }
