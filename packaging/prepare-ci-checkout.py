@@ -16,7 +16,14 @@ configured = os.environ.get("CARGO_TARGET_DIR")
 if configured and Path(configured).resolve() != target:
     raise SystemExit("Existing Cargo target does not match the isolated checkout")
 target.mkdir(parents=True, exist_ok=True)
-temp_root = target / "ci-private-tmp"
+temp_base = Path(os.environ.get("RUNNER_TEMP", root.parent)).resolve()
+if any((parent / ".git").exists() for parent in (temp_base, *temp_base.parents)):
+    raise SystemExit("CI temporary root must be outside a Git checkout")
+temp_key = hashlib.sha256("|".join([
+    str(root), os.environ.get("GITHUB_RUN_ID", "local"),
+    os.environ.get("GITHUB_JOB", "checkout"), os.environ.get("GITHUB_RUN_ATTEMPT", "1"),
+]).encode()).hexdigest()[:16]
+temp_root = temp_base / f"devmanager-ci-{temp_key}"
 temp_root.mkdir(mode=0o700, exist_ok=True)
 metadata = temp_root.lstat()
 if not stat.S_ISDIR(metadata.st_mode) or temp_root.resolve() != temp_root:

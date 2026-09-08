@@ -1451,7 +1451,12 @@ fn linked_worktree_allows_normal_stage_and_commit_transitions() {
     let confirmation = confirm(&repository, &commit);
     repository
         .commit(&commit, &confirmation)
-        .unwrap_or_else(|error| panic!("commit linked file: {error}"));
+        .unwrap_or_else(|error| match error {
+            GitError::InvalidRepositoryRoot { reason, .. } => {
+                panic!("commit linked file: {reason}")
+            }
+            error => panic!("commit linked file: {error}"),
+        });
     assert!(repository
         .status()
         .expect("linked status")

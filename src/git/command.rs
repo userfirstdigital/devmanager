@@ -1827,7 +1827,9 @@ fn directory_identity_impl(
         return Ok(FileIdentity {
             device: metadata.dev(),
             inode: metadata.ino(),
-            number_of_links: metadata.nlink(),
+            // On ext4 this counts child directories, so ordinary object/ref
+            // creation changes it. The retained directory inode is the fence.
+            number_of_links: 0,
             file_size: 0,
             modified_seconds: 0,
             modified_nanos: 0,
@@ -6051,11 +6053,12 @@ impl RepositoryRoot {
                 .handle
                 .metadata()
                 .map_err(|_| "held repository root handle is unavailable".to_string())?;
-            // Match directory_identity: mutable directory timestamps/size are not replacement identity.
+            // Match directory_identity: child link counts, timestamps, and
+            // size change during ordinary directory maintenance.
             let held_identity = FileIdentity {
                 device: metadata.dev(),
                 inode: metadata.ino(),
-                number_of_links: metadata.nlink(),
+                number_of_links: 0,
                 file_size: 0,
                 modified_seconds: 0,
                 modified_nanos: 0,

@@ -2203,7 +2203,7 @@ impl ProviderAuthEvidenceRegistry {
     }
 }
 
-/// The attested file, kept open only while a launch is in flight.
+/// Attested identity and a file slot retained while a launch is in flight.
 ///
 /// The open handle's Windows share mode (see `open_nofollow`) is what stops the
 /// path being renamed or replaced between identity capture and `CreateProcess`.
@@ -2212,11 +2212,17 @@ impl ProviderAuthEvidenceRegistry {
 /// a provider CLI: `npm i -g @openai/codex` fails with `EBUSY` renaming
 /// `codex.cmd` while devmanager runs, and npm treats the half-written package
 /// as a success. Holders take a pin for the launch and drop it once the child
-/// is gone; with no holders the file is closed and the path is free again.
+/// is gone; with no holders the Windows file is closed and the path is free
+/// again. Unix additionally keeps a descriptor that prevents inode reuse
+/// without denying rename or unlink.
 struct ProviderExecutablePinState {
     path: PathBuf,
     file_identity: ProviderFileIdentity,
     is_native: bool,
+    // Unix replacement is allowed while this descriptor is open, but the old
+    // inode cannot be recycled into a new executable under its attested id.
+    #[cfg(unix)]
+    _identity_guard: File,
     slot: Mutex<ProviderExecutablePinSlot>,
 }
 
@@ -2723,10 +2729,10 @@ impl ProviderExecutable {
             ));
         }
 
-        // The attesting handles are dropped here on purpose: from this point
-        // the file is opened only for the span of a launch (see
-        // `ProviderExecutablePinState`). `pin()` re-verifies the identity
-        // captured above before it hands the launch anything.
+        // Windows must release attestation handles between launches to permit
+        // CLI upgrades. Unix retains one identity guard without denying rename
+        // or unlink, preventing inode reuse while this attestation is live.
+        #[cfg(not(unix))]
         drop(first.file);
         drop(confirmation);
         Ok(Self {
@@ -2738,6 +2744,8 @@ impl ProviderExecutable {
                 path: canonical_path,
                 file_identity: first.identity,
                 is_native,
+                #[cfg(unix)]
+                _identity_guard: first.file,
                 slot: Mutex::new(ProviderExecutablePinSlot::default()),
             }),
         })

@@ -209,7 +209,7 @@ jobs:
       - name: Run Linux library and file tests serially
         run: |
           set -o pipefail
-          cargo test --locked --lib -j 2 -- --test-threads=1 2>&1 | tee launch-evidence/library.log
+          GDK_BACKEND=x11 xvfb-run -a cargo test --locked --lib -j 2 -- --test-threads=1 2>&1 | tee launch-evidence/library.log
           cargo test --locked --test file_service -j 2 -- --test-threads=1 2>&1 | tee launch-evidence/files.log
 
       - name: Build desktop acceptance archive

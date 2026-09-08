@@ -1545,6 +1545,26 @@ fn maybe_test_cleanup_barrier() {
 fn maybe_test_cleanup_barrier() {}
 
 fn remove_unrecognized_entry(path: &Path) -> Result<(), CredentialError> {
+    #[cfg(target_os = "linux")]
+    let identity_guard = {
+        use std::os::unix::fs::OpenOptionsExt;
+        match fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_PATH | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(path)
+        {
+            Ok(handle) => handle,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+            Err(_) => return Err(CredentialError::CleanupUncertain),
+        }
+    };
+    // O_PATH retains even a symlink inode without following it. A replacement
+    // cannot recycle its identity between classification and quarantine.
+    #[cfg(target_os = "linux")]
+    let metadata = identity_guard
+        .metadata()
+        .map_err(|_| CredentialError::CleanupUncertain)?;
+    #[cfg(not(target_os = "linux"))]
     let metadata = match fs::symlink_metadata(path) {
         Ok(metadata) => metadata,
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
@@ -1560,6 +1580,10 @@ fn remove_unrecognized_entry(path: &Path) -> Result<(), CredentialError> {
     }
     let handle = open_no_follow(path).map_err(|_| CredentialError::CleanupUncertain)?;
     let identity = file_identity(&handle).map_err(|_| CredentialError::CleanupUncertain)?;
+    #[cfg(target_os = "linux")]
+    if identity != entry_identity(&metadata)? {
+        return Err(CredentialError::CleanupUncertain);
+    }
     let fingerprint = if path
         .extension()
         .is_some_and(|extension| extension == "json")
@@ -1779,7 +1803,7 @@ fn quarantine_entry(
         // atomic no-replace move.  The moved entry is checked again below;
         // either mismatch leaves the quarantine visible and fails closed.
         let current = fs::symlink_metadata(path).map_err(|_| CredentialError::CleanupUncertain)?;
-        if entry_identity(&current)? != expected_identity {
+        if !current.file_type().is_symlink() || entry_identity(&current)? != expected_identity {
             return Err(CredentialError::CleanupUncertain);
         }
         let quarantine = quarantine_path(path)?;
@@ -2776,6 +2800,25 @@ mod tests {
             .expect("records")
             .contains_key(&identity));
         assert!(store.inner.uncertain_cleanups.load(Ordering::Acquire) > 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn quarantine_refuses_regular_entry_even_when_identity_matches() {
+        let root = tempfile::tempdir().expect("root");
+        let path = root.path().join("ssh-orphan.tmp");
+        let replacement = b"replacement must remain at its original path";
+        fs::write(&path, replacement).expect("replacement");
+        // Model a regular file that reused a removed symlink's inode. Identity
+        // equality alone must never authorize moving the replacement.
+        let identity =
+            entry_identity(&fs::symlink_metadata(&path).expect("metadata")).expect("identity");
+        assert!(matches!(
+            quarantine_entry(&path, identity),
+            Err(CredentialError::CleanupUncertain)
+        ));
+        assert_eq!(fs::read(&path).expect("original path remains"), replacement);
+        assert_eq!(fs::read_dir(root.path()).expect("entries").count(), 1);
     }
 
     #[cfg(unix)]

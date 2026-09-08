@@ -27,8 +27,7 @@ pub struct WorkspaceProjectRoots {
 /// authorization compares the retained identity, never a caller-supplied root.
 #[derive(Clone, PartialEq, Eq)]
 pub(crate) struct ConfiguredProjectRoot {
-    path: PathBuf,
-    identity: String,
+    validated: crate::workspace::service::ValidatedHostWorkspacePath,
 }
 
 /// One active configured project folder retained by sealed workspace authority.
@@ -41,7 +40,7 @@ pub(crate) struct ConfiguredProjectFolder {
     project_id: ProjectId,
     label: String,
     path: PathBuf,
-    identity: Option<String>,
+    identity: Option<crate::workspace::service::ValidatedHostWorkspacePath>,
 }
 
 impl ConfiguredProjectFolder {
@@ -62,7 +61,9 @@ impl ConfiguredProjectFolder {
     }
 
     pub(crate) fn identity(&self) -> Option<&str> {
-        self.identity.as_deref()
+        self.identity
+            .as_ref()
+            .map(|validated| validated.identity.as_str())
     }
 
     pub(crate) fn is_admitted(&self) -> bool {
@@ -72,11 +73,11 @@ impl ConfiguredProjectFolder {
 
 impl ConfiguredProjectRoot {
     pub(crate) fn path(&self) -> &Path {
-        &self.path
+        &self.validated.path
     }
 
     pub(crate) fn identity(&self) -> &str {
-        &self.identity
+        &self.validated.identity
     }
 }
 
@@ -196,12 +197,9 @@ impl WorkspaceProjectRoots {
 
             let validated = crate::workspace::service::validate_host_workspace_path(&root, true)
                 .map_err(|_| WorkspaceProjectRootsError::MalformedProjectRoot(root.clone()))?;
-            let configured = ConfiguredProjectRoot {
-                path: validated.path,
-                identity: validated.identity,
-            };
+            let configured = ConfiguredProjectRoot { validated };
 
-            if let Some((first, first_root)) = identities.get(&configured.identity) {
+            if let Some((first, first_root)) = identities.get(configured.identity()) {
                 return Err(WorkspaceProjectRootsError::AmbiguousProjectRoot {
                     root: first_root.clone(),
                     first: *first,
@@ -209,8 +207,8 @@ impl WorkspaceProjectRoots {
                 });
             }
             identities.insert(
-                configured.identity.clone(),
-                (project_id, configured.path.clone()),
+                configured.identity().to_string(),
+                (project_id, configured.path().to_path_buf()),
             );
             roots.insert(project_id, configured);
         }
@@ -298,7 +296,7 @@ impl WorkspaceProjectRoots {
     }
 
     pub(crate) fn root_for(&self, project_id: ProjectId) -> Option<&Path> {
-        self.roots.get(&project_id).map(|root| root.path.as_path())
+        self.roots.get(&project_id).map(|root| root.path())
     }
 
     pub(crate) fn configured_root_for(
@@ -349,7 +347,7 @@ fn admit_configured_folders(
                 (path, None)
             } else {
                 match crate::workspace::service::validate_host_workspace_path(&path, true) {
-                    Ok(validated) => (validated.path, Some(validated.identity)),
+                    Ok(validated) => (validated.path.clone(), Some(validated)),
                     Err(_) => (path, None),
                 }
             };

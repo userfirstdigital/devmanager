@@ -5,11 +5,43 @@ launch platforms. macOS is outside the verified launch scope because no Mac
 test machine is available. This Linux machine cannot certify the Windows
 desktop or installer.
 Linux production packaging and a real signed 0.4.1 → 0.4.2 AppImage upgrade
-pass. The final serial library suite passed: **4,178 passed, zero failed,
+pass. The final native ext4 serial library suite passed: **4,180 passed, zero failed,
 22 ignored**. Exact-session identity checks, native contracts, the real WebKit
 engine, CLI/updater/package contracts, and the locked all-target compiler check
 are recorded below. Windows desktop and installer acceptance still require a
 Windows machine; public release promotion has not occurred.
+
+## ext4 and cleanup follow-up
+
+Native ext4 verification exposed directory link counts changing during normal
+Git object/ref maintenance and deleted inode numbers being reused quickly.
+Directory identity comparisons now ignore child link counts in both pathname
+and retained-handle checks. Unix configured workspace roots and provider
+attestations retain their original descriptors so a replacement cannot reuse
+the admitted inode. Ordinary Unix rename/unlink remains possible. SSH orphan
+cleanup retains a no-follow Linux identity handle and checks the entry kind
+before quarantine, preserving an unexpected regular replacement at its path.
+
+A separate cleanup waiter race could report failure after teardown had already
+completed. The waiter now observes the notification before looking up the
+report. A deterministic regression reproduced the old failure; the correction
+passed all 54 teardown tests and 100 repetitions of the 257-cleanup acceptance
+case with the process restricted to two CPUs.
+
+CI now gives the full Linux library suite an X11 display. Test temporary roots
+are private, canonical directories outside Git checkout ancestry, so a plain
+folder fixture cannot accidentally discover the runner's parent repository.
+The source checkout retains its own isolated Cargo target. Private preparation
+checks verified permissions, symlink rejection, Git ancestry rejection and the
+reviewed WASM inputs. Verification on a private kernel-mounted ext4 volume
+passed 4,180 library tests (22 ignored), 128 Git tests, six configured-root
+checks, 21 native contracts, the real WebKit lifecycle, four exact-session
+checks, nine CLI tests, 86 file-service tests (one ignored), 45 updater/package
+checks, and the locked all-target compiler check. A further 100 linked-worktree
+Stage/Commit cycles passed on two CPUs. No owned harness/compiler remained;
+production settings hashes and the installed app PID/start time were unchanged.
+The final AppImage and live acceptance are identified in draft PR #2; earlier
+package evidence below names its own artifact.
 
 ## Linux production package and updater acceptance
 
@@ -121,7 +153,7 @@ one accepted input exactly once, displayed `SHIPPING LINUX READY.`, and cleared
 the composer. Archive removed the exact provider PID and emptied its running
 ledger; the packaged client then closed with exit code zero.
 
-The installed AppImage SHA-256 is
+The previous installed AppImage SHA-256 was
 `bcbe0d447ce59eb8e36129751c2fc9c667d7ff2444cfa563d18e7a4326104f8d`.
 It includes the repository's public update verification key, the official GitHub
 release feed, and the browser bundle reproduced identically on Windows and Linux.
@@ -131,13 +163,12 @@ and both settings files. The old host exited at 0.524s, image exchange occurred 
 remained Open and both recovery journals cleared. The fixture client, host,
 private display and update server all exited afterward.
 
-This artifact is installed at `/home/robin/Applications/DevManager.AppImage`, with
-a desktop launcher and icon. It is intentionally left running on the real KDE
+This artifact was installed at `/home/robin/Applications/DevManager.AppImage`, with
+a desktop launcher and icon, and was left running on the real KDE
 NVIDIA desktop. Process-to-window measured 0.615s; the subsequent full 960×640
 capture showed the canonical empty workspace with Add project enabled. Eight
 embedded browser asset tests and the locked all-target compiler check passed
-after the final browser bundle rebuild. Documentation and CI-only changes do
-not require a replacement of this verified binary.
+after the final browser bundle rebuild. The ext4 and cleanup follow-up above is verified separately from this artifact.
 
 The final serial run also includes a deterministic test-only Claude hook
 publication fix: SessionStart publication finishes before the test arms its
@@ -629,8 +660,11 @@ source assertions, and process-lifecycle fixtures. CI now uses a canonical
 Windows temporary directory, Rust source checks out with LF, and the Windows
 process fixture launches its child directly without shell activation. The
 257-cleanup regression now reports the exact failing cleanup for any remaining
-failure; it passes locally. These corrections still require a green Windows
-rerun. Linux CI's four initial CLI failures reproduced under shared `/tmp`;
+failure. Its notification race is now fixed with a deterministic regression and
+100 repeated stress runs. The later Windows run at `71e15e31` passed 4,279 tests
+with 15 failures, all in the path-alias, source-line-ending and process-fixture
+areas corrected for the next candidate. These corrections still require a green
+Windows rerun. Linux CI's four initial CLI failures reproduced under shared `/tmp`;
 all nine tests pass using the new private temporary directory. Consult the PR
 checks for the final platform results. The separate web workflow
 now restores the reviewed WASM inputs and installs the native dependencies needed

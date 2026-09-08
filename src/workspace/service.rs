@@ -2709,11 +2709,23 @@ impl PinnedPath {
 /// traversal used by live workspace authorities. The returned path is only a
 /// lexical absolute locator for host-private use; its authority is the handle
 /// identity captured during this call.
-#[derive(Clone, PartialEq, Eq)]
+#[derive(Clone)]
 pub(crate) struct ValidatedHostWorkspacePath {
     pub(crate) path: PathBuf,
     pub(crate) identity: String,
+    // Keep the physical object allocated for the lifetime of issued authority;
+    // a recycled inode must never impersonate a deleted configured root.
+    #[cfg(unix)]
+    _identity_guard: Arc<fs::File>,
 }
+
+impl PartialEq for ValidatedHostWorkspacePath {
+    fn eq(&self, other: &Self) -> bool {
+        self.path == other.path && self.identity == other.identity
+    }
+}
+
+impl Eq for ValidatedHostWorkspacePath {}
 
 pub(crate) fn validate_host_workspace_path(
     path: &Path,
@@ -2735,6 +2747,8 @@ pub(crate) fn validate_host_workspace_path(
     Ok(ValidatedHostWorkspacePath {
         path: pinned.path,
         identity: pinned.identity,
+        #[cfg(unix)]
+        _identity_guard: Arc::new(pinned.file),
     })
 }
 
@@ -3179,7 +3193,13 @@ fn security_fingerprint(_: &fs::File) -> io::Result<Option<[u8; 32]>> {
 fn hard_link_count(file: &fs::File, metadata: &fs::Metadata) -> u64 {
     use std::os::unix::fs::MetadataExt;
     let _ = file;
-    metadata.nlink()
+    // Directory link counts include child directories on ext4. They are not
+    // replacement identity and must not invalidate unrelated retained roots.
+    if metadata.is_dir() {
+        0
+    } else {
+        metadata.nlink()
+    }
 }
 
 #[cfg(windows)]

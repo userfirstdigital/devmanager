@@ -3538,8 +3538,16 @@ impl CleanupCell {
     }
 
     async fn wait(&self) -> TeardownReport {
+        self.wait_observing_lookup(|| {}).await
+    }
+
+    async fn wait_observing_lookup(&self, mut after_lookup: impl FnMut()) -> TeardownReport {
         let mut done = self.done.subscribe();
         loop {
+            // Observe the notification before looking up its report. A finish
+            // between the lookup and notification check must trigger another
+            // lookup, not turn the completed cleanup into a synthetic failure.
+            let settled = *done.borrow_and_update();
             let report = match lock_mutex_until(
                 &self.result,
                 self.absolute_deadline,
@@ -3551,10 +3559,11 @@ impl CleanupCell {
                 // attempt state remains available to a later exact retry.
                 Err(_) => return self.fallback.clone(),
             };
+            after_lookup();
             if let Some(report) = report {
                 return report;
             }
-            if *done.borrow_and_update() {
+            if settled {
                 // Settlement was signalled but its report was unavailable.
                 // Waiting for another watch transition could hang forever.
                 return self.fallback.clone();
@@ -6332,6 +6341,44 @@ mod tests {
                 .expect("signalled waiter must resolve within its bound")
         });
         assert_eq!(report.outcome(), super::TeardownOutcome::CleanupFailed);
+    }
+
+    #[test]
+    fn settlement_between_result_lookup_and_notification_returns_exact_report() {
+        let key = completion_key_for_test(
+            12,
+            std::env::current_exe().expect("current test executable"),
+        );
+        let ticket = super::TeardownTicket::new(
+            crate::domain::id::OperationId::new(),
+            super::TeardownScope::Host,
+            key.action_epoch,
+            key.fence.clone(),
+        )
+        .expect("exact waiter ticket");
+        let cell = super::CleanupCell::new(&ticket, Instant::now() + Duration::from_secs(1));
+        let expected = super::TeardownReport {
+            ticket,
+            outcome: super::TeardownOutcome::Closed,
+            attempted_stages: Vec::new(),
+            stage_notes: vec!["exact completed cleanup".into()],
+            errors: Vec::new(),
+            residue: None,
+        };
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("waiter test runtime");
+        let mut published = false;
+        let report = runtime.block_on(cell.wait_observing_lookup(|| {
+            if !published {
+                // Publish immediately after the first empty result lookup,
+                // before the waiter observes or awaits the watch notification.
+                published = true;
+                cell.finish(expected.clone());
+            }
+        }));
+        assert_eq!(report, expected);
     }
 
     #[test]
