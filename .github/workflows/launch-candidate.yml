@@ -8,12 +8,11 @@ on:
 permissions:
   contents: read
 
-concurrency:
-  group: launch-candidate-${{ github.ref }}
-  cancel-in-progress: false
-
 jobs:
   windows:
+    concurrency:
+      group: launch-candidate-${{ github.ref }}-windows
+      cancel-in-progress: false
     runs-on: windows-latest
     timeout-minutes: 90
     env:
@@ -69,13 +68,21 @@ jobs:
           ./packaging/Assert-ThirdPartyProvenance.ps1
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
 
-      - name: Compile every target and run tests serially
+      - name: Compile every Windows target
         shell: pwsh
         run: |
           cargo check --locked --lib --bins --tests --target-dir "$env:CARGO_TARGET_DIR" -j 2 2>&1 | Tee-Object launch-evidence/compiler.log
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
+
+      - name: Build Windows process test helper
+        shell: pwsh
+        run: |
           cargo build --locked --bin devmanager-process-test-helper --target-dir "$env:CARGO_TARGET_DIR" -j 2 2>&1 | Tee-Object launch-evidence/process-helper.log
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
+
+      - name: Run Windows tests serially
+        shell: pwsh
+        run: |
           cargo test --locked --all-targets --target-dir "$env:CARGO_TARGET_DIR" -j 2 -- --test-threads=1 2>&1 | Tee-Object launch-evidence/tests.log
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
 
@@ -119,6 +126,9 @@ jobs:
           if-no-files-found: error
 
   linux:
+    concurrency:
+      group: launch-candidate-${{ github.ref }}-linux
+      cancel-in-progress: false
     runs-on: ubuntu-24.04
     timeout-minutes: 90
     env:
@@ -171,16 +181,28 @@ jobs:
           npm --prefix web run build
           GIT_OPTIONAL_LOCKS=0 git diff --exit-code -- web/bundle
 
-      - name: Compile all targets and verify library and desktop contracts
+      - name: Compile every Linux target
         run: |
           set -o pipefail
           python packaging/assert-linux-process-clean.py
           cargo check --locked --lib --bins --tests -j 2 2>&1 | tee launch-evidence/compiler.log
+
+      - name: Build Linux process test helper
+        run: |
+          set -o pipefail
           cargo build --locked --bin devmanager-process-test-helper -j 2 2>&1 | tee launch-evidence/process-helper.log
+
+      - name: Verify Linux CLI and native contracts
+        run: |
+          set -o pipefail
           cargo test --locked --test cli_client -j 2 -- --test-threads=1
           cargo test --locked --lib exact_resume_mismatch -j 2 -- --test-threads=1 2>&1 | tee launch-evidence/session-identity.log
           xvfb-run -a cargo test --locked --test ui_native_shell -j 2 -- --test-threads=1 2>&1 | tee launch-evidence/native-contract.log
           GDK_BACKEND=x11 xvfb-run -a cargo test --locked --lib linux_webkit_native_lifecycle -j 2 -- --ignored --test-threads=1 2>&1 | tee launch-evidence/linux-browser-engine.log
+
+      - name: Run Linux library and file tests serially
+        run: |
+          set -o pipefail
           cargo test --locked --lib -j 2 -- --test-threads=1 2>&1 | tee launch-evidence/library.log
           cargo test --locked --test file_service -j 2 -- --test-threads=1 2>&1 | tee launch-evidence/files.log
 
